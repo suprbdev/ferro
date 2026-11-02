@@ -25,8 +25,9 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 
 ## Canonical tree
 
-`Map` is a Merkle search tree. A key's level is `trailing_zeros(blake3(encoded key)) / 4`, so
-about 1 in 16 keys is promoted per level. A node holds all keys of exactly its level within its
+`Map` is a Merkle search tree. A key's level is `trailing_zeros(blake3(encoded key)) / 3`, so
+about 1 in 8 keys is promoted per level. Fanout 8 was chosen by measurement at 300k keys: against
+fanout 16 it writes 33% fewer bytes per commit for 27% slower gets. A node holds all keys of exactly its level within its
 range, and children hold the gaps. Tree shape depends only on the key set, never on insertion
 order. Consequences that the rest of the system relies on:
 
@@ -67,6 +68,25 @@ Each branch head holds a `Map<u64, Commit>` log, stored in ferro's own tree, whi
 version lookup O(log n). `Refs` is `Map<String, Head>` and the superblock points at it. Forking a
 branch copies one `Head`. `restore` commits an old value as a new version, so history is never
 rewritten.
+
+`Db::history_of` walks the log and reports the versions where a projection of the root changed.
+
+## Merging
+
+`Db::common_ancestor` finds the newest commit two branches share. Forking copies the log, so the
+logs agree up to the fork and differ after it, which makes this a binary search. `Map::merge` and
+`Table::merge` then do a three-way merge driven by `diff(base, theirs)`, costing O(changes). A
+key changed only by theirs is applied. A key changed the same way on both sides is left alone.
+A key changed differently on both sides goes to a `resolve` closure. Merging runs inside an
+ordinary commit, so a root with several collections merges each one in plain Rust.
+
+## Compaction
+
+Compaction is offline and needs no user types. It prunes each branch's log, then copies every
+object still reachable into a new file. Hashes do not cover offsets, so objects move verbatim
+and only their link offsets are rewritten; every object is re-verified on the way through. The
+new file replaces the old with an atomic rename. A read-only handle holding the old inode keeps
+reading its old snapshot, and `refresh` reports `Error::Replaced`.
 
 ## Schema evolution
 
