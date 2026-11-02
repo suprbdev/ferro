@@ -82,6 +82,33 @@ blocks, never changes, and stays valid for as long as you hold it. Collections w
 standard library counterparts: `get`, `iter`, `range`, `keys`, `values`, `first`, `last`, with
 `DoubleEndedIterator` and `ExactSizeIterator`. Filtering, grouping and joining are iterator code.
 
+`get` and the iterators hand out a `Val<V>`, which derefs to `V`. A small value with no heap of its
+own, such as an integer, a `()` or a struct of integers, is copied into it. Any other `Val` shares
+its node's column of values and keeps that column alive, so call `into_owned` before holding many of
+them for long.
+
+**Reads in bulk.** `sum`, `count`, `for_each` and other folds on the plain iterators take whole
+nodes at a time. `Map::for_each`, `try_for_each`, `for_each_range` and `try_for_each_range` lend
+`&K` and `&V`, so they clone nothing, and the `try_` forms stop on `ControlFlow::Break`.
+`Map::cursor` gives a `Cursor` that keeps its path through the tree, so `seek` and `seek_back` cost
+the distance moved instead of a walk from the root, which suits sorted lookups and merge joins.
+`get_many` and `contains_many` run a cursor over an iterator of keys, and keys out of order still
+give the right answer, at the cost of a fresh walk each. `Map::floor` finds the last key at or
+before a key in one walk.
+
+```rust
+frontier.sort_unstable();
+let reached: u64 = degrees
+    .get_many(&frontier)
+    .filter_map(|(_, count)| count)
+    .map(|count| u64::from(*count))
+    .sum();
+
+let mut shared = 0;
+let mut other = right.cursor();
+left.for_each(|key, _| shared += usize::from(other.seek(key)));
+```
+
 **Writes are closures.** `update`, `commit` and `commit_with` give you `&mut T`. When the closure
 returns, the change commits atomically. If it panics or `try_update` returns `Err`, nothing
 happens. Writers run one at a time, so a transaction is serializable by construction.
@@ -96,7 +123,7 @@ hash of any `Data` value, which makes an ETag one line.
 | --- | --- |
 | `Map<K, V>` | Ordered map, with `get_mut` handing out a real `&mut V` |
 | `Map<K, V, S>` | The same, keeping a `Summary` of every subtree for O(log n) range totals |
-| `Set<T>` | Ordered set |
+| `Set<T>` | Ordered set, whose `range` has a `len` like the rest |
 | `List<T>` | Append-mostly sequence with indexed access |
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
 | `Bytes` | Byte buffer value with `Deref<Target = [u8]>` and O(1) clone |
@@ -287,19 +314,19 @@ cargo run --release -p tracker -- undo
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`. Each is a single run.
+`ferro-bench`, as the median of five runs alternating with the build before.
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 1.6 s |
-| Random `get` | 1.0 µs |
-| Full scan | 53 ns per key |
-| Range read | 54 ns per key |
-| Single-key commit, fsync | 460 µs, about 2,200 per second |
-| Single-key commits, fsync, 8 writers | about 9,800 per second |
-| Single-key commit, `Durability::Buffered` | 72 µs |
-| Bytes written per single-key commit | 8.5 KB |
-| `diff` | 5.7 µs per changed key |
+| Bulk insert in one commit | 1.5 s |
+| Random `get` | 0.41 µs |
+| Full scan | 35 ns per key |
+| Range read | 39 ns per key |
+| Single-key commit, fsync | 480 to 650 µs, about 1,500 to 2,000 per second |
+| Single-key commits, fsync, 8 writers | about 9,500 per second |
+| Single-key commit, `Durability::Buffered` | 27 µs |
+| Bytes written per single-key commit | 3.5 KB |
+| `diff` | 4.4 µs per changed key |
 
 The tracker with 100,000 issues in a 39 MB file, as whole process runs including open: seeding in
 845 ms, indexed `list` in 2 ms, `show` in 1 ms, durable `close` in 1 ms, `stats` in 3 ms,
@@ -311,7 +338,7 @@ This is an experiment, not a production database.
 
 - The file format is not stable and may change without migration.
 - It runs on Unix only.
-- Storage only grows until you compact. A single-key commit writes about 8.5 KB at this size, so
+- Storage only grows until you compact. A single-key commit writes about 3.5 KB at this size, so
   batch related changes into one commit. Secondary indexes add to that.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
   every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
@@ -329,6 +356,6 @@ This is an experiment, not a production database.
   not idempotent, such as one adding a counter delta, applies it twice.
 - Version 0 is not stored. `at(0)` and forks of an empty database use your current `Default`.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
-  You choose the index.
+  You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 
 See `DESIGN.md` for how it works.
