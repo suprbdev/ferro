@@ -67,6 +67,8 @@ enum Op {
     SplitOff(u32),
     SplitRejoin(u32),
     AppendMap(Vec<(u32, u64, usize)>),
+    Extend(Vec<(u32, u64, usize)>),
+    ApplyEdits(Vec<(u32, Option<(u64, usize)>)>),
     Range(Bound<u32>, Bound<u32>, Vec<Step>),
     Walk(Vec<Step>),
     KeysWalk(Vec<Step>),
@@ -122,6 +124,9 @@ fn op(keys: u32, durable: bool) -> impl Strategy<Value = Op> {
         1 => (0..keys).prop_map(Op::SplitOff),
         2 => (0..keys).prop_map(Op::SplitRejoin),
         2 => prop::collection::vec((0..keys, any::<u64>(), sizes()), 0..12).prop_map(Op::AppendMap),
+        3 => prop::collection::vec((0..keys, any::<u64>(), sizes()), 0..40).prop_map(Op::Extend),
+        3 => prop::collection::vec((0..keys, prop::option::of((any::<u64>(), sizes()))), 0..40)
+            .prop_map(Op::ApplyEdits),
         4 => (bound(keys), bound(keys), steps()).prop_map(|(a, b, s)| Op::Range(a, b, s)),
         2 => steps().prop_map(Op::Walk),
         1 => steps().prop_map(Op::KeysWalk),
@@ -341,6 +346,34 @@ fn apply<K: TestKey>(
             map.append(&mut other);
             assert!(other.is_empty());
             model.append(&mut wanted);
+        }
+        Op::Extend(entries) => {
+            let items: Vec<(K, String)> = entries
+                .iter()
+                .map(|(seed, salt, len)| (resolve(*seed), text(*salt, *len)))
+                .collect();
+            map.extend(items.clone());
+            model.extend(items);
+        }
+        Op::ApplyEdits(edits) => {
+            let items: Vec<(K, Option<String>)> = edits
+                .iter()
+                .map(|(seed, edit)| {
+                    let value = edit.map(|(salt, len)| text(salt, len));
+                    (resolve(*seed), value)
+                })
+                .collect();
+            map.apply(items.clone());
+            for (key, value) in items {
+                match value {
+                    Some(value) => {
+                        model.insert(key, value);
+                    }
+                    None => {
+                        model.remove(&key);
+                    }
+                }
+            }
         }
         Op::Range(low, high, steps) => {
             let low = map_bound(*low, resolve);

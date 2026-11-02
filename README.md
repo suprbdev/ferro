@@ -99,7 +99,8 @@ the contents. A commit that changes nothing is skipped.
 
 `Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and
 join trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range
-and returns the rows, which is O(rows) because every index has to be updated.
+and returns the rows, which is O(rows) because every index has to be updated. `Map::apply` takes a
+batch of puts and deletes and merges it in one descent of the tree, as `extend` does for puts.
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
 `by_status_range(range)` and `by_status_counts()`, which needs no row reads. An `Option<T>` index

@@ -90,6 +90,10 @@ impl<T: Data + Ord> Set<T> {
         self.0.pop_last().map(|(key, _)| key)
     }
 
+    pub fn apply(&mut self, edits: impl IntoIterator<Item = (T, bool)>) {
+        self.0.apply(edits.into_iter().map(|(item, keep)| (item, keep.then_some(()))));
+    }
+
     pub fn take_range<Q, R>(&mut self, range: R) -> Set<T>
     where
         T: Borrow<Q>,

@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, OnceLock, Weak};
+use std::vec;
 
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
@@ -670,6 +671,12 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
     Ok(Link::stored(ptr, node.count))
 }
 
+struct Edit<K, V> {
+    key: K,
+    level: u8,
+    value: Option<Arc<V>>,
+}
+
 struct Open<K, V> {
     level: u8,
     keys: Vec<K>,
@@ -684,10 +691,140 @@ impl<K, V> Open<K, V> {
     }
 }
 
-fn build_sorted<K: Data + Ord, V: Data>(items: Vec<(K, V)>) -> Result<Link<K, V>> {
+fn rise<K: Data + Ord, V: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V>,
+    level: u8,
+    edits: &mut vec::IntoIter<Edit<K, V>>,
+    count: usize,
+) -> Result<()> {
+    let mut left = count;
+    let mut keys = Vec::new();
+    let mut slots = Vec::new();
+    let mut children = Vec::new();
+    let mut piece = link.take();
+    while let Some(before) = edits.as_slice()[..left]
+        .iter()
+        .position(|edit| edit.level == level && edit.value.is_some())
+    {
+        let key = &edits.as_slice()[before].key;
+        let (mut low, high) = split(store, piece, &|probe: &K| probe.cmp(key))?;
+        absorb(store, &mut low, edits, before)?;
+        children.push(low);
+        let edit = edits.next().ok_or(Error::Detached)?;
+        keys.push(edit.key);
+        slots.push(Slot::Fresh(edit.value.ok_or(Error::Detached)?));
+        piece = high;
+        left -= before + 1;
+    }
+    absorb(store, &mut piece, edits, left)?;
+    children.push(piece);
+    *link = link_from(level, keys, slots, children, None);
+    Ok(())
+}
+
+fn absorb<K: Data + Ord, V: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V>,
+    edits: &mut vec::IntoIter<Edit<K, V>>,
+    mut count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    if matches!(link, Link::Empty) {
+        *link = build_sorted(edits.by_ref().take(count));
+        return Ok(());
+    }
+    if let Link::Stored { .. } = link {
+        *link = Link::Mem(load(store, link)?.ok_or(Error::Detached)?);
+    }
+    let top = edits.as_slice()[..count]
+        .iter()
+        .filter(|edit| edit.value.is_some())
+        .map(|edit| edit.level)
+        .max();
+    if let (Link::Mem(current), Some(level)) = (&*link, top)
+        && level > current.level
+    {
+        return rise(store, link, level, edits, count);
+    }
+    let node = node_mut(store, link)?;
+    let level = node.level;
+    let mut position = 0;
+    while count > 0 {
+        let pending = &edits.as_slice()[..count];
+        position += node.keys[position..].partition_point(|key| *key < pending[0].key);
+        if node.keys.get(position) == Some(&pending[0].key) {
+            count -= 1;
+            match edits.next().and_then(|edit| edit.value) {
+                Some(value) => {
+                    node.slots[position] = Slot::Fresh(value);
+                    position += 1;
+                }
+                None => {
+                    node.keys.remove(position);
+                    node.slots.remove(position);
+                    if !node.children.is_empty() {
+                        let right = node.children.remove(position + 1);
+                        let left = node.children[position].take();
+                        node.children[position] = merge(store, left, right)?;
+                    }
+                }
+            }
+            continue;
+        }
+        let group = match node.keys.get(position) {
+            Some(limit) => pending.partition_point(|edit| edit.key < *limit),
+            None => count,
+        };
+        let found = pending[..group]
+            .iter()
+            .position(|edit| edit.level == level && edit.value.is_some());
+        match found {
+            None => {
+                absorb(store, &mut node.children_mut()[position], edits, group)?;
+                count -= group;
+            }
+            Some(before) => {
+                if node.children.is_empty() && before == 0 {
+                    let edit = edits.next().ok_or(Error::Detached)?;
+                    node.keys.insert(position, edit.key);
+                    node.slots.insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
+                } else {
+                    let key = &pending[before].key;
+                    let piece = node.children_mut()[position].take();
+                    let (mut low, high) = split(store, piece, &|probe: &K| probe.cmp(key))?;
+                    absorb(store, &mut low, edits, before)?;
+                    let edit = edits.next().ok_or(Error::Detached)?;
+                    node.keys.insert(position, edit.key);
+                    node.slots.insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
+                    node.children[position] = low;
+                    node.children.insert(position + 1, high);
+                }
+                position += 1;
+                count -= before + 1;
+            }
+        }
+    }
+    node.recount();
+    if node.keys.is_empty() {
+        *link = node.children.first_mut().map_or(Link::Empty, Link::take);
+    }
+    Ok(())
+}
+
+fn build_sorted<K: Data + Ord, V: Data>(edits: impl Iterator<Item = Edit<K, V>>) -> Link<K, V> {
     let mut stack: Vec<Open<K, V>> = Vec::new();
-    for (key, value) in items {
-        let level = level_of(&key)?;
+    for edit in edits {
+        let Edit {
+            key,
+            level,
+            value: Some(value),
+        } = edit
+        else {
+            continue;
+        };
         let mut carry = Link::Empty;
         while stack.last().is_some_and(|top| top.level < level) {
             if let Some(top) = stack.pop() {
@@ -698,12 +835,12 @@ fn build_sorted<K: Data + Ord, V: Data>(items: Vec<(K, V)>) -> Result<Link<K, V>
             Some(top) if top.level == level => {
                 top.children.push(carry);
                 top.keys.push(key);
-                top.slots.push(Slot::Fresh(Arc::new(value)));
+                top.slots.push(Slot::Fresh(value));
             }
             _ => stack.push(Open {
                 level,
                 keys: vec![key],
-                slots: vec![Slot::Fresh(Arc::new(value))],
+                slots: vec![Slot::Fresh(value)],
                 children: vec![carry],
             }),
         }
@@ -712,7 +849,22 @@ fn build_sorted<K: Data + Ord, V: Data>(items: Vec<(K, V)>) -> Result<Link<K, V>
     while let Some(top) = stack.pop() {
         carry = top.close(carry);
     }
-    Ok(carry)
+    carry
+}
+
+fn sorted_unique<K: Ord, T>(mut items: Vec<(K, T)>) -> Vec<(K, T)> {
+    if items.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return items;
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut unique: Vec<(K, T)> = Vec::with_capacity(items.len());
+    for item in items {
+        match unique.last_mut() {
+            Some(last) if last.0 == item.0 => *last = item,
+            _ => unique.push(item),
+        }
+    }
+    unique
 }
 
 fn below<K, Q>(key: &K, start: Bound<&Q>) -> bool
@@ -1101,21 +1253,37 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
             self.store = store;
             return;
         }
-        for (key, value) in other.iter() {
-            self.insert_shared(key, value);
-        }
+        self.batch(other.iter().map(|(key, value)| (key, Some(value))).collect());
         other.clear();
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
-        let doomed: Vec<K> = self
+        let doomed: Vec<(K, Option<Arc<V>>)> = self
             .iter()
             .filter(|(key, value)| !keep(key, value))
-            .map(|(key, _)| key)
+            .map(|(key, _)| (key, None))
             .collect();
-        for key in doomed {
-            self.remove(&key);
-        }
+        self.batch(doomed);
+    }
+
+    pub fn apply(&mut self, edits: impl IntoIterator<Item = (K, Option<V>)>) {
+        self.batch(edits.into_iter().map(|(key, value)| (key, value.map(Arc::new))).collect());
+    }
+
+    fn batch(&mut self, items: Vec<(K, Option<Arc<V>>)>) {
+        let items = sorted_unique(items);
+        let count = items.len();
+        let mut edits: vec::IntoIter<Edit<K, V>> = items
+            .into_iter()
+            .map(|(key, value)| Edit {
+                level: fatal(level_of(&key)),
+                key,
+                value,
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        let store = self.store.as_ref();
+        fatal(absorb(store, &mut self.root, &mut edits, count));
     }
 
     pub fn diff(&self, newer: &Map<K, V>) -> Diff<K, V>
@@ -1172,11 +1340,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     }
 
     fn rebuilt(&self) -> Map<K, V> {
-        let mut copy = Map::new();
-        for (key, value) in self.iter() {
-            copy.insert(key, (*value).clone());
-        }
-        copy
+        self.iter().map(|(key, value)| (key, (*value).clone())).collect()
     }
 }
 
@@ -1238,25 +1402,16 @@ impl<K: Data + Ord + fmt::Debug, V: Data + fmt::Debug> fmt::Debug for Map<K, V> 
 
 impl<K: Data + Ord, V: Data> Extend<(K, V)> for Map<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, items: I) {
-        let mut items: Vec<(K, V)> = items.into_iter().collect();
-        if !items.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            items.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut unique: Vec<(K, V)> = Vec::with_capacity(items.len());
-            for item in items {
-                match unique.last_mut() {
-                    Some(last) if last.0 == item.0 => *last = item,
-                    _ => unique.push(item),
-                }
-            }
-            items = unique;
-        }
-        if self.is_empty() {
-            self.root = fatal(build_sorted(items));
+        if !self.is_empty() {
+            self.apply(items.into_iter().map(|(key, value)| (key, Some(value))));
             return;
         }
-        for (key, value) in items {
-            self.insert(key, value);
-        }
+        let items = sorted_unique(items.into_iter().collect());
+        self.root = build_sorted(items.into_iter().map(|(key, value)| Edit {
+            level: fatal(level_of(&key)),
+            key,
+            value: Some(Arc::new(value)),
+        }));
     }
 }
 

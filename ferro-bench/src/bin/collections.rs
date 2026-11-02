@@ -94,6 +94,52 @@ fn range_bench(dir: &Path, n: u64) {
     report(&format!("append disjoint halves of {n}"), &cost);
 }
 
+fn seeded_mixed(dir: &Path, n: u64) -> Db<Map<u64, String>> {
+    let path = dir.join("merge.ferro");
+    let _ = std::fs::remove_file(&path);
+    let db = open::<Map<u64, String>>(dir, "merge.ferro");
+    db.update(|root| root.extend((0..n).map(|i| (mix(i), format!("value-{i}")))))
+        .unwrap();
+    db
+}
+
+fn merge_bench(dir: &Path, n: u64) {
+    for size in [1u64, 10, 100, 1_000, 10_000, 100_000, 1_000_000] {
+        if size > n {
+            continue;
+        }
+        for (mode, offset) in [("update", 0), ("new", n)] {
+            let mut items: Vec<(u64, String)> = (0..size)
+                .map(|i| (mix(mix(i) % n + offset), format!("fresh-{i}")))
+                .collect();
+            items.sort();
+            items.dedup_by_key(|item| item.0);
+            let count = items.len() as f64;
+            let db = seeded_mixed(dir, n);
+            let mut batch = Some(items.clone());
+            let merged = measure(&db, |root| root.extend(batch.take().unwrap()));
+            drop(db);
+            let db = seeded_mixed(dir, n);
+            let mut batch = Some(items);
+            let incremental = measure(&db, |root| {
+                for (key, value) in batch.take().unwrap() {
+                    root.insert(key, value);
+                }
+            });
+            drop(db);
+            println!(
+                "{mode:<7} batch {size:>8} of {n}: merge {:>9.0} ns/key commit {:>9.0}, insert {:>9.0} ns/key commit {:>9.0}, bytes {} vs {}",
+                merged.closure_ms * 1e6 / count,
+                merged.commit_ms * 1e6 / count,
+                incremental.closure_ms * 1e6 / count,
+                incremental.commit_ms * 1e6 / count,
+                merged.bytes,
+                incremental.bytes,
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map_or("all", String::as_str);
@@ -102,6 +148,7 @@ fn main() {
     let dir = tempfile::tempdir_in("target/bench").unwrap();
     match command {
         "range" => range_bench(dir.path(), n),
+        "merge" => merge_bench(dir.path(), n),
         _ => {
             println!("{}", mix(0));
             range_bench(dir.path(), n);

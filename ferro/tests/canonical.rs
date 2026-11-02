@@ -287,6 +287,111 @@ proptest! {
     }
 }
 
+fn edited(model: &Model, edits: &[(u32, Option<String>)]) -> Model {
+    let mut out = model.clone();
+    for (key, value) in edits {
+        match value {
+            Some(value) => {
+                out.insert(*key, value.clone());
+            }
+            None => {
+                out.remove(key);
+            }
+        }
+    }
+    out
+}
+
+fn batch_forms_agree(model: &Model, edits: &[(u32, Option<String>)]) {
+    let wanted = edited(model, edits);
+    let hash = sorted(&wanted).root_hash();
+    let mut memory = reversed(model);
+    memory.apply(edits.iter().cloned());
+    assert_eq!(memory.len(), wanted.len());
+    assert_eq!(memory.root_hash(), hash);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let db = uncached().open::<Map<u32, String>>(&path).unwrap();
+    db.update(|root| *root = sorted(model)).unwrap();
+    db.update(|root| root.apply(edits.iter().cloned())).unwrap();
+    assert_eq!(db.read().root_hash(), hash);
+    assert_eq!(db.read().len(), wanted.len());
+    let puts: Vec<(u32, String)> = edits
+        .iter()
+        .filter_map(|(key, value)| Some((*key, value.clone()?)))
+        .collect();
+    let mut grown = sorted(model);
+    grown.extend(puts.iter().cloned());
+    let mut wanted_puts = model.clone();
+    wanted_puts.extend(puts.iter().cloned());
+    assert_eq!(grown.root_hash(), sorted(&wanted_puts).root_hash());
+    drop(db);
+    let db = uncached().open::<Map<u32, String>>(&path).unwrap();
+    assert_eq!(db.read().root_hash(), hash);
+    db.verify().unwrap();
+}
+
+fn batch(keys: u32, max: usize) -> impl Strategy<Value = Vec<(u32, Option<String>)>> {
+    let edit = (0..keys, prop::option::weighted(0.7, (any::<u64>(), sizes())));
+    prop::collection::vec(edit, 0..max).prop_map(|edits| {
+        edits
+            .into_iter()
+            .map(|(key, value)| (key, value.map(|(salt, len)| text(salt, len))))
+            .collect()
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(600), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn batches_match_incremental_insertion(model in contents(40, 40), edits in batch(50, 40)) {
+        batch_forms_agree(&model, &edits);
+    }
+
+    #[test]
+    fn batches_match_incremental_insertion_large(model in contents(100_000, 600), edits in batch(100_000, 600)) {
+        batch_forms_agree(&model, &edits);
+    }
+
+    #[test]
+    fn dense_batches_match_incremental_insertion(model in contents(800, 500), edits in batch(800, 900)) {
+        batch_forms_agree(&model, &edits);
+    }
+}
+
+#[test]
+fn batch_onto_a_large_tree_matches_incremental_insertion() {
+    let mut rng = Rng::new(31);
+    let mut map: Map<u64, u64> = (0..150_000u64).map(|key| (key * 3, key)).collect();
+    let mut model: BTreeMap<u64, u64> = (0..150_000u64).map(|key| (key * 3, key)).collect();
+    for round in 0..40u64 {
+        let size = 1 << (round % 14);
+        let edits: Vec<(u64, Option<u64>)> = (0..size)
+            .map(|_| {
+                let key = rng.below(600_000);
+                (key, rng.chance(70).then_some(round))
+            })
+            .collect();
+        for (key, value) in &edits {
+            match value {
+                Some(value) => {
+                    model.insert(*key, *value);
+                }
+                None => {
+                    model.remove(key);
+                }
+            }
+        }
+        map.apply(edits);
+        assert_eq!(map.len(), model.len());
+    }
+    let direct: Map<u64, u64> = model.iter().map(|(k, v)| (*k, *v)).collect();
+    assert_eq!(map.root_hash(), direct.root_hash());
+    let got: Vec<(u64, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+    assert_eq!(got, model.into_iter().collect::<Vec<_>>());
+}
+
 #[test]
 fn bulk_build_matches_incremental_insertion_at_scale() {
     let mut rng = Rng::new(7);

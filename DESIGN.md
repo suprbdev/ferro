@@ -83,8 +83,20 @@ instead, so nested collections always come back clean and a foreign store is nev
 inserted or mutated since the node was loaded are decoded once as a check before they become
 durable; unchanged values are not.
 
-`Extend` and `FromIterator` sort the batch, keep the last value per key, and for an empty map
-assemble the tree bottom-up in one pass, which gives the same tree as inserting key by key.
+`Extend`, `FromIterator` and `apply`, which also takes deletes, sort the batch and keep the last
+edit per key. An empty map is assembled bottom-up in one pass, which gives the same tree as
+inserting key by key. A non-empty map takes the batch in one descent: each node sorts the edits
+into its gaps, applies the ones at its own level in place, and passes each group to one child, so a
+subtree no edit falls in stays shared and a node is walked once however many edits it receives.
+Editing the node in place, not rebuilding its vectors from the old and new entries, is what makes
+this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is modest, because
+a touched node has to be read and copied either way and `flush` costs three to four times the tree
+work. At 1M keys the closure takes 5 to 24% less time than sorted per-key inserts from 1,000 to
+100,000 edits and 35% less for 1M edits, and the commit as a whole 0 to 22% less. A 50,000 page wiki
+import, 20M posting entries, gained 4% in its posting phase, and the metrics load test nothing
+measurable, since chunk merging dominates there. `retain` collects its deletes and applies them
+the same way. A disjoint batch needs no special case, since the same descent walks one edge of the
+tree.
 
 Values over 512 encoded bytes spill to their own object, so a large value does not bloat its
 node or get rewritten when a neighbour changes. Lower thresholds were measured and rejected:

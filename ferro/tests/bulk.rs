@@ -284,6 +284,78 @@ proptest! {
 }
 
 #[test]
+fn a_batch_of_absent_deletes_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = filled(&dir.path().join("a.ferro"), 10_000);
+    let version = db.version();
+    let size = db.size_on_disk();
+    db.update(|root| root.apply((20_000..20_100).map(|key| (key, None))))
+        .unwrap();
+    assert_eq!(db.version(), version);
+    assert_eq!(db.size_on_disk(), size);
+    let hash = db.read().root_hash();
+    let mut map = (*db.read()).clone();
+    map.apply(std::iter::empty());
+    assert!(!map.is_dirty());
+    map.extend(std::iter::empty());
+    assert!(!map.is_dirty());
+    assert_eq!(map.root_hash(), hash);
+}
+
+#[test]
+fn a_batch_keeps_the_last_edit_of_each_key() {
+    let mut map: Map<u32, u32> = (0..100).map(|key| (key, key)).collect();
+    map.apply([(5, None), (5, Some(50)), (6, Some(60)), (6, None), (200, Some(1)), (200, None)]);
+    assert_eq!(map.get(&5).as_deref(), Some(&50));
+    assert_eq!(map.get(&6), None);
+    assert_eq!(map.get(&200), None);
+    assert_eq!(map.len(), 99);
+    let mut set: Set<u32> = (0..10).collect();
+    set.apply([(3, false), (4, false), (4, true), (20, true)]);
+    assert_eq!(set.iter().collect::<Vec<u32>>(), [0, 1, 2, 4, 5, 6, 7, 8, 9, 20]);
+}
+
+static KEY_COMPARES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Probe(u64);
+
+impl PartialOrd for Probe {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Probe {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        KEY_COMPARES.fetch_add(1, Ordering::Relaxed);
+        self.0.cmp(&other.0)
+    }
+}
+
+impl Data for Probe {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Probe(u64::decode(r)?))
+    }
+}
+
+#[test]
+fn a_dense_batch_walks_the_tree_once() {
+    let n = 100_000u64;
+    let mut map: Map<Probe, u64> = (0..n).map(|key| (Probe(key * 2), key)).collect();
+    let batch: Vec<(Probe, u64)> = (0..n).map(|key| (Probe(key * 2 + 1), key)).collect();
+    let start = KEY_COMPARES.load(Ordering::Relaxed);
+    map.extend(batch);
+    let cost = KEY_COMPARES.load(Ordering::Relaxed) - start;
+    assert_eq!(map.len() as u64, 2 * n);
+    assert!(cost < 12 * n, "{cost} comparisons for {n} edits");
+}
+
+#[test]
 fn inverted_ranges_remove_nothing() {
     let mut map: Map<u32, u32> = (0..1000).map(|key| (key, key)).collect();
     let hash = map.root_hash();

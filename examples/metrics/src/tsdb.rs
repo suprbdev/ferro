@@ -733,21 +733,17 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
         if cutoff > boundary
             && let Some(part) = m.chunks.get_mut(&boundary)
         {
-            let sids: Vec<u64> = part.keys().collect();
-            for sid in sids {
-                let chunk = part.get(&sid).expect("key was just listed");
+            let mut trimmed = Vec::new();
+            for (sid, chunk) in part.iter() {
                 let kept: Vec<(u64, f64)> = chunk
                     .decode_points()?
                     .into_iter()
                     .filter(|point| point.0 >= cutoff)
                     .collect();
                 report.points_dropped += (chunk.len() - kept.len()) as u64;
-                if kept.is_empty() {
-                    part.remove(&sid);
-                } else {
-                    part.insert(sid, Chunk::encode_points(&kept));
-                }
+                trimmed.push((sid, (!kept.is_empty()).then(|| Chunk::encode_points(&kept))));
             }
+            part.apply(trimmed);
             if part.is_empty() {
                 m.chunks.remove(&boundary);
             }
