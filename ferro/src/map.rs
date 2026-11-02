@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash;
-use std::ops::{Bound, Deref, RangeBounds};
+use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::mem::needs_drop;
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
@@ -532,6 +532,24 @@ impl<K, V: Data, S> Node<K, V, S> {
         match &self.cells {
             Cells::Column(column) => Ok(Val::of_column(column, index)),
             Cells::Slots(slots) => read_slot(store, &slots[index]),
+        }
+    }
+
+    #[inline]
+    fn read<R>(
+        &self,
+        store: Option<&Store>,
+        index: usize,
+        f: impl FnOnce(&V) -> R,
+    ) -> Result<R> {
+        match &self.cells {
+            Cells::Column(column) => Ok(f(&column[index])),
+            Cells::Slots(slots) => match &slots[index] {
+                Slot::Spilled(ptr, _) => {
+                    Ok(f(&*store.ok_or(Error::Detached)?.load::<V>(*ptr)?))
+                }
+                held => held.held().map(f).ok_or(Error::Detached),
+            },
         }
     }
 }
@@ -1311,6 +1329,54 @@ fn gather<K: Data, V: Data, S: Summary<K, V>>(
     Ok(total)
 }
 
+fn scan<K, V, S, B>(
+    store: Option<&Store>,
+    link: &Link<K, V, S>,
+    depth: usize,
+    start: Cut<'_, K>,
+    end: Cut<'_, K>,
+    visit: &mut impl FnMut(&K, &V) -> ControlFlow<B>,
+) -> Result<ControlFlow<B>>
+where
+    K: Data,
+    V: Data,
+    S: Data,
+{
+    let reached = reach(store, link, depth)?;
+    let node = match &reached {
+        Reach::Absent => return Ok(ControlFlow::Continue(())),
+        Reach::Borrowed(node) => &***node,
+        Reach::Owned(node) => &**node,
+    };
+    let low = start.map_or(0, |below| node.keys.partition_point(below));
+    let high = end.map_or(node.keys.len(), |within| node.keys.partition_point(within));
+    if low > high {
+        return Ok(ControlFlow::Continue(()));
+    }
+    let leaf = node.children.is_empty();
+    if !leaf {
+        let last = if low == high { end } else { None };
+        if let ControlFlow::Break(out) = scan(store, node.child(low), depth + 1, start, last, visit)? {
+            return Ok(ControlFlow::Break(out));
+        }
+    }
+    for index in low..high {
+        let outcome = node.read(store, index, |value| visit(&node.keys[index], value))?;
+        if let ControlFlow::Break(out) = outcome {
+            return Ok(ControlFlow::Break(out));
+        }
+        if !leaf {
+            let last = if index + 1 == high { end } else { None };
+            if let ControlFlow::Break(out) =
+                scan(store, node.child(index + 1), depth + 1, None, last, visit)?
+            {
+                return Ok(ControlFlow::Break(out));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 fn left_if(left: bool) -> Ordering {
     if left {
         Ordering::Less
@@ -1568,6 +1634,49 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     pub fn iter(&self) -> Iter<K, V, S> {
         self.range_by(|_| false, |_| true)
+    }
+
+    pub fn for_each(&self, mut f: impl FnMut(&K, &V)) {
+        let _ = self.try_for_each(|key, value| -> ControlFlow<()> {
+            f(key, value);
+            ControlFlow::Continue(())
+        });
+    }
+
+    pub fn try_for_each<B>(
+        &self,
+        mut f: impl FnMut(&K, &V) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        fatal(scan(self.store(), &self.root, 0, None, None, &mut f))
+    }
+
+    pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&K, &V))
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let _ = self.try_for_each_range::<Q, R, ()>(range, |key, value| {
+            f(key, value);
+            ControlFlow::Continue(())
+        });
+    }
+
+    pub fn try_for_each_range<Q, R, B>(
+        &self,
+        range: R,
+        mut f: impl FnMut(&K, &V) -> ControlFlow<B>,
+    ) -> ControlFlow<B>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        let below = |key: &K| below(key, start);
+        let within = |key: &K| within(key, end);
+        fatal(scan(self.store(), &self.root, 0, Some(&below), Some(&within), &mut f))
     }
 
     pub fn keys(&self) -> Keys<K, V, S> {
@@ -1961,6 +2070,46 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         Some(index)
     }
 
+    fn drain<B>(
+        &mut self,
+        init: B,
+        mut visit: impl FnMut(B, &Node<K, V, S>, Range<usize>) -> B,
+    ) -> B {
+        let mut total = init;
+        while self.remaining > 0 {
+            let depth = self.front.len();
+            let Some(frame) = self.front.last_mut() else {
+                break;
+            };
+            let width = frame.node.keys.len();
+            if frame.position > 2 * width as isize {
+                self.front.pop();
+                continue;
+            }
+            if frame.node.children.is_empty() {
+                let start = (frame.position / 2) as usize;
+                let stop = width.min(start.saturating_add(self.remaining as usize));
+                total = visit(total, &frame.node, start..stop);
+                self.remaining -= (stop - start) as u64;
+                frame.position = 2 * stop as isize + 1;
+                continue;
+            }
+            let position = frame.position;
+            frame.position += 1;
+            if position % 2 == 1 {
+                self.remaining -= 1;
+                let index = (position / 2) as usize;
+                total = visit(total, &frame.node, index..index + 1);
+                continue;
+            }
+            let child = frame.node.child((position / 2) as usize);
+            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
+                self.front.push(Frame { node, position: 0 });
+            }
+        }
+        total
+    }
+
     fn retreat(&mut self) -> Option<usize> {
         if self.remaining == 0 {
             return None;
@@ -2008,6 +2157,25 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining as usize, Some(self.remaining as usize))
     }
+
+    fn fold<B, F: FnMut(B, Self::Item) -> B>(mut self, init: B, mut f: F) -> B {
+        let store = self.store.clone();
+        self.drain(init, |mut total, node, run| {
+            if let Cells::Column(column) = &node.cells
+                && by_copy::<V>()
+            {
+                for (key, value) in node.keys[run.clone()].iter().zip(&column[run]) {
+                    total = f(total, (key.clone(), Val(Held::Copied(value.clone()))));
+                }
+                return total;
+            }
+            for index in run {
+                let value = fatal(node.value(store.as_ref(), index));
+                total = f(total, (node.keys[index].clone(), value));
+            }
+            total
+        })
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Iter<K, V, S> {
@@ -2032,6 +2200,10 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Keys<K, V, S> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.0.size_hint()
     }
+
+    fn fold<B, F: FnMut(B, K) -> B>(mut self, init: B, mut f: F) -> B {
+        self.0.drain(init, |total, node, run| node.keys[run].iter().cloned().fold(total, &mut f))
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Keys<K, V, S> {
@@ -2055,6 +2227,16 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.0.size_hint()
+    }
+
+    fn fold<B, F: FnMut(B, Val<V>) -> B>(mut self, init: B, mut f: F) -> B {
+        let store = self.0.store.clone();
+        self.0.drain(init, |mut total, node, run| {
+            for index in run {
+                total = f(total, fatal(node.value(store.as_ref(), index)));
+            }
+            total
+        })
     }
 }
 
