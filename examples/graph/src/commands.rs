@@ -269,6 +269,15 @@ fn stats(out: &mut dyn Write, snap: &Snapshot<Graph>) -> Res<()> {
     for (followers, id) in top.iter().take(5) {
         writeln!(out, "top {id} followers {followers}")?;
     }
+    let mut busy: Vec<(u32, UserId)> = g
+        .degrees
+        .iter()
+        .map(|(id, d)| (d.following, id))
+        .collect();
+    busy.sort_unstable_by(|a, b| b.cmp(a));
+    for (following, id) in busy.iter().take(3) {
+        writeln!(out, "busiest {id} following {following}")?;
+    }
     Ok(())
 }
 

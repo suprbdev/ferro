@@ -152,7 +152,8 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
             .map(|(_, ids)| ids.len())
             .sum::<usize>()
     });
-    let (vec_scan, _) = timed(|| csr.out_to.iter().map(|&v| v as u64).sum::<u64>());
+    let (vec_scan, vs) = timed(|| std::hint::black_box(&csr.out_to).iter().map(|&v| v as u64).sum::<u64>());
+    std::hint::black_box(vs);
     writeln!(
         out,
         "full out-edge scan: ferro {:.3}s ({:.1} ns/edge)  Vec {:.3}s ({:.2} ns/edge)  ratio {:.0}x",
@@ -272,11 +273,11 @@ fn writers_bench(
     seconds: usize,
 ) -> Res<()> {
     let n = db.read().user_count() as u64;
-    let run_writers = |stop: &AtomicBool, count: &AtomicU64| {
+    let run_writers = |stop: &AtomicBool, count: &AtomicU64, phase: u64| {
         thread::scope(|scope| {
             for w in 0..writers {
                 scope.spawn(move || {
-                    let mut rng = Rng::new(1000 + w as u64);
+                    let mut rng = Rng::new(1000 + w as u64 + phase * 100);
                     while !stop.load(Ordering::Relaxed) {
                         let a = rng.below(n) as UserId;
                         let b = rng.below(n) as UserId;
@@ -286,7 +287,7 @@ fn writers_bench(
                         let done = db.try_commit_with::<_, String, Box<dyn std::error::Error>>(|g| {
                             ops::follow(g, a, b).map(|v| ("follow".to_string(), v))
                         });
-                        if done.is_ok() {
+                        if done.is_ok_and(|d| d.changed) {
                             count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -295,6 +296,9 @@ fn writers_bench(
         });
     };
 
+    let warm = db.read();
+    analytics::pagerank(&warm, 8, 1);
+    drop(warm);
     let stop = AtomicBool::new(false);
     let count = AtomicU64::new(0);
     let alone = thread::scope(|scope| {
@@ -303,7 +307,7 @@ fn writers_bench(
             thread::sleep(Duration::from_secs(seconds as u64));
             stop.store(true, Ordering::Relaxed);
         });
-        run_writers(&stop, &count);
+        run_writers(&stop, &count, 1);
         count.load(Ordering::Relaxed) as f64 / t.elapsed().as_secs_f64()
     });
     writeln!(out, "{writers} writers alone: {alone:.0} commits/s")?;
@@ -321,7 +325,7 @@ fn writers_bench(
             stop.store(true, Ordering::Relaxed);
             (secs, ranks)
         });
-        run_writers(&stop, &count);
+        run_writers(&stop, &count, 2);
         let during = count.load(Ordering::Relaxed) as f64 / t.elapsed().as_secs_f64();
         let (secs, ranks) = handle.join().unwrap();
         (secs, during, ranks)
