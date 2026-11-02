@@ -321,10 +321,11 @@ fn drive<T: Data>(
             let (stop, cycles, cycle_secs) = (&stop, &cycles, &cycle_secs);
             scope.spawn(move || {
                 let mut last = 0;
+                let mut live = 0;
                 while !stop.load(Ordering::Relaxed) {
                     let space = db.space().unwrap();
                     last = last.min(space.log_bytes);
-                    let goal = run.every.max(space.live_bytes);
+                    let goal = run.every.max(live);
                     if space.log_bytes.saturating_sub(last) < goal {
                         thread::sleep(Duration::from_millis(5));
                         continue;
@@ -333,6 +334,7 @@ fn drive<T: Data>(
                     let began = Instant::now();
                     let done = db.compact(Keep::Last(run.keep)).unwrap();
                     *cycle_secs.lock().unwrap() += began.elapsed().as_secs_f64();
+                    live = done.live_bytes;
                     cycles.lock().unwrap().push(done);
                 }
             });
@@ -376,13 +378,23 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     let reads = &outcome.read_latencies;
     let pauses: Vec<f64> = outcome.cycles.iter().map(|c| c.pause.as_secs_f64() * 1e3).collect();
     let moved: u64 = outcome.cycles.iter().map(|c| c.moved_bytes).sum();
+    let ratios: Vec<f64> = outcome
+        .cycles
+        .iter()
+        .map(|c| {
+            let garbage = c.before_bytes.saturating_sub(c.live_bytes).max(1);
+            c.before_bytes.saturating_sub(c.after_bytes) as f64 / garbage as f64
+        })
+        .collect();
+    let ratio = ratios.iter().sum::<f64>() / ratios.len().max(1) as f64;
+    let after = outcome.cycles.last().map_or(0, |c| c.after_bytes);
     let peak = outcome.samples.iter().map(|s| s.1).max().unwrap_or(0);
     let space = db.space().unwrap();
     let verified = db.verify().unwrap();
     let garbage = space.log_bytes.saturating_sub(verified.bytes).max(1);
     let reclaimed = space.log_bytes.saturating_sub(space.allocated_bytes);
     println!(
-        "{name} fill={} keep={} commits/s={:.0} p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms cycles={} cycle_secs={:.2} pause_max={:.2}ms pause_sum={:.1}ms moved={:.1}MiB log={:.1}MiB peak={:.1}MiB alloc={:.1}MiB live={:.1}MiB reclaim={:.1}% reads/s={:.0} read_p50={:.2}us read_p99={:.2}us read_p999={:.1}us read_max={:.0}us",
+        "{name} fill={} keep={} commits/s={:.0} p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms cycles={} cycle_secs={:.2} pause_max={:.2}ms pause_sum={:.1}ms moved={:.1}MiB log={:.1}MiB peak={:.1}MiB alloc={:.1}MiB live={:.1}MiB reclaim={:.1}% cycle_ratio={:.1}% after_cycle={:.1}MiB reads/s={:.0} read_p50={:.2}us read_p99={:.2}us read_p999={:.1}us read_max={:.0}us",
         run.fill,
         run.keep,
         outcome.commits as f64 / run.seconds as f64,
@@ -400,6 +412,8 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
         mib(space.allocated_bytes),
         mib(verified.bytes),
         100.0 * reclaimed as f64 / garbage as f64,
+        100.0 * ratio,
+        mib(after),
         outcome.reads as f64 / run.seconds as f64,
         percentile(reads, 50.0),
         percentile(reads, 99.0),

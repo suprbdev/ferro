@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::ops::Deref;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -23,6 +24,7 @@ use crate::watch::{Feed, Watcher};
 
 const MAIN: &str = "main";
 const READ_RETRIES: u32 = 32;
+const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Commit {
@@ -680,7 +682,10 @@ impl<T: Data> Shared<T> {
                 let Some(shared) = weak.upgrade() else {
                     return;
                 };
-                let _ = shared.compact(shared.history, Some(&signal.stop));
+                let cycle = AssertUnwindSafe(|| shared.compact(shared.history, Some(&signal.stop)));
+                if panic::catch_unwind(cycle).is_err() {
+                    shared.log.lock().last_error = Some("reclamation panicked".to_string());
+                }
             }
         })
     }
@@ -735,8 +740,8 @@ impl<T: Data> Shared<T> {
         Ok(start)
     }
 
-    fn write_table(&self, marks: &Marks, tip: Option<&mut RefState>) -> Result<Ptr> {
-        let (record, hash) = reclaim::table_record(&marks.places());
+    fn write_table(&self, pairs: &[(u64, u64)], tip: Option<&mut RefState>) -> Result<Ptr> {
+        let (record, hash) = reclaim::table_record(pairs);
         let bytes = record.len() as u64;
         let offset = match tip {
             Some(tip) => self.gap(tip, bytes)?,
@@ -808,7 +813,10 @@ impl<T: Data> Shared<T> {
             self.relocate(&mut marks, extras, &mut report)?;
         }
         store.sync_data()?;
-        let mut table = self.write_table(&marks, None)?;
+        let pairs = marks.places();
+        let mut table = self.write_table(&pairs, None)?;
+        let mut places = Places::new(Moved::default(), pairs);
+        let mut live = marks.live_bytes();
         self.settle(store.last_seq())?;
         store.sync_data()?;
         self.step("tabled");
@@ -817,7 +825,10 @@ impl<T: Data> Shared<T> {
         let extras = marks.rescan(store)?;
         if !extras.is_empty() {
             self.relocate_locked(&mut tip, &mut marks, extras, &mut report)?;
-            table = self.write_table(&marks, Some(&mut tip))?;
+            let pairs = marks.places();
+            table = self.write_table(&pairs, Some(&mut tip))?;
+            places = Places::new(Moved::default(), pairs);
+            live = marks.live_bytes();
         }
         let head = tip.ptr.ok_or(Error::Detached)?;
         let frame = store.begin()?.write(head)?;
@@ -828,18 +839,21 @@ impl<T: Data> Shared<T> {
             update: None,
         });
         self.settle(frame.seq)?;
-        let moved = Moved {
+        let before = store.places().moved;
+        let grown = live.saturating_sub(before.live) as f64;
+        places.moved = Moved {
             floor: end,
             table: Some(table),
-            live: marks.live_bytes(),
+            live,
+            survival: (grown / (end - before.floor).max(1) as f64 * SURVIVAL_ONE) as u64,
         };
-        store.publish(frame, Places::new(moved, marks.places()))?;
+        store.publish(frame, places)?;
         drop(tip);
         report.pause = paused.elapsed();
         report.objects = marks.objects();
-        report.live_bytes = moved.live;
+        report.live_bytes = live;
         self.step("published");
-        self.signal.threshold.store(moved.live, Ordering::Relaxed);
+        self.signal.threshold.store(live, Ordering::Relaxed);
         report.punched_bytes = marks.punch(store)?;
         self.step("punched");
         report.after_bytes = store.allocated()?;
@@ -898,7 +912,7 @@ impl<T: Data> Db<T> {
         let live_bytes = if moved.floor == 0 {
             log_bytes
         } else {
-            let survived = moved.live as f64 / moved.floor as f64;
+            let survived = moved.survival as f64 / SURVIVAL_ONE;
             moved.live + (log_bytes.saturating_sub(moved.floor) as f64 * survived) as u64
         };
         let log = self.shared.log.lock();

@@ -25,7 +25,7 @@ const GAP_MAGIC: &[u8; 8] = b"FERROGAP";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const FRAME_CHECKED: usize = 32 + HASH_BYTES;
-const SUPER_CHECKED: usize = FRAME_CHECKED + 44;
+const SUPER_CHECKED: usize = FRAME_CHECKED + 52;
 const SUPER_BYTES: usize = SUPER_CHECKED + 32;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 const SCAN_CHUNK: usize = 1 << 20;
@@ -110,6 +110,7 @@ pub(crate) struct Moved {
     pub(crate) floor: u64,
     pub(crate) table: Option<Ptr>,
     pub(crate) live: u64,
+    pub(crate) survival: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +156,7 @@ impl Super {
             extra[16..24].copy_from_slice(&table.offset.to_le_bytes());
             extra[24..24 + HASH_BYTES].copy_from_slice(&table.hash);
         }
+        extra[44..52].copy_from_slice(&self.moved.survival.to_le_bytes());
         let check = blake3::hash(&out[..SUPER_CHECKED]);
         out[SUPER_CHECKED..SUPER_BYTES].copy_from_slice(check.as_bytes());
         out
@@ -174,7 +176,13 @@ impl Super {
         let offset = u64::from_le_bytes(extra[16..24].try_into().ok()?);
         let hash: Hash = extra[24..24 + HASH_BYTES].try_into().ok()?;
         let table = (offset != 0).then_some(Ptr { hash, offset });
-        let moved = Moved { floor, table, live };
+        let survival = u64::from_le_bytes(extra[44..52].try_into().ok()?);
+        let moved = Moved {
+            floor,
+            table,
+            live,
+            survival,
+        };
         Some(Super {
             moved,
             ..Super::fields(bytes)?
