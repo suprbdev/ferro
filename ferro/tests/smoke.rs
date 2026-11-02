@@ -56,3 +56,22 @@ fn round_trip_history_and_reopen() {
     let report = db.verify().unwrap();
     assert!(report.objects > 0);
 }
+
+#[test]
+fn nested_maps_are_clean_after_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::<Map<u64, Map<u64, u64>>>::open(dir.path().join("n.ferro")).unwrap();
+    for i in 0..200u64 {
+        db.update(|root| {
+            root.get_or_insert_with(i % 3, Map::new).insert(i, i);
+        })
+        .unwrap();
+        assert!(!db.log().is_dirty());
+        let latest = db.read();
+        for key in 0..=(i % 3) {
+            if let Some(inner) = latest.get(&key) {
+                assert!(!inner.is_dirty());
+            }
+        }
+    }
+}

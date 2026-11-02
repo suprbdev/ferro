@@ -421,6 +421,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         key.encode(&mut encoder)?;
     }
     let mut slots = Vec::with_capacity(node.slots.len());
+    let mut nested = false;
     for slot in &node.slots {
         match slot {
             Slot::Spilled(ptr) => {
@@ -439,6 +440,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
                     encoder.link(ptr);
                     slots.push(Slot::Spilled(ptr));
                 } else {
+                    nested |= encoder.mark().1 != mark.1;
                     slots.push(Slot::Inline(value.clone()));
                 }
             }
@@ -464,7 +466,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
     };
-    if sink.store_id() != 0 {
+    if sink.store_id() != 0 && !nested {
         sink.remember(
             ptr,
             Arc::new(Node {
@@ -518,6 +520,10 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
 
     pub fn is_empty(&self) -> bool {
         self.root.count() == 0
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        matches!(self.root, Link::Mem(_))
     }
 
     pub fn clear(&mut self) {
