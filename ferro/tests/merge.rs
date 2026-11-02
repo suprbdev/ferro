@@ -349,3 +349,55 @@ fn merging_back_uses_the_reverse_record() {
     assert_eq!(written.value, 1);
     assert_eq!(main.read().tasks.len(), 3);
 }
+
+#[test]
+fn changing_a_key_onto_an_existing_row_unindexes_the_displaced_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    db.update(|b| {
+        b.tasks.insert(task(1, None, "one", &["x"]));
+        b.tasks.insert(task(2, None, "two", &["y"]));
+    })
+    .unwrap();
+    db.update(|b| b.tasks.get_mut(&1).unwrap().id = 2).unwrap();
+    let snapshot = db.read();
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks.get(&2).unwrap().state, "one");
+    assert_eq!(snapshot.tasks.by_state("one").len(), 1);
+    assert_eq!(snapshot.tasks.by_state("two").len(), 0);
+    assert_eq!(snapshot.tasks.by_tags("x").len(), 1);
+    assert_eq!(snapshot.tasks.by_tags("y").len(), 0);
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Lopsided(u64);
+
+impl ferro::codec::Data for Lopsided {
+    fn encode(&self, w: &mut ferro::codec::Encoder<'_>) -> ferro::Result<()> {
+        w.varint(self.0);
+        Ok(())
+    }
+
+    fn decode(r: &mut ferro::codec::Decoder<'_>) -> ferro::Result<Self> {
+        let value = r.varint()?;
+        if value == 7 {
+            return Err(Error::Decode("seven is unreadable".into()));
+        }
+        Ok(Lopsided(value))
+    }
+}
+
+#[test]
+fn a_root_that_cannot_be_read_back_is_refused_before_it_becomes_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.ferro");
+    {
+        let db = Db::<Lopsided>::open(&path).unwrap();
+        db.update(|root| root.0 = 1).unwrap();
+        assert!(db.update(|root| root.0 = 7).is_err());
+        assert_eq!(db.read().0, 1);
+    }
+    let db = Db::<Lopsided>::open(&path).unwrap();
+    assert_eq!(db.read().0, 1);
+    assert_eq!(db.version(), 1);
+}

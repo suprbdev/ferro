@@ -212,11 +212,14 @@ impl<T: Record> Drop for RowMut<'_, T> {
         };
         let old_key = self.old.key();
         let new_key = row.key();
-        if old_key != new_key {
+        if old_key == new_key {
+            self.table.0.reindex(Some(&self.old), Some(&row));
+            self.table.0.rows_mut().insert(new_key, row);
+        } else {
             self.table.0.rows_mut().remove(&old_key);
+            self.table.0.reindex(Some(&self.old), None);
+            self.table.insert(row);
         }
-        self.table.0.reindex(Some(&self.old), Some(&row));
-        self.table.0.rows_mut().insert(new_key, row);
     }
 }
 

@@ -124,7 +124,10 @@ impl<K: Data, V: Data> Node<K, V> {
     fn decode(decoder: &mut Decoder<'_>, origin: Ptr) -> Result<Self> {
         let level = decoder.u8()?;
         let n = decoder.varint()? as usize;
-        let mut keys = Vec::with_capacity(n.min(decoder.remaining()));
+        if n > decoder.remaining() {
+            return Err(Error::Decode(format!("node claims {n} keys")));
+        }
+        let mut keys = Vec::with_capacity(n);
         for _ in 0..n {
             keys.push(K::decode(decoder)?);
         }
@@ -420,14 +423,11 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
     for key in &node.keys {
         key.encode(&mut encoder)?;
     }
-    let mut slots = Vec::with_capacity(node.slots.len());
-    let mut nested = false;
     for slot in &node.slots {
         match slot {
             Slot::Spilled(ptr) => {
                 encoder.u8(1);
                 encoder.link(*ptr);
-                slots.push(Slot::Spilled(*ptr));
             }
             Slot::Inline(value) => {
                 let mark = encoder.mark();
@@ -438,47 +438,37 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
                     let ptr = encoder.child(|inner| value.encode(inner))?;
                     encoder.u8(1);
                     encoder.link(ptr);
-                    slots.push(Slot::Spilled(ptr));
-                } else {
-                    nested |= encoder.mark().1 != mark.1;
-                    slots.push(Slot::Inline(value.clone()));
                 }
             }
         }
     }
-    let mut children = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        let stored = flush(child, encoder.sink())?;
-        match &stored {
+        match flush(child, encoder.sink())? {
             Link::Empty => encoder.varint(0),
             Link::Stored { ptr, count } => {
-                encoder.varint(*count);
-                encoder.link(*ptr);
+                encoder.varint(count);
+                encoder.link(ptr);
             }
             Link::Mem(_) => return Err(Error::Detached),
         }
-        children.push(stored);
     }
     let object = encoder.into_object();
     let hash = object.hash();
     let weight = (object.body.len() + object.links.len() * 40 + 128) as u32;
+    let cached = sink
+        .store()
+        .map(|store| {
+            let mut decoder = Decoder::new(&object.body, &object.links, Some(&store));
+            Node::<K, V>::decode(&mut decoder, Ptr { hash, offset: 0 })
+        })
+        .transpose()?;
     let ptr = match node.origin {
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
     };
-    if sink.store_id() != 0 && !nested {
-        sink.remember(
-            ptr,
-            Arc::new(Node {
-                level: node.level,
-                keys: node.keys.clone(),
-                slots,
-                children,
-                count: node.count,
-                origin: Some(ptr),
-            }),
-            weight,
-        );
+    if let Some(mut decoded) = cached {
+        decoded.origin = Some(ptr);
+        sink.remember(ptr, Arc::new(decoded), weight);
     }
     Ok(Link::Stored {
         ptr,
@@ -1241,9 +1231,10 @@ impl<K: Data + Ord, V: Data + PartialEq> Iterator for Diff<K, V> {
                     let new = self.new.pop();
                     if let (Some(Step::Entry(key, a)), Some(Step::Entry(_, b))) = (old, new) {
                         if let (Slot::Spilled(x), Slot::Spilled(y)) = (&a, &b)
-                            && x.hash == y.hash {
-                                continue;
-                            }
+                            && x.hash == y.hash
+                        {
+                            continue;
+                        }
                         let before = fatal(read_slot(self.old_store.as_ref(), &a));
                         let after = fatal(read_slot(self.new_store.as_ref(), &b));
                         if before != after {

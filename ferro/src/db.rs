@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
-use crate::codec::{Data, Decoder, Encoder, HashSink, Hash, Ptr};
+use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
 use crate::map::Map;
 use crate::store::{Durability, Store, StoreOptions, Txn};
@@ -146,6 +146,16 @@ struct Branch<T> {
     watchers: Mutex<Vec<Sender<Snapshot<T>>>>,
 }
 
+impl<T> Branch<T> {
+    fn publish(&self, state: State<T>) {
+        let snapshot = state.snapshot.clone();
+        self.state.store(Arc::new(state));
+        self.watchers
+            .lock()
+            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+    }
+}
+
 struct Shared<T> {
     store: Store,
     refs: Mutex<RefState>,
@@ -241,6 +251,16 @@ fn write_value<D: Data>(value: &D, txn: &mut Txn) -> Result<Ptr> {
     let mut encoder = Encoder::new(txn);
     value.encode(&mut encoder)?;
     encoder.finish()
+}
+
+fn write_root<T: Data>(value: &T, txn: &mut Txn, store: &Store) -> Result<Ptr> {
+    let mut encoder = Encoder::new(txn);
+    value.encode(&mut encoder)?;
+    let object = encoder.into_object();
+    let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
+    T::decode(&mut decoder)?;
+    let hash = object.hash();
+    txn.put(object, hash)
 }
 
 fn now_ms() -> u64 {
@@ -418,7 +438,7 @@ impl<T: Data> Db<T> {
     ) -> Result<u64> {
         let store = &self.shared.store;
         let mut txn = store.begin()?;
-        let root = write_value(working, &mut txn)?;
+        let root = write_root(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let mut merged = state.merged.clone();
         let recorded = match intent.merged {
@@ -453,13 +473,7 @@ impl<T: Data> Db<T> {
         );
         self.shared.write_refs(refs, next, txn)?;
         let head = refs.refs.try_get(&self.branch.name)?;
-        let state = self.shared.state_of(head.as_deref())?;
-        let snapshot = state.snapshot.clone();
-        self.branch.state.store(Arc::new(state));
-        self.branch
-            .watchers
-            .lock()
-            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+        self.branch.publish(self.shared.state_of(head.as_deref())?);
         Ok(version)
     }
 
@@ -675,7 +689,11 @@ impl<T: Data> Db<T> {
         for branch in branches.values() {
             let head = refs.refs.try_get(&branch.name)?;
             let state = self.shared.state_of(head.as_deref())?;
-            branch.state.store(Arc::new(state));
+            if state.snapshot.version() == branch.state.load().snapshot.version() {
+                branch.state.store(Arc::new(state));
+            } else {
+                branch.publish(state);
+            }
         }
         Ok(true)
     }
