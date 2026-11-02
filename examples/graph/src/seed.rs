@@ -97,13 +97,8 @@ pub fn seed(db: &Db<Graph>, opts: &SeedOpts, say: &mut dyn FnMut(String)) -> Res
         ));
         if opts.likes > 0 {
             let t = Instant::now();
-            let likes: Vec<((u64, UserId), ())> = (0..opts.likes)
-                .map(|_| {
-                    (
-                        (1 + rng.below(opts.posts), rng.below(n as u64) as UserId),
-                        (),
-                    )
-                })
+            let likes: Vec<(u64, UserId)> = (0..opts.likes)
+                .map(|_| (1 + rng.below(opts.posts), rng.below(n as u64) as UserId))
                 .collect();
             db.commit("seed likes", |g| g.likes.extend(likes))?;
             say(format!(

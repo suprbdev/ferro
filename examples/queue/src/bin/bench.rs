@@ -514,7 +514,7 @@ fn split(args: &HashMap<String, String>) {
         state.jobs.insert(id, job);
     });
     measure("leases map only (insert one key)", &|state, i| {
-        state.leases.insert((10_000_000 + i, "q".to_string(), i), ());
+        state.leases.insert((10_000_000 + i, "q".to_string(), i));
     });
     measure("ready map only (remove one key)", &|state, i| {
         let id = 11 + (i * 17) % (depth - 20);
@@ -525,7 +525,7 @@ fn split(args: &HashMap<String, String>) {
         state.ready.remove(&queue::state::ready_key("q", 0, id));
         let mut job = (*state.jobs.get(&id).unwrap()).clone();
         job.attempts += 1;
-        state.leases.insert((20_000_000 + i, "q".to_string(), id), ());
+        state.leases.insert((20_000_000 + i, "q".to_string(), id));
         state.jobs.insert(id, job);
     });
 }

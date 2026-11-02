@@ -488,7 +488,7 @@ fn fanout_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
         let (warm, _) = timed(|| query::timeline(g, user, 20));
         let wanted: Vec<_> = query::timeline(g, user, 200).iter().map(|p| p.id).collect();
         db.commit("materialize inbox", |g| {
-            g.inbox.extend(wanted.iter().map(|&id| ((user, id), ())));
+            g.inbox.extend(wanted.iter().map(|&id| (user, id)));
         })?;
         let snap2 = db.read();
         let g2: &Graph = &snap2;

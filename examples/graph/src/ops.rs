@@ -104,7 +104,7 @@ pub fn post(
     });
     if fanout {
         let followers: Vec<UserId> = g.inn.iter(author).collect();
-        g.inbox.extend(followers.into_iter().map(|f| ((f, id), ())));
+        g.inbox.extend(followers.into_iter().map(|f| (f, id)));
     }
     Ok(id)
 }
@@ -114,5 +114,5 @@ pub fn like(g: &mut Graph, user: UserId, post: PostId) -> Res<bool> {
     if !g.posts.contains(&post) {
         return Err(format!("no such post {post}").into());
     }
-    Ok(g.likes.insert((post, user), ()).is_none())
+    Ok(g.likes.insert((post, user)))
 }

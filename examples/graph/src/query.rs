@@ -210,7 +210,7 @@ pub fn inbox_timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Val<Post>> {
     g.inbox
         .range((user, 0)..=(user, u64::MAX))
         .rev()
-        .filter_map(|((_, id), _)| g.posts.get(&id))
+        .filter_map(|(_, id)| g.posts.get(&id))
         .take(limit)
         .collect()
 }

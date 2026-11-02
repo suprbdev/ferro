@@ -26,17 +26,17 @@ pub struct State {
     pub next_id: u64,
     pub epoch: u64,
     pub jobs: Map<u64, Job>,
-    pub ready: Map<ReadyKey, ()>,
-    pub delayed: Map<(u64, String, u64), ()>,
-    pub leases: Map<(u64, String, u64), ()>,
-    pub blocked: Map<(String, u64), ()>,
-    pub dead: Map<(String, u64), ()>,
-    pub children: Map<(u64, u64), ()>,
+    pub ready: Set<ReadyKey>,
+    pub delayed: Set<(u64, String, u64)>,
+    pub leases: Set<(u64, String, u64)>,
+    pub blocked: Set<(String, u64)>,
+    pub dead: Set<(String, u64)>,
+    pub children: Set<(u64, u64)>,
     pub paused: Set<String>,
     pub idem: Map<(String, String), (u64, u64)>,
-    pub idem_exp: Map<(u64, String, String), ()>,
+    pub idem_exp: Set<(u64, String, String)>,
     pub recurring: Map<String, Recurring>,
-    pub rec_due: Map<(u64, String), ()>,
+    pub rec_due: Set<(u64, String)>,
 }
 
 pub fn ready_key(queue: &str, priority: u8, id: u64) -> ReadyKey {
@@ -53,10 +53,10 @@ fn backoff(base_ms: u64, attempts: u32) -> u64 {
 impl State {
     pub fn due_at(&self) -> Option<u64> {
         [
-            self.idem_exp.first().map(|(key, _)| key.0),
-            self.leases.first().map(|(key, _)| key.0),
-            self.delayed.first().map(|(key, _)| key.0),
-            self.rec_due.first().map(|(key, _)| key.0),
+            self.idem_exp.first().map(|key| key.0),
+            self.leases.first().map(|key| key.0),
+            self.delayed.first().map(|key| key.0),
+            self.rec_due.first().map(|key| key.0),
         ]
         .into_iter()
         .flatten()
@@ -97,12 +97,10 @@ impl State {
     fn place(&mut self, job: &mut Job, now: u64) {
         if job.run_at > now {
             job.state = JobState::Delayed;
-            self.delayed
-                .insert((job.run_at, job.queue.clone(), job.id), ());
+            self.delayed.insert((job.run_at, job.queue.clone(), job.id));
         } else {
             job.state = JobState::Ready;
-            self.ready
-                .insert(ready_key(&job.queue, job.priority, job.id), ());
+            self.ready.insert(ready_key(&job.queue, job.priority, job.id));
         }
     }
 
@@ -162,16 +160,15 @@ impl State {
             self.place(&mut job, now);
         } else {
             job.state = JobState::Blocked;
-            self.blocked.insert((job.queue.clone(), id), ());
+            self.blocked.insert((job.queue.clone(), id));
             for parent in live {
-                self.children.insert((parent, id), ());
+                self.children.insert((parent, id));
             }
         }
         if let Some(key) = &spec.key {
             let expires = now + spec.key_ttl_ms;
             self.idem.insert((spec.queue.clone(), key.clone()), (id, expires));
-            self.idem_exp
-                .insert((expires, spec.queue.clone(), key.clone()), ());
+            self.idem_exp.insert((expires, spec.queue.clone(), key.clone()));
         }
         self.jobs.insert(id, job);
         Ok((id, false))
@@ -187,7 +184,6 @@ impl State {
             .ready
             .range::<ReadyKey, _>(low..=high)
             .take(n)
-            .map(|(key, _)| key)
             .collect();
         let expires = now + ttl_ms;
         let mut leased = Vec::with_capacity(keys.len());
@@ -202,11 +198,11 @@ impl State {
             job.attempts += 1;
             job.worker = Some(worker.to_string());
             job.expires_ms = expires;
-            lease_edits.push(((expires, job.queue.clone(), job.id), Some(())));
+            lease_edits.push(((expires, job.queue.clone(), job.id), true));
             job_edits.push((job.id, Some(job.clone())));
             leased.push(job);
         }
-        self.ready.apply(keys.into_iter().map(|key| (key, None)));
+        self.ready.apply(keys.into_iter().map(|key| (key, false)));
         self.leases.apply(lease_edits);
         self.jobs.apply(job_edits);
         leased
@@ -235,8 +231,7 @@ impl State {
         self.leases
             .remove(&(job.expires_ms, job.queue.clone(), id));
         job.expires_ms = now + ttl_ms;
-        self.leases
-            .insert((job.expires_ms, job.queue.clone(), id), ());
+        self.leases.insert((job.expires_ms, job.queue.clone(), id));
         self.jobs.insert(id, job);
         Ok(())
     }
@@ -261,7 +256,7 @@ impl State {
         job.error = Some(error.to_string());
         if job.attempts >= job.max_attempts {
             job.state = JobState::Dead;
-            self.dead.insert((job.queue.clone(), job.id), ());
+            self.dead.insert((job.queue.clone(), job.id));
         } else {
             let delay = retry_in_ms.unwrap_or_else(|| backoff(job.backoff_ms, job.attempts));
             job.run_at = now + delay;
@@ -278,7 +273,7 @@ impl State {
         let kids: Vec<u64> = self
             .children
             .range::<(u64, u64), _>(low..=high)
-            .map(|(key, _)| key.1)
+            .map(|key| key.1)
             .collect();
         if kids.is_empty() {
             return;
@@ -315,7 +310,7 @@ impl State {
     pub fn maintain(&mut self, now: u64) -> Tick {
         let mut tick = Tick::default();
         while tick.pruned < MAINTAIN_LIMIT {
-            let Some((key, _)) = self.idem_exp.first() else {
+            let Some(key) = self.idem_exp.first() else {
                 break;
             };
             if key.0 > now {
@@ -326,7 +321,7 @@ impl State {
             tick.pruned += 1;
         }
         while tick.expired.len() < MAINTAIN_LIMIT {
-            let Some((key, _)) = self.leases.first() else {
+            let Some(key) = self.leases.first() else {
                 break;
             };
             if key.0 > now {
@@ -343,7 +338,7 @@ impl State {
             tick.expired.push(key.2);
         }
         while tick.promoted < MAINTAIN_LIMIT {
-            let Some((key, _)) = self.delayed.first() else {
+            let Some(key) = self.delayed.first() else {
                 break;
             };
             if key.0 > now {
@@ -359,7 +354,7 @@ impl State {
             tick.promoted += 1;
         }
         while tick.spawned < MAINTAIN_LIMIT {
-            let Some((key, _)) = self.rec_due.first() else {
+            let Some(key) = self.rec_due.first() else {
                 break;
             };
             if key.0 > now {
@@ -378,7 +373,7 @@ impl State {
             let _ = self.enqueue(&spec, &[], now);
             let missed = (now - key.0) / rec.every_ms;
             rec.next_run = key.0 + rec.every_ms * (missed + 1);
-            self.rec_due.insert((rec.next_run, rec.name.clone()), ());
+            self.rec_due.insert((rec.next_run, rec.name.clone()));
             self.recurring.insert(rec.name.clone(), rec);
             tick.spawned += 1;
         }

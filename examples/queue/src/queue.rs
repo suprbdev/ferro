@@ -312,8 +312,8 @@ impl Queue {
             .into_iter()
             .map(|name| Stats {
                 ready: snapshot.count_ready(&name),
-                delayed: snapshot.delayed.keys().filter(|key| key.1 == name).count(),
-                leased: snapshot.leases.keys().filter(|key| key.1 == name).count(),
+                delayed: snapshot.delayed.iter().filter(|key| key.1 == name).count(),
+                leased: snapshot.leases.iter().filter(|key| key.1 == name).count(),
                 blocked: snapshot.count_blocked(&name),
                 dead: snapshot.count_dead(&name),
                 paused: snapshot.paused.contains(name.as_str()),
@@ -326,7 +326,7 @@ impl Queue {
         let snapshot = self.db.read();
         snapshot
             .dead
-            .keys()
+            .iter()
             .filter(|key| queue.is_none_or(|name| key.0 == name))
             .take(limit)
             .filter_map(|key| snapshot.jobs.get(&key.1))
@@ -348,7 +348,7 @@ impl Queue {
             let ids: Vec<u64> = state
                 .dead
                 .range::<(String, u64), _>((queue.to_string(), 0u64)..=(queue.to_string(), u64::MAX))
-                .map(|(key, _)| key.1)
+                .map(|key| key.1)
                 .collect();
             for id in &ids {
                 state.retry_dead(*id, now)?;
@@ -366,7 +366,7 @@ impl Queue {
             if let Some(old) = state.recurring.get(&rec.name) {
                 state.rec_due.remove(&(old.next_run, rec.name.clone()));
             }
-            state.rec_due.insert((rec.next_run, rec.name.clone()), ());
+            state.rec_due.insert((rec.next_run, rec.name.clone()));
             let message = format!("recurring add {}", rec.name);
             state.recurring.insert(rec.name.clone(), rec);
             Ok((message, ()))
@@ -485,7 +485,7 @@ impl Queue {
         let past = self.db.at(from)?;
         let mut originals: Vec<Job> = past
             .leases
-            .keys()
+            .iter()
             .filter_map(|key| past.jobs.get(&key.2))
             .map(|job| (*job).clone())
             .collect();
@@ -531,6 +531,6 @@ impl Queue {
             .ready
             .range::<(String, u8, u64), _>(low..=high)
             .next()
-            .map(|(key, _)| key.2)
+            .map(|key| key.2)
     }
 }
