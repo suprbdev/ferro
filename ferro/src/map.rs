@@ -5,14 +5,17 @@ use std::fmt;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, OnceLock, Weak};
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Store, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
-const SPILL_BYTES: usize = 512;
+pub(crate) const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
 const PIN_DEPTH: usize = 3;
+const ARC_HEADER: usize = 16;
+const ALLOCATION_BYTES: usize = 16;
+const ITEM_BYTES: usize = 32;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -184,6 +187,15 @@ impl<K, V> Node<K, V> {
         self.count =
             self.keys.len() as u64 + self.children.iter().map(Link::count).sum::<u64>();
     }
+
+    fn fixed_bytes(&self) -> usize {
+        let held = self.slots.iter().filter(|slot| !matches!(slot, Slot::Spilled(_)));
+        size_of::<Self>()
+            + self.keys.capacity() * (size_of::<K>() + ITEM_BYTES)
+            + self.slots.capacity() * size_of::<Slot<V>>()
+            + self.children.capacity() * size_of::<Link<K, V>>()
+            + held.count() * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
+    }
 }
 
 impl<K: Data, V: Data> Node<K, V> {
@@ -256,7 +268,7 @@ fn reach<'a, K: Data, V: Data>(
         None => {}
     }
     let store = store.ok_or(Error::Detached)?;
-    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr))?;
+    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::fixed_bytes)?;
     if depth < PIN_DEPTH {
         if let Memo::Pinned(node) = memo.get_or_init(|| Memo::Pinned(node.clone())) {
             return Ok(Reach::Borrowed(node));
@@ -289,7 +301,8 @@ fn load<K: Data, V: Data>(
         Link::Stored { ptr, .. } => {
             let store = store.ok_or(Error::Detached)?;
             let ptr = *ptr;
-            Ok(Some(store.load_as(ptr, |decoder| Node::decode(decoder, ptr))?))
+            let (node, _) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::fixed_bytes)?;
+            Ok(Some(node))
         }
     }
 }
@@ -633,7 +646,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
     let unsettled = encoder.is_unsettled();
     let object = encoder.into_object();
     let hash = object.hash();
-    let weight = (object.body.len() + object.links.len() * 40 + 128) as u32;
+    let body_bytes = object.body.len();
     let cached = match &store {
         None => None,
         Some(store) if unsettled => {
@@ -655,6 +668,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
     };
     if let Some(mut decoded) = cached {
         decoded.origin = Some(ptr);
+        let weight = heap_weight(decoded.fixed_bytes(), body_bytes);
         sink.remember(ptr, Arc::new(decoded), weight);
     }
     Ok(Link::stored(ptr, node.count))
@@ -799,6 +813,21 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         Q: Ord + ?Sized,
     {
         fatal(self.try_get(key))
+    }
+
+    pub fn value_hash<Q>(&self, key: &Q) -> Option<Hash>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let found = self.walk(|node| match node.search(key) {
+            Ok(index) => Visit::Done(match &node.slots[index] {
+                Slot::Spilled(ptr) => Ok(ptr.hash),
+                Slot::Inline(value) | Slot::Fresh(value) => try_hash_of(&**value),
+            }),
+            Err(position) => Visit::Descend(position),
+        });
+        fatal(fatal(found).transpose())
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool

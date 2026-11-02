@@ -88,7 +88,9 @@ happens. Writers run one at a time, so a transaction is serializable by construc
 
 **Collections are values too.** `Map`, `Set`, `List` and `Table` nest freely inside your types.
 Cloning one is O(1), and `==` compares root hashes in O(1) because the tree shape depends only on
-the contents. A commit that changes nothing is skipped.
+the contents. A commit that changes nothing is skipped. `Map::root_hash` and `Table::root_hash`
+expose those hashes, `Map::value_hash(&key)` gives the hash of one value, and `hash_of(&value)` the
+hash of any `Data` value, which makes an ETag one line.
 
 | Type | Use it for |
 | --- | --- |
@@ -98,16 +100,18 @@ the contents. A commit that changes nothing is skipped.
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
-`by_status_range(range)` and `by_status_counts()`, which needs no row reads. An `Option<T>` index
-also gets `by_field_some(&value)`, and `#[index(each)]` indexes every element of a collection
-field.
+`by_status_range(range)` and `by_status_counts()`, which needs no row reads.
+`by_status_after(&value, &key)` continues after a row's key within that value, so a filtered page
+costs a seek, not a walk over the rows already shown. An `Option<T>` index also gets
+`by_field_some(&value)` and `by_field_some_after(&value, &key)`, and `#[index(each)]` indexes every
+element of a collection field.
 
 ## History, diffs and branches
 
 ```rust
 let old = db.at(12)?;
 let then = db.as_of(unix_ms)?;
-for commit in db.log().values().rev() {
+for commit in db.log().values().rev().take(20) {
     println!("v{} {}", commit.version, commit.message);
 }
 
@@ -115,13 +119,23 @@ for change in old.orders.diff(&db.read().orders) {
     println!("{:?} changed", change.key());
 }
 
-let versions = db.history_of(|shop| shop.orders.get(&order_id))?;
+let life: Vec<_> = db
+    .history_of(|shop| shop.orders.get(&order_id))
+    .take_while(|(_, row)| row.is_some())
+    .collect();
 
 db.restore(&old)?;
 ```
 
 `diff` skips identical subtrees by hash, so it costs O(changes), not O(size). `restore` commits
 an old value as a new version, so history is never rewritten.
+
+`history_of` walks the log newest first and yields `(commit, value)` for each commit that changed
+the projection, including a change back to an earlier value. It reads nothing until you ask and
+stops when you stop, so `take`, `find` and the `take_while` above cost the commits actually
+walked: for that `take_while`, the age of the row, not the length of the log. To show changes
+oldest first, collect and reverse. `log().iter()` runs in version order like any collection, and
+`.rev()` walks newest first the same lazy way.
 
 ```rust
 let what_if = db.fork("what-if")?;
@@ -138,6 +152,31 @@ db.merge_with(&what_if, |shop, base, theirs| {
 A fork is one small commit whatever the database size. Merges are three-way and cost O(changes).
 You decide conflicts in Rust, and you merge each collection in your root yourself. Repeat merges
 between two branches, in either direction, do not apply a change twice.
+
+`db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
+the handle you call it on. Other handles on that branch keep reading what they had, commits through
+them fail with `Error::NoBranch`, and its watchers end. The bytes stay in the file until you compact.
+
+```rust
+let mut seen = db.read();
+for snapshot in db.watch() {
+    for change in seen.orders.diff(&snapshot.orders) {
+        println!("{:?} changed", change.key());
+    }
+    seen = snapshot;
+}
+```
+
+A `Watcher` does not queue. `recv` returns the newest snapshot it has not returned yet, so a slow
+consumer skips versions, costs the writers nothing and uses no memory, and `diff` covers whatever
+it skipped. `recv_timeout` and `try_recv` work like `std::sync::mpsc`. A watcher ends when the last
+`Db` handle goes, and it does not keep the file open: a snapshot it had not taken by then is lost.
+A read-only handle fires its watchers on `refresh`.
+
+`db.head_hash()` is a hash over the whole history of a branch, for publishing somewhere an attacker
+cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows
+that version and everything before it are unchanged. It is not a signature and says nothing about
+later commits, other branches or whether timestamps were true. See `DESIGN.md`.
 
 ## Changing your types
 
@@ -228,7 +267,7 @@ This is an experiment, not a production database.
   batch related changes into one commit. Secondary indexes add to that.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
   every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
-  closure and encoding. Calling `update` or `fork` from inside it deadlocks.
+  closure and encoding. Calling `update`, `fork` or `drop_branch` from inside it deadlocks.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall

@@ -11,7 +11,9 @@ of `T`, and all earlier versions stay readable.
   verification, node cache.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
-- `db.rs`: `Db<T>`, `Snapshot<T>`, commits, history, branches, watchers.
+- `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
+- `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
+- `watch.rs`: `Watcher<T>` and the per-branch feed behind it.
 
 ## Objects and links
 
@@ -24,6 +26,10 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 - Every read re-hashes the object and compares it with the pointer it came from.
 - Links are stored in a side table and consumed in order by `Decoder::link`. They take no bytes
   in the body, which keeps encoded size independent of a value's position.
+
+`hash_of(&value)` gives the hash a value has as an object of its own, whether or not it is stored as
+one. `Map::value_hash(&key)` returns the same hash, from the stored pointer without reading a spilled
+value, or by encoding an inline value that is already in memory.
 
 Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
 instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage
@@ -44,6 +50,33 @@ Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller
 runs after hashing and decompression before the hash check, so the hash covers the canonical
 body and two files with different physical compression still agree on every root hash. The
 decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
+
+## Deduplication
+
+`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset.
+It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
+at which a value becomes its own object. Smaller objects are cheap to write again, and registering
+every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
+their hash check. Offsets are not hashed, so a link in a node proves nothing about the offset it
+carries until it is followed, and registering links would let a damaged offset spread into new
+commits. A read-only handle registers nothing.
+
+So rewriting a value costs nothing if this process read the old one, whichever process wrote it.
+`get_mut` on a spilled value needs no special case: the slot becomes `Fresh`, the value is encoded
+again, and the hash finds the old object. Keeping the pointer in the slot would save only that one
+lookup, because the encode and hash are needed to know the value did not change, and it would cost
+every slot eight bytes.
+
+It does not close the gap for code that replaces a collection without reading it. In `chunkexp`,
+1000 edits to a 100 KB page as a `List<String>`:
+
+| Update | Warm process | New process per edit, before | New process per edit, after |
+| --- | --- | --- | --- |
+| Rebuilt from a fresh `collect` | 2.83 MB | 87.1 MB | 87.1 MB |
+| Read, then `set` the chunks that differ | 2.75 MB | 4.53 MB | 2.76 MB |
+
+A rebuild reads nothing, so nothing is registered. Finding an unread object by hash would need an
+index on disk or a scan at open, and neither is justified by one write pattern that can read first.
 
 ## Canonical tree
 
@@ -138,9 +171,30 @@ most records. Measured and left out:
   than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
   that avoided that saved only 6 to 8%.
 
-`cache_bytes` bounds cache weight, which tracks on-disk size, not heap. Decoded nodes take several
-times that: a 16 MiB cache holds about 71 MiB, and at 1 MiB, with pins and `Arc` allocations
-included, about 4.6 MiB. Size it at a quarter of the memory you mean to spend.
+`cache_bytes` is an approximate bound on the decoded heap of cached objects. An entry weighs its
+body bytes, which stand for the strings and vectors inside it, plus what decoding allocates around
+them: the `size_of` of the object, of each key, slot and child link, an `Arc` header and allocation
+per value held in the node, and a flat allowance per key and value for the rounding of small
+allocations. There is no size hook on `Data`, because walking every value on load would cost more
+than the accuracy is worth. Heap measured by `ferro-bench`'s `heap` tool with a counting allocator,
+after two scans of data larger than the cache, as a multiple of the setting at 1 to 256 MiB:
+
+| Values | Weight tracking disk size | Now |
+| --- | --- | --- |
+| Short strings | 3.8 to 3.9 | 0.76 to 0.83 |
+| 300 byte strings | 1.4 to 1.5 | 0.89 to 0.93 |
+| 2 KiB spilled strings | 1.0 to 1.7 | 1.0 to 1.1 |
+| Table rows and their indexes | 3.1 to 4.6 | 1.25 to 1.3 |
+
+Rows land above 1 because a row of small strings makes more allocations than the allowance covers.
+Outside the bound are pinned nodes, the `Arc` allocations memos keep, nodes held by live snapshots
+and dirty trees, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it
+up to 65,536 entries.
+
+The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full, and
+`peak_rss_mib` stays at 343 MiB. A setting carried over from before now holds about a quarter of what
+it did. `map_get_cold_ns` at 1 MiB went from 4.5 to 6.4 µs for that reason, and 5 MiB, which
+holds what 1 MiB used to, gives 4.6 µs.
 
 ## File format and durability
 
@@ -204,7 +258,7 @@ was measured and rejected: it adds a wakeup to every uncontended commit and gain
 contention.
 
 Nothing is published or acknowledged before it is durable, so readers, watchers and other
-processes never see a commit that could be lost, and they see every commit in order. A closure
+processes never see a commit that could be lost, and they see commits in order. A closure
 that ends without a frame, because nothing changed or it returned `Err`, may still have read an
 unpublished tip, so it waits for that tip before returning, and reports the failure instead if the
 tip never became durable. `fork` copies the tip and waits the same way, so the new branch appears
@@ -225,6 +279,20 @@ a reopen 27% slower, and a read-only follower's `refresh` rose from 5 µs to 117
 an in-memory pending log on the read path, a fallback, and buffered reads overlapping direct writes
 on the tail block.
 
+Each branch has one `Feed`: a mutex over the newest published snapshot and a publish count, and a
+condvar. Publishing stores one snapshot and wakes waiters whatever the number of watchers. A
+`Watcher` remembers the count it last saw, so a snapshot is never queued, and a consumer that falls
+behind gets the newest one and uses `diff` for what it skipped, which costs O(changes). With the
+channel this replaced, a watcher that never read grew RSS by 147 MB over 100,000 order commits
+against 53 MB with no watcher. Now it is 53 MB either way, and commit throughput matches. The count
+is compared rather than versions so that a read-only handle stays right when a branch is dropped
+and forked again at a lower version.
+
+A `Branch` closes its feed when it drops, which is when the last `Db` handle goes, because
+`Shared` holds every branch. Closing wakes parked watchers and drops the held snapshot. A `Watcher`
+holds only the feed, so a parked one keeps neither the file nor the writer lock. The price is that
+a snapshot nobody had taken by then is lost.
+
 A `Snapshot<T>` keeps its version alive for as long as it is held, and so does any `Map` or `Table`
 cloned from it. All of them also keep the writer lock held after the `Db` is dropped, so a new
 writer gets `Error::Locked` until they are gone. A closure works on a clone of the tip, so a panic
@@ -244,10 +312,56 @@ rewritten.
 
 The log used to be a `Map<u64, Commit>`, which rewrote a tree path per commit and was about 20%
 of the bytes of a single-key commit. `Db::log()` now returns a `Log` handle with `len`, `get`,
-`first`, `last`, `iter` and `values`. `iter` reads the whole chain, so it is O(n).
+`first`, `last`, `iter` and `values`. `iter` runs in version order, like a `Map`, and is double
+ended. `next_back` follows `prev` links from the tip and reads only what it yields, so
+`.rev().take(n)` costs O(n). The chain has no forward links, so the first `next` reads what is
+left of it once.
 
-`Db::history_of` walks the chain oldest first and reports the versions where a projection of the
-root changed.
+`Db::history_of` walks `prev` links newest first and yields `(commit, value)` for each version
+whose projection differs from the version before it. Only adjacent versions are compared, so a
+value that comes back is reported again, and skip links cannot speed this up: a change and its
+reversal could both fall between two probes. Version 1 is compared with the projection of the
+genesis value, and a pruned chain reports its oldest retained commit, since what came before is
+gone. `History` is not double ended, because reversing it would need the whole walk. Callers that
+show changes oldest first collect and reverse, so the cost is in plain sight.
+
+A value's item is ready only when the walk reaches the start of that value's run. A row's creation
+is followed by a run of `None` back to version 1 that reports nothing, so `Iterator::take_while`
+would read the rest of the log to learn that no older item exists. `History::take_while` is an
+inherent method for that reason. It tests the predicate against each older value as the walk
+enters its run, paired with the commit last reported, and stops there. Its items match the
+`Iterator` adaptor for a predicate on the value, on the commit, or on the conjunction of the two.
+The predicate is `Fn` because it can run twice per item. The run at the tip has no commit to pair
+with, so a row that is absent at the tip costs the age of that absence; check with `get` first.
+
+A step loads one `Entry`, loads and decodes the root `T`, and runs the projection. Measured on a
+50,000-commit shop in a fresh process: 0.8 µs for the entry, 1.3 µs for the root, then 1.3 µs for
+a row in a quiet part of the tree and 11.5 µs for a recent row, whose nodes every commit rewrote,
+so each step reads and decodes those nodes in full, values included. With the same commits cached
+the whole step is 0.7 to 2 µs. Going through `at(v)` instead costs about 3 µs more per step, for
+the skip-link descent from the tip. Entries hold the `Commit` behind an `Arc`, so walking the log
+and `db.read()` do not copy the message.
+
+`Db::head_hash` is the hash of the tip entry, and `Log::hash_at` that of any retained entry. An
+entry links its commit's root and its `prev` entry, and the hash covers link hashes, so one hash
+covers every commit's version, time, message and `restored` field, and every root value, back to
+the oldest retained entry. Compaction with `Keep::All` keeps it, because offsets are not hashed.
+
+Published where the writer of the file cannot change it, the hash is a tamper-evidence anchor. If
+`hash_at(version)` matches an anchor for that version and `verify` passes, then the history up to
+that version is what it was when the anchor was taken, subject to the limits of 160-bit hashes
+described under Objects and links. That is all it shows:
+
+- It is not a signature. Hashes are unkeyed, so anyone who can write the file can rewrite history
+  and get a consistent chain with a new hash. Only comparing with the anchor reveals that.
+- It proves nothing about commits after the anchored version, or about history before the anchor
+  was taken: a chain forged first and anchored afterwards verifies.
+- `time_ms` and `message` are what the writer recorded. The hash shows they were not changed, not
+  that they were true.
+- It covers one branch's chain. Other branches, and the `merged` records in the head, are outside
+  it, and `verify` is what checks those objects.
+- Pruning rebuilds the chain, so every retained entry gets a new hash and old anchors stop matching.
+  Check them before compacting with `Keep::Last` or `Keep::Since`.
 
 ## Merging
 
@@ -271,6 +385,29 @@ not recognised. A merge closure that is not idempotent, such as one that adds a 
 applies it again, and the built-in merges may report a conflict for it. If compaction pruned the
 recorded version, `common_ancestor` falls back to the fork point, or returns `NoCommonAncestor`
 if that was pruned too.
+
+## Dropping a branch
+
+`Db::drop_branch` writes one frame: a `Refs` without the branch, and with its name removed from the
+`merged` map of every other head, including records a fork inherited. Records are keyed by name,
+so one left behind would match any later branch of that name. Its version would then be read
+against the new branch's log, which gives a base older than the real fork point, and merges would
+report conflicts and re-apply old changes. The branch's own head and records go with it. Commits
+read `merged` from the head in `tip.refs` rather than from a copy in the branch state, so nothing
+in memory can write a removed record back.
+
+A commit writes its head by name, so a handle on a dropped branch would quietly recreate it. Each
+`Branch` therefore has a `retired` flag, which commits, forks and merges from that branch check
+under the `tip` mutex, returning `Error::NoBranch`. `drop_branch` holds the mutex through its sync
+and until the flag is set, so no commit fits between the frame and the flag. That stalls writers for
+one fsync, on an operation that is rare. Retiring also closes the feed, which ends the branch's
+watchers. Reads through an old handle still work, because state is a value and the objects are
+there until compaction. A later fork of the same name is a new `Branch`, so old handles stay dead.
+
+Counting handles and refusing the drop while others exist was rejected: a clone parked on another
+thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
+handle learns of the drop on `refresh`, and retires its `Branch` the same way instead of falling
+back to the genesis value.
 
 ## Compaction
 

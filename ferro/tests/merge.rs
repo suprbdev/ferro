@@ -130,7 +130,7 @@ fn history_of_reports_only_versions_where_the_projection_changed() {
     })
     .unwrap();
     db.commit("gone", |b| b.tasks.remove(&1)).unwrap();
-    let history = db.history_of(|b| b.tasks.get(&1)).unwrap();
+    let history: Vec<_> = db.history_of(|b| b.tasks.get(&1)).collect();
     let summary: Vec<(u64, &str, Option<String>)> = history
         .iter()
         .map(|(commit, row)| {
@@ -144,9 +144,9 @@ fn history_of_reports_only_versions_where_the_projection_changed() {
     assert_eq!(
         summary,
         vec![
-            (1, "create", Some("open".to_string())),
-            (3, "close", Some("done".to_string())),
             (4, "gone", None),
+            (3, "close", Some("done".to_string())),
+            (1, "create", Some("open".to_string())),
         ]
     );
 }

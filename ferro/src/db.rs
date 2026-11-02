@@ -1,19 +1,22 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
+use crate::history::History;
 use crate::log::{Chain, Log};
 use crate::map::Map;
 use crate::store::{Durability, Frame, Store, StoreOptions, Txn};
+use crate::watch::{Feed, Watcher};
 
 const MAIN: &str = "main";
 
@@ -111,7 +114,7 @@ struct RefState {
 
 pub struct Snapshot<T> {
     value: Arc<T>,
-    commit: Commit,
+    commit: Arc<Commit>,
 }
 
 impl<T> Clone for Snapshot<T> {
@@ -131,6 +134,15 @@ impl<T> Deref for Snapshot<T> {
     }
 }
 
+impl<T> fmt::Debug for Snapshot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &self.commit.version)
+            .field("message", &self.commit.message)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> Snapshot<T> {
     pub fn version(&self) -> u64 {
         self.commit.version
@@ -144,29 +156,53 @@ impl<T> Snapshot<T> {
 struct State<T> {
     snapshot: Snapshot<T>,
     log: Chain,
-    merged: Map<String, (u64, u64)>,
 }
 
-#[derive(Default)]
-struct Intent {
+struct Intent<T> {
     restored: Option<u64>,
-    merged: Option<(String, u64)>,
+    merged: Option<(Arc<Branch<T>>, u64)>,
+}
+
+impl<T> Default for Intent<T> {
+    fn default() -> Self {
+        Intent {
+            restored: None,
+            merged: None,
+        }
+    }
 }
 
 struct Branch<T> {
     name: String,
     state: ArcSwap<State<T>>,
     tip: ArcSwap<State<T>>,
-    watchers: Mutex<Vec<Sender<Snapshot<T>>>>,
+    feed: Arc<Feed<T>>,
+    retired: AtomicBool,
 }
 
 impl<T> Branch<T> {
     fn publish(&self, state: Arc<State<T>>) {
         let snapshot = state.snapshot.clone();
         self.state.store(state);
-        self.watchers
-            .lock()
-            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+        self.feed.publish(snapshot);
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.feed.close();
+    }
+
+    fn check_live(&self) -> Result<()> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(Error::NoBranch(self.name.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl<T> Drop for Branch<T> {
+    fn drop(&mut self) {
+        self.feed.close();
     }
 }
 
@@ -205,6 +241,16 @@ impl<T> Drop for Shared<T> {
 pub struct Db<T> {
     shared: Arc<Shared<T>>,
     branch: Arc<Branch<T>>,
+}
+
+impl<T> fmt::Debug for Db<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Db")
+            .field("path", &self.shared.store.path())
+            .field("branch", &self.branch.name)
+            .field("version", &self.branch.state.load().snapshot.commit.version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> Clone for Db<T> {
@@ -252,7 +298,7 @@ impl Options {
     ) -> Result<Db<T>> {
         let (store, head) = Store::open(path.as_ref(), self.store)?;
         let genesis = Arc::new(init());
-        let genesis_hash = value_hash(&*genesis)?;
+        let genesis_hash = try_hash_of(&*genesis)?;
         let refs = match head {
             Some(ptr) => (*store.load::<Refs>(ptr)?).clone(),
             None => Map::new(),
@@ -284,13 +330,6 @@ impl Options {
     }
 }
 
-fn value_hash<D: Data>(value: &D) -> Result<Hash> {
-    let mut sink = HashSink;
-    let mut encoder = Encoder::new(&mut sink);
-    value.encode(&mut encoder)?;
-    Ok(encoder.finish()?.hash)
-}
-
 fn write_value<D: Data>(value: &D, txn: &mut Txn) -> Result<Ptr> {
     let mut encoder = Encoder::new(txn);
     value.encode(&mut encoder)?;
@@ -320,10 +359,9 @@ impl<T: Data> Shared<T> {
             return Ok(State {
                 snapshot: Snapshot {
                     value: self.genesis.clone(),
-                    commit: Commit::genesis(),
+                    commit: Arc::new(Commit::genesis()),
                 },
                 log: Chain::empty(),
-                merged: Map::new(),
             });
         };
         let value = match head.root {
@@ -334,11 +372,10 @@ impl<T: Data> Shared<T> {
             .log
             .tip_entry(&self.store)?
             .map(|entry| entry.commit.clone())
-            .unwrap_or_else(Commit::genesis);
+            .unwrap_or_else(|| Arc::new(Commit::genesis()));
         Ok(State {
             snapshot: Snapshot { value, commit },
             log: head.log,
-            merged: head.merged.clone(),
         })
     }
 
@@ -356,7 +393,8 @@ impl<T: Data> Shared<T> {
             name: name.to_string(),
             state: ArcSwap::new(state.clone()),
             tip: ArcSwap::new(state),
-            watchers: Mutex::new(Vec::new()),
+            feed: Arc::new(Feed::new()),
+            retired: AtomicBool::new(false),
         });
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
@@ -468,6 +506,10 @@ impl<T: Data> Db<T> {
         self.branch.state.load().snapshot.commit.version
     }
 
+    pub fn head_hash(&self) -> Option<Hash> {
+        self.branch.state.load().log.tip.map(|ptr| ptr.hash)
+    }
+
     pub fn log(&self) -> Log {
         Log {
             chain: self.branch.state.load().log,
@@ -526,10 +568,14 @@ impl<T: Data> Db<T> {
 
     fn transact<R, E: From<Error>>(
         &self,
-        intent: Intent,
+        intent: Intent<T>,
         f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let mut tip = self.shared.tip.lock();
+        self.branch.check_live()?;
+        if let Some((other, _)) = &intent.merged {
+            other.check_live()?;
+        }
         let state = self.branch.tip.load_full();
         let mut working = (*state.snapshot.value).clone();
         let before = state.snapshot.commit.version;
@@ -553,7 +599,7 @@ impl<T: Data> Db<T> {
         tip: &mut RefState,
         state: &State<T>,
         message: String,
-        intent: Intent,
+        intent: Intent<T>,
         working: &T,
     ) -> Result<u64> {
         let store = &self.shared.store;
@@ -561,10 +607,16 @@ impl<T: Data> Db<T> {
         let root = write_root(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let version = state.snapshot.commit.version + 1;
-        let mut merged = state.merged.clone();
+        let mut merged = tip
+            .refs
+            .try_get(&self.branch.name)?
+            .map(|head| head.merged.clone())
+            .unwrap_or_default();
         let recorded = match intent.merged {
-            Some((branch, theirs)) if merged.try_get(&branch)?.map(|seen| seen.0) != Some(theirs) => {
-                merged.insert(branch, (theirs, version));
+            Some((branch, theirs))
+                if merged.try_get(&branch.name)?.map(|seen| seen.0) != Some(theirs) =>
+            {
+                merged.insert(branch.name.clone(), (theirs, version));
                 true
             }
             _ => false,
@@ -598,7 +650,7 @@ impl<T: Data> Db<T> {
         if version == 0 {
             return Ok(Snapshot {
                 value: self.shared.genesis.clone(),
-                commit: Commit::genesis(),
+                commit: Arc::new(Commit::genesis()),
             });
         }
         let chain = self.branch.state.load().log;
@@ -608,7 +660,7 @@ impl<T: Data> Db<T> {
         self.snapshot_of(&entry.commit)
     }
 
-    fn snapshot_of(&self, commit: &Commit) -> Result<Snapshot<T>> {
+    fn snapshot_of(&self, commit: &Arc<Commit>) -> Result<Snapshot<T>> {
         let root = commit.root.ok_or(Error::NoVersion(commit.version))?;
         Ok(Snapshot {
             value: self.shared.store.load::<T>(root)?,
@@ -646,24 +698,14 @@ impl<T: Data> Db<T> {
         })
     }
 
-    pub fn history_of<V: PartialEq + Clone>(
-        &self,
-        project: impl Fn(&T) -> V,
-    ) -> Result<Vec<(Commit, V)>> {
+    pub fn history_of<V, F>(&self, project: F) -> History<T, V, F>
+    where
+        V: PartialEq,
+        F: Fn(&T) -> V,
+    {
         let chain = self.branch.state.load().log;
-        let mut previous = None;
-        if chain.tip.is_some() && chain.first == 1 {
-            previous = Some(project(&self.shared.genesis));
-        }
-        let mut changes = Vec::new();
-        for commit in chain.commits(&self.shared.store)? {
-            let value = project(&*self.snapshot_of(&commit)?);
-            if previous.as_ref() != Some(&value) {
-                changes.push((commit, value.clone()));
-                previous = Some(value);
-            }
-        }
-        Ok(changes)
+        let genesis = (chain.first == 1).then(|| self.shared.genesis.clone());
+        History::new(chain.walk(&self.shared.store), self.shared.store.clone(), genesis, project)
     }
 
     pub fn merge_with<R, S: Into<String>>(
@@ -677,7 +719,7 @@ impl<T: Data> Db<T> {
         let intent = Intent {
             restored: None,
             merged: (advanced && !Arc::ptr_eq(&self.branch, &other.branch))
-                .then(|| (other.branch.name.clone(), theirs.version())),
+                .then(|| (other.branch.clone(), theirs.version())),
         };
         self.transact::<R, Error>(intent, |root| {
             let (message, value) = f(root, &base, &theirs);
@@ -687,8 +729,12 @@ impl<T: Data> Db<T> {
 
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
         let recorded = |db: &Db<T>, from: &Db<T>| -> Result<Option<(Snapshot<T>, u64)>> {
-            let state = db.branch.state.load();
-            let Some(seen) = state.merged.try_get(&from.branch.name)? else {
+            let head = db.shared.published.lock().refs.try_get(&db.branch.name)?;
+            let seen = match head {
+                Some(head) => head.merged.try_get(&from.branch.name)?,
+                None => None,
+            };
+            let Some(seen) = seen else {
                 return Ok(None);
             };
             match from.at(seen.0) {
@@ -738,11 +784,17 @@ impl<T: Data> Db<T> {
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
         let mut tip = self.shared.tip.lock();
+        self.branch.check_live()?;
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
         let state = self.branch.tip.load_full();
         let commit = &state.snapshot.commit;
+        let merged = tip
+            .refs
+            .try_get(&self.branch.name)?
+            .map(|head| head.merged.clone())
+            .unwrap_or_default();
         let mut next = tip.refs.clone();
         next.insert(
             name.to_string(),
@@ -750,7 +802,7 @@ impl<T: Data> Db<T> {
                 version: commit.version,
                 root: commit.root,
                 log: state.log,
-                merged: state.merged.clone(),
+                merged,
             },
         );
         let txn = self.shared.store.begin()?;
@@ -770,6 +822,38 @@ impl<T: Data> Db<T> {
         })
     }
 
+    pub fn drop_branch(&self, name: &str) -> Result<()> {
+        if name == MAIN || name == self.branch.name {
+            return Err(Error::BranchInUse(name.to_string()));
+        }
+        let mut tip = self.shared.tip.lock();
+        if tip.refs.try_get(name)?.is_none() {
+            return Err(Error::NoBranch(name.to_string()));
+        }
+        let txn = self.shared.store.begin()?;
+        let mut next = tip.refs.clone();
+        next.remove(name);
+        let branches: Vec<_> = next.iter().collect();
+        for (branch, head) in branches {
+            if head.merged.try_get(name)?.is_some() {
+                let mut head = (*head).clone();
+                head.merged.remove(name);
+                next.insert(branch, head);
+            }
+        }
+        self.shared.stage(&mut tip, next, txn, None)?;
+        let ticket = self.shared.store.last_seq();
+        self.shared.settle(ticket)?;
+        let published = self.shared.published.lock();
+        let retired = self.shared.branches.lock().remove(name);
+        drop(published);
+        if let Some(branch) = &retired {
+            branch.retire();
+        }
+        drop(tip);
+        Ok(())
+    }
+
     pub fn branches(&self) -> Vec<String> {
         let refs = self.shared.published.lock();
         let mut names: Vec<String> = refs.refs.keys().collect();
@@ -780,10 +864,8 @@ impl<T: Data> Db<T> {
         names
     }
 
-    pub fn watch(&self) -> Receiver<Snapshot<T>> {
-        let (sender, receiver) = channel();
-        self.branch.watchers.lock().push(sender);
-        receiver
+    pub fn watch(&self) -> Watcher<T> {
+        Watcher::new(self.branch.feed.clone())
     }
 
     pub fn refresh(&self) -> Result<bool> {
@@ -801,15 +883,25 @@ impl<T: Data> Db<T> {
         tip.refs = (*self.shared.store.load::<Refs>(ptr)?).clone();
         tip.ptr = Some(ptr);
         *self.shared.published.lock() = tip.clone();
-        let branches = self.shared.branches.lock();
+        let mut branches = self.shared.branches.lock();
+        let mut gone = Vec::new();
         for branch in branches.values() {
             let head = tip.refs.try_get(&branch.name)?;
+            if head.is_none() && branch.name != MAIN {
+                gone.push(branch.name.clone());
+                continue;
+            }
             let state = Arc::new(self.shared.state_of(head.as_deref())?);
             branch.tip.store(state.clone());
-            if state.snapshot.version() == branch.state.load().snapshot.version() {
+            if state.snapshot.commit == branch.state.load().snapshot.commit {
                 branch.state.store(state);
             } else {
                 branch.publish(state);
+            }
+        }
+        for name in gone {
+            if let Some(branch) = branches.remove(&name) {
+                branch.retire();
             }
         }
         Ok(true)

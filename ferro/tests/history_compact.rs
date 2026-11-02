@@ -276,71 +276,60 @@ fn history_of_pruned_log_returned_values_and_forks() {
         let project = |root: &Root| root.get(&0).map(|v| *v);
         let versions: Vec<(u64, Option<u32>)> = main
             .history_of(project)
-            .unwrap()
-            .into_iter()
             .map(|(c, v)| (c.version, v))
             .collect();
         assert_eq!(
             versions,
             vec![
-                (1, Some(1)),
-                (2, Some(2)),
-                (3, Some(1)),
-                (4, Some(3)),
-                (5, Some(1)),
+                (7, Some(3)),
                 (6, Some(2)),
-                (7, Some(3))
+                (5, Some(1)),
+                (4, Some(3)),
+                (3, Some(1)),
+                (2, Some(2)),
+                (1, Some(1))
             ]
         );
         let side_versions: Vec<(u64, Option<u32>)> = side
             .history_of(project)
-            .unwrap()
-            .into_iter()
             .map(|(c, v)| (c.version, v))
             .collect();
         assert_eq!(
             side_versions,
             vec![
-                (1, Some(1)),
-                (2, Some(2)),
-                (3, Some(1)),
-                (4, Some(3)),
-                (5, Some(1)),
-                (6, Some(2)),
+                (8, Some(9)),
                 (7, Some(1)),
-                (8, Some(9))
+                (6, Some(2)),
+                (5, Some(1)),
+                (4, Some(3)),
+                (3, Some(1)),
+                (2, Some(2)),
+                (1, Some(1))
             ]
         );
-        let untouched = main.history_of(|root| root.get(&7).map(|v| *v)).unwrap();
-        assert!(untouched.is_empty());
-        let whole = main.history_of(|root| root.len()).unwrap();
-        assert_eq!(whole.len(), 1);
+        assert_eq!(main.history_of(|root| root.get(&7).map(|v| *v)).count(), 0);
+        assert_eq!(main.history_of(|root| root.len()).count(), 1);
     }
     admin::compact(&path, Keep::Last(4)).unwrap();
     let main: Db<Root> = fast().open(&path).unwrap();
     let project = |root: &Root| root.get(&0).map(|v| *v);
     let pruned: Vec<(u64, Option<u32>)> = main
         .history_of(project)
-        .unwrap()
-        .into_iter()
         .map(|(c, v)| (c.version, v))
         .collect();
     assert_eq!(
         pruned,
-        vec![(4, Some(3)), (5, Some(1)), (6, Some(2)), (7, Some(3))]
+        vec![(7, Some(3)), (6, Some(2)), (5, Some(1)), (4, Some(3))]
     );
-    let flat = main.history_of(|root| root.get(&1).map(|v| *v)).unwrap();
-    assert_eq!(flat.len(), 3);
+    assert_eq!(main.history_of(|root| root.get(&1).map(|v| *v)).count(), 3);
     let side = main.branch("side").unwrap();
     let side_pruned: Vec<(u64, Option<u32>)> = side
         .history_of(project)
-        .unwrap()
-        .into_iter()
         .map(|(c, v)| (c.version, v))
         .collect();
     assert_eq!(
         side_pruned,
-        vec![(5, Some(1)), (6, Some(2)), (7, Some(1)), (8, Some(9))]
+        vec![(8, Some(9)), (7, Some(1)), (6, Some(2)), (5, Some(1))]
     );
 }
 
@@ -368,11 +357,9 @@ fn history_of_starts_from_genesis_for_a_custom_initial_value() {
     .unwrap();
     let changes: Vec<(u64, Option<u32>)> = db
         .history_of(|root| root.get(&0).map(|v| *v))
-        .unwrap()
-        .into_iter()
         .map(|(c, v)| (c.version, v))
         .collect();
-    assert_eq!(changes, vec![(2, Some(8)), (3, Some(7))]);
+    assert_eq!(changes, vec![(3, Some(7)), (2, Some(8))]);
 }
 
 fn populate(path: &std::path::Path, commits: u32) -> Vec<(u8, u32)> {

@@ -551,8 +551,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
         let range = format_ident!("{}_range", field);
         let counts = format_ident!("{}_counts", field);
+        let after = format_ident!("{}_after", field);
         if let (IndexKind::Value, Some(inner)) = (&ix.kind, option_inner(&ix.ty)) {
             let some = format_ident!("{}_some", field);
+            let some_after = format_ident!("{}_some_after", field);
             methods.push(quote! {
                 pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
                 where
@@ -560,6 +562,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
                     ::ferro::table::index_eq_some::<#inner, #name, __Q>(&self.rows, &self.#field, value)
+                }
+
+                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name>
+                where
+                    #inner: ::std::borrow::Borrow<__Q>,
+                    #key_ty: ::std::borrow::Borrow<__A>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                    __A: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::index_after_some::<#inner, #name, __Q, __A>(&self.rows, &self.#field, value, after)
                 }
             });
         }
@@ -574,6 +586,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
             {
                 ::ferro::table::index_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+            }
+
+            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name>
+            where
+                #vt: ::std::borrow::Borrow<__Q>,
+                #key_ty: ::std::borrow::Borrow<__A>,
+                __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                __A: ::std::cmp::Ord + ?::std::marker::Sized,
+            {
+                ::ferro::table::index_after::<#vt, #name, __Q, __A>(&self.rows, &self.#field, value, after)
             }
 
             pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name>

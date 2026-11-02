@@ -388,7 +388,7 @@ fn restore_reports_its_own_version_under_contention() {
 }
 
 #[test]
-fn watchers_see_every_commit_in_order() {
+fn watchers_see_newer_commits_in_order_and_end_with_the_last_handle() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast().open::<Map<u64, u64>>(dir.path().join("w.ferro")).unwrap();
     let early = db.watch();
@@ -408,10 +408,12 @@ fn watchers_see_every_commit_in_order() {
             }
         })
     };
-    for expected in 1..=500u64 {
+    let mut last = 0;
+    while last < 500 {
         let snapshot = early.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(snapshot.version(), expected);
-        assert_eq!(snapshot.len() as u64, expected);
+        assert!(snapshot.version() > last);
+        assert_eq!(snapshot.len() as u64, snapshot.version());
+        last = snapshot.version();
     }
     writer.join().unwrap();
     assert!(early.try_recv().is_err());
@@ -620,6 +622,7 @@ fn watchers_on_a_read_only_handle_fire_on_refresh() {
         root.insert(2, 2);
     })
     .unwrap();
+    assert!(events.try_recv().is_err());
     assert!(reader.refresh().unwrap());
     let snapshot = events.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(snapshot.version(), 2);

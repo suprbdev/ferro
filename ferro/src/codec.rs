@@ -65,6 +65,17 @@ pub trait Data: Clone + Send + Sync + 'static {
     }
 }
 
+pub fn try_hash_of<D: Data>(value: &D) -> Result<Hash> {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder)?;
+    Ok(encoder.finish()?.hash)
+}
+
+pub fn hash_of<D: Data>(value: &D) -> Hash {
+    crate::map::fatal(try_hash_of(value))
+}
+
 pub const fn field_tag(name: &str) -> u16 {
     let bytes = name.as_bytes();
     let mut hash: u32 = 0x811c9dc5;

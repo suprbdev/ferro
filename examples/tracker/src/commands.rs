@@ -522,7 +522,9 @@ fn stats(w: &mut dyn Write, t: &Tracker, meta: &Meta) -> Res<()> {
 fn history(w: &mut dyn Write, db: &Db<Tracker>, id: u64) -> Res<()> {
     let mut previous: Option<Arc<Issue>> = None;
     let mut seen = false;
-    for (commit, current) in db.history_of(|t| t.issues.get(&id))? {
+    let mut changes: Vec<_> = db.history_of(|t| t.issues.get(&id)).collect();
+    changes.reverse();
+    for (commit, current) in changes {
         let lines = match (&previous, &current) {
             (None, Some(new)) => vec![format!("created: {}", new.title)],
             (Some(_), None) => vec!["removed".to_string()],

@@ -101,6 +101,7 @@ pub enum Command {
 pub enum DraftCommand {
     Start { name: String },
     Publish { name: String },
+    Drop { name: String },
     List,
 }
 

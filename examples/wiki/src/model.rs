@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferro::{Data, Map, Record, Set, Table};
+use ferro::{Data, List, Map, Record, Set, Table};
 
-pub type Body = Map<u64, String>;
+pub type Body = List<String>;
 
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Page {

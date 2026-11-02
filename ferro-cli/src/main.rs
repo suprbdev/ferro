@@ -56,7 +56,7 @@ fn run(cli: Cli) -> ferro::Result<()> {
             branch,
             limit,
         } => {
-            for commit in admin::log(&path, &branch)?.iter().rev().take(limit) {
+            for commit in admin::log(&path, &branch, limit)? {
                 println!(
                     "v{}  {}  {}",
                     commit.version, commit.time_ms, commit.message
