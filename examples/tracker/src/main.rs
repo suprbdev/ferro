@@ -18,9 +18,6 @@ pub type Res<T> = Result<T, Box<dyn Error>>;
 
 fn run(cli: Cli) -> Res<()> {
     let read_only = cli.command.is_read_only();
-    if read_only && !cli.db.exists() {
-        return Err(format!("no database at {}", cli.db.display()).into());
-    }
     let mut options = Options::new();
     if read_only {
         options = options.read_only();

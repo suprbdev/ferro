@@ -692,3 +692,122 @@ fn state_survives_many_processes() {
     env.ok(&["verify"]);
     assert!(env.ok(&["show", "15"]).contains("comments (1):"));
 }
+
+fn forked() -> Env {
+    let env = populated();
+    env.ok(&["branch", "side"]);
+    env
+}
+
+#[test]
+fn merge_applies_disjoint_changes() {
+    let env = forked();
+    env.ok(&["--branch", "side", "close", "1"]);
+    env.ok(&["--branch", "side", "assign", "2", "carol"]);
+    env.ok(&["comment", "3", "on main"]);
+    let out = env.ok(&["merge", "side"]);
+    assert!(out.contains("merge side: 3 applied, 0 conflicts"), "{out}");
+    assert!(env.lines(&["log", "--limit", "1"])[0].ends_with("merge side: 3 applied, 0 conflicts"));
+    assert_eq!(env.ids(&["list", "--status", "closed"]), vec![4, 1]);
+    assert_eq!(env.ids(&["list", "--assignee", "carol"]), vec![2]);
+    assert!(env.ok(&["show", "3"]).contains("on main"));
+    assert!(env.ok(&["users"]).contains("carol"));
+}
+
+#[test]
+fn merge_conflict_keeps_ours_by_default() {
+    let env = forked();
+    env.ok(&["--branch", "side", "edit", "1", "--title", "Theirs"]);
+    env.ok(&["edit", "1", "--title", "Ours"]);
+    env.ok(&["--branch", "side", "close", "2"]);
+    let out = env.ok(&["merge", "side"]);
+    assert!(out.contains("merge side: 1 applied, 1 conflicts"), "{out}");
+    assert!(out.contains("conflict #1: kept main"), "{out}");
+    assert!(env.ok(&["show", "1"]).contains("Ours"));
+    assert!(env.ids(&["list", "--status", "closed"]).contains(&2));
+}
+
+#[test]
+fn merge_conflict_with_theirs_flag_takes_theirs() {
+    let env = forked();
+    env.ok(&["--branch", "side", "edit", "1", "--title", "Theirs"]);
+    env.ok(&["edit", "1", "--title", "Ours"]);
+    let out = env.ok(&["merge", "side", "--theirs"]);
+    assert!(out.contains("merge side: 0 applied, 1 conflicts"), "{out}");
+    assert!(out.contains("conflict #1: kept side"), "{out}");
+    assert!(env.ok(&["show", "1"]).contains("Theirs"));
+}
+
+#[test]
+fn merge_without_changes_is_a_no_op() {
+    let env = forked();
+    let before = env.version();
+    let out = env.ok(&["merge", "side"]);
+    assert!(
+        out.contains("no change: merge side: 0 applied, 0 conflicts"),
+        "{out}"
+    );
+    assert_eq!(env.version(), before);
+    env.fail(&["merge", "ghost"]);
+}
+
+#[test]
+fn merge_same_id_adds_are_renumbered_not_lost() {
+    let env = forked();
+    env.ok(&["add", "Ours five"]);
+    env.ok(&["--branch", "side", "add", "Theirs five"]);
+    env.ok(&["--branch", "side", "add", "Theirs six"]);
+    let out = env.ok(&["merge", "side"]);
+    assert!(out.contains("merge side: 2 applied, 0 conflicts"), "{out}");
+    assert!(out.contains("renumbered #5 from side as #7"), "{out}");
+    let titles = env.ok(&["list"]);
+    assert!(titles.contains("Ours five"));
+    assert!(titles.contains("Theirs five"));
+    assert!(titles.contains("Theirs six"));
+    assert_eq!(env.ids(&["list"]), vec![7, 6, 5, 4, 3, 2, 1]);
+    assert!(env.ok(&["show", "5"]).contains("Ours five"));
+    assert!(env.ok(&["show", "7"]).contains("Theirs five"));
+    env.ok(&["add", "After"]);
+    assert_eq!(env.ids(&["list", "--limit", "1"]), vec![8]);
+}
+
+#[test]
+fn stats_are_correct_after_merge() {
+    let env = forked();
+    env.ok(&["--branch", "side", "close", "1"]);
+    env.ok(&["--branch", "side", "assign", "2", "bob"]);
+    env.ok(&["--branch", "side", "label", "3", "ui"]);
+    env.ok(&[
+        "--branch",
+        "side",
+        "add",
+        "New",
+        "--assignee",
+        "dave",
+        "--priority",
+        "critical",
+    ]);
+    env.ok(&["merge", "side"]);
+    let out = env.ok(&["stats"]);
+    let row = |name: &str| -> u64 {
+        out.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .unwrap()
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(out.contains("issues:   5"));
+    assert_eq!(row("open"), 2);
+    assert_eq!(row("closed"), 2);
+    assert_eq!(row("in-progress"), 1);
+    assert_eq!(row("bob"), 2);
+    assert_eq!(row("dave"), 1);
+    assert_eq!(row("alice"), 1);
+    assert_eq!(row("critical"), 1);
+    assert_eq!(row("ui"), 2);
+    assert_eq!(env.ids(&["list", "--assignee", "dave"]), vec![5]);
+    assert_eq!(env.ids(&["list", "--label", "ui"]), vec![3, 1]);
+}
