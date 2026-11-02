@@ -7,6 +7,7 @@ use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
 use crate::map::Map;
+pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::Roots;
 use crate::store::{LOG_START, Store, StoreOptions, append_record, seal};
 
@@ -32,14 +33,6 @@ pub struct BranchInfo {
 pub struct Info {
     pub file_bytes: u64,
     pub branches: Vec<BranchInfo>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Compacted {
-    pub before_bytes: u64,
-    pub after_bytes: u64,
-    pub objects: u64,
-    pub commits_dropped: u64,
 }
 
 fn read_only(path: &Path) -> Result<(Store, Option<Ptr>)> {
@@ -72,9 +65,10 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
             last_commit_ms: last.unwrap_or(0),
         });
     }
+    let file_bytes = store.on_disk();
     store.close();
     Ok(Info {
-        file_bytes: store.size(),
+        file_bytes,
         branches,
     })
 }
@@ -106,7 +100,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
 
 pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {
     let mut report = crate::Verified {
-        file_bytes: store.size(),
+        file_bytes: store.on_disk(),
         ..crate::Verified::default()
     };
     if let Some(ptr) = head {
@@ -146,6 +140,32 @@ pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let file_bytes = store.size();
     store.close();
     Ok(Layout { file_bytes, extents })
+}
+
+#[derive(Clone, Default)]
+struct Raw;
+
+impl Data for Raw {
+    fn encode(&self, _w: &mut Encoder<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn decode(_r: &mut crate::codec::Decoder<'_>) -> Result<Self> {
+        Ok(Raw)
+    }
+}
+
+pub fn reclaim(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
+    let db: crate::Db<Raw> = crate::Options::new().reclaim(Reclaim {
+        every_bytes: 0,
+        ..Reclaim::default()
+    })
+    .open(path)?;
+    db.compact(keep)
+}
+
+pub fn space(path: impl AsRef<Path>) -> Result<Space> {
+    crate::Options::new().read_only().open::<Raw>(path)?.space()
 }
 
 struct CopySink {
@@ -266,8 +286,7 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
         return Ok(Compacted {
             before_bytes,
             after_bytes: before_bytes,
-            objects: 0,
-            commits_dropped: 0,
+            ..Compacted::default()
         });
     };
     let refs = load_refs(&store, Some(head))?;
@@ -283,6 +302,7 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
             after_bytes,
             objects,
             commits_dropped,
+            ..Compacted::default()
         })
     });
     if result.is_err() {
@@ -315,7 +335,7 @@ fn write_copy(store: &Store, refs: &Refs, keep: Keep, temp: &Path) -> Result<(u6
     for (name, branch) in refs.iter() {
         let log = branch.log.pruned(store, keep)?;
         commits_dropped += (branch.log.len() - log.len()) as u64;
-        log.visit(store, |ptr, entry, _, _| {
+        log.visit(store, false, |ptr, entry, _, _| {
             retained.insert(ptr.hash);
             edge.extend(entry.prev.iter().chain(&entry.skip).map(|link| link.hash));
             Ok(())

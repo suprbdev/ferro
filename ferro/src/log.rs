@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
-use crate::db::Commit;
+use crate::db::{Commit, Held};
 use crate::error::{Error, Result};
 use crate::store::Store;
 
@@ -184,12 +184,16 @@ impl Chain {
     pub(crate) fn visit(
         &self,
         store: &Store,
+        lenient: bool,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<()>,
     ) -> Result<()> {
         let mut next = self.tip;
         let mut above = u64::MAX;
         while let Some(ptr) = next {
-            let (object, len) = store.read_record(ptr)?;
+            let (object, len) = match store.read_record(ptr) {
+                Err(Error::Pruned(_)) if lenient => return Ok(()),
+                other => other?,
+            };
             let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
             let at = entry.commit.version;
             if at >= above {
@@ -279,6 +283,7 @@ impl Walk {
 pub struct Log {
     pub(crate) chain: Chain,
     pub(crate) store: Store,
+    pub(crate) pin: Arc<Held>,
 }
 
 impl Log {
@@ -323,6 +328,7 @@ impl Log {
             walk: self.chain.walk(&self.store),
             front: VecDeque::new(),
             remaining: self.chain.len(),
+            _pin: self.pin.clone(),
         }
     }
 
@@ -335,6 +341,7 @@ pub struct Iter {
     walk: Walk,
     front: VecDeque<Arc<Commit>>,
     remaining: usize,
+    _pin: Arc<Held>,
 }
 
 impl Iter {

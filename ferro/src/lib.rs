@@ -14,7 +14,7 @@ pub mod store;
 pub mod table;
 pub mod watch;
 
-pub use admin::Keep;
+pub use admin::{Compacted, Keep, Reclaim, Space};
 pub use codec::{Data, Hash, Ptr, hash_of};
 pub use db::{Commit, Committed, Db, Options, Snapshot, Verified};
 pub use error::{Error, Result};

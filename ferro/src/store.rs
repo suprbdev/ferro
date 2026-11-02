@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
@@ -18,13 +20,14 @@ use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 
-const MAGIC: &[u8; 8] = b"FERRODB1";
+const MAGIC: &[u8; 8] = b"FERRODB2";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+const GAP_MAGIC: &[u8; 8] = b"FERROGAP";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
-const SUPER_BYTES: usize = 96;
-const SUPER_CHECKED: usize = 64;
 const FRAME_CHECKED: usize = 32 + HASH_BYTES;
+const SUPER_CHECKED: usize = FRAME_CHECKED + 44;
+const SUPER_BYTES: usize = SUPER_CHECKED + 32;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 const SCAN_CHUNK: usize = 1 << 20;
 const FIRST_RESERVE: u64 = 64 << 10;
@@ -37,6 +40,9 @@ const MAX_DEDUPE: u64 = 1 << 16;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
+const MIN_BLOCK: u64 = 4096;
+const PUNCH_CHUNK: u64 = 64 << 20;
+const OPEN_RETRIES: u32 = 64;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -46,11 +52,26 @@ pub enum Durability {
     Buffered,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Op {
+    Write(u64, Vec<u8>),
+    SetLen(u64),
+    Sync,
+    Punch(u64, u64),
+    Acked(u64),
+}
+
+#[doc(hidden)]
+pub type Trace = Arc<Mutex<Vec<Op>>>;
+
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub durability: Durability,
     pub cache_bytes: u64,
     pub read_only: bool,
+    #[doc(hidden)]
+    pub trace: Option<Trace>,
 }
 
 impl Default for StoreOptions {
@@ -59,6 +80,7 @@ impl Default for StoreOptions {
             durability: Durability::Fsync,
             cache_bytes: 1 << 30,
             read_only: false,
+            trace: None,
         }
     }
 }
@@ -71,6 +93,7 @@ pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
 #[derive(Clone)]
 struct CacheEntry {
     value: Arc<dyn Any + Send + Sync>,
+    offset: u64,
     weight: u32,
 }
 
@@ -83,10 +106,19 @@ impl Weighter<Hash, CacheEntry> for EntryWeight {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Moved {
+    pub(crate) floor: u64,
+    pub(crate) table: Option<Ptr>,
+    pub(crate) live: u64,
+}
+
+#[derive(Clone, Copy)]
 struct Super {
     seq: u64,
     log_end: u64,
     head: Option<Ptr>,
+    moved: Moved,
 }
 
 impl Super {
@@ -106,12 +138,24 @@ impl Super {
         let offset = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
         let hash: Hash = bytes[32..32 + HASH_BYTES].try_into().ok()?;
         let head = (offset != 0).then_some(Ptr { hash, offset });
-        Some(Super { seq, log_end, head })
+        Some(Super {
+            seq,
+            log_end,
+            head,
+            moved: Moved::default(),
+        })
     }
 
     fn encode(&self) -> [u8; SUPER_BYTES] {
         let mut out = [0u8; SUPER_BYTES];
         self.fill(MAGIC, &mut out);
+        let extra = &mut out[FRAME_CHECKED..SUPER_CHECKED];
+        extra[..8].copy_from_slice(&self.moved.floor.to_le_bytes());
+        extra[8..16].copy_from_slice(&self.moved.live.to_le_bytes());
+        if let Some(table) = self.moved.table {
+            extra[16..24].copy_from_slice(&table.offset.to_le_bytes());
+            extra[24..24 + HASH_BYTES].copy_from_slice(&table.hash);
+        }
         let check = blake3::hash(&out[..SUPER_CHECKED]);
         out[SUPER_CHECKED..SUPER_BYTES].copy_from_slice(check.as_bytes());
         out
@@ -125,7 +169,77 @@ impl Super {
         if check.as_bytes() != &bytes[SUPER_CHECKED..SUPER_BYTES] {
             return None;
         }
-        Super::fields(bytes)
+        let extra = &bytes[FRAME_CHECKED..SUPER_CHECKED];
+        let floor = u64::from_le_bytes(extra[..8].try_into().ok()?);
+        let live = u64::from_le_bytes(extra[8..16].try_into().ok()?);
+        let offset = u64::from_le_bytes(extra[16..24].try_into().ok()?);
+        let hash: Hash = extra[24..24 + HASH_BYTES].try_into().ok()?;
+        let table = (offset != 0).then_some(Ptr { hash, offset });
+        let moved = Moved { floor, table, live };
+        Some(Super {
+            moved,
+            ..Super::fields(bytes)?
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Places {
+    pub(crate) moved: Moved,
+    offsets: Vec<u64>,
+    places: Vec<u64>,
+}
+
+impl Places {
+    pub(crate) fn new(moved: Moved, pairs: Vec<(u64, u64)>) -> Places {
+        let (offsets, places) = pairs.into_iter().unzip();
+        Places {
+            moved,
+            offsets,
+            places,
+        }
+    }
+
+    pub(crate) fn place(&self, offset: u64) -> Option<u64> {
+        if offset >= self.moved.floor {
+            return Some(offset);
+        }
+        self.offsets
+            .binary_search(&offset)
+            .ok()
+            .map(|index| self.places[index])
+    }
+
+    fn holds(&self, offset: u64) -> bool {
+        offset >= self.moved.floor || self.offsets.binary_search(&offset).is_ok()
+    }
+
+    pub(crate) fn encode(pairs: &[(u64, u64)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(pairs.len() * 6 + 10);
+        push_varint(&mut out, pairs.len() as u64);
+        let (mut last_offset, mut last_place) = (0u64, 0u64);
+        for (offset, place) in pairs {
+            push_varint(&mut out, offset - last_offset);
+            push_varint(&mut out, zigzag(place.wrapping_sub(last_place) as i64));
+            (last_offset, last_place) = (*offset, *place);
+        }
+        out
+    }
+
+    fn decode(moved: Moved, body: &[u8]) -> Result<Places> {
+        let mut decoder = Decoder::new(body, &[], None);
+        let count = decoder.varint()? as usize;
+        if count > body.len() / 2 {
+            return Err(Error::Corrupt("place table claims too many entries".into()));
+        }
+        let mut pairs = Vec::with_capacity(count);
+        let (mut offset, mut place) = (0u64, 0u64);
+        for _ in 0..count {
+            offset = offset.wrapping_add(decoder.varint()?);
+            place = place.wrapping_add(unzigzag(decoder.varint()?) as u64);
+            pairs.push((offset, place));
+        }
+        Ok(Places::new(moved, pairs))
     }
 }
 
@@ -162,20 +276,26 @@ fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
         return Ok(None);
     }
     let mut header = [0u8; FRAME_BYTES];
-    if !read_or_end(file, &mut header, start)? || &header[0..8] != FRAME_MAGIC {
+    if !read_or_end(file, &mut header, start)? {
         return Ok(None);
     }
-    let Some(frame) = Super::fields(&header) else {
+    let gap = &header[0..8] == GAP_MAGIC;
+    if !gap && &header[0..8] != FRAME_MAGIC {
+        return Ok(None);
+    }
+    let Some(mut frame) = Super::fields(&header) else {
         return Ok(None);
     };
+    frame.moved = tip.moved;
     if frame.seq != tip.seq + 1 || frame.log_end < body_start || frame.log_end > len {
         return Ok(None);
     }
     let mut hasher = Xxh3::new();
     hasher.update(&header[..FRAME_CHECKED]);
-    let mut chunk = vec![0u8; SCAN_CHUNK.min((frame.log_end - body_start) as usize)];
+    let checked = if gap { 0 } else { frame.log_end - body_start };
+    let mut chunk = vec![0u8; SCAN_CHUNK.min(checked as usize)];
     let mut at = body_start;
-    while at < frame.log_end {
+    while !gap && at < frame.log_end {
         let take = chunk.len().min((frame.log_end - at) as usize);
         if !read_or_end(file, &mut chunk[..take], at)? {
             return Ok(None);
@@ -333,6 +453,15 @@ impl RecordReader<'_> {
         Err(Error::Corrupt("varint overflow in record".into()))
     }
 
+    fn prefix(&mut self) -> Result<(usize, usize, bool)> {
+        let stored_len = usize::try_from(self.varint()?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        let flagged = self.varint()?;
+        let link_count = usize::try_from(flagged >> 1)
+            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
+        Ok((stored_len, link_count, flagged & 1 == 1))
+    }
+
     fn take(&mut self, n: usize) -> Result<&[u8]> {
         let end = self
             .pos
@@ -351,6 +480,7 @@ pub(crate) fn seal(file: &File, log_end: u64, head: Ptr) -> Result<()> {
         seq: 1,
         log_end,
         head: Some(head),
+        moved: Moved::default(),
     };
     file.write_all_at(&sb.encode(), SLOT_BYTES)?;
     file.sync_all()?;
@@ -394,8 +524,8 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
     pub(crate) seq: u64,
-    end: u64,
-    head: Ptr,
+    pub(crate) end: u64,
+    pub(crate) head: Ptr,
 }
 
 struct Cursor {
@@ -404,16 +534,55 @@ struct Cursor {
     reserve: u64,
 }
 
+struct Traced {
+    file: File,
+    trace: Option<Trace>,
+}
+
+impl Traced {
+    fn log(&self, op: impl FnOnce() -> Op) {
+        if let Some(trace) = &self.trace {
+            trace.lock().push(op());
+        }
+    }
+
+    fn write_all_at(&self, bytes: &[u8], at: u64) -> std::io::Result<()> {
+        self.log(|| Op::Write(at, bytes.to_vec()));
+        self.file.write_all_at(bytes, at)
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.file.sync_data()?;
+        self.log(|| Op::Sync);
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.log(|| Op::SetLen(len));
+        self.file.set_len(len)
+    }
+}
+
+impl std::ops::Deref for Traced {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
 struct Inner {
     id: u64,
     path: PathBuf,
-    file: File,
+    file: Traced,
     tail: AtomicU64,
     written: AtomicU64,
     cursor: Mutex<Cursor>,
     slot: AtomicU64,
     cache: Cache<Hash, CacheEntry, EntryWeight>,
     dedupe: Cache<Hash, u64>,
+    places: ArcSwap<Places>,
+    reloading: Mutex<()>,
     poisoned: AtomicBool,
     closed: AtomicBool,
     options: StoreOptions,
@@ -460,6 +629,7 @@ impl Store {
                     seq: 0,
                     log_end: LOG_START,
                     head: None,
+                    moved: Moved::default(),
                 };
                 file.set_len(LOG_START)?;
                 file.write_all_at(&sb.encode(), 0)?;
@@ -478,7 +648,10 @@ impl Store {
             inner: Arc::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
                 path: path.to_path_buf(),
-                file,
+                file: Traced {
+                    file,
+                    trace: options.trace.clone(),
+                },
                 tail: AtomicU64::new(sb.log_end),
                 written: AtomicU64::new(sb.log_end),
                 cursor: Mutex::new(Cursor {
@@ -489,12 +662,109 @@ impl Store {
                 slot: AtomicU64::new(slot),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
                 dedupe: Cache::new(dedupe),
+                places: ArcSwap::from_pointee(Places::default()),
+                reloading: Mutex::new(()),
                 poisoned: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 options,
             }),
         };
+        let head = store.adopt_first(sb, head)?;
         Ok((store, head))
+    }
+
+    fn adopt_first(&self, sb: Super, head: Option<Ptr>) -> Result<Option<Ptr>> {
+        let mut sb = sb;
+        let mut head = head;
+        for _ in 0..OPEN_RETRIES {
+            match self.load_places(sb.moved) {
+                Ok(places) => {
+                    self.inner.places.store(Arc::new(places));
+                    return Ok(head);
+                }
+                Err(error) if !self.inner.options.read_only => return Err(error),
+                Err(error) => {
+                    let len = self.inner.file.metadata()?.len();
+                    let newer = read_supers(&self.inner.file, len)?.map(|found| found.0);
+                    match newer {
+                        Some(found) if found.moved != sb.moved => {
+                            self.inner.cursor.lock().seq = found.seq;
+                            self.inner.tail.fetch_max(found.log_end, Ordering::AcqRel);
+                            self.inner.written.fetch_max(found.log_end, Ordering::AcqRel);
+                            head = found.head;
+                            sb = found;
+                        }
+                        _ => return Err(error),
+                    }
+                }
+            }
+        }
+        Err(Error::Corrupt("place table kept moving during open".into()))
+    }
+
+    fn load_places(&self, moved: Moved) -> Result<Places> {
+        let Some(table) = moved.table else {
+            return Ok(Places {
+                moved,
+                ..Places::default()
+            });
+        };
+        let tail = self.inner.written.load(Ordering::Acquire);
+        let (object, _) = self.read_at(table, table.offset, tail)?;
+        Places::decode(moved, &object.body)
+    }
+
+    fn newer_places(&self, current: &Arc<Places>) -> Result<Option<Arc<Places>>> {
+        let inner = &self.inner;
+        let now = inner.places.load_full();
+        if !Arc::ptr_eq(&now, current) {
+            return Ok(Some(now));
+        }
+        if !inner.options.read_only {
+            return Ok(None);
+        }
+        let _guard = inner.reloading.lock();
+        let now = inner.places.load_full();
+        if !Arc::ptr_eq(&now, current) {
+            return Ok(Some(now));
+        }
+        let len = inner.file.metadata()?.len();
+        let Some((sb, _)) = read_supers(&inner.file, len)? else {
+            return Ok(None);
+        };
+        if sb.moved == current.moved {
+            return Ok(None);
+        }
+        inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
+        let places = Arc::new(self.load_places(sb.moved)?);
+        inner.places.store(places.clone());
+        Ok(Some(places))
+    }
+
+    pub(crate) fn places(&self) -> Arc<Places> {
+        self.inner.places.load_full()
+    }
+
+    pub(crate) fn written(&self) -> u64 {
+        self.inner.written.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn allocated(&self) -> Result<u64> {
+        Ok(self.inner.file.metadata()?.blocks() * 512)
+    }
+
+    pub(crate) fn on_disk(&self) -> u64 {
+        let size = self.size();
+        self.allocated().map_or(size, |bytes| bytes.min(size))
+    }
+
+    #[doc(hidden)]
+    pub fn trace(&self, op: Op) {
+        self.inner.file.log(|| op);
+    }
+
+    pub(crate) fn block_bytes(&self) -> Result<u64> {
+        Ok(self.inner.file.metadata()?.blksize().max(MIN_BLOCK))
     }
 
     pub fn id(&self) -> u64 {
@@ -532,6 +802,11 @@ impl Store {
         cursor.seq = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
         self.inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
+        if sb.moved != self.inner.places.load().moved {
+            let _guard = self.inner.reloading.lock();
+            let places = self.load_places(sb.moved)?;
+            self.inner.places.store(Arc::new(places));
+        }
         Ok(sb.head)
     }
 
@@ -550,6 +825,7 @@ impl Store {
                 seq: frame.seq,
                 log_end: frame.end,
                 head: Some(frame.head),
+                moved: inner.places.load().moved,
             };
             let slot = 1 - inner.slot.load(Ordering::Relaxed);
             inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
@@ -561,6 +837,89 @@ impl Store {
             return Err(error);
         }
         inner.tail.store(frame.end, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn publish(&self, frame: Frame, places: Places) -> Result<()> {
+        let inner = &self.inner;
+        let moved = places.moved;
+        let attempt = (|| -> Result<u64> {
+            inner.file.sync_data()?;
+            let sb = Super {
+                seq: frame.seq,
+                log_end: frame.end,
+                head: Some(frame.head),
+                moved,
+            };
+            let first = 1 - inner.slot.load(Ordering::Relaxed);
+            inner.file.write_all_at(&sb.encode(), first * SLOT_BYTES)?;
+            inner.file.sync_data()?;
+            inner.file.write_all_at(&sb.encode(), (1 - first) * SLOT_BYTES)?;
+            inner.file.sync_data()?;
+            Ok(1 - first)
+        })();
+        match attempt {
+            Ok(slot) => {
+                inner.slot.store(slot, Ordering::Relaxed);
+                inner.places.store(Arc::new(places));
+                Ok(())
+            }
+            Err(error) => {
+                self.poison();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn punch(&self, start: u64, end: u64, block: u64) -> Result<u64> {
+        let first = start.next_multiple_of(block);
+        let last = end - end % block;
+        let mut at = first;
+        while at < last {
+            let len = (last - at).min(PUNCH_CHUNK);
+            punch_hole(&self.inner.file, at, len)?;
+            self.inner.file.log(|| Op::Punch(at, len));
+            at += len;
+        }
+        Ok(last.saturating_sub(first))
+    }
+
+    pub(crate) fn write_at(&self, bytes: &[u8], at: u64) -> Result<()> {
+        self.inner.file.write_all_at(bytes, at)?;
+        Ok(())
+    }
+
+    pub(crate) fn read_place(&self, buf: &mut [u8], at: u64) -> Result<()> {
+        self.inner.file.read_exact_at(buf, at)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_data(&self) -> Result<()> {
+        self.inner.file.sync_data()?;
+        Ok(())
+    }
+
+    pub(crate) fn scan_links(&self, from: u64, to: u64, mut each: impl FnMut(Ptr)) -> Result<()> {
+        let file = &self.inner.file;
+        let mut at = from;
+        while at < to {
+            let mut header = [0u8; FRAME_BYTES];
+            file.read_exact_at(&mut header, at)?;
+            let frame = Super::fields(&header)
+                .ok_or_else(|| Error::Corrupt(format!("no frame at {at}")))?;
+            if &header[0..8] == GAP_MAGIC {
+                at = frame.log_end;
+                continue;
+            }
+            if &header[0..8] != FRAME_MAGIC || frame.log_end > to {
+                return Err(Error::Corrupt(format!("no frame at {at}")));
+            }
+            let mut record = at + FRAME_BYTES as u64;
+            while record < frame.log_end {
+                record = links_of(file, record, frame.log_end, &mut each)?;
+            }
+            at = frame.log_end;
+        }
         Ok(())
     }
 
@@ -576,22 +935,46 @@ impl Store {
                 ptr.offset
             )));
         }
-        let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
+        let mut places = self.inner.places.load_full();
+        loop {
+            let found = match places.place(ptr.offset) {
+                Some(place) => self.read_at(ptr, place, self.inner.written.load(Ordering::Acquire)),
+                None => Err(Error::Pruned(ptr.offset)),
+            };
+            let stale = match &found {
+                Err(Error::Corrupt(_) | Error::Pruned(_)) => true,
+                Err(Error::Io(error)) => error.kind() == ErrorKind::UnexpectedEof,
+                _ => false,
+            };
+            if !stale {
+                return found;
+            }
+            match self.newer_places(&places)? {
+                Some(newer) => places = newer,
+                None => return found,
+            }
+        }
+    }
+
+    fn read_at(&self, ptr: Ptr, place: u64, tail: u64) -> Result<(Object, u32)> {
+        if place >= tail {
+            return Err(Error::Corrupt(format!(
+                "object at {} placed past the end of the log",
+                ptr.offset
+            )));
+        }
+        let want = (tail - place).min(READ_AHEAD as u64) as usize;
         let mut bytes = vec![0u8; want];
-        self.inner.file.read_exact_at(&mut bytes, ptr.offset)?;
+        self.inner.file.read_exact_at(&mut bytes, place)?;
         let mut reader = RecordReader {
             file: &self.inner.file,
-            start: ptr.offset,
+            start: place,
             tail,
             bytes,
             pos: 0,
         };
-        let stored_len = usize::try_from(reader.varint()?)
-            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-        let flagged = reader.varint()?;
-        let link_count = usize::try_from(flagged >> 1)
-            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
-        let body = if flagged & 1 == 1 {
+        let (stored_len, link_count, packed) = reader.prefix()?;
+        let body = if packed {
             let raw_len = usize::try_from(reader.varint()?)
                 .map_err(|_| Error::Corrupt("body length overflow".into()))?;
             if raw_len > stored_len.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
@@ -634,6 +1017,7 @@ impl Store {
         fixed_bytes: impl FnOnce(&T) -> usize,
     ) -> Result<(Arc<T>, bool)> {
         if let Some(entry) = self.inner.cache.get(&ptr.hash)
+            && entry.offset == ptr.offset
             && let Ok(value) = entry.value.downcast::<T>()
         {
             return Ok((value, true));
@@ -650,6 +1034,7 @@ impl Store {
                 ptr.hash,
                 CacheEntry {
                     value: value.clone(),
+                    offset: ptr.offset,
                     weight,
                 },
             );
@@ -691,6 +1076,7 @@ impl Store {
             buf: vec![0u8; FRAME_BYTES],
             seen: HashMap::new(),
             remembered: Vec::new(),
+            places: self.inner.places.load_full(),
         })
     }
 
@@ -715,6 +1101,7 @@ pub struct Txn {
     buf: Vec<u8>,
     seen: HashMap<Hash, u64>,
     remembered: Vec<(Hash, CacheEntry)>,
+    places: Arc<Places>,
 }
 
 impl Sink for Txn {
@@ -728,8 +1115,13 @@ impl Sink for Txn {
                 offset: *offset,
             });
         }
-        if let Some(offset) = self.store.inner.dedupe.get(&hash) {
+        if let Some(offset) = self.store.inner.dedupe.get(&hash)
+            && self.places.holds(offset)
+        {
             return Ok(Ptr { hash, offset });
+        }
+        if let Some(link) = object.links.iter().find(|link| !self.places.holds(link.offset)) {
+            return Err(Error::Pruned(link.offset));
         }
         let offset = self.start + self.buf.len() as u64;
         append_record(&mut self.buf, offset, &object.body, &object.links);
@@ -738,7 +1130,14 @@ impl Sink for Txn {
     }
 
     fn remember(&mut self, ptr: Ptr, value: Arc<dyn Any + Send + Sync>, weight: u32) {
-        self.remembered.push((ptr.hash, CacheEntry { value, weight }));
+        if self.seen.get(&ptr.hash) == Some(&ptr.offset) {
+            let entry = CacheEntry {
+                value,
+                offset: ptr.offset,
+                weight,
+            };
+            self.remembered.push((ptr.hash, entry));
+        }
     }
 
     fn store_id(&self) -> u64 {
@@ -748,6 +1147,66 @@ impl Sink for Txn {
     fn store(&self) -> Option<Store> {
         Some(self.store.clone())
     }
+}
+
+fn extend(file: &Traced, end: u64) -> std::io::Result<()> {
+    if file.metadata()?.len() < end {
+        file.set_len(end)?;
+    }
+    Ok(())
+}
+
+fn links_of(file: &File, at: u64, end: u64, each: &mut impl FnMut(Ptr)) -> Result<u64> {
+    let mut reader = RecordReader {
+        file,
+        start: at,
+        tail: end,
+        bytes: Vec::new(),
+        pos: 0,
+    };
+    let (stored_len, link_count, packed) = reader.prefix()?;
+    if packed {
+        reader.varint()?;
+    }
+    let body_end = at + reader.pos as u64 + stored_len as u64;
+    let mut reader = RecordReader {
+        file,
+        start: body_end,
+        tail: end,
+        bytes: Vec::new(),
+        pos: 0,
+    };
+    for _ in 0..link_count {
+        let hash: Hash = reader
+            .take(HASH_BYTES)?
+            .try_into()
+            .expect("slice length is HASH_BYTES");
+        let delta = unzigzag(reader.varint()?);
+        each(Ptr {
+            hash,
+            offset: at.wrapping_sub(delta as u64),
+        });
+    }
+    Ok(body_end + reader.pos as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, at: u64, len: u64) -> Result<()> {
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let done = unsafe { libc::fallocate(file.as_raw_fd(), mode, at as libc::off_t, len as libc::off_t) };
+    if done == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Err(Error::Unsupported),
+        _ => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_file: &File, _at: u64, _len: u64) -> Result<()> {
+    Err(Error::Unsupported)
 }
 
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
@@ -764,10 +1223,19 @@ fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
 }
 
 impl Txn {
-    pub(crate) fn write(mut self, head: Ptr) -> Result<Frame> {
+    pub(crate) fn write(self, head: Ptr) -> Result<Frame> {
+        self.write_frame(head, FRAME_MAGIC, 0)
+    }
+
+    pub(crate) fn write_gap(self, head: Ptr, bytes: u64) -> Result<(Frame, u64)> {
+        let start = self.start + FRAME_BYTES as u64;
+        Ok((self.write_frame(head, GAP_MAGIC, bytes)?, start))
+    }
+
+    fn write_frame(mut self, head: Ptr, magic: &[u8; 8], gap: u64) -> Result<Frame> {
         let store = self.store.clone();
         let inner = &store.inner;
-        let end = self.start + self.buf.len() as u64;
+        let end = self.start + self.buf.len() as u64 + gap;
         let mut cursor = inner.cursor.lock();
         if inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -781,14 +1249,16 @@ impl Txn {
             seq: frame.seq,
             log_end: end,
             head: Some(head),
+            moved: Moved::default(),
         };
-        header.fill(FRAME_MAGIC, &mut self.buf);
+        header.fill(magic, &mut self.buf);
         let mut hasher = Xxh3::new();
         hasher.update(&self.buf[..FRAME_CHECKED]);
         hasher.update(&self.buf[FRAME_BYTES..]);
         self.buf[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
         reserve(inner, &mut cursor, end);
-        if let Err(error) = inner.file.write_all_at(&self.buf, self.start) {
+        let extended = if gap > 0 { extend(&inner.file, end) } else { Ok(()) };
+        if let Err(error) = extended.and(inner.file.write_all_at(&self.buf, self.start)) {
             inner.poisoned.store(true, Ordering::Release);
             return Err(error.into());
         }

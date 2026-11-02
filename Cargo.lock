@@ -382,6 +382,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "ferro-derive",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "proptest",
@@ -396,7 +397,10 @@ name = "ferro-bench"
 version = "0.1.0"
 dependencies = [
  "ferro",
+ "ledger",
+ "metrics",
  "tempfile",
+ "wiki",
 ]
 
 [[package]]
