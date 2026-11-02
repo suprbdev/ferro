@@ -369,6 +369,23 @@ enum IndexKind {
     Each,
 }
 
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    match arguments.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
 struct Indexed {
     ident: Ident,
     ty: Type,
@@ -529,8 +546,25 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
         let range = format_ident!("{}_range", field);
+        let counts = format_ident!("{}_counts", field);
+        if let (IndexKind::Value, Some(inner)) = (&ix.kind, option_inner(&ix.ty)) {
+            let some = format_ident!("{}_some", field);
+            methods.push(quote! {
+                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+                where
+                    #inner: ::std::borrow::Borrow<__Q>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::index_eq_some::<#inner, #name, __Q>(&self.rows, &self.#field, value)
+                }
+            });
+        }
         methods.push(quote! {
-            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#vt, #name>
+            pub fn #counts(&self) -> ::std::vec::Vec<(#vt, usize)> {
+                ::ferro::table::index_counts(&self.#field)
+            }
+
+            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
@@ -538,7 +572,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
             }
 
-            pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#vt, #name>
+            pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,

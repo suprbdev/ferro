@@ -145,7 +145,13 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
             .write(!read_only)
             .create(!read_only)
             .truncate(false)
-            .open(path)?;
+            .open(path)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound if read_only => {
+                    Error::NoDatabase(path.display().to_string())
+                }
+                _ => error.into(),
+            })?;
         if read_only {
             return Ok(file);
         }

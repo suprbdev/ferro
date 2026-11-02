@@ -21,6 +21,7 @@ pub struct Commit {
     pub time_ms: u64,
     pub message: String,
     pub root: Option<Ptr>,
+    pub restored: Option<u64>,
 }
 
 impl Commit {
@@ -30,8 +31,16 @@ impl Commit {
             time_ms: 0,
             message: String::new(),
             root: None,
+            restored: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Committed<R> {
+    pub value: R,
+    pub version: u64,
+    pub changed: bool,
 }
 
 impl Data for Commit {
@@ -39,7 +48,8 @@ impl Data for Commit {
         self.version.encode(w)?;
         self.time_ms.encode(w)?;
         self.message.encode(w)?;
-        self.root.encode(w)
+        self.root.encode(w)?;
+        self.restored.encode(w)
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
@@ -48,6 +58,7 @@ impl Data for Commit {
             time_ms: u64::decode(r)?,
             message: String::decode(r)?,
             root: Option::<Ptr>::decode(r)?,
+            restored: Option::<u64>::decode(r)?,
         })
     }
 }
@@ -319,18 +330,30 @@ impl<T: Data> Db<T> {
     }
 
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
-        self.transact(String::new(), |root| Ok(f(root)))
+        self.commit("", f)
     }
 
     pub fn commit<R>(&self, message: impl Into<String>, f: impl FnOnce(&mut T) -> R) -> Result<R> {
-        self.transact(message.into(), |root| Ok(f(root)))
+        let message = message.into();
+        let done = self.transact::<R, Error>(None, |root| Ok((message, f(root))))?;
+        Ok(done.value)
+    }
+
+    pub fn commit_with<R, S: Into<String>>(
+        &self,
+        f: impl FnOnce(&mut T) -> (S, R),
+    ) -> Result<Committed<R>> {
+        self.transact::<R, Error>(None, |root| {
+            let (message, value) = f(root);
+            Ok((message.into(), value))
+        })
     }
 
     pub fn try_update<R, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
-        self.transact(String::new(), f)
+        self.try_commit("", f)
     }
 
     pub fn try_commit<R, E: From<Error>>(
@@ -338,20 +361,37 @@ impl<T: Data> Db<T> {
         message: impl Into<String>,
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
-        self.transact(message.into(), f)
+        let message = message.into();
+        let done = self.transact::<R, E>(None, |root| f(root).map(|value| (message, value)))?;
+        Ok(done.value)
+    }
+
+    pub fn try_commit_with<R, S: Into<String>, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        self.transact(None, |root| {
+            let (message, value) = f(root)?;
+            Ok((message.into(), value))
+        })
     }
 
     fn transact<R, E: From<Error>>(
         &self,
-        message: String,
-        f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
-    ) -> std::result::Result<R, E> {
+        restored: Option<u64>,
+        f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
         let mut refs = self.shared.refs.lock();
         let state = self.branch.state.load_full();
         let mut working = (*state.snapshot.value).clone();
-        let out = f(&mut working)?;
-        self.commit_locked(&mut refs, &state, message, &working)?;
-        Ok(out)
+        let (message, value) = f(&mut working)?;
+        let before = state.snapshot.commit.version;
+        let version = self.commit_locked(&mut refs, &state, message, restored, &working)?;
+        Ok(Committed {
+            value,
+            version,
+            changed: version != before,
+        })
     }
 
     fn commit_locked(
@@ -359,14 +399,15 @@ impl<T: Data> Db<T> {
         refs: &mut RefState,
         state: &State<T>,
         message: String,
+        restored: Option<u64>,
         working: &T,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let store = &self.shared.store;
         let mut txn = store.begin()?;
         let root = write_value(working, &mut txn)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         if previous.unwrap_or(self.shared.genesis_hash) == root.hash {
-            return Ok(());
+            return Ok(state.snapshot.commit.version);
         }
         let version = state.snapshot.commit.version + 1;
         let commit = Commit {
@@ -374,6 +415,7 @@ impl<T: Data> Db<T> {
             time_ms: now_ms().max(state.snapshot.commit.time_ms),
             message,
             root: Some(root),
+            restored,
         };
         let mut log = state.log.clone();
         log.insert(version, commit);
@@ -395,7 +437,7 @@ impl<T: Data> Db<T> {
             .watchers
             .lock()
             .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
-        Ok(())
+        Ok(version)
     }
 
     pub fn at(&self, version: u64) -> Result<Snapshot<T>> {
@@ -431,11 +473,74 @@ impl<T: Data> Db<T> {
         }
     }
 
-    pub fn restore(&self, snapshot: &Snapshot<T>) -> Result<u64> {
-        let value = (*snapshot.value).clone();
+    pub fn restore(&self, snapshot: &Snapshot<T>) -> Result<Committed<()>> {
         let message = format!("restore v{}", snapshot.commit.version);
-        self.commit(message, move |root| *root = value)?;
-        Ok(self.version())
+        self.restore_with(snapshot, message)
+    }
+
+    pub fn restore_with(
+        &self,
+        snapshot: &Snapshot<T>,
+        message: impl Into<String>,
+    ) -> Result<Committed<()>> {
+        let value = (*snapshot.value).clone();
+        let message = message.into();
+        self.transact::<(), Error>(Some(snapshot.commit.version), move |root| {
+            *root = value;
+            Ok((message, ()))
+        })
+    }
+
+    pub fn history_of<V: PartialEq + Clone>(
+        &self,
+        project: impl Fn(&T) -> V,
+    ) -> Result<Vec<(Commit, V)>> {
+        let log = self.log();
+        let mut previous = None;
+        if log.first().is_some_and(|(version, _)| version == 1) {
+            previous = Some(project(&self.shared.genesis));
+        }
+        let mut changes = Vec::new();
+        for (version, commit) in log.iter() {
+            let value = project(&*self.at(version)?);
+            if previous.as_ref() != Some(&value) {
+                changes.push(((*commit).clone(), value.clone()));
+                previous = Some(value);
+            }
+        }
+        Ok(changes)
+    }
+
+    pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
+        let (ours, theirs) = (self.log(), other.log());
+        let (Some((first_a, _)), Some((first_b, _))) = (ours.first(), theirs.first()) else {
+            return self.at(0);
+        };
+        let start = first_a.max(first_b);
+        let same = |version: &u64| {
+            matches!(
+                (ours.get(version), theirs.get(version)),
+                (Some(a), Some(b)) if a == b
+            )
+        };
+        if !same(&start) {
+            return if start == 1 {
+                self.at(0)
+            } else {
+                Err(Error::NoCommonAncestor)
+            };
+        }
+        let mut low = start;
+        let mut high = self.version().min(other.version());
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if same(&middle) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        self.at(low)
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {

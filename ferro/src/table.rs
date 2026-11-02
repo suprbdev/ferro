@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder};
 use crate::error::Result;
-use crate::map::{Diff, Iter, Map, Values};
+use crate::map::{Conflict, Diff, Iter, Map, Values, three_way};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -157,6 +157,32 @@ impl<T: Record> Table<T> {
     {
         self.0.rows().diff(newer.0.rows())
     }
+
+    pub fn merge(
+        &mut self,
+        base: &Table<T>,
+        theirs: &Table<T>,
+        resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
+    ) -> usize
+    where
+        T: PartialEq,
+    {
+        three_way(
+            self,
+            base.0.rows(),
+            theirs.0.rows(),
+            |table, key| table.get(key),
+            |table, key, value| match value {
+                Some(row) => {
+                    table.insert(row);
+                }
+                None => {
+                    table.remove(&key);
+                }
+            },
+            resolve,
+        )
+    }
 }
 
 pub struct RowMut<'a, T: Record> {
@@ -223,57 +249,107 @@ where
     }
 }
 
-pub struct IndexIter<I, T: Record> {
-    rows: Map<T::Key, T>,
-    inner: Iter<(I, T::Key), ()>,
+trait KeyCursor<K>: Send {
+    fn forward(&mut self) -> Option<K>;
+    fn backward(&mut self) -> Option<K>;
+    fn left(&self) -> usize;
 }
 
-impl<I: Data + Ord, T: Record> Iterator for IndexIter<I, T> {
+struct Entries<I, K>(Iter<(I, K), ()>);
+
+impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
+    fn forward(&mut self) -> Option<K> {
+        self.0.next().map(|((_, key), _)| key)
+    }
+
+    fn backward(&mut self) -> Option<K> {
+        self.0.next_back().map(|((_, key), _)| key)
+    }
+
+    fn left(&self) -> usize {
+        self.0.len()
+    }
+}
+
+pub struct IndexIter<T: Record> {
+    rows: Map<T::Key, T>,
+    keys: Box<dyn KeyCursor<T::Key>>,
+}
+
+impl<T: Record> IndexIter<T> {
+    fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
+        IndexIter {
+            rows: rows.clone(),
+            keys: Box::new(Entries(entries)),
+        }
+    }
+}
+
+impl<T: Record> Iterator for IndexIter<T> {
     type Item = Arc<T>;
 
     fn next(&mut self) -> Option<Arc<T>> {
-        let ((_, key), _) = self.inner.next()?;
+        let key = self.keys.forward()?;
         self.rows.get(&key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        (self.keys.left(), Some(self.keys.left()))
     }
 }
 
-impl<I: Data + Ord, T: Record> DoubleEndedIterator for IndexIter<I, T> {
+impl<T: Record> DoubleEndedIterator for IndexIter<T> {
     fn next_back(&mut self) -> Option<Arc<T>> {
-        let ((_, key), _) = self.inner.next_back()?;
+        let key = self.keys.backward()?;
         self.rows.get(&key)
     }
 }
 
-impl<I: Data + Ord, T: Record> ExactSizeIterator for IndexIter<I, T> {}
+impl<T: Record> ExactSizeIterator for IndexIter<T> {}
 
 pub fn index_eq<I, T, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), ()>,
     value: &Q,
-) -> IndexIter<I, T>
+) -> IndexIter<T>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,
     Q: Ord + ?Sized,
 {
-    IndexIter {
-        rows: rows.clone(),
-        inner: index.range_by(
+    IndexIter::over(
+        rows,
+        index.range_by(
             |entry| entry.0.borrow() < value,
             |entry| entry.0.borrow() <= value,
         ),
-    }
+    )
+}
+
+pub fn index_eq_some<X, T, Q>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(Option<X>, T::Key), ()>,
+    value: &Q,
+) -> IndexIter<T>
+where
+    X: Data + Ord + Borrow<Q>,
+    T: Record,
+    Q: Ord + ?Sized,
+{
+    IndexIter::over(
+        rows,
+        index.range_by(
+            |entry| entry.0.as_ref().is_none_or(|x| x.borrow() < value),
+            |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
+        ),
+    )
 }
 
 pub fn index_range<I, T, Q, R>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), ()>,
     range: R,
-) -> IndexIter<I, T>
+) -> IndexIter<T>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,
@@ -282,9 +358,9 @@ where
 {
     let start = range.start_bound();
     let end = range.end_bound();
-    IndexIter {
-        rows: rows.clone(),
-        inner: index.range_by(
+    IndexIter::over(
+        rows,
+        index.range_by(
             |entry| match start {
                 Bound::Included(bound) => entry.0.borrow() < bound,
                 Bound::Excluded(bound) => entry.0.borrow() <= bound,
@@ -296,7 +372,20 @@ where
                 Bound::Unbounded => true,
             },
         ),
+    )
+}
+
+pub fn index_counts<I: Data + Ord, K: Data + Ord>(index: &Map<(I, K), ()>) -> Vec<(I, usize)> {
+    let mut counts = Vec::new();
+    let mut next = index.first();
+    while let Some(((value, _), _)) = next {
+        let count = index
+            .range_by(|entry| entry.0 < value, |entry| entry.0 <= value)
+            .len();
+        next = index.range_by(|entry| entry.0 <= value, |_| true).next();
+        counts.push((value, count));
     }
+    counts
 }
 
 pub trait IndexEach {

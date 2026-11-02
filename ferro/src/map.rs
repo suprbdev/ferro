@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::store::Store;
 
 const SPILL_BYTES: usize = 512;
-const LEVEL_BITS: u32 = 4;
+const LEVEL_BITS: u32 = 3;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -803,6 +803,32 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         }
     }
 
+    pub fn merge(
+        &mut self,
+        base: &Map<K, V>,
+        theirs: &Map<K, V>,
+        resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
+    ) -> usize
+    where
+        V: PartialEq,
+    {
+        three_way(
+            self,
+            base,
+            theirs,
+            |map, key| map.get(key),
+            |map, key, value| match value {
+                Some(value) => {
+                    map.insert(key, value);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            },
+            resolve,
+        )
+    }
+
     pub fn root_hash(&self) -> Option<Hash> {
         match &self.root {
             Link::Empty => None,
@@ -1070,6 +1096,51 @@ impl<K, V> Change<K, V> {
             Change::Added(_, value) | Change::Changed(_, _, value) => Some(value),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Conflict<K, V> {
+    pub key: K,
+    pub base: Option<Arc<V>>,
+    pub ours: Option<Arc<V>>,
+    pub theirs: Option<Arc<V>>,
+}
+
+pub(crate) fn three_way<S, K, V>(
+    target: &mut S,
+    base: &Map<K, V>,
+    theirs: &Map<K, V>,
+    read: impl Fn(&S, &K) -> Option<Arc<V>>,
+    mut write: impl FnMut(&mut S, K, Option<V>),
+    mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
+) -> usize
+where
+    K: Data + Ord,
+    V: Data + PartialEq,
+{
+    let mut written = 0;
+    for change in base.diff(theirs) {
+        let key = change.key().clone();
+        let before = change.before().cloned();
+        let after = change.after().cloned();
+        let ours = read(target, &key);
+        if ours == after {
+            continue;
+        }
+        let value = if ours == before {
+            after.map(|value| (*value).clone())
+        } else {
+            resolve(Conflict {
+                key: key.clone(),
+                base: before,
+                ours,
+                theirs: after,
+            })
+        };
+        write(target, key, value);
+        written += 1;
+    }
+    written
 }
 
 enum Step<K, V> {

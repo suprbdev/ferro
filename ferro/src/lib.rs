@@ -11,11 +11,11 @@ pub mod store;
 pub mod table;
 
 pub use codec::{Data, Hash, Ptr};
-pub use db::{Commit, Db, Options, Snapshot, Verified};
+pub use db::{Commit, Committed, Db, Options, Snapshot, Verified};
 pub use error::{Error, Result};
 pub use ferro_derive::{Data, Record};
 pub use list::List;
-pub use map::{Change, Map};
+pub use map::{Change, Conflict, Map};
 pub use set::Set;
 pub use store::Durability;
 pub use table::{Record, RowMut, Table, TableData};

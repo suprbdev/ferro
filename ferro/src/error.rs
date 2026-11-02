@@ -6,6 +6,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("database is locked by another writer")]
     Locked,
+    #[error("no database at {0}")]
+    NoDatabase(String),
     #[error("not a ferro database: {0}")]
     NotFerro(String),
     #[error("corrupt database: {0}")]
@@ -18,6 +20,8 @@ pub enum Error {
     NoVersion(u64),
     #[error("no such branch: {0}")]
     NoBranch(String),
+    #[error("branches share no retained version")]
+    NoCommonAncestor,
     #[error("branch already exists: {0}")]
     BranchExists(String),
     #[error("collection has stored nodes but no store attached")]
