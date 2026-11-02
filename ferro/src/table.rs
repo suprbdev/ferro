@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Iter, Keys, Map, Val, Values, three_way};
+use crate::map::{Conflict, Cursor, Diff, Iter, Keys, Map, Val, Values, three_way};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -103,6 +103,19 @@ impl<T: Record> Table<T> {
 
     pub fn iter(&self) -> Values<T::Key, T> {
         self.0.rows().values()
+    }
+
+    pub fn for_each(&self, mut f: impl FnMut(&T)) {
+        self.0.rows().for_each(|_, row| f(row));
+    }
+
+    pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&T))
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.0.rows().for_each_range::<Q, R>(range, |_, row| f(row));
     }
 
     pub fn range<Q, R>(&self, range: R) -> Iter<T::Key, T>
@@ -393,16 +406,24 @@ impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
 }
 
 pub struct IndexIter<T: Record> {
-    rows: Map<T::Key, T>,
+    rows: Cursor<T::Key, T>,
     keys: Box<dyn KeyCursor<T::Key>>,
 }
 
 impl<T: Record> IndexIter<T> {
     fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
         IndexIter {
-            rows: rows.clone(),
+            rows: rows.cursor(),
             keys: Box::new(Entries(entries.into_keys())),
         }
+    }
+
+    pub fn keys(self) -> IndexKeys<T> {
+        IndexKeys(self.keys)
+    }
+
+    fn row(&mut self, key: &T::Key) -> Option<Val<T>> {
+        self.rows.seek(key).then(|| self.rows.value()).flatten()
     }
 }
 
@@ -411,7 +432,7 @@ impl<T: Record> Iterator for IndexIter<T> {
 
     fn next(&mut self) -> Option<Val<T>> {
         let key = self.keys.forward()?;
-        self.rows.get(&key)
+        self.row(&key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -422,11 +443,33 @@ impl<T: Record> Iterator for IndexIter<T> {
 impl<T: Record> DoubleEndedIterator for IndexIter<T> {
     fn next_back(&mut self) -> Option<Val<T>> {
         let key = self.keys.backward()?;
-        self.rows.get(&key)
+        self.row(&key)
     }
 }
 
 impl<T: Record> ExactSizeIterator for IndexIter<T> {}
+
+pub struct IndexKeys<T: Record>(Box<dyn KeyCursor<T::Key>>);
+
+impl<T: Record> Iterator for IndexKeys<T> {
+    type Item = T::Key;
+
+    fn next(&mut self) -> Option<T::Key> {
+        self.0.forward()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.left(), Some(self.0.left()))
+    }
+}
+
+impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
+    fn next_back(&mut self) -> Option<T::Key> {
+        self.0.backward()
+    }
+}
+
+impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 
 pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Val<T>>
 where

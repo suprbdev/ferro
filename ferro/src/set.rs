@@ -4,7 +4,7 @@ use std::ops::RangeBounds;
 
 use crate::codec::{Data, Decoder, Encoder};
 use crate::error::Result;
-use crate::map::{Diff, Keys, Map};
+use crate::map::{Cursor, Diff, Keys, Map};
 
 pub struct Set<T>(Map<T, ()>);
 
@@ -61,17 +61,29 @@ impl<T: Data + Ord> Set<T> {
         self.0.contains_key(value)
     }
 
+    pub fn contains_many<I>(&self, items: I) -> impl Iterator<Item = (I::Item, bool)> + use<I, T>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<T>,
+    {
+        self.0.contains_many(items)
+    }
+
+    pub fn cursor(&self) -> Cursor<T, ()> {
+        self.0.cursor()
+    }
+
     pub fn iter(&self) -> Keys<T, ()> {
         self.0.keys()
     }
 
-    pub fn range<Q, R>(&self, range: R) -> impl DoubleEndedIterator<Item = T> + use<T, Q, R>
+    pub fn range<Q, R>(&self, range: R) -> Keys<T, ()>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        self.0.range::<Q, R>(range).map(|(key, _)| key)
+        self.0.range::<Q, R>(range).into_keys()
     }
 
     pub fn first(&self) -> Option<T> {
@@ -133,7 +145,7 @@ impl<T: Data + Ord> Set<T> {
     }
 
     pub fn is_subset(&self, other: &Set<T>) -> bool {
-        self.len() <= other.len() && self.iter().all(|item| other.contains(&item))
+        self.len() <= other.len() && other.contains_many(self.iter()).all(|(_, found)| found)
     }
 
     pub fn union(&self, other: &Set<T>) -> Set<T> {
@@ -143,11 +155,11 @@ impl<T: Data + Ord> Set<T> {
     }
 
     pub fn intersection(&self, other: &Set<T>) -> Set<T> {
-        self.iter().filter(|item| other.contains(item)).collect()
+        other.contains_many(self.iter()).filter(|(_, found)| *found).map(|(item, _)| item).collect()
     }
 
     pub fn difference(&self, other: &Set<T>) -> Set<T> {
-        self.iter().filter(|item| !other.contains(item)).collect()
+        other.contains_many(self.iter()).filter(|(_, found)| !found).map(|(item, _)| item).collect()
     }
 }
 
