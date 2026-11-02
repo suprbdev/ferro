@@ -7,14 +7,14 @@ of `T`, and all earlier versions stay readable.
 ## Layers
 
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls.
-- `store.rs`: the log file, commit and gap frames, superblocks, recovery, the place table, object
-  reads with hash verification, node cache.
+- `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
+  recovery, object reads with hash verification, node cache.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
 - `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
 - `watch.rs`: `Watcher<T>` and the per-branch feed behind it.
-- `reclaim.rs`: marking, planning and punching for a reclamation cycle, which `Db::compact` drives.
+- `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share.
 
 ## Objects and links
 
@@ -23,9 +23,8 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 - The hash is BLAKE3 over body length, link count, body, and the link hashes, truncated to 20
   bytes (`HASH_BYTES`). Offsets are not hashed, so identical content has an identical hash
   wherever it sits. The file is a Merkle DAG.
-- The offset lets a reader jump straight to a child, so no hash index is needed. It is a permanent
-  name for the object: below the reclaim floor it resolves through the place table, so no pointer
-  ever changes.
+- The offset lets a reader jump straight to a child, so no hash index is needed. It means
+  something only inside one generation of the file, as Reclamation explains.
 - Every read re-hashes the object and compares it with the pointer it came from.
 - Links are stored in a side table and consumed in order by `Decoder::link`. They take no bytes
   in the body, which keeps encoded size independent of a value's position.
@@ -49,16 +48,15 @@ A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an opt
 `varint raw_len`, the body, then the links. Each link is its hash followed by a zigzag varint of
 `record offset - target offset`. Children are written before parents, so the deltas are small and
 positive in the common case, and nothing in a record depends on where it sits except that delta.
-A record moved by reclamation keeps its bytes, so that delta stays relative to the object's offset,
-not to where the record now sits. Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
+Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
 runs after hashing and decompression before the hash check, so the hash covers the canonical
 body and two files with different physical compression still agree on every root hash. The
 decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
 
 ## Deduplication
 
-`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset,
-as long as the place table still holds that offset. It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
+`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset.
+It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
 at which a value becomes its own object. Smaller objects are cheap to write again, and registering
 every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
 their hash check. Offsets are not hashed, so a link in a node proves nothing about the offset it
@@ -140,11 +138,7 @@ So each `Link::Stored` carries a write-once memo of the node it points at, in a 
   and each `ArcSwap` store has to settle with every reader thread.
 
 A memo holds only what a load for that link's own `Ptr` returned, and the cache is keyed by the full
-hash, so a damaged link still fails its hash check whatever else is cached. An entry also records
-the offset it was decoded from, and a lookup with another offset misses. The same content can be
-written twice with different child offsets, and a decode of the older copy can name objects a cycle
-has since reclaimed. For the same reason a commit caches only the nodes it wrote itself, not a node
-whose hash `dedupe` found in an older record. `Link::clone` starts
+hash, so a damaged link still fails its hash check whatever else is cached. `Link::clone` starts
 with an empty memo, since copying one touches the child's header, a cache miss per link that slowed
 `diff` by 45%. Only `Map::clone` keeps its root's memo.
 
@@ -206,13 +200,11 @@ holds what 1 MiB used to, gives 4.6 µs.
 
 ## File format and durability
 
-Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, and carries
-the reclaim floor, the place table pointer and the live bytes counted by the last cycle. The log is
-a run of frames, one per commit. A frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
+Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, and records
+the size the file had when this generation began and how much of the previous one survived. The log
+is a run of frames, one per commit. A frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
 the commit wrote. The check covers the header and every record, so a frame proves by itself that
-it reached the disk whole. Frames do not repeat the reclaim fields, so a commit pays nothing for
-them, and the scan on open carries them forward from the superblock it started at. A commit does
-this:
+it reached the disk whole. A commit does this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.
@@ -243,13 +235,12 @@ written, which needs only the device flush. The zeroes must be real: `posix_fall
 unwritten extents, and converting those commits the journal just the same (640 µs). The first
 commit of a process reserves nothing, so a short run pays for no zeroes. The reservation is only
 an optimization. A failed reservation stops further attempts without failing the commit, open
-discards it, and a clean close truncates it, so the file can be up to 4 MiB longer than the log
-while open.
+discards it, and a clean close truncates it, so the file can be up to 4 MiB longer than
+`size_on_disk` while open.
 
 A failed write or fsync poisons the store until reopen. Only one process may hold the writer lock.
-Read-only opens otherwise take no lock, and `refresh` picks up new commits. Bytes under a published
-head never change, but a cycle can move them. It publishes where they went before it frees them, so
-a read that fails reloads the table from the superblock and tries again.
+Read-only opens otherwise take no lock, since log bytes under a published head never change, and
+`refresh` picks up new commits.
 
 ## Concurrency
 
@@ -306,10 +297,9 @@ holds only the feed, so a parked one keeps neither the file nor the writer lock.
 a snapshot nobody had taken by then is lost.
 
 A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
-does a `Log` or `History` handle for its range. A `Map` or `Table` cloned from a snapshot does not,
-as Reclamation explains. All of them keep the writer lock held after the `Db` is dropped, so a new
-writer gets `Error::Locked` until they are gone. A closure works on a clone of the tip, so a panic
-or an `Err` discards its changes.
+does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them also keep the
+writer lock held after the `Db` is dropped, so a new writer gets `Error::Locked` until they are gone.
+A closure works on a clone of the tip, so a panic or an `Err` discards its changes.
 
 ## History
 
@@ -325,7 +315,8 @@ rewritten.
 
 Pruning only raises `first`. Walks stop there, and lookups below it return `NoVersion`. Retained
 entries are not rewritten, so the entry at `first` still links `prev` and perhaps `skip` entries that
-are gone. Those links are hashes nothing follows, and offline compaction writes them with offset 0.
+are gone. Those links are hashes nothing follows, and a copy into a new file writes them with
+offset 0.
 `Options::history(Keep::Last(n))` raises `first` as part of each commit, which costs no extra bytes.
 `Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each reclamation cycle.
 `as_of` a time before the oldest retained commit returns `NoVersion`.
@@ -366,8 +357,8 @@ and `db.read()` do not copy the message.
 entry links its commit's root and its `prev` entry, and the hash covers link hashes, so one hash
 covers every commit's version, time, message and `restored` field, and every root value, back to
 the oldest retained entry, and commits to everything older as well, though that can no longer be
-checked. Pruning, reclamation and compaction all keep it, because offsets are not hashed and retained
-entries are never rewritten.
+checked. Pruning and reclamation keep it, because offsets are not hashed and retained entries are
+never rewritten.
 
 Published where the writer of the file cannot change it, the hash is a tamper-evidence anchor. If
 `hash_at(version)` matches an anchor for that version and `verify` passes, then the history up to
@@ -423,23 +414,155 @@ A commit writes its head by name, so a handle on a dropped branch would quietly 
 under the `tip` mutex, returning `Error::NoBranch`. `drop_branch` holds the mutex through its sync
 and until the flag is set, so no commit fits between the frame and the flag. That stalls writers for
 one fsync, on an operation that is rare. Retiring also closes the feed, which ends the branch's
-watchers. Reads through an old handle still work, because its snapshot pins what it reads. A later
-fork of the same name is a new `Branch`, so old handles stay dead.
+watchers. Reads through an old handle still work, because state is a value and its objects are
+there at least until a cycle, and after one the handle keeps the old file open. A later fork of the same name is a new `Branch`, so old handles stay dead.
 
 Counting handles and refusing the drop while others exist was rejected: a clone parked on another
 thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
 handle learns of the drop on `refresh`, and retires its `Branch` the same way instead of falling
 back to the genesis value.
 
-## Compaction
+## Reclamation
 
-Compaction is offline and needs no user types. It prunes each branch's log by rebuilding the
-chain from the retained commits, since dropping the oldest entries changes every later entry's
-link, then copies every object still reachable into a new file. The copy is iterative, because a
-chain is as deep as the number of commits. Hashes do not cover offsets, so objects are re-emitted
-with new link offsets and compressed again; every object is re-verified on the way through. The
-new file replaces the old with an atomic rename. A read-only handle holding the old inode keeps
-reading its old snapshot, and `refresh` reports `Error::Replaced`.
+Retention says what to keep, and reclamation gives the rest back while writers run. A cycle copies
+what is retained into a new file and renames it over the old one. Each file is a generation.
+`Db::compact` runs one cycle on the caller's thread. `Options::history` runs them on a background
+thread once the file has grown by `every_bytes` or by the size it had after the last cycle, whichever
+is larger, so the copying stays proportional to what was written.
+
+1. Prune. One frame raises `first` on every branch. Branch state changes before anything else, so
+   `at` stops serving a version before its objects are left behind.
+2. Copy, with no lock. Walk the published refs and write each reachable object to
+   `<file>.compacting`, re-emitting links with new offsets, verifying each object's hash and
+   compressing again. Chain entries are copied like anything else, but a link past `first` is written
+   as a tombstone instead of being followed. Copies are keyed by hash, so a later pass from newer refs
+   visits only what is new. Data is immutable, so no write barrier is needed. Passes repeat, up to
+   six, until one copies less than 256 KiB.
+3. Sync, with no lock, so the pause does not pay for it.
+4. Swap, under the `tip` mutex. This is the only pause. Wait for queued commits, copy what is left,
+   write both superblock slots and sync. Open the new file, which takes its writer lock, rename it
+   over the old one, sync the directory, and rebind every branch.
+5. Retire, with no lock. Clear the old generation's cache. Its file goes when the last handle does.
+
+The new file continues the frame sequence, so group commit tickets stay in order. It has no frames
+yet, only records and a superblock naming them, the same shape offline compaction produces.
+
+### Generations
+
+A `Store` is one generation: a file, a node cache, a dedupe cache and an id. Offsets mean nothing
+outside it. Decoded nodes, memos and cached entries all hold offsets, and each belongs to the
+generation it was read from, so none of them needs rewriting. A cycle replaces the whole set, and
+the first reads after it are cold. The page cache is warm, because the copy just wrote those bytes,
+so a miss costs a decode and not a disk read.
+
+A branch's state holds its chain and its `Store` together, because a chain offset read through the
+wrong file would fail its hash check and look like corruption. `at`, `as_of`, `log` and `history_of`
+all take both from one state. Commits compare root hashes, not offsets, so the same commit in two
+generations is equal.
+
+Whatever holds a `Store` keeps reading the file it came from: a `Snapshot`, a `Map` cloned from one, a
+`Log`, a `History`, or a handle on a dropped branch. Nothing old ever fails, because nothing old
+changes. A cycle frees no disk space while such a handle lives, and it holds the whole old file, not
+only its version. `Space::retired_bytes` shows that. A branch's watcher feed would hold the file too,
+so a swap rebinds its latest snapshot without firing it. Old generations read uncached, because a
+cached node can hold a `Map` that holds the `Store`, which would keep the file open forever.
+
+Writing is where a generation can go wrong. A `Map` from an older generation put into a commit must
+not write its old offsets into the new file. `Map::encode` already compares store ids for maps from
+another database, so such a map is rebuilt and written by value, and a dirty one is too. This takes
+time proportional to the map's size, under the `tip` mutex, so `restore` of a snapshot held across a
+cycle stalls writers for that long. Stale maps are the only way to reach it: the working copy in a
+commit closure comes from the rebound tip.
+
+A read-only handle keeps its view, in the old file if need be, and `refresh` notices that the path
+names a new inode, opens it, and rebinds. Its watchers fire only if the version moved. A process that
+never refreshes never fails, and holds the old file open instead.
+
+### Crashes
+
+Until the rename is durable, the name points at the old file, which is complete and has every
+acknowledged commit, and a writer's open removes the temp file. The new file is synced before the
+rename, so once the name points at it, it is complete. Writers stay paused until the directory sync
+returns, so no commit is acknowledged in a file whose name could roll back. If that sync fails the
+store poisons, because the new file may or may not be the one found after a crash. Both slots are
+written so that one damaged sector cannot lose a new generation with no commits yet.
+
+A failed copy, a full disk or a failed rename removes the temp file and reports the error from
+`Db::compact` or in `Space::last_error`, and commits never notice.
+
+### Measurements
+
+Four workloads ran for 15 seconds each on the test NVMe with ext4, with fsync, keeping the last 100
+versions and starting a cycle every 64 MiB. These are medians of three runs, alternated with the
+alternatives below on a machine other work was sharing:
+
+| Workload | Commits/s without cycles | With cycles | Longest pause | File after a cycle | Live | Grows to without cycles |
+| --- | --- | --- | --- | --- | --- | --- |
+| `metrics`, one commit per scrape | 5,200 | 5,230 | 2.9 ms | 1.6 MiB | 1.5 MiB | 245 MiB |
+| `ledger`, single entries | 4,920 | 4,720 | 4.4 ms | 4.9 MiB | 4.3 MiB | 427 MiB |
+| `wiki`, edits of 64 KiB pages | 670 | 700 | 4.0 ms | 7.2 MiB | 7.1 MiB | 100 MiB |
+| Table updates, 200,000 rows | 5,190 | 4,900 | 3.1 ms | 13.2 MiB | 12.2 MiB | 339 MiB |
+
+The difference in commits per second is within what the same mode varied between runs. p99 commit
+latency was 0.9 to 1.6 ms, and 4.6 ms on `wiki`, against 0.9 to 1.1 ms and 5.0 ms without cycles. The
+file saws between what is live and 64 MiB above it. While both files exist the peak is higher by what
+has been copied, which came to 76 MiB on `ledger` and 96 MiB on table updates.
+
+With 8 readers on a 1M row table and 60 MiB live, at 3,100 commits a second with or without cycles,
+reads went from 1.05M a second to 0.96M, because every swap empties the node cache. p99 read latency
+stayed at 96 µs. Each cycle took 1.4 s in the background and the longest pause was 5.6 ms. In one run
+of `Durability::Buffered` at 19,000 commits a second the longest pause was 6.4 ms.
+
+Three alternatives were built or simulated on the same workloads, and left out:
+
+| | Reclaimed per cycle | File after a cycle, 1M rows | Pause | Buffered commits/s | Reads/s, 1M rows | Copied, 1M rows | Lines in `ferro/src` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Copy and swap | 100% | 62 MiB | 2.9 to 5.6 ms | 11,900 to 19,400 | 0.96M | 564 MiB | +961 -251 |
+| Hole punching alone | 44 to 91% | not run | 2 to 3.5 ms | not run | not run | 0 | see below |
+| Copying sparse runs to the tail, then punching | 64 to 96% | 87 MiB | 2 to 3.9 ms | 10,500 to 16,000 | 0.99M | 136 MiB | +1,345 -88 |
+| Fixed segments, dropped when dead | 0 to 89% | simulated | none | not run | not run | 0 | not built |
+
+- Hole punching needs no pointer changes at all, because offsets stay valid. But a hole frees whole
+  blocks, and one live record pins its block. Over a whole run of 0.2 to 2.3 GB it freed 99.9% of the
+  garbage in `metrics`, whose live data clusters by time, but 71 to 90% elsewhere, leaving 8 to 17
+  times the live size. Per 64 MiB cycle it freed 44 to 91%, because the same live records sit in less
+  garbage. Each commit scatters survivors across the log, so this decides it.
+- Copying only the records in sparse runs to the tail and punching the rest copies a quarter as much
+  on the 1M row table. Offsets stay valid through a table from offset to place, so caches stay warm.
+  It was built in full and is in the history at `c384c6c`. It reads 3% faster than swapping and needs
+  less spare disk. It lost on the rest. It ran 13 to 21% fewer Buffered commits, with a table check
+  on every link and a pin for every snapshot in the path. The log's apparent size only grows, so ext4
+  would stop it at 16 TiB, which at 10 MB/s of log is 20 days, and a tool that does not preserve holes
+  would copy the apparent size. A `Map` that outlived its snapshot and a read-only handle that lagged
+  both needed a new error, and a filesystem that cannot punch freed nothing. Review found that a head
+  rebuilt by dedupe could be reclaimed, which left the file unopenable. Liveness there was a property
+  every path had to get right, and here an old object is simply never freed while anything can reach
+  it.
+- A segmented log drops a segment only when nothing in it is live. At 1 MiB or more that freed 0 to
+  1% of the garbage in `ledger`, `wiki` and table updates, and 89% to 99.7% in `metrics`. Live data
+  would have to move, which needs the same table or rewritten parents, and a directory gives up the
+  single file.
+
+The numbers for hole punching and segments come from the real layout of live records in each
+workload's file. Only the relocation design ran live.
+
+### Limits
+
+A cycle reads, verifies, recompresses and writes everything retained, in one thread, at about 50 MB/s,
+so a 10 GB database takes minutes and needs 10 GB free. The trigger keeps that to one extra byte
+copied per byte written, at worst. `Keep::All` copies all of history, so `history` is what makes
+background cycles worthwhile. The copy holds a map from hash to offset, about 50 bytes per object.
+
+`Space::live_bytes` is an estimate: the size of this generation when it began, plus the bytes since
+then scaled by the share that survived the last cycle. Before the first cycle it is the file size.
+`verify` still gives the exact number.
+
+## Offline compaction
+
+`admin::compact` is the same copy in one pass, with no writer running. It prunes by raising `first`
+in a private copy of the refs and needs no user types. The copy is iterative, because a chain is as
+deep as the number of commits. A read-only handle follows it on `refresh` the same way it follows a
+cycle.
 
 ## Schema evolution
 
@@ -451,6 +574,5 @@ its hash. Unknown fields are skipped. Missing fields use `Data::missing`, or `#[
 ## Errors
 
 Collections read like native types, so `get` and iterators do not return `Result`. An I/O failure
-or corruption during a read panics, and so does a read of something reclaimed, with a message saying
-so. `try_get` exists for callers that need to handle it. Inside `update` a panic discards the
-transaction and leaves the database unchanged.
+or corruption during a read panics. `try_get` exists for callers that need to handle it. Inside
+`update` a panic discards the transaction and leaves the database unchanged.

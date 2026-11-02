@@ -193,26 +193,29 @@ let db = Options::new()
     .open::<Shop>("shop.ferro")?;
 
 let space = db.space()?;
-println!("{} allocated, about {} live", space.allocated_bytes, space.live_bytes);
+println!("{} on disk, about {} live", space.file_bytes, space.live_bytes);
 
 let report = db.compact(Keep::Last(10))?;
-println!("freed down to {}, writers waited {:?}", report.after_bytes, report.pause);
+println!("down to {}, writers waited {:?}", report.after_bytes, report.pause);
 ```
 
-`history` prunes as part of each commit and runs reclamation on a background thread whenever the log
-has grown by `every_bytes` or by the live size, whichever is larger. `Keep::Since(unix_ms)` and
-`Keep::Within(duration)` retain by time instead, and take effect at each cycle. `compact` runs one
-cycle now, with writers still running, and can prune harder than `history` does.
+`history` prunes as part of each commit and reclaims on a background thread whenever the file has
+grown by `every_bytes` or by its size after the last cycle, whichever is larger.
+`Keep::Since(unix_ms)` and `Keep::Within(duration)` retain by time instead, and take effect at each
+cycle. `compact` runs one cycle now, with writers still running, and can prune harder than `history`
+does. A cycle copies what is retained to a new file and swaps it in. Writers wait a few milliseconds
+for the swap, and readers do not wait at all.
 
 A pruned version is gone: `at` returns `NoVersion` and `log` stops at the oldest retained commit.
 `head_hash` does not change, because retained commits are not rewritten, and `merge_with` falls back
 to the fork point, or returns `NoCommonAncestor` if that was pruned too.
 
-A held `Snapshot`, `Log` or `History` keeps working for as long as you hold it, even past pruning,
-and keeps its objects from being freed. A `Map` cloned out of a snapshot does not: once its version
-is pruned and reclaimed, reading it or committing it returns `Error::Pruned`. A read-only process
-follows moved objects by itself, but cannot keep a version alive, so one that lags behind the
-retained window gets `Error::Pruned` until it calls `refresh`.
+Nothing you hold ever breaks. A `Snapshot`, a `Map` cloned from one, a `Log` or a `History` keeps
+reading the file it came from, even past pruning, and a read-only process does the same until it
+calls `refresh`. The price is that the old file stays on disk until the last such handle is dropped,
+which `space.retired_bytes` shows. Committing a `Map` held from before a cycle writes it again by
+value, under the writer lock, so `restore` of a snapshot held across a cycle costs time proportional
+to its size.
 
 ## Changing your types
 
@@ -253,13 +256,12 @@ cargo run --release -p ferro-cli -- info shop.ferro
 cargo run --release -p ferro-cli -- log shop.ferro --limit 20
 cargo run --release -p ferro-cli -- verify shop.ferro
 cargo run --release -p ferro-cli -- space shop.ferro
-cargo run --release -p ferro-cli -- reclaim shop.ferro --keep-last 1000
 cargo run --release -p ferro-cli -- compact shop.ferro --keep-last 1000
 ```
 
-`reclaim` frees dead space in place. `compact` copies what is reachable to a new dense file and
-swaps it in, which needs no writer running and is the way to get a file that copies small. See
-[Keeping history bounded](#keeping-history-bounded) for doing this from a running program.
+`compact` copies what is reachable to a new file and swaps it in atomically, and needs no writer
+running. See [Keeping history bounded](#keeping-history-bounded) for doing this from a running
+program.
 
 ## A real example
 
@@ -304,19 +306,13 @@ This is an experiment, not a production database.
 - It runs on Unix only.
 - A single-key commit writes about 8.5 KB at this size, so batch related changes into one commit.
   Secondary indexes add to that. Without retention the file only grows.
-- Reclamation punches holes, so the log's apparent size keeps growing while its allocated size stays
-  bounded. `ls -l` shows the former and `du` the latter. A copy with a tool that does not preserve
-  holes, such as `scp` or `rsync` without `--sparse`, writes the apparent size. ext4 stops a file at
-  16 TiB of apparent size, at which point a commit fails with an I/O error and offline `compact`
-  resets it. A filesystem that cannot punch holes keeps its space until `compact`.
+- A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
+  miss the node cache are slower for a moment after each swap.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
   every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
   closure and encoding. Calling `update`, `fork` or `drop_branch` from inside it deadlocks.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
-- A `Map` cloned out of a snapshot does not keep its version alive, and a read-only handle in another
-  process cannot pin anything. Either gets `Error::Pruned` once its version has been pruned and
-  reclaimed, which `get` turns into a panic. `refresh` fixes the read-only handle.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
   order, and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never
   tested on real hardware.
