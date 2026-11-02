@@ -108,6 +108,10 @@ batch of puts and deletes and merges it in one descent of the tree, as `extend` 
 also gets `by_field_some(&value)`, and `#[index(each)]` indexes every element of a collection
 field.
 
+`#[index(a, b)]` on the struct indexes a combination of fields in that order. It gets the same
+`by_a_b(&(a, b))`, `by_a_b_range` and `by_a_b_counts`, and `by_a_b_prefix(&a)` for every row with
+that `a`, ordered by `b`.
+
 `#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
 `by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
 index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,

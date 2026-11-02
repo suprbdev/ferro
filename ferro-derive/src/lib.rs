@@ -602,16 +602,21 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     }
     for attr in &input.attrs {
-        if attr.path().is_ident("unique") {
-            let fields = composite(attr, named)?;
-            let names: Vec<String> = fields.iter().map(|(ident, _)| ident.to_string()).collect();
-            indexes.push(Indexed {
-                name: names.join("_"),
-                span: attr.span(),
-                fields,
-                kind: IndexKind::Unique,
-            });
-        }
+        let kind = if attr.path().is_ident("unique") {
+            IndexKind::Unique
+        } else if attr.path().is_ident("index") {
+            IndexKind::Value
+        } else {
+            continue;
+        };
+        let fields = composite(attr, named)?;
+        let names: Vec<String> = fields.iter().map(|(ident, _)| ident.to_string()).collect();
+        indexes.push(Indexed {
+            name: names.join("_"),
+            span: attr.span(),
+            fields,
+            kind,
+        });
     }
     let Some((key_ident, key_ty)) = key else {
         return Err(syn::Error::new(
@@ -776,6 +781,24 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
         let range = format_ident!("{}_range", field);
         let counts = format_ident!("{}_counts", field);
+        if let (IndexKind::Value, None) = (&ix.kind, ix.sole()) {
+            let prefix = format_ident!("{}_prefix", field);
+            let first = &ix.fields[0].1;
+            methods.push(quote! {
+                pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+                where
+                    #first: ::std::borrow::Borrow<__Q>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::index_where::<#vt, #name>(
+                        &self.rows,
+                        &self.#field,
+                        |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) < value,
+                        |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) <= value,
+                    )
+                }
+            });
+        }
         let wrapped = ix.sole().and_then(|(_, ty)| option_inner(ty));
         if let (IndexKind::Value, Some(inner)) = (&ix.kind, wrapped) {
             let some = format_ident!("{}_some", field);

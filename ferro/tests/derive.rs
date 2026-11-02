@@ -348,6 +348,50 @@ fn ids(iter: impl Iterator<Item = Arc<Issue>>) -> Vec<u64> {
     iter.map(|row| row.id).collect()
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+#[index(tenant, created)]
+struct Event {
+    #[key]
+    id: u64,
+    tenant: String,
+    created: u32,
+}
+
+#[test]
+fn composite_index_orders_by_each_field_in_turn() {
+    let mut table: Table<Event> = Table::new();
+    let event = |id, tenant: &str, created| Event {
+        id,
+        tenant: tenant.to_string(),
+        created,
+    };
+    table.insert(event(1, "b", 30));
+    table.insert(event(2, "a", 20));
+    table.insert(event(3, "a", 10));
+    table.insert(event(4, "a", 20));
+    let listed = |rows: ferro::table::IndexIter<Event>| -> Vec<u64> {
+        rows.map(|row| row.id).collect()
+    };
+    assert_eq!(listed(table.by_tenant_created(&("a".to_string(), 20))), [2, 4]);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [3, 2, 4]);
+    assert_eq!(listed(table.by_tenant_created_prefix("b")), [1]);
+    assert_eq!(listed(table.by_tenant_created_prefix("c")), [0u64; 0]);
+    let span = ("a".to_string(), 15)..("b".to_string(), 0);
+    assert_eq!(listed(table.by_tenant_created_range(span)), [2, 4]);
+    assert_eq!(
+        table.by_tenant_created_counts(),
+        [
+            (("a".to_string(), 10), 1),
+            (("a".to_string(), 20), 2),
+            (("b".to_string(), 30), 1),
+        ]
+    );
+    table.update(&2, |row| row.created = 5);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [2, 3, 4]);
+    table.remove(&3);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [2, 4]);
+}
+
 #[test]
 fn record_table() {
     let dir = tempfile::tempdir().unwrap();

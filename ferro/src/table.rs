@@ -428,6 +428,22 @@ where
     rows.get(&*index.get(value)?)
 }
 
+pub fn index_where<I, T>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), ()>,
+    below: impl Fn(&I) -> bool,
+    within: impl Fn(&I) -> bool,
+) -> IndexIter<T>
+where
+    I: Data + Ord,
+    T: Record,
+{
+    IndexIter::over(
+        rows,
+        index.range_by(|entry| below(&entry.0), |entry| within(&entry.0)),
+    )
+}
+
 pub fn index_eq<I, T, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), ()>,
