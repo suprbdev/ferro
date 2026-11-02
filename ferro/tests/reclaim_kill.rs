@@ -13,10 +13,7 @@ use tempfile::TempDir;
 type Root = Map<u64, String>;
 type Model = BTreeMap<u64, String>;
 
-const MANUAL: Reclaim = Reclaim {
-    every_bytes: 0,
-    fill: 0.5,
-};
+const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
 
 fn dir() -> TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
@@ -63,7 +60,7 @@ fn process_child() {
 
 #[test]
 fn killing_the_process_at_every_stage_keeps_every_acknowledged_commit() {
-    for stage in ["marked", "copied", "tabled", "published", "punched"] {
+    for stage in ["created", "copied", "synced", "swapped", "retired"] {
         for attempt in 0..cases(3) {
             let dir = dir();
             let path = dir.path().join("killed.ferro");

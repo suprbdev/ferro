@@ -735,10 +735,7 @@ async fn retention_reclaims_under_load_and_the_replica_keeps_following() {
     }
     assert!(cycles >= 2, "only {cycles} cycles");
     let stats = writer.get("/admin/stats").await.unwrap().json();
-    assert!(
-        stats["db_bytes"].as_u64().unwrap() < stats["db_log_bytes"].as_u64().unwrap(),
-        "{stats}"
-    );
+    assert!(stats["db_bytes"].as_u64().unwrap() < sold * 8 * 1024 / 2, "{stats}");
     assert_eq!(stock_of(&mut writer, item).await, 100_000 - sold);
     let mut seen = 0;
     for _ in 0..200 {

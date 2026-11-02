@@ -27,14 +27,10 @@ impl Tsdb {
         keep: Keep,
         every_bytes: u64,
     ) -> Result<Tsdb> {
-        let reclaim = Reclaim {
-            every_bytes,
-            ..Reclaim::default()
-        };
         let db = Options::new()
             .durability(durability)
             .history(keep)
-            .reclaim(reclaim)
+            .reclaim(Reclaim { every_bytes })
             .open(path)?;
         Ok(Tsdb { db })
     }

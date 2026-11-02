@@ -375,7 +375,7 @@ fn populate(path: &std::path::Path, commits: u32) -> Vec<(u8, u32)> {
 }
 
 #[test]
-fn compact_with_a_reader_open_keeps_the_reader_on_its_snapshot() {
+fn compact_with_a_reader_open_keeps_the_reader_on_its_snapshot_until_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rd.ferro");
     let content = populate(&path, 200);
@@ -383,12 +383,15 @@ fn compact_with_a_reader_open_keeps_the_reader_on_its_snapshot() {
     let old = reader.at(50).unwrap();
     let old_content = dump(&old);
     admin::compact(&path, Keep::Last(5)).unwrap();
-    assert!(matches!(reader.refresh(), Err(Error::Replaced)));
-    assert!(matches!(reader.refresh(), Err(Error::Replaced)));
     assert_eq!(dump(&reader.read()), content);
     assert_eq!(dump(&reader.at(50).unwrap()), old_content);
     assert_eq!(reader.log().len(), 200);
     reader.verify().unwrap();
+    assert!(reader.refresh().unwrap());
+    assert_eq!(dump(&old), old_content);
+    assert_eq!(reader.log().len(), 5);
+    assert!(matches!(reader.at(50), Err(Error::NoVersion(50))));
+    assert_eq!(dump(&reader.read()), content);
     let fresh: Db<Root> = Options::new().read_only().open(&path).unwrap();
     assert_eq!(fresh.log().len(), 5);
     assert_eq!(dump(&fresh.read()), content);

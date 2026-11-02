@@ -15,7 +15,7 @@ type Model = BTreeMap<u64, String>;
 
 const LOG_START: usize = 8192;
 const SLOT: usize = 4096;
-const SUPER: usize = 136;
+const SUPER: usize = 100;
 const FRAME_CHECKED: usize = 32 + HASH_BYTES;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 

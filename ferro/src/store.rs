@@ -2,14 +2,14 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
+use std::ops::Deref;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
@@ -18,15 +18,16 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
+use crate::reclaim::sibling;
 
 const MAGIC: &[u8; 8] = b"FERRODB2";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
-const GAP_MAGIC: &[u8; 8] = b"FERROGAP";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const FRAME_CHECKED: usize = 32 + HASH_BYTES;
-const SUPER_CHECKED: usize = FRAME_CHECKED + 52;
+const SUPER_CHECKED: usize = FRAME_CHECKED + 16;
 const SUPER_BYTES: usize = SUPER_CHECKED + 32;
+const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 const SCAN_CHUNK: usize = 1 << 20;
 const FIRST_RESERVE: u64 = 64 << 10;
@@ -39,9 +40,6 @@ const MAX_DEDUPE: u64 = 1 << 16;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
-const MIN_BLOCK: u64 = 4096;
-const PUNCH_CHUNK: u64 = 64 << 20;
-const OPEN_RETRIES: u32 = 64;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -54,10 +52,12 @@ pub enum Durability {
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    Write(u64, Vec<u8>),
-    SetLen(u64),
-    Sync,
-    Punch(u64, u64),
+    Create(u64),
+    Write(u64, u64, Vec<u8>),
+    SetLen(u64, u64),
+    Sync(u64),
+    Rename(u64),
+    SyncDir,
     Acked(u64),
 }
 
@@ -92,7 +92,6 @@ pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
 #[derive(Clone)]
 struct CacheEntry {
     value: Arc<dyn Any + Send + Sync>,
-    offset: u64,
     weight: u32,
 }
 
@@ -106,11 +105,22 @@ impl Weighter<Hash, CacheEntry> for EntryWeight {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Moved {
-    pub(crate) floor: u64,
-    pub(crate) table: Option<Ptr>,
-    pub(crate) live: u64,
-    pub(crate) survival: u64,
+pub(crate) struct Basis {
+    pub(crate) bytes: u64,
+    survival: u64,
+}
+
+impl Basis {
+    pub(crate) fn new(bytes: u64, survival: f64) -> Basis {
+        Basis {
+            bytes,
+            survival: (survival.clamp(0.0, 1.0) * SURVIVAL_ONE) as u64,
+        }
+    }
+
+    pub(crate) fn survival(&self) -> f64 {
+        self.survival as f64 / SURVIVAL_ONE
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +128,7 @@ struct Super {
     seq: u64,
     log_end: u64,
     head: Option<Ptr>,
-    moved: Moved,
+    basis: Basis,
 }
 
 impl Super {
@@ -142,21 +152,15 @@ impl Super {
             seq,
             log_end,
             head,
-            moved: Moved::default(),
+            basis: Basis::default(),
         })
     }
 
     fn encode(&self) -> [u8; SUPER_BYTES] {
         let mut out = [0u8; SUPER_BYTES];
         self.fill(MAGIC, &mut out);
-        let extra = &mut out[FRAME_CHECKED..SUPER_CHECKED];
-        extra[..8].copy_from_slice(&self.moved.floor.to_le_bytes());
-        extra[8..16].copy_from_slice(&self.moved.live.to_le_bytes());
-        if let Some(table) = self.moved.table {
-            extra[16..24].copy_from_slice(&table.offset.to_le_bytes());
-            extra[24..24 + HASH_BYTES].copy_from_slice(&table.hash);
-        }
-        extra[44..52].copy_from_slice(&self.moved.survival.to_le_bytes());
+        out[FRAME_CHECKED..FRAME_CHECKED + 8].copy_from_slice(&self.basis.bytes.to_le_bytes());
+        out[FRAME_CHECKED + 8..SUPER_CHECKED].copy_from_slice(&self.basis.survival.to_le_bytes());
         let check = blake3::hash(&out[..SUPER_CHECKED]);
         out[SUPER_CHECKED..SUPER_BYTES].copy_from_slice(check.as_bytes());
         out
@@ -170,83 +174,16 @@ impl Super {
         if check.as_bytes() != &bytes[SUPER_CHECKED..SUPER_BYTES] {
             return None;
         }
-        let extra = &bytes[FRAME_CHECKED..SUPER_CHECKED];
-        let floor = u64::from_le_bytes(extra[..8].try_into().ok()?);
-        let live = u64::from_le_bytes(extra[8..16].try_into().ok()?);
-        let offset = u64::from_le_bytes(extra[16..24].try_into().ok()?);
-        let hash: Hash = extra[24..24 + HASH_BYTES].try_into().ok()?;
-        let table = (offset != 0).then_some(Ptr { hash, offset });
-        let survival = u64::from_le_bytes(extra[44..52].try_into().ok()?);
-        let moved = Moved {
-            floor,
-            table,
-            live,
-            survival,
+        let bytes_at = bytes[FRAME_CHECKED..FRAME_CHECKED + 8].try_into().ok()?;
+        let survival = bytes[FRAME_CHECKED + 8..SUPER_CHECKED].try_into().ok()?;
+        let basis = Basis {
+            bytes: u64::from_le_bytes(bytes_at),
+            survival: u64::from_le_bytes(survival),
         };
         Some(Super {
-            moved,
+            basis,
             ..Super::fields(bytes)?
         })
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct Places {
-    pub(crate) moved: Moved,
-    offsets: Vec<u64>,
-    places: Vec<u64>,
-}
-
-impl Places {
-    pub(crate) fn new(moved: Moved, pairs: Vec<(u64, u64)>) -> Places {
-        let (offsets, places) = pairs.into_iter().unzip();
-        Places {
-            moved,
-            offsets,
-            places,
-        }
-    }
-
-    pub(crate) fn place(&self, offset: u64) -> Option<u64> {
-        if offset >= self.moved.floor {
-            return Some(offset);
-        }
-        self.offsets
-            .binary_search(&offset)
-            .ok()
-            .map(|index| self.places[index])
-    }
-
-    fn holds(&self, offset: u64) -> bool {
-        offset >= self.moved.floor || self.offsets.binary_search(&offset).is_ok()
-    }
-
-    pub(crate) fn encode(pairs: &[(u64, u64)]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(pairs.len() * 6 + 10);
-        push_varint(&mut out, pairs.len() as u64);
-        let (mut last_offset, mut last_place) = (0u64, 0u64);
-        for (offset, place) in pairs {
-            push_varint(&mut out, offset - last_offset);
-            push_varint(&mut out, zigzag(place.wrapping_sub(last_place) as i64));
-            (last_offset, last_place) = (*offset, *place);
-        }
-        out
-    }
-
-    fn decode(moved: Moved, body: &[u8]) -> Result<Places> {
-        let mut decoder = Decoder::new(body, &[], None);
-        let count = decoder.varint()? as usize;
-        if count > body.len() / 2 {
-            return Err(Error::Corrupt("place table claims too many entries".into()));
-        }
-        let mut pairs = Vec::with_capacity(count);
-        let (mut offset, mut place) = (0u64, 0u64);
-        for _ in 0..count {
-            offset = offset.wrapping_add(decoder.varint()?);
-            place = place.wrapping_add(unzigzag(decoder.varint()?) as u64);
-            pairs.push((offset, place));
-        }
-        Ok(Places::new(moved, pairs))
     }
 }
 
@@ -283,26 +220,21 @@ fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
         return Ok(None);
     }
     let mut header = [0u8; FRAME_BYTES];
-    if !read_or_end(file, &mut header, start)? {
-        return Ok(None);
-    }
-    let gap = &header[0..8] == GAP_MAGIC;
-    if !gap && &header[0..8] != FRAME_MAGIC {
+    if !read_or_end(file, &mut header, start)? || &header[0..8] != FRAME_MAGIC {
         return Ok(None);
     }
     let Some(mut frame) = Super::fields(&header) else {
         return Ok(None);
     };
-    frame.moved = tip.moved;
+    frame.basis = tip.basis;
     if frame.seq != tip.seq + 1 || frame.log_end < body_start || frame.log_end > len {
         return Ok(None);
     }
     let mut hasher = Xxh3::new();
     hasher.update(&header[..FRAME_CHECKED]);
-    let checked = if gap { 0 } else { frame.log_end - body_start };
-    let mut chunk = vec![0u8; SCAN_CHUNK.min(checked as usize)];
+    let mut chunk = vec![0u8; SCAN_CHUNK.min((frame.log_end - body_start) as usize)];
     let mut at = body_start;
-    while !gap && at < frame.log_end {
+    while at < frame.log_end {
         let take = chunk.len().min((frame.log_end - at) as usize);
         if !read_or_end(file, &mut chunk[..take], at)? {
             return Ok(None);
@@ -460,15 +392,6 @@ impl RecordReader<'_> {
         Err(Error::Corrupt("varint overflow in record".into()))
     }
 
-    fn prefix(&mut self) -> Result<(usize, usize, bool)> {
-        let stored_len = usize::try_from(self.varint()?)
-            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-        let flagged = self.varint()?;
-        let link_count = usize::try_from(flagged >> 1)
-            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
-        Ok((stored_len, link_count, flagged & 1 == 1))
-    }
-
     fn take(&mut self, n: usize) -> Result<&[u8]> {
         let end = self
             .pos
@@ -481,14 +404,15 @@ impl RecordReader<'_> {
     }
 }
 
-pub(crate) fn seal(file: &File, log_end: u64, head: Ptr) -> Result<()> {
+pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basis) -> Result<()> {
     file.sync_data()?;
     let sb = Super {
-        seq: 1,
+        seq,
         log_end,
         head: Some(head),
-        moved: Moved::default(),
+        basis,
     };
+    file.write_all_at(&sb.encode(), 0)?;
     file.write_all_at(&sb.encode(), SLOT_BYTES)?;
     file.sync_all()?;
     Ok(())
@@ -532,7 +456,7 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
 pub(crate) struct Frame {
     pub(crate) seq: u64,
     pub(crate) end: u64,
-    pub(crate) head: Ptr,
+    head: Ptr,
 }
 
 struct Cursor {
@@ -541,40 +465,64 @@ struct Cursor {
     reserve: u64,
 }
 
-struct Traced {
+pub(crate) struct Traced {
     file: File,
     trace: Option<Trace>,
+    inode: u64,
 }
 
 impl Traced {
-    fn log(&self, op: impl FnOnce() -> Op) {
+    pub(crate) fn new(file: File, trace: Option<Trace>) -> Result<Traced> {
+        let inode = file.metadata()?.ino();
+        Ok(Traced { file, trace, inode })
+    }
+
+    fn log(&self, op: impl FnOnce(u64) -> Op) {
         if let Some(trace) = &self.trace {
-            trace.lock().push(op());
+            trace.lock().push(op(self.inode));
         }
     }
 
-    fn write_all_at(&self, bytes: &[u8], at: u64) -> std::io::Result<()> {
-        self.log(|| Op::Write(at, bytes.to_vec()));
+    pub(crate) fn created(&self) {
+        self.log(Op::Create);
+    }
+
+    pub(crate) fn write_all_at(&self, bytes: &[u8], at: u64) -> std::io::Result<()> {
+        self.log(|inode| Op::Write(inode, at, bytes.to_vec()));
         self.file.write_all_at(bytes, at)
     }
 
-    fn sync_data(&self) -> std::io::Result<()> {
+    pub(crate) fn sync_data(&self) -> std::io::Result<()> {
         self.file.sync_data()?;
-        self.log(|| Op::Sync);
+        self.log(Op::Sync);
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> std::io::Result<()> {
-        self.log(|| Op::SetLen(len));
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()?;
+        self.log(Op::Sync);
+        Ok(())
+    }
+
+    pub(crate) fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.log(|inode| Op::SetLen(inode, len));
         self.file.set_len(len)
     }
 }
 
-impl std::ops::Deref for Traced {
+impl Deref for Traced {
     type Target = File;
 
     fn deref(&self) -> &File {
         &self.file
+    }
+}
+
+pub(crate) struct Retired(Weak<Inner>);
+
+impl Retired {
+    pub(crate) fn bytes(&self) -> Option<u64> {
+        self.0.upgrade().map(|inner| inner.tail.load(Ordering::Acquire))
     }
 }
 
@@ -588,8 +536,7 @@ struct Inner {
     slot: AtomicU64,
     cache: Cache<Hash, CacheEntry, EntryWeight>,
     dedupe: Cache<Hash, u64>,
-    places: ArcSwap<Places>,
-    reloading: Mutex<()>,
+    basis: Basis,
     poisoned: AtomicBool,
     closed: AtomicBool,
     options: StoreOptions,
@@ -602,7 +549,18 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
-        let file = open_locked(path, options.read_only)?;
+        Store::open_as(path, path, options)
+    }
+
+    pub(crate) fn open_as(
+        actual: &Path,
+        path: &Path,
+        options: StoreOptions,
+    ) -> Result<(Store, Option<Ptr>)> {
+        let file = open_locked(actual, options.read_only)?;
+        if !options.read_only && actual == path {
+            let _ = std::fs::remove_file(sibling(path));
+        }
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
         let (sb, slot) = match existing {
@@ -636,7 +594,7 @@ impl Store {
                     seq: 0,
                     log_end: LOG_START,
                     head: None,
-                    moved: Moved::default(),
+                    basis: Basis::default(),
                 };
                 file.set_len(LOG_START)?;
                 file.write_all_at(&sb.encode(), 0)?;
@@ -651,14 +609,12 @@ impl Store {
         let items = ((cache_bytes / 4096).max(64)) as usize;
         let dedupe = (cache_bytes / 4096).clamp(MIN_DEDUPE, MAX_DEDUPE) as usize;
         let head = sb.head;
+        let file = Traced::new(file, options.trace.clone())?;
         let store = Store {
             inner: Arc::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
                 path: path.to_path_buf(),
-                file: Traced {
-                    file,
-                    trace: options.trace.clone(),
-                },
+                file,
                 tail: AtomicU64::new(sb.log_end),
                 written: AtomicU64::new(sb.log_end),
                 cursor: Mutex::new(Cursor {
@@ -669,100 +625,13 @@ impl Store {
                 slot: AtomicU64::new(slot),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
                 dedupe: Cache::new(dedupe),
-                places: ArcSwap::from_pointee(Places::default()),
-                reloading: Mutex::new(()),
+                basis: sb.basis,
                 poisoned: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 options,
             }),
         };
-        store.inner.places.store(store.load_newest(sb.moved)?);
         Ok((store, head))
-    }
-
-    fn load_newest(&self, moved: Moved) -> Result<Arc<Places>> {
-        let inner = &self.inner;
-        let mut moved = moved;
-        for _ in 0..OPEN_RETRIES {
-            let error = match self.load_places(moved) {
-                Ok(places) => return Ok(Arc::new(places)),
-                Err(error) => error,
-            };
-            let len = inner.file.metadata()?.len();
-            match read_supers(&inner.file, len)? {
-                Some((sb, _)) if inner.options.read_only && sb.moved != moved => {
-                    inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
-                    moved = sb.moved;
-                }
-                _ => return Err(error),
-            }
-        }
-        Err(Error::Corrupt("place table kept moving".into()))
-    }
-
-    fn load_places(&self, moved: Moved) -> Result<Places> {
-        let Some(table) = moved.table else {
-            return Ok(Places {
-                moved,
-                ..Places::default()
-            });
-        };
-        let tail = self.inner.written.load(Ordering::Acquire);
-        let (object, _) = self.read_at(table, table.offset, tail)?;
-        Places::decode(moved, &object.body)
-    }
-
-    fn newer_places(&self, current: &Arc<Places>) -> Result<Option<Arc<Places>>> {
-        let inner = &self.inner;
-        let now = inner.places.load_full();
-        if !Arc::ptr_eq(&now, current) {
-            return Ok(Some(now));
-        }
-        if !inner.options.read_only {
-            return Ok(None);
-        }
-        let _guard = inner.reloading.lock();
-        let now = inner.places.load_full();
-        if !Arc::ptr_eq(&now, current) {
-            return Ok(Some(now));
-        }
-        let len = inner.file.metadata()?.len();
-        let Some((sb, _)) = read_supers(&inner.file, len)? else {
-            return Ok(None);
-        };
-        if sb.moved == current.moved {
-            return Ok(None);
-        }
-        inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
-        let places = self.load_newest(sb.moved)?;
-        inner.places.store(places.clone());
-        Ok(Some(places))
-    }
-
-    pub(crate) fn places(&self) -> Arc<Places> {
-        self.inner.places.load_full()
-    }
-
-    pub(crate) fn written(&self) -> u64 {
-        self.inner.written.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn allocated(&self) -> Result<u64> {
-        Ok(self.inner.file.metadata()?.blocks() * 512)
-    }
-
-    pub(crate) fn on_disk(&self) -> u64 {
-        let size = self.size();
-        self.allocated().map_or(size, |bytes| bytes.min(size))
-    }
-
-    #[doc(hidden)]
-    pub fn trace(&self, op: Op) {
-        self.inner.file.log(|| op);
-    }
-
-    pub(crate) fn block_bytes(&self) -> Result<u64> {
-        Ok(self.inner.file.metadata()?.blksize().max(MIN_BLOCK))
     }
 
     pub fn id(&self) -> u64 {
@@ -785,6 +654,23 @@ impl Store {
         self.inner.cursor.lock().seq
     }
 
+    pub(crate) fn basis(&self) -> Basis {
+        self.inner.basis
+    }
+
+    pub(crate) fn retired(&self) -> Retired {
+        Retired(Arc::downgrade(&self.inner))
+    }
+
+    #[doc(hidden)]
+    pub fn trace(&self, op: Op) {
+        self.inner.file.log(|_| op);
+    }
+
+    pub(crate) fn trace_rename(&self) {
+        self.inner.file.log(Op::Rename);
+    }
+
     pub fn refresh(&self) -> Result<Option<Ptr>> {
         let mut cursor = self.inner.cursor.lock();
         let opened = self.inner.file.metadata()?;
@@ -800,10 +686,6 @@ impl Store {
         cursor.seq = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
         self.inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
-        if sb.moved != self.inner.places.load().moved {
-            let _guard = self.inner.reloading.lock();
-            self.inner.places.store(self.load_newest(sb.moved)?);
-        }
         Ok(sb.head)
     }
 
@@ -822,7 +704,7 @@ impl Store {
                 seq: frame.seq,
                 log_end: frame.end,
                 head: Some(frame.head),
-                moved: inner.places.load().moved,
+                basis: inner.basis,
             };
             let slot = 1 - inner.slot.load(Ordering::Relaxed);
             inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
@@ -834,91 +716,6 @@ impl Store {
             return Err(error);
         }
         inner.tail.store(frame.end, Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) fn publish(&self, frame: Frame, places: Places) -> Result<()> {
-        let inner = &self.inner;
-        let moved = places.moved;
-        let attempt = (|| -> Result<u64> {
-            inner.file.sync_data()?;
-            let sb = Super {
-                seq: frame.seq,
-                log_end: frame.end,
-                head: Some(frame.head),
-                moved,
-            };
-            let first = 1 - inner.slot.load(Ordering::Relaxed);
-            inner.file.write_all_at(&sb.encode(), first * SLOT_BYTES)?;
-            inner.file.sync_data()?;
-            inner.file.write_all_at(&sb.encode(), (1 - first) * SLOT_BYTES)?;
-            inner.file.sync_data()?;
-            Ok(1 - first)
-        })();
-        match attempt {
-            Ok(slot) => {
-                inner.slot.store(slot, Ordering::Relaxed);
-                inner.places.store(Arc::new(places));
-                Ok(())
-            }
-            Err(error) => {
-                self.poison();
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn punch(&self, start: u64, end: u64, block: u64) -> Result<u64> {
-        let first = start.next_multiple_of(block);
-        let last = end - end % block;
-        let mut at = first;
-        while at < last {
-            let len = (last - at).min(PUNCH_CHUNK);
-            if !punch_hole(&self.inner.file, at, len)? {
-                return Ok(at - first);
-            }
-            self.inner.file.log(|| Op::Punch(at, len));
-            at += len;
-        }
-        Ok(last.saturating_sub(first))
-    }
-
-    pub(crate) fn write_at(&self, bytes: &[u8], at: u64) -> Result<()> {
-        self.inner.file.write_all_at(bytes, at)?;
-        Ok(())
-    }
-
-    pub(crate) fn read_place(&self, buf: &mut [u8], at: u64) -> Result<()> {
-        self.inner.file.read_exact_at(buf, at)?;
-        Ok(())
-    }
-
-    pub(crate) fn sync_data(&self) -> Result<()> {
-        self.inner.file.sync_data().inspect_err(|_| self.poison())?;
-        Ok(())
-    }
-
-    pub(crate) fn scan_links(&self, from: u64, to: u64, mut each: impl FnMut(Ptr)) -> Result<()> {
-        let file = &self.inner.file;
-        let mut at = from;
-        while at < to {
-            let mut header = [0u8; FRAME_BYTES];
-            file.read_exact_at(&mut header, at)?;
-            let frame = Super::fields(&header)
-                .ok_or_else(|| Error::Corrupt(format!("no frame at {at}")))?;
-            if &header[0..8] == GAP_MAGIC {
-                at = frame.log_end;
-                continue;
-            }
-            if &header[0..8] != FRAME_MAGIC || frame.log_end > to {
-                return Err(Error::Corrupt(format!("no frame at {at}")));
-            }
-            let mut record = at + FRAME_BYTES as u64;
-            while record < frame.log_end {
-                record = links_of(file, record, frame.log_end, &mut each)?;
-            }
-            at = frame.log_end;
-        }
         Ok(())
     }
 
@@ -934,49 +731,22 @@ impl Store {
                 ptr.offset
             )));
         }
-        let first = self.inner.places.load();
-        let found = self.read_placed(ptr, &first);
-        if !stale(&found) {
-            return found;
-        }
-        let mut places = arc_swap::Guard::into_inner(first);
-        let mut found = found;
-        while let Some(newer) = self.newer_places(&places)? {
-            places = newer;
-            found = self.read_placed(ptr, &places);
-            if !stale(&found) {
-                break;
-            }
-        }
-        found
-    }
-
-    fn read_placed(&self, ptr: Ptr, places: &Places) -> Result<(Object, u32)> {
-        match places.place(ptr.offset) {
-            Some(place) => self.read_at(ptr, place, self.inner.written.load(Ordering::Acquire)),
-            None => Err(Error::Pruned(ptr.offset)),
-        }
-    }
-
-    fn read_at(&self, ptr: Ptr, place: u64, tail: u64) -> Result<(Object, u32)> {
-        if place >= tail {
-            return Err(Error::Corrupt(format!(
-                "object at {} placed past the end of the log",
-                ptr.offset
-            )));
-        }
-        let want = (tail - place).min(READ_AHEAD as u64) as usize;
+        let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
         let mut bytes = vec![0u8; want];
-        self.inner.file.read_exact_at(&mut bytes, place)?;
+        self.inner.file.read_exact_at(&mut bytes, ptr.offset)?;
         let mut reader = RecordReader {
             file: &self.inner.file,
-            start: place,
+            start: ptr.offset,
             tail,
             bytes,
             pos: 0,
         };
-        let (stored_len, link_count, packed) = reader.prefix()?;
-        let body = if packed {
+        let stored_len = usize::try_from(reader.varint()?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        let flagged = reader.varint()?;
+        let link_count = usize::try_from(flagged >> 1)
+            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
+        let body = if flagged & 1 == 1 {
             let raw_len = usize::try_from(reader.varint()?)
                 .map_err(|_| Error::Corrupt("body length overflow".into()))?;
             if raw_len > stored_len.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
@@ -1019,7 +789,6 @@ impl Store {
         fixed_bytes: impl FnOnce(&T) -> usize,
     ) -> Result<(Arc<T>, bool)> {
         if let Some(entry) = self.inner.cache.get(&ptr.hash)
-            && entry.offset == ptr.offset
             && let Ok(value) = entry.value.downcast::<T>()
         {
             return Ok((value, true));
@@ -1036,7 +805,6 @@ impl Store {
                 ptr.hash,
                 CacheEntry {
                     value: value.clone(),
-                    offset: ptr.offset,
                     weight,
                 },
             );
@@ -1078,7 +846,6 @@ impl Store {
             buf: vec![0u8; FRAME_BYTES],
             seen: HashMap::new(),
             remembered: Vec::new(),
-            places: self.inner.places.load_full(),
         })
     }
 
@@ -1103,7 +870,6 @@ pub struct Txn {
     buf: Vec<u8>,
     seen: HashMap<Hash, u64>,
     remembered: Vec<(Hash, CacheEntry)>,
-    places: Arc<Places>,
 }
 
 impl Sink for Txn {
@@ -1117,13 +883,8 @@ impl Sink for Txn {
                 offset: *offset,
             });
         }
-        if let Some(offset) = self.store.inner.dedupe.get(&hash)
-            && self.places.holds(offset)
-        {
+        if let Some(offset) = self.store.inner.dedupe.get(&hash) {
             return Ok(Ptr { hash, offset });
-        }
-        if let Some(link) = object.links.iter().find(|link| !self.places.holds(link.offset)) {
-            return Err(Error::Pruned(link.offset));
         }
         let offset = self.start + self.buf.len() as u64;
         append_record(&mut self.buf, offset, &object.body, &object.links);
@@ -1132,14 +893,7 @@ impl Sink for Txn {
     }
 
     fn remember(&mut self, ptr: Ptr, value: Arc<dyn Any + Send + Sync>, weight: u32) {
-        if self.seen.get(&ptr.hash) == Some(&ptr.offset) {
-            let entry = CacheEntry {
-                value,
-                offset: ptr.offset,
-                weight,
-            };
-            self.remembered.push((ptr.hash, entry));
-        }
+        self.remembered.push((ptr.hash, CacheEntry { value, weight }));
     }
 
     fn store_id(&self) -> u64 {
@@ -1149,76 +903,6 @@ impl Sink for Txn {
     fn store(&self) -> Option<Store> {
         Some(self.store.clone())
     }
-}
-
-fn stale(found: &Result<(Object, u32)>) -> bool {
-    match found {
-        Err(Error::Corrupt(_) | Error::Pruned(_)) => true,
-        Err(Error::Io(error)) => error.kind() == ErrorKind::UnexpectedEof,
-        _ => false,
-    }
-}
-
-fn extend(file: &Traced, end: u64) -> std::io::Result<()> {
-    if file.metadata()?.len() < end {
-        file.set_len(end)?;
-    }
-    Ok(())
-}
-
-fn links_of(file: &File, at: u64, end: u64, each: &mut impl FnMut(Ptr)) -> Result<u64> {
-    let mut reader = RecordReader {
-        file,
-        start: at,
-        tail: end,
-        bytes: Vec::new(),
-        pos: 0,
-    };
-    let (stored_len, link_count, packed) = reader.prefix()?;
-    if packed {
-        reader.varint()?;
-    }
-    let body_end = at + reader.pos as u64 + stored_len as u64;
-    let mut reader = RecordReader {
-        file,
-        start: body_end,
-        tail: end,
-        bytes: Vec::new(),
-        pos: 0,
-    };
-    for _ in 0..link_count {
-        let hash: Hash = reader
-            .take(HASH_BYTES)?
-            .try_into()
-            .expect("slice length is HASH_BYTES");
-        let delta = unzigzag(reader.varint()?);
-        each(Ptr {
-            hash,
-            offset: at.wrapping_sub(delta as u64),
-        });
-    }
-    Ok(body_end + reader.pos as u64)
-}
-
-#[cfg(target_os = "linux")]
-fn punch_hole(file: &File, at: u64, len: u64) -> Result<bool> {
-    use std::os::fd::AsRawFd;
-
-    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-    let done = unsafe { libc::fallocate(file.as_raw_fd(), mode, at as libc::off_t, len as libc::off_t) };
-    if done == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Ok(false),
-        _ => Err(error.into()),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn punch_hole(_file: &File, _at: u64, _len: u64) -> Result<bool> {
-    Ok(false)
 }
 
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
@@ -1235,19 +919,10 @@ fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
 }
 
 impl Txn {
-    pub(crate) fn write(self, head: Ptr) -> Result<Frame> {
-        self.write_frame(head, FRAME_MAGIC, 0)
-    }
-
-    pub(crate) fn write_gap(self, head: Ptr, bytes: u64) -> Result<(Frame, u64)> {
-        let start = self.start + FRAME_BYTES as u64;
-        Ok((self.write_frame(head, GAP_MAGIC, bytes)?, start))
-    }
-
-    fn write_frame(mut self, head: Ptr, magic: &[u8; 8], gap: u64) -> Result<Frame> {
+    pub(crate) fn write(mut self, head: Ptr) -> Result<Frame> {
         let store = self.store.clone();
         let inner = &store.inner;
-        let end = self.start + self.buf.len() as u64 + gap;
+        let end = self.start + self.buf.len() as u64;
         let mut cursor = inner.cursor.lock();
         if inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -1261,16 +936,15 @@ impl Txn {
             seq: frame.seq,
             log_end: end,
             head: Some(head),
-            moved: Moved::default(),
+            basis: inner.basis,
         };
-        header.fill(magic, &mut self.buf);
+        header.fill(FRAME_MAGIC, &mut self.buf);
         let mut hasher = Xxh3::new();
         hasher.update(&self.buf[..FRAME_CHECKED]);
         hasher.update(&self.buf[FRAME_BYTES..]);
         self.buf[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
         reserve(inner, &mut cursor, end);
-        let extended = if gap > 0 { extend(&inner.file, end) } else { Ok(()) };
-        if let Err(error) = extended.and(inner.file.write_all_at(&self.buf, self.start)) {
+        if let Err(error) = inner.file.write_all_at(&self.buf, self.start) {
             inner.poisoned.store(true, Ordering::Release);
             return Err(error.into());
         }

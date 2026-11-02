@@ -331,10 +331,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             )?;
             writeln!(
                 out,
-                "reclaim: {} cycles, longest writer pause {:.2} ms, {} logged, about {} live",
+                "reclaim: {} cycles, longest writer pause {:.2} ms, about {} live",
                 report.cycles,
                 report.longest_pause.as_secs_f64() * 1000.0,
-                human(report.log_bytes),
                 human(report.live_bytes)
             )?;
             for (at, bytes) in &report.size_samples {

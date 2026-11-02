@@ -2,7 +2,7 @@ use std::mem;
 use std::sync::Arc;
 
 use crate::codec::Data;
-use crate::db::{Commit, Held};
+use crate::db::Commit;
 use crate::error::{Error, Result};
 use crate::log::Walk;
 use crate::map::fatal;
@@ -15,17 +15,10 @@ pub struct History<T, V, F> {
     project: F,
     run: Option<(Arc<Commit>, V)>,
     started: bool,
-    _pin: Arc<Held>,
 }
 
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
-    pub(crate) fn new(
-        walk: Walk,
-        store: Store,
-        genesis: Option<Arc<T>>,
-        project: F,
-        pin: Arc<Held>,
-    ) -> Self {
+    pub(crate) fn new(walk: Walk, store: Store, genesis: Option<Arc<T>>, project: F) -> Self {
         History {
             walk,
             store,
@@ -33,7 +26,6 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
             project,
             run: None,
             started: false,
-            _pin: pin,
         }
     }
 

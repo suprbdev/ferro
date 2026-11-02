@@ -94,7 +94,6 @@ pub struct LoadReport {
     pub commits: u64,
     pub latencies_ms: Vec<f64>,
     pub file_bytes: u64,
-    pub log_bytes: u64,
     pub live_bytes: u64,
     pub versions: usize,
     pub cycles: u64,
@@ -228,7 +227,6 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
     report.size_samples = samples;
     let space = tsdb.db.space()?;
     report.file_bytes = tsdb.db.size_on_disk();
-    report.log_bytes = space.log_bytes;
     report.live_bytes = space.live_bytes;
     report.cycles = space.cycles;
     report.longest_pause = space.longest_pause;

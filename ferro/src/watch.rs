@@ -43,6 +43,17 @@ impl<T> Feed<T> {
         drop(replaced);
     }
 
+    pub(crate) fn rebind(&self, snapshot: Snapshot<T>) {
+        let mut slot = self.slot.lock();
+        let replaced = if slot.latest.is_some() {
+            slot.latest.replace(snapshot)
+        } else {
+            None
+        };
+        drop(slot);
+        drop(replaced);
+    }
+
     pub(crate) fn close(&self) {
         let mut slot = self.slot.lock();
         slot.closed = true;

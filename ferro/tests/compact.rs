@@ -112,14 +112,19 @@ fn compaction_refuses_a_live_writer_and_empty_is_a_noop() {
 }
 
 #[test]
-fn read_only_handle_learns_the_file_was_replaced() {
+fn read_only_handle_follows_a_replaced_file_on_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.ferro");
     build(&path, 5);
     let reader = ferro::Options::new().read_only().open::<Root>(&path).unwrap();
+    let held = reader.read();
     admin::compact(&path, Keep::Last(1)).unwrap();
-    assert!(matches!(reader.refresh(), Err(Error::Replaced)));
+    assert_eq!(reader.log().len(), 5);
+    assert!(reader.refresh().unwrap());
+    assert_eq!(reader.log().len(), 1);
     assert_eq!(reader.read().len(), 5);
+    assert_eq!(held.len(), 5);
+    assert!(!reader.refresh().unwrap());
 }
 
 #[test]

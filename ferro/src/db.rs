@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::mem;
 use std::ops::Deref;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,21 +19,31 @@ use crate::error::{Error, Result};
 use crate::history::History;
 use crate::log::{Chain, Log};
 use crate::map::Map;
-use crate::reclaim::{self, Compacted, Marks, Reclaim, Roots, Space};
-use crate::store::{Durability, Frame, Moved, Places, Store, StoreOptions, Txn};
+use crate::reclaim::{Compacted, Copier, Reclaim, Space, sibling, sync_parent};
+use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
 use crate::watch::{Feed, Watcher};
 
 const MAIN: &str = "main";
-const READ_RETRIES: u32 = 32;
-const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
+const MAX_PASSES: u32 = 6;
+const QUIET_BYTES: u64 = 256 << 10;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Commit {
     pub version: u64,
     pub time_ms: u64,
     pub message: String,
     pub root: Option<Ptr>,
     pub restored: Option<u64>,
+}
+
+impl PartialEq for Commit {
+    fn eq(&self, other: &Commit) -> bool {
+        self.version == other.version
+            && self.time_ms == other.time_ms
+            && self.message == other.message
+            && self.restored == other.restored
+            && self.root.map(|ptr| ptr.hash) == other.root.map(|ptr| ptr.hash)
+    }
 }
 
 impl Commit {
@@ -118,56 +129,9 @@ struct RefState {
     ptr: Option<Ptr>,
 }
 
-pub(crate) struct Held {
-    commit: Arc<Commit>,
-    chain: Option<Chain>,
-}
-
-impl Deref for Held {
-    type Target = Commit;
-
-    fn deref(&self) -> &Commit {
-        &self.commit
-    }
-}
-
-impl PartialEq for Held {
-    fn eq(&self, other: &Held) -> bool {
-        self.commit == other.commit
-    }
-}
-
-#[derive(Default)]
-struct Pins {
-    held: Vec<Weak<Held>>,
-    limit: usize,
-}
-
-impl Pins {
-    fn add(&mut self, held: &Arc<Held>) {
-        if self.held.len() >= self.limit {
-            self.held.retain(|held| held.strong_count() > 0);
-            self.limit = (self.held.len() * 2).max(64);
-        }
-        self.held.push(Arc::downgrade(held));
-    }
-
-    fn roots(&self) -> Roots {
-        let mut roots = Roots {
-            lenient: true,
-            ..Roots::default()
-        };
-        for held in self.held.iter().filter_map(Weak::upgrade) {
-            roots.trees.extend(held.commit.root);
-            roots.chains.extend(held.chain);
-        }
-        roots
-    }
-}
-
 pub struct Snapshot<T> {
     value: Arc<T>,
-    commit: Arc<Held>,
+    commit: Arc<Commit>,
 }
 
 impl<T> Clone for Snapshot<T> {
@@ -202,13 +166,14 @@ impl<T> Snapshot<T> {
     }
 
     pub fn commit(&self) -> &Commit {
-        &self.commit.commit
+        &self.commit
     }
 }
 
 struct State<T> {
     snapshot: Snapshot<T>,
     log: Chain,
+    store: Store,
 }
 
 struct Intent<T> {
@@ -274,26 +239,6 @@ struct Queue<T> {
     failed: bool,
 }
 
-struct Shared<T> {
-    store: Store,
-    tip: Mutex<RefState>,
-    published: Mutex<RefState>,
-    queue: Mutex<Queue<T>>,
-    done: Condvar,
-    genesis: Arc<T>,
-    genesis_hash: Hash,
-    branches: Mutex<HashMap<String, Arc<Branch<T>>>>,
-    history: Keep,
-    reclaim: Reclaim,
-    automatic: bool,
-    hook: Option<Hook>,
-    cycle: Mutex<()>,
-    log: Mutex<CycleLog>,
-    pins: Mutex<Pins>,
-    plain: Arc<Commit>,
-    signal: Arc<Signal>,
-}
-
 #[derive(Default)]
 struct CycleLog {
     cycles: u64,
@@ -306,8 +251,7 @@ struct Signal {
     stop: AtomicBool,
     due: Mutex<bool>,
     wake: Condvar,
-    grown: AtomicU64,
-    threshold: AtomicU64,
+    base: AtomicU64,
 }
 
 impl Signal {
@@ -341,9 +285,36 @@ impl Drop for Keeper {
     }
 }
 
+struct Shared<T> {
+    store: ArcSwap<Store>,
+    path: PathBuf,
+    options: StoreOptions,
+    tip: Mutex<RefState>,
+    published: Mutex<RefState>,
+    queue: Mutex<Queue<T>>,
+    done: Condvar,
+    genesis: Arc<T>,
+    genesis_hash: Hash,
+    branches: Mutex<HashMap<String, Arc<Branch<T>>>>,
+    history: Keep,
+    reclaim: Reclaim,
+    automatic: bool,
+    hook: Option<Hook>,
+    cycle: Mutex<()>,
+    log: Mutex<CycleLog>,
+    retired: Mutex<Vec<Retired>>,
+    signal: Arc<Signal>,
+}
+
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
-        self.store.close();
+        self.store.load().close();
+    }
+}
+
+impl<T> Shared<T> {
+    fn store(&self) -> Store {
+        (**self.store.load()).clone()
     }
 }
 
@@ -356,7 +327,7 @@ pub struct Db<T> {
 impl<T> fmt::Debug for Db<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Db")
-            .field("path", &self.shared.store.path())
+            .field("path", &self.shared.path)
             .field("branch", &self.branch.name)
             .field("version", &self.branch.state.load().snapshot.commit.version)
             .finish_non_exhaustive()
@@ -392,21 +363,6 @@ pub struct Options {
 }
 
 impl Options {
-    fn first_refs(store: &Store, head: Option<Ptr>) -> Result<(Refs, Option<Ptr>)> {
-        let mut head = head;
-        for _ in 0..READ_RETRIES {
-            let Some(ptr) = head else {
-                return Ok((Map::new(), None));
-            };
-            match store.load::<Refs>(ptr) {
-                Ok(refs) => return Ok(((*refs).clone(), head)),
-                Err(Error::Pruned(_)) if store.is_read_only() => head = store.refresh()?,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(Error::Pruned(0))
-    }
-
     pub fn new() -> Self {
         Options::default()
     }
@@ -443,7 +399,7 @@ impl Options {
     }
 
     #[doc(hidden)]
-    pub fn trace(mut self, trace: crate::store::Trace) -> Self {
+    pub fn trace(mut self, trace: Trace) -> Self {
         self.store.trace = Some(trace);
         self
     }
@@ -458,14 +414,24 @@ impl Options {
         init: impl FnOnce() -> T,
     ) -> Result<Db<T>> {
         let read_only = self.store.read_only;
+        let options = self.store.clone();
         let (store, head) = Store::open(path.as_ref(), self.store)?;
         let genesis = Arc::new(init());
         let genesis_hash = try_hash_of(&*genesis)?;
-        let (refs, head) = Self::first_refs(&store, head)?;
+        let refs = match head {
+            Some(ptr) => (*store.load::<Refs>(ptr)?).clone(),
+            None => Map::new(),
+        };
         let settled = store.last_seq();
         let automatic = !read_only && self.history != Keep::All && self.reclaim.every_bytes > 0;
+        let signal = Arc::new(Signal {
+            base: AtomicU64::new(store.basis().bytes),
+            ..Signal::default()
+        });
         let shared = Arc::new(Shared {
-            store,
+            store: ArcSwap::from_pointee(store),
+            path: path.as_ref().to_path_buf(),
+            options,
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
                 ptr: head,
@@ -487,9 +453,8 @@ impl Options {
             hook: self.hook,
             cycle: Mutex::new(()),
             log: Mutex::new(CycleLog::default()),
-            pins: Mutex::new(Pins::default()),
-            plain: Arc::new(Commit::genesis()),
-            signal: Arc::new(Signal::default()),
+            retired: Mutex::new(Vec::new()),
+            signal: signal.clone(),
         });
         let branch = {
             let state = shared.published.lock();
@@ -497,7 +462,7 @@ impl Options {
         };
         let thread = automatic.then(|| Shared::spawn(&shared));
         let keeper = Arc::new(Keeper {
-            signal: shared.signal.clone(),
+            signal,
             thread: Mutex::new(thread),
         });
         Ok(Db {
@@ -532,39 +497,30 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl<T: Data> Shared<T> {
-    fn hold(&self, commit: Arc<Commit>, chain: Option<Chain>) -> Arc<Held> {
-        let held = Arc::new(Held { commit, chain });
-        if !self.store.is_read_only() {
-            self.pins.lock().add(&held);
-        }
-        held
-    }
-
-    fn state_of(&self, head: Option<&Head>) -> Result<State<T>> {
+    fn state_of(&self, store: &Store, head: Option<&Head>) -> Result<State<T>> {
         let Some(head) = head else {
             return Ok(State {
                 snapshot: Snapshot {
                     value: self.genesis.clone(),
-                    commit: self.hold(self.plain.clone(), None),
+                    commit: Arc::new(Commit::genesis()),
                 },
                 log: Chain::empty(),
+                store: store.clone(),
             });
         };
         let value = match head.root {
-            Some(ptr) => self.store.load::<T>(ptr)?,
+            Some(ptr) => store.load::<T>(ptr)?,
             None => self.genesis.clone(),
         };
         let commit = head
             .log
-            .tip_entry(&self.store)?
+            .tip_entry(store)?
             .map(|entry| entry.commit.clone())
-            .unwrap_or_else(|| self.plain.clone());
+            .unwrap_or_else(|| Arc::new(Commit::genesis()));
         Ok(State {
-            snapshot: Snapshot {
-                value,
-                commit: self.hold(commit, None),
-            },
+            snapshot: Snapshot { value, commit },
             log: head.log,
+            store: store.clone(),
         })
     }
 
@@ -577,7 +533,7 @@ impl<T: Data> Shared<T> {
         if head.is_none() && name != MAIN {
             return Err(Error::NoBranch(name.to_string()));
         }
-        let state = Arc::new(self.state_of(head.as_deref())?);
+        let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
         let branch = Arc::new(Branch {
             name: name.to_string(),
             state: ArcSwap::new(state.clone()),
@@ -599,7 +555,7 @@ impl<T: Data> Shared<T> {
         let ptr = write_value(&refs, &mut txn)?;
         let frame = txn.write(ptr)?;
         let loaded = self.load_tip(ptr, branch);
-        let (refs, update) = loaded.inspect_err(|_| self.store.poison())?;
+        let (refs, update) = loaded.inspect_err(|_| self.store().poison())?;
         tip.refs = refs;
         tip.ptr = Some(ptr);
         let refs = tip.clone();
@@ -608,12 +564,13 @@ impl<T: Data> Shared<T> {
     }
 
     fn load_tip(&self, ptr: Ptr, branch: Option<&Arc<Branch<T>>>) -> Result<(Refs, Update<T>)> {
-        let refs = (*self.store.load::<Refs>(ptr)?).clone();
+        let store = self.store();
+        let refs = (*store.load::<Refs>(ptr)?).clone();
         let Some(branch) = branch else {
             return Ok((refs, None));
         };
         let head = refs.try_get(&branch.name)?;
-        let state = Arc::new(self.state_of(head.as_deref())?);
+        let state = Arc::new(self.state_of(&store, head.as_deref())?);
         branch.tip.store(state.clone());
         Ok((refs, Some((branch.clone(), state))))
     }
@@ -643,7 +600,7 @@ impl<T: Data> Shared<T> {
         drop(queue);
         let last = batch.last().expect("a leader has queued commits");
         let (frame, refs) = (last.frame, last.refs.clone());
-        let outcome = self.store.sync(frame);
+        let outcome = self.store().sync(frame);
         if outcome.is_ok() {
             *self.published.lock() = refs;
             for pending in batch {
@@ -660,10 +617,12 @@ impl<T: Data> Shared<T> {
         }
         drop(queue);
         self.done.notify_all();
-        let grown = frame.end.saturating_sub(self.signal.grown.load(Ordering::Relaxed));
-        let threshold = self.signal.threshold.load(Ordering::Relaxed);
-        if self.automatic && grown >= threshold.max(self.reclaim.every_bytes) {
-            self.signal.raise();
+        if self.automatic {
+            let base = self.signal.base.load(Ordering::Relaxed);
+            let goal = base.max(self.reclaim.every_bytes);
+            if frame.end.saturating_sub(base) >= goal {
+                self.signal.raise();
+            }
         }
         outcome
     }
@@ -694,12 +653,13 @@ impl<T: Data> Shared<T> {
         if keep == Keep::All {
             return Ok(0);
         }
+        let store = self.store();
         let mut tip = self.tip.lock();
         let mut next = tip.refs.clone();
         let mut dropped = 0;
         let heads: Vec<_> = tip.refs.iter().collect();
         for (name, head) in heads {
-            let log = head.log.pruned(&self.store, keep)?;
+            let log = head.log.pruned(&store, keep)?;
             if log != head.log {
                 dropped += (head.log.len() - log.len()) as u64;
                 let mut head = (*head).clone();
@@ -710,9 +670,9 @@ impl<T: Data> Shared<T> {
         if dropped == 0 {
             return Ok(0);
         }
-        let txn = self.store.begin()?;
+        let txn = store.begin()?;
         self.stage(&mut tip, next, txn, None)?;
-        self.settle(self.store.last_seq())?;
+        self.settle(store.last_seq())?;
         let refs = tip.refs.clone();
         for branch in self.branches.lock().values() {
             if let Some(head) = refs.try_get(&branch.name)? {
@@ -720,6 +680,7 @@ impl<T: Data> Shared<T> {
                 let next = Arc::new(State {
                     snapshot: state.snapshot.clone(),
                     log: head.log,
+                    store: state.store.clone(),
                 });
                 branch.tip.store(next.clone());
                 branch.state.store(next);
@@ -728,35 +689,13 @@ impl<T: Data> Shared<T> {
         Ok(dropped)
     }
 
-    fn gap(&self, tip: &mut RefState, bytes: u64) -> Result<u64> {
-        let head = tip.ptr.ok_or(Error::Detached)?;
-        let (frame, start) = self.store.begin()?.write_gap(head, bytes)?;
-        let refs = tip.clone();
-        self.queue.lock().waiting.push(Pending {
-            frame,
-            refs,
-            update: None,
-        });
-        Ok(start)
-    }
-
-    fn write_table(&self, pairs: &[(u64, u64)], tip: Option<&mut RefState>) -> Result<Ptr> {
-        let (record, hash) = reclaim::table_record(pairs);
-        let bytes = record.len() as u64;
-        let offset = match tip {
-            Some(tip) => self.gap(tip, bytes)?,
-            None => self.gap(&mut self.tip.lock(), bytes)?,
-        };
-        self.store.write_at(&record, offset)?;
-        Ok(Ptr { hash, offset })
-    }
-
     fn compact(&self, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
-        if self.store.is_read_only() {
+        if self.options.read_only {
             return Err(Error::ReadOnly);
         }
         let _only = self.cycle.lock();
-        let outcome = self.run_cycle(keep, stop);
+        let store = self.store();
+        let outcome = self.run_cycle(&store, keep, stop);
         let mut log = self.log.lock();
         log.cycles += 1;
         match &outcome {
@@ -768,120 +707,93 @@ impl<T: Data> Shared<T> {
             Err(error) => log.last_error = Some(error.to_string()),
         }
         drop(log);
-        self.signal.grown.store(self.store.written(), Ordering::Relaxed);
+        if outcome.is_err() {
+            Copier::abandon(&sibling(&self.path));
+            self.signal.base.store(self.store().size(), Ordering::Relaxed);
+        }
         outcome
     }
 
-    fn run_cycle(&self, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
-        let store = &self.store;
+    fn run_cycle(&self, store: &Store, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
         let mut report = Compacted {
-            before_bytes: store.allocated()?,
+            before_bytes: store.size(),
             commits_dropped: self.prune(keep)?,
             ..Compacted::default()
         };
-        let tip = self.tip.lock();
-        self.settle(store.last_seq())?;
-        let Some(head) = tip.ptr else {
+        let mut refs = self.published.lock().refs.clone();
+        if self.published.lock().ptr.is_none() {
             report.after_bytes = report.before_bytes;
             return Ok(report);
-        };
-        let refs = tip.refs.clone();
-        let end = store.written();
-        let pinned = self.pins.lock().roots();
-        drop(tip);
-        let current = Roots::of(head, &refs)?;
-        let mut marks = Marks::new(end);
-        let block = store.block_bytes()?;
-        let mut found = marks.walk(store, &current, stop)?;
-        found.extend(marks.walk(store, &pinned, stop)?);
-        self.step("marked");
-        marks.plan(found, self.reclaim.fill, block);
-        let mut moved = mem::take(&mut marks.moved);
-        moved.sort_unstable_by_key(|extent| extent.place);
-        let bytes = moved.iter().map(|extent| u64::from(extent.len)).sum::<u64>();
-        report.moved_bytes = bytes;
-        if bytes > 0 {
-            let mut tip = self.tip.lock();
-            let start = self.gap(&mut tip, bytes)?;
-            drop(tip);
-            reclaim::copy_to(store, &mut moved, start, stop)?;
         }
-        marks.moved = moved;
+        let temp = sibling(&self.path);
+        let mut copier = Copier::create(store, &temp, &self.options, stop)?;
+        self.step("created");
+        for _ in 0..MAX_PASSES {
+            let copied = copier.pass(&refs)?;
+            report.passes += 1;
+            refs = self.published.lock().refs.clone();
+            if copied < QUIET_BYTES {
+                break;
+            }
+        }
         self.step("copied");
-        let extras = marks.rescan(store)?;
-        if !extras.is_empty() {
-            self.relocate(&mut marks, extras, &mut report)?;
-        }
-        store.sync_data()?;
-        let pairs = marks.places();
-        let mut table = self.write_table(&pairs, None)?;
-        let mut places = Places::new(Moved::default(), pairs);
-        let mut live = marks.live_bytes();
-        self.settle(store.last_seq())?;
-        store.sync_data()?;
-        self.step("tabled");
+        copier.sync()?;
+        self.step("synced");
         let paused = Instant::now();
         let mut tip = self.tip.lock();
-        let extras = marks.rescan(store)?;
-        if !extras.is_empty() {
-            self.relocate_locked(&mut tip, &mut marks, extras, &mut report)?;
-            let pairs = marks.places();
-            table = self.write_table(&pairs, Some(&mut tip))?;
-            places = Places::new(Moved::default(), pairs);
-            live = marks.live_bytes();
-        }
-        let head = tip.ptr.ok_or(Error::Detached)?;
-        let frame = store.begin()?.write(head)?;
-        let refs = tip.clone();
-        self.queue.lock().waiting.push(Pending {
-            frame,
-            refs,
-            update: None,
-        });
-        self.settle(frame.seq)?;
-        let before = store.places().moved;
-        let grown = live.saturating_sub(before.live) as f64;
-        places.moved = Moved {
-            floor: end,
-            table: Some(table),
-            live,
-            survival: (grown / (end - before.floor).max(1) as f64 * SURVIVAL_ONE) as u64,
+        self.settle(store.last_seq())?;
+        let basis = store.basis();
+        let (head, objects) = {
+            let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
+            let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
+            copier.finish(&tip.refs, store.last_seq(), survival)?
         };
-        store.publish(frame, places)?;
+        let (fresh, _) = Store::open_as(&temp, &self.path, self.options.clone())?;
+        fs::rename(&temp, &self.path)?;
+        fresh.trace_rename();
+        if let Err(error) = sync_parent(&self.path) {
+            store.poison();
+            return Err(error.into());
+        }
+        fresh.trace(Op::SyncDir);
+        let swapped = self.swap_in(&mut tip, &fresh, head);
+        swapped.inspect_err(|_| {
+            store.poison();
+            fresh.poison();
+        })?;
+        self.signal.base.store(fresh.size(), Ordering::Relaxed);
         drop(tip);
         report.pause = paused.elapsed();
-        report.objects = marks.objects();
-        report.live_bytes = live;
-        self.step("published");
-        self.signal.threshold.store(live, Ordering::Relaxed);
-        report.punched_bytes = marks.punch(store, stop)?;
-        self.step("punched");
-        report.after_bytes = store.allocated()?;
+        self.step("swapped");
+        report.after_bytes = fresh.size();
+        report.objects = objects;
+        let mut retired = self.retired.lock();
+        retired.retain(|old| old.bytes().is_some());
+        retired.push(store.retired());
+        drop(retired);
+        store.close();
+        self.step("retired");
         Ok(report)
     }
 
-    fn relocate(
-        &self,
-        marks: &mut Marks,
-        extras: Vec<reclaim::Extent>,
-        report: &mut Compacted,
-    ) -> Result<()> {
-        let mut tip = self.tip.lock();
-        self.relocate_locked(&mut tip, marks, extras, report)
-    }
-
-    fn relocate_locked(
-        &self,
-        tip: &mut RefState,
-        marks: &mut Marks,
-        mut extras: Vec<reclaim::Extent>,
-        report: &mut Compacted,
-    ) -> Result<()> {
-        let bytes = extras.iter().map(|extent| u64::from(extent.len)).sum::<u64>();
-        report.moved_bytes += bytes;
-        let start = self.gap(tip, bytes)?;
-        reclaim::copy_to(&self.store, &mut extras, start, None)?;
-        marks.moved.append(&mut extras);
+    fn swap_in(&self, tip: &mut RefState, fresh: &Store, head: Ptr) -> Result<()> {
+        let refs = (*fresh.load::<Refs>(head)?).clone();
+        let mut published = self.published.lock();
+        let branches = self.branches.lock();
+        let mut states = Vec::new();
+        for branch in branches.values() {
+            let found = refs.try_get(&branch.name)?;
+            states.push((branch, Arc::new(self.state_of(fresh, found.as_deref())?)));
+        }
+        tip.refs = refs;
+        tip.ptr = Some(head);
+        self.store.store(Arc::new(fresh.clone()));
+        *published = tip.clone();
+        for (branch, state) in states {
+            branch.feed.rebind(state.snapshot.clone());
+            branch.tip.store(state.clone());
+            branch.state.store(state);
+        }
         Ok(())
     }
 }
@@ -898,28 +810,31 @@ impl<T: Data> Db<T> {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.shared.store.path().to_path_buf()
+        self.shared.path.clone()
     }
 
     pub fn size_on_disk(&self) -> u64 {
-        self.shared.store.on_disk()
+        self.shared.store().size()
     }
 
     pub fn space(&self) -> Result<Space> {
-        let store = &self.shared.store;
-        let log_bytes = store.size();
-        let moved = store.places().moved;
-        let live_bytes = if moved.floor == 0 {
-            log_bytes
+        let store = self.shared.store();
+        let file_bytes = store.size();
+        let basis = store.basis();
+        let live_bytes = if basis.bytes == 0 {
+            file_bytes
         } else {
-            let survived = moved.survival as f64 / SURVIVAL_ONE;
-            moved.live + (log_bytes.saturating_sub(moved.floor) as f64 * survived) as u64
+            let grown = file_bytes.saturating_sub(basis.bytes) as f64;
+            basis.bytes + (grown * basis.survival()) as u64
         };
+        let retired = self.shared.retired.lock();
+        let retired_bytes = retired.iter().filter_map(Retired::bytes).sum();
+        drop(retired);
         let log = self.shared.log.lock();
         Ok(Space {
-            log_bytes,
-            allocated_bytes: store.allocated()?,
+            file_bytes,
             live_bytes,
+            retired_bytes,
             cycles: log.cycles,
             longest_pause: log.longest_pause,
             last_error: log.last_error.clone(),
@@ -931,13 +846,8 @@ impl<T: Data> Db<T> {
     }
 
     #[doc(hidden)]
-    pub fn size_log(&self) -> u64 {
-        self.shared.store.size()
-    }
-
-    #[doc(hidden)]
-    pub fn trace_op(&self, op: crate::store::Op) {
-        self.shared.store.trace(op);
+    pub fn trace_op(&self, op: Op) {
+        self.shared.store().trace(op);
     }
 
     pub fn branch_name(&self) -> &str {
@@ -957,21 +867,10 @@ impl<T: Data> Db<T> {
     }
 
     pub fn log(&self) -> Log {
-        let (chain, pin) = self.pinned_chain();
+        let state = self.branch.state.load();
         Log {
-            chain,
-            store: self.shared.store.clone(),
-            pin,
-        }
-    }
-
-    fn pinned_chain(&self) -> (Chain, Arc<Held>) {
-        loop {
-            let chain = self.branch.state.load().log;
-            let pin = self.shared.hold(self.shared.plain.clone(), Some(chain));
-            if self.branch.state.load().log.first <= chain.first {
-                return (chain, pin);
-            }
+            chain: state.log,
+            store: state.store.clone(),
         }
     }
 
@@ -1041,7 +940,7 @@ impl<T: Data> Db<T> {
             let version = self.commit_locked(&mut tip, &state, message, intent, &working)?;
             Ok((value, version))
         });
-        let ticket = self.shared.store.last_seq();
+        let ticket = self.shared.store().last_seq();
         drop(tip);
         self.shared.settle(ticket)?;
         let (value, version) = result?;
@@ -1060,7 +959,7 @@ impl<T: Data> Db<T> {
         intent: Intent<T>,
         working: &T,
     ) -> Result<u64> {
-        let store = &self.shared.store;
+        let store = &self.shared.store();
         let mut txn = store.begin()?;
         let root = write_root(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
@@ -1112,37 +1011,31 @@ impl<T: Data> Db<T> {
         if version == 0 {
             return Ok(Snapshot {
                 value: self.shared.genesis.clone(),
-                commit: self.shared.hold(self.shared.plain.clone(), None),
+                commit: Arc::new(Commit::genesis()),
             });
         }
-        let chain = self.branch.state.load().log;
-        let entry = match chain.get(&self.shared.store, version) {
-            Err(Error::Pruned(_)) => return Err(Error::NoVersion(version)),
-            found => found?.ok_or(Error::NoVersion(version))?,
-        };
-        self.snapshot_of(&entry.commit)
+        let state = self.branch.state.load_full();
+        let entry = state
+            .log
+            .get(&state.store, version)?
+            .ok_or(Error::NoVersion(version))?;
+        Self::snapshot_of(&state.store, &entry.commit)
     }
 
-    fn snapshot_of(&self, commit: &Arc<Commit>) -> Result<Snapshot<T>> {
+    fn snapshot_of(store: &Store, commit: &Arc<Commit>) -> Result<Snapshot<T>> {
         let root = commit.root.ok_or(Error::NoVersion(commit.version))?;
-        let held = self.shared.hold(commit.clone(), None);
-        if commit.version < self.branch.state.load().log.first {
-            return Err(Error::NoVersion(commit.version));
-        }
         Ok(Snapshot {
-            value: self.shared.store.load::<T>(root)?,
-            commit: held,
+            value: store.load::<T>(root)?,
+            commit: commit.clone(),
         })
     }
 
     pub fn as_of(&self, time_ms: u64) -> Result<Snapshot<T>> {
-        let chain = self.branch.state.load().log;
-        match chain.at_time(&self.shared.store, time_ms) {
-            Ok(Some(entry)) => self.snapshot_of(&entry.commit),
-            Ok(None) if chain.first > 1 => Err(Error::NoVersion(chain.first - 1)),
-            Ok(None) => self.at(0),
-            Err(Error::Pruned(_)) => Err(Error::NoVersion(chain.first.saturating_sub(1))),
-            Err(error) => Err(error),
+        let state = self.branch.state.load_full();
+        match state.log.at_time(&state.store, time_ms)? {
+            Some(entry) => Self::snapshot_of(&state.store, &entry.commit),
+            None if state.log.first > 1 => Err(Error::NoVersion(state.log.first - 1)),
+            None => self.at(0),
         }
     }
 
@@ -1173,9 +1066,9 @@ impl<T: Data> Db<T> {
         V: PartialEq,
         F: Fn(&T) -> V,
     {
-        let (chain, pin) = self.pinned_chain();
-        let genesis = (chain.first == 1).then(|| self.shared.genesis.clone());
-        History::new(chain.walk(&self.shared.store), self.shared.store.clone(), genesis, project, pin)
+        let state = self.branch.state.load();
+        let genesis = (state.log.first == 1).then(|| self.shared.genesis.clone());
+        History::new(state.log.walk(&state.store), state.store.clone(), genesis, project)
     }
 
     pub fn merge_with<R, S: Into<String>>(
@@ -1220,15 +1113,15 @@ impl<T: Data> Db<T> {
             (Some((snapshot, _)), None) | (None, Some((snapshot, _))) => return Ok(snapshot),
             (None, None) => {}
         }
-        let (ours, theirs) = (self.branch.state.load().log, other.branch.state.load().log);
-        if ours.tip.is_none() || theirs.tip.is_none() {
+        let (ours, theirs) = (self.branch.state.load_full(), other.branch.state.load_full());
+        if ours.log.tip.is_none() || theirs.log.tip.is_none() {
             return self.at(0);
         }
-        let start = ours.first.max(theirs.first);
+        let start = ours.log.first.max(theirs.log.first);
         let same = |version: &u64| -> Result<bool> {
             let (a, b) = (
-                ours.get(&self.shared.store, *version)?,
-                theirs.get(&other.shared.store, *version)?,
+                ours.log.get(&ours.store, *version)?,
+                theirs.log.get(&theirs.store, *version)?,
             );
             Ok(matches!((a, b), (Some(a), Some(b)) if a.commit == b.commit))
         };
@@ -1278,9 +1171,10 @@ impl<T: Data> Db<T> {
                 merged,
             },
         );
-        let txn = self.shared.store.begin()?;
+        let store = self.shared.store();
+        let txn = store.begin()?;
         self.shared.stage(&mut tip, next, txn, None)?;
-        let ticket = self.shared.store.last_seq();
+        let ticket = store.last_seq();
         drop(tip);
         self.shared.settle(ticket)?;
         self.branch(name)
@@ -1304,7 +1198,8 @@ impl<T: Data> Db<T> {
         if tip.refs.try_get(name)?.is_none() {
             return Err(Error::NoBranch(name.to_string()));
         }
-        let txn = self.shared.store.begin()?;
+        let store = self.shared.store();
+        let txn = store.begin()?;
         let mut next = tip.refs.clone();
         next.remove(name);
         let branches: Vec<_> = next.iter().collect();
@@ -1316,7 +1211,7 @@ impl<T: Data> Db<T> {
             }
         }
         self.shared.stage(&mut tip, next, txn, None)?;
-        let ticket = self.shared.store.last_seq();
+        let ticket = store.last_seq();
         self.shared.settle(ticket)?;
         let published = self.shared.published.lock();
         let retired = self.shared.branches.lock().remove(name);
@@ -1343,31 +1238,35 @@ impl<T: Data> Db<T> {
     }
 
     pub fn refresh(&self) -> Result<bool> {
-        if !self.shared.store.is_read_only() {
+        if !self.shared.options.read_only {
             return Ok(false);
         }
-        let mut last = Ok(false);
-        for _ in 0..READ_RETRIES {
-            last = self.refresh_once();
-            if !matches!(last, Err(Error::Pruned(_))) {
-                break;
-            }
-        }
-        last
-    }
-
-    fn refresh_once(&self) -> Result<bool> {
         let mut tip = self.shared.tip.lock();
-        let head = self.shared.store.refresh()?;
-        if head == tip.ptr {
+        let current = self.shared.store();
+        let (store, head) = match current.refresh() {
+            Err(Error::Replaced) => {
+                Store::open(&self.shared.path, self.shared.options.clone())?
+            }
+            other => (current.clone(), other?),
+        };
+        let replaced = store.id() != current.id();
+        if !replaced && head == tip.ptr {
             return Ok(false);
         }
         let Some(ptr) = head else {
             return Ok(false);
         };
-        tip.refs = (*self.shared.store.load::<Refs>(ptr)?).clone();
+        tip.refs = (*store.load::<Refs>(ptr)?).clone();
         tip.ptr = Some(ptr);
-        *self.shared.published.lock() = tip.clone();
+        let mut published = self.shared.published.lock();
+        if replaced {
+            self.shared.store.store(Arc::new(store.clone()));
+        }
+        *published = tip.clone();
+        drop(published);
+        if replaced {
+            current.close();
+        }
         let mut branches = self.shared.branches.lock();
         let mut gone = Vec::new();
         for branch in branches.values() {
@@ -1376,9 +1275,10 @@ impl<T: Data> Db<T> {
                 gone.push(branch.name.clone());
                 continue;
             }
-            let state = Arc::new(self.shared.state_of(head.as_deref())?);
+            let state = Arc::new(self.shared.state_of(&store, head.as_deref())?);
             branch.tip.store(state.clone());
             if state.snapshot.commit == branch.state.load().snapshot.commit {
+                branch.feed.rebind(state.snapshot.clone());
                 branch.state.store(state);
             } else {
                 branch.publish(state);
@@ -1393,15 +1293,11 @@ impl<T: Data> Db<T> {
     }
 
     pub fn verify(&self) -> Result<Verified> {
-        let mut last = Ok(Verified::default());
-        for _ in 0..READ_RETRIES {
-            let head = self.shared.published.lock().ptr;
-            last = crate::admin::verified(&self.shared.store, head);
-            if !matches!(last, Err(Error::Pruned(_))) {
-                break;
-            }
-        }
-        last
+        let (head, store) = {
+            let published = self.shared.published.lock();
+            (published.ptr, self.shared.store())
+        };
+        crate::admin::verified(&store, head)
     }
 }
 

@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::admin::{self, Layout};
-use ferro::{Compacted, Data, Db, Durability, Keep, Map, Options, Reclaim, Record, Table};
+use ferro::{Compacted, Data, Db, Durability, Keep, Options, Reclaim, Record, Table};
 use ledger::Ledger;
 use ledger::ops::NewEntry;
 use metrics::load::{self, LoadOptions, synthetic_series};
@@ -324,17 +324,17 @@ fn drive<T: Data>(
                 let mut live = 0;
                 while !stop.load(Ordering::Relaxed) {
                     let space = db.space().unwrap();
-                    last = last.min(space.log_bytes);
+                    last = last.min(space.file_bytes);
                     let goal = run.every.max(live);
-                    if space.log_bytes.saturating_sub(last) < goal {
+                    if space.file_bytes.saturating_sub(last) < goal {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
                     let began = Instant::now();
                     let done = db.compact(Keep::Last(run.keep)).unwrap();
                     *cycle_secs.lock().unwrap() += began.elapsed().as_secs_f64();
-                    live = done.live_bytes;
-                    last = db.space().unwrap().log_bytes;
+                    live = done.after_bytes;
+                    last = done.after_bytes;
                     cycles.lock().unwrap().push(done);
                 }
             });
@@ -348,8 +348,8 @@ fn drive<T: Data>(
                 let extra = std::fs::metadata(&temp).map_or(0, |meta| meta.len());
                 samples.lock().unwrap().push((
                     start.elapsed().as_secs_f64(),
-                    space.allocated_bytes + extra,
-                    space.log_bytes,
+                    space.file_bytes + space.retired_bytes + extra,
+                    space.file_bytes,
                 ));
                 thread::sleep(Duration::from_millis(50));
             }
@@ -380,12 +380,12 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     let lat = &outcome.latencies;
     let reads = &outcome.read_latencies;
     let pauses: Vec<f64> = outcome.cycles.iter().map(|c| c.pause.as_secs_f64() * 1e3).collect();
-    let moved: u64 = outcome.cycles.iter().map(|c| c.moved_bytes).sum();
+    let moved: u64 = outcome.cycles.iter().map(|c| c.after_bytes).sum();
     let ratios: Vec<f64> = outcome
         .cycles
         .iter()
         .map(|c| {
-            let garbage = c.before_bytes.saturating_sub(c.live_bytes).max(1);
+            let garbage = c.before_bytes.saturating_sub(c.after_bytes).max(1);
             c.before_bytes.saturating_sub(c.after_bytes) as f64 / garbage as f64
         })
         .collect();
@@ -394,8 +394,9 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     let peak = outcome.samples.iter().map(|s| s.1).max().unwrap_or(0);
     let space = db.space().unwrap();
     let verified = db.verify().unwrap();
-    let garbage = space.log_bytes.saturating_sub(verified.bytes).max(1);
-    let reclaimed = space.log_bytes.saturating_sub(space.allocated_bytes);
+    let written = outcome.cycles.iter().map(|c| c.before_bytes).sum::<u64>() + space.file_bytes;
+    let garbage = written.saturating_sub(verified.bytes).max(1);
+    let reclaimed = written.saturating_sub(space.file_bytes);
     println!(
         "{name} fill={} keep={} commits/s={:.0} p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms cycles={} cycle_secs={:.2} pause_max={:.2}ms pause_sum={:.1}ms moved={:.1}MiB log={:.1}MiB peak={:.1}MiB alloc={:.1}MiB live={:.1}MiB reclaim={:.1}% cycle_ratio={:.1}% after_cycle={:.1}MiB reads/s={:.0} read_p50={:.2}us read_p99={:.2}us read_p999={:.1}us read_max={:.0}us",
         run.fill,
@@ -410,9 +411,9 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
         pauses.iter().copied().fold(0.0, f64::max),
         pauses.iter().sum::<f64>(),
         mib(moved),
-        mib(space.log_bytes),
+        mib(space.file_bytes),
         mib(peak),
-        mib(space.allocated_bytes),
+        mib(space.file_bytes + space.retired_bytes),
         mib(verified.bytes),
         100.0 * reclaimed as f64 / garbage as f64,
         100.0 * ratio,
@@ -440,10 +441,7 @@ fn open_options(run: &Run) -> Options {
         .durability(durability)
         .cache_bytes(1 << 28)
         .history(Keep::Last(run.keep))
-        .reclaim(Reclaim {
-            every_bytes: 0,
-            fill: run.fill,
-        })
+        .reclaim(Reclaim { every_bytes: 0 })
 }
 
 fn run_metrics(path: &Path, run: &Run) {
@@ -534,83 +532,6 @@ fn run_table(path: &Path, run: &Run) {
     report("table", &db, run, outcome);
 }
 
-fn cost_build(path: &Path, keys: u64) {
-    let db: Db<Map<u64, String>> = fast().open(path).unwrap();
-    db.update(|root| {
-        root.extend((0..keys).map(|i| (mix(i), format!("value {i}"))));
-    })
-    .unwrap();
-    for i in 0..2000 {
-        db.update(|root| {
-            root.insert(mix(i), format!("again {i}"));
-        })
-        .unwrap();
-    }
-}
-
-fn cost_open(path: &Path) -> Db<Map<u64, String>> {
-    Options::new()
-        .durability(Durability::Buffered)
-        .cache_bytes(1 << 20)
-        .reclaim(Reclaim {
-            every_bytes: 0,
-            fill: 2.0,
-        })
-        .open(path)
-        .unwrap()
-}
-
-fn cost(args: &[String]) {
-    let keys: u64 = args.get(3).map_or(1_000_000, |text| text.parse().unwrap());
-    let plain = Path::new(&args[2]).with_extension("plain");
-    let moved = Path::new(&args[2]).with_extension("moved");
-    cost_build(&plain, keys);
-    cost_build(&moved, keys);
-    let plain_db = cost_open(&plain);
-    let moved_db = cost_open(&moved);
-    let done = moved_db.compact(Keep::Last(1)).unwrap();
-    println!("cycle {done:?}");
-    let mut totals = [[0.0f64; 2]; 2];
-    let rounds = 7;
-    for round in 0..rounds {
-        for (index, db) in [&plain_db, &moved_db].into_iter().enumerate() {
-            let snapshot = db.read();
-            let started = Instant::now();
-            let gets = 300_000;
-            for i in 0..gets {
-                std::hint::black_box(snapshot.get(&mix((i + round * 7919) % keys)));
-            }
-            let get_ns = started.elapsed().as_secs_f64() * 1e9 / gets as f64;
-            drop(snapshot);
-            let started = Instant::now();
-            let commits = 5000;
-            for i in 0..commits {
-                db.update(|root| {
-                    root.insert(mix(i * 3 % keys), format!("commit {round} {i}"));
-                })
-                .unwrap();
-            }
-            let commit_us = started.elapsed().as_secs_f64() * 1e6 / commits as f64;
-            println!("round {round} {} get {get_ns:.0} ns, buffered commit {commit_us:.1} us", ["plain", "moved"][index]);
-            if round > 0 {
-                totals[index][0] += get_ns;
-                totals[index][1] += commit_us;
-            }
-        }
-    }
-    let scale = (rounds - 1) as f64;
-    println!(
-        "mean plain get {:.0} ns commit {:.1} us; moved get {:.0} ns commit {:.1} us",
-        totals[0][0] / scale,
-        totals[0][1] / scale,
-        totals[1][0] / scale,
-        totals[1][1] / scale
-    );
-    drop((plain_db, moved_db));
-    let _ = std::fs::remove_file(plain);
-    let _ = std::fs::remove_file(moved);
-}
-
 fn live(args: &[String]) {
     let (workload, path) = (args[2].as_str(), Path::new(&args[3]));
     let number = |index: usize, default: f64| -> f64 {
@@ -640,10 +561,7 @@ fn main() {
         live(&args);
         return;
     }
-    if args[1] == "cost" {
-        cost(&args);
-        return;
-    }
+
     let command = args[1].as_str();
     let path = Path::new(&args[2]);
     let number = |index: usize, default: u64| -> u64 {

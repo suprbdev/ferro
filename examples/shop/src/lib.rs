@@ -48,7 +48,6 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
         _ if config.replica => options.read_only(),
         Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {
             every_bytes: config.reclaim_bytes,
-            ..Reclaim::default()
         }),
         None => options,
     };
@@ -68,9 +67,6 @@ pub fn build(db: Db<Shop>, config: &Config) -> Arc<App> {
                     std::thread::sleep(pause);
                     if let Err(error) = db.refresh() {
                         eprintln!("refresh failed: {error}");
-                        if matches!(error, ferro::Error::Replaced) {
-                            return;
-                        }
                     }
                 }
             })

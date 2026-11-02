@@ -32,12 +32,10 @@ pub enum Error {
     ReadOnly,
     #[error("database file was replaced by compaction; reopen it")]
     Replaced,
-    #[error("a previous commit failed; reopen the database to recover")]
-    Poisoned,
-    #[error("object at offset {0} belongs to a pruned version and was reclaimed")]
-    Pruned(u64),
     #[error("reclamation was interrupted by shutdown")]
     Interrupted,
+    #[error("a previous commit failed; reopen the database to recover")]
+    Poisoned,
     #[error("object of {0} bytes exceeds the 4 GiB limit")]
     TooLarge(u64),
 }
