@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use ferro::admin::{self, Keep};
 use ferro::{Durability, Result};
 
-use crate::model::{SeriesKey, now_ms};
+use crate::model::{SeriesKey, SeriesRef, now_ms};
 use crate::tsdb::{Batch, Tsdb};
 
 const METRICS: [&str; 10] = [
@@ -21,22 +21,22 @@ const METRICS: [&str; 10] = [
     "temperature_celsius",
 ];
 
-pub fn synthetic_series(count: usize) -> Vec<SeriesKey> {
+pub fn synthetic_series(count: usize) -> Vec<SeriesRef> {
     (0..count)
         .map(|i| {
-            SeriesKey::new(
+            SeriesRef::new(SeriesKey::new(
                 METRICS[i % METRICS.len()].to_string(),
                 vec![
                     ("host".to_string(), format!("h{}", i / 100)),
                     ("region".to_string(), format!("r{}", (i / 10) % 10)),
                 ],
-            )
+            ))
         })
         .collect()
 }
 
-fn is_counter(key: &SeriesKey) -> bool {
-    key.metric.ends_with("_total")
+fn is_counter(key: &SeriesRef) -> bool {
+    key.0.metric.ends_with("_total")
 }
 
 struct Rng(u64);
@@ -51,7 +51,7 @@ impl Rng {
 }
 
 struct Worker {
-    keys: Vec<SeriesKey>,
+    keys: Vec<SeriesRef>,
     values: Vec<f64>,
     counter: Vec<bool>,
     emitted: u64,
@@ -59,7 +59,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn point(&mut self) -> (SeriesKey, usize) {
+    fn point(&mut self) -> (SeriesRef, usize) {
         let index = (self.emitted % self.keys.len() as u64) as usize;
         let step = self.rng.next() % 100;
         if self.counter[index] {
@@ -156,7 +156,7 @@ fn run_epoch(
                             let scrape = worker.emitted / worker.keys.len() as u64;
                             let (key, index) = worker.point();
                             let ts = options.start_ts + scrape * options.interval_ms;
-                            batch.push(key, ts, worker.values[index]);
+                            batch.push(&key, ts, worker.values[index]);
                         }
                         let written = writer.write(batch)?;
                         lat.push(written.commit.as_secs_f64() * 1000.0);
@@ -184,7 +184,7 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
     let threads = options.threads.max(1).min(all.len().max(1));
     let mut workers: Vec<Worker> = (0..threads)
         .map(|t| {
-            let keys: Vec<SeriesKey> = all.iter().skip(t).step_by(threads).cloned().collect();
+            let keys: Vec<SeriesRef> = all.iter().skip(t).step_by(threads).cloned().collect();
             Worker {
                 counter: keys.iter().map(is_counter).collect(),
                 values: vec![100.0; keys.len()],
@@ -202,7 +202,7 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
             let mut batch = Batch::default();
             for _ in 0..worker.keys.len() {
                 let (key, index) = worker.point();
-                batch.push(key, options.start_ts, worker.values[index]);
+                batch.push(&key, options.start_ts, worker.values[index]);
             }
             writer.write(batch)?;
         }

@@ -2,7 +2,7 @@ mod cli;
 
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -53,9 +53,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             no_sync,
             strict,
         } => {
-            let input: Box<dyn BufRead + Send> = match file {
-                Some(file) => Box::new(BufReader::with_capacity(1 << 20, File::open(file)?)),
-                None => Box::new(BufReader::with_capacity(1 << 20, io::stdin())),
+            let input: Box<dyn Read + Send> = match file {
+                Some(file) => Box::new(File::open(file)?),
+                None => Box::new(io::stdin()),
             };
             let tsdb = Tsdb::open(path, durability(no_sync))?;
             let mut writer = tsdb.writer();
@@ -73,13 +73,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             let secs = report.elapsed.as_secs_f64().max(1e-9);
             writeln!(
                 out,
-                "ingested {} points in {} commits ({} new series), rejected {} lines, {:.2}s, {:.0} points/s",
+                "ingested {} points in {} commits ({} new series), rejected {} lines, {:.2}s, {:.0} points/s, {:.2}s in commits",
                 report.points,
                 report.commits,
                 report.new_series,
                 report.rejected,
                 secs,
-                report.points as f64 / secs
+                report.points as f64 / secs,
+                report.commit_time.as_secs_f64()
             )?;
             if strict && report.rejected > 0 {
                 return Err(format!("{} lines rejected", report.rejected).into());

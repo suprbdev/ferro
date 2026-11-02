@@ -1,11 +1,12 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferro::{Data, Map, Record, Table};
 
 use crate::chunk::Chunk;
 
-pub const BUCKET_MS: u64 = 3_600_000;
+pub const BUCKET_MS: u64 = 600_000;
 
 pub fn bucket_of(ts: u64) -> u64 {
     ts / BUCKET_MS * BUCKET_MS
@@ -75,6 +76,29 @@ impl SeriesKey {
 
     pub fn canonical(&self) -> String {
         self.to_string()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SeriesRef(pub Arc<SeriesKey>);
+
+impl SeriesRef {
+    pub fn new(key: SeriesKey) -> SeriesRef {
+        SeriesRef(Arc::new(key))
+    }
+}
+
+impl PartialEq for SeriesRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SeriesRef {}
+
+impl std::hash::Hash for SeriesRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
     }
 }
 

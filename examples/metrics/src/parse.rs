@@ -133,7 +133,16 @@ pub fn parse_line(line: &str) -> Result<Option<Sample>, String> {
             }
         }
     }
-    let mut fields = cur.rest().split_whitespace();
+    let (value, ts) = parse_tail(cur.rest())?;
+    Ok(Some(Sample {
+        key: SeriesKey::new(metric.to_string(), labels),
+        ts,
+        value,
+    }))
+}
+
+pub fn parse_tail(rest: &str) -> Result<(f64, Option<u64>), String> {
+    let mut fields = rest.split_whitespace();
     let value = parse_value(fields.next().ok_or("missing value")?)?;
     let ts = match fields.next() {
         Some(token) => Some(
@@ -146,11 +155,34 @@ pub fn parse_line(line: &str) -> Result<Option<Sample>, String> {
     if fields.next().is_some() {
         return Err("trailing input".to_string());
     }
-    Ok(Some(Sample {
-        key: SeriesKey::new(metric.to_string(), labels),
-        ts,
-        value,
-    }))
+    Ok((value, ts))
+}
+
+pub fn split_series(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    let mut quoted = false;
+    let mut braced = false;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if quoted {
+            match byte {
+                b'\\' => at += 1,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'{' => braced = true,
+                b'}' => return Some(line.split_at(at + 1)),
+                b' ' | b'\t' if !braced => return Some(line.split_at(at)),
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

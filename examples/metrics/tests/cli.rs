@@ -83,6 +83,19 @@ fn ingest_reports_and_rejects_bad_lines() {
 }
 
 #[test]
+fn ingest_unifies_label_order_and_repeated_series() {
+    let env = Env::new();
+    env.ingest_text(
+        "m{a=\"1\",b=\"x}y\"} 1 1000\nm{b=\"x}y\",a=\"1\"} 2 2000\nm{a=\"1\",b=\"x}y\"} 3 3000\n",
+    );
+    assert_eq!(env.ok(&["series", "--count"]).trim(), "1");
+    assert_eq!(env.lines(&["query", "m"]).len(), 3);
+    let out = env.ingest_text("m{a=\"1\",b=\"x}y\"} 4 4000\nm{a=\"1\",b=\"x}y\"} nope 5000\n");
+    assert!(out.contains("ingested 1 points"), "{out}");
+    assert!(out.contains("rejected 1 lines"), "{out}");
+}
+
+#[test]
 fn ingest_strict_fails_on_bad_line() {
     let env = Env::new();
     let path = env.dir.path().join("bad.txt");
@@ -462,7 +475,7 @@ fn retain_drops_old_points_and_shrinks_file() {
     let size_before = std::fs::metadata(&env.db).unwrap().len();
     let now = (T0 + 6 * HOUR).to_string();
     let out = env.ok(&["retain", "--older-than", "3h", "--now", &now]);
-    assert!(out.contains("dropped 36 points in 3 partitions"), "{out}");
+    assert!(out.contains("dropped 36 points in 18 partitions"), "{out}");
     assert!(out.contains("compacted"), "{out}");
     let size_after = std::fs::metadata(&env.db).unwrap().len();
     assert!(size_after < size_before, "{size_after} < {size_before}");

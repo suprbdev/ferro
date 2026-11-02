@@ -7,7 +7,7 @@ use ferro::table::IndexIter;
 use ferro::{Db, Durability, Error, Map, Options, Result, Snapshot};
 
 use crate::chunk::{Chunk, merge_points};
-use crate::model::{BUCKET_MS, Metrics, Rollup, SeriesKey, SeriesRec, bucket_of};
+use crate::model::{BUCKET_MS, Metrics, Rollup, SeriesKey, SeriesRec, SeriesRef, bucket_of};
 use crate::parse::{Op, Selector};
 
 pub struct Tsdb {
@@ -39,17 +39,17 @@ impl Tsdb {
 
 #[derive(Default)]
 pub struct Batch {
-    groups: HashMap<SeriesKey, Vec<(u64, f64)>>,
+    groups: HashMap<SeriesRef, Vec<(u64, f64)>>,
     points: usize,
 }
 
 impl Batch {
-    pub fn push(&mut self, key: SeriesKey, ts: u64, value: f64) {
+    pub fn push(&mut self, key: &SeriesRef, ts: u64, value: f64) {
         self.points += 1;
-        match self.groups.get_mut(&key) {
+        match self.groups.get_mut(key) {
             Some(points) => points.push((ts, value)),
             None => {
-                self.groups.insert(key, vec![(ts, value)]);
+                self.groups.insert(key.clone(), vec![(ts, value)]);
             }
         }
     }
@@ -72,7 +72,7 @@ pub struct Written {
 
 pub struct Writer {
     db: Db<Metrics>,
-    cache: HashMap<SeriesKey, u64>,
+    cache: HashMap<SeriesRef, u64>,
 }
 
 type Work = (u64, u64, Vec<(u64, f64)>);
@@ -111,7 +111,7 @@ impl Writer {
                 let sid = match cache.get(&key) {
                     Some(id) => *id,
                     None => {
-                        let id = register(m, &key);
+                        let id = register(m, &key.0);
                         learned.push((key, id));
                         id
                     }
