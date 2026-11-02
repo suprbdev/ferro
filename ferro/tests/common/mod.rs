@@ -58,9 +58,7 @@ pub fn level_of<K: Data>(key: &K) -> u32 {
     let mut sink = HashSink;
     let mut encoder = Encoder::new(&mut sink);
     key.encode(&mut encoder).unwrap();
-    let hash = blake3::hash(encoder.bytes());
-    let word = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
-    word.trailing_zeros() / 4
+    xxhash_rust::xxh3::xxh3_64(encoder.bytes()).trailing_zeros() / 3
 }
 
 pub fn fast() -> Options {

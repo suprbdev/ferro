@@ -94,9 +94,9 @@ impl<T: Record> Table<T> {
 
     pub fn insert(&mut self, row: T) -> Option<Arc<T>> {
         let key = row.key();
-        let old = self.0.rows().get(&key);
+        let row = Arc::new(row);
+        let old = self.0.rows_mut().insert_shared(key, row.clone());
         self.0.reindex(old.as_deref(), Some(&row));
-        self.0.rows_mut().insert(key, row);
         old
     }
 

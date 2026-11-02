@@ -307,7 +307,11 @@ fn insert_at<K: Data + Ord, V: Data>(
     level: u8,
     value: Arc<V>,
 ) -> Result<Option<Slot<V>>> {
-    let Some(current) = load(store, link)? else {
+    if let Link::Stored { .. } = link {
+        let node = load(store, link)?.ok_or(Error::Detached)?;
+        *link = Link::Mem(node);
+    }
+    let Link::Mem(current) = &*link else {
         *link = link_from(
             level,
             vec![key],
@@ -317,12 +321,10 @@ fn insert_at<K: Data + Ord, V: Data>(
         return Ok(None);
     };
     if level > current.level {
-        drop(current);
         let (left, right) = split(store, link.take(), &key)?;
         *link = link_from(level, vec![key], vec![Slot::Fresh(value)], vec![left, right]);
         return Ok(None);
     }
-    drop(current);
     let node = node_mut(store, link)?;
     match node.search(&key) {
         Ok(index) => Ok(Some(std::mem::replace(
@@ -675,8 +677,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         if !self.contains_key(key) {
             return None;
         }
-        let store = self.store.clone();
-        fatal(find_mut(store.as_ref(), &mut self.root, key))
+        fatal(find_mut(self.store.as_ref(), &mut self.root, key))
     }
 
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
@@ -701,16 +702,14 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<Arc<V>> {
-        let store = self.store.clone();
+        self.insert_shared(key, Arc::new(value))
+    }
+
+    pub(crate) fn insert_shared(&mut self, key: K, value: Arc<V>) -> Option<Arc<V>> {
         let level = fatal(level_of(&key));
-        let replaced = fatal(insert_at(
-            store.as_ref(),
-            &mut self.root,
-            key,
-            level,
-            Arc::new(value),
-        ));
-        replaced.map(|slot| fatal(read_slot(store.as_ref(), &slot)))
+        let store = self.store.as_ref();
+        let replaced = fatal(insert_at(store, &mut self.root, key, level, value));
+        replaced.map(|slot| fatal(read_slot(store, &slot)))
     }
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<Arc<V>>
@@ -721,9 +720,9 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         if !self.contains_key(key) {
             return None;
         }
-        let store = self.store.clone();
-        let removed = fatal(remove_at(store.as_ref(), &mut self.root, key));
-        removed.map(|slot| fatal(read_slot(store.as_ref(), &slot)))
+        let store = self.store.as_ref();
+        let removed = fatal(remove_at(store, &mut self.root, key));
+        removed.map(|slot| fatal(read_slot(store, &slot)))
     }
 
     pub fn first(&self) -> Option<(K, Arc<V>)> {

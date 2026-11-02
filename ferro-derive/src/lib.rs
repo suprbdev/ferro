@@ -510,14 +510,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             IndexKind::Value => {
                 reindex.push(quote! {
                     {
-                        let __old = __old.map(|__r| (::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)));
-                        let __new = __new.map(|__r| (::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)));
-                        if __old != __new {
-                            if let ::std::option::Option::Some(__entry) = __old {
-                                self.#field.remove(&__entry);
+                        let __same = match (__old, __new) {
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => __o.#ident == __n.#ident && __o.#key_ident == __n.#key_ident,
+                            _ => false,
+                        };
+                        if !__same {
+                            if let ::std::option::Option::Some(__r) = __old {
+                                self.#field.remove(&(::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
-                            if let ::std::option::Option::Some(__entry) = __new {
-                                self.#field.insert(__entry, ());
+                            if let ::std::option::Option::Some(__r) = __new {
+                                self.#field.insert((::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)), ());
                             }
                         }
                     }
