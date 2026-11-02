@@ -167,9 +167,30 @@ most records. Measured and left out:
   than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
   that avoided that saved only 6 to 8%.
 
-`cache_bytes` bounds cache weight, which tracks on-disk size, not heap. Decoded nodes take several
-times that: a 16 MiB cache holds about 71 MiB, and at 1 MiB, with pins and `Arc` allocations
-included, about 4.6 MiB. Size it at a quarter of the memory you mean to spend.
+`cache_bytes` is an approximate bound on the decoded heap of cached objects. An entry weighs its
+body bytes, which stand for the strings and vectors inside it, plus what decoding allocates around
+them: the `size_of` of the object, of each key, slot and child link, an `Arc` header and allocation
+per value held in the node, and a flat allowance per key and value for the rounding of small
+allocations. There is no size hook on `Data`, because walking every value on load would cost more
+than the accuracy is worth. Heap measured by `ferro-bench`'s `heap` tool with a counting allocator,
+after two scans of data larger than the cache, as a multiple of the setting at 1 to 256 MiB:
+
+| Values | Weight tracking disk size | Now |
+| --- | --- | --- |
+| Short strings | 3.8 to 3.9 | 0.76 to 0.83 |
+| 300 byte strings | 1.4 to 1.5 | 0.89 to 0.93 |
+| 2 KiB spilled strings | 1.0 to 1.7 | 1.0 to 1.1 |
+| Table rows and their indexes | 3.1 to 4.6 | 1.25 to 1.3 |
+
+Rows land above 1 because a row of small strings makes more allocations than the allowance covers.
+Outside the bound are pinned nodes, the `Arc` allocations memos keep, nodes held by live snapshots
+and dirty trees, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it
+up to 65,536 entries.
+
+The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full, and
+`peak_rss_mib` stays at 343 MiB. A setting carried over from before now holds about a quarter of what
+it did. `map_get_cold_ns` at 1 MiB went from 4.4 to 6.5 µs for that reason, and 5 MiB, which
+holds what 1 MiB used to, gives 4.7 µs.
 
 ## File format and durability
 

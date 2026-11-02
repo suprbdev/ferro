@@ -31,7 +31,9 @@ const FIRST_RESERVE: u64 = 64 << 10;
 const MAX_RESERVE: u64 = 4 << 20;
 const LOCK_RETRIES: u32 = 5;
 const READ_AHEAD: usize = 1024;
-const LINK_WEIGHT: usize = HASH_BYTES + 3;
+const ENTRY_BYTES: usize = 96;
+const MIN_DEDUPE: u64 = 1 << 10;
+const MAX_DEDUPE: u64 = 1 << 16;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
@@ -55,10 +57,15 @@ impl Default for StoreOptions {
     fn default() -> Self {
         StoreOptions {
             durability: Durability::Fsync,
-            cache_bytes: 256 * 1024 * 1024,
+            cache_bytes: 1 << 30,
             read_only: false,
         }
     }
+}
+
+pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
+    let weight = ENTRY_BYTES + fixed_bytes + body_bytes;
+    u32::try_from(weight).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone)]
@@ -464,7 +471,8 @@ impl Store {
             }
         };
         let cache_bytes = options.cache_bytes.max(1);
-        let items = ((cache_bytes / 2048).max(64)) as usize;
+        let items = ((cache_bytes / 4096).max(64)) as usize;
+        let dedupe = (cache_bytes / 4096).clamp(MIN_DEDUPE, MAX_DEDUPE) as usize;
         let head = sb.head;
         let store = Store {
             inner: Arc::new(Inner {
@@ -480,7 +488,7 @@ impl Store {
                 }),
                 slot: AtomicU64::new(slot),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
-                dedupe: Cache::new(1 << 16),
+                dedupe: Cache::new(dedupe),
                 poisoned: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 options,
@@ -614,18 +622,11 @@ impl Store {
         Ok(object)
     }
 
-    pub fn load_as<T: Send + Sync + 'static>(
-        &self,
-        ptr: Ptr,
-        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
-    ) -> Result<Arc<T>> {
-        self.fetch(ptr, decode).map(|(value, _)| value)
-    }
-
     pub(crate) fn fetch<T: Send + Sync + 'static>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+        fixed_bytes: impl FnOnce(&T) -> usize,
     ) -> Result<(Arc<T>, bool)> {
         if let Some(entry) = self.inner.cache.get(&ptr.hash)
             && let Ok(value) = entry.value.downcast::<T>()
@@ -636,9 +637,9 @@ impl Store {
         if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
             self.inner.dedupe.insert(ptr.hash, ptr.offset);
         }
-        let weight = (object.body.len() + object.links.len() * LINK_WEIGHT + 128) as u32;
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = Arc::new(decode(&mut decoder)?);
+        let weight = heap_weight(fixed_bytes(&value), object.body.len());
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(
                 ptr.hash,
@@ -668,7 +669,8 @@ impl Store {
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
-        self.load_as(ptr, |decoder| T::decode(decoder))
+        let (value, _) = self.fetch(ptr, |decoder| T::decode(decoder), |_| size_of::<T>())?;
+        Ok(value)
     }
 
     pub fn begin(&self) -> Result<Txn> {

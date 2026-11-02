@@ -135,7 +135,7 @@ fn snapshot_experiment() {
         let path = fresh("probe-snap.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(16 << 20)
+                .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 2000);
@@ -198,7 +198,7 @@ fn watch_experiment() {
         let path = fresh("probe-watch.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(16 << 20)
+                .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 2000);
@@ -261,7 +261,7 @@ fn history_experiment() {
         let path = fresh("probe-history.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(16 << 20)
+                .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 100);
@@ -362,7 +362,7 @@ fn open_experiment() {
         {
             let db = Options::new()
                 .durability(Durability::Buffered)
-                .cache_bytes(16 << 20)
+                .cache_bytes(64 << 20)
                 .open::<Shop>(&path)
                 .expect("open");
             seed(&db, 2000);
