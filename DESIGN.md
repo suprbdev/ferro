@@ -16,18 +16,41 @@ of `T`, and all earlier versions stay readable.
 
 Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offset }`.
 
-- The hash is BLAKE3 over body length, link count, body, and the link hashes. Offsets are not
-  hashed, so identical content has an identical hash wherever it sits. The file is a Merkle DAG.
+- The hash is BLAKE3 over body length, link count, body, and the link hashes, truncated to 20
+  bytes (`HASH_BYTES`). Offsets are not hashed, so identical content has an identical hash
+  wherever it sits. The file is a Merkle DAG.
 - The offset lets a reader jump straight to a child, so no hash index is needed.
 - Every read re-hashes the object and compares it with the pointer it came from.
 - Links are stored in a side table and consumed in order by `Decoder::link`. They take no bytes
   in the body, which keeps encoded size independent of a value's position.
 
+Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
+instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage
+resistance, which is what tamper evidence on read needs, is 2^160. Collision resistance is 2^80
+instead of 2^128. Anyone who can pick the bytes of two objects and can afford about 2^80 hash
+evaluations can make two different objects share a hash, and ferro would then treat them as the
+same content in `==`, `diff` and write deduplication. Nothing in ferro authenticates against such
+an attacker; the superblock checksum is unkeyed. Raising `HASH_BYTES` to 32 restores the full
+claim at the cost of those bytes.
+
+## Records
+
+A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an optional
+`varint raw_len`, the body, then the links. Each link is its hash followed by a zigzag varint of
+`record offset - target offset`. Children are written before parents, so the deltas are small and
+positive in the common case, and nothing in a record depends on where it sits except that delta.
+Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
+runs after hashing and decompression before the hash check, so the hash covers the canonical
+body and two files with different physical compression still agree on every root hash. The
+decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
+
 ## Canonical tree
 
 `Map` is a Merkle search tree. A key's level is `trailing_zeros(blake3(encoded key)) / 3`, so
-about 1 in 8 keys is promoted per level. Fanout 8 was chosen by measurement at 300k keys: against
-fanout 16 it writes 33% fewer bytes per commit for 27% slower gets. A node holds all keys of exactly its level within its
+about 1 in 8 keys is promoted per level. Fanout 8 was chosen by measurement and re-checked after
+links shrank and bodies were compressed, at 1M keys: against fanout 16 it writes 31% fewer bytes
+per commit for 33% slower gets, and against fanout 4 it writes 32% more bytes per commit for 32%
+faster gets and 17% smaller bulk loads. A node holds all keys of exactly its level within its
 range, and children hold the gaps. Tree shape depends only on the key set, never on insertion
 order. Consequences that the rest of the system relies on:
 
@@ -40,7 +63,9 @@ Insert and remove use treap-style `split` and `merge`. Mutation is copy-on-write
 `flush` writes dirty nodes bottom up during `Data::encode`.
 
 Values over 512 encoded bytes spill to their own object, so a large value does not bloat its
-node or get rewritten when a neighbour changes.
+node or get rewritten when a neighbour changes. Lower thresholds were measured and rejected:
+spilling interior-node values over 64 bytes cut table update bytes by 19% but grew bulk size by
+14% and slowed table reads by 20 to 50%, once compression was already shrinking interior nodes.
 
 ## File format and durability
 
@@ -66,17 +91,28 @@ working copy, so a panic or an `Err` discards it.
 
 ## History
 
-Each branch head holds a `Map<u64, Commit>` log, stored in ferro's own tree, which makes
-version lookup O(log n). `Refs` is `Map<String, Head>` and the superblock points at it. Forking a
-branch copies one `Head`. `restore` commits an old value as a new version, so history is never
+Each branch head holds a commit log stored as a chain of entries, newest first. An entry holds
+the `Commit`, a link to the previous entry, and for even versions a second link to the entry at
+`version - lowest_set_bit(version)`. Appending a commit writes one small object and finds its
+skip target by following skip links from the tip, which is O(1) amortized. Looking up a version
+or a time follows skip links while they do not overshoot, which is O(log n). The head records the
+tip pointer, the first retained version, and the head version. `Refs` is `Map<String, Head>` and
+the superblock points at it. Forking a branch copies one `Head`, so the chain is shared and
+nothing is rewritten. `restore` commits an old value as a new version, so history is never
 rewritten.
 
-`Db::history_of` walks the log and reports the versions where a projection of the root changed.
+The log used to be a `Map<u64, Commit>`, which rewrote a tree path per commit and was about 20%
+of the bytes of a single-key commit. `Db::log()` now returns a `Log` handle with `len`, `get`,
+`first`, `last`, `iter` and `values`. `iter` reads the whole chain, so it is O(n).
+
+`Db::history_of` walks the chain oldest first and reports the versions where a projection of the
+root changed.
 
 ## Merging
 
-`Db::common_ancestor` finds the newest commit two branches share. Forking copies the log, so the
-logs agree up to the fork and differ after it, which makes this a binary search. `Map::merge` and
+`Db::common_ancestor` finds the newest commit two branches share. Forking shares the log, so the
+logs agree up to the fork and differ after it, which makes this a binary search that compares
+commits at a version. Each probe is a version lookup, so it costs O(log^2 n). `Map::merge` and
 `Table::merge` then do a three-way merge driven by `diff(base, theirs)`, costing O(changes). A
 key changed only by theirs is applied. A key changed the same way on both sides is left alone.
 A key changed differently on both sides goes to a `resolve` closure. Merging runs inside an
@@ -97,9 +133,11 @@ if that was pruned too.
 
 ## Compaction
 
-Compaction is offline and needs no user types. It prunes each branch's log, then copies every
-object still reachable into a new file. Hashes do not cover offsets, so objects move verbatim
-and only their link offsets are rewritten; every object is re-verified on the way through. The
+Compaction is offline and needs no user types. It prunes each branch's log by rebuilding the
+chain from the retained commits, since dropping the oldest entries changes every later entry's
+link, then copies every object still reachable into a new file. The copy is iterative, because a
+chain is as deep as the number of commits. Hashes do not cover offsets, so objects are re-emitted
+with new link offsets and compressed again; every object is re-verified on the way through. The
 new file replaces the old with an atomic rename. A read-only handle holding the old inode keeps
 reading its old snapshot, and `refresh` reports `Error::Replaced`.
 
