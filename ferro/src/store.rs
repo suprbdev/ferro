@@ -693,6 +693,13 @@ impl Store {
         self.inner.poisoned.store(true, Ordering::Release);
     }
 
+    pub(crate) fn check_healthy(&self) -> Result<()> {
+        if self.inner.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        Ok(())
+    }
+
     pub(crate) fn sync(&self, frame: Frame) -> Result<()> {
         let inner = &self.inner;
         let durable = inner.options.durability == Durability::Fsync;

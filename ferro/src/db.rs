@@ -288,6 +288,7 @@ impl Drop for Keeper {
 struct Shared<T> {
     store: ArcSwap<Store>,
     path: PathBuf,
+    file: PathBuf,
     options: StoreOptions,
     tip: Mutex<RefState>,
     published: Mutex<RefState>,
@@ -428,10 +429,16 @@ impl Options {
             base: AtomicU64::new(store.basis().bytes),
             ..Signal::default()
         });
+        let file = fs::canonicalize(path.as_ref())?;
+        let mut options = options;
         let shared = Arc::new(Shared {
             store: ArcSwap::from_pointee(store),
             path: path.as_ref().to_path_buf(),
-            options,
+            file,
+            options: {
+                options.read_only = read_only;
+                options
+            },
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
                 ptr: head,
@@ -708,7 +715,7 @@ impl<T: Data> Shared<T> {
         }
         drop(log);
         if outcome.is_err() {
-            Copier::abandon(&sibling(&self.path));
+            Copier::abandon(&sibling(&self.file));
             self.signal.base.store(self.store().size(), Ordering::Relaxed);
         }
         outcome
@@ -725,7 +732,7 @@ impl<T: Data> Shared<T> {
             report.after_bytes = report.before_bytes;
             return Ok(report);
         }
-        let temp = sibling(&self.path);
+        let temp = sibling(&self.file);
         let mut copier = Copier::create(store, &temp, &self.options, stop)?;
         self.step("created");
         for _ in 0..MAX_PASSES {
@@ -742,16 +749,17 @@ impl<T: Data> Shared<T> {
         let paused = Instant::now();
         let mut tip = self.tip.lock();
         self.settle(store.last_seq())?;
+        store.check_healthy()?;
         let basis = store.basis();
         let (head, objects) = {
             let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
             let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
             copier.finish(&tip.refs, store.last_seq(), survival)?
         };
-        let (fresh, _) = Store::open_as(&temp, &self.path, self.options.clone())?;
-        fs::rename(&temp, &self.path)?;
+        let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
+        fs::rename(&temp, &self.file)?;
         fresh.trace_rename();
-        if let Err(error) = sync_parent(&self.path) {
+        if let Err(error) = sync_parent(&self.file) {
             store.poison();
             return Err(error.into());
         }
@@ -1245,7 +1253,7 @@ impl<T: Data> Db<T> {
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
             Err(Error::Replaced) => {
-                Store::open(&self.shared.path, self.shared.options.clone())?
+                Store::open(&self.shared.file, self.shared.options.clone())?
             }
             other => (current.clone(), other?),
         };

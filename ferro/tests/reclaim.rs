@@ -745,6 +745,40 @@ fn a_head_rebuilt_with_the_hash_of_an_older_one_survives_a_cycle() {
 }
 
 #[test]
+fn a_cycle_keeps_the_mode_of_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Root> = options().open(&path).unwrap();
+    fill(&db, 50, 5);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    db.compact(Keep::Last(1)).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn a_cycle_through_a_symlink_replaces_the_file_it_names() {
+    let dir = dir();
+    let real = path_in(&dir);
+    let link = dir.path().join("link.ferro");
+    let db: Db<Root> = options().open(&real).unwrap();
+    fill(&db, 50, 5);
+    drop(db);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let db: Db<Root> = options().open(&link).unwrap();
+    assert_eq!(db.path(), link);
+    fill(&db, 50, 5);
+    let want = dump(&db.read());
+    db.compact(Keep::Last(1)).unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(dump(&db.read()), want);
+    drop(db);
+    let db: Db<Root> = options().open(&real).unwrap();
+    assert_eq!(dump(&db.read()), want);
+    assert_eq!(db.log().len(), 1);
+}
+
+#[test]
 fn a_cycle_on_an_empty_database_does_nothing() {
     let dir = dir();
     let empty: Db<Root> = options().open(path_in(&dir)).unwrap();

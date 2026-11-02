@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, fchown};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -227,6 +228,9 @@ impl<'a> Copier<'a> {
             .create(true)
             .truncate(true)
             .open(temp)?;
+        let source = fs::metadata(store.path())?;
+        file.set_permissions(source.permissions())?;
+        let _ = fchown(&file, Some(source.uid()), Some(source.gid()));
         let file = Traced::new(file, options.trace.clone())?;
         file.created();
         file.set_len(LOG_START)?;

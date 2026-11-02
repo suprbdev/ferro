@@ -159,6 +159,44 @@ fn running_out_of_space_during_the_copy_fails_the_cycle_and_commits_continue() {
 }
 
 #[test]
+fn a_cycle_does_not_heal_a_store_poisoned_during_it() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let slot: Arc<Mutex<Option<Db<Root>>>> = Arc::new(Mutex::new(None));
+    let hook = {
+        let slot = slot.clone();
+        move |name: &'static str| {
+            if name == "synced" {
+                let db = slot.lock().unwrap().clone().unwrap();
+                WRITES_FAIL.with(|fail| fail.set(true));
+                let failed = db.update(|root| {
+                    root.insert(1, text(9, 400));
+                });
+                WRITES_FAIL.with(|fail| fail.set(false));
+                assert!(matches!(failed, Err(Error::Io(_))), "{failed:?}");
+            }
+        }
+    };
+    let db: Db<Root> = options().hook(Hook(Arc::new(hook))).open(&path).unwrap();
+    *slot.lock().unwrap() = Some(db.clone());
+    fill(&db, 0, 50);
+    let want = dump(&db.read());
+    let outcome = db.compact(Keep::Last(1));
+    *slot.lock().unwrap() = None;
+    assert!(matches!(outcome, Err(Error::Poisoned)), "{outcome:?}");
+    assert!(no_temp(&path));
+    let late = db.update(|root| {
+        root.insert(u64::MAX, "late".into());
+    });
+    assert!(matches!(late, Err(Error::Poisoned)), "{late:?}");
+    drop(db);
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(dump(&db.read()), want);
+    db.verify().unwrap();
+}
+
+#[test]
 fn a_failed_rename_fails_the_cycle_and_commits_continue() {
     let _turn = serial();
     let dir = dir();
