@@ -307,16 +307,27 @@ impl<'a> Decoder<'a> {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
+    #[inline]
     pub fn varint(&mut self) -> Result<u64> {
+        match self.buf.get(self.pos) {
+            Some(&byte) if byte < 0x80 => {
+                self.pos += 1;
+                Ok(u64::from(byte))
+            }
+            _ => self.long_varint(),
+        }
+    }
+
+    fn long_varint(&mut self) -> Result<u64> {
         let mut value = 0u64;
         let mut shift = 0u32;
-        loop {
-            let byte = self.u8()?;
+        for (index, &byte) in self.buf[self.pos..].iter().enumerate() {
             if shift == 63 && byte > 1 {
                 return Err(Error::Decode("varint overflow".into()));
             }
             value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
+                self.pos += index + 1;
                 return Ok(value);
             }
             shift += 7;
@@ -324,6 +335,8 @@ impl<'a> Decoder<'a> {
                 return Err(Error::Decode("varint overflow".into()));
             }
         }
+        self.pos = self.buf.len();
+        Err(Error::Decode("varint runs off the end of its object".into()))
     }
 
     pub fn item<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
