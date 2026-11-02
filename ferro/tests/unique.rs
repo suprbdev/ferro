@@ -5,7 +5,7 @@ use std::ops::Bound;
 use std::panic::{self, AssertUnwindSafe};
 
 use common::{cases, fast};
-use ferro::{Conflict, Data, Db, Record, Table, TableData, Taken};
+use ferro::{Conflict, Data, Db, Record, Table, Taken};
 use proptest::prelude::*;
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
