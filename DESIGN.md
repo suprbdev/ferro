@@ -11,7 +11,9 @@ of `T`, and all earlier versions stay readable.
   verification, node cache.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
-- `db.rs`: `Db<T>`, `Snapshot<T>`, commits, history, branches, watchers.
+- `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
+- `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
+- `watch.rs`: `Watcher<T>` and the per-branch feed behind it.
 
 ## Objects and links
 
@@ -204,7 +206,7 @@ was measured and rejected: it adds a wakeup to every uncontended commit and gain
 contention.
 
 Nothing is published or acknowledged before it is durable, so readers, watchers and other
-processes never see a commit that could be lost, and they see every commit in order. A closure
+processes never see a commit that could be lost, and they see commits in order. A closure
 that ends without a frame, because nothing changed or it returned `Err`, may still have read an
 unpublished tip, so it waits for that tip before returning, and reports the failure instead if the
 tip never became durable. `fork` copies the tip and waits the same way, so the new branch appears
@@ -224,6 +226,20 @@ writes bypass the page cache: reads after a bulk commit go cold, which made buff
 a reopen 27% slower, and a read-only follower's `refresh` rose from 5 µs to 117 µs. It also needs
 an in-memory pending log on the read path, a fallback, and buffered reads overlapping direct writes
 on the tail block.
+
+Each branch has one `Feed`: a mutex over the newest published snapshot and a publish count, and a
+condvar. Publishing stores one snapshot and wakes waiters whatever the number of watchers. A
+`Watcher` remembers the count it last saw, so a snapshot is never queued, and a consumer that falls
+behind gets the newest one and uses `diff` for what it skipped, which costs O(changes). With the
+channel this replaced, a watcher that never read grew RSS by 147 MB over 100,000 order commits
+against 53 MB with no watcher. Now it is 53 MB either way, and commit throughput matches. The count
+is compared rather than versions so that a read-only handle stays right when a branch is dropped
+and forked again at a lower version.
+
+A `Branch` closes its feed when it drops, which is when the last `Db` handle goes, because
+`Shared` holds every branch. Closing wakes parked watchers and drops the held snapshot. A `Watcher`
+holds only the feed, so a parked one keeps neither the file nor the writer lock. The price is that
+a snapshot nobody had taken by then is lost.
 
 A `Snapshot<T>` keeps its version alive for as long as it is held, and so does any `Map` or `Table`
 cloned from it. All of them also keep the writer lock held after the `Db` is dropped, so a new

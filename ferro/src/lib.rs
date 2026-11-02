@@ -11,6 +11,7 @@ pub mod map;
 pub mod set;
 pub mod store;
 pub mod table;
+pub mod watch;
 
 pub use codec::{Data, Hash, Ptr};
 pub use db::{Commit, Committed, Db, Options, Snapshot, Verified};
@@ -23,3 +24,4 @@ pub use map::{Change, Conflict, Map};
 pub use set::Set;
 pub use store::Durability;
 pub use table::{Record, RowMut, Table, TableData};
+pub use watch::Watcher;

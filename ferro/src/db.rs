@@ -3,7 +3,6 @@ use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -15,6 +14,7 @@ use crate::history::History;
 use crate::log::{Chain, Log};
 use crate::map::Map;
 use crate::store::{Durability, Frame, Store, StoreOptions, Txn};
+use crate::watch::{Feed, Watcher};
 
 const MAIN: &str = "main";
 
@@ -158,16 +158,20 @@ struct Branch<T> {
     name: String,
     state: ArcSwap<State<T>>,
     tip: ArcSwap<State<T>>,
-    watchers: Mutex<Vec<Sender<Snapshot<T>>>>,
+    feed: Arc<Feed<T>>,
 }
 
 impl<T> Branch<T> {
     fn publish(&self, state: Arc<State<T>>) {
         let snapshot = state.snapshot.clone();
         self.state.store(state);
-        self.watchers
-            .lock()
-            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+        self.feed.publish(snapshot);
+    }
+}
+
+impl<T> Drop for Branch<T> {
+    fn drop(&mut self) {
+        self.feed.close();
     }
 }
 
@@ -357,7 +361,7 @@ impl<T: Data> Shared<T> {
             name: name.to_string(),
             state: ArcSwap::new(state.clone()),
             tip: ArcSwap::new(state),
-            watchers: Mutex::new(Vec::new()),
+            feed: Arc::new(Feed::new()),
         });
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
@@ -771,10 +775,8 @@ impl<T: Data> Db<T> {
         names
     }
 
-    pub fn watch(&self) -> Receiver<Snapshot<T>> {
-        let (sender, receiver) = channel();
-        self.branch.watchers.lock().push(sender);
-        receiver
+    pub fn watch(&self) -> Watcher<T> {
+        Watcher::new(self.branch.feed.clone())
     }
 
     pub fn refresh(&self) -> Result<bool> {

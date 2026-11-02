@@ -149,6 +149,22 @@ A fork is one small commit whatever the database size. Merges are three-way and 
 You decide conflicts in Rust, and you merge each collection in your root yourself. Repeat merges
 between two branches, in either direction, do not apply a change twice.
 
+```rust
+let mut seen = db.read();
+for snapshot in db.watch() {
+    for change in seen.orders.diff(&snapshot.orders) {
+        println!("{:?} changed", change.key());
+    }
+    seen = snapshot;
+}
+```
+
+A `Watcher` does not queue. `recv` returns the newest snapshot it has not returned yet, so a slow
+consumer skips versions, costs the writers nothing and uses no memory, and `diff` covers whatever
+it skipped. `recv_timeout` and `try_recv` work like `std::sync::mpsc`. A watcher ends when the last
+`Db` handle goes, and it does not keep the file open: a snapshot it had not taken by then is lost.
+A read-only handle fires its watchers on `refresh`.
+
 ## Changing your types
 
 Your struct is the schema. Fields are stored by name hash, so old data keeps loading after you

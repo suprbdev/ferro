@@ -336,9 +336,8 @@ fn lock_is_released_after_every_handle_is_gone() {
     assert!(old.get(&5).is_some());
     drop(old);
     drop(inner);
-    assert!(events.try_recv().is_ok());
+    assert!(events.try_recv().is_err());
     drop(log);
-    drop(events);
     assert_unlocked::<Flat>(&path);
 }
 

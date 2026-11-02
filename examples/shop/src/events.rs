@@ -103,15 +103,12 @@ pub fn diff_frame(old: &Snapshot<Shop>, new: &Snapshot<Shop>) -> Frame {
 }
 
 pub fn spawn_broadcaster(db: &ferro::Db<Shop>, feed: broadcast::Sender<Arc<Frame>>) {
-    let receiver = db.watch();
+    let watcher = db.watch();
     let mut previous = db.read();
     std::thread::Builder::new()
         .name("shop-broadcaster".into())
         .spawn(move || {
-            for snapshot in receiver {
-                if snapshot.version() <= previous.version() {
-                    continue;
-                }
+            for snapshot in watcher {
                 if feed.receiver_count() > 0 {
                     let frame = diff_frame(&previous, &snapshot);
                     let _ = feed.send(Arc::new(frame));

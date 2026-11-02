@@ -204,11 +204,10 @@ fn queued_commits_stay_invisible_until_their_sync_returns() {
     assert!(hook().calls < 5, "no group formed");
     assert_eq!(db.version(), 6);
     assert_eq!(counter(&db.read()), 6);
-    for expected in 2..=6 {
-        let snapshot = events.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(snapshot.version(), expected);
-        assert_eq!(counter(&snapshot), expected);
-    }
+    let snapshot = events.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(snapshot.version(), 6);
+    assert_eq!(counter(&snapshot), 6);
+    drop(snapshot);
     assert!(outside.refresh().unwrap());
     assert_eq!(outside.version(), 6);
     drop(db);
