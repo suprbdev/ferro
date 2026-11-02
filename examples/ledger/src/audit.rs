@@ -178,6 +178,15 @@ pub fn audit(db: &Db<Ledger>, samples: usize) -> Result<AuditReport> {
                 format_amount(sum, &account.currency)
             ));
         }
+        let folded = ledger.sum_postings(account.id, i32::MIN, i32::MAX);
+        if folded != sum {
+            problems.push(format!(
+                "account {} postings fold to {} but journal recomputes {}",
+                account.name,
+                format_amount(folded, &account.currency),
+                format_amount(sum, &account.currency)
+            ));
+        }
     }
     if ledger.next_entry != last_id || ledger.next_entry != entries {
         problems.push(format!(
