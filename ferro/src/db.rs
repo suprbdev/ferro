@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,13 +7,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Log};
 use crate::map::Map;
-use crate::store::{Durability, Store, StoreOptions, Txn};
+use crate::store::{Durability, Frame, Store, StoreOptions, Txn};
 
 const MAIN: &str = "main";
 
@@ -102,6 +103,7 @@ impl Data for Head {
 
 pub(crate) type Refs = Map<String, Head>;
 
+#[derive(Clone)]
 struct RefState {
     refs: Refs,
     ptr: Option<Ptr>,
@@ -154,22 +156,41 @@ struct Intent {
 struct Branch<T> {
     name: String,
     state: ArcSwap<State<T>>,
+    tip: ArcSwap<State<T>>,
     watchers: Mutex<Vec<Sender<Snapshot<T>>>>,
 }
 
 impl<T> Branch<T> {
-    fn publish(&self, state: State<T>) {
+    fn publish(&self, state: Arc<State<T>>) {
         let snapshot = state.snapshot.clone();
-        self.state.store(Arc::new(state));
+        self.state.store(state);
         self.watchers
             .lock()
             .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
     }
 }
 
+type Update<T> = Option<(Arc<Branch<T>>, Arc<State<T>>)>;
+
+struct Pending<T> {
+    frame: Frame,
+    refs: RefState,
+    update: Update<T>,
+}
+
+struct Queue<T> {
+    waiting: Vec<Pending<T>>,
+    settled: u64,
+    syncing: bool,
+    failed: bool,
+}
+
 struct Shared<T> {
     store: Store,
-    refs: Mutex<RefState>,
+    tip: Mutex<RefState>,
+    published: Mutex<RefState>,
+    queue: Mutex<Queue<T>>,
+    done: Condvar,
     genesis: Arc<T>,
     genesis_hash: Hash,
     branches: Mutex<HashMap<String, Arc<Branch<T>>>>,
@@ -236,15 +257,27 @@ impl Options {
             Some(ptr) => (*store.load::<Refs>(ptr)?).clone(),
             None => Map::new(),
         };
+        let settled = store.last_seq();
         let shared = Arc::new(Shared {
             store,
-            refs: Mutex::new(RefState { refs, ptr: head }),
+            tip: Mutex::new(RefState {
+                refs: refs.clone(),
+                ptr: head,
+            }),
+            published: Mutex::new(RefState { refs, ptr: head }),
+            queue: Mutex::new(Queue {
+                waiting: Vec::new(),
+                settled,
+                syncing: false,
+                failed: false,
+            }),
+            done: Condvar::new(),
             genesis,
             genesis_hash,
             branches: Mutex::new(HashMap::new()),
         });
         let branch = {
-            let state = shared.refs.lock();
+            let state = shared.published.lock();
             shared.attach(MAIN, &state.refs)?
         };
         Ok(Db { shared, branch })
@@ -318,22 +351,89 @@ impl<T: Data> Shared<T> {
         if head.is_none() && name != MAIN {
             return Err(Error::NoBranch(name.to_string()));
         }
-        let state = self.state_of(head.as_deref())?;
+        let state = Arc::new(self.state_of(head.as_deref())?);
         let branch = Arc::new(Branch {
             name: name.to_string(),
-            state: ArcSwap::from_pointee(state),
+            state: ArcSwap::new(state.clone()),
+            tip: ArcSwap::new(state),
             watchers: Mutex::new(Vec::new()),
         });
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
     }
 
-    fn write_refs(&self, state: &mut RefState, refs: Refs, mut txn: Txn) -> Result<()> {
+    fn stage(
+        &self,
+        tip: &mut RefState,
+        refs: Refs,
+        mut txn: Txn,
+        branch: Option<&Arc<Branch<T>>>,
+    ) -> Result<()> {
         let ptr = write_value(&refs, &mut txn)?;
-        txn.commit(ptr)?;
-        state.refs = (*self.store.load::<Refs>(ptr)?).clone();
-        state.ptr = Some(ptr);
+        let frame = txn.write(ptr)?;
+        let loaded = self.load_tip(ptr, branch);
+        let (refs, update) = loaded.inspect_err(|_| self.store.poison())?;
+        tip.refs = refs;
+        tip.ptr = Some(ptr);
+        let refs = tip.clone();
+        self.queue.lock().waiting.push(Pending { frame, refs, update });
         Ok(())
+    }
+
+    fn load_tip(&self, ptr: Ptr, branch: Option<&Arc<Branch<T>>>) -> Result<(Refs, Update<T>)> {
+        let refs = (*self.store.load::<Refs>(ptr)?).clone();
+        let Some(branch) = branch else {
+            return Ok((refs, None));
+        };
+        let head = refs.try_get(&branch.name)?;
+        let state = Arc::new(self.state_of(head.as_deref())?);
+        branch.tip.store(state.clone());
+        Ok((refs, Some((branch.clone(), state))))
+    }
+
+    fn settle(&self, ticket: u64) -> Result<()> {
+        let mut queue = self.queue.lock();
+        loop {
+            if queue.settled >= ticket {
+                return Ok(());
+            }
+            if queue.failed {
+                return Err(Error::Poisoned);
+            }
+            if !queue.syncing {
+                if queue.waiting.is_empty() {
+                    return Ok(());
+                }
+                return self.lead(queue);
+            }
+            self.done.wait(&mut queue);
+        }
+    }
+
+    fn lead(&self, mut queue: MutexGuard<'_, Queue<T>>) -> Result<()> {
+        queue.syncing = true;
+        let batch = mem::take(&mut queue.waiting);
+        drop(queue);
+        let last = batch.last().expect("a leader has queued commits");
+        let (frame, refs) = (last.frame, last.refs.clone());
+        let outcome = self.store.sync(frame);
+        if outcome.is_ok() {
+            *self.published.lock() = refs;
+            for pending in batch {
+                if let Some((branch, state)) = pending.update {
+                    branch.publish(state);
+                }
+            }
+        }
+        let mut queue = self.queue.lock();
+        queue.syncing = false;
+        match outcome {
+            Ok(()) => queue.settled = frame.seq,
+            Err(_) => queue.failed = true,
+        }
+        drop(queue);
+        self.done.notify_all();
+        outcome
     }
 }
 
@@ -429,12 +529,18 @@ impl<T: Data> Db<T> {
         intent: Intent,
         f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        let mut refs = self.shared.refs.lock();
-        let state = self.branch.state.load_full();
+        let mut tip = self.shared.tip.lock();
+        let state = self.branch.tip.load_full();
         let mut working = (*state.snapshot.value).clone();
-        let (message, value) = f(&mut working)?;
         let before = state.snapshot.commit.version;
-        let version = self.commit_locked(&mut refs, &state, message, intent, &working)?;
+        let result = f(&mut working).and_then(|(message, value)| {
+            let version = self.commit_locked(&mut tip, &state, message, intent, &working)?;
+            Ok((value, version))
+        });
+        let ticket = self.shared.store.last_seq();
+        drop(tip);
+        self.shared.settle(ticket)?;
+        let (value, version) = result?;
         Ok(Committed {
             value,
             version,
@@ -444,7 +550,7 @@ impl<T: Data> Db<T> {
 
     fn commit_locked(
         &self,
-        refs: &mut RefState,
+        tip: &mut RefState,
         state: &State<T>,
         message: String,
         intent: Intent,
@@ -474,7 +580,7 @@ impl<T: Data> Db<T> {
             restored: intent.restored,
         };
         let log = state.log.append(store, &mut txn, commit)?;
-        let mut next = refs.refs.clone();
+        let mut next = tip.refs.clone();
         next.insert(
             self.branch.name.clone(),
             Head {
@@ -484,9 +590,7 @@ impl<T: Data> Db<T> {
                 merged,
             },
         );
-        self.shared.write_refs(refs, next, txn)?;
-        let head = refs.refs.try_get(&self.branch.name)?;
-        self.branch.publish(self.shared.state_of(head.as_deref())?);
+        self.shared.stage(tip, next, txn, Some(&self.branch))?;
         Ok(version)
     }
 
@@ -633,13 +737,13 @@ impl<T: Data> Db<T> {
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
-        let mut refs = self.shared.refs.lock();
-        if name == MAIN || refs.refs.try_get(name)?.is_some() {
+        let mut tip = self.shared.tip.lock();
+        if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
-        let state = self.branch.state.load_full();
+        let state = self.branch.tip.load_full();
         let commit = &state.snapshot.commit;
-        let mut next = refs.refs.clone();
+        let mut next = tip.refs.clone();
         next.insert(
             name.to_string(),
             Head {
@@ -650,16 +754,15 @@ impl<T: Data> Db<T> {
             },
         );
         let txn = self.shared.store.begin()?;
-        self.shared.write_refs(&mut refs, next, txn)?;
-        let branch = self.shared.attach(name, &refs.refs)?;
-        Ok(Db {
-            shared: self.shared.clone(),
-            branch,
-        })
+        self.shared.stage(&mut tip, next, txn, None)?;
+        let ticket = self.shared.store.last_seq();
+        drop(tip);
+        self.shared.settle(ticket)?;
+        self.branch(name)
     }
 
     pub fn branch(&self, name: &str) -> Result<Db<T>> {
-        let refs = self.shared.refs.lock();
+        let refs = self.shared.published.lock();
         let branch = self.shared.attach(name, &refs.refs)?;
         Ok(Db {
             shared: self.shared.clone(),
@@ -668,7 +771,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn branches(&self) -> Vec<String> {
-        let refs = self.shared.refs.lock();
+        let refs = self.shared.published.lock();
         let mut names: Vec<String> = refs.refs.keys().collect();
         if !names.iter().any(|name| name == MAIN) {
             names.push(MAIN.to_string());
@@ -687,22 +790,24 @@ impl<T: Data> Db<T> {
         if !self.shared.store.is_read_only() {
             return Ok(false);
         }
-        let mut refs = self.shared.refs.lock();
+        let mut tip = self.shared.tip.lock();
         let head = self.shared.store.refresh()?;
-        if head == refs.ptr {
+        if head == tip.ptr {
             return Ok(false);
         }
         let Some(ptr) = head else {
             return Ok(false);
         };
-        refs.refs = (*self.shared.store.load::<Refs>(ptr)?).clone();
-        refs.ptr = Some(ptr);
+        tip.refs = (*self.shared.store.load::<Refs>(ptr)?).clone();
+        tip.ptr = Some(ptr);
+        *self.shared.published.lock() = tip.clone();
         let branches = self.shared.branches.lock();
         for branch in branches.values() {
-            let head = refs.refs.try_get(&branch.name)?;
-            let state = self.shared.state_of(head.as_deref())?;
+            let head = tip.refs.try_get(&branch.name)?;
+            let state = Arc::new(self.shared.state_of(head.as_deref())?);
+            branch.tip.store(state.clone());
             if state.snapshot.version() == branch.state.load().snapshot.version() {
-                branch.state.store(Arc::new(state));
+                branch.state.store(state);
             } else {
                 branch.publish(state);
             }
@@ -711,9 +816,9 @@ impl<T: Data> Db<T> {
     }
 
     pub fn verify(&self) -> Result<Verified> {
-        let refs = self.shared.refs.lock();
+        let head = self.shared.published.lock().ptr;
         let mut report = Verified::default();
-        if let Some(ptr) = refs.ptr {
+        if let Some(ptr) = head {
             self.shared.store.walk(ptr, |ptr, object| {
                 report.objects += 1;
                 report.bytes += crate::store::record_len(ptr.offset, object) as u64;

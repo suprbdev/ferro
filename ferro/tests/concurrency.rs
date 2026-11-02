@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::{Rng, fast, quiet_ferro_panics, uncached};
 use ferro::codec::{Decoder, Encoder};
-use ferro::{Data, Db, Error, Map, Snapshot};
+use ferro::{Data, Db, Error, Map, Options, Snapshot};
 
 const TOTAL: u64 = 1_000_000;
 const ACCOUNTS: u64 = 64;
@@ -458,6 +458,49 @@ fn read_only_open_never_races_a_writer_into_an_error() {
     stop.store(true, Ordering::Relaxed);
     let opens: u64 = openers.into_iter().map(|t| t.join().unwrap()).sum();
     assert!(opens > 10);
+}
+
+#[test]
+fn read_only_open_never_races_a_durable_writer_closing() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("c.ferro");
+    let open = |path: &std::path::Path| Options::new().open::<Map<u64, u64>>(path);
+    open(&path)
+        .unwrap()
+        .update(|root| {
+            root.insert(0, 0);
+        })
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (path, stop) = (path.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut last = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let reader = fast().read_only().open::<Map<u64, u64>>(&path).unwrap();
+                    assert!(reader.version() >= last);
+                    last = reader.version();
+                }
+            })
+        })
+        .collect();
+    for n in 1..=200u64 {
+        let db = open(&path).unwrap();
+        db.update(|root| {
+            root.insert(0, n);
+        })
+        .unwrap();
+        db.update(|root| {
+            root.insert(1, n);
+        })
+        .unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(open(&path).unwrap().version(), 401);
 }
 
 #[test]

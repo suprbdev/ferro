@@ -155,9 +155,10 @@ Do not change the encoding or `Ord` of a key type on existing data. Tree placeme
 ## Durability
 
 The file is an append-only log of content-addressed objects behind two checksummed superblock
-slots. A commit writes its objects, fsyncs, writes the superblock, and fsyncs again. Recovery
-needs no replay: open picks the newest valid superblock and truncates anything past it, so a crash
-loses at most a commit that was never acknowledged.
+slots. A commit writes one checksummed frame holding its objects, fsyncs once, and then updates
+the superblock without syncing it. Open starts from the newest valid superblock, walks forward over
+every complete frame, and truncates the rest, so a crash loses at most a commit that was never
+acknowledged. Concurrent writers share a sync: one leader's fsync covers everything queued.
 
 Every read re-hashes the object against the pointer it came from, so corruption surfaces as an
 error, not wrong data. The whole database is a Merkle tree, and `verify` re-hashes all of it.
@@ -207,7 +208,8 @@ Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short strin
 | Random `get` | 1.0 µs |
 | Full scan | 53 ns per key |
 | Range read | 54 ns per key |
-| Single-key commit, fsync | 1.1 ms, about 900 per second |
+| Single-key commit, fsync | 460 µs, about 2,200 per second |
+| Single-key commits, fsync, 8 writers | about 9,800 per second |
 | Single-key commit, `Durability::Buffered` | 72 µs |
 | Bytes written per single-key commit | 8.5 KB |
 | `diff` | 5.7 µs per changed key |
@@ -224,14 +226,17 @@ This is an experiment, not a production database.
 - It runs on Unix only.
 - Storage only grows until you compact. A single-key commit writes about 8.5 KB at this size, so
   batch related changes into one commit. Secondary indexes add to that.
-- One writer at a time. The closure runs under the writer lock, so a long closure blocks every
-  branch. Calling `update`, `fork`, `branch`, `branches` or `verify` from inside it deadlocks.
+- One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
+  every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
+  closure and encoding. Calling `update` or `fork` from inside it deadlocks.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
-  order, never with a real power cut. Only log write failure was injected, not fsync failure.
-- A corrupted newest superblock cannot be told from a torn write, so open rolls back to the
-  previous commit, losing that one acknowledged commit.
+  order, and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never
+  tested on real hardware.
+- A frame past the superblock that is damaged cannot be told from a torn write, so open stops
+  there and truncates it, losing at most the commits of the last sync. Bit rot further back is
+  reported by the hash checks, not truncated.
 - Only direct merges are recorded. A change that arrives through a third branch, or through a
   fork of an already merged branch, is seen again. Nothing is lost, but a merge closure that is
   not idempotent, such as one adding a counter delta, applies it twice.

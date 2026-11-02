@@ -3,9 +3,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use common::{fast, text, uncached};
-use ferro::{Error, Map};
+use ferro::{Error, Map, Options};
 
 type Root = Map<u64, String>;
 
@@ -56,6 +58,76 @@ fn write_limit_child() {
     if let Ok(path) = std::env::var("FERRO_POISON_PATH") {
         child_body(&path);
     }
+}
+
+fn durable_group_child(path: &str) {
+    let db = Options::new().open::<Root>(path).unwrap();
+    let acked = Arc::new(Mutex::new(BTreeMap::new()));
+    let handles: Vec<_> = (0..4u64)
+        .map(|writer| {
+            let (db, acked) = (db.clone(), acked.clone());
+            thread::spawn(move || {
+                for round in 0..200_000u64 {
+                    let key = writer * 1_000_000 + round;
+                    let value = text(key, 700);
+                    match db.update(|root| {
+                        root.insert(key, value.clone());
+                    }) {
+                        Ok(()) => {
+                            acked.lock().unwrap().insert(key, value);
+                        }
+                        Err(Error::Io(_) | Error::Poisoned) => return,
+                        Err(other) => panic!("unexpected {other}"),
+                    }
+                }
+                panic!("write limit never hit");
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let acked = acked.lock().unwrap();
+    assert!(!acked.is_empty());
+    assert!(matches!(db.update(|_| ()), Err(Error::Poisoned)));
+    let snapshot = db.read();
+    assert_eq!(snapshot.len(), acked.len());
+    let report: Vec<String> = acked.keys().map(u64::to_string).collect();
+    fs::write(format!("{path}.report"), report.join(" ")).unwrap();
+}
+
+#[test]
+fn durable_write_limit_child() {
+    if let Ok(path) = std::env::var("FERRO_POISON_GROUP_PATH") {
+        durable_group_child(&path);
+    }
+}
+
+#[test]
+fn failed_write_poisons_queued_writers_and_keeps_what_was_acknowledged() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("group.ferro");
+    let exe = std::env::current_exe().unwrap();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 512; exec \"$0\" --exact durable_write_limit_child --test-threads=1")
+        .arg(&exe)
+        .env("FERRO_POISON_GROUP_PATH", &path)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let report = fs::read_to_string(format!("{}.report", path.display())).unwrap();
+    let db = Options::new().open::<Root>(&path).unwrap();
+    db.verify().unwrap();
+    let snapshot = db.read();
+    let mut acked = 0;
+    for key in report.split(' ').map(|key| key.parse::<u64>().unwrap()) {
+        assert_eq!(*snapshot.get(&key).unwrap(), text(key, 700));
+        acked += 1;
+    }
+    assert!(snapshot.len() >= acked);
+    assert_eq!(db.version() as usize, snapshot.len());
 }
 
 #[test]

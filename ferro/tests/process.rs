@@ -43,6 +43,15 @@ fn check(root: &Root) {
     assert_eq!(*spill, payload(root.n + 1));
 }
 
+const WRITERS: u64 = 4;
+
+fn ack_forever(db: &Db<Root>) -> ! {
+    loop {
+        let n = commit_one(db);
+        println!("ACK {n}");
+    }
+}
+
 fn child(role: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -59,8 +68,9 @@ fn child_entry() {
     let path = std::env::var("FERRO_PATH").unwrap();
     let path = Path::new(&path);
     match role.as_str() {
-        "writer" => {
-            let db: Db<Root> = fast().open(path).unwrap();
+        "writer" | "durable-writer" => {
+            let options = if role == "writer" { fast() } else { Options::new() };
+            let db: Db<Root> = options.open(path).unwrap();
             let millis: u64 = std::env::var("FERRO_MS").unwrap().parse().unwrap();
             let start = Instant::now();
             while start.elapsed() < Duration::from_millis(millis) {
@@ -109,6 +119,14 @@ fn child_entry() {
                 println!("ACK {n}");
             }
         }
+        "killgroup" => {
+            let db: Db<Root> = Options::new().open(path).unwrap();
+            for _ in 1..WRITERS {
+                let db = db.clone();
+                std::thread::spawn(move || ack_forever(&db));
+            }
+            ack_forever(&db);
+        }
         other => panic!("unknown role {other}"),
     }
 }
@@ -137,13 +155,22 @@ fn wait_ok(mut child: Child, limit: Duration) -> String {
 
 #[test]
 fn a_reader_process_never_sees_a_torn_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    reader_race("writer");
+}
+
+#[test]
+fn a_reader_process_never_sees_a_torn_durable_commit() {
+    reader_race("durable-writer");
+}
+
+fn reader_race(role: &str) {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let path = dir.path().join("w.ferro");
     {
         let db: Db<Root> = fast().open(&path).unwrap();
         commit_one(&db);
     }
-    let writer = child("writer")
+    let writer = child(role)
         .env("FERRO_PATH", &path)
         .env("FERRO_MS", "2500")
         .stdout(Stdio::piped())
@@ -163,6 +190,51 @@ fn a_reader_process_never_sees_a_torn_commit() {
     for reader in readers {
         let out = wait_ok(reader, Duration::from_secs(15));
         assert!(out.contains("reader saw"), "{out}");
+    }
+}
+
+#[test]
+fn sigkill_during_group_commit_keeps_every_acknowledged_version() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("g.ferro");
+    let mut rng = Rng::new(0xBEEF);
+    let mut floor = 0u64;
+    for round in 0..15 {
+        let mut proc = child("killgroup")
+            .env("FERRO_PATH", &path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = proc.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let mut acked = 0u64;
+        for line in lines.by_ref() {
+            if let Some(n) = line.unwrap().strip_prefix("ACK ") {
+                acked = n.parse().unwrap();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(rng.below(40)));
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+        for line in lines.map_while(Result::ok) {
+            if let Some(n) = line.strip_prefix("ACK ")
+                && let Ok(n) = n.parse::<u64>()
+            {
+                acked = acked.max(n);
+            }
+        }
+        let db: Db<Root> = Options::new().open(&path).unwrap();
+        let snapshot = db.read();
+        check(&snapshot);
+        assert_eq!(snapshot.n, db.version());
+        assert!(
+            snapshot.n >= acked && snapshot.n >= floor,
+            "round {round}: acked {acked}, recovered {}",
+            snapshot.n
+        );
+        db.verify().unwrap();
+        floor = snapshot.n;
     }
 }
 

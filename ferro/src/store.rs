@@ -1,22 +1,34 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"FERRODB1";
+const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const SUPER_BYTES: usize = 96;
+const SUPER_CHECKED: usize = 64;
+const FRAME_CHECKED: usize = 32 + HASH_BYTES;
+const FRAME_BYTES: usize = FRAME_CHECKED + 16;
+const SCAN_CHUNK: usize = 1 << 20;
+const FIRST_RESERVE: u64 = 64 << 10;
+const MAX_RESERVE: u64 = 4 << 20;
+const LOCK_RETRIES: u32 = 5;
 const READ_AHEAD: usize = 4096;
 const LINK_WEIGHT: usize = HASH_BYTES + 3;
 const MAX_VARINT: usize = 10;
@@ -70,28 +82,17 @@ struct Super {
 }
 
 impl Super {
-    fn encode(&self) -> [u8; SUPER_BYTES] {
-        let mut out = [0u8; SUPER_BYTES];
-        out[0..8].copy_from_slice(MAGIC);
+    fn fill(&self, magic: &[u8; 8], out: &mut [u8]) {
+        out[0..8].copy_from_slice(magic);
         out[8..16].copy_from_slice(&self.seq.to_le_bytes());
         out[16..24].copy_from_slice(&self.log_end.to_le_bytes());
         if let Some(head) = self.head {
             out[24..32].copy_from_slice(&head.offset.to_le_bytes());
             out[32..32 + HASH_BYTES].copy_from_slice(&head.hash);
         }
-        let check = blake3::hash(&out[..64]);
-        out[64..96].copy_from_slice(check.as_bytes());
-        out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Super> {
-        if bytes.len() < SUPER_BYTES || &bytes[0..8] != MAGIC {
-            return None;
-        }
-        let check = blake3::hash(&bytes[..64]);
-        if check.as_bytes() != &bytes[64..96] {
-            return None;
-        }
+    fn fields(bytes: &[u8]) -> Option<Super> {
         let seq = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let log_end = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
         let offset = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
@@ -99,10 +100,29 @@ impl Super {
         let head = (offset != 0).then_some(Ptr { hash, offset });
         Some(Super { seq, log_end, head })
     }
+
+    fn encode(&self) -> [u8; SUPER_BYTES] {
+        let mut out = [0u8; SUPER_BYTES];
+        self.fill(MAGIC, &mut out);
+        let check = blake3::hash(&out[..SUPER_CHECKED]);
+        out[SUPER_CHECKED..SUPER_BYTES].copy_from_slice(check.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Super> {
+        if bytes.len() < SUPER_BYTES || &bytes[0..8] != MAGIC {
+            return None;
+        }
+        let check = blake3::hash(&bytes[..SUPER_CHECKED]);
+        if check.as_bytes() != &bytes[SUPER_CHECKED..SUPER_BYTES] {
+            return None;
+        }
+        Super::fields(bytes)
+    }
 }
 
-fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
-    let mut best: Option<Super> = None;
+fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
+    let mut best: Option<(Super, u64)> = None;
     for slot in 0..2u64 {
         let start = slot * SLOT_BYTES;
         if len < start + SUPER_BYTES as u64 {
@@ -111,12 +131,102 @@ fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
         let mut bytes = [0u8; SUPER_BYTES];
         file.read_exact_at(&mut bytes, start)?;
         if let Some(candidate) = Super::decode(&bytes)
-            && best.as_ref().is_none_or(|b| candidate.seq > b.seq)
+            && best.as_ref().is_none_or(|b| candidate.seq > b.0.seq)
         {
-            best = Some(candidate);
+            best = Some((candidate, slot));
         }
     }
     Ok(best)
+}
+
+fn read_or_end(file: &File, out: &mut [u8], at: u64) -> Result<bool> {
+    match file.read_exact_at(out, at) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
+    let start = tip.log_end;
+    let body_start = start.saturating_add(FRAME_BYTES as u64);
+    if body_start > len {
+        return Ok(None);
+    }
+    let mut header = [0u8; FRAME_BYTES];
+    if !read_or_end(file, &mut header, start)? || &header[0..8] != FRAME_MAGIC {
+        return Ok(None);
+    }
+    let Some(frame) = Super::fields(&header) else {
+        return Ok(None);
+    };
+    if frame.seq != tip.seq + 1 || frame.log_end < body_start || frame.log_end > len {
+        return Ok(None);
+    }
+    let mut hasher = Xxh3::new();
+    hasher.update(&header[..FRAME_CHECKED]);
+    let mut chunk = vec![0u8; SCAN_CHUNK.min((frame.log_end - body_start) as usize)];
+    let mut at = body_start;
+    while at < frame.log_end {
+        let take = chunk.len().min((frame.log_end - at) as usize);
+        if !read_or_end(file, &mut chunk[..take], at)? {
+            return Ok(None);
+        }
+        hasher.update(&chunk[..take]);
+        at += take as u64;
+    }
+    if hasher.digest128().to_le_bytes() != header[FRAME_CHECKED..FRAME_BYTES] {
+        return Ok(None);
+    }
+    Ok(Some(frame))
+}
+
+fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
+    let mut tip = sb;
+    while let Some(next) = read_frame(file, &tip, len)? {
+        tip = next;
+    }
+    Ok(tip)
+}
+
+fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
+    let before = sb.seq;
+    let tip = scan(file, sb, len)?;
+    let moved = tip.seq != before;
+    let shrink = len > tip.log_end;
+    if moved {
+        file.sync_data()?;
+    }
+    if shrink {
+        file.set_len(tip.log_end)?;
+    }
+    let slot = if moved { 1 - slot } else { slot };
+    if moved {
+        file.write_all_at(&tip.encode(), slot * SLOT_BYTES)?;
+    }
+    if moved || shrink {
+        file.sync_all()?;
+    }
+    Ok((tip, slot))
+}
+
+fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
+    if read_frame(file, &sb, len)?.is_none() || file.try_lock_shared().is_err() {
+        return Ok(sb);
+    }
+    let before = sb.seq;
+    let scanned = file
+        .metadata()
+        .map_err(Error::from)
+        .and_then(|meta| scan(file, sb, meta.len()))
+        .and_then(|tip| {
+            if tip.seq != before {
+                file.sync_data()?;
+            }
+            Ok(tip)
+        });
+    file.unlock()?;
+    scanned
 }
 
 fn zigzag(value: i64) -> u64 {
@@ -240,6 +350,7 @@ pub(crate) fn seal(file: &File, log_end: u64, head: Ptr) -> Result<()> {
 }
 
 fn open_locked(path: &Path, read_only: bool) -> Result<File> {
+    let mut retries = 0;
     loop {
         let file = OpenOptions::new()
             .read(true)
@@ -258,7 +369,12 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
         }
         match file.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(Error::Locked),
+            Err(TryLockError::WouldBlock) if retries == LOCK_RETRIES => return Err(Error::Locked),
+            Err(TryLockError::WouldBlock) => {
+                retries += 1;
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         if std::fs::metadata(path).is_ok_and(|on_disk| on_disk.ino() == file.metadata().map(|m| m.ino()).unwrap_or(0)) {
@@ -267,12 +383,27 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Frame {
+    pub(crate) seq: u64,
+    end: u64,
+    head: Ptr,
+}
+
+struct Cursor {
+    seq: u64,
+    reserved: u64,
+    reserve: u64,
+}
+
 struct Inner {
     id: u64,
     path: PathBuf,
     file: File,
     tail: AtomicU64,
-    seq: Mutex<u64>,
+    written: AtomicU64,
+    cursor: Mutex<Cursor>,
+    slot: AtomicU64,
     cache: Cache<Hash, CacheEntry, EntryWeight>,
     dedupe: Cache<Hash, u64>,
     poisoned: AtomicBool,
@@ -290,8 +421,8 @@ impl Store {
         let file = open_locked(path, options.read_only)?;
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
-        let sb = match existing {
-            Some(sb) => {
+        let (sb, slot) = match existing {
+            Some((sb, slot)) => {
                 let len = file.metadata()?.len();
                 if len < sb.log_end {
                     return Err(Error::Corrupt(format!(
@@ -299,11 +430,11 @@ impl Store {
                         sb.log_end
                     )));
                 }
-                if !options.read_only && len > sb.log_end {
-                    file.set_len(sb.log_end)?;
-                    file.sync_all()?;
+                if options.read_only {
+                    (observe(&file, sb, len)?, slot)
+                } else {
+                    recover(&file, sb, slot, len)?
                 }
-                sb
             }
             None => {
                 if options.read_only {
@@ -328,7 +459,7 @@ impl Store {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     File::open(parent)?.sync_all()?;
                 }
-                sb
+                (sb, 0)
             }
         };
         let cache_bytes = options.cache_bytes.max(1);
@@ -340,7 +471,13 @@ impl Store {
                 path: path.to_path_buf(),
                 file,
                 tail: AtomicU64::new(sb.log_end),
-                seq: Mutex::new(sb.seq),
+                written: AtomicU64::new(sb.log_end),
+                cursor: Mutex::new(Cursor {
+                    seq: sb.seq,
+                    reserved: sb.log_end,
+                    reserve: 0,
+                }),
+                slot: AtomicU64::new(slot),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
                 dedupe: Cache::new(1 << 16),
                 poisoned: AtomicBool::new(false),
@@ -367,25 +504,59 @@ impl Store {
         self.inner.options.read_only
     }
 
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.inner.cursor.lock().seq
+    }
+
     pub fn refresh(&self) -> Result<Option<Ptr>> {
-        let mut seen = self.inner.seq.lock();
+        let mut cursor = self.inner.cursor.lock();
         let opened = self.inner.file.metadata()?;
         if std::fs::metadata(&self.inner.path)?.ino() != opened.ino() {
             return Err(Error::Replaced);
         }
         let len = opened.len();
-        let sb = read_supers(&self.inner.file, len)?
+        let (sb, _) = read_supers(&self.inner.file, len)?
             .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
-        if sb.seq < *seen {
+        if sb.seq < cursor.seq {
             return Ok(None);
         }
-        *seen = sb.seq;
+        cursor.seq = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
+        self.inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
         Ok(sb.head)
     }
 
+    pub(crate) fn poison(&self) {
+        self.inner.poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn sync(&self, frame: Frame) -> Result<()> {
+        let inner = &self.inner;
+        let durable = inner.options.durability == Durability::Fsync;
+        let attempt = (|| -> Result<()> {
+            if durable {
+                inner.file.sync_data()?;
+            }
+            let sb = Super {
+                seq: frame.seq,
+                log_end: frame.end,
+                head: Some(frame.head),
+            };
+            let slot = 1 - inner.slot.load(Ordering::Relaxed);
+            inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+            inner.slot.store(slot, Ordering::Relaxed);
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            self.poison();
+            return Err(error);
+        }
+        inner.tail.store(frame.end, Ordering::Release);
+        Ok(())
+    }
+
     pub fn read_object(&self, ptr: Ptr) -> Result<Object> {
-        let tail = self.inner.tail.load(Ordering::Acquire);
+        let tail = self.inner.written.load(Ordering::Acquire);
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
                 "pointer {} outside log of {tail} bytes",
@@ -472,8 +643,16 @@ impl Store {
     }
 
     pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::SeqCst);
-        self.inner.cache.clear();
+        let inner = &self.inner;
+        inner.closed.store(true, Ordering::SeqCst);
+        inner.cache.clear();
+        if inner.options.read_only || inner.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let end = inner.written.load(Ordering::Acquire);
+        if inner.file.metadata().is_ok_and(|meta| meta.len() > end) {
+            let _ = inner.file.set_len(end);
+        }
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
@@ -489,8 +668,8 @@ impl Store {
         }
         Ok(Txn {
             store: self.clone(),
-            base: self.inner.tail.load(Ordering::Acquire),
-            buf: Vec::new(),
+            start: self.inner.written.load(Ordering::Acquire),
+            buf: vec![0u8; FRAME_BYTES],
             seen: HashMap::new(),
             remembered: Vec::new(),
         })
@@ -513,7 +692,7 @@ impl Store {
 
 pub struct Txn {
     store: Store,
-    base: u64,
+    start: u64,
     buf: Vec<u8>,
     seen: HashMap<Hash, u64>,
     remembered: Vec<(Hash, CacheEntry)>,
@@ -533,7 +712,7 @@ impl Sink for Txn {
         if let Some(offset) = self.store.inner.dedupe.get(&hash) {
             return Ok(Ptr { hash, offset });
         }
-        let offset = self.base + self.buf.len() as u64;
+        let offset = self.start + self.buf.len() as u64;
         append_record(&mut self.buf, offset, &object.body, &object.links);
         self.seen.insert(hash, offset);
         Ok(Ptr { hash, offset })
@@ -552,42 +731,63 @@ impl Sink for Txn {
     }
 }
 
+fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
+    if inner.options.durability != Durability::Fsync || end <= cursor.reserved {
+        return;
+    }
+    let zeros = vec![0u8; cursor.reserve as usize];
+    if inner.file.write_all_at(&zeros, end).is_ok() {
+        cursor.reserved = end + cursor.reserve;
+        cursor.reserve = (cursor.reserve * 2).clamp(FIRST_RESERVE, MAX_RESERVE);
+    } else {
+        cursor.reserved = u64::MAX;
+    }
+}
+
 impl Txn {
-    pub fn commit(self, head: Ptr) -> Result<()> {
-        let inner = &self.store.inner;
-        let end = self.base + self.buf.len() as u64;
-        let mut seq = inner.seq.lock();
-        let next = *seq + 1;
-        let sync = inner.options.durability == Durability::Fsync;
-        let attempt = (|| -> Result<()> {
-            inner.file.write_all_at(&self.buf, self.base)?;
-            if sync {
-                inner.file.sync_data()?;
-            }
-            let sb = Super {
-                seq: next,
-                log_end: end,
-                head: Some(head),
-            };
-            inner.file.write_all_at(&sb.encode(), (next % 2) * SLOT_BYTES)?;
-            if sync {
-                inner.file.sync_data()?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = attempt {
-            inner.poisoned.store(true, Ordering::Release);
-            return Err(error);
+    pub(crate) fn write(mut self, head: Ptr) -> Result<Frame> {
+        let store = self.store.clone();
+        let inner = &store.inner;
+        let end = self.start + self.buf.len() as u64;
+        let mut cursor = inner.cursor.lock();
+        if inner.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
         }
-        *seq = next;
-        inner.tail.store(end, Ordering::Release);
-        drop(seq);
+        let frame = Frame {
+            seq: cursor.seq + 1,
+            end,
+            head,
+        };
+        let header = Super {
+            seq: frame.seq,
+            log_end: end,
+            head: Some(head),
+        };
+        header.fill(FRAME_MAGIC, &mut self.buf);
+        let mut hasher = Xxh3::new();
+        hasher.update(&self.buf[..FRAME_CHECKED]);
+        hasher.update(&self.buf[FRAME_BYTES..]);
+        self.buf[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+        reserve(inner, &mut cursor, end);
+        if let Err(error) = inner.file.write_all_at(&self.buf, self.start) {
+            inner.poisoned.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+        cursor.seq = frame.seq;
+        inner.written.store(end, Ordering::Release);
+        drop(cursor);
         for (hash, offset) in self.seen {
             inner.dedupe.insert(hash, offset);
         }
         for (hash, entry) in self.remembered {
             inner.cache.insert(hash, entry);
         }
-        Ok(())
+        Ok(frame)
+    }
+
+    pub fn commit(self, head: Ptr) -> Result<()> {
+        let store = self.store.clone();
+        let frame = self.write(head)?;
+        store.sync(frame)
     }
 }

@@ -7,7 +7,8 @@ of `T`, and all earlier versions stay readable.
 ## Layers
 
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls.
-- `store.rs`: the append-only file, superblocks, object reads with hash verification, node cache.
+- `store.rs`: the append-only file, commit frames, superblocks, recovery, object reads with hash
+  verification, node cache.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, commits, history, branches, watchers.
@@ -82,25 +83,91 @@ spilling interior-node values over 64 bytes cut table update bytes by 19% but gr
 
 ## File format and durability
 
-Two 4 KiB superblock slots, then the log. A commit does this:
+Two 4 KiB superblock slots, then the log. The log is a run of frames, one per commit. A frame is a
+68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
+the commit wrote. The check covers the header and every record, so a frame proves by itself that
+it reached the disk whole. A commit does this:
 
-1. Append all new objects past the published tail, then fsync.
-2. Write the superblock to the alternate slot with sequence, log end, head pointer, checksum.
-3. fsync.
+1. Write the frame at the log tail.
+2. fdatasync. This is the durability point.
+3. Write the superblock to the other slot, without syncing it.
 
-Open picks the valid slot with the highest sequence and truncates anything past its log end, so
-a crash can lose only a commit that was never acknowledged. A failed write or fsync poisons the
-store until reopen. Only one process may hold the writer lock. Read-only opens take no lock,
-since log bytes under a published head never change, and `refresh` picks up new commits.
+The superblock is written only after its frame is durable, so it never names anything a crash can
+lose, and the next fdatasync carries it to disk. A crash leaves it at most one sync behind.
+
+Open picks the valid slot with the highest sequence and scans forward from its log end. A frame
+counts only if its magic, sequence (the previous one plus 1), end offset and check are all right,
+and the first that is not ends the log. A torn tail, zeroes and garbage all stop the scan, and an
+acknowledged commit survives a stale or torn superblock. A writer then syncs the frames it
+accepted, truncates the rest, and rewrites the superblock, in that order. The truncation is durable
+before any new frame is written, so a frame stranded past a torn one can never line up with the
+log later.
+
+A frame past the superblock may not be durable while a writer is alive, so `refresh` reads only
+the superblock and never scans. A read-only open scans only when a frame follows the superblock
+and it can take a shared lock, which proves no writer is alive. It holds that lock for the scan
+and syncs what it accepted, since a dead writer's frames may exist only in the page cache. If a
+writer holds the lock, the superblock is current and the reader uses it. A writer opening during
+that short scan retries for a few milliseconds before reporting `Error::Locked`.
+
+fdatasync after extending a file has to commit the ext4 journal, which took 620 µs against 360 µs
+for overwriting allocated blocks on the test NVMe. So in `Durability::Fsync` the log grows in
+zero-filled chunks, doubling from 64 KiB to 4 MiB, and frames overwrite blocks that are already
+written, which needs only the device flush. The zeroes must be real: `posix_fallocate` leaves
+unwritten extents, and converting those commits the journal just the same (640 µs). The first
+commit of a process reserves nothing, so a short run pays for no zeroes. The reservation is only
+an optimization. A failed reservation stops further attempts without failing the commit, open
+discards it, and a clean close truncates it, so the file can be up to 4 MiB longer than
+`size_on_disk` while open.
+
+A failed write or fsync poisons the store until reopen. Only one process may hold the writer lock.
+Read-only opens otherwise take no lock, since log bytes under a published head never change, and
+`refresh` picks up new commits.
 
 ## Concurrency
 
-One writer at a time, serialized by a mutex. `update` clones the root, runs the closure, flushes,
-and publishes through `ArcSwap`. Readers never block and never see partial state. A `Snapshot<T>`
-keeps its version alive for as long as it is held, and so does any `Map` or `Table` cloned from
-it. All of them also keep the writer lock held after the `Db` is dropped, so a new writer gets
-`Error::Locked` until they are gone. Unpublished state lives only in the closure's
-working copy, so a panic or an `Err` discards it.
+Writers run their closures one at a time under the `tip` mutex and sync outside it. Each branch
+has two states: `state`, the published one that readers load through `ArcSwap`, and `tip`, the
+newest one written. Under the mutex a writer clones the tip, runs the closure, flushes, writes its
+frame to the page cache, queues it, and releases the mutex. The next writer builds on that tip
+even though it is not durable yet. Object reads are bounded by `written`, the end of the frames in
+the file, rather than `tail`, the published end, so unpublished objects stay readable to writers.
+Published pointers never reach past `tail`.
+
+Each writer then waits for its frame. The first to find no sync running becomes the leader: it
+takes the whole queue, fdatasyncs, writes one superblock for the last frame, publishes the batch
+in order, and wakes the others. Writers that arrive during the sync form the next batch, and one
+of them leads it. A lone writer leads its own one-frame batch, which adds no syscall and no thread
+switch. `Durability::Buffered` takes the same path without the fdatasync. A dedicated sync thread
+was measured and rejected: it adds a wakeup to every uncontended commit and gained nothing under
+contention.
+
+Nothing is published or acknowledged before it is durable, so readers, watchers and other
+processes never see a commit that could be lost, and they see every commit in order. A closure
+that ends without a frame, because nothing changed or it returned `Err`, may still have read an
+unpublished tip, so it waits for that tip before returning, and reports the failure instead if the
+tip never became durable. `fork` copies the tip and waits the same way, so the new branch appears
+in `branches` only once durable. `branch`, `branches` and `verify` use the published refs and do
+not touch the mutex.
+
+If a sync fails, the store poisons, nothing in the batch is published, the leader gets the I/O
+error, and every queued writer gets `Error::Poisoned`. A failed commit's frame may still be on disk
+and reappear after reopen: an error means not acknowledged, not guaranteed absent. A failed frame
+write poisons the same way, but frames queued ahead of it are whole, so they still sync and
+acknowledge.
+
+Writing frames with `O_DIRECT|O_DSYNC` was also measured. On the test NVMe a forced-unit-access
+write is cheaper than a cache flush, which cut single-writer latency by 26% and raised contended
+throughput by 40%. It was rejected because the gain exists only where FUA beats FLUSH, and the
+writes bypass the page cache: reads after a bulk commit go cold, which made buffered commits after
+a reopen 27% slower, and a read-only follower's `refresh` rose from 5 µs to 117 µs. It also needs
+an in-memory pending log on the read path, a fallback, and buffered reads overlapping direct writes
+on the tail block.
+
+A `Snapshot<T>` keeps its version alive for as long as it is held, and so does any `Map` or `Table`
+cloned from it. All of them also keep the writer lock held after the `Db` is dropped, so a new
+writer gets `Error::Locked` until they are gone. A closure works on a clone of the tip, so a panic
+or an `Err` discards its changes.
 
 ## History
 

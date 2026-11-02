@@ -16,6 +16,8 @@ type Model = BTreeMap<u64, String>;
 const LOG_START: usize = 8192;
 const SLOT: usize = 4096;
 const SUPER: usize = 96;
+const FRAME_CHECKED: usize = 32 + HASH_BYTES;
+const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 
 struct Built {
     dir: TempDir,
@@ -150,7 +152,7 @@ fn crash_images_open_at_the_last_durable_commit() {
     for commit in 0..built.lens.len() - 1 {
         let start = built.lens[commit];
         let end = built.lens[commit + 1];
-        for tail in start..=end {
+        for tail in start..end {
             let image = built.image(commit, tail);
             fs::write(&path, &image).unwrap();
             let readonly = fast().read_only().open::<Root>(&path).unwrap();
@@ -160,6 +162,13 @@ fn crash_images_open_at_the_last_durable_commit() {
             check_at_version(&db, &built, commit);
             assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
         }
+        fs::write(&path, built.image(commit, end)).unwrap();
+        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        check_at_version(&readonly, &built, commit + 1);
+        drop(readonly);
+        let db = fast().open::<Root>(&path).unwrap();
+        check_at_version(&db, &built, commit + 1);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, end);
     }
 }
 
@@ -233,6 +242,9 @@ fn repeated_crashes_always_land_on_the_last_durable_commit() {
         let slot = Built::newest_slot(version);
         let torn = rng.below(SUPER as u64) as usize;
         let keep = head.len() + rng.below((after.len() - head.len()) as u64 + 1) as usize;
+        if keep == after.len() {
+            versions.push(next);
+        }
         let mut image = after[..keep].to_vec();
         image[..LOG_START].copy_from_slice(&head[..LOG_START]);
         if rng.chance(50) {
@@ -271,7 +283,7 @@ fn recovered_database_keeps_working_after_a_crash_image() {
 }
 
 #[test]
-fn torn_superblock_write_keeps_the_previous_commit() {
+fn torn_superblock_write_recovers_from_the_complete_frame() {
     let built = build(8, 3);
     let path = built.target();
     let last = built.lens.len() - 1;
@@ -282,19 +294,143 @@ fn torn_superblock_write_keeps_the_previous_commit() {
             let new = &built.headers[commit + 1][slot..slot + SUPER];
             head[slot..slot + torn].copy_from_slice(&new[..torn]);
             fs::write(&path, &head).unwrap();
-            let complete = &head[slot..slot + SUPER] == new;
-            let expected = if complete { commit + 1 } else { commit };
             let db = fast().open::<Root>(&path).unwrap();
-            check_at_version(&db, &built, expected);
+            check_at_version(&db, &built, commit + 1);
             drop(db);
             let mut suffix = built.image(commit, built.lens[commit + 1]);
             suffix[slot + torn..slot + SUPER].copy_from_slice(&new[torn..]);
             fs::write(&path, &suffix).unwrap();
-            let complete = &suffix[slot..slot + SUPER] == new;
-            let expected = if complete { commit + 1 } else { commit };
             let db = fast().open::<Root>(&path).unwrap();
-            check_at_version(&db, &built, expected);
+            check_at_version(&db, &built, commit + 1);
         }
+    }
+}
+
+#[test]
+fn torn_superblock_over_a_torn_frame_keeps_the_previous_commit() {
+    let built = build(8, 3);
+    let path = built.target();
+    let last = built.lens.len() - 1;
+    for commit in 0..last {
+        let slot = Built::newest_slot(commit + 1);
+        let new = &built.headers[commit + 1][slot..slot + SUPER];
+        for torn in 0..SUPER {
+            let mut image = built.image(commit, built.lens[commit + 1] - 1);
+            image[slot..slot + torn].copy_from_slice(&new[..torn]);
+            if image[slot..slot + SUPER] == *new {
+                continue;
+            }
+            fs::write(&path, &image).unwrap();
+            let db = fast().open::<Root>(&path).unwrap();
+            check_at_version(&db, &built, commit);
+        }
+    }
+}
+
+#[test]
+fn recovery_replays_every_complete_frame_past_a_stale_superblock() {
+    let built = build(8, 3);
+    let path = built.target();
+    let last = built.lens.len() - 1;
+    for base in 0..last {
+        for frames in base + 1..=last {
+            let full = built.lens[frames];
+            fs::write(&path, built.image(base, full)).unwrap();
+            let readonly = fast().read_only().open::<Root>(&path).unwrap();
+            check_at_version(&readonly, &built, frames);
+            drop(readonly);
+            assert_eq!(fs::read(&path).unwrap(), built.image(base, full));
+            let db = fast().open::<Root>(&path).unwrap();
+            check_at_version(&db, &built, frames);
+            drop(db);
+            assert_eq!(fs::metadata(&path).unwrap().len() as usize, full);
+            let mut image = fs::read(&path).unwrap();
+            image[built.lens[frames - 1]] ^= 0xFF;
+            fs::write(&path, &image).unwrap();
+            let db = fast().open::<Root>(&path).unwrap();
+            check_at_version(&db, &built, frames);
+        }
+    }
+}
+
+#[test]
+fn recovery_stops_at_the_first_damaged_frame() {
+    let built = build(5, 3);
+    let path = built.target();
+    let (base, damaged, last) = (1, 3, built.lens.len() - 1);
+    for position in built.lens[damaged - 1]..built.lens[damaged] {
+        let mut image = built.image(base, built.lens[last]);
+        image[position] ^= 0x41;
+        fs::write(&path, &image).unwrap();
+        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        check_at_version(&readonly, &built, damaged - 1);
+        drop(readonly);
+        let db = fast().open::<Root>(&path).unwrap();
+        check_at_version(&db, &built, damaged - 1);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, built.lens[damaged - 1]);
+    }
+}
+
+#[test]
+fn recovery_refuses_frames_that_do_not_follow_the_tail() {
+    let built = build(5, 3);
+    let path = built.target();
+    for commit in 0..built.lens.len() - 2 {
+        let (start, next, after) = (
+            built.lens[commit],
+            built.lens[commit + 1],
+            built.lens[commit + 2],
+        );
+        let mut skipped = built.image(commit, start);
+        skipped.extend_from_slice(&built.bytes[next..after]);
+        fs::write(&path, &skipped).unwrap();
+        let db = fast().open::<Root>(&path).unwrap();
+        check_at_version(&db, &built, commit);
+        drop(db);
+        let mut replayed = built.image(commit, next);
+        replayed.extend_from_slice(&built.bytes[start..next]);
+        fs::write(&path, &replayed).unwrap();
+        let db = fast().open::<Root>(&path).unwrap();
+        check_at_version(&db, &built, commit + 1);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, next);
+    }
+}
+
+#[test]
+fn recovery_refuses_a_checksummed_frame_with_the_wrong_sequence() {
+    let built = build(4, 3);
+    let path = built.target();
+    let commit = 1;
+    let (start, end) = (built.lens[commit], built.lens[commit + 1]);
+    let mut image = built.image(commit, end);
+    let forged = commit as u64 + 2;
+    image[start + 8..start + 16].copy_from_slice(&forged.to_le_bytes());
+    let mut check = xxhash_rust::xxh3::Xxh3::new();
+    check.update(&image[start..start + FRAME_CHECKED]);
+    check.update(&image[start + FRAME_BYTES..end]);
+    image[start + FRAME_CHECKED..start + FRAME_BYTES].copy_from_slice(&check.digest128().to_le_bytes());
+    fs::write(&path, &image).unwrap();
+    let db = fast().open::<Root>(&path).unwrap();
+    check_at_version(&db, &built, commit);
+    assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
+}
+
+#[test]
+fn zeroed_space_past_the_last_frame_ends_the_log() {
+    let built = build(6, 3);
+    let path = built.target();
+    let last = built.lens.len() - 1;
+    for base in [last - 2, last] {
+        let mut image = built.image(base, built.lens[last]);
+        image.resize(built.lens[last] + (1 << 18), 0);
+        fs::write(&path, &image).unwrap();
+        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        check_at_version(&readonly, &built, last);
+        drop(readonly);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, image.len());
+        let db = fast().open::<Root>(&path).unwrap();
+        check_at_version(&db, &built, last);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, built.lens[last]);
     }
 }
 
@@ -309,6 +445,12 @@ fn corrupt_superblocks_fall_back_or_report() {
         for bit in [0x01u8, 0x80] {
             let mut image = built.bytes.clone();
             image[newest + byte] ^= bit;
+            fs::write(&path, &image).unwrap();
+            let db = fast().read_only().open::<Root>(&path).unwrap();
+            check_at_version(&db, &built, last);
+            drop(db);
+
+            image[built.lens[last - 1]] ^= bit;
             fs::write(&path, &image).unwrap();
             let db = fast().read_only().open::<Root>(&path).unwrap();
             check_at_version(&db, &built, last - 1);
