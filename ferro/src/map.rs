@@ -29,6 +29,27 @@ thread_local! {
     static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+pub trait Summary<K, V>: Data {
+    fn of(key: &K, value: &V) -> Self;
+    fn combine(&self, other: &Self) -> Self;
+}
+
+impl<K, V> Summary<K, V> for () {
+    #[inline]
+    fn of(_key: &K, _value: &V) {}
+
+    #[inline]
+    fn combine(&self, _other: &Self) {}
+}
+
+#[inline]
+fn fold<K, V, S: Summary<K, V>>(total: Option<S>, next: &S) -> Option<S> {
+    Some(match total {
+        Some(total) => total.combine(next),
+        None => next.clone(),
+    })
+}
+
 fn level_of<K: Data>(key: &K) -> Result<u8> {
     let mut sink = HashSink;
     let mut encoder = Encoder::reusing(&mut sink, KEY_SCRATCH.take());
@@ -40,28 +61,41 @@ fn level_of<K: Data>(key: &K) -> Result<u8> {
     Ok((word.trailing_zeros() / LEVEL_BITS) as u8)
 }
 
-enum Slot<V> {
+enum Slot<V, S> {
     Inline(Arc<V>),
     Fresh(Arc<V>),
-    Spilled(Ptr),
+    Spilled(Ptr, S),
 }
 
-impl<V> Clone for Slot<V> {
-    fn clone(&self) -> Self {
+impl<V, S> Slot<V, S> {
+    #[inline]
+    fn summary<K>(&self, key: &K) -> S
+    where
+        S: Summary<K, V>,
+    {
         match self {
-            Slot::Inline(value) => Slot::Inline(value.clone()),
-            Slot::Fresh(value) => Slot::Fresh(value.clone()),
-            Slot::Spilled(ptr) => Slot::Spilled(*ptr),
+            Slot::Inline(value) | Slot::Fresh(value) => S::of(key, value),
+            Slot::Spilled(_, summary) => summary.clone(),
         }
     }
 }
 
-enum Memo<K, V> {
-    Pinned(Arc<Node<K, V>>),
-    Weak(Weak<Node<K, V>>),
+impl<V, S: Clone> Clone for Slot<V, S> {
+    fn clone(&self) -> Self {
+        match self {
+            Slot::Inline(value) => Slot::Inline(value.clone()),
+            Slot::Fresh(value) => Slot::Fresh(value.clone()),
+            Slot::Spilled(ptr, summary) => Slot::Spilled(*ptr, summary.clone()),
+        }
+    }
 }
 
-impl<K, V> Clone for Memo<K, V> {
+enum Memo<K, V, S> {
+    Pinned(Arc<Node<K, V, S>>),
+    Weak(Weak<Node<K, V, S>>),
+}
+
+impl<K, V, S> Clone for Memo<K, V, S> {
     fn clone(&self) -> Self {
         match self {
             Memo::Pinned(node) => Memo::Pinned(node.clone()),
@@ -70,40 +104,56 @@ impl<K, V> Clone for Memo<K, V> {
     }
 }
 
-enum Link<K, V> {
+enum Link<K, V, S> {
     Empty,
     Stored {
         ptr: Ptr,
         count: u64,
-        memo: OnceLock<Memo<K, V>>,
+        summary: S,
+        memo: OnceLock<Memo<K, V, S>>,
     },
-    Mem(Arc<Node<K, V>>),
+    Mem(Arc<Node<K, V, S>>),
 }
 
-impl<K, V> Clone for Link<K, V> {
+impl<K, V, S: Clone> Clone for Link<K, V, S> {
     fn clone(&self) -> Self {
         match self {
             Link::Empty => Link::Empty,
-            Link::Stored { ptr, count, .. } => Link::stored(*ptr, *count),
+            Link::Stored {
+                ptr,
+                count,
+                summary,
+                ..
+            } => Link::stored(*ptr, *count, summary.clone()),
             Link::Mem(node) => Link::Mem(node.clone()),
         }
     }
 }
 
-impl<K, V> Link<K, V> {
-    fn stored(ptr: Ptr, count: u64) -> Self {
+impl<K, V, S> Link<K, V, S> {
+    fn stored(ptr: Ptr, count: u64, summary: S) -> Self {
         Link::Stored {
             ptr,
             count,
+            summary,
             memo: OnceLock::new(),
         }
     }
 
-    fn with_memo(&self) -> Self {
+    fn with_memo(&self) -> Self
+    where
+        S: Clone,
+    {
         match self {
-            Link::Stored { ptr, count, memo } => Link::Stored {
+            Link::Stored {
+                ptr,
+                count,
+                summary,
+                memo,
+            } => Link::Stored {
                 ptr: *ptr,
                 count: *count,
+                summary: summary.clone(),
                 memo: memo.clone(),
             },
             other => other.clone(),
@@ -115,6 +165,17 @@ impl<K, V> Link<K, V> {
             Link::Empty => 0,
             Link::Stored { count, .. } => *count,
             Link::Mem(node) => node.count,
+        }
+    }
+
+    fn summary(&self) -> Option<S>
+    where
+        S: Summary<K, V>,
+    {
+        match self {
+            Link::Empty => None,
+            Link::Stored { summary, .. } => Some(summary.clone()),
+            Link::Mem(node) => node.summary(),
         }
     }
 
@@ -132,16 +193,16 @@ impl<K, V> Link<K, V> {
     }
 }
 
-struct Node<K, V> {
+struct Node<K, V, S> {
     level: u8,
     keys: Vec<K>,
-    slots: Vec<Slot<V>>,
-    children: Vec<Link<K, V>>,
+    slots: Vec<Slot<V, S>>,
+    children: Vec<Link<K, V, S>>,
     count: u64,
     origin: Option<Ptr>,
 }
 
-impl<K: Clone, V> Clone for Node<K, V> {
+impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
     fn clone(&self) -> Self {
         Node {
             level: self.level,
@@ -154,7 +215,7 @@ impl<K: Clone, V> Clone for Node<K, V> {
     }
 }
 
-impl<K, V> Node<K, V> {
+impl<K, V, S> Node<K, V, S> {
     fn search<Q>(&self, key: &Q) -> std::result::Result<usize, usize>
     where
         K: Borrow<Q>,
@@ -163,11 +224,11 @@ impl<K, V> Node<K, V> {
         self.keys.binary_search_by(|probe| probe.borrow().cmp(key))
     }
 
-    fn child(&self, position: usize) -> &Link<K, V> {
+    fn child(&self, position: usize) -> &Link<K, V, S> {
         self.children.get(position).unwrap_or(&Link::Empty)
     }
 
-    fn children_mut(&mut self) -> &mut Vec<Link<K, V>> {
+    fn children_mut(&mut self) -> &mut Vec<Link<K, V, S>> {
         if self.children.is_empty() {
             self.children.resize_with(self.keys.len() + 1, || Link::Empty);
         }
@@ -189,17 +250,31 @@ impl<K, V> Node<K, V> {
             self.keys.len() as u64 + self.children.iter().map(Link::count).sum::<u64>();
     }
 
+    fn summary(&self) -> Option<S>
+    where
+        S: Summary<K, V>,
+    {
+        let mut total = self.child(0).summary();
+        for (index, slot) in self.slots.iter().enumerate() {
+            total = fold(total, &slot.summary(&self.keys[index]));
+            if let Some(next) = self.child(index + 1).summary() {
+                total = fold(total, &next);
+            }
+        }
+        total
+    }
+
     fn fixed_bytes(&self) -> usize {
-        let held = self.slots.iter().filter(|slot| !matches!(slot, Slot::Spilled(_)));
+        let held = self.slots.iter().filter(|slot| !matches!(slot, Slot::Spilled(..)));
         size_of::<Self>()
             + self.keys.capacity() * (size_of::<K>() + ITEM_BYTES)
-            + self.slots.capacity() * size_of::<Slot<V>>()
-            + self.children.capacity() * size_of::<Link<K, V>>()
+            + self.slots.capacity() * size_of::<Slot<V, S>>()
+            + self.children.capacity() * size_of::<Link<K, V, S>>()
             + held.count() * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
     }
 }
 
-impl<K: Data, V: Data> Node<K, V> {
+impl<K: Data, V: Data, S: Data> Node<K, V, S> {
     fn decode(decoder: &mut Decoder<'_>, origin: Ptr) -> Result<Self> {
         let level = decoder.u8()?;
         let n = decoder.varint()? as usize;
@@ -214,7 +289,7 @@ impl<K: Data, V: Data> Node<K, V> {
         for _ in 0..n {
             slots.push(match decoder.u8()? {
                 0 => Slot::Inline(Arc::new(V::decode(decoder)?)),
-                1 => Slot::Spilled(decoder.link()?),
+                1 => Slot::Spilled(decoder.link()?, S::decode(decoder)?),
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
             });
         }
@@ -224,7 +299,8 @@ impl<K: Data, V: Data> Node<K, V> {
             if count != 0 {
                 children.reserve_exact(n + 1 - children.len());
                 children.resize_with(position, || Link::Empty);
-                children.push(Link::stored(decoder.link()?, count));
+                let summary = S::decode(decoder)?;
+                children.push(Link::stored(decoder.link()?, count, summary));
             }
         }
         if !children.is_empty() {
@@ -243,17 +319,17 @@ impl<K: Data, V: Data> Node<K, V> {
     }
 }
 
-enum Reach<'a, K, V> {
+enum Reach<'a, K, V, S> {
     Absent,
-    Borrowed(&'a Arc<Node<K, V>>),
-    Owned(Arc<Node<K, V>>),
+    Borrowed(&'a Arc<Node<K, V, S>>),
+    Owned(Arc<Node<K, V, S>>),
 }
 
-fn reach<'a, K: Data, V: Data>(
+fn reach<'a, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &'a Link<K, V>,
+    link: &'a Link<K, V, S>,
     depth: usize,
-) -> Result<Reach<'a, K, V>> {
+) -> Result<Reach<'a, K, V, S>> {
     let (ptr, memo) = match link {
         Link::Empty => return Ok(Reach::Absent),
         Link::Mem(node) => return Ok(Reach::Borrowed(node)),
@@ -280,11 +356,11 @@ fn reach<'a, K: Data, V: Data>(
     Ok(Reach::Owned(node))
 }
 
-fn resident<K: Data, V: Data>(
+fn resident<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &Link<K, V>,
+    link: &Link<K, V, S>,
     depth: usize,
-) -> Result<Option<Arc<Node<K, V>>>> {
+) -> Result<Option<Arc<Node<K, V, S>>>> {
     Ok(match reach(store, link, depth)? {
         Reach::Absent => None,
         Reach::Borrowed(node) => Some(node.clone()),
@@ -292,10 +368,10 @@ fn resident<K: Data, V: Data>(
     })
 }
 
-fn load<K: Data, V: Data>(
+fn load<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &Link<K, V>,
-) -> Result<Option<Arc<Node<K, V>>>> {
+    link: &Link<K, V, S>,
+) -> Result<Option<Arc<Node<K, V, S>>>> {
     match link {
         Link::Empty => Ok(None),
         Link::Mem(node) => Ok(Some(node.clone())),
@@ -313,10 +389,10 @@ enum Visit<R> {
     Descend(usize),
 }
 
-fn node_mut<'a, K: Data, V: Data>(
+fn node_mut<'a, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &'a mut Link<K, V>,
-) -> Result<&'a mut Node<K, V>> {
+    link: &'a mut Link<K, V, S>,
+) -> Result<&'a mut Node<K, V, S>> {
     if let Link::Stored { .. } = link {
         let node = load(store, link)?.ok_or(Error::Detached)?;
         *link = Link::Mem(node);
@@ -327,13 +403,13 @@ fn node_mut<'a, K: Data, V: Data>(
     }
 }
 
-fn link_from<K, V>(
+fn link_from<K, V, S>(
     level: u8,
     keys: Vec<K>,
-    slots: Vec<Slot<V>>,
-    mut children: Vec<Link<K, V>>,
+    slots: Vec<Slot<V, S>>,
+    mut children: Vec<Link<K, V, S>>,
     origin: Option<Ptr>,
-) -> Link<K, V> {
+) -> Link<K, V, S> {
     if keys.is_empty() {
         return children.pop().unwrap_or(Link::Empty);
     }
@@ -352,11 +428,11 @@ fn link_from<K, V>(
     Link::Mem(Arc::new(node))
 }
 
-fn split<K: Data + Ord, V: Data>(
+fn split<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
-    link: Link<K, V>,
+    link: Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
-) -> Result<(Link<K, V>, Link<K, V>)> {
+) -> Result<(Link<K, V, S>, Link<K, V, S>)> {
     let Some(node) = load(store, &link)? else {
         return Ok((Link::Empty, Link::Empty));
     };
@@ -392,11 +468,11 @@ fn split<K: Data + Ord, V: Data>(
     ))
 }
 
-fn merge<K: Data + Ord, V: Data>(
+fn merge<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
-    a: Link<K, V>,
-    b: Link<K, V>,
-) -> Result<Link<K, V>> {
+    a: Link<K, V, S>,
+    b: Link<K, V, S>,
+) -> Result<Link<K, V, S>> {
     let (Some(x), Some(y)) = (load(store, &a)?, load(store, &b)?) else {
         return Ok(if a.count() == 0 { b } else { a });
     };
@@ -435,13 +511,13 @@ fn merge<K: Data + Ord, V: Data>(
     }
 }
 
-fn insert_at<K: Data + Ord, V: Data>(
+fn insert_at<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &mut Link<K, V>,
+    link: &mut Link<K, V, S>,
     key: K,
     level: u8,
     value: Arc<V>,
-) -> Result<Option<Slot<V>>> {
+) -> Result<Option<Slot<V, S>>> {
     if let Link::Stored { .. } = link {
         let node = load(store, link)?.ok_or(Error::Detached)?;
         *link = Link::Mem(node);
@@ -500,14 +576,15 @@ fn insert_at<K: Data + Ord, V: Data>(
     }
 }
 
-fn remove_at<K, V, Q>(
+fn remove_at<K, V, S, Q>(
     store: Option<&Store>,
-    link: &mut Link<K, V>,
+    link: &mut Link<K, V, S>,
     key: &Q,
-) -> Result<Option<Slot<V>>>
+) -> Result<Option<Slot<V, S>>>
 where
     K: Data + Ord + Borrow<Q>,
     V: Data,
+    S: Data,
     Q: Ord + ?Sized,
 {
     if matches!(link, Link::Empty) {
@@ -539,14 +616,15 @@ where
     }
 }
 
-fn find_mut<'a, K, V, Q>(
+fn find_mut<'a, K, V, S, Q>(
     store: Option<&Store>,
-    link: &'a mut Link<K, V>,
+    link: &'a mut Link<K, V, S>,
     key: &Q,
 ) -> Result<Option<&'a mut V>>
 where
     K: Data + Ord + Borrow<Q>,
     V: Data,
+    S: Data,
     Q: Ord + ?Sized,
 {
     if matches!(link, Link::Empty) {
@@ -559,7 +637,7 @@ where
             let value = match &*slot {
                 Slot::Inline(value) => Some(value.clone()),
                 Slot::Fresh(_) => None,
-                Slot::Spilled(ptr) => Some(store.ok_or(Error::Detached)?.load::<V>(*ptr)?),
+                Slot::Spilled(ptr, _) => Some(store.ok_or(Error::Detached)?.load::<V>(*ptr)?),
             };
             if let Some(value) = value {
                 *slot = Slot::Fresh(value);
@@ -573,10 +651,10 @@ where
     }
 }
 
-fn read_slot<V: Data>(store: Option<&Store>, slot: &Slot<V>) -> Result<Arc<V>> {
+fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Arc<V>> {
     match slot {
         Slot::Inline(value) | Slot::Fresh(value) => Ok(value.clone()),
-        Slot::Spilled(ptr) => store.ok_or(Error::Detached)?.load::<V>(*ptr),
+        Slot::Spilled(ptr, _) => store.ok_or(Error::Detached)?.load::<V>(*ptr),
     }
 }
 
@@ -589,7 +667,10 @@ fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -
     T::decode(&mut decoder).map(drop)
 }
 
-fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Link<K, V>> {
+fn flush<K: Data, V: Data, S: Summary<K, V>>(
+    link: &Link<K, V, S>,
+    sink: &mut dyn Sink,
+) -> Result<Link<K, V, S>> {
     let Link::Mem(node) = link else {
         return Ok(link.clone());
     };
@@ -606,14 +687,15 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
             verify::<K>(&encoder, mark, store)?;
         }
     }
-    let mut settled: Vec<Slot<V>> = Vec::with_capacity(if caching { width } else { 0 });
-    for slot in &node.slots {
+    let mut settled: Vec<Slot<V, S>> = Vec::with_capacity(if caching { width } else { 0 });
+    for (key, slot) in node.keys.iter().zip(&node.slots) {
         match slot {
-            Slot::Spilled(ptr) => {
+            Slot::Spilled(ptr, summary) => {
                 encoder.u8(1);
                 encoder.link(*ptr);
+                summary.encode(&mut encoder)?;
                 if caching {
-                    settled.push(Slot::Spilled(*ptr));
+                    settled.push(Slot::Spilled(*ptr, summary.clone()));
                 }
             }
             Slot::Inline(value) | Slot::Fresh(value) => {
@@ -627,10 +709,12 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
                 if encoder.since(mark) > SPILL_BYTES {
                     encoder.rewind(mark);
                     let ptr = encoder.child(|inner| value.encode(inner))?;
+                    let summary = S::of(key, value);
                     encoder.u8(1);
                     encoder.link(ptr);
+                    summary.encode(&mut encoder)?;
                     if caching {
-                        settled.push(Slot::Spilled(ptr));
+                        settled.push(Slot::Spilled(ptr, summary));
                     }
                 } else if caching {
                     settled.push(Slot::Inline(value.clone()));
@@ -639,21 +723,33 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         }
     }
     let branching = caching && !node.children.is_empty();
-    let mut stored: Vec<Link<K, V>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
+    let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
+    let mut total = None;
     for position in 0..=width {
         let flushed = flush(node.child(position), encoder.sink())?;
         match &flushed {
             Link::Empty => encoder.varint(0),
-            Link::Stored { ptr, count, .. } => {
+            Link::Stored {
+                ptr,
+                count,
+                summary,
+                ..
+            } => {
                 encoder.varint(*count);
+                summary.encode(&mut encoder)?;
                 encoder.link(*ptr);
+                total = fold(total, summary);
             }
             Link::Mem(_) => return Err(Error::Detached),
         }
         if branching {
             stored.push(flushed);
         }
+        if let Some(slot) = node.slots.get(position) {
+            total = fold(total, &slot.summary(&node.keys[position]));
+        }
     }
+    let total = total.ok_or(Error::Detached)?;
     let unsettled = encoder.is_unsettled();
     let object = encoder.into_object();
     let hash = object.hash();
@@ -662,7 +758,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         None => None,
         Some(store) if unsettled => {
             let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
-            Some(Node::<K, V>::decode(&mut decoder, Ptr { hash, offset: 0 })?)
+            Some(Node::<K, V, S>::decode(&mut decoder, Ptr { hash, offset: 0 })?)
         }
         Some(_) => Some(Node {
             level: node.level,
@@ -682,7 +778,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         let weight = heap_weight(decoded.fixed_bytes(), body_bytes);
         sink.remember(ptr, Arc::new(decoded), weight);
     }
-    Ok(Link::stored(ptr, node.count))
+    Ok(Link::stored(ptr, node.count, total))
 }
 
 struct Edit<K, V> {
@@ -691,23 +787,23 @@ struct Edit<K, V> {
     value: Option<Arc<V>>,
 }
 
-struct Open<K, V> {
+struct Open<K, V, S> {
     level: u8,
     keys: Vec<K>,
-    slots: Vec<Slot<V>>,
-    children: Vec<Link<K, V>>,
+    slots: Vec<Slot<V, S>>,
+    children: Vec<Link<K, V, S>>,
 }
 
-impl<K, V> Open<K, V> {
-    fn close(mut self, last: Link<K, V>) -> Link<K, V> {
+impl<K, V, S> Open<K, V, S> {
+    fn close(mut self, last: Link<K, V, S>) -> Link<K, V, S> {
         self.children.push(last);
         link_from(self.level, self.keys, self.slots, self.children, None)
     }
 }
 
-fn rise<K: Data + Ord, V: Data>(
+fn rise<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &mut Link<K, V>,
+    link: &mut Link<K, V, S>,
     level: u8,
     edits: &mut vec::IntoIter<Edit<K, V>>,
     count: usize,
@@ -737,9 +833,9 @@ fn rise<K: Data + Ord, V: Data>(
     Ok(())
 }
 
-fn absorb<K: Data + Ord, V: Data>(
+fn absorb<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &mut Link<K, V>,
+    link: &mut Link<K, V, S>,
     edits: &mut vec::IntoIter<Edit<K, V>>,
     mut count: usize,
 ) -> Result<()> {
@@ -828,8 +924,10 @@ fn absorb<K: Data + Ord, V: Data>(
     Ok(())
 }
 
-fn build_sorted<K: Data + Ord, V: Data>(edits: impl Iterator<Item = Edit<K, V>>) -> Link<K, V> {
-    let mut stack: Vec<Open<K, V>> = Vec::new();
+fn build_sorted<K: Data + Ord, V: Data, S: Data>(
+    edits: impl Iterator<Item = Edit<K, V>>,
+) -> Link<K, V, S> {
+    let mut stack: Vec<Open<K, V, S>> = Vec::new();
     for edit in edits {
         let Edit {
             key,
@@ -905,6 +1003,45 @@ where
     }
 }
 
+type Cut<'a, K> = Option<&'a dyn Fn(&K) -> bool>;
+
+fn gather<K: Data, V: Data, S: Summary<K, V>>(
+    store: Option<&Store>,
+    link: &Link<K, V, S>,
+    depth: usize,
+    start: Cut<'_, K>,
+    end: Cut<'_, K>,
+    total: Option<S>,
+) -> Result<Option<S>> {
+    if start.is_none() && end.is_none() {
+        return Ok(match link.summary() {
+            Some(whole) => fold(total, &whole),
+            None => total,
+        });
+    }
+    let reached = reach(store, link, depth)?;
+    let node = match &reached {
+        Reach::Absent => return Ok(total),
+        Reach::Borrowed(node) => &***node,
+        Reach::Owned(node) => &**node,
+    };
+    let low = start.map_or(0, |below| node.keys.partition_point(below));
+    let high = end.map_or(node.keys.len(), |within| node.keys.partition_point(within));
+    if low > high {
+        return Ok(total);
+    }
+    if low == high {
+        return gather(store, node.child(low), depth + 1, start, end, total);
+    }
+    let mut total = gather(store, node.child(low), depth + 1, start, None, total)?;
+    for index in low..high {
+        total = fold(total, &node.slots[index].summary(&node.keys[index]));
+        let last = if index + 1 == high { end } else { None };
+        total = gather(store, node.child(index + 1), depth + 1, None, last, total)?;
+    }
+    Ok(total)
+}
+
 fn left_if(left: bool) -> Ordering {
     if left {
         Ordering::Less
@@ -913,12 +1050,12 @@ fn left_if(left: bool) -> Ordering {
     }
 }
 
-pub struct Map<K, V> {
-    root: Link<K, V>,
+pub struct Map<K, V, S = ()> {
+    root: Link<K, V, S>,
     store: Option<Store>,
 }
 
-impl<K, V> Clone for Map<K, V> {
+impl<K, V, S: Clone> Clone for Map<K, V, S> {
     fn clone(&self) -> Self {
         Map {
             root: self.root.with_memo(),
@@ -927,7 +1064,7 @@ impl<K, V> Clone for Map<K, V> {
     }
 }
 
-impl<K, V> Default for Map<K, V> {
+impl<K, V, S> Default for Map<K, V, S> {
     fn default() -> Self {
         Map {
             root: Link::Empty,
@@ -936,11 +1073,13 @@ impl<K, V> Default for Map<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data> Map<K, V> {
+impl<K, V> Map<K, V> {
     pub fn new() -> Self {
         Map::default()
     }
+}
 
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     pub fn len(&self) -> usize {
         self.root.count() as usize
     }
@@ -961,7 +1100,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         self.store.as_ref()
     }
 
-    fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V>) -> Visit<R>) -> Result<Option<R>> {
+    fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V, S>) -> Visit<R>) -> Result<Option<R>> {
         let store = self.store();
         let mut link = &self.root;
         let mut depth = 0;
@@ -1016,7 +1155,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     {
         let found = self.walk(|node| match node.search(key) {
             Ok(index) => Visit::Done(match &node.slots[index] {
-                Slot::Spilled(ptr) => Ok(ptr.hash),
+                Slot::Spilled(ptr, _) => Ok(ptr.hash),
                 Slot::Inline(value) | Slot::Fresh(value) => try_hash_of(&**value),
             }),
             Err(position) => Visit::Descend(position),
@@ -1138,7 +1277,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         &self,
         before: &impl Fn(&K) -> bool,
         offset: isize,
-    ) -> Result<(u64, Vec<Frame<K, V>>)> {
+    ) -> Result<(u64, Vec<Frame<K, V, S>>)> {
         let store = self.store();
         let mut rank = 0u64;
         let mut stack = Vec::new();
@@ -1162,8 +1301,8 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         &self,
         below: impl Fn(&K) -> bool,
         within: impl Fn(&K) -> bool,
-    ) -> Iter<K, V> {
-        let build = || -> Result<Iter<K, V>> {
+    ) -> Iter<K, V, S> {
+        let build = || -> Result<Iter<K, V, S>> {
             let (low, front) = self.edge(&below, 1)?;
             let (high, back) = self.edge(&within, -1)?;
             Ok(Iter {
@@ -1177,19 +1316,19 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         fatal(build())
     }
 
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<K, V, S> {
         self.range_by(|_| false, |_| true)
     }
 
-    pub fn keys(&self) -> Keys<K, V> {
+    pub fn keys(&self) -> Keys<K, V, S> {
         self.iter().into_keys()
     }
 
-    pub fn values(&self) -> Values<K, V> {
+    pub fn values(&self) -> Values<K, V, S> {
         Values(self.iter())
     }
 
-    pub fn range<Q, R>(&self, range: R) -> Iter<K, V>
+    pub fn range<Q, R>(&self, range: R) -> Iter<K, V, S>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -1200,7 +1339,30 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         self.range_by(|key| below(key, start), |key| within(key, end))
     }
 
-    pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V>
+    pub fn summary(&self) -> Option<S> {
+        self.root.summary()
+    }
+
+    pub fn summary_by(
+        &self,
+        below: impl Fn(&K) -> bool,
+        within: impl Fn(&K) -> bool,
+    ) -> Option<S> {
+        fatal(gather(self.store(), &self.root, 0, Some(&below), Some(&within), None))
+    }
+
+    pub fn range_summary<Q, R>(&self, range: R) -> Option<S>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        self.summary_by(|key| below(key, start), |key| within(key, end))
+    }
+
+    pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V, S>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -1238,7 +1400,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         self.take_range::<Q, R>(range).len()
     }
 
-    pub fn split_off<Q>(&mut self, key: &Q) -> Map<K, V>
+    pub fn split_off<Q>(&mut self, key: &Q) -> Map<K, V, S>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -1255,7 +1417,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         }
     }
 
-    pub fn append(&mut self, other: &mut Map<K, V>) {
+    pub fn append(&mut self, other: &mut Map<K, V, S>) {
         if other.is_empty() {
             return;
         }
@@ -1315,7 +1477,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         fatal(absorb(store, &mut self.root, &mut edits, count));
     }
 
-    pub fn diff(&self, newer: &Map<K, V>) -> Diff<K, V>
+    pub fn diff(&self, newer: &Map<K, V, S>) -> Diff<K, V, S>
     where
         V: PartialEq,
     {
@@ -1329,8 +1491,8 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
 
     pub fn merge(
         &mut self,
-        base: &Map<K, V>,
-        theirs: &Map<K, V>,
+        base: &Map<K, V, S>,
+        theirs: &Map<K, V, S>,
         resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
     ) -> usize
     where
@@ -1368,12 +1530,12 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         }
     }
 
-    fn rebuilt(&self) -> Map<K, V> {
+    fn rebuilt(&self) -> Map<K, V, S> {
         self.iter().map(|(key, value)| (key, (*value).clone())).collect()
     }
 }
 
-impl<K: Data + Ord, V: Data> Data for Map<K, V> {
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         let target = w.store_id();
         let foreign =
@@ -1388,8 +1550,14 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
         };
         match stored {
             Link::Empty => w.varint(0),
-            Link::Stored { ptr, count, .. } => {
+            Link::Stored {
+                ptr,
+                count,
+                summary,
+                ..
+            } => {
                 w.varint(count);
+                summary.encode(w)?;
                 w.link(ptr);
             }
             Link::Mem(_) => return Err(Error::Detached),
@@ -1402,7 +1570,8 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
         let root = if count == 0 {
             Link::Empty
         } else {
-            Link::stored(r.link()?, count)
+            let summary = S::decode(r)?;
+            Link::stored(r.link()?, count, summary)
         };
         Ok(Map {
             root,
@@ -1411,25 +1580,30 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
     }
 
     fn missing() -> Option<Self> {
-        Some(Map::new())
+        Some(Map::default())
     }
 }
 
-impl<K: Data + Ord, V: Data> PartialEq for Map<K, V> {
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> PartialEq for Map<K, V, S> {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.root_hash() == other.root_hash()
     }
 }
 
-impl<K: Data + Ord, V: Data> Eq for Map<K, V> {}
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> Eq for Map<K, V, S> {}
 
-impl<K: Data + Ord + fmt::Debug, V: Data + fmt::Debug> fmt::Debug for Map<K, V> {
+impl<K, V, S> fmt::Debug for Map<K, V, S>
+where
+    K: Data + Ord + fmt::Debug,
+    V: Data + fmt::Debug,
+    S: Summary<K, V>,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K: Data + Ord, V: Data> Extend<(K, V)> for Map<K, V> {
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> Extend<(K, V)> for Map<K, V, S> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, items: I) {
         if !self.is_empty() {
             self.apply(items.into_iter().map(|(key, value)| (key, Some(value))));
@@ -1444,38 +1618,38 @@ impl<K: Data + Ord, V: Data> Extend<(K, V)> for Map<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data> FromIterator<(K, V)> for Map<K, V> {
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> FromIterator<(K, V)> for Map<K, V, S> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(items: I) -> Self {
-        let mut map = Map::new();
+        let mut map = Map::default();
         map.extend(items);
         map
     }
 }
 
-impl<K: Data + Ord, V: Data> IntoIterator for &Map<K, V> {
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> IntoIterator for &Map<K, V, S> {
     type Item = (K, Arc<V>);
-    type IntoIter = Iter<K, V>;
+    type IntoIter = Iter<K, V, S>;
 
-    fn into_iter(self) -> Iter<K, V> {
+    fn into_iter(self) -> Iter<K, V, S> {
         self.iter()
     }
 }
 
-struct Frame<K, V> {
-    node: Arc<Node<K, V>>,
+struct Frame<K, V, S> {
+    node: Arc<Node<K, V, S>>,
     position: isize,
 }
 
-pub struct Iter<K, V> {
+pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
-    front: Vec<Frame<K, V>>,
-    back: Vec<Frame<K, V>>,
+    front: Vec<Frame<K, V, S>>,
+    back: Vec<Frame<K, V, S>>,
     remaining: u64,
     warm: bool,
 }
 
-impl<K: Data + Ord, V: Data> Iter<K, V> {
-    pub(crate) fn into_keys(mut self) -> Keys<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
+    pub(crate) fn into_keys(mut self) -> Keys<K, V, S> {
         self.warm = false;
         Keys(self)
     }
@@ -1536,17 +1710,17 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
         }
     }
 
-    fn value_of(&self, frame: Option<&Frame<K, V>>, index: usize) -> Option<Arc<V>> {
+    fn value_of(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<Arc<V>> {
         frame.map(|frame| fatal(read_slot(self.store.as_ref(), &frame.node.slots[index])))
     }
 
-    fn pair(&self, frame: Option<&Frame<K, V>>, index: usize) -> Option<(K, Arc<V>)> {
+    fn pair(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<(K, Arc<V>)> {
         let value = self.value_of(frame, index)?;
         frame.map(|frame| (frame.node.keys[index].clone(), value))
     }
 }
 
-impl<K: Data + Ord, V: Data> Iterator for Iter<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
     type Item = (K, Arc<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1559,18 +1733,18 @@ impl<K: Data + Ord, V: Data> Iterator for Iter<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data> DoubleEndedIterator for Iter<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Iter<K, V, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let index = self.retreat()?;
         self.pair(self.back.last(), index)
     }
 }
 
-impl<K: Data + Ord, V: Data> ExactSizeIterator for Iter<K, V> {}
+impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Iter<K, V, S> {}
 
-pub struct Keys<K, V>(Iter<K, V>);
+pub struct Keys<K, V, S = ()>(Iter<K, V, S>);
 
-impl<K: Data + Ord, V: Data> Iterator for Keys<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> Iterator for Keys<K, V, S> {
     type Item = K;
 
     fn next(&mut self) -> Option<K> {
@@ -1583,18 +1757,18 @@ impl<K: Data + Ord, V: Data> Iterator for Keys<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data> DoubleEndedIterator for Keys<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Keys<K, V, S> {
     fn next_back(&mut self) -> Option<K> {
         let index = self.0.retreat()?;
         self.0.back.last().map(|frame| frame.node.keys[index].clone())
     }
 }
 
-impl<K: Data + Ord, V: Data> ExactSizeIterator for Keys<K, V> {}
+impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 
-pub struct Values<K, V>(Iter<K, V>);
+pub struct Values<K, V, S = ()>(Iter<K, V, S>);
 
-impl<K: Data + Ord, V: Data> Iterator for Values<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
     type Item = Arc<V>;
 
     fn next(&mut self) -> Option<Arc<V>> {
@@ -1607,14 +1781,14 @@ impl<K: Data + Ord, V: Data> Iterator for Values<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data> DoubleEndedIterator for Values<K, V> {
+impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Values<K, V, S> {
     fn next_back(&mut self) -> Option<Arc<V>> {
         let index = self.0.retreat()?;
         self.0.value_of(self.0.back.last(), index)
     }
 }
 
-impl<K: Data + Ord, V: Data> ExactSizeIterator for Values<K, V> {}
+impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Values<K, V, S> {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Change<K, V> {
@@ -1653,17 +1827,18 @@ pub struct Conflict<K, V> {
     pub theirs: Option<Arc<V>>,
 }
 
-pub(crate) fn three_way<S, K, V>(
-    target: &mut S,
-    base: &Map<K, V>,
-    theirs: &Map<K, V>,
-    read: impl Fn(&S, &K) -> Option<Arc<V>>,
-    mut write: impl FnMut(&mut S, K, Option<V>),
+pub(crate) fn three_way<T, K, V, S>(
+    target: &mut T,
+    base: &Map<K, V, S>,
+    theirs: &Map<K, V, S>,
+    read: impl Fn(&T, &K) -> Option<Arc<V>>,
+    mut write: impl FnMut(&mut T, K, Option<V>),
     mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
 ) -> usize
 where
     K: Data + Ord,
     V: Data + PartialEq,
+    S: Summary<K, V>,
 {
     let mut written = 0;
     for change in base.diff(theirs) {
@@ -1690,16 +1865,16 @@ where
     written
 }
 
-enum Step<K, V> {
-    Sub(Link<K, V>),
-    Entry(K, Slot<V>),
+enum Step<K, V, S> {
+    Sub(Link<K, V, S>),
+    Entry(K, Slot<V, S>),
 }
 
-pub struct Diff<K, V> {
+pub struct Diff<K, V, S = ()> {
     old_store: Option<Store>,
     new_store: Option<Store>,
-    old: Vec<Step<K, V>>,
-    new: Vec<Step<K, V>>,
+    old: Vec<Step<K, V, S>>,
+    new: Vec<Step<K, V, S>>,
 }
 
 enum Action {
@@ -1712,7 +1887,10 @@ enum Action {
     Compare,
 }
 
-fn expand<K: Data + Ord, V: Data>(store: Option<&Store>, steps: &mut Vec<Step<K, V>>) {
+fn expand<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    steps: &mut Vec<Step<K, V, S>>,
+) {
     let Some(Step::Sub(link)) = steps.pop() else {
         return;
     };
@@ -1730,7 +1908,7 @@ fn expand<K: Data + Ord, V: Data>(store: Option<&Store>, steps: &mut Vec<Step<K,
     }
 }
 
-impl<K: Data + Ord, V: Data + PartialEq> Diff<K, V> {
+impl<K: Data + Ord, V: Data + PartialEq, S: Data> Diff<K, V, S> {
     fn action(&self) -> Action {
         match (self.old.last(), self.new.last()) {
             (None, None) => Action::Done,
@@ -1758,7 +1936,7 @@ impl<K: Data + Ord, V: Data + PartialEq> Diff<K, V> {
     }
 }
 
-impl<K: Data + Ord, V: Data + PartialEq> Iterator for Diff<K, V> {
+impl<K: Data + Ord, V: Data + PartialEq, S: Data> Iterator for Diff<K, V, S> {
     type Item = Change<K, V>;
 
     fn next(&mut self) -> Option<Change<K, V>> {
@@ -1787,7 +1965,7 @@ impl<K: Data + Ord, V: Data + PartialEq> Iterator for Diff<K, V> {
                     let old = self.old.pop();
                     let new = self.new.pop();
                     if let (Some(Step::Entry(key, a)), Some(Step::Entry(_, b))) = (old, new) {
-                        if let (Slot::Spilled(x), Slot::Spilled(y)) = (&a, &b)
+                        if let (Slot::Spilled(x, _), Slot::Spilled(y, _)) = (&a, &b)
                             && x.hash == y.hash
                         {
                             continue;

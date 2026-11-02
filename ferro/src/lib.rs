@@ -20,7 +20,7 @@ pub use ferro_derive::{Data, Record};
 pub use history::History;
 pub use list::List;
 pub use log::Log;
-pub use map::{Change, Conflict, Map};
+pub use map::{Change, Conflict, Map, Summary};
 pub use set::Set;
 pub use store::Durability;
 pub use table::{Record, RowMut, Table, TableData, Taken};
