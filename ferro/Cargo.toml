@@ -1,0 +1,16 @@
+[package]
+name = "ferro"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ferro-derive = { path = "../ferro-derive" }
+arc-swap = "1"
+blake3 = "1"
+parking_lot = "0.12"
+quick_cache = "0.6"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

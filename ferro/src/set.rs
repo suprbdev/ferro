@@ -1,0 +1,171 @@
+use std::borrow::Borrow;
+use std::fmt;
+use std::ops::RangeBounds;
+
+use crate::codec::{Data, Decoder, Encoder};
+use crate::error::Result;
+use crate::map::{Diff, Keys, Map};
+
+pub struct Set<T>(Map<T, ()>);
+
+impl<T> Clone for Set<T> {
+    fn clone(&self) -> Self {
+        Set(self.0.clone())
+    }
+}
+
+impl<T> Default for Set<T> {
+    fn default() -> Self {
+        Set(Map::default())
+    }
+}
+
+impl<T: Data + Ord> Set<T> {
+    pub fn new() -> Self {
+        Set::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn insert(&mut self, value: T) -> bool {
+        if self.0.contains_key(&value) {
+            return false;
+        }
+        self.0.insert(value, ());
+        true
+    }
+
+    pub fn remove<Q>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.remove(value).is_some()
+    }
+
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.contains_key(value)
+    }
+
+    pub fn iter(&self) -> Keys<T, ()> {
+        self.0.keys()
+    }
+
+    pub fn range<Q, R>(&self, range: R) -> impl DoubleEndedIterator<Item = T> + use<T, Q, R>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.0.range::<Q, R>(range).map(|(key, _)| key)
+    }
+
+    pub fn first(&self) -> Option<T> {
+        self.0.first().map(|(key, _)| key)
+    }
+
+    pub fn last(&self) -> Option<T> {
+        self.0.last().map(|(key, _)| key)
+    }
+
+    pub fn pop_first(&mut self) -> Option<T> {
+        self.0.pop_first().map(|(key, _)| key)
+    }
+
+    pub fn pop_last(&mut self) -> Option<T> {
+        self.0.pop_last().map(|(key, _)| key)
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.0.retain(|key, _| keep(key));
+    }
+
+    pub fn diff(&self, newer: &Set<T>) -> Diff<T, ()> {
+        self.0.diff(&newer.0)
+    }
+
+    pub fn is_subset(&self, other: &Set<T>) -> bool {
+        self.len() <= other.len() && self.iter().all(|item| other.contains(&item))
+    }
+
+    pub fn union(&self, other: &Set<T>) -> Set<T> {
+        let mut out = self.clone();
+        out.extend(other.iter());
+        out
+    }
+
+    pub fn intersection(&self, other: &Set<T>) -> Set<T> {
+        self.iter().filter(|item| other.contains(item)).collect()
+    }
+
+    pub fn difference(&self, other: &Set<T>) -> Set<T> {
+        self.iter().filter(|item| !other.contains(item)).collect()
+    }
+}
+
+impl<T: Data + Ord> Data for Set<T> {
+    fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> Result<Self> {
+        Ok(Set(Map::decode(r)?))
+    }
+
+    fn missing() -> Option<Self> {
+        Some(Set::new())
+    }
+}
+
+impl<T: Data + Ord> PartialEq for Set<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T: Data + Ord> Eq for Set<T> {}
+
+impl<T: Data + Ord + fmt::Debug> fmt::Debug for Set<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Data + Ord> Extend<T> for Set<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
+        for item in items {
+            self.insert(item);
+        }
+    }
+}
+
+impl<T: Data + Ord> FromIterator<T> for Set<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
+        let mut set = Set::new();
+        set.extend(items);
+        set
+    }
+}
+
+impl<T: Data + Ord> IntoIterator for &Set<T> {
+    type Item = T;
+    type IntoIter = Keys<T, ()>;
+
+    fn into_iter(self) -> Keys<T, ()> {
+        self.iter()
+    }
+}
