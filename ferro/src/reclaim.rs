@@ -219,7 +219,7 @@ impl Marks {
         pairs
     }
 
-    pub(crate) fn punch(&mut self, store: &Store) -> Result<u64> {
+    pub(crate) fn punch(&mut self, store: &Store, stop: Option<&AtomicBool>) -> Result<u64> {
         let block = store.block_bytes()?;
         self.kept.sort_unstable_by_key(|extent| extent.place);
         let mut punched = 0;
@@ -227,6 +227,9 @@ impl Marks {
         for extent in &self.kept {
             if extent.place >= self.end {
                 break;
+            }
+            if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                return Ok(punched);
             }
             if extent.place > at {
                 punched += store.punch(at, extent.place, block)?;

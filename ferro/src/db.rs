@@ -854,7 +854,7 @@ impl<T: Data> Shared<T> {
         report.live_bytes = live;
         self.step("published");
         self.signal.threshold.store(live, Ordering::Relaxed);
-        report.punched_bytes = marks.punch(store)?;
+        report.punched_bytes = marks.punch(store, stop)?;
         self.step("punched");
         report.after_bytes = store.allocated()?;
         Ok(report)

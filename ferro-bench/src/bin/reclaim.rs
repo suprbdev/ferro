@@ -330,11 +330,11 @@ fn drive<T: Data>(
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
-                    last = space.log_bytes;
                     let began = Instant::now();
                     let done = db.compact(Keep::Last(run.keep)).unwrap();
                     *cycle_secs.lock().unwrap() += began.elapsed().as_secs_f64();
                     live = done.live_bytes;
+                    last = db.space().unwrap().log_bytes;
                     cycles.lock().unwrap().push(done);
                 }
             });
@@ -343,12 +343,15 @@ fn drive<T: Data>(
         scope.spawn(move || {
             while start.elapsed() < Duration::from_secs(run.seconds) {
                 let space = db.space().unwrap();
+                let mut temp = db.path().into_os_string();
+                temp.push(".compacting");
+                let extra = std::fs::metadata(&temp).map_or(0, |meta| meta.len());
                 samples.lock().unwrap().push((
                     start.elapsed().as_secs_f64(),
-                    space.allocated_bytes,
+                    space.allocated_bytes + extra,
                     space.log_bytes,
                 ));
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_millis(50));
             }
             stop.store(true, Ordering::Relaxed);
         });
@@ -428,7 +431,13 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
 }
 
 fn open_options(run: &Run) -> Options {
+    let durability = if env_number("RECLAIM_BUFFERED", 0) == 1 {
+        Durability::Buffered
+    } else {
+        Durability::Fsync
+    };
     Options::new()
+        .durability(durability)
         .cache_bytes(1 << 28)
         .history(Keep::Last(run.keep))
         .reclaim(Reclaim {

@@ -619,6 +619,41 @@ fn dropping_the_last_handle_stops_the_background_thread_and_frees_the_lock() {
 }
 
 #[test]
+fn shutting_down_during_a_punch_frees_nothing_that_was_kept() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let reached = Arc::new(Barrier::new(2));
+    let once = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (reached, once) = (reached.clone(), once.clone());
+        move |name: &'static str| {
+            if name == "published" && !once.swap(true, Ordering::SeqCst) {
+                reached.wait();
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let db: Db<Root> = fast()
+        .history(Keep::Last(2))
+        .reclaim(Reclaim {
+            every_bytes: 32 << 10,
+            fill: 0.0,
+        })
+        .hook(Hook(Arc::new(hook)))
+        .open(&path)
+        .unwrap();
+    while !once.load(Ordering::SeqCst) {
+        fill(&db, 50, 400);
+    }
+    reached.wait();
+    let want = dump(&db.read());
+    drop(db);
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(dump(&db.read()), want);
+    db.verify().unwrap();
+}
+
+#[test]
 fn offline_tools_work_after_online_cycles() {
     let dir = dir();
     let path = path_in(&dir);

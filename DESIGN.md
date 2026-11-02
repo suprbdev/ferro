@@ -7,13 +7,14 @@ of `T`, and all earlier versions stay readable.
 ## Layers
 
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls.
-- `store.rs`: the append-only file, commit frames, superblocks, recovery, object reads with hash
-  verification, node cache.
+- `store.rs`: the log file, commit and gap frames, superblocks, recovery, the place table, object
+  reads with hash verification, node cache.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
 - `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
 - `watch.rs`: `Watcher<T>` and the per-branch feed behind it.
+- `reclaim.rs`: marking, planning and punching for a reclamation cycle, which `Db::compact` drives.
 
 ## Objects and links
 
@@ -22,7 +23,9 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 - The hash is BLAKE3 over body length, link count, body, and the link hashes, truncated to 20
   bytes (`HASH_BYTES`). Offsets are not hashed, so identical content has an identical hash
   wherever it sits. The file is a Merkle DAG.
-- The offset lets a reader jump straight to a child, so no hash index is needed.
+- The offset lets a reader jump straight to a child, so no hash index is needed. It is a permanent
+  name for the object: below the reclaim floor it resolves through the place table, so no pointer
+  ever changes.
 - Every read re-hashes the object and compares it with the pointer it came from.
 - Links are stored in a side table and consumed in order by `Decoder::link`. They take no bytes
   in the body, which keeps encoded size independent of a value's position.
@@ -46,15 +49,16 @@ A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an opt
 `varint raw_len`, the body, then the links. Each link is its hash followed by a zigzag varint of
 `record offset - target offset`. Children are written before parents, so the deltas are small and
 positive in the common case, and nothing in a record depends on where it sits except that delta.
-Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
+A record moved by reclamation keeps its bytes, so that delta stays relative to the object's offset,
+not to where the record now sits. Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
 runs after hashing and decompression before the hash check, so the hash covers the canonical
 body and two files with different physical compression still agree on every root hash. The
 decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
 
 ## Deduplication
 
-`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset.
-It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
+`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset,
+as long as the place table still holds that offset. It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
 at which a value becomes its own object. Smaller objects are cheap to write again, and registering
 every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
 their hash check. Offsets are not hashed, so a link in a node proves nothing about the offset it
@@ -136,7 +140,11 @@ So each `Link::Stored` carries a write-once memo of the node it points at, in a 
   and each `ArcSwap` store has to settle with every reader thread.
 
 A memo holds only what a load for that link's own `Ptr` returned, and the cache is keyed by the full
-hash, so a damaged link still fails its hash check whatever else is cached. `Link::clone` starts
+hash, so a damaged link still fails its hash check whatever else is cached. An entry also records
+the offset it was decoded from, and a lookup with another offset misses. The same content can be
+written twice with different child offsets, and a decode of the older copy can name objects a cycle
+has since reclaimed. For the same reason a commit caches only the nodes it wrote itself, not a node
+whose hash `dedupe` found in an older record. `Link::clone` starts
 with an empty memo, since copying one touches the child's header, a cache miss per link that slowed
 `diff` by 45%. Only `Map::clone` keeps its root's memo.
 
@@ -198,10 +206,13 @@ holds what 1 MiB used to, gives 4.6 µs.
 
 ## File format and durability
 
-Two 4 KiB superblock slots, then the log. The log is a run of frames, one per commit. A frame is a
-68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
+Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, and carries
+the reclaim floor, the place table pointer and the live bytes counted by the last cycle. The log is
+a run of frames, one per commit. A frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
 the commit wrote. The check covers the header and every record, so a frame proves by itself that
-it reached the disk whole. A commit does this:
+it reached the disk whole. Frames do not repeat the reclaim fields, so a commit pays nothing for
+them, and the scan on open carries them forward from the superblock it started at. A commit does
+this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.
@@ -232,12 +243,13 @@ written, which needs only the device flush. The zeroes must be real: `posix_fall
 unwritten extents, and converting those commits the journal just the same (640 µs). The first
 commit of a process reserves nothing, so a short run pays for no zeroes. The reservation is only
 an optimization. A failed reservation stops further attempts without failing the commit, open
-discards it, and a clean close truncates it, so the file can be up to 4 MiB longer than
-`size_on_disk` while open.
+discards it, and a clean close truncates it, so the file can be up to 4 MiB longer than the log
+while open.
 
 A failed write or fsync poisons the store until reopen. Only one process may hold the writer lock.
-Read-only opens otherwise take no lock, since log bytes under a published head never change, and
-`refresh` picks up new commits.
+Read-only opens otherwise take no lock, and `refresh` picks up new commits. Bytes under a published
+head never change, but a cycle can move them. It publishes where they went before it frees them, so
+a read that fails reloads the table from the superblock and tries again.
 
 ## Concurrency
 
@@ -293,8 +305,9 @@ A `Branch` closes its feed when it drops, which is when the last `Db` handle goe
 holds only the feed, so a parked one keeps neither the file nor the writer lock. The price is that
 a snapshot nobody had taken by then is lost.
 
-A `Snapshot<T>` keeps its version alive for as long as it is held, and so does any `Map` or `Table`
-cloned from it. All of them also keep the writer lock held after the `Db` is dropped, so a new
+A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
+does a `Log` or `History` handle for its range. A `Map` or `Table` cloned from a snapshot does not,
+as Reclamation explains. All of them keep the writer lock held after the `Db` is dropped, so a new
 writer gets `Error::Locked` until they are gone. A closure works on a clone of the tip, so a panic
 or an `Err` discards its changes.
 
@@ -309,6 +322,13 @@ tip pointer, the first retained version, and the head version. `Refs` is `Map<St
 the superblock points at it. Forking a branch copies one `Head`, so the chain is shared and
 nothing is rewritten. `restore` commits an old value as a new version, so history is never
 rewritten.
+
+Pruning only raises `first`. Walks stop there, and lookups below it return `NoVersion`. Retained
+entries are not rewritten, so the entry at `first` still links `prev` and perhaps `skip` entries that
+are gone. Those links are hashes nothing follows, and offline compaction writes them with offset 0.
+`Options::history(Keep::Last(n))` raises `first` as part of each commit, which costs no extra bytes.
+`Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each reclamation cycle.
+`as_of` a time before the oldest retained commit returns `NoVersion`.
 
 The log used to be a `Map<u64, Commit>`, which rewrote a tree path per commit and was about 20%
 of the bytes of a single-key commit. `Db::log()` now returns a `Log` handle with `len`, `get`,
@@ -345,7 +365,9 @@ and `db.read()` do not copy the message.
 `Db::head_hash` is the hash of the tip entry, and `Log::hash_at` that of any retained entry. An
 entry links its commit's root and its `prev` entry, and the hash covers link hashes, so one hash
 covers every commit's version, time, message and `restored` field, and every root value, back to
-the oldest retained entry. Compaction with `Keep::All` keeps it, because offsets are not hashed.
+the oldest retained entry, and commits to everything older as well, though that can no longer be
+checked. Pruning, reclamation and compaction all keep it, because offsets are not hashed and retained
+entries are never rewritten.
 
 Published where the writer of the file cannot change it, the hash is a tamper-evidence anchor. If
 `hash_at(version)` matches an anchor for that version and `verify` passes, then the history up to
@@ -360,8 +382,8 @@ described under Objects and links. That is all it shows:
   that they were true.
 - It covers one branch's chain. Other branches, and the `merged` records in the head, are outside
   it, and `verify` is what checks those objects.
-- Pruning rebuilds the chain, so every retained entry gets a new hash and old anchors stop matching.
-  Check them before compacting with `Keep::Last` or `Keep::Since`.
+- An anchor for a pruned version can no longer be checked, since `hash_at` returns `None` for it.
+  An anchor for a retained version still matches.
 
 ## Merging
 
@@ -382,7 +404,7 @@ merge that keeps only our side still commits, so the record is not lost.
 Only direct merges are recorded. A change that reaches a branch through a third branch (A merges
 B after B merged C, then A merges C), or through a fork of a branch that was already merged, is
 not recognised. A merge closure that is not idempotent, such as one that adds a counter delta,
-applies it again, and the built-in merges may report a conflict for it. If compaction pruned the
+applies it again, and the built-in merges may report a conflict for it. If pruning removed the
 recorded version, `common_ancestor` falls back to the fork point, or returns `NoCommonAncestor`
 if that was pruned too.
 
@@ -401,8 +423,8 @@ A commit writes its head by name, so a handle on a dropped branch would quietly 
 under the `tip` mutex, returning `Error::NoBranch`. `drop_branch` holds the mutex through its sync
 and until the flag is set, so no commit fits between the frame and the flag. That stalls writers for
 one fsync, on an operation that is rare. Retiring also closes the feed, which ends the branch's
-watchers. Reads through an old handle still work, because state is a value and the objects are
-there until compaction. A later fork of the same name is a new `Branch`, so old handles stay dead.
+watchers. Reads through an old handle still work, because its snapshot pins what it reads. A later
+fork of the same name is a new `Branch`, so old handles stay dead.
 
 Counting handles and refusing the drop while others exist was rejected: a clone parked on another
 thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
@@ -429,5 +451,6 @@ its hash. Unknown fields are skipped. Missing fields use `Data::missing`, or `#[
 ## Errors
 
 Collections read like native types, so `get` and iterators do not return `Result`. An I/O failure
-or corruption during a read panics. `try_get` exists for callers that need to handle it. Inside
-`update` a panic discards the transaction and leaves the database unchanged.
+or corruption during a read panics, and so does a read of something reclaimed, with a message saying
+so. `try_get` exists for callers that need to handle it. Inside `update` a panic discards the
+transaction and leaves the database unchanged.

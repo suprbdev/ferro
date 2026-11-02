@@ -676,37 +676,28 @@ impl Store {
                 options,
             }),
         };
-        let head = store.adopt_first(sb, head)?;
+        store.inner.places.store(store.load_newest(sb.moved)?);
         Ok((store, head))
     }
 
-    fn adopt_first(&self, sb: Super, head: Option<Ptr>) -> Result<Option<Ptr>> {
-        let mut sb = sb;
-        let mut head = head;
+    fn load_newest(&self, moved: Moved) -> Result<Arc<Places>> {
+        let inner = &self.inner;
+        let mut moved = moved;
         for _ in 0..OPEN_RETRIES {
-            match self.load_places(sb.moved) {
-                Ok(places) => {
-                    self.inner.places.store(Arc::new(places));
-                    return Ok(head);
+            let error = match self.load_places(moved) {
+                Ok(places) => return Ok(Arc::new(places)),
+                Err(error) => error,
+            };
+            let len = inner.file.metadata()?.len();
+            match read_supers(&inner.file, len)? {
+                Some((sb, _)) if inner.options.read_only && sb.moved != moved => {
+                    inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
+                    moved = sb.moved;
                 }
-                Err(error) if !self.inner.options.read_only => return Err(error),
-                Err(error) => {
-                    let len = self.inner.file.metadata()?.len();
-                    let newer = read_supers(&self.inner.file, len)?.map(|found| found.0);
-                    match newer {
-                        Some(found) if found.moved != sb.moved => {
-                            self.inner.cursor.lock().seq = found.seq;
-                            self.inner.tail.fetch_max(found.log_end, Ordering::AcqRel);
-                            self.inner.written.fetch_max(found.log_end, Ordering::AcqRel);
-                            head = found.head;
-                            sb = found;
-                        }
-                        _ => return Err(error),
-                    }
-                }
+                _ => return Err(error),
             }
         }
-        Err(Error::Corrupt("place table kept moving during open".into()))
+        Err(Error::Corrupt("place table kept moving".into()))
     }
 
     fn load_places(&self, moved: Moved) -> Result<Places> {
@@ -743,7 +734,7 @@ impl Store {
             return Ok(None);
         }
         inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
-        let places = Arc::new(self.load_places(sb.moved)?);
+        let places = self.load_newest(sb.moved)?;
         inner.places.store(places.clone());
         Ok(Some(places))
     }
@@ -811,8 +802,7 @@ impl Store {
         self.inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
         if sb.moved != self.inner.places.load().moved {
             let _guard = self.inner.reloading.lock();
-            let places = self.load_places(sb.moved)?;
-            self.inner.places.store(Arc::new(places));
+            self.inner.places.store(self.load_newest(sb.moved)?);
         }
         Ok(sb.head)
     }
@@ -904,7 +894,7 @@ impl Store {
     }
 
     pub(crate) fn sync_data(&self) -> Result<()> {
-        self.inner.file.sync_data()?;
+        self.inner.file.sync_data().inspect_err(|_| self.poison())?;
         Ok(())
     }
 

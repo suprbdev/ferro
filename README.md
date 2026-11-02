@@ -155,7 +155,8 @@ between two branches, in either direction, do not apply a change twice.
 
 `db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
 the handle you call it on. Other handles on that branch keep reading what they had, commits through
-them fail with `Error::NoBranch`, and its watchers end. The bytes stay in the file until you compact.
+them fail with `Error::NoBranch`, and its watchers end. The bytes stay in the file until the next
+reclamation cycle.
 
 ```rust
 let mut seen = db.read();
@@ -177,6 +178,41 @@ A read-only handle fires its watchers on `refresh`.
 cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows
 that version and everything before it are unchanged. It is not a signature and says nothing about
 later commits, other branches or whether timestamps were true. See `DESIGN.md`.
+
+## Keeping history bounded
+
+Every version stays readable by default, so the file grows with every commit. Most programs want
+recent history, not all of it:
+
+```rust
+use ferro::{Keep, Options, Reclaim};
+
+let db = Options::new()
+    .history(Keep::Last(1000))
+    .reclaim(Reclaim { every_bytes: 64 << 20, ..Reclaim::default() })
+    .open::<Shop>("shop.ferro")?;
+
+let space = db.space()?;
+println!("{} allocated, about {} live", space.allocated_bytes, space.live_bytes);
+
+let report = db.compact(Keep::Last(10))?;
+println!("freed down to {}, writers waited {:?}", report.after_bytes, report.pause);
+```
+
+`history` prunes as part of each commit and runs reclamation on a background thread whenever the log
+has grown by `every_bytes` or by the live size, whichever is larger. `Keep::Since(unix_ms)` and
+`Keep::Within(duration)` retain by time instead, and take effect at each cycle. `compact` runs one
+cycle now, with writers still running, and can prune harder than `history` does.
+
+A pruned version is gone: `at` returns `NoVersion` and `log` stops at the oldest retained commit.
+`head_hash` does not change, because retained commits are not rewritten, and `merge_with` falls back
+to the fork point, or returns `NoCommonAncestor` if that was pruned too.
+
+A held `Snapshot`, `Log` or `History` keeps working for as long as you hold it, even past pruning,
+and keeps its objects from being freed. A `Map` cloned out of a snapshot does not: once its version
+is pruned and reclaimed, reading it or committing it returns `Error::Pruned`. A read-only process
+follows moved objects by itself, but cannot keep a version alive, so one that lags behind the
+retained window gets `Error::Pruned` until it calls `refresh`.
 
 ## Changing your types
 
@@ -216,11 +252,14 @@ is corrupt, they panic. Use `try_get` to handle that case. A panic inside a comm
 cargo run --release -p ferro-cli -- info shop.ferro
 cargo run --release -p ferro-cli -- log shop.ferro --limit 20
 cargo run --release -p ferro-cli -- verify shop.ferro
+cargo run --release -p ferro-cli -- space shop.ferro
+cargo run --release -p ferro-cli -- reclaim shop.ferro --keep-last 1000
 cargo run --release -p ferro-cli -- compact shop.ferro --keep-last 1000
 ```
 
-Compaction is the only way the file shrinks. It runs offline, copies what is still reachable to a
-new file, and swaps it in atomically. Versions it drops are gone: `at` then reports `NoVersion`.
+`reclaim` frees dead space in place. `compact` copies what is reachable to a new dense file and
+swaps it in, which needs no writer running and is the way to get a file that copies small. See
+[Keeping history bounded](#keeping-history-bounded) for doing this from a running program.
 
 ## A real example
 
@@ -263,13 +302,21 @@ This is an experiment, not a production database.
 
 - The file format is not stable and may change without migration.
 - It runs on Unix only.
-- Storage only grows until you compact. A single-key commit writes about 8.5 KB at this size, so
-  batch related changes into one commit. Secondary indexes add to that.
+- A single-key commit writes about 8.5 KB at this size, so batch related changes into one commit.
+  Secondary indexes add to that. Without retention the file only grows.
+- Reclamation punches holes, so the log's apparent size keeps growing while its allocated size stays
+  bounded. `ls -l` shows the former and `du` the latter. A copy with a tool that does not preserve
+  holes, such as `scp` or `rsync` without `--sparse`, writes the apparent size. ext4 stops a file at
+  16 TiB of apparent size, at which point a commit fails with an I/O error and offline `compact`
+  resets it. A filesystem that cannot punch holes keeps its space until `compact`.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
   every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
   closure and encoding. Calling `update`, `fork` or `drop_branch` from inside it deadlocks.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
+- A `Map` cloned out of a snapshot does not keep its version alive, and a read-only handle in another
+  process cannot pin anything. Either gets `Error::Pruned` once its version has been pruned and
+  reclaimed, which `get` turns into a panic. `refresh` fixes the read-only handle.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
   order, and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never
   tested on real hardware.
