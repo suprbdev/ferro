@@ -16,6 +16,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
+use crate::map::SPILL_BYTES;
 
 const MAGIC: &[u8; 8] = b"FERRODB1";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
@@ -632,6 +633,9 @@ impl Store {
             return Ok((value, true));
         }
         let object = self.read_object(ptr)?;
+        if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
+            self.inner.dedupe.insert(ptr.hash, ptr.offset);
+        }
         let weight = (object.body.len() + object.links.len() * LINK_WEIGHT + 128) as u32;
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = Arc::new(decode(&mut decoder)?);

@@ -160,6 +160,19 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
             }
         });
     }
+    {
+        let db = Options::new()
+            .durability(Durability::Buffered)
+            .cache_bytes(COLD_CACHE)
+            .open::<Map<u64, String>>(&path)
+            .unwrap();
+        let snapshot = db.read();
+        report.timed("map_get_cold_writer", COLD_SAMPLES, || {
+            for i in 0..COLD_SAMPLES {
+                assert!(snapshot.get(&mix(i % n)).is_some());
+            }
+        });
+    }
 }
 
 fn table_workload(report: &mut Report, dir: &Path, n: u64) {

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::store::Store;
 use xxhash_rust::xxh3::xxh3_64;
 
-const SPILL_BYTES: usize = 512;
+pub(crate) const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
 const PIN_DEPTH: usize = 3;
 

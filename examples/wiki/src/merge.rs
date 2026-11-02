@@ -17,7 +17,7 @@ fn same(a: &Page, b: &Page) -> bool {
         && a.title == b.title
         && a.author == b.author
         && a.tags == b.tags
-        && (a.body == b.body || chunk::text(&a.body) == chunk::text(&b.body))
+        && a.body == b.body
 }
 
 fn scalar<T: PartialEq + Clone>(base: &T, ours: &T, theirs: &T) -> (T, bool) {

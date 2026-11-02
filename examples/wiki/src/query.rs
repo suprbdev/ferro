@@ -49,7 +49,7 @@ pub fn search(w: &Wiki, terms: &[String], limit: usize) -> (usize, Vec<Hit>) {
 }
 
 pub fn snippet(page: &Page, terms: &[String]) -> Option<String> {
-    for chunk in page.body.values() {
+    for chunk in page.body.iter() {
         for line in chunk.lines() {
             let lower = line.to_lowercase();
             if terms.iter().any(|term| lower.contains(term.as_str())) {

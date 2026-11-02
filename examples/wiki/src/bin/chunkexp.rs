@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use ferro::{Data, Db, List, Options};
 use wiki::chunk::{self, Chunker};
-use wiki::model::Body;
 use wiki::synth::{Rng, Vocab, prose};
 
 #[derive(Clone, Default, Data)]
@@ -15,11 +14,6 @@ struct StringRoot {
 #[derive(Clone, Default, Data)]
 struct ListRoot {
     body: List<String>,
-}
-
-#[derive(Clone, Default, Data)]
-struct GappedRoot {
-    body: Body,
 }
 
 struct Edit {
@@ -91,22 +85,6 @@ fn fixed(text: &str, size: usize) -> Vec<String> {
     chunks
 }
 
-fn smart_list(list: &mut List<String>, chunks: Vec<String>) {
-    let old = list.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        match list.get(i) {
-            Some(existing) if *existing == *chunk => {}
-            Some(_) => {
-                list.set(i, chunk.clone());
-            }
-            None => list.push(chunk.clone()),
-        }
-    }
-    if old > chunks.len() {
-        list.truncate(chunks.len());
-    }
-}
-
 fn run<T: Data + Default>(
     label: &str,
     dir: &Path,
@@ -163,10 +141,14 @@ fn main() {
         .nth(2)
         .and_then(|n| n.parse().ok())
         .unwrap_or(1000);
+    let base_kib: usize = std::env::args()
+        .nth(3)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(100);
     fs::create_dir_all(&dir).unwrap();
     let mut rng = Rng::new(7);
     let vocab = Vocab::new(30_000);
-    let base = prose(&mut rng, &vocab, 100 * 1024, &mut |_| None);
+    let base = prose(&mut rng, &vocab, base_kib * 1024, &mut |_| None);
     let edits = make_edits(&mut rng, &vocab, &base, count);
     println!("base {} bytes, {} edits", base.len(), edits.len());
     for reopen in [false, true] {
@@ -197,33 +179,18 @@ fn main() {
                     .collect();
             },
         );
-        run::<ListRoot>(
-            "list cdc 1k set-diff",
-            &dir,
-            &base,
-            &edits,
-            reopen,
-            |root, text| {
-                let chunks = chunk::DEFAULT
-                    .split(text)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                smart_list(&mut root.body, chunks);
-            },
-        );
         for (name, chunker) in [
             (
-                "gapped map cdc 512",
+                "list cdc 512 update",
                 Chunker {
                     min: 256,
                     bits: 9,
                     max: 2048,
                 },
             ),
-            ("gapped map cdc 1k", chunk::DEFAULT),
+            ("list cdc 1k update", chunk::DEFAULT),
             (
-                "gapped map cdc 4k",
+                "list cdc 4k update",
                 Chunker {
                     min: 1024,
                     bits: 12,
@@ -231,7 +198,7 @@ fn main() {
                 },
             ),
         ] {
-            run::<GappedRoot>(name, &dir, &base, &edits, reopen, move |root, text| {
+            run::<ListRoot>(name, &dir, &base, &edits, reopen, move |root, text| {
                 chunk::update(&mut root.body, text, &chunker);
             });
         }

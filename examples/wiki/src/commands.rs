@@ -93,7 +93,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
                     page.body.len()
                 )?;
             } else {
-                for piece in page.body.values() {
+                for piece in page.body.iter() {
                     w.write_all(piece.as_bytes())?;
                 }
             }
@@ -246,7 +246,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
                     fs::create_dir_all(parent)?;
                 }
                 let mut file = io::BufWriter::new(fs::File::create(&path)?);
-                for piece in page.body.values() {
+                for piece in page.body.iter() {
                     file.write_all(piece.as_bytes())?;
                 }
                 file.flush()?;

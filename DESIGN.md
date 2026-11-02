@@ -47,6 +47,33 @@ runs after hashing and decompression before the hash check, so the hash covers t
 body and two files with different physical compression still agree on every root hash. The
 decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
 
+## Deduplication
+
+`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset.
+It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
+at which a value becomes its own object. Smaller objects are cheap to write again, and registering
+every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
+their hash check. Offsets are not hashed, so a link in a node proves nothing about the offset it
+carries until it is followed, and registering links would let a damaged offset spread into new
+commits. A read-only handle registers nothing.
+
+So rewriting a value costs nothing if this process read the old one, whichever process wrote it.
+`get_mut` on a spilled value needs no special case: the slot becomes `Fresh`, the value is encoded
+again, and the hash finds the old object. Keeping the pointer in the slot would save only that one
+lookup, because the encode and hash are needed to know the value did not change, and it would cost
+every slot eight bytes.
+
+It does not close the gap for code that replaces a collection without reading it. In `chunkexp`,
+1000 edits to a 100 KB page as a `List<String>`:
+
+| Update | Warm process | New process per edit, before | New process per edit, after |
+| --- | --- | --- | --- |
+| Rebuilt from a fresh `collect` | 2.83 MB | 87.1 MB | 87.1 MB |
+| Read, then `set` the chunks that differ | 2.75 MB | 4.53 MB | 2.76 MB |
+
+A rebuild reads nothing, so nothing is registered. Finding an unread object by hash would need an
+index on disk or a scan at open, and neither is justified by one write pattern that can read first.
+
 ## Canonical tree
 
 `Map` is a Merkle search tree. A key's level is `trailing_zeros(xxh3_64(encoded key)) / 3`, so
