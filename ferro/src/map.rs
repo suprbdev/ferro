@@ -159,6 +159,17 @@ impl<K, V> Node<K, V> {
         self.keys.binary_search_by(|probe| probe.borrow().cmp(key))
     }
 
+    fn child(&self, position: usize) -> &Link<K, V> {
+        self.children.get(position).unwrap_or(&Link::Empty)
+    }
+
+    fn children_mut(&mut self) -> &mut Vec<Link<K, V>> {
+        if self.children.is_empty() {
+            self.children.resize_with(self.keys.len() + 1, || Link::Empty);
+        }
+        &mut self.children
+    }
+
     fn recount(&mut self) {
         self.count =
             self.keys.len() as u64 + self.children.iter().map(Link::count).sum::<u64>();
@@ -184,14 +195,17 @@ impl<K: Data, V: Data> Node<K, V> {
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
             });
         }
-        let mut children = Vec::with_capacity(keys.len() + 1);
-        for _ in 0..=n {
+        let mut children = Vec::new();
+        for position in 0..=n {
             let count = decoder.varint()?;
-            children.push(if count == 0 {
-                Link::Empty
-            } else {
-                Link::stored(decoder.link()?, count)
-            });
+            if count != 0 {
+                children.reserve_exact(n + 1 - children.len());
+                children.resize_with(position, || Link::Empty);
+                children.push(Link::stored(decoder.link()?, count));
+            }
+        }
+        if !children.is_empty() {
+            children.resize_with(n + 1, || Link::Empty);
         }
         let mut node = Node {
             level,
@@ -298,6 +312,9 @@ fn link_from<K, V>(
     if keys.is_empty() {
         return children.pop().unwrap_or(Link::Empty);
     }
+    if children.iter().all(|child| matches!(child, Link::Empty)) {
+        children = Vec::new();
+    }
     let mut node = Node {
         level,
         keys,
@@ -332,6 +349,12 @@ fn split<K: Data + Ord, V: Data>(
         .ok_or_else(|| Error::Corrupt("key found at a level it does not hash to".into()))?;
     let right_keys = keys.split_off(position);
     let right_slots = slots.split_off(position);
+    if children.is_empty() {
+        return Ok((
+            link_from(level, keys, slots, children),
+            link_from(level, right_keys, right_slots, Vec::new()),
+        ));
+    }
     let mut right_children = children.split_off(position + 1);
     let middle = children.pop().ok_or(Error::Detached)?;
     let (left_part, right_part) = split(store, middle, key)?;
@@ -355,7 +378,7 @@ fn merge<K: Data + Ord, V: Data>(
         Ordering::Greater => {
             drop(a);
             let mut node = Arc::unwrap_or_clone(x);
-            let last = node.children.pop().ok_or(Error::Detached)?;
+            let last = node.children_mut().pop().ok_or(Error::Detached)?;
             node.children.push(merge(store, last, b)?);
             node.recount();
             Ok(Link::Mem(Arc::new(node)))
@@ -363,7 +386,7 @@ fn merge<K: Data + Ord, V: Data>(
         Ordering::Less => {
             drop(b);
             let mut node = Arc::unwrap_or_clone(y);
-            let first = node.children[0].take();
+            let first = node.children_mut()[0].take();
             node.children[0] = merge(store, a, first)?;
             node.recount();
             Ok(Link::Mem(Arc::new(node)))
@@ -373,8 +396,8 @@ fn merge<K: Data + Ord, V: Data>(
             drop(b);
             let mut left = Arc::unwrap_or_clone(x);
             let mut right = Arc::unwrap_or_clone(y);
-            let inner_left = left.children.pop().ok_or(Error::Detached)?;
-            let inner_right = right.children[0].take();
+            let inner_left = left.children_mut().pop().ok_or(Error::Detached)?;
+            let inner_right = right.children_mut()[0].take();
             left.children.push(merge(store, inner_left, inner_right)?);
             left.children.extend(right.children.drain(1..));
             left.keys.append(&mut right.keys);
@@ -418,6 +441,12 @@ fn insert_at<K: Data + Ord, V: Data>(
             Slot::Fresh(value),
         ))),
         Err(position) if level == node.level => {
+            if node.children.is_empty() {
+                node.keys.insert(position, key);
+                node.slots.insert(position, Slot::Fresh(value));
+                node.count += 1;
+                return Ok(None);
+            }
             let (left, right) = split(store, node.children[position].take(), &key)?;
             node.keys.insert(position, key);
             node.slots.insert(position, Slot::Fresh(value));
@@ -427,7 +456,8 @@ fn insert_at<K: Data + Ord, V: Data>(
             Ok(None)
         }
         Err(position) => {
-            let replaced = insert_at(store, &mut node.children[position], key, level, value)?;
+            let replaced =
+                insert_at(store, &mut node.children_mut()[position], key, level, value)?;
             if replaced.is_none() {
                 node.count += 1;
             }
@@ -454,18 +484,19 @@ where
         Ok(index) => {
             node.keys.remove(index);
             let slot = node.slots.remove(index);
-            let right = node.children.remove(index + 1);
-            let left = node.children[index].take();
-            node.children[index] = merge(store, left, right)?;
+            if !node.children.is_empty() {
+                let right = node.children.remove(index + 1);
+                let left = node.children[index].take();
+                node.children[index] = merge(store, left, right)?;
+            }
             node.count -= 1;
             if node.keys.is_empty() {
-                let only = node.children[0].take();
-                *link = only;
+                *link = node.children.first_mut().map_or(Link::Empty, Link::take);
             }
             Ok(Some(slot))
         }
         Err(position) => {
-            let removed = remove_at(store, &mut node.children[position], key)?;
+            let removed = remove_at(store, &mut node.children_mut()[position], key)?;
             if removed.is_some() {
                 node.count -= 1;
             }
@@ -504,7 +535,7 @@ where
                 _ => Err(Error::Detached),
             }
         }
-        Err(position) => find_mut(store, &mut node.children[position], key),
+        Err(position) => find_mut(store, &mut node.children_mut()[position], key),
     }
 }
 
@@ -573,9 +604,10 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
             }
         }
     }
-    let mut stored: Vec<Link<K, V>> = Vec::with_capacity(if caching { width + 1 } else { 0 });
-    for child in &node.children {
-        let flushed = flush(child, encoder.sink())?;
+    let branching = caching && !node.children.is_empty();
+    let mut stored: Vec<Link<K, V>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
+    for position in 0..=width {
+        let flushed = flush(node.child(position), encoder.sink())?;
         match &flushed {
             Link::Empty => encoder.varint(0),
             Link::Stored { ptr, count, .. } => {
@@ -584,7 +616,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
             }
             Link::Mem(_) => return Err(Error::Detached),
         }
-        if caching {
+        if branching {
             stored.push(flushed);
         }
     }
@@ -724,7 +756,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
             depth += 1;
             match visit(node) {
                 Visit::Done(result) => return Ok(Some(result)),
-                Visit::Descend(position) => link = &node.children[position],
+                Visit::Descend(position) => link = node.child(position),
             }
         };
         while let Some(node) = current {
@@ -732,7 +764,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
             match visit(&node) {
                 Visit::Done(result) => return Ok(Some(result)),
                 Visit::Descend(position) => {
-                    current = resident(store, &node.children[position], depth)?;
+                    current = resident(store, node.child(position), depth)?;
                 }
             }
         }
@@ -850,8 +882,8 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     pub fn nth(&self, index: usize) -> Option<(K, Arc<V>)> {
         let mut remaining = index as u64;
         let found = self.walk(|node| {
-            for (position, child) in node.children.iter().enumerate() {
-                let size = child.count();
+            for position in 0..=node.keys.len() {
+                let size = node.child(position).count();
                 if remaining < size {
                     return Visit::Descend(position);
                 }
@@ -882,9 +914,9 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         while let Some(node) = current {
             let position = node.keys.partition_point(|key| before(key));
             rank += position as u64;
-            rank += node.children[..position].iter().map(Link::count).sum::<u64>();
+            rank += node.children.iter().take(position).map(Link::count).sum::<u64>();
             depth += 1;
-            current = resident(store, &node.children[position], depth)?;
+            current = resident(store, node.child(position), depth)?;
             stack.push(Frame {
                 node,
                 position: 2 * position as isize + offset,
@@ -1146,7 +1178,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
                 self.remaining -= 1;
                 return Some((position / 2) as usize);
             }
-            let child = &frame.node.children[(position / 2) as usize];
+            let child = frame.node.child((position / 2) as usize);
             if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
                 self.front.push(Frame { node, position: 0 });
             }
@@ -1170,7 +1202,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
                 self.remaining -= 1;
                 return Some((position / 2) as usize);
             }
-            let child = &frame.node.children[(position / 2) as usize];
+            let child = frame.node.child((position / 2) as usize);
             if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
@@ -1362,7 +1394,7 @@ fn expand<K: Data + Ord, V: Data>(store: Option<&Store>, steps: &mut Vec<Step<K,
         return;
     };
     for index in (0..=node.keys.len()).rev() {
-        steps.push(Step::Sub(node.children[index].clone()));
+        steps.push(Step::Sub(node.child(index).clone()));
         if index > 0 {
             steps.push(Step::Entry(
                 node.keys[index - 1].clone(),
