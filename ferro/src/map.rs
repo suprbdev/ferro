@@ -1661,6 +1661,103 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.range_by(|_| false, |_| true)
     }
 
+    pub fn cursor(&self) -> Cursor<K, V, S> {
+        Cursor {
+            store: self.store.clone(),
+            root: self.root.with_memo(),
+            path: Vec::with_capacity(PATH_FRAMES),
+            index: None,
+        }
+    }
+
+
+    pub fn floor<Q>(&self, key: &Q) -> Option<(K, Val<V>)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        fatal(self.try_floor(key))
+    }
+
+    fn try_floor<Q>(&self, key: &Q) -> Result<Option<(K, Val<V>)>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let store = self.store();
+        let entry = |node: &Node<K, V, S>, index: usize| -> Result<(K, Val<V>)> {
+            Ok((node.keys[index].clone(), node.value(store, index)?))
+        };
+        let mut link = &self.root;
+        let mut depth = 0;
+        let mut pinned = None;
+        let mut current = loop {
+            let node = match reach(store, link, depth)? {
+                Reach::Absent => break None,
+                Reach::Borrowed(node) => node,
+                Reach::Owned(node) => break Some(node),
+            };
+            depth += 1;
+            match node.search(key) {
+                Ok(index) => return entry(node, index).map(Some),
+                Err(position) => {
+                    if position > 0 {
+                        pinned = Some((node, position - 1));
+                    }
+                    link = node.child(position);
+                }
+            }
+        };
+        let mut owned = None;
+        while let Some(node) = current {
+            depth += 1;
+            match node.search(key) {
+                Ok(index) => return entry(&node, index).map(Some),
+                Err(position) => {
+                    current = resident(store, node.child(position), depth)?;
+                    if position > 0 {
+                        owned = Some((node, position - 1));
+                    }
+                }
+            }
+        }
+        match (owned, pinned) {
+            (Some((node, index)), _) => entry(&node, index).map(Some),
+            (None, Some((node, index))) => entry(node, index).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub fn get_many<I>(
+        &self,
+        keys: I,
+    ) -> impl Iterator<Item = (I::Item, Option<Val<V>>)> + use<I, K, V, S>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<K>,
+    {
+        let mut cursor = self.cursor();
+        keys.into_iter().map(move |key| {
+            let value = cursor.seek(key.borrow()).then(|| cursor.value()).flatten();
+            (key, value)
+        })
+    }
+
+    pub fn contains_many<I>(
+        &self,
+        keys: I,
+    ) -> impl Iterator<Item = (I::Item, bool)> + use<I, K, V, S>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<K>,
+    {
+        let mut cursor = self.cursor();
+        keys.into_iter().map(move |key| {
+            let found = cursor.descend(key.borrow());
+            (key, found)
+        })
+    }
+
     pub fn for_each(&self, mut f: impl FnMut(&K, &V)) {
         let _ = self.try_for_each(|key, value| -> ControlFlow<()> {
             f(key, value);
@@ -2071,6 +2168,128 @@ fn edge<K: Data, V: Data, S: Data>(
         });
     }
     Ok(rank)
+}
+
+pub struct Cursor<K, V, S = ()> {
+    store: Option<Store>,
+    root: Link<K, V, S>,
+    path: Vec<Frame<K, V, S>>,
+    index: Option<usize>,
+}
+
+impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
+    pub fn rewind(&mut self) {
+        self.path.clear();
+        if let Some(node) = fatal(resident(self.store.as_ref(), &self.root, 0)) {
+            self.path.push(Frame { node, position: 0 });
+        }
+        self.index = step(self.store.as_ref(), &mut self.path);
+    }
+
+    fn climb<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        while let [.., _, frame] = self.path.as_slice() {
+            let keys = &frame.node.keys;
+            let inside = keys.first().is_some_and(|first| first.borrow() <= key)
+                && keys.last().is_some_and(|last| key <= last.borrow());
+            if inside {
+                return;
+            }
+            self.path.pop();
+        }
+        if self.path.is_empty()
+            && let Some(node) = fatal(resident(self.store.as_ref(), &self.root, 0))
+        {
+            self.path.push(Frame { node, position: 0 });
+        }
+    }
+
+    fn descend<Q>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.climb(key);
+        let store = self.store.as_ref();
+        loop {
+            let depth = self.path.len();
+            let Some(frame) = self.path.last_mut() else {
+                return false;
+            };
+            match frame.node.search(key) {
+                Ok(index) => {
+                    frame.position = 2 * index as isize + 2;
+                    self.index = Some(index);
+                    return true;
+                }
+                Err(position) => {
+                    frame.position = 2 * position as isize + 1;
+                    match fatal(resident(store, frame.node.child(position), depth)) {
+                        Some(node) => self.path.push(Frame { node, position: 0 }),
+                        None => return false,
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn seek<Q>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.descend(key) {
+            return true;
+        }
+        self.index = step(self.store.as_ref(), &mut self.path);
+        false
+    }
+
+    pub fn seek_back<Q>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.descend(key) {
+            return true;
+        }
+        self.index = None;
+        while let Some(frame) = self.path.last_mut() {
+            let position = (frame.position / 2) as usize;
+            if position > 0 {
+                frame.position = 2 * position as isize;
+                self.index = Some(position - 1);
+                break;
+            }
+            self.path.pop();
+        }
+        false
+    }
+
+    pub fn advance(&mut self) -> Option<&K> {
+        self.index?;
+        self.index = step(self.store.as_ref(), &mut self.path);
+        self.key()
+    }
+
+    pub fn key(&self) -> Option<&K> {
+        let index = self.index?;
+        self.path.last().map(|frame| &frame.node.keys[index])
+    }
+
+    pub fn value(&self) -> Option<Val<V>> {
+        let index = self.index?;
+        self.path.last().map(|frame| fatal(frame.node.value(self.store.as_ref(), index)))
+    }
+
+    pub fn read<R>(&self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
+        let index = self.index?;
+        let node = &self.path.last()?.node;
+        Some(fatal(node.read(self.store.as_ref(), index, |value| f(&node.keys[index], value))))
+    }
 }
 
 pub struct Iter<K, V, S = ()> {
