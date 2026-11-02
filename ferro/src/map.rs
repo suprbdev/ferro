@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
@@ -12,6 +12,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
+const PIN_DEPTH: usize = 3;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -51,9 +52,27 @@ impl<V> Clone for Slot<V> {
     }
 }
 
+enum Memo<K, V> {
+    Pinned(Arc<Node<K, V>>),
+    Weak(Weak<Node<K, V>>),
+}
+
+impl<K, V> Clone for Memo<K, V> {
+    fn clone(&self) -> Self {
+        match self {
+            Memo::Pinned(node) => Memo::Pinned(node.clone()),
+            Memo::Weak(node) => Memo::Weak(node.clone()),
+        }
+    }
+}
+
 enum Link<K, V> {
     Empty,
-    Stored { ptr: Ptr, count: u64 },
+    Stored {
+        ptr: Ptr,
+        count: u64,
+        memo: OnceLock<Memo<K, V>>,
+    },
     Mem(Arc<Node<K, V>>),
 }
 
@@ -61,16 +80,32 @@ impl<K, V> Clone for Link<K, V> {
     fn clone(&self) -> Self {
         match self {
             Link::Empty => Link::Empty,
-            Link::Stored { ptr, count } => Link::Stored {
-                ptr: *ptr,
-                count: *count,
-            },
+            Link::Stored { ptr, count, .. } => Link::stored(*ptr, *count),
             Link::Mem(node) => Link::Mem(node.clone()),
         }
     }
 }
 
 impl<K, V> Link<K, V> {
+    fn stored(ptr: Ptr, count: u64) -> Self {
+        Link::Stored {
+            ptr,
+            count,
+            memo: OnceLock::new(),
+        }
+    }
+
+    fn with_memo(&self) -> Self {
+        match self {
+            Link::Stored { ptr, count, memo } => Link::Stored {
+                ptr: *ptr,
+                count: *count,
+                memo: memo.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     fn count(&self) -> u64 {
         match self {
             Link::Empty => 0,
@@ -155,10 +190,7 @@ impl<K: Data, V: Data> Node<K, V> {
             children.push(if count == 0 {
                 Link::Empty
             } else {
-                Link::Stored {
-                    ptr: decoder.link()?,
-                    count,
-                }
+                Link::stored(decoder.link()?, count)
             });
         }
         let mut node = Node {
@@ -174,6 +206,55 @@ impl<K: Data, V: Data> Node<K, V> {
     }
 }
 
+enum Reach<'a, K, V> {
+    Absent,
+    Borrowed(&'a Arc<Node<K, V>>),
+    Owned(Arc<Node<K, V>>),
+}
+
+fn reach<'a, K: Data, V: Data>(
+    store: Option<&Store>,
+    link: &'a Link<K, V>,
+    depth: usize,
+) -> Result<Reach<'a, K, V>> {
+    let (ptr, memo) = match link {
+        Link::Empty => return Ok(Reach::Absent),
+        Link::Mem(node) => return Ok(Reach::Borrowed(node)),
+        Link::Stored { ptr, memo, .. } => (*ptr, memo),
+    };
+    match memo.get() {
+        Some(Memo::Pinned(node)) => return Ok(Reach::Borrowed(node)),
+        Some(Memo::Weak(weak)) => {
+            if let Some(node) = weak.upgrade() {
+                return Ok(Reach::Owned(node));
+            }
+        }
+        None => {}
+    }
+    let store = store.ok_or(Error::Detached)?;
+    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr))?;
+    if depth < PIN_DEPTH {
+        if let Memo::Pinned(node) = memo.get_or_init(|| Memo::Pinned(node.clone())) {
+            return Ok(Reach::Borrowed(node));
+        }
+    } else if cached {
+        memo.get_or_init(|| Memo::Weak(Arc::downgrade(&node)));
+    }
+    Ok(Reach::Owned(node))
+}
+
+fn resident<K: Data, V: Data>(
+    store: Option<&Store>,
+    link: &Link<K, V>,
+    depth: usize,
+) -> Result<Option<Arc<Node<K, V>>>> {
+    Ok(match reach(store, link, depth)? {
+        Reach::Absent => None,
+        Reach::Borrowed(node) => Some(node.clone()),
+        Reach::Owned(node) => Some(node),
+    })
+}
+
 fn load<K: Data, V: Data>(
     store: Option<&Store>,
     link: &Link<K, V>,
@@ -187,6 +268,11 @@ fn load<K: Data, V: Data>(
             Ok(Some(store.load_as(ptr, |decoder| Node::decode(decoder, ptr))?))
         }
     }
+}
+
+enum Visit<R> {
+    Done(R),
+    Descend(usize),
 }
 
 fn node_mut<'a, K: Data, V: Data>(
@@ -492,7 +578,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         let flushed = flush(child, encoder.sink())?;
         match &flushed {
             Link::Empty => encoder.varint(0),
-            Link::Stored { ptr, count } => {
+            Link::Stored { ptr, count, .. } => {
                 encoder.varint(*count);
                 encoder.link(*ptr);
             }
@@ -529,10 +615,7 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
         decoded.origin = Some(ptr);
         sink.remember(ptr, Arc::new(decoded), weight);
     }
-    Ok(Link::Stored {
-        ptr,
-        count: node.count,
-    })
+    Ok(Link::stored(ptr, node.count))
 }
 
 struct Open<K, V> {
@@ -588,7 +671,7 @@ pub struct Map<K, V> {
 impl<K, V> Clone for Map<K, V> {
     fn clone(&self) -> Self {
         Map {
-            root: self.root.clone(),
+            root: self.root.with_memo(),
             store: self.store.clone(),
         }
     }
@@ -628,19 +711,44 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         self.store.as_ref()
     }
 
+    fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V>) -> Visit<R>) -> Result<Option<R>> {
+        let store = self.store();
+        let mut link = &self.root;
+        let mut depth = 0;
+        let mut current = loop {
+            let node = match reach(store, link, depth)? {
+                Reach::Absent => return Ok(None),
+                Reach::Borrowed(node) => node,
+                Reach::Owned(node) => break Some(node),
+            };
+            depth += 1;
+            match visit(node) {
+                Visit::Done(result) => return Ok(Some(result)),
+                Visit::Descend(position) => link = &node.children[position],
+            }
+        };
+        while let Some(node) = current {
+            depth += 1;
+            match visit(&node) {
+                Visit::Done(result) => return Ok(Some(result)),
+                Visit::Descend(position) => {
+                    current = resident(store, &node.children[position], depth)?;
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Arc<V>>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut current = load(self.store(), &self.root)?;
-        while let Some(node) = current {
-            match node.search(key) {
-                Ok(index) => return read_slot(self.store(), &node.slots[index]).map(Some),
-                Err(position) => current = load(self.store(), &node.children[position])?,
-            }
-        }
-        Ok(None)
+        self.walk(|node| match node.search(key) {
+            Ok(index) => Visit::Done(read_slot(self.store(), &node.slots[index])),
+            Err(position) => Visit::Descend(position),
+        })?
+        .transpose()
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<Arc<V>>
@@ -656,17 +764,11 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let walk = || -> Result<bool> {
-            let mut current = load(self.store(), &self.root)?;
-            while let Some(node) = current {
-                match node.search(key) {
-                    Ok(_) => return Ok(true),
-                    Err(position) => current = load(self.store(), &node.children[position])?,
-                }
-            }
-            Ok(false)
-        };
-        fatal(walk())
+        let found = self.walk(|node| match node.search(key) {
+            Ok(_) => Visit::Done(()),
+            Err(position) => Visit::Descend(position),
+        });
+        fatal(found).is_some()
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -746,34 +848,25 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     }
 
     pub fn nth(&self, index: usize) -> Option<(K, Arc<V>)> {
-        let walk = || -> Result<Option<(K, Arc<V>)>> {
-            let mut remaining = index as u64;
-            let mut current = load(self.store(), &self.root)?;
-            while let Some(node) = current {
-                let mut next = None;
-                for (position, child) in node.children.iter().enumerate() {
-                    let size = child.count();
-                    if remaining < size {
-                        next = Some(position);
-                        break;
-                    }
-                    remaining -= size;
-                    if position < node.keys.len() {
-                        if remaining == 0 {
-                            let value = read_slot(self.store(), &node.slots[position])?;
-                            return Ok(Some((node.keys[position].clone(), value)));
-                        }
-                        remaining -= 1;
-                    }
+        let mut remaining = index as u64;
+        let found = self.walk(|node| {
+            for (position, child) in node.children.iter().enumerate() {
+                let size = child.count();
+                if remaining < size {
+                    return Visit::Descend(position);
                 }
-                let Some(position) = next else {
-                    return Ok(None);
-                };
-                current = load(self.store(), &node.children[position])?;
+                remaining -= size;
+                if position < node.keys.len() {
+                    if remaining == 0 {
+                        let value = read_slot(self.store(), &node.slots[position]);
+                        return Visit::Done(Some((node.keys[position].clone(), value)));
+                    }
+                    remaining -= 1;
+                }
             }
-            Ok(None)
-        };
-        fatal(walk())
+            Visit::Done(None)
+        });
+        fatal(found).flatten().map(|(key, value)| (key, fatal(value)))
     }
 
     fn edge(
@@ -781,14 +874,17 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         before: &impl Fn(&K) -> bool,
         offset: isize,
     ) -> Result<(u64, Vec<Frame<K, V>>)> {
+        let store = self.store();
         let mut rank = 0u64;
         let mut stack = Vec::new();
-        let mut current = load(self.store(), &self.root)?;
+        let mut depth = 0;
+        let mut current = resident(store, &self.root, depth)?;
         while let Some(node) = current {
             let position = node.keys.partition_point(|key| before(key));
             rank += position as u64;
             rank += node.children[..position].iter().map(Link::count).sum::<u64>();
-            current = load(self.store(), &node.children[position])?;
+            depth += 1;
+            current = resident(store, &node.children[position], depth)?;
             stack.push(Frame {
                 node,
                 position: 2 * position as isize + offset,
@@ -937,7 +1033,7 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
         };
         match stored {
             Link::Empty => w.varint(0),
-            Link::Stored { ptr, count } => {
+            Link::Stored { ptr, count, .. } => {
                 w.varint(count);
                 w.link(ptr);
             }
@@ -951,10 +1047,7 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
         let root = if count == 0 {
             Link::Empty
         } else {
-            Link::Stored {
-                ptr: r.link()?,
-                count,
-            }
+            Link::stored(r.link()?, count)
         };
         Ok(Map {
             root,
@@ -1040,6 +1133,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             return None;
         }
         loop {
+            let depth = self.front.len();
             let frame = self.front.last_mut()?;
             let limit = 2 * frame.node.keys.len() as isize;
             if frame.position > limit {
@@ -1053,7 +1147,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
                 return Some((position / 2) as usize);
             }
             let child = &frame.node.children[(position / 2) as usize];
-            if let Some(node) = fatal(load(self.store.as_ref(), child)) {
+            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
                 self.front.push(Frame { node, position: 0 });
             }
         }
@@ -1064,6 +1158,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             return None;
         }
         loop {
+            let depth = self.back.len();
             let frame = self.back.last_mut()?;
             if frame.position < 0 {
                 self.back.pop();
@@ -1076,7 +1171,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
                 return Some((position / 2) as usize);
             }
             let child = &frame.node.children[(position / 2) as usize];
-            if let Some(node) = fatal(load(self.store.as_ref(), child)) {
+            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
             }

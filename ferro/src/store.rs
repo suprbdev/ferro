@@ -618,10 +618,18 @@ impl Store {
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<Arc<T>> {
+        self.fetch(ptr, decode).map(|(value, _)| value)
+    }
+
+    pub(crate) fn fetch<T: Send + Sync + 'static>(
+        &self,
+        ptr: Ptr,
+        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+    ) -> Result<(Arc<T>, bool)> {
         if let Some(entry) = self.inner.cache.get(&ptr.hash)
             && let Ok(value) = entry.value.downcast::<T>()
         {
-            return Ok(value);
+            return Ok((value, true));
         }
         let object = self.read_object(ptr)?;
         let weight = (object.body.len() + object.links.len() * LINK_WEIGHT + 128) as u32;
@@ -639,7 +647,7 @@ impl Store {
                 self.inner.cache.clear();
             }
         }
-        Ok(value)
+        Ok((value, false))
     }
 
     pub fn close(&self) {

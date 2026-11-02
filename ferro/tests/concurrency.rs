@@ -648,3 +648,60 @@ fn second_writer_is_locked_out_and_reader_is_not() {
     drop(clone);
     fast().open::<Map<u64, u64>>(&path).unwrap();
 }
+
+#[test]
+fn memoized_reads_stay_correct_while_a_tiny_cache_evicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.ferro");
+    let db = fast().cache_bytes(2048).open::<Map<u64, String>>(&path).unwrap();
+    db.update(|root| {
+        for key in 0..4000 {
+            root.insert(key, format!("value-{key}"));
+        }
+    })
+    .unwrap();
+    let snapshot = db.read();
+    thread::scope(|scope| {
+        for shift in 0..4u64 {
+            let snapshot = &snapshot;
+            scope.spawn(move || {
+                for round in 0..3 {
+                    for step in 0..4000u64 {
+                        let key = (step * 7 + shift * 13 + round) % 4000;
+                        assert_eq!(*snapshot.get(&key).unwrap(), format!("value-{key}"));
+                    }
+                    let keys: Vec<u64> = snapshot.keys().collect();
+                    assert_eq!(keys, (0..4000).collect::<Vec<u64>>());
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn pinned_nested_maps_do_not_hold_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested.ferro");
+    {
+        let db = fast().open::<Map<u64, Map<u64, u64>>>(&path).unwrap();
+        db.update(|root| {
+            for outer in 0..500 {
+                let mut inner = Map::new();
+                for key in 0..20 {
+                    inner.insert(key, outer + key);
+                }
+                root.insert(outer, inner);
+            }
+        })
+        .unwrap();
+        let snapshot = db.read();
+        for outer in 0..500 {
+            assert_eq!(*snapshot.get(&outer).unwrap().get(&3).unwrap(), outer + 3);
+        }
+        let held = snapshot.get(&7).unwrap();
+        drop(snapshot);
+        assert_eq!(*held.get(&1).unwrap(), 8);
+    }
+    let db = fast().open::<Map<u64, Map<u64, u64>>>(&path).unwrap();
+    assert_eq!(db.read().len(), 500);
+}

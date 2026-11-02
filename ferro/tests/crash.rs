@@ -786,6 +786,28 @@ fn redirected_link_is_caught_even_when_the_wrong_target_is_cached() {
 }
 
 #[test]
+fn redirected_link_stays_caught_once_child_memos_are_warm() {
+    quiet_ferro_panics();
+    let (_dir, path, keys) = wide_database();
+    redirect_sibling_link(&path);
+    let db = fast().cache_bytes(64 << 20).open::<Root>(&path).unwrap();
+    let snapshot = db.read();
+    let mut failed = None;
+    for _ in 0..3 {
+        let mut failures = Vec::new();
+        for key in 0..keys {
+            match guarded(|| snapshot.get(&key)) {
+                Outcome::Value(Some(value)) => assert_eq!(*value, format!("value-{key}")),
+                Outcome::Value(None) => panic!("key {key} silently vanished"),
+                Outcome::FerroPanic(_) => failures.push(key),
+            }
+        }
+        assert!(!failures.is_empty(), "the redirected link was never followed");
+        assert_eq!(*failed.get_or_insert_with(|| failures.clone()), failures);
+    }
+}
+
+#[test]
 fn verify_reports_a_link_redirected_to_a_visited_object() {
     let (_dir, path, _) = wide_database();
     redirect_sibling_link(&path);
