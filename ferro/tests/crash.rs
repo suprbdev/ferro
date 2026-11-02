@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{Outcome, Rng, cases, fast, guarded, quiet_ferro_panics, text, uncached};
-use ferro::codec::{Object, Sink};
-use ferro::store::{Store, StoreOptions};
+use ferro::codec::{HASH_BYTES, Object, Sink};
+use ferro::store::{Store, StoreOptions, record_len};
 use ferro::{Db, Error, Map, Ptr};
 use tempfile::TempDir;
 
@@ -404,10 +404,6 @@ fn truncated_database_is_never_reinitialised() {
     assert_eq!(fs::read(&path).unwrap(), torn);
 }
 
-fn object_size(body: usize, links: usize) -> usize {
-    8 + body + links * 40
-}
-
 fn reachable(path: &Path) -> Vec<(usize, usize, Vec<Ptr>)> {
     let options = StoreOptions {
         read_only: true,
@@ -418,7 +414,7 @@ fn reachable(path: &Path) -> Vec<(usize, usize, Vec<Ptr>)> {
     store
         .walk(head.unwrap(), |ptr, object| {
             let start = ptr.offset as usize;
-            let end = start + object_size(object.body.len(), object.links.len());
+            let end = start + record_len(ptr.offset, object);
             out.push((start, end, object.links.clone()));
         })
         .unwrap();
@@ -571,6 +567,35 @@ fn wide_database() -> (TempDir, PathBuf, u64) {
     (dir, path, 20_000)
 }
 
+fn zigzag_len(offset: u64, target: u64) -> usize {
+    let delta = offset.wrapping_sub(target) as i64;
+    let mut value = ((delta << 1) ^ (delta >> 63)) as u64;
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn padded_zigzag(offset: u64, target: u64, len: usize) -> Option<Vec<u8>> {
+    if zigzag_len(offset, target) > len {
+        return None;
+    }
+    let delta = offset.wrapping_sub(target) as i64;
+    let mut value = ((delta << 1) ^ (delta >> 63)) as u64;
+    let mut out = Vec::new();
+    for position in 0..len {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if position + 1 < len {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+    Some(out)
+}
+
 fn redirect_sibling_link(path: &Path) -> usize {
     let ranges = reachable(path);
     let (start, end, links) = ranges
@@ -578,14 +603,25 @@ fn redirect_sibling_link(path: &Path) -> usize {
         .max_by_key(|entry| entry.2.len())
         .expect("database has objects");
     assert!(links.len() > 3);
-    let table = end - links.len() * 40;
-    let index = links.len() / 2;
-    let wrong = links[index + 1].offset;
+    let lens: Vec<usize> = links
+        .iter()
+        .map(|link| HASH_BYTES + zigzag_len(*start as u64, link.offset))
+        .collect();
     let mut image = fs::read(path).unwrap();
-    image[table + index * 40 + 32..table + index * 40 + 40].copy_from_slice(&wrong.to_le_bytes());
-    fs::write(path, image).unwrap();
-    assert!(end > start);
-    index
+    let mut position = end - lens.iter().sum::<usize>();
+    for index in 0..links.len() - 1 {
+        let delta_len = lens[index] - HASH_BYTES;
+        if let Some(patch) = padded_zigzag(*start as u64, links[index + 1].offset, delta_len)
+            && links[index + 1].offset != links[index].offset
+        {
+            let delta_at = position + HASH_BYTES;
+            image[delta_at..delta_at + delta_len].copy_from_slice(&patch);
+            fs::write(path, image).unwrap();
+            return index;
+        }
+        position += lens[index];
+    }
+    panic!("no link could be redirected in place");
 }
 
 #[test]
@@ -645,7 +681,7 @@ fn oversized_object_is_refused_before_it_reaches_the_log() {
         body: vec![0u8; (1usize << 32) + 1],
         links: Vec::new(),
     };
-    assert!(matches!(txn.put(object, [0; 32]), Err(Error::TooLarge(_))));
+    assert!(matches!(txn.put(object, [0; HASH_BYTES]), Err(Error::TooLarge(_))));
 }
 
 #[test]

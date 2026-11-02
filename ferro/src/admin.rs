@@ -95,9 +95,9 @@ pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
         ..crate::Verified::default()
     };
     if let Some(ptr) = head {
-        store.walk(ptr, |_, object| {
+        store.walk(ptr, |ptr, object| {
             report.objects += 1;
-            report.bytes += (object.body.len() + object.links.len() * 40 + 8) as u64;
+            report.bytes += crate::store::record_len(ptr.offset, object) as u64;
         })?;
     }
     store.close();
@@ -145,8 +145,8 @@ impl Sink for CopySink {
             links.push(self.copy(*link)?);
         }
         let before = self.buf.len();
-        append_record(&mut self.buf, &object.body, &links);
         let offset = self.end;
+        append_record(&mut self.buf, offset, &object.body, &links);
         self.end += (self.buf.len() - before) as u64;
         self.copied.insert(hash, offset);
         if self.buf.len() >= FLUSH_BYTES {

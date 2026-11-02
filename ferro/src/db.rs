@@ -703,9 +703,9 @@ impl<T: Data> Db<T> {
         let refs = self.shared.refs.lock();
         let mut report = Verified::default();
         if let Some(ptr) = refs.ptr {
-            self.shared.store.walk(ptr, |_, object| {
+            self.shared.store.walk(ptr, |ptr, object| {
                 report.objects += 1;
-                report.bytes += (object.body.len() + object.links.len() * 40 + 8) as u64;
+                report.bytes += crate::store::record_len(ptr.offset, object) as u64;
             })?;
         }
         report.file_bytes = self.shared.store.size();

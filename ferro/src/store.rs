@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 
-use crate::codec::{Decoder, Hash, Object, Ptr, Sink};
+use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"FERRODB1";
@@ -18,8 +18,8 @@ const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const SUPER_BYTES: usize = 96;
 const READ_AHEAD: usize = 4096;
-const LINK_BYTES: usize = 40;
-const HEADER_BYTES: usize = 8;
+const LINK_WEIGHT: usize = HASH_BYTES + 3;
+const MAX_VARINT: usize = 10;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -75,7 +75,7 @@ impl Super {
         out[16..24].copy_from_slice(&self.log_end.to_le_bytes());
         if let Some(head) = self.head {
             out[24..32].copy_from_slice(&head.offset.to_le_bytes());
-            out[32..64].copy_from_slice(&head.hash);
+            out[32..32 + HASH_BYTES].copy_from_slice(&head.hash);
         }
         let check = blake3::hash(&out[..64]);
         out[64..96].copy_from_slice(check.as_bytes());
@@ -93,7 +93,7 @@ impl Super {
         let seq = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let log_end = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
         let offset = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
-        let hash: Hash = bytes[32..64].try_into().ok()?;
+        let hash: Hash = bytes[32..32 + HASH_BYTES].try_into().ok()?;
         let head = (offset != 0).then_some(Ptr { hash, offset });
         Some(Super { seq, log_end, head })
     }
@@ -117,13 +117,84 @@ fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
     Ok(best)
 }
 
-pub(crate) fn append_record(buf: &mut Vec<u8>, body: &[u8], links: &[Ptr]) {
-    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&(links.len() as u32).to_le_bytes());
+fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+fn unzigzag(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+
+pub fn append_record(buf: &mut Vec<u8>, offset: u64, body: &[u8], links: &[Ptr]) {
+    push_varint(buf, body.len() as u64);
+    push_varint(buf, links.len() as u64);
     buf.extend_from_slice(body);
     for link in links {
         buf.extend_from_slice(&link.hash);
-        buf.extend_from_slice(&link.offset.to_le_bytes());
+        push_varint(buf, zigzag(offset.wrapping_sub(link.offset) as i64));
+    }
+}
+
+pub fn record_len(offset: u64, object: &Object) -> usize {
+    let mut buf = Vec::new();
+    append_record(&mut buf, offset, &object.body, &object.links);
+    buf.len()
+}
+
+struct RecordReader<'a> {
+    file: &'a File,
+    start: u64,
+    tail: u64,
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+impl RecordReader<'_> {
+    fn ensure(&mut self, upto: usize) -> Result<()> {
+        if upto <= self.bytes.len() {
+            return Ok(());
+        }
+        if self.start + upto as u64 > self.tail {
+            return Err(Error::Corrupt(format!(
+                "record at {} runs past end of log",
+                self.start
+            )));
+        }
+        let have = self.bytes.len();
+        let want = (upto - have).max(READ_AHEAD);
+        let want = want.min((self.tail - self.start) as usize - have);
+        self.bytes.resize(have + want, 0);
+        self.file
+            .read_exact_at(&mut self.bytes[have..], self.start + have as u64)?;
+        Ok(())
+    }
+
+    fn varint(&mut self) -> Result<u64> {
+        let mut value = 0u64;
+        for index in 0..MAX_VARINT {
+            self.ensure(self.pos + 1)?;
+            let byte = self.bytes[self.pos];
+            self.pos += 1;
+            if index == MAX_VARINT - 1 && byte > 1 {
+                break;
+            }
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(Error::Corrupt("varint overflow in record".into()))
+    }
+
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| Error::Corrupt("record size overflow".into()))?;
+        self.ensure(end)?;
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(out)
     }
 }
 
@@ -286,8 +357,7 @@ impl Store {
 
     pub fn read_object(&self, ptr: Ptr) -> Result<Object> {
         let tail = self.inner.tail.load(Ordering::Acquire);
-        let header_end = ptr.offset.checked_add(HEADER_BYTES as u64);
-        if ptr.offset < LOG_START || header_end.is_none_or(|end| end > tail) {
+        if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
                 "pointer {} outside log of {tail} bytes",
                 ptr.offset
@@ -296,33 +366,26 @@ impl Store {
         let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
         let mut bytes = vec![0u8; want];
         self.inner.file.read_exact_at(&mut bytes, ptr.offset)?;
-        let body_len = u32::from_le_bytes(bytes[0..4].try_into().expect("slice length is 4")) as usize;
-        let link_count = u32::from_le_bytes(bytes[4..8].try_into().expect("slice length is 4")) as usize;
-        let links_len = link_count
-            .checked_mul(LINK_BYTES)
-            .ok_or_else(|| Error::Corrupt("link table overflow".into()))?;
-        let total = HEADER_BYTES
-            .checked_add(body_len)
-            .and_then(|n| n.checked_add(links_len))
-            .ok_or_else(|| Error::Corrupt("record size overflow".into()))?;
-        if ptr.offset + total as u64 > tail {
-            return Err(Error::Corrupt(format!(
-                "record at {} runs past end of log",
-                ptr.offset
-            )));
-        }
-        if total > bytes.len() {
-            let have = bytes.len();
-            bytes.resize(total, 0);
-            self.inner
-                .file
-                .read_exact_at(&mut bytes[have..], ptr.offset + have as u64)?;
-        }
-        let body = bytes[HEADER_BYTES..HEADER_BYTES + body_len].to_vec();
-        let mut links = Vec::with_capacity(link_count);
-        for raw in bytes[HEADER_BYTES + body_len..total].chunks_exact(LINK_BYTES) {
-            let hash: Hash = raw[..32].try_into().expect("slice length is 32");
-            let offset = u64::from_le_bytes(raw[32..40].try_into().expect("slice length is 8"));
+        let mut reader = RecordReader {
+            file: &self.inner.file,
+            start: ptr.offset,
+            tail,
+            bytes,
+            pos: 0,
+        };
+        let body_len = usize::try_from(reader.varint()?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        let link_count = usize::try_from(reader.varint()?)
+            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
+        let body = reader.take(body_len)?.to_vec();
+        let mut links = Vec::with_capacity(link_count.min(1024));
+        for _ in 0..link_count {
+            let hash: Hash = reader
+                .take(HASH_BYTES)?
+                .try_into()
+                .expect("slice length is HASH_BYTES");
+            let delta = unzigzag(reader.varint()?);
+            let offset = ptr.offset.wrapping_sub(delta as u64);
             links.push(Ptr { hash, offset });
         }
         let object = Object { body, links };
@@ -346,7 +409,7 @@ impl Store {
             return Ok(value);
         }
         let object = self.read_object(ptr)?;
-        let weight = (object.body.len() + object.links.len() * LINK_BYTES + 128) as u32;
+        let weight = (object.body.len() + object.links.len() * LINK_WEIGHT + 128) as u32;
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = Arc::new(decode(&mut decoder)?);
         if !self.inner.closed.load(Ordering::SeqCst) {
@@ -427,7 +490,7 @@ impl Sink for Txn {
             return Ok(Ptr { hash, offset });
         }
         let offset = self.base + self.buf.len() as u64;
-        append_record(&mut self.buf, &object.body, &object.links);
+        append_record(&mut self.buf, offset, &object.body, &object.links);
         self.seen.insert(hash, offset);
         Ok(Ptr { hash, offset })
     }
