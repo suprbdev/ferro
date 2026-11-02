@@ -1,0 +1,28 @@
+[package]
+name = "shop"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shop"
+path = "src/main.rs"
+
+[[bin]]
+name = "shop-load"
+path = "src/bin/load.rs"
+
+[[bin]]
+name = "shop-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+ferro = { path = "../../ferro" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
