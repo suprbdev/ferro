@@ -108,11 +108,10 @@ fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
         }
         let mut bytes = [0u8; SUPER_BYTES];
         file.read_exact_at(&mut bytes, start)?;
-        if let Some(candidate) = Super::decode(&bytes) {
-            if best.as_ref().is_none_or(|b| candidate.seq > b.seq) {
+        if let Some(candidate) = Super::decode(&bytes)
+            && best.as_ref().is_none_or(|b| candidate.seq > b.seq) {
                 best = Some(candidate);
             }
-        }
     }
     Ok(best)
 }
@@ -291,11 +290,10 @@ impl Store {
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<Arc<T>> {
-        if let Some(entry) = self.inner.cache.get(&ptr.offset) {
-            if let Ok(value) = entry.value.downcast::<T>() {
+        if let Some(entry) = self.inner.cache.get(&ptr.offset)
+            && let Ok(value) = entry.value.downcast::<T>() {
                 return Ok(value);
             }
-        }
         let object = self.read_object(ptr)?;
         let weight = (object.body.len() + object.links.len() * LINK_BYTES + 128) as u32;
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));

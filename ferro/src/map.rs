@@ -1163,11 +1163,10 @@ impl<K: Data + Ord, V: Data + PartialEq> Iterator for Diff<K, V> {
                     let old = self.old.pop();
                     let new = self.new.pop();
                     if let (Some(Step::Entry(key, a)), Some(Step::Entry(_, b))) = (old, new) {
-                        if let (Slot::Spilled(x), Slot::Spilled(y)) = (&a, &b) {
-                            if x.hash == y.hash {
+                        if let (Slot::Spilled(x), Slot::Spilled(y)) = (&a, &b)
+                            && x.hash == y.hash {
                                 continue;
                             }
-                        }
                         let before = fatal(read_slot(self.old_store.as_ref(), &a));
                         let after = fatal(read_slot(self.new_store.as_ref(), &b));
                         if before != after {

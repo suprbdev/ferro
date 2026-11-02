@@ -298,3 +298,41 @@ where
         ),
     }
 }
+
+pub trait IndexEach {
+    type Value: Data + Ord;
+
+    fn values(&self) -> Vec<Self::Value>;
+}
+
+impl<X: Data + Ord> IndexEach for Vec<X> {
+    type Value = X;
+
+    fn values(&self) -> Vec<X> {
+        self.to_vec()
+    }
+}
+
+impl<X: Data + Ord> IndexEach for std::collections::BTreeSet<X> {
+    type Value = X;
+
+    fn values(&self) -> Vec<X> {
+        self.iter().cloned().collect()
+    }
+}
+
+impl<X: Data + Ord> IndexEach for crate::set::Set<X> {
+    type Value = X;
+
+    fn values(&self) -> Vec<X> {
+        self.iter().collect()
+    }
+}
+
+impl<X: Data + Ord> IndexEach for Option<X> {
+    type Value = X;
+
+    fn values(&self) -> Vec<X> {
+        self.iter().cloned().collect()
+    }
+}
