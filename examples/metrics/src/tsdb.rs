@@ -278,6 +278,18 @@ impl Cell {
         }
     }
 
+    fn absorb(&mut self, roll: &Rollup) {
+        if self.count == 0 {
+            self.min = roll.min;
+            self.max = roll.max;
+        } else {
+            self.min = self.min.min(roll.min);
+            self.max = self.max.max(roll.max);
+        }
+        self.count += roll.count;
+        self.sum += roll.sum;
+    }
+
     fn merge(&mut self, other: Cell) {
         if other.count == 0 {
             return;
@@ -321,6 +333,7 @@ struct RateState {
 }
 
 const MAX_CELLS: u64 = 5_000_000;
+const FOLD_ROWS: u64 = 8;
 
 struct Grid {
     from: u64,
@@ -376,6 +389,11 @@ impl Grid {
         } else {
             ((ts / self.step * self.step - self.first_bucket) / self.step) as usize
         }
+    }
+
+    fn bucket_span(&self, index: usize, from: u64, to: u64) -> (u64, u64) {
+        let start = self.first_bucket + index as u64 * self.step;
+        (start.max(from), (start + self.step).min(to))
     }
 
     fn bucket_start(&self, index: usize) -> u64 {
@@ -612,22 +630,20 @@ pub fn aggregate_rollups(
     let mut grid = Grid::new(from, to, step, names)?;
     let buckets = grid.buckets;
     let mut merged: Vec<Cell> = (0..grid.cells.len()).map(|_| Cell::default()).collect();
+    let folding = grid.step / rollup_step >= FOLD_ROWS;
     for (index, rec) in rows.iter().enumerate() {
         let group = assignment[index];
-        for ((_, start), roll) in table.range((rec.id, bucket_floor(from, rollup_step))..(rec.id, to)) {
-            if start < from {
-                continue;
+        if folding {
+            for bucket in 0..buckets {
+                let (low, high) = grid.bucket_span(bucket, from, to);
+                if let Some(roll) = table.range_summary((rec.id, low)..(rec.id, high)) {
+                    merged[group * buckets + bucket].absorb(&roll);
+                }
             }
-            let cell = &mut merged[group * buckets + grid.bucket_index(start)];
-            if cell.count == 0 {
-                cell.min = roll.min;
-                cell.max = roll.max;
-            } else {
-                cell.min = cell.min.min(roll.min);
-                cell.max = cell.max.max(roll.max);
+        } else {
+            for ((_, start), roll) in table.range((rec.id, from)..(rec.id, to)) {
+                merged[group * buckets + grid.bucket_index(start)].absorb(&roll);
             }
-            cell.count += roll.count;
-            cell.sum += roll.sum;
         }
     }
     grid.cells = merged;
@@ -709,7 +725,7 @@ pub fn downsample(
     let entries: Vec<((u64, u64), Rollup)> = per_series.into_iter().flatten().collect();
     let rollups = entries.len();
     db.commit(format!("downsample {step}ms"), |m| {
-        m.rollups.get_or_insert_with(step, Map::new).extend(entries);
+        m.rollups.get_or_insert_with(step, Map::default).extend(entries);
     })?;
     Ok(Downsampled {
         series: sids.len(),
