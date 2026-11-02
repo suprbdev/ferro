@@ -53,10 +53,10 @@ impl Data for Commit {
 }
 
 #[derive(Clone)]
-struct Head {
-    version: u64,
-    root: Option<Ptr>,
-    log: Map<u64, Commit>,
+pub(crate) struct Head {
+    pub(crate) version: u64,
+    pub(crate) root: Option<Ptr>,
+    pub(crate) log: Map<u64, Commit>,
 }
 
 impl Data for Head {
@@ -75,7 +75,7 @@ impl Data for Head {
     }
 }
 
-type Refs = Map<String, Head>;
+pub(crate) type Refs = Map<String, Head>;
 
 struct RefState {
     refs: Refs,

@@ -1,5 +1,6 @@
 extern crate self as ferro;
 
+pub mod admin;
 pub mod codec;
 pub mod db;
 pub mod error;

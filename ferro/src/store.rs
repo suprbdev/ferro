@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"FERRODB1";
 const SLOT_BYTES: u64 = 4096;
-const LOG_START: u64 = 2 * SLOT_BYTES;
+pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const SUPER_BYTES: usize = 96;
 const READ_AHEAD: usize = 4096;
 const LINK_BYTES: usize = 40;
@@ -116,6 +116,50 @@ fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
     Ok(best)
 }
 
+pub(crate) fn append_record(buf: &mut Vec<u8>, body: &[u8], links: &[Ptr]) {
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(links.len() as u32).to_le_bytes());
+    buf.extend_from_slice(body);
+    for link in links {
+        buf.extend_from_slice(&link.hash);
+        buf.extend_from_slice(&link.offset.to_le_bytes());
+    }
+}
+
+pub(crate) fn seal(file: &File, log_end: u64, head: Ptr) -> Result<()> {
+    file.sync_data()?;
+    let sb = Super {
+        seq: 1,
+        log_end,
+        head: Some(head),
+    };
+    file.write_all_at(&sb.encode(), SLOT_BYTES)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn open_locked(path: &Path, read_only: bool) -> Result<File> {
+    loop {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .create(!read_only)
+            .truncate(false)
+            .open(path)?;
+        if read_only {
+            return Ok(file);
+        }
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(Error::Locked),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if std::fs::metadata(path).is_ok_and(|on_disk| on_disk.ino() == file.metadata().map(|m| m.ino()).unwrap_or(0)) {
+            return Ok(file);
+        }
+    }
+}
+
 struct Inner {
     id: u64,
     path: PathBuf,
@@ -136,19 +180,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!options.read_only)
-            .create(!options.read_only)
-            .truncate(false)
-            .open(path)?;
-        if !options.read_only {
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => return Err(Error::Locked),
-                Err(TryLockError::Error(e)) => return Err(e.into()),
-            }
-        }
+        let file = open_locked(path, options.read_only)?;
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
         let sb = match existing {
@@ -227,7 +259,11 @@ impl Store {
     }
 
     pub fn refresh(&self) -> Result<Option<Ptr>> {
-        let len = self.inner.file.metadata()?.len();
+        let opened = self.inner.file.metadata()?;
+        if std::fs::metadata(&self.inner.path)?.ino() != opened.ino() {
+            return Err(Error::Replaced);
+        }
+        let len = opened.len();
         let sb = read_supers(&self.inner.file, len)?
             .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
@@ -373,15 +409,7 @@ impl Sink for Txn {
             return Ok(Ptr { hash, offset });
         }
         let offset = self.base + self.buf.len() as u64;
-        self.buf
-            .extend_from_slice(&(object.body.len() as u32).to_le_bytes());
-        self.buf
-            .extend_from_slice(&(object.links.len() as u32).to_le_bytes());
-        self.buf.extend_from_slice(&object.body);
-        for link in &object.links {
-            self.buf.extend_from_slice(&link.hash);
-            self.buf.extend_from_slice(&link.offset.to_le_bytes());
-        }
+        append_record(&mut self.buf, &object.body, &object.links);
         self.seen.insert(hash, offset);
         Ok(Ptr { hash, offset })
     }

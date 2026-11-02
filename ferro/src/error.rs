@@ -24,6 +24,8 @@ pub enum Error {
     Detached,
     #[error("database is read-only")]
     ReadOnly,
+    #[error("database file was replaced by compaction; reopen it")]
+    Replaced,
     #[error("a previous commit failed; reopen the database to recover")]
     Poisoned,
 }

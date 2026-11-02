@@ -28,7 +28,10 @@ fn main() {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(1_000_000);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = match std::env::args().nth(2) {
+        Some(parent) => tempfile::tempdir_in(parent).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     let path = dir.path().join("perf.ferro");
     let db = Options::new()
         .durability(Durability::Fsync)
