@@ -125,6 +125,16 @@ struct Branch<T> {
     watchers: Mutex<Vec<Sender<Snapshot<T>>>>,
 }
 
+impl<T> Branch<T> {
+    fn publish(&self, state: State<T>) {
+        let snapshot = state.snapshot.clone();
+        self.state.store(Arc::new(state));
+        self.watchers
+            .lock()
+            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+    }
+}
+
 struct Shared<T> {
     store: Store,
     refs: Mutex<RefState>,
@@ -388,13 +398,7 @@ impl<T: Data> Db<T> {
         );
         self.shared.write_refs(refs, next, txn)?;
         let head = refs.refs.try_get(&self.branch.name)?;
-        let state = self.shared.state_of(head.as_deref())?;
-        let snapshot = state.snapshot.clone();
-        self.branch.state.store(Arc::new(state));
-        self.branch
-            .watchers
-            .lock()
-            .retain(|watcher| watcher.send(snapshot.clone()).is_ok());
+        self.branch.publish(self.shared.state_of(head.as_deref())?);
         Ok(())
     }
 
@@ -432,9 +436,10 @@ impl<T: Data> Db<T> {
     }
 
     pub fn restore(&self, snapshot: &Snapshot<T>) -> Result<u64> {
-        let value = (*snapshot.value).clone();
         let message = format!("restore v{}", snapshot.commit.version);
-        self.commit(message, move |root| *root = value)?;
+        let mut refs = self.shared.refs.lock();
+        let state = self.branch.state.load_full();
+        self.commit_locked(&mut refs, &state, message, &snapshot.value)?;
         Ok(self.version())
     }
 
@@ -506,7 +511,11 @@ impl<T: Data> Db<T> {
         for branch in branches.values() {
             let head = refs.refs.try_get(&branch.name)?;
             let state = self.shared.state_of(head.as_deref())?;
-            branch.state.store(Arc::new(state));
+            if state.snapshot.version() == branch.state.load().snapshot.version() {
+                branch.state.store(Arc::new(state));
+            } else {
+                branch.publish(state);
+            }
         }
         Ok(true)
     }

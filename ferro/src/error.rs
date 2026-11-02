@@ -26,6 +26,8 @@ pub enum Error {
     ReadOnly,
     #[error("a previous commit failed; reopen the database to recover")]
     Poisoned,
+    #[error("object of {0} bytes exceeds the 4 GiB limit")]
+    TooLarge(u64),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

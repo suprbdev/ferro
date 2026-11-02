@@ -35,6 +35,9 @@ pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
     fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Any + Send + Sync>, _weight: u32) {}
     fn store_id(&self) -> u64;
+    fn store(&self) -> Option<Store> {
+        None
+    }
 }
 
 pub struct HashSink;
@@ -184,12 +187,15 @@ impl<'a> Encoder<'a> {
     }
 }
 
+const MAX_EMPTY_ITEMS: u64 = 1 << 24;
+
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
     links: &'a [Ptr],
     cursor: usize,
     store: Option<&'a Store>,
+    empty_items: u64,
 }
 
 impl<'a> Decoder<'a> {
@@ -200,6 +206,7 @@ impl<'a> Decoder<'a> {
             links,
             cursor: 0,
             store,
+            empty_items: 0,
         }
     }
 
@@ -247,6 +254,18 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    pub fn item<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let before = (self.pos, self.cursor);
+        let value = read(self)?;
+        if (self.pos, self.cursor) == before {
+            self.empty_items += 1;
+            if self.empty_items > MAX_EMPTY_ITEMS {
+                return Err(Error::Decode("too many zero-width items".into()));
+            }
+        }
+        Ok(value)
+    }
+
     pub fn link(&mut self) -> Result<Ptr> {
         let ptr = self
             .links
@@ -286,9 +305,11 @@ impl<'a> Decoder<'a> {
                 links: &self.links[self.cursor..end],
                 cursor: 0,
                 store: self.store,
+                empty_items: self.empty_items,
             };
             self.cursor = end;
             f(tag, &mut sub)?;
+            self.empty_items = sub.empty_items;
         }
         Ok(())
     }
@@ -494,9 +515,10 @@ impl<T: Data> Data for Vec<T> {
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let len = r.varint()? as usize;
-        let mut out = Vec::with_capacity(len.min(r.remaining()));
+        let room = r.remaining() / size_of::<T>().max(1);
+        let mut out = Vec::with_capacity(len.min(room));
         for _ in 0..len {
-            out.push(T::decode(r)?);
+            out.push(r.item(T::decode)?);
         }
         Ok(out)
     }
@@ -566,8 +588,7 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
         let len = r.varint()?;
         let mut out = BTreeMap::new();
         for _ in 0..len {
-            let key = K::decode(r)?;
-            let value = V::decode(r)?;
+            let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
             out.insert(key, value);
         }
         Ok(out)
@@ -591,7 +612,7 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
         let len = r.varint()?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
-            out.insert(T::decode(r)?);
+            out.insert(r.item(T::decode)?);
         }
         Ok(out)
     }

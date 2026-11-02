@@ -55,8 +55,8 @@ struct CacheEntry {
 #[derive(Clone)]
 struct EntryWeight;
 
-impl Weighter<u64, CacheEntry> for EntryWeight {
-    fn weight(&self, _key: &u64, entry: &CacheEntry) -> u64 {
+impl Weighter<Hash, CacheEntry> for EntryWeight {
+    fn weight(&self, _key: &Hash, entry: &CacheEntry) -> u64 {
         u64::from(entry.weight)
     }
 }
@@ -108,10 +108,10 @@ fn read_supers(file: &File, len: u64) -> Result<Option<Super>> {
         }
         let mut bytes = [0u8; SUPER_BYTES];
         file.read_exact_at(&mut bytes, start)?;
-        if let Some(candidate) = Super::decode(&bytes) {
-            if best.as_ref().is_none_or(|b| candidate.seq > b.seq) {
-                best = Some(candidate);
-            }
+        if let Some(candidate) = Super::decode(&bytes)
+            && best.as_ref().is_none_or(|b| candidate.seq > b.seq)
+        {
+            best = Some(candidate);
         }
     }
     Ok(best)
@@ -123,7 +123,7 @@ struct Inner {
     file: File,
     tail: AtomicU64,
     seq: Mutex<u64>,
-    cache: Cache<u64, CacheEntry, EntryWeight>,
+    cache: Cache<Hash, CacheEntry, EntryWeight>,
     dedupe: Cache<Hash, u64>,
     poisoned: AtomicBool,
     closed: AtomicBool,
@@ -154,6 +154,7 @@ impl Store {
         let existing = read_supers(&file, len)?;
         let sb = match existing {
             Some(sb) => {
+                let len = file.metadata()?.len();
                 if len < sb.log_end {
                     return Err(Error::Corrupt(format!(
                         "file is {len} bytes but superblock expects {}",
@@ -172,13 +173,11 @@ impl Store {
                 }
                 let mut probe = vec![0u8; len.min(LOG_START) as usize];
                 file.read_exact_at(&mut probe, 0)?;
-                if len >= LOG_START || probe.iter().any(|b| *b != 0) {
-                    if !probe.starts_with(MAGIC) {
-                        return Err(Error::NotFerro(path.display().to_string()));
-                    }
-                    if len >= LOG_START {
-                        return Err(Error::Corrupt("both superblocks are invalid".into()));
-                    }
+                if probe.starts_with(MAGIC) {
+                    return Err(Error::Corrupt("both superblocks are invalid".into()));
+                }
+                if len > LOG_START || probe.iter().any(|b| *b != 0) {
+                    return Err(Error::NotFerro(path.display().to_string()));
                 }
                 let sb = Super {
                     seq: 0,
@@ -228,9 +227,14 @@ impl Store {
     }
 
     pub fn refresh(&self) -> Result<Option<Ptr>> {
+        let mut seen = self.inner.seq.lock();
         let len = self.inner.file.metadata()?.len();
         let sb = read_supers(&self.inner.file, len)?
             .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
+        if sb.seq < *seen {
+            return Ok(None);
+        }
+        *seen = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
         Ok(sb.head)
     }
@@ -291,10 +295,10 @@ impl Store {
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<Arc<T>> {
-        if let Some(entry) = self.inner.cache.get(&ptr.offset) {
-            if let Ok(value) = entry.value.downcast::<T>() {
-                return Ok(value);
-            }
+        if let Some(entry) = self.inner.cache.get(&ptr.hash)
+            && let Ok(value) = entry.value.downcast::<T>()
+        {
+            return Ok(value);
         }
         let object = self.read_object(ptr)?;
         let weight = (object.body.len() + object.links.len() * LINK_BYTES + 128) as u32;
@@ -302,7 +306,7 @@ impl Store {
         let value = Arc::new(decode(&mut decoder)?);
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(
-                ptr.offset,
+                ptr.hash,
                 CacheEntry {
                     value: value.clone(),
                     weight,
@@ -344,7 +348,7 @@ impl Store {
         let mut seen = HashSet::new();
         let mut stack = vec![head];
         while let Some(ptr) = stack.pop() {
-            if !seen.insert(ptr.offset) {
+            if !seen.insert(ptr) {
                 continue;
             }
             let object = self.read_object(ptr)?;
@@ -360,11 +364,14 @@ pub struct Txn {
     base: u64,
     buf: Vec<u8>,
     seen: HashMap<Hash, u64>,
-    remembered: Vec<(u64, CacheEntry)>,
+    remembered: Vec<(Hash, CacheEntry)>,
 }
 
 impl Sink for Txn {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
+        if u32::try_from(object.body.len()).is_err() {
+            return Err(Error::TooLarge(object.body.len() as u64));
+        }
         if let Some(offset) = self.seen.get(&hash) {
             return Ok(Ptr {
                 hash,
@@ -389,11 +396,15 @@ impl Sink for Txn {
     }
 
     fn remember(&mut self, ptr: Ptr, value: Arc<dyn Any + Send + Sync>, weight: u32) {
-        self.remembered.push((ptr.offset, CacheEntry { value, weight }));
+        self.remembered.push((ptr.hash, CacheEntry { value, weight }));
     }
 
     fn store_id(&self) -> u64 {
         self.store.inner.id
+    }
+
+    fn store(&self) -> Option<Store> {
+        Some(self.store.clone())
     }
 }
 
@@ -430,8 +441,8 @@ impl Txn {
         for (hash, offset) in self.seen {
             inner.dedupe.insert(hash, offset);
         }
-        for (offset, entry) in self.remembered {
-            inner.cache.insert(offset, entry);
+        for (hash, entry) in self.remembered {
+            inner.cache.insert(hash, entry);
         }
         Ok(())
     }
