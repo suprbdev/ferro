@@ -91,12 +91,12 @@ subtree no edit falls in stays shared and a node is walked once however many edi
 Editing the node in place, not rebuilding its vectors from the old and new entries, is what makes
 this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is modest, because
 a touched node has to be read and copied either way and `flush` costs three to four times the tree
-work. At 1M keys the closure takes 5 to 24% less time than sorted per-key inserts from 1,000 to
-100,000 edits and 35% less for 1M edits, and the commit as a whole 0 to 22% less. A 50,000 page wiki
-import, 20M posting entries, gained 4% in its posting phase, and the metrics load test nothing
-measurable, since chunk merging dominates there. `retain` collects its deletes and applies them
-the same way. A disjoint batch needs no special case, since the same descent walks one edge of the
-tree.
+work. At 1M keys the closure takes 5 to 25% less time than sorted per-key inserts from 1,000 to
+100,000 edits and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less, and batches
+under 1,000 edits show no difference. A 50,000 page wiki import, 20M posting entries, gained 4% in
+its posting phase. The metrics load test gained nothing measurable, since chunk merging dominates
+there, so its ingest keeps plain inserts. `retain` collects its deletes and applies them the same
+way. A disjoint batch needs no special case, since the same descent walks one edge of the tree.
 
 Values over 512 encoded bytes spill to their own object, so a large value does not bloat its
 node or get rewritten when a neighbour changes. Lower thresholds were measured and rejected:
@@ -169,11 +169,11 @@ most records. Measured and left out:
   the string case to 2.4 KB but the `u64` case to 2.9 KB, and 64 per chunk to 5.9 KB, because a node
   then holds several chunks just under the spill limit, while cold gets rose up to six times. A
   vector trie of fanout 8 with values only in its leaves came to about 1.0 and 1.2 KB in a simulation
-  built from real record sizes, but at that fanout it has as many levels as the `Map`, so it reads no
-  faster, and fanout 32, which would, gave the bytes back at 2.0 and 2.5 KB. It helps one shape, a
-  long list appended to one item per commit, and costs a second tree beside `Map` with its own
-  nodes, flush, memos, diff and foreign store handling. Bulk appends already go down one edge in one
-  descent.
+  built from real record sizes, but at that fanout it has as many levels as the `Map`, so it would
+  read no faster, and fanout 32, which would, gave the bytes back at 2.0 and 2.5 KB. It helps one
+  shape, a long list appended to one item per commit, and costs a second tree beside `Map` with its
+  own nodes, flush, memos, diff and foreign store handling. Bulk appends already go down one edge
+  in one descent.
 - Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
   leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger
   than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
