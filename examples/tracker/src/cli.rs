@@ -134,6 +134,11 @@ pub enum Command {
         name: String,
     },
     Branches,
+    Merge {
+        from: String,
+        #[arg(long)]
+        theirs: bool,
+    },
     Compare {
         other: String,
         #[arg(long, default_value_t = 50)]

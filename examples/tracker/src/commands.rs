@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use ferro::{Change, Commit, Db, Map};
+use ferro::table::IndexIter;
+use ferro::{Change, Committed, Db};
 
 use crate::Res;
 use crate::cli::{Command, ListArgs, ReadCmd};
@@ -28,15 +28,13 @@ fn mutate<R>(
     db: &Db<Tracker>,
     message: String,
     f: impl FnOnce(&mut Tracker) -> Res<R>,
-) -> Res<(R, bool)> {
-    let before = db.version();
-    let out = db.try_commit(message, f)?;
-    Ok((out, db.version() != before))
+) -> Res<Committed<R>> {
+    db.try_commit_with::<_, _, Box<dyn std::error::Error>>(|t| f(t).map(|value| (message, value)))
 }
 
-fn report(w: &mut dyn Write, db: &Db<Tracker>, changed: bool, what: &str) -> Res<()> {
-    if changed {
-        writeln!(w, "{what} (v{})", db.version())?;
+fn report<R>(w: &mut dyn Write, done: &Committed<R>, what: &str) -> Res<()> {
+    if done.changed {
+        writeln!(w, "{what} (v{})", done.version)?;
     } else {
         writeln!(w, "no change: {what}")?;
     }
@@ -62,7 +60,7 @@ fn ensure_user(t: &mut Tracker, name: &str) {
 }
 
 fn set_status(w: &mut dyn Write, db: &Db<Tracker>, id: u64, verb: &str, status: Status) -> Res<()> {
-    let (_, changed) = mutate(db, format!("{verb} #{id}"), |t| {
+    let done = mutate(db, format!("{verb} #{id}"), |t| {
         if find(t, id)?.status == status {
             return Ok(());
         }
@@ -72,7 +70,7 @@ fn set_status(w: &mut dyn Write, db: &Db<Tracker>, id: u64, verb: &str, status: 
         });
         Ok(())
     })?;
-    report(w, db, changed, &format!("{verb} #{id}"))
+    report(w, &done, &format!("{verb} #{id}"))
 }
 
 pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<()> {
@@ -84,9 +82,9 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
             labels,
             priority,
         } => {
-            let id = db.read().next_id + 1;
-            let (_, changed) = mutate(db, format!("add #{id}: {title}"), |t| {
+            let done = db.try_commit_with::<_, _, Box<dyn std::error::Error>>(|t| {
                 t.next_id += 1;
+                let id = t.next_id;
                 let now = now_ms();
                 if let Some(name) = &assignee {
                     ensure_user(t, name);
@@ -98,8 +96,8 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                     }
                 }
                 t.issues.insert(Issue {
-                    id: t.next_id,
-                    title,
+                    id,
+                    title: title.clone(),
                     body,
                     status: Status::Open,
                     assignee,
@@ -109,9 +107,9 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                     updated_ms: now,
                     comments: Default::default(),
                 });
-                Ok(())
+                Ok((format!("add #{id}: {title}"), id))
             })?;
-            report(w, db, changed, &format!("added #{id}"))
+            report(w, &done, &format!("added #{}", done.value))
         }
         Command::Edit {
             id,
@@ -122,7 +120,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
             if title.is_none() && body.is_none() && priority.is_none() {
                 return Err("nothing to edit: pass --title, --body or --priority".into());
             }
-            let (_, changed) = mutate(db, format!("edit #{id}"), |t| {
+            let done = mutate(db, format!("edit #{id}"), |t| {
                 find(t, id)?;
                 t.issues.update(&id, |issue| {
                     if let Some(title) = title {
@@ -138,10 +136,10 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("edited #{id}"))
+            report(w, &done, &format!("edited #{id}"))
         }
         Command::Assign { id, user } => {
-            let (_, changed) = mutate(db, format!("assign #{id} to {user}"), |t| {
+            let done = mutate(db, format!("assign #{id} to {user}"), |t| {
                 if find(t, id)?.assignee.as_deref() == Some(user.as_str()) {
                     return Ok(());
                 }
@@ -152,10 +150,10 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("assigned #{id}"))
+            report(w, &done, &format!("assigned #{id}"))
         }
         Command::Unassign { id } => {
-            let (_, changed) = mutate(db, format!("unassign #{id}"), |t| {
+            let done = mutate(db, format!("unassign #{id}"), |t| {
                 if find(t, id)?.assignee.is_none() {
                     return Ok(());
                 }
@@ -165,10 +163,10 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("unassigned #{id}"))
+            report(w, &done, &format!("unassigned #{id}"))
         }
         Command::Label { id, label } => {
-            let (_, changed) = mutate(db, format!("label #{id} {label}"), |t| {
+            let done = mutate(db, format!("label #{id} {label}"), |t| {
                 if find(t, id)?.labels.contains(&label) {
                     return Ok(());
                 }
@@ -178,10 +176,10 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("labelled #{id}"))
+            report(w, &done, &format!("labelled #{id}"))
         }
         Command::Unlabel { id, label } => {
-            let (_, changed) = mutate(db, format!("unlabel #{id} {label}"), |t| {
+            let done = mutate(db, format!("unlabel #{id} {label}"), |t| {
                 if !find(t, id)?.labels.contains(&label) {
                     return Ok(());
                 }
@@ -191,10 +189,10 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("unlabelled #{id}"))
+            report(w, &done, &format!("unlabelled #{id}"))
         }
         Command::Comment { id, text, author } => {
-            let (_, changed) = mutate(db, format!("comment on #{id}"), |t| {
+            let done = mutate(db, format!("comment on #{id}"), |t| {
                 find(t, id)?;
                 t.issues.update(&id, |issue| {
                     let now = now_ms();
@@ -207,7 +205,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 });
                 Ok(())
             })?;
-            report(w, db, changed, &format!("commented on #{id}"))
+            report(w, &done, &format!("commented on #{id}"))
         }
         Command::Start { id } => set_status(w, db, id, "start", Status::InProgress),
         Command::Close { id } => set_status(w, db, id, "close", Status::Closed),
@@ -215,12 +213,8 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
         Command::Undo => undo(w, db),
         Command::Restore { version } => {
             let snapshot = db.at(version)?;
-            let value = (*snapshot).clone();
-            let (_, changed) = mutate(db, format!("restore v{version}"), |t| {
-                *t = value;
-                Ok(())
-            })?;
-            report(w, db, changed, &format!("restored v{version}"))
+            let done = db.restore(&snapshot)?;
+            report(w, &done, &format!("restored v{version}"))
         }
         Command::Seed { n, batch } => {
             let before = db.version();
@@ -235,6 +229,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
             )?;
             Ok(())
         }
+        Command::Merge { from, theirs } => merge(w, db, &from, theirs),
         Command::Branch { name } => {
             let from = db.version();
             db.fork(&name)?;
@@ -249,42 +244,92 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
     }
 }
 
-fn undo_target(log: &Map<u64, Commit>, mut version: u64) -> u64 {
-    loop {
-        let Some(commit) = log.get(&version) else {
-            return version;
-        };
-        let restored = commit
-            .message
-            .strip_prefix("undo v")
-            .and_then(|rest| rest.split_once(": restore v"))
-            .and_then(|(_, target)| target.parse::<u64>().ok());
-        match restored {
-            Some(target) => version = target,
-            None => return version,
+fn merge(w: &mut dyn Write, db: &Db<Tracker>, branch: &str, take_theirs: bool) -> Res<()> {
+    let other = db.branch(branch)?;
+    let base = db.common_ancestor(&other)?;
+    let theirs = other.read();
+    let done = db.commit_with(|t| {
+        t.next_id = t.next_id.max(theirs.next_id);
+        let mut conflicts: Vec<u64> = Vec::new();
+        let mut collisions: Vec<Issue> = Vec::new();
+        let mut applied = t.issues.merge(&base.issues, &theirs.issues, |conflict| {
+            if conflict.base.is_none() {
+                if let Some(row) = conflict.theirs.as_deref() {
+                    collisions.push(row.clone());
+                }
+                return conflict.ours.as_deref().cloned();
+            }
+            conflicts.push(conflict.key);
+            let chosen = if take_theirs {
+                conflict.theirs
+            } else {
+                conflict.ours
+            };
+            chosen.as_deref().cloned()
+        });
+        let mut renumbered = Vec::new();
+        for mut issue in collisions {
+            let old = issue.id;
+            t.next_id += 1;
+            issue.id = t.next_id;
+            renumbered.push((old, issue.id));
+            t.issues.insert(issue);
         }
+        applied += t.users.merge(&base.users, &theirs.users, |conflict| {
+            match (conflict.ours.as_deref(), conflict.theirs.as_deref()) {
+                (Some(ours), Some(theirs)) if theirs.created_ms < ours.created_ms => {
+                    Some(theirs.clone())
+                }
+                (ours, theirs) => ours.or(theirs).cloned(),
+            }
+        });
+        applied -= conflicts.len();
+        conflicts.sort_unstable();
+        let message = format!(
+            "merge {branch}: {applied} applied, {} conflicts",
+            conflicts.len()
+        );
+        (message.clone(), (message, conflicts, renumbered))
+    })?;
+    let (message, conflicts, renumbered) = &done.value;
+    report(w, &done, message)?;
+    for (old, new) in renumbered {
+        writeln!(w, "renumbered #{old} from {branch} as #{new}")?;
     }
+    for id in conflicts {
+        let kept = if take_theirs {
+            branch
+        } else {
+            db.branch_name()
+        };
+        writeln!(w, "conflict #{id}: kept {kept}")?;
+    }
+    Ok(())
+}
+
+fn undo_target(db: &Db<Tracker>) -> u64 {
+    let log = db.log();
+    let mut version = db.version();
+    while let Some(restored) = log.get(&version).and_then(|commit| commit.restored) {
+        version = restored;
+    }
+    version
 }
 
 fn undo(w: &mut dyn Write, db: &Db<Tracker>) -> Res<()> {
     let head = db.version();
-    let current = undo_target(&db.log(), head);
+    let current = undo_target(db);
     if current == 0 {
         writeln!(w, "nothing to undo")?;
         return Ok(());
     }
     let target = current - 1;
-    let snapshot = db.at(target)?;
-    let value = (*snapshot).clone();
-    let (_, changed) = mutate(db, format!("undo v{head}: restore v{target}"), |t| {
-        *t = value;
-        Ok(())
-    })?;
-    if changed {
+    let done = db.restore_with(&db.at(target)?, format!("undo v{head}: restore v{target}"))?;
+    if done.changed {
         writeln!(
             w,
             "undid v{current}, restored state of v{target} as v{}",
-            db.version()
+            done.version
         )?;
     } else {
         writeln!(w, "nothing to undo")?;
@@ -363,7 +408,7 @@ fn read_cmd(w: &mut dyn Write, cmd: &ReadCmd, t: &Tracker, meta: &Meta) -> Res<(
         ReadCmd::Stats => stats(w, t, meta),
         ReadCmd::Users => {
             for (name, _) in t.users.iter() {
-                let open = t.issues.by_assignee(&Some(name.clone())).len();
+                let open = t.issues.by_assignee_some(&name).len();
                 writeln!(w, "{name:<12} {open} assigned")?;
             }
             Ok(())
@@ -371,47 +416,50 @@ fn read_cmd(w: &mut dyn Write, cmd: &ReadCmd, t: &Tracker, meta: &Meta) -> Res<(
     }
 }
 
-type Source = Box<dyn DoubleEndedIterator<Item = Arc<Issue>>>;
-
 fn contains_ci(haystack: &str, needle_lower: &str) -> bool {
     haystack.to_lowercase().contains(needle_lower)
 }
 
 fn list(w: &mut dyn Write, t: &Tracker, args: &ListArgs) -> Res<()> {
-    let mut candidates: Vec<(&str, usize, Source)> = Vec::new();
+    let mut candidates: Vec<(&str, IndexIter<Issue>)> = Vec::new();
     if let Some(status) = args.status {
-        let rows = t.issues.by_status(&status);
-        candidates.push(("status", rows.len(), Box::new(rows)));
+        candidates.push(("status", t.issues.by_status(&status)));
     }
     if let Some(name) = &args.assignee {
-        let rows = t.issues.by_assignee(&Some(name.clone()));
-        candidates.push(("assignee", rows.len(), Box::new(rows)));
+        candidates.push(("assignee", t.issues.by_assignee_some(name)));
     }
     if args.unassigned {
-        let rows = t.issues.by_assignee(&None);
-        candidates.push(("assignee", rows.len(), Box::new(rows)));
+        candidates.push(("assignee", t.issues.by_assignee(&None)));
     }
     if let Some(label) = &args.label {
-        let rows = t.issues.by_labels(label.as_str());
-        candidates.push(("labels", rows.len(), Box::new(rows)));
+        candidates.push(("labels", t.issues.by_labels(label.as_str())));
     }
     if let Some(priority) = args.priority {
-        let rows = t.issues.by_priority(&priority);
-        candidates.push(("priority", rows.len(), Box::new(rows)));
+        candidates.push(("priority", t.issues.by_priority(&priority)));
     }
-    let (plan, source): (String, Source) =
-        match candidates.into_iter().min_by_key(|(_, len, _)| *len) {
-            Some((name, len, rows)) => (format!("index {name} ({len} candidates)"), rows),
-            None => (
-                format!("full scan ({} rows)", t.issues.len()),
-                Box::new(t.issues.iter()),
-            ),
-        };
-    if args.explain {
-        eprintln!("plan: {plan}");
+    match candidates.into_iter().min_by_key(|(_, rows)| rows.len()) {
+        Some((name, rows)) => {
+            if args.explain {
+                eprintln!("plan: index {name} ({} candidates)", rows.len());
+            }
+            print_matching(w, rows.rev(), args)
+        }
+        None => {
+            if args.explain {
+                eprintln!("plan: full scan ({} rows)", t.issues.len());
+            }
+            print_matching(w, t.issues.iter().rev(), args)
+        }
     }
+}
+
+fn print_matching(
+    w: &mut dyn Write,
+    rows: impl Iterator<Item = Arc<Issue>>,
+    args: &ListArgs,
+) -> Res<()> {
     let needle = args.text.as_ref().map(|text| text.to_lowercase());
-    let matching = source.rev().filter(|issue| {
+    let matching = rows.filter(|issue| {
         args.status.is_none_or(|status| issue.status == status)
             && args
                 .assignee
@@ -435,45 +483,39 @@ fn list(w: &mut dyn Write, t: &Tracker, args: &ListArgs) -> Res<()> {
     Ok(())
 }
 
+fn count_of<K: PartialEq>(counts: &[(K, usize)], key: &K) -> usize {
+    counts
+        .iter()
+        .find(|(k, _)| k == key)
+        .map_or(0, |(_, count)| *count)
+}
+
 fn stats(w: &mut dyn Write, t: &Tracker, meta: &Meta) -> Res<()> {
     writeln!(w, "branch:   {}", meta.branch)?;
     writeln!(w, "version:  v{}", meta.version)?;
     writeln!(w, "database: {} bytes", meta.file_bytes)?;
     writeln!(w, "issues:   {}", t.issues.len())?;
     writeln!(w, "users:    {}", t.users.len())?;
+    let statuses = t.issues.by_status_counts();
     writeln!(w, "by status:")?;
     for status in Status::ALL {
-        writeln!(w, "  {status:<12} {}", t.issues.by_status(&status).len())?;
+        writeln!(w, "  {status:<12} {}", count_of(&statuses, &status))?;
     }
+    let priorities = t.issues.by_priority_counts();
     writeln!(w, "by priority:")?;
     for priority in Priority::ALL {
-        writeln!(
-            w,
-            "  {priority:<12} {}",
-            t.issues.by_priority(&priority).len()
-        )?;
+        writeln!(w, "  {priority:<12} {}", count_of(&priorities, &priority))?;
     }
+    let assignees = t.issues.by_assignee_counts();
     writeln!(w, "by assignee:")?;
-    for (name, _) in t.users.iter() {
-        let count = t.issues.by_assignee(&Some(name.clone())).len();
-        if count > 0 {
+    for (name, count) in &assignees {
+        if let Some(name) = name {
             writeln!(w, "  {name:<12} {count}")?;
         }
     }
-    writeln!(
-        w,
-        "  {:<12} {}",
-        "unassigned",
-        t.issues.by_assignee(&None).len()
-    )?;
-    let mut labels: BTreeMap<String, usize> = BTreeMap::new();
-    for issue in t.issues.iter() {
-        for label in &issue.labels {
-            *labels.entry(label.clone()).or_default() += 1;
-        }
-    }
+    writeln!(w, "  {:<12} {}", "unassigned", count_of(&assignees, &None))?;
     writeln!(w, "by label:")?;
-    for (label, count) in labels {
+    for (label, count) in t.issues.by_labels_counts() {
         writeln!(w, "  {label:<12} {count}")?;
     }
     Ok(())
@@ -482,25 +524,25 @@ fn stats(w: &mut dyn Write, t: &Tracker, meta: &Meta) -> Res<()> {
 fn history(w: &mut dyn Write, db: &Db<Tracker>, id: u64) -> Res<()> {
     let mut previous: Option<Arc<Issue>> = None;
     let mut seen = false;
-    for (version, commit) in db.log().iter() {
-        let current = db.at(version)?.issues.get(&id);
+    for (commit, current) in db.history_of(|t| t.issues.get(&id))? {
         let lines = match (&previous, &current) {
             (None, Some(new)) => vec![format!("created: {}", new.title)],
             (Some(_), None) => vec!["removed".to_string()],
-            (Some(old), Some(new)) if old != new => {
+            (Some(old), Some(new)) => {
                 let mut lines = describe(old, new);
                 if lines.is_empty() {
                     lines.push("changed".to_string());
                 }
                 lines
             }
-            _ => Vec::new(),
+            (None, None) => Vec::new(),
         };
         if !lines.is_empty() {
             seen = true;
             writeln!(
                 w,
-                "v{version} {}  {}",
+                "v{} {}  {}",
+                commit.version,
                 timestamp(commit.time_ms),
                 commit.message
             )?;
