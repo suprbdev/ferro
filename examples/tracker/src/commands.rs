@@ -246,9 +246,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
 
 fn merge(w: &mut dyn Write, db: &Db<Tracker>, branch: &str, take_theirs: bool) -> Res<()> {
     let other = db.branch(branch)?;
-    let base = db.common_ancestor(&other)?;
-    let theirs = other.read();
-    let done = db.commit_with(|t| {
+    let done = db.merge_with(&other, |t, base, theirs| {
         t.next_id = t.next_id.max(theirs.next_id);
         let mut conflicts: Vec<u64> = Vec::new();
         let mut collisions: Vec<Issue> = Vec::new();

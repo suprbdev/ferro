@@ -68,13 +68,15 @@ pub(crate) struct Head {
     pub(crate) version: u64,
     pub(crate) root: Option<Ptr>,
     pub(crate) log: Map<u64, Commit>,
+    pub(crate) merged: Map<String, u64>,
 }
 
 impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.version.encode(w)?;
         self.root.encode(w)?;
-        self.log.encode(w)
+        self.log.encode(w)?;
+        self.merged.encode(w)
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
@@ -82,6 +84,7 @@ impl Data for Head {
             version: u64::decode(r)?,
             root: Option::<Ptr>::decode(r)?,
             log: Map::decode(r)?,
+            merged: Map::decode(r)?,
         })
     }
 }
@@ -128,6 +131,13 @@ impl<T> Snapshot<T> {
 struct State<T> {
     snapshot: Snapshot<T>,
     log: Map<u64, Commit>,
+    merged: Map<String, u64>,
+}
+
+#[derive(Default)]
+struct Intent {
+    restored: Option<u64>,
+    merged: Option<(String, u64)>,
 }
 
 struct Branch<T> {
@@ -249,6 +259,7 @@ impl<T: Data> Shared<T> {
                     commit: Commit::genesis(),
                 },
                 log: Map::new(),
+                merged: Map::new(),
             });
         };
         let value = match head.root {
@@ -263,6 +274,7 @@ impl<T: Data> Shared<T> {
         Ok(State {
             snapshot: Snapshot { value, commit },
             log: head.log.clone(),
+            merged: head.merged.clone(),
         })
     }
 
@@ -335,7 +347,7 @@ impl<T: Data> Db<T> {
 
     pub fn commit<R>(&self, message: impl Into<String>, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         let message = message.into();
-        let done = self.transact::<R, Error>(None, |root| Ok((message, f(root))))?;
+        let done = self.transact::<R, Error>(Intent::default(), |root| Ok((message, f(root))))?;
         Ok(done.value)
     }
 
@@ -343,7 +355,7 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> (S, R),
     ) -> Result<Committed<R>> {
-        self.transact::<R, Error>(None, |root| {
+        self.transact::<R, Error>(Intent::default(), |root| {
             let (message, value) = f(root);
             Ok((message.into(), value))
         })
@@ -362,7 +374,9 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
         let message = message.into();
-        let done = self.transact::<R, E>(None, |root| f(root).map(|value| (message, value)))?;
+        let done = self.transact::<R, E>(Intent::default(), |root| {
+            f(root).map(|value| (message, value))
+        })?;
         Ok(done.value)
     }
 
@@ -370,7 +384,7 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        self.transact(None, |root| {
+        self.transact(Intent::default(), |root| {
             let (message, value) = f(root)?;
             Ok((message.into(), value))
         })
@@ -378,7 +392,7 @@ impl<T: Data> Db<T> {
 
     fn transact<R, E: From<Error>>(
         &self,
-        restored: Option<u64>,
+        intent: Intent,
         f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let mut refs = self.shared.refs.lock();
@@ -386,7 +400,7 @@ impl<T: Data> Db<T> {
         let mut working = (*state.snapshot.value).clone();
         let (message, value) = f(&mut working)?;
         let before = state.snapshot.commit.version;
-        let version = self.commit_locked(&mut refs, &state, message, restored, &working)?;
+        let version = self.commit_locked(&mut refs, &state, message, intent, &working)?;
         Ok(Committed {
             value,
             version,
@@ -399,14 +413,22 @@ impl<T: Data> Db<T> {
         refs: &mut RefState,
         state: &State<T>,
         message: String,
-        restored: Option<u64>,
+        intent: Intent,
         working: &T,
     ) -> Result<u64> {
         let store = &self.shared.store;
         let mut txn = store.begin()?;
         let root = write_value(working, &mut txn)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
-        if previous.unwrap_or(self.shared.genesis_hash) == root.hash {
+        let mut merged = state.merged.clone();
+        let recorded = match intent.merged {
+            Some((branch, version)) if merged.try_get(&branch)?.as_deref() != Some(&version) => {
+                merged.insert(branch, version);
+                true
+            }
+            _ => false,
+        };
+        if !recorded && previous.unwrap_or(self.shared.genesis_hash) == root.hash {
             return Ok(state.snapshot.commit.version);
         }
         let version = state.snapshot.commit.version + 1;
@@ -415,7 +437,7 @@ impl<T: Data> Db<T> {
             time_ms: now_ms().max(state.snapshot.commit.time_ms),
             message,
             root: Some(root),
-            restored,
+            restored: intent.restored,
         };
         let mut log = state.log.clone();
         log.insert(version, commit);
@@ -426,6 +448,7 @@ impl<T: Data> Db<T> {
                 version,
                 root: Some(root),
                 log,
+                merged,
             },
         );
         self.shared.write_refs(refs, next, txn)?;
@@ -485,7 +508,11 @@ impl<T: Data> Db<T> {
     ) -> Result<Committed<()>> {
         let value = (*snapshot.value).clone();
         let message = message.into();
-        self.transact::<(), Error>(Some(snapshot.commit.version), move |root| {
+        let intent = Intent {
+            restored: Some(snapshot.commit.version),
+            merged: None,
+        };
+        self.transact::<(), Error>(intent, move |root| {
             *root = value;
             Ok((message, ()))
         })
@@ -511,7 +538,43 @@ impl<T: Data> Db<T> {
         Ok(changes)
     }
 
+    pub fn merge_with<R, S: Into<String>>(
+        &self,
+        other: &Db<T>,
+        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+    ) -> Result<Committed<R>> {
+        let base = self.common_ancestor(other)?;
+        let theirs = other.read();
+        let advanced = base.commit.root.map(|ptr| ptr.hash) != theirs.commit.root.map(|ptr| ptr.hash);
+        let intent = Intent {
+            restored: None,
+            merged: (advanced && !Arc::ptr_eq(&self.branch, &other.branch))
+                .then(|| (other.branch.name.clone(), theirs.version())),
+        };
+        self.transact::<R, Error>(intent, |root| {
+            let (message, value) = f(root, &base, &theirs);
+            Ok((message.into(), value))
+        })
+    }
+
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
+        let recorded = |db: &Db<T>, from: &Db<T>| -> Result<Option<Snapshot<T>>> {
+            let state = db.branch.state.load();
+            let Some(version) = state.merged.try_get(&from.branch.name)? else {
+                return Ok(None);
+            };
+            match from.at(*version) {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(Error::NoVersion(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        if let Some(snapshot) = recorded(self, other)? {
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = recorded(other, self)? {
+            return Ok(snapshot);
+        }
         let (ours, theirs) = (self.log(), other.log());
         let (Some((first_a, _)), Some((first_b, _))) = (ours.first(), theirs.first()) else {
             return self.at(0);
@@ -557,6 +620,7 @@ impl<T: Data> Db<T> {
                 version: commit.version,
                 root: commit.root,
                 log: state.log.clone(),
+                merged: state.merged.clone(),
             },
         );
         let txn = self.shared.store.begin()?;

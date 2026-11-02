@@ -188,6 +188,7 @@ fn prune(head: &Head, keep: Keep) -> (Head, u64) {
             version: head.version,
             root: head.root,
             log,
+            merged: head.merged.clone(),
         },
         dropped,
     )

@@ -80,6 +80,10 @@ key changed only by theirs is applied. A key changed the same way on both sides 
 A key changed differently on both sides goes to a `resolve` closure. Merging runs inside an
 ordinary commit, so a root with several collections merges each one in plain Rust.
 
+`Db::merge_with` wraps this and records the merged branch and version in the head. The next
+`common_ancestor` starts from that version, so changes that were already merged are not applied
+again. A merge that keeps only our side still commits, so the record is not lost.
+
 ## Compaction
 
 Compaction is offline and needs no user types. It prunes each branch's log, then copies every

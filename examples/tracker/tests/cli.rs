@@ -772,6 +772,23 @@ fn merge_same_id_adds_are_renumbered_not_lost() {
 }
 
 #[test]
+fn merging_twice_does_not_duplicate_renumbered_issues() {
+    let env = forked();
+    env.ok(&["add", "Ours five"]);
+    env.ok(&["--branch", "side", "add", "Theirs five"]);
+    env.ok(&["merge", "side"]);
+    let count = env.ids(&["list"]).len();
+    let out = env.ok(&["merge", "side"]);
+    assert!(out.contains("no change"), "{out}");
+    assert_eq!(env.ids(&["list"]).len(), count);
+    env.ok(&["--branch", "side", "add", "Theirs later"]);
+    let out = env.ok(&["merge", "side"]);
+    assert!(out.contains("renumbered"), "{out}");
+    assert_eq!(env.ids(&["list"]).len(), count + 1);
+    assert!(env.ok(&["list"]).contains("Theirs later"));
+}
+
+#[test]
 fn stats_are_correct_after_merge() {
     let env = forked();
     env.ok(&["--branch", "side", "close", "1"]);

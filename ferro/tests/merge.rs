@@ -259,3 +259,93 @@ fn map_merge_matches_table_semantics_and_read_only_error_is_clear() {
         .open::<Map<u64, u64>>(dir.path().join("nope.ferro"));
     assert!(matches!(missing.err(), Some(Error::NoDatabase(_))));
 }
+
+#[test]
+fn merge_with_remembers_what_it_already_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = open(&dir);
+    main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+    let side = main.fork("side").unwrap();
+    side.update(|b| b.tasks.update(&1, |t| t.state = "side".to_string())).unwrap();
+    let take = |main: &Db<Board>, side: &Db<Board>| {
+        main.merge_with(side, |b, base, theirs| {
+            let written = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+            ("merge", written)
+        })
+        .unwrap()
+    };
+    assert_eq!(take(&main, &side).value, 1);
+    main.update(|b| b.tasks.update(&1, |t| t.state = "main".to_string())).unwrap();
+    let again = take(&main, &side);
+    assert_eq!(again.value, 0);
+    assert!(!again.changed);
+    assert_eq!(main.read().tasks.get(&1).unwrap().state, "main");
+    side.update(|b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    assert_eq!(take(&main, &side).value, 1);
+    assert_eq!(main.read().tasks.len(), 2);
+    assert_eq!(main.read().tasks.get(&1).unwrap().state, "main");
+}
+
+#[test]
+fn merge_keeping_only_ours_still_records_progress_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k.ferro");
+    {
+        let main = Db::<Board>::open(&path).unwrap();
+        main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+        let side = main.fork("side").unwrap();
+        side.update(|b| b.tasks.update(&1, |t| t.state = "theirs".to_string())).unwrap();
+        main.update(|b| b.tasks.update(&1, |t| t.state = "ours".to_string())).unwrap();
+        let done = main
+            .merge_with(&side, |b, base, theirs| {
+                let mut seen = 0;
+                b.tasks.merge(&base.tasks, &theirs.tasks, |c| {
+                    seen += 1;
+                    c.ours.as_deref().cloned()
+                });
+                ("merge", seen)
+            })
+            .unwrap();
+        assert_eq!(done.value, 1);
+        assert!(done.changed);
+    }
+    let main = Db::<Board>::open(&path).unwrap();
+    let side = main.branch("side").unwrap();
+    assert_eq!(main.common_ancestor(&side).unwrap().version(), side.version());
+    let done = main
+        .merge_with(&side, |b, base, theirs| {
+            let mut seen = 0;
+            b.tasks.merge(&base.tasks, &theirs.tasks, |c| {
+                seen += 1;
+                c.ours.as_deref().cloned()
+            });
+            ("merge", seen)
+        })
+        .unwrap();
+    assert_eq!(done.value, 0);
+    assert!(!done.changed);
+}
+
+#[test]
+fn merging_back_uses_the_reverse_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = open(&dir);
+    main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+    let side = main.fork("side").unwrap();
+    main.update(|b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    side.merge_with(&main, |b, base, theirs| {
+        let written = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+        ("sync", written)
+    })
+    .unwrap();
+    side.update(|b| b.tasks.insert(task(3, None, "open", &[]))).unwrap();
+    assert_eq!(main.common_ancestor(&side).unwrap().version(), main.version());
+    let written = main
+        .merge_with(&side, |b, base, theirs| {
+            let n = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+            ("back", n)
+        })
+        .unwrap();
+    assert_eq!(written.value, 1);
+    assert_eq!(main.read().tasks.len(), 3);
+}
