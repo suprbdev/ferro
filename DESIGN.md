@@ -95,7 +95,7 @@ So each `Link::Stored` carries a write-once memo of the node it points at, in a 
   until the `Map` is dropped.
 - Deeper links memoize a `Weak`, and only when the child was found in the cache. The cache stays
   the owner, so eviction still frees the node, and the memo keeps only the node's `Arc` allocation,
-  144 bytes, until its parent goes. A child just read from disk is not memoized, so a one-off read
+  about 150 bytes, until its parent goes. A child just read from disk is not memoized, so a one-off read
   leaves nothing behind.
 - A memo is never replaced. Once its child is evicted the link falls back to the cache, whose `get`
   restores the recency that memo hits skip, so eviction keeps seeing nodes that are really in use.
@@ -109,19 +109,19 @@ with an empty memo, since copying one touches the child's header, a cache miss p
 
 Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row of `Link::Empty`.
 `Node::child` reads through that and `Node::children_mut` fills it in when a leaf gains a child.
-This cut peak RSS by 28% and bulk load time by 14%.
+This cut peak RSS by 28% and bulk load time by 4 to 14%.
 
 `range_by` builds each edge and its rank in one walk, and iterators read their top frame in place
 instead of cloning an `Arc<Node>` per item. A node flushed by this process shares the values of the
 in-memory tree, and those sit in insertion order, so a scan in key order would take one miss per
 value in turn. `Node::warm_values` reads every value's reference count on entering a node, so those
-misses overlap instead of queueing. That cut scans by 40% with no cost to writes, where moving
+misses overlap instead of queueing. That cut scans by 38% with no cost to writes, where moving
 values into node order during `flush` cost 22% of bulk load speed and 16% more memory for less gain.
 `Keys` and index iterators skip it, since they never touch a value.
 
-A node miss is dominated by BLAKE3, at 600 to 1000 ns on an interior node against 130 to 190 ns for
-`pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits most records.
-Measured and left out, each from a tree with memos already in place:
+A node miss is dominated by BLAKE3, at roughly 500 to 900 ns on an interior node against 130 to
+190 ns for `pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits
+most records. Measured and left out:
 
 - Lazy value decoding. Decoding one value on demand made cold gets 6 to 13% faster, but cold scans
   25% slower and fully read nodes 24% larger. Decoding a node's values together on first use was
@@ -130,12 +130,13 @@ Measured and left out, each from a tree with memos already in place:
   check, gained 3 to 9% on cold reads. That does not pay for SIGBUS when another process truncates
   the file, or for I/O errors arriving as signals instead of `Error`. It also caps what batching
   reads during scans could gain.
-- Keying the cache by offset with a hash compare, or by a hash prefix instead of ahash, gained at
-  most 1.4%, since memo hits skip the cache and the cost was never the hashing.
+- Cheaper cache keys. A hash prefix in place of ahash gained 1.4% with memos in place, since memo
+  hits skip the cache. Keying by offset with a hash compare was no better than that prefix even
+  before memos, because the cost was misses, not hashing.
 - Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
   leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger
-  than the cache, but made repeated short range pages 4 times slower, and a budget per iterator that
-  avoided that saved only 6 to 8%.
+  than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
+  that avoided that saved only 6 to 8%.
 
 `cache_bytes` bounds cache weight, which tracks on-disk size, not heap. Decoded nodes take several
 times that: a 16 MiB cache holds about 71 MiB, and at 1 MiB, with pins and `Arc` allocations
