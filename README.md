@@ -96,6 +96,7 @@ the contents. A commit that changes nothing is skipped.
 | `Set<T>` | Ordered set |
 | `List<T>` | Append-mostly sequence with indexed access |
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
+| `Bytes` | Byte buffer value with `Deref<Target = [u8]>` and O(1) clone |
 
 `Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and
 join trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range

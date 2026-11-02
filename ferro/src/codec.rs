@@ -1,5 +1,7 @@
 use std::any::Any;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -62,6 +64,20 @@ pub trait Data: Clone + Send + Sync + 'static {
     fn decode(r: &mut Decoder<'_>) -> Result<Self>;
     fn missing() -> Option<Self> {
         None
+    }
+    fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
+        for item in items {
+            item.encode(w)?;
+        }
+        Ok(())
+    }
+    fn decode_vec(r: &mut Decoder<'_>, len: usize) -> Result<Vec<Self>> {
+        let room = r.remaining() / size_of::<Self>().max(1);
+        let mut out = Vec::with_capacity(len.min(room));
+        for _ in 0..len {
+            out.push(r.item(Self::decode)?);
+        }
+        Ok(out)
     }
 }
 
@@ -405,6 +421,15 @@ impl Data for u8 {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         r.u8()
     }
+
+    fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
+        w.raw(items);
+        Ok(())
+    }
+
+    fn decode_vec(r: &mut Decoder<'_>, len: usize) -> Result<Vec<Self>> {
+        Ok(r.take(len)?.to_vec())
+    }
 }
 
 macro_rules! unsigned {
@@ -552,20 +577,12 @@ impl<T: Data> Data for Option<T> {
 impl<T: Data> Data for Vec<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         w.varint(self.len() as u64);
-        for item in self {
-            item.encode(w)?;
-        }
-        Ok(())
+        T::encode_slice(self, w)
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let len = r.varint()? as usize;
-        let room = r.remaining() / size_of::<T>().max(1);
-        let mut out = Vec::with_capacity(len.min(room));
-        for _ in 0..len {
-            out.push(r.item(T::decode)?);
-        }
-        Ok(out)
+        T::decode_vec(r, len)
     }
 
     fn missing() -> Option<Self> {
@@ -573,20 +590,72 @@ impl<T: Data> Data for Vec<T> {
     }
 }
 
-impl<T: Data, const N: usize> Data for [T; N] {
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bytes(Arc<[u8]>);
+
+impl Bytes {
+    pub fn new() -> Self {
+        Bytes::default()
+    }
+}
+
+impl Deref for Bytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Borrow<[u8]> for Bytes {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Bytes(bytes.into())
+    }
+}
+
+impl From<&[u8]> for Bytes {
+    fn from(bytes: &[u8]) -> Self {
+        Bytes(bytes.into())
+    }
+}
+
+impl Data for Bytes {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        for item in self {
-            item.encode(w)?;
-        }
+        w.varint(self.len() as u64);
+        w.raw(self);
         Ok(())
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let mut out = Vec::with_capacity(N);
-        for _ in 0..N {
-            out.push(T::decode(r)?);
-        }
-        out.try_into()
+        let len = r.varint()? as usize;
+        Ok(Bytes(r.take(len)?.into()))
+    }
+
+    fn missing() -> Option<Self> {
+        Some(Bytes::new())
+    }
+}
+
+impl<T: Data, const N: usize> Data for [T; N] {
+    fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
+        T::encode_slice(self, w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> Result<Self> {
+        T::decode_vec(r, N)?
+            .try_into()
             .map_err(|_| Error::Decode("array length mismatch".into()))
     }
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ferro::codec::{Decoder, Encoder, HashSink};
-use ferro::{Data, Db, Record, Set, Table};
+use ferro::{Bytes, Data, Db, Record, Set, Table};
 
 fn bytes<T: Data>(value: &T) -> Vec<u8> {
     let mut sink = HashSink;
@@ -105,6 +105,49 @@ struct V2 {
     #[ferro(default = "seven")]
     added: u32,
     id: u64,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+#[ferro(transparent)]
+struct Blob(Bytes);
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+#[ferro(transparent)]
+struct Named {
+    inner: Vec<u8>,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct HoldsBlob {
+    kept: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct GrewBlob {
+    kept: u8,
+    blob: Blob,
+    named: Named,
+}
+
+#[test]
+fn transparent_newtypes_encode_as_their_field() {
+    let raw = Bytes::from(vec![1u8, 2, 3, 4]);
+    assert_eq!(bytes(&Blob(raw.clone())), bytes(&raw));
+    assert_eq!(bytes(&Named { inner: raw.to_vec() }), bytes(&raw));
+    roundtrip(Blob(raw.clone()));
+    roundtrip(Named { inner: raw.to_vec() });
+    let mut encoded = Vec::new();
+    {
+        let mut sink = HashSink;
+        let mut w = Encoder::new(&mut sink);
+        HoldsBlob { kept: 7 }.encode(&mut w).unwrap();
+        encoded.extend_from_slice(w.bytes());
+    }
+    let mut r = Decoder::new(&encoded, &[], None);
+    let grown = GrewBlob::decode(&mut r).unwrap();
+    assert_eq!(grown.kept, 7);
+    assert_eq!(grown.blob, Blob::default());
+    assert_eq!(grown.named, Named::default());
 }
 
 #[test]

@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{Rng, cases, fast, text, uncached};
-use ferro::codec::{Decoder, Encoder};
-use ferro::{Data, Db, List, Map, Set};
+use ferro::codec::{Decoder, Encoder, HashSink};
+use ferro::{Bytes, Data, Db, List, Map, Set};
 use proptest::prelude::*;
 
 static RANGE_DECODES: AtomicU64 = AtomicU64::new(0);
@@ -353,6 +353,115 @@ fn a_dense_batch_walks_the_tree_once() {
     let cost = KEY_COMPARES.load(Ordering::Relaxed) - start;
     assert_eq!(map.len() as u64, 2 * n);
     assert!(cost < 12 * n, "{cost} comparisons for {n} edits");
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Tally(u8);
+
+static SLICE_ENCODES: AtomicU64 = AtomicU64::new(0);
+static VEC_DECODES: AtomicU64 = AtomicU64::new(0);
+
+impl Data for Tally {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.u8(self.0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Tally(r.u8()?))
+    }
+
+    fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> ferro::Result<()> {
+        SLICE_ENCODES.fetch_add(1, Ordering::Relaxed);
+        for item in items {
+            item.encode(w)?;
+        }
+        Ok(())
+    }
+
+    fn decode_vec(r: &mut Decoder<'_>, len: usize) -> ferro::Result<Vec<Self>> {
+        VEC_DECODES.fetch_add(1, Ordering::Relaxed);
+        (0..len).map(|_| Self::decode(r)).collect()
+    }
+}
+
+fn encoded<T: Data>(value: &T) -> Vec<u8> {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder).unwrap();
+    encoder.bytes().to_vec()
+}
+
+fn decoded<T: Data>(bytes: &[u8]) -> ferro::Result<T> {
+    T::decode(&mut Decoder::new(bytes, &[], None))
+}
+
+#[test]
+fn vectors_and_arrays_go_through_the_element_slice_hooks() {
+    let items = vec![Tally(1), Tally(2)];
+    let bytes = encoded(&items);
+    assert_eq!(SLICE_ENCODES.load(Ordering::Relaxed), 1);
+    assert_eq!(decoded::<Vec<Tally>>(&bytes).unwrap(), items);
+    assert_eq!(VEC_DECODES.load(Ordering::Relaxed), 1);
+    let array = [Tally(3), Tally(4), Tally(5)];
+    let bytes = encoded(&array);
+    assert_eq!(SLICE_ENCODES.load(Ordering::Relaxed), 2);
+    assert_eq!(decoded::<[Tally; 3]>(&bytes).unwrap(), array);
+    assert_eq!(VEC_DECODES.load(Ordering::Relaxed), 2);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(500), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn byte_buffers_share_one_encoding(raw in prop::collection::vec(any::<u8>(), 0..2_000)) {
+        let bytes = Bytes::from(raw.clone());
+        let wire = encoded(&raw);
+        prop_assert_eq!(encoded(&bytes), wire.clone());
+        prop_assert_eq!(decoded::<Bytes>(&wire).unwrap(), bytes.clone());
+        prop_assert_eq!(decoded::<Vec<u8>>(&wire).unwrap(), raw.clone());
+        prop_assert_eq!(&*bytes, raw.as_slice());
+        prop_assert!(decoded::<Bytes>(&wire[..wire.len() - 1]).is_err() || raw.is_empty());
+        prop_assert!(decoded::<Vec<u8>>(&wire[..wire.len() - 1]).is_err() || raw.is_empty());
+    }
+}
+
+#[test]
+fn byte_keys_look_up_by_slice() {
+    let mut map: Map<Bytes, u32> = Map::new();
+    let mut model = BTreeMap::new();
+    for n in 0..2_000u32 {
+        let key = Bytes::from(n.to_be_bytes().to_vec());
+        map.insert(key, n);
+        model.insert(n.to_be_bytes().to_vec(), n);
+    }
+    assert_eq!(map.get(&5u32.to_be_bytes()[..]).as_deref(), Some(&5));
+    let keys: Vec<Vec<u8>> = map.keys().map(|key| key.to_vec()).collect();
+    assert_eq!(keys, model.keys().cloned().collect::<Vec<_>>());
+    let vectors: Map<Vec<u8>, u32> = model.into_iter().collect();
+    assert_eq!(map.root_hash(), vectors.root_hash());
+    assert_eq!(Bytes::new().len(), 0);
+    assert_eq!(Bytes::default(), Bytes::from(Vec::new()));
+}
+
+#[test]
+fn byte_values_survive_the_store_at_every_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let sizes = [0usize, 1, 511, 512, 513, 4_096, 1 << 16, 1 << 20];
+    let sample = |size: usize| -> Vec<u8> { text(size as u64, size).into_bytes() };
+    let db = uncached().open::<Map<u64, Bytes>>(&path).unwrap();
+    db.update(|root| {
+        root.extend(sizes.iter().map(|size| (*size as u64, Bytes::from(sample(*size)))));
+    })
+    .unwrap();
+    drop(db);
+    let db = uncached().open::<Map<u64, Bytes>>(&path).unwrap();
+    let snapshot = db.read();
+    for size in sizes {
+        assert_eq!(&**snapshot.get(&(size as u64)).unwrap(), sample(size).as_slice());
+    }
+    db.verify().unwrap();
 }
 
 #[test]

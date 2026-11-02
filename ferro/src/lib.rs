@@ -11,7 +11,7 @@ pub mod set;
 pub mod store;
 pub mod table;
 
-pub use codec::{Data, Hash, Ptr};
+pub use codec::{Bytes, Data, Hash, Ptr};
 pub use db::{Commit, Committed, Db, Options, Snapshot, Verified};
 pub use error::{Error, Result};
 pub use ferro_derive::{Data, Record};

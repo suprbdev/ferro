@@ -224,7 +224,68 @@ fn vars(count: usize) -> Vec<Ident> {
     (0..count).map(|i| format_ident!("__f{}", i)).collect()
 }
 
+fn is_transparent(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut found = false;
+    for attr in attrs {
+        if !attr.path().is_ident("ferro") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("transparent") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown ferro attribute"))
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let name = &input.ident;
+    let generics = bound_generics(&input.generics);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new(
+            input.span(),
+            "transparent needs a struct with one field",
+        ));
+    };
+    let fields = parse_fields(&data.fields)?;
+    let [field] = fields.as_slice() else {
+        return Err(syn::Error::new(
+            input.span(),
+            "transparent needs a struct with one field",
+        ));
+    };
+    let access = match &field.ident {
+        Some(ident) => quote! { &self.#ident },
+        None => quote! { &self.0 },
+    };
+    let build = construct(quote! { Self }, &fields, &data.fields, &[quote! { __v }]);
+    Ok(quote! {
+        impl #impl_generics ::ferro::Data for #name #ty_generics #where_clause {
+            fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
+                ::ferro::Data::encode(#access, __w)
+            }
+
+            fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
+                let __v = ::ferro::Data::decode(__r)?;
+                ::std::result::Result::Ok(#build)
+            }
+
+            fn missing() -> ::std::option::Option<Self> {
+                ::ferro::Data::missing().map(|__v| #build)
+            }
+        }
+    })
+}
+
 fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
+    if is_transparent(&input.attrs)? {
+        return expand_transparent(&input);
+    }
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();

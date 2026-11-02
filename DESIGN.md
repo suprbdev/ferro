@@ -103,6 +103,14 @@ node or get rewritten when a neighbour changes. Lower thresholds were measured a
 spilling interior-node values over 64 bytes cut table update bytes by 19% but grew bulk size by
 14% and slowed table reads by 20 to 50%, once compression was already shrinking interior nodes.
 
+`Vec<u8>` and `[u8; N]` copy their bytes in one go, through the `encode_slice` and `decode_vec` hooks
+on `Data` that `u8` overrides, which took a 1 MiB value from 5.3 ms to 0.49 ms to commit and from
+2.0 ms to 0.16 ms for a cold read. `Bytes` has the same encoding and adds an O(1) clone and
+`Borrow<[u8]>`, so `Map<Bytes, V>` looks up by slice. It copies once on decode. Sharing the object
+buffer instead gained 8% on a cold read at 1 MiB and under 4% at 64 KiB and 1 KiB, where `pread` and
+BLAKE3 dominate, for a wider handle, a change to the read path, and a small value that pins the
+whole node it was decoded from. `#[ferro(transparent)]` gives a newtype the encoding of its field.
+
 ## Read path
 
 A warm get at 1M keys walks about seven levels, and nearly all of its time is CPU cache misses, not
