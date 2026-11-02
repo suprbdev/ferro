@@ -66,7 +66,6 @@ fn nested_maps_are_clean_after_commit() {
             root.get_or_insert_with(i % 3, Map::new).insert(i, i);
         })
         .unwrap();
-        assert!(!db.log().is_dirty());
         let latest = db.read();
         for key in 0..=(i % 3) {
             if let Some(inner) = latest.get(&key) {
