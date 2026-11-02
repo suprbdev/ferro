@@ -147,9 +147,7 @@ impl<T: Data + Ord + fmt::Debug> fmt::Debug for Set<T> {
 
 impl<T: Data + Ord> Extend<T> for Set<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
-        for item in items {
-            self.insert(item);
-        }
+        self.0.extend(items.into_iter().map(|item| (item, ())));
     }
 }
 

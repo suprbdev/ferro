@@ -112,9 +112,8 @@ impl<T: Data + fmt::Debug> fmt::Debug for List<T> {
 
 impl<T: Data> Extend<T> for List<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
-        for item in items {
-            self.push(item);
-        }
+        let start = self.0.len() as u64;
+        self.0.extend(items.into_iter().enumerate().map(|(i, item)| (start + i as u64, item)));
     }
 }
 

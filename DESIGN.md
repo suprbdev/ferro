@@ -25,8 +25,12 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 
 ## Canonical tree
 
-`Map` is a Merkle search tree. A key's level is `trailing_zeros(blake3(encoded key)) / 3`, so
-about 1 in 8 keys is promoted per level. Fanout 8 was chosen by measurement at 300k keys: against
+`Map` is a Merkle search tree. A key's level is `trailing_zeros(xxh3_64(encoded key)) / 3`, so
+about 1 in 8 keys is promoted per level. The level hash is fixed-seed and not collision resistant: someone
+who can choose keys could craft many keys of a high level and unbalance the tree, which costs
+performance but not correctness, because node hashes are still BLAKE3. xxh3 replaced BLAKE3 here
+because hashing a key was the largest per-insert cost; level frequencies on sequential integers,
+strings and tuples match the ideal geometric distribution. Fanout 8 was chosen by measurement at 300k keys: against
 fanout 16 it writes 33% fewer bytes per commit for 27% slower gets. A node holds all keys of exactly its level within its
 range, and children hold the gaps. Tree shape depends only on the key set, never on insertion
 order. Consequences that the rest of the system relies on:
@@ -36,8 +40,16 @@ order. Consequences that the rest of the system relies on:
 - `diff` skips any subtree with matching hashes, so it costs O(changes), not O(size).
 
 Insert and remove use treap-style `split` and `merge`. Mutation is copy-on-write through
-`Arc::make_mut`. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one.
-`flush` writes dirty nodes bottom up during `Data::encode`.
+`Arc::make_mut`, so a node is copied once per transaction and then mutated in place. `Link::Mem`
+is a dirty in-memory node, and `Link::Stored` a persisted one. `flush` writes dirty nodes bottom
+up during `Data::encode` and seeds the node cache with the nodes it wrote. It clones the in-memory
+node unless a value held a dirty or foreign collection, in which case it decodes the written bytes
+instead, so nested collections always come back clean and a foreign store is never pinned. Values
+inserted or mutated since the node was loaded are decoded once as a check before they become
+durable; unchanged values are not.
+
+`Extend` and `FromIterator` sort the batch, keep the last value per key, and for an empty map
+assemble the tree bottom-up in one pass, which gives the same tree as inserting key by key.
 
 Values over 512 encoded bytes spill to their own object, so a large value does not bloat its
 node or get rewritten when a neighbour changes.
