@@ -20,6 +20,8 @@ const SUPER_BYTES: usize = 96;
 const READ_AHEAD: usize = 4096;
 const LINK_WEIGHT: usize = HASH_BYTES + 3;
 const MAX_VARINT: usize = 10;
+const COMPRESS_MIN: usize = 96;
+const MAX_RATIO: usize = 255;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -125,10 +127,37 @@ fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn compressed(body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() < COMPRESS_MIN {
+        return None;
+    }
+    let packed = lz4_flex::block::compress(body);
+    (packed.len() + varint_len(body.len() as u64) < body.len()).then_some(packed)
+}
+
 pub fn append_record(buf: &mut Vec<u8>, offset: u64, body: &[u8], links: &[Ptr]) {
-    push_varint(buf, body.len() as u64);
-    push_varint(buf, links.len() as u64);
-    buf.extend_from_slice(body);
+    match compressed(body) {
+        Some(packed) => {
+            push_varint(buf, packed.len() as u64);
+            push_varint(buf, (links.len() as u64) << 1 | 1);
+            push_varint(buf, body.len() as u64);
+            buf.extend_from_slice(&packed);
+        }
+        None => {
+            push_varint(buf, body.len() as u64);
+            push_varint(buf, (links.len() as u64) << 1);
+            buf.extend_from_slice(body);
+        }
+    }
     for link in links {
         buf.extend_from_slice(&link.hash);
         push_varint(buf, zigzag(offset.wrapping_sub(link.offset) as i64));
@@ -373,11 +402,26 @@ impl Store {
             bytes,
             pos: 0,
         };
-        let body_len = usize::try_from(reader.varint()?)
+        let stored_len = usize::try_from(reader.varint()?)
             .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-        let link_count = usize::try_from(reader.varint()?)
+        let flagged = reader.varint()?;
+        let link_count = usize::try_from(flagged >> 1)
             .map_err(|_| Error::Corrupt("link count overflow".into()))?;
-        let body = reader.take(body_len)?.to_vec();
+        let body = if flagged & 1 == 1 {
+            let raw_len = usize::try_from(reader.varint()?)
+                .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+            if raw_len > stored_len.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
+                return Err(Error::Corrupt(format!(
+                    "implausible compression at {}",
+                    ptr.offset
+                )));
+            }
+            lz4_flex::block::decompress(reader.take(stored_len)?, raw_len).map_err(|error| {
+                Error::Corrupt(format!("bad compressed body at {}: {error}", ptr.offset))
+            })?
+        } else {
+            reader.take(stored_len)?.to_vec()
+        };
         let mut links = Vec::with_capacity(link_count.min(1024));
         for _ in 0..link_count {
             let hash: Hash = reader
