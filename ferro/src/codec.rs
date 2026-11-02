@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::store::Store;
 
-pub const HASH_BYTES: usize = 32;
+pub const HASH_BYTES: usize = 20;
 
 pub type Hash = [u8; HASH_BYTES];
 

@@ -51,7 +51,7 @@ static ALLOCATOR: Tracking = Tracking;
 fn fake_links(count: usize) -> Vec<Ptr> {
     (0..count)
         .map(|n| Ptr {
-            hash: [n as u8; 32],
+            hash: [n as u8; ferro::codec::HASH_BYTES],
             offset: 8192 + n as u64,
         })
         .collect()
