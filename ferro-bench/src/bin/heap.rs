@@ -177,6 +177,43 @@ fn main() {
         })
     });
 
+    let churn = dir.path().join("churn.ferro");
+    row("commits and reads", &sizes, |bytes| {
+        let _ = std::fs::remove_file(&churn);
+        let before = LIVE.load(Ordering::Relaxed);
+        let db = Options::new()
+            .durability(ferro::Durability::Buffered)
+            .cache_bytes(bytes as u64)
+            .open::<Map<u64, String>>(&churn)
+            .unwrap();
+        db.update(|root| {
+            root.extend((0..500_000u64).map(|i| (mix(i), format!("value-{i}"))));
+        })
+        .unwrap();
+        for i in 0..30_000u64 {
+            db.update(|root| {
+                root.insert(mix(i), format!("again-{i}"));
+            })
+            .unwrap();
+            let snapshot = db.read();
+            std::hint::black_box(snapshot.get(&mix(i + 7)));
+            std::hint::black_box(snapshot.get(&mix(i * 31)));
+        }
+        LIVE.load(Ordering::Relaxed).saturating_sub(before) as f64 / MIB as f64
+    });
+    row("history walk", &sizes, |bytes| {
+        let db = Options::new()
+            .read_only()
+            .cache_bytes(bytes as u64)
+            .open::<Map<u64, String>>(&churn)
+            .unwrap();
+        let before = LIVE.load(Ordering::Relaxed);
+        let key = mix(29_000);
+        let changes = db.history_of(|root| root.get(&key)).count();
+        std::hint::black_box(changes);
+        LIVE.load(Ordering::Relaxed).saturating_sub(before) as f64 / MIB as f64
+    });
+
     let table = dir.path().join("table.ferro");
     let accounts = 1_500_000u64;
     built::<Bank>(&table, |db| {

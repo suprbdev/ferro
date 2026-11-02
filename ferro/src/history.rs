@@ -90,7 +90,10 @@ pub struct TakeWhile<T, V, F, P> {
 
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V, P: Fn(&(Commit, V)) -> bool> TakeWhile<T, V, F, P> {
     fn older_rejected(&mut self) -> bool {
-        let (Some(last), Some((commit, value))) = (self.last.take(), self.history.run.take()) else {
+        let Some(last) = self.last.take() else {
+            return false;
+        };
+        let Some((commit, value)) = self.history.run.take() else {
             return false;
         };
         let probe = (last, value);

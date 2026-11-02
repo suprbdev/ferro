@@ -39,6 +39,9 @@ fn reverse_log_walk_reads_only_what_it_yields() {
     assert_eq!(newest, vec![400, 399, 398, 397, 396]);
     assert!(catch_unwind(AssertUnwindSafe(|| db.log().iter().count())).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| db.log().iter().rev().count())).is_err());
+    let tail = admin::log(&path, "main", 3).unwrap();
+    let versions: Vec<u64> = tail.iter().map(|commit| commit.version).collect();
+    assert_eq!(versions, vec![400, 399, 398]);
 }
 
 #[test]
@@ -235,6 +238,19 @@ fn take_while_gives_the_same_items_as_the_plain_adaptor() {
     assert_eq!(every.len(), 5);
     assert_eq!(every[2].1, Some(2));
     assert_eq!(every[3].1, None);
+}
+
+#[test]
+fn take_while_keeps_a_walk_that_has_already_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = with_late_row(&dir.path().join("a.ferro"), 50);
+    let mut history = db.history_of(|root| root.get(&7).map(|v| *v));
+    assert_eq!(history.next().unwrap().0.version, 48);
+    let rest: Vec<u64> = history
+        .take_while(|(_, row)| row.is_some())
+        .map(|(commit, _)| commit.version)
+        .collect();
+    assert_eq!(rest, vec![44]);
 }
 
 #[test]

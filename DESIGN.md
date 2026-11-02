@@ -193,8 +193,8 @@ up to 65,536 entries.
 
 The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full, and
 `peak_rss_mib` stays at 343 MiB. A setting carried over from before now holds about a quarter of what
-it did. `map_get_cold_ns` at 1 MiB went from 4.4 to 6.5 µs for that reason, and 5 MiB, which
-holds what 1 MiB used to, gives 4.7 µs.
+it did. `map_get_cold_ns` at 1 MiB went from 4.5 to 6.4 µs for that reason, and 5 MiB, which
+holds what 1 MiB used to, gives 4.6 µs.
 
 ## File format and durability
 

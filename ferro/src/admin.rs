@@ -78,13 +78,20 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     })
 }
 
-pub fn log(path: impl AsRef<Path>, branch: &str) -> Result<Vec<Commit>> {
+pub fn log(path: impl AsRef<Path>, branch: &str, limit: usize) -> Result<Vec<Commit>> {
     let (store, head) = read_only(path.as_ref())?;
     let refs = load_refs(&store, head)?;
     let found = refs
         .try_get(branch)?
         .ok_or_else(|| Error::NoBranch(branch.to_string()))?;
-    let commits = found.log.commits(&store)?;
+    let mut walk = found.log.walk(&store);
+    let mut commits = Vec::new();
+    while commits.len() < limit {
+        let Some(entry) = walk.step()? else {
+            break;
+        };
+        commits.push((*entry.commit).clone());
+    }
     store.close();
     Ok(commits)
 }
