@@ -502,6 +502,20 @@ fn forecast_leaves_main_untouched() {
 }
 
 #[test]
+fn an_unnamed_forecast_leaves_no_branch_behind() {
+    let env = Env::new();
+    env.chart();
+    let file = env.ok(&["forecast", "--transfer", "assets:bank>expense:rent=300.00@2024-06-01"]);
+    assert!(file.contains("1 hypothetical entries"), "{file}");
+    assert!(file.contains("main unchanged"), "{file}");
+    let failed = env.fail(&["forecast", "--transfer", "assets:bank>expense:nowhere=1.00"]);
+    assert!(!failed.is_empty());
+    let branches = ferro::admin::info(&env.db).unwrap().branches;
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(branches[0].name, "main");
+}
+
+#[test]
 fn close_period_refuses_postings_but_allows_adjusting_entries() {
     let env = Env::new();
     env.chart();

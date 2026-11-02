@@ -206,12 +206,27 @@ fn forecast(
         .iter()
         .map(|text| parse_forecast(text))
         .collect::<Result<Vec<_>, _>>()?;
+    let temporary = name.is_none();
     let name = name.unwrap_or_else(|| format!("forecast-{}", now_ms()));
-    let before = db.version();
     let branch = db.fork(&name)?;
-    for (from, to, amount, date) in &parsed {
+    let outcome = project_forecast(w, db, &branch, &name, &parsed);
+    if temporary {
+        db.drop_branch(&name)?;
+    }
+    outcome
+}
+
+fn project_forecast(
+    w: &mut dyn Write,
+    db: &Db<Ledger>,
+    branch: &Db<Ledger>,
+    name: &str,
+    parsed: &[(String, String, String, Option<String>)],
+) -> Res<()> {
+    let before = db.version();
+    for (from, to, amount, date) in parsed {
         let date = opt_date(date)?.unwrap_or_else(today);
-        mutate(&branch, |l| {
+        mutate(branch, |l| {
             let id = transfer(l, from, to, amount, None, date, "forecast")?;
             Ok((format!("forecast #{id}: {from} -> {to}"), id))
         })?;

@@ -522,6 +522,15 @@ fn draft(w: &mut dyn Write, db: &Db<Wiki>, command: DraftCommand) -> Res<()> {
             for conflict in &done.value.conflicts {
                 writeln!(w, "conflict: {conflict}")?;
             }
+            if done.value.conflicts.is_empty() && name != "main" && name != ours {
+                db.drop_branch(&name)?;
+                writeln!(w, "dropped draft {name}")?;
+            }
+            Ok(())
+        }
+        DraftCommand::Drop { name } => {
+            db.drop_branch(&name)?;
+            writeln!(w, "dropped draft {name}")?;
             Ok(())
         }
     }

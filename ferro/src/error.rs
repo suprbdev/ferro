@@ -24,6 +24,8 @@ pub enum Error {
     NoCommonAncestor,
     #[error("branch already exists: {0}")]
     BranchExists(String),
+    #[error("cannot drop branch {0}: it is main or this handle's own branch")]
+    BranchInUse(String),
     #[error("collection has stored nodes but no store attached")]
     Detached,
     #[error("database is read-only")]

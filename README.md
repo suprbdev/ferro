@@ -149,6 +149,10 @@ A fork is one small commit whatever the database size. Merges are three-way and 
 You decide conflicts in Rust, and you merge each collection in your root yourself. Repeat merges
 between two branches, in either direction, do not apply a change twice.
 
+`db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
+the handle you call it on. Other handles on that branch keep reading what they had, commits through
+them fail with `Error::NoBranch`, and its watchers end. The bytes stay in the file until you compact.
+
 ```rust
 let mut seen = db.read();
 for snapshot in db.watch() {
@@ -254,7 +258,7 @@ This is an experiment, not a production database.
   batch related changes into one commit. Secondary indexes add to that.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
   every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
-  closure and encoding. Calling `update` or `fork` from inside it deadlocks.
+  closure and encoding. Calling `update`, `fork` or `drop_branch` from inside it deadlocks.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall

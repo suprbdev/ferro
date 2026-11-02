@@ -313,6 +313,29 @@ applies it again, and the built-in merges may report a conflict for it. If compa
 recorded version, `common_ancestor` falls back to the fork point, or returns `NoCommonAncestor`
 if that was pruned too.
 
+## Dropping a branch
+
+`Db::drop_branch` writes one frame: a `Refs` without the branch, and with its name removed from the
+`merged` map of every other head, including records a fork inherited. Records are keyed by name,
+so one left behind would match any later branch of that name. Its version would then be read
+against the new branch's log, which gives a base older than the real fork point, and merges would
+report conflicts and re-apply old changes. The branch's own head and records go with it. Commits
+read `merged` from the head in `tip.refs` rather than from a copy in the branch state, so nothing
+in memory can write a removed record back.
+
+A commit writes its head by name, so a handle on a dropped branch would quietly recreate it. Each
+`Branch` therefore has a `retired` flag, which commits, forks and merges from that branch check
+under the `tip` mutex, returning `Error::NoBranch`. `drop_branch` holds the mutex through its sync
+and until the flag is set, so no commit fits between the frame and the flag. That stalls writers for
+one fsync, on an operation that is rare. Retiring also closes the feed, which ends the branch's
+watchers. Reads through an old handle still work, because state is a value and the objects are
+there until compaction. A later fork of the same name is a new `Branch`, so old handles stay dead.
+
+Counting handles and refusing the drop while others exist was rejected: a clone parked on another
+thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
+handle learns of the drop on `refresh`, and retires its `Branch` the same way instead of falling
+back to the genesis value.
+
 ## Compaction
 
 Compaction is offline and needs no user types. It prunes each branch's log by rebuilding the
