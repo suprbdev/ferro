@@ -438,6 +438,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "ledger"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "ferro",
+ "predicates",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

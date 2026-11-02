@@ -1,5 +1,5 @@
 [workspace]
-members = ["ferro", "ferro-bench", "ferro-cli", "ferro-derive", "examples/tracker"]
+members = ["ferro", "ferro-bench", "ferro-cli", "ferro-derive", "examples/tracker", "examples/ledger"]
 exclude = ["benchmarks/compare"]
 resolver = "3"
 
