@@ -501,7 +501,11 @@ fn audit_trail(w: &mut dyn Write, db: &Db<Ledger>, name: &str, limit: usize) -> 
         writeln!(w, "  ... {skip} earlier postings not shown")?;
     }
     writeln!(w, "commits that changed {name}")?;
-    let changes = db.history_of(|l| l.accounts.get(&id).map(|row| (row.balance, row.closed)))?;
+    let mut changes: Vec<_> = db
+        .history_of(|l| l.accounts.get(&id).map(|row| (row.balance, row.closed)))
+        .take_while(|(_, state)| state.is_some())
+        .collect();
+    changes.reverse();
     let skip = changes.len().saturating_sub(limit);
     for (commit, state) in changes.iter().skip(skip) {
         if let Some((balance, closed)) = state {

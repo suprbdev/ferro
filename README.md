@@ -107,7 +107,7 @@ field.
 ```rust
 let old = db.at(12)?;
 let then = db.as_of(unix_ms)?;
-for commit in db.log().values().rev() {
+for commit in db.log().values().rev().take(20) {
     println!("v{} {}", commit.version, commit.message);
 }
 
@@ -115,13 +115,23 @@ for change in old.orders.diff(&db.read().orders) {
     println!("{:?} changed", change.key());
 }
 
-let versions = db.history_of(|shop| shop.orders.get(&order_id))?;
+let life: Vec<_> = db
+    .history_of(|shop| shop.orders.get(&order_id))
+    .take_while(|(_, row)| row.is_some())
+    .collect();
 
 db.restore(&old)?;
 ```
 
 `diff` skips identical subtrees by hash, so it costs O(changes), not O(size). `restore` commits
 an old value as a new version, so history is never rewritten.
+
+`history_of` walks the log newest first and yields `(commit, value)` for each commit that changed
+the projection, including a change back to an earlier value. It reads nothing until you ask and
+stops when you stop, so `take`, `find` and the `take_while` above cost the commits actually
+walked: for that `take_while`, the age of the row, not the length of the log. To show changes
+oldest first, collect and reverse. `log().iter()` runs in version order like any collection, and
+`.rev()` walks newest first the same lazy way.
 
 ```rust
 let what_if = db.fork("what-if")?;

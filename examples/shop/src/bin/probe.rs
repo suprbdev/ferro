@@ -274,19 +274,85 @@ fn history_experiment() {
                 .expect("ship");
             }
         }
+        let row = |id: u64| {
+            let at = Instant::now();
+            let count = db
+                .history_of(|shop| shop.orders.get(&id))
+                .take_while(|(_, order)| order.is_some())
+                .count();
+            (count, at.elapsed().as_secs_f64() * 1e3)
+        };
+        let (old, old_ms) = row(1);
+        let (latest, latest_ms) = row(total as u64);
         let at = Instant::now();
-        let history = db.history_of(|shop| shop.orders.get(&1)).expect("history");
-        let first = at.elapsed();
+        let full = db.history_of(|shop| shop.orders.get(&1)).count();
+        let full_ms = at.elapsed().as_secs_f64() * 1e3;
         let at = Instant::now();
-        let latest = db.history_of(|shop| shop.orders.get(&(total as u64))).expect("history");
+        let recent = db.log().iter().rev().take(20).count();
+        let recent_ms = at.elapsed().as_secs_f64() * 1e3;
         println!(
-            "{total} commits: order 1 -> {} entries in {:.1} ms; newest order -> {} entries in {:.1} ms",
-            history.len(),
-            first.as_secs_f64() * 1e3,
-            latest.len(),
-            at.elapsed().as_secs_f64() * 1e3
+            "{total} commits: order 1 -> {old} entries in {old_ms:.1} ms; newest order -> {latest} entries in {latest_ms:.2} ms; full walk {full} entries in {full_ms:.1} ms; last {recent} log entries in {recent_ms:.3} ms"
         );
     }
+}
+
+fn step_experiment() {
+    println!("cost of one history step, us per commit");
+    let total = 50_000usize;
+    let path = fresh("probe-step.ferro");
+    {
+        let db = Options::new()
+            .durability(Durability::Buffered)
+            .open::<Shop>(&path)
+            .expect("open");
+        seed(&db, 100);
+        for index in 0..total {
+            order_commit(&db, 1 + (index as u64 % 100), 0);
+        }
+    }
+    let fresh_handle = || Options::new().read_only().open::<Shop>(&path).expect("open");
+    let steps = total as f64 + 1.0;
+    let per = |at: Instant| at.elapsed().as_secs_f64() * 1e6 / steps;
+    let latest = total as u64;
+    let db = fresh_handle();
+    let at = Instant::now();
+    db.log().iter().rev().count();
+    let walk_cold = per(at);
+    let at = Instant::now();
+    db.log().iter().rev().count();
+    let walk_warm = per(at);
+    let db = fresh_handle();
+    let at = Instant::now();
+    db.history_of(|_| 0u8).count();
+    let root_cold = per(at);
+    let at = Instant::now();
+    db.history_of(|_| 0u8).count();
+    let root_warm = per(at);
+    let db = fresh_handle();
+    let at = Instant::now();
+    db.history_of(|shop| shop.orders.get(&1)).count();
+    let old_cold = per(at);
+    let at = Instant::now();
+    db.history_of(|shop| shop.orders.get(&1)).count();
+    let old_warm = per(at);
+    let db = fresh_handle();
+    let at = Instant::now();
+    db.history_of(|shop| shop.orders.get(&latest)).count();
+    let new_cold = per(at);
+    let at = Instant::now();
+    db.history_of(|shop| shop.orders.get(&latest)).count();
+    let new_warm = per(at);
+    let db = fresh_handle();
+    let at = Instant::now();
+    for version in (1..=db.version()).rev().take(5000) {
+        std::hint::black_box(db.at(version).expect("at").orders.get(&latest));
+    }
+    let via_at = at.elapsed().as_secs_f64() * 1e6 / 5000.0;
+    println!("log entry only        cold {walk_cold:.2} warm {walk_warm:.2}");
+    println!("entry and root        cold {root_cold:.2} warm {root_warm:.2}");
+    println!("order 1               cold {old_cold:.2} warm {old_warm:.2}");
+    println!("newest order          cold {new_cold:.2} warm {new_warm:.2}");
+    println!("at(v) and newest row  cold {via_at:.2}");
 }
 
 fn open_experiment() {
@@ -413,6 +479,7 @@ fn main() {
         "snapshot" => snapshot_experiment(),
         "watch" => watch_experiment(),
         "history" => history_experiment(),
+        "step" => step_experiment(),
         "open" => open_experiment(),
         "etag" => {
             etag_experiment();
@@ -422,6 +489,6 @@ fn main() {
                 .expect("runtime")
                 .block_on(etag_http());
         }
-        _ => eprintln!("usage: shop-probe lock|snapshot|watch|history|open|etag"),
+        _ => eprintln!("usage: shop-probe lock|snapshot|watch|history|step|open|etag"),
     }
 }

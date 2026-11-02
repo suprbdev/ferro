@@ -244,10 +244,35 @@ rewritten.
 
 The log used to be a `Map<u64, Commit>`, which rewrote a tree path per commit and was about 20%
 of the bytes of a single-key commit. `Db::log()` now returns a `Log` handle with `len`, `get`,
-`first`, `last`, `iter` and `values`. `iter` reads the whole chain, so it is O(n).
+`first`, `last`, `iter` and `values`. `iter` runs in version order, like a `Map`, and is double
+ended. `next_back` follows `prev` links from the tip and reads only what it yields, so
+`.rev().take(n)` costs O(n). The chain has no forward links, so the first `next` reads what is
+left of it once.
 
-`Db::history_of` walks the chain oldest first and reports the versions where a projection of the
-root changed.
+`Db::history_of` walks `prev` links newest first and yields `(commit, value)` for each version
+whose projection differs from the version before it. Only adjacent versions are compared, so a
+value that comes back is reported again, and skip links cannot speed this up: a change and its
+reversal could both fall between two probes. Version 1 is compared with the projection of the
+genesis value, and a pruned chain reports its oldest retained commit, since what came before is
+gone. `History` is not double ended, because reversing it would need the whole walk. Callers that
+show changes oldest first collect and reverse, so the cost is in plain sight.
+
+A value's item is ready only when the walk reaches the start of that value's run. A row's creation
+is followed by a run of `None` back to version 1 that reports nothing, so `Iterator::take_while`
+would read the rest of the log to learn that no older item exists. `History::take_while` is an
+inherent method for that reason. It tests the predicate against each older value as the walk
+enters its run, paired with the commit last reported, and stops there. Its items match the
+`Iterator` adaptor for a predicate on the value, on the commit, or on the conjunction of the two.
+The predicate is `Fn` because it can run twice per item. The run at the tip has no commit to pair
+with, so a row that is absent at the tip costs the age of that absence; check with `get` first.
+
+A step loads one `Entry`, loads and decodes the root `T`, and runs the projection. Measured on a
+50,000-commit shop in a fresh process: 0.8 µs for the entry, 1.3 µs for the root, then 1.3 µs for
+a row in a quiet part of the tree and 11.5 µs for a recent row, whose nodes every commit rewrote,
+so each step reads and decodes those nodes in full, values included. With the same commits cached
+the whole step is 0.7 to 2 µs. Going through `at(v)` instead costs about 3 µs more per step, for
+the skip-link descent from the tip. Entries hold the `Commit` behind an `Arc`, so walking the log
+and `db.read()` do not copy the message.
 
 ## Merging
 

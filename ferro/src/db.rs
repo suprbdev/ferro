@@ -11,6 +11,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
+use crate::history::History;
 use crate::log::{Chain, Log};
 use crate::map::Map;
 use crate::store::{Durability, Frame, Store, StoreOptions, Txn};
@@ -111,7 +112,7 @@ struct RefState {
 
 pub struct Snapshot<T> {
     value: Arc<T>,
-    commit: Commit,
+    commit: Arc<Commit>,
 }
 
 impl<T> Clone for Snapshot<T> {
@@ -320,7 +321,7 @@ impl<T: Data> Shared<T> {
             return Ok(State {
                 snapshot: Snapshot {
                     value: self.genesis.clone(),
-                    commit: Commit::genesis(),
+                    commit: Arc::new(Commit::genesis()),
                 },
                 log: Chain::empty(),
                 merged: Map::new(),
@@ -334,7 +335,7 @@ impl<T: Data> Shared<T> {
             .log
             .tip_entry(&self.store)?
             .map(|entry| entry.commit.clone())
-            .unwrap_or_else(Commit::genesis);
+            .unwrap_or_else(|| Arc::new(Commit::genesis()));
         Ok(State {
             snapshot: Snapshot { value, commit },
             log: head.log,
@@ -598,7 +599,7 @@ impl<T: Data> Db<T> {
         if version == 0 {
             return Ok(Snapshot {
                 value: self.shared.genesis.clone(),
-                commit: Commit::genesis(),
+                commit: Arc::new(Commit::genesis()),
             });
         }
         let chain = self.branch.state.load().log;
@@ -608,7 +609,7 @@ impl<T: Data> Db<T> {
         self.snapshot_of(&entry.commit)
     }
 
-    fn snapshot_of(&self, commit: &Commit) -> Result<Snapshot<T>> {
+    fn snapshot_of(&self, commit: &Arc<Commit>) -> Result<Snapshot<T>> {
         let root = commit.root.ok_or(Error::NoVersion(commit.version))?;
         Ok(Snapshot {
             value: self.shared.store.load::<T>(root)?,
@@ -646,24 +647,14 @@ impl<T: Data> Db<T> {
         })
     }
 
-    pub fn history_of<V: PartialEq + Clone>(
-        &self,
-        project: impl Fn(&T) -> V,
-    ) -> Result<Vec<(Commit, V)>> {
+    pub fn history_of<V, F>(&self, project: F) -> History<T, V, F>
+    where
+        V: PartialEq,
+        F: Fn(&T) -> V,
+    {
         let chain = self.branch.state.load().log;
-        let mut previous = None;
-        if chain.tip.is_some() && chain.first == 1 {
-            previous = Some(project(&self.shared.genesis));
-        }
-        let mut changes = Vec::new();
-        for commit in chain.commits(&self.shared.store)? {
-            let value = project(&*self.snapshot_of(&commit)?);
-            if previous.as_ref() != Some(&value) {
-                changes.push((commit, value.clone()));
-                previous = Some(value);
-            }
-        }
-        Ok(changes)
+        let genesis = (chain.first == 1).then(|| self.shared.genesis.clone());
+        History::new(chain.walk(&self.shared.store), self.shared.store.clone(), genesis, project)
     }
 
     pub fn merge_with<R, S: Into<String>>(

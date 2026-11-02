@@ -376,22 +376,25 @@ async fn order_history(
     let id = id_of(&params)?;
     let db = app.db.clone();
     let horizon = snap.snapshot.version();
-    let history = blocking(move || db.history_of(|shop| shop.orders.get(&id))).await??;
-    let versions: Vec<Value> = history
-        .into_iter()
-        .filter(|(commit, _)| commit.version <= horizon)
-        .map(|(commit, order)| {
-            json!({
-                "version": commit.version,
-                "time_ms": commit.time_ms,
-                "message": commit.message,
-                "order": order.as_deref(),
-            })
-        })
-        .collect();
-    if versions.is_empty() {
+    if !snap.snapshot.orders.contains(&id) {
         return Err(ApiError::NotFound(format!("order {id}")));
     }
+    let mut versions: Vec<Value> = blocking(move || {
+        db.history_of(|shop| shop.orders.get(&id))
+            .take_while(|(_, order)| order.is_some())
+            .skip_while(|(commit, _)| commit.version > horizon)
+            .map(|(commit, order)| {
+                json!({
+                    "version": commit.version,
+                    "time_ms": commit.time_ms,
+                    "message": commit.message,
+                    "order": order.as_deref(),
+                })
+            })
+            .collect()
+    })
+    .await?;
+    versions.reverse();
     Ok(Json(json!({"id": id, "history": versions})).into_response())
 }
 

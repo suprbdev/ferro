@@ -312,21 +312,20 @@ fn history(w: &mut dyn Write, db: &Db<Wiki>, slug: &str) -> Res<()> {
     let head = db.read();
     let id = match query::find(&head, &slug) {
         Some(page) => page.id,
-        None => {
-            let mut found = None;
-            for (version, _) in db.log().iter().rev() {
-                let past = db.at(version)?;
-                if let Some(page) = query::find(&past, &slug) {
-                    found = Some(page.id);
-                    break;
-                }
-            }
-            found.ok_or_else(|| format!("no history for {slug}"))?
-        }
+        None => db
+            .history_of(|wiki| query::find(wiki, &slug).map(|page| page.id))
+            .find_map(|(_, id)| id)
+            .ok_or_else(|| format!("no history for {slug}"))?,
     };
     drop(head);
+    let mut changes: Vec<_> = db
+        .history_of(|wiki| (wiki.next_id >= id).then(|| wiki.pages.get(&id)))
+        .take_while(|(_, page)| page.is_some())
+        .collect();
+    changes.reverse();
     let mut previous: Option<Arc<Page>> = None;
-    for (commit, page) in db.history_of(|wiki| wiki.pages.get(&id))? {
+    for (commit, page) in changes {
+        let page = page.flatten();
         let summary = match (&previous, &page) {
             (_, None) => "deleted".to_string(),
             (None, Some(new)) => format!("created, {} bytes", chunk::bytes(&new.body)),

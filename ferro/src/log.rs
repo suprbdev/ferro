@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Ptr, Sink};
@@ -10,7 +11,7 @@ const HAS_SKIP: u8 = 2;
 
 #[derive(Clone)]
 pub(crate) struct Entry {
-    pub(crate) commit: Commit,
+    pub(crate) commit: Arc<Commit>,
     pub(crate) prev: Option<Ptr>,
     pub(crate) skip: Option<Ptr>,
 }
@@ -30,7 +31,7 @@ impl Data for Entry {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let commit = Commit::decode(r)?;
+        let commit = Arc::new(Commit::decode(r)?);
         let flags = r.u8()?;
         if flags & !(HAS_PREV | HAS_SKIP) != 0 {
             return Err(Error::Decode(format!("invalid log entry flags {flags}")));
@@ -147,23 +148,19 @@ impl Chain {
         Ok(Some(entry))
     }
 
+    pub(crate) fn walk(&self, store: &Store) -> Walk {
+        Walk {
+            store: store.clone(),
+            next: self.tip,
+            above: u64::MAX,
+        }
+    }
+
     pub(crate) fn commits(&self, store: &Store) -> Result<Vec<Commit>> {
         let mut out = Vec::with_capacity(self.len());
-        let Some(mut entry) = self.tip_entry(store)? else {
-            return Ok(out);
-        };
-        loop {
-            out.push(entry.commit.clone());
-            match entry.prev {
-                Some(prev) => {
-                    let loaded = store.load::<Entry>(prev)?;
-                    if loaded.commit.version >= entry.commit.version {
-                        return Err(corrupt("versions do not descend"));
-                    }
-                    entry = loaded;
-                }
-                None => break,
-            }
+        let mut walk = self.walk(store);
+        while let Some(entry) = walk.step()? {
+            out.push((*entry.commit).clone());
         }
         out.reverse();
         Ok(out)
@@ -179,7 +176,7 @@ impl Chain {
             None
         };
         let entry = Entry {
-            commit,
+            commit: Arc::new(commit),
             prev: self.tip,
             skip,
         };
@@ -223,7 +220,7 @@ impl Chain {
             let skip = (target >= first && target != version - 1)
                 .then(|| pointers[(target - first) as usize]);
             let entry = Entry {
-                commit: commit.clone(),
+                commit: Arc::new(commit.clone()),
                 prev: pointers.last().copied(),
                 skip,
             };
@@ -246,6 +243,27 @@ enum Step {
     Prev,
 }
 
+pub(crate) struct Walk {
+    store: Store,
+    next: Option<Ptr>,
+    above: u64,
+}
+
+impl Walk {
+    pub(crate) fn step(&mut self) -> Result<Option<Arc<Entry>>> {
+        let Some(ptr) = self.next else {
+            return Ok(None);
+        };
+        let entry = self.store.load::<Entry>(ptr)?;
+        if entry.commit.version >= self.above {
+            return Err(corrupt("versions do not descend"));
+        }
+        self.above = entry.commit.version;
+        self.next = entry.prev;
+        Ok(Some(entry))
+    }
+}
+
 #[derive(Clone)]
 pub struct Log {
     pub(crate) chain: Chain,
@@ -265,7 +283,7 @@ impl Log {
         Ok(self
             .chain
             .get(&self.store, *version)?
-            .map(|entry| Arc::new(entry.commit.clone())))
+            .map(|entry| entry.commit.clone()))
     }
 
     pub fn get(&self, version: &u64) -> Option<Arc<Commit>> {
@@ -278,19 +296,81 @@ impl Log {
 
     pub fn last(&self) -> Option<(u64, Arc<Commit>)> {
         let entry = crate::map::fatal(self.chain.tip_entry(&self.store))?;
-        Some((self.chain.last, Arc::new(entry.commit.clone())))
+        Some((self.chain.last, entry.commit.clone()))
     }
 
-    pub fn iter(&self) -> std::vec::IntoIter<(u64, Arc<Commit>)> {
-        let commits = crate::map::fatal(self.chain.commits(&self.store));
-        commits
-            .into_iter()
-            .map(|commit| (commit.version, Arc::new(commit)))
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn iter(&self) -> Iter {
+        Iter {
+            walk: self.chain.walk(&self.store),
+            front: VecDeque::new(),
+            remaining: self.chain.len(),
+        }
     }
 
-    pub fn values(&self) -> impl DoubleEndedIterator<Item = Arc<Commit>> {
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = Arc<Commit>> + ExactSizeIterator {
         self.iter().map(|(_, commit)| commit)
     }
 }
+
+pub struct Iter {
+    walk: Walk,
+    front: VecDeque<Arc<Commit>>,
+    remaining: usize,
+}
+
+impl Iter {
+    fn older(&mut self) -> Result<Arc<Commit>> {
+        let entry = self.walk.step()?;
+        entry
+            .map(|entry| entry.commit.clone())
+            .ok_or_else(|| corrupt("chain ends early"))
+    }
+
+    fn try_next(&mut self) -> Result<Option<Arc<Commit>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        if self.front.is_empty() {
+            for _ in 0..self.remaining {
+                let commit = self.older()?;
+                self.front.push_front(commit);
+            }
+        }
+        self.remaining -= 1;
+        Ok(self.front.pop_front())
+    }
+
+    fn try_next_back(&mut self) -> Result<Option<Arc<Commit>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let commit = match self.front.pop_back() {
+            Some(commit) => commit,
+            None => self.older()?,
+        };
+        self.remaining -= 1;
+        Ok(Some(commit))
+    }
+}
+
+impl Iterator for Iter {
+    type Item = (u64, Arc<Commit>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let commit = crate::map::fatal(self.try_next())?;
+        Some((commit.version, commit))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl DoubleEndedIterator for Iter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let commit = crate::map::fatal(self.try_next_back())?;
+        Some((commit.version, commit))
+    }
+}
+
+impl ExactSizeIterator for Iter {}
