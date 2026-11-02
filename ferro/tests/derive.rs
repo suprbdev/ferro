@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use ferro::codec::{Decoder, Encoder, HashSink};
 use ferro::{Bytes, Data, Db, Record, Set, Table};
@@ -344,7 +343,7 @@ fn issue(id: u64, status: Status, labels: &[&str]) -> Issue {
     }
 }
 
-fn ids(iter: impl Iterator<Item = Arc<Issue>>) -> Vec<u64> {
+fn ids(iter: impl Iterator<Item = ferro::Val<Issue>>) -> Vec<u64> {
     iter.map(|row| row.id).collect()
 }
 
@@ -504,7 +503,7 @@ fn each_with_set_types() {
         set: ["x".to_string(), "y".to_string()].into_iter().collect(),
         rank: 5,
     });
-    let names = |iter: Box<dyn Iterator<Item = Arc<Doc>>>| -> Vec<String> {
+    let names = |iter: Box<dyn Iterator<Item = ferro::Val<Doc>>>| -> Vec<String> {
         iter.map(|row| row.name.clone()).collect()
     };
     assert_eq!(names(Box::new(table.by_tags(&2))), vec!["a", "b"]);

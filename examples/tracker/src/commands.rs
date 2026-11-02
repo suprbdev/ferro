@@ -1,8 +1,7 @@
 use std::io::Write;
-use std::sync::Arc;
 
 use ferro::table::IndexIter;
-use ferro::{Change, Committed, Db};
+use ferro::{Change, Committed, Db, Val};
 
 use crate::Res;
 use crate::cli::{Command, ListArgs, ReadCmd};
@@ -41,7 +40,7 @@ fn report<R>(w: &mut dyn Write, done: &Committed<R>, what: &str) -> Res<()> {
     Ok(())
 }
 
-fn find(t: &Tracker, id: u64) -> Res<Arc<Issue>> {
+fn find(t: &Tracker, id: u64) -> Res<Val<Issue>> {
     t.issues
         .get(&id)
         .ok_or_else(|| format!("no such issue #{id}").into())
@@ -453,7 +452,7 @@ fn list(w: &mut dyn Write, t: &Tracker, args: &ListArgs) -> Res<()> {
 
 fn print_matching(
     w: &mut dyn Write,
-    rows: impl Iterator<Item = Arc<Issue>>,
+    rows: impl Iterator<Item = Val<Issue>>,
     args: &ListArgs,
 ) -> Res<()> {
     let needle = args.text.as_ref().map(|text| text.to_lowercase());
@@ -520,7 +519,7 @@ fn stats(w: &mut dyn Write, t: &Tracker, meta: &Meta) -> Res<()> {
 }
 
 fn history(w: &mut dyn Write, db: &Db<Tracker>, id: u64) -> Res<()> {
-    let mut previous: Option<Arc<Issue>> = None;
+    let mut previous: Option<Val<Issue>> = None;
     let mut seen = false;
     let mut changes: Vec<_> = db.history_of(|t| t.issues.get(&id)).collect();
     changes.reverse();

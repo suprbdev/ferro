@@ -1,7 +1,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use ferro::Val;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{Rng, cases, fast, level_of, roomy, text, uncached};
@@ -416,10 +416,10 @@ fn expected_changes(old: &Model, new: &Model) -> Vec<Change<u32, String>> {
     for (key, value) in old {
         match new.get(key) {
             None => {
-                changes.insert(*key, Change::Removed(*key, Arc::new(value.clone())));
+                changes.insert(*key, Change::Removed(*key, Val::new(value.clone())));
             }
             Some(other) if other != value => {
-                let change = Change::Changed(*key, Arc::new(value.clone()), Arc::new(other.clone()));
+                let change = Change::Changed(*key, Val::new(value.clone()), Val::new(other.clone()));
                 changes.insert(*key, change);
             }
             Some(_) => {}
@@ -427,7 +427,7 @@ fn expected_changes(old: &Model, new: &Model) -> Vec<Change<u32, String>> {
     }
     for (key, value) in new {
         if !old.contains_key(key) {
-            changes.insert(*key, Change::Added(*key, Arc::new(value.clone())));
+            changes.insert(*key, Change::Added(*key, Val::new(value.clone())));
         }
     }
     changes.into_values().collect()

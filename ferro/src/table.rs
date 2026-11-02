@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Iter, Keys, Map, Values, three_way};
+use crate::map::{Conflict, Diff, Iter, Keys, Map, Val, Values, three_way};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -85,7 +85,7 @@ impl<T: Record> Table<T> {
         self.0.rows().is_empty()
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<Arc<T>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -114,26 +114,26 @@ impl<T: Record> Table<T> {
         self.0.rows().range::<Q, R>(range)
     }
 
-    pub fn first(&self) -> Option<Arc<T>> {
+    pub fn first(&self) -> Option<Val<T>> {
         self.0.rows().first().map(|(_, row)| row)
     }
 
-    pub fn last(&self) -> Option<Arc<T>> {
+    pub fn last(&self) -> Option<Val<T>> {
         self.0.rows().last().map(|(_, row)| row)
     }
 
-    pub fn insert(&mut self, row: T) -> Option<Arc<T>> {
+    pub fn insert(&mut self, row: T) -> Option<Val<T>> {
         self.try_insert(row).unwrap_or_else(|taken| clash(taken))
     }
 
-    pub fn try_insert(&mut self, row: T) -> std::result::Result<Option<Arc<T>>, Taken<T::Key>> {
+    pub fn try_insert(&mut self, row: T) -> std::result::Result<Option<Val<T>>, Taken<T::Key>> {
         if let Some(taken) = self.0.conflict(&row, None) {
             return Err(taken);
         }
         Ok(self.put(row))
     }
 
-    fn put(&mut self, row: T) -> Option<Arc<T>> {
+    fn put(&mut self, row: T) -> Option<Val<T>> {
         let key = row.key();
         let row = Arc::new(row);
         let old = self.0.rows_mut().insert_shared(key, row.clone());
@@ -154,7 +154,7 @@ impl<T: Record> Table<T> {
         }
     }
 
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<Arc<T>>
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -226,13 +226,13 @@ impl<T: Record> Table<T> {
         }
     }
 
-    pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Arc<T>>
+    pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        let drained: Vec<Arc<T>> = self.0.rows_mut().take_range::<Q, R>(range).values().collect();
+        let drained: Vec<Val<T>> = self.0.rows_mut().take_range::<Q, R>(range).values().collect();
         for row in &drained {
             self.0.reindex(Some(row), None);
         }
@@ -293,7 +293,7 @@ impl<T: Record> Table<T> {
                 key: key.clone(),
                 base: base.get(&key),
                 ours: holder,
-                theirs: Some(Arc::new(row)),
+                theirs: Some(Val::new(row)),
             });
             match resolved {
                 Some(row) => {
@@ -310,7 +310,7 @@ impl<T: Record> Table<T> {
 
 pub struct RowMut<'a, T: Record> {
     table: &'a mut Table<T>,
-    old: Arc<T>,
+    old: Val<T>,
     row: Option<T>,
 }
 
@@ -407,9 +407,9 @@ impl<T: Record> IndexIter<T> {
 }
 
 impl<T: Record> Iterator for IndexIter<T> {
-    type Item = Arc<T>;
+    type Item = Val<T>;
 
-    fn next(&mut self) -> Option<Arc<T>> {
+    fn next(&mut self) -> Option<Val<T>> {
         let key = self.keys.forward()?;
         self.rows.get(&key)
     }
@@ -420,7 +420,7 @@ impl<T: Record> Iterator for IndexIter<T> {
 }
 
 impl<T: Record> DoubleEndedIterator for IndexIter<T> {
-    fn next_back(&mut self) -> Option<Arc<T>> {
+    fn next_back(&mut self) -> Option<Val<T>> {
         let key = self.keys.backward()?;
         self.rows.get(&key)
     }
@@ -428,7 +428,7 @@ impl<T: Record> DoubleEndedIterator for IndexIter<T> {
 
 impl<T: Record> ExactSizeIterator for IndexIter<T> {}
 
-pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Arc<T>>
+pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Val<T>>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,

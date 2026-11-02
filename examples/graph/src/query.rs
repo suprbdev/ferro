@@ -1,8 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
 
 use clap::ValueEnum;
+use ferro::Val;
 
 use crate::adj::{Adj, intersect};
 use crate::model::{Graph, Post, UserId};
@@ -180,9 +180,9 @@ pub fn recommend(g: &Graph, user: UserId, limit: usize, max_fanout: usize) -> Ve
     ranked
 }
 
-pub fn timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Arc<Post>> {
+pub fn timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Val<Post>> {
     let mut streams = Vec::new();
-    let mut heads: Vec<Option<Arc<Post>>> = Vec::new();
+    let mut heads: Vec<Option<Val<Post>>> = Vec::new();
     let mut heap = BinaryHeap::new();
     for followed in g.out.iter(user) {
         let mut stream = g.posts.by_author(&followed).rev();
@@ -206,7 +206,7 @@ pub fn timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Arc<Post>> {
     out
 }
 
-pub fn inbox_timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Arc<Post>> {
+pub fn inbox_timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Val<Post>> {
     g.inbox
         .range((user, 0)..=(user, u64::MAX))
         .rev()

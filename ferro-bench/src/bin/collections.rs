@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferro::codec::{Encoder, HashSink, Object};
-use ferro::{Bytes, Data, Db, Durability, List, Map, Options, Ptr};
+use ferro::{Bytes, Data, Db, Durability, List, Map, Options, Ptr, Val};
 
 fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e3779b97f4a7c15);
@@ -228,7 +228,7 @@ trait Seq: Data + Default {
     type Item: Data;
     fn fill(&mut self, items: Vec<Self::Item>);
     fn push(&mut self, item: Self::Item);
-    fn fetch(&self, index: u64) -> Arc<Self::Item>;
+    fn fetch(&self, index: u64) -> Val<Self::Item>;
     fn scan(&self) -> u64;
 }
 
@@ -243,7 +243,7 @@ impl<T: Data> Seq for List<T> {
         List::push(self, item);
     }
 
-    fn fetch(&self, index: u64) -> Arc<T> {
+    fn fetch(&self, index: u64) -> Val<T> {
         self.get(index as usize).unwrap()
     }
 
@@ -289,8 +289,8 @@ impl<T: Data + Ord, const N: u64> Seq for Chunked<T, N> {
         self.len += 1;
     }
 
-    fn fetch(&self, index: u64) -> Arc<T> {
-        self.chunks.get(&(index / N)).unwrap()[(index % N) as usize].clone()
+    fn fetch(&self, index: u64) -> Val<T> {
+        Val::from(self.chunks.get(&(index / N)).unwrap()[(index % N) as usize].clone())
     }
 
     fn scan(&self) -> u64 {

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 
+use ferro::Val;
 use crate::Res;
 use crate::chunk::{self, DEFAULT};
 use crate::index::Tx;
@@ -92,7 +92,7 @@ pub fn put(tx: &mut Tx, edit: Edit, now: u64) -> Res<Outcome> {
     }
 }
 
-pub fn delete(tx: &mut Tx, slug: &str) -> Res<Arc<Page>> {
+pub fn delete(tx: &mut Tx, slug: &str) -> Res<Val<Page>> {
     let slug = clean_slug(slug)?;
     let page = tx
         .by_slug(&slug)

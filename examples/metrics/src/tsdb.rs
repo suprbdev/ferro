@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::table::IndexIter;
-use ferro::{Db, Durability, Error, Map, Options, Result, Snapshot};
+use ferro::{Db, Durability, Error, Map, Options, Result, Snapshot, Val};
 
 use crate::chunk::{Chunk, merge_points};
 use crate::model::{BUCKET_MS, Metrics, Rollup, SeriesKey, SeriesRec, SeriesRef, bucket_of};
@@ -164,7 +163,7 @@ impl Writer {
     }
 }
 
-pub fn select(m: &Metrics, selector: &Selector) -> Vec<Arc<SeriesRec>> {
+pub fn select(m: &Metrics, selector: &Selector) -> Vec<Val<SeriesRec>> {
     let mut best: Option<IndexIter<SeriesRec>> = None;
     let mut consider = |candidate: IndexIter<SeriesRec>| {
         if best.as_ref().is_none_or(|b| candidate.len() < b.len()) {
@@ -180,7 +179,7 @@ pub fn select(m: &Metrics, selector: &Selector) -> Vec<Arc<SeriesRec>> {
             consider(m.series.by_pairs(pair.as_str()));
         }
     }
-    let mut rows: Vec<Arc<SeriesRec>> = match best {
+    let mut rows: Vec<Val<SeriesRec>> = match best {
         Some(rows) => rows.filter(|rec| selector.matches(rec)).collect(),
         None => m.series.iter().filter(|rec| selector.matches(rec)).collect(),
     };
@@ -425,7 +424,7 @@ impl Grid {
     }
 }
 
-fn group_assignment(rows: &[Arc<SeriesRec>], by: Option<&str>) -> (Vec<String>, Vec<usize>) {
+fn group_assignment(rows: &[Val<SeriesRec>], by: Option<&str>) -> (Vec<String>, Vec<usize>) {
     let Some(by) = by else {
         return (vec![String::new()], vec![0; rows.len()]);
     };

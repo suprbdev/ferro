@@ -1,23 +1,22 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use ferro::Map;
+use ferro::{Map, Val};
 
 use crate::chunk;
 use crate::index::analyze;
 use crate::model::{Page, Wiki};
 
-pub fn find(w: &Wiki, slug: &str) -> Option<Arc<Page>> {
+pub fn find(w: &Wiki, slug: &str) -> Option<Val<Page>> {
     w.pages.by_slug(slug)
 }
 
 pub struct Hit {
     pub score: u32,
-    pub page: Arc<Page>,
+    pub page: Val<Page>,
 }
 
 pub fn search(w: &Wiki, terms: &[String], limit: usize) -> (usize, Vec<Hit>) {
-    let mut postings: Vec<Arc<Map<u64, u32>>> = Vec::new();
+    let mut postings: Vec<Val<Map<u64, u32>>> = Vec::new();
     for term in terms {
         match w.terms.get(term.as_str()) {
             Some(posting) => postings.push(posting),
@@ -62,8 +61,8 @@ pub fn snippet(page: &Page, terms: &[String]) -> Option<String> {
     None
 }
 
-pub fn backlinks(w: &Wiki, slug: &str) -> Vec<Arc<Page>> {
-    let mut pages: Vec<Arc<Page>> = w
+pub fn backlinks(w: &Wiki, slug: &str) -> Vec<Val<Page>> {
+    let mut pages: Vec<Val<Page>> = w
         .links
         .get(slug)
         .map(|sources| sources.iter().filter_map(|id| w.pages.get(&id)).collect())
@@ -80,11 +79,11 @@ pub fn orphans(w: &Wiki) -> Vec<String> {
         .collect()
 }
 
-pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> Vec<Arc<Page>> {
+pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> Vec<Val<Page>> {
     let wanted = |page: &Page| prefix.is_none_or(|prefix| page.slug.starts_with(prefix));
     match tag {
         Some(tag) => {
-            let mut pages: Vec<Arc<Page>> = w
+            let mut pages: Vec<Val<Page>> = w
                 .pages
                 .by_tags(tag.to_lowercase().as_str())
                 .filter(|page| wanted(page))

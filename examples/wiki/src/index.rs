@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 
-use ferro::{Map, Set};
+use ferro::{Map, Set, Val};
 
 use crate::chunk;
 use crate::model::{Page, Wiki};
@@ -47,11 +46,11 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub fn page(&self, id: u64) -> Option<Arc<Page>> {
+    pub fn page(&self, id: u64) -> Option<Val<Page>> {
         self.w.pages.get(&id)
     }
 
-    pub fn by_slug(&self, slug: &str) -> Option<Arc<Page>> {
+    pub fn by_slug(&self, slug: &str) -> Option<Val<Page>> {
         self.w.pages.by_slug(slug)
     }
 
@@ -81,7 +80,7 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub fn put(&mut self, new: Page) -> Option<Arc<Page>> {
+    pub fn put(&mut self, new: Page) -> Option<Val<Page>> {
         let old = self.page(new.id);
         let unchanged_text = old.as_ref().is_some_and(|old| {
             old.body == new.body && old.title == new.title && old.slug == new.slug
@@ -95,7 +94,7 @@ impl<'a> Tx<'a> {
         old
     }
 
-    pub fn remove(&mut self, id: u64) -> Option<Arc<Page>> {
+    pub fn remove(&mut self, id: u64) -> Option<Val<Page>> {
         let old = self.page(id)?;
         let before = analyze(&old);
         self.record(id, Some(before), None);

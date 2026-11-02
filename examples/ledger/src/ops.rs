@@ -1,5 +1,5 @@
-use std::sync::Arc;
 
+use ferro::Val;
 use crate::error::{LedgerError, Result};
 use crate::model::{Account, Entry, Kind, Ledger, Line, PostingKey};
 use crate::money::{format_amount, format_date};
@@ -82,7 +82,7 @@ impl Ledger {
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
     }
 
-    pub fn account(&self, name: &str) -> Result<Arc<Account>> {
+    pub fn account(&self, name: &str) -> Result<Val<Account>> {
         self.accounts
             .by_name(name)
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
@@ -295,7 +295,7 @@ impl Ledger {
         }
     }
 
-    pub fn trial_balance(&self, as_of: Option<i32>) -> Vec<(Arc<Account>, i128)> {
+    pub fn trial_balance(&self, as_of: Option<i32>) -> Vec<(Val<Account>, i128)> {
         self.accounts
             .iter()
             .map(|account| {
@@ -340,7 +340,7 @@ impl Ledger {
     }
 }
 
-pub fn net_by_currency(balances: &[(Arc<Account>, i128)]) -> Vec<(String, i128)> {
+pub fn net_by_currency(balances: &[(Val<Account>, i128)]) -> Vec<(String, i128)> {
     let mut totals: Vec<(String, i128)> = Vec::new();
     for (account, balance) in balances {
         match totals

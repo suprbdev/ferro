@@ -3,10 +3,10 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use common::{Rng, fast, level_of, text, uncached};
-use ferro::{Data, Db, List, Map, Options, Set};
+use ferro::{Data, Db, List, Map, Options, Set, Val};
 use proptest::prelude::*;
 
 trait TestKey: Data + Ord + Debug {
@@ -200,10 +200,10 @@ where
     assert_eq!(iter.len(), 0);
 }
 
-fn pairs<K: Clone>(model: &BTreeMap<K, String>) -> VecDeque<(K, Arc<String>)> {
+fn pairs<K: Clone>(model: &BTreeMap<K, String>) -> VecDeque<(K, Val<String>)> {
     model
         .iter()
-        .map(|(key, value)| (key.clone(), Arc::new(value.clone())))
+        .map(|(key, value)| (key.clone(), Val::new(value.clone())))
         .collect()
 }
 
@@ -378,14 +378,14 @@ fn apply<K: TestKey>(
         Op::Range(low, high, steps) => {
             let low = map_bound(*low, resolve);
             let high = map_bound(*high, resolve);
-            let expected: VecDeque<(K, Arc<String>)> = model
+            let expected: VecDeque<(K, Val<String>)> = model
                 .iter()
                 .filter(|(key, _)| in_range(*key, &low, &high))
-                .map(|(key, value)| (key.clone(), Arc::new(value.clone())))
+                .map(|(key, value)| (key.clone(), Val::new(value.clone())))
                 .collect();
-            let reversed: Vec<(K, Arc<String>)> = expected.iter().rev().cloned().collect();
+            let reversed: Vec<(K, Val<String>)> = expected.iter().rev().cloned().collect();
             let bounds = (low, high);
-            let got: Vec<(K, Arc<String>)> = map.range::<K, _>(bounds.clone()).rev().collect();
+            let got: Vec<(K, Val<String>)> = map.range::<K, _>(bounds.clone()).rev().collect();
             assert_eq!(got, reversed);
             walk(map.range::<K, _>(bounds), expected, steps);
         }
@@ -393,7 +393,7 @@ fn apply<K: TestKey>(
         Op::KeysWalk(steps) => walk(map.keys(), model.keys().cloned().collect(), steps),
         Op::ValuesWalk(steps) => walk(
             map.values(),
-            model.values().map(|v| Arc::new(v.clone())).collect(),
+            model.values().map(|v| Val::new(v.clone())).collect(),
             steps,
         ),
         Op::Nth(index) => {
@@ -409,15 +409,15 @@ fn apply<K: TestKey>(
 
 fn check_full<K: TestKey>(map: &Map<K, String>, model: &BTreeMap<K, String>) {
     assert_eq!(map.len(), model.len());
-    let forward: Vec<(K, Arc<String>)> = map.iter().collect();
+    let forward: Vec<(K, Val<String>)> = map.iter().collect();
     assert_eq!(forward, Vec::from(pairs(model)));
-    let mut backward: Vec<(K, Arc<String>)> = map.iter().rev().collect();
+    let mut backward: Vec<(K, Val<String>)> = map.iter().rev().collect();
     backward.reverse();
     assert_eq!(backward, forward);
     let keys: Vec<K> = map.keys().collect();
     assert_eq!(keys, model.keys().cloned().collect::<Vec<K>>());
-    let values: Vec<Arc<String>> = map.values().rev().collect();
-    let wanted: Vec<Arc<String>> = model.values().rev().map(|v| Arc::new(v.clone())).collect();
+    let values: Vec<Val<String>> = map.values().rev().collect();
+    let wanted: Vec<Val<String>> = model.values().rev().map(|v| Val::new(v.clone())).collect();
     assert_eq!(values, wanted);
     assert_eq!(map.first().map(|p| p.0), model.keys().next().cloned());
     assert_eq!(map.last().map(|p| p.0), model.keys().next_back().cloned());

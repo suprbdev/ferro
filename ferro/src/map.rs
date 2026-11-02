@@ -2,7 +2,9 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
-use std::ops::{Bound, RangeBounds};
+use std::hash;
+use std::ops::{Bound, Deref, RangeBounds};
+use std::mem::needs_drop;
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
 
@@ -61,21 +63,165 @@ fn level_of<K: Data>(key: &K) -> Result<u8> {
     Ok((word.trailing_zeros() / LEVEL_BITS) as u8)
 }
 
+const fn by_copy<V>() -> bool {
+    !needs_drop::<V>() && size_of::<V>() <= 2 * size_of::<usize>()
+}
+
+pub struct Val<V>(Held<V>);
+
+enum Held<V> {
+    Copied(V),
+    Column(Arc<[V]>, u32),
+    Single(Arc<V>),
+}
+
+impl<V: Clone> Val<V> {
+    #[inline]
+    fn of_column(column: &Arc<[V]>, index: usize) -> Self {
+        if by_copy::<V>() {
+            Val(Held::Copied(column[index].clone()))
+        } else {
+            Val(Held::Column(column.clone(), index as u32))
+        }
+    }
+
+    #[inline]
+    fn of_single(value: &Arc<V>) -> Self {
+        if by_copy::<V>() {
+            Val(Held::Copied((**value).clone()))
+        } else {
+            Val(Held::Single(value.clone()))
+        }
+    }
+
+    pub fn new(value: V) -> Self {
+        if by_copy::<V>() {
+            Val(Held::Copied(value))
+        } else {
+            Val(Held::Single(Arc::new(value)))
+        }
+    }
+
+    pub fn into_owned(self) -> V {
+        match self.0 {
+            Held::Copied(value) => value,
+            Held::Column(column, index) => column[index as usize].clone(),
+            Held::Single(value) => Arc::unwrap_or_clone(value),
+        }
+    }
+
+    pub fn into_arc(self) -> Arc<V> {
+        match self.0 {
+            Held::Single(value) => value,
+            other => Arc::new(Val(other).into_owned()),
+        }
+    }
+}
+
+impl<V> Deref for Val<V> {
+    type Target = V;
+
+    #[inline]
+    fn deref(&self) -> &V {
+        match &self.0 {
+            Held::Copied(value) => value,
+            Held::Column(column, index) => &column[*index as usize],
+            Held::Single(value) => value,
+        }
+    }
+}
+
+impl<V: Clone> Clone for Val<V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Val(match &self.0 {
+            Held::Copied(value) => Held::Copied(value.clone()),
+            Held::Column(column, index) => Held::Column(column.clone(), *index),
+            Held::Single(value) => Held::Single(value.clone()),
+        })
+    }
+}
+
+impl<V> From<Arc<V>> for Val<V> {
+    fn from(value: Arc<V>) -> Self {
+        Val(Held::Single(value))
+    }
+}
+
+impl<V> AsRef<V> for Val<V> {
+    fn as_ref(&self) -> &V {
+        self
+    }
+}
+
+impl<V> Borrow<V> for Val<V> {
+    fn borrow(&self) -> &V {
+        self
+    }
+}
+
+impl<V: fmt::Debug> fmt::Debug for Val<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<V: fmt::Display> fmt::Display for Val<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<V: PartialEq> PartialEq for Val<V> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<V: Eq> Eq for Val<V> {}
+
+impl<V: PartialOrd> PartialOrd for Val<V> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<V: Ord> Ord for Val<V> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<V: hash::Hash> hash::Hash for Val<V> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
 enum Slot<V, S> {
-    Inline(Arc<V>),
+    Packed(Arc<[V]>, u32),
     Fresh(Arc<V>),
     Spilled(Ptr, S),
 }
 
 impl<V, S> Slot<V, S> {
     #[inline]
+    fn held(&self) -> Option<&V> {
+        match self {
+            Slot::Packed(column, index) => Some(&column[*index as usize]),
+            Slot::Fresh(value) => Some(value),
+            Slot::Spilled(..) => None,
+        }
+    }
+
+    #[inline]
     fn summary<K>(&self, key: &K) -> S
     where
         S: Summary<K, V>,
     {
         match self {
-            Slot::Inline(value) | Slot::Fresh(value) => S::of(key, value),
             Slot::Spilled(_, summary) => summary.clone(),
+            held => S::of(key, held.held().expect("a slot that is not spilled holds its value")),
         }
     }
 }
@@ -83,10 +229,85 @@ impl<V, S> Slot<V, S> {
 impl<V, S: Clone> Clone for Slot<V, S> {
     fn clone(&self) -> Self {
         match self {
-            Slot::Inline(value) => Slot::Inline(value.clone()),
+            Slot::Packed(column, index) => Slot::Packed(column.clone(), *index),
             Slot::Fresh(value) => Slot::Fresh(value.clone()),
             Slot::Spilled(ptr, summary) => Slot::Spilled(*ptr, summary.clone()),
         }
+    }
+}
+
+enum Cells<V, S> {
+    Column(Arc<[V]>),
+    Slots(Vec<Slot<V, S>>),
+}
+
+impl<V: Clone, S: Clone> Cells<V, S> {
+    fn settled(&self, spills: Vec<(usize, Slot<V, S>)>) -> Self {
+        let width = match self {
+            Cells::Column(_) if spills.is_empty() => return self.clone(),
+            Cells::Column(column) => column.len(),
+            Cells::Slots(slots) => slots.len(),
+        };
+        let mut spills = spills.into_iter().peekable();
+        let mut column = Vec::with_capacity(width);
+        let mut spilled = Vec::new();
+        for index in 0..width {
+            match (spills.next_if(|(at, _)| *at == index), self) {
+                (Some(spill), _) => spilled.push(spill),
+                (None, Cells::Column(values)) => column.push(values[index].clone()),
+                (None, Cells::Slots(slots)) => match slots[index].held() {
+                    Some(value) => column.push(value.clone()),
+                    None => spilled.push((index, slots[index].clone())),
+                },
+            }
+        }
+        Cells::spliced(column.into(), spilled)
+    }
+}
+
+impl<V, S: Clone> Clone for Cells<V, S> {
+    fn clone(&self) -> Self {
+        match self {
+            Cells::Column(column) => Cells::Column(column.clone()),
+            Cells::Slots(slots) => Cells::Slots(slots.clone()),
+        }
+    }
+}
+
+impl<V, S> Cells<V, S> {
+    fn spliced(column: Arc<[V]>, spilled: Vec<(usize, Slot<V, S>)>) -> Self {
+        if spilled.is_empty() {
+            return Cells::Column(column);
+        }
+        let width = column.len() + spilled.len();
+        let mut slots = Vec::with_capacity(width);
+        let mut spilled = spilled.into_iter().peekable();
+        let mut held = 0;
+        for index in 0..width {
+            match spilled.next_if(|(at, _)| *at == index) {
+                Some((_, slot)) => slots.push(slot),
+                None => {
+                    slots.push(Slot::Packed(column.clone(), held));
+                    held += 1;
+                }
+            }
+        }
+        Cells::Slots(slots)
+    }
+
+    fn slots(&mut self) -> &mut Vec<Slot<V, S>> {
+        if let Cells::Column(column) = self {
+            let packed = (0..column.len() as u32).map(|index| Slot::Packed(column.clone(), index));
+            *self = Cells::Slots(packed.collect());
+        }
+        match self {
+            Cells::Slots(slots) => slots,
+            Cells::Column(_) => unreachable!(),
+        }
+    }
+
+    fn into_slots(mut self) -> Vec<Slot<V, S>> {
+        std::mem::take(self.slots())
     }
 }
 
@@ -193,12 +414,13 @@ impl<K, V, S> Link<K, V, S> {
     }
 }
 
+#[repr(C)]
 struct Node<K, V, S> {
-    level: u8,
     keys: Vec<K>,
-    slots: Vec<Slot<V, S>>,
     children: Vec<Link<K, V, S>>,
+    cells: Cells<V, S>,
     count: u64,
+    level: u8,
     origin: Option<Ptr>,
 }
 
@@ -207,7 +429,7 @@ impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
         Node {
             level: self.level,
             keys: self.keys.clone(),
-            slots: self.slots.clone(),
+            cells: self.cells.clone(),
             children: self.children.clone(),
             count: self.count,
             origin: self.origin,
@@ -235,14 +457,34 @@ impl<K, V, S> Node<K, V, S> {
         &mut self.children
     }
 
-    fn warm_values(&self) {
-        let mut total = 0;
-        for slot in &self.slots {
-            if let Slot::Inline(value) | Slot::Fresh(value) = slot {
-                total += Arc::strong_count(value);
-            }
+    #[inline]
+    fn slot(&self, index: usize) -> Slot<V, S>
+    where
+        S: Clone,
+    {
+        match &self.cells {
+            Cells::Column(column) => Slot::Packed(column.clone(), index as u32),
+            Cells::Slots(slots) => slots[index].clone(),
         }
-        std::hint::black_box(total);
+    }
+
+    #[inline]
+    fn entry_summary(&self, index: usize) -> S
+    where
+        S: Summary<K, V>,
+    {
+        match &self.cells {
+            Cells::Column(column) => S::of(&self.keys[index], &column[index]),
+            Cells::Slots(slots) => slots[index].summary(&self.keys[index]),
+        }
+    }
+
+    #[inline]
+    fn is_fresh(&self, index: usize) -> bool {
+        match &self.cells {
+            Cells::Column(_) => false,
+            Cells::Slots(slots) => matches!(slots[index], Slot::Fresh(_)),
+        }
     }
 
     fn recount(&mut self) {
@@ -255,8 +497,8 @@ impl<K, V, S> Node<K, V, S> {
         S: Summary<K, V>,
     {
         let mut total = self.child(0).summary();
-        for (index, slot) in self.slots.iter().enumerate() {
-            total = fold(total, &slot.summary(&self.keys[index]));
+        for index in 0..self.keys.len() {
+            total = fold(total, &self.entry_summary(index));
             if let Some(next) = self.child(index + 1).summary() {
                 total = fold(total, &next);
             }
@@ -265,12 +507,32 @@ impl<K, V, S> Node<K, V, S> {
     }
 
     fn fixed_bytes(&self) -> usize {
-        let held = self.slots.iter().filter(|slot| !matches!(slot, Slot::Spilled(..)));
+        let inner = |owns_heap: bool, bytes: usize| if owns_heap { bytes } else { 0 };
+        let values = match &self.cells {
+            Cells::Column(column) => {
+                let each = inner(needs_drop::<V>(), size_of::<V>() + ITEM_BYTES);
+                ARC_HEADER + ALLOCATION_BYTES + column.len() * (size_of::<V>() + each)
+            }
+            Cells::Slots(slots) => {
+                let held = slots.iter().filter(|slot| slot.held().is_some());
+                slots.capacity() * size_of::<Slot<V, S>>()
+                    + held.count() * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
+            }
+        };
         size_of::<Self>()
-            + self.keys.capacity() * (size_of::<K>() + ITEM_BYTES)
-            + self.slots.capacity() * size_of::<Slot<V, S>>()
+            + self.keys.capacity() * (size_of::<K>() + inner(needs_drop::<K>(), ITEM_BYTES))
             + self.children.capacity() * size_of::<Link<K, V, S>>()
-            + held.count() * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
+            + values
+    }
+}
+
+impl<K, V: Data, S> Node<K, V, S> {
+    #[inline]
+    fn value(&self, store: Option<&Store>, index: usize) -> Result<Val<V>> {
+        match &self.cells {
+            Cells::Column(column) => Ok(Val::of_column(column, index)),
+            Cells::Slots(slots) => read_slot(store, &slots[index]),
+        }
     }
 }
 
@@ -285,14 +547,16 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
         for _ in 0..n {
             keys.push(K::decode(decoder)?);
         }
-        let mut slots = Vec::with_capacity(keys.len());
-        for _ in 0..n {
-            slots.push(match decoder.u8()? {
-                0 => Slot::Inline(Arc::new(V::decode(decoder)?)),
-                1 => Slot::Spilled(decoder.link()?, S::decode(decoder)?),
+        let mut column = Vec::with_capacity(keys.len());
+        let mut spilled = Vec::new();
+        for index in 0..n {
+            match decoder.u8()? {
+                0 => column.push(V::decode(decoder)?),
+                1 => spilled.push((index, Slot::Spilled(decoder.link()?, S::decode(decoder)?))),
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
-            });
+            }
         }
+        let cells = Cells::spliced(column.into(), spilled);
         let mut children = Vec::new();
         for position in 0..=n {
             let count = decoder.varint()?;
@@ -309,7 +573,7 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
         let mut node = Node {
             level,
             keys,
-            slots,
+            cells,
             children,
             count: 0,
             origin: Some(origin),
@@ -419,7 +683,7 @@ fn link_from<K, V, S>(
     let mut node = Node {
         level,
         keys,
-        slots,
+        cells: Cells::Slots(slots),
         children,
         count: 0,
         origin,
@@ -442,11 +706,12 @@ fn split<K: Data + Ord, V: Data, S: Data>(
     let Node {
         level,
         mut keys,
-        mut slots,
+        cells,
         mut children,
         origin,
         ..
     } = Arc::unwrap_or_clone(node);
+    let mut slots = cells.into_slots();
     let position = keys
         .binary_search_by(side)
         .err()
@@ -505,7 +770,7 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
             left.children.push(merge(store, inner_left, inner_right)?);
             left.children.extend(right.children.drain(1..));
             left.keys.append(&mut right.keys);
-            left.slots.append(&mut right.slots);
+            left.cells.slots().append(right.cells.slots());
             left.origin = None;
             left.recount();
             Ok(Link::Mem(Arc::new(left)))
@@ -548,20 +813,20 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
     let node = node_mut(store, link)?;
     match node.search(&key) {
         Ok(index) => Ok(Some(std::mem::replace(
-            &mut node.slots[index],
+            &mut node.cells.slots()[index],
             Slot::Fresh(value),
         ))),
         Err(position) if level == node.level => {
             if node.children.is_empty() {
                 node.keys.insert(position, key);
-                node.slots.insert(position, Slot::Fresh(value));
+                node.cells.slots().insert(position, Slot::Fresh(value));
                 node.count += 1;
                 return Ok(None);
             }
             let (left, right) =
                 split(store, node.children[position].take(), &|probe: &K| probe.cmp(&key))?;
             node.keys.insert(position, key);
-            node.slots.insert(position, Slot::Fresh(value));
+            node.cells.slots().insert(position, Slot::Fresh(value));
             node.children[position] = left;
             node.children.insert(position + 1, right);
             node.count += 1;
@@ -596,7 +861,7 @@ where
     match node.search(key) {
         Ok(index) => {
             node.keys.remove(index);
-            let slot = node.slots.remove(index);
+            let slot = node.cells.slots().remove(index);
             if !node.children.is_empty() {
                 let right = node.children.remove(index + 1);
                 let left = node.children[index].take();
@@ -635,9 +900,11 @@ where
     let node = node_mut(store, link)?;
     match node.search(key) {
         Ok(index) => {
-            let slot = &mut node.slots[index];
+            let slot = &mut node.cells.slots()[index];
             let value = match &*slot {
-                Slot::Inline(value) => Some(value.clone()),
+                Slot::Packed(column, position) => {
+                    Some(Arc::new(column[*position as usize].clone()))
+                }
                 Slot::Fresh(_) => None,
                 Slot::Spilled(ptr, _) => Some(store.ok_or(Error::Detached)?.load::<V>(*ptr)?),
             };
@@ -653,10 +920,11 @@ where
     }
 }
 
-fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Arc<V>> {
+fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Val<V>> {
     match slot {
-        Slot::Inline(value) | Slot::Fresh(value) => Ok(value.clone()),
-        Slot::Spilled(ptr, _) => store.ok_or(Error::Detached)?.load::<V>(*ptr),
+        Slot::Packed(column, index) => Ok(Val::of_column(column, *index as usize)),
+        Slot::Fresh(value) => Ok(Val::of_single(value)),
+        Slot::Spilled(ptr, _) => Ok(Val(Held::Single(store.ok_or(Error::Detached)?.load::<V>(*ptr)?))),
     }
 }
 
@@ -682,45 +950,44 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
     let mut encoder = Encoder::with_capacity(&mut *sink, 64 + 24 * width, width + 1);
     encoder.u8(node.level);
     encoder.varint(width as u64);
-    for (key, slot) in node.keys.iter().zip(&node.slots) {
+    for (index, key) in node.keys.iter().enumerate() {
         let mark = encoder.mark();
         key.encode(&mut encoder)?;
-        if let (Slot::Fresh(_), Some(store)) = (slot, &store) {
+        if let (true, Some(store)) = (node.is_fresh(index), &store) {
             verify::<K>(&encoder, mark, store)?;
         }
     }
-    let mut settled: Vec<Slot<V, S>> = Vec::with_capacity(if caching { width } else { 0 });
-    for (key, slot) in node.keys.iter().zip(&node.slots) {
-        match slot {
-            Slot::Spilled(ptr, summary) => {
-                encoder.u8(1);
-                encoder.link(*ptr);
-                summary.encode(&mut encoder)?;
-                if caching {
-                    settled.push(Slot::Spilled(*ptr, summary.clone()));
-                }
-            }
-            Slot::Inline(value) | Slot::Fresh(value) => {
-                let mark = encoder.mark();
-                encoder.u8(0);
-                let body = encoder.mark();
-                value.encode(&mut encoder)?;
-                if let (Slot::Fresh(_), Some(store)) = (slot, &store) {
-                    verify::<V>(&encoder, body, store)?;
-                }
-                if encoder.since(mark) > SPILL_BYTES {
-                    encoder.rewind(mark);
-                    let ptr = encoder.child(|inner| value.encode(inner))?;
-                    let summary = S::of(key, value);
+    let mut spills: Vec<(usize, Slot<V, S>)> = Vec::new();
+    for (index, key) in node.keys.iter().enumerate() {
+        let value = match &node.cells {
+            Cells::Column(column) => &column[index],
+            Cells::Slots(slots) => match &slots[index] {
+                Slot::Spilled(ptr, summary) => {
                     encoder.u8(1);
-                    encoder.link(ptr);
+                    encoder.link(*ptr);
                     summary.encode(&mut encoder)?;
-                    if caching {
-                        settled.push(Slot::Spilled(ptr, summary));
-                    }
-                } else if caching {
-                    settled.push(Slot::Inline(value.clone()));
+                    continue;
                 }
+                Slot::Packed(column, position) => &column[*position as usize],
+                Slot::Fresh(value) => &**value,
+            },
+        };
+        let mark = encoder.mark();
+        encoder.u8(0);
+        let body = encoder.mark();
+        value.encode(&mut encoder)?;
+        if let (true, Some(store)) = (node.is_fresh(index), &store) {
+            verify::<V>(&encoder, body, store)?;
+        }
+        if encoder.since(mark) > SPILL_BYTES {
+            encoder.rewind(mark);
+            let ptr = encoder.child(|inner| value.encode(inner))?;
+            let summary = S::of(key, value);
+            encoder.u8(1);
+            encoder.link(ptr);
+            summary.encode(&mut encoder)?;
+            if caching {
+                spills.push((index, Slot::Spilled(ptr, summary)));
             }
         }
     }
@@ -747,8 +1014,8 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
         if branching {
             stored.push(flushed);
         }
-        if let Some(slot) = node.slots.get(position) {
-            total = fold(total, &slot.summary(&node.keys[position]));
+        if position < width {
+            total = fold(total, &node.entry_summary(position));
         }
     }
     let total = total.ok_or(Error::Detached)?;
@@ -765,7 +1032,7 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
         Some(_) => Some(Node {
             level: node.level,
             keys: node.keys.clone(),
-            slots: settled,
+            cells: node.cells.settled(spills),
             children: stored,
             count: node.count,
             origin: None,
@@ -871,12 +1138,12 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
             count -= 1;
             match edits.next().and_then(|edit| edit.value) {
                 Some(value) => {
-                    node.slots[position] = Slot::Fresh(value);
+                    node.cells.slots()[position] = Slot::Fresh(value);
                     position += 1;
                 }
                 None => {
                     node.keys.remove(position);
-                    node.slots.remove(position);
+                    node.cells.slots().remove(position);
                     if !node.children.is_empty() {
                         let right = node.children.remove(position + 1);
                         let left = node.children[position].take();
@@ -902,7 +1169,7 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
                 if node.children.is_empty() && before == 0 {
                     let edit = edits.next().ok_or(Error::Detached)?;
                     node.keys.insert(position, edit.key);
-                    node.slots.insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
+                    node.cells.slots().insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
                 } else {
                     let key = &pending[before].key;
                     let piece = node.children_mut()[position].take();
@@ -910,7 +1177,7 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
                     absorb(store, &mut low, edits, before)?;
                     let edit = edits.next().ok_or(Error::Detached)?;
                     node.keys.insert(position, edit.key);
-                    node.slots.insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
+                    node.cells.slots().insert(position, Slot::Fresh(edit.value.ok_or(Error::Detached)?));
                     node.children[position] = low;
                     node.children.insert(position + 1, high);
                 }
@@ -1037,7 +1304,7 @@ fn gather<K: Data, V: Data, S: Summary<K, V>>(
     }
     let mut total = gather(store, node.child(low), depth + 1, start, None, total)?;
     for index in low..high {
-        total = fold(total, &node.slots[index].summary(&node.keys[index]));
+        total = fold(total, &node.entry_summary(index));
         let last = if index + 1 == high { end } else { None };
         total = gather(store, node.child(index + 1), depth + 1, None, last, total)?;
     }
@@ -1130,19 +1397,19 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(None)
     }
 
-    pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Arc<V>>>
+    pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val<V>>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
         self.walk(|node| match node.search(key) {
-            Ok(index) => Visit::Done(read_slot(self.store(), &node.slots[index])),
+            Ok(index) => Visit::Done(node.value(self.store(), index)),
             Err(position) => Visit::Descend(position),
         })?
         .transpose()
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<Arc<V>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -1156,9 +1423,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Q: Ord + ?Sized,
     {
         let found = self.walk(|node| match node.search(key) {
-            Ok(index) => Visit::Done(match &node.slots[index] {
-                Slot::Spilled(ptr, _) => Ok(ptr.hash),
-                Slot::Inline(value) | Slot::Fresh(value) => try_hash_of(&**value),
+            Ok(index) => Visit::Done(match &node.cells {
+                Cells::Column(column) => try_hash_of(&column[index]),
+                Cells::Slots(slots) => match &slots[index] {
+                    Slot::Spilled(ptr, _) => Ok(ptr.hash),
+                    held => held.held().map_or(Err(Error::Detached), try_hash_of),
+                },
             }),
             Err(position) => Visit::Descend(position),
         });
@@ -1209,18 +1479,18 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<Arc<V>> {
+    pub fn insert(&mut self, key: K, value: V) -> Option<Val<V>> {
         self.insert_shared(key, Arc::new(value))
     }
 
-    pub(crate) fn insert_shared(&mut self, key: K, value: Arc<V>) -> Option<Arc<V>> {
+    pub(crate) fn insert_shared(&mut self, key: K, value: Arc<V>) -> Option<Val<V>> {
         let level = fatal(level_of(&key));
         let store = self.store.as_ref();
         let replaced = fatal(insert_at(store, &mut self.root, key, level, value));
         replaced.map(|slot| fatal(read_slot(store, &slot)))
     }
 
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<Arc<V>>
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -1233,27 +1503,27 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         removed.map(|slot| fatal(read_slot(store, &slot)))
     }
 
-    pub fn first(&self) -> Option<(K, Arc<V>)> {
+    pub fn first(&self) -> Option<(K, Val<V>)> {
         self.iter().next()
     }
 
-    pub fn last(&self) -> Option<(K, Arc<V>)> {
+    pub fn last(&self) -> Option<(K, Val<V>)> {
         self.iter().next_back()
     }
 
-    pub fn pop_first(&mut self) -> Option<(K, Arc<V>)> {
+    pub fn pop_first(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.first()?;
         self.remove(&key);
         Some((key, value))
     }
 
-    pub fn pop_last(&mut self) -> Option<(K, Arc<V>)> {
+    pub fn pop_last(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.last()?;
         self.remove(&key);
         Some((key, value))
     }
 
-    pub fn nth(&self, index: usize) -> Option<(K, Arc<V>)> {
+    pub fn nth(&self, index: usize) -> Option<(K, Val<V>)> {
         let mut remaining = index as u64;
         let found = self.walk(|node| {
             for position in 0..=node.keys.len() {
@@ -1264,7 +1534,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 remaining -= size;
                 if position < node.keys.len() {
                     if remaining == 0 {
-                        let value = read_slot(self.store(), &node.slots[position]);
+                        let value = node.value(self.store(), position);
                         return Visit::Done(Some((node.keys[position].clone(), value)));
                     }
                     remaining -= 1;
@@ -1275,44 +1545,22 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(found).flatten().map(|(key, value)| (key, fatal(value)))
     }
 
-    fn edge(
-        &self,
-        before: &impl Fn(&K) -> bool,
-        offset: isize,
-    ) -> Result<Edge<K, V, S>> {
-        let store = self.store();
-        let mut rank = 0u64;
-        let mut stack = Vec::new();
-        let mut depth = 0;
-        let mut current = resident(store, &self.root, depth)?;
-        while let Some(node) = current {
-            let position = node.keys.partition_point(|key| before(key));
-            rank += position as u64;
-            rank += node.children.iter().take(position).map(Link::count).sum::<u64>();
-            depth += 1;
-            current = resident(store, node.child(position), depth)?;
-            stack.push(Frame {
-                node,
-                position: 2 * position as isize + offset,
-            });
-        }
-        Ok((rank, stack))
-    }
-
     pub fn range_by(
         &self,
         below: impl Fn(&K) -> bool,
         within: impl Fn(&K) -> bool,
     ) -> Iter<K, V, S> {
         let build = || -> Result<Iter<K, V, S>> {
-            let (low, front) = self.edge(&below, 1)?;
-            let (high, back) = self.edge(&within, -1)?;
+            let store = self.store();
+            let mut front = Vec::new();
+            let mut back = Vec::new();
+            let low = edge(store, &self.root, 0, &below, 1, &mut front)?;
+            let high = edge(store, &self.root, 0, &within, -1, &mut back)?;
             Ok(Iter {
                 store: self.store.clone(),
                 front,
                 back,
                 remaining: high.saturating_sub(low),
-                warm: true,
             })
         };
         fatal(build())
@@ -1446,7 +1694,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             self.store = store;
             return;
         }
-        self.batch(other.iter().map(|(key, value)| (key, Some(value))).collect());
+        self.batch(other.iter().map(|(key, value)| (key, Some(value.into_arc()))).collect());
         other.clear();
     }
 
@@ -1629,7 +1877,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> FromIterator<(K, V)> for Map<K, V
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> IntoIterator for &Map<K, V, S> {
-    type Item = (K, Arc<V>);
+    type Item = (K, Val<V>);
     type IntoIter = Iter<K, V, S>;
 
     fn into_iter(self) -> Iter<K, V, S> {
@@ -1642,48 +1890,75 @@ struct Frame<K, V, S> {
     position: isize,
 }
 
-type Edge<K, V, S> = (u64, Vec<Frame<K, V, S>>);
+#[inline]
+fn step<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    path: &mut Vec<Frame<K, V, S>>,
+) -> Option<usize> {
+    loop {
+        let depth = path.len();
+        let frame = path.last_mut()?;
+        if frame.position > 2 * frame.node.keys.len() as isize {
+            path.pop();
+            continue;
+        }
+        let position = frame.position;
+        if position % 2 == 1 {
+            frame.position += if frame.node.children.is_empty() { 2 } else { 1 };
+            return Some((position / 2) as usize);
+        }
+        frame.position += 1;
+        let child = frame.node.child((position / 2) as usize);
+        if let Some(node) = fatal(resident(store, child, depth)) {
+            path.push(Frame { node, position: 0 });
+        }
+    }
+}
+
+fn edge<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &Link<K, V, S>,
+    mut depth: usize,
+    before: &impl Fn(&K) -> bool,
+    offset: isize,
+    path: &mut Vec<Frame<K, V, S>>,
+) -> Result<u64> {
+    let mut rank = 0u64;
+    let mut current = resident(store, link, depth)?;
+    while let Some(node) = current {
+        let position = node.keys.partition_point(|key| before(key));
+        rank += position as u64;
+        rank += node.children.iter().take(position).map(Link::count).sum::<u64>();
+        depth += 1;
+        current = resident(store, node.child(position), depth)?;
+        path.push(Frame {
+            node,
+            position: 2 * position as isize + offset,
+        });
+    }
+    Ok(rank)
+}
 
 pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
     front: Vec<Frame<K, V, S>>,
     back: Vec<Frame<K, V, S>>,
     remaining: u64,
-    warm: bool,
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
-    pub(crate) fn into_keys(mut self) -> Keys<K, V, S> {
-        self.warm = false;
+    pub(crate) fn into_keys(self) -> Keys<K, V, S> {
         Keys(self)
     }
 
+    #[inline]
     fn advance(&mut self) -> Option<usize> {
         if self.remaining == 0 {
             return None;
         }
-        loop {
-            let depth = self.front.len();
-            let frame = self.front.last_mut()?;
-            let limit = 2 * frame.node.keys.len() as isize;
-            if frame.position > limit {
-                self.front.pop();
-                continue;
-            }
-            let position = frame.position;
-            frame.position += 1;
-            if position % 2 == 1 {
-                self.remaining -= 1;
-                return Some((position / 2) as usize);
-            }
-            let child = frame.node.child((position / 2) as usize);
-            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
-                if self.warm {
-                    node.warm_values();
-                }
-                self.front.push(Frame { node, position: 0 });
-            }
-        }
+        let index = step(self.store.as_ref(), &mut self.front)?;
+        self.remaining -= 1;
+        Some(index)
     }
 
     fn retreat(&mut self) -> Option<usize> {
@@ -1698,34 +1973,32 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
                 continue;
             }
             let position = frame.position;
-            frame.position -= 1;
             if position % 2 == 1 {
+                frame.position -= if frame.node.children.is_empty() { 2 } else { 1 };
                 self.remaining -= 1;
                 return Some((position / 2) as usize);
             }
+            frame.position -= 1;
             let child = frame.node.child((position / 2) as usize);
             if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
-                if self.warm {
-                    node.warm_values();
-                }
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
             }
         }
     }
 
-    fn value_of(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<Arc<V>> {
-        frame.map(|frame| fatal(read_slot(self.store.as_ref(), &frame.node.slots[index])))
+    fn value_of(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<Val<V>> {
+        frame.map(|frame| fatal(frame.node.value(self.store.as_ref(), index)))
     }
 
-    fn pair(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<(K, Arc<V>)> {
+    fn pair(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<(K, Val<V>)> {
         let value = self.value_of(frame, index)?;
         frame.map(|frame| (frame.node.keys[index].clone(), value))
     }
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
-    type Item = (K, Arc<V>);
+    type Item = (K, Val<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.advance()?;
@@ -1773,9 +2046,9 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 pub struct Values<K, V, S = ()>(Iter<K, V, S>);
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
-    type Item = Arc<V>;
+    type Item = Val<V>;
 
-    fn next(&mut self) -> Option<Arc<V>> {
+    fn next(&mut self) -> Option<Val<V>> {
         let index = self.0.advance()?;
         self.0.value_of(self.0.front.last(), index)
     }
@@ -1786,7 +2059,7 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
 }
 
 impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Values<K, V, S> {
-    fn next_back(&mut self) -> Option<Arc<V>> {
+    fn next_back(&mut self) -> Option<Val<V>> {
         let index = self.0.retreat()?;
         self.0.value_of(self.0.back.last(), index)
     }
@@ -1796,9 +2069,9 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Values<K, V, S> {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Change<K, V> {
-    Added(K, Arc<V>),
-    Removed(K, Arc<V>),
-    Changed(K, Arc<V>, Arc<V>),
+    Added(K, Val<V>),
+    Removed(K, Val<V>),
+    Changed(K, Val<V>, Val<V>),
 }
 
 impl<K, V> Change<K, V> {
@@ -1808,14 +2081,14 @@ impl<K, V> Change<K, V> {
         }
     }
 
-    pub fn before(&self) -> Option<&Arc<V>> {
+    pub fn before(&self) -> Option<&Val<V>> {
         match self {
             Change::Added(..) => None,
             Change::Removed(_, value) | Change::Changed(_, value, _) => Some(value),
         }
     }
 
-    pub fn after(&self) -> Option<&Arc<V>> {
+    pub fn after(&self) -> Option<&Val<V>> {
         match self {
             Change::Removed(..) => None,
             Change::Added(_, value) | Change::Changed(_, _, value) => Some(value),
@@ -1826,16 +2099,16 @@ impl<K, V> Change<K, V> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conflict<K, V> {
     pub key: K,
-    pub base: Option<Arc<V>>,
-    pub ours: Option<Arc<V>>,
-    pub theirs: Option<Arc<V>>,
+    pub base: Option<Val<V>>,
+    pub ours: Option<Val<V>>,
+    pub theirs: Option<Val<V>>,
 }
 
 pub(crate) fn three_way<T, K, V, S>(
     target: &mut T,
     base: &Map<K, V, S>,
     theirs: &Map<K, V, S>,
-    read: impl Fn(&T, &K) -> Option<Arc<V>>,
+    read: impl Fn(&T, &K) -> Option<Val<V>>,
     mut write: impl FnMut(&mut T, K, Option<V>),
     mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
 ) -> usize
@@ -1904,10 +2177,7 @@ fn expand<K: Data + Ord, V: Data, S: Data>(
     for index in (0..=node.keys.len()).rev() {
         steps.push(Step::Sub(node.child(index).clone()));
         if index > 0 {
-            steps.push(Step::Entry(
-                node.keys[index - 1].clone(),
-                node.slots[index - 1].clone(),
-            ));
+            steps.push(Step::Entry(node.keys[index - 1].clone(), node.slot(index - 1)));
         }
     }
 }

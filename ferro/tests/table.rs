@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
+use ferro::Val;
 
 use common::{Rng, fast};
 use ferro::table::IndexIter;
@@ -144,7 +144,7 @@ fn within<V: Ord>(value: &V, low: &Bound<V>, high: &Bound<V>) -> bool {
     })
 }
 
-fn ids(iter: impl Iterator<Item = Arc<Row>>) -> Vec<(u32, Arc<Row>)> {
+fn ids(iter: impl Iterator<Item = Val<Row>>) -> Vec<(u32, Val<Row>)> {
     iter.map(|row| (row.id, row)).collect()
 }
 
@@ -175,10 +175,10 @@ fn check_index<V: Ord + Clone + Debug>(
     }
     assert_eq!(counts, expected_counts);
     for value in values {
-        let wanted: Vec<(u32, Arc<Row>)> = entries
+        let wanted: Vec<(u32, Val<Row>)> = entries
             .iter()
             .filter(|(v, _)| v == value)
-            .map(|(_, id)| (*id, Arc::new(model[id].clone())))
+            .map(|(_, id)| (*id, Val::new(model[id].clone())))
             .collect();
         let iter = eq(value);
         assert_eq!(iter.len(), wanted.len());
@@ -188,10 +188,10 @@ fn check_index<V: Ord + Clone + Debug>(
         assert_eq!(ids(eq(value).rev()), reversed);
     }
     for (low, high) in bounds(values) {
-        let wanted: Vec<(u32, Arc<Row>)> = entries
+        let wanted: Vec<(u32, Val<Row>)> = entries
             .iter()
             .filter(|(v, _)| within(v, &low, &high))
-            .map(|(_, id)| (*id, Arc::new(model[id].clone())))
+            .map(|(_, id)| (*id, Val::new(model[id].clone())))
             .collect();
         let iter = range((low.clone(), high.clone()));
         assert_eq!(iter.len(), wanted.len(), "{low:?} {high:?}");
