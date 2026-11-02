@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::Bound;
 
-use common::{Rng, cases, fast, roomy, text, uncached};
+use common::{Rng, cases, fast, quiet_ferro_panics, roomy, text, uncached};
 use ferro::admin::{self, Keep};
 use ferro::{Change, Data, Db, Map, Options, Summary};
 use proptest::prelude::*;
@@ -712,6 +712,48 @@ impl Summary<(u8, u32), i64> for Pair {
     fn combine(&self, other: &Self) -> Self {
         Pair(self.0 + other.0)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Data)]
+#[ferro(transparent)]
+struct Fragile(u64);
+
+impl Summary<u64, u64> for Fragile {
+    fn of(_key: &u64, value: &u64) -> Self {
+        assert!(*value != u64::MAX, "ferro: test summary refused a value");
+        Fragile(*value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Fragile(self.0 + other.0)
+    }
+}
+
+#[test]
+fn a_panicking_summary_discards_the_commit() {
+    quiet_ferro_panics();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.ferro");
+    let db = fast().open::<Map<u64, u64, Fragile>>(&path).unwrap();
+    db.update(|root| root.extend((0..1_000u64).map(|key| (key, 1)))).unwrap();
+    let version = db.version();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.update(|root| {
+            root.insert(5_000, u64::MAX);
+        })
+    }));
+    assert!(failed.is_err());
+    assert_eq!(db.version(), version);
+    assert_eq!(db.read().summary(), Some(Fragile(1_000)));
+    db.update(|root| {
+        root.insert(5_000, 7);
+    })
+    .unwrap();
+    assert_eq!(db.read().summary(), Some(Fragile(1_007)));
+    drop(db);
+    let db = fast().open::<Map<u64, u64, Fragile>>(&path).unwrap();
+    assert_eq!(db.read().summary(), Some(Fragile(1_007)));
+    db.verify().unwrap();
 }
 
 #[test]
