@@ -1,0 +1,12 @@
+[package]
+name = "ferro-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ferro-bench"
+path = "src/main.rs"
+
+[dependencies]
+ferro = { path = "../ferro" }
+tempfile = "3"

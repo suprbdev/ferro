@@ -332,6 +332,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-bench"
+version = "0.1.0"
+dependencies = [
+ "ferro",
+ "tempfile",
+]
+
+[[package]]
 name = "ferro-cli"
 version = "0.1.0"
 dependencies = [

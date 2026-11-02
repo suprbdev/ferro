@@ -199,7 +199,7 @@ cargo run --release -p tracker -- undo
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro/examples/perf.rs`. Each is a single run.
+`ferro-bench`. Each is a single run.
 
 | Operation | Result |
 | --- | --- |
