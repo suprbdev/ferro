@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::table::IndexIter;
-use ferro::{Db, Durability, Error, Map, Options, Result, Snapshot};
+use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim, Result, Snapshot};
 
 use crate::chunk::{Chunk, merge_points};
 use crate::model::{BUCKET_MS, Metrics, Rollup, SeriesKey, SeriesRec, SeriesRef, bucket_of};
@@ -18,6 +18,24 @@ pub struct Tsdb {
 impl Tsdb {
     pub fn open(path: impl AsRef<Path>, durability: Durability) -> Result<Tsdb> {
         let db = Options::new().durability(durability).open(path)?;
+        Ok(Tsdb { db })
+    }
+
+    pub fn open_retaining(
+        path: impl AsRef<Path>,
+        durability: Durability,
+        keep: Keep,
+        every_bytes: u64,
+    ) -> Result<Tsdb> {
+        let reclaim = Reclaim {
+            every_bytes,
+            ..Reclaim::default()
+        };
+        let db = Options::new()
+            .durability(durability)
+            .history(keep)
+            .reclaim(reclaim)
+            .open(path)?;
         Ok(Tsdb { db })
     }
 

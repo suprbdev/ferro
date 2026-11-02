@@ -617,24 +617,25 @@ fn load_reports_rate_and_latency() {
 }
 
 #[test]
-fn load_with_periodic_compaction_reports_stalls() {
+fn load_reclaims_while_writers_run() {
     let env = Env::new();
     let out = env.ok(&[
         "load",
-        "20000",
+        "200000",
         "3",
         "--series",
         "100",
         "--threads",
         "2",
         "--batch-ms",
-        "50",
-        "--compact-every",
+        "2",
+        "--reclaim-mb",
         "1",
         "--no-sync",
     ]);
-    assert!(out.contains("compaction at"), "{out}");
-    assert!(out.contains("writers stalled"), "{out}");
+    assert!(out.contains("reclaim: "), "{out}");
+    assert!(out.contains("longest writer pause"), "{out}");
+    assert!(!out.contains("reclaim: 0 cycles"), "{out}");
     env.ok(&["verify"]);
 }
 

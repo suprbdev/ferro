@@ -2,12 +2,12 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferro::admin::{self, Keep};
-use ferro::{Durability, Result};
+use ferro::{Durability, Keep, Result};
 
 use crate::model::{SeriesKey, SeriesRef, now_ms};
 use crate::tsdb::{Batch, Tsdb};
 
+const SIZE_SAMPLES: u32 = 20;
 const METRICS: [&str; 10] = [
     "http_requests_total",
     "cpu_seconds_total",
@@ -82,17 +82,9 @@ pub struct LoadOptions {
     pub batch: Duration,
     pub interval_ms: u64,
     pub start_ts: u64,
-    pub compact_every: Option<u64>,
     pub keep: Keep,
+    pub reclaim_bytes: u64,
     pub durability: Durability,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CompactionEvent {
-    pub at_secs: f64,
-    pub before_bytes: u64,
-    pub after_bytes: u64,
-    pub pause_secs: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,8 +94,11 @@ pub struct LoadReport {
     pub commits: u64,
     pub latencies_ms: Vec<f64>,
     pub file_bytes: u64,
+    pub log_bytes: u64,
+    pub live_bytes: u64,
     pub versions: usize,
-    pub compactions: Vec<CompactionEvent>,
+    pub cycles: u64,
+    pub longest_pause: Duration,
     pub size_samples: Vec<(f64, u64)>,
 }
 
@@ -117,66 +112,55 @@ impl LoadReport {
     }
 }
 
-fn run_epoch(
+fn write_load(
     tsdb: &Tsdb,
-    workers: &mut [Worker],
+    worker: &mut Worker,
     options: &LoadOptions,
-    run_start: Instant,
-    epoch_end: Instant,
-    latencies: &mut Vec<f64>,
-    commits: &mut u64,
-) -> Result<()> {
-    let per_thread_rate = options.rate as f64 / workers.len() as f64;
-    let results: Vec<Result<(Vec<f64>, u64)>> = thread::scope(|scope| {
-        let handles: Vec<_> = workers
-            .iter_mut()
-            .map(|worker| {
-                scope.spawn(move || -> Result<(Vec<f64>, u64)> {
-                    let mut writer = tsdb.writer();
-                    let mut lat = Vec::new();
-                    let mut count = 0u64;
-                    let mut next_tick = Instant::now();
-                    loop {
-                        let now = Instant::now();
-                        if now >= epoch_end {
-                            break;
-                        }
-                        if next_tick > now {
-                            thread::sleep(next_tick - now);
-                        }
-                        next_tick += options.batch;
-                        let elapsed = run_start.elapsed().as_secs_f64();
-                        let target = (per_thread_rate * elapsed) as u64;
-                        if target <= worker.emitted {
-                            continue;
-                        }
-                        let due = target - worker.emitted;
-                        let mut batch = Batch::default();
-                        for _ in 0..due {
-                            let scrape = worker.emitted / worker.keys.len() as u64;
-                            let (key, index) = worker.point();
-                            let ts = options.start_ts + scrape * options.interval_ms;
-                            batch.push(&key, ts, worker.values[index]);
-                        }
-                        let written = writer.write(batch)?;
-                        lat.push(written.commit.as_secs_f64() * 1000.0);
-                        count += 1;
-                    }
-                    Ok((lat, count))
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("load worker panicked"))
-            .collect()
-    });
-    for result in results {
-        let (lat, count) = result?;
-        latencies.extend(lat);
-        *commits += count;
+    per_thread_rate: f64,
+    start: Instant,
+    end: Instant,
+) -> Result<(Vec<f64>, u64)> {
+    let mut writer = tsdb.writer();
+    let mut latencies = Vec::new();
+    let mut commits = 0u64;
+    let mut next_tick = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        }
+        next_tick += options.batch;
+        let target = (per_thread_rate * start.elapsed().as_secs_f64()) as u64;
+        if target <= worker.emitted {
+            continue;
+        }
+        let due = target - worker.emitted;
+        let mut batch = Batch::default();
+        for _ in 0..due {
+            let scrape = worker.emitted / worker.keys.len() as u64;
+            let (key, index) = worker.point();
+            let ts = options.start_ts + scrape * options.interval_ms;
+            batch.push(&key, ts, worker.values[index]);
+        }
+        let written = writer.write(batch)?;
+        latencies.push(written.commit.as_secs_f64() * 1000.0);
+        commits += 1;
     }
-    Ok(())
+    Ok((latencies, commits))
+}
+
+fn sample_sizes(tsdb: &Tsdb, total: Duration, start: Instant) -> Vec<(f64, u64)> {
+    let pause = (total / SIZE_SAMPLES).max(Duration::from_millis(50));
+    let mut samples = Vec::new();
+    while start.elapsed() < total {
+        samples.push((start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
+        thread::sleep(pause.min(total.saturating_sub(start.elapsed())));
+    }
+    samples.push((start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
+    samples
 }
 
 pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
@@ -195,7 +179,10 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
         })
         .collect();
     let mut report = LoadReport::default();
-    let mut tsdb = Tsdb::open(path, options.durability)?;
+    let tsdb = match options.reclaim_bytes {
+        0 => Tsdb::open(path, options.durability)?,
+        bytes => Tsdb::open_retaining(path, options.durability, options.keep, bytes)?,
+    };
     {
         let mut writer = tsdb.writer();
         for worker in workers.iter_mut() {
@@ -208,58 +195,43 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
         }
     }
     let total = Duration::from_secs(options.seconds);
-    let mut run_start = Instant::now();
-    let wall_start = run_start;
+    let start = Instant::now();
+    let end = start + total;
     for worker in workers.iter_mut() {
         worker.emitted = worker.keys.len() as u64;
     }
     let initial: u64 = workers.iter().map(|w| w.emitted).sum();
-    loop {
-        let spent = run_start.elapsed();
-        if spent >= total {
-            break;
-        }
-        let epoch_len = match options.compact_every {
-            Some(secs) => Duration::from_secs(secs).min(total - spent),
-            None => total - spent,
-        };
-        let epoch_end = Instant::now() + epoch_len;
-        run_epoch(
-            &tsdb,
-            &mut workers,
-            options,
-            run_start,
-            epoch_end,
-            &mut report.latencies_ms,
-            &mut report.commits,
-        )?;
-        report
-            .size_samples
-            .push((wall_start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
-        let finished = run_start.elapsed() >= total;
-        if options.compact_every.is_some() && !finished {
-            let before = tsdb.db.size_on_disk();
-            let pause = Instant::now();
-            drop(tsdb);
-            let result = admin::compact(path, options.keep)?;
-            tsdb = Tsdb::open(path, options.durability)?;
-            let stall = pause.elapsed();
-            run_start += stall;
-            report.compactions.push(CompactionEvent {
-                at_secs: wall_start.elapsed().as_secs_f64(),
-                before_bytes: before,
-                after_bytes: result.after_bytes,
-                pause_secs: stall.as_secs_f64(),
-            });
-            report
-                .size_samples
-                .push((wall_start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
-        }
+    let per_thread_rate = options.rate as f64 / workers.len() as f64;
+    let (results, samples) = thread::scope(|scope| {
+        let sampler = scope.spawn(|| sample_sizes(&tsdb, total, start));
+        let handles: Vec<_> = workers
+            .iter_mut()
+            .map(|worker| {
+                let tsdb = &tsdb;
+                scope.spawn(move || write_load(tsdb, worker, options, per_thread_rate, start, end))
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("load worker panicked"))
+            .collect();
+        (results, sampler.join().expect("size sampler panicked"))
+    });
+    for result in results {
+        let (latencies, commits) = result?;
+        report.latencies_ms.extend(latencies);
+        report.commits += commits;
     }
-    report.wall_secs = wall_start.elapsed().as_secs_f64();
+    report.wall_secs = start.elapsed().as_secs_f64();
     report.points = workers.iter().map(|w| w.emitted).sum::<u64>() - initial;
     report.latencies_ms.sort_by(|a, b| a.total_cmp(b));
+    report.size_samples = samples;
+    let space = tsdb.db.space()?;
     report.file_bytes = tsdb.db.size_on_disk();
+    report.log_bytes = space.log_bytes;
+    report.live_bytes = space.live_bytes;
+    report.cycles = space.cycles;
+    report.longest_pause = space.longest_pause;
     report.versions = tsdb.db.log().len();
     Ok(report)
 }

@@ -285,7 +285,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             batch_ms,
             interval_ms,
             start_ts,
-            compact_every,
+            reclaim_mb,
             keep_versions,
             no_sync,
         } => {
@@ -301,8 +301,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
                 batch: Duration::from_millis(batch_ms.max(1)),
                 interval_ms,
                 start_ts,
-                compact_every,
                 keep: Keep::Last(keep_versions),
+                reclaim_bytes: reclaim_mb << 20,
                 durability: durability(no_sync),
             };
             let report = load::run(Path::new(path), &options)?;
@@ -329,16 +329,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
                 report.file_bytes as f64 / report.points.max(1) as f64,
                 report.versions
             )?;
-            for event in &report.compactions {
-                writeln!(
-                    out,
-                    "compaction at {:.1}s: {} -> {}, writers stalled {:.2}s",
-                    event.at_secs,
-                    human(event.before_bytes),
-                    human(event.after_bytes),
-                    event.pause_secs
-                )?;
-            }
+            writeln!(
+                out,
+                "reclaim: {} cycles, longest writer pause {:.2} ms, {} logged, about {} live",
+                report.cycles,
+                report.longest_pause.as_secs_f64() * 1000.0,
+                human(report.log_bytes),
+                human(report.live_bytes)
+            )?;
             for (at, bytes) in &report.size_samples {
                 writeln!(out, "size at {at:.1}s: {}", human(*bytes))?;
             }

@@ -93,8 +93,8 @@ pub enum Command {
         interval_ms: u64,
         #[arg(long)]
         start_ts: Option<u64>,
-        #[arg(long)]
-        compact_every: Option<u64>,
+        #[arg(long, default_value_t = 64)]
+        reclaim_mb: u64,
         #[arg(long, default_value_t = 1)]
         keep_versions: usize,
         #[arg(long)]
