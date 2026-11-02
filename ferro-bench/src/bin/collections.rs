@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
-use ferro::{Bytes, Data, Db, Durability, Map, Options};
+use ferro::codec::{Encoder, HashSink, Object};
+use ferro::{Bytes, Data, Db, Durability, List, Map, Options, Ptr};
 
 fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e3779b97f4a7c15);
@@ -210,6 +212,212 @@ fn bytes_bench(dir: &Path) {
     }
 }
 
+trait Seq: Data + Default {
+    type Item: Data;
+    fn fill(&mut self, items: Vec<Self::Item>);
+    fn push(&mut self, item: Self::Item);
+    fn fetch(&self, index: u64) -> Arc<Self::Item>;
+    fn scan(&self) -> u64;
+}
+
+impl<T: Data> Seq for List<T> {
+    type Item = T;
+
+    fn fill(&mut self, items: Vec<T>) {
+        self.extend(items);
+    }
+
+    fn push(&mut self, item: T) {
+        List::push(self, item);
+    }
+
+    fn fetch(&self, index: u64) -> Arc<T> {
+        self.get(index as usize).unwrap()
+    }
+
+    fn scan(&self) -> u64 {
+        self.iter().count() as u64
+    }
+}
+
+#[derive(Clone, Data)]
+struct Chunked<T: Data + Ord, const N: u64> {
+    len: u64,
+    chunks: Map<u64, Vec<Arc<T>>>,
+}
+
+impl<T: Data + Ord, const N: u64> Default for Chunked<T, N> {
+    fn default() -> Self {
+        Chunked {
+            len: 0,
+            chunks: Map::new(),
+        }
+    }
+}
+
+impl<T: Data + Ord, const N: u64> Seq for Chunked<T, N> {
+    type Item = T;
+
+    fn fill(&mut self, items: Vec<T>) {
+        self.len = items.len() as u64;
+        let mut groups: Vec<(u64, Vec<Arc<T>>)> = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            let chunk = index as u64 / N;
+            match groups.last_mut() {
+                Some(last) if last.0 == chunk => last.1.push(Arc::new(item)),
+                _ => groups.push((chunk, vec![Arc::new(item)])),
+            }
+        }
+        self.chunks.extend(groups);
+    }
+
+    fn push(&mut self, item: T) {
+        let chunk = self.len / N;
+        self.chunks.get_or_insert_with(chunk, Vec::new).push(Arc::new(item));
+        self.len += 1;
+    }
+
+    fn fetch(&self, index: u64) -> Arc<T> {
+        self.chunks.get(&(index / N)).unwrap()[(index % N) as usize].clone()
+    }
+
+    fn scan(&self) -> u64 {
+        self.chunks.values().map(|chunk| chunk.len() as u64).sum()
+    }
+}
+
+fn seq_bench<S: Seq>(dir: &Path, label: &str, n: u64, make: impl Fn(u64) -> S::Item) {
+    let path = dir.join("seq.ferro");
+    let _ = std::fs::remove_file(&path);
+    let db = open::<S>(dir, "seq.ferro");
+    let items: Vec<S::Item> = (0..n).map(&make).collect();
+    db.update(|root| root.fill(items)).unwrap();
+    let base = db.size_on_disk();
+    let pushes = 20_000u64;
+    let start = Instant::now();
+    for i in 0..pushes {
+        let item = make(n + i);
+        db.update(|root| root.push(item)).unwrap();
+    }
+    let push_ns = start.elapsed().as_secs_f64() * 1e9 / pushes as f64;
+    let per_push = (db.size_on_disk() - base) as f64 / pushes as f64;
+    let snapshot = db.read();
+    let start = Instant::now();
+    for i in 0..500_000u64 {
+        std::hint::black_box(snapshot.fetch(mix(i) % n));
+    }
+    let warm = start.elapsed().as_secs_f64() * 1e9 / 500_000.0;
+    let start = Instant::now();
+    let total = snapshot.scan();
+    let scan = start.elapsed().as_secs_f64() * 1e9 / total as f64;
+    drop(snapshot);
+    let size = db.size_on_disk();
+    drop(db);
+    let cold_db = Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(1 << 20)
+        .open::<S>(&path)
+        .unwrap();
+    let snapshot = cold_db.read();
+    let start = Instant::now();
+    for i in 0..100_000u64 {
+        std::hint::black_box(snapshot.fetch(mix(i) % n));
+    }
+    let cold = start.elapsed().as_secs_f64() * 1e9 / 100_000.0;
+    println!(
+        "{label:<22} n {n:>8}: {per_push:>7.0} bytes/push {push_ns:>7.0} ns/push, file {:>6.1} B/item, warm get {warm:>6.0} ns, cold get {cold:>6.0} ns, scan {scan:>5.0} ns/item",
+        size as f64 / n as f64
+    );
+}
+
+fn comment(i: u64) -> String {
+    let word = |x: u64| ["ferro", "commit", "merge", "branch", "index", "table", "scan", "flush"][x as usize % 8];
+    let seed = mix(i);
+    format!(
+        "user{} wrote about {} and {} near {} on {} {} {}",
+        seed % 5000,
+        word(seed >> 8),
+        word(seed >> 16),
+        word(seed >> 24),
+        word(seed >> 32),
+        word(seed >> 40),
+        seed % 1000,
+    )
+}
+
+fn trie_record(body: Vec<u8>, links: usize, seed: u64) -> usize {
+    let links: Vec<Ptr> = (0..links)
+        .map(|i| {
+            let mut hash = [0u8; 20];
+            hash[..8].copy_from_slice(&mix(seed ^ i as u64).to_le_bytes());
+            hash[8..16].copy_from_slice(&mix(seed + i as u64).to_le_bytes());
+            Ptr {
+                hash,
+                offset: 1 << 16,
+            }
+        })
+        .collect();
+    ferro::store::record_len(1 << 40, &Object { body, links })
+}
+
+fn trie_estimate(label: &str, n: u64, fanout: u64, make: impl Fn(u64) -> Vec<u8>) {
+    let mut total = 0usize;
+    let pushes = 20_000u64;
+    for i in 0..pushes {
+        let length = n + i + 1;
+        let held = (length - 1) % fanout + 1;
+        let mut body = Vec::new();
+        push(&mut body, held);
+        for item in length - held..length {
+            body.extend_from_slice(&make(item));
+        }
+        total += trie_record(body, 0, i);
+        let mut span = fanout;
+        while span < length {
+            let links = ((length - 1) / span) % fanout + 1;
+            let mut body = Vec::new();
+            push(&mut body, links);
+            total += trie_record(body, links as usize, i + span);
+            span *= fanout;
+        }
+    }
+    println!(
+        "{label:<22} n {n:>8}: {:>7.0} bytes/push before commit overhead",
+        total as f64 / pushes as f64
+    );
+}
+
+fn push(body: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        body.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    body.push(value as u8);
+}
+
+fn encoded<T: Data>(value: &T) -> Vec<u8> {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder).unwrap();
+    encoder.into_buf()
+}
+
+fn list_bench(dir: &Path) {
+    for n in [100_000u64, 1_000_000] {
+        seq_bench::<List<u64>>(dir, "List u64", n, |i| i);
+        seq_bench::<Chunked<u64, 16>>(dir, "Chunked16 u64", n, |i| i);
+        seq_bench::<Chunked<u64, 64>>(dir, "Chunked64 u64", n, |i| i);
+        seq_bench::<Chunked<u64, 256>>(dir, "Chunked256 u64", n, |i| i);
+        trie_estimate("Trie8 u64", n, 8, |i| encoded(&i));
+        trie_estimate("Trie32 u64", n, 32, |i| encoded(&i));
+        seq_bench::<List<String>>(dir, "List text", n, comment);
+        seq_bench::<Chunked<String, 16>>(dir, "Chunked16 text", n, comment);
+        seq_bench::<Chunked<String, 64>>(dir, "Chunked64 text", n, comment);
+        trie_estimate("Trie8 text", n, 8, |i| encoded(&comment(i)));
+        trie_estimate("Trie32 text", n, 32, |i| encoded(&comment(i)));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map_or("all", String::as_str);
@@ -220,10 +428,12 @@ fn main() {
         "range" => range_bench(dir.path(), n),
         "merge" => merge_bench(dir.path(), n),
         "bytes" => bytes_bench(dir.path()),
+        "list" => list_bench(dir.path()),
         _ => {
             range_bench(dir.path(), n);
             merge_bench(dir.path(), n);
             bytes_bench(dir.path());
+            list_bench(dir.path());
         }
     }
 }

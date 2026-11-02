@@ -163,6 +163,17 @@ most records. Measured and left out:
 - Cheaper cache keys. A hash prefix in place of ahash gained 1.4% with memos in place, since memo
   hits skip the cache. Keying by offset with a hash compare was no better than that prefix even
   before memos, because the cost was misses, not hashing.
+- A chunked or trie `List`. `List<T>` stays a `Map<u64, T>`, and a push rewrites the right spine with
+  the values held at each level: 1.6 KB for a `u64` and 3.2 KB for a 60 byte string at 1M items, or
+  1.3 and 2.5 KB at 100k. Chunks in a `Map<u64, Vec<T>>` did not win clearly. At 1M, 16 per chunk took
+  the string case to 2.4 KB but the `u64` case to 2.9 KB, and 64 per chunk to 5.9 KB, because a node
+  then holds several chunks just under the spill limit, while cold gets rose up to six times. A
+  vector trie of fanout 8 with values only in its leaves came to about 1.0 and 1.2 KB in a simulation
+  built from real record sizes, but at that fanout it has as many levels as the `Map`, so it reads no
+  faster, and fanout 32, which would, gave the bytes back at 2.0 and 2.5 KB. It helps one shape, a
+  long list appended to one item per commit, and costs a second tree beside `Map` with its own
+  nodes, flush, memos, diff and foreign store handling. Bulk appends already go down one edge in one
+  descent.
 - Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
   leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger
   than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
