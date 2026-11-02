@@ -35,13 +35,13 @@ thread_local! {
 }
 
 #[repr(C)]
-pub struct Timespec {
+struct Timespec {
     seconds: i64,
     nanos: i64,
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
+extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
     let symbol = unsafe { dlsym(RTLD_NEXT, c"clock_gettime".as_ptr()) };
     let real: extern "C" fn(c_int, *mut Timespec) -> c_int = unsafe { std::mem::transmute(symbol) };
     let code = real(clock, out);
