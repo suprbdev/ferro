@@ -776,47 +776,25 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         fatal(walk())
     }
 
-    fn rank_by(&self, before: &impl Fn(&K) -> bool) -> Result<u64> {
-        let mut total = 0u64;
-        let mut current = load(self.store(), &self.root)?;
-        while let Some(node) = current {
-            let position = node.keys.partition_point(|key| before(key));
-            total += position as u64;
-            total += node.children[..position]
-                .iter()
-                .map(Link::count)
-                .sum::<u64>();
-            current = load(self.store(), &node.children[position])?;
-        }
-        Ok(total)
-    }
-
-    fn front_stack(&self, before: &impl Fn(&K) -> bool) -> Result<Vec<Frame<K, V>>> {
+    fn edge(
+        &self,
+        before: &impl Fn(&K) -> bool,
+        offset: isize,
+    ) -> Result<(u64, Vec<Frame<K, V>>)> {
+        let mut rank = 0u64;
         let mut stack = Vec::new();
         let mut current = load(self.store(), &self.root)?;
         while let Some(node) = current {
             let position = node.keys.partition_point(|key| before(key));
+            rank += position as u64;
+            rank += node.children[..position].iter().map(Link::count).sum::<u64>();
             current = load(self.store(), &node.children[position])?;
             stack.push(Frame {
                 node,
-                position: 2 * position as isize + 1,
+                position: 2 * position as isize + offset,
             });
         }
-        Ok(stack)
-    }
-
-    fn back_stack(&self, before: &impl Fn(&K) -> bool) -> Result<Vec<Frame<K, V>>> {
-        let mut stack = Vec::new();
-        let mut current = load(self.store(), &self.root)?;
-        while let Some(node) = current {
-            let position = node.keys.partition_point(|key| before(key));
-            current = load(self.store(), &node.children[position])?;
-            stack.push(Frame {
-                node,
-                position: 2 * position as isize - 1,
-            });
-        }
-        Ok(stack)
+        Ok((rank, stack))
     }
 
     pub fn range_by(
@@ -825,12 +803,12 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         within: impl Fn(&K) -> bool,
     ) -> Iter<K, V> {
         let build = || -> Result<Iter<K, V>> {
-            let low = self.rank_by(&below)?;
-            let high = self.rank_by(&within)?;
+            let (low, front) = self.edge(&below, 1)?;
+            let (high, back) = self.edge(&within, -1)?;
             Ok(Iter {
                 store: self.store.clone(),
-                front: self.front_stack(&below)?,
-                back: self.back_stack(&within)?,
+                front,
+                back,
                 remaining: high.saturating_sub(low),
             })
         };
@@ -1057,7 +1035,7 @@ pub struct Iter<K, V> {
 }
 
 impl<K: Data + Ord, V: Data> Iter<K, V> {
-    fn advance(&mut self) -> Option<(Arc<Node<K, V>>, usize)> {
+    fn advance(&mut self) -> Option<usize> {
         if self.remaining == 0 {
             return None;
         }
@@ -1072,7 +1050,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             frame.position += 1;
             if position % 2 == 1 {
                 self.remaining -= 1;
-                return Some((frame.node.clone(), (position / 2) as usize));
+                return Some((position / 2) as usize);
             }
             let child = &frame.node.children[(position / 2) as usize];
             if let Some(node) = fatal(load(self.store.as_ref(), child)) {
@@ -1081,7 +1059,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
         }
     }
 
-    fn retreat(&mut self) -> Option<(Arc<Node<K, V>>, usize)> {
+    fn retreat(&mut self) -> Option<usize> {
         if self.remaining == 0 {
             return None;
         }
@@ -1095,7 +1073,7 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             frame.position -= 1;
             if position % 2 == 1 {
                 self.remaining -= 1;
-                return Some((frame.node.clone(), (position / 2) as usize));
+                return Some((position / 2) as usize);
             }
             let child = &frame.node.children[(position / 2) as usize];
             if let Some(node) = fatal(load(self.store.as_ref(), child)) {
@@ -1105,9 +1083,13 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
         }
     }
 
-    fn pair(&self, node: &Node<K, V>, index: usize) -> (K, Arc<V>) {
-        let value = fatal(read_slot(self.store.as_ref(), &node.slots[index]));
-        (node.keys[index].clone(), value)
+    fn value_of(&self, frame: Option<&Frame<K, V>>, index: usize) -> Option<Arc<V>> {
+        frame.map(|frame| fatal(read_slot(self.store.as_ref(), &frame.node.slots[index])))
+    }
+
+    fn pair(&self, frame: Option<&Frame<K, V>>, index: usize) -> Option<(K, Arc<V>)> {
+        let value = self.value_of(frame, index)?;
+        frame.map(|frame| (frame.node.keys[index].clone(), value))
     }
 }
 
@@ -1115,8 +1097,8 @@ impl<K: Data + Ord, V: Data> Iterator for Iter<K, V> {
     type Item = (K, Arc<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (node, index) = self.advance()?;
-        Some(self.pair(&node, index))
+        let index = self.advance()?;
+        self.pair(self.front.last(), index)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1126,8 +1108,8 @@ impl<K: Data + Ord, V: Data> Iterator for Iter<K, V> {
 
 impl<K: Data + Ord, V: Data> DoubleEndedIterator for Iter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let (node, index) = self.retreat()?;
-        Some(self.pair(&node, index))
+        let index = self.retreat()?;
+        self.pair(self.back.last(), index)
     }
 }
 
@@ -1139,8 +1121,8 @@ impl<K: Data + Ord, V: Data> Iterator for Keys<K, V> {
     type Item = K;
 
     fn next(&mut self) -> Option<K> {
-        let (node, index) = self.0.advance()?;
-        Some(node.keys[index].clone())
+        let index = self.0.advance()?;
+        self.0.front.last().map(|frame| frame.node.keys[index].clone())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1150,8 +1132,8 @@ impl<K: Data + Ord, V: Data> Iterator for Keys<K, V> {
 
 impl<K: Data + Ord, V: Data> DoubleEndedIterator for Keys<K, V> {
     fn next_back(&mut self) -> Option<K> {
-        let (node, index) = self.0.retreat()?;
-        Some(node.keys[index].clone())
+        let index = self.0.retreat()?;
+        self.0.back.last().map(|frame| frame.node.keys[index].clone())
     }
 }
 
@@ -1163,7 +1145,8 @@ impl<K: Data + Ord, V: Data> Iterator for Values<K, V> {
     type Item = Arc<V>;
 
     fn next(&mut self) -> Option<Arc<V>> {
-        self.0.next().map(|(_, value)| value)
+        let index = self.0.advance()?;
+        self.0.value_of(self.0.front.last(), index)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1173,7 +1156,8 @@ impl<K: Data + Ord, V: Data> Iterator for Values<K, V> {
 
 impl<K: Data + Ord, V: Data> DoubleEndedIterator for Values<K, V> {
     fn next_back(&mut self) -> Option<Arc<V>> {
-        self.0.next_back().map(|(_, value)| value)
+        let index = self.0.retreat()?;
+        self.0.value_of(self.0.back.last(), index)
     }
 }
 
