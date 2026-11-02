@@ -36,8 +36,6 @@ pub enum Error {
     Poisoned,
     #[error("object at offset {0} belongs to a pruned version and was reclaimed")]
     Pruned(u64),
-    #[error("this filesystem or platform cannot punch holes")]
-    Unsupported,
     #[error("reclamation was interrupted by shutdown")]
     Interrupted,
     #[error("object of {0} bytes exceeds the 4 GiB limit")]

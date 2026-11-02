@@ -647,16 +647,30 @@ fn offline_tools_work_after_online_cycles() {
 }
 
 #[test]
-fn a_filesystem_that_cannot_punch_still_keeps_everything_consistent() {
+fn a_cycle_on_an_empty_database_does_nothing() {
     let dir = dir();
-    let db: Db<Root> = options().open(path_in(&dir)).unwrap();
-    fill(&db, 100, 10);
-    let report = db.compact(Keep::Last(5)).unwrap();
-    assert!(report.objects > 0);
-    let empty_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let empty: Db<Root> = options().open(path_in(&empty_dir)).unwrap();
+    let empty: Db<Root> = options().open(path_in(&dir)).unwrap();
     let none = empty.compact(Keep::Last(1)).unwrap();
     assert_eq!(none.objects, 0);
+    assert_eq!(none.moved_bytes, 0);
+    assert_eq!(empty.version(), 0);
+}
+
+#[test]
+fn keep_within_prunes_by_age_at_each_cycle() {
+    let dir = dir();
+    let db: Db<Root> = options().open(path_in(&dir)).unwrap();
+    fill(&db, 50, 5);
+    thread::sleep(Duration::from_millis(60));
+    let boundary = db.version();
+    db.update(|root| {
+        root.insert(100, "new".into());
+    })
+    .unwrap();
+    db.compact(Keep::Within(Duration::from_millis(30))).unwrap();
+    assert_eq!(db.log().first().unwrap().0, boundary + 1);
+    assert_eq!(db.log().len(), 1);
+    assert!(matches!(db.as_of(1), Err(Error::NoVersion(_))));
 }
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
@@ -798,6 +812,8 @@ fn step() -> impl Strategy<Value = Step> {
 
 const BRANCHES: [&str; 3] = ["main", "one", "two"];
 
+type Held = (Snapshot<Root>, Vec<(u64, String)>);
+
 #[derive(Default, Clone)]
 struct BranchModel {
     versions: BTreeMap<u64, Vec<(u64, String)>>,
@@ -805,7 +821,7 @@ struct BranchModel {
 }
 
 fn body(key: u64, value: u64) -> String {
-    text(key * 31 + value, if key % 5 == 0 { 700 } else { 30 })
+    text(key * 31 + value, if key.is_multiple_of(5) { 700 } else { 30 })
 }
 
 fn check_all(main: &Db<Root>, models: &[Option<BranchModel>]) {
@@ -848,7 +864,7 @@ proptest! {
         let mut main = open(&path);
         let mut models: Vec<Option<BranchModel>> = vec![Some(BranchModel::default()), None, None];
         models[0].as_mut().unwrap().versions.insert(0, Vec::new());
-        let mut held: Vec<(Snapshot<Root>, Vec<(u64, String)>)> = Vec::new();
+        let mut held: Vec<Held> = Vec::new();
         for step in &steps {
             match step {
                 Step::Put(b, k, v) => {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
@@ -285,14 +285,17 @@ struct Shared<T> {
     reclaim: Reclaim,
     automatic: bool,
     hook: Option<Hook>,
-    cycle: Mutex<CycleLog>,
+    cycle: Mutex<()>,
+    log: Mutex<CycleLog>,
     pins: Mutex<Pins>,
+    plain: Arc<Commit>,
     signal: Arc<Signal>,
 }
 
 #[derive(Default)]
 struct CycleLog {
-    done: u64,
+    cycles: u64,
+    longest_pause: Duration,
     last_error: Option<String>,
 }
 
@@ -480,8 +483,10 @@ impl Options {
             reclaim: self.reclaim,
             automatic,
             hook: self.hook,
-            cycle: Mutex::new(CycleLog::default()),
+            cycle: Mutex::new(()),
+            log: Mutex::new(CycleLog::default()),
             pins: Mutex::new(Pins::default()),
+            plain: Arc::new(Commit::genesis()),
             signal: Arc::new(Signal::default()),
         });
         let branch = {
@@ -517,7 +522,7 @@ fn write_root<T: Data>(value: &T, txn: &mut Txn, store: &Store) -> Result<Ptr> {
     txn.put(object, hash)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -538,7 +543,7 @@ impl<T: Data> Shared<T> {
             return Ok(State {
                 snapshot: Snapshot {
                     value: self.genesis.clone(),
-                    commit: self.hold(Arc::new(Commit::genesis()), None),
+                    commit: self.hold(self.plain.clone(), None),
                 },
                 log: Chain::empty(),
             });
@@ -551,7 +556,7 @@ impl<T: Data> Shared<T> {
             .log
             .tip_entry(&self.store)?
             .map(|entry| entry.commit.clone())
-            .unwrap_or_else(|| Arc::new(Commit::genesis()));
+            .unwrap_or_else(|| self.plain.clone());
         Ok(State {
             snapshot: Snapshot {
                 value,
@@ -745,14 +750,24 @@ impl<T: Data> Shared<T> {
         if self.store.is_read_only() {
             return Err(Error::ReadOnly);
         }
-        let mut cycles = self.cycle.lock();
-        let outcome = self.cycle(keep, stop);
-        cycles.done += 1;
-        cycles.last_error = outcome.as_ref().err().map(ToString::to_string);
+        let _only = self.cycle.lock();
+        let outcome = self.run_cycle(keep, stop);
+        let mut log = self.log.lock();
+        log.cycles += 1;
+        match &outcome {
+            Ok(report) => {
+                log.longest_pause = log.longest_pause.max(report.pause);
+                log.last_error = None;
+            }
+            Err(Error::Interrupted) => {}
+            Err(error) => log.last_error = Some(error.to_string()),
+        }
+        drop(log);
+        self.signal.grown.store(self.store.written(), Ordering::Relaxed);
         outcome
     }
 
-    fn cycle(&self, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
+    fn run_cycle(&self, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
         let store = &self.store;
         let mut report = Compacted {
             before_bytes: store.allocated()?,
@@ -824,14 +839,9 @@ impl<T: Data> Shared<T> {
         report.objects = marks.objects();
         report.live_bytes = moved.live;
         self.step("published");
-        let punched = marks.punch(store);
-        self.step("punched");
-        self.signal.grown.store(end, Ordering::Relaxed);
         self.signal.threshold.store(moved.live, Ordering::Relaxed);
-        match punched {
-            Ok(_) | Err(Error::Unsupported) => {}
-            Err(error) => return Err(error),
-        }
+        report.punched_bytes = marks.punch(store)?;
+        self.step("punched");
         report.after_bytes = store.allocated()?;
         Ok(report)
     }
@@ -891,13 +901,14 @@ impl<T: Data> Db<T> {
             let survived = moved.live as f64 / moved.floor as f64;
             moved.live + (log_bytes.saturating_sub(moved.floor) as f64 * survived) as u64
         };
-        let cycles = self.shared.cycle.try_lock();
+        let log = self.shared.log.lock();
         Ok(Space {
             log_bytes,
             allocated_bytes: store.allocated()?,
             live_bytes,
-            cycles: cycles.as_ref().map_or(0, |log| log.done),
-            last_error: cycles.and_then(|log| log.last_error.clone()),
+            cycles: log.cycles,
+            longest_pause: log.longest_pause,
+            last_error: log.last_error.clone(),
         })
     }
 
@@ -943,7 +954,7 @@ impl<T: Data> Db<T> {
     fn pinned_chain(&self) -> (Chain, Arc<Held>) {
         loop {
             let chain = self.branch.state.load().log;
-            let pin = self.shared.hold(Arc::new(Commit::genesis()), Some(chain));
+            let pin = self.shared.hold(self.shared.plain.clone(), Some(chain));
             if self.branch.state.load().log.first <= chain.first {
                 return (chain, pin);
             }
@@ -1087,13 +1098,14 @@ impl<T: Data> Db<T> {
         if version == 0 {
             return Ok(Snapshot {
                 value: self.shared.genesis.clone(),
-                commit: self.shared.hold(Arc::new(Commit::genesis()), None),
+                commit: self.shared.hold(self.shared.plain.clone(), None),
             });
         }
         let chain = self.branch.state.load().log;
-        let entry = chain
-            .get(&self.shared.store, version)?
-            .ok_or(Error::NoVersion(version))?;
+        let entry = match chain.get(&self.shared.store, version) {
+            Err(Error::Pruned(_)) => return Err(Error::NoVersion(version)),
+            found => found?.ok_or(Error::NoVersion(version))?,
+        };
         self.snapshot_of(&entry.commit)
     }
 
@@ -1111,10 +1123,12 @@ impl<T: Data> Db<T> {
 
     pub fn as_of(&self, time_ms: u64) -> Result<Snapshot<T>> {
         let chain = self.branch.state.load().log;
-        match chain.at_time(&self.shared.store, time_ms)? {
-            Some(entry) => self.snapshot_of(&entry.commit),
-            None if chain.first > 1 => Err(Error::NoVersion(chain.first - 1)),
-            None => self.at(0),
+        match chain.at_time(&self.shared.store, time_ms) {
+            Ok(Some(entry)) => self.snapshot_of(&entry.commit),
+            Ok(None) if chain.first > 1 => Err(Error::NoVersion(chain.first - 1)),
+            Ok(None) => self.at(0),
+            Err(Error::Pruned(_)) => Err(Error::NoVersion(chain.first.saturating_sub(1))),
+            Err(error) => Err(error),
         }
     }
 
@@ -1221,7 +1235,10 @@ impl<T: Data> Db<T> {
                 high = middle - 1;
             }
         }
-        self.at(low)
+        self.at(low).map_err(|error| match error {
+            Error::NoVersion(_) => Error::NoCommonAncestor,
+            other => other,
+        })
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {

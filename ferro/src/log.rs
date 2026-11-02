@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
-use crate::db::{Commit, Held};
+use crate::db::{Commit, Held, now_ms};
 use crate::error::{Error, Result};
 use crate::store::Store;
 
@@ -159,6 +159,11 @@ impl Chain {
         }
     }
 
+    fn first_since(&self, store: &Store, time_ms: u64) -> Result<u64> {
+        let older = self.at_time(store, time_ms.saturating_sub(1))?;
+        Ok(older.map_or(self.first, |entry| entry.commit.version + 1))
+    }
+
     pub(crate) fn retained_skip(&self, entry: &Entry) -> Option<Ptr> {
         entry.skip.filter(|_| skip_version(entry.commit.version) >= self.first)
     }
@@ -170,10 +175,11 @@ impl Chain {
         let first = match keep {
             Keep::All => self.first,
             Keep::Last(count) => self.last.saturating_add(1).saturating_sub(count.max(1) as u64),
-            Keep::Since(time_ms) => match self.at_time(store, time_ms.saturating_sub(1))? {
-                Some(entry) => entry.commit.version + 1,
-                None => self.first,
-            },
+            Keep::Since(time_ms) => self.first_since(store, time_ms)?,
+            Keep::Within(age) => {
+                let age = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+                self.first_since(store, now_ms().saturating_sub(age))?
+            }
         };
         Ok(Chain {
             first: first.clamp(self.first, self.last),

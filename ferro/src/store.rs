@@ -2,7 +2,6 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -877,7 +876,9 @@ impl Store {
         let mut at = first;
         while at < last {
             let len = (last - at).min(PUNCH_CHUNK);
-            punch_hole(&self.inner.file, at, len)?;
+            if !punch_hole(&self.inner.file, at, len)? {
+                return Ok(at - first);
+            }
             self.inner.file.log(|| Op::Punch(at, len));
             at += len;
         }
@@ -935,24 +936,27 @@ impl Store {
                 ptr.offset
             )));
         }
-        let mut places = self.inner.places.load_full();
-        loop {
-            let found = match places.place(ptr.offset) {
-                Some(place) => self.read_at(ptr, place, self.inner.written.load(Ordering::Acquire)),
-                None => Err(Error::Pruned(ptr.offset)),
-            };
-            let stale = match &found {
-                Err(Error::Corrupt(_) | Error::Pruned(_)) => true,
-                Err(Error::Io(error)) => error.kind() == ErrorKind::UnexpectedEof,
-                _ => false,
-            };
-            if !stale {
-                return found;
+        let first = self.inner.places.load();
+        let found = self.read_placed(ptr, &first);
+        if !stale(&found) {
+            return found;
+        }
+        let mut places = arc_swap::Guard::into_inner(first);
+        let mut found = found;
+        while let Some(newer) = self.newer_places(&places)? {
+            places = newer;
+            found = self.read_placed(ptr, &places);
+            if !stale(&found) {
+                break;
             }
-            match self.newer_places(&places)? {
-                Some(newer) => places = newer,
-                None => return found,
-            }
+        }
+        found
+    }
+
+    fn read_placed(&self, ptr: Ptr, places: &Places) -> Result<(Object, u32)> {
+        match places.place(ptr.offset) {
+            Some(place) => self.read_at(ptr, place, self.inner.written.load(Ordering::Acquire)),
+            None => Err(Error::Pruned(ptr.offset)),
         }
     }
 
@@ -1149,6 +1153,14 @@ impl Sink for Txn {
     }
 }
 
+fn stale(found: &Result<(Object, u32)>) -> bool {
+    match found {
+        Err(Error::Corrupt(_) | Error::Pruned(_)) => true,
+        Err(Error::Io(error)) => error.kind() == ErrorKind::UnexpectedEof,
+        _ => false,
+    }
+}
+
 fn extend(file: &Traced, end: u64) -> std::io::Result<()> {
     if file.metadata()?.len() < end {
         file.set_len(end)?;
@@ -1191,22 +1203,24 @@ fn links_of(file: &File, at: u64, end: u64, each: &mut impl FnMut(Ptr)) -> Resul
 }
 
 #[cfg(target_os = "linux")]
-fn punch_hole(file: &File, at: u64, len: u64) -> Result<()> {
+fn punch_hole(file: &File, at: u64, len: u64) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
     let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
     let done = unsafe { libc::fallocate(file.as_raw_fd(), mode, at as libc::off_t, len as libc::off_t) };
     if done == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Err(Error::Unsupported),
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Ok(false),
         _ => Err(error.into()),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn punch_hole(_file: &File, _at: u64, _len: u64) -> Result<()> {
-    Err(Error::Unsupported)
+fn punch_hole(_file: &File, _at: u64, _len: u64) -> Result<bool> {
+    Ok(false)
 }
 
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {

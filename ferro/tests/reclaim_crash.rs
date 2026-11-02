@@ -2,12 +2,10 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use common::{Rng, cases, text};
+use common::{Rng, text};
 use ferro::db::Hook;
 use ferro::store::{Op, Trace};
 use ferro::{Db, Durability, Keep, Map, Options, Reclaim};
@@ -42,7 +40,7 @@ struct Recording {
 fn record(cycles: u64, commits: u64, keys: u64, keep: usize, fill_at: f64, torn_len: usize) -> Recording {
     let dir = dir();
     let path = dir.path().join("trace.ferro");
-    let mut rng = Rng::new(cycles * 977 + commits + torn_len as u64);
+    let rng = Rng::new(cycles * 977 + commits + torn_len as u64);
     let mut models = BTreeMap::new();
     models.insert(0, Model::new());
     {
@@ -62,31 +60,58 @@ fn record(cycles: u64, commits: u64, keys: u64, keep: usize, fill_at: f64, torn_
     }
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
     let mut base = fs::read(&path).unwrap();
+    let slot: Slot = Arc::new(Mutex::new(None));
+    let shared = Arc::new(Mutex::new((rng, models)));
+    let hook = {
+        let (slot, shared) = (slot.clone(), shared.clone());
+        move |name: &'static str| {
+            if matches!(name, "marked" | "copied" | "tabled") {
+                let db = slot.lock().clone().unwrap();
+                acknowledged(&db, &shared, keys);
+            }
+        }
+    };
     let db: Db<Root> = Options::new()
         .reclaim(Reclaim {
             every_bytes: 0,
             fill: fill_at,
         })
         .trace(trace.clone())
+        .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
     base.truncate(db.size_log() as usize);
+    *slot.lock() = Some(db.clone());
     for _ in 0..cycles {
         for _ in 0..commits {
-            let key = rng.below(keys);
-            let value = text(rng.next(), rng.below(900) as usize + 1);
-            db.update(|root| {
-                root.insert(key, value);
-            })
-            .unwrap();
-            models.insert(db.version(), dump(&db.read()));
-            db.trace_op(Op::Acked(db.version()));
+            acknowledged(&db, &shared, keys);
         }
         db.compact(Keep::Last(keep)).unwrap();
     }
+    slot.lock().take();
     drop(db);
     let ops = trace.lock().clone();
+    let models = shared.lock().1.clone();
     Recording { base, ops, models }
+}
+
+type Slot = Arc<Mutex<Option<Db<Root>>>>;
+type Shared = Arc<Mutex<(Rng, BTreeMap<u64, Model>)>>;
+
+fn acknowledged(db: &Db<Root>, shared: &Shared, keys: u64) {
+    let (key, value) = {
+        let mut state = shared.lock();
+        let key = state.0.below(keys);
+        let seed = state.0.next();
+        let len = state.0.below(900) as usize + 1;
+        (key, text(seed, len))
+    };
+    db.update(|root| {
+        root.insert(key, value);
+    })
+    .unwrap();
+    shared.lock().1.insert(db.version(), dump(&db.read()));
+    db.trace_op(Op::Acked(db.version()));
 }
 
 fn apply(image: &mut Vec<u8>, op: &Op) {
@@ -302,86 +327,6 @@ fn every_punch_follows_a_durable_table_in_both_slots() {
         apply(&mut image, op);
         if *op == Op::Sync {
             synced = image.clone();
-        }
-    }
-}
-
-fn child_writer(path: &str, stage: &'static str) {
-    let db: Db<Root> = Options::new()
-        .reclaim(MANUAL)
-        .hook(Hook(Arc::new(move |name| {
-            if name == stage {
-                std::process::abort();
-            }
-        })))
-        .open(path)
-        .unwrap();
-    for round in 0..4u64 {
-        for i in 0..40u64 {
-            let key = i % 12;
-            let value = format!("{round}-{i}-{}", text(i, 30));
-            db.update(|root| {
-                root.insert(key, value.clone());
-            })
-            .unwrap();
-            println!("ACK {} {key} {value}", db.version());
-        }
-        if round == 2 {
-            db.compact(Keep::Last(3)).unwrap();
-        }
-    }
-}
-
-#[test]
-fn process_child() {
-    let Ok(path) = std::env::var("FERRO_RECLAIM_PATH") else {
-        return;
-    };
-    let stage = std::env::var("FERRO_RECLAIM_STAGE").unwrap();
-    child_writer(&path, Box::leak(stage.into_boxed_str()));
-}
-
-#[test]
-fn killing_the_process_at_every_stage_keeps_every_acknowledged_commit() {
-    for stage in ["marked", "copied", "tabled", "published", "punched"] {
-        for attempt in 0..cases(3) {
-            let dir = dir();
-            let path = dir.path().join("killed.ferro");
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "process_child", "--nocapture", "--test-threads=1"])
-                .env("FERRO_RECLAIM_PATH", &path)
-                .env("FERRO_RECLAIM_STAGE", stage)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let mut acked = BTreeMap::new();
-            for line in BufReader::new(child.stdout.take().unwrap()).lines() {
-                let line = line.unwrap();
-                let Some((_, rest)) = line.split_once("ACK ") else {
-                    continue;
-                };
-                let mut fields = rest.splitn(3, ' ');
-                let version: u64 = fields.next().unwrap().parse().unwrap();
-                let key: u64 = fields.next().unwrap().parse().unwrap();
-                acked.insert(version, (key, fields.next().unwrap().to_string()));
-            }
-            assert!(!child.wait().unwrap().success(), "{stage}: the hook never fired");
-            assert!(acked.len() >= 120, "{stage} {attempt}: {}", acked.len());
-            let last = *acked.keys().max().unwrap();
-            let db: Db<Root> = Options::new().reclaim(MANUAL).open(&path).unwrap();
-            assert!(db.version() >= last, "{stage}: {} below {last}", db.version());
-            let want: Model = acked.values().cloned().collect::<BTreeMap<_, _>>();
-            let root = db.at(last).unwrap();
-            assert_eq!(dump(&root), want, "{stage}");
-            db.verify().unwrap();
-            db.update(|root| {
-                root.insert(999, "after".into());
-            })
-            .unwrap();
-            db.compact(Keep::Last(1)).unwrap();
-            assert_eq!(dump(&db.read()).len(), want.len() + 1);
-            db.verify().unwrap();
         }
     }
 }

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::{Commit, Refs};
@@ -12,6 +13,7 @@ use crate::reclaim::Roots;
 use crate::store::{LOG_START, Store, StoreOptions, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;
+const VERIFY_RETRIES: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Keep {
@@ -19,6 +21,7 @@ pub enum Keep {
     All,
     Last(usize),
     Since(u64),
+    Within(Duration),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,10 +95,16 @@ pub fn log(path: impl AsRef<Path>, branch: &str, limit: usize) -> Result<Vec<Com
 }
 
 pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
-    let (store, head) = read_only(path.as_ref())?;
-    let report = verified(&store, head)?;
-    store.close();
-    Ok(report)
+    let mut last = Err(Error::Pruned(0));
+    for _ in 0..VERIFY_RETRIES {
+        let (store, head) = read_only(path.as_ref())?;
+        last = verified(&store, head);
+        store.close();
+        if !matches!(last, Err(Error::Pruned(_))) {
+            break;
+        }
+    }
+    last
 }
 
 pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {

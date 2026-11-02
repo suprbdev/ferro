@@ -33,6 +33,7 @@ pub struct Compacted {
     pub commits_dropped: u64,
     pub live_bytes: u64,
     pub moved_bytes: u64,
+    pub punched_bytes: u64,
     pub pause: Duration,
 }
 
@@ -42,6 +43,7 @@ pub struct Space {
     pub allocated_bytes: u64,
     pub live_bytes: u64,
     pub cycles: u64,
+    pub longest_pause: Duration,
     pub last_error: Option<String>,
 }
 
