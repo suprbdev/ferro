@@ -178,12 +178,6 @@ pub fn audit(db: &Db<Ledger>, samples: usize) -> Result<AuditReport> {
                 format_amount(sum, &account.currency)
             ));
         }
-        if ledger.names.get(account.name.as_str()).map(|id| *id) != Some(account.id) {
-            problems.push(format!("name index disagrees for account {}", account.name));
-        }
-    }
-    if ledger.names.len() != ledger.accounts.len() {
-        problems.push("name index and account table differ in size".to_string());
     }
     if ledger.next_entry != last_id || ledger.next_entry != entries {
         problems.push(format!(

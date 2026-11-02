@@ -52,7 +52,7 @@ impl<'a> Tx<'a> {
     }
 
     pub fn by_slug(&self, slug: &str) -> Option<Arc<Page>> {
-        self.w.slugs.get(slug).and_then(|id| self.w.pages.get(&id))
+        self.w.pages.by_slug(slug)
     }
 
     pub fn allocate(&mut self) -> u64 {
@@ -91,13 +91,6 @@ impl<'a> Tx<'a> {
             let after = analyze(&new);
             self.record(new.id, before, Some(after));
         }
-        if let Some(old) = &old
-            && old.slug != new.slug
-            && self.w.slugs.get(&old.slug).as_deref() == Some(&new.id)
-        {
-            self.w.slugs.remove(&old.slug);
-        }
-        self.w.slugs.insert(new.slug.clone(), new.id);
         self.w.pages.insert(new);
         old
     }
@@ -106,9 +99,6 @@ impl<'a> Tx<'a> {
         let old = self.page(id)?;
         let before = analyze(&old);
         self.record(id, Some(before), None);
-        if self.w.slugs.get(&old.slug).as_deref() == Some(&id) {
-            self.w.slugs.remove(&old.slug);
-        }
         self.w.pages.remove(&id);
         Some(old)
     }

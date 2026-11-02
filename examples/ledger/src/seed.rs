@@ -173,7 +173,7 @@ fn make_entry(rng: &mut Rng, date: i32) -> NewEntry {
 }
 
 fn setup(ledger: &mut Ledger, date: i32, now: u64) -> Result<()> {
-    if ledger.names.contains_key("assets:cash") {
+    if ledger.accounts.key_by_name("assets:cash").is_some() {
         return Ok(());
     }
     for (name, kind) in USD {

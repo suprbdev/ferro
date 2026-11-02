@@ -85,14 +85,13 @@ fn normalized(points: &[(u64, f64)]) -> Vec<(u64, f64)> {
 }
 
 fn register(m: &mut Metrics, key: &SeriesKey) -> u64 {
-    let canonical = key.canonical();
-    if let Some(id) = m.by_key.get(&canonical) {
-        return *id;
+    let series = (key.metric.clone(), key.labels.clone());
+    if let Some(id) = m.series.key_by_metric_labels(&series) {
+        return id;
     }
     m.next_id += 1;
     let id = m.next_id;
     m.series.insert(SeriesRec::new(id, key));
-    m.by_key.insert(canonical, id);
     id
 }
 
@@ -807,18 +806,6 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
         ..Verification::default()
     };
     let m = db.read();
-    if m.series.len() != m.by_key.len() {
-        report.problems.push(format!(
-            "series table has {} rows but key index has {}",
-            m.series.len(),
-            m.by_key.len()
-        ));
-    }
-    for rec in m.series.iter() {
-        if m.by_key.get(&rec.key().canonical()).as_deref() != Some(&rec.id) {
-            report.problems.push(format!("series {} missing from key index", rec.id));
-        }
-    }
     for (bucket, part) in m.chunks.iter() {
         for (sid, chunk) in part.iter() {
             report.chunks += 1;

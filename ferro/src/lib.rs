@@ -20,4 +20,4 @@ pub use log::Log;
 pub use map::{Change, Conflict, Map};
 pub use set::Set;
 pub use store::Durability;
-pub use table::{Record, RowMut, Table, TableData};
+pub use table::{Record, RowMut, Table, TableData, Taken};

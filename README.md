@@ -108,6 +108,12 @@ batch of puts and deletes and merges it in one descent of the tree, as `extend` 
 also gets `by_field_some(&value)`, and `#[index(each)]` indexes every element of a collection
 field.
 
+`#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
+`by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
+index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,
+`update` and `get_mut` have no error channel, so they panic, which discards the transaction.
+`Table::merge` passes a clash to your `resolve` closure.
+
 ## History, diffs and branches
 
 ```rust

@@ -14,10 +14,31 @@ pub trait Record: Data {
     fn key(&self) -> Self::Key;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Taken<K> {
+    pub index: &'static str,
+    pub holder: K,
+}
+
+impl<K: fmt::Debug> fmt::Display for Taken<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unique index {} already holds this value for {:?}", self.index, self.holder)
+    }
+}
+
+impl<K: fmt::Debug> std::error::Error for Taken<K> {}
+
 pub trait TableData<T: Record>: Data + Default {
     fn rows(&self) -> &Map<T::Key, T>;
     fn rows_mut(&mut self) -> &mut Map<T::Key, T>;
     fn reindex(&mut self, old: Option<&T>, new: Option<&T>);
+    fn conflict(&self, _row: &T, _moving: Option<&T::Key>) -> Option<Taken<T::Key>> {
+        None
+    }
+}
+
+fn clash<K>(taken: Taken<K>) -> ! {
+    panic!("ferro: unique index {} already holds this value", taken.index)
 }
 
 pub struct Table<T: Record>(T::Table);
@@ -93,11 +114,35 @@ impl<T: Record> Table<T> {
     }
 
     pub fn insert(&mut self, row: T) -> Option<Arc<T>> {
+        self.try_insert(row).unwrap_or_else(|taken| clash(taken))
+    }
+
+    pub fn try_insert(&mut self, row: T) -> std::result::Result<Option<Arc<T>>, Taken<T::Key>> {
+        if let Some(taken) = self.0.conflict(&row, None) {
+            return Err(taken);
+        }
+        Ok(self.put(row))
+    }
+
+    fn put(&mut self, row: T) -> Option<Arc<T>> {
         let key = row.key();
         let row = Arc::new(row);
         let old = self.0.rows_mut().insert_shared(key, row.clone());
         self.0.reindex(old.as_deref(), Some(&row));
         old
+    }
+
+    fn replace(&mut self, old: &T, row: T) {
+        let old_key = old.key();
+        let new_key = row.key();
+        if old_key == new_key {
+            self.0.reindex(Some(old), Some(&row));
+            self.0.rows_mut().insert(new_key, row);
+        } else {
+            self.0.rows_mut().remove(&old_key);
+            self.0.reindex(Some(old), None);
+            self.put(row);
+        }
     }
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<Arc<T>>
@@ -138,6 +183,27 @@ impl<T: Record> Table<T> {
         }
     }
 
+    pub fn try_update<Q>(
+        &mut self,
+        key: &Q,
+        f: impl FnOnce(&mut T),
+    ) -> std::result::Result<bool, Taken<T::Key>>
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let Some(old) = self.0.rows().get(key) else {
+            return Ok(false);
+        };
+        let mut row = (*old).clone();
+        f(&mut row);
+        if let Some(taken) = self.0.conflict(&row, Some(&old.key())) {
+            return Err(taken);
+        }
+        self.replace(&old, row);
+        Ok(true)
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let doomed: Vec<T::Key> = self
             .0
@@ -175,26 +241,61 @@ impl<T: Record> Table<T> {
         &mut self,
         base: &Table<T>,
         theirs: &Table<T>,
-        resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
+        mut resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
     ) -> usize
     where
         T: PartialEq,
     {
-        three_way(
+        let mut clashes: Vec<(T::Key, T)> = Vec::new();
+        let written = three_way(
             self,
             base.0.rows(),
             theirs.0.rows(),
             |table, key| table.get(key),
             |table, key, value| match value {
+                Some(row) if table.0.conflict(&row, None).is_some() => clashes.push((key, row)),
                 Some(row) => {
-                    table.insert(row);
+                    table.put(row);
                 }
                 None => {
                     table.remove(&key);
                 }
             },
-            resolve,
-        )
+            &mut resolve,
+        );
+        let mut settling = true;
+        while settling {
+            settling = false;
+            for (key, row) in std::mem::take(&mut clashes) {
+                if self.0.conflict(&row, None).is_some() {
+                    clashes.push((key, row));
+                } else {
+                    self.put(row);
+                    settling = true;
+                }
+            }
+        }
+        for (key, row) in clashes {
+            let holder = self
+                .0
+                .conflict(&row, None)
+                .and_then(|taken| self.get(&taken.holder));
+            let resolved = resolve(Conflict {
+                key: key.clone(),
+                base: base.get(&key),
+                ours: holder,
+                theirs: Some(Arc::new(row)),
+            });
+            match resolved {
+                Some(row) => {
+                    self.insert(row);
+                }
+                None => {
+                    self.remove(&key);
+                }
+            }
+        }
+        written
     }
 }
 
@@ -223,15 +324,10 @@ impl<T: Record> Drop for RowMut<'_, T> {
         let Some(row) = self.row.take() else {
             return;
         };
-        let old_key = self.old.key();
-        let new_key = row.key();
-        if old_key == new_key {
-            self.table.0.reindex(Some(&self.old), Some(&row));
-            self.table.0.rows_mut().insert(new_key, row);
-        } else {
-            self.table.0.rows_mut().remove(&old_key);
-            self.table.0.reindex(Some(&self.old), None);
-            self.table.insert(row);
+        match self.table.0.conflict(&row, Some(&self.old.key())) {
+            None => self.table.replace(&self.old, row),
+            Some(_) if std::thread::panicking() => {}
+            Some(taken) => clash(taken),
         }
     }
 }
@@ -322,6 +418,15 @@ impl<T: Record> DoubleEndedIterator for IndexIter<T> {
 }
 
 impl<T: Record> ExactSizeIterator for IndexIter<T> {}
+
+pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Arc<T>>
+where
+    I: Data + Ord + Borrow<Q>,
+    T: Record,
+    Q: Ord + ?Sized,
+{
+    rows.get(&*index.get(value)?)
+}
 
 pub fn index_eq<I, T, Q>(
     rows: &Map<T::Key, T>,
