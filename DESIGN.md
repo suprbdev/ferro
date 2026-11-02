@@ -435,17 +435,23 @@ is larger, so the copying stays proportional to what was written.
 2. Copy, with no lock. Walk the published refs and write each reachable object to
    `<file>.compacting`, re-emitting links with new offsets, verifying each object's hash and
    compressing again. Chain entries are copied like anything else, but a link past `first` is written
-   as a tombstone instead of being followed. Copies are keyed by hash, so a later pass from newer refs
+   with offset 0 instead of being followed. Copies are keyed by hash, so a later pass from newer refs
    visits only what is new. Data is immutable, so no write barrier is needed. Passes repeat, up to
    six, until one copies less than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.
 4. Swap, under the `tip` mutex. This is the only pause. Wait for queued commits, copy what is left,
-   write both superblock slots and sync. Open the new file, which takes its writer lock, rename it
-   over the old one, sync the directory, and rebind every branch.
+   write both superblock slots and sync. Open the new file, which takes its writer lock, and read
+   every branch's tip and root from it. Rename it over the old one, sync the directory, and rebind
+   every branch.
 5. Retire, with no lock. Clear the old generation's cache. Its file goes when the last handle does.
 
 The new file continues the frame sequence, so group commit tickets stay in order. It has no frames
 yet, only records and a superblock naming them, the same shape offline compaction produces.
+
+An entry's hash covers its version, time, message, root and links, so a branch can make a commit
+identical to one pruned from another branch, in the same millisecond or when the clock has stepped
+back. Pruned hashes are therefore kept apart from copied ones and drop out of the set when a chain
+retains that hash again, and a link already at offset 0 is never followed.
 
 ### Generations
 
@@ -474,6 +480,11 @@ time proportional to the map's size, under the `tip` mutex, so `restore` of a sn
 cycle stalls writers for that long. Stale maps are the only way to reach it: the working copy in a
 commit closure comes from the rebound tip.
 
+`Ptr` and `Commit` are `Data` too, so a program can put one in its root. Those carry no store to
+compare, so encoding a `Ptr` reads the object it names, unless the same commit wrote it, and fails
+with `Error::StalePointer` if it is not there. A pointer read back from the current generation is
+fine, because the copy rewrote it. One held in memory across a cycle is refused.
+
 A read-only handle keeps its view, in the old file if need be, and `refresh` notices that the path
 names a new inode, opens it, and rebinds. Its watchers fire only if the version moved. A process that
 never refreshes never fails, and holds the old file open instead.
@@ -482,13 +493,17 @@ never refreshes never fails, and holds the old file open instead.
 
 Until the rename is durable, the name points at the old file, which is complete and has every
 acknowledged commit, and a writer's open removes the temp file. The new file is synced before the
-rename, so once the name points at it, it is complete. Writers stay paused until the directory sync
-returns, so no commit is acknowledged in a file whose name could roll back. If that sync fails the
-store poisons, because the new file may or may not be the one found after a crash. Both slots are
-written so that one damaged sector cannot lose a new generation with no commits yet.
+rename, so once the name points at it, it is complete. Reading each branch's tip and root from it
+first means a bug in the copy fails the cycle while the old file still has the name. Writers stay
+paused until the directory sync returns, so no commit is acknowledged in a file whose name could roll
+back. If that sync fails the store poisons, because the new file may or may not be the one found
+after a crash. Both slots are written so that one damaged sector cannot lose a new generation with no
+commits yet.
 
 A failed copy, a full disk or a failed rename removes the temp file and reports the error from
-`Db::compact` or in `Space::last_error`, and commits never notice.
+`Db::compact` or in `Space::last_error`, and commits never notice. A store poisoned while a cycle
+copied stays poisoned, because the swap checks first. The new file takes the old one's mode and owner,
+and a path through a symlink stays a symlink.
 
 ### Measurements
 
@@ -552,6 +567,11 @@ A cycle reads, verifies, recompresses and writes everything retained, in one thr
 so a 10 GB database takes minutes and needs 10 GB free. The trigger keeps that to one extra byte
 copied per byte written, at worst. `Keep::All` copies all of history, so `history` is what makes
 background cycles worthwhile. The copy holds a map from hash to offset, about 50 bytes per object.
+
+The pause copies what the last pass left, so it depends on how much reachable data changed in that
+pass, not on the size of the database. Writers that outrun the copier for all six passes make the
+pause longer. That did not happen in any run here, at up to 19,000 commits a second, but nothing
+bounds it.
 
 `Space::live_bytes` is an estimate: the size of this generation when it began, plus the bytes since
 then scaled by the share that survived the last cycle. Before the first cycle it is the file size.
