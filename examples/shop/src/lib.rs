@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferro::{Db, Durability, Options};
+use ferro::{Db, Durability, Keep, Options, Reclaim};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
@@ -23,6 +23,8 @@ pub struct Config {
     pub durability: Durability,
     pub refresh_ms: u64,
     pub feed_capacity: usize,
+    pub keep_versions: Option<usize>,
+    pub reclaim_bytes: u64,
 }
 
 impl Default for Config {
@@ -34,16 +36,21 @@ impl Default for Config {
             durability: Durability::Fsync,
             refresh_ms: 5,
             feed_capacity: 1024,
+            keep_versions: None,
+            reclaim_bytes: Reclaim::default().every_bytes,
         }
     }
 }
 
 pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
     let options = Options::new().durability(config.durability);
-    let options = if config.replica {
-        options.read_only()
-    } else {
-        options
+    let options = match config.keep_versions {
+        _ if config.replica => options.read_only(),
+        Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {
+            every_bytes: config.reclaim_bytes,
+            ..Reclaim::default()
+        }),
+        None => options,
     };
     options.open::<Shop>(path)
 }

@@ -688,6 +688,72 @@ async fn slow_event_consumer_does_not_stall_writers_and_catches_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_reclaims_under_load_and_the_replica_keeps_following() {
+    let dir = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("shop.ferro");
+    let config = Config {
+        durability: Durability::Buffered,
+        keep_versions: Some(20),
+        reclaim_bytes: 256 << 10,
+        ..Config::default()
+    };
+    let primary = Server::start(&path, config).await;
+    let mut writer = primary.client().await;
+    let item = make_product(&mut writer, "Item", "books", 100, 100_000).await;
+    let replica = Server::start(
+        &path,
+        Config {
+            replica: true,
+            refresh_ms: 2,
+            ..Config::default()
+        },
+    )
+    .await;
+    let mut reader = replica.client().await;
+    let bulk = "x".repeat(8 * 1024);
+    let mut sold = 0;
+    let mut cycles = 0;
+    for round in 0..3000 {
+        let response = writer
+            .json(
+                "PATCH",
+                &format!("/products/{item}"),
+                &json!({"stock_delta": -1, "name": format!("{round}{bulk}")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        sold += 1;
+        if round % 100 == 99 {
+            cycles = writer.get("/admin/stats").await.unwrap().json()["reclaim_cycles"]
+                .as_u64()
+                .unwrap();
+            if cycles >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(cycles >= 2, "only {cycles} cycles");
+    let stats = writer.get("/admin/stats").await.unwrap().json();
+    assert!(
+        stats["db_bytes"].as_u64().unwrap() < stats["db_log_bytes"].as_u64().unwrap(),
+        "{stats}"
+    );
+    assert_eq!(stock_of(&mut writer, item).await, 100_000 - sold);
+    let mut seen = 0;
+    for _ in 0..200 {
+        seen = stock_of(&mut reader, item).await;
+        if seen == 100_000 - sold {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(seen, 100_000 - sold);
+    replica.shutdown().await;
+    primary.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replica_serves_reads_follows_primary_and_refuses_writes() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("shop.ferro");

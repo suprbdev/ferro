@@ -9,7 +9,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: shop --db PATH [--addr HOST:PORT] [--replica] [--reads inline|blocking] \
          [--writes inline|blocking|pool:N] [--durability fsync|buffered] [--refresh-ms N] \
-         [--workers N]"
+         [--workers N] [--keep-versions N] [--reclaim-mb N]"
     );
     std::process::exit(2)
 }
@@ -29,6 +29,12 @@ fn main() {
             "--reads" => config.reads = value().parse().unwrap_or_else(|_| usage()),
             "--writes" => config.writes = value().parse().unwrap_or_else(|_| usage()),
             "--refresh-ms" => config.refresh_ms = value().parse().unwrap_or_else(|_| usage()),
+            "--keep-versions" => {
+                config.keep_versions = Some(value().parse().unwrap_or_else(|_| usage()));
+            }
+            "--reclaim-mb" => {
+                config.reclaim_bytes = value().parse::<u64>().unwrap_or_else(|_| usage()) << 20;
+            }
             "--workers" => workers = Some(value().parse::<usize>().unwrap_or_else(|_| usage())),
             "--durability" => {
                 config.durability = match value().as_str() {

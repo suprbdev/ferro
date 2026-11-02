@@ -406,6 +406,7 @@ async fn health(State(app): State<Shared>, snap: Snap) -> Json<Value> {
 async fn stats(State(app): State<Shared>, snap: Snap) -> Json<Value> {
     let shop = &*snap.snapshot;
     let counters = &app.counters;
+    let space = app.db.space().unwrap_or_default();
     Json(json!({
         "version": snap.snapshot.version(),
         "products": shop.products.len(),
@@ -421,6 +422,10 @@ async fn stats(State(app): State<Shared>, snap: Snap) -> Json<Value> {
         "events_lagged": counters.events_lagged.load(Ordering::Relaxed),
         "feed_subscribers": app.feed.receiver_count(),
         "db_bytes": app.db.size_on_disk(),
+        "db_log_bytes": space.log_bytes,
+        "db_live_bytes": space.live_bytes,
+        "reclaim_cycles": space.cycles,
+        "reclaim_longest_pause_ms": space.longest_pause.as_secs_f64() * 1000.0,
     }))
 }
 
