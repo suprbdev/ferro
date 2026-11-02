@@ -297,12 +297,13 @@ async fn customer_orders(
                 let limit = query.limit.unwrap_or(50).clamp(1, 200);
                 let before = query.before.unwrap_or(u64::MAX);
                 let status: Option<OrderStatus> = query.status.map(Into::into);
-                let mut orders: Vec<Arc<Order>> = shop
-                    .orders
-                    .by_customer(&id)
+                let rows = match status {
+                    Some(status) => shop.orders.by_customer_status(&(id, status)),
+                    None => shop.orders.by_customer(&id),
+                };
+                let mut orders: Vec<Arc<Order>> = rows
                     .rev()
                     .filter(|order| order.id < before)
-                    .filter(|order| status.is_none_or(|status| order.status == status))
                     .take(limit + 1)
                     .collect();
                 let next = if orders.len() > limit {

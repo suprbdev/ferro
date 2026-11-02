@@ -224,7 +224,68 @@ fn vars(count: usize) -> Vec<Ident> {
     (0..count).map(|i| format_ident!("__f{}", i)).collect()
 }
 
+fn is_transparent(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut found = false;
+    for attr in attrs {
+        if !attr.path().is_ident("ferro") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("transparent") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown ferro attribute"))
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let name = &input.ident;
+    let generics = bound_generics(&input.generics);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new(
+            input.span(),
+            "transparent needs a struct with one field",
+        ));
+    };
+    let fields = parse_fields(&data.fields)?;
+    let [field] = fields.as_slice() else {
+        return Err(syn::Error::new(
+            input.span(),
+            "transparent needs a struct with one field",
+        ));
+    };
+    let access = match &field.ident {
+        Some(ident) => quote! { &self.#ident },
+        None => quote! { &self.0 },
+    };
+    let build = construct(quote! { Self }, &fields, &data.fields, &[quote! { __v }]);
+    Ok(quote! {
+        impl #impl_generics ::ferro::Data for #name #ty_generics #where_clause {
+            fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
+                ::ferro::Data::encode(#access, __w)
+            }
+
+            fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
+                let __v = ::ferro::Data::decode(__r)?;
+                ::std::result::Result::Ok(#build)
+            }
+
+            fn missing() -> ::std::option::Option<Self> {
+                ::ferro::Data::missing().map(|__v| #build)
+            }
+        }
+    })
+}
+
 fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
+    if is_transparent(&input.attrs)? {
+        return expand_transparent(&input);
+    }
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
@@ -367,6 +428,7 @@ pub fn derive_data(input: TokenStream) -> TokenStream {
 enum IndexKind {
     Value,
     Each,
+    Unique,
 }
 
 fn option_inner(ty: &Type) -> Option<&Type> {
@@ -387,9 +449,91 @@ fn option_inner(ty: &Type) -> Option<&Type> {
 }
 
 struct Indexed {
-    ident: Ident,
-    ty: Type,
+    name: String,
+    span: Span,
+    fields: Vec<(Ident, Type)>,
     kind: IndexKind,
+}
+
+impl Indexed {
+    fn field(&self) -> Ident {
+        match self.kind {
+            IndexKind::Unique => format_ident!("unique_{}", self.name),
+            _ => format_ident!("by_{}", self.name),
+        }
+    }
+
+    fn method(&self) -> Ident {
+        format_ident!("by_{}", self.name)
+    }
+
+    fn sole(&self) -> Option<&(Ident, Type)> {
+        match self.fields.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    fn sparse(&self) -> Option<&Type> {
+        match self.kind {
+            IndexKind::Unique => self.sole().and_then(|(_, ty)| option_inner(ty)),
+            _ => None,
+        }
+    }
+
+    fn value_ty(&self) -> TokenStream2 {
+        if let Some(inner) = self.sparse() {
+            return quote! { #inner };
+        }
+        let tys = self.fields.iter().map(|(_, ty)| ty);
+        match (&self.kind, self.sole()) {
+            (IndexKind::Each, Some((_, ty))) => quote! { <#ty as ::ferro::table::IndexEach>::Value },
+            (_, Some((_, ty))) => quote! { #ty },
+            _ => quote! { (#(#tys),*) },
+        }
+    }
+
+    fn owned(&self) -> TokenStream2 {
+        let clones = self
+            .fields
+            .iter()
+            .map(|(ident, _)| quote! { ::std::clone::Clone::clone(&__r.#ident) });
+        match self.sole() {
+            Some(_) => quote! { #(#clones)* },
+            None => quote! { (#(#clones),*) },
+        }
+    }
+
+    fn optional(&self) -> TokenStream2 {
+        let owned = self.owned();
+        if self.sparse().is_some() {
+            owned
+        } else {
+            quote! { ::std::option::Option::Some(#owned) }
+        }
+    }
+}
+
+fn field_named(fields: &syn::FieldsNamed, name: &Ident) -> syn::Result<(Ident, Type)> {
+    fields
+        .named
+        .iter()
+        .find(|field| field.ident.as_ref() == Some(name))
+        .map(|field| (name.clone(), field.ty.clone()))
+        .ok_or_else(|| syn::Error::new(name.span(), format!("no field named `{name}`")))
+}
+
+fn composite(attr: &Attribute, fields: &syn::FieldsNamed) -> syn::Result<Vec<(Ident, Type)>> {
+    let names = attr.parse_args_with(
+        syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated,
+    )?;
+    if names.len() < 2 {
+        return Err(syn::Error::new(
+            attr.span(),
+            "a struct level index needs at least two fields",
+        ));
+    }
+    names.iter().map(|name| field_named(fields, name)).collect()
 }
 
 fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
@@ -441,12 +585,38 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     })?;
                 }
                 indexes.push(Indexed {
-                    ident: ident.clone(),
-                    ty: field.ty.clone(),
+                    name: ident.to_string(),
+                    span: ident.span(),
+                    fields: vec![(ident.clone(), field.ty.clone())],
                     kind,
+                });
+            } else if attr.path().is_ident("unique") {
+                attr.meta.require_path_only()?;
+                indexes.push(Indexed {
+                    name: ident.to_string(),
+                    span: ident.span(),
+                    fields: vec![(ident.clone(), field.ty.clone())],
+                    kind: IndexKind::Unique,
                 });
             }
         }
+    }
+    for attr in &input.attrs {
+        let kind = if attr.path().is_ident("unique") {
+            IndexKind::Unique
+        } else if attr.path().is_ident("index") {
+            IndexKind::Value
+        } else {
+            continue;
+        };
+        let fields = composite(attr, named)?;
+        let names: Vec<String> = fields.iter().map(|(ident, _)| ident.to_string()).collect();
+        indexes.push(Indexed {
+            name: names.join("_"),
+            span: attr.span(),
+            fields,
+            kind,
+        });
     }
     let Some((key_ident, key_ty)) = key else {
         return Err(syn::Error::new(
@@ -454,15 +624,6 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             "Record requires exactly one #[key] field",
         ));
     };
-
-    let index_value_ty = |ix: &Indexed| -> TokenStream2 {
-        let ty = &ix.ty;
-        match ix.kind {
-            IndexKind::Value => quote! { #ty },
-            IndexKind::Each => quote! { <#ty as ::ferro::table::IndexEach>::Value },
-        }
-    };
-    let index_field = |ix: &Indexed| format_ident!("by_{}", ix.ident);
 
     let mut table_fields: Vec<Field> = vec![Field {
         ident: Some(format_ident!("rows")),
@@ -472,13 +633,17 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         fallback: Fallback::Required,
     }];
     for ix in &indexes {
-        let field = index_field(ix);
-        let vt = index_value_ty(ix);
+        let field = ix.field();
+        let vt = ix.value_ty();
+        let ty: Type = match ix.kind {
+            IndexKind::Unique => syn::parse_quote!(::ferro::Map<#vt, #key_ty>),
+            _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), ()>),
+        };
         table_fields.push(Field {
-            ty: syn::parse_quote!(::ferro::Map<(#vt, #key_ty), ()>),
+            ty,
             name: field.to_string(),
             ident: Some(field),
-            span: ix.ident.span(),
+            span: ix.span,
             fallback: Fallback::Required,
         });
     }
@@ -501,31 +666,96 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let index_idents: Vec<&Ident> = idents.iter().skip(1).copied().collect();
 
     let mut reindex = Vec::new();
+    let mut conflicts = Vec::new();
     let mut methods = Vec::new();
     for ix in &indexes {
-        let field = index_field(ix);
-        let ident = &ix.ident;
-        let vt = index_value_ty(ix);
+        let field = ix.field();
+        let vt = ix.value_ty();
+        let owned = ix.owned();
+        let same = ix.fields.iter().map(|(ident, _)| quote! { __o.#ident == __n.#ident });
+        let same = quote! { #(#same &&)* __o.#key_ident == __n.#key_ident };
         match ix.kind {
             IndexKind::Value => {
                 reindex.push(quote! {
                     {
                         let __same = match (__old, __new) {
-                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => __o.#ident == __n.#ident && __o.#key_ident == __n.#key_ident,
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => #same,
                             _ => false,
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__r) = __old {
-                                self.#field.remove(&(::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)));
+                                self.#field.remove(&(#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
                             if let ::std::option::Option::Some(__r) = __new {
-                                self.#field.insert((::std::clone::Clone::clone(&__r.#ident), ::std::clone::Clone::clone(&__r.#key_ident)), ());
+                                self.#field.insert((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ());
                             }
                         }
                     }
                 });
             }
+            IndexKind::Unique => {
+                let optional = ix.optional();
+                let index_name = &ix.name;
+                reindex.push(quote! {
+                    {
+                        let __same = match (__old, __new) {
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => #same,
+                            _ => false,
+                        };
+                        if !__same {
+                            if let ::std::option::Option::Some(__value) = __old.and_then(|__r| #optional) {
+                                self.#field.remove(&__value);
+                            }
+                            if let ::std::option::Option::Some(__r) = __new {
+                                if let ::std::option::Option::Some(__value) = #optional {
+                                    self.#field.insert(__value, ::std::clone::Clone::clone(&__r.#key_ident));
+                                }
+                            }
+                        }
+                    }
+                });
+                conflicts.push(quote! {
+                    {
+                        let __r = __row;
+                        if let ::std::option::Option::Some(__value) = #optional {
+                            if let ::std::option::Option::Some(__holder) = self.#field.get(&__value) {
+                                if *__holder != __r.#key_ident && ::std::option::Option::Some(&*__holder) != __moving {
+                                    return ::std::option::Option::Some(::ferro::table::Taken {
+                                        index: #index_name,
+                                        holder: ::std::clone::Clone::clone(&*__holder),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+                let by = ix.method();
+                let key_by = format_ident!("key_{}", by);
+                methods.push(quote! {
+                    pub fn #field(&self) -> &::ferro::Map<#vt, #key_ty> {
+                        &self.#field
+                    }
+
+                    pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::std::sync::Arc<#name>>
+                    where
+                        #vt: ::std::borrow::Borrow<__Q>,
+                        __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                    {
+                        ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                    }
+
+                    pub fn #key_by<__Q>(&self, value: &__Q) -> ::std::option::Option<#key_ty>
+                    where
+                        #vt: ::std::borrow::Borrow<__Q>,
+                        __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                    {
+                        self.#field.get(value).map(|__key| ::std::clone::Clone::clone(&*__key))
+                    }
+                });
+                continue;
+            }
             IndexKind::Each => {
+                let ident = &ix.fields[0].0;
                 reindex.push(quote! {
                     {
                         let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
@@ -552,7 +782,26 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let range = format_ident!("{}_range", field);
         let counts = format_ident!("{}_counts", field);
         let after = format_ident!("{}_after", field);
-        if let (IndexKind::Value, Some(inner)) = (&ix.kind, option_inner(&ix.ty)) {
+        if let (IndexKind::Value, None) = (&ix.kind, ix.sole()) {
+            let prefix = format_ident!("{}_prefix", field);
+            let first = &ix.fields[0].1;
+            methods.push(quote! {
+                pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+                where
+                    #first: ::std::borrow::Borrow<__Q>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::index_where::<#vt, #name>(
+                        &self.rows,
+                        &self.#field,
+                        |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) < value,
+                        |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) <= value,
+                    )
+                }
+            });
+        }
+        let wrapped = ix.sole().and_then(|(_, ty)| option_inner(ty));
+        if let (IndexKind::Value, Some(inner)) = (&ix.kind, wrapped) {
             let some = format_ident!("{}_some", field);
             let some_after = format_ident!("{}_some_after", field);
             methods.push(quote! {
@@ -641,6 +890,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     #(__table.#index_idents = ::std::default::Default::default();)*
                     let __rows: ::std::vec::Vec<::std::sync::Arc<#name>> = __table.rows.values().collect();
                     for __row in __rows {
+                        if let ::std::option::Option::Some(__taken) = ::ferro::TableData::<#name>::conflict(&__table, &*__row, ::std::option::Option::None) {
+                            return ::std::result::Result::Err(::ferro::Error::Decode(::std::format!(
+                                "two rows of {} share a value of unique index {}",
+                                ::std::stringify!(#name),
+                                __taken.index,
+                            )));
+                        }
                         ::ferro::TableData::<#name>::reindex(&mut __table, ::std::option::Option::None, ::std::option::Option::Some(&*__row));
                     }
                 }
@@ -669,6 +925,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn reindex(&mut self, __old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>) {
                 #(#reindex)*
             }
+
+            fn conflict(
+                &self,
+                __row: &#name,
+                __moving: ::std::option::Option<&#key_ty>,
+            ) -> ::std::option::Option<::ferro::table::Taken<#key_ty>> {
+                #(#conflicts)*
+                ::std::option::Option::None
+            }
         }
 
         impl #table {
@@ -677,7 +942,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-#[proc_macro_derive(Record, attributes(key, index, ferro))]
+#[proc_macro_derive(Record, attributes(key, index, unique, ferro))]
 pub fn derive_record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand_record(input)

@@ -72,9 +72,7 @@ impl<T: Data> List<T> {
     }
 
     pub fn truncate(&mut self, len: usize) {
-        while self.len() > len {
-            self.pop();
-        }
+        self.0.remove_range(len as u64..);
     }
 
     pub fn iter(&self) -> Values<u64, T> {

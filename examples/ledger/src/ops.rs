@@ -77,16 +77,14 @@ fn bucket(sums: &mut Vec<(String, i128, i128)>, currency: &str) -> usize {
 
 impl Ledger {
     pub fn account_id(&self, name: &str) -> Result<u32> {
-        self.names
-            .get(name)
-            .map(|id| *id)
+        self.accounts
+            .key_by_name(name)
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
     }
 
     pub fn account(&self, name: &str) -> Result<Arc<Account>> {
-        let id = self.account_id(name)?;
         self.accounts
-            .get(&id)
+            .by_name(name)
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
     }
 
@@ -99,20 +97,18 @@ impl Ledger {
                 "invalid currency `{currency}`, expected three capital letters"
             )));
         }
-        if self.names.contains_key(name) {
-            return Err(LedgerError::AccountExists(name.to_string()));
-        }
-        self.next_account += 1;
-        let id = self.next_account;
-        self.names.insert(name.to_string(), id);
-        self.accounts.insert(Account {
-            id,
-            name: name.to_string(),
-            kind,
-            currency: currency.to_string(),
-            closed: false,
-            balance: 0,
-        });
+        let id = self.next_account + 1;
+        self.accounts
+            .try_insert(Account {
+                id,
+                name: name.to_string(),
+                kind,
+                currency: currency.to_string(),
+                closed: false,
+                balance: 0,
+            })
+            .map_err(|_| LedgerError::AccountExists(name.to_string()))?;
+        self.next_account = id;
         Ok(id)
     }
 

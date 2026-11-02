@@ -98,6 +98,12 @@ hash of any `Data` value, which makes an ETag one line.
 | `Set<T>` | Ordered set |
 | `List<T>` | Append-mostly sequence with indexed access |
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
+| `Bytes` | Byte buffer value with `Deref<Target = [u8]>` and O(1) clone |
+
+`Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and
+join trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range
+and returns the rows, which is O(rows) because every index has to be updated. `Map::apply` takes a
+batch of puts and deletes and merges it in one descent of the tree, as `extend` does for puts.
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
 `by_status_range(range)` and `by_status_counts()`, which needs no row reads.
@@ -105,6 +111,16 @@ hash of any `Data` value, which makes an ETag one line.
 costs a seek, not a walk over the rows already shown. An `Option<T>` index also gets
 `by_field_some(&value)` and `by_field_some_after(&value, &key)`, and `#[index(each)]` indexes every
 element of a collection field.
+
+`#[index(a, b)]` on the struct indexes a combination of fields in that order. It gets the same
+`by_a_b(&(a, b))`, `by_a_b_range` and `by_a_b_counts`, and `by_a_b_prefix(&a)` for every row with
+that `a`, ordered by `b`.
+
+`#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
+`by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
+index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,
+`update` and `get_mut` have no error channel, so they panic, which discards the transaction.
+`Table::merge` passes a clash to your `resolve` closure.
 
 ## History, diffs and branches
 

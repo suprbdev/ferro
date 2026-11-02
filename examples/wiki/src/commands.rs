@@ -237,7 +237,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
                 None => db.read(),
             };
             let mut count = 0usize;
-            for (slug, id) in snapshot.slugs.iter() {
+            for (slug, id) in snapshot.pages.unique_slug().iter() {
                 let Some(page) = snapshot.pages.get(&id) else {
                     continue;
                 };

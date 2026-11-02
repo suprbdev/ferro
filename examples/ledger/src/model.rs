@@ -38,6 +38,7 @@ impl fmt::Display for Kind {
 pub struct Account {
     #[key]
     pub id: u32,
+    #[unique]
     pub name: String,
     pub kind: Kind,
     pub currency: String,
@@ -68,7 +69,6 @@ pub type PostingKey = (u32, i32, u64, u16);
 #[derive(Clone, Default, Data)]
 pub struct Ledger {
     pub accounts: Table<Account>,
-    pub names: Map<String, u32>,
     pub entries: Table<Entry>,
     pub postings: Map<PostingKey, i64>,
     pub reversed: Map<u64, u64>,

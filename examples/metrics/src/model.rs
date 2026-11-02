@@ -20,6 +20,7 @@ pub fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Data, Record)]
+#[unique(metric, labels)]
 pub struct SeriesRec {
     #[key]
     pub id: u64,
@@ -72,10 +73,6 @@ impl SeriesKey {
     pub fn new(metric: String, mut labels: Vec<(String, String)>) -> SeriesKey {
         labels.sort();
         SeriesKey { metric, labels }
-    }
-
-    pub fn canonical(&self) -> String {
-        self.to_string()
     }
 }
 
@@ -162,9 +159,9 @@ impl Rollup {
 #[derive(Clone, Default, Data)]
 pub struct Metrics {
     pub series: Table<SeriesRec>,
-    pub by_key: Map<String, u64>,
     pub next_id: u64,
     pub chunks: Map<u64, Map<u64, Chunk>>,
+    pub part_points: Map<u64, u64>,
     pub rollups: Map<u64, Map<(u64, u64), Rollup>>,
     pub raw_floor: u64,
     pub points: u64,

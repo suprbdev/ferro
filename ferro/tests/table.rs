@@ -12,6 +12,7 @@ use ferro::{Data, Db, Map, Record, Table};
 use proptest::prelude::*;
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
+#[index(n, opt)]
 struct Row {
     #[key]
     id: u32,
@@ -74,10 +75,19 @@ enum Op {
     Untouched(u32),
     Rewrite(u32),
     Retain(u8),
+    DrainRange(Bound<u32>, Bound<u32>),
     PanicUpdate(u32, Fields),
     Forget(u32, Fields),
     Commit,
     Reopen,
+}
+
+fn id_bound() -> impl Strategy<Value = Bound<u32>> {
+    prop_oneof![
+        Just(Bound::Unbounded),
+        (0..IDS).prop_map(Bound::Included),
+        (0..IDS).prop_map(Bound::Excluded),
+    ]
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -90,6 +100,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0..IDS).prop_map(Op::Untouched),
         2 => (0..IDS).prop_map(Op::Rewrite),
         1 => (2..4u8).prop_map(Op::Retain),
+        2 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::DrainRange(a, b)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::PanicUpdate(k, f)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::Forget(k, f)),
         3 => Just(Op::Commit),
@@ -222,6 +233,31 @@ fn check(table: &Table<Row>, model: &BTreeMap<u32, Row>) {
         |r| table.by_opt_range::<Option<String>, _>(r),
         table.by_opt_counts(),
     );
+    let pairs: Vec<(u8, Option<String>)> = vec![
+        (0, None),
+        (1, Some("a".into())),
+        (2, Some("b".into())),
+        (3, Some("c".into())),
+    ];
+    check_index(
+        model,
+        &pairs,
+        |row| vec![(row.n, row.opt.clone())],
+        table.by_n_opt.keys().collect(),
+        |v| table.by_n_opt(v),
+        |r| table.by_n_opt_range::<(u8, Option<String>), _>(r),
+        table.by_n_opt_counts(),
+    );
+    for n in 0..5u8 {
+        let mut wanted: Vec<&Row> = model.values().filter(|row| row.n == n).collect();
+        wanted.sort_by_key(|row| (&row.opt, row.id));
+        let wanted: Vec<u32> = wanted.iter().map(|row| row.id).collect();
+        let got: Vec<u32> = table.by_n_opt_prefix(&n).map(|row| row.id).collect();
+        assert_eq!(got, wanted);
+        assert_eq!(table.by_n_opt_prefix(&n).len(), wanted.len());
+        let back: Vec<u32> = table.by_n_opt_prefix(&n).rev().map(|row| row.id).collect();
+        assert_eq!(back, wanted.iter().rev().cloned().collect::<Vec<_>>());
+    }
     for probe in ["", "a", "b", "c", "zz"] {
         let wanted: Vec<u32> = model
             .values()
@@ -269,6 +305,7 @@ fn same_form(a: &Table<Row>, b: &Table<Row>) {
     assert_eq!(a.by_n.root_hash(), b.by_n.root_hash());
     assert_eq!(a.by_opt.root_hash(), b.by_opt.root_hash());
     assert_eq!(a.by_tags.root_hash(), b.by_tags.root_hash());
+    assert_eq!(a.by_n_opt.root_hash(), b.by_n_opt.root_hash());
 }
 
 fn run(ops: Vec<Op>) {
@@ -329,6 +366,20 @@ fn run(ops: Vec<Op>) {
             Op::Retain(modulus) => {
                 table.retain(|row| row.n % modulus == 0);
                 model.retain(|_, row| row.n % modulus == 0);
+            }
+            Op::DrainRange(low, high) => {
+                let wanted: Vec<Row> = model
+                    .values()
+                    .filter(|row| within(&row.id, &low, &high))
+                    .cloned()
+                    .collect();
+                let drained: Vec<Row> = table
+                    .drain_range::<u32, _>((low, high))
+                    .iter()
+                    .map(|row| (**row).clone())
+                    .collect();
+                assert_eq!(drained, wanted);
+                model.retain(|_, row| !within(&row.id, &low, &high));
             }
             Op::PanicUpdate(id, f) => {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {

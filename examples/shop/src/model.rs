@@ -39,6 +39,7 @@ pub struct Line {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Data, Record)]
+#[index(customer, status)]
 pub struct Order {
     #[key]
     pub id: u64,

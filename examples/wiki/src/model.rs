@@ -8,6 +8,7 @@ pub type Body = List<String>;
 pub struct Page {
     #[key]
     pub id: u64,
+    #[unique]
     pub slug: String,
     pub title: String,
     pub body: Body,
@@ -21,7 +22,6 @@ pub struct Page {
 #[derive(Clone, Default, Data)]
 pub struct Wiki {
     pub pages: Table<Page>,
-    pub slugs: Map<String, u64>,
     pub links: Map<String, Set<u64>>,
     pub terms: Map<String, Map<u64, u32>>,
     pub next_id: u64,
