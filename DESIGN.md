@@ -53,12 +53,12 @@ someone who can choose keys could craft many keys of a high level and unbalance 
 costs performance but not correctness, because node hashes are still BLAKE3. xxh3 replaced BLAKE3
 here because hashing a key was the largest per-insert cost; level frequencies on sequential
 integers, strings and tuples match the ideal geometric distribution. Fanout 8 was chosen by
-measurement and re-checked after links shrank and bodies were compressed, at 1M keys: against
-fanout 16 it writes 31% fewer bytes per commit for 33% slower gets, and against fanout 4 it writes
-32% more bytes per commit for 32% faster gets and 17% smaller bulk loads. A node holds all keys of
-exactly its level within its
-range, and children hold the gaps. Tree shape depends only on the key set, never on insertion
-order. Consequences that the rest of the system relies on:
+measurement and re-checked after links shrank, bodies were compressed and reads gained child
+memos, at 1M keys: against fanout 16 it writes 27% fewer bytes per commit for 31% slower warm gets
+and 29% faster cold gets, and against fanout 4 it writes 30% more bytes per commit for 12% faster
+warm gets and 17% smaller bulk loads. A node holds all keys of exactly its level within its range,
+and children hold the gaps. Tree shape depends only on the key set, never on insertion order.
+Consequences that the rest of the system relies on:
 
 - `a == b` for two maps compares root hashes in O(1).
 - A commit that changes nothing has the same root hash and is skipped.
@@ -80,6 +80,66 @@ Values over 512 encoded bytes spill to their own object, so a large value does n
 node or get rewritten when a neighbour changes. Lower thresholds were measured and rejected:
 spilling interior-node values over 64 bytes cut table update bytes by 19% but grew bulk size by
 14% and slowed table reads by 20 to 50%, once compression was already shrinking interior nodes.
+
+## Read path
+
+A warm get at 1M keys walks about seven levels, and nearly all of its time is CPU cache misses, not
+logic. One node cache lookup per level was 55% of the get. Reference counts on nodes near the root,
+written by every reader, held eight readers to about 10M reads a second.
+
+So each `Link::Stored` carries a write-once memo of the node it points at, in a `OnceLock`:
+
+- The first `PIN_DEPTH` (3) levels of a tree memoize a strong `Arc`. `Map::walk` follows those by
+  reference and writes no shared memory, which took eight readers from 9M to 60M reads a second. A
+  fourth level added nothing. A `Map` pins about 73 nodes whatever its size, outside `cache_bytes`,
+  until the `Map` is dropped.
+- Deeper links memoize a `Weak`, and only when the child was found in the cache. The cache stays
+  the owner, so eviction still frees the node, and the memo keeps only the node's `Arc` allocation,
+  144 bytes, until its parent goes. A child just read from disk is not memoized, so a one-off read
+  leaves nothing behind.
+- A memo is never replaced. Once its child is evicted the link falls back to the cache, whose `get`
+  restores the recency that memo hits skip, so eviction keeps seeing nodes that are really in use.
+  A replaceable `ArcSwap` memo made cold gets 44% slower, because a small cache evicts constantly
+  and each `ArcSwap` store has to settle with every reader thread.
+
+A memo holds only what a load for that link's own `Ptr` returned, and the cache is keyed by the full
+hash, so a damaged link still fails its hash check whatever else is cached. `Link::clone` starts
+with an empty memo, since copying one touches the child's header, a cache miss per link that slowed
+`diff` by 45%. Only `Map::clone` keeps its root's memo.
+
+Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row of `Link::Empty`.
+`Node::child` reads through that and `Node::children_mut` fills it in when a leaf gains a child.
+This cut peak RSS by 28% and bulk load time by 14%.
+
+`range_by` builds each edge and its rank in one walk, and iterators read their top frame in place
+instead of cloning an `Arc<Node>` per item. A node flushed by this process shares the values of the
+in-memory tree, and those sit in insertion order, so a scan in key order would take one miss per
+value in turn. `Node::warm_values` reads every value's reference count on entering a node, so those
+misses overlap instead of queueing. That cut scans by 40% with no cost to writes, where moving
+values into node order during `flush` cost 22% of bulk load speed and 16% more memory for less gain.
+`Keys` and index iterators skip it, since they never touch a value.
+
+A node miss is dominated by BLAKE3, at 600 to 1000 ns on an interior node against 130 to 190 ns for
+`pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits most records.
+Measured and left out, each from a tree with memos already in place:
+
+- Lazy value decoding. Decoding one value on demand made cold gets 6 to 13% faster, but cold scans
+  25% slower and fully read nodes 24% larger. Decoding a node's values together on first use was
+  slower than eager decoding once only leaves were missing from the cache.
+- `mmap`. Copying out of a mapping before hashing, the only form that cannot be changed under the
+  check, gained 3 to 9% on cold reads. That does not pay for SIGBUS when another process truncates
+  the file, or for I/O errors arriving as signals instead of `Error`. It also caps what batching
+  reads during scans could gain.
+- Keying the cache by offset with a hash compare, or by a hash prefix instead of ahash, gained at
+  most 1.4%, since memo hits skip the cache and the cost was never the hashing.
+- Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
+  leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger
+  than the cache, but made repeated short range pages 4 times slower, and a budget per iterator that
+  avoided that saved only 6 to 8%.
+
+`cache_bytes` bounds cache weight, which tracks on-disk size, not heap. Decoded nodes take several
+times that: a 16 MiB cache holds about 71 MiB, and at 1 MiB, with pins and `Arc` allocations
+included, about 4.6 MiB. Size it at a quarter of the memory you mean to spend.
 
 ## File format and durability
 
