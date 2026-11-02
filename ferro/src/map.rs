@@ -533,6 +533,51 @@ fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Lin
     })
 }
 
+struct Open<K, V> {
+    level: u8,
+    keys: Vec<K>,
+    slots: Vec<Slot<V>>,
+    children: Vec<Link<K, V>>,
+}
+
+impl<K, V> Open<K, V> {
+    fn close(mut self, last: Link<K, V>) -> Link<K, V> {
+        self.children.push(last);
+        link_from(self.level, self.keys, self.slots, self.children)
+    }
+}
+
+fn build_sorted<K: Data + Ord, V: Data>(items: Vec<(K, V)>) -> Result<Link<K, V>> {
+    let mut stack: Vec<Open<K, V>> = Vec::new();
+    for (key, value) in items {
+        let level = level_of(&key)?;
+        let mut carry = Link::Empty;
+        while stack.last().is_some_and(|top| top.level < level) {
+            if let Some(top) = stack.pop() {
+                carry = top.close(carry);
+            }
+        }
+        match stack.last_mut() {
+            Some(top) if top.level == level => {
+                top.children.push(carry);
+                top.keys.push(key);
+                top.slots.push(Slot::Fresh(Arc::new(value)));
+            }
+            _ => stack.push(Open {
+                level,
+                keys: vec![key],
+                slots: vec![Slot::Fresh(Arc::new(value))],
+                children: vec![carry],
+            }),
+        }
+    }
+    let mut carry = Link::Empty;
+    while let Some(top) = stack.pop() {
+        carry = top.close(carry);
+    }
+    Ok(carry)
+}
+
 pub struct Map<K, V> {
     root: Link<K, V>,
     store: Option<Store>,
@@ -961,6 +1006,22 @@ impl<K: Data + Ord + fmt::Debug, V: Data + fmt::Debug> fmt::Debug for Map<K, V> 
 
 impl<K: Data + Ord, V: Data> Extend<(K, V)> for Map<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, items: I) {
+        let mut items: Vec<(K, V)> = items.into_iter().collect();
+        if !items.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut unique: Vec<(K, V)> = Vec::with_capacity(items.len());
+            for item in items {
+                match unique.last_mut() {
+                    Some(last) if last.0 == item.0 => *last = item,
+                    _ => unique.push(item),
+                }
+            }
+            items = unique;
+        }
+        if self.is_empty() {
+            self.root = fatal(build_sorted(items));
+            return;
+        }
         for (key, value) in items {
             self.insert(key, value);
         }

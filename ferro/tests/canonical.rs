@@ -174,6 +174,78 @@ proptest! {
     }
 }
 
+fn bulk_forms_agree(model: &Model, seed: u64) {
+    let base = sorted(model);
+    let hash = base.root_hash();
+    let ascending: Map<u32, String> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
+    assert_eq!(ascending.root_hash(), hash);
+    assert_eq!(ascending.len(), model.len());
+    let mut rng = Rng::new(seed);
+    let mut order: Vec<(u32, String)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
+    rng.shuffle(&mut order);
+    let shuffled: Map<u32, String> = order.iter().cloned().collect();
+    assert_eq!(shuffled.root_hash(), hash);
+    assert!(shuffled == base);
+    let mut doubled = order.clone();
+    for (key, value) in &order {
+        if rng.chance(40) {
+            doubled.push((*key, format!("{value}-stale")));
+        }
+    }
+    let mut stale_first: Vec<(u32, String)> = doubled
+        .iter()
+        .filter(|(_, value)| value.ends_with("-stale"))
+        .cloned()
+        .collect();
+    stale_first.extend(order.iter().cloned());
+    let deduped: Map<u32, String> = stale_first.into_iter().collect();
+    assert_eq!(deduped.root_hash(), hash);
+    assert_eq!(deduped.len(), model.len());
+    for (key, value) in model {
+        assert_eq!(deduped.get(key).as_deref(), Some(value));
+    }
+    let split = order.len() / 2;
+    let mut partial: Map<u32, String> = order[..split].iter().cloned().collect();
+    partial.extend(order[split..].iter().cloned());
+    assert_eq!(partial.root_hash(), hash);
+    assert_eq!(partial.len(), model.len());
+    let reread: Vec<(u32, String)> = ascending.iter().map(|(k, v)| (k, (*v).clone())).collect();
+    assert_eq!(reread, model.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(600), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn bulk_build_matches_incremental_insertion(model in contents(40, 40), seed in any::<u64>()) {
+        bulk_forms_agree(&model, seed);
+    }
+
+    #[test]
+    fn bulk_build_matches_incremental_insertion_large(model in contents(100_000, 600), seed in any::<u64>()) {
+        bulk_forms_agree(&model, seed);
+    }
+}
+
+#[test]
+fn bulk_build_matches_incremental_insertion_at_scale() {
+    let mut rng = Rng::new(7);
+    let entries: Vec<(u64, u64)> = (0..120_000).map(|i| (rng.next(), i)).collect();
+    let mut incremental = Map::new();
+    for (key, value) in &entries {
+        incremental.insert(*key, *value);
+    }
+    let bulk: Map<u64, u64> = entries.iter().cloned().collect();
+    assert_eq!(bulk.len(), incremental.len());
+    assert_eq!(bulk.root_hash(), incremental.root_hash());
+    let sequential: Map<u64, u64> = (0..120_000u64).map(|i| (i, i)).collect();
+    let mut stepwise = Map::new();
+    for i in 0..120_000u64 {
+        stepwise.insert(i, i);
+    }
+    assert_eq!(sequential.root_hash(), stepwise.root_hash());
+}
+
 fn expected_changes(old: &Model, new: &Model) -> Vec<Change<u32, String>> {
     let mut changes: BTreeMap<u32, Change<u32, String>> = BTreeMap::new();
     for (key, value) in old {
