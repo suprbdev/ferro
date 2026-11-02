@@ -497,6 +497,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let encode = encode_stmts(&table_fields, &access);
     let vs = vars(table_fields.len());
     let (decode_ts, values) = decode_stmts(&table_fields, &vs);
+    let index_vars: Vec<&Ident> = vs.iter().skip(1).collect();
+    let index_idents: Vec<&Ident> = idents.iter().skip(1).copied().collect();
 
     let mut reindex = Vec::new();
     let mut methods = Vec::new();
@@ -608,7 +610,17 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
                 #decode_ts
-                ::std::result::Result::Ok(#table { #(#idents: #values),* })
+                let __rebuild = false #(|| #index_vars.is_none())*;
+                #[allow(unused_mut)]
+                let mut __table = #table { #(#idents: #values),* };
+                if __rebuild {
+                    #(__table.#index_idents = ::std::default::Default::default();)*
+                    let __rows: ::std::vec::Vec<::std::sync::Arc<#name>> = __table.rows.values().collect();
+                    for __row in __rows {
+                        ::ferro::TableData::<#name>::reindex(&mut __table, ::std::option::Option::None, ::std::option::Option::Some(&*__row));
+                    }
+                }
+                ::std::result::Result::Ok(__table)
             }
         }
 
