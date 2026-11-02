@@ -658,6 +658,10 @@ impl Store {
         self.inner.basis
     }
 
+    pub(crate) fn metadata(&self) -> Result<std::fs::Metadata> {
+        Ok(self.inner.file.metadata()?)
+    }
+
     pub(crate) fn retired(&self) -> Retired {
         Retired(Arc::downgrade(&self.inner))
     }

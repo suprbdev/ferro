@@ -228,7 +228,7 @@ impl<'a> Copier<'a> {
             .create(true)
             .truncate(true)
             .open(temp)?;
-        let source = fs::metadata(store.path())?;
+        let source = store.metadata()?;
         file.set_permissions(source.permissions())?;
         let _ = fchown(&file, Some(source.uid()), Some(source.gid()));
         let file = Traced::new(file, options.trace.clone())?;
