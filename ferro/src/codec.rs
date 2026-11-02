@@ -82,6 +82,7 @@ pub struct Encoder<'a> {
     buf: Vec<u8>,
     links: Vec<Ptr>,
     sink: &'a mut dyn Sink,
+    unsettled: bool,
 }
 
 fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
@@ -98,7 +99,39 @@ impl<'a> Encoder<'a> {
             buf: Vec::new(),
             links: Vec::new(),
             sink,
+            unsettled: false,
         }
+    }
+
+    pub fn with_capacity(sink: &'a mut dyn Sink, bytes: usize, links: usize) -> Self {
+        Encoder {
+            buf: Vec::with_capacity(bytes),
+            links: Vec::with_capacity(links),
+            sink,
+            unsettled: false,
+        }
+    }
+
+    pub fn reusing(sink: &'a mut dyn Sink, mut buf: Vec<u8>) -> Self {
+        buf.clear();
+        Encoder {
+            buf,
+            links: Vec::new(),
+            sink,
+            unsettled: false,
+        }
+    }
+
+    pub fn into_buf(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn mark_unsettled(&mut self) {
+        self.unsettled = true;
+    }
+
+    pub fn is_unsettled(&self) -> bool {
+        self.unsettled
     }
 
     pub fn u8(&mut self, value: u8) {
@@ -133,6 +166,10 @@ impl<'a> Encoder<'a> {
         &self.buf
     }
 
+    pub fn links(&self) -> &[Ptr] {
+        &self.links
+    }
+
     pub fn mark(&self) -> (usize, usize) {
         (self.buf.len(), self.links.len())
     }
@@ -149,6 +186,7 @@ impl<'a> Encoder<'a> {
     pub fn child(&mut self, f: impl FnOnce(&mut Encoder<'_>) -> Result<()>) -> Result<Ptr> {
         let mut encoder = Encoder::new(&mut *self.sink);
         f(&mut encoder)?;
+        self.unsettled |= encoder.unsettled;
         encoder.finish()
     }
 
@@ -180,7 +218,9 @@ impl<'a> Encoder<'a> {
     }
 
     pub fn finish(self) -> Result<Ptr> {
-        let Encoder { buf, links, sink } = self;
+        let Encoder {
+            buf, links, sink, ..
+        } = self;
         let object = Object { body: buf, links };
         let hash = object.hash();
         sink.put(object, hash)

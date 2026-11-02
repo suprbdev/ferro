@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
 use crate::store::Store;
+use xxhash_rust::xxh3::xxh3_64;
 
 const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
@@ -18,17 +20,24 @@ pub(crate) fn fatal<T>(result: Result<T>) -> T {
     }
 }
 
+thread_local! {
+    static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 fn level_of<K: Data>(key: &K) -> Result<u8> {
     let mut sink = HashSink;
-    let mut encoder = Encoder::new(&mut sink);
-    key.encode(&mut encoder)?;
-    let hash = blake3::hash(encoder.bytes());
-    let word = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("slice length is 8"));
+    let mut encoder = Encoder::reusing(&mut sink, KEY_SCRATCH.take());
+    let encoded = key.encode(&mut encoder);
+    let buf = encoder.into_buf();
+    let word = xxh3_64(&buf);
+    KEY_SCRATCH.set(buf);
+    encoded?;
     Ok((word.trailing_zeros() / LEVEL_BITS) as u8)
 }
 
 enum Slot<V> {
     Inline(Arc<V>),
+    Fresh(Arc<V>),
     Spilled(Ptr),
 }
 
@@ -36,6 +45,7 @@ impl<V> Clone for Slot<V> {
     fn clone(&self) -> Self {
         match self {
             Slot::Inline(value) => Slot::Inline(value.clone()),
+            Slot::Fresh(value) => Slot::Fresh(value.clone()),
             Slot::Spilled(ptr) => Slot::Spilled(*ptr),
         }
     }
@@ -301,7 +311,7 @@ fn insert_at<K: Data + Ord, V: Data>(
         *link = link_from(
             level,
             vec![key],
-            vec![Slot::Inline(value)],
+            vec![Slot::Fresh(value)],
             vec![Link::Empty, Link::Empty],
         );
         return Ok(None);
@@ -309,7 +319,7 @@ fn insert_at<K: Data + Ord, V: Data>(
     if level > current.level {
         drop(current);
         let (left, right) = split(store, link.take(), &key)?;
-        *link = link_from(level, vec![key], vec![Slot::Inline(value)], vec![left, right]);
+        *link = link_from(level, vec![key], vec![Slot::Fresh(value)], vec![left, right]);
         return Ok(None);
     }
     drop(current);
@@ -317,12 +327,12 @@ fn insert_at<K: Data + Ord, V: Data>(
     match node.search(&key) {
         Ok(index) => Ok(Some(std::mem::replace(
             &mut node.slots[index],
-            Slot::Inline(value),
+            Slot::Fresh(value),
         ))),
         Err(position) if level == node.level => {
             let (left, right) = split(store, node.children[position].take(), &key)?;
             node.keys.insert(position, key);
-            node.slots.insert(position, Slot::Inline(value));
+            node.slots.insert(position, Slot::Fresh(value));
             node.children[position] = left;
             node.children.insert(position + 1, right);
             node.count += 1;
@@ -393,13 +403,17 @@ where
     match node.search(key) {
         Ok(index) => {
             let slot = &mut node.slots[index];
-            if let Slot::Spilled(ptr) = slot {
-                let value = store.ok_or(Error::Detached)?.load::<V>(*ptr)?;
-                *slot = Slot::Inline(value);
+            let value = match &*slot {
+                Slot::Inline(value) => Some(value.clone()),
+                Slot::Fresh(_) => None,
+                Slot::Spilled(ptr) => Some(store.ok_or(Error::Detached)?.load::<V>(*ptr)?),
+            };
+            if let Some(value) = value {
+                *slot = Slot::Fresh(value);
             }
             match slot {
-                Slot::Inline(value) => Ok(Some(Arc::make_mut(value))),
-                Slot::Spilled(_) => Err(Error::Detached),
+                Slot::Fresh(value) => Ok(Some(Arc::make_mut(value))),
+                _ => Err(Error::Detached),
             }
         }
         Err(position) => find_mut(store, &mut node.children[position], key),
@@ -408,60 +422,103 @@ where
 
 fn read_slot<V: Data>(store: Option<&Store>, slot: &Slot<V>) -> Result<Arc<V>> {
     match slot {
-        Slot::Inline(value) => Ok(value.clone()),
+        Slot::Inline(value) | Slot::Fresh(value) => Ok(value.clone()),
         Slot::Spilled(ptr) => store.ok_or(Error::Detached)?.load::<V>(*ptr),
     }
+}
+
+fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -> Result<()> {
+    let mut decoder = Decoder::new(
+        &encoder.bytes()[mark.0..],
+        &encoder.links()[mark.1..],
+        Some(store),
+    );
+    T::decode(&mut decoder).map(drop)
 }
 
 fn flush<K: Data, V: Data>(link: &Link<K, V>, sink: &mut dyn Sink) -> Result<Link<K, V>> {
     let Link::Mem(node) = link else {
         return Ok(link.clone());
     };
-    let mut encoder = Encoder::new(&mut *sink);
+    let store = sink.store();
+    let caching = store.is_some();
+    let width = node.keys.len();
+    let mut encoder = Encoder::with_capacity(&mut *sink, 64 + 24 * width, width + 1);
     encoder.u8(node.level);
-    encoder.varint(node.keys.len() as u64);
-    for key in &node.keys {
+    encoder.varint(width as u64);
+    for (key, slot) in node.keys.iter().zip(&node.slots) {
+        let mark = encoder.mark();
         key.encode(&mut encoder)?;
+        if let (Slot::Fresh(_), Some(store)) = (slot, &store) {
+            verify::<K>(&encoder, mark, store)?;
+        }
     }
+    let mut settled: Vec<Slot<V>> = Vec::with_capacity(if caching { width } else { 0 });
     for slot in &node.slots {
         match slot {
             Slot::Spilled(ptr) => {
                 encoder.u8(1);
                 encoder.link(*ptr);
+                if caching {
+                    settled.push(Slot::Spilled(*ptr));
+                }
             }
-            Slot::Inline(value) => {
+            Slot::Inline(value) | Slot::Fresh(value) => {
                 let mark = encoder.mark();
                 encoder.u8(0);
+                let body = encoder.mark();
                 value.encode(&mut encoder)?;
+                if let (Slot::Fresh(_), Some(store)) = (slot, &store) {
+                    verify::<V>(&encoder, body, store)?;
+                }
                 if encoder.since(mark) > SPILL_BYTES {
                     encoder.rewind(mark);
                     let ptr = encoder.child(|inner| value.encode(inner))?;
                     encoder.u8(1);
                     encoder.link(ptr);
+                    if caching {
+                        settled.push(Slot::Spilled(ptr));
+                    }
+                } else if caching {
+                    settled.push(Slot::Inline(value.clone()));
                 }
             }
         }
     }
+    let mut stored: Vec<Link<K, V>> = Vec::with_capacity(if caching { width + 1 } else { 0 });
     for child in &node.children {
-        match flush(child, encoder.sink())? {
+        let flushed = flush(child, encoder.sink())?;
+        match &flushed {
             Link::Empty => encoder.varint(0),
             Link::Stored { ptr, count } => {
-                encoder.varint(count);
-                encoder.link(ptr);
+                encoder.varint(*count);
+                encoder.link(*ptr);
             }
             Link::Mem(_) => return Err(Error::Detached),
         }
+        if caching {
+            stored.push(flushed);
+        }
     }
+    let unsettled = encoder.is_unsettled();
     let object = encoder.into_object();
     let hash = object.hash();
     let weight = (object.body.len() + object.links.len() * 40 + 128) as u32;
-    let cached = sink
-        .store()
-        .map(|store| {
-            let mut decoder = Decoder::new(&object.body, &object.links, Some(&store));
-            Node::<K, V>::decode(&mut decoder, Ptr { hash, offset: 0 })
-        })
-        .transpose()?;
+    let cached = match &store {
+        None => None,
+        Some(store) if unsettled => {
+            let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
+            Some(Node::<K, V>::decode(&mut decoder, Ptr { hash, offset: 0 })?)
+        }
+        Some(_) => Some(Node {
+            level: node.level,
+            keys: node.keys.clone(),
+            slots: settled,
+            children: stored,
+            count: node.count,
+            origin: None,
+        }),
+    };
     let ptr = match node.origin {
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
@@ -848,6 +905,9 @@ impl<K: Data + Ord, V: Data> Data for Map<K, V> {
         let target = w.store_id();
         let foreign =
             target != 0 && self.store.as_ref().is_some_and(|store| store.id() != target);
+        if foreign || matches!(self.root, Link::Mem(_)) {
+            w.mark_unsettled();
+        }
         let stored = if foreign {
             flush(&self.rebuilt().root, w.sink())?
         } else {
