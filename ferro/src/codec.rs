@@ -5,7 +5,9 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::store::Store;
 
-pub type Hash = [u8; 32];
+pub const HASH_BYTES: usize = 20;
+
+pub type Hash = [u8; HASH_BYTES];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Ptr {
@@ -27,7 +29,10 @@ impl Object {
         for link in &self.links {
             hasher.update(&link.hash);
         }
-        *hasher.finalize().as_bytes()
+        let full = hasher.finalize();
+        let mut out = [0u8; HASH_BYTES];
+        out.copy_from_slice(&full.as_bytes()[..HASH_BYTES]);
+        out
     }
 }
 
@@ -85,7 +90,7 @@ pub struct Encoder<'a> {
     unsettled: bool,
 }
 
-fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
+pub(crate) fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buf.push((value as u8) | 0x80);
         value >>= 7;

@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 
 use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
 use crate::error::{Error, Result};
+use crate::log::{Chain, Log};
 use crate::map::Map;
 use crate::store::{Durability, Store, StoreOptions, Txn};
 
@@ -67,24 +68,34 @@ impl Data for Commit {
 pub(crate) struct Head {
     pub(crate) version: u64,
     pub(crate) root: Option<Ptr>,
-    pub(crate) log: Map<u64, Commit>,
+    pub(crate) log: Chain,
     pub(crate) merged: Map<String, (u64, u64)>,
 }
 
 impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.version.encode(w)?;
+        self.log.first.encode(w)?;
         self.root.encode(w)?;
-        self.log.encode(w)?;
+        self.log.tip.encode(w)?;
         self.merged.encode(w)
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
+        let version = u64::decode(r)?;
+        let first = u64::decode(r)?;
+        let root = Option::<Ptr>::decode(r)?;
+        let tip = Option::<Ptr>::decode(r)?;
+        let merged = Map::decode(r)?;
         Ok(Head {
-            version: u64::decode(r)?,
-            root: Option::<Ptr>::decode(r)?,
-            log: Map::decode(r)?,
-            merged: Map::decode(r)?,
+            version,
+            root,
+            log: Chain {
+                tip,
+                first,
+                last: version,
+            },
+            merged,
         })
     }
 }
@@ -130,7 +141,7 @@ impl<T> Snapshot<T> {
 
 struct State<T> {
     snapshot: Snapshot<T>,
-    log: Map<u64, Commit>,
+    log: Chain,
     merged: Map<String, (u64, u64)>,
 }
 
@@ -278,7 +289,7 @@ impl<T: Data> Shared<T> {
                     value: self.genesis.clone(),
                     commit: Commit::genesis(),
                 },
-                log: Map::new(),
+                log: Chain::empty(),
                 merged: Map::new(),
             });
         };
@@ -288,12 +299,12 @@ impl<T: Data> Shared<T> {
         };
         let commit = head
             .log
-            .try_get(&head.version)?
-            .map(|commit| (*commit).clone())
+            .tip_entry(&self.store)?
+            .map(|entry| entry.commit.clone())
             .unwrap_or_else(Commit::genesis);
         Ok(State {
             snapshot: Snapshot { value, commit },
-            log: head.log.clone(),
+            log: head.log,
             merged: head.merged.clone(),
         })
     }
@@ -357,8 +368,11 @@ impl<T: Data> Db<T> {
         self.branch.state.load().snapshot.commit.version
     }
 
-    pub fn log(&self) -> Map<u64, Commit> {
-        self.branch.state.load().log.clone()
+    pub fn log(&self) -> Log {
+        Log {
+            chain: self.branch.state.load().log,
+            store: self.shared.store.clone(),
+        }
     }
 
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
@@ -459,8 +473,7 @@ impl<T: Data> Db<T> {
             root: Some(root),
             restored: intent.restored,
         };
-        let mut log = state.log.clone();
-        log.insert(version, commit);
+        let log = state.log.append(store, &mut txn, commit)?;
         let mut next = refs.refs.clone();
         next.insert(
             self.branch.name.clone(),
@@ -484,28 +497,25 @@ impl<T: Data> Db<T> {
                 commit: Commit::genesis(),
             });
         }
-        let log = self.log();
-        let commit = log.try_get(&version)?.ok_or(Error::NoVersion(version))?;
-        let root = commit.root.ok_or(Error::NoVersion(version))?;
+        let chain = self.branch.state.load().log;
+        let entry = chain
+            .get(&self.shared.store, version)?
+            .ok_or(Error::NoVersion(version))?;
+        self.snapshot_of(&entry.commit)
+    }
+
+    fn snapshot_of(&self, commit: &Commit) -> Result<Snapshot<T>> {
+        let root = commit.root.ok_or(Error::NoVersion(commit.version))?;
         Ok(Snapshot {
             value: self.shared.store.load::<T>(root)?,
-            commit: (*commit).clone(),
+            commit: commit.clone(),
         })
     }
 
     pub fn as_of(&self, time_ms: u64) -> Result<Snapshot<T>> {
-        let log = self.log();
-        let mut low = 0usize;
-        let mut high = log.len();
-        while low < high {
-            let middle = low + (high - low) / 2;
-            match log.nth(middle) {
-                Some((_, commit)) if commit.time_ms <= time_ms => low = middle + 1,
-                _ => high = middle,
-            }
-        }
-        match low.checked_sub(1).and_then(|index| log.nth(index)) {
-            Some((version, _)) => self.at(version),
+        let chain = self.branch.state.load().log;
+        match chain.at_time(&self.shared.store, time_ms)? {
+            Some(entry) => self.snapshot_of(&entry.commit),
             None => self.at(0),
         }
     }
@@ -536,16 +546,16 @@ impl<T: Data> Db<T> {
         &self,
         project: impl Fn(&T) -> V,
     ) -> Result<Vec<(Commit, V)>> {
-        let log = self.log();
+        let chain = self.branch.state.load().log;
         let mut previous = None;
-        if log.first().is_some_and(|(version, _)| version == 1) {
+        if chain.tip.is_some() && chain.first == 1 {
             previous = Some(project(&self.shared.genesis));
         }
         let mut changes = Vec::new();
-        for (version, commit) in log.iter() {
-            let value = project(&*self.at(version)?);
+        for commit in chain.commits(&self.shared.store)? {
+            let value = project(&*self.snapshot_of(&commit)?);
             if previous.as_ref() != Some(&value) {
-                changes.push(((*commit).clone(), value.clone()));
+                changes.push((commit, value.clone()));
                 previous = Some(value);
             }
         }
@@ -590,18 +600,19 @@ impl<T: Data> Db<T> {
             (Some((snapshot, _)), None) | (None, Some((snapshot, _))) => return Ok(snapshot),
             (None, None) => {}
         }
-        let (ours, theirs) = (self.log(), other.log());
-        let (Some((first_a, _)), Some((first_b, _))) = (ours.first(), theirs.first()) else {
+        let (ours, theirs) = (self.branch.state.load().log, other.branch.state.load().log);
+        if ours.tip.is_none() || theirs.tip.is_none() {
             return self.at(0);
+        }
+        let start = ours.first.max(theirs.first);
+        let same = |version: &u64| -> Result<bool> {
+            let (a, b) = (
+                ours.get(&self.shared.store, *version)?,
+                theirs.get(&other.shared.store, *version)?,
+            );
+            Ok(matches!((a, b), (Some(a), Some(b)) if a.commit == b.commit))
         };
-        let start = first_a.max(first_b);
-        let same = |version: &u64| {
-            matches!(
-                (ours.get(version), theirs.get(version)),
-                (Some(a), Some(b)) if a == b
-            )
-        };
-        if !same(&start) {
+        if !same(&start)? {
             return if start == 1 {
                 self.at(0)
             } else {
@@ -612,7 +623,7 @@ impl<T: Data> Db<T> {
         let mut high = self.version().min(other.version());
         while low < high {
             let middle = low + (high - low).div_ceil(2);
-            if same(&middle) {
+            if same(&middle)? {
                 low = middle;
             } else {
                 high = middle - 1;
@@ -634,7 +645,7 @@ impl<T: Data> Db<T> {
             Head {
                 version: commit.version,
                 root: commit.root,
-                log: state.log.clone(),
+                log: state.log,
                 merged: state.merged.clone(),
             },
         );
@@ -703,9 +714,9 @@ impl<T: Data> Db<T> {
         let refs = self.shared.refs.lock();
         let mut report = Verified::default();
         if let Some(ptr) = refs.ptr {
-            self.shared.store.walk(ptr, |_, object| {
+            self.shared.store.walk(ptr, |ptr, object| {
                 report.objects += 1;
-                report.bytes += (object.body.len() + object.links.len() * 40 + 8) as u64;
+                report.bytes += crate::store::record_len(ptr.offset, object) as u64;
             })?;
         }
         report.file_bytes = self.shared.store.size();
