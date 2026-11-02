@@ -284,9 +284,8 @@ impl Ledger {
         let low: PostingKey = (account, from, 0, 0);
         let high: PostingKey = (account, to, u64::MAX, u16::MAX);
         self.postings
-            .range::<PostingKey, _>(low..=high)
-            .map(|(_, amount)| i128::from(*amount))
-            .sum()
+            .range_summary::<PostingKey, _>(low..=high)
+            .map_or(0, |net| net.0)
     }
 
     pub fn balance_at(&self, account: &Account, as_of: Option<i32>) -> i128 {
