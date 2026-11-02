@@ -1,5 +1,5 @@
 [workspace]
-members = ["ferro", "ferro-cli", "ferro-derive"]
+members = ["ferro", "ferro-cli", "ferro-derive", "examples/tracker"]
 resolver = "3"
 
 [workspace.package]
