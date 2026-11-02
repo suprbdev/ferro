@@ -497,13 +497,15 @@ impl Data for u128 {
 
 impl Data for i128 {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        w.raw(&self.to_le_bytes());
+        let bits = ((*self << 1) ^ (*self >> 127)) as u128;
+        w.varint(bits as u64);
+        w.varint((bits >> 64) as u64);
         Ok(())
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let bytes: [u8; 16] = r.take(16)?.try_into().expect("slice length is 16");
-        Ok(i128::from_le_bytes(bytes))
+        let bits = u128::from(r.varint()?) | (u128::from(r.varint()?) << 64);
+        Ok(((bits >> 1) as i128) ^ -((bits & 1) as i128))
     }
 }
 
