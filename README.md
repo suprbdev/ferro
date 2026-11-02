@@ -136,7 +136,8 @@ db.merge_with(&what_if, |shop, base, theirs| {
 ```
 
 A fork is one small commit whatever the database size. Merges are three-way and cost O(changes).
-You decide conflicts in Rust, and you merge each collection in your root yourself.
+You decide conflicts in Rust, and you merge each collection in your root yourself. Repeat merges
+between two branches, in either direction, do not apply a change twice.
 
 ## Changing your types
 
@@ -231,6 +232,9 @@ This is an experiment, not a production database.
   order, never with a real power cut. Only log write failure was injected, not fsync failure.
 - A corrupted newest superblock cannot be told from a torn write, so open rolls back to the
   previous commit, losing that one acknowledged commit.
+- Only direct merges are recorded. A change that arrives through a third branch, or through a
+  fork of an already merged branch, is seen again. Nothing is lost, but a merge closure that is
+  not idempotent, such as one adding a counter delta, applies it twice.
 - Version 0 is not stored. `at(0)` and forks of an empty database use your current `Default`.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
   You choose the index.
