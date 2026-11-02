@@ -170,6 +170,16 @@ impl<K, V> Node<K, V> {
         &mut self.children
     }
 
+    fn warm_values(&self) {
+        let mut total = 0;
+        for slot in &self.slots {
+            if let Slot::Inline(value) | Slot::Fresh(value) = slot {
+                total += Arc::strong_count(value);
+            }
+        }
+        std::hint::black_box(total);
+    }
+
     fn recount(&mut self) {
         self.count =
             self.keys.len() as u64 + self.children.iter().map(Link::count).sum::<u64>();
@@ -938,6 +948,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
                 front,
                 back,
                 remaining: high.saturating_sub(low),
+                warm: true,
             })
         };
         fatal(build())
@@ -948,7 +959,7 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     }
 
     pub fn keys(&self) -> Keys<K, V> {
-        Keys(self.iter())
+        self.iter().into_keys()
     }
 
     pub fn values(&self) -> Values<K, V> {
@@ -1157,9 +1168,15 @@ pub struct Iter<K, V> {
     front: Vec<Frame<K, V>>,
     back: Vec<Frame<K, V>>,
     remaining: u64,
+    warm: bool,
 }
 
 impl<K: Data + Ord, V: Data> Iter<K, V> {
+    pub(crate) fn into_keys(mut self) -> Keys<K, V> {
+        self.warm = false;
+        Keys(self)
+    }
+
     fn advance(&mut self) -> Option<usize> {
         if self.remaining == 0 {
             return None;
@@ -1180,6 +1197,9 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             }
             let child = frame.node.child((position / 2) as usize);
             if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
+                if self.warm {
+                    node.warm_values();
+                }
                 self.front.push(Frame { node, position: 0 });
             }
         }
@@ -1204,6 +1224,9 @@ impl<K: Data + Ord, V: Data> Iter<K, V> {
             }
             let child = frame.node.child((position / 2) as usize);
             if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
+                if self.warm {
+                    node.warm_values();
+                }
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
             }

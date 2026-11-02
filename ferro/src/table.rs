@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Iter, Map, Values, three_way};
+use crate::map::{Conflict, Diff, Iter, Keys, Map, Values, three_way};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -258,15 +258,15 @@ trait KeyCursor<K>: Send {
     fn left(&self) -> usize;
 }
 
-struct Entries<I, K>(Iter<(I, K), ()>);
+struct Entries<I, K>(Keys<(I, K), ()>);
 
 impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
     fn forward(&mut self) -> Option<K> {
-        self.0.next().map(|((_, key), _)| key)
+        self.0.next().map(|(_, key)| key)
     }
 
     fn backward(&mut self) -> Option<K> {
-        self.0.next_back().map(|((_, key), _)| key)
+        self.0.next_back().map(|(_, key)| key)
     }
 
     fn left(&self) -> usize {
@@ -283,7 +283,7 @@ impl<T: Record> IndexIter<T> {
     fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
         IndexIter {
             rows: rows.clone(),
-            keys: Box::new(Entries(entries)),
+            keys: Box::new(Entries(entries.into_keys())),
         }
     }
 }
