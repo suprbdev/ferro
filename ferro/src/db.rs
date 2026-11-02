@@ -68,7 +68,7 @@ pub(crate) struct Head {
     pub(crate) version: u64,
     pub(crate) root: Option<Ptr>,
     pub(crate) log: Map<u64, Commit>,
-    pub(crate) merged: Map<String, u64>,
+    pub(crate) merged: Map<String, (u64, u64)>,
 }
 
 impl Data for Head {
@@ -131,7 +131,7 @@ impl<T> Snapshot<T> {
 struct State<T> {
     snapshot: Snapshot<T>,
     log: Map<u64, Commit>,
-    merged: Map<String, u64>,
+    merged: Map<String, (u64, u64)>,
 }
 
 #[derive(Default)]
@@ -440,10 +440,11 @@ impl<T: Data> Db<T> {
         let mut txn = store.begin()?;
         let root = write_root(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
+        let version = state.snapshot.commit.version + 1;
         let mut merged = state.merged.clone();
         let recorded = match intent.merged {
-            Some((branch, version)) if merged.try_get(&branch)?.as_deref() != Some(&version) => {
-                merged.insert(branch, version);
+            Some((branch, theirs)) if merged.try_get(&branch)?.map(|seen| seen.0) != Some(theirs) => {
+                merged.insert(branch, (theirs, version));
                 true
             }
             _ => false,
@@ -451,7 +452,6 @@ impl<T: Data> Db<T> {
         if !recorded && previous.unwrap_or(self.shared.genesis_hash) == root.hash {
             return Ok(state.snapshot.commit.version);
         }
-        let version = state.snapshot.commit.version + 1;
         let commit = Commit {
             version,
             time_ms: now_ms().max(state.snapshot.commit.time_ms),
@@ -572,22 +572,23 @@ impl<T: Data> Db<T> {
     }
 
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
-        let recorded = |db: &Db<T>, from: &Db<T>| -> Result<Option<Snapshot<T>>> {
+        let recorded = |db: &Db<T>, from: &Db<T>| -> Result<Option<(Snapshot<T>, u64)>> {
             let state = db.branch.state.load();
-            let Some(version) = state.merged.try_get(&from.branch.name)? else {
+            let Some(seen) = state.merged.try_get(&from.branch.name)? else {
                 return Ok(None);
             };
-            match from.at(*version) {
-                Ok(snapshot) => Ok(Some(snapshot)),
+            match from.at(seen.0) {
+                Ok(snapshot) => Ok(Some((snapshot, seen.1))),
                 Err(Error::NoVersion(_)) => Ok(None),
                 Err(error) => Err(error),
             }
         };
-        if let Some(snapshot) = recorded(self, other)? {
-            return Ok(snapshot);
-        }
-        if let Some(snapshot) = recorded(other, self)? {
-            return Ok(snapshot);
+        match (recorded(self, other)?, recorded(other, self)?) {
+            (Some((mine, merged_at)), Some((yours, _))) => {
+                return Ok(if merged_at <= yours.version() { yours } else { mine });
+            }
+            (Some((snapshot, _)), None) | (None, Some((snapshot, _))) => return Ok(snapshot),
+            (None, None) => {}
         }
         let (ours, theirs) = (self.log(), other.log());
         let (Some((first_a, _)), Some((first_b, _))) = (ours.first(), theirs.first()) else {

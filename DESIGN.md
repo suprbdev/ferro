@@ -59,7 +59,9 @@ since log bytes under a published head never change, and `refresh` picks up new 
 
 One writer at a time, serialized by a mutex. `update` clones the root, runs the closure, flushes,
 and publishes through `ArcSwap`. Readers never block and never see partial state. A `Snapshot<T>`
-keeps its version alive for as long as it is held. Unpublished state lives only in the closure's
+keeps its version alive for as long as it is held, and so does any `Map` or `Table` cloned from
+it. All of them also keep the writer lock held after the `Db` is dropped, so a new writer gets
+`Error::Locked` until they are gone. Unpublished state lives only in the closure's
 working copy, so a panic or an `Err` discards it.
 
 ## History
@@ -80,9 +82,18 @@ key changed only by theirs is applied. A key changed the same way on both sides 
 A key changed differently on both sides goes to a `resolve` closure. Merging runs inside an
 ordinary commit, so a root with several collections merges each one in plain Rust.
 
-`Db::merge_with` wraps this and records the merged branch and version in the head. The next
-`common_ancestor` starts from that version, so changes that were already merged are not applied
-again. A merge that keeps only our side still commits, so the record is not lost.
+`Db::merge_with` wraps this and records in the head the other branch's merged version and the
+version the merge became. `common_ancestor` prefers a recorded version over the fork point. When
+each branch has recorded a merge of the other, it takes the one that contains the other. So
+repeated merges, and merges back and forth between two branches, do not apply a change twice. A
+merge that keeps only our side still commits, so the record is not lost.
+
+Only direct merges are recorded. A change that reaches a branch through a third branch (A merges
+B after B merged C, then A merges C), or through a fork of a branch that was already merged, is
+not recognised. A merge closure that is not idempotent, such as one that adds a counter delta,
+applies it again, and the built-in merges may report a conflict for it. If compaction pruned the
+recorded version, `common_ancestor` falls back to the fork point, or returns `NoCommonAncestor`
+if that was pruned too.
 
 ## Compaction
 
