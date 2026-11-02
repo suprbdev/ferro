@@ -725,12 +725,10 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
     db.try_commit::<_, Error>("retain", |m| {
         let mut report = Retained::default();
         let boundary = bucket_of(cutoff);
-        let doomed: Vec<u64> = m.chunks.range(..boundary).map(|(bucket, _)| bucket).collect();
-        for bucket in doomed {
-            if let Some(part) = m.chunks.remove(&bucket) {
-                report.partitions_dropped += 1;
-                report.points_dropped += part.values().map(|chunk| chunk.len() as u64).sum::<u64>();
-            }
+        let dropped = m.chunks.take_range(..boundary);
+        report.partitions_dropped = dropped.len();
+        for part in dropped.values() {
+            report.points_dropped += part.values().map(|chunk| chunk.len() as u64).sum::<u64>();
         }
         if cutoff > boundary
             && let Some(part) = m.chunks.get_mut(&boundary)

@@ -318,6 +318,7 @@ fn link_from<K, V>(
     keys: Vec<K>,
     slots: Vec<Slot<V>>,
     mut children: Vec<Link<K, V>>,
+    origin: Option<Ptr>,
 ) -> Link<K, V> {
     if keys.is_empty() {
         return children.pop().unwrap_or(Link::Empty);
@@ -331,7 +332,7 @@ fn link_from<K, V>(
         slots,
         children,
         count: 0,
-        origin: None,
+        origin,
     };
     node.recount();
     Link::Mem(Arc::new(node))
@@ -340,7 +341,7 @@ fn link_from<K, V>(
 fn split<K: Data + Ord, V: Data>(
     store: Option<&Store>,
     link: Link<K, V>,
-    key: &K,
+    side: &impl Fn(&K) -> Ordering,
 ) -> Result<(Link<K, V>, Link<K, V>)> {
     let Some(node) = load(store, &link)? else {
         return Ok((Link::Empty, Link::Empty));
@@ -351,28 +352,29 @@ fn split<K: Data + Ord, V: Data>(
         mut keys,
         mut slots,
         mut children,
+        origin,
         ..
     } = Arc::unwrap_or_clone(node);
     let position = keys
-        .binary_search(key)
+        .binary_search_by(side)
         .err()
         .ok_or_else(|| Error::Corrupt("key found at a level it does not hash to".into()))?;
     let right_keys = keys.split_off(position);
     let right_slots = slots.split_off(position);
     if children.is_empty() {
         return Ok((
-            link_from(level, keys, slots, children),
-            link_from(level, right_keys, right_slots, Vec::new()),
+            link_from(level, keys, slots, children, origin),
+            link_from(level, right_keys, right_slots, Vec::new(), origin),
         ));
     }
     let mut right_children = children.split_off(position + 1);
     let middle = children.pop().ok_or(Error::Detached)?;
-    let (left_part, right_part) = split(store, middle, key)?;
+    let (left_part, right_part) = split(store, middle, side)?;
     children.push(left_part);
     right_children.insert(0, right_part);
     Ok((
-        link_from(level, keys, slots, children),
-        link_from(level, right_keys, right_slots, right_children),
+        link_from(level, keys, slots, children, origin),
+        link_from(level, right_keys, right_slots, right_children, origin),
     ))
 }
 
@@ -436,12 +438,19 @@ fn insert_at<K: Data + Ord, V: Data>(
             vec![key],
             vec![Slot::Fresh(value)],
             vec![Link::Empty, Link::Empty],
+            None,
         );
         return Ok(None);
     };
     if level > current.level {
-        let (left, right) = split(store, link.take(), &key)?;
-        *link = link_from(level, vec![key], vec![Slot::Fresh(value)], vec![left, right]);
+        let (left, right) = split(store, link.take(), &|probe: &K| probe.cmp(&key))?;
+        *link = link_from(
+            level,
+            vec![key],
+            vec![Slot::Fresh(value)],
+            vec![left, right],
+            None,
+        );
         return Ok(None);
     }
     let node = node_mut(store, link)?;
@@ -457,7 +466,8 @@ fn insert_at<K: Data + Ord, V: Data>(
                 node.count += 1;
                 return Ok(None);
             }
-            let (left, right) = split(store, node.children[position].take(), &key)?;
+            let (left, right) =
+                split(store, node.children[position].take(), &|probe: &K| probe.cmp(&key))?;
             node.keys.insert(position, key);
             node.slots.insert(position, Slot::Fresh(value));
             node.children[position] = left;
@@ -670,7 +680,7 @@ struct Open<K, V> {
 impl<K, V> Open<K, V> {
     fn close(mut self, last: Link<K, V>) -> Link<K, V> {
         self.children.push(last);
-        link_from(self.level, self.keys, self.slots, self.children)
+        link_from(self.level, self.keys, self.slots, self.children, None)
     }
 }
 
@@ -703,6 +713,38 @@ fn build_sorted<K: Data + Ord, V: Data>(items: Vec<(K, V)>) -> Result<Link<K, V>
         carry = top.close(carry);
     }
     Ok(carry)
+}
+
+fn below<K, Q>(key: &K, start: Bound<&Q>) -> bool
+where
+    K: Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    match start {
+        Bound::Included(bound) => key.borrow() < bound,
+        Bound::Excluded(bound) => key.borrow() <= bound,
+        Bound::Unbounded => false,
+    }
+}
+
+fn within<K, Q>(key: &K, end: Bound<&Q>) -> bool
+where
+    K: Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    match end {
+        Bound::Included(bound) => key.borrow() <= bound,
+        Bound::Excluded(bound) => key.borrow() < bound,
+        Bound::Unbounded => true,
+    }
+}
+
+fn left_if(left: bool) -> Ordering {
+    if left {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
 }
 
 pub struct Map<K, V> {
@@ -974,18 +1016,95 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
     {
         let start = range.start_bound();
         let end = range.end_bound();
-        self.range_by(
-            |key| match start {
-                Bound::Included(bound) => key.borrow() < bound,
-                Bound::Excluded(bound) => key.borrow() <= bound,
-                Bound::Unbounded => false,
-            },
-            |key| match end {
-                Bound::Included(bound) => key.borrow() <= bound,
-                Bound::Excluded(bound) => key.borrow() < bound,
-                Bound::Unbounded => true,
-            },
-        )
+        self.range_by(|key| below(key, start), |key| within(key, end))
+    }
+
+    pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        let empty = self
+            .range_by(|key| below(key, start), |key| within(key, end))
+            .len()
+            == 0;
+        let mut taken = Map {
+            root: Link::Empty,
+            store: self.store.clone(),
+        };
+        if empty {
+            return taken;
+        }
+        let store = self.store.as_ref();
+        let (kept, rest) = fatal(split(store, self.root.take(), &|key| {
+            left_if(below(key, start))
+        }));
+        let (middle, tail) = fatal(split(store, rest, &|key| left_if(within(key, end))));
+        self.root = fatal(merge(store, kept, tail));
+        taken.root = middle;
+        taken
+    }
+
+    pub fn remove_range<Q, R>(&mut self, range: R) -> usize
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.take_range::<Q, R>(range).len()
+    }
+
+    pub fn split_off<Q>(&mut self, key: &Q) -> Map<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let start = Bound::Included(key);
+        let store = self.store.as_ref();
+        let (kept, tail) = fatal(split(store, self.root.take(), &|probe| {
+            left_if(below(probe, start))
+        }));
+        self.root = kept;
+        Map {
+            root: tail,
+            store: self.store.clone(),
+        }
+    }
+
+    pub fn append(&mut self, other: &mut Map<K, V>) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            std::mem::swap(self, other);
+            other.clear();
+            return;
+        }
+        let joinable = self
+            .store
+            .as_ref()
+            .zip(other.store.as_ref())
+            .is_none_or(|(ours, theirs)| ours.id() == theirs.id());
+        let ascending = self.keys().next_back() < other.keys().next();
+        let descending = other.keys().next_back() < self.keys().next();
+        if joinable && (ascending || descending) {
+            let store = self.store.clone().or_else(|| other.store.clone());
+            let (low, high) = if ascending {
+                (self.root.take(), other.root.take())
+            } else {
+                (other.root.take(), self.root.take())
+            };
+            self.root = fatal(merge(store.as_ref(), low, high));
+            self.store = store;
+            return;
+        }
+        for (key, value) in other.iter() {
+            self.insert_shared(key, value);
+        }
+        other.clear();
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {

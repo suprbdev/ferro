@@ -64,9 +64,19 @@ Consequences that the rest of the system relies on:
 - A commit that changes nothing has the same root hash and is skipped.
 - `diff` skips any subtree with matching hashes, so it costs O(changes), not O(size).
 
-Insert and remove use treap-style `split` and `merge`. Mutation is copy-on-write through
-`Arc::make_mut`, so a node is copied once per transaction and then mutated in place. `Link::Mem`
-is a dirty in-memory node, and `Link::Stored` a persisted one. `flush` writes dirty nodes bottom
+Insert and remove use treap-style `split` and `merge`, and so do the range operations:
+`take_range`, `remove_range` and `split_off` cut the tree along one or two paths and `append` joins
+two maps whose key ranges do not overlap, so each touches O(log n) nodes. `remove_range` returns
+the count stored on the cut-out subtree links and never reads those subtrees. At 1M keys it took
+0.8 to 2.5 ms where collecting the keys and removing them one by one took 5 to 260 ms, for the same
+bytes written. A cut that moves nothing keeps each node's `origin`, so it writes nothing back.
+`Table::drain_range` has to update every index for every row, so it is O(rows) and returns them.
+`append` across two stores, or with overlapping keys, copies `other` entry by entry, since
+links only mean something inside their own store.
+
+Mutation is copy-on-write through `Arc::make_mut`, so a node is copied once per transaction and
+then mutated in place. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one.
+`flush` writes dirty nodes bottom
 up during `Data::encode` and seeds the node cache with the nodes it wrote. It clones the in-memory
 node unless a value held a dirty or foreign collection, in which case it decodes the written bytes
 instead, so nested collections always come back clean and a foreign store is never pinned. Values

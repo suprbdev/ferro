@@ -227,6 +227,66 @@ proptest! {
     }
 }
 
+fn range_forms_agree(model: &Model, keys: u32, low: u32, span: u32, pivot: u32) {
+    let high = low.saturating_add(span);
+    let pivot = pivot % keys;
+    let trimmed: Model = model
+        .iter()
+        .filter(|(key, _)| !(low..high).contains(*key))
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    let mut removed = sorted(model);
+    assert_eq!(removed.remove_range(low..high), model.len() - trimmed.len());
+    assert_eq!(removed.root_hash(), sorted(&trimmed).root_hash());
+    let dir = tempfile::tempdir().unwrap();
+    let db = uncached()
+        .open::<Map<u32, String>>(dir.path().join("r.ferro"))
+        .unwrap();
+    db.update(|root| *root = sorted(model)).unwrap();
+    db.update(|root| {
+        root.remove_range(low..high);
+    })
+    .unwrap();
+    assert_eq!(db.read().root_hash(), sorted(&trimmed).root_hash());
+    let mut head = reversed(model);
+    let tail = head.split_off(&pivot);
+    let mut left = model.clone();
+    let right = left.split_off(&pivot);
+    assert_eq!(head.root_hash(), sorted(&left).root_hash());
+    assert_eq!(tail.root_hash(), sorted(&right).root_hash());
+    let mut swapped = tail.clone();
+    swapped.append(&mut head);
+    assert_eq!(swapped.root_hash(), sorted(model).root_hash());
+    let mut parts = (*db.read()).clone();
+    let mut rest = parts.split_off(&pivot);
+    parts.append(&mut rest);
+    assert_eq!(parts.root_hash(), sorted(&trimmed).root_hash());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(600), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn range_removal_matches_incremental_insertion(
+        model in contents(40, 40),
+        low in 0..50u32,
+        span in 0..50u32,
+        pivot in any::<u32>(),
+    ) {
+        range_forms_agree(&model, 40, low, span, pivot);
+    }
+
+    #[test]
+    fn range_removal_matches_incremental_insertion_large(
+        model in contents(100_000, 600),
+        low in 0..100_000u32,
+        span in 0..100_000u32,
+        pivot in any::<u32>(),
+    ) {
+        range_forms_agree(&model, 100_000, low, span, pivot);
+    }
+}
+
 #[test]
 fn bulk_build_matches_incremental_insertion_at_scale() {
     let mut rng = Rng::new(7);

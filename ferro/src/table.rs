@@ -151,6 +151,19 @@ impl<T: Record> Table<T> {
         }
     }
 
+    pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Arc<T>>
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let drained: Vec<Arc<T>> = self.0.rows_mut().take_range::<Q, R>(range).values().collect();
+        for row in &drained {
+            self.0.reindex(Some(row), None);
+        }
+        drained
+    }
+
     pub fn diff(&self, newer: &Table<T>) -> Diff<T::Key, T>
     where
         T: PartialEq,

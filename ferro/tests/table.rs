@@ -74,10 +74,19 @@ enum Op {
     Untouched(u32),
     Rewrite(u32),
     Retain(u8),
+    DrainRange(Bound<u32>, Bound<u32>),
     PanicUpdate(u32, Fields),
     Forget(u32, Fields),
     Commit,
     Reopen,
+}
+
+fn id_bound() -> impl Strategy<Value = Bound<u32>> {
+    prop_oneof![
+        Just(Bound::Unbounded),
+        (0..IDS).prop_map(Bound::Included),
+        (0..IDS).prop_map(Bound::Excluded),
+    ]
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -90,6 +99,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0..IDS).prop_map(Op::Untouched),
         2 => (0..IDS).prop_map(Op::Rewrite),
         1 => (2..4u8).prop_map(Op::Retain),
+        2 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::DrainRange(a, b)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::PanicUpdate(k, f)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::Forget(k, f)),
         3 => Just(Op::Commit),
@@ -329,6 +339,20 @@ fn run(ops: Vec<Op>) {
             Op::Retain(modulus) => {
                 table.retain(|row| row.n % modulus == 0);
                 model.retain(|_, row| row.n % modulus == 0);
+            }
+            Op::DrainRange(low, high) => {
+                let wanted: Vec<Row> = model
+                    .values()
+                    .filter(|row| within(&row.id, &low, &high))
+                    .cloned()
+                    .collect();
+                let drained: Vec<Row> = table
+                    .drain_range::<u32, _>((low, high))
+                    .iter()
+                    .map(|row| (**row).clone())
+                    .collect();
+                assert_eq!(drained, wanted);
+                model.retain(|_, row| !within(&row.id, &low, &high));
             }
             Op::PanicUpdate(id, f) => {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {

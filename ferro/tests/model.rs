@@ -62,6 +62,11 @@ enum Op {
     PopFirst,
     PopLast,
     Retain(u64, u64),
+    RemoveRange(Bound<u32>, Bound<u32>),
+    TakeRange(Bound<u32>, Bound<u32>),
+    SplitOff(u32),
+    SplitRejoin(u32),
+    AppendMap(Vec<(u32, u64, usize)>),
     Range(Bound<u32>, Bound<u32>, Vec<Step>),
     Walk(Vec<Step>),
     KeysWalk(Vec<Step>),
@@ -112,6 +117,11 @@ fn op(keys: u32, durable: bool) -> impl Strategy<Value = Op> {
         2 => Just(Op::PopFirst),
         2 => Just(Op::PopLast),
         1 => (any::<u64>(), 2..7u64).prop_map(|(s, m)| Op::Retain(s, m)),
+        2 => (bound(keys), bound(keys)).prop_map(|(a, b)| Op::RemoveRange(a, b)),
+        1 => (bound(keys), bound(keys)).prop_map(|(a, b)| Op::TakeRange(a, b)),
+        1 => (0..keys).prop_map(Op::SplitOff),
+        2 => (0..keys).prop_map(Op::SplitRejoin),
+        2 => prop::collection::vec((0..keys, any::<u64>(), sizes()), 0..12).prop_map(Op::AppendMap),
         4 => (bound(keys), bound(keys), steps()).prop_map(|(a, b, s)| Op::Range(a, b, s)),
         2 => steps().prop_map(Op::Walk),
         1 => steps().prop_map(Op::KeysWalk),
@@ -190,6 +200,14 @@ fn pairs<K: Clone>(model: &BTreeMap<K, String>) -> VecDeque<(K, Arc<String>)> {
         .iter()
         .map(|(key, value)| (key.clone(), Arc::new(value.clone())))
         .collect()
+}
+
+fn fresh<K: TestKey>(model: &BTreeMap<K, String>) -> Map<K, String> {
+    let mut map = Map::new();
+    for (key, value) in model.iter().rev() {
+        map.insert(key.clone(), value.clone());
+    }
+    map
 }
 
 fn apply<K: TestKey>(
@@ -278,6 +296,52 @@ fn apply<K: TestKey>(
             assert_eq!(visited, all);
             model.retain(|key, _| !doomed.contains(key));
         }
+        Op::RemoveRange(low, high) => {
+            let low = map_bound(*low, resolve);
+            let high = map_bound(*high, resolve);
+            let before = model.len();
+            model.retain(|key, _| !in_range(key, &low, &high));
+            assert_eq!(map.remove_range::<K, _>((low, high)), before - model.len());
+        }
+        Op::TakeRange(low, high) => {
+            let low = map_bound(*low, resolve);
+            let high = map_bound(*high, resolve);
+            let wanted: BTreeMap<K, String> = model
+                .iter()
+                .filter(|(key, _)| in_range(*key, &low, &high))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            model.retain(|key, _| !in_range(key, &low, &high));
+            let taken = map.take_range::<K, _>((low, high));
+            check_full(&taken, &wanted);
+            assert_eq!(taken.root_hash(), fresh(&wanted).root_hash());
+        }
+        Op::SplitOff(seed) => {
+            let key = resolve(*seed);
+            let wanted = model.split_off(&key);
+            let tail = map.split_off(&key);
+            check_full(&tail, &wanted);
+            assert_eq!(tail.root_hash(), fresh(&wanted).root_hash());
+        }
+        Op::SplitRejoin(seed) => {
+            let key = resolve(*seed);
+            let mut tail = map.split_off(&key);
+            map.append(&mut tail);
+            assert!(tail.is_empty());
+        }
+        Op::AppendMap(entries) => {
+            let mut other = Map::new();
+            let mut wanted = BTreeMap::new();
+            for (seed, salt, len) in entries {
+                let key = resolve(*seed);
+                let value = text(*salt, *len);
+                other.insert(key.clone(), value.clone());
+                wanted.insert(key, value);
+            }
+            map.append(&mut other);
+            assert!(other.is_empty());
+            model.append(&mut wanted);
+        }
         Op::Range(low, high, steps) => {
             let low = map_bound(*low, resolve);
             let high = map_bound(*high, resolve);
@@ -329,6 +393,7 @@ fn check_full<K: TestKey>(map: &Map<K, String>, model: &BTreeMap<K, String>) {
         assert_eq!(map.nth(index).map(|p| p.0).as_ref(), Some(key));
     }
     assert_eq!(map.nth(model.len()).map(|p| p.0), None);
+    assert_eq!(map.root_hash(), fresh(model).root_hash());
 }
 
 fn memory_run<K: TestKey>(ops: &[Op], resolve: impl Fn(u32) -> K) {

@@ -97,6 +97,10 @@ the contents. A commit that changes nothing is skipped.
 | `List<T>` | Append-mostly sequence with indexed access |
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
 
+`Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and
+join trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range
+and returns the rows, which is O(rows) because every index has to be updated.
+
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
 `by_status_range(range)` and `by_status_counts()`, which needs no row reads. An `Option<T>` index
 also gets `by_field_some(&value)`, and `#[index(each)]` indexes every element of a collection

@@ -90,6 +90,36 @@ impl<T: Data + Ord> Set<T> {
         self.0.pop_last().map(|(key, _)| key)
     }
 
+    pub fn take_range<Q, R>(&mut self, range: R) -> Set<T>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        Set(self.0.take_range::<Q, R>(range))
+    }
+
+    pub fn remove_range<Q, R>(&mut self, range: R) -> usize
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.0.remove_range::<Q, R>(range)
+    }
+
+    pub fn split_off<Q>(&mut self, value: &Q) -> Set<T>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Set(self.0.split_off(value))
+    }
+
+    pub fn append(&mut self, other: &mut Set<T>) {
+        self.0.append(&mut other.0);
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         self.0.retain(|key, _| keep(key));
     }
