@@ -166,11 +166,7 @@ fn products_page(shop: &Shop, query: &ListQuery) -> Value {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let after = query.after.unwrap_or(0);
     let candidates: Box<dyn Iterator<Item = Arc<Product>>> = match &query.category {
-        Some(category) => Box::new(
-            shop.products
-                .by_category(category.as_str())
-                .skip_while(move |product| product.id <= after),
-        ),
+        Some(category) => Box::new(shop.products.by_category_after(category.as_str(), &after)),
         None => Box::new(
             shop.products
                 .range((Bound::Excluded(after), Bound::Unbounded))

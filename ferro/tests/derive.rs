@@ -253,7 +253,7 @@ fn schema_evolution() {
     );
     db.update(|root| root.added = 99).unwrap();
     drop(db);
-    let db = Db::<V1>::open(&path).err().unwrap();
+    let db = Db::<V1>::open(&path).unwrap_err();
     assert!(matches!(db, ferro::Error::MissingField("gone")));
 }
 

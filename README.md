@@ -88,7 +88,9 @@ happens. Writers run one at a time, so a transaction is serializable by construc
 
 **Collections are values too.** `Map`, `Set`, `List` and `Table` nest freely inside your types.
 Cloning one is O(1), and `==` compares root hashes in O(1) because the tree shape depends only on
-the contents. A commit that changes nothing is skipped.
+the contents. A commit that changes nothing is skipped. `Map::root_hash` and `Table::root_hash`
+expose those hashes, `Map::value_hash(&key)` gives the hash of one value, and `hash_of(&value)` the
+hash of any `Data` value, which makes an ETag one line.
 
 | Type | Use it for |
 | --- | --- |
@@ -98,9 +100,11 @@ the contents. A commit that changes nothing is skipped.
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
-`by_status_range(range)` and `by_status_counts()`, which needs no row reads. An `Option<T>` index
-also gets `by_field_some(&value)`, and `#[index(each)]` indexes every element of a collection
-field.
+`by_status_range(range)` and `by_status_counts()`, which needs no row reads.
+`by_status_after(&value, &key)` continues after a row's key within that value, so a filtered page
+costs a seek, not a walk over the rows already shown. An `Option<T>` index also gets
+`by_field_some(&value)` and `by_field_some_after(&value, &key)`, and `#[index(each)]` indexes every
+element of a collection field.
 
 ## History, diffs and branches
 
@@ -168,6 +172,11 @@ consumer skips versions, costs the writers nothing and uses no memory, and `diff
 it skipped. `recv_timeout` and `try_recv` work like `std::sync::mpsc`. A watcher ends when the last
 `Db` handle goes, and it does not keep the file open: a snapshot it had not taken by then is lost.
 A read-only handle fires its watchers on `refresh`.
+
+`db.head_hash()` is a hash over the whole history of a branch, for publishing somewhere an attacker
+cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows
+that version and everything before it are unchanged. It is not a signature and says nothing about
+later commits, other branches or whether timestamps were true. See `DESIGN.md`.
 
 ## Changing your types
 

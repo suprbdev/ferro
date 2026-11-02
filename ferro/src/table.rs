@@ -1,9 +1,10 @@
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder};
+use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
 use crate::map::{Conflict, Diff, Iter, Keys, Map, Values, three_way};
 
@@ -45,6 +46,14 @@ impl<T: Record> Deref for Table<T> {
 impl<T: Record> Table<T> {
     pub fn new() -> Self {
         Table::default()
+    }
+
+    pub fn rows(&self) -> &Map<T::Key, T> {
+        self.0.rows()
+    }
+
+    pub fn root_hash(&self) -> Option<Hash> {
+        self.0.rows().root_hash()
     }
 
     pub fn len(&self) -> usize {
@@ -374,6 +383,66 @@ where
                 Bound::Excluded(bound) => entry.0.borrow() < bound,
                 Bound::Unbounded => true,
             },
+        ),
+    )
+}
+
+fn past_cursor<K, A>(key: &K, after: &A) -> bool
+where
+    K: Borrow<A>,
+    A: Ord + ?Sized,
+{
+    key.borrow() <= after
+}
+
+pub fn index_after<I, T, Q, A>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), ()>,
+    value: &Q,
+    after: &A,
+) -> IndexIter<T>
+where
+    I: Data + Ord + Borrow<Q>,
+    T: Record,
+    T::Key: Borrow<A>,
+    Q: Ord + ?Sized,
+    A: Ord + ?Sized,
+{
+    IndexIter::over(
+        rows,
+        index.range_by(
+            |entry| match entry.0.borrow().cmp(value) {
+                Ordering::Less => true,
+                Ordering::Equal => past_cursor(&entry.1, after),
+                Ordering::Greater => false,
+            },
+            |entry| entry.0.borrow() <= value,
+        ),
+    )
+}
+
+pub fn index_after_some<X, T, Q, A>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(Option<X>, T::Key), ()>,
+    value: &Q,
+    after: &A,
+) -> IndexIter<T>
+where
+    X: Data + Ord + Borrow<Q>,
+    T: Record,
+    T::Key: Borrow<A>,
+    Q: Ord + ?Sized,
+    A: Ord + ?Sized,
+{
+    IndexIter::over(
+        rows,
+        index.range_by(
+            |entry| match entry.0.as_ref().map(|x| x.borrow().cmp(value)) {
+                None | Some(Ordering::Less) => true,
+                Some(Ordering::Equal) => past_cursor(&entry.1, after),
+                Some(Ordering::Greater) => false,
+            },
+            |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
         ),
     )
 }

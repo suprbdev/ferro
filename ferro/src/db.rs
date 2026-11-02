@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::history::History;
 use crate::log::{Chain, Log};
@@ -133,6 +134,15 @@ impl<T> Deref for Snapshot<T> {
     }
 }
 
+impl<T> fmt::Debug for Snapshot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &self.commit.version)
+            .field("message", &self.commit.message)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> Snapshot<T> {
     pub fn version(&self) -> u64 {
         self.commit.version
@@ -233,6 +243,16 @@ pub struct Db<T> {
     branch: Arc<Branch<T>>,
 }
 
+impl<T> fmt::Debug for Db<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Db")
+            .field("path", &self.shared.store.path())
+            .field("branch", &self.branch.name)
+            .field("version", &self.branch.state.load().snapshot.commit.version)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> Clone for Db<T> {
     fn clone(&self) -> Self {
         Db {
@@ -278,7 +298,7 @@ impl Options {
     ) -> Result<Db<T>> {
         let (store, head) = Store::open(path.as_ref(), self.store)?;
         let genesis = Arc::new(init());
-        let genesis_hash = value_hash(&*genesis)?;
+        let genesis_hash = try_hash_of(&*genesis)?;
         let refs = match head {
             Some(ptr) => (*store.load::<Refs>(ptr)?).clone(),
             None => Map::new(),
@@ -308,13 +328,6 @@ impl Options {
         };
         Ok(Db { shared, branch })
     }
-}
-
-fn value_hash<D: Data>(value: &D) -> Result<Hash> {
-    let mut sink = HashSink;
-    let mut encoder = Encoder::new(&mut sink);
-    value.encode(&mut encoder)?;
-    Ok(encoder.finish()?.hash)
 }
 
 fn write_value<D: Data>(value: &D, txn: &mut Txn) -> Result<Ptr> {
@@ -491,6 +504,10 @@ impl<T: Data> Db<T> {
 
     pub fn version(&self) -> u64 {
         self.branch.state.load().snapshot.commit.version
+    }
+
+    pub fn head_hash(&self) -> Option<Hash> {
+        self.branch.state.load().log.tip.map(|ptr| ptr.hash)
     }
 
     pub fn log(&self) -> Log {

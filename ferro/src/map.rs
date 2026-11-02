@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, OnceLock, Weak};
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::store::{Store, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
@@ -813,6 +813,21 @@ impl<K: Data + Ord, V: Data> Map<K, V> {
         Q: Ord + ?Sized,
     {
         fatal(self.try_get(key))
+    }
+
+    pub fn value_hash<Q>(&self, key: &Q) -> Option<Hash>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let found = self.walk(|node| match node.search(key) {
+            Ok(index) => Visit::Done(match &node.slots[index] {
+                Slot::Spilled(ptr) => Ok(ptr.hash),
+                Slot::Inline(value) | Slot::Fresh(value) => try_hash_of(&**value),
+            }),
+            Err(position) => Visit::Descend(position),
+        });
+        fatal(fatal(found).transpose())
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool

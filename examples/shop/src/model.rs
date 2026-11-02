@@ -1,7 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferro::codec::{Encoder, HashSink};
-use ferro::{Data, Map, Record, Table, TableData};
+use ferro::{Data, Hash, Map, Record, Table, hash_of};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Data, Record)]
@@ -82,26 +81,23 @@ pub fn hex(hash: &[u8]) -> String {
 }
 
 pub fn row_hash<D: Data>(row: &D) -> String {
-    let mut sink = HashSink;
-    let mut encoder = Encoder::new(&mut sink);
-    row.encode(&mut encoder).expect("hash encode");
-    hex(&encoder.finish().expect("hash finish").hash)
+    hex(&hash_of(row))
 }
 
-pub fn root_tag<K: Data + Ord, V: Data>(map: &Map<K, V>) -> String {
-    map.root_hash().map(|hash| hex(&hash)).unwrap_or_default()
+pub fn root_tag(hash: Option<Hash>) -> String {
+    hash.map(|hash| hex(&hash)).unwrap_or_default()
 }
 
 pub fn products_tag(shop: &Shop) -> String {
     format!(
         "{}-{}",
-        root_tag(shop.products.rows()),
-        root_tag(&shop.stock)
+        root_tag(shop.products.root_hash()),
+        root_tag(shop.stock.root_hash())
     )
 }
 
 pub fn orders_tag(shop: &Shop) -> String {
-    root_tag(shop.orders.rows())
+    root_tag(shop.orders.root_hash())
 }
 
 pub fn cart_view(cart: &Cart) -> serde_json::Value {

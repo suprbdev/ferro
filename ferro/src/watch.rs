@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -55,6 +56,12 @@ impl<T> Feed<T> {
 pub struct Watcher<T> {
     feed: Arc<Feed<T>>,
     seen: Cell<u64>,
+}
+
+impl<T> fmt::Debug for Watcher<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Watcher").field("seen", &self.seen.get()).finish_non_exhaustive()
+    }
 }
 
 impl<T> Watcher<T> {

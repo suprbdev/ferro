@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink};
 use crate::db::Commit;
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -297,6 +297,14 @@ impl Log {
     pub fn last(&self) -> Option<(u64, Arc<Commit>)> {
         let entry = crate::map::fatal(self.chain.tip_entry(&self.store))?;
         Some((self.chain.last, entry.commit.clone()))
+    }
+
+    pub fn hash_at(&self, version: &u64) -> Option<Hash> {
+        if self.is_empty() || *version < self.chain.first || *version > self.chain.last {
+            return None;
+        }
+        let ptr = crate::map::fatal(self.chain.pointer_to(&self.store, *version));
+        ptr.map(|ptr| ptr.hash)
     }
 
     pub fn iter(&self) -> Iter {

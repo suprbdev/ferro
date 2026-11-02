@@ -27,6 +27,10 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 - Links are stored in a side table and consumed in order by `Decoder::link`. They take no bytes
   in the body, which keeps encoded size independent of a value's position.
 
+`hash_of(&value)` gives the hash a value has as an object of its own, whether or not it is stored as
+one. `Map::value_hash(&key)` returns the same hash, from the stored pointer without reading a spilled
+value, or by encoding an inline value that is already in memory.
+
 Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
 instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage
 resistance, which is what tamper evidence on read needs, is 2^160. Collision resistance is 2^80
@@ -337,6 +341,27 @@ so each step reads and decodes those nodes in full, values included. With the sa
 the whole step is 0.7 to 2 µs. Going through `at(v)` instead costs about 3 µs more per step, for
 the skip-link descent from the tip. Entries hold the `Commit` behind an `Arc`, so walking the log
 and `db.read()` do not copy the message.
+
+`Db::head_hash` is the hash of the tip entry, and `Log::hash_at` that of any retained entry. An
+entry links its commit's root and its `prev` entry, and the hash covers link hashes, so one hash
+covers every commit's version, time, message and `restored` field, and every root value, back to
+the oldest retained entry. Compaction with `Keep::All` keeps it, because offsets are not hashed.
+
+Published where the writer of the file cannot change it, the hash is a tamper-evidence anchor. If
+`hash_at(version)` matches an anchor for that version and `verify` passes, then the history up to
+that version is what it was when the anchor was taken, subject to the limits of 160-bit hashes
+described under Objects and links. That is all it shows:
+
+- It is not a signature. Hashes are unkeyed, so anyone who can write the file can rewrite history
+  and get a consistent chain with a new hash. Only comparing with the anchor reveals that.
+- It proves nothing about commits after the anchored version, or about history before the anchor
+  was taken: a chain forged first and anchored afterwards verifies.
+- `time_ms` and `message` are what the writer recorded. The hash shows they were not changed, not
+  that they were true.
+- It covers one branch's chain. Other branches, and the `merged` records in the head, are outside
+  it, and `verify` is what checks those objects.
+- Pruning rebuilds the chain, so every retained entry gets a new hash and old anchors stop matching.
+  Check them before compacting with `Keep::Last` or `Keep::Since`.
 
 ## Merging
 
