@@ -1,5 +1,6 @@
 [workspace]
 members = ["ferro", "ferro-bench", "ferro-cli", "ferro-derive", "examples/tracker"]
+exclude = ["benchmarks/compare"]
 resolver = "3"
 
 [workspace.package]
