@@ -65,9 +65,9 @@ pub fn out_degrees(g: &Graph, threads: usize) -> Vec<u32> {
             let low = i * chunk;
             let high = low + slice.len();
             scope.spawn(move || {
-                for (user, ids) in g.out.scan(low as UserId, high as UserId) {
-                    slice[user as usize - low] = ids.len() as u32;
-                }
+                g.out.degrees(low as UserId, high as UserId, |user, count| {
+                    slice[user as usize - low] += count as u32;
+                });
             });
         }
     });
@@ -77,9 +77,7 @@ pub fn out_degrees(g: &Graph, threads: usize) -> Vec<u32> {
 pub fn pagerank(g: &Graph, threads: usize, iterations: usize) -> Vec<f64> {
     let deg = out_degrees(g, threads);
     pagerank_with(g.user_count(), threads, iterations, &deg, |low, high, f| {
-        for (user, ids) in g.inn.scan(low, high) {
-            f(user, &ids);
-        }
+        g.inn.for_each_user(low, high, &mut *f);
     })
 }
 
@@ -97,14 +95,14 @@ impl Csr {
             let mut off = vec![0usize; n + 1];
             let mut to = Vec::new();
             let mut cursor = 0usize;
-            for (user, ids) in adj.scan(0, n as UserId) {
+            adj.for_each_user(0, n as UserId, |user, ids| {
                 let user = user as usize;
                 while cursor <= user {
                     off[cursor] = to.len();
                     cursor += 1;
                 }
-                to.extend_from_slice(&ids);
-            }
+                to.extend_from_slice(ids);
+            });
             while cursor <= n {
                 off[cursor] = to.len();
                 cursor += 1;
@@ -158,14 +156,14 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 pub fn wcc(g: &Graph) -> Vec<u32> {
     let n = g.user_count();
     let mut parent: Vec<u32> = (0..n as u32).collect();
-    for (user, ids) in g.out.scan(0, n as UserId) {
-        for other in ids {
+    g.out.for_each_user(0, n as UserId, |user, ids| {
+        for &other in ids {
             let (a, b) = (find(&mut parent, user), find(&mut parent, other));
             if a != b {
                 parent[a.max(b) as usize] = a.min(b);
             }
         }
-    }
+    });
     (0..n as u32).map(|u| find(&mut parent, u)).collect()
 }
 

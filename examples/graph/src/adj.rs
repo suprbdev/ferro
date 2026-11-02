@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use ferro::map::Iter;
-use ferro::{Bytes, Change, Data, Map};
+use ferro::{Bytes, Change, Cursor, Data, Map};
 
 pub type UserId = u32;
 pub type Edges = Vec<(UserId, UserId)>;
@@ -25,28 +25,54 @@ pub fn encode_block(ids: &[u32]) -> Bytes {
 }
 
 pub fn decode_into(first: u32, bytes: &[u8], out: &mut Vec<u32>) {
-    out.push(first);
+    let start = out.len();
+    out.resize(start + bytes.len() + 1, first);
+    let ids = &mut out[start..];
+    let mut written = 1;
+    let mut current = first;
+    let mut delta = 0u32;
+    let mut shift = 0;
+    for &byte in bytes {
+        delta |= ((byte & 0x7f) as u32) << shift;
+        let done = byte < 0x80;
+        let next = current + delta;
+        ids[written] = next;
+        written += usize::from(done);
+        current = if done { next } else { current };
+        delta = if done { 0 } else { delta };
+        shift = if done { 0 } else { shift + 7 };
+    }
+    out.truncate(start + written);
+}
+
+fn block_len(bytes: &[u8]) -> usize {
+    1 + bytes.iter().filter(|&&b| b < 0x80).count()
+}
+
+fn holds(first: u32, bytes: &[u8], wanted: u32) -> bool {
+    if first == wanted {
+        return true;
+    }
     let mut current = first;
     let mut i = 0;
     while i < bytes.len() {
         let mut delta = 0u32;
         let mut shift = 0;
         loop {
-            let b = bytes[i];
+            let byte = bytes[i];
             i += 1;
-            delta |= ((b & 0x7f) as u32) << shift;
-            if b < 0x80 {
+            delta |= ((byte & 0x7f) as u32) << shift;
+            if byte < 0x80 {
                 break;
             }
             shift += 7;
         }
         current += delta;
-        out.push(current);
+        if current >= wanted {
+            return current == wanted;
+        }
     }
-}
-
-fn block_len(bytes: &[u8]) -> usize {
-    1 + bytes.iter().filter(|&&b| b < 0x80).count()
+    false
 }
 
 #[derive(Data, Clone, Default)]
@@ -79,39 +105,22 @@ impl Adj {
     }
 
     fn floor(&self, a: UserId, b: UserId) -> Option<(UserId, Bytes)> {
-        self.0
-            .range((a, 0)..=(a, b))
-            .next_back()
-            .map(|((_, first), bytes)| (first, (*bytes).clone()))
+        let ((user, first), bytes) = self.0.floor(&(a, b))?;
+        (user == a).then(|| (first, (*bytes).clone()))
     }
 
     pub fn contains(&self, a: UserId, b: UserId) -> bool {
-        let Some((first, bytes)) = self.floor(a, b) else {
+        let Some(((user, first), bytes)) = self.0.floor(&(a, b)) else {
             return false;
         };
-        if first == b {
-            return true;
+        user == a && holds(first, &bytes, b)
+    }
+
+    pub fn walker(&self) -> Walker {
+        Walker {
+            cursor: self.0.cursor(),
+            ids: Vec::new(),
         }
-        let mut current = first;
-        let mut i = 0;
-        while i < bytes.len() {
-            let mut delta = 0u32;
-            let mut shift = 0;
-            loop {
-                let byte = bytes[i];
-                i += 1;
-                delta |= ((byte & 0x7f) as u32) << shift;
-                if byte < 0x80 {
-                    break;
-                }
-                shift += 7;
-            }
-            current += delta;
-            if current >= b {
-                return current == b;
-            }
-        }
-        false
     }
 
     pub fn insert(&mut self, a: UserId, b: UserId) -> bool {
@@ -160,10 +169,13 @@ impl Adj {
     }
 
     pub fn degree(&self, a: UserId) -> usize {
-        self.0
-            .range((a, 0)..=(a, UserId::MAX))
-            .map(|(_, bytes)| block_len(&bytes))
-            .sum()
+        let mut total = 0;
+        self.0.for_each_range((a, 0)..=(a, UserId::MAX), |_, bytes| total += block_len(bytes));
+        total
+    }
+
+    pub fn degrees(&self, low: UserId, high: UserId, mut f: impl FnMut(UserId, usize)) {
+        self.0.for_each_range((low, 0)..(high, 0), |&(user, _), bytes| f(user, block_len(bytes)));
     }
 
     pub fn neighbours(&self, a: UserId) -> Vec<UserId> {
@@ -175,16 +187,12 @@ impl Adj {
     }
 
     pub fn iter_after(&self, a: UserId, after: Option<UserId>) -> Neighbours {
-        let start = after
-            .and_then(|b| {
-                self.0
-                    .range((a, 0)..=(a, b))
-                    .next_back()
-                    .map(|((_, first), _)| first)
-            })
-            .unwrap_or(0);
+        let start = after.and_then(|b| self.floor(a, b)).map_or(0, |(first, _)| first);
+        let mut cursor = self.0.cursor();
+        cursor.seek(&(a, start));
         Neighbours {
-            blocks: self.0.range((a, start)..=(a, UserId::MAX)),
+            cursor,
+            user: a,
             buf: Vec::new(),
             pos: 0,
             after,
@@ -195,6 +203,23 @@ impl Adj {
         Scan {
             blocks: self.0.range((low, 0)..(high, 0)),
             pending: None,
+        }
+    }
+
+    pub fn for_each_user(&self, low: UserId, high: UserId, mut f: impl FnMut(UserId, &[u32])) {
+        let mut ids = Vec::new();
+        let mut owner = None;
+        self.0.for_each_range((low, 0)..(high, 0), |&(user, first), bytes| {
+            if owner != Some(user) {
+                if let Some(done) = owner.replace(user) {
+                    f(done, &ids);
+                }
+                ids.clear();
+            }
+            decode_into(first, bytes, &mut ids);
+        });
+        if let Some(done) = owner {
+            f(done, &ids);
         }
     }
 
@@ -237,8 +262,41 @@ impl Adj {
     }
 }
 
+pub struct Walker {
+    cursor: Cursor<(UserId, UserId), Bytes>,
+    ids: Vec<u32>,
+}
+
+impl Walker {
+    pub fn neighbours(&mut self, user: UserId, limit: usize) -> &[u32] {
+        let Walker { cursor, ids } = self;
+        ids.clear();
+        cursor.seek(&(user, 0));
+        while ids.len() < limit {
+            let decoded = cursor.read(|&(owner, first), bytes| {
+                if owner == user {
+                    decode_into(first, bytes, ids);
+                }
+                owner == user
+            });
+            if decoded != Some(true) {
+                break;
+            }
+            cursor.advance();
+        }
+        &ids[..ids.len().min(limit)]
+    }
+
+    pub fn contains(&mut self, a: UserId, b: UserId) -> bool {
+        self.cursor.seek_back(&(a, b));
+        let held = self.cursor.read(|&(user, first), bytes| user == a && holds(first, bytes, b));
+        held == Some(true)
+    }
+}
+
 pub struct Neighbours {
-    blocks: Iter<(UserId, UserId), Bytes>,
+    cursor: Cursor<(UserId, UserId), Bytes>,
+    user: UserId,
     buf: Vec<u32>,
     pos: usize,
     after: Option<UserId>,
@@ -254,13 +312,28 @@ impl Iterator for Neighbours {
                 self.pos += 1;
                 return Some(id);
             }
-            let ((_, first), bytes) = self.blocks.next()?;
-            self.buf.clear();
-            decode_into(first, &bytes, &mut self.buf);
-            self.pos = match self.after {
-                Some(after) => self.buf.partition_point(|&x| x <= after),
-                None => 0,
-            };
+            let Neighbours {
+                cursor,
+                user,
+                buf,
+                pos,
+                after,
+            } = self;
+            buf.clear();
+            *pos = 0;
+            let decoded = cursor.read(|&(owner, first), bytes| {
+                if owner == *user {
+                    decode_into(first, bytes, buf);
+                }
+                owner == *user
+            });
+            if decoded != Some(true) {
+                return None;
+            }
+            cursor.advance();
+            if let Some(after) = after {
+                *pos = buf.partition_point(|x| x <= after);
+            }
         }
     }
 }
@@ -310,10 +383,8 @@ pub fn intersect(
         return Vec::new();
     }
     if small_degree * 16 < large_degree {
-        return small
-            .iter(small_user)
-            .filter(|&id| large.contains(large_user, id))
-            .collect();
+        let mut walker = large.walker();
+        return small.iter(small_user).filter(|&id| walker.contains(large_user, id)).collect();
     }
     let mut out = Vec::new();
     let mut x = small.iter(small_user);

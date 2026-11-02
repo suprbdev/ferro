@@ -1,8 +1,8 @@
+use ferro::Val;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use clap::ValueEnum;
-use ferro::Val;
 
 use crate::adj::{Adj, intersect};
 use crate::model::{Graph, Post, UserId};
@@ -69,28 +69,23 @@ impl Bits {
     }
 }
 
-fn neighbours_dir(g: &Graph, user: UserId, dir: Dir, f: &mut dyn FnMut(UserId)) {
-    if matches!(dir, Dir::Out | Dir::Both) {
-        g.out.iter(user).for_each(&mut *f);
-    }
-    if matches!(dir, Dir::In | Dir::Both) {
-        g.inn.iter(user).for_each(&mut *f);
-    }
-}
-
 pub fn reach(g: &Graph, start: UserId, hops: usize, dir: Dir) -> Vec<usize> {
     let mut seen = Bits::new(g.user_count());
     seen.set(start);
     let mut frontier = vec![start];
     let mut levels = Vec::new();
+    let mut out = g.out.walker();
+    let mut inn = g.inn.walker();
     for _ in 0..hops {
         let mut next = Vec::new();
+        frontier.sort_unstable();
         for &user in &frontier {
-            neighbours_dir(g, user, dir, &mut |other| {
-                if seen.set(other) {
-                    next.push(other);
-                }
-            });
+            if matches!(dir, Dir::Out | Dir::Both) {
+                next.extend(out.neighbours(user, usize::MAX).iter().filter(|&&id| seen.set(id)));
+            }
+            if matches!(dir, Dir::In | Dir::Both) {
+                next.extend(inn.neighbours(user, usize::MAX).iter().filter(|&&id| seen.set(id)));
+            }
         }
         levels.push(next.len());
         if next.is_empty() {
@@ -163,8 +158,9 @@ pub fn recommend(g: &Graph, user: UserId, limit: usize, max_fanout: usize) -> Ve
     let following = g.out.neighbours(user);
     let blocked = g.blocked_either_way(user);
     let mut counts: HashMap<UserId, u32> = HashMap::new();
+    let mut walker = g.out.walker();
     for &friend in &following {
-        for candidate in g.out.iter(friend).take(max_fanout) {
+        for &candidate in walker.neighbours(friend, max_fanout) {
             if candidate == user
                 || following.binary_search(&candidate).is_ok()
                 || blocked.binary_search(&candidate).is_ok()

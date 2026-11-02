@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -54,6 +56,22 @@ fn csr_reach(csr: &Csr, start: UserId, hops: usize) -> (usize, usize, usize) {
     (total, lookups, edges)
 }
 
+fn csr_recommend(csr: &Csr, user: UserId, limit: usize, max_fanout: usize) -> Vec<(UserId, u32)> {
+    let following = csr.out(user);
+    let mut counts: HashMap<UserId, u32> = HashMap::new();
+    for &friend in following {
+        for &candidate in csr.out(friend).iter().take(max_fanout) {
+            if candidate != user && following.binary_search(&candidate).is_err() {
+                *counts.entry(candidate).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(UserId, u32)> = counts.into_iter().collect();
+    ranked.sort_unstable_by_key(|&(id, n)| (Reverse(n), id));
+    ranked.truncate(limit);
+    ranked
+}
+
 fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
     let snap = db.read();
     let g: &Graph = &snap;
@@ -72,17 +90,18 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
     let edges_walked: usize = users.iter().map(|&u| csr.out(u).len()).sum();
 
     for pass in ["cold", "warm"] {
+        let mut walker = g.out.walker();
         let (seek, s1) = timed(|| {
             let mut s = 0u64;
             for &u in &users {
-                s += g.out.iter(u).next().unwrap_or(0) as u64;
+                s += walker.neighbours(u, 1).first().copied().unwrap_or(0) as u64;
             }
             s
         });
         let (full, s2) = timed(|| {
             let mut s = 0u64;
             for &u in &users {
-                for v in g.out.iter(u) {
+                for &v in walker.neighbours(u, usize::MAX) {
                     s += v as u64;
                 }
             }
@@ -147,13 +166,25 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
     )?;
 
     let (scan_t, scan_n) = timed(|| {
-        g.out
-            .scan(0, n as UserId)
-            .map(|(_, ids)| ids.len())
-            .sum::<usize>()
+        let mut total = 0;
+        g.out.for_each_user(0, n as UserId, |_, ids| total += ids.len());
+        total
     });
+    let (walk_t, walked) = timed(|| {
+        let mut total = 0;
+        g.out.degrees(0, n as UserId, |_, count| total += count);
+        total
+    });
+    assert_eq!(walked, scan_n);
     let (vec_scan, vs) = timed(|| std::hint::black_box(&csr.out_to).iter().map(|&v| v as u64).sum::<u64>());
     std::hint::black_box(vs);
+    writeln!(
+        out,
+        "out-edge walk without varint decode: ferro {:.3}s ({:.1} ns/edge, {} blocks)",
+        walk_t,
+        walk_t * 1e9 / scan_n as f64,
+        g.out.block_count()
+    )?;
     writeln!(
         out,
         "full out-edge scan: ferro {:.3}s ({:.1} ns/edge)  Vec {:.3}s ({:.2} ns/edge)  ratio {:.0}x",
@@ -213,10 +244,11 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
                     frontier = next;
                 }
             }
+            let mut walker = g.out.walker();
             let (t, _) = timed(|| {
                 let mut s = 0u64;
                 for &x in &frontier_all {
-                    s += g.out.iter(x).next().unwrap_or(0) as u64;
+                    s += walker.neighbours(x, 1).first().copied().unwrap_or(0) as u64;
                 }
                 s
             });
@@ -236,6 +268,25 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
             seek_only / t_warm * 100.0
         )?;
     }
+    let (t_vec, picks) = timed(|| {
+        starts.iter().map(|&u| csr_recommend(&csr, u, 10, 10_000).len()).sum::<usize>()
+    });
+    let (t_cold, cold_picks) = timed(|| {
+        starts.iter().map(|&u| query::recommend(g, u, 10, 10_000).len()).sum::<usize>()
+    });
+    let (t_warm, _) = timed(|| {
+        starts.iter().map(|&u| query::recommend(g, u, 10, 10_000).len()).sum::<usize>()
+    });
+    assert_eq!(picks, cold_picks);
+    writeln!(
+        out,
+        "recommend x{}: Vec {:.1} ms  ferro cold {:.1} ms  warm {:.1} ms ({:.1}x Vec)",
+        starts.len(),
+        t_vec * 1e3,
+        t_cold * 1e3,
+        t_warm * 1e3,
+        t_warm / t_vec.max(1e-12)
+    )?;
     writeln!(out, "peak RSS {} MiB", rss_mib())?;
     Ok(())
 }
