@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use common::text;
 use ferro::db::Hook;
@@ -28,10 +29,13 @@ static RENAME_ERROR: AtomicI32 = AtomicI32::new(0);
 static CLOCK_BACK_SECONDS: AtomicI64 = AtomicI64::new(0);
 static SYNCS_UNTIL_FAILURE: AtomicI64 = AtomicI64::new(-1);
 static FAILED_SYNC: AtomicBool = AtomicBool::new(false);
+static SYNC_ENTERED: AtomicBool = AtomicBool::new(false);
+static SYNC_RELEASED: AtomicBool = AtomicBool::new(false);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
+    static SYNC_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
 #[repr(C)]
@@ -66,6 +70,12 @@ fn fails_now() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fdatasync(fd: c_int) -> c_int {
+    if SYNC_HELD.with(Cell::get) {
+        SYNC_ENTERED.store(true, Ordering::SeqCst);
+        while !SYNC_RELEASED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
     if fails_now() {
         return -1;
     }
@@ -297,6 +307,62 @@ fn a_commit_with_the_hash_of_a_tombstone_does_not_stop_later_cycles() {
     }
     assert!(db.space().unwrap().last_error.is_none());
     assert_eq!(*side.read().get(&10).unwrap(), "other");
+}
+
+#[test]
+fn a_swap_waits_for_commits_that_are_still_syncing() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let db: Db<Root> = Options::new().cache_bytes(1).reclaim(MANUAL).open(&path).unwrap();
+    fill(&db, 0, 100);
+    SYNC_ENTERED.store(false, Ordering::SeqCst);
+    SYNC_RELEASED.store(false, Ordering::SeqCst);
+    let leader = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            SYNC_HELD.with(|held| held.set(true));
+            db.update(|root| {
+                root.insert(1000, "leader".into());
+            })
+            .unwrap();
+            SYNC_HELD.with(|held| held.set(false));
+        })
+    };
+    while !SYNC_ENTERED.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    let follower = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            db.update(|root| {
+                root.insert(1001, "follower".into());
+            })
+            .unwrap();
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let release = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(200));
+        SYNC_RELEASED.store(true, Ordering::SeqCst);
+    });
+    let report = db.compact(Keep::All).unwrap();
+    release.join().unwrap();
+    leader.join().unwrap();
+    follower.join().unwrap();
+    assert!(report.pause >= Duration::from_millis(100), "{report:?}");
+    db.update(|root| {
+        root.insert(1002, "after".into());
+    })
+    .unwrap();
+    let want = dump(&db.read());
+    assert!(want.iter().any(|row| row.0 == 1001));
+    db.verify().unwrap();
+    drop(db);
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(dump(&db.read()), want);
+    assert_eq!(db.version(), 103);
+    db.verify().unwrap();
 }
 
 #[test]
