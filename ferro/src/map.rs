@@ -19,6 +19,7 @@ const PIN_DEPTH: usize = 3;
 const ARC_HEADER: usize = 16;
 const ALLOCATION_BYTES: usize = 16;
 const ITEM_BYTES: usize = 32;
+const PATH_FRAMES: usize = 8;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -1618,15 +1619,39 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ) -> Iter<K, V, S> {
         let build = || -> Result<Iter<K, V, S>> {
             let store = self.store();
-            let mut front = Vec::new();
-            let mut back = Vec::new();
-            let low = edge(store, &self.root, 0, &below, 1, &mut front)?;
-            let high = edge(store, &self.root, 0, &within, -1, &mut back)?;
+            let mut front = Vec::with_capacity(PATH_FRAMES);
+            let mut back = Vec::with_capacity(PATH_FRAMES);
+            let mut remaining = 0;
+            let mut depth = 0;
+            let mut current = resident(store, &self.root, depth)?;
+            while let Some(node) = current.take() {
+                let low = node.keys.partition_point(|key| below(key));
+                let high = node.keys.partition_point(|key| within(key));
+                depth += 1;
+                if low == high {
+                    current = resident(store, node.child(low), depth)?;
+                }
+                back.push(Frame {
+                    node: node.clone(),
+                    position: 2 * high as isize - 1,
+                });
+                front.push(Frame {
+                    node: node.clone(),
+                    position: 2 * low as isize + 1,
+                });
+                if low < high {
+                    let inner = (low + 1..high).map(|position| node.child(position).count());
+                    let skipped = edge(store, node.child(low), depth, &below, 1, &mut front)?;
+                    let kept = edge(store, node.child(high), depth, &within, -1, &mut back)?;
+                    remaining = (high - low) as u64 + inner.sum::<u64>() + kept
+                        + node.child(low).count().saturating_sub(skipped);
+                }
+            }
             Ok(Iter {
                 store: self.store.clone(),
                 front,
                 back,
-                remaining: high.saturating_sub(low),
+                remaining,
             })
         };
         fatal(build())
