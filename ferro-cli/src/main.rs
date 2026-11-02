@@ -25,7 +25,17 @@ enum Command {
     },
     #[command(about = "Re-hash every object reachable from the current head")]
     Verify { path: PathBuf },
-    #[command(about = "Rewrite the file, optionally dropping old versions")]
+    #[command(about = "Show log, allocated and estimated live bytes")]
+    Space { path: PathBuf },
+    #[command(about = "Free dead space in place, optionally dropping old versions")]
+    Reclaim {
+        path: PathBuf,
+        #[arg(long, conflicts_with = "since_ms", help = "Keep this many newest commits per branch")]
+        keep_last: Option<usize>,
+        #[arg(long, help = "Keep commits at or after this unix time in milliseconds")]
+        since_ms: Option<u64>,
+    },
+    #[command(about = "Rewrite the file densely, optionally dropping old versions")]
     Compact {
         path: PathBuf,
         #[arg(long, conflicts_with = "since_ms", help = "Keep this many newest commits per branch")]
@@ -33,6 +43,14 @@ enum Command {
         #[arg(long, help = "Keep commits at or after this unix time in milliseconds")]
         since_ms: Option<u64>,
     },
+}
+
+fn retention(keep_last: Option<usize>, since_ms: Option<u64>) -> Keep {
+    match (keep_last, since_ms) {
+        (Some(count), _) => Keep::Last(count),
+        (None, Some(time)) => Keep::Since(time),
+        (None, None) => Keep::All,
+    }
 }
 
 fn mib(bytes: u64) -> String {
@@ -72,17 +90,33 @@ fn run(cli: Cli) -> ferro::Result<()> {
                 mib(report.file_bytes)
             );
         }
+        Command::Space { path } => {
+            let space = admin::space(&path)?;
+            println!("log        {}", mib(space.log_bytes));
+            println!("allocated  {}", mib(space.allocated_bytes));
+            println!("live       {} (estimate)", mib(space.live_bytes));
+        }
+        Command::Reclaim {
+            path,
+            keep_last,
+            since_ms,
+        } => {
+            let report = admin::reclaim(&path, retention(keep_last, since_ms))?;
+            println!(
+                "{} to {}, {} objects live, {} moved, {} commits dropped",
+                mib(report.before_bytes),
+                mib(report.after_bytes),
+                report.objects,
+                mib(report.moved_bytes),
+                report.commits_dropped
+            );
+        }
         Command::Compact {
             path,
             keep_last,
             since_ms,
         } => {
-            let keep = match (keep_last, since_ms) {
-                (Some(count), _) => Keep::Last(count),
-                (None, Some(time)) => Keep::Since(time),
-                (None, None) => Keep::All,
-            };
-            let report = admin::compact(&path, keep)?;
+            let report = admin::compact(&path, retention(keep_last, since_ms))?;
             println!(
                 "{} to {}, {} objects kept, {} commits dropped",
                 mib(report.before_bytes),
