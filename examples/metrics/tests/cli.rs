@@ -277,6 +277,37 @@ fn aggregate_rate_sums_across_series() {
 }
 
 #[test]
+fn aggregate_across_many_series_is_exact() {
+    let env = Env::new();
+    let mut text = String::new();
+    for id in 0..300u64 {
+        for i in 0..4u64 {
+            writeln!(
+                text,
+                "many{{id=\"{id}\",grp=\"g{}\"}} {} {}",
+                id % 3,
+                id + i * 1000,
+                T0 + i * 10_000
+            )
+            .unwrap();
+        }
+    }
+    env.ingest_text(&text);
+    let sum = |args: &[&str]| rows(&env, args);
+    assert_eq!(sum(&["aggregate", "many", "--fn", "sum"])[0].1, (0..300u64).map(|id| 4 * id + 6000).sum::<u64>() as f64);
+    assert_eq!(sum(&["aggregate", "many", "--fn", "count"])[0].1, 1200.0);
+    assert_eq!(sum(&["aggregate", "many", "--fn", "max"])[0].1, 3299.0);
+    assert_eq!(sum(&["aggregate", "many", "--fn", "min"])[0].1, 0.0);
+    let p50 = sum(&["aggregate", "many", "--fn", "p50"])[0].1;
+    assert!((1000.0..=3000.0).contains(&p50), "{p50}");
+    let by_group = env.lines(&["aggregate", "many", "--fn", "count", "--by", "grp", "--step", "20s"]);
+    assert_eq!(by_group.len(), 3 * 2, "{by_group:?}");
+    assert!(by_group.iter().all(|l| field(l, 2) == "200"), "{by_group:?}");
+    let rate = sum(&["aggregate", "many", "--fn", "rate", "--step", "1h"])[0].1;
+    assert!((rate - 300.0 * 1000.0 / 10.0).abs() < 1e-6, "{rate}");
+}
+
+#[test]
 fn aggregate_rejects_unknown_function() {
     let env = Env::new();
     env.seed();

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::table::IndexIter;
@@ -274,6 +275,22 @@ impl Cell {
         }
     }
 
+    fn merge(&mut self, other: Cell) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            self.min = other.min;
+            self.max = other.max;
+        } else {
+            self.min = self.min.min(other.min);
+            self.max = self.max.max(other.max);
+        }
+        self.count += other.count;
+        self.sum += other.sum;
+        self.values.extend(other.values);
+    }
+
     fn finish(&mut self, func: Func) -> f64 {
         match func {
             Func::Avg => self.sum / self.count as f64,
@@ -300,7 +317,7 @@ struct RateState {
     live: bool,
 }
 
-const MAX_CELLS: u64 = 20_000_000;
+const MAX_CELLS: u64 = 5_000_000;
 
 struct Grid {
     from: u64,
@@ -337,6 +354,17 @@ impl Grid {
             groups,
             cells,
         })
+    }
+
+    fn empty_like(&self) -> Grid {
+        Grid {
+            from: self.from,
+            step: self.step,
+            first_bucket: self.first_bucket,
+            buckets: self.buckets,
+            groups: self.groups.clone(),
+            cells: (0..self.cells.len()).map(|_| Cell::default()).collect(),
+        }
     }
 
     fn bucket_index(&self, ts: u64) -> usize {
@@ -418,8 +446,58 @@ pub fn aggregate(
     let rows = select(m, selector);
     let sids: Vec<u64> = rows.iter().map(|rec| rec.id).collect();
     let (names, assignment) = group_assignment(&rows, by);
-    let mut grid = Grid::new(from, to, step, names)?;
+    let grid = Grid::new(from, to, step, names)?;
+    let shards = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(sids.len().div_ceil(64))
+        .max(1);
+    let grid = if shards == 1 {
+        let mut grid = grid;
+        fill(m, &sids, &assignment, &mut grid, from, to, func)?;
+        grid
+    } else {
+        let per = sids.len().div_ceil(shards);
+        let template = &grid;
+        let results: Vec<std::result::Result<Grid, String>> = thread::scope(|scope| {
+            let handles: Vec<_> = sids
+                .chunks(per)
+                .zip(assignment.chunks(per))
+                .map(|(sids, assignment)| {
+                    scope.spawn(move || {
+                        let mut shard = template.empty_like();
+                        fill(m, sids, assignment, &mut shard, from, to, func)?;
+                        Ok(shard)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("aggregate shard panicked"))
+                .collect()
+        });
+        let mut merged = grid.empty_like();
+        for shard in results {
+            for (cell, other) in merged.cells.iter_mut().zip(shard?.cells) {
+                cell.merge(other);
+            }
+        }
+        merged
+    };
+    Ok(grid.into_rows(func))
+}
+
+fn fill(
+    m: &Metrics,
+    sids: &[u64],
+    assignment: &[usize],
+    grid: &mut Grid,
+    from: u64,
+    to: u64,
+    func: Func,
+) -> std::result::Result<(), String> {
     let keep = matches!(func, Func::Pct(_));
+    let buckets = grid.buckets;
     if func == Func::Rate {
         let mut states = vec![
             RateState {
@@ -432,7 +510,6 @@ pub fn aggregate(
             };
             sids.len()
         ];
-        let buckets = grid.buckets;
         let flush = |grid: &mut Grid, group: usize, state: &RateState| {
             if state.last_ts > state.first_ts {
                 let seconds = (state.last_ts - state.first_ts) as f64 / 1000.0;
@@ -441,7 +518,7 @@ pub fn aggregate(
                 cell.sum += state.increase / seconds;
             }
         };
-        scan(m, &sids, from, to, |index, points| {
+        scan(m, sids, from, to, |index, points| {
             let group = assignment[index];
             for (ts, value) in points {
                 let bucket = grid.bucket_index(*ts);
@@ -457,7 +534,7 @@ pub fn aggregate(
                 } else {
                     if state.live {
                         let done = *state;
-                        flush(&mut grid, group, &done);
+                        flush(grid, group, &done);
                     }
                     *state = RateState {
                         bucket,
@@ -473,12 +550,11 @@ pub fn aggregate(
         .map_err(|e| e.to_string())?;
         for (index, state) in states.iter().enumerate() {
             if state.live {
-                flush(&mut grid, assignment[index], state);
+                flush(grid, assignment[index], state);
             }
         }
     } else {
-        let buckets = grid.buckets;
-        scan(m, &sids, from, to, |index, points| {
+        scan(m, sids, from, to, |index, points| {
             let group = assignment[index];
             for (ts, value) in points {
                 let bucket = grid.bucket_index(*ts);
@@ -487,7 +563,7 @@ pub fn aggregate(
         })
         .map_err(|e| e.to_string())?;
     }
-    Ok(grid.into_rows(func))
+    Ok(())
 }
 
 pub fn aggregate_rollups(
