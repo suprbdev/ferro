@@ -91,7 +91,7 @@ fn head_hash_covers_the_whole_chain_and_stands_for_it_later() {
     admin::compact(&path, Keep::Last(1)).unwrap();
     let db = fast().open::<Map<u64, u64>>(&path).unwrap();
     assert_eq!(db.log().hash_at(&1), None);
-    assert_ne!(db.head_hash(), Some(second));
+    assert_eq!(db.head_hash(), Some(second));
 }
 
 #[test]

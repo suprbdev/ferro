@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink};
+use crate::admin::Keep;
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::Commit;
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -129,12 +130,13 @@ impl Chain {
         };
         let mut entry = store.load::<Entry>(tip)?;
         while entry.commit.time_ms > time_ms {
-            let Some(prev) = entry.prev else {
+            let at = entry.commit.version;
+            let Some(prev) = entry.prev.filter(|_| at > self.first) else {
                 return Ok(None);
             };
             let far = match entry.skip {
-                Some(skip) => Some(store.load::<Entry>(skip)?),
-                None => None,
+                Some(skip) if skip_version(at) >= self.first => Some(store.load::<Entry>(skip)?),
+                _ => None,
             };
             let loaded = match far {
                 Some(far) if far.commit.time_ms > time_ms => far,
@@ -153,17 +155,51 @@ impl Chain {
             store: store.clone(),
             next: self.tip,
             above: u64::MAX,
+            first: self.first,
         }
     }
 
-    pub(crate) fn commits(&self, store: &Store) -> Result<Vec<Commit>> {
-        let mut out = Vec::with_capacity(self.len());
-        let mut walk = self.walk(store);
-        while let Some(entry) = walk.step()? {
-            out.push((*entry.commit).clone());
+    pub(crate) fn retained_skip(&self, entry: &Entry) -> Option<Ptr> {
+        entry.skip.filter(|_| skip_version(entry.commit.version) >= self.first)
+    }
+
+    pub(crate) fn pruned(&self, store: &Store, keep: Keep) -> Result<Chain> {
+        if self.tip.is_none() {
+            return Ok(*self);
         }
-        out.reverse();
-        Ok(out)
+        let first = match keep {
+            Keep::All => self.first,
+            Keep::Last(count) => self.last.saturating_add(1).saturating_sub(count.max(1) as u64),
+            Keep::Since(time_ms) => match self.at_time(store, time_ms.saturating_sub(1))? {
+                Some(entry) => entry.commit.version + 1,
+                None => self.first,
+            },
+        };
+        Ok(Chain {
+            first: first.clamp(self.first, self.last),
+            ..*self
+        })
+    }
+
+    pub(crate) fn visit(
+        &self,
+        store: &Store,
+        mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = self.tip;
+        let mut above = u64::MAX;
+        while let Some(ptr) = next {
+            let (object, len) = store.read_record(ptr)?;
+            let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+            let at = entry.commit.version;
+            if at >= above {
+                return Err(corrupt("versions do not descend"));
+            }
+            above = at;
+            each(ptr, &entry, &object, len)?;
+            next = entry.prev.filter(|_| at > self.first);
+        }
+        Ok(())
     }
 
     pub(crate) fn append(&self, store: &Store, sink: &mut dyn Sink, commit: Commit) -> Result<Chain> {
@@ -208,32 +244,6 @@ impl Chain {
             ptr = next.ok_or_else(|| corrupt("chain ends early"))?;
         }
     }
-
-    pub(crate) fn rebuild(commits: &[Commit], sink: &mut dyn Sink) -> Result<Chain> {
-        let Some(first) = commits.first().map(|commit| commit.version) else {
-            return Ok(Chain::empty());
-        };
-        let mut pointers: Vec<Ptr> = Vec::with_capacity(commits.len());
-        for commit in commits {
-            let version = commit.version;
-            let target = skip_version(version);
-            let skip = (target >= first && target != version - 1)
-                .then(|| pointers[(target - first) as usize]);
-            let entry = Entry {
-                commit: Arc::new(commit.clone()),
-                prev: pointers.last().copied(),
-                skip,
-            };
-            let mut encoder = Encoder::new(&mut *sink);
-            entry.encode(&mut encoder)?;
-            pointers.push(encoder.finish()?);
-        }
-        Ok(Chain {
-            tip: pointers.last().copied(),
-            first,
-            last: commits[commits.len() - 1].version,
-        })
-    }
 }
 
 enum Step {
@@ -247,6 +257,7 @@ pub(crate) struct Walk {
     store: Store,
     next: Option<Ptr>,
     above: u64,
+    first: u64,
 }
 
 impl Walk {
@@ -259,7 +270,7 @@ impl Walk {
             return Err(corrupt("versions do not descend"));
         }
         self.above = entry.commit.version;
-        self.next = entry.prev;
+        self.next = entry.prev.filter(|_| entry.commit.version > self.first);
         Ok(Some(entry))
     }
 }

@@ -672,6 +672,7 @@ impl<T: Data> Db<T> {
         let chain = self.branch.state.load().log;
         match chain.at_time(&self.shared.store, time_ms)? {
             Some(entry) => self.snapshot_of(&entry.commit),
+            None if chain.first > 1 => Err(Error::NoVersion(chain.first - 1)),
             None => self.at(0),
         }
     }
@@ -909,15 +910,7 @@ impl<T: Data> Db<T> {
 
     pub fn verify(&self) -> Result<Verified> {
         let head = self.shared.published.lock().ptr;
-        let mut report = Verified::default();
-        if let Some(ptr) = head {
-            self.shared.store.walk(ptr, |ptr, object| {
-                report.objects += 1;
-                report.bytes += crate::store::record_len(ptr.offset, object) as u64;
-            })?;
-        }
-        report.file_bytes = self.shared.store.size();
-        Ok(report)
+        crate::admin::verified(&self.shared.store, head)
     }
 }
 

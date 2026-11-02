@@ -1,19 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
-use crate::db::{Commit, Head, Refs};
+use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
-use crate::log::Chain;
 use crate::map::Map;
+use crate::reclaim::Roots;
 use crate::store::{LOG_START, Store, StoreOptions, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Keep {
+    #[default]
     All,
     Last(usize),
     Since(u64),
@@ -98,18 +99,53 @@ pub fn log(path: impl AsRef<Path>, branch: &str, limit: usize) -> Result<Vec<Com
 
 pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
     let (store, head) = read_only(path.as_ref())?;
+    let report = verified(&store, head)?;
+    store.close();
+    Ok(report)
+}
+
+pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {
     let mut report = crate::Verified {
         file_bytes: store.size(),
         ..crate::Verified::default()
     };
     if let Some(ptr) = head {
-        store.walk(ptr, |ptr, object| {
+        let mut seen = HashSet::new();
+        let roots = Roots::of(ptr, &load_refs(store, head)?)?;
+        roots.walk(store, |ptr| seen.insert(ptr), |_, _, len| {
             report.objects += 1;
-            report.bytes += crate::store::record_len(ptr.offset, object) as u64;
+            report.bytes += u64::from(len);
         })?;
     }
-    store.close();
     Ok(report)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub file_bytes: u64,
+    pub extents: Vec<(u64, u32)>,
+}
+
+pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
+    let (store, head) = read_only(path.as_ref())?;
+    let mut extents = Vec::new();
+    if let Some(ptr) = head {
+        let refs = load_refs(&store, head)?;
+        let mut roots = Roots::of(ptr, &refs)?;
+        for chain in &mut roots.chains {
+            *chain = chain.pruned(&store, keep)?;
+        }
+        let mut seen = HashSet::new();
+        roots.walk(
+            &store,
+            |ptr| seen.insert(ptr.offset),
+            |ptr, _, len| extents.push((ptr.offset, len)),
+        )?;
+    }
+    extents.sort_unstable();
+    let file_bytes = store.size();
+    store.close();
+    Ok(Layout { file_bytes, extents })
 }
 
 struct CopySink {
@@ -118,6 +154,7 @@ struct CopySink {
     buf: Vec<u8>,
     end: u64,
     copied: HashMap<Hash, u64>,
+    objects: u64,
 }
 
 struct Frame {
@@ -141,6 +178,7 @@ impl CopySink {
         append_record(&mut self.buf, offset, &object.body, links);
         self.end += (self.buf.len() - before) as u64;
         self.copied.insert(hash, offset);
+        self.objects += 1;
         if self.buf.len() >= FLUSH_BYTES {
             self.drain()?;
         }
@@ -213,33 +251,6 @@ impl Sink for CopySink {
     }
 }
 
-fn prune(store: &Store, sink: &mut CopySink, head: &Head, keep: Keep) -> Result<(Head, u64)> {
-    let total = head.log.len();
-    let drop = match keep {
-        Keep::All => 0,
-        Keep::Last(count) => total.saturating_sub(count.max(1)),
-        Keep::Since(time_ms) => {
-            let commits = head.log.commits(store)?;
-            let stale = commits.iter().take_while(|commit| commit.time_ms < time_ms).count();
-            stale.min(total.saturating_sub(1))
-        }
-    };
-    if drop == 0 {
-        return Ok((head.clone(), 0));
-    }
-    let commits = head.log.commits(store)?;
-    let log = Chain::rebuild(&commits[drop..], sink)?;
-    Ok((
-        Head {
-            version: head.version,
-            root: head.root,
-            log,
-            merged: head.merged.clone(),
-        },
-        drop as u64,
-    ))
-}
-
 fn sibling(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".compacting");
@@ -295,18 +306,30 @@ fn write_copy(store: &Store, refs: &Refs, keep: Keep, temp: &Path) -> Result<(u6
         buf: Vec::new(),
         end: LOG_START,
         copied: HashMap::new(),
+        objects: 0,
     };
     let mut pruned: Refs = Map::new();
     let mut commits_dropped = 0;
+    let mut retained = HashSet::new();
+    let mut edge = Vec::new();
     for (name, branch) in refs.iter() {
-        let (next, dropped) = prune(store, &mut sink, &branch, keep)?;
-        commits_dropped += dropped;
+        let log = branch.log.pruned(store, keep)?;
+        commits_dropped += (branch.log.len() - log.len()) as u64;
+        log.visit(store, |ptr, entry, _, _| {
+            retained.insert(ptr.hash);
+            edge.extend(entry.prev.iter().chain(&entry.skip).map(|link| link.hash));
+            Ok(())
+        })?;
+        let mut next = (*branch).clone();
+        next.log = log;
         pruned.insert(name, next);
     }
+    let tombstones: Vec<Hash> = edge.into_iter().filter(|hash| !retained.contains(hash)).collect();
+    sink.copied.extend(tombstones.iter().map(|hash| (*hash, 0)));
     let mut encoder = Encoder::new(&mut sink);
     pruned.encode(&mut encoder)?;
     let head = encoder.finish()?;
     sink.drain()?;
     seal(&sink.file, sink.end, head)?;
-    Ok((sink.copied.len() as u64, sink.end, commits_dropped))
+    Ok((sink.objects, sink.end, commits_dropped))
 }

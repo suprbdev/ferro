@@ -565,6 +565,10 @@ impl Store {
     }
 
     pub fn read_object(&self, ptr: Ptr) -> Result<Object> {
+        self.read_record(ptr).map(|(object, _)| object)
+    }
+
+    pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
         let tail = self.inner.written.load(Ordering::Acquire);
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
@@ -619,7 +623,8 @@ impl Store {
                 ptr.offset
             )));
         }
-        Ok(object)
+        let len = u32::try_from(reader.pos).map_err(|_| Error::Corrupt("record overflow".into()))?;
+        Ok((object, len))
     }
 
     pub(crate) fn fetch<T: Send + Sync + 'static>(
