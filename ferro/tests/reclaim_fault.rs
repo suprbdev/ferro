@@ -25,12 +25,30 @@ unsafe extern "C" {
 }
 
 static RENAME_ERROR: AtomicI32 = AtomicI32::new(0);
+static CLOCK_BACK_SECONDS: AtomicI64 = AtomicI64::new(0);
 static SYNCS_UNTIL_FAILURE: AtomicI64 = AtomicI64::new(-1);
 static FAILED_SYNC: AtomicBool = AtomicBool::new(false);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
+}
+
+#[repr(C)]
+pub struct Timespec {
+    seconds: i64,
+    nanos: i64,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
+    let symbol = unsafe { dlsym(RTLD_NEXT, c"clock_gettime".as_ptr()) };
+    let real: extern "C" fn(c_int, *mut Timespec) -> c_int = unsafe { std::mem::transmute(symbol) };
+    let code = real(clock, out);
+    if clock == 0 {
+        unsafe { (*out).seconds -= CLOCK_BACK_SECONDS.load(Ordering::SeqCst) };
+    }
+    code
 }
 
 fn fails_now() -> bool {
@@ -94,6 +112,7 @@ pub extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
 fn serial() -> MutexGuard<'static, ()> {
     let turn = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     RENAME_ERROR.store(0, Ordering::SeqCst);
+    CLOCK_BACK_SECONDS.store(0, Ordering::SeqCst);
     SYNCS_UNTIL_FAILURE.store(-1, Ordering::SeqCst);
     FAILED_SYNC.store(false, Ordering::SeqCst);
     turn
@@ -194,6 +213,90 @@ fn a_cycle_does_not_heal_a_store_poisoned_during_it() {
     let db: Db<Root> = options().open(&path).unwrap();
     assert_eq!(dump(&db.read()), want);
     db.verify().unwrap();
+}
+
+fn base_then_fork(db: &Db<Root>) -> Db<Root> {
+    for i in 0..3u64 {
+        db.commit("base", |root| {
+            root.insert(i, format!("v{i}"));
+        })
+        .unwrap();
+    }
+    let side = db.fork("side").unwrap();
+    CLOCK_BACK_SECONDS.store(3600, Ordering::SeqCst);
+    side.commit("sync", |root| {
+        root.insert(9, "same".into());
+    })
+    .unwrap();
+    side.commit("more", |root| {
+        root.insert(10, "other".into());
+    })
+    .unwrap();
+    side
+}
+
+#[test]
+fn a_commit_with_the_hash_of_a_pruned_entry_during_a_cycle_is_copied() {
+    let _turn = serial();
+    for stage in ["created", "copied", "synced"] {
+        let dir = dir();
+        let path = dir.path().join("db.ferro");
+        let slot: Arc<Mutex<Option<Db<Root>>>> = Arc::new(Mutex::new(None));
+        let hook = {
+            let slot = slot.clone();
+            move |name: &'static str| {
+                if name == stage {
+                    let db = slot.lock().unwrap().clone().unwrap();
+                    db.commit("sync", |root| {
+                        root.insert(9, "same".into());
+                    })
+                    .unwrap();
+                }
+            }
+        };
+        let db: Db<Root> = options().hook(Hook(Arc::new(hook))).open(&path).unwrap();
+        let side = base_then_fork(&db);
+        *slot.lock().unwrap() = Some(db.clone());
+        db.compact(Keep::Last(1)).unwrap();
+        *slot.lock().unwrap() = None;
+        let want = dump(&db.read());
+        assert_eq!(want.iter().find(|row| row.0 == 9).unwrap().1, "same", "{stage}");
+        db.update(|root| {
+            root.insert(1, "after".into());
+        })
+        .unwrap();
+        db.verify().unwrap();
+        let want = dump(&db.read());
+        drop((db, side));
+        CLOCK_BACK_SECONDS.store(0, Ordering::SeqCst);
+        let db: Db<Root> = options().open(&path).unwrap();
+        assert_eq!(dump(&db.read()), want, "{stage}");
+        db.verify().unwrap();
+        ferro::admin::verify(&path).unwrap();
+    }
+}
+
+#[test]
+fn a_commit_with_the_hash_of_a_tombstone_does_not_stop_later_cycles() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let db: Db<Root> = options().open(&path).unwrap();
+    let side = base_then_fork(&db);
+    db.compact(Keep::Last(1)).unwrap();
+    db.commit("sync", |root| {
+        root.insert(9, "same".into());
+    })
+    .unwrap();
+    db.verify().unwrap();
+    let want = dump(&db.read());
+    for _ in 0..3 {
+        db.compact(Keep::All).unwrap();
+        assert_eq!(dump(&db.read()), want);
+        db.verify().unwrap();
+    }
+    assert!(db.space().unwrap().last_error.is_none());
+    assert_eq!(*side.read().get(&10).unwrap(), "other");
 }
 
 #[test]

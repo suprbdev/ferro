@@ -559,7 +559,8 @@ impl Store {
     ) -> Result<(Store, Option<Ptr>)> {
         let file = open_locked(actual, options.read_only)?;
         if !options.read_only && actual == path {
-            let _ = std::fs::remove_file(sibling(path));
+            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let _ = std::fs::remove_file(sibling(&real));
         }
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
@@ -884,6 +885,17 @@ pub struct Txn {
 }
 
 impl Sink for Txn {
+    fn check_link(&self, ptr: Ptr) -> Result<()> {
+        if self.seen.get(&ptr.hash) == Some(&ptr.offset) {
+            return Ok(());
+        }
+        match self.store.read_object(ptr) {
+            Ok(_) => Ok(()),
+            Err(Error::Corrupt(_)) => Err(Error::StalePointer(ptr.offset)),
+            Err(error) => Err(error),
+        }
+    }
+
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
         if u32::try_from(object.body.len()).is_err() {
             return Err(Error::TooLarge(object.body.len() as u64));

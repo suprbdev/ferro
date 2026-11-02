@@ -172,6 +172,8 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 
 pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     let path = path.as_ref();
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = real.as_path();
     let (store, head) = Store::open(path, StoreOptions::default())?;
     let before_bytes = store.size();
     let Some(head) = head else {

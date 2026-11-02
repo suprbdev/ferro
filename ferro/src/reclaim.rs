@@ -111,6 +111,7 @@ struct CopySink<'a> {
     buf: Vec<u8>,
     end: u64,
     copied: HashMap<Hash, u64>,
+    pruned: HashSet<Hash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
 }
@@ -150,6 +151,18 @@ impl CopySink<'_> {
         })
     }
 
+    fn settled(&self, link: Ptr) -> Option<Ptr> {
+        let tombstone = Ptr {
+            hash: link.hash,
+            offset: 0,
+        };
+        if link.offset == 0 {
+            return Some(tombstone);
+        }
+        self.remap(link)
+            .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
+    }
+
     fn read(&self, ptr: Ptr) -> Result<Pending> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
@@ -163,7 +176,7 @@ impl CopySink<'_> {
     }
 
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
-        if let Some(done) = self.remap(root) {
+        if let Some(done) = self.settled(root) {
             return Ok(done);
         }
         let mut stack = vec![self.read(root)?];
@@ -171,7 +184,7 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.object.links.len() {
                 let link = top.object.links[top.next];
-                if let Some(done) = self.remap(link) {
+                if let Some(done) = self.settled(link) {
                     let top = stack.last_mut().expect("stack is not empty");
                     top.links.push(done);
                     top.next += 1;
@@ -241,6 +254,7 @@ impl<'a> Copier<'a> {
                 buf: Vec::new(),
                 end: LOG_START,
                 copied: HashMap::new(),
+                pruned: HashSet::new(),
                 objects: 0,
                 stop,
             },
@@ -261,9 +275,12 @@ impl<'a> Copier<'a> {
                 Ok(true)
             })?;
         }
+        for hash in &retained {
+            sink.pruned.remove(hash);
+        }
         for hash in edge {
             if !retained.contains(&hash) && !sink.copied.contains_key(&hash) {
-                sink.copied.insert(hash, 0);
+                sink.pruned.insert(hash);
             }
         }
         let mut encoder = Encoder::new(&mut *sink);

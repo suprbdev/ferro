@@ -93,12 +93,19 @@ pub(crate) struct Head {
     pub(crate) merged: Map<String, (u64, u64)>,
 }
 
+fn encode_link(w: &mut Encoder<'_>, link: Option<Ptr>) {
+    w.u8(u8::from(link.is_some()));
+    if let Some(ptr) = link {
+        w.link(ptr);
+    }
+}
+
 impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.version.encode(w)?;
         self.log.first.encode(w)?;
-        self.root.encode(w)?;
-        self.log.tip.encode(w)?;
+        encode_link(w, self.root);
+        encode_link(w, self.log.tip);
         self.merged.encode(w)
     }
 
@@ -652,6 +659,7 @@ impl<T: Data> Shared<T> {
                 if panic::catch_unwind(cycle).is_err() {
                     shared.log.lock().last_error = Some("reclamation panicked".to_string());
                 }
+                *signal.due.lock() = false;
             }
         })
     }
@@ -757,18 +765,8 @@ impl<T: Data> Shared<T> {
             copier.finish(&tip.refs, store.last_seq(), survival)?
         };
         let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
-        fs::rename(&temp, &self.file)?;
-        fresh.trace_rename();
-        if let Err(error) = sync_parent(&self.file) {
-            store.poison();
-            return Err(error.into());
-        }
-        fresh.trace(Op::SyncDir);
-        let swapped = self.swap_in(&mut tip, &fresh, head);
-        swapped.inspect_err(|_| {
-            store.poison();
-            fresh.poison();
-        })?;
+        let swapped = self.swap_in(&mut tip, store, &fresh, &temp, head);
+        swapped.inspect_err(|_| fresh.close())?;
         self.signal.base.store(fresh.size(), Ordering::Relaxed);
         drop(tip);
         report.pause = paused.elapsed();
@@ -784,15 +782,34 @@ impl<T: Data> Shared<T> {
         Ok(report)
     }
 
-    fn swap_in(&self, tip: &mut RefState, fresh: &Store, head: Ptr) -> Result<()> {
+    fn swap_in(
+        &self,
+        tip: &mut RefState,
+        old: &Store,
+        fresh: &Store,
+        temp: &Path,
+        head: Ptr,
+    ) -> Result<()> {
         let refs = (*fresh.load::<Refs>(head)?).clone();
         let mut published = self.published.lock();
         let branches = self.branches.lock();
+        for (_, found) in refs.iter() {
+            for ptr in found.root.iter().chain(&found.log.tip) {
+                fresh.read_object(*ptr)?;
+            }
+        }
         let mut states = Vec::new();
         for branch in branches.values() {
             let found = refs.try_get(&branch.name)?;
             states.push((branch, Arc::new(self.state_of(fresh, found.as_deref())?)));
         }
+        fs::rename(temp, &self.file)?;
+        fresh.trace_rename();
+        if let Err(error) = sync_parent(&self.file) {
+            old.poison();
+            return Err(error.into());
+        }
+        fresh.trace(Op::SyncDir);
         tip.refs = refs;
         tip.ptr = Some(head);
         self.store.store(Arc::new(fresh.clone()));

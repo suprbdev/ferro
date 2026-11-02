@@ -34,6 +34,8 @@ pub enum Error {
     Replaced,
     #[error("reclamation was interrupted by shutdown")]
     Interrupted,
+    #[error("pointer {0} does not name an object in this generation of the file")]
+    StalePointer(u64),
     #[error("a previous commit failed; reopen the database to recover")]
     Poisoned,
     #[error("object of {0} bytes exceeds the 4 GiB limit")]

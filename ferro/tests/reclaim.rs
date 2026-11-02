@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{Rng, fast, text, uncached};
 use ferro::db::Hook;
-use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim, Snapshot, admin};
+use ferro::{Commit, Data, Db, Durability, Error, Keep, Map, Options, Ptr, Reclaim, Snapshot, admin};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -742,6 +742,100 @@ fn a_head_rebuilt_with_the_hash_of_an_older_one_survives_a_cycle() {
         db.verify().unwrap();
         admin::verify(&path).unwrap();
     }
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Notes {
+    rows: Map<u64, String>,
+    commit: Option<Commit>,
+    pointer: Option<Ptr>,
+}
+
+#[test]
+fn a_commit_or_pointer_held_across_a_cycle_cannot_be_written_back() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Notes> = options().open(&path).unwrap();
+    for i in 0..200u64 {
+        db.update(|notes| {
+            notes.rows.insert(i % 20, text(i, 200));
+        })
+        .unwrap();
+    }
+    let commit = db.read().commit().clone();
+    let pointer = commit.root;
+    db.update(|notes| {
+        notes.commit = Some(commit.clone());
+        notes.pointer = pointer;
+    })
+    .unwrap();
+    db.verify().unwrap();
+    db.compact(Keep::Last(1)).unwrap();
+    db.verify().unwrap();
+    let version = db.version();
+    let by_commit = db.update(|notes| {
+        notes.commit = None;
+        notes.pointer = None;
+        notes.commit = Some(commit.clone());
+    });
+    assert!(matches!(by_commit, Err(Error::StalePointer(_))), "{by_commit:?}");
+    let by_pointer = db.update(|notes| {
+        notes.commit = None;
+        notes.pointer = pointer;
+    });
+    assert!(matches!(by_pointer, Err(Error::StalePointer(_))), "{by_pointer:?}");
+    assert_eq!(db.version(), version);
+    db.verify().unwrap();
+    let kept = db.read().commit.clone().unwrap();
+    db.update(|notes| {
+        notes.rows.insert(99, "fine".into());
+    })
+    .unwrap();
+    db.compact(Keep::Last(1)).unwrap();
+    db.verify().unwrap();
+    assert_eq!(db.read().commit.as_ref().unwrap(), &kept);
+    drop(db);
+    admin::verify(&path).unwrap();
+}
+
+#[test]
+fn a_leftover_temp_file_behind_a_symlink_is_cleared_on_open() {
+    let dir = dir();
+    let real = path_in(&dir);
+    let link = dir.path().join("link.ferro");
+    let db: Db<Root> = options().open(&real).unwrap();
+    fill(&db, 10, 3);
+    drop(db);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut temp = real.clone().into_os_string();
+    temp.push(".compacting");
+    std::fs::write(&temp, vec![0xAB; 4096]).unwrap();
+    let db: Db<Root> = options().open(&link).unwrap();
+    assert!(!Path::new(&temp).exists());
+    drop(db);
+    let report = admin::compact(&link, Keep::Last(1)).unwrap();
+    assert!(report.objects > 0);
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+}
+
+#[test]
+fn one_trigger_runs_one_cycle() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Root> = fast()
+        .history(Keep::Last(1))
+        .reclaim(Reclaim { every_bytes: 64 << 10 })
+        .open(&path)
+        .unwrap();
+    let started = Instant::now();
+    while db.space().unwrap().cycles == 0 && started.elapsed() < Duration::from_secs(20) {
+        fill(&db, 20, 10);
+    }
+    thread::sleep(Duration::from_millis(100));
+    let settled = db.space().unwrap();
+    assert!(settled.cycles >= 1, "{settled:?}");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(db.space().unwrap().cycles, settled.cycles);
 }
 
 #[test]

@@ -38,6 +38,9 @@ impl Object {
 
 pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
+    fn check_link(&self, _ptr: Ptr) -> Result<()> {
+        Ok(())
+    }
     fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Any + Send + Sync>, _weight: u32) {}
     fn store_id(&self) -> u64;
     fn store(&self) -> Option<Store> {
@@ -373,6 +376,7 @@ impl<'a> Decoder<'a> {
 
 impl Data for Ptr {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
+        w.sink().check_link(*self)?;
         w.link(*self);
         Ok(())
     }
