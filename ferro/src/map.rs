@@ -428,11 +428,13 @@ fn link_from<K, V, S>(
     Link::Mem(Arc::new(node))
 }
 
+type Parts<K, V, S> = (Link<K, V, S>, Link<K, V, S>);
+
 fn split<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
-) -> Result<(Link<K, V, S>, Link<K, V, S>)> {
+) -> Result<Parts<K, V, S>> {
     let Some(node) = load(store, &link)? else {
         return Ok((Link::Empty, Link::Empty));
     };
@@ -1277,7 +1279,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         &self,
         before: &impl Fn(&K) -> bool,
         offset: isize,
-    ) -> Result<(u64, Vec<Frame<K, V, S>>)> {
+    ) -> Result<Edge<K, V, S>> {
         let store = self.store();
         let mut rank = 0u64;
         let mut stack = Vec::new();
@@ -1639,6 +1641,8 @@ struct Frame<K, V, S> {
     node: Arc<Node<K, V, S>>,
     position: isize,
 }
+
+type Edge<K, V, S> = (u64, Vec<Frame<K, V, S>>);
 
 pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
