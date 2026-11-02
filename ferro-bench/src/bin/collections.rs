@@ -94,6 +94,18 @@ fn range_bench(dir: &Path, n: u64) {
     .unwrap();
     let cost = measure(&db, |root| root.append(&mut tail));
     report(&format!("append disjoint halves of {n}"), &cost);
+    drop(db);
+    let extra = || (n..n + n / 10).map(|i| (i, format!("value-{i}")));
+    let db = seeded(dir, n);
+    let cost = measure(&db, |root| root.extend(extra()));
+    report(&format!("extend 10% past the end of {n}"), &cost);
+    drop(db);
+    let db = seeded(dir, n);
+    let cost = measure(&db, |root| {
+        let mut other: Map<u64, String> = extra().collect();
+        root.append(&mut other);
+    });
+    report(&format!("collect and append 10% past {n}"), &cost);
 }
 
 fn seeded_mixed(dir: &Path, n: u64) -> Db<Map<u64, String>> {

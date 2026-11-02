@@ -534,6 +534,31 @@ fn retain_trims_the_boundary_partition_exactly() {
 }
 
 #[test]
+fn retain_inside_a_partition_keeps_its_counter_right() {
+    let env = Env::new();
+    let start = T0 / 600_000 * 600_000;
+    env.ingest_text(&format!(
+        "m{{host=\"a\"}} 1 {}\nm{{host=\"a\"}} 2 {}\nm{{host=\"b\"}} 3 {}\n",
+        start + 1_000,
+        start + 300_000,
+        start + 2_000,
+    ));
+    let now = (start + 200_000 + HOUR).to_string();
+    let out = env.ok(&["retain", "--older-than", "1h", "--now", &now]);
+    assert!(out.contains("dropped 2 points in 0 partitions"), "{out}");
+    assert_eq!(env.lines(&["query", r#"m{host="a"}"#, "--from", "0"]).len(), 1);
+    env.ok(&["verify"]);
+    env.ingest_text(&format!("m{{host=\"a\"}} 4 {}\n", start + 400_000));
+    env.ok(&["verify"]);
+    let now = (start + 500_000 + HOUR).to_string();
+    let out = env.ok(&["retain", "--older-than", "1h", "--now", &now]);
+    assert!(out.contains("dropped 2 points in 0 partitions"), "{out}");
+    env.ok(&["verify"]);
+    let stats = env.ok(&["stats"]);
+    assert!(stats.contains("partitions   0 "), "{stats}");
+}
+
+#[test]
 fn retain_keep_versions_controls_history() {
     let env = Env::new();
     for i in 0..10u64 {

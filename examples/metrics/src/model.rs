@@ -74,10 +74,6 @@ impl SeriesKey {
         labels.sort();
         SeriesKey { metric, labels }
     }
-
-    pub fn canonical(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +161,7 @@ pub struct Metrics {
     pub series: Table<SeriesRec>,
     pub next_id: u64,
     pub chunks: Map<u64, Map<u64, Chunk>>,
+    pub part_points: Map<u64, u64>,
     pub rollups: Map<u64, Map<(u64, u64), Rollup>>,
     pub raw_floor: u64,
     pub points: u64,

@@ -134,16 +134,20 @@ impl Writer {
             while index < work.len() {
                 let bucket = work[index].0;
                 let part = m.chunks.get_or_insert_with(bucket, Map::new);
+                let mut growth = 0i64;
                 while index < work.len() && work[index].0 == bucket {
                     let (_, sid, pts) = &work[index];
                     let (chunk, before) = match part.get(sid) {
                         Some(old) => (old.merged(pts)?, old.len()),
                         None => (Chunk::encode_points(&normalized(pts)), 0),
                     };
-                    added += chunk.len() as i64 - before as i64;
+                    growth += chunk.len() as i64 - before as i64;
                     part.insert(*sid, chunk);
                     index += 1;
                 }
+                let held = m.part_points.get_or_insert_with(bucket, || 0);
+                *held = (*held as i64 + growth) as u64;
+                added += growth;
             }
             m.points = (m.points as i64 + added) as u64;
             Ok(learned)
@@ -724,15 +728,13 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
     db.try_commit::<_, Error>("retain", |m| {
         let mut report = Retained::default();
         let boundary = bucket_of(cutoff);
-        let dropped = m.chunks.take_range(..boundary);
-        report.partitions_dropped = dropped.len();
-        for part in dropped.values() {
-            report.points_dropped += part.values().map(|chunk| chunk.len() as u64).sum::<u64>();
-        }
+        report.partitions_dropped = m.chunks.remove_range(..boundary);
+        report.points_dropped = m.part_points.take_range(..boundary).values().map(|n| *n).sum();
         if cutoff > boundary
             && let Some(part) = m.chunks.get_mut(&boundary)
         {
             let mut trimmed = Vec::new();
+            let mut left = 0;
             for (sid, chunk) in part.iter() {
                 let kept: Vec<(u64, f64)> = chunk
                     .decode_points()?
@@ -740,11 +742,17 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
                     .filter(|point| point.0 >= cutoff)
                     .collect();
                 report.points_dropped += (chunk.len() - kept.len()) as u64;
+                left += kept.len() as u64;
                 trimmed.push((sid, (!kept.is_empty()).then(|| Chunk::encode_points(&kept))));
             }
             part.apply(trimmed);
             if part.is_empty() {
                 m.chunks.remove(&boundary);
+            }
+            if left == 0 {
+                m.part_points.remove(&boundary);
+            } else {
+                m.part_points.insert(boundary, left);
             }
         }
         m.points -= report.points_dropped.min(m.points);
@@ -807,6 +815,7 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
     };
     let m = db.read();
     for (bucket, part) in m.chunks.iter() {
+        let before = report.points;
         for (sid, chunk) in part.iter() {
             report.chunks += 1;
             if !m.series.contains(&sid) {
@@ -831,6 +840,19 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
                 }
             }
         }
+        let held = report.points - before;
+        if m.part_points.get(&bucket).as_deref() != Some(&held) {
+            report
+                .problems
+                .push(format!("bucket {bucket} holds {held} points but its counter disagrees"));
+        }
+    }
+    if m.part_points.len() != m.chunks.len() {
+        report.problems.push(format!(
+            "{} partition counters for {} partitions",
+            m.part_points.len(),
+            m.chunks.len()
+        ));
     }
     if report.points != m.points {
         report.problems.push(format!(
