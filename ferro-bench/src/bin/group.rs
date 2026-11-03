@@ -71,6 +71,7 @@ fn main() {
     let work = Duration::from_micros(argument("--closure-us").and_then(|v| v.parse().ok()).unwrap_or(0));
     let coalesce = argument("--coalesce").is_some_and(|v| v == "1");
     let awaited = argument("--async").is_some_and(|v| v == "1");
+    let own = argument("--branches").is_some_and(|v| v == "own");
     let durability = match argument("--durability").as_deref() {
         Some("buffered") => Durability::Buffered,
         _ => Durability::Fsync,
@@ -92,11 +93,23 @@ fn main() {
             }
         })
         .unwrap();
-        let (bytes_before, version_before) = (db.size_on_disk(), db.version());
+        let lanes: Vec<_> = (0..count)
+            .map(|writer| match own && writer > 0 {
+                true => db.fork(&format!("writer-{writer}")).unwrap(),
+                false => db.clone(),
+            })
+            .collect();
+        let total = |lanes: &[ferro::Db<Root>]| -> u64 {
+            match own {
+                true => lanes.iter().map(|lane| lane.version()).sum(),
+                false => db.version(),
+            }
+        };
+        let (bytes_before, version_before) = (db.size_on_disk(), total(&lanes));
         let stop = Arc::new(AtomicBool::new(false));
         let handles: Vec<_> = (0..count)
             .map(|writer| {
-                let (db, stop) = (db.clone(), stop.clone());
+                let (db, stop) = (lanes[writer as usize].clone(), stop.clone());
                 thread::spawn(move || {
                     let mut samples = Vec::new();
                     let mut i = writer << 40;
@@ -132,7 +145,7 @@ fn main() {
         samples.sort_unstable();
         let closures = samples.len() as f64;
         let grown = (db.size_on_disk() - bytes_before) as f64;
-        let versions = (db.version() - version_before) as f64;
+        let versions = (total(&lanes) - version_before) as f64;
         println!(
             "{label} writers={count} closures_per_s={:.0} versions_per_s={:.0} per_version={:.2} bytes_per_closure={:.0} p50={:.0}us p99={:.0}us max={:.0}us",
             closures / elapsed,
