@@ -2070,6 +2070,10 @@ impl<T: Data> Db<T> {
         (self.shared.store(), published.refs.clone())
     }
 
+    pub(crate) fn step(&self, name: &'static str) {
+        self.shared.step(name);
+    }
+
     pub(crate) fn rewrite_refs<X>(
         &self,
         edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,

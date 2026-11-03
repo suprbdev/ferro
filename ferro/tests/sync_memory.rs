@@ -3,8 +3,11 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use common::fast;
-use ferro::{Bundle, Db, Error, Map, Snapshot};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+
+use common::{fast, text};
+use ferro::{Bundle, Db, Error, Map, Outcome, Snapshot};
 
 struct Peak;
 
@@ -77,14 +80,20 @@ fn refuse(_: &mut Root, _: &Snapshot<Root>, _: &Snapshot<Root>) -> (String, ()) 
     panic!("no merge expected")
 }
 
-fn peak_of(db: &Db<Root>, bundle: &Bundle) -> usize {
+fn heap_of<R>(run: impl FnOnce() -> R) -> (R, usize) {
     let start = LIVE.with(Cell::get);
     HIGH.with(|high| high.set(start));
-    match db.receive("evil", bundle, refuse) {
+    let out = run();
+    (out, HIGH.with(Cell::get) - start)
+}
+
+fn peak_of(db: &Db<Root>, bundle: &Bundle) -> usize {
+    let (received, peak) = heap_of(|| db.receive("evil", bundle, refuse));
+    match received {
         Err(Error::Bundle(_)) => {}
         other => panic!("accepted a hostile bundle: {other:?}"),
     }
-    HIGH.with(Cell::get) - start
+    peak
 }
 
 fn claims_many_objects() -> Bundle {
@@ -131,6 +140,20 @@ fn expands_far() -> Bundle {
     Bundle::from(out)
 }
 
+fn carries_large_objects(count: u64) -> Bundle {
+    let mut out = Vec::new();
+    header(&mut out, 0);
+    varint(&mut out, count + 1);
+    for index in 0..count {
+        let mut body = vec![0u8; MIB];
+        body[..8].copy_from_slice(&index.to_le_bytes());
+        varint(&mut out, (body.len() as u64) << 1);
+        out.extend_from_slice(&body);
+        varint(&mut out, 0);
+    }
+    Bundle::from(out)
+}
+
 fn with_huge_claimed_size() -> Bundle {
     let mut out = Vec::new();
     header(&mut out, 0);
@@ -169,4 +192,67 @@ fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
     }
     assert_eq!(db.version(), 1);
     assert_eq!(db.branches(), vec!["main".to_string()]);
+}
+
+#[test]
+fn a_hostile_stream_of_large_objects_costs_one_object_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let db: Db<Root> = fast().open(&path).unwrap();
+    db.commit("seed", |root| {
+        root.insert(1, "one".to_string());
+    })
+    .unwrap();
+    let size = db.size_on_disk();
+    let bundle = carries_large_objects(48);
+    let len = bundle.as_bytes().len();
+    let peak = peak_of(&db, &bundle);
+    println!("{len} bytes in 48 objects of 1 MiB, peak {peak}");
+    assert!(
+        peak < 8 * MIB,
+        "a stream of {len} bytes took {peak} bytes of heap"
+    );
+    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+    assert_eq!(db.version(), 1);
+}
+
+#[test]
+fn a_streamed_bundle_costs_a_buffer_and_its_objects_not_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Root> = fast().open(dir.path().join("b.ferro")).unwrap();
+    for round in 0..8u64 {
+        a.commit(format!("round {round}"), |root| {
+            for key in round * 500..(round + 1) * 500 {
+                root.insert(key, text(key, 8 << 10));
+            }
+        })
+        .unwrap();
+    }
+    let have = b.have().unwrap();
+    let path = dir.path().join("bundle");
+    let (written, sent) = heap_of(|| {
+        a.bundle_to(&have, BufWriter::new(File::create(&path).unwrap()))
+            .unwrap()
+    });
+    let (pulled, received) = heap_of(|| {
+        let input = BufReader::new(File::open(&path).unwrap());
+        b.receive_from("a", input, refuse).unwrap()
+    });
+    let objects = pulled.objects as usize;
+    println!(
+        "{written} bytes in {objects} objects, sent with {sent} bytes of heap, received with {received}"
+    );
+    assert!(written > 30 * MIB as u64, "{written}");
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.head_hash(), a.head_hash());
+    assert!(
+        sent < 4 * MIB,
+        "sending {written} bytes took {sent} bytes of heap"
+    );
+    assert!(
+        received < 6 * MIB + objects * 1024,
+        "receiving {written} bytes in {objects} objects took {received} bytes of heap"
+    );
 }

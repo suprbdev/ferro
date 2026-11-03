@@ -1,8 +1,12 @@
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, hash_map};
+use std::io::{self, BufReader, ErrorKind, Read, Write};
+use std::mem;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
 
 use crate::codec::{
-    Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, Sink, push_varint,
+    Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::error::{Error, Result};
@@ -22,6 +26,13 @@ const MAX_BODY: usize = u32::MAX as usize;
 const MAX_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 const MAIN: &str = "main";
 const MAX_VERSION: u64 = u64::MAX >> 1;
+const READ_BUFFER: usize = 64 << 10;
+const READ_STEP: usize = 1 << 20;
+const WRITE_CHUNK: usize = 64 << 10;
+const SPILL_AT: usize = 1 << 20;
+const PIPE_CHUNKS: usize = 8;
+const PIPE_OBJECTS: usize = 256;
+const CACHED_LINKS: usize = 1 << 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Have(Vec<u8>);
@@ -94,20 +105,13 @@ struct Marks {
     tips: usize,
 }
 
-struct Wire {
-    hash: Hash,
-    body: Vec<u8>,
-    links: Vec<(Hash, usize)>,
-}
-
 #[derive(Default)]
-struct Plan {
+struct Header {
     tip: Option<Mark>,
     bases: Vec<Mark>,
     roots: Vec<usize>,
     hints: Vec<(usize, usize)>,
-    objects: Vec<Wire>,
-    index: HashMap<Hash, usize>,
+    count: u64,
 }
 
 fn bad(what: impl Into<String>) -> Error {
@@ -131,45 +135,61 @@ fn varint_len(mut value: u64) -> usize {
     len
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+fn from_io(error: io::Error) -> Error {
+    if error.get_ref().is_some_and(|inner| inner.is::<Error>()) {
+        let inner = error.into_inner().expect("the error has a source");
+        return *inner
+            .downcast::<Error>()
+            .expect("the source is a ferro error");
+    }
+    Error::Io(error)
+}
+
+struct Input<R> {
+    source: BufReader<R>,
+    read: u64,
     bodies: usize,
 }
 
-impl<'a> Reader<'a> {
-    fn open(bytes: &'a [u8], magic: &[u8; 8]) -> Result<Reader<'a>> {
-        if bytes.len() < magic.len() + 1 || &bytes[..magic.len()] != magic {
+impl<R: Read> Input<R> {
+    fn open(source: R, magic: &[u8; 8]) -> Result<Input<R>> {
+        let mut input = Input {
+            source: BufReader::with_capacity(READ_BUFFER, source),
+            read: 0,
+            bodies: 0,
+        };
+        let mut head = [0u8; 9];
+        match input.fill(&mut head) {
+            Err(Error::Bundle(_)) => return Err(bad("not a ferro sync message")),
+            other => other?,
+        }
+        if &head[..magic.len()] != magic {
             return Err(bad("not a ferro sync message"));
         }
-        if bytes[magic.len()] != FORMAT {
+        if head[magic.len()] != FORMAT {
             return Err(bad(format!(
                 "format {} is not supported",
-                bytes[magic.len()]
+                head[magic.len()]
             )));
         }
-        Ok(Reader {
-            bytes,
-            pos: magic.len() + 1,
-            bodies: 0,
-        })
+        Ok(input)
     }
 
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.pos
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if n > self.remaining() {
-            return Err(bad("truncated"));
+    fn fill(&mut self, out: &mut [u8]) -> Result<()> {
+        match self.source.read_exact(out) {
+            Ok(()) => {
+                self.read += out.len() as u64;
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(bad("truncated")),
+            Err(error) => Err(from_io(error)),
         }
-        let out = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(out)
     }
 
     fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        let mut byte = [0u8];
+        self.fill(&mut byte)?;
+        Ok(byte[0])
     }
 
     fn varint(&mut self) -> Result<u64> {
@@ -191,14 +211,6 @@ impl<'a> Reader<'a> {
         usize::try_from(self.varint()?).map_err(|_| bad("size overflow"))
     }
 
-    fn count(&mut self, each: usize) -> Result<usize> {
-        let count = self.size()?;
-        if count > self.remaining() / each.max(1) {
-            return Err(bad("count runs past the end"));
-        }
-        Ok(count)
-    }
-
     fn below(&mut self, limit: usize) -> Result<usize> {
         let value = self.size()?;
         if value >= limit {
@@ -208,10 +220,9 @@ impl<'a> Reader<'a> {
     }
 
     fn hash(&mut self) -> Result<Hash> {
-        Ok(self
-            .take(HASH_BYTES)?
-            .try_into()
-            .expect("slice length is HASH_BYTES"))
+        let mut hash = [0u8; HASH_BYTES];
+        self.fill(&mut hash)?;
+        Ok(hash)
     }
 
     fn mark(&mut self) -> Result<Mark> {
@@ -221,46 +232,64 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn body(&mut self) -> Result<Vec<u8>> {
-        let flagged = self.varint()?;
-        let stored = usize::try_from(flagged >> 1).map_err(|_| bad("size overflow"))?;
-        let raw = match flagged & 1 {
-            0 => stored,
-            _ => self.size()?,
-        };
-        if stored > self.remaining() {
+    fn bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len.min(READ_STEP));
+        let got = (&mut self.source)
+            .take(len as u64)
+            .read_to_end(&mut out)
+            .map_err(from_io)?;
+        self.read += got as u64;
+        if got != len {
             return Err(bad("truncated"));
         }
-        if raw > MAX_BODY {
-            return Err(bad(format!("an object of {raw} bytes is too large to store")));
+        Ok(out)
+    }
+
+    fn body(&mut self) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let flagged = self.varint()?;
+        let stored = usize::try_from(flagged >> 1).map_err(|_| bad("size overflow"))?;
+        let packed = flagged & 1 == 1;
+        let raw = if packed { self.size()? } else { stored };
+        if raw.max(stored) > MAX_BODY {
+            return Err(bad(format!(
+                "an object of {} bytes is too large to store",
+                raw.max(stored)
+            )));
+        }
+        if packed && raw > stored.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
+            return Err(bad("implausible compression"));
         }
         let bodies = self.bodies.saturating_add(raw);
-        if !affordable(bodies, self.pos + stored) {
+        let through = (self.read as usize).saturating_add(stored);
+        if !affordable(bodies, through) {
             return Err(bad(format!(
-                "its objects expand to {bodies} bytes from the first {} it carries",
-                self.pos + stored
+                "its objects expand to {bodies} bytes from the first {through} it carries"
             )));
         }
         self.bodies = bodies;
-        if flagged & 1 == 0 {
-            return Ok(self.take(stored)?.to_vec());
+        let bytes = self.bytes(stored)?;
+        if !packed {
+            return Ok((bytes, None));
         }
-        if raw > stored.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
-            return Err(bad("implausible compression"));
-        }
-        let body = lz4_flex::block::decompress(self.take(stored)?, raw)
+        let body = lz4_flex::block::decompress(&bytes, raw)
             .map_err(|error| bad(format!("bad compressed body: {error}")))?;
         if body.len() != raw {
             return Err(bad("compressed body has the wrong length"));
         }
-        Ok(body)
+        let smaller = raw >= COMPRESS_MIN && stored + varint_len(raw as u64) < raw;
+        Ok((body, smaller.then_some(bytes)))
     }
 
-    fn finish(&self) -> Result<()> {
-        if self.remaining() != 0 {
-            return Err(bad("trailing bytes"));
+    fn finish(&mut self) -> Result<()> {
+        let mut byte = [0u8];
+        loop {
+            match self.source.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Err(bad("trailing bytes")),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(from_io(error)),
+            }
         }
-        Ok(())
     }
 }
 
@@ -269,12 +298,15 @@ fn put_mark(out: &mut Vec<u8>, mark: Mark) {
     push_varint(out, mark.version);
 }
 
-fn put_body(out: &mut Vec<u8>, body: &[u8], bodies: &mut usize) {
+fn put_body(
+    out: &mut Vec<u8>,
+    body: &[u8],
+    packed: Option<Vec<u8>>,
+    bodies: &mut usize,
+    before: usize,
+) {
     *bodies += body.len();
-    let packed = (body.len() >= COMPRESS_MIN)
-        .then(|| lz4_flex::block::compress(body))
-        .filter(|packed| packed.len() + varint_len(body.len() as u64) < body.len())
-        .filter(|packed| affordable(*bodies, out.len() + packed.len()));
+    let packed = packed.filter(|packed| affordable(*bodies, before + out.len() + packed.len()));
     match packed {
         Some(packed) => {
             push_varint(out, (packed.len() as u64) << 1 | 1);
@@ -301,21 +333,22 @@ impl Marks {
     }
 
     fn decode(bytes: &[u8]) -> Result<Marks> {
-        let mut reader = Reader::open(bytes, HAVE_MAGIC)?;
-        let tips = reader.size()?;
-        let count = reader.count(HASH_BYTES + 1)?;
-        if tips > count {
+        let mut input = Input::open(bytes, HAVE_MAGIC)?;
+        let tips = input.size()?;
+        let count = input.varint()?;
+        if tips as u64 > count {
             return Err(bad("more tips than commits"));
         }
-        let marks = (0..count)
-            .map(|_| reader.mark())
-            .collect::<Result<Vec<_>>>()?;
-        reader.finish()?;
+        let mut marks = Vec::new();
+        for _ in 0..count {
+            marks.push(input.mark()?);
+        }
+        input.finish()?;
         Ok(Marks { marks, tips })
     }
 }
 
-impl Plan {
+impl Header {
     fn encode(&self) -> Vec<u8> {
         let mut out = BUNDLE_MAGIC.to_vec();
         out.push(FORMAT);
@@ -339,86 +372,153 @@ impl Plan {
             push_varint(&mut out, *parent as u64);
             push_varint(&mut out, *index as u64);
         }
-        push_varint(&mut out, self.objects.len() as u64);
-        let mut bodies = 0;
-        for object in &self.objects {
-            put_body(&mut out, &object.body, &mut bodies);
-            push_varint(&mut out, object.links.len() as u64);
-            for (hash, reference) in &object.links {
-                out.extend_from_slice(hash);
-                push_varint(&mut out, *reference as u64);
-            }
-        }
+        push_varint(&mut out, self.count);
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Plan> {
-        let mut reader = Reader::open(bytes, BUNDLE_MAGIC)?;
-        let tip = match reader.u8()? {
+    fn decode<R: Read>(input: &mut Input<R>) -> Result<Header> {
+        let tip = match input.u8()? {
             0 => None,
-            1 => Some(reader.mark()?),
+            1 => Some(input.mark()?),
             _ => return Err(bad("bad head flag")),
         };
-        let count = reader.count(HASH_BYTES + 1)?;
-        let bases = (0..count)
-            .map(|_| reader.mark())
-            .collect::<Result<Vec<_>>>()?;
-        let count = reader.count(1)?;
-        let roots = (0..count)
-            .map(|_| reader.below(bases.len()))
-            .collect::<Result<Vec<_>>>()?;
-        let count = reader.count(2)?;
+        let mut bases = Vec::new();
+        for _ in 0..input.varint()? {
+            bases.push(input.mark()?);
+        }
+        let mut roots = Vec::new();
+        for _ in 0..input.varint()? {
+            roots.push(input.below(bases.len())?);
+        }
         let mut hints = Vec::new();
-        for hint in 0..count {
-            let parent = reader.below(roots.len() + hint)?;
-            hints.push((parent, reader.size()?));
+        for _ in 0..input.varint()? {
+            let parent = input.below(roots.len() + hints.len())?;
+            hints.push((parent, input.size()?));
         }
-        let references = 1 + roots.len() + hints.len();
-        let count = reader.count(2)?;
-        let mut objects = Vec::new();
-        let mut index = HashMap::new();
-        for _ in 0..count {
-            let body = reader.body()?;
-            let links = reader.count(HASH_BYTES + 1)?;
-            let mut wire = Wire {
-                hash: [0; HASH_BYTES],
-                body,
-                links: Vec::new(),
-            };
-            for _ in 0..links {
-                let hash = reader.hash()?;
-                wire.links.push((hash, reader.below(references)?));
-            }
-            let object = Object {
-                body: wire.body,
-                links: wire
-                    .links
-                    .iter()
-                    .map(|(hash, _)| Ptr {
-                        hash: *hash,
-                        offset: 0,
-                    })
-                    .collect(),
-            };
-            wire.hash = object.hash();
-            wire.body = object.body;
-            if index.insert(wire.hash, objects.len()).is_some() {
-                return Err(bad("it repeats an object"));
-            }
-            objects.push(wire);
-        }
-        reader.finish()?;
-        if tip.is_none() && !(bases.is_empty() && objects.is_empty()) {
+        let count = input.varint()?;
+        if tip.is_none() && !(bases.is_empty() && count == 0) {
             return Err(bad("it carries objects but no head"));
         }
-        Ok(Plan {
+        Ok(Header {
             tip,
             bases,
             roots,
             hints,
-            objects,
-            index,
+            count,
         })
+    }
+}
+
+struct Emitter {
+    store: Store,
+    header: Vec<u8>,
+    order: Vec<Ptr>,
+    next: usize,
+    references: HashMap<Hash, usize>,
+    bodies: usize,
+    sent: usize,
+    out: Vec<u8>,
+    pos: usize,
+}
+
+impl Emitter {
+    fn new(
+        store: &Store,
+        header: &Header,
+        order: Vec<Ptr>,
+        references: HashMap<Hash, usize>,
+    ) -> Emitter {
+        Emitter {
+            store: store.clone(),
+            header: header.encode(),
+            order,
+            next: 0,
+            references,
+            bodies: 0,
+            sent: 0,
+            out: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn fill(&mut self) -> Result<bool> {
+        self.out.clear();
+        self.pos = 0;
+        if !self.header.is_empty() {
+            mem::swap(&mut self.out, &mut self.header);
+            self.sent += self.out.len();
+            return Ok(true);
+        }
+        while self.out.len() < WRITE_CHUNK && self.next < self.order.len() {
+            let (object, packed) = self.store.read_packed(self.order[self.next])?;
+            self.next += 1;
+            let before = self.sent;
+            put_body(&mut self.out, &object.body, packed, &mut self.bodies, before);
+            push_varint(&mut self.out, object.links.len() as u64);
+            for link in &object.links {
+                self.out.extend_from_slice(&link.hash);
+                let reference = self.references.get(&link.hash).copied().unwrap_or(0);
+                push_varint(&mut self.out, reference as u64);
+            }
+        }
+        self.sent += self.out.len();
+        Ok(!self.out.is_empty())
+    }
+
+    fn send(mut self, pipe: SyncSender<Result<Vec<u8>>>) {
+        loop {
+            let chunk = match self.fill() {
+                Ok(true) => Ok(mem::take(&mut self.out)),
+                Ok(false) => return,
+                Err(error) => Err(error),
+            };
+            let failed = chunk.is_err();
+            if pipe.send(chunk).is_err() || failed {
+                return;
+            }
+        }
+    }
+
+    fn write_to(mut self, out: &mut impl Write) -> Result<u64> {
+        while self.fill()? {
+            out.write_all(&self.out)?;
+        }
+        out.flush()?;
+        Ok(self.sent as u64)
+    }
+}
+
+struct Piped {
+    pipe: Receiver<Result<Vec<u8>>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for Piped {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos == self.chunk.len() {
+            match self.pipe.recv() {
+                Ok(Ok(chunk)) => (self.chunk, self.pos) = (chunk, 0),
+                Ok(Err(error)) => return Err(io::Error::other(error)),
+                Err(_) => return Ok(0),
+            }
+        }
+        let take = buf.len().min(self.chunk.len() - self.pos);
+        buf[..take].copy_from_slice(&self.chunk[self.pos..self.pos + take]);
+        self.pos += take;
+        Ok(take)
+    }
+}
+
+impl Read for Emitter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.out.len() && !self.fill().map_err(io::Error::other)? {
+            return Ok(0);
+        }
+        let take = buf.len().min(self.out.len() - self.pos);
+        buf[..take].copy_from_slice(&self.out[self.pos..self.pos + take]);
+        self.pos += take;
+        Ok(take)
     }
 }
 
@@ -515,13 +615,17 @@ enum Origin {
 
 struct Difference {
     known: HashMap<Hash, Origin>,
-    send: HashMap<Hash, Object>,
+    send: HashSet<Hash>,
+    links: HashMap<Hash, Vec<Ptr>>,
+    cached: usize,
 }
 
 fn difference(store: &Store, old_roots: &[Ptr], new_roots: Vec<Ptr>) -> Result<Difference> {
     let mut found = Difference {
         known: HashMap::new(),
-        send: HashMap::new(),
+        send: HashSet::new(),
+        links: HashMap::new(),
+        cached: 0,
     };
     for (slot, root) in old_roots.iter().enumerate() {
         found.known.entry(root.hash).or_insert(Origin::Root(slot));
@@ -536,7 +640,7 @@ fn difference(store: &Store, old_roots: &[Ptr], new_roots: Vec<Ptr>) -> Result<D
 
 impl Difference {
     fn classified(&self, hash: &Hash) -> bool {
-        self.known.contains_key(hash) || self.send.contains_key(hash)
+        self.known.contains_key(hash) || self.send.contains(hash)
     }
 
     fn step(&mut self, store: &Store, mut old: Vec<Ptr>, root: Ptr) -> Result<()> {
@@ -553,9 +657,9 @@ impl Difference {
                 if seen.contains(&ptr.hash) || !expanded.insert(ptr.hash) {
                     continue;
                 }
-                let links = match self.send.get(&ptr.hash) {
-                    Some(object) => object.links.clone(),
-                    None => store.read_object(ptr)?.links,
+                let links = match self.links.get(&ptr.hash) {
+                    Some(links) => links.clone(),
+                    None => store.read_links(ptr)?,
                 };
                 for (index, link) in links.into_iter().enumerate() {
                     if link.offset == 0 {
@@ -578,44 +682,81 @@ impl Difference {
                         "the branch links to pruned history outside its commit log",
                     ));
                 }
-                let object = store.read_object(ptr)?;
-                for link in &object.links {
+                let links = store.read_links(ptr)?;
+                for link in &links {
                     if seen.insert(link.hash) {
                         next.push(*link);
                     }
                 }
-                self.send.insert(ptr.hash, object);
+                self.send.insert(ptr.hash);
+                if self.cached + 1 + links.len() <= CACHED_LINKS {
+                    self.cached += 1 + links.len();
+                    self.links.insert(ptr.hash, links);
+                }
             }
             fresh = next;
         }
     }
 }
 
-fn post_order(pool: &HashMap<Hash, Object>, start: Hash) -> Vec<Hash> {
-    let mut order = Vec::with_capacity(pool.len());
-    if !pool.contains_key(&start) {
-        return order;
-    }
-    let mut done = HashSet::new();
-    let mut open = HashSet::from([start]);
-    let mut stack = vec![(start, 0usize)];
-    while let Some((hash, next)) = stack.last_mut() {
-        let links = &pool[&*hash].links;
-        if *next < links.len() {
-            let link = links[*next].hash;
-            *next += 1;
-            if pool.contains_key(&link) && !done.contains(&link) && open.insert(link) {
-                stack.push((link, 0));
-            }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    Waiting,
+    Open,
+    Done,
+}
+
+struct Ordered {
+    order: Vec<Ptr>,
+    ids: HashMap<Hash, usize>,
+    hints: Vec<(usize, usize)>,
+}
+
+fn post_order(
+    store: &Store,
+    starts: &[Ptr],
+    state: &mut HashMap<Hash, Visit>,
+    mut cached: HashMap<Hash, Vec<Ptr>>,
+    old: &HashMap<Hash, Origin>,
+    anchors: usize,
+) -> Result<Ordered> {
+    let mut links_of = |ptr: Ptr| match cached.remove(&ptr.hash) {
+        Some(links) => Ok(links),
+        None => store.read_links(ptr),
+    };
+    let mut found = Ordered {
+        order: Vec::with_capacity(state.len()),
+        ids: HashMap::new(),
+        hints: Vec::new(),
+    };
+    for start in starts {
+        if state.get(&start.hash) != Some(&Visit::Waiting) {
             continue;
         }
-        let hash = *hash;
-        stack.pop();
-        open.remove(&hash);
-        done.insert(hash);
-        order.push(hash);
+        state.insert(start.hash, Visit::Open);
+        let mut stack = vec![(*start, links_of(*start)?, 0usize)];
+        while let Some((_, links, next)) = stack.last_mut() {
+            if let Some(link) = links.get(*next).copied() {
+                *next += 1;
+                if link.offset != 0 && state.get(&link.hash) == Some(&Visit::Waiting) {
+                    state.insert(link.hash, Visit::Open);
+                    stack.push((link, links_of(link)?, 0));
+                }
+                continue;
+            }
+            let (ptr, links, _) = stack.pop().expect("the stack has a top");
+            for link in &links {
+                if !state.contains_key(&link.hash)
+                    && matches!(old.get(&link.hash), Some(Origin::Child(..)))
+                {
+                    hint_for(link.hash, old, &mut found.ids, &mut found.hints, anchors);
+                }
+            }
+            state.insert(ptr.hash, Visit::Done);
+            found.order.push(ptr);
+        }
     }
-    order
+    Ok(found)
 }
 
 struct Known {
@@ -625,10 +766,29 @@ struct Known {
     tip: bool,
 }
 
-fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Plan> {
+struct Sending {
+    ptr: Ptr,
+    root: Option<Ptr>,
+    merged: Option<Merged>,
+    generation: u64,
+}
+
+impl Sending {
+    fn of(ptr: Ptr, entry: &Entry) -> Sending {
+        Sending {
+            ptr,
+            root: entry.commit.root,
+            merged: entry.merged,
+            generation: entry.generation(),
+        }
+    }
+}
+
+fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter> {
+    let mut header = Header::default();
     let chain = refs.try_get(name)?.map(|head| head.log);
     let Some(chain) = chain.filter(|chain| chain.tip.is_some()) else {
-        return Ok(Plan::default());
+        return Ok(Emitter::new(store, &header, Vec::new(), HashMap::new()));
     };
     let tip = chain.tip.expect("chain has a tip");
     let mut known = Vec::new();
@@ -656,22 +816,18 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Plan> {
     let mut entries = Vec::new();
     let mut next = Some(tip);
     while let Some(ptr) = next {
-        let object = store.read_object(ptr)?;
-        let entry = read_entry(&object)?;
+        let entry = read_entry(&store.read_object(ptr)?)?;
         let at = entry.commit.version;
         if at <= floor {
             break;
         }
         next = entry.prev.filter(|_| at > chain.first);
-        entries.push((ptr, object, entry));
+        entries.push(Sending::of(ptr, &entry));
     }
-    let mut out = Plan {
-        tip: Some(Mark {
-            hash: tip.hash,
-            version: chain.last,
-        }),
-        ..Plan::default()
-    };
+    header.tip = Some(Mark {
+        hash: tip.hash,
+        version: chain.last,
+    });
     let mut slots: HashMap<usize, usize> = HashMap::new();
     let mut base_slot = |slot: usize, bases: &mut Vec<Mark>| -> usize {
         *slots.entry(slot).or_insert_with(|| {
@@ -691,68 +847,65 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Plan> {
         if old_roots.iter().any(|old| old.hash == root.hash) {
             continue;
         }
-        out.roots.push(base_slot(slot, &mut out.bases));
+        header.roots.push(base_slot(slot, &mut header.bases));
         old_roots.push(root);
     }
-    let extra = closures(store, &chain, &entries, &known, &mut out.bases)?;
+    let extra = closures(store, &chain, &entries, &known, &mut header.bases)?;
     let mut new_roots = Vec::new();
-    for (_, _, entry) in entries.iter().rev().chain(&extra) {
-        new_roots.extend(entry.commit.root);
+    for sending in entries.iter().rev().chain(&extra) {
+        new_roots.extend(sending.root);
     }
-    let Difference { known: old, send } = difference(store, &old_roots, new_roots)?;
-    let mut pool = send;
-    for (ptr, object, _) in entries.into_iter().chain(extra) {
-        pool.insert(ptr.hash, object);
+    let Difference {
+        known: old,
+        send,
+        links,
+        ..
+    } = difference(store, &old_roots, new_roots)?;
+    let mut state: HashMap<Hash, Visit> = send
+        .into_iter()
+        .map(|hash| (hash, Visit::Waiting))
+        .collect();
+    let mut starts: Vec<(u64, Ptr)> = Vec::with_capacity(entries.len() + extra.len());
+    for sending in entries.iter().chain(&extra) {
+        state.insert(sending.ptr.hash, Visit::Waiting);
+        starts.push((sending.generation, sending.ptr));
     }
-    let order = post_order(&pool, tip.hash);
-    if order.len() != pool.len() {
+    starts.sort_by_key(|(generation, ptr)| (*generation, ptr.offset));
+    let starts: Vec<Ptr> = starts.into_iter().map(|(_, ptr)| ptr).collect();
+    let Ordered { order, ids, hints } =
+        post_order(store, &starts, &mut state, links, &old, old_roots.len())?;
+    if order.len() != state.len() {
         return Err(Error::Corrupt(
             "sync found objects its head does not reach".into(),
         ));
     }
-    let mut ids: HashMap<Hash, usize> = HashMap::new();
-    let mut emitted: HashSet<Hash> = HashSet::with_capacity(order.len());
-    for hash in order {
-        let object = pool.remove(&hash).expect("ordered objects are pooled");
-        let mut links = Vec::with_capacity(object.links.len());
-        for link in &object.links {
-            let reference = if emitted.contains(&link.hash) {
-                0
-            } else {
-                match old.get(&link.hash) {
-                    Some(Origin::Root(slot)) => 1 + slot,
-                    Some(Origin::Child(..)) => {
-                        let id =
-                            hint_for(link.hash, &old, &mut ids, &mut out.hints, old_roots.len());
-                        1 + old_roots.len() + id
-                    }
-                    None => 0,
-                }
-            };
-            links.push((link.hash, reference));
-        }
-        emitted.insert(hash);
-        out.objects.push(Wire {
-            hash,
-            body: object.body,
-            links,
-        });
+    drop(state);
+    header.hints = hints;
+    header.count = order.len() as u64;
+    let mut references = HashMap::with_capacity(old_roots.len() + ids.len());
+    for (slot, root) in old_roots.iter().enumerate() {
+        references.entry(root.hash).or_insert(1 + slot);
     }
-    Ok(out)
+    for (hash, id) in ids {
+        if let Some(Origin::Child(..)) = old.get(&hash) {
+            references.insert(hash, 1 + old_roots.len() + id);
+        }
+    }
+    Ok(Emitter::new(store, &header, order, references))
 }
 
 fn closures(
     store: &Store,
     chain: &Chain,
-    entries: &[(Ptr, Object, Entry)],
+    entries: &[Sending],
     known: &[Known],
     bases: &mut Vec<Mark>,
-) -> Result<Vec<(Ptr, Object, Entry)>> {
+) -> Result<Vec<Sending>> {
     let after = chain.after(store)?;
-    let mut sending: HashSet<Hash> = entries.iter().map(|(ptr, _, _)| ptr.hash).collect();
+    let mut sending: HashSet<Hash> = entries.iter().map(|sending| sending.ptr.hash).collect();
     let mut seeds: Vec<(Merged, Option<u64>)> = entries
         .iter()
-        .filter_map(|(_, _, entry)| entry.merged.map(|merged| (merged, after)))
+        .filter_map(|sending| sending.merged.map(|merged| (merged, after)))
         .collect();
     let mut extra = Vec::new();
     while let Some((merged, path)) = seeds.pop() {
@@ -793,8 +946,7 @@ fn closures(
             if at.offset == 0 || sending.contains(&at.hash) {
                 break;
             }
-            let object = store.read_object(at)?;
-            let entry = read_entry(&object)?;
+            let entry = read_entry(&store.read_object(at)?)?;
             let version = entry.commit.version;
             if version < stop {
                 break;
@@ -804,7 +956,7 @@ fn closures(
                 seeds.push((nested, after));
             }
             next = entry.prev.filter(|_| version > stop);
-            extra.push((at, object, entry));
+            extra.push(Sending::of(at, &entry));
         }
     }
     Ok(extra)
@@ -865,17 +1017,16 @@ impl Facts {
 }
 
 fn check_graph(
-    entry: &Entry,
+    own: Facts,
+    link: Option<Merged>,
     prev: Option<Option<Facts>>,
     merged: Option<Option<Facts>>,
 ) -> Result<()> {
-    let own = Facts::of(entry);
     let known = prev.is_none_or(|facts| facts.is_some()) && merged.is_none_or(|f| f.is_some());
     let (prev, linked) = (prev.flatten(), merged.flatten());
     let generation = |facts: Option<Facts>| facts.map_or(0, |facts| facts.generation);
     let parents = generation(prev).max(generation(linked));
     let reach = prev.map_or(0, |facts| facts.reach).max(linked.map_or(0, |facts| facts.generation));
-    let link = entry.merged;
     let bounded = prev.is_some_and(|facts| facts.bounded)
         || link.is_some_and(|link| link.floor > 1 || link.after.is_some())
         || linked.is_some_and(|facts| facts.bounded);
@@ -923,11 +1074,55 @@ enum Found {
     Gone,
 }
 
+struct Sent {
+    facts: Facts,
+    root: Option<Ptr>,
+    prev: Option<Ptr>,
+    skip: Option<Ptr>,
+    merged: Option<Merged>,
+    segment: usize,
+}
+
+impl Sent {
+    fn of(entry: &Entry, segment: usize) -> Sent {
+        Sent {
+            facts: Facts::of(entry),
+            root: entry.commit.root,
+            prev: entry.prev,
+            skip: entry.skip,
+            merged: entry.merged,
+            segment,
+        }
+    }
+}
+
+fn decode_commit(object: &Object) -> Result<Entry> {
+    let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))
+        .map_err(|error| bad(format!("an object it links as a commit is not one: {error}")))?;
+    let used = usize::from(entry.commit.root.is_some())
+        + usize::from(entry.prev.is_some())
+        + usize::from(entry.skip.is_some())
+        + usize::from(entry.merged.is_some());
+    if used != object.links.len() {
+        return Err(bad("a commit carries links it does not use"));
+    }
+    Ok(entry)
+}
+
+fn sent_ptr(txn: &Txn, hash: Hash) -> Ptr {
+    let offset = txn.offset_of(&hash).expect("a sent object has an offset");
+    Ptr { hash, offset }
+}
+
+fn read_commit(txn: &Txn, hash: Hash) -> Result<Entry> {
+    decode_commit(&txn.read_object(sent_ptr(txn, hash))?)
+}
+
 struct Landing<'a> {
     store: &'a Store,
+    low: u64,
     segments: Vec<Segment>,
-    decoded: HashMap<Hash, (usize, usize)>,
-    entries: HashMap<usize, Entry>,
+    commits: HashMap<Hash, Sent>,
 }
 
 impl Landing<'_> {
@@ -942,7 +1137,7 @@ impl Landing<'_> {
                     .ok_or_else(|| bad("a commit links past the top of its chain"));
             }
             match &seg.below {
-                Below::Joins(hash) => segment = self.decoded[hash].1,
+                Below::Joins(hash) => segment = self.commits[hash].segment,
                 Below::Chain(chain) => {
                     let found = entry_at(self.store, chain, version)?;
                     return Ok(found.map_or(Found::Gone, Found::Held));
@@ -956,49 +1151,68 @@ impl Landing<'_> {
         if ptr.offset == 0 {
             return Ok(None);
         }
-        match self.decoded.get(&ptr.hash) {
-            Some((slot, _)) => Ok(Some(Facts::of(&self.entries[slot]))),
+        match self.commits.get(&ptr.hash) {
+            Some(sent) => Ok(Some(sent.facts)),
             None => Ok(Some(Facts::of(&*self.store.load::<Entry>(ptr)?))),
         }
     }
 
-    fn segment(
-        &mut self,
-        refs: &Refs,
-        plan: &Plan,
-        index: &HashMap<Hash, usize>,
-        top: Hash,
-    ) -> Result<Vec<Hash>> {
+    fn chained(
+        &self,
+        txn: &Txn,
+        unused: &mut HashSet<Hash>,
+        segment: usize,
+        want: Ptr,
+        at: u64,
+    ) -> Result<Ptr> {
+        match self.find(segment, at)? {
+            Found::Sent(hash) if hash == want.hash => {
+                unused.remove(&hash);
+                Ok(sent_ptr(txn, hash))
+            }
+            Found::Held(ptr) if ptr.hash == want.hash => Ok(ptr),
+            Found::Gone => Ok(Ptr {
+                hash: want.hash,
+                offset: 0,
+            }),
+            Found::Held(_) if segment == 0 && at < self.low => Err(bad(format!(
+                "v{at}, which it builds on, does not match this database"
+            ))),
+            _ => Err(bad(
+                "a commit links to one that is not the commit at that version",
+            )),
+        }
+    }
+
+    fn segment(&mut self, refs: &Refs, txn: &Txn, top: Hash) -> Result<Vec<Hash>> {
         let id = self.segments.len();
         let mut versions = HashMap::new();
         let mut merged = Vec::new();
         let (mut at, mut expected) = (top, None);
         let below = loop {
-            let slot = index[&at];
-            let entry = decode_entry(plan, slot)?;
+            let entry = read_commit(txn, at)?;
             let version = entry.commit.version;
             let skipped = expected.is_some_and(|want| want != version);
             if version == 0 || version > MAX_VERSION || skipped {
                 return Err(bad("a merged chain's versions do not descend one at a time"));
             }
             versions.insert(version, at);
-            self.decoded.insert(at, (slot, id));
             merged.extend(entry.merged.map(|link| link.ptr.hash));
             let prev = entry.prev;
-            self.entries.insert(slot, entry);
+            self.commits.insert(at, Sent::of(&entry, id));
             let Some(prev) = prev else {
                 if version != 1 {
                     return Err(bad(format!("v{version} has no parent")));
                 }
                 break Below::Gone;
             };
-            if let Some((slot, _)) = self.decoded.get(&prev.hash) {
-                if self.entries[slot].commit.version != version - 1 {
+            if let Some(sent) = self.commits.get(&prev.hash) {
+                if sent.facts.version != version - 1 {
                     return Err(bad("a merged chain joins another at the wrong version"));
                 }
                 break Below::Joins(prev.hash);
             }
-            if index.contains_key(&prev.hash) {
+            if txn.offset_of(&prev.hash).is_some() {
                 (at, expected) = (prev.hash, Some(version - 1));
                 continue;
             }
@@ -1021,34 +1235,12 @@ impl Landing<'_> {
     }
 }
 
-fn decode_entry(plan: &Plan, slot: usize) -> Result<Entry> {
-    let wire = &plan.objects[slot];
-    let links: Vec<Ptr> = wire
-        .links
-        .iter()
-        .map(|(hash, _)| Ptr {
-            hash: *hash,
-            offset: 0,
-        })
-        .collect();
-    let entry = Entry::decode(&mut Decoder::new(&wire.body, &links, None))
-        .map_err(|error| bad(format!("an object it links as a commit is not one: {error}")))?;
-    let used = usize::from(entry.commit.root.is_some())
-        + usize::from(entry.prev.is_some())
-        + usize::from(entry.skip.is_some())
-        + usize::from(entry.merged.is_some());
-    if used != links.len() {
-        return Err(bad("a commit carries links it does not use"));
-    }
-    Ok(entry)
-}
-
 type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
 
 struct Vetting<'a> {
     store: &'a Store,
-    plan: &'a Plan,
-    index: &'a HashMap<Hash, usize>,
+    txn: &'a Txn,
+    held_at: &'a HashMap<Hash, usize>,
     roots: &'a [Ptr],
     hinted: &'a [Ptr],
     hint_kinds: &'a [Option<Kind>],
@@ -1057,7 +1249,7 @@ struct Vetting<'a> {
     held: Checked,
     spent: usize,
     budget: usize,
-    queue: Vec<(Hash, usize, Kind)>,
+    queue: Vec<(Ptr, Kind)>,
 }
 
 fn rejected(error: Error) -> Error {
@@ -1069,13 +1261,24 @@ fn rejected(error: Error) -> Error {
 
 impl Vetting<'_> {
     fn run(&mut self) -> Result<()> {
-        while let Some((hash, reference, kind)) = self.queue.pop() {
-            let shape = match reference {
-                0 => self.sent(hash, &kind)?,
-                _ => match self.held(hash, reference, &kind)? {
-                    Some(shape) => shape,
-                    None => continue,
-                },
+        while let Some((ptr, kind)) = self.queue.pop() {
+            let shape = match self.txn.offset_of(&ptr.hash) {
+                Some(offset) => self.sent(
+                    Ptr {
+                        hash: ptr.hash,
+                        offset,
+                    },
+                    &kind,
+                )?,
+                None => {
+                    let reference = *self.held_at.get(&ptr.hash).ok_or_else(|| {
+                        bad("an object links to one that was neither sent nor known")
+                    })?;
+                    match self.held(ptr.hash, reference, &kind)? {
+                        Some(shape) => shape,
+                        None => continue,
+                    }
+                }
             };
             if !kind.fits(shape) {
                 return Err(bad(format!(
@@ -1087,35 +1290,22 @@ impl Vetting<'_> {
         Ok(())
     }
 
-    fn sent(&mut self, hash: Hash, kind: &Kind) -> Result<Shape> {
-        if let Some(shape) = self.sent.get(&hash, kind) {
+    fn sent(&mut self, ptr: Ptr, kind: &Kind) -> Result<Shape> {
+        if let Some(shape) = self.sent.get(&ptr.hash, kind) {
             return Ok(shape);
         }
-        let slot = *self
-            .index
-            .get(&hash)
-            .ok_or_else(|| bad("an object links to one that was neither sent nor known"))?;
-        let wire = &self.plan.objects[slot];
-        self.spent = self.spent.saturating_add(wire.body.len());
+        let object = self.txn.read_object(ptr)?;
+        self.spent = self.spent.saturating_add(object.body.len());
         if self.spent > self.budget {
             return Err(bad("it reuses its objects under too many key ranges"));
         }
-        let links: Vec<Ptr> = wire
-            .links
-            .iter()
-            .map(|(hash, _)| Ptr {
-                hash: *hash,
-                offset: 0,
-            })
-            .collect();
         let (shape, found) = kind
-            .check(&wire.body, &links)
+            .check(&object.body, &object.links)
             .map_err(|error| bad(format!("a {} it carries does not decode: {error}", kind.name)))?;
         for (index, child) in found {
-            let (hash, reference) = wire.links[index];
-            self.queue.push((hash, reference, child));
+            self.queue.push((object.links[index], child));
         }
-        self.sent.insert(hash, kind, shape);
+        self.sent.insert(ptr.hash, kind, shape);
         Ok(shape)
     }
 
@@ -1155,24 +1345,16 @@ impl Vetting<'_> {
     }
 }
 
-fn land<T: Data>(
-    store: &Store,
-    txn: &mut Txn,
-    refs: &Refs,
-    remote: &str,
-    mut plan: Plan,
-) -> Result<Option<Refs>> {
-    let Some(tip) = plan.tip else {
-        return Ok(None);
-    };
-    if tip.version > MAX_VERSION {
-        return Err(bad(format!(
-            "its head is at v{}, past what a commit log can reach",
-            tip.version
-        )));
-    }
-    let mut bases = Vec::with_capacity(plan.bases.len());
-    for mark in &plan.bases {
+struct Anchors {
+    bases: Vec<(Ptr, Chain)>,
+    roots: Vec<Ptr>,
+    hinted: Vec<Ptr>,
+    hint_kinds: Vec<Option<Kind>>,
+}
+
+fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Result<Anchors> {
+    let mut bases = Vec::with_capacity(header.bases.len());
+    for mark in &header.bases {
         let found = locate(store, refs, *mark)?.ok_or_else(|| {
             Error::StaleHave(format!(
                 "it builds on v{} {}, which this database does not have",
@@ -1182,93 +1364,8 @@ fn land<T: Data>(
         })?;
         bases.push(found);
     }
-    let index = std::mem::take(&mut plan.index);
-    let mut entries: HashMap<usize, Entry> = HashMap::new();
-    let mut decoded: HashMap<Hash, (usize, usize)> = HashMap::new();
-    let mut versions: HashMap<u64, Hash> = HashMap::new();
-    let mut below = Some(tip);
-    while let Some(mark) = below {
-        let Some(&slot) = index.get(&mark.hash) else {
-            break;
-        };
-        let entry = decode_entry(&plan, slot)
-            .map_err(|error| bad(format!("v{} is not a commit: {error}", mark.version)))?;
-        if mark.version == 0 || entry.commit.version != mark.version {
-            return Err(bad("its commit versions do not descend one at a time"));
-        }
-        below = match entry.prev {
-            Some(prev) => Some(Mark {
-                hash: prev.hash,
-                version: mark.version - 1,
-            }),
-            None if mark.version == 1 => None,
-            None => return Err(bad(format!("v{} has no parent", mark.version))),
-        };
-        versions.insert(mark.version, mark.hash);
-        decoded.insert(mark.hash, (slot, 0));
-        entries.insert(slot, entry);
-    }
-    let low = tip
-        .version
-        .saturating_sub(entries.len() as u64)
-        .saturating_add(1);
-    let mut prefix = None;
-    let mut first = low;
-    let mut tip_ptr = None;
-    if let Some(mark) = below {
-        match locate(store, refs, mark)? {
-            Some((ptr, chain)) => {
-                first = chain.first;
-                prefix = Some(chain);
-                if entries.is_empty() {
-                    tip_ptr = Some(ptr);
-                }
-            }
-            None if entries.is_empty() && plan.objects.is_empty() => {
-                return Err(Error::StaleHave(format!(
-                    "its head is v{} {}, which this database does not have",
-                    mark.version,
-                    hex(&mark.hash)
-                )));
-            }
-            None if entries.is_empty() => {
-                return Err(bad("its head is neither in it nor in this database"));
-            }
-            None => {}
-        }
-    }
-    let mut landing = Landing {
-        store,
-        segments: vec![Segment {
-            versions,
-            bottom: low,
-            below: prefix.map_or(Below::Gone, Below::Chain),
-        }],
-        decoded,
-        entries,
-    };
-    let mut pending: Vec<Hash> = landing
-        .entries
-        .values()
-        .filter_map(|entry| entry.merged.map(|link| link.ptr.hash))
-        .collect();
-    while let Some(top) = pending.pop() {
-        if landing.decoded.contains_key(&top) || !index.contains_key(&top) {
-            continue;
-        }
-        pending.extend(landing.segment(refs, &plan, &index, top)?);
-    }
-    let now = now_ms();
-    let horizon = now.saturating_add(MAX_AHEAD_MS);
-    if let Some(entry) = landing.entries.values().find(|entry| entry.commit.time_ms > horizon) {
-        return Err(bad(format!(
-            "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
-            entry.commit.version,
-            entry.commit.time_ms - now
-        )));
-    }
-    let mut roots = Vec::with_capacity(plan.roots.len());
-    for slot in &plan.roots {
+    let mut roots = Vec::with_capacity(header.roots.len());
+    for slot in &header.roots {
         let entry = store.load::<Entry>(bases[*slot].0)?;
         roots.push(
             entry
@@ -1277,13 +1374,12 @@ fn land<T: Data>(
                 .ok_or_else(|| bad("a base it names has no root"))?,
         );
     }
-    let root_kind = Kind::value::<T>();
-    let mut hinted: Vec<Ptr> = Vec::with_capacity(plan.hints.len());
-    let mut hint_kinds: Vec<Option<Kind>> = Vec::with_capacity(plan.hints.len());
+    let mut hinted: Vec<Ptr> = Vec::with_capacity(header.hints.len());
+    let mut hint_kinds: Vec<Option<Kind>> = Vec::with_capacity(header.hints.len());
     let mut parents: HashMap<(Ptr, Option<TypeId>), Parent> = HashMap::new();
-    for (parent, slot) in &plan.hints {
+    for (parent, slot) in &header.hints {
         let (from, kind) = if *parent < roots.len() {
-            (roots[*parent], Some(&root_kind))
+            (roots[*parent], Some(root_kind))
         } else {
             let id = *parent - roots.len();
             (hinted[id], hint_kinds[id].as_ref())
@@ -1308,14 +1404,200 @@ fn land<T: Data>(
         hinted.push(link);
         hint_kinds.push(kinds.get(slot).cloned());
     }
-    let carried: usize = plan.objects.iter().map(|wire| wire.body.len()).sum();
+    Ok(Anchors {
+        bases,
+        roots,
+        hinted,
+        hint_kinds,
+    })
+}
+
+struct Streamed {
+    unused: HashSet<Hash>,
+    loose: HashSet<Hash>,
+    carried: usize,
+}
+
+fn stream<R: Read>(
+    txn: &mut Txn,
+    header: &Header,
+    anchors: &Anchors,
+    input: &mut Input<R>,
+) -> Result<Streamed> {
+    let (roots, hinted) = (&anchors.roots, &anchors.hinted);
+    let references = 1 + roots.len() + hinted.len();
+    let mut found = Streamed {
+        unused: HashSet::new(),
+        loose: HashSet::new(),
+        carried: 0,
+    };
+    for _ in 0..header.count {
+        let (body, packed) = input.body()?;
+        let mut links = Vec::new();
+        let mut open = false;
+        for _ in 0..input.varint()? {
+            let hash = input.hash()?;
+            let ptr = match input.below(references)? {
+                0 => match txn.offset_of(&hash) {
+                    Some(offset) => {
+                        found.unused.remove(&hash);
+                        Ptr { hash, offset }
+                    }
+                    None => {
+                        open = true;
+                        Ptr { hash, offset: 0 }
+                    }
+                },
+                reference if reference <= roots.len() => roots[reference - 1],
+                reference => hinted[reference - 1 - roots.len()],
+            };
+            if ptr.hash != hash {
+                return Err(bad("a link does not match the object it names"));
+            }
+            links.push(ptr);
+        }
+        let object = Object { body, links };
+        let hash = object.hash();
+        if txn.offset_of(&hash).is_some() {
+            return Err(bad("it repeats an object"));
+        }
+        found.carried = found.carried.saturating_add(object.body.len());
+        txn.put_packed(object, hash, packed)?;
+        found.unused.insert(hash);
+        if open {
+            found.loose.insert(hash);
+        }
+        if txn.buffered() >= SPILL_AT {
+            txn.spill()?;
+        }
+    }
+    input.finish()?;
+    Ok(found)
+}
+
+fn land<T: Data, R: Read>(
+    store: &Store,
+    txn: &mut Txn,
+    refs: &Refs,
+    remote: &str,
+    header: &Header,
+    input: &mut Input<R>,
+) -> Result<Option<Refs>> {
+    let Some(tip) = header.tip else {
+        return Ok(None);
+    };
+    if tip.version > MAX_VERSION {
+        return Err(bad(format!(
+            "its head is at v{}, past what a commit log can reach",
+            tip.version
+        )));
+    }
+    let root_kind = Kind::value::<T>();
+    let anchors = anchors(store, refs, header, &root_kind)?;
+    let Streamed {
+        mut unused,
+        loose,
+        carried,
+    } = stream(txn, header, &anchors, input)?;
+    let mut held_at: HashMap<Hash, usize> = HashMap::new();
+    for (index, ptr) in anchors.roots.iter().chain(&anchors.hinted).enumerate() {
+        held_at.entry(ptr.hash).or_insert(1 + index);
+    }
+    let mut commits: HashMap<Hash, Sent> = HashMap::new();
+    let mut versions: HashMap<u64, Hash> = HashMap::new();
+    let mut below = Some(tip);
+    while let Some(mark) = below {
+        if txn.offset_of(&mark.hash).is_none() {
+            break;
+        }
+        let entry = read_commit(txn, mark.hash)
+            .map_err(|error| bad(format!("v{} is not a commit: {error}", mark.version)))?;
+        if mark.version == 0 || entry.commit.version != mark.version {
+            return Err(bad("its commit versions do not descend one at a time"));
+        }
+        below = match entry.prev {
+            Some(prev) => Some(Mark {
+                hash: prev.hash,
+                version: mark.version - 1,
+            }),
+            None if mark.version == 1 => None,
+            None => return Err(bad(format!("v{} has no parent", mark.version))),
+        };
+        versions.insert(mark.version, mark.hash);
+        commits.insert(mark.hash, Sent::of(&entry, 0));
+    }
+    let landed = commits.len() as u64;
+    let low = tip.version.saturating_sub(landed).saturating_add(1);
+    let mut prefix = None;
+    let mut first = low;
+    let mut tip_ptr = None;
+    if let Some(mark) = below {
+        match locate(store, refs, mark)? {
+            Some((ptr, chain)) => {
+                first = chain.first;
+                prefix = Some(chain);
+                if landed == 0 {
+                    tip_ptr = Some(ptr);
+                }
+            }
+            None if landed == 0 && header.count == 0 => {
+                return Err(Error::StaleHave(format!(
+                    "its head is v{} {}, which this database does not have",
+                    mark.version,
+                    hex(&mark.hash)
+                )));
+            }
+            None if landed == 0 => {
+                return Err(bad("its head is neither in it nor in this database"));
+            }
+            None => {}
+        }
+    }
+    let mut landing = Landing {
+        store,
+        low,
+        segments: vec![Segment {
+            versions,
+            bottom: low,
+            below: prefix.map_or(Below::Gone, Below::Chain),
+        }],
+        commits,
+    };
+    let mut pending: Vec<Hash> = landing
+        .commits
+        .values()
+        .filter_map(|sent| sent.merged.map(|link| link.ptr.hash))
+        .collect();
+    while let Some(top) = pending.pop() {
+        if landing.commits.contains_key(&top) || txn.offset_of(&top).is_none() {
+            continue;
+        }
+        pending.extend(landing.segment(refs, txn, top)?);
+    }
+    let now = now_ms();
+    let horizon = now.saturating_add(MAX_AHEAD_MS);
+    if let Some(sent) = landing.commits.values().find(|sent| sent.facts.time > horizon) {
+        return Err(bad(format!(
+            "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
+            sent.facts.version,
+            sent.facts.time - now
+        )));
+    }
+    let unresolved = loose.iter().any(|hash| !landing.commits.contains_key(hash))
+        || landing
+            .commits
+            .values()
+            .any(|sent| sent.root.is_some_and(|root| root.offset == 0));
+    if unresolved {
+        return Err(bad("an object links to one that was neither sent nor known"));
+    }
     let mut vetting = Vetting {
         store,
-        plan: &plan,
-        index: &index,
-        roots: &roots,
-        hinted: &hinted,
-        hint_kinds: &hint_kinds,
+        txn,
+        held_at: &held_at,
+        roots: &anchors.roots,
+        hinted: &anchors.hinted,
+        hint_kinds: &anchors.hint_kinds,
         root_kind: &root_kind,
         sent: Checked::default(),
         held: Checked::default(),
@@ -1323,130 +1605,79 @@ fn land<T: Data>(
         budget: carried.saturating_mul(2).saturating_add(RECHECK_SLACK),
         queue: Vec::new(),
     };
-    for (slot, entry) in &landing.entries {
-        if entry.commit.root.is_some() {
-            let (hash, reference) = plan.objects[*slot].links[0];
-            vetting.queue.push((hash, reference, root_kind.clone()));
+    for sent in landing.commits.values() {
+        if let Some(root) = sent.root {
+            vetting.queue.push((root, root_kind.clone()));
         }
     }
     vetting.run()?;
-    let based: HashMap<Hash, Ptr> = bases.iter().map(|(ptr, _)| (ptr.hash, *ptr)).collect();
-    let mut written: HashMap<Hash, Ptr> = HashMap::with_capacity(plan.objects.len());
-    let mut used = vec![false; plan.objects.len()];
+    drop(vetting);
+    let based: HashMap<Hash, Ptr> = anchors
+        .bases
+        .iter()
+        .map(|(ptr, _)| (ptr.hash, *ptr))
+        .collect();
+    let mut order: Vec<(u64, u64, Hash)> = landing
+        .commits
+        .iter()
+        .map(|(hash, sent)| (sent.facts.generation, sent.facts.version, *hash))
+        .collect();
+    order.sort_unstable();
     let mut tip_root = None;
-    for (slot, wire) in plan.objects.into_iter().enumerate() {
-        let mut links = Vec::with_capacity(wire.links.len());
-        let sent = |hash: &Hash, used: &mut Vec<bool>| -> Result<Ptr> {
-            let ptr = written
-                .get(hash)
-                .copied()
-                .ok_or_else(|| bad("an object links to one that was neither sent nor known"))?;
-            used[index[hash]] = true;
-            Ok(ptr)
-        };
-        let value = |hash: &Hash, reference: usize, used: &mut Vec<bool>| -> Result<Ptr> {
-            let ptr = match reference {
-                0 => sent(hash, used)?,
-                _ if reference <= roots.len() => roots[reference - 1],
-                _ => hinted[reference - 1 - roots.len()],
-            };
-            if ptr.hash != *hash {
-                return Err(bad("a link does not match the object it names"));
-            }
-            Ok(ptr)
-        };
-        let commit = landing.decoded.get(&wire.hash).filter(|(found, _)| *found == slot);
-        let Some(&(_, segment)) = commit else {
-            for (hash, reference) in &wire.links {
-                links.push(value(hash, *reference, &mut used)?);
-            }
-            let object = Object {
-                body: wire.body,
-                links,
-            };
-            written.insert(wire.hash, txn.put(object, wire.hash)?);
-            continue;
-        };
-        let entry = &landing.entries[&slot];
-        let version = entry.commit.version;
-        let mut wires = wire.links.iter();
-        if entry.commit.root.is_some() {
-            let (hash, reference) = wires.next().ok_or_else(|| bad("a commit lost its root"))?;
-            links.push(value(hash, *reference, &mut used)?);
-        }
-        let chained = |want: Ptr, at: u64, used: &mut Vec<bool>| -> Result<Ptr> {
-            match landing.find(segment, at)? {
-                Found::Sent(hash) if hash == want.hash => {
-                    let ptr = written
-                        .get(&hash)
-                        .copied()
-                        .ok_or_else(|| bad("a commit links to one sent after it"))?;
-                    used[index[&hash]] = true;
-                    Ok(ptr)
-                }
-                Found::Held(ptr) if ptr.hash == want.hash => Ok(ptr),
-                Found::Gone => Ok(Ptr {
-                    hash: want.hash,
-                    offset: 0,
-                }),
-                Found::Held(_) if segment == 0 && at < low => Err(bad(format!(
-                    "v{at}, which it builds on, does not match this database"
-                ))),
-                _ => Err(bad(
-                    "a commit links to one that is not the commit at that version",
-                )),
-            }
-        };
+    for (_, _, hash) in order {
+        let object = txn.read_object(sent_ptr(txn, hash))?;
+        let sent = &landing.commits[&hash];
+        let version = sent.facts.version;
+        let mut links = Vec::with_capacity(object.links.len());
+        links.extend(sent.root);
         let mut prev_facts = None;
-        if let Some(prev) = entry.prev {
-            let ptr = chained(prev, version - 1, &mut used)?;
+        if let Some(prev) = sent.prev {
+            let ptr = landing.chained(txn, &mut unused, sent.segment, prev, version - 1)?;
             prev_facts = Some(landing.facts(ptr)?);
             links.push(ptr);
         }
-        if let Some(skip) = entry.skip {
-            links.push(chained(skip, skip_version(version), &mut used)?);
+        if let Some(skip) = sent.skip {
+            let at = skip_version(version);
+            links.push(landing.chained(txn, &mut unused, sent.segment, skip, at)?);
         }
         let mut merged_facts = None;
-        if let Some(link) = entry.merged {
-            let hash = link.ptr.hash;
-            let ptr = if landing.decoded.contains_key(&hash) {
-                let ptr = written
-                    .get(&hash)
-                    .copied()
-                    .ok_or_else(|| bad("a merge links to a commit sent after it"))?;
-                used[index[&hash]] = true;
-                ptr
+        if let Some(link) = sent.merged {
+            let merged = link.ptr.hash;
+            let ptr = if landing.commits.contains_key(&merged) {
+                unused.remove(&merged);
+                sent_ptr(txn, merged)
             } else {
-                based.get(&hash).copied().unwrap_or(Ptr { hash, offset: 0 })
+                based.get(&merged).copied().unwrap_or(Ptr {
+                    hash: merged,
+                    offset: 0,
+                })
             };
             merged_facts = Some(landing.facts(ptr)?);
             links.push(ptr);
         }
-        check_graph(entry, prev_facts, merged_facts)?;
-        if wire.hash == tip.hash {
-            tip_root = entry
-                .commit
-                .root
-                .and_then(|root| links.iter().copied().find(|link| link.hash == root.hash));
+        check_graph(sent.facts, sent.merged, prev_facts, merged_facts)?;
+        if hash == tip.hash {
+            tip_root = sent.root;
         }
-        let object = Object {
-            body: wire.body,
-            links,
-        };
-        let ptr = txn.put(object, wire.hash)?;
-        written.insert(wire.hash, ptr);
+        if links != object.links {
+            txn.put_fresh(
+                Object {
+                    body: object.body,
+                    links,
+                },
+                hash,
+            )?;
+        }
     }
-    if let Some(slot) = index.get(&tip.hash) {
-        used[*slot] = true;
-    }
-    if used.iter().any(|used| !used) {
+    unused.remove(&tip.hash);
+    if !unused.is_empty() {
         return Err(bad("it carries objects nothing links to"));
     }
     let tip_ptr = match tip_ptr {
         Some(ptr) => ptr,
-        None => written[&tip.hash],
+        None => sent_ptr(txn, tip.hash),
     };
-    let root = if index.contains_key(&tip.hash) {
+    let root = if landing.commits.contains_key(&tip.hash) {
         tip_root
     } else {
         store.load::<Entry>(tip_ptr)?.commit.root
@@ -1588,11 +1819,19 @@ impl<T: Data> Db<T> {
     }
 
     pub fn bundle(&self, have: &Have) -> Result<Bundle> {
+        let mut out = Vec::new();
+        self.bundle_to(have, &mut out)?;
+        Ok(Bundle(out))
+    }
+
+    pub fn bundle_to(&self, have: &Have, mut out: impl Write) -> Result<u64> {
+        self.emitter(have)?.write_to(&mut out)
+    }
+
+    fn emitter(&self, have: &Have) -> Result<Emitter> {
         let have = Marks::decode(have.as_bytes())?;
         let (store, refs) = self.published_refs();
-        Ok(Bundle(
-            plan(&store, &refs, self.branch_name(), &have)?.encode(),
-        ))
+        plan(&store, &refs, self.branch_name(), &have)
     }
 
     pub fn pull<R, S: Into<String>>(
@@ -1612,8 +1851,22 @@ impl<T: Data> Db<T> {
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
         let have = self.have()?;
-        let bundle = from.bundle(&have)?;
-        let mut pulled = self.try_receive(remote, &bundle, merge)?;
+        let emitter = from.emitter(&have)?;
+        self.step("bundled");
+        let mut pulled = if emitter.order.len() < PIPE_OBJECTS {
+            self.try_receive_from(remote, emitter, merge)?
+        } else {
+            let (sender, pipe) = mpsc::sync_channel(PIPE_CHUNKS);
+            thread::scope(|scope| {
+                scope.spawn(move || emitter.send(sender));
+                let piped = Piped {
+                    pipe,
+                    chunk: Vec::new(),
+                    pos: 0,
+                };
+                self.try_receive_from(remote, piped, merge)
+            })?
+        };
         pulled.sent_bytes = have.as_bytes().len() as u64;
         Ok(pulled)
     }
@@ -1651,15 +1904,37 @@ impl<T: Data> Db<T> {
         bundle: &Bundle,
         merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
+        self.try_receive_from(remote, bundle.as_bytes(), merge)
+    }
+
+    pub fn receive_from<R, S: Into<String>>(
+        &self,
+        remote: &str,
+        input: impl Read,
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+    ) -> Result<Pulled<R>> {
+        self.try_receive_from::<R, S, Error>(remote, input, infallible(merge))
+    }
+
+    pub fn try_receive_from<R, S: Into<String>, E: From<Error>>(
+        &self,
+        remote: &str,
+        input: impl Read,
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
-        let plan = Plan::decode(bundle.as_bytes())?;
-        let objects = plan.objects.len() as u64;
-        let landing = plan.tip.is_some();
+        let mut input = Input::open(input, BUNDLE_MAGIC)?;
+        let header = Header::decode(&mut input)?;
+        let landing = header.tip.is_some();
         if landing {
             self.rewrite_refs(|store, txn, refs| {
-                Ok((land::<T>(store, txn, refs, remote, plan)?, ()))
+                Ok((land::<T, _>(store, txn, refs, remote, &header, &mut input)?, ()))
             })?;
+        } else {
+            input.finish()?;
         }
+        let received_bytes = input.read;
+        drop(input);
         let (outcome, value) = if landing {
             self.integrate(remote, merge)?
         } else {
@@ -1669,9 +1944,9 @@ impl<T: Data> Db<T> {
             outcome,
             value,
             version: self.version(),
-            objects,
+            objects: header.count,
             sent_bytes: 0,
-            received_bytes: bundle.as_bytes().len() as u64,
+            received_bytes,
         })
     }
 
