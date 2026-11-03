@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use common::{fast, quiet_ferro_panics};
 use ferro::codec::{Decoder, Encoder};
 use ferro::db::Clock;
-use ferro::{Committed, Data, Db, Error, Keep, Map, Options, Reclaim};
+use ferro::{Committed, Data, Db, Durability, Error, Keep, Map, Options, Reclaim};
 use tempfile::TempDir;
 
 type Root = Map<u64, u64>;
@@ -623,6 +623,67 @@ fn a_closure_alone_keeps_the_plain_path() {
     let done = db.commit_with(|_| ("none", ())).unwrap();
     assert_eq!((done.version, done.changed), (2, false));
     assert_eq!(db.read().commit().message, "one");
+}
+
+fn closer_then_follower(db: &Db<Root>, arrivals: &Arc<AtomicUsize>) -> (u64, u64) {
+    let before = arrivals.load(Ordering::SeqCst);
+    let holding = Arc::new(AtomicBool::new(false));
+    let closer = {
+        let (db, arrivals, holding) = (db.clone(), arrivals.clone(), holding.clone());
+        thread::spawn(move || {
+            db.commit_with(|root| {
+                holding.store(true, Ordering::SeqCst);
+                wait_until("the follower to arrive", || arrivals.load(Ordering::SeqCst) > before);
+                ("closer", increment(root))
+            })
+        })
+    };
+    wait_until("the closer to hold the lock", || holding.load(Ordering::SeqCst));
+    let follower = {
+        let db = db.clone();
+        thread::Builder::new()
+            .name("follower".to_string())
+            .spawn(move || db.commit_with(|root| ("follower", increment(root))))
+            .unwrap()
+    };
+    let closer = closer.join().unwrap().unwrap();
+    let follower = follower.join().unwrap().unwrap();
+    (closer.version, follower.version)
+}
+
+#[test]
+fn a_closure_stops_waiting_for_followers_that_are_slow_to_reach_the_lock() {
+    let _turn = serial();
+    let dir = on_disk();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let slow = Arc::new(AtomicBool::new(true));
+    let hook = {
+        let (arrivals, slow) = (arrivals.clone(), slow.clone());
+        move |step: &'static str| {
+            if step == "arriving" && thread::current().name() == Some("follower") {
+                arrivals.fetch_add(1, Ordering::SeqCst);
+                if slow.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    };
+    let db = coalesced()
+        .durability(Durability::Buffered)
+        .hook(ferro::db::Hook(Arc::new(hook)))
+        .open::<Root>(dir.path().join("slow.ferro"))
+        .unwrap();
+    db.update(|root| {
+        root.insert(0, 1);
+    })
+    .unwrap();
+    assert_eq!(closer_then_follower(&db, &arrivals), (2, 2));
+    slow.store(false, Ordering::SeqCst);
+    assert_eq!(closer_then_follower(&db, &arrivals), (3, 4));
+    assert_eq!(counter(&db.read()), 5);
+    let log = db.log();
+    assert_eq!(log.get(&2).unwrap().messages().count(), 2);
+    assert_eq!(log.get(&3).unwrap().messages().collect::<Vec<_>>(), vec!["closer"]);
 }
 
 #[test]

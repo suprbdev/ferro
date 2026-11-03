@@ -405,6 +405,54 @@ struct Group<T> {
     members: usize,
     seal: Arc<Seal>,
     time: OnceCell<u64>,
+    handed: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Costs {
+    sync: AtomicU64,
+    seal: AtomicU64,
+    handoff: AtomicU64,
+}
+
+fn nanos(took: Duration) -> u64 {
+    u64::try_from(took.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn average(slot: &AtomicU64, took: Duration) {
+    let mean = slot.load(Ordering::Relaxed);
+    slot.store(mean - mean / 8 + nanos(took) / 8, Ordering::Relaxed);
+}
+
+impl Costs {
+    fn synced(&self, took: Duration) {
+        average(&self.sync, took);
+    }
+
+    fn sealed(&self, took: Duration) {
+        average(&self.seal, took);
+    }
+
+    fn handed_over(&self, took: Duration) {
+        let sample = nanos(took);
+        let estimate = self.handoff.load(Ordering::Relaxed);
+        let next = if sample >= estimate {
+            sample
+        } else {
+            estimate - (estimate - sample) / 8
+        };
+        self.handoff.store(next, Ordering::Relaxed);
+    }
+
+    fn worth_waiting(&self) -> bool {
+        let handoff = self.handoff.load(Ordering::Relaxed);
+        let saved = self.seal.load(Ordering::Relaxed).saturating_add(self.sync.load(Ordering::Relaxed));
+        if handoff < saved {
+            return true;
+        }
+        self.handoff.store(handoff - handoff / 1024, Ordering::Relaxed);
+        false
+    }
 }
 
 #[derive(Default)]
@@ -460,6 +508,7 @@ struct Shared<T> {
     options: StoreOptions,
     coalesce: bool,
     arriving: AtomicUsize,
+    costs: Costs,
     open: Mutex<Option<Group<T>>>,
     tip: Mutex<RefState>,
     published: Mutex<RefState>,
@@ -647,6 +696,7 @@ impl Options {
             },
             coalesce: self.coalesce && !read_only,
             arriving: AtomicUsize::new(0),
+            costs: Costs::default(),
             open: Mutex::new(None),
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
@@ -777,6 +827,7 @@ impl<T: Data> Shared<T> {
 
     fn arrive(&self) -> MutexGuard<'_, RefState> {
         self.arriving.fetch_add(1, Ordering::AcqRel);
+        self.step("arriving");
         let tip = self.tip.lock();
         self.arriving.fetch_sub(1, Ordering::AcqRel);
         tip
@@ -785,7 +836,12 @@ impl<T: Data> Shared<T> {
     fn join_group(&self, tip: &mut RefState, branch: &Arc<Branch<T>>) -> Group<T> {
         let open = self.open.lock().take();
         match open {
-            Some(group) if Arc::ptr_eq(&group.branch, branch) => return group,
+            Some(mut group) if Arc::ptr_eq(&group.branch, branch) => {
+                if let Some(handed) = group.handed.take() {
+                    self.costs.handed_over(handed.elapsed());
+                }
+                return group;
+            }
             Some(group) => self.seal_for_others(tip, group),
             None => {}
         }
@@ -798,16 +854,19 @@ impl<T: Data> Shared<T> {
             members: 0,
             seal: Arc::new(Seal::default()),
             time: OnceCell::new(),
+            handed: None,
         }
     }
 
-    fn pass_on(&self, group: Group<T>) -> Option<Group<T>> {
+    fn pass_on(&self, mut group: Group<T>) -> Option<Group<T>> {
         if group.members == 0 {
             return None;
         }
         let mut queue = self.queue.lock();
-        let handed_on = queue.syncing || self.arriving.load(Ordering::Acquire) > 0;
+        let arriving = self.arriving.load(Ordering::Acquire) > 0;
+        let handed_on = queue.syncing || (arriving && self.costs.worth_waiting());
         if handed_on && group.members < MAX_GROUP {
+            group.handed = arriving.then(Instant::now);
             queue.open = Some(group.seal.clone());
             *self.open.lock() = Some(group);
             return None;
@@ -826,6 +885,7 @@ impl<T: Data> Shared<T> {
             ..
         } = group;
         let (message, parts) = Parts::join(messages);
+        let started = Instant::now();
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
             self.commit_locked(
                 tip,
@@ -843,6 +903,7 @@ impl<T: Data> Shared<T> {
                 },
             )
         }));
+        self.costs.sealed(started.elapsed());
         let ticket = self.store().last_seq();
         let mut queue = self.queue.lock();
         if queue.open.as_ref().is_some_and(|open| Arc::ptr_eq(open, &seal)) {
@@ -978,7 +1039,9 @@ impl<T: Data> Shared<T> {
         let last = batch.last().expect("a leader has queued commits");
         let (frame, refs) = (last.frame, last.refs.clone());
         let store = self.store();
+        let started = Instant::now();
         let outcome = store.sync(frame);
+        self.costs.synced(started.elapsed());
         let mut seals = Vec::new();
         if outcome.is_ok() {
             *self.published.lock() = refs;
