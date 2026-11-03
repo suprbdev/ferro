@@ -612,15 +612,16 @@ enum Reach<'a, K, V, S> {
     Owned(Arc<Node<K, V, S>>),
 }
 
+#[inline]
 fn reach<'a, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &'a Link<K, V, S>,
     depth: usize,
 ) -> Result<Reach<'a, K, V, S>> {
-    let (ptr, memo) = match link {
+    let memo = match link {
         Link::Empty => return Ok(Reach::Absent),
         Link::Mem(node) => return Ok(Reach::Borrowed(node)),
-        Link::Stored { ptr, memo, .. } => (*ptr, memo),
+        Link::Stored { memo, .. } => memo,
     };
     match memo.get() {
         Some(Memo::Pinned(node)) => return Ok(Reach::Borrowed(node)),
@@ -631,6 +632,20 @@ fn reach<'a, K: Data, V: Data, S: Data>(
         }
         None => {}
     }
+    fetch_link(store, link, depth)
+}
+
+#[cold]
+#[inline(never)]
+fn fetch_link<'a, K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &'a Link<K, V, S>,
+    depth: usize,
+) -> Result<Reach<'a, K, V, S>> {
+    let Link::Stored { ptr, memo, .. } = link else {
+        return Err(Error::Detached);
+    };
+    let ptr = *ptr;
     let store = store.ok_or(Error::Detached)?;
     let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::weight)?;
     if depth < PIN_DEPTH {
