@@ -2468,6 +2468,14 @@ where
         return Ok(ControlFlow::Continue(()));
     }
     let leaf = node.children.is_empty();
+    if leaf && let Cells::Column(column) = &node.cells {
+        for (key, value) in node.keys[low..high].iter().zip(&column[low..high]) {
+            if let ControlFlow::Break(out) = visit(key, value) {
+                return Ok(ControlFlow::Break(out));
+            }
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
     if !leaf {
         let last = if low == high { end } else { None };
         if let ControlFlow::Break(out) = scan(store, node.child(low), depth + 1, start, last, visit)? {
@@ -3811,9 +3819,17 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
                 }
                 return total;
             }
-            for index in run {
+            let keys = &node.keys[run.clone()];
+            if let Cells::Column(column) = &node.cells {
+                let column = column.clone();
+                for (key, index) in keys.iter().zip(run) {
+                    total = f(total, (key.clone(), Val::of_column(&column, index)));
+                }
+                return total;
+            }
+            for (key, index) in keys.iter().zip(run) {
                 let value = fatal(node.value(store.as_ref(), index));
-                total = f(total, (node.keys[index].clone(), value));
+                total = f(total, (key.clone(), value));
             }
             total
         })
@@ -3874,6 +3890,13 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
     fn fold<B, F: FnMut(B, Val<V>) -> B>(mut self, init: B, mut f: F) -> B {
         let store = self.0.store.clone();
         self.0.drain(init, |mut total, node, run| {
+            if let Cells::Column(column) = &node.cells {
+                let column = column.clone();
+                for index in run {
+                    total = f(total, Val::of_column(&column, index));
+                }
+                return total;
+            }
             for index in run {
                 total = f(total, fatal(node.value(store.as_ref(), index)));
             }
