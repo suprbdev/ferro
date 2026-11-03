@@ -1717,26 +1717,27 @@ impl<T: Data> Db<T> {
         let Some(ptr) = head else {
             return Ok(false);
         };
-        tip.refs = (*store.load::<Refs>(ptr)?).clone();
-        tip.ptr = Some(ptr);
+        let refs = (*store.load::<Refs>(ptr)?).clone();
         let mut published = self.shared.published.lock();
-        if replaced {
-            self.shared.store.store(Arc::new(store.clone()));
-        }
-        *published = tip.clone();
-        drop(published);
-        if replaced {
-            current.close();
-        }
         let attached: Vec<_> = self.shared.branches.lock().values().cloned().collect();
+        let mut states = Vec::new();
         let mut gone = Vec::new();
         for branch in attached {
-            let head = tip.refs.try_get(&branch.name)?;
+            let head = refs.try_get(&branch.name)?;
             if head.is_none() && branch.name != MAIN {
                 gone.push(branch.name.clone());
                 continue;
             }
             let state = Arc::new(self.shared.state_of(&store, head.as_deref())?);
+            states.push((branch, state));
+        }
+        tip.refs = refs;
+        tip.ptr = Some(ptr);
+        if replaced {
+            self.shared.store.store(Arc::new(store.clone()));
+        }
+        *published = tip.clone();
+        for (branch, state) in states {
             branch.tip.store(state.clone());
             if state.snapshot.commit == branch.state.load().snapshot.commit {
                 branch.feed.rebind(state.snapshot.clone());
@@ -1750,6 +1751,11 @@ impl<T: Data> Db<T> {
             if let Some(branch) = branches.remove(&name) {
                 branch.retire();
             }
+        }
+        drop(branches);
+        drop(published);
+        if replaced {
+            current.close();
         }
         Ok(true)
     }

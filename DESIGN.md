@@ -557,7 +557,12 @@ discards it, and a clean close truncates it, so the file can be up to 4 MiB long
 
 A failed write or fsync poisons the store until reopen. Only one process may hold the writer lock.
 Read-only opens otherwise take no lock, since log bytes under a published head never change, and
-`refresh` picks up new commits.
+`refresh` picks up new commits. It reads the new refs and the state of every attached branch before
+it changes anything, holding the published refs so that no branch attaches in between, and only then
+records the head, swaps in a replaced file and publishes. A refresh that fails partway, say on a read
+error, therefore leaves the handle as it was, and the next one starts over and catches every branch
+up. It used to record the head first, so the next call saw nothing new and the branches the failed
+one missed stayed behind until another commit landed.
 
 ## Concurrency
 
