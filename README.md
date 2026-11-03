@@ -394,22 +394,39 @@ let bundle: Vec<u8> = laptop.bundle(&Have::from(have))?.into();
 phone.receive("laptop", &Bundle::from(bundle), merge)?;
 ```
 
+A bundle can also stream, so neither side holds it whole. On the laptop, `bundle_to` writes it to
+any `io::Write`, such as a socket or a response body, and returns the bytes written. On the phone,
+`receive_from` reads it from any `io::Read` to its end:
+
+```rust
+let sent = laptop.bundle_to(&have, BufWriter::new(response))?;
+let pulled = phone.receive_from("laptop", BufReader::new(download), merge)?;
+```
+
+`bundle` and `receive` are the same calls on a byte buffer, and `pull` streams between the two
+files. Cloning a 330 MB file of a million keys took 65 MiB at peak and 2.3 s, where the in-memory
+version took 1.1 GB and 2.6 s, and a pull of three small commits takes as long as it did.
+
 A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
 it lacks and the objects their trees reach that it does not hold, so it costs what changed: three
 commits on a 9 MB file of 100,000 keys sent 15 KB. The first pull into an empty file carries
-everything. `receive` hashes every object and checks every link before it writes, and checks every
+everything. `receive` hashes every object and checks every link as it reads, and checks every
 object it is sent as the type that will read it: each map node, spilled value, nested collection,
 table index and summary decodes, and each node's count, level and key range agree with its parent.
 It costs about half again the time of applying a bundle, and nothing for the objects it already
-holds. A damaged or forged bundle is rejected with `Error::Bundle` without touching the file, and a
-bundle is applied in one frame, so a crash leaves the previous head. `receive` uses memory for what
-a bundle carries, not what it claims, and refuses commits dated more than a day past this machine's
-clock.
+holds. Objects go into the file past its end as they arrive, where nothing can find them, and only
+once the whole bundle has passed does one frame point the remote branch at them, so a crash leaves
+the previous head. A damaged or forged bundle is rejected with `Error::Bundle`, and what it had written
+past the end is cut off again. `receive` uses a fixed buffer, the object it is reading and under
+500 bytes for each object the bundle carries, not memory for its bytes or for what it claims, and
+refuses commits dated more than a day past this machine's clock. It holds the writer lock while it
+reads, so commits on the receiving file wait for the transfer: write a slow download to a file
+first and receive from that if they must not.
 
 If this file does not hold the commit a bundle builds on, because the bundle was built for another
 file, or this one pruned or dropped that commit after sending its have, `receive` returns
 `Error::StaleHave` and changes nothing: build a new bundle from a fresh have and try again. `pull`
-returns the same error rather than retrying, so call it again.
+returns the same error rather than retrying, so call it again, as `examples/notes` does once.
 
 A pulled commit keeps the version, time, message and hash it had. A fast-forward adopts the other
 branch, so afterwards `head_hash` is the same in both files. A merge commits at this branch's next
@@ -698,8 +715,10 @@ This is an experiment, not a production database.
   counter delta, applies it twice. Nothing is lost.
 - Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
   your current `Default`.
-- Sync builds and applies a bundle in memory, so the first pull of a large file needs its size in
-  memory on both sides. Files that share no commit send everything on their first pull.
+- Sync streams, but keeps under 500 bytes per object received and 110 per object sent, and holds
+  each object whole, so a clone of tens of millions of objects or of one huge value still needs
+  memory to match. `receive` holds the writer lock while it reads. Files that share no commit send
+  everything on their first pull.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
   You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 

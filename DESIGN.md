@@ -1262,9 +1262,11 @@ back to the genesis value.
 `Db::pull(&other, remote, merge)` copies the branch of `other`, usually a handle on another file,
 into this file as the branch `remote`, then brings this handle's branch up to it. It is three steps
 that a transport can split: `have` on the pulling side lists what it holds, `bundle` on the other
-side packs what that lacks, and `receive` checks and applies it. `Have` and `Bundle` are byte
-buffers, so the same code runs over a file, a socket or HTTP. `pull` runs the three in one process,
-and `push` is `pull` called from the other side.
+side packs what that lacks, and `receive` checks and applies it. A have is a byte buffer and a
+bundle a byte stream, so the same code runs over a file, a socket or HTTP: `bundle_to` writes to an
+`io::Write` and `receive_from` reads from an `io::Read`, and `bundle` and `receive` are those two
+over a `Vec<u8>`. `pull` runs the three in one process, and `push` is `pull` called from the other
+side.
 
 ### Negotiation
 
@@ -1313,15 +1315,26 @@ ends at the same hash, which costs one read of each parent on a changed path. A 
 needs nothing, because objects go children first. Bodies are LZ4 compressed when that is smaller,
 as in the file.
 
+The sender plans without bodies. The tree comparison reads only the links of each record, and keeps
+the hashes it will send, with the links of the first 64K or so objects and links so that a small
+bundle reads nothing twice. The sent commits are then visited in generation order, each depth first
+through what it links that is to be sent, so a commit's trees and parents are out before it and the
+stack is as deep as a tree, not as a history. That walk names the hints, so the header, with the
+anchors, the hints and the object count, goes first. Then each object is read once more, its hash
+checked, and written in 64 KiB chunks with the LZ4 bytes the file already holds for it, so nothing
+is compressed twice. Planning holds about 110 bytes for each object sent. `pull` runs the sender on
+a second thread once it sends 256 objects, with eight chunks in flight between the two.
+
 ### Applying
 
-`receive` checks everything before it writes anything:
+`receive` checks everything before anything it writes can be found:
 
-- Every object is hashed as the bundle is parsed. Nothing is reserved from a count the bundle
-  claims: lists grow as entries are read. The bodies, after LZ4, may come to at most 16 times the
-  bytes read so far plus 16 MiB, checked before a body is decompressed, and no body may pass the
-  4 GiB a record can hold. The sender sends a body uncompressed when compressing it would break that
-  rule, so a bundle from `bundle` always passes.
+- Every object is hashed as the bundle is read. Nothing is reserved from a count the bundle
+  claims: lists grow as entries are read, and a body is read into memory as it arrives. The bodies,
+  after LZ4, may come to at most 16 times the bytes read so far plus 16 MiB, checked before a body
+  is read, and no body may pass the 4 GiB a record can hold. The sender sends a body uncompressed
+  when compressing it would break that rule, so a bundle from `bundle` always passes. The stream must
+  end after the last object.
 - The new commits are walked from the head through `prev`, and their versions must descend one at a
   time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to
   wrap the version past `u64::MAX`. The commit below the oldest one sent is looked up in the
@@ -1357,18 +1370,61 @@ as in the file.
   be pulled from until the puller's clock catches up.
 - Every object the bundle sends is checked as the type it will be read as, below.
 
-All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
-the `tip` mutex and synced like a commit, so a crash leaves the previous head: a torn frame is not
-replayed. Branch handles on `remote` are rebound and its watchers fire. Their notices drop once
-the pull has released `tip`, so a `watch_when` test may commit or pull. A bad bundle is
-`Error::Bundle` and writes nothing. Flipping every byte of a 3,358 byte bundle with three masks gave
-10,073 rejections and one flip inside an LZ4 body that decoded to the same bytes, and so landed the
-same commit.
+All the objects and a `Refs` that points `remote` at the new head are then one frame, synced like a
+commit, so a crash leaves the previous head: a torn frame is not replayed. Branch handles on
+`remote` are rebound and its watchers fire. Their notices drop once the pull has released `tip`, so
+a `watch_when` test may commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
+was. Flipping every byte of a 3,358 byte bundle with three masks gave 10,073 rejections and one flip
+inside an LZ4 body that decoded to the same bytes, and so landed the same commit.
 
-A bundle whose head `remote` already holds at that version writes nothing. Bundles are plain bytes,
-so one can arrive late, from a slow transfer or a second pull running at the same time, or be sent
-again. Landing it would move `remote` back, drop the records under its name, and merge older state
-over newer.
+### Where checked objects wait
+
+A bundle is read once and not kept, so its objects have to be somewhere between being hashed and
+being published. They go into the frame that will publish them, before that frame has a header.
+
+`receive` reads the bundle's header, then takes the `tip` mutex and resolves the anchors and hints
+against this file, so a stale have fails before any object is read. A frame is a header at the end
+of the log followed by records, and the header names the frame's end, the refs it publishes and a
+hash over the whole frame. The transaction that will become the landing frame starts at the end of
+the log with its header left as zeros. Each object is appended to it as it is hashed, with its links
+resolved to offsets: to an object sent earlier, to an anchor or hint, or, where a link names
+something not sent, to offset 0 for now. Whenever 1 MiB has built up, the transaction writes it to
+the file past the end of the log. The checks above read the objects back, from the file or from what
+is still buffered, without hashing them again, since they were hashed on the way in.
+
+Only a commit may link to something not sent, and an object that does and is not one of the new
+commits rejects the bundle. Which commit such a link names is only known once the chains are walked,
+so after the checks each sent commit whose links differ from what the walk resolved is appended
+again with the right ones, in generation order so that its parents' final copies come first. A clone
+into an empty file rewrites none, and an incremental pull rewrites its few commits. The first copies
+stay in the frame with nothing linking to them, and the next reclamation cycle drops them. The refs
+that point `remote` at the head go last. Then the header is written over the zeros, with a hash that
+reads the part already on disk back in 1 MiB chunks. A bundle smaller than 1 MiB never reaches the
+file before that, and its frame is written in one piece like a commit's.
+
+Until the header lands, nothing can find the objects. Readers bound every offset by the published
+end of the log, nothing outside the frame links into it, and the dedupe cache learns its objects
+only once the frame is written. A crash leaves zeros where the header goes, or a header whose hash
+does not cover what reached the disk, so `open` stops scanning there and truncates the rest: the
+previous head comes back and the partial bundle is gone. A refused or failed receive, including one
+that filled the disk, cuts the file back to where the frame began and does not poison the store. A
+power cut at every write of a receive that spilled several times, keeping or dropping each write not
+yet synced, always opened at the previous head, the landed remote or the forwarded branch, with
+nothing past the end of the log.
+
+The `tip` mutex is held from the bundle's header to the end of the stream. Commits on the receiving
+file wait for the transfer, and so does reclamation, which needs the mutex to prune and to swap: a
+cycle waits at whichever it reaches first, so the offsets the frame hands out stay in this
+generation, and pruning cannot take away a commit the frame links to. A slow peer therefore stalls
+writers on the receiving file. A caller that cannot have that writes the download to a file and
+receives from it.
+
+The receiver holds a 64 KiB read buffer, up to 1 MiB of frame not yet written, the object being
+read, and for each object its hash, its offset in the frame and the types it was checked as, under
+500 bytes an object. An object is held whole, about three times over while it is read, hashed and
+copied into the frame, so the largest value sent bounds memory too. A hostile stream gets no more:
+48 distinct objects of 1 MiB took 2.1 MiB of heap, and were cut off the file when the stream ended
+early.
 
 ### Checking trees
 
@@ -1512,12 +1568,34 @@ On one NVMe SSD with ext4, in release:
 A notes edit rewrites a path of four or five nodes in the rows and, for a tag, in the index, 6 to
 8 KB a commit, and every commit since the last sync is sent, not only the final state.
 
+Streaming was measured with `cargo run --release -p ferro-bench --bin clone`, whose `build`, `pull`,
+`send`, `receive` and `incremental` steps each run in a process of their own, on a
+`Map<u64, String>` of a million keys with 320 byte values, loaded in ten commits: a 330 MB file
+whose clone sends 330 MB in 124,937 objects. Each case ran with fsync three times, alternating with
+the in-memory version on a machine other work was sharing, and these are the medians:
+
+| Case | In memory | Streaming |
+| --- | --- | --- |
+| `pull` into an empty file | 2.63 s, 1,085 MiB RSS, 1,494 MiB heap | 2.25 s, 65 MiB RSS, 56 MiB heap |
+| `bundle` into a file | 1.37 s, 677 MiB RSS, 1,125 MiB heap | 1.20 s, 19 MiB RSS, 13.5 MiB heap |
+| `receive` from that file into an empty one | 1.69 s, 1,071 MiB RSS, 1,276 MiB heap | 1.40 s, 63 MiB RSS, 56 MiB heap |
+| `pull` of three one-key commits into the clone, 200 times | median 2.78 ms, fastest 1.57 ms | median 2.58 ms, fastest 1.54 ms |
+| The same with `Durability::Buffered` | median 0.98 ms, fastest 0.65 ms | median 0.93 ms, fastest 0.60 ms |
+
+The heap that is left is the receiver's bookkeeping, 467 bytes an object, and the sender's, 113. It
+got faster mostly because neither side compresses a body the file already holds compressed, and
+`pull` runs the two sides on two threads. A small pull costs what it did: its bundle is below 1 MiB,
+so the frame is written in one piece, and the planning reads that streaming added are served from
+the links the tree comparison kept.
+
 ### Limits
 
-- A bundle is built and applied in memory, and the first pull into an empty file carries all of the
-  retained history, so it needs that much memory on both sides. A hostile bundle costs memory for
-  what it carries, not what it claims: about 70 bytes of bookkeeping for each distinct object it
-  holds, and bodies of at most 16 times its size plus 16 MiB.
+- A bundle streams, but the receiver keeps under 500 bytes for each object and the sender about 110,
+  so the first pull of a file of tens of millions of objects still needs gigabytes. Each object is
+  held whole, so one huge value needs a few times its size. A hostile stream costs the same, for what
+  it carries and not for what it claims.
+- `receive` holds the `tip` mutex for the whole transfer, so a slow or stalled peer stalls commits on
+  the receiving file until the reader errors or times out.
 - Files that share no commit share no anchors, so their first pull sends everything, even trees both
   happen to hold.
 - Each commit in a have is looked up in every branch of the sender, so recognising them costs the
