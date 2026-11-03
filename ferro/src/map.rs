@@ -2589,6 +2589,15 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(scan(self.store(), &self.root, 0, None, None, &mut f))
     }
 
+    pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
+        let mut entries = Vec::new();
+        let _ = scan(self.store(), &self.root, 0, None, None, &mut |key: &K, value: &V| {
+            entries.push((key.clone(), value.clone()));
+            ControlFlow::<()>::Continue(())
+        })?;
+        Ok(entries)
+    }
+
     pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&K, &V))
     where
         K: Borrow<Q>,

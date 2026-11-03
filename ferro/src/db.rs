@@ -1848,7 +1848,7 @@ impl<T: Data> Db<T> {
             let Some(head) = refs.try_get(name)? else {
                 return Ok(starts);
             };
-            for (other, seen) in head.merged.iter() {
+            for (other, seen) in head.merged.try_entries()? {
                 let Some(found) = refs.try_get(&other)? else {
                     continue;
                 };

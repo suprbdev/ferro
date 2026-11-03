@@ -72,7 +72,7 @@ pub(crate) struct Roots {
 
 impl Roots {
     pub(crate) fn of(head: Ptr, refs: &Refs) -> Result<Roots> {
-        let chains = refs.iter().map(|(_, branch)| branch.log).collect();
+        let chains = refs.try_entries()?.into_iter().map(|(_, branch)| branch.log).collect();
         Ok(Roots {
             trees: vec![head],
             chains,

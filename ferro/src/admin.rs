@@ -56,7 +56,7 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     let (store, head) = read_only(path.as_ref())?;
     let refs = load_refs(&store, head)?;
     let mut branches = Vec::new();
-    for (name, branch) in refs.iter() {
+    for (name, branch) in refs.try_entries()? {
         let last = branch.log.tip_entry(&store)?.map(|entry| entry.commit.time_ms);
         branches.push(BranchInfo {
             name,
@@ -213,10 +213,10 @@ pub fn space(path: impl AsRef<Path>) -> Result<Space> {
 fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
     let mut pruned: Refs = Map::new();
     let mut dropped = 0;
-    for (name, branch) in refs.iter() {
+    for (name, branch) in refs.try_entries()? {
         let log = branch.log.pruned(store, keep)?;
         dropped += (branch.log.len() - log.len()) as u64;
-        let mut next = (*branch).clone();
+        let mut next = branch;
         next.log = log;
         pruned.insert(name, next);
     }
