@@ -280,8 +280,9 @@ closer.close();
 ```
 
 `watch_when` sleeps through commits whose snapshot fails the test. The test runs as the commit is
-published, outside the writer lock, only while a watcher is parked, and that commit's writers wait
-for it, so keep it to a quick read. `closer` gives a cloneable handle that ends a watcher and its
+published, only while a watcher is parked, and that commit's writers wait for it, so keep it to a
+quick read. It usually runs outside the writer lock, but when `drop_branch`, a reclamation cycle or
+a read-only `refresh` publishes, it runs under that operation's lock, so it must never commit. `closer` gives a cloneable handle that ends a watcher and its
 clones from any thread without a commit. Clones share the closer and the test and keep their own
 place.
 
@@ -318,8 +319,9 @@ does. A cycle copies what is retained to a new file and swaps it in. Writers wai
 for the swap, and readers do not wait at all.
 
 A pruned version is gone: `at` returns `NoVersion` and `log` stops at the oldest retained commit.
-`head_hash` does not change, because retained commits are not rewritten, and `merge_with` falls back
-to the fork point, or returns `NoCommonAncestor` if that was pruned too.
+`head_hash` does not change, because retained commits are not rewritten, and `merge_with` uses the other
+branch's merge record if that is still retained, then the fork point, and returns
+`NoCommonAncestor` only when none of them is.
 
 Nothing you hold ever breaks. A `Snapshot`, a `Map` cloned from one, a `Log` or a `History` keeps
 reading the file it came from, even past pruning, and a read-only process does the same until it
@@ -463,7 +465,8 @@ This is an experiment, not a production database.
   from inside it deadlocks. With `coalesce`, so does a closure that waits for another thread's commit
   to be acknowledged.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
-  `Error::Locked`.
+  `Error::Locked`, unless a reclamation cycle has replaced the file since, because the handle then
+  holds only the old, unlinked file.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
   order, and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never
   tested on real hardware.

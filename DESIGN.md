@@ -577,8 +577,10 @@ switch. `Durability::Buffered` takes the same path without the fdatasync. A dedi
 was measured and rejected: it adds a wakeup to every uncontended commit and gained nothing under
 contention.
 
-Nothing is published or acknowledged before it is durable, so readers, watchers and other
-processes never see a commit that could be lost, and they see commits in order. A closure
+Under `Durability::Fsync`, nothing is published or acknowledged before it is durable, so readers,
+watchers and other processes never see a commit that could be lost, and they see commits in order.
+Under `Durability::Buffered` the superblock can name frames that are not yet synced, and a
+read-only follower that refreshes may adopt commits that a power cut later takes back. A closure
 that ends without a frame, because nothing changed or it returned `Err`, may still have read an
 unpublished tip, so it waits for that tip before returning, and reports the failure instead if the
 tip never became durable. `fork` copies the tip and waits the same way, so the new branch appears
@@ -623,8 +625,10 @@ watcher and its clones park on a condvar of their own, listed in the feed by a `
 finds the lists with someone parked and runs `test` on the new snapshot, and wakes them only if it
 passes, so a commit nobody wants costs one evaluation per filter and no thread switch, and a filter
 with nobody parked costs nothing. The test runs on the thread that leads the batch, after the frame
-is durable and outside the writer lock, so a writer's closure can run while it does, but it holds up
-that batch's acknowledgement: it should be a quick read. A panic is caught there and counts as a
+is durable. Normally that is outside the writer lock, so a writer's closure can run while it does,
+but it holds up that batch's acknowledgement: it should be a quick read. When `drop_branch` or a
+reclamation cycle leads the batch it holds `tip`, and a read-only `refresh` also runs tests under
+its `tip` mutex, so a test must never commit. A panic is caught there and counts as a
 pass, so that the watcher wakes and hits the same panic on its own thread. A woken watcher tests the
 snapshot again, since what passed may be gone, and it tests whatever it finds when it next looks, so
 nothing that landed while it was busy is missed.
@@ -642,7 +646,8 @@ here: a timeout already covers what it would do, and the queue only ever needed 
 
 A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
 does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them also keep the
-writer lock held after the `Db` is dropped, so a new writer gets `Error::Locked` until they are gone.
+writer lock held after the `Db` is dropped, so a new writer gets `Error::Locked` until they are gone,
+unless a reclamation cycle has replaced the file since: then they hold only the old, unlinked file.
 A closure works on a clone of the tip, or of its group's working copy, so a panic or an `Err`
 discards its changes.
 
@@ -901,8 +906,8 @@ Only direct merges are recorded. A change that reaches a branch through a third 
 B after B merged C, then A merges C), or through a fork of a branch that was already merged, is
 not recognised. A merge closure that is not idempotent, such as one that adds a counter delta,
 applies it again, and the built-in merges may report a conflict for it. If pruning removed the
-recorded version, `common_ancestor` falls back to the fork point, or returns `NoCommonAncestor`
-if that was pruned too.
+recorded version, `common_ancestor` uses the other branch's merge record if that is still
+retained, then the fork point, and returns `NoCommonAncestor` only when none of them is.
 
 ## Dropping a branch
 
