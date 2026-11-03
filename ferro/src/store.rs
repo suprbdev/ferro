@@ -1443,3 +1443,50 @@ impl Txn {
         store.sync(frame)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Probe {
+        held: AtomicBool,
+        lent: AtomicBool,
+        releases: AtomicUsize,
+    }
+
+    impl Cached for Probe {
+        fn hold(&self) {
+            self.held.store(true, Ordering::SeqCst);
+        }
+
+        fn release(&self) -> bool {
+            self.held.store(false, Ordering::SeqCst);
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            self.lent.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn epoch_only_the_cached_entry_releases_its_value() {
+        for lent in [false, true] {
+            let value = Arc::new(Probe::default());
+            value.lent.store(lent, Ordering::SeqCst);
+            let entry = CacheEntry::new(value.clone(), 64);
+            assert!(value.held.load(Ordering::SeqCst));
+            let mut copy = entry.clone();
+            assert!(copy.value.take().is_some());
+            drop(copy);
+            drop(entry.clone());
+            assert!(value.held.load(Ordering::SeqCst));
+            assert_eq!(value.releases.load(Ordering::SeqCst), 0);
+            drop(entry);
+            assert!(!value.held.load(Ordering::SeqCst));
+            assert_eq!(value.releases.load(Ordering::SeqCst), 1);
+            crate::epoch::flush();
+            assert_eq!(Arc::strong_count(&value), 1);
+        }
+    }
+}

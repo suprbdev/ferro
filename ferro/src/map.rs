@@ -4102,3 +4102,101 @@ impl<K: Data + Ord, V: Data + PartialEq, S: Data> Iterator for Diff<K, V, S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    const ROUNDS: usize = 40;
+
+    fn leaf(first: u64) -> Arc<Node<u64, u64, ()>> {
+        let keys: Vec<u64> = (first..first + 8).collect();
+        let column: Arc<[u64]> = keys.iter().map(|key| key * 3).collect();
+        let node = Node {
+            count: keys.len() as u64,
+            keys,
+            children: Vec::new(),
+            cells: Cells::Column(column),
+            level: 0,
+            cached: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
+            origin: None,
+            prefix: None,
+        };
+        Arc::new(node)
+    }
+
+    fn read(weak: &Weak<Node<u64, u64, ()>>, first: u64) -> bool {
+        let Some(guard) = epoch::pin() else {
+            return false;
+        };
+        let Some(node) = held(weak, &guard) else {
+            return false;
+        };
+        assert_eq!(node.keys.iter().sum::<u64>(), 8 * first + 28);
+        match &node.cells {
+            Cells::Column(column) => assert_eq!(column[7], (first + 7) * 3),
+            Cells::Slots(_) => panic!("a leaf built from a column keeps it"),
+        }
+        true
+    }
+
+    fn evict(node: Arc<Node<u64, u64, ()>>) {
+        if node.release() {
+            epoch::retire(node, 64);
+        }
+    }
+
+    #[test]
+    fn epoch_borrows_survive_an_eviction_that_races_them() {
+        for round in 0..4u64 {
+            let first = round * 100;
+            let node = leaf(first);
+            node.hold();
+            let weak = Arc::downgrade(&node);
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    let weak = weak.clone();
+                    thread::spawn(move || (0..ROUNDS).filter(|_| read(&weak, first)).count())
+                })
+                .collect();
+            thread::yield_now();
+            evict(node);
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert!(!read(&weak, first));
+            epoch::flush();
+            assert_eq!(weak.strong_count(), 0);
+        }
+    }
+
+    #[test]
+    fn epoch_a_node_never_lent_is_freed_at_eviction() {
+        let node = leaf(7);
+        node.hold();
+        let weak = Arc::downgrade(&node);
+        evict(node);
+        assert_eq!(weak.strong_count(), 0);
+        assert!(!read(&weak, 7));
+    }
+
+    #[test]
+    fn epoch_a_lent_node_waits_for_the_reader_that_borrowed_it() {
+        let node = leaf(30);
+        node.hold();
+        let weak = Arc::downgrade(&node);
+        let guard = epoch::pin().unwrap();
+        let borrowed = held(&weak, &guard).unwrap();
+        evict(node);
+        let flusher = thread::spawn(epoch::flush);
+        assert_eq!(borrowed.keys[0], 30);
+        assert_eq!(weak.strong_count(), 1);
+        drop(guard);
+        flusher.join().unwrap();
+        epoch::flush();
+        assert_eq!(weak.strong_count(), 0);
+    }
+}

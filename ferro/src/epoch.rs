@@ -191,3 +191,62 @@ pub(crate) fn flush() {
         std::thread::yield_now();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    use super::*;
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn epoch_retired_values_wait_for_every_earlier_pin() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let outer = pin().unwrap();
+        let inner = pin().unwrap();
+        drop(inner);
+        let pinned = thread::spawn(|| {
+            let guard = pin().unwrap();
+            thread::yield_now();
+            drop(guard);
+        });
+        retire(Arc::new(Counted(dropped.clone())), 1);
+        let flusher = thread::spawn(flush);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(outer);
+        flusher.join().unwrap();
+        pinned.join().unwrap();
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn epoch_a_full_batch_frees_what_no_pin_can_see() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let dropped = dropped.clone();
+                thread::spawn(move || {
+                    for _ in 0..BATCH + 1 {
+                        let guard = pin().unwrap();
+                        retire(Arc::new(Counted(dropped.clone())), 1);
+                        drop(guard);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2 * (BATCH + 1));
+    }
+}
