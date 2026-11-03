@@ -500,6 +500,38 @@ second, a post took 0.9 ms at p50 and 2.7 ms at p99 and reached each member's fe
 with `coalesce`. These ran on a machine shared with other work. Every watcher's test runs on the
 committing thread, so each commit pays for every connected feed.
 
+## A booking system under contention
+
+`examples/booking` sells hotel rooms by the night. A hold claims each night through a
+`#[unique(room, night)]` index, so a second claim fails inside the commit and names the holder. A
+hold blocks everyone until it is paid or lapses, and a sweeper or the next buyer releases it once
+it lapses. Every write is a `try_commit_with` closure that returns a typed error. The till, each
+customer's credit and the per-night counters move in the same commit as the rows they sum.
+
+Receipts come from `as_of` checked against `bisect`, audit trails and price history from
+`history_of`. A what-if reprice or venue closure runs on a fork, which you preview, then merge
+with `merge_with` or drop.
+
+```sh
+cargo run --release -p booking -- seed
+cargo run --release -p booking -- hold guest1@example.com "Harbour House/101" --from 2030-01-10 --nights 2
+cargo run --release -p booking -- confirm 1
+cargo run --release -p booking -- receipt 1
+cargo run --release -p booking -- whatif close storm --venue "Harbour House"
+cargo run --release -p booking -- check
+cargo run --release -p booking --bin booking-stress -- --threads 64
+```
+
+`booking-stress` races threads for the same rooms and nights while holds lapse, then checks
+every transition between versions and every 50th version in full. With 64 threads, the fsync on,
+and three 5 second rounds, the median rose from 5,300 writes a second alone to 12,900 with
+`coalesce`. Bytes per write fell from 11.2 KB to 2.6 KB, and hold p99 fell from 13.7 to 6.1 ms. At
+16 threads, where the writer was less busy, the gain was 9%. No round found a violation.
+
+Without `coalesce` the limit is CPU, not the fsync. A booking write changes about ten small trees,
+the rows and their indexes, and re-encodes each path under the writer lock. In one run with
+`Durability::Buffered` the writes alone managed 4,800 a second, and with `coalesce` 17,300.
+
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
