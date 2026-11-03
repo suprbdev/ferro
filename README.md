@@ -401,8 +401,15 @@ everything. `receive` hashes every object and checks every link before it writes
 object it is sent as the type that will read it: each map node, spilled value, nested collection,
 table index and summary decodes, and each node's count, level and key range agree with its parent.
 It costs about half again the time of applying a bundle, and nothing for the objects it already
-holds. A damaged, forged or foreign bundle is rejected with `Error::Bundle` without touching the
-file, and a bundle is applied in one frame, so a crash leaves the previous head.
+holds. A damaged or forged bundle is rejected with `Error::Bundle` without touching the file, and a
+bundle is applied in one frame, so a crash leaves the previous head. `receive` uses memory for what
+a bundle carries, not what it claims, and refuses commits dated more than a day past this machine's
+clock.
+
+If this file does not hold the commit a bundle builds on, because the bundle was built for another
+file, or this one pruned or dropped that commit after sending its have, `receive` returns
+`Error::StaleHave` and changes nothing: build a new bundle from a fresh have and try again. `pull`
+returns the same error rather than retrying, so call it again.
 
 A pulled commit keeps the version, time, message and hash it had. A fast-forward adopts the other
 branch, so afterwards `head_hash` is the same in both files. A merge commits at this branch's next

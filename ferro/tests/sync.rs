@@ -449,7 +449,7 @@ fn every_corrupted_byte_of_a_bundle_is_rejected_and_leaves_the_target_untouched(
             let mut damaged = bytes.clone();
             damaged[position] ^= mask;
             match b.receive("a", &Bundle::from(damaged), theirs_win) {
-                Err(Error::Bundle(_)) => rejected += 1,
+                Err(Error::Bundle(_) | Error::StaleHave(_)) => rejected += 1,
                 Err(other) => panic!("byte {position} mask {mask:#x}: unexpected error {other}"),
                 Ok(pulled) => {
                     assert_eq!(
@@ -525,7 +525,7 @@ fn a_bundle_built_for_another_database_is_rejected() {
     put(&c, 7, "seven");
     let size = c.size_on_disk();
     match c.receive("a", &for_b, theirs_win) {
-        Err(Error::Bundle(message)) => assert!(message.contains("does not have"), "{message}"),
+        Err(Error::StaleHave(message)) => assert!(message.contains("does not have"), "{message}"),
         other => panic!("accepted a foreign bundle: {other:?}"),
     }
     assert_eq!(c.size_on_disk(), size);
@@ -1885,4 +1885,67 @@ fn verify_typed_finds_nodes_that_do_not_decode_as_the_type() {
         Err(Error::Corrupt(message)) => assert!(message.contains("decode"), "{message}"),
         other => panic!("typed verify passed a file whose nodes do not decode: {other:?}"),
     }
+}
+
+#[test]
+fn a_bundle_dated_far_past_this_clock_is_rejected() {
+    let now = now_ms();
+    let day = 24 * 60 * 60 * 1000;
+    for (time, accepted) in [(u64::MAX, false), (now + 2 * day, false), (now + 60_000, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
+        let root = object_of(&7u64);
+        let tip = forged_entry(
+            &root,
+            Forged {
+                version: 1,
+                time,
+                prev: None,
+                merged: None,
+                graph: None,
+            },
+        );
+        let result = b.receive("evil", &forged(&tip, 1, &[&root, &tip]), untouched);
+        if accepted {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            assert_eq!(*b.read(), 7);
+            continue;
+        }
+        match result {
+            Err(Error::Bundle(message)) => assert!(message.contains("clock"), "{message}"),
+            other => panic!("accepted a commit dated {time}: {other:?}"),
+        }
+        assert_eq!(b.branches(), vec!["main".to_string()]);
+        b.update(|value| *value += 1).unwrap();
+        assert!(b.log().get(&1).unwrap().time_ms <= now_ms());
+    }
+}
+
+#[test]
+fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open(&dir, "a.ferro");
+    let b: Db<Root> = fast()
+        .history(Keep::Last(1))
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    put(&b, 1, "one");
+    a.pull(&b, "b", refuse).unwrap();
+    let have = b.have().unwrap();
+    put(&b, 2, "two");
+    put(&a, 3, "three");
+    let bundle = a.bundle(&have).unwrap();
+    let before = (b.head_hash(), b.size_on_disk());
+    match b.receive("a", &bundle, theirs_win) {
+        Err(Error::StaleHave(message)) => assert!(message.contains("does not have"), "{message}"),
+        other => panic!("a bundle whose base was pruned was not retryable: {other:?}"),
+    }
+    assert_eq!((b.head_hash(), b.size_on_disk()), before);
+    let fresh = a.bundle(&b.have().unwrap()).unwrap();
+    match b.receive("a", &fresh, theirs_win) {
+        Err(Error::NoCommonAncestor) => {}
+        other => panic!("a bundle from a fresh have did not land: {other:?}"),
+    }
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    assert_eq!(b.head_hash(), before.0);
 }

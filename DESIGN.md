@@ -1279,7 +1279,11 @@ as in the file.
 
 `receive` checks everything before it writes anything:
 
-- Every object is hashed as the bundle is parsed.
+- Every object is hashed as the bundle is parsed. Nothing is reserved from a count the bundle
+  claims: lists grow as entries are read. The bodies, after LZ4, may come to at most 16 times the
+  bytes read so far plus 16 MiB, checked before a body is decompressed, and no body may pass the
+  4 GiB a record can hold. The sender sends a body uncompressed when compressing it would break that
+  rule, so a bundle from `bundle` always passes.
 - The new commits are walked from the head through `prev`, and their versions must descend one at a
   time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to
   wrap the version past `u64::MAX`. The commit below the oldest one sent is looked up in the
@@ -1287,6 +1291,11 @@ as in the file.
   of it and keeps the lowest `first` among the chains that hold it, so a fast-forward does not cut
   our history short to where another branch was pruned. Not found, the link is written with offset 0
   and the branch starts at the oldest sent commit, the way a pruned chain does.
+- Every commit the bundle says the receiver holds must still be in one of its chains. If the
+  receiver pruned or dropped one after it sent its have, `receive` returns `Error::StaleHave`,
+  writes nothing, and a bundle built from a fresh have lands. `pull` returns it as well rather than
+  retrying, so a caller sees the same error whether it pulls in one process or over a network, and
+  decides itself whether to try again.
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
@@ -1304,6 +1313,10 @@ as in the file.
   the generation must exceed the known parent's, and so on. The numbers are a function of the
   graph alone, so a commit hashes the same in every file, and a forged generation or merge link is
   rejected rather than landed.
+- No sent commit may be dated more than a day past the receiver's clock. Commit times only go up
+  along a chain and a merge takes the later of its parents' times, so a forged time of `u64::MAX`
+  would have pinned every later commit there. A device whose clock runs more than a day fast cannot
+  be pulled from until the puller's clock catches up.
 - Every object the bundle sends is checked as the type it will be read as, below.
 
 All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
@@ -1416,7 +1429,8 @@ Each commit's time is at least its previous commit's, as described under Commit 
 never goes back along a chain and `as_of` works after a fast-forward. A pulled entry keeps its stamp
 flag, so the next commit after a fast-forward onto a stamped commit takes a later millisecond. A
 device whose clock runs ahead holds the times of our later commits at its reading until our clock
-passes it.
+passes it. `receive` refuses commits more than a day past our clock, so that hold lasts a day at
+most.
 
 ### The merge base
 
@@ -1463,7 +1477,9 @@ A notes edit rewrites a path of four or five nodes in the rows and, for a tag, i
 ### Limits
 
 - A bundle is built and applied in memory, and the first pull into an empty file carries all of the
-  retained history, so it needs that much memory on both sides.
+  retained history, so it needs that much memory on both sides. A hostile bundle costs memory for
+  what it carries, not what it claims: about 70 bytes of bookkeeping for each distinct object it
+  holds, and bodies of at most 16 times its size plus 16 MiB.
 - Files that share no commit share no anchors, so their first pull sends everything, even trees both
   happen to hold.
 - Each commit in a have is looked up in every branch of the sender, so recognising them costs the

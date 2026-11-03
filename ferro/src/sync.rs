@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, hash_map};
 use crate::codec::{
     Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, Sink, push_varint,
 };
-use crate::db::{Db, Head, Refs, Snapshot};
+use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
@@ -16,6 +16,10 @@ const FORMAT: u8 = 1;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
 const RECHECK_SLACK: usize = 16 << 20;
+const EXPANSION: usize = 16;
+const EXPANSION_SLACK: usize = 16 << 20;
+const MAX_BODY: usize = u32::MAX as usize;
+const MAX_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 const MAIN: &str = "main";
 const MAX_VERSION: u64 = u64::MAX >> 1;
 
@@ -103,6 +107,7 @@ struct Plan {
     roots: Vec<usize>,
     hints: Vec<(usize, usize)>,
     objects: Vec<Wire>,
+    index: HashMap<Hash, usize>,
 }
 
 fn bad(what: impl Into<String>) -> Error {
@@ -111,6 +116,10 @@ fn bad(what: impl Into<String>) -> Error {
 
 fn skip_version(version: u64) -> u64 {
     version - (version & version.wrapping_neg())
+}
+
+fn affordable(bodies: usize, read: usize) -> bool {
+    bodies <= read.saturating_mul(EXPANSION).saturating_add(EXPANSION_SLACK)
 }
 
 fn varint_len(mut value: u64) -> usize {
@@ -125,6 +134,7 @@ fn varint_len(mut value: u64) -> usize {
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    bodies: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -141,6 +151,7 @@ impl<'a> Reader<'a> {
         Ok(Reader {
             bytes,
             pos: magic.len() + 1,
+            bodies: 0,
         })
     }
 
@@ -213,10 +224,27 @@ impl<'a> Reader<'a> {
     fn body(&mut self) -> Result<Vec<u8>> {
         let flagged = self.varint()?;
         let stored = usize::try_from(flagged >> 1).map_err(|_| bad("size overflow"))?;
+        let raw = match flagged & 1 {
+            0 => stored,
+            _ => self.size()?,
+        };
+        if stored > self.remaining() {
+            return Err(bad("truncated"));
+        }
+        if raw > MAX_BODY {
+            return Err(bad(format!("an object of {raw} bytes is too large to store")));
+        }
+        let bodies = self.bodies.saturating_add(raw);
+        if !affordable(bodies, self.pos + stored) {
+            return Err(bad(format!(
+                "its objects expand to {bodies} bytes from the first {} it carries",
+                self.pos + stored
+            )));
+        }
+        self.bodies = bodies;
         if flagged & 1 == 0 {
             return Ok(self.take(stored)?.to_vec());
         }
-        let raw = self.size()?;
         if raw > stored.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
             return Err(bad("implausible compression"));
         }
@@ -241,10 +269,12 @@ fn put_mark(out: &mut Vec<u8>, mark: Mark) {
     push_varint(out, mark.version);
 }
 
-fn put_body(out: &mut Vec<u8>, body: &[u8]) {
+fn put_body(out: &mut Vec<u8>, body: &[u8], bodies: &mut usize) {
+    *bodies += body.len();
     let packed = (body.len() >= COMPRESS_MIN)
         .then(|| lz4_flex::block::compress(body))
-        .filter(|packed| packed.len() + varint_len(body.len() as u64) < body.len());
+        .filter(|packed| packed.len() + varint_len(body.len() as u64) < body.len())
+        .filter(|packed| affordable(*bodies, out.len() + packed.len()));
     match packed {
         Some(packed) => {
             push_varint(out, (packed.len() as u64) << 1 | 1);
@@ -310,8 +340,9 @@ impl Plan {
             push_varint(&mut out, *index as u64);
         }
         push_varint(&mut out, self.objects.len() as u64);
+        let mut bodies = 0;
         for object in &self.objects {
-            put_body(&mut out, &object.body);
+            put_body(&mut out, &object.body, &mut bodies);
             push_varint(&mut out, object.links.len() as u64);
             for (hash, reference) in &object.links {
                 out.extend_from_slice(hash);
@@ -337,21 +368,22 @@ impl Plan {
             .map(|_| reader.below(bases.len()))
             .collect::<Result<Vec<_>>>()?;
         let count = reader.count(2)?;
-        let mut hints = Vec::with_capacity(count);
+        let mut hints = Vec::new();
         for hint in 0..count {
             let parent = reader.below(roots.len() + hint)?;
             hints.push((parent, reader.size()?));
         }
         let references = 1 + roots.len() + hints.len();
         let count = reader.count(2)?;
-        let mut objects = Vec::with_capacity(count);
+        let mut objects = Vec::new();
+        let mut index = HashMap::new();
         for _ in 0..count {
             let body = reader.body()?;
             let links = reader.count(HASH_BYTES + 1)?;
             let mut wire = Wire {
                 hash: [0; HASH_BYTES],
                 body,
-                links: Vec::with_capacity(links),
+                links: Vec::new(),
             };
             for _ in 0..links {
                 let hash = reader.hash()?;
@@ -370,6 +402,9 @@ impl Plan {
             };
             wire.hash = object.hash();
             wire.body = object.body;
+            if index.insert(wire.hash, objects.len()).is_some() {
+                return Err(bad("it repeats an object"));
+            }
             objects.push(wire);
         }
         reader.finish()?;
@@ -382,6 +417,7 @@ impl Plan {
             roots,
             hints,
             objects,
+            index,
         })
     }
 }
@@ -1124,7 +1160,7 @@ fn land<T: Data>(
     txn: &mut Txn,
     refs: &Refs,
     remote: &str,
-    plan: Plan,
+    mut plan: Plan,
 ) -> Result<Option<Refs>> {
     let Some(tip) = plan.tip else {
         return Ok(None);
@@ -1138,7 +1174,7 @@ fn land<T: Data>(
     let mut bases = Vec::with_capacity(plan.bases.len());
     for mark in &plan.bases {
         let found = locate(store, refs, *mark)?.ok_or_else(|| {
-            bad(format!(
+            Error::StaleHave(format!(
                 "it builds on v{} {}, which this database does not have",
                 mark.version,
                 hex(&mark.hash)
@@ -1146,12 +1182,7 @@ fn land<T: Data>(
         })?;
         bases.push(found);
     }
-    let mut index: HashMap<Hash, usize> = HashMap::with_capacity(plan.objects.len());
-    for (slot, wire) in plan.objects.iter().enumerate() {
-        if index.insert(wire.hash, slot).is_some() {
-            return Err(bad("it repeats an object"));
-        }
-    }
+    let index = std::mem::take(&mut plan.index);
     let mut entries: HashMap<usize, Entry> = HashMap::new();
     let mut decoded: HashMap<Hash, (usize, usize)> = HashMap::new();
     let mut versions: HashMap<u64, Hash> = HashMap::new();
@@ -1193,6 +1224,13 @@ fn land<T: Data>(
                     tip_ptr = Some(ptr);
                 }
             }
+            None if entries.is_empty() && plan.objects.is_empty() => {
+                return Err(Error::StaleHave(format!(
+                    "its head is v{} {}, which this database does not have",
+                    mark.version,
+                    hex(&mark.hash)
+                )));
+            }
             None if entries.is_empty() => {
                 return Err(bad("its head is neither in it nor in this database"));
             }
@@ -1219,6 +1257,15 @@ fn land<T: Data>(
             continue;
         }
         pending.extend(landing.segment(refs, &plan, &index, top)?);
+    }
+    let now = now_ms();
+    let horizon = now.saturating_add(MAX_AHEAD_MS);
+    if let Some(entry) = landing.entries.values().find(|entry| entry.commit.time_ms > horizon) {
+        return Err(bad(format!(
+            "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
+            entry.commit.version,
+            entry.commit.time_ms - now
+        )));
     }
     let mut roots = Vec::with_capacity(plan.roots.len());
     for slot in &plan.roots {

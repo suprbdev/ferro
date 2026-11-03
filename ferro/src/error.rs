@@ -44,6 +44,8 @@ pub enum Error {
     GroupFailed(String),
     #[error("sync bundle rejected: {0}")]
     Bundle(String),
+    #[error("sync bundle is stale: {0}; build a new one from a fresh have")]
+    StaleHave(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
