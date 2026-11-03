@@ -85,7 +85,8 @@ index on disk or a scan at open, and neither is justified by one write pattern t
 
 The table is two-way set associative. A set is one 64-byte line holding two full hashes and their
 offsets behind a one-byte lock, so a lookup or an insert touches one line. A hit moves to the front
-of its set and a new entry pushes out the older way. It has one entry for every 4 KiB of
+of its set when it is looked up, under the same lock, and when it is inserted again, and a new entry
+pushes out the older way. It has one entry for every 4 KiB of
 `cache_bytes`, between 1,024 and 65,536, and is allocated in 4 KiB chunks as entries first land in
 them, so an open costs nothing and a writer that has made a few thousand commits holds about 2 MiB.
 It was a `quick_cache`, and a booking commit registers and looks up about 36 objects. Once that
@@ -93,6 +94,15 @@ cache held its 65,536 entries every insert evicted through its clock lists, and 
 lookup took several cache misses in its shard map and slab: 14% of a booking commit's time went
 there. With the table, thread CPU time outside the closure fell 7 to 12% for a booking hold and 4 to
 9% for a confirm, and the hit rate held: bytes per write went from 12,210 to 12,208.
+
+Lookups did not always promote: a hit was moved only if the commit registered the object again,
+which `put_packed` does and `put` does not. Promoting every hit makes no difference at the default
+size. Over 4,000 measured `tables` hold and confirm pairs with the default cache, hits went from
+15,373 to 15,391 of 340,455 lookups and bytes per write stayed at 12,208. With `cache_bytes` at
+4 MiB, which gives the minimum 1,024 entries, hits rose 6%, from 13,878 to 14,756, and bytes per
+write fell from 12,225 to 12,214. Instructions per commit moved by less than 0.15% either way and
+thread CPU time by less than the noise between runs. The map and table commits in `ferro-bench`
+find nothing in the table, so promotion has nothing to do there.
 
 ## Canonical tree
 
