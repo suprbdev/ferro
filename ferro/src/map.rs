@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::convert::Infallible;
 use std::fmt;
 use std::hash;
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
@@ -2076,12 +2077,28 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         &mut self,
         base: &Map<K, V, S>,
         theirs: &Map<K, V, S>,
-        resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
+        mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
     ) -> usize
     where
         V: PartialEq,
     {
-        three_way(
+        let Ok(written) = self.try_merge(base, theirs, |conflict| {
+            Ok::<_, Infallible>(resolve(conflict))
+        });
+        written
+    }
+
+    pub fn try_merge<E>(
+        &mut self,
+        base: &Map<K, V, S>,
+        theirs: &Map<K, V, S>,
+        resolve: impl FnMut(Conflict<K, V>) -> std::result::Result<Option<V>, E>,
+    ) -> std::result::Result<usize, E>
+    where
+        V: PartialEq,
+    {
+        let kept = self.clone();
+        let merged = three_way(
             self,
             base,
             theirs,
@@ -2095,7 +2112,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 }
             },
             resolve,
-        )
+        );
+        if merged.is_err() {
+            *self = kept;
+        }
+        merged
     }
 
     pub fn root_hash(&self) -> Option<Hash> {
@@ -2632,14 +2653,14 @@ pub struct Conflict<K, V> {
     pub theirs: Option<Val<V>>,
 }
 
-pub(crate) fn three_way<T, K, V, S>(
+pub(crate) fn three_way<T, K, V, S, E>(
     target: &mut T,
     base: &Map<K, V, S>,
     theirs: &Map<K, V, S>,
     read: impl Fn(&T, &K) -> Option<Val<V>>,
     mut write: impl FnMut(&mut T, K, Option<V>),
-    mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
-) -> usize
+    mut resolve: impl FnMut(Conflict<K, V>) -> std::result::Result<Option<V>, E>,
+) -> std::result::Result<usize, E>
 where
     K: Data + Ord,
     V: Data + PartialEq,
@@ -2662,12 +2683,12 @@ where
                 base: before,
                 ours,
                 theirs: after,
-            })
+            })?
         };
         write(target, key, value);
         written += 1;
     }
-    written
+    Ok(written)
 }
 
 enum Step<K, V, S> {

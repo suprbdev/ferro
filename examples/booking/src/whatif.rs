@@ -1,5 +1,3 @@
-use std::panic::{self, AssertUnwindSafe};
-
 use ferro::{Change, Db, Error};
 
 use crate::date::night_of;
@@ -220,26 +218,11 @@ pub fn apply(svc: &Reservations, name: &str) -> Result<Applied> {
         .clone()
         .ok_or_else(|| BookingError::NoScenario(name.to_string()))?;
     let now = svc.now();
-    let merge = panic::catch_unwind(AssertUnwindSafe(|| {
-        svc.db().merge_with(&branch, |ours, base, theirs| {
-            match merged(ours, base, theirs, &scenario, now) {
-                Ok((summary, conflicts, cancelled)) => {
-                    (format!("merge what-if {name}: {summary}"), (summary, conflicts, cancelled))
-                }
-                Err(error) => panic::panic_any(error.to_string()),
-            }
-        })
-    }));
-    let done = match merge {
-        Ok(done) => done?,
-        Err(panicked) => {
-            let reason = panicked
-                .downcast_ref::<String>()
-                .cloned()
-                .unwrap_or_else(|| "merge panicked".to_string());
-            return Err(BookingError::Usage(format!("merge of {name} abandoned: {reason}")));
-        }
-    };
+    let done = svc.db().try_merge_with(&branch, |ours, base, theirs| {
+        let (summary, conflicts, cancelled) = merged(ours, base, theirs, &scenario, now)?;
+        let message = format!("merge what-if {name}: {summary}");
+        Ok::<_, BookingError>((message, (summary, conflicts, cancelled)))
+    })?;
     svc.db().drop_branch(&format!("{PREFIX}{name}"))?;
     let (summary, conflicts, cancelled) = done.value;
     Ok(Applied {

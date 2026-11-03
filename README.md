@@ -281,6 +281,12 @@ does, so a change is merged once however it arrives: directly, back and forth, t
 branch or through a fork of a branch that was already merged. Finding the base costs about two
 binary searches over the log, plus a step for each merge made since the base.
 
+A merge that finds it cannot go ahead uses `try_merge_with`, whose closure returns a `Result` as
+`try_commit_with`'s does. `Err` discards the merge: nothing is written or recorded, the next merge
+finds the same base, and the error comes back in your own type. `Map::try_merge` and
+`Table::try_merge` take a `resolve` that returns a `Result`, stop at its first `Err` and leave the
+collection as it was.
+
 `db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
 the handle you call it on. Other handles on that branch keep reading what they had, commits through
 them fail with `Error::NoBranch`, and its watchers end. The bytes stay in the file until the next
@@ -374,7 +380,10 @@ this branch has nothing it lacks, or `Merged`. Only a merge calls your closure. 
 `merge_with`: the merge commit links the remote commit it merged, and the base is a best common
 ancestor over the merge graph of every file the commits passed through, so a change that reaches
 you through a third device is merged once, and a revert routed through one is not lost. `push` is
-`pull` from the other side.
+`pull` from the other side. `try_pull`, `try_push` and `try_receive` take a closure that returns a
+`Result`. An `Err` leaves this branch and its merge records as they were and comes back as your
+error, while the other side's commits stay landed on `phone`, so the next pull sends nothing new
+and merges them again.
 
 Over a network the same pull is three calls, and only bytes cross: the phone sends its `have`, the
 laptop answers with a `bundle`, and the phone applies it with `receive`.
@@ -586,7 +595,8 @@ customer's credit and the per-night counters move in the same commit as the rows
 
 A confirm records its own version from the `Stamp`, so a receipt is `at` that version. Audit trails
 and price history come from `history_of`. A what-if reprice or venue closure runs on a fork, which
-you preview, then merge with `merge_with` or drop.
+you preview, then merge with `try_merge_with` or drop. If the merge cannot cancel a booking that
+main took since the fork, it returns that `BookingError` and writes nothing.
 
 ```sh
 cargo run --release -p booking -- seed

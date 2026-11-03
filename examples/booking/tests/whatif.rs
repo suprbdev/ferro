@@ -130,12 +130,12 @@ fn a_bad_proposal_leaves_no_branch_and_a_failing_merge_commits_nothing() {
     branch
         .update(|h| h.scenario = Some(Scenario::Close { venue: 42 }))
         .unwrap();
-    let version = w.svc.db().version();
+    let (version, head) = (w.svc.db().version(), w.svc.db().head_hash());
     match whatif::apply(&w.svc, "rigged") {
-        Err(BookingError::Usage(message)) => assert!(message.contains("no such venue"), "{message}"),
-        other => panic!("expected the merge to be abandoned, got {other:?}"),
+        Err(BookingError::NoVenue(venue)) => assert_eq!(venue, "42"),
+        other => panic!("expected the merge to be refused, got {other:?}"),
     }
-    assert_eq!(w.svc.db().version(), version);
+    assert_eq!((w.svc.db().version(), w.svc.db().head_hash()), (version, head));
     assert_eq!(whatif::list(&w.svc).unwrap().len(), 1);
     assert_clean(&w.svc);
 }

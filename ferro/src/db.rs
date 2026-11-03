@@ -1718,7 +1718,15 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
-        self.alone::<R, Error>(|tip, ours, root, _| {
+        self.try_merge_with::<R, S, Error>(other, |ours, base, theirs| Ok(f(ours, base, theirs)))
+    }
+
+    pub fn try_merge_with<R, S: Into<String>, E: From<Error>>(
+        &self,
+        other: &Db<T>,
+        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        self.alone(|tip, ours, root, _| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -1734,7 +1742,7 @@ impl<T: Data> Db<T> {
                 _ => None,
             };
             let base = self.snapshot_at(found)?;
-            let (message, value) = f(root, &base, &theirs.snapshot);
+            let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
                 ..Intent::default()
@@ -1743,12 +1751,12 @@ impl<T: Data> Db<T> {
         })
     }
 
-    pub(crate) fn merge_tracking<R, S: Into<String>>(
+    pub(crate) fn merge_tracking<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
-        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<std::result::Result<Committed<R>, u64>> {
-        let done = self.alone::<std::result::Result<R, u64>, Error>(|tip, ours, root, _| {
+        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
+        let done = self.alone::<std::result::Result<R, u64>, E>(|tip, ours, root, _| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -1764,7 +1772,7 @@ impl<T: Data> Db<T> {
             };
             let link = Self::link_to(tip, other, &theirs, ptr)?;
             let base = self.snapshot_at(found)?;
-            let (message, value) = f(root, &base, &theirs.snapshot);
+            let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
                 record: Some((other.branch.name.clone(), theirs.log.last)),

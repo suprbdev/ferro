@@ -1099,6 +1099,19 @@ each delta once. The base is computed under the writer lock against the tip the 
 A merge that keeps only our side still commits, so the link is not lost, and merging a branch
 whose tip we already contain writes nothing.
 
+`merge_with` had no error channel, so a merge closure that found it could not go ahead had to
+panic, and `examples/booking` caught the panic and turned its payload back into a message.
+`try_merge_with` is the same merge with a closure that returns `Result<(S, R), E>` for any
+`E: From<Error>`, like `try_commit_with`, and `merge_with` is now that with a closure that cannot
+fail. The closure runs on a copy of our tip under the writer lock, and the merge link and the
+`merged` record are only written by the commit after it returns, so an `Err` drops the copy and
+nothing reaches the file: the next merge finds the same base and runs again. The errors of the merge
+itself, such as `NoBranch` for a dropped branch, come back through `E::from`. `Map::try_merge` and
+`Table::try_merge` do the same for `resolve`, which matters when one conflict decides that the merge
+cannot happen. They stop at the first `Err` and put back an O(1) clone of the collection taken
+before they started, since a half merged collection is of no use to anyone but a closure that is
+about to fail.
+
 Only direct merges used to be recorded, as `(their version, our version)` per branch name in the
 head, and the base was the fork point found by binary search unless a record said otherwise. A
 change that came through a third branch was seen again.
@@ -1326,7 +1339,10 @@ our side of it being pruned, and the search treats it as a known ancestor of our
 pruned past its last sync with an idle remote still finds itself `Ahead`. Equal roots without that
 ancestry record nothing, since a record there would make the remote's history look like ours. A crash between the landing and this step leaves `remote` landed and
 our branch as it was. The next pull's have names the landed tip, so its bundle is empty and the step
-runs again.
+runs again. `try_pull`, `try_push` and `try_receive` take a merge closure that returns a `Result`,
+and an `Err` from it leaves the file as that crash would, with the error returned in the caller's
+type. Undoing the landing as well would take a frame of its own and make the next pull send the
+same commits again.
 
 ### Commit identity
 

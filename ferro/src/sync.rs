@@ -1415,10 +1415,19 @@ impl<T: Data> Db<T> {
         remote: &str,
         merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
+        self.try_pull::<R, S, Error>(from, remote, infallible(merge))
+    }
+
+    pub fn try_pull<R, S: Into<String>, E: From<Error>>(
+        &self,
+        from: &Db<T>,
+        remote: &str,
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
         let have = self.have()?;
         let bundle = from.bundle(&have)?;
-        let mut pulled = self.receive(remote, &bundle, merge)?;
+        let mut pulled = self.try_receive(remote, &bundle, merge)?;
         pulled.sent_bytes = have.as_bytes().len() as u64;
         Ok(pulled)
     }
@@ -1432,12 +1441,30 @@ impl<T: Data> Db<T> {
         to.pull(self, remote, merge)
     }
 
+    pub fn try_push<R, S: Into<String>, E: From<Error>>(
+        &self,
+        to: &Db<T>,
+        remote: &str,
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Pulled<R>, E> {
+        to.try_pull(self, remote, merge)
+    }
+
     pub fn receive<R, S: Into<String>>(
         &self,
         remote: &str,
         bundle: &Bundle,
         merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
+        self.try_receive::<R, S, Error>(remote, bundle, infallible(merge))
+    }
+
+    pub fn try_receive<R, S: Into<String>, E: From<Error>>(
+        &self,
+        remote: &str,
+        bundle: &Bundle,
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
         let plan = Plan::decode(bundle.as_bytes())?;
         let objects = plan.objects.len() as u64;
@@ -1462,11 +1489,11 @@ impl<T: Data> Db<T> {
         })
     }
 
-    fn integrate<R, S: Into<String>>(
+    fn integrate<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<(Outcome, Option<R>)> {
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<(Outcome, Option<R>), E> {
         let name = self.branch_name().to_string();
         let decision = self.rewrite_refs(|store, _, refs| {
             let theirs = refs
@@ -1496,11 +1523,11 @@ impl<T: Data> Db<T> {
         Ok((outcome, None))
     }
 
-    fn merge_remote<R, S: Into<String>>(
+    fn merge_remote<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<(Outcome, Option<R>)> {
+        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<(Outcome, Option<R>), E> {
         let tracking = self.branch(remote)?;
         let seen = match self.merge_tracking(&tracking, merge)? {
             Ok(committed) => return Ok((Outcome::Merged, Some(committed.value))),
@@ -1515,6 +1542,12 @@ impl<T: Data> Db<T> {
         })?;
         Ok((Outcome::Ahead, None))
     }
+}
+
+fn infallible<T, R, S>(
+    merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+) -> impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> Result<(S, R)> {
+    |ours, base, theirs| Ok(merge(ours, base, theirs))
 }
 
 fn recorded(

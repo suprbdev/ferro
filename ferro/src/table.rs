@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
@@ -269,6 +270,38 @@ impl<T: Record> Table<T> {
     where
         T: PartialEq,
     {
+        let Ok(written) = self.try_merge(base, theirs, |conflict| {
+            Ok::<_, Infallible>(resolve(conflict))
+        });
+        written
+    }
+
+    pub fn try_merge<E>(
+        &mut self,
+        base: &Table<T>,
+        theirs: &Table<T>,
+        resolve: impl FnMut(Conflict<T::Key, T>) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<usize, E>
+    where
+        T: PartialEq,
+    {
+        let kept = self.clone();
+        let merged = self.merge_rows(base, theirs, resolve);
+        if merged.is_err() {
+            *self = kept;
+        }
+        merged
+    }
+
+    fn merge_rows<E>(
+        &mut self,
+        base: &Table<T>,
+        theirs: &Table<T>,
+        mut resolve: impl FnMut(Conflict<T::Key, T>) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<usize, E>
+    where
+        T: PartialEq,
+    {
         let mut held = Pending::default();
         let mut written = 0;
         for change in base.0.rows().diff(theirs.0.rows()) {
@@ -289,7 +322,7 @@ impl<T: Record> Table<T> {
                     ours,
                     theirs: after,
                 };
-                (resolve(conflict), true)
+                (resolve(conflict)?, true)
             };
             match row {
                 None => {
@@ -314,7 +347,7 @@ impl<T: Record> Table<T> {
                 base: base.get(&key),
                 ours,
                 theirs: Some(Val::new(row)),
-            });
+            })?;
             match resolved {
                 None => {
                     self.remove(&key);
@@ -327,7 +360,7 @@ impl<T: Record> Table<T> {
                 Some(_) => {}
             }
         }
-        written
+        Ok(written)
     }
 
     fn settle(&mut self, held: &mut Pending<T>) {
