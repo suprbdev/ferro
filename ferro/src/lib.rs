@@ -29,4 +29,4 @@ pub use set::Set;
 pub use store::Durability;
 pub use sync::{Bundle, Have, Outcome, Pulled};
 pub use table::{Record, RowMut, Table, TableData, Taken};
-pub use watch::{Closer, Watcher};
+pub use watch::{Changed, Closer, Watcher};

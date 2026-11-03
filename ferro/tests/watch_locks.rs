@@ -1,10 +1,13 @@
 mod common;
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle, ThreadId};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ferro::db::Hook;
@@ -19,19 +22,26 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
-static SYNC_ENTERED: AtomicBool = AtomicBool::new(false);
-static SYNC_RELEASED: AtomicBool = AtomicBool::new(false);
-static SERIAL: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+struct Gate {
+    entered: AtomicBool,
+    released: AtomicBool,
+}
 
 thread_local! {
-    static SYNC_HELD: Cell<bool> = const { Cell::new(false) };
+    static ARMED: RefCell<Option<Arc<Gate>>> = const { RefCell::new(None) };
+}
+
+fn arm(gate: &Arc<Gate>) {
+    ARMED.with(|armed| *armed.borrow_mut() = Some(gate.clone()));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fdatasync(fd: c_int) -> c_int {
-    if SYNC_HELD.with(Cell::get) {
-        SYNC_ENTERED.store(true, Ordering::SeqCst);
-        while !SYNC_RELEASED.load(Ordering::SeqCst) {
+    let gate = ARMED.try_with(|armed| armed.borrow_mut().take()).ok().flatten();
+    if let Some(gate) = gate {
+        gate.entered.store(true, Ordering::SeqCst);
+        while !gate.released.load(Ordering::SeqCst) {
             thread::yield_now();
         }
     }
@@ -40,11 +50,12 @@ pub extern "C" fn fdatasync(fd: c_int) -> c_int {
     real(fd)
 }
 
-fn serial() -> MutexGuard<'static, ()> {
-    let turn = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    SYNC_ENTERED.store(false, Ordering::SeqCst);
-    SYNC_RELEASED.store(false, Ordering::SeqCst);
-    turn
+struct Flag(AtomicBool);
+
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn put(db: &Db<Root>, key: u64, value: u64) {
@@ -54,32 +65,33 @@ fn put(db: &Db<Root>, key: u64, value: u64) {
     .unwrap();
 }
 
-fn wait_for(flag: &AtomicBool, what: &str) {
+fn eventually(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !flag.load(Ordering::SeqCst) {
+    while !done() {
         assert!(Instant::now() < deadline, "{what} never happened");
         thread::sleep(Duration::from_millis(1));
     }
 }
 
 fn joined<R>(handle: JoinHandle<R>, what: &str) -> R {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !handle.is_finished() {
-        assert!(Instant::now() < deadline, "{what} deadlocked");
-        thread::sleep(Duration::from_millis(1));
-    }
+    eventually(&format!("{what} finishing"), || handle.is_finished());
     handle.join().unwrap()
 }
 
-fn a_test_commits_while(what: &str, during: fn(&Db<Root>)) -> bool {
-    let _turn = serial();
+#[derive(Clone, Copy, PartialEq)]
+enum Armed {
+    AtStart,
+    AfterCopy,
+}
+
+fn a_test_commits_while(what: &str, armed: Armed, during: fn(&Db<Root>)) -> Option<String> {
     let dir = tempfile::tempdir().unwrap();
-    let synced = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(Gate::default());
     let hook = {
-        let synced = synced.clone();
+        let held = held.clone();
         move |step: &'static str| {
-            if step == "synced" {
-                synced.store(true, Ordering::SeqCst);
+            if armed == Armed::AfterCopy && step == "synced" {
+                arm(&held);
             }
         }
     };
@@ -93,73 +105,65 @@ fn a_test_commits_while(what: &str, during: fn(&Db<Root>)) -> bool {
     let watched = db.fork("watched").unwrap();
     db.fork("doomed").unwrap();
     let fired = Arc::new(AtomicUsize::new(0));
-    let committed_on: Arc<Mutex<Option<ThreadId>>> = Arc::default();
+    let committing = Arc::new(AtomicBool::new(false));
+    let ran_on: Arc<Mutex<Option<String>>> = Arc::default();
     let watcher = {
-        let (db, fired, committed_on) = (db.clone(), fired.clone(), committed_on.clone());
+        let (db, held) = (db.clone(), held.clone());
+        let (fired, committing, ran_on) = (fired.clone(), committing.clone(), ran_on.clone());
         watched.watch_when(move |snapshot| {
             if snapshot.contains_key(&1) && fired.fetch_add(1, Ordering::SeqCst) == 0 {
-                *committed_on.lock().unwrap() = Some(thread::current().id());
+                *ran_on.lock().unwrap() = thread::current().name().map(str::to_string);
+                eventually("the runner's sync under tip", || {
+                    held.entered.load(Ordering::SeqCst)
+                });
+                committing.store(true, Ordering::SeqCst);
                 put(&db, 9, 9);
             }
             snapshot.contains_key(&1)
         })
     };
-    let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
-    thread::sleep(Duration::from_millis(30));
-    let leader = {
-        let db = db.clone();
+    let woken = Arc::new(Flag(AtomicBool::new(false)));
+    let waker = Waker::from(woken.clone());
+    let mut future = watcher.changed();
+    let mut poll = || Pin::new(&mut future).poll(&mut Context::from_waker(&waker));
+    assert!(poll().is_pending());
+    put(&watched, 1, 1);
+    eventually("the test firing", || fired.load(Ordering::SeqCst) > 0);
+    let runner = {
+        let (db, held) = (db.clone(), held.clone());
         thread::spawn(move || {
-            SYNC_HELD.with(|held| held.set(true));
-            put(&db, 1, 1);
-            SYNC_HELD.with(|held| held.set(false));
+            if armed == Armed::AtStart {
+                arm(&held);
+            }
+            during(&db);
         })
     };
-    wait_for(&SYNC_ENTERED, "the leader's sync");
-    let member = {
-        let watched = watched.clone();
-        thread::spawn(move || put(&watched, 1, 1))
-    };
-    thread::sleep(Duration::from_millis(30));
-    let runner = {
-        let db = db.clone();
-        thread::spawn(move || during(&db))
-    };
-    if what == "compact" {
-        wait_for(&synced, "the cycle's copy");
-    }
-    thread::sleep(Duration::from_millis(50));
-    SYNC_RELEASED.store(true, Ordering::SeqCst);
-    let runner_id = runner.thread().id();
+    eventually("the test's own commit", || committing.load(Ordering::SeqCst));
+    held.released.store(true, Ordering::SeqCst);
     joined(runner, what);
-    joined(member, "the member's commit");
-    joined(leader, "the leader's commit");
-    assert_eq!(joined(parked_thread, "the watcher").unwrap(), 2);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !db.read().contains_key(&9) {
-        assert!(Instant::now() < deadline, "the test's own commit never landed");
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(fired.load(Ordering::SeqCst) >= 1);
+    eventually("the watcher's wake", || woken.0.load(Ordering::SeqCst));
+    let Poll::Ready(Ok(snapshot)) = poll() else {
+        panic!("the woken watcher found nothing");
+    };
+    assert!(snapshot.contains_key(&1));
+    eventually("the test's commit landing", || db.read().contains_key(&9));
     assert_eq!(watched.version(), 2);
     db.verify().unwrap();
-    let committed_on = *committed_on.lock().unwrap();
-    committed_on == Some(runner_id)
+    ran_on.lock().unwrap().take()
 }
 
 #[test]
-fn a_test_may_commit_while_drop_branch_leads_its_batch() {
-    let led = (0..8).any(|_| {
-        a_test_commits_while("drop_branch", |db| db.drop_branch("doomed").unwrap())
+fn a_test_may_commit_while_drop_branch_holds_tip() {
+    let ran_on = a_test_commits_while("drop_branch", Armed::AtStart, |db| {
+        db.drop_branch("doomed").unwrap()
     });
-    assert!(led, "drop_branch never led the batch that ran the test");
+    assert_eq!(ran_on.as_deref(), Some("ferro-watch"));
 }
 
 #[test]
-fn a_test_may_commit_while_a_cycle_leads_its_batch() {
-    let led = (0..8).any(|_| {
-        a_test_commits_while("compact", |db| {
-            db.compact(Keep::All).unwrap();
-        })
+fn a_test_may_commit_while_a_cycle_holds_tip() {
+    let ran_on = a_test_commits_while("compact", Armed::AfterCopy, |db| {
+        db.compact(Keep::All).unwrap();
     });
-    assert!(led, "the cycle never led the batch that ran the test");
+    assert_eq!(ran_on.as_deref(), Some("ferro-watch"));
 }

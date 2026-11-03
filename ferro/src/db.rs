@@ -22,7 +22,7 @@ use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, sibling, sync_parent};
 use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
-use crate::watch::{Feed, Notice, Watcher};
+use crate::watch::{Feed, Filter, Notice, Watcher};
 
 const MAIN: &str = "main";
 const MAX_PASSES: u32 = 6;
@@ -704,9 +704,9 @@ impl<T: Data> Shared<T> {
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
         let branch = Arc::new(Branch {
             name: name.to_string(),
+            feed: Arc::new(Feed::new(state.snapshot.clone())),
             state: ArcSwap::new(state.clone()),
             tip: ArcSwap::new(state),
-            feed: Arc::new(Feed::new()),
             retired: AtomicBool::new(false),
         });
         branches.insert(name.to_string(), branch.clone());
@@ -1831,14 +1831,21 @@ impl<T: Data> Db<T> {
     }
 
     pub fn watch(&self) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone(), None)
+        Watcher::new(self.branch.feed.clone(), Filter::All)
     }
 
     pub fn watch_when(
         &self,
         test: impl Fn(&Snapshot<T>) -> bool + Send + Sync + 'static,
     ) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone(), Some(Box::new(test)))
+        Watcher::new(self.branch.feed.clone(), Filter::When(Box::new(test)))
+    }
+
+    pub fn watch_changes(
+        &self,
+        test: impl Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync + 'static,
+    ) -> Watcher<T> {
+        Watcher::new(self.branch.feed.clone(), Filter::Changes(Box::new(test)))
     }
 
     pub fn refresh(&self) -> Result<bool> {

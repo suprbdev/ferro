@@ -262,42 +262,44 @@ fn a_closer_wakes_a_parked_timeout_and_a_filtered_watcher() {
 #[test]
 fn a_filtered_watcher_sleeps_through_commits_that_do_not_concern_it() {
     let (_dir, db) = opened();
-    let (on_commit, on_waiter) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let waiter: Arc<Mutex<Option<ThreadId>>> = Arc::default();
+    let counters: [Arc<AtomicUsize>; 3] = Default::default();
+    let threads: Arc<Mutex<[Option<ThreadId>; 2]>> = Arc::default();
     let watcher = {
-        let (on_commit, on_waiter, waiter) = (on_commit.clone(), on_waiter.clone(), waiter.clone());
+        let (counters, threads) = (counters.clone(), threads.clone());
         db.watch_when(move |snapshot| {
-            let counter = match *waiter.lock().unwrap() == Some(thread::current().id()) {
-                true => &on_waiter,
-                false => &on_commit,
-            };
-            counter.fetch_add(1, Ordering::SeqCst);
+            let here = Some(thread::current().id());
+            let at = threads.lock().unwrap().iter().position(|id| *id == here).unwrap_or(2);
+            counters[at].fetch_add(1, Ordering::SeqCst);
             snapshot.contains_key(&7)
         })
     };
+    let [on_committer, on_waiter, elsewhere] = counters;
+    threads.lock().unwrap()[0] = Some(thread::current().id());
     put(&db, 0, 0);
     let parked_on = {
-        let waiter = waiter.clone();
+        let threads = threads.clone();
         thread::spawn(move || {
-            *waiter.lock().unwrap() = Some(thread::current().id());
+            threads.lock().unwrap()[1] = Some(thread::current().id());
             watcher.recv().unwrap().version()
         })
     };
     let mut tries = 0;
-    while on_commit.load(Ordering::SeqCst) == 0 {
+    while elsewhere.load(Ordering::SeqCst) == 0 {
         tries += 1;
         assert!(tries < 20_000, "the watcher never parked");
         put(&db, 1, tries);
+        thread::sleep(Duration::from_micros(100));
     }
     let woken = on_waiter.load(Ordering::SeqCst);
-    let evaluated = on_commit.load(Ordering::SeqCst);
+    let evaluated = elsewhere.load(Ordering::SeqCst);
     for i in 0..200 {
         put(&db, 2, i);
     }
-    assert_eq!(on_waiter.load(Ordering::SeqCst), woken, "woken by a commit it does not want");
-    assert_eq!(on_commit.load(Ordering::SeqCst), evaluated + 200);
     put(&db, 7, 7);
     assert_eq!(parked_on.join().unwrap(), db.version());
+    assert_eq!(on_waiter.load(Ordering::SeqCst), woken, "woken by a commit it does not want");
+    assert_eq!(on_committer.load(Ordering::SeqCst), 0, "a test ran on the committing thread");
+    assert!(elsewhere.load(Ordering::SeqCst) <= evaluated + 201);
 }
 
 #[test]
@@ -502,14 +504,14 @@ fn a_test_may_commit_while_its_commit_publishes() {
 }
 
 #[test]
-fn a_slow_test_holds_up_only_the_commit_that_ran_it() {
+fn a_slow_test_holds_up_no_commit() {
     let (_dir, db) = opened();
     let (calls, hold) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(1)));
     let watcher = {
         let (calls, hold) = (calls.clone(), hold.clone());
-        db.watch_when(move |snapshot| {
+        db.watch_when(move |_| {
             calls.fetch_add(1, Ordering::SeqCst);
-            while !snapshot.contains_key(&2) && hold.load(Ordering::SeqCst) == 1 {
+            while hold.load(Ordering::SeqCst) == 1 {
                 thread::sleep(Duration::from_millis(1));
             }
             false
@@ -518,17 +520,17 @@ fn a_slow_test_holds_up_only_the_commit_that_ran_it() {
     let parked_thread = thread::spawn(move || watcher.recv().is_err());
     thread::sleep(Duration::from_millis(30));
     let before = calls.load(Ordering::SeqCst);
-    let leader = {
-        let db = db.clone();
-        thread::spawn(move || put(&db, 1, 1))
-    };
+    let writer = db.clone();
+    within("the commit that starts a slow test", move || put(&writer, 1, 1));
     parked(&calls, before);
     let writer = db.clone();
-    within("a commit behind a slow test", move || put(&writer, 2, 2));
-    assert_eq!(db.version(), 2);
-    assert!(!leader.is_finished());
+    within("commits while a test is held", move || {
+        for value in 2..50 {
+            put(&writer, 2, value);
+        }
+    });
+    assert_eq!(db.version(), 49);
     hold.store(0, Ordering::SeqCst);
-    within("the slow commit", move || leader.join().unwrap());
     drop(db);
     assert!(within("the watcher", move || parked_thread.join().unwrap()));
 }
@@ -590,4 +592,180 @@ fn a_dropped_filtered_watcher_is_forgotten() {
     assert_eq!(Arc::strong_count(&held), 1);
     put(&db, 1, 1);
     put(&db, 1, 2);
+}
+
+#[test]
+fn a_changes_test_compares_against_what_the_watcher_returned_last() {
+    let (_dir, db) = opened();
+    put(&db, 7, 1);
+    let watcher = db.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+    assert_eq!(watcher.seen().unwrap().version(), 1);
+    put(&db, 1, 1);
+    assert!(matches!(watcher.try_recv(), Err(TryRecvError::Empty)));
+    put(&db, 7, 2);
+    assert_eq!(watcher.try_recv().unwrap().version(), 3);
+    assert_eq!(watcher.seen().unwrap().version(), 3);
+    put(&db, 7, 3);
+    put(&db, 7, 2);
+    assert!(matches!(watcher.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(watcher.seen().unwrap().version(), 3);
+    put(&db, 7, 4);
+    assert_eq!(watcher.recv_timeout(Duration::from_secs(5)).unwrap().version(), 6);
+    assert_eq!(watcher.seen().unwrap().version(), 6);
+}
+
+#[test]
+fn a_parked_changes_watcher_wakes_only_for_a_difference() {
+    let (_dir, db) = opened();
+    put(&db, 7, 1);
+    let watcher = db.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+    let parked_thread = thread::spawn(move || {
+        let snapshot = watcher.recv().unwrap();
+        (snapshot.version(), *snapshot.get(&7).unwrap())
+    });
+    thread::sleep(Duration::from_millis(30));
+    for value in 0..20 {
+        put(&db, 1, value);
+    }
+    put(&db, 7, 1);
+    put(&db, 7, 2);
+    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()), (22, 2));
+}
+
+#[test]
+fn a_changes_watcher_starts_from_the_snapshot_it_reports() {
+    let (_dir, db) = opened();
+    let stop = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let (db, stop) = (db.clone(), stop.clone());
+        thread::spawn(move || {
+            let mut step = 0u64;
+            while stop.load(Ordering::SeqCst) == 0 {
+                step += 1;
+                put(&db, step % 3, step);
+                put(&db, 7, step % 2);
+            }
+        })
+    };
+    let mut watchers = Vec::new();
+    for _ in 0..300 {
+        let watcher = db.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+        let seen = watcher.seen().unwrap();
+        assert!(seen.version() <= db.version());
+        watchers.push((watcher, seen));
+    }
+    stop.store(1, Ordering::SeqCst);
+    writer.join().unwrap();
+    let last = db.read();
+    for (watcher, seen) in watchers {
+        match watcher.try_recv() {
+            Ok(snapshot) => {
+                assert_ne!(seen.get(&7), last.get(&7));
+                assert_eq!(snapshot.version(), last.version());
+            }
+            Err(TryRecvError::Empty) => assert_eq!(seen.get(&7), last.get(&7)),
+            Err(TryRecvError::Disconnected) => panic!("the watcher closed"),
+        }
+    }
+}
+
+#[test]
+fn clones_of_a_changes_watcher_share_what_was_seen() {
+    let (_dir, db) = opened();
+    put(&db, 7, 1);
+    let first = db.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+    let second = first.clone();
+    put(&db, 7, 2);
+    assert_eq!(first.try_recv().unwrap().version(), 2);
+    assert_eq!(second.seen().unwrap().version(), 2);
+    assert!(matches!(second.try_recv(), Err(TryRecvError::Empty)));
+    put(&db, 7, 3);
+    assert_eq!(second.try_recv().unwrap().version(), 3);
+    assert_eq!(first.seen().unwrap().version(), 3);
+}
+
+#[test]
+fn only_a_changes_watcher_reports_what_it_saw() {
+    let (_dir, db) = opened();
+    put(&db, 1, 1);
+    assert!(db.watch().seen().is_none());
+    assert!(db.watch_when(|_| true).seen().is_none());
+    assert_eq!(db.watch_changes(|_, _| true).seen().unwrap().version(), 1);
+}
+
+#[test]
+fn a_test_may_use_the_feed_it_runs_on() {
+    let (_dir, db) = opened();
+    let other = db.watch_when(|snapshot| snapshot.contains_key(&3));
+    let ended = db.watch_when(|_| false);
+    let used = Arc::new(AtomicUsize::new(0));
+    let watcher = {
+        let (db, used, closer) = (db.clone(), used.clone(), ended.closer());
+        db.clone().watch_changes(move |seen, now| {
+            let _ = other.try_recv();
+            let _ = db.read();
+            let _ = db.watch_changes(|_, _| true).seen();
+            closer.close();
+            used.fetch_add(1, Ordering::SeqCst);
+            seen.get(&1) != now.get(&1)
+        })
+    };
+    let parked_thread = thread::spawn(move || {
+        let snapshot = watcher.recv().unwrap();
+        (watcher.seen().unwrap().version(), snapshot.version())
+    });
+    thread::sleep(Duration::from_millis(30));
+    let writer = db.clone();
+    within("a commit while a test uses the feed", move || {
+        put(&writer, 2, 2);
+        put(&writer, 1, 1);
+    });
+    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()), (2, 2));
+    assert!(used.load(Ordering::SeqCst) >= 1);
+    assert!(ended.recv().is_err());
+}
+
+#[test]
+fn watchers_never_see_versions_out_of_order() {
+    let (_dir, db) = opened();
+    let consumers: Vec<_> = (0..4)
+        .map(|index| {
+            let watcher = match index % 2 {
+                0 => db.watch(),
+                _ => db.watch_when(|snapshot| snapshot.get(&0).is_some_and(|value| *value % 2 == 0)),
+            };
+            thread::spawn(move || {
+                let mut versions = Vec::new();
+                while let Ok(snapshot) = watcher.recv() {
+                    versions.push(snapshot.version());
+                    if snapshot.contains_key(&99) {
+                        break;
+                    }
+                }
+                versions
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..4)
+        .map(|writer| {
+            let db = db.clone();
+            thread::spawn(move || {
+                for step in 0..200 {
+                    put(&db, writer, step);
+                }
+            })
+        })
+        .collect();
+    writers.into_iter().for_each(|writer| writer.join().unwrap());
+    db.update(|root| {
+        root.insert(0, 0);
+        root.insert(99, 99);
+    })
+    .unwrap();
+    let last = db.version();
+    for consumer in consumers {
+        let versions = within("a consumer", move || consumer.join().unwrap());
+        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]), "{versions:?}");
+        assert_eq!(versions.last(), Some(&last));
+    }
 }
