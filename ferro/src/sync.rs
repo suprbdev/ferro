@@ -444,7 +444,11 @@ fn shared_prefix(store: &Store, a: &Chain, b: &Chain) -> Result<Option<u64>> {
 }
 
 fn locate(store: &Store, refs: &Refs, mark: Mark) -> Result<Option<(Ptr, Chain)>> {
+    let mut found: Option<(Ptr, Chain)> = None;
     for (_, head) in refs.iter() {
+        if found.is_some_and(|(_, chain)| chain.first <= head.log.first) {
+            continue;
+        }
         if let Some(ptr) = entry_at(store, &head.log, mark.version)?
             && ptr.hash == mark.hash
         {
@@ -453,10 +457,10 @@ fn locate(store: &Store, refs: &Refs, mark: Mark) -> Result<Option<(Ptr, Chain)>
                 first: head.log.first,
                 last: mark.version,
             };
-            return Ok(Some((ptr, chain)));
+            found = Some((ptr, chain));
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn read_entry(object: &Object) -> Result<Entry> {

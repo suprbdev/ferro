@@ -1160,3 +1160,33 @@ fn a_pruned_branch_ahead_of_an_idle_remote_stays_ahead() {
     assert!(!b.read().contains_key(&0));
     assert_eq!(dump(&b.read()).len(), 9);
 }
+
+#[test]
+fn a_fast_forward_keeps_history_that_another_branch_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = open(&dir, "b.ferro");
+    for key in 1..=10 {
+        put(&b, key, "b");
+    }
+    let a = open(&dir, "a.ferro");
+    a.pull(&b, "b", refuse).unwrap();
+    put(&a, 11, "a");
+    put(&a, 12, "a");
+    drop(b);
+    let pruning: Db<Root> = fast()
+        .history(Keep::Last(2))
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    let side = pruning.fork("aside").unwrap();
+    put(&side, 100, "side");
+    assert_eq!(side.log().len(), 2);
+    drop((side, pruning));
+    let b = open(&dir, "b.ferro");
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.log().len(), 12);
+    assert_eq!(dump(&b.at(3).unwrap()).len(), 3);
+    b.verify().unwrap();
+}

@@ -1018,11 +1018,12 @@ as in the file.
 
 - Every object is hashed as the bundle is parsed.
 - The new commits are walked from the head through `prev`, and their versions must descend one at a
-  time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to wrap
-  the version past `u64::MAX`. The commit below the oldest one sent is looked up in the receiver's chains by hash and
-  version. Found, the landed branch continues into the receiver's copy of it and keeps that chain's
-  `first`. Not found, the link is written with offset 0 and the branch starts at the oldest sent
-  commit, the way a pruned chain does.
+  time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to
+  wrap the version past `u64::MAX`. The commit below the oldest one sent is looked up in the
+  receiver's chains by hash and version. Found, the landed branch continues into the receiver's copy
+  of it and keeps the lowest `first` among the chains that hold it, so a fast-forward does not cut
+  our history short to where another branch was pruned. Not found, the link is written with offset 0
+  and the branch starts at the oldest sent commit, the way a pruned chain does.
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
