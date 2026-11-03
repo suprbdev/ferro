@@ -1820,6 +1820,20 @@ until nothing that is not stale is left, and returns `NoCommonAncestor` if the o
 anything that old and that low, or if both sides ran into pruned history, because the base could be
 hidden there. Otherwise its answer is the one the whole history would give.
 
+A merged chain is kept down to where its `prev` links stop, and the search finds that place by
+following them, taking a skip link only to a commit the `prev` links also reach. Two writers broke
+that. A pull writes a sent commit's skip link with offset 0 when it lands below the `first` of the
+branch the chain joins, though the `prev` links can go on below it through commits another merge
+keeps. The search found a merged chain's bottom through `prev`, then went back down to it through
+that skip link and read offset 0, and a sender comparing such a chain with the receiver's could do
+the same. A step down now takes `prev` where a skip link is cut, as finding the bottom already did.
+Reclamation kept a skip link whenever its target was retained, by any branch or merge, even where a
+`prev` link between had been cut because the commit there was not. The search then took the skip
+link past the gap and put the chain's bottom below a commit that was gone, and the next step down
+failed. Reclamation now writes a skip link with offset 0 when it lands below where the copied
+entry's `prev` links reach, which it knows because it copies `prev` first. A branch reaches down to
+its `first` through `prev`, so its skip links above `first` all stay.
+
 ### Format
 
 Log entries have three more flag bits: the merge link, followed by its floor version and time; the
@@ -1877,6 +1891,16 @@ link their parents, so a commit with the same hash in both files has the same hi
 For each recognised commit the sender binary-searches the newest version its branch shares with
 that commit's chain, O(log^2 n), and the newest of those is the floor: its commits above the floor
 are new. Commits are matched by hash. A version alone means nothing across files.
+
+The floor stays below the sender's head unless the have names the head. A commit below one the
+receiver named is in the receiver's history, but not necessarily still in its file, since the
+receiver may have pruned it from every branch. The floor used to reach the head whenever the sender
+held the head below a recognised commit, which happens when the sender's branch is behind a commit
+of the receiver's that the sender holds on another branch. The bundle was then empty, the receiver
+could not land a head it did not hold and returned `StaleHave`, and a fresh have gave the same
+answer, so pulls between the two files failed for good with no prune between have and bundle.
+Sending the head costs its entry and what its tree changed from the anchors, and only when the
+receiver holds the head without naming it.
 
 ### What is sent
 
@@ -1941,11 +1965,11 @@ a second thread once it sends 256 objects, with eight chunks in flight between t
   of it and keeps the lowest `first` among the chains that hold it, so a fast-forward does not cut
   our history short to where another branch was pruned. Not found, the link is written with offset 0
   and the branch starts at the oldest sent commit, the way a pruned chain does.
-- Every commit the bundle says the receiver holds must still be in one of its chains. If the
-  receiver pruned or dropped one after it sent its have, `receive` returns `Error::StaleHave`,
-  writes nothing, and a bundle built from a fresh have lands. `pull` returns it as well rather than
-  retrying, so a caller sees the same error whether it pulls in one process or over a network, and
-  decides itself whether to try again.
+- Every commit the bundle says the receiver holds must still be in one of its chains, and so must
+  the head of an empty bundle, which the have named. If the receiver pruned or dropped one after it
+  sent its have, `receive` returns `Error::StaleHave`, writes nothing, and a bundle built from a
+  fresh have lands. `pull` returns it as well rather than retrying, so a caller sees the same error
+  whether it pulls in one process or over a network, and decides itself whether to try again.
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
@@ -2024,6 +2048,37 @@ read, and for each object its hash, its offset in the frame and the types it was
 copied into the frame, so the largest value sent bounds memory too. A hostile stream gets no more:
 48 distinct objects of 1 MiB took 2.1 MiB of heap, and were cut off the file when the stream ended
 early.
+
+### Commits stored twice
+
+A bundle can carry commits the receiver already holds where its have does not name them: on a
+branch whose head the sender does not know, or only in a merge's history. They land as new records
+beside the old ones, with the same hash and possibly other links. The receiver's copy of the oldest
+commit a branch kept links its parent with offset 0, while the landed copy, whose parent came in the
+same bundle, links it in full. Devices that keep a few versions and relay each other's commits make
+this routine (#36). One device held a second device's v3 on the branch it had pulled from a third,
+which had fast-forwarded onto it and kept nothing below it. A pull from the second device sent v2 to
+v4 and landed its branch with `first` at 2, through a new copy of v3 that links v2.
+
+Every layer that keys objects by hash took the two copies of v3 for one. The node cache returned
+whichever had been read first, so reading the landed branch reached the old copy's offset 0 and
+failed with `Corrupt("pointer 0 outside log")`, and so did `verify`. Reclamation copied whichever it
+met first, in the order of the branch names, so a cycle could leave the landed branch unreadable in
+the new file even when the cache had held the right copy.
+
+Hashes do not cover offsets, so for any other object the copies are interchangeable: a tree node
+links only objects that are there. An entry is the one object whose links may be offset 0, so
+entries are read and copied as the records they are. A cached entry remembers the offset it was
+decoded from, and a load through a link to another copy decodes that copy without caching it, which
+costs a read only where a commit is stored twice. Reclamation copies each stored entry once, keyed
+by the offset it was read from, so every branch keeps the links it was written with, in the new file
+as in the old. `verify` names a branch whose entries do not reach its `first`: `commit log keeps
+versions from 2 but v3 links pruned history`.
+
+The other way was to land onto the receiver's existing record and start the landed branch where that
+record's parent link stops. That throws away history the bundle brought, here v2, and it needs to
+find the existing record, which for a commit held only in a merge's history takes an index from hash
+to offset that `ferro` does not keep.
 
 ### Checking trees
 
@@ -2214,7 +2269,9 @@ the links the tree comparison kept.
   name are dropped, and if nothing retained connects the two branches the pull refuses with
   `NoCommonAncestor`.
 - A merged commit the receiver holds only inside another commit's merged history, not on a chain
-  its have names, is sent again.
+  its have names, is sent again, and so is a commit on a branch whose head the sender does not
+  hold. Both are stored a second time, as described under Commits stored twice, until the copy the
+  receiver had stops being retained.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. A table without one of its index fields passes, because the
   check visits fields and does not rebuild the index. Reading it rebuilds the index, and if two rows
@@ -2237,9 +2294,11 @@ is larger, so the copying stays proportional to what was written.
    `<file>.compacting`, re-emitting links with new offsets, verifying each object's hash and
    compressing again. Chain entries are copied like anything else, but a link to an entry that is
    past `first` and was not brought in by a retained merge, as described under Merges and pruning,
-   is written with offset 0 instead of being followed. Copies are keyed by hash, so a later pass from newer refs
-   visits only what is new. Data is immutable, so no write barrier is needed. Passes repeat, up to
-   six, until one copies less than 256 KiB.
+   is written with offset 0 instead of being followed, and so is a skip link below where the entry's
+   `prev` links reach. Copies are keyed by hash, and entries by the offset they were read from, as
+   described under Commits stored twice, so a later pass from newer refs visits only what is new.
+   Data is immutable, so no write barrier is needed. Passes repeat, up to six, until one copies less
+   than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.
 4. Swap, under the `tip` mutex. This is the only pause. Wait for queued commits, copy what is left,
    write both superblock slots and sync. Open the new file, which takes its writer lock, and read
