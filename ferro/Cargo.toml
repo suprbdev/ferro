@@ -7,7 +7,7 @@ edition.workspace = true
 ferro-derive = { path = "../ferro-derive" }
 arc-swap = "1"
 blake3 = "1"
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 parking_lot = "0.12"
 quick_cache = "0.6"
 thiserror = "2"
