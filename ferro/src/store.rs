@@ -186,7 +186,7 @@ impl Super {
         self.anchor == self.mark()
     }
 
-    fn from_anchor(&self) -> Super {
+    fn at_anchor(&self) -> Super {
         Super::new(self.anchor, self.anchor, self.basis)
     }
 
@@ -305,7 +305,7 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
 }
 
 fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
-    let mut tip = scan(file, sb.from_anchor(), len)?;
+    let mut tip = scan(file, sb.at_anchor(), len)?;
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
     let shrink = len > tip.log_end;
@@ -339,7 +339,7 @@ fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
     let scanned = file
         .metadata()
         .map_err(Error::from)
-        .and_then(|meta| scan(file, sb.from_anchor(), meta.len()))
+        .and_then(|meta| scan(file, sb.at_anchor(), meta.len()))
         .and_then(|tip| {
             if tip.seq != before {
                 file.sync_data()?;

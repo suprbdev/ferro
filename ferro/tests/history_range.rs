@@ -38,6 +38,11 @@ fn seeded(seed: u64, commits: u64) -> (TempDir, Db<Root>, Vec<Option<u64>>) {
     (dir, db, states)
 }
 
+fn backwards() -> std::ops::Range<u64> {
+    let (high, low) = (9, 4);
+    high..low
+}
+
 fn watched(root: &Root) -> Option<u64> {
     root.get(&WATCHED).map(|v| *v)
 }
@@ -82,7 +87,7 @@ fn every_kind_of_bound_means_what_a_range_means() {
     assert_eq!(changes(db.history_of_range(..9, watched)), expected(&states, 0, 8));
     assert_eq!(changes(db.history_of_range(4..9, watched)), expected(&states, 4, 8));
     assert_eq!(changes(db.history_of_range(..0, watched)), Vec::new());
-    assert_eq!(changes(db.history_of_range(9..4, watched)), Vec::new());
+    assert_eq!(changes(db.history_of_range(backwards(), watched)), Vec::new());
     let excluded = (Bound::Excluded(4), Bound::Included(9));
     assert_eq!(excluded.start_bound(), Bound::Excluded(&4));
     assert_eq!(changes(db.history_of_range(excluded, watched)), expected(&states, 5, 9));
@@ -181,7 +186,7 @@ fn bisect_finds_where_a_monotone_test_turns_true() {
     assert_eq!(db.bisect(40..=50, |root| root.len() >= 60).unwrap(), None);
     assert_eq!(db.bisect(40..=50, |root| root.len() >= 45).unwrap(), Some(45));
     assert_eq!(db.bisect(500.., |_| true).unwrap(), None);
-    assert_eq!(db.bisect(9..4, |_| true).unwrap(), None);
+    assert_eq!(db.bisect(backwards(), |_| true).unwrap(), None);
 }
 
 #[test]
