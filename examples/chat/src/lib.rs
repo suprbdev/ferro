@@ -25,7 +25,6 @@ pub struct Config {
     pub coalesce: bool,
     pub keep_versions: Option<usize>,
     pub reclaim_bytes: u64,
-    pub feed_buffer: usize,
     pub max_changes: usize,
 }
 
@@ -36,7 +35,6 @@ impl Default for Config {
             coalesce: false,
             keep_versions: None,
             reclaim_bytes: Reclaim::default().every_bytes,
-            feed_buffer: 16,
             max_changes: 2000,
         }
     }
@@ -95,7 +93,7 @@ impl App {
 pub fn build(db: Db<Chat>, config: &Config) -> Shared {
     Arc::new(App {
         db,
-        feeds: Arc::new(Feeds::new(config.max_changes, config.feed_buffer)),
+        feeds: Arc::new(Feeds::new(config.max_changes)),
         counters: Counters::default(),
         closing: watch::channel(false).0,
     })

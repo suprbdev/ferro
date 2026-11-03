@@ -1,26 +1,17 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
-use ferro::{Change, Closer, Db, Snapshot, Val, Watcher};
+use ferro::{Change, Closer, Db, Snapshot, Watcher};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use crate::error::ApiError;
-use crate::model::{Chat, Room, User, message_view, reactions_view, room_view};
+use crate::model::{Chat, Room, message_view, reactions_view, room_view};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Room(u64),
     User(u64),
-}
-
-#[derive(Default)]
-struct Marks {
-    user: Option<Val<User>>,
-    rooms: Vec<(u64, Option<Val<Room>>)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -53,26 +44,19 @@ impl Scope {
         }
     }
 
-    fn marks(self, chat: &Chat) -> Marks {
-        let user = self.viewer().and_then(|user| chat.users.get(&user));
-        let rooms = self
-            .rooms(chat)
-            .into_iter()
-            .map(|room| (room, chat.rooms.get(&room)))
-            .collect();
-        Marks { user, rooms }
-    }
-
-    fn moved(self, marks: &Marks, chat: &Chat) -> bool {
-        if let Some(user) = self.viewer()
-            && chat.users.get(&user) != marks.user
-        {
-            return true;
+    fn moved(self, seen: &Chat, now: &Chat) -> bool {
+        match self {
+            Scope::Room(room) => seen.rooms.get(&room) != now.rooms.get(&room),
+            Scope::User(user) => {
+                let row = seen.users.get(&user);
+                row != now.users.get(&user)
+                    || row.is_some_and(|row| {
+                        row.rooms
+                            .iter()
+                            .any(|room| seen.rooms.get(room) != now.rooms.get(room))
+                    })
+            }
         }
-        marks
-            .rooms
-            .iter()
-            .any(|(room, seen)| chat.rooms.get(room) != *seen)
     }
 }
 
@@ -242,21 +226,17 @@ enum Start {
 pub struct Feeds {
     next: AtomicU64,
     live: Mutex<HashMap<u64, Closer<Chat>>>,
-    threads: Mutex<Vec<JoinHandle<()>>>,
     pub frames: AtomicU64,
     pub limit: usize,
-    pub buffer: usize,
 }
 
 impl Feeds {
-    pub fn new(limit: usize, buffer: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Feeds {
             next: AtomicU64::new(1),
             live: Mutex::new(HashMap::new()),
-            threads: Mutex::new(Vec::new()),
             frames: AtomicU64::new(0),
             limit: limit.max(1),
-            buffer: buffer.max(1),
         }
     }
 
@@ -270,42 +250,84 @@ impl Feeds {
         for closer in closers {
             closer.close();
         }
-        let mut threads = std::mem::take(&mut *lock(&self.threads));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !threads.is_empty() && Instant::now() < deadline {
-            let (done, running) = threads.into_iter().partition(JoinHandle::is_finished);
-            threads = running;
-            for thread in done {
-                let _ = thread.join();
+    }
+}
+
+pub struct Subscription {
+    id: u64,
+    scope: Scope,
+    watcher: Watcher<Chat>,
+    opening: VecDeque<Frame>,
+    feeds: Arc<Feeds>,
+}
+
+impl Subscription {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn sent(&self, frame: Frame) -> Frame {
+        self.feeds.frames.fetch_add(1, Ordering::Relaxed);
+        frame
+    }
+
+    pub async fn next(&mut self) -> Option<Frame> {
+        if let Some(frame) = self.opening.pop_front() {
+            return Some(self.sent(frame));
+        }
+        loop {
+            let seen = self.watcher.seen()?;
+            let snapshot = self.watcher.changed().await.ok()?;
+            if snapshot.version() <= seen.version() {
+                continue;
             }
-            if !threads.is_empty() {
-                thread::sleep(Duration::from_millis(5));
+            let (list, more) = changes(self.scope, &seen, &snapshot, self.feeds.limit);
+            if !list.is_empty() || more {
+                let frame = change_frame(seen.version(), snapshot.version(), list, more);
+                return Some(self.sent(frame));
             }
         }
     }
 }
 
-pub struct Subscription {
-    pub frames: mpsc::Receiver<Frame>,
-    guard: Guard,
-}
-
-impl Subscription {
-    pub fn id(&self) -> u64 {
-        self.guard.id
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        lock(&self.feeds.live).remove(&self.id);
     }
 }
 
-struct Guard {
-    id: u64,
-    closer: Closer<Chat>,
-    feeds: Arc<Feeds>,
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        self.closer.close();
-        lock(&self.feeds.live).remove(&self.id);
+fn opening(scope: Scope, current: &Snapshot<Chat>, start: Start, limit: usize) -> Vec<Frame> {
+    match start {
+        Start::Fresh => vec![Frame {
+            event: "hello",
+            id: Some(current.version()),
+            data: state(scope, current).to_string(),
+        }],
+        Start::Resume(from, old) => {
+            let mut hello = state(scope, current);
+            hello["resumed_from"] = json!(from);
+            let mut frames = vec![Frame {
+                event: "hello",
+                id: None,
+                data: hello.to_string(),
+            }];
+            if let Some(old) = old {
+                let (list, more) = changes(scope, &old, current, limit);
+                if !list.is_empty() || more {
+                    frames.push(change_frame(from, current.version(), list, more));
+                }
+            }
+            frames
+        }
+        Start::Reset(reason) => {
+            let mut reset = state(scope, current);
+            reset["reason"] = json!(reason);
+            vec![Frame {
+                event: "reset",
+                id: Some(current.version()),
+                data: reset.to_string(),
+            }]
+        }
     }
 }
 
@@ -315,23 +337,16 @@ pub fn subscribe(
     scope: Scope,
     since: Option<u64>,
 ) -> Result<Subscription, ApiError> {
-    if !scope.exists(&db.read()) {
+    let watcher = db.watch_changes(move |seen, now| scope.moved(seen, now));
+    let current = watcher
+        .seen()
+        .ok_or_else(|| ApiError::Internal("the database is closing".into()))?;
+    if !scope.exists(&current) {
         return Err(ApiError::NotFound(match scope {
             Scope::Room(room) => format!("no room {room}"),
             Scope::User(user) => format!("no user {user}"),
         }));
     }
-    let marks = Arc::new(Mutex::new(Marks::default()));
-    let watcher = db.watch_when({
-        let marks = marks.clone();
-        move |snapshot| scope.moved(&lock(&marks), snapshot)
-    });
-    let current = {
-        let mut held = lock(&marks);
-        let current = db.read();
-        *held = scope.marks(&current);
-        current
-    };
     let start = match since {
         None => Start::Fresh,
         Some(version) if version == current.version() => Start::Resume(version, None),
@@ -347,104 +362,14 @@ pub fn subscribe(
             Err(error) => return Err(error.into()),
         },
     };
-    let (sender, frames) = mpsc::channel(feeds.buffer);
+    let opening = opening(scope, &current, start, feeds.limit).into();
     let id = feeds.next.fetch_add(1, Ordering::Relaxed);
-    let closer = watcher.closer();
-    lock(&feeds.live).insert(id, closer.clone());
-    let worker = Worker {
+    lock(&feeds.live).insert(id, watcher.closer());
+    Ok(Subscription {
+        id,
         scope,
         watcher,
-        marks,
-        seen: current,
-        sender,
+        opening,
         feeds: feeds.clone(),
-    };
-    let spawned = thread::Builder::new()
-        .name(format!("chat-feed-{id}"))
-        .stack_size(256 << 10)
-        .spawn(move || worker.run(start));
-    let guard = Guard {
-        id,
-        closer,
-        feeds: feeds.clone(),
-    };
-    let handle = spawned.map_err(|error| ApiError::Internal(format!("spawn feed: {error}")))?;
-    let mut threads = lock(&feeds.threads);
-    threads.retain(|thread| !thread.is_finished());
-    threads.push(handle);
-    drop(threads);
-    Ok(Subscription { frames, guard })
-}
-
-struct Worker {
-    scope: Scope,
-    watcher: Watcher<Chat>,
-    marks: Arc<Mutex<Marks>>,
-    seen: Snapshot<Chat>,
-    sender: mpsc::Sender<Frame>,
-    feeds: Arc<Feeds>,
-}
-
-impl Worker {
-    fn send(&self, frame: Frame) -> bool {
-        self.feeds.frames.fetch_add(1, Ordering::Relaxed);
-        self.sender.blocking_send(frame).is_ok()
-    }
-
-    fn opening(&self, start: Start) -> Vec<Frame> {
-        let current = &self.seen;
-        match start {
-            Start::Fresh => vec![Frame {
-                event: "hello",
-                id: Some(current.version()),
-                data: state(self.scope, current).to_string(),
-            }],
-            Start::Resume(from, old) => {
-                let mut hello = state(self.scope, current);
-                hello["resumed_from"] = json!(from);
-                let mut frames = vec![Frame {
-                    event: "hello",
-                    id: None,
-                    data: hello.to_string(),
-                }];
-                if let Some(old) = old {
-                    let (list, more) = changes(self.scope, &old, current, self.feeds.limit);
-                    if !list.is_empty() || more {
-                        frames.push(change_frame(from, current.version(), list, more));
-                    }
-                }
-                frames
-            }
-            Start::Reset(reason) => {
-                let mut reset = state(self.scope, current);
-                reset["reason"] = json!(reason);
-                vec![Frame {
-                    event: "reset",
-                    id: Some(current.version()),
-                    data: reset.to_string(),
-                }]
-            }
-        }
-    }
-
-    fn run(mut self, start: Start) {
-        for frame in self.opening(start) {
-            if !self.send(frame) {
-                return;
-            }
-        }
-        while let Ok(snapshot) = self.watcher.recv() {
-            if snapshot.version() <= self.seen.version() {
-                continue;
-            }
-            let (list, more) = changes(self.scope, &self.seen, &snapshot, self.feeds.limit);
-            *lock(&self.marks) = self.scope.marks(&snapshot);
-            let from = self.seen.version();
-            let version = snapshot.version();
-            self.seen = snapshot;
-            if (!list.is_empty() || more) && !self.send(change_frame(from, version, list, more)) {
-                return;
-            }
-        }
-    }
+    })
 }

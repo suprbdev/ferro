@@ -522,10 +522,12 @@ Each room is a `Table` row holding its members, its messages and a word index. T
 `range_summary` past the user's receipt, O(log n) however long the room's history. A history page
 is a reversed `range` before a cursor.
 
-Live updates are Server-Sent Events. Each subscriber has a `watch_when` watcher that wakes only when
-one of its rooms or its own membership changed, and a `diff` between the last snapshot it delivered
-and the new one gives the events. The event id is the version, so a client reconnecting with
-`Last-Event-ID` gets one diff from that version, or a reset if that version is no longer retained.
+Live updates are Server-Sent Events. Each subscriber is a `watch_changes` watcher whose test
+compares its rooms and its own membership between the snapshot it delivered last and the new one,
+and a `diff` between those two gives the events. The stream awaits `changed()`, so a subscriber
+holds no thread, and dropping the stream when the client goes drops the watcher. The event id is
+the version, so a client reconnecting with `Last-Event-ID` gets one diff from that version, or a
+reset if that version is no longer retained.
 
 ```sh
 cargo run --release -p chat -- --db chat.ferro
@@ -534,10 +536,12 @@ cargo run --release -p chat --bin chat-load -- --db load.ferro --rate 1000
 
 `chat-load` seeds 1,000 rooms and 10,000 users in 5 rooms each, opens 300 feeds and posts from 32
 connections, and a quarter of the deliveries send a read receipt. With fsync, at 1,000 posts a
-second, a post took 0.9 ms at p50 and 2.7 ms at p99 and reached each member's feed in 0.8 ms and
-2.5 ms. Flat out it took about 2,700 posts and 1,900 receipts a second at 11 ms p50, and 4,200 posts
-with `coalesce`. These ran on a machine shared with other work. Every watcher's test runs on the
-committing thread, so each commit pays for every connected feed.
+second, a post took 0.18 ms at p50 and 0.41 ms at p99 and reached each member's feed in 0.47 ms and
+1.0 ms. Flat out it took about 3,500 posts and 2,500 receipts a second at 9 ms p50, and 5,800 posts
+with `coalesce`. With `--clients 3000` it took 700 posts and 5,300 receipts a second at 43 ms p50,
+where running every test on the committing thread had managed 126 posts at 206 ms. Without
+receipts, 3,000 feeds took 1,000 posts a second at 0.35 ms per post and 2.1 ms to delivery. These
+ran on a machine shared with other work.
 
 ## A booking system under contention
 

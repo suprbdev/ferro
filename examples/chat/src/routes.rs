@@ -454,7 +454,7 @@ fn sse(
                 return None;
             }
             let frame = tokio::select! {
-                frame = subscription.frames.recv() => frame?,
+                frame = subscription.next() => frame?,
                 _ = closing.changed() => return None,
             };
             let mut event = Event::default().event(frame.event).data(frame.data);
