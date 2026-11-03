@@ -738,6 +738,21 @@ long as ferro and redb 1.9 times, and redb's `get` is about 15% faster. These nu
 warm cache, on a workload with few overwrites. Full results, including caveats about sled, are in
 `benchmarks/compare/RESULTS.md`.
 
+## Development
+
+The Makefile wraps the common commands, and `make help` lists every target. `make ci` runs clippy
+for Linux and Windows and then every test, `make test-one T=sync` runs the library tests whose
+names match, and `make bench-tables` times booking-style commits. The examples and the `ferro`
+tool take their paths from variables:
+
+```sh
+make shop DB=target/demo/shop.ferro ADDR=127.0.0.1:3000
+make info DB=target/demo/shop.ferro
+```
+
+Cargo runs inside a `systemd-run` scope capped at `MEM` (16G by default), so a runaway test cannot
+take the machine down. Set `CAP=` to run without the cap.
+
 ## Limitations
 
 This is an experiment, not a production database.
