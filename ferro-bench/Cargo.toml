@@ -27,6 +27,10 @@ path = "src/bin/clone.rs"
 name = "tables"
 path = "src/bin/tables.rs"
 
+[[bin]]
+name = "delta"
+path = "src/bin/delta.rs"
+
 [dependencies]
 booking = { path = "../examples/booking" }
 fastrand = "2"
