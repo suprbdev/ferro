@@ -409,7 +409,9 @@ So each `Link::Stored` carries a write-once memo of the node it points at, in a 
 - Deeper links memoize a `Weak` when the child was found in the cache, or when `flush` wrote it
   beside a sibling, as described below. The cache stays the owner, so eviction still frees the
   node, and the memo keeps only the node's `Arc` allocation, about 150 bytes, until its parent goes.
-  A child just read from disk is not memoized, so a one-off read leaves nothing behind.
+  A child just read from disk is not memoized, so a one-off read leaves nothing behind. A get reads
+  through these memos without upgrading them, under an epoch guard, as described under Reading from
+  many threads.
 - A memo is never replaced. Once its child is evicted the link falls back to the cache, whose `get`
   restores the recency that memo hits skip, so eviction keeps seeing nodes that are really in use.
   A replaceable `ArcSwap` memo made cold gets 44% slower, because a small cache evicts constantly
@@ -437,8 +439,9 @@ bits. `reach` prefetches those lines before it upgrades, so the header, the keys
 the next level arrive together, and a get waits about once a level instead of three times. The
 offsets fit beside the `Weak` in space the enum already had, so `Memo` is still 16 bytes and `Link`
 72. A hint comes from a live node, and once that node is evicted a stale hint prefetches a line
-nobody wants and nothing more, since a prefetch never faults. That call is the crate's one `unsafe`
-block, and it does nothing on targets other than x86_64.
+nobody wants and nothing more, since a prefetch never faults. That call and the guarded borrow
+described under Reading from many threads are the tree's only `unsafe` blocks, and the prefetch does
+nothing on targets other than x86_64.
 
 On 1M `u64` keys, median of 15 alternating rounds in one process holding two such maps, in
 nanoseconds, the last two per key:
@@ -593,9 +596,151 @@ was 20% slower than `get`, and it would have written the reference counts of pin
 returns the named `Keys`, so it has `len` and `next_back`, and the set operations probe through
 `contains_many`.
 
-`IndexIter` fetches rows through a cursor. Rows of one index value sit in key order, so those went
-from 163 to 60 ns each, and rows scattered across the table from 208 to 161 ns. `IndexIter::keys`
-stops before the rows and takes 5 ns a key.
+`IndexIter` fetched rows through a cursor. Rows of one index value sit in key order, so those went
+from 163 to 60 ns each, and rows scattered across the table from 208 to 161 ns. It now fetches them
+through a finder that keeps the last leaf and its parent, as described under Reading from many
+threads. `IndexIter::keys` stops before the rows and takes 5 ns a key.
+
+### Reading from many threads
+
+`ferro-bench --bin scaling` runs reader threads over shared snapshots of a 1M-key `Map<u64, String>`
+and a 200,000-row table with two indexes. Its workloads are a random `get`, a full scan through
+`iter().fold`, a full scan through `for_each`, ranges of about 100 keys through `range(..).fold`,
+index lookups of about 20 scattered rows through `by_balance_range`, and pages of 200 rows that sit
+in key order through `by_tier(..).take(200)`. Each runs with a 1 GiB cache that holds everything and
+a 16 MiB one that holds about a seventh of the decoded map, with no writer and with one thread
+committing single-key updates as fast as it can. The test machine has 16 cores in two CCDs of 8,
+each CCD with its own L3, and two threads per core. Threads are pinned a core at a time, so 8 fill
+one CCD, 16 both, and 32 add the second thread of every core. The tool reads cycles, instructions
+and the cache lines a thread pulled from another core's cache through `perf_event_open`, and how
+busy the rest of the machine was, since the machine is shared. The tables are medians of runs that
+alternated the two builds, leaving out runs during which other work kept more than two cores busy.
+
+Operations a second with the 1 GiB cache and no writer, and in brackets the speedup over one thread:
+
+| Workload | | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `get` | before | 3.0M | 6.1M (2.0) | 12.0M (4.0) | 23.1M (7.6) | 32.1M (10.6) | 50.4M (16.7) |
+| `get` | after | 2.9M | 5.8M (2.0) | 11.9M (4.1) | 23.2M (8.0) | 41.9M (14.5) | 67.2M (23.2) |
+| `iter()` scan | before | 53.1M | 57.2M (1.1) | 112.8M (2.1) | 214.1M (4.0) | 409.3M (7.7) | 834.6M (15.7) |
+| `iter()` scan | after | 52.4M | 53.7M (1.0) | 104.9M (2.0) | 201.4M (3.8) | 386.5M (7.4) | 796.3M (15.2) |
+| `for_each` scan | before | 68.0M | 120.9M (1.8) | 206.0M (3.0) | 400.8M (5.9) | 784.4M (11.5) | 1282.3M (18.9) |
+| `for_each` scan | after | 67.8M | 120.9M (1.8) | 206.3M (3.0) | 402.9M (5.9) | 782.2M (11.5) | 1276.6M (18.8) |
+| 100-key range | before | 376k | 737k (2.0) | 1.5M (3.9) | 2.8M (7.5) | 3.9M (10.4) | 6.0M (15.9) |
+| 100-key range | after | 386k | 744k (1.9) | 1.5M (3.8) | 2.8M (7.2) | 4.0M (10.3) | 5.9M (15.4) |
+| Index lookup | before | 235k | 434k (1.8) | 757k (3.2) | 1.4M (5.8) | 1.3M (5.6) | 2.0M (8.3) |
+| Index lookup | after | 225k | 452k (2.0) | 850k (3.8) | 1.6M (6.9) | 1.8M (8.1) | 3.0M (13.3) |
+| Page of 200 rows | before | 175k | 317k (1.8) | 504k (2.9) | 759k (4.3) | 707k (4.0) | 983k (5.6) |
+| Page of 200 rows | after | 178k | 322k (1.8) | 530k (3.0) | 830k (4.7) | 719k (4.0) | 979k (5.5) |
+
+With the 16 MiB cache and no writer:
+
+| Workload | | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `get` | before | 334k | 602k (1.8) | 1.1M (3.2) | 1.9M (5.7) | 2.0M (6.1) | 2.9M (8.8) |
+| `get` | after | 330k | 626k (1.9) | 1.1M (3.3) | 1.9M (5.8) | 2.0M (6.2) | 3.0M (9.2) |
+| `iter()` scan | before | 7.6M | 12.2M (1.6) | 21.7M (2.9) | 38.8M (5.1) | 41.9M (5.5) | 70.6M (9.3) |
+| `iter()` scan | after | 7.6M | 12.2M (1.6) | 21.7M (2.9) | 38.6M (5.1) | 41.8M (5.5) | 70.5M (9.3) |
+| `for_each` scan | before | 8.0M | 12.8M (1.6) | 22.8M (2.8) | 40.7M (5.1) | 42.0M (5.2) | 73.0M (9.1) |
+| `for_each` scan | after | 8.1M | 12.8M (1.6) | 22.9M (2.8) | 40.7M (5.0) | 42.1M (5.2) | 67.2M (8.3) |
+| 100-key range | before | 55k | 96k (1.7) | 162k (2.9) | 277k (5.0) | 270k (4.9) | 398k (7.2) |
+| 100-key range | after | 54k | 95k (1.8) | 160k (3.0) | 274k (5.1) | 274k (5.1) | 385k (7.1) |
+| Index lookup | before | 14k | 24k (1.7) | 41k (2.9) | 70k (4.9) | 74k (5.2) | 107k (7.6) |
+| Index lookup | after | 14k | 24k (1.7) | 40k (2.9) | 71k (5.0) | 75k (5.3) | 113k (8.0) |
+| Page of 200 rows | before | 168k | 314k (1.9) | 524k (3.1) | 809k (4.8) | 742k (4.4) | 1.0M (6.1) |
+| Page of 200 rows | after | 175k | 319k (1.8) | 533k (3.1) | 852k (4.9) | 708k (4.1) | 1.0M (5.7) |
+
+Beside a writer, with the 1 GiB cache, gets went from 37.5M to 43.6M a second at 32 threads and
+index lookups from 1.6M to 2.3M, and with the 16 MiB cache nothing moved beyond noise. In
+`ferro-bench`'s concurrent section, eight readers beside eight writers on a 100,000-key map, reads
+went from 62M to between 67M and 70M a second in the runs least disturbed by other work.
+
+What held scaling back:
+
+- Reference counts below the pinned levels. Every get upgraded a `Weak` memo on each of its four or
+  so deeper levels and dropped the `Arc` again, two locked operations on the cache line that also
+  holds the node's `keys` and `children`. With 8 readers on one CCD a get scaled with the thread
+  count. At 16 a get pulled 1.6 lines a time from the other CCD where it had pulled none, its cycles
+  rose from 1,730 to 2,440 for the same 1,231 instructions, and each thread lost 28% of its rate. A
+  probe that read through the memo without upgrading, which is unsound under eviction, took 16
+  readers from 32M to 44M gets a second and 32 from 51M to 69M, and `for_each` scans 35 to 40%
+  higher.
+- Index lookups. A cursor holds an `Arc` per level, so each row it seeks clones the pinned nodes of
+  the first three levels again and drops them on the way back up, a few locked operations a row on
+  the 72 nodes every reader shares. Lines pulled from other cores went from 100 to 209 a lookup
+  between 1 and 8 threads, and 16 threads ran no faster than 8.
+- A `Val` per item. `iter()` over values with a destructor hands out a `Val` that holds the node's
+  column, a locked increment and decrement on a line other scanning threads write too. Two threads
+  scanning the same map pulled 1.5 lines a key and each ran at 27M keys a second against 42M alone,
+  where `for_each`, which lends the value, keeps 95% of its rate. Pages of the same 200 rows read by
+  every thread stop at about 6 times one thread for the same reason.
+- The allocator, with a cache smaller than the data. A get then decodes a node or two from the file
+  and evicts as many, and the eviction frees nodes that other threads allocated. A gperftools
+  profile at 16 threads put 31% of the time in those frees and 13% in the decode's allocations,
+  against 8% and 5% on one thread, and at 32 threads the readers spent up to a quarter of their time
+  asleep on glibc's arena locks. Preloading jemalloc took 32 threads from 2.7M to 4.2M gets a second
+  and index lookups from 89,000 to 169,000. Shard locks in the cache were under 1% of the profile.
+
+A guarded get. `epoch.rs` keeps a slot per thread, padded to its own lines, with the global epoch
+the thread saw when it pinned, or zero. `Map::walk`, which serves `get`, `contains_key`,
+`value_hash` and `nth`, `floor` and `summary_by` pin for the length of one descent, an exchange on
+the thread's own slot, and read through a `Weak` memo by reference when its node is flagged as held
+by the cache, so a get writes no shared memory at any level. A `Node` carries two flags. `cached`
+is set when a cache entry takes the node and cleared when that entry is dropped by eviction,
+replacement or `clear`; the entry's clones that `get` hands out are not owners, and the flag is
+cleared before the entry lets go of its reference. `lent` is set by the first reader that borrows
+the node. An evicted node that was never lent is freed at once, as before. One that was lent is
+retired with the epoch it was cleared at and freed once every pinned slot is at a later epoch,
+checked when a thread has retired 128 nodes or 64 KiB, and on `Store::close`, which waits for
+readers pinned before it so that retired nodes holding nested maps do not keep the file open. A
+reader stores `lent` before it reads `cached` again, and the cache clears `cached` before it reads
+`lent`, all sequentially consistent, so either the reader sees the flag cleared or the cache sees
+the loan and defers the free. Iterators and cursors still hold `Arc`s, since they live across the
+caller's code, and so does `for_each`, whose callback could hold a pin, and with it every retired
+node, for as long as it likes.
+
+The first version retired every evicted node. Gets with the 16 MiB cache fell by 44% at 16 and 32
+threads, and a profile put 40% of the time in freeing the batches of 128 cold nodes, most of them
+allocated by other threads. Retiring only lent nodes brought that back to within noise. An owner beside each
+cache entry, holding a second `Arc`, doubled the entry from 24 to 48 bytes and grew the heap per key
+by 3 to 5%; the entry now marks the copy the cache owns with a flag and gives up its value with
+`Option::take` on a hit.
+
+Index rows. `IndexIter` fetches rows through a `Finder` that keeps the last leaf it found and that
+leaf's parent. A key within the leaf's first and last keys is in that leaf or nowhere, so rows in
+key order are found in it without a descent; a key within the parent's span descends one level, and
+any other key descends from the root under the guard. Only a new leaf and parent are upgraded, so a
+scattered row takes two upgrades where the cursor took about five.
+
+Measured and left out:
+
+- Pinning every level. Pinned memos carry no hint, so a get on one thread was 38% slower, and 15%
+  faster at 32.
+- Holding the pinned levels of iterators and cursors by child index instead of by `Arc`, resolved
+  from the root when needed. Index lookups gained 18% at 16 threads and 22% at 32, but lost 26% on
+  one thread, ranges 17% and `iter()` scans 14%.
+- Prefetching the node's header and flag lines along with the hint: no faster, a get on one thread
+  3.3% slower than base where the guarded get alone was 2% slower.
+- A plain store in place of the exchange on pin, which is unsound: no faster on one thread, so the
+  fence is not what the guard costs.
+- Moving `cached` and `lent` ahead of `keys`, so that they share a line with the header a walk
+  reads anyway: no faster.
+- A per-thread read buffer in place of the 1 KiB vector each disk read allocates: within 3% either
+  way, with the 16 MiB cache and the 1 GiB one.
+- 512 cache shards sized for four times the items, against the default of 128: gets and index
+  lookups with the 16 MiB cache 11 to 18% slower.
+- Aligning the store's shared state to 128 bytes, so that the `Store` clone every iterator takes
+  does not share a line with the cache's shard table: within noise.
+
+What is left. With the 16 MiB cache the allocator still decides: the library cannot choose one, and
+the decode allocates a vector, a column and a string per value whatever the reader does. A `Val`
+for a value with a destructor costs a shared reference count per item, which `for_each` avoids but
+`iter()` cannot without lending, so scans through `iter()` and hot pages of rows scale with it.
+Each iterator still clones the store and the root, two counts every reader of a map shares, which
+holds ranges near 16 times one thread at 32. A get on one thread is 1 to 4% slower than before,
+about what the pin costs, since the same build with an unguarded walk was as fast as before.
+`iter()` scans from two threads up came out 4 to 6% slower in every build of this work, the
+unguarded ones included, and the cause is not found.
 
 ### What is left, on `examples/graph`
 
@@ -690,9 +835,10 @@ miss and nothing on a hit.
 
 Outside the bound are pinned nodes, including those the maps of a cached root pin, the `Arc`
 allocations memos keep, the column of any `Val` still held, nodes held by live snapshots and dirty
-trees, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it up to
-65,536 entries. A history walk that reads sixteen maps in every version peaks at 1.2 to 1.4 times
-the setting, mostly from those pins.
+trees, evicted nodes a guarded read may still be using, which wait in batches of up to 128 nodes or
+64 KiB a thread, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it
+up to 65,536 entries. A history walk that reads sixteen maps in every version peaks at 1.2 to 1.4
+times the setting, mostly from those pins.
 
 The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full.
 A setting carried over from before that holds about a quarter of what it did. `map_get_cold_ns` is 5.4 µs at 1 MiB and 3.8 µs at
