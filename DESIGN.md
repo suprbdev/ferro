@@ -55,7 +55,11 @@ positive in the common case, and nothing in a record depends on where it sits ex
 Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression
 runs after hashing and decompression before the hash check, so the hash covers the canonical
 body and two files with different physical compression still agree on every root hash. The
-decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
+decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating. `lz4_flex` is
+built with `safe-decode` and without `safe-encode`: the compressor is its unsafe implementation,
+unsafe code from a dependency on the write path that only ever reads bytes ferro produced, and the
+decompressor is its safe module, which forbids unsafe code, because it reads bodies from files and
+sync bundles that may be damaged or hostile.
 
 ## Deduplication
 
@@ -178,10 +182,76 @@ of several thousand entries, did that on every commit, and lost a third of its C
 closure and nearly half of its wall time to it. 256 dirty nodes are about a millisecond of work on
 one thread.
 
-Most of a 1M-key bulk load is still the per-key inserts, about 60%, which miss the CPU cache a few
-times per level, and dropping the in-memory tree after the commit, about 25%. Measured and
-rejected:
+A 1M-key bulk load of random keys then spent about 60% of its time in the per-key inserts and 25%
+dropping the in-memory tree after the commit. `ferro-bench`'s `bulk` tool times the inserts, the
+rest of the commit and, with `--split`, the drop apart, with user-space instructions counted
+through `perf_event_open`.
 
+Below the top levels an insert waited on memory three times per level: for the child's header,
+then its keys, then the line of its children, or of its slots in a leaf, that the search picked.
+A dirty link now carries a hint like a memo's, the offsets of its node's keys and of its children
+or slots. It is computed for nodes below level 3 when they are built and again when an insert
+moves their buffers, a node copied for a write starts without one, and a parent at level 3 or
+below prefetches all of it as it steps into the child, so the three arrive together. Over three
+sets of seven interleaved runs the inserts took 22 to 31% less time, for 11% more instructions.
+Ascending keys keep their path in cache, and took 1 to 5% more time for 9% more instructions,
+until new leaves and the right parts of splits started with room for eight keys instead of
+reallocating at the second and fifth: 42% fewer reallocations, inserts 1.7% faster on random keys
+and 5.7% on ascending ones, for 2 to 3% more peak RSS. A booking closure, which copies a few paths
+from the file, runs 5% more instructions and 2.5% more CPU time, about 0.3 µs.
+
+Dropping the tree freed 2.4M allocations in key order: a box and a string for each value and up to
+four for each node. Random keys leave the values in memory in an order unrelated to the keys, so
+every free missed the cache on its chunk and on the neighbours glibc merges it with. Since glibc
+2.42 every free past the per-thread cache of 16 also takes the arena lock once the process has a
+second thread, which keeps those misses from overlapping. A `Map` of 4096 keys or more that is
+dropped with a dirty root samples the fresh values on four root-to-leaf paths. If more than one
+step in five between neighbouring values goes down in memory, it walks the dirty nodes it alone
+holds breadth first, prefetching ahead, collects the values, key vectors, slot vectors, child
+vectors and nodes, sorts each by address and frees all of them in one ascending pass that merges
+the five lists, so each chunk merges with the one freed just before it. At 1M keys the drop went
+from 286 to 110 ms, and the gets, scans and ranges right after the load did not change. A tree
+built in key order, by ascending inserts or `Extend`, already frees in address order and keeps the
+plain drop.
+
+With the LZ4 change described under Commits of a few rows, a 1M-key bulk load in `bulk`, median
+of five interleaved runs on a quiet machine, went from 1,018 to 703 ms: the inserts from 649 to
+514 ms, the drop from 286 to 103 ms, and the rest of the commit stayed at 87 ms of wall time for
+7% less CPU time. Peak RSS rose from 365 to 374 MiB, and the `heap` tool's live heap after reads
+moved by at most 0.2 MiB. Ascending keys and `Extend` did not move beyond 3%. In the compare harness it went from 1.04 to 0.71 s against 0.60 s for SQLite, as
+`benchmarks/compare/RESULTS.md` describes.
+
+Measured and rejected:
+
+- Prefetching a node's keys and its children or slots after reading its header, without hints in
+  the links: inserts 12% faster for 20% more instructions, against 22 to 31% with the hints.
+- Prefetching from the hints at every level: 1 to 6% faster inserts on random keys than stopping
+  at level 3, for 8% more instructions, but ascending keys lost 6 to 8% where the gate lost 1 to
+  5%.
+- Skipping the prefetch into the last child, the one ascending keys always take: ascending keys
+  as fast as before, random keys 2.5 to 6% slower than with it.
+- Splitting a child in place for an insert, keeping its node as the left part: 12% fewer
+  allocations and almost no frees during the inserts, but no faster, for 4 to 5% more
+  instructions.
+- Linear search up to 32 keys instead of 16: inserts unchanged, gets 1.4% slower for 4.6% more
+  instructions.
+- Checking that a node is unshared with plain loads, which takes unsafe code, instead of the
+  compare-and-swap in `Arc::make_mut`: no faster in a repeated run. The samples on the swap were
+  the cache miss on the header.
+- Sorting the frees by address whatever the order: 30% slower drops after ascending inserts and
+  10 to 16% after `Extend`, since freeing every value before the vectors around it leaves holes
+  that later frees merge one by one.
+- Freeing each kind in turn, values first: 155 ms against 111, since a free often landed next to a
+  chunk of another kind freed earlier, which glibc had to unlink from wherever its bin had put it.
+- Collecting every piece into one array and sorting that: 10% slower than freeing kind by kind,
+  from sorting 60 MB of pieces.
+- A per-commit arena or bump allocation for working-tree nodes. Not built: `Arc` takes no
+  allocator on stable Rust, a global allocator is the application's choice, and the values and
+  what they own are allocated by the caller's types anyway.
+- Buffering per-key inserts to build leaves from a sorted batch. Not built: `insert` returns the
+  value it replaced and later reads in the closure must see the new one, so each insert needs its
+  lookup either way. `Extend` and `apply` already sort a batch and build or absorb it directly, in
+  about a quarter of the time of per-key inserts of 1M random keys.
 - Dropping the old tree on a background thread. It took about 300 ms off a 1M-key load, but its
   frees contend with every other allocation in the process: the gets right after the load were
   about 25% slower, reopen 0.2 ms slower, and a table loaded in 50,000-row commits up to 25%
@@ -1281,6 +1351,13 @@ in the node cache, 98.3% are read again, 61% by the very next commit, so the ins
 `heap` tool's commits and reads case ends with 154.8 MiB of live heap against 170.9 before at a
 256 MiB setting, and its other cases moved by under 1%.
 
+LZ4 compression later dropped `lz4_flex`'s `safe-encode`, which had been left out below for the
+unsafe code it brings into the write path; the decoder stays safe, as described under Records.
+Median of seven interleaved runs of `tables`, a hold, a confirm and a cancel ran 7.7, 8.8 and 9.7%
+fewer instructions outside the closure, with the same 12,208 bytes per write. CPU time there was 0
+to 4% lower across three sets of runs, not clearly beyond noise. Single-key commits ran 5 to 6%
+fewer instructions.
+
 Measured and left out:
 
 - Encoding, hashing and compressing outside the writer lock. A closure is `FnOnce` and has to run
@@ -1297,8 +1374,6 @@ Measured and left out:
 - An LZ4 block compressor of our own, with a table sized to the input and reused per thread, which
   saves `lz4_flex`'s zeroed 8 KiB table and output vector on every call. 7% more instructions per
   commit, the same CPU time over five rounds, and 0.1% more bytes.
-- `lz4_flex` without `safe-encode`: 27% fewer LZ4 instructions, 6% fewer per commit and the same
-  bytes, but it brings unsafe code into the write path.
 - No LZ4 under 128 or 192 bytes: 2 or 5% fewer instructions for 0.35 or 1.2% more bytes, and CPU
   time within noise. Bodies under 128 bytes compressed in 53 to 70% of cases, saving 11 to 16% of
   their bytes.

@@ -708,7 +708,7 @@ coalesced writers of eight on a machine shared with other jobs, and the booking 
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 1.1 s |
+| Bulk insert in one commit | 0.69 s |
 | Random `get` | 0.34 µs |
 | Full scan | 22 ns per key |
 | Range read | 33 ns per key |
@@ -719,23 +719,24 @@ coalesced writers of eight on a machine shared with other jobs, and the booking 
 | Single-key commit, `Durability::Buffered` | 27 µs |
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.5 µs per changed key |
-| Booking hold commit, `Durability::Buffered` | 85 µs of CPU, 13 µs of it in the closure |
-| Booking confirm commit, `Durability::Buffered` | 97 µs of CPU, 12 µs of it in the closure |
+| Booking hold commit, `Durability::Buffered` | 82 µs of CPU, 13 µs of it in the closure |
+| Booking confirm commit, `Durability::Buffered` | 93 µs of CPU, 12 µs of it in the closure |
 
 Against other embedded stores on the same workload, with 1 GiB of cache each, medians of five runs
 of 3 rounds on a machine shared with other jobs:
 
 | Engine | Get | Scan | Durable commit | 8 writers, commits/s | File size |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ferro | 0.35 µs | 23 ns | 0.43 ms | 8,592 | 23 MiB |
-| redb | 0.31 µs | 51 ns | 0.45 ms | 2,132 | 65 MiB |
-| SQLite, `synchronous=FULL` | 1.23 µs | 58 ns | 0.58 ms | 979 | 57 MiB |
-| fjall | 1.42 µs | 97 ns | 0.54 ms | 1,930 | 64 MiB |
+| ferro | 0.32 µs | 20 ns | 0.41 ms | 9,094 | 23 MiB |
+| redb | 0.27 µs | 49 ns | 0.43 ms | 2,263 | 65 MiB |
+| SQLite, `synchronous=FULL` | 0.87 µs | 50 ns | 0.48 ms | 1,085 | 57 MiB |
+| fjall | 1.21 µs | 79 ns | 0.51 ms | 1,957 | 64 MiB |
 
 ferro keeps every version and re-hashes objects as it reads them, and the others do neither.
-SQLite bulk loads about 1.6 times faster and fjall about 8% faster, and redb's `get` is about 10%
-faster. These numbers come from a warm cache, on a workload with few overwrites. Full results,
-including caveats about sled, are in `benchmarks/compare/RESULTS.md`.
+SQLite bulk loads about 1.2 times faster, 0.59 s against 0.70 s, while fjall takes 1.4 times as
+long as ferro and redb 1.9 times, and redb's `get` is about 15% faster. These numbers come from a
+warm cache, on a workload with few overwrites. Full results, including caveats about sled, are in
+`benchmarks/compare/RESULTS.md`.
 
 ## Limitations
 
