@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use crate::admin::Keep;
@@ -157,6 +158,35 @@ impl Chain {
             above: u64::MAX,
             first: self.first,
         }
+    }
+
+    pub(crate) fn walk_down(&self, store: &Store, to: u64, floor: u64) -> Result<Walk> {
+        let next = if to == self.last {
+            self.tip
+        } else {
+            self.pointer_to(store, to)?
+        };
+        Ok(Walk {
+            store: store.clone(),
+            next,
+            above: u64::MAX,
+            first: floor,
+        })
+    }
+
+    pub(crate) fn retained(&self, versions: &impl RangeBounds<u64>) -> Option<(u64, u64)> {
+        let from = match versions.start_bound() {
+            Bound::Included(version) => *version,
+            Bound::Excluded(version) => version.checked_add(1)?,
+            Bound::Unbounded => 0,
+        };
+        let to = match versions.end_bound() {
+            Bound::Included(version) => *version,
+            Bound::Excluded(version) => version.checked_sub(1)?,
+            Bound::Unbounded => u64::MAX,
+        };
+        let (from, to) = (from.max(self.first), to.min(self.last));
+        (self.tip.is_some() && from <= to).then_some((from, to))
     }
 
     fn first_since(&self, store: &Store, time_ms: u64) -> Result<u64> {

@@ -1,36 +1,48 @@
-use std::mem;
 use std::sync::Arc;
 
 use crate::codec::Data;
 use crate::db::Commit;
 use crate::error::{Error, Result};
-use crate::log::Walk;
+use crate::log::{Chain, Walk};
 use crate::map::fatal;
 use crate::store::Store;
 
 pub struct History<T, V, F> {
-    walk: Walk,
+    chain: Chain,
+    pending: Option<(u64, u64)>,
+    floor: u64,
+    walk: Option<Walk>,
     store: Store,
     genesis: Option<Arc<T>>,
     project: F,
     run: Option<(Arc<Commit>, V)>,
-    started: bool,
 }
 
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
-    pub(crate) fn new(walk: Walk, store: Store, genesis: Option<Arc<T>>, project: F) -> Self {
+    pub(crate) fn new(
+        chain: Chain,
+        bounds: Option<(u64, u64)>,
+        store: Store,
+        genesis: Option<Arc<T>>,
+        project: F,
+    ) -> Self {
         History {
-            walk,
+            chain,
+            pending: bounds,
+            floor: bounds.map_or(0, |(from, _)| from),
+            walk: None,
             store,
             genesis,
             project,
             run: None,
-            started: false,
         }
     }
 
     fn older(&mut self) -> Result<Option<(Arc<Commit>, V)>> {
-        let Some(entry) = self.walk.step()? else {
+        let Some(walk) = &mut self.walk else {
+            return Ok(None);
+        };
+        let Some(entry) = walk.step()? else {
             return Ok(None);
         };
         let version = entry.commit.version;
@@ -40,7 +52,9 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
     }
 
     pub fn try_next(&mut self) -> Result<Option<(Commit, V)>> {
-        if !mem::replace(&mut self.started, true) {
+        if let Some((from, to)) = self.pending.take() {
+            let baseline = from.saturating_sub(1).max(self.chain.first);
+            self.walk = Some(self.chain.walk_down(&self.store, to, baseline)?);
             self.run = self.older()?;
         }
         let Some((mut commit, value)) = self.run.take() else {
@@ -52,6 +66,9 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
                 return Ok(Some((Arc::unwrap_or_clone(commit), value)));
             }
             commit = older;
+        }
+        if commit.version < self.floor {
+            return Ok(None);
         }
         let unchanged = match &self.genesis {
             Some(genesis) => (self.project)(genesis) == value,

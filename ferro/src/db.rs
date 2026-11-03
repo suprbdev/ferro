@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::mem;
-use std::ops::Deref;
+use std::ops::{Deref, RangeBounds};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -181,6 +181,33 @@ struct State<T> {
     snapshot: Snapshot<T>,
     log: Chain,
     store: Store,
+}
+
+impl<T: Data> State<T> {
+    fn root_at(&self, version: u64) -> Result<Arc<T>> {
+        let entry = self.log.get(&self.store, version)?;
+        let root = entry.and_then(|entry| entry.commit.root);
+        self.store.load::<T>(root.ok_or(Error::NoVersion(version))?)
+    }
+}
+
+fn changes_between<V: PartialEq>(
+    low: (u64, &V),
+    high: (u64, &V),
+    value_at: &impl Fn(u64) -> Result<V>,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    if low.1 == high.1 {
+        return Ok(());
+    }
+    if high.0 == low.0 + 1 {
+        out.push(high.0);
+        return Ok(());
+    }
+    let middle = low.0 + (high.0 - low.0) / 2;
+    let value = value_at(middle)?;
+    changes_between(low, (middle, &value), value_at, out)?;
+    changes_between((middle, &value), high, value_at, out)
 }
 
 struct Intent<T> {
@@ -1100,9 +1127,78 @@ impl<T: Data> Db<T> {
         V: PartialEq,
         F: Fn(&T) -> V,
     {
+        self.history_of_range(.., project)
+    }
+
+    pub fn history_of_range<V, F>(
+        &self,
+        versions: impl RangeBounds<u64>,
+        project: F,
+    ) -> History<T, V, F>
+    where
+        V: PartialEq,
+        F: Fn(&T) -> V,
+    {
         let state = self.branch.state.load();
         let genesis = (state.log.first == 1).then(|| self.shared.genesis.clone());
-        History::new(state.log.walk(&state.store), state.store.clone(), genesis, project)
+        let bounds = state.log.retained(&versions);
+        History::new(state.log, bounds, state.store.clone(), genesis, project)
+    }
+
+    pub fn bisect(
+        &self,
+        versions: impl RangeBounds<u64>,
+        test: impl Fn(&T) -> bool,
+    ) -> Result<Option<u64>> {
+        let state = self.branch.state.load_full();
+        let Some((mut low, mut high)) = state.log.retained(&versions) else {
+            return Ok(None);
+        };
+        if !test(&*state.root_at(high)?) {
+            return Ok(None);
+        }
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if test(&*state.root_at(middle)?) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok(Some(low))
+    }
+
+    pub fn bisect_changes<V: PartialEq>(
+        &self,
+        versions: impl RangeBounds<u64>,
+        project: impl Fn(&T) -> V,
+    ) -> Result<Vec<(Commit, V)>> {
+        let state = self.branch.state.load_full();
+        let Some((from, to)) = state.log.retained(&versions) else {
+            return Ok(Vec::new());
+        };
+        let value_at = |version: u64| -> Result<V> { Ok(project(&*state.root_at(version)?)) };
+        let mut changed = Vec::new();
+        let high = (to, value_at(to)?);
+        if from == 1 || from > state.log.first {
+            let before = if from == 1 {
+                project(&self.shared.genesis)
+            } else {
+                value_at(from - 1)?
+            };
+            changes_between((from - 1, &before), (to, &high.1), &value_at, &mut changed)?;
+        } else {
+            changed.push(from);
+            changes_between((from, &value_at(from)?), (to, &high.1), &value_at, &mut changed)?;
+        }
+        changed
+            .into_iter()
+            .map(|version| {
+                let entry = state.log.get(&state.store, version)?;
+                let entry = entry.ok_or(Error::NoVersion(version))?;
+                Ok(((*entry.commit).clone(), value_at(version)?))
+            })
+            .collect()
     }
 
     pub fn merge_with<R, S: Into<String>>(
