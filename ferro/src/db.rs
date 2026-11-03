@@ -1364,7 +1364,14 @@ impl<T: Data> Db<T> {
     }
 
     pub fn watch(&self) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone())
+        Watcher::new(self.branch.feed.clone(), None)
+    }
+
+    pub fn watch_when(
+        &self,
+        test: impl Fn(&Snapshot<T>) -> bool + Send + Sync + 'static,
+    ) -> Watcher<T> {
+        Watcher::new(self.branch.feed.clone(), Some(Box::new(test)))
     }
 
     pub fn refresh(&self) -> Result<bool> {

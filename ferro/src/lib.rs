@@ -26,4 +26,4 @@ pub use map::{Change, Conflict, Cursor, Map, Summary, Val};
 pub use set::Set;
 pub use store::Durability;
 pub use table::{Record, RowMut, Table, TableData, Taken};
-pub use watch::Watcher;
+pub use watch::{Closer, Watcher};
