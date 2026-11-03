@@ -2244,3 +2244,61 @@ fn a_remote_landed_again_after_a_drop_keeps_the_links_it_landed_with() {
     c.verify_typed().unwrap();
     assert_eq!(c.branch("a").unwrap().head_hash(), landed);
 }
+
+#[test]
+fn a_reader_verifies_a_remote_landed_again_after_a_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str, keep: Keep| -> Db<Events> {
+        fast()
+            .history(keep)
+            .reclaim(Reclaim { every_bytes: 0 })
+            .open(dir.path().join(name))
+            .unwrap()
+    };
+    let (a, b) = (open("a.ferro", Keep::All), open("b.ferro", Keep::Last(2)));
+    let reader: Db<Events> = Options::new().read_only().open(dir.path().join("a.ferro")).unwrap();
+    event(&b, 0);
+    assert_eq!(a.pull(&b, "b", add_deltas).unwrap().outcome, Outcome::FastForward);
+    for next in 1..4 {
+        event(&b, next);
+    }
+    assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+    a.compact(Keep::All).unwrap();
+    reader.refresh().unwrap();
+    reader.verify().unwrap();
+    a.drop_branch("b").unwrap();
+    assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+    a.verify().unwrap();
+    reader.refresh().unwrap();
+    reader.verify().unwrap();
+    reader.verify_typed().unwrap();
+}
+
+#[test]
+fn a_writer_with_a_small_cache_verifies_a_remote_landed_again_after_a_drop() {
+    for cache in (1..=64).map(|step| step * 256) {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str, keep: Keep, cache: u64| -> Db<Events> {
+            fast()
+                .cache_bytes(cache)
+                .history(keep)
+                .reclaim(Reclaim { every_bytes: 0 })
+                .open(dir.path().join(name))
+                .unwrap()
+        };
+        let a = open("a.ferro", Keep::All, cache);
+        let b = open("b.ferro", Keep::Last(2), 1 << 20);
+        event(&b, 0);
+        assert_eq!(a.pull(&b, "b", add_deltas).unwrap().outcome, Outcome::FastForward);
+        for next in 1..4 {
+            event(&b, next);
+        }
+        assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+        a.compact(Keep::All).unwrap();
+        a.verify().unwrap();
+        a.drop_branch("b").unwrap();
+        assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+        a.verify().unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
+        a.verify_typed().unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
+    }
+}

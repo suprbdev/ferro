@@ -2090,6 +2090,35 @@ record's parent link stops. That throws away history the bundle brought, here v2
 find the existing record, which for a commit held only in a merge's history takes an index from hash
 to offset that `ferro` does not keep.
 
+The node cache, which is keyed by hash, kept the same confusion for every handle that had not just
+written the table (#39). A read-only handle that had loaded the table before the drop held decodes
+of the table object and its node, and `refresh` after the second landing took them for the new
+table's, which hash the same. Its branches started from the copy the old table named while the
+table on disk named the new one, so `verify` and `verify_typed` failed on the same offset 0, and
+stayed wrong while those decodes stayed cached. The writer was right only because the decodes it
+remembers for the nodes it writes replace the old ones under their hash. It does not remember the
+table object, so with a small cache, a `verify` that found the old table object still cached after
+the remembered node had been evicted read the old node through it. With `cache_bytes` at every
+multiple of 256 bytes up to 16 KiB, some size failed that way in each of 20 runs.
+
+So the rule that served entries now covers every decode whose meaning depends on the offsets in its
+links: a cached decode serves only the record it was decoded from. `Data::LOCATED`, a hidden
+constant that defaults to false, marks such a type. `Entry` and `Head` set it, since they link
+entries, and a `Map` takes it from its keys and values, which covers the branch table's object, its
+nodes and a head stored as its own object. `Store::load` caches a marked value with the offset it
+was decoded from, as it did for entries, and a map node already keeps the pointer it was decoded
+from as its `origin`, so `fetch_node` compares that for a map of marked values. A hit for another
+copy decodes the record without caching it, which costs a read only where an object is stored
+twice. The constant is known at compile time, so every other map and value compiles to the lookup it
+had before. In `bench-reads`, eight runs alternating with the build before, the medians moved by
+-0.3 to +2.2% for random gets, -2.3 to -0.2% for sorted gets, -2.4 to +0.1% for cold scans and
+-1.8 to +1.5% for `for` scans, inside a spread between runs of up to 18% for random gets.
+
+Keying the cache by hash and offset separates the copies too, but every lookup would hash a longer
+key, and copies of an ordinary tree node, which are interchangeable, would stop sharing a decode.
+Resolving links by hash when they are followed needs the index from hash to offset that `ferro`
+does not keep.
+
 ### Checking trees
 
 A `Map` decodes lazily, so decoding a root as `T` says nothing about the nodes under it. A bundle

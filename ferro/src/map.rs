@@ -789,7 +789,11 @@ fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetc
         }
         Ok(node)
     };
-    store.fetch(ptr, decode, Node::weight)
+    let (node, cached) = store.fetch(ptr, decode, Node::weight)?;
+    if (K::LOCATED || V::LOCATED) && node.origin != Some(ptr) {
+        return Ok((Arc::new(store.decode_at(ptr, decode)?), false));
+    }
+    Ok((node, cached))
 }
 
 fn admit<K, V, S>(node: &Node<K, V, S>, count: u64, ceiling: u8) -> Result<()> {
@@ -3110,6 +3114,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
+    const LOCATED: bool = K::LOCATED || V::LOCATED;
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         let target = w.store_id();
         let foreign =

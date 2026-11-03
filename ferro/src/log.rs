@@ -4,10 +4,10 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use crate::admin::Keep;
-use crate::codec::{ARC_HEADER, Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::{Commit, Parts, now_ms};
 use crate::error::{Error, Result};
-use crate::store::{Store, heap_weight};
+use crate::store::Store;
 
 const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
@@ -56,35 +56,13 @@ impl Entry {
     }
 
     pub(crate) fn load(store: &Store, ptr: Ptr) -> Result<Arc<Entry>> {
-        let offset = ptr.offset;
-        let (found, _) = store.fetch(
-            ptr,
-            |decoder| {
-                Ok(Located {
-                    offset,
-                    entry: Arc::new(Entry::decode(decoder)?),
-                })
-            },
-            |_, body, heap| {
-                let fixed = 2 * ARC_HEADER + size_of::<Located>() + size_of::<Entry>();
-                heap_weight(fixed, body.max(heap))
-            },
-        )?;
-        if found.offset == offset {
-            return Ok(found.entry.clone());
-        }
-        let object = store.read_object(ptr)?;
-        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
-        Ok(Arc::new(entry))
+        store.load(ptr)
     }
 }
 
-struct Located {
-    offset: u64,
-    entry: Arc<Entry>,
-}
-
 impl Data for Entry {
+    const LOCATED: bool = true;
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.commit.encode(w)?;
         let parts = match &self.commit.parts {

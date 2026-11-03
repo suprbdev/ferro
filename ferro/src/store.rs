@@ -104,6 +104,11 @@ struct CacheEntry {
     weight: u32,
 }
 
+struct Located<T> {
+    offset: u64,
+    value: Arc<T>,
+}
+
 #[derive(Clone)]
 struct EntryWeight;
 
@@ -1040,12 +1045,44 @@ impl Store {
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
+        if T::LOCATED {
+            return self.load_located(ptr);
+        }
         let (value, _) = self.fetch(
             ptr,
             |decoder| T::decode(decoder),
             |_, body, heap| heap_weight(ARC_HEADER + size_of::<T>(), body.max(heap)),
         )?;
         Ok(value)
+    }
+
+    fn load_located<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
+        let (found, _) = self.fetch(
+            ptr,
+            |decoder| {
+                Ok(Located {
+                    offset: ptr.offset,
+                    value: Arc::new(T::decode(decoder)?),
+                })
+            },
+            |_, body, heap| {
+                let fixed = 2 * ARC_HEADER + size_of::<Located<T>>() + size_of::<T>();
+                heap_weight(fixed, body.max(heap))
+            },
+        )?;
+        if found.offset == ptr.offset {
+            return Ok(found.value.clone());
+        }
+        Ok(Arc::new(self.decode_at(ptr, T::decode)?))
+    }
+
+    pub(crate) fn decode_at<T>(
+        &self,
+        ptr: Ptr,
+        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let object = self.read_object(ptr)?;
+        decode(&mut Decoder::new(&object.body, &object.links, Some(self)))
     }
 
     pub fn begin(&self) -> Result<Txn> {

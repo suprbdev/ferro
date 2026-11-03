@@ -117,6 +117,8 @@ impl Sink for HashSink {
 }
 
 pub trait Data: Clone + Send + Sync + 'static {
+    #[doc(hidden)]
+    const LOCATED: bool = false;
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()>;
     fn decode(r: &mut Decoder<'_>) -> Result<Self>;
     fn visit(r: &mut Decoder<'_>) -> Result<()> {

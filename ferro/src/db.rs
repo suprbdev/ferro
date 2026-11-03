@@ -197,6 +197,8 @@ fn encode_link(w: &mut Encoder<'_>, link: Option<Ptr>) {
 }
 
 impl Data for Head {
+    const LOCATED: bool = true;
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.version.encode(w)?;
         self.log.first.encode(w)?;
