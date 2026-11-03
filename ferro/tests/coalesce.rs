@@ -243,6 +243,42 @@ fn closures_queued_behind_a_sync_share_one_version() {
 }
 
 #[test]
+fn multi_line_messages_stay_whole_alone_and_in_a_group() {
+    let _turn = serial();
+    let (_dir, path, db) = database();
+    db.commit("alone\nsecond line", increment).unwrap();
+    assert_eq!(db.version(), 2);
+    let alone: Vec<String> = db.read().commit().messages().map(str::to_string).collect();
+    assert_eq!(alone, vec!["alone\nsecond line".to_string()]);
+    let ran = Ran::new();
+    let leader = stall_leader(&db, &ran);
+    let names = ["one\ntwo", "three", "four\n\nfive\n", "\nsix"];
+    let followers: Vec<_> = names.iter().map(|name| bump(&db, &ran, name.to_string())).collect();
+    ran.reach(names.len() + 1);
+    settle_queue();
+    release(false);
+    leader.join().unwrap().unwrap();
+    for follower in followers {
+        assert_eq!(follower.join().unwrap().unwrap().version, 4);
+    }
+    let read = |db: &Db<Root>| {
+        let log = db.log();
+        let mut group: Vec<String> = log.get(&4).unwrap().messages().map(str::to_string).collect();
+        group.sort_unstable();
+        let alone: Vec<String> = log.get(&2).unwrap().messages().map(str::to_string).collect();
+        (alone, group)
+    };
+    let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    expected.sort_unstable();
+    assert_eq!(read(&db), (vec!["alone\nsecond line".to_string()], expected.clone()));
+    let message = db.log().get(&4).unwrap().message.clone();
+    assert_eq!(message.matches('\n').count(), 8);
+    drop(db);
+    let reopened = Options::new().open::<Root>(&path).unwrap();
+    assert_eq!(read(&reopened), (vec!["alone\nsecond line".to_string()], expected));
+}
+
+#[test]
 fn without_the_option_closures_keep_a_version_each() {
     let _turn = serial();
     let dir = on_disk();

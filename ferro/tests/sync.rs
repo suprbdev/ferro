@@ -13,7 +13,7 @@ use common::{Rng, cases, fast, text};
 use ferro::codec::{Encoder, HashSink, Object};
 use ferro::store::{Op, Trace};
 use ferro::{
-    Bundle, Commit, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Snapshot,
+    Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Snapshot,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -1005,16 +1005,13 @@ fn object_of<D: Data>(value: &D) -> Object {
 }
 
 fn entry_of(version: u64, root: &Object, prev: Option<Ptr>, skip: Option<Ptr>) -> Object {
-    let commit = Commit {
-        version,
-        time_ms: version,
-        message: String::new(),
-        root: Some(link_to(root)),
-        restored: None,
-    };
     let mut sink = HashSink;
     let mut encoder = Encoder::new(&mut sink);
-    commit.encode(&mut encoder).unwrap();
+    version.encode(&mut encoder).unwrap();
+    version.encode(&mut encoder).unwrap();
+    String::new().encode(&mut encoder).unwrap();
+    Some(link_to(root)).encode(&mut encoder).unwrap();
+    None::<u64>.encode(&mut encoder).unwrap();
     encoder.u8(u8::from(prev.is_some()) + 2 * u8::from(skip.is_some()));
     for chained in prev.into_iter().chain(skip) {
         encoder.link(chained);

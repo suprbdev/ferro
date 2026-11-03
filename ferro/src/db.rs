@@ -35,6 +35,46 @@ pub struct Commit {
     pub message: String,
     pub root: Option<Ptr>,
     pub restored: Option<u64>,
+    pub(crate) parts: Parts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Parts {
+    Lines,
+    Whole,
+    Joined(Arc<[usize]>),
+}
+
+impl Parts {
+    pub(crate) fn join(messages: Vec<String>) -> (String, Parts) {
+        if messages.len() < 2 {
+            return (messages.into_iter().next().unwrap_or_default(), Parts::Whole);
+        }
+        let lengths = messages.iter().map(String::len).collect();
+        (messages.join("\n"), Parts::Joined(lengths))
+    }
+
+    pub(crate) fn check(&self, message: &str) -> Result<()> {
+        let Parts::Joined(lengths) = self else {
+            return Ok(());
+        };
+        let mut start = 0usize;
+        for (index, len) in lengths.iter().enumerate() {
+            let end = start
+                .checked_add(*len)
+                .filter(|end| *end <= message.len() && message.is_char_boundary(*end))
+                .ok_or_else(|| Error::Decode("commit message parts overrun".into()))?;
+            let last = index + 1 == lengths.len();
+            if last != (end == message.len()) || (!last && message.as_bytes()[end] != b'\n') {
+                return Err(Error::Decode("commit message parts do not match".into()));
+            }
+            start = end + 1;
+        }
+        if lengths.len() < 2 {
+            return Err(Error::Decode("a joined commit message needs two parts".into()));
+        }
+        Ok(())
+    }
 }
 
 impl PartialEq for Commit {
@@ -42,6 +82,7 @@ impl PartialEq for Commit {
         self.version == other.version
             && self.time_ms == other.time_ms
             && self.message == other.message
+            && self.parts == other.parts
             && self.restored == other.restored
             && self.root.map(|ptr| ptr.hash) == other.root.map(|ptr| ptr.hash)
     }
@@ -49,7 +90,23 @@ impl PartialEq for Commit {
 
 impl Commit {
     pub fn messages(&self) -> impl Iterator<Item = &str> {
-        self.message.split('\n').filter(|message| !message.is_empty())
+        let messages: Vec<&str> = match &self.parts {
+            Parts::Lines => self.message.split('\n').filter(|line| !line.is_empty()).collect(),
+            Parts::Whole if self.message.is_empty() => Vec::new(),
+            Parts::Whole => vec![self.message.as_str()],
+            Parts::Joined(lengths) => {
+                let mut start = 0;
+                lengths
+                    .iter()
+                    .map(|len| {
+                        let message = &self.message[start..start + len];
+                        start += len + 1;
+                        message
+                    })
+                    .collect()
+            }
+        };
+        messages.into_iter()
     }
 
     fn genesis() -> Self {
@@ -59,6 +116,7 @@ impl Commit {
             message: String::new(),
             root: None,
             restored: None,
+            parts: Parts::Whole,
         }
     }
 }
@@ -86,6 +144,7 @@ impl Data for Commit {
             message: String::decode(r)?,
             root: Option::<Ptr>::decode(r)?,
             restored: Option::<u64>::decode(r)?,
+            parts: Parts::Lines,
         })
     }
 }
@@ -225,6 +284,7 @@ struct Change<'a, T> {
     state: &'a State<T>,
     working: &'a T,
     message: String,
+    parts: Parts,
     intent: Intent<T>,
     seal: Option<&'a Arc<Seal>>,
 }
@@ -725,7 +785,7 @@ impl<T: Data> Shared<T> {
             seal,
             ..
         } = group;
-        let message = messages.join("\n");
+        let (message, parts) = Parts::join(messages);
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
             self.commit_locked(
                 tip,
@@ -734,6 +794,7 @@ impl<T: Data> Shared<T> {
                     state: &state,
                     working: &working,
                     message,
+                    parts,
                     intent: Intent::default(),
                     seal: Some(&seal),
                 },
@@ -931,6 +992,7 @@ impl<T: Data> Shared<T> {
             state,
             working,
             message,
+            parts,
             intent,
             seal,
         } = change;
@@ -962,6 +1024,7 @@ impl<T: Data> Shared<T> {
             message,
             root: Some(root),
             restored: intent.restored,
+            parts,
         };
         let log = state.log.append(store, &mut txn, commit)?;
         let log = match self.history {
@@ -1319,6 +1382,7 @@ impl<T: Data> Db<T> {
                 state: &state,
                 working: &working,
                 message,
+                parts: Parts::Whole,
                 intent,
                 seal: None,
             };

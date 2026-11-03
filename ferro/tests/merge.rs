@@ -52,6 +52,25 @@ fn commit_with_takes_the_message_from_the_closure_and_reports_outcome() {
 }
 
 #[test]
+fn a_multi_line_message_is_one_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    {
+        let db = Db::<Board>::open(&path).unwrap();
+        db.commit("title\n\nbody line\n", |b| b.tasks.insert(task(1, None, "open", &[])))
+            .unwrap();
+        db.commit("", |b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+        assert_eq!(db.read().commit().messages().count(), 0);
+    }
+    let db = Db::<Board>::open(&path).unwrap();
+    let log = db.log();
+    let first = log.get(&1).unwrap();
+    assert_eq!(first.message, "title\n\nbody line\n");
+    assert_eq!(first.messages().collect::<Vec<_>>(), vec!["title\n\nbody line\n"]);
+    assert_eq!(log.get(&2).unwrap().messages().count(), 0);
+}
+
+#[test]
 fn restore_records_its_source_and_reports_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);

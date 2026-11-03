@@ -700,8 +700,12 @@ every closure:
 
 - A version is a group. `Committed::version` is the group's, so several closures can return the same
   one. `at` cannot show the state between two closures of a group, because it was never written.
-- `Commit::message` holds the group's messages, one per line, and `Commit::messages` lists them.
-  This needs no format change, and a commit made alone reads as it always did.
+- `Commit::message` holds the group's messages joined by newlines, and `Commit::messages` lists
+  them. A message may contain newlines itself, so the log entry records where each one ends: one
+  flag bit marks a commit made alone, whose message is one message whatever it contains, and
+  another marks a group, followed by the byte length of each message. Entries written before
+  these bits existed have neither, and `messages` splits them on newlines as it always did, which
+  is the only reading they allow.
 - `history_of` and `Log` see groups. A row changed twice in a group shows once, with its last value,
   and a change undone inside a group does not show at all.
 - Closures still run in order, each seeing what the ones before it did.

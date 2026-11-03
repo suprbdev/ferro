@@ -403,9 +403,10 @@ at 50 µs and 8 writers it lost 16% of its throughput. See `DESIGN.md`.
 
 What you give up is a version per closure. `Committed::version` is the group's, `at` cannot show
 the state between two closures of a group, and `history_of` reports the group's net change once.
-The commit's `message` holds every closure's message, one per line, and `messages()` lists them.
-`changed` says the group made a new version, so a closure that changed nothing reports `true` if
-another closure in its group did. If the group cannot be written, every closure in it gets
+The commit's `message` holds every closure's message joined by newlines, and `messages()` lists
+them, each whole even if it has newlines of its own. `changed` says the group made a new version,
+so a closure that changed nothing reports `true` if another closure in its group did. If the
+group cannot be written, every closure in it gets
 `Error::GroupFailed`. `restore` and `merge_with` always commit alone, and a writer alone behaves as
 without the option. `examples/queue` uses it.
 

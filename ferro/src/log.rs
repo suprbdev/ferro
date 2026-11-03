@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
-use crate::db::{Commit, now_ms};
+use crate::db::{Commit, Parts, now_ms};
 use crate::error::{Error, Result};
 use crate::store::Store;
 
 const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
+const WHOLE: u8 = 4;
+const JOINED: u8 = 8;
+const KNOWN: u8 = HAS_PREV | HAS_SKIP | WHOLE | JOINED;
 
 #[derive(Clone)]
 pub(crate) struct Entry {
@@ -21,8 +24,19 @@ pub(crate) struct Entry {
 impl Data for Entry {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.commit.encode(w)?;
+        let parts = match &self.commit.parts {
+            Parts::Lines => 0,
+            Parts::Whole => WHOLE,
+            Parts::Joined(_) => JOINED,
+        };
         let flags = u8::from(self.prev.is_some()) * HAS_PREV + u8::from(self.skip.is_some()) * HAS_SKIP;
-        w.u8(flags);
+        w.u8(flags | parts);
+        if let Parts::Joined(lengths) = &self.commit.parts {
+            w.varint(lengths.len() as u64);
+            for len in lengths.iter() {
+                w.varint(*len as u64);
+            }
+        }
         if let Some(prev) = self.prev {
             w.link(prev);
         }
@@ -33,14 +47,32 @@ impl Data for Entry {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let commit = Arc::new(Commit::decode(r)?);
+        let mut commit = Commit::decode(r)?;
         let flags = r.u8()?;
-        if flags & !(HAS_PREV | HAS_SKIP) != 0 {
+        if flags & !KNOWN != 0 || flags & (WHOLE | JOINED) == WHOLE | JOINED {
             return Err(Error::Decode(format!("invalid log entry flags {flags}")));
+        }
+        if flags & WHOLE != 0 {
+            commit.parts = Parts::Whole;
+        }
+        if flags & JOINED != 0 {
+            let count = r.varint()?;
+            if count > commit.message.len() as u64 + 1 {
+                return Err(Error::Decode(format!("{count} parts in a short commit message")));
+            }
+            let lengths = (0..count)
+                .map(|_| Ok(usize::try_from(r.varint()?).unwrap_or(usize::MAX)))
+                .collect::<Result<_>>()?;
+            commit.parts = Parts::Joined(lengths);
+            commit.parts.check(&commit.message)?;
         }
         let prev = if flags & HAS_PREV != 0 { Some(r.link()?) } else { None };
         let skip = if flags & HAS_SKIP != 0 { Some(r.link()?) } else { None };
-        Ok(Entry { commit, prev, skip })
+        Ok(Entry {
+            commit: Arc::new(commit),
+            prev,
+            skip,
+        })
     }
 }
 
