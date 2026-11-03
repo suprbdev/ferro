@@ -24,7 +24,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -33,5 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.92.0
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --release -- -D warnings
       - run: cargo test --release -p ferro --no-fail-fast
