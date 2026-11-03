@@ -1,0 +1,282 @@
+# The read path
+
+How a get, a scan, a range and a cursor find their entries, and what each costs. Reads from many
+threads at once, the epoch scheme and the node cache's weight are in [Reading from many
+threads](read-scaling.md).
+
+## Where a get spends its time
+
+A warm get at 1M keys walks about seven levels, and nearly all of its time is CPU cache misses, not
+logic. One node cache lookup per level was 55% of the get. Reference counts on nodes near the root,
+written by every reader, held eight readers to about 10M reads a second. At 10,000 keys, which fit
+in L2, a scan costs 2 ns a key and a get 67 ns. At 1M keys the same code costs 6 to 8 ns and 240 to
+340 ns, so memory, not instructions, is what the read path has to save.
+
+## Memos
+
+So each `Link::Stored` carries a write-once memo of the node it points at, in a `OnceLock`:
+
+- The first `PIN_DEPTH` (3) levels of a tree memoize a strong `Arc`. `Map::walk` follows those by
+  reference and writes no shared memory, which took eight readers from 9M to 60M reads a second. A
+  fourth level added nothing. A `Map` pins about 73 nodes whatever its size, outside `cache_bytes`,
+  until the `Map` is dropped.
+- Deeper links memoize a `Weak` when the child was found in the cache, or when `flush` wrote it
+  beside a sibling, as described below. The cache stays the owner, so eviction still frees the node,
+  and the memo keeps only the node's `Arc` allocation, about 150 bytes, until its parent goes. A
+  child just read from disk is not memoized, so a one-off read leaves nothing behind. A get reads
+  through these memos without upgrading them, under an epoch guard, as described under [Reading from
+  many threads](read-scaling.md#guarded-gets-and-the-epoch-scheme).
+- A memo is never replaced. Once its child is evicted the link falls back to the cache, whose `get`
+  restores the recency that memo hits skip, so eviction keeps seeing nodes that are really in use. A
+  replaceable `ArcSwap` memo made cold gets 44% slower, because a small cache evicts constantly and
+  each `ArcSwap` store has to settle with every reader thread.
+
+A memo holds only what a load for that link's own `Ptr` returned, and the cache is keyed by the full
+hash, so a damaged link still fails its hash check whatever else is cached. `Link::clone` starts
+with an empty memo, since copying one touches the child's header, a cache miss per link that slowed
+`diff` by 45%. Only `Map::clone` keeps its root's memo.
+
+## Node layout
+
+Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row of `Link::Empty`.
+`Node::child` reads through that and `Node::children_mut` fills it in when a leaf gains a child.
+This cut peak RSS by 28% and bulk load time by 4 to 14%. `Node` is `repr(C)` with `keys` and
+`children` first, so the first cache line of its allocation holds both pointers a walk follows,
+which took 12% off `contains_key` and 6% off `get`.
+
+## Prefetching the next level
+
+Memos took the cache lookups out of a get and left the misses. Below the pinned levels a get still
+waited, level after level, for the link, then the node header that `Weak::upgrade` reads, then the
+key array behind that header, and then the link its search picked. A `Weak` memo now also carries
+a `Hint`: where its node keeps its keys and, for an interior node, its child links, or for a leaf
+its value column, as two 32 bit offsets from the node with a count of cache lines in their low
+four bits. `reach` prefetches those lines before it upgrades, so the header, the keys and the
+links of the next level arrive together, and a get waits about once a level instead of three
+times. The offsets fit beside the `Weak` in space the enum already had, so `Memo` is still 16
+bytes and `Link` 72. A hint comes from a live node, and once that node is evicted a stale hint
+prefetches a line nobody wants and nothing more, since a prefetch never faults. That call, the
+guarded borrow described under [Reading from many
+threads](read-scaling.md#guarded-gets-and-the-epoch-scheme) and the tagged pointers of iterator
+frames, described under [Iterator frames](read-scaling.md#iterator-frames), are the tree's only
+`unsafe` code, and the prefetch does nothing on targets other than x86_64.
+
+On 1M `u64` keys, median of 15 alternating rounds in one process holding two such maps, in
+nanoseconds, the last two per key:
+
+| Memo holds | `get`, string value | `contains_key` | `get`, then read it | `get`, `u64` value | Scan | 1000-key range |
+| --- | --- | --- | --- | --- | --- | --- |
+| The node | 549 | 471 | 642 | 578 | 33 | 48 |
+| The node and a hint | 325 | 276 | 334 | 293 | 22 | 35 |
+
+The price is a few dozen instructions a level and lines fetched that a read may not use. Gets on
+10,000 keys, which stay in L2, were 6 to 12% slower until the linear search below won that back, and
+walking an index's keys alone, at about 6 ns a key, is 7 to 15% slower.
+
+Measured and left out:
+
+- Prefetching from a node once it is reached, out of its header: every line of its links and its
+  column took L1 misses from 24 to 112 a get and gained nothing, and a leaf's column alone gained at
+  most 3%. The lines have to be asked for before the header arrives.
+- Fewer lines. A hint of the keys alone, which fits in one word, was 1 to 6% slower than keys and
+  column. Child links only for nodes of level 1, whose children are leaves, were 7 to 11% slower
+  than for every interior node, and no child links at all a further 11 to 14%. The column's header
+  line alone, without its values, was 13% slower for `u64` gets and 21% for gets that read a string.
+- `_MM_HINT_T1`, which stops in L2: 1 to 20% slower at 1M keys and 4% at 10,000.
+- Full addresses in place of offsets: no faster, and `Link` grew from 72 to 80 bytes.
+- Pinning every level, which is unbounded and was only a probe: with hints it was no faster than
+  `Weak` memos, so their reference counts are no longer what a get waits on, and `PIN_DEPTH` stays.
+
+A node of at most 16 keys, each at most 16 bytes with no destructor, is searched by counting the
+keys below the target instead of by binary search, which leaves no chain of dependent loads. That
+took 7 to 11% off gets and `contains_key` at 10,000 keys and up to 5% at 1M. Keys that own heap keep
+the binary search, since every comparison would chase a pointer.
+
+`flush` leaves every node it writes in the cache, but it used to hand back links with empty memos,
+so the first read of each node after a bulk load went through a cache lookup: the first pass of gets
+after loading 1M keys took 460 ns against 365 ns warm. A link it writes now gets a `Weak` memo and
+its hint when the node sits below the pinned levels and its parent rewrote more than one child, and
+that first pass takes 335 ns. A single-key commit rewrites one child a level and memoizes nothing.
+Memoizing every written node grew the live heap of `heap`'s commits and reads case by 4%, from 46.5
+to 48.4 MiB with a 64 MiB cache, because the old paths of single-key commits kept the `Arc`
+allocations of their evicted children. With the rule it is 46.7 MiB.
+
+## Values
+
+A node holds its values in one `Arc<[V]>` column in key order, beside its keys. There used to be one
+`Arc<V>` per value behind a 40 byte `Slot`, which is 72 bytes and a separate allocation for each
+`u32`, and even for the `()` of a `Set` or an index entry. A `Slot` now exists only for what a
+column cannot say: `Fresh` for a value changed since it was read, `Spilled` for a value in its own
+object, and `Packed` for an unchanged value in a node that has one of those. `Cells::slots` turns a
+column into slots at the first edit of that node's values, which takes one reference count per value
+and copies none. A node on the path to an edit only gains a new child, so it keeps its column, and
+copying it costs one reference count where it used to cost one per value. That is why commits got
+cheaper: 34% for small values at 1M keys and 18% for short strings.
+
+`flush` leaves a column behind for every node it writes, putting the values of a changed node into
+key order as they decode from the written bytes. So a process reads what it wrote exactly as it
+reads what it opened, a `#[ferro(skip)]` field included, and no `Fresh` slot outlives its commit.
+The price is a clone, and later a free, per value in a bulk load.
+
+A column cannot hand out an `Arc<V>`, so `get`, the iterators, `Change` and `Conflict` return a
+`Val<V>`, which derefs to `V`. It is one of three things:
+
+- The value itself, when `V` has no destructor and is at most 16 bytes. Only this case takes no
+  atomic operation.
+- The column and an index, for any other value. One value keeps the other values of its node alive
+  for as long as it is held, which is outside `cache_bytes`. `into_owned` and `into_arc` end that.
+- An `Arc<V>`, for a spilled or uncommitted value.
+
+A `NodeRef<V>` holding the node's `Arc` was not built. It would need `K` and `S` in its type or a
+virtual call on every deref, and it would pin keys and child links as well. One more allocation per
+node buys a handle with a single type parameter that only pins values.
+
+Reopened and read twice at 1M `u64` keys, median of three alternating runs, in nanoseconds per key
+except for heap:
+
+| Values held in | `u64` heap per key | `u64` fold | `u64` get | String heap per key | String fold | String get |
+| --- | --- | --- | --- | --- | --- | --- |
+| One `Arc<V>` each | 123 bytes | 27 | 614 | 171 bytes | 36 | 614 |
+| A column, for values with no destructor | 61 bytes | 13 | 375 | 170 bytes | 29 | 656 |
+| A column, for all values | 61 bytes | 13 | 383 | 109 bytes | 24 | 490 |
+
+Half the heap matters more than the missing pointer. A million keys now nearly fit in the last level
+cache, so a fold over keys alone, which never touches a value, went from 23 to 7 ns. Stopping there
+left the process that wrote the data with the old slots, and `ferro-bench` reads in that process.
+Median of three alternating runs:
+
+| After `flush` | Bulk load | Get | Scan | Range | Table get | Table filter | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| One `Arc<V>` each | 1,164 ns | 568 ns | 48 ns | 46 ns | 340 ns | 70 ns | 343 MiB |
+| Slots that share each `Arc` | 1,295 ns | 673 ns | 47 ns | 55 ns | 400 ns | 41 ns | 343 MiB |
+| A column | 1,500 ns | 486 ns | 39 ns | 44 ns | 207 ns | 22 ns | 362 MiB |
+
+The bulk figure is the worst case, a short `String` per key, and building the column without copying
+the slots first won most of it back. Over five alternating runs of `reads`, a bulk load through
+`extend` took 24% longer for short strings and 2 to 5% longer for values with no destructor, and
+`ferro-bench` could not tell its bulk loads apart from noise.
+
+## Scans
+
+`Iterator::fold` is overridden on `Iter`, `Keys` and `Values` to take a run of a node's entries in
+one loop, which `sum`, `count`, `for_each`, `filter` and `map` reach with no new API. `try_fold`
+cannot be overridden, because naming `Try` needs a nightly compiler, so `find`, `any` and `Take` go
+through `next`, as do `for` loops and `collect`. A fold still builds an item, so it clones the key
+and, for a value held by column, takes a reference count. `Map::for_each`, `try_for_each`,
+`for_each_range` and `try_for_each_range` lend `&K` and `&V` instead and pay one reference count per
+node, not per item, with a `ControlFlow` for early exit. In nanoseconds per key at 1M keys,
+reopened, median of five alternating runs:
+
+| Map | `for` before | `for` | `fold` before | `fold` | `for_each` | Keys `fold` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `u64` to `u64` | 27 | 15 | 26 | 8 | 8 | 7 |
+| `u64` to `()` | 27 | 13 | 26 | 6 | 6 | 6 |
+| `u64` to short string | 36 | 37 | 35 | 24 | 19 | 12 |
+| String key to `u64` | 49 | 34 | 48 | 28 | 20 | |
+| Table rows | 37 | 29 | 35 | 14 | 9 | |
+
+For values with no destructor a fold is as good as `for_each`, so the fold is the one to use.
+`for_each` stays for what a fold has to clone: it takes 20 to 37% off strings and rows, and over a
+value held by column it removes the atomic pair per item, which is 8 of the 11 ns at 10,000 keys.
+With memory out of the picture at that size, the floor is 2 ns a key for a fold or `for_each` and 9
+ns for a `for` loop. A `for` loop over strings gained nothing, because the same two atomic
+operations now act on a wider handle.
+
+## Sorted lookups and cursors
+
+A `Cursor` keeps the path to its position, one frame per level, which holds its node as described
+under [Iterator frames](read-scaling.md#iterator-frames). `seek` climbs only until a node's key span
+holds the target and searches down from there, so it costs the distance moved, not the height of the
+tree. Both ends of the span are checked, so a seek backwards is as cheap as one forwards and sorted
+input is not an obligation. `seek_back` finds the last key at or before the target, and `advance`
+steps in key order. `value` returns a `Val`. `read` lends the entry, loading a spilled value first.
+
+`get_many` and `contains_many` run a cursor over an iterator of keys. They yield each key with its
+result, so they compose like `map`, and keys may be owned or borrowed. On 1M `u64` keys, median of
+five alternating runs, in nanoseconds per key:
+
+| Keys, sorted unless noted | `get` before | `get` | `get_many` | `contains_many` |
+| --- | --- | --- | --- | --- |
+| Every second key | 115 | 85 | 26 | 28 |
+| Every 16th key | 464 | 233 | 153 | 97 |
+| Random order | 586 | 342 | 363 | |
+
+Unsorted input costs 6% more than plain `get`, which is the price of keeping the path. A batch that
+recursed through the tree, cutting a sorted slice at each node as `absorb` does, was 6% faster at
+the densest and 7 to 26% slower when sparse, and needs a slice, a callback and sorted input, so the
+cursor replaced it. A cursor also serves merge joins, which a batch cannot.
+
+`range_by` used to walk its two edges separately, adding a rank at each level to learn its length.
+They now share one walk until they part and count only the links between them, so a narrow range
+reads each node once and sums almost nothing, and `range(key..).next()` went from 860 to 565 ns.
+`floor` is one walk that remembers the last node with a key before the target. Built on a cursor it
+was 20% slower than `get`, and it would have written the reference counts of pinned nodes.
+`Set::range` returns the named `Keys`, so it has `len` and `next_back`, and the set operations probe
+through `contains_many`.
+
+`IndexIter` fetched rows through a cursor. Rows of one index value sit in key order, so those went
+from 163 to 60 ns each, and rows scattered across the table from 208 to 161 ns. It now fetches them
+through a finder that keeps the last leaf and its parent, as described under [Reading from many
+threads](read-scaling.md#index-rows). `IndexIter::keys` stops before the rows and takes 5 ns a key.
+
+## What is left, on `examples/graph`
+
+`bench overhead` at 1M users and 46M edges, median of seven alternating runs:
+
+| Operation | Before | After | `Vec` |
+| --- | --- | --- | --- |
+| Point `contains` | 1,403 ns | 927 ns | 108 ns |
+| Neighbour fetch | 1,718 ns | 1,089 ns | 128 ns |
+| Sequential edge scan | 6.7 ns per edge | 3.3 ns | 0.12 ns |
+| Pagerank per iteration | 0.40 s | 0.22 s | 0.042 s |
+| Reach, 3 hops | 40.6 ms | 21.1 ms | 9.5 ms |
+| Recommend, 20 users | 1.7 ms | 1.2 ms | 1.1 ms |
+| Peak RSS, including 368 MiB of `Vec` | 955 MiB | 805 MiB | |
+
+Half of a scan is now varint decoding, 1.6 ns per edge, which is what storing an edge in 2.9 bytes
+costs, even with a decode loop that has no branch per byte. A decoder that took eight bytes at a
+time was 24% slower, because each block ends in a tail it has to take byte by byte. The other half,
+1.7 ns per edge or 75 ns per block of 44 edges, is walking keys and reaching each block's bytes,
+which has no counterpart in a `Vec`. `Vec`'s 0.12 ns is a SIMD sum that does no work per edge:
+pagerank's real work is 0.9 ns per edge on `Vec` and ferro pays the same on top of its scan. A
+random seek is 1.1 µs because seven levels, in a heap far larger than the last level cache and the
+reach of the TLB, take several DRAM misses where a `Vec` takes two. Neither the walk nor the
+decoding goes away without a different structure. What a `Vec` cannot do at any price is take a
+commit or keep an old version.
+
+## Measured and left out
+
+A node miss is dominated by BLAKE3, at roughly 500 to 900 ns on an interior node against 130 to 190
+ns for `pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits most
+records. `Decoder::varint` takes a one byte varint inline, which took `Vec<u64>` of small numbers
+from 6.1 to 1.5 ns an item and cold scans down about 7%.
+
+- Bulk decode hooks for keys. `Vec<f64>`, eight raw bytes an item, decodes at 1.4 ns, and a random
+  `u64` varint at 8.8 ns, so raw keys would save at most 7 ns in a cold scan of about 100 ns a key.
+  That needs fixed-width keys on disk, which would change every root hash and grow every node. For
+  varints, a `decode_vec` override has nothing left to skip.
+- Lazy value decoding. Decoding one value on demand made cold gets 6 to 13% faster, but cold scans
+  25% slower and fully read nodes 24% larger. Decoding a node's values together on first use was
+  slower than eager decoding once only leaves were missing from the cache.
+- `mmap`. Copying out of a mapping before hashing, the only form that cannot be changed under the
+  check, gained 3 to 9% on cold reads. That does not pay for SIGBUS when another process truncates
+  the file, or for I/O errors arriving as signals instead of `Error`. It also caps what batching
+  reads during scans could gain.
+- Cheaper cache keys. A hash prefix in place of ahash gained 1.4% with memos in place, since memo
+  hits skip the cache. Keying by offset with a hash compare was no better than that prefix even
+  before memos, because the cost was misses, not hashing.
+- A chunked or trie `List`. `List<T>` stays a `Map<u64, T>`, and a push rewrites the right spine
+  with the values held at each level: 1.6 KB for a `u64` and 3.2 KB for a 60 byte string at 1M
+  items, or 1.3 and 2.5 KB at 100k. Chunks in a `Map<u64, Vec<T>>` did not win clearly. At 1M, 16
+  per chunk took the string case to 2.4 KB but the `u64` case to 2.9 KB, and 64 per chunk to 5.9 KB,
+  because a node then holds several chunks just under the spill limit, while cold gets rose up to
+  six times. A vector trie of fanout 8 with values only in its leaves came to about 1.0 and 1.2 KB
+  in a simulation built from real record sizes, but at that fanout it has as many levels as the
+  `Map`, so it would read no faster, and fanout 32, which would, gave the bytes back at 2.0 and 2.5
+  KB. It helps one shape, a long list appended to one item per commit, and costs a second tree
+  beside `Map` with its own nodes, flush, memos, diff and foreign store handling. Bulk appends
+  already go down one edge in one descent.
+- Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
+  leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger than
+  the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator that
+  avoided that saved only 6 to 8%.
