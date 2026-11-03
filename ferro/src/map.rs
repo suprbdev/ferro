@@ -33,6 +33,9 @@ const LINEAR_KEYS: usize = 16;
 const LINEAR_KEY_BYTES: usize = 16;
 const PARALLEL_ITEMS: usize = 1 << 14;
 const MAX_WORKERS: usize = 16;
+const TEARDOWN_KEYS: u64 = 4096;
+const TEARDOWN_AHEAD: usize = 16;
+const TEARDOWN_PATHS: usize = 4;
 const HINTED_LEVEL: u8 = 3;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
@@ -428,6 +431,13 @@ fn prefetch(address: usize) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = address;
+}
+
+fn prefetch_items<T>(items: &[T]) {
+    let start = items.as_ptr().addr();
+    for line in (0..size_of_val(items)).step_by(LINE_BYTES) {
+        prefetch(start + line);
+    }
 }
 
 enum Link<K, V, S> {
@@ -3151,6 +3161,100 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
+}
+
+impl<K, V, S> Drop for Map<K, V, S> {
+    fn drop(&mut self) {
+        if let Link::Mem(root, _) = self.root.take()
+            && root.count >= TEARDOWN_KEYS
+            && scattered(&root)
+        {
+            teardown(root);
+        }
+    }
+}
+
+fn scattered<K, V, S>(root: &Node<K, V, S>) -> bool {
+    let (mut rising, mut falling) = (0, 0);
+    for path in 0..TEARDOWN_PATHS {
+        let mut node = root;
+        loop {
+            if let Cells::Slots(slots) = &node.cells {
+                let mut last = None;
+                for slot in slots {
+                    if let Slot::Fresh(value) = slot {
+                        let at = Arc::as_ptr(value).addr();
+                        match last {
+                            Some(before) if at > before => rising += 1,
+                            Some(_) => falling += 1,
+                            None => {}
+                        }
+                        last = Some(at);
+                    }
+                }
+            }
+            let position = node.children.len() * path / TEARDOWN_PATHS;
+            match node.children.get(position) {
+                Some(Link::Mem(child, _)) => node = child,
+                _ => break,
+            }
+        }
+    }
+    falling * 4 > rising
+}
+
+fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
+    let mut nodes = vec![root];
+    let mut values = Vec::new();
+    let mut keys = Vec::new();
+    let mut slots = Vec::new();
+    let mut children = Vec::new();
+    let mut index = 0;
+    while index < nodes.len() {
+        if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD) {
+            let base = Arc::as_ptr(ahead).addr();
+            prefetch(base);
+            prefetch(base + LINE_BYTES);
+        }
+        if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD / 2) {
+            prefetch_items(&ahead.children);
+            if let Cells::Slots(held) = &ahead.cells {
+                prefetch_items(held);
+            }
+        }
+        let Some(node) = Arc::get_mut(&mut nodes[index]) else {
+            index += 1;
+            continue;
+        };
+        keys.push(std::mem::take(&mut node.keys));
+        let mut links = std::mem::take(&mut node.children);
+        let cells = std::mem::replace(&mut node.cells, Cells::Slots(Vec::new()));
+        for link in &mut links {
+            if let Link::Mem(..) = link
+                && let Link::Mem(child, _) = link.take()
+            {
+                nodes.push(child);
+            }
+        }
+        children.push(links);
+        if let Cells::Slots(mut held) = cells {
+            values.extend(held.drain(..).filter_map(|slot| match slot {
+                Slot::Fresh(value) => Some(value),
+                _ => None,
+            }));
+            slots.push(held);
+        }
+        index += 1;
+    }
+    values.sort_unstable_by_key(|value| Arc::as_ptr(value).addr());
+    drop(values);
+    keys.sort_unstable_by_key(|keys| keys.as_ptr().addr());
+    drop(keys);
+    slots.sort_unstable_by_key(|slots| slots.as_ptr().addr());
+    drop(slots);
+    children.sort_unstable_by_key(|children| children.as_ptr().addr());
+    drop(children);
+    nodes.sort_unstable_by_key(|node| Arc::as_ptr(node).addr());
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Extend<(K, V)> for Map<K, V, S> {
