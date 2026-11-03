@@ -309,11 +309,22 @@ does, so a change is merged once however it arrives: directly, back and forth, t
 branch or through a fork of a branch that was already merged. Finding the base costs about two
 binary searches over the log, plus a step for each merge made since the base.
 
+When two branches have each merged an older state of the other, they have several best common
+ancestors, a criss-cross, and `common_ancestors` returns them all, best first. `merge_with` then does
+what git's recursive strategy does: it first merges those ancestors into a virtual base with your
+closure, and then runs your merge against that base, so a counter delta that only one of them
+carries is still applied once. The closure is therefore `FnMut`. Without a criss-cross it runs once,
+as before. With one it first runs once for each ancestor after the first, with a working copy of
+the base built so far as `ours`, the next ancestor as `theirs` and their own base. It resolves
+conflicts there the way it always does, and what it returns from those calls is dropped. The virtual
+base is never written: its commit has version 0, no root, the latest time of what it merged and the
+message your closure returned for it.
+
 A merge that finds it cannot go ahead uses `try_merge_with`, whose closure returns a `Result` as
-`try_commit_with`'s does. `Err` discards the merge: nothing is written or recorded, the next merge
-finds the same base, and the error comes back in your own type. `Map::try_merge` and
-`Table::try_merge` take a `resolve` that returns a `Result`, stop at its first `Err` and leave the
-collection as it was.
+`try_commit_with`'s does. `Err` discards the merge, including an `Err` while the virtual base is
+built: nothing is written or recorded, the next merge finds the same base, and the error comes back
+in your own type. `Map::try_merge` and `Table::try_merge` take a `resolve` that returns a `Result`,
+stop at its first `Err` and leave the collection as it was.
 
 `db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
 the handle you call it on. Other handles on that branch keep reading what they had, commits through
@@ -406,8 +417,9 @@ println!("{:?}, {} bytes in", pulled.outcome, pulled.received_bytes);
 to it. The outcome is `UpToDate`, `Ahead` when this branch already has all of it, `FastForward` when
 this branch has nothing it lacks, or `Merged`. Only a merge calls your closure. It works as in
 `merge_with`: the merge commit links the remote commit it merged, and the base is a best common
-ancestor over the merge graph of every file the commits passed through, so a change that reaches
-you through a third device is merged once, and a revert routed through one is not lost. `push` is
+ancestor over the merge graph of every file the commits passed through, or the virtual base of all
+of them after a criss-cross, which devices that sync both ways make, so a change that reaches you
+through a third device is merged once, and a revert routed through one is not lost. `push` is
 `pull` from the other side. `try_pull`, `try_push` and `try_receive` take a closure that returns a
 `Result`. An `Err` leaves this branch and its merge records as they were and comes back as your
 error, while the other side's commits stay landed on `phone`, so the next pull sends nothing new
@@ -749,11 +761,11 @@ This is an experiment, not a production database.
 - A frame past the superblock that is damaged cannot be told from a torn write, so open stops
   there and truncates it, losing at most the commits of the last sync. Bit rot further back is
   reported by the hash checks, not truncated.
-- When two branches have each merged an older state of the other, through any route, they have
-  several best common ancestors (a criss-cross). `merge_with` uses the one with the highest
-  generation, then the newest, then the highest hash, so the choice is stable, but what only the
-  others have is seen again, and a merge closure that is not idempotent, such as one adding a
-  counter delta, applies it twice. Nothing is lost.
+- After a criss-cross, a merge closure runs more than once: once for each extra best common
+  ancestor, to build the virtual base, then for the merge. A closure with effects outside its
+  return value, such as logging each conflict, has them for the ancestors too. When the base of
+  those ancestors could lie in pruned history, the merge refuses with `NoCommonAncestor`, even
+  though `common_ancestors` answers.
 - Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
   your current `Default`.
 - Sync streams, but keeps under 500 bytes per object received and 110 per object sent, and holds

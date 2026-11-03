@@ -1587,8 +1587,8 @@ O(changes). A key changed only by theirs is applied. A key changed the same way 
 left alone. A key changed differently on both sides goes to a `resolve` closure. Merging runs
 inside an ordinary commit, so a root with several collections merges each one in plain Rust.
 
-`Db::merge_with` finds the base, runs the closure on our tip with the base and their snapshot, and
-commits. The log entry it writes has a second link, to the entry of the other branch's tip: the
+`Db::merge_with` finds the base, or builds a virtual one after a criss-cross as described below,
+runs the closure on our tip with the base and their snapshot, and commits. The log entry it writes has a second link, to the entry of the other branch's tip: the
 merge's second parent. Commits are then a graph, as in git, and `common_ancestor` returns a best
 common ancestor in it: a commit both tips reach through `prev` and merge links that is not an
 ancestor of another such commit. Because it follows merge links, a change counts as shared however
@@ -1650,13 +1650,74 @@ base, since each of those could have brought in something the other side has. Me
 | 1,000 features merged since a branch forked | 31 ms | 30 ms |
 | The same branch after syncing, with 200 features merged since | 1.3 ms | 1.3 ms |
 
-When the tips have several best common ancestors, a criss-cross, `common_ancestor` returns the one
-with the highest generation, then the latest `time_ms`, then the highest entry hash. The rule
-depends only on the set, so both sides and every run agree, and a stale candidate can never win,
-since it is below a best one and so has a lower generation. What the other best ancestors have and
-the chosen one lacks is then seen again, so a closure that is not idempotent applies it twice.
-Git's recursive strategy first merges the best ancestors into a virtual base. That needs the
-closure more than once, which `FnOnce` does not allow, and it was left out.
+### Criss-crosses
+
+When two branches have each merged an older state of the other, the tips have several best common
+ancestors. The search returns every candidate it found, ordered by generation, then `time_ms`, then
+entry hash, highest first. The order depends only on the set, so both sides and every run agree.
+`common_ancestor` returns the first, which is the one every merge used to take, and
+`common_ancestors` returns them all. The model tests compare that list with the true set of best
+common ancestors on every merge, with and without pruning, and whenever the search answers they
+match.
+
+Merging against the first alone made what only the others carry look new: a closure adding counter
+deltas applied it twice, and a three-way merge could undo a revert, since the base held the value
+from before the change that was reverted. Merging is now recursive, as in git. With best ancestors
+B1 to Bk in that order, the virtual base starts as B1. For each later Bi, the search runs again
+with B1 to Bi-1 together as one side and Bi as the other, which is the ancestry a commit merging
+B1 to Bi-1 would have. If Bi is among the answers, it is below something already merged and is
+skipped. Otherwise the answers become the base for this step, virtual themselves if there are
+several, and the closure merges Bi into a working copy of the virtual base built so far. The merge
+then runs against the result. For counter deltas this is inclusion and exclusion over ancestor
+sets, so each delta is counted once whatever the shape.
+
+The closure is the user's, so it must be callable more than once, and the merge methods and the sync
+methods take `FnMut` instead of `FnOnce`. Each step calls it as a merge with the virtual base built
+so far as `ours`, so it resolves conflicts between the ancestors as it resolves any. Git writes
+conflict markers into a virtual base, so that the final merge conflicts again. Ferro has no conflict
+state to write, and a closure that resolves the same way whichever side is ours, such as
+last-writer-wins, makes the virtual base agree with what each side already chose. What the steps
+return is dropped. An `Err` from any step discards the whole merge, as an `Err` from the merge
+itself does, and nothing is written. The virtual base is never written either. It lives in memory
+for the merge, its commit has version 0, no root, the latest `time_ms` of what it merged and the
+message the closure returned for it, and the merge commit still links only our tip and theirs, so
+later searches see the same graph.
+
+The steps start from commits below the tips, with the limits the first search reached them with, so
+they read only what pruning keeps, and when the base of the ancestors could be in pruned history the
+merge refuses with `NoCommonAncestor`. A record in the old `merged` map says that a version of the
+named branch is below the head's commit at the recorded version, so a step that starts on that
+head's chain at or above that version also starts from the recorded commit. Without that, a
+criss-cross over a merge recorded before merge links lost the recorded branch's changes, because the
+step found the fork point instead.
+
+Other shapes were considered. Handing the closure every best ancestor leaves it unable to build
+the right base, which needs the ancestors' own bases, recursively, so each caller would redo this.
+A merge trait on the root type that ferro calls recursively has no room for what closures capture,
+such as a policy, a clock or a device name, or for a value returned to the caller, and it would be
+a second merge API. Keeping `FnOnce` with an opt-in recursive variant would leave the default
+wrong, and the sync API alone has eight methods that take a merge closure. Whether a closure can run
+twice is a static bound in Rust, so it cannot depend on whether a criss-cross occurs. Most closures
+are `FnMut` already. In this workspace one test closure moved a captured string into its message
+and needed a clone.
+
+Without a criss-cross, the closure runs once and the only added work is ordering the candidates.
+`cargo run --release -p ferro-bench --bin merge` builds the shapes above, its feature merges smaller
+than those of the table, and a criss-cross of two branches after 11,000 commits, merged without its
+commit:
+
+| Shape | Before | After |
+| --- | --- | --- |
+| Fork at 10,000, then 10,000 and 1,000 commits | 48 µs | 49 µs |
+| `main` took a side branch 1,000 times among 21,000 commits | 40 µs | 41 µs |
+| A side branch took `main` 1,000 times | 40 µs | 41 µs |
+| 1,000 features merged since a branch forked | 5.9 ms | 6.0 ms |
+| The same branch after syncing, with 200 features merged since | 1.8 ms | 1.8 ms |
+| The criss-cross, its search | 120 µs | 120 µs |
+| The criss-cross, the whole merge | 120 µs | 166 µs |
+
+The merge costs one more search, from the two ancestors to their fork point, and one more call of
+the closure.
 
 ### Merges and pruning
 
@@ -1954,8 +2015,8 @@ A second step compares the pulling branch with `remote`:
 - Their tip is our entry at their version: `Ahead`.
 - Otherwise the merge-base search of `merge_with` runs under the writer lock against our tip and
   the landed `remote`. If their tip is the base, we already hold it through a merge: `Ahead`.
-  Otherwise `merge` runs against that base as a commit on our branch that links their tip as its
-  second parent.
+  Otherwise `merge` runs against that base, or against the virtual base after a criss-cross, as a
+  commit on our branch that links their tip as its second parent.
 
 Each outcome that shows their tip is an ancestor of ours records `(their version, our version)`
 under `remote` in our head's `merged` map. The merge link says the same thing, but a record survives
@@ -2001,6 +2062,14 @@ it looked like a state A already held, and the revert was dropped on A's first p
 graph base is B's commit, which both have, and the revert applies. A change that reaches us through
 a third device is a common ancestor once it is, so it is merged once, and a remote that has
 nothing we lack is found to be an ancestor of our tip and reported `Ahead`.
+
+Devices that pull from each other while a third relays make criss-crosses routinely: when A merges
+B's commit and B merges one of A's that C passed on, each has merged an older state of the other,
+and the next pull between them has two best common ancestors. The pull then merges against their
+virtual base, as `merge_with` does. `examples/notes` needs no change for that: its merge is a
+function, so it is `FnMut`, and since every note only moves forward under its last-writer-wins
+join, a three-way merge against any common ancestor gives the join. The virtual base spares it
+conflicts over changes both sides already hold, which it counted among the notes it applied.
 
 When the base could lie in pruned history, the search returns `NoCommonAncestor` and the pull
 leaves our branch alone, with `remote` landed. That happens when the remote has pruned past the
