@@ -11,6 +11,7 @@ pub mod map;
 mod reclaim;
 pub mod set;
 pub mod store;
+pub mod sync;
 pub mod table;
 pub mod watch;
 
@@ -25,5 +26,6 @@ pub use log::Log;
 pub use map::{Change, Conflict, Cursor, Map, Summary, Val};
 pub use set::Set;
 pub use store::Durability;
+pub use sync::{Bundle, Have, Outcome, Pulled};
 pub use table::{Record, RowMut, Table, TableData, Taken};
 pub use watch::{Closer, Watcher};

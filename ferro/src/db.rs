@@ -1528,7 +1528,16 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
         let base = self.common_ancestor(other)?;
-        let theirs = other.read();
+        self.merge_onto(other, base, other.read(), f)
+    }
+
+    pub(crate) fn merge_onto<R, S: Into<String>>(
+        &self,
+        other: &Db<T>,
+        base: Snapshot<T>,
+        theirs: Snapshot<T>,
+        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+    ) -> Result<Committed<R>> {
         let advanced = base.commit.root.map(|ptr| ptr.hash) != theirs.commit.root.map(|ptr| ptr.hash);
         let intent = Intent {
             restored: None,
@@ -1774,4 +1783,52 @@ pub struct Verified {
     pub objects: u64,
     pub bytes: u64,
     pub file_bytes: u64,
+}
+
+impl<T: Data> Db<T> {
+    pub(crate) fn published_refs(&self) -> (Store, Refs) {
+        let published = self.shared.published.lock();
+        (self.shared.store(), published.refs.clone())
+    }
+
+    pub(crate) fn rewrite_refs<X>(
+        &self,
+        edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,
+    ) -> Result<X> {
+        let shared = &self.shared;
+        let mut notices = Vec::new();
+        let mut tip = shared.lock_tip();
+        self.branch.check_live()?;
+        let store = shared.store();
+        let mut txn = store.begin()?;
+        let (next, out) = edit(&store, &mut txn, &tip.refs)?;
+        let Some(next) = next else {
+            return Ok(out);
+        };
+        let before = tip.refs.clone();
+        shared.stage(&mut tip, next, txn, None, None)?;
+        shared.settle(store.last_seq(), &mut notices)?;
+        let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
+        let mut states = Vec::new();
+        for branch in attached {
+            let old = before.try_get(&branch.name)?;
+            let new = tip.refs.try_get(&branch.name)?;
+            let moved = match (&old, &new) {
+                (Some(old), Some(new)) => {
+                    old.log != new.log || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
+                }
+                (None, None) => false,
+                _ => true,
+            };
+            if moved {
+                states.push((branch, Arc::new(shared.state_of(&store, new.as_deref())?)));
+            }
+        }
+        for (branch, state) in states {
+            branch.tip.store(state.clone());
+            notices.push(branch.publish(state));
+        }
+        drop(tip);
+        Ok(out)
+    }
 }

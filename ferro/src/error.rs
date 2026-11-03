@@ -42,6 +42,8 @@ pub enum Error {
     TooLarge(u64),
     #[error("the coalesced group this closure joined was not written: {0}")]
     GroupFailed(String),
+    #[error("sync bundle rejected: {0}")]
+    Bundle(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
