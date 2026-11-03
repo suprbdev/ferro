@@ -132,6 +132,17 @@ pub(crate) fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
     buf.push(value as u8);
 }
 
+fn varint_into(out: &mut [u8], mut value: u64) -> usize {
+    let mut used = 0;
+    while value >= 0x80 {
+        out[used] = (value as u8) | 0x80;
+        value >>= 7;
+        used += 1;
+    }
+    out[used] = value as u8;
+    used + 1
+}
+
 impl<'a> Encoder<'a> {
     pub fn new(sink: &'a mut dyn Sink) -> Self {
         Encoder {
@@ -235,17 +246,22 @@ impl<'a> Encoder<'a> {
         f: impl FnOnce(&mut Encoder<'a>) -> Result<()>,
     ) -> Result<()> {
         self.u16(tag);
-        let head = self.buf.len();
+        let at = self.buf.len();
+        self.buf.push(0);
         let links_before = self.links.len();
         f(self)?;
-        let len = (self.buf.len() - head) as u64;
+        let len = (self.buf.len() - at - 1) as u64;
         let link_count = (self.links.len() - links_before) as u64;
-        let mut prefix = Vec::with_capacity(4);
-        push_varint(&mut prefix, (len << 1) | u64::from(link_count > 0));
+        let mut prefix = [0u8; 20];
+        let mut used = varint_into(&mut prefix, (len << 1) | u64::from(link_count > 0));
         if link_count > 0 {
-            push_varint(&mut prefix, link_count);
+            used += varint_into(&mut prefix[used..], link_count);
         }
-        self.buf.splice(head..head, prefix);
+        if used == 1 {
+            self.buf[at] = prefix[0];
+        } else {
+            self.buf.splice(at..at + 1, prefix[..used].iter().copied());
+        }
         Ok(())
     }
 
