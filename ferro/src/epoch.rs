@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -13,6 +13,7 @@ const FLUSH_WAIT: Duration = Duration::from_secs(1);
 
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static SLOTS: Mutex<Vec<&'static Slot>> = Mutex::new(Vec::new());
+static FREEING: AtomicUsize = AtomicUsize::new(0);
 
 struct Retired {
     epoch: u64,
@@ -58,6 +59,7 @@ thread_local! {
         slot: claim(),
         depth: Cell::new(0),
     };
+    static FREEING_HERE: Cell<usize> = const { Cell::new(0) };
 }
 
 fn claim() -> &'static Slot {
@@ -133,10 +135,24 @@ pub(crate) fn retire(value: Arc<dyn Any + Send + Sync>, bytes: usize) {
         pending.items.len() >= BATCH || pending.bytes >= BATCH_BYTES
     };
     if due {
-        let oldest = oldest(None);
-        let freed = slot.pending.lock().take(oldest);
-        drop(freed);
+        free(slot, oldest(None));
     }
+}
+
+fn free(slot: &Slot, oldest: u64) {
+    let freed = {
+        let mut pending = slot.pending.lock();
+        let freed = pending.take(oldest);
+        FREEING.fetch_add(freed.len(), Ordering::SeqCst);
+        freed
+    };
+    let count = freed.len();
+    let counted = FREEING_HERE.try_with(|here| here.set(here.get() + count)).is_ok();
+    drop(freed);
+    if counted {
+        let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));
+    }
+    FREEING.fetch_sub(count, Ordering::SeqCst);
 }
 
 fn oldest(skip: Option<&'static Slot>) -> u64 {
@@ -168,7 +184,10 @@ pub(crate) fn flush() {
     };
     let slots: Vec<&'static Slot> = SLOTS.lock().clone();
     for slot in slots {
-        let freed = slot.pending.lock().take(oldest);
-        drop(freed);
+        free(slot, oldest);
+    }
+    let here = FREEING_HERE.try_with(Cell::get).unwrap_or(0);
+    while FREEING.load(Ordering::SeqCst) > here && start.elapsed() <= FLUSH_WAIT {
+        std::thread::yield_now();
     }
 }
