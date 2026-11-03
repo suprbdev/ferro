@@ -27,7 +27,7 @@ mod imp {
         file.unlock()
     }
 
-    pub(crate) fn sync_reader(file: &File) -> io::Result<()> {
+    pub(crate) fn sync_reader(file: &File, _path: &Path) -> io::Result<()> {
         file.sync_data()
     }
 
@@ -51,16 +51,13 @@ mod imp {
     use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io::{self, ErrorKind};
     use std::os::windows::fs::{FileExt as _, OpenOptionsExt};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED, INVALID_HANDLE_VALUE,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED};
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK,
-        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, ReOpenFile, UnlockFileEx,
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, LOCK_FILE_FLAGS,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
     };
     use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 
@@ -172,17 +169,17 @@ mod imp {
         }
     }
 
-    pub(crate) fn sync_reader(file: &File) -> io::Result<()> {
+    pub(crate) fn sync_reader(file: &File, path: &Path) -> io::Result<()> {
         match file.sync_data() {
             Err(error) if error.kind() == ErrorKind::PermissionDenied => {}
             synced => return synced,
         }
-        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-        let handle = unsafe { ReOpenFile(file.as_raw_handle(), FILE_GENERIC_WRITE, share, 0) };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
+        let id = file_id(file)?;
+        match path_id(path) {
+            Ok(named) if named == id => OpenOptions::new().write(true).open(path)?.sync_data(),
+            Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
         }
-        unsafe { File::from_raw_handle(handle) }.sync_data()
     }
 
     pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {

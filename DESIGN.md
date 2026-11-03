@@ -2357,10 +2357,20 @@ write-cache buffer flushing on the device"), the same caveat as a Linux disk mou
 barriers.
 
 The flush needs a handle with write access. A read-only open that has to sync the frames a dead
-writer left, as described under File format and durability, reopens the same file object with
-`ReOpenFile` and write access and flushes that. A process that may not write the file gets
-`PermissionDenied` there, rather than reading frames that a power cut could still take back. It
-opens normally once a writer has recovered the file.
+writer left, as described under File format and durability, first checks that the path still names
+its file. If it does, the reader opens the path for writing and flushes that. A process that may not
+write the file gets `PermissionDenied` there, rather than reading frames that a power cut could
+still take back, and opens normally once a writer has recovered the file. If the path names another
+file, a cycle replaced this one and there is nothing to sync. A writer lets go of a generation only
+after the rename that replaced it is durable, so no crash names it again, unless the writer died or
+poisoned between the rename and its flush. Even then, `Durability::Fsync` synced every frame before
+the swap, and `Buffered` may lose commits by contract. The reader keeps the old view, and its next
+`refresh` moves to the new file.
+
+The reader used to reopen its own file with `ReOpenFile` instead. That failed with access denied
+whenever it had opened the path just before a swap and taken the lock just after the writer retired
+the old file, because Windows refuses every new handle to a file that has lost its name. Checking
+the path also means the reader never needs write access to a file that is not the database any more.
 
 Windows has no directory sync. A directory opens only with `FILE_FLAG_BACKUP_SEMANTICS`, and nothing
 documents what `FlushFileBuffers` does to one. Where Unix syncs the parent directory, after creating

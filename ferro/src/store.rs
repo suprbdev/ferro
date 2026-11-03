@@ -336,7 +336,7 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
     Ok((tip, slot))
 }
 
-fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
+fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let settled = sb.settled() && read_frame(file, &sb, len)?.is_none();
     if settled || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
@@ -348,7 +348,7 @@ fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
         .and_then(|meta| scan(file, sb.at_anchor(), meta.len()))
         .and_then(|tip| {
             if tip.seq != before {
-                platform::sync_reader(file)?;
+                platform::sync_reader(file, path)?;
             }
             Ok(tip)
         });
@@ -678,7 +678,7 @@ impl Store {
                     )));
                 }
                 if options.read_only {
-                    (observe(&file, sb, len)?, slot)
+                    (observe(&file, actual, sb, len)?, slot)
                 } else {
                     recover(&file, sb, slot, len)?
                 }
