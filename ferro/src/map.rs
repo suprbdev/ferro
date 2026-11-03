@@ -25,6 +25,7 @@ const ALLOCATION_BYTES: usize = 16;
 const ITEM_BYTES: usize = 32;
 const PATH_FRAMES: usize = 8;
 const PARALLEL_KEYS: u64 = 4096;
+const PARALLEL_NODES: usize = 256;
 const LINE_BYTES: usize = 64;
 const SPAN_LINES: i32 = 15;
 const LINEAR_KEYS: usize = 16;
@@ -1294,8 +1295,15 @@ fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Arc<Node<K, V, S>>) {
 }
 
 fn fans_out<K, V, S>(node: &Node<K, V, S>) -> bool {
+    let mut budget = PARALLEL_NODES;
     node.count >= PARALLEL_KEYS
         && node.children.iter().filter(|child| matches!(child, Link::Mem(_))).nth(1).is_some()
+        && busy(node, &mut budget)
+}
+
+fn busy<K, V, S>(node: &Node<K, V, S>, budget: &mut usize) -> bool {
+    *budget = budget.saturating_sub(1);
+    *budget == 0 || dirty(node).any(|child| busy(child, budget))
 }
 
 struct Flushed<K, V, S> {
