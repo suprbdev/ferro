@@ -1105,7 +1105,9 @@ the receiver holds, and the link resolves to it there. Otherwise the merged comm
 chain down to the newest entry a recognised commit's chain shares with it, and the same for the
 merges inside it, so far as the sender keeps them under the retention rule for merges. A merged
 commit the sender has let go is not sent, and the receiver writes the link with offset 0, which the
-merge-base search treats as pruned history.
+merge-base search treats as pruned history. The receiver may keep more of its history than the
+sender did, so a merge can claim older commits than arrived. The search finds where a merged chain
+ends by its links, not only by the merge's limits, and a chain cut short reads as pruned there.
 
 A sent object that links a known one names it with a hint: the anchor or earlier hint it hangs from,
 and the index of the link there. The receiver follows the path in its own file and checks that it

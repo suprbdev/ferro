@@ -277,15 +277,14 @@ impl Search {
         if node.version() < merged.floor {
             return Err(Error::Corrupt(format!("merge link below its floor {}", merged.floor)));
         }
-        let mut low = merged.floor;
         let after = merged.after(item.after);
         let bare = after.is_some_and(|after| node.time() < after);
-        if bare {
-            low = node.version();
-        } else if let Some(after) = after {
-            let kept = |entry: &Entry| entry.commit.time_ms >= after;
-            low = node.lowest_kept(&item.store, merged.floor, kept)?;
-        }
+        let kept = |entry: &Entry| after.is_none_or(|after| entry.commit.time_ms >= after);
+        let low = if bare {
+            node.version()
+        } else {
+            node.lowest_kept(&item.store, merged.floor, kept)?
+        };
         Ok(Some(Item {
             store: item.store.clone(),
             node,

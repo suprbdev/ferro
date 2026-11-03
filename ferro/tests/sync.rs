@@ -891,6 +891,78 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
 }
 
 #[test]
+fn a_merged_chain_the_sender_cut_short_reads_as_pruned_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let pause = || thread::sleep(Duration::from_millis(3));
+    let r = open(&dir, "r.ferro");
+    let b = open(&dir, "b.ferro");
+    put(&r, 100, "r");
+    assert_eq!(b.pull(&r, "r", refuse).unwrap().outcome, Outcome::FastForward);
+    put(&r, 101, "r");
+    put(&r, 102, "r");
+    pause();
+    let a: Db<Root> = fast().history(Keep::Last(5)).open(dir.path().join("a.ferro")).unwrap();
+    for key in 0..5 {
+        put(&a, key, "a");
+    }
+    assert_eq!(b.pull(&a, "a", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(a.pull(&r, "r", theirs_win).unwrap().outcome, Outcome::Merged);
+    put(&a, 5, "a");
+    put(&a, 6, "a");
+    assert_eq!(a.log().first().unwrap().0, 4);
+    let tracking = b.branch("a").unwrap();
+    let before = (b.head_hash(), dump(&b.read()));
+    match b.pull(&a, "a", theirs_win) {
+        Ok(pulled) => assert_eq!(pulled.outcome, Outcome::Merged),
+        Err(Error::NoCommonAncestor) => assert_eq!((b.head_hash(), dump(&b.read())), before),
+        Err(other) => panic!("{other}"),
+    }
+    let answer = |db: &Db<Root>| match db.common_ancestor(&tracking) {
+        Ok(base) => Some(base.version()),
+        Err(Error::NoCommonAncestor) => None,
+        Err(other) => panic!("{other}"),
+    };
+    let found = answer(&b);
+    b.verify().unwrap();
+    b.compact(Keep::All).unwrap();
+    b.verify().unwrap();
+    assert_eq!(answer(&b), found);
+}
+
+#[test]
+fn a_merge_whose_history_the_sender_had_let_go_still_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let pause = || thread::sleep(Duration::from_millis(3));
+    let r = open(&dir, "r.ferro");
+    for key in 100..103 {
+        put(&r, key, "r");
+    }
+    pause();
+    let a: Db<Root> = fast().history(Keep::Last(5)).open(dir.path().join("a.ferro")).unwrap();
+    let b = open(&dir, "b.ferro");
+    for key in 0..5 {
+        put(&a, key, "a");
+    }
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(a.pull(&r, "r", theirs_win).unwrap().outcome, Outcome::Merged);
+    put(&a, 5, "a");
+    put(&a, 6, "a");
+    assert_eq!(a.log().first().unwrap().0, 4);
+    put(&b, 50, "b");
+    let pulled = b.pull(&a, "a", theirs_win).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    let merged = dump(&b.read());
+    assert_eq!(merged.len(), 11);
+    assert_eq!(merged[&101], "r");
+    b.verify().unwrap();
+    b.compact(Keep::All).unwrap();
+    b.verify().unwrap();
+    put(&a, 7, "a");
+    assert_eq!(b.pull(&a, "a", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(dump(&b.read()).len(), 12);
+}
+
+#[test]
 fn a_change_that_reaches_us_through_a_third_device_is_counted_once() {
     let dir = tempfile::tempdir().unwrap();
     let devices: Vec<Db<Events>> = ["a", "b", "c"]
