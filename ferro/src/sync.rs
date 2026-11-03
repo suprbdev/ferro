@@ -961,7 +961,7 @@ fn land<T: Data>(
     };
     let existing = refs.try_get(remote)?;
     if let Some(old) = &existing
-        && old.log == head.log
+        && (old.log == head.log || hash_at(store, &old.log, tip.version)? == Some(tip.hash))
     {
         return Ok(None);
     }

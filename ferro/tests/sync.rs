@@ -1190,3 +1190,26 @@ fn a_fast_forward_keeps_history_that_another_branch_pruned() {
     assert_eq!(dump(&b.at(3).unwrap()).len(), 3);
     b.verify().unwrap();
 }
+
+#[test]
+fn a_stale_bundle_does_not_move_the_remote_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
+    put(&a, 1, "one");
+    b.pull(&a, "a", refuse).unwrap();
+    put(&b, 9, "nine");
+    let have = b.have().unwrap();
+    put(&a, 1, "two");
+    let stale = a.bundle(&have).unwrap();
+    put(&a, 1, "three");
+    assert_eq!(
+        b.pull(&a, "a", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    let before = (b.head_hash(), b.size_on_disk());
+    let replayed = b.receive("a", &stale, theirs_win).unwrap();
+    assert_ne!(replayed.outcome, Outcome::Merged);
+    assert_eq!(*b.read().get(&1).unwrap(), "three");
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    assert_eq!((b.head_hash(), b.size_on_disk()), before);
+}

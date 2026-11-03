@@ -1040,6 +1040,11 @@ the pull has released `tip`, so a `watch_when` test may commit or pull. A bad bu
 10,073 rejections and one flip inside an LZ4 body that decoded to the same bytes, and so landed the
 same commit.
 
+A bundle whose head `remote` already holds at that version writes nothing. Bundles are plain bytes,
+so one can arrive late, from a slow transfer or a second pull running at the same time, or be sent
+again. Landing it would move `remote` back, drop the records under its name, and merge older state
+over newer.
+
 ### Bringing the branch up
 
 A second step compares the pulling branch with `remote`:
