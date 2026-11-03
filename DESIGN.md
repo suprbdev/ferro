@@ -69,7 +69,9 @@ at which a value becomes its own object. Smaller objects are cheap to write agai
 every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
 their hash check. Offsets are not hashed, so a link in a node proves nothing about the offset it
 carries until it is followed, and registering links would let a damaged offset spread into new
-commits. A read-only handle registers nothing.
+commits. A read-only handle registers nothing. A commit drafted outside `tip`, as described under
+Drafting outside `tip`, takes only offsets below the start of its draft, and looks its records up
+again if its frame has to move.
 
 So rewriting a value costs nothing if this process read the old one, whichever process wrote it.
 `get_mut` on a spilled value needs no special case: the slot becomes `Fresh`, the value is encoded
@@ -947,11 +949,12 @@ one missed stayed behind until another commit landed.
 ## Concurrency
 
 Each branch has a writer lock of its own, its lane, and the database has one more, the `tip`
-mutex, which orders frames. Writers run their closures one at a time on a branch under its lane,
-encode and write one at a time under `tip`, and sync outside both. Each branch has two states:
-`state`, the published one that readers load through `ArcSwap`, and `tip`, the newest one
-written. Under its lane a writer clones the branch's tip and runs the closure, then under `tip` it
-flushes, writes its frame to the page cache and queues it, and it releases both. The next writer
+mutex, which orders frames. Writers run their closures and encode what they changed one at a time
+on a branch under its lane, place and write their frames one at a time under `tip`, and sync
+outside both. Each branch has two states: `state`, the published one that readers load through
+`ArcSwap`, and `tip`, the newest one written. Under its lane a writer clones the branch's tip, runs
+the closure and drafts its records, then under `tip` it places them, writes its frame to the page
+cache and queues it, and it releases both. The next writer
 on the branch builds on that tip even though it is not durable yet, and a writer on another branch
 runs its closure meanwhile, as described under a lock per branch below. Object reads are bounded
 by `written`, the end of the frames in the file, rather than `tail`, the published end, so
@@ -1457,22 +1460,23 @@ Every branch used to share the `tip` mutex for the whole of a write, so a closur
 stalled commits on every other, and closures on different branches never overlapped though they
 touch independent state (#37). Each `Branch` now has a lane, a mutex held while a closure runs on a
 copy of that branch's tip, which also holds the branch's open coalescing group. `tip` is taken
-after the closure, only to encode the working copy, append the log entry, write the refs and the
-frame and queue it. Locks are always taken in the order lane, `tip`, `published`, the attached
+after the closure and its draft, only to place the drafted records, append the log entry, write the
+refs and the frame and queue it. Locks are always taken in the order lane, `tip`, `published`, the attached
 branches, the queue, and nothing waits for a lane while it holds `tip`.
 
-A commit has to know where its frame starts before it encodes its first record. A record names
-each link by offset, stored as the distance back from the record itself, and the flush leaves
-those offsets in the cached copies of the nodes it wrote and in the new tip. So encoding stays
-under `tip`, and only the closure runs in parallel. Three ways to move encoding out were
-considered. Relocating a finished frame changes the distance to every object outside it, and with
+When the lanes were added, a commit had to know where its frame started before it encoded its
+first record. A record names each link by offset, stored as the distance back from the record
+itself, and the flush leaves those offsets in the cached copies of the nodes it wrote and in the
+new tip. So encoding stayed under `tip`, and only the closure ran in parallel, until the draft
+described under Drafting outside `tip` below. Three ways to move encoding out were considered
+first. Relocating a finished frame changes the distance to every object outside it, and with
 it the length of its varint, so every record after it moves: that is encoding again, and the cached
 nodes would need patching too. Encoding at the current end and starting again when another frame
 got there first wastes the work under exactly the contention this is for. Reserving a region per
 writer and padding what it leaves would change the format. The parallel flush already encodes,
 hashes and compresses subtrees before it knows their offsets and appends them in a second pass,
 which is the shape a first phase that needs no position would take, but it lives in the map's
-flush and was not extended. Sequence numbers, the dedupe table, the superblock and the queue were
+flush and was not extended then. Sequence numbers, the dedupe table, the superblock and the queue were
 already ordered by `tip` or the queue's mutex and did not change.
 
 The queue is shared, so frames from every branch wait for one fdatasync as before, and the leader
@@ -1500,8 +1504,8 @@ stranded group before it leads rather than after, so the two share a sync.
 
 An awaited write waits at its branch's gate, so it queues only behind writers of its branch. After
 its closure it takes `tip` with a plain `lock()` in the same poll, since a guard cannot be kept
-across polls. `tip` is held for one encode at a time, a few tens of microseconds, and through one
-fsync by `drop_branch`, so an executor thread can wait that long behind other branches' commits,
+across polls. `tip` is held for one frame's placement and write at a time, a few microseconds, and
+through one fsync by `drop_branch`, so an executor thread can wait that long behind other branches' commits,
 but never behind a closure.
 
 `fork` takes its branch's lane, which seals its open group, then `tip`, and copies the tip the
@@ -1587,14 +1591,108 @@ six runs, and the same cells, on code that is the same for one branch, came out 
 
 Left open:
 
-- Encoding under `tip`, which bounds commits across all branches at one encode at a time. Moving
-  it out needs the position-free first phase described above.
 - A cycle or `receive` that waits for a long closure holds the lanes it has already taken, those
   that sort before that closure's branch, so those branches wait for the rest of that closure, as
   every branch did before.
 - A closure that commits on another branch no longer deadlocks by itself, but it can deadlock
   against a cycle, which takes lanes in name order, so it is still not allowed.
 - An awaited write takes `tip` without a gate after its closure.
+
+### Drafting outside `tip`
+
+A commit encodes before it takes `tip` (#18). Under its lane alone it drafts: it encodes, hashes
+and compresses every new object of the working copy into a transaction laid out as if its frame
+began where the log ended when the draft started, builds the cached copies of the nodes it wrote,
+and decodes the new root as a check, as the flush did under `tip` before. It takes offsets from
+`dedupe` only below that start, since anything above it belongs to a frame it cannot yet place
+itself after. Under `tip` it checks whether another frame landed since. If none did, the draft is
+the frame, byte for byte. What is left under `tip` is checking that the branch is live, the log
+entry, the refs, the frame's check and its write to the page cache, and the queue. The cached
+copies go into the node cache, and the frame's objects into `dedupe`, after `tip` is released,
+still under the lane.
+
+If another branch's frame landed first, the draft moves. A record depends on where it sits only
+through the distances of its links, so moving it copies its header and body and rewrites those
+distances. A distance to an older object grows, and its varint with it, so the pass runs record by
+record and keeps a table from each drafted offset to its new one. It also looks each record up in
+`dedupe` again and drops it if the frames before wrote the same object, pointing its entry in the
+table at that copy, as a draft made in place would have done. The root is decoded again from its
+moved links. Each cached copy is then cloned with its origin, its children and its spilled values
+moved through the table, and its memos pointed at its children's moved copies. A node whose
+values hold links of their own, a nested collection, would have to be decoded again to move them,
+and so would the nodes a parallel flush decoded from its arenas; those are left out of the cache
+and read from the file when next needed.
+
+The format did not change. A moved frame is the frame the same commit would have written in its
+place: `a_frame_another_branch_moves_is_the_frame_written_in_its_place` has another branch commit,
+from the hook, inside every draft on main, and compares the file byte for byte with one where those
+commits came first, across nested maps, spilled values, a value both branches write and parallel
+flushes. The two can only differ when `dedupe` hands out a different copy of the same object, as
+it can between any two interleavings, so the test keeps each branch's edits apart and the cache
+large enough that reads register nothing.
+
+`tables`, one Buffered writer, median of five interleaved runs against the tree before, with
+counters around the time `tip` is held:
+
+| Commit | Under `tip`, before | After | Instructions under `tip`, before | After |
+| --- | ---: | ---: | ---: | ---: |
+| Hold | 64.7 µs | 6.5 µs (-90%) | 519,449 | 30,973 (-94%) |
+| Confirm | 77.4 µs | 7.2 µs (-91%) | 643,082 | 33,041 (-95%) |
+| Cancel | 102.3 µs | 8.4 µs (-92%) | 807,614 | 35,780 (-96%) |
+
+A hold's draft runs 469,000 instructions in 51 µs under the lane, and the cache and `dedupe`
+inserts after `tip` 23,000 in 6 µs. Of what stays under `tip`, the log entry is about 8,000
+instructions, the refs 7,000, and the frame's check and write about 9,000 and 3 µs, most of it the
+copy into the page cache. The commit as a whole costs one writer about what it did: outside the
+closure a hold ran 542,230 instructions before and 544,272 after, a confirm 667,726 and 670,666, and
+a cancel 832,852 and 835,314, 0.3 to 0.4% more, with thread CPU time of 70.3 and 69.9, 83.5 and
+83.0, and 109.9 and 109.9 µs, and bytes per write stayed at 12,208. A single-key Buffered commit into 100,000 keys ran
+110,310 instructions outside its closure before and 111,315 after, 0.9% more, with CPU time at the
+median of 15.2 to 15.6 µs before and 15.4 to 15.6 µs after over five runs each. Where those last
+thousand instructions go was not found.
+
+`ferro-bench`'s `group` tool with `--branches own`, single-key commits into 100,000 keys from
+closures that spin for the given time, median of five alternating runs on the NVMe drive of a
+16-core machine shared with other work, closures a second:
+
+| Durability | Closure | 4 branches, before | After | 8 branches, before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Buffered | none | 42,337 | 85,071 (2.01x) | 36,716 | 67,241 (1.83x) |
+| Buffered | 10 µs | 42,145 | 79,048 (1.88x) | 36,373 | 70,582 (1.94x) |
+| Buffered | 50 µs | 43,082 | 49,219 (1.14x) | 36,404 | 73,701 (2.02x) |
+| Fsync | none | 5,494 | 5,292 | 10,070 | 9,617 |
+| Fsync | 10 µs | 5,119 | 5,535 | 9,981 | 10,072 |
+| Fsync | 50 µs | 5,184 | 5,285 | 9,736 | 9,838 |
+
+Buffered p50 at 8 branches with no closure fell from 220 to 116 µs and p99 from 437 to 282 µs.
+Four branches with 50 µs closures were already near what four threads that each spend 50 µs in a
+closure and about 20 in a commit can do. Fsync waits on the disk, one fdatasync per round of
+branches, and moved by no more than its runs did between themselves: two sets of the same runs,
+made before the guarded reads described under Reading from many threads, gave 0.72 to 0.99 of
+before and 0.95 to 1.09. Bytes per commit in the timed runs came out about 0.8% higher, because
+twice the commits in the same seconds leave more of the tool's longer values in each tree and twice
+the file between a node and the seed it links to; over the first 88,962 frames of a run of each,
+frames averaged 2,495.0 and 2,494.6 bytes, with the same records and links.
+
+A 1M-key bulk load, median of three interleaved runs, took 706 ms before and 712 ms after, 0.4%
+more instructions, all of it in the commit, and the gets, scans and ranges after it did not move.
+Peak RSS rose from 373 to 377 MiB in both `bulk` and `ferro-bench`: each node a commit remembers
+for the cache now carries the function that moves it and its link count, 16 bytes over 140,000
+nodes, held in a vector that doubles. Keeping those in a vector of their own put RSS back but cost a
+single-key commit 1,000 instructions more, for the allocation. The rest of `ferro-bench` stayed
+within 3% but for `map_diff_per_change`, a read this change does not touch, at 5%: a single-key
+commit took 24.2 and 24.0 µs Buffered and 411 and 405 µs with fsync, and its concurrent commits went
+from 10,382 to 10,501 a second.
+
+Left open:
+
+- The log entry, a fifth of what is left under `tip`, depends only on the branch's own chain except
+  when a merge records what it merged, so it could be drafted too.
+- The frame's write to the page cache is the largest part left. Writing it after `tip` would need
+  frames written out of order and `written` advanced only over a contiguous run of them.
+- A frame that moves loses the cached copies of nodes holding nested collections and of a parallel
+  flush, so the next commit on the branch reads those back.
+- The thousand instructions a single-key commit gained, and the 4 MiB of a 1M-key commit.
 
 ### Commits of a few rows
 
