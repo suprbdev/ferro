@@ -433,6 +433,41 @@ fn a_filtered_watcher_follows_a_read_only_refresh() {
 }
 
 #[test]
+fn a_read_only_test_may_open_a_branch_while_refresh_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watch.ferro");
+    let db = common::fast().open::<Root>(&path).unwrap();
+    put(&db, 1, 1);
+    db.fork("side").unwrap();
+    let reader = common::fast().read_only().open::<Root>(&path).unwrap();
+    let watcher = {
+        let reader = reader.clone();
+        reader.clone().watch_when(move |snapshot| {
+            reader.branch("side").is_ok_and(|side| side.version() < snapshot.version())
+        })
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
+    thread::sleep(Duration::from_millis(30));
+    put(&db, 2, 2);
+    let refresher = {
+        let calls = calls.clone();
+        thread::spawn(move || {
+            let refreshed = reader.refresh().unwrap();
+            calls.fetch_add(1, Ordering::SeqCst);
+            refreshed
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "refresh never returned from a test that opens a branch");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(refresher.join().unwrap());
+    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+}
+
+#[test]
 fn a_test_costs_commits_nothing_while_nobody_is_parked() {
     let (_dir, db) = opened();
     let calls = Arc::new(AtomicUsize::new(0));

@@ -1712,9 +1712,9 @@ impl<T: Data> Db<T> {
         if replaced {
             current.close();
         }
-        let mut branches = self.shared.branches.lock();
+        let attached: Vec<_> = self.shared.branches.lock().values().cloned().collect();
         let mut gone = Vec::new();
-        for branch in branches.values() {
+        for branch in attached {
             let head = tip.refs.try_get(&branch.name)?;
             if head.is_none() && branch.name != MAIN {
                 gone.push(branch.name.clone());
@@ -1729,6 +1729,7 @@ impl<T: Data> Db<T> {
                 branch.publish(state);
             }
         }
+        let mut branches = self.shared.branches.lock();
         for name in gone {
             if let Some(branch) = branches.remove(&name) {
                 branch.retire();
