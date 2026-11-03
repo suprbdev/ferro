@@ -20,6 +20,8 @@ const ARC_HEADER: usize = 16;
 const ALLOCATION_BYTES: usize = 16;
 const ITEM_BYTES: usize = 32;
 const PATH_FRAMES: usize = 8;
+const LINE_BYTES: usize = 64;
+const SPAN_LINES: i32 = 15;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -314,16 +316,75 @@ impl<V, S> Cells<V, S> {
 
 enum Memo<K, V, S> {
     Pinned(Arc<Node<K, V, S>>),
-    Weak(Weak<Node<K, V, S>>),
+    Weak(Weak<Node<K, V, S>>, Hint),
 }
 
 impl<K, V, S> Clone for Memo<K, V, S> {
     fn clone(&self) -> Self {
         match self {
             Memo::Pinned(node) => Memo::Pinned(node.clone()),
-            Memo::Weak(node) => Memo::Weak(node.clone()),
+            Memo::Weak(node, hint) => Memo::Weak(node.clone(), *hint),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Hint {
+    keys: i32,
+    rest: i32,
+}
+
+impl Hint {
+    fn of<K, V, S>(node: &Arc<Node<K, V, S>>) -> Hint {
+        let base = Arc::as_ptr(node).addr();
+        let span = |start: usize, bytes: usize| -> i32 {
+            let Ok(offset) = i32::try_from(start.wrapping_sub(base) as isize) else {
+                return 0;
+            };
+            let offset = offset & !SPAN_LINES;
+            let first = base.wrapping_add_signed(offset as isize) / LINE_BYTES;
+            let last = (start + bytes.max(1) - 1) / LINE_BYTES;
+            let lines = (last + 1).saturating_sub(first).min(SPAN_LINES as usize);
+            offset | lines as i32
+        };
+        let rest = match &node.cells {
+            _ if !node.children.is_empty() => span(
+                node.children.as_ptr().addr(),
+                node.children.len() * size_of::<Link<K, V, S>>(),
+            ),
+            Cells::Column(column) => span(
+                column.as_ptr().addr().wrapping_sub(ARC_HEADER),
+                ARC_HEADER + column.len() * size_of::<V>(),
+            ),
+            Cells::Slots(_) => 0,
+        };
+        Hint {
+            keys: span(node.keys.as_ptr().addr(), node.keys.len() * size_of::<K>()),
+            rest,
+        }
+    }
+
+    #[inline]
+    fn prefetch<T>(self, node: &Weak<T>) {
+        let base = node.as_ptr().addr();
+        for span in [self.keys, self.rest] {
+            let start = base.wrapping_add_signed((span & !SPAN_LINES) as isize);
+            for line in 0..(span & SPAN_LINES) as usize {
+                prefetch(start.wrapping_add(line * LINE_BYTES));
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn prefetch(address: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(std::ptr::without_provenance(address));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = address;
 }
 
 enum Link<K, V, S> {
@@ -625,7 +686,8 @@ fn reach<'a, K: Data, V: Data, S: Data>(
     };
     match memo.get() {
         Some(Memo::Pinned(node)) => return Ok(Reach::Borrowed(node)),
-        Some(Memo::Weak(weak)) => {
+        Some(Memo::Weak(weak, hint)) => {
+            hint.prefetch(weak);
             if let Some(node) = weak.upgrade() {
                 return Ok(Reach::Owned(node));
             }
@@ -653,7 +715,7 @@ fn fetch_link<'a, K: Data, V: Data, S: Data>(
             return Ok(Reach::Borrowed(node));
         }
     } else if cached {
-        memo.get_or_init(|| Memo::Weak(Arc::downgrade(&node)));
+        memo.get_or_init(|| Memo::Weak(Arc::downgrade(&node), Hint::of(&node)));
     }
     Ok(Reach::Owned(node))
 }
