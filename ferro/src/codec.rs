@@ -23,16 +23,37 @@ pub struct Object {
     pub links: Vec<Ptr>,
 }
 
+const JOINED_BYTES: usize = 4096;
+
+thread_local! {
+    static JOINED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 impl Object {
     pub fn hash(&self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&(self.body.len() as u32).to_le_bytes());
-        hasher.update(&(self.links.len() as u32).to_le_bytes());
-        hasher.update(&self.body);
-        for link in &self.links {
-            hasher.update(&link.hash);
-        }
-        let full = hasher.finalize();
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&(self.body.len() as u32).to_le_bytes());
+        header[4..].copy_from_slice(&(self.links.len() as u32).to_le_bytes());
+        let total = header.len() + self.body.len() + self.links.len() * HASH_BYTES;
+        let full = if total <= JOINED_BYTES {
+            JOINED.with_borrow_mut(|joined| {
+                joined.clear();
+                joined.extend_from_slice(&header);
+                joined.extend_from_slice(&self.body);
+                for link in &self.links {
+                    joined.extend_from_slice(&link.hash);
+                }
+                blake3::hash(joined)
+            })
+        } else {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&header);
+            hasher.update(&self.body);
+            for link in &self.links {
+                hasher.update(&link.hash);
+            }
+            hasher.finalize()
+        };
         let mut out = [0u8; HASH_BYTES];
         out.copy_from_slice(&full.as_bytes()[..HASH_BYTES]);
         out
