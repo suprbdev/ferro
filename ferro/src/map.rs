@@ -256,16 +256,21 @@ enum Cells<V, S> {
 }
 
 impl<V: Clone, S: Clone> Cells<V, S> {
-    fn settled(&self, spills: Vec<(usize, Slot<V, S>)>) -> Self {
+    fn settled(&self, spills: Vec<(usize, Slot<V, S>)>, decoded: Vec<(usize, V)>) -> Self {
         let width = match self {
-            Cells::Column(_) if spills.is_empty() => return self.clone(),
+            Cells::Column(_) if spills.is_empty() && decoded.is_empty() => return self.clone(),
             Cells::Column(column) => column.len(),
             Cells::Slots(slots) => slots.len(),
         };
         let mut spills = spills.into_iter().peekable();
+        let mut decoded = decoded.into_iter().peekable();
         let mut column = Vec::with_capacity(width);
         let mut spilled = Vec::new();
         for index in 0..width {
+            if let Some((_, value)) = decoded.next_if(|(at, _)| *at == index) {
+                column.push(value);
+                continue;
+            }
             match (spills.next_if(|(at, _)| *at == index), self) {
                 (Some(spill), _) => spilled.push(spill),
                 (None, Cells::Column(values)) => column.push(values[index].clone()),
@@ -1275,13 +1280,13 @@ fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Val
     }
 }
 
-fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -> Result<()> {
+fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -> Result<T> {
     let mut decoder = Decoder::new(
         &encoder.bytes()[mark.0..],
         &encoder.links()[mark.1..],
         Some(store),
     );
-    T::decode(&mut decoder).map(drop)
+    T::decode(&mut decoder)
 }
 
 struct Probe(u64);
@@ -1387,13 +1392,13 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     };
     let bytes = reused.as_ref().map_or(64 + 24 * width, |prefix| prefix.bytes.len() + 24 * (width + 1));
     let mut encoder = Encoder::with_capacity(&mut *sink, bytes, width + 1);
-    let spilled = match &reused {
+    let (spilled, checked) = match &reused {
         Some(prefix) => {
             encoder.raw(&prefix.bytes);
             for link in &prefix.links {
                 encoder.link(*link);
             }
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
         None => entries(node, &mut encoder, store.as_ref(), caching, decoding)?,
     };
@@ -1444,7 +1449,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
         Some(_) => Some(Node {
             level: node.level,
             keys: node.keys.clone(),
-            cells: node.cells.settled(spilled),
+            cells: node.cells.settled(spilled, checked),
             children: stored,
             count: node.count,
             origin: None,
@@ -1467,13 +1472,15 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     })
 }
 
+type Entries<V, S> = (Vec<(usize, Slot<V, S>)>, Vec<(usize, V)>);
+
 fn entries<K: Data, V: Data, S: Summary<K, V>>(
     node: &Node<K, V, S>,
     encoder: &mut Encoder<'_>,
     store: Option<&Store>,
     caching: bool,
     decoding: bool,
-) -> Result<Vec<(usize, Slot<V, S>)>> {
+) -> Result<Entries<V, S>> {
     encoder.u8(node.level);
     encoder.varint(node.keys.len() as u64);
     for (index, key) in node.keys.iter().enumerate() {
@@ -1484,6 +1491,7 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
         }
     }
     let mut spilled = Vec::new();
+    let mut checked = Vec::new();
     for (index, key) in node.keys.iter().enumerate() {
         let value = match &node.cells {
             Cells::Column(column) => &column[index],
@@ -1504,7 +1512,10 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
         value.encode(encoder)?;
         let spill = encoder.since(mark) > SPILL_BYTES;
         if let (true, true, Some(store)) = (node.is_fresh(index), spill || !decoding, store) {
-            verify::<V>(encoder, body, store)?;
+            let decoded = verify::<V>(encoder, body, store)?;
+            if !spill && caching && !decoding {
+                checked.push((index, decoded));
+            }
         }
         if spill {
             encoder.rewind(mark);
@@ -1518,7 +1529,7 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
             }
         }
     }
-    Ok(spilled)
+    Ok((spilled, checked))
 }
 
 fn emit<K: Data, V: Data, S: Data>(

@@ -1050,3 +1050,41 @@ fn large_commits_of_nested_maps_match_a_fresh_build() {
         .collect();
     assert!(held == model);
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Data)]
+struct Note {
+    text: String,
+    #[ferro(skip)]
+    scratch: u64,
+}
+
+fn notes(db: &Db<Map<u32, Note>>) -> Vec<(u32, Note)> {
+    db.read()
+        .iter()
+        .map(|(key, note)| (key, (*note).clone()))
+        .collect()
+}
+
+#[test]
+fn a_value_written_beside_unchanged_neighbours_reads_as_the_file_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.ferro");
+    let db = roomy().open::<Map<u32, Note>>(&path).unwrap();
+    let note = |key: u32, round: u32, scratch: u64| Note {
+        text: format!("note {key} of round {round}"),
+        scratch,
+    };
+    db.update(|root| root.extend((0..2_000u32).map(|key| (key, note(key, 0, 1)))))
+        .unwrap();
+    db.update(|root| {
+        root.insert(5, note(5, 1, 7));
+        root.insert(1_500, note(1_500, 1, 7));
+    })
+    .unwrap();
+    let written = notes(&db);
+    assert_eq!(written[5], (5, note(5, 1, 0)));
+    assert_eq!(written[1_500], (1_500, note(1_500, 1, 0)));
+    drop(db);
+    let db = roomy().open::<Map<u32, Note>>(&path).unwrap();
+    assert_eq!(notes(&db), written);
+}

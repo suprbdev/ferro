@@ -130,8 +130,9 @@ up during `Data::encode` and seeds the node cache with the nodes it wrote. Value
 mutated since the node was loaded are decoded once as a check before they become durable;
 unchanged values are not. When at least half of a node's values are fresh, the cached copy is
 decoded from the written bytes, which is that check and the copy in one pass; otherwise the node is
-cloned. A value holding a dirty or foreign collection also forces the decode, so nested
-collections always come back clean and a foreign store is never pinned.
+cloned and each fresh value is the one its check decoded. A value holding a dirty or foreign
+collection also forces the decode, so nested collections always come back clean and a foreign store
+is never pinned.
 
 A node that `flush` writes or decodes keeps the bytes and links of its level, keys and values while
 its values are still one column, which they stop being at the first edit of a key or value, since
@@ -410,9 +411,10 @@ copies none. A node on the path to an edit only gains a new child, so it keeps i
 copying it costs one reference count where it used to cost one per value. That is why commits got
 cheaper: 34% for small values at 1M keys and 18% for short strings.
 
-`flush` leaves a column behind for every node it writes, cloning the values of a changed node into
-key order. So a process reads what it wrote exactly as it reads what it opened, and no `Fresh` slot
-outlives its commit. The price is a clone, and later a free, per value in a bulk load.
+`flush` leaves a column behind for every node it writes, putting the values of a changed node into
+key order as they decode from the written bytes. So a process reads what it wrote exactly as it
+reads what it opened, a `#[ferro(skip)]` field included, and no `Fresh` slot outlives its commit.
+The price is a clone, and later a free, per value in a bulk load.
 
 A column cannot hand out an `Arc<V>`, so `get`, the iterators, `Change` and `Conflict` return a
 `Val<V>`, which derefs to `V`. It is one of three things:
