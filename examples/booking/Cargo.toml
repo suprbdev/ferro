@@ -1,0 +1,27 @@
+[package]
+name = "booking"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "booking"
+path = "src/lib.rs"
+
+[[bin]]
+name = "booking"
+path = "src/main.rs"
+
+[[bin]]
+name = "booking-stress"
+path = "src/bin/stress.rs"
+
+[dependencies]
+ferro = { path = "../../ferro" }
+clap = { version = "4", features = ["derive"] }
+fastrand = "2"
+thiserror = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
