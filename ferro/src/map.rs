@@ -3247,14 +3247,35 @@ fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
         index += 1;
     }
     values.sort_unstable_by_key(|value| Arc::as_ptr(value).addr());
-    drop(values);
     keys.sort_unstable_by_key(|keys| keys.as_ptr().addr());
-    drop(keys);
     slots.sort_unstable_by_key(|slots| slots.as_ptr().addr());
-    drop(slots);
     children.sort_unstable_by_key(|children| children.as_ptr().addr());
-    drop(children);
     nodes.sort_unstable_by_key(|node| Arc::as_ptr(node).addr());
+    let mut values = values.into_iter().peekable();
+    let mut keys = keys.into_iter().peekable();
+    let mut slots = slots.into_iter().peekable();
+    let mut children = children.into_iter().peekable();
+    let mut nodes = nodes.into_iter().peekable();
+    loop {
+        let heads = [
+            values.peek().map_or(usize::MAX, |value| Arc::as_ptr(value).addr()),
+            keys.peek().map_or(usize::MAX, |keys| keys.as_ptr().addr()),
+            slots.peek().map_or(usize::MAX, |slots| slots.as_ptr().addr()),
+            children.peek().map_or(usize::MAX, |children| children.as_ptr().addr()),
+            nodes.peek().map_or(usize::MAX, |node| Arc::as_ptr(node).addr()),
+        ];
+        let lowest = heads.iter().copied().min().unwrap_or(usize::MAX);
+        if lowest == usize::MAX {
+            break;
+        }
+        match heads.iter().position(|&head| head == lowest) {
+            Some(0) => drop(values.next()),
+            Some(1) => drop(keys.next()),
+            Some(2) => drop(slots.next()),
+            Some(3) => drop(children.next()),
+            _ => drop(nodes.next()),
+        }
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Extend<(K, V)> for Map<K, V, S> {
