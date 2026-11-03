@@ -193,7 +193,7 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
     let rows = root.row_edits;
     let mut checked = 0;
     for _ in 0..24 {
-        match rng.below(7) {
+        match rng.below(8) {
             0 | 1 => {
                 let key = pick(rng, hot);
                 let got = root.values.get(&key).map(|value| *value);
@@ -244,6 +244,32 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
                     None
                 };
                 assert_eq!(got, want, "{context}: row {id} after {rows} edits");
+            }
+            5 => {
+                let low = pick(rng, hot).min(KEYS - 1);
+                let high = low + 1 + rng.below(80);
+                let want: Vec<(u64, u64)> = (low..high.min(KEYS))
+                    .filter_map(|key| model.value_at(key, values).map(|value| (key, value)))
+                    .collect();
+                let got: Vec<(u64, u64)> = root
+                    .values
+                    .range(low..high)
+                    .map(|(key, value)| (key, *value))
+                    .collect();
+                assert_eq!(got, want, "{context}: range {low}..{high} after {values} edits");
+                let mut back: Vec<(u64, u64)> = root
+                    .values
+                    .range(low..high)
+                    .rev()
+                    .map(|(key, value)| (key, *value))
+                    .collect();
+                back.reverse();
+                assert_eq!(back, want, "{context}: reversed range {low}..{high}");
+                let mut cursor = root.values.cursor();
+                for (key, value) in &want {
+                    assert!(cursor.seek(key), "{context}: cursor seek {key}");
+                    assert_eq!(cursor.value().map(|found| *found), Some(*value));
+                }
             }
             _ => {
                 let group = rng.below(GROUPS);

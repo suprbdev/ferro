@@ -5,8 +5,10 @@ use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::fmt;
 use std::hash;
+use std::marker::PhantomData;
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::mem::needs_drop;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering as Atomic};
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
@@ -2786,34 +2788,47 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             let mut back = Vec::with_capacity(PATH_FRAMES);
             let mut remaining = 0;
             let mut depth = 0;
-            let mut current = resident(store, &self.root, depth)?;
+            let root = match reach(store, &self.root, depth, None)? {
+                Reach::Absent => None,
+                Reach::Borrowed(node) => Some(node.clone()),
+                Reach::Owned(node) => Some(node),
+                Reach::Held(_) => unreachable!("an unguarded reach holds no node"),
+            };
+            let mut current = root.as_deref().map(Hold::anchored_at);
             while let Some(node) = current.take() {
                 let low = node.keys.partition_point(|key| below(key));
                 let high = node.keys.partition_point(|key| within(key));
+                let anchored = node.anchored();
                 depth += 1;
                 if low == high {
-                    current = resident(store, node.child(low), depth)?;
+                    current = hold(store, node.child(low), depth, anchored)?;
                 }
                 back.push(Frame {
-                    node: node.clone(),
+                    node: node.share(),
                     position: 2 * high as isize - 1,
                 });
+                if low >= high {
+                    front.push(Frame {
+                        node,
+                        position: 2 * low as isize + 1,
+                    });
+                    continue;
+                }
                 front.push(Frame {
-                    node: node.clone(),
+                    node: node.share(),
                     position: 2 * low as isize + 1,
                 });
-                if low < high {
-                    let inner = (low + 1..high).map(|position| node.child(position).count());
-                    let skipped = edge(store, node.child(low), depth, &below, 1, &mut front)?;
-                    let kept = edge(store, node.child(high), depth, &within, -1, &mut back)?;
-                    remaining = (high - low) as u64 + inner.sum::<u64>() + kept
-                        + node.child(low).count().saturating_sub(skipped);
-                }
+                let inner = (low + 1..high).map(|position| node.child(position).count());
+                let skipped = edge(store, node.child(low), anchored, depth, &below, 1, &mut front)?;
+                let kept = edge(store, node.child(high), anchored, depth, &within, -1, &mut back)?;
+                remaining = (high - low) as u64 + inner.sum::<u64>() + kept
+                    + node.child(low).count().saturating_sub(skipped);
             }
             Ok(Iter {
                 store: self.store.clone(),
                 front,
                 back,
+                _root: root,
                 remaining,
             })
         };
@@ -2836,8 +2851,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     pub fn cursor(&self) -> Cursor<K, V, S> {
         Cursor {
             store: self.store.clone(),
-            root: self.root.with_memo(),
             path: Vec::with_capacity(PATH_FRAMES),
+            root: self.root.with_memo(),
             index: None,
         }
     }
@@ -3459,8 +3474,90 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> IntoIterator for &Map<K, V, S> {
     }
 }
 
+struct Hold<K, V, S> {
+    tagged: NonNull<Node<K, V, S>>,
+    _owns: PhantomData<Arc<Node<K, V, S>>>,
+}
+
+unsafe impl<K, V, S> Send for Hold<K, V, S> where Arc<Node<K, V, S>>: Send {}
+
+unsafe impl<K, V, S> Sync for Hold<K, V, S> where Arc<Node<K, V, S>>: Sync {}
+
+impl<K, V, S> Deref for Hold<K, V, S> {
+    type Target = Node<K, V, S>;
+
+    #[inline]
+    fn deref(&self) -> &Node<K, V, S> {
+        unsafe { &*self.node() }
+    }
+}
+
+impl<K, V, S> Drop for Hold<K, V, S> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.anchored() {
+            drop(unsafe { Arc::from_raw(self.node()) });
+        }
+    }
+}
+
+impl<K, V, S> Hold<K, V, S> {
+    #[inline]
+    fn owned(node: Arc<Node<K, V, S>>) -> Self {
+        Hold {
+            tagged: unsafe { NonNull::new_unchecked(Arc::into_raw(node).cast_mut()) },
+            _owns: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn anchored_at(node: &Node<K, V, S>) -> Self {
+        Hold {
+            tagged: NonNull::from(node).map_addr(|addr| addr | 1),
+            _owns: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn node(&self) -> *const Node<K, V, S> {
+        self.tagged.as_ptr().map_addr(|addr| addr & !1).cast_const()
+    }
+
+    #[inline]
+    fn anchored(&self) -> bool {
+        self.tagged.addr().get() & 1 == 1
+    }
+
+    #[inline]
+    fn share(&self) -> Self {
+        if !self.anchored() {
+            unsafe { Arc::increment_strong_count(self.node()) };
+        }
+        Hold {
+            tagged: self.tagged,
+            _owns: PhantomData,
+        }
+    }
+}
+
+#[inline(always)]
+fn hold<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &Link<K, V, S>,
+    depth: usize,
+    anchored: bool,
+) -> Result<Option<Hold<K, V, S>>> {
+    Ok(match reach(store, link, depth, None)? {
+        Reach::Absent => None,
+        Reach::Borrowed(node) if anchored => Some(Hold::anchored_at(node)),
+        Reach::Borrowed(node) => Some(Hold::owned(node.clone())),
+        Reach::Owned(node) => Some(Hold::owned(node)),
+        Reach::Held(_) => unreachable!("an unguarded reach holds no node"),
+    })
+}
+
 struct Frame<K, V, S> {
-    node: Arc<Node<K, V, S>>,
+    node: Hold<K, V, S>,
     position: isize,
 }
 
@@ -3482,29 +3579,43 @@ fn step<K: Data, V: Data, S: Data>(
             return Some((position / 2) as usize);
         }
         frame.position += 1;
-        let child = frame.node.child((position / 2) as usize);
-        if let Some(node) = fatal(resident(store, child, depth)) {
-            path.push(Frame { node, position: 0 });
-        }
+        enter(store, path, (position / 2) as usize, depth);
+    }
+}
+
+#[inline(never)]
+fn enter<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    path: &mut Vec<Frame<K, V, S>>,
+    position: usize,
+    depth: usize,
+) {
+    let Some(frame) = path.last() else {
+        return;
+    };
+    let child = frame.node.child(position);
+    if let Some(node) = fatal(hold(store, child, depth, frame.node.anchored())) {
+        path.push(Frame { node, position: 0 });
     }
 }
 
 fn edge<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &Link<K, V, S>,
+    anchored: bool,
     mut depth: usize,
     before: &impl Fn(&K) -> bool,
     offset: isize,
     path: &mut Vec<Frame<K, V, S>>,
 ) -> Result<u64> {
     let mut rank = 0u64;
-    let mut current = resident(store, link, depth)?;
+    let mut current = hold(store, link, depth, anchored)?;
     while let Some(node) = current {
         let position = node.keys.partition_point(|key| before(key));
         rank += position as u64;
         rank += node.children.iter().take(position).map(Link::count).sum::<u64>();
         depth += 1;
-        current = resident(store, node.child(position), depth)?;
+        current = hold(store, node.child(position), depth, node.anchored())?;
         path.push(Frame {
             node,
             position: 2 * position as isize + offset,
@@ -3515,15 +3626,15 @@ fn edge<K: Data, V: Data, S: Data>(
 
 pub struct Cursor<K, V, S = ()> {
     store: Option<Store>,
-    root: Link<K, V, S>,
     path: Vec<Frame<K, V, S>>,
+    root: Link<K, V, S>,
     index: Option<usize>,
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     pub fn rewind(&mut self) {
         self.path.clear();
-        if let Some(node) = fatal(resident(self.store.as_ref(), &self.root, 0)) {
+        if let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true)) {
             self.path.push(Frame { node, position: 0 });
         }
         self.index = step(self.store.as_ref(), &mut self.path);
@@ -3544,7 +3655,7 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
             self.path.pop();
         }
         if self.path.is_empty()
-            && let Some(node) = fatal(resident(self.store.as_ref(), &self.root, 0))
+            && let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true))
         {
             self.path.push(Frame { node, position: 0 });
         }
@@ -3570,7 +3681,8 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
                 }
                 Err(position) => {
                     frame.position = 2 * position as isize + 1;
-                    match fatal(resident(store, frame.node.child(position), depth)) {
+                    let anchored = frame.node.anchored();
+                    match fatal(hold(store, frame.node.child(position), depth, anchored)) {
                         Some(node) => self.path.push(Frame { node, position: 0 }),
                         None => return false,
                     }
@@ -3747,6 +3859,7 @@ pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
     front: Vec<Frame<K, V, S>>,
     back: Vec<Frame<K, V, S>>,
+    _root: Option<Arc<Node<K, V, S>>>,
     remaining: u64,
 }
 
@@ -3798,7 +3911,8 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
                 continue;
             }
             let child = frame.node.child((position / 2) as usize);
-            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
+            let anchored = frame.node.anchored();
+            if let Some(node) = fatal(hold(self.store.as_ref(), child, depth, anchored)) {
                 self.front.push(Frame { node, position: 0 });
             }
         }
@@ -3824,7 +3938,8 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
             }
             frame.position -= 1;
             let child = frame.node.child((position / 2) as usize);
-            if let Some(node) = fatal(resident(self.store.as_ref(), child, depth)) {
+            let anchored = frame.node.anchored();
+            if let Some(node) = fatal(hold(self.store.as_ref(), child, depth, anchored)) {
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
             }
@@ -4153,6 +4268,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::codec::HASH_BYTES;
 
     const ROUNDS: usize = 40;
 
@@ -4226,6 +4342,89 @@ mod tests {
         evict(node);
         assert_eq!(weak.strong_count(), 0);
         assert!(!read(&weak, 7));
+    }
+
+    type Tree = (Arc<Node<u64, u64, ()>>, Vec<u64>);
+
+    fn tree(depth: usize, next: &mut u64, keep: &mut Vec<Arc<Node<u64, u64, ()>>>) -> Tree {
+        if depth == PIN_DEPTH + 1 {
+            let node = leaf(*next);
+            *next += 10;
+            let keys = node.keys.clone();
+            return (node, keys);
+        }
+        let (left, mut keys) = tree(depth + 1, next, keep);
+        let key = *next;
+        *next += 1;
+        let (right, right_keys) = tree(depth + 1, next, keep);
+        let mut link = |node: Arc<Node<u64, u64, ()>>, count: usize| {
+            if depth + 1 < PIN_DEPTH {
+                return Link::Mem(node, Hint::NONE);
+            }
+            let ptr = Ptr {
+                hash: [0; HASH_BYTES],
+                offset: 0,
+            };
+            let link = Link::under(ptr, count as u64, LEVELS, ());
+            if let Link::Stored { memo, .. } = &link {
+                let _ = memo.set(Memo::Weak(Arc::downgrade(&node), Hint::NONE));
+            }
+            keep.push(node);
+            link
+        };
+        let children = vec![link(left, keys.len()), link(right, right_keys.len())];
+        keys.push(key);
+        keys.extend(right_keys);
+        let node = Node {
+            count: keys.len() as u64,
+            keys: vec![key],
+            children,
+            cells: Cells::Column(Arc::from([key * 3])),
+            level: (PIN_DEPTH + 1 - depth) as u8,
+            cached: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
+            origin: None,
+            prefix: None,
+        };
+        (Arc::new(node), keys)
+    }
+
+    #[test]
+    fn epoch_iterators_borrow_what_their_root_pins() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let pairs: Vec<(u64, u64)> = keys.iter().map(|key| (*key, key * 3)).collect();
+        let seen: Vec<(u64, u64)> = map.iter().map(|(key, value)| (key, *value)).collect();
+        assert_eq!(seen, pairs);
+        let back: Vec<u64> = map.keys().rev().collect();
+        assert!(back.iter().rev().eq(keys.iter()));
+        let (low, high) = (keys[5], keys[keys.len() - 7]);
+        let inner: Vec<u64> = keys.iter().copied().filter(|key| (low..high).contains(key)).collect();
+        assert_eq!(map.range(low..high).map(|(key, _)| key).collect::<Vec<_>>(), inner);
+        assert!(map.range(low..high).rev().map(|(key, _)| key).eq(inner.iter().rev().copied()));
+        let narrow = map.range(keys[1]..keys[4]);
+        assert!(narrow.map(|(key, _)| key).eq(keys[1..4].iter().copied()));
+        let mut cursor = map.cursor();
+        for key in keys.iter().rev() {
+            assert!(cursor.seek(key));
+            assert_eq!(cursor.value().map(|value| *value), Some(key * 3));
+        }
+        let mut walk = map.iter();
+        let mut edited = map.clone();
+        let middle = keys[keys.len() / 2];
+        *edited.get_mut(&middle).unwrap() = 1;
+        drop(map);
+        drop(cursor);
+        assert_eq!(walk.next().map(|(key, value)| (key, *value)), Some(pairs[0]));
+        assert_eq!(edited.get(&middle).map(|value| *value), Some(1));
+        drop(edited);
+        let rest: Vec<(u64, u64)> = walk.map(|(key, value)| (key, *value)).collect();
+        assert_eq!(rest, pairs[1..]);
+        assert!(keep.iter().all(|node| Arc::strong_count(node) == 1));
     }
 
     #[test]
