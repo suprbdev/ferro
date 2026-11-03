@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 fn usage() -> ! {
     eprintln!(
         "usage: chat --db PATH [--addr HOST:PORT] [--durability fsync|buffered] [--coalesce] \
-         [--keep-versions N] [--max-changes N]"
+         [--keep-versions N] [--reclaim-mb N] [--max-changes N]"
     );
     std::process::exit(2)
 }
@@ -25,6 +25,9 @@ fn main() {
             "--coalesce" => config.coalesce = true,
             "--keep-versions" => {
                 config.keep_versions = Some(value().parse().unwrap_or_else(|_| usage()));
+            }
+            "--reclaim-mb" => {
+                config.reclaim_bytes = value().parse::<u64>().unwrap_or_else(|_| usage()) << 20;
             }
             "--max-changes" => config.max_changes = value().parse().unwrap_or_else(|_| usage()),
             "--durability" => {

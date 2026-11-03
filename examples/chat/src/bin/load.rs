@@ -45,6 +45,8 @@ struct Args {
     receipts: f64,
     durability: Durability,
     coalesce: bool,
+    keep_versions: Option<usize>,
+    reclaim_mb: Option<u64>,
     seed: u64,
 }
 
@@ -64,6 +66,8 @@ impl Default for Args {
             receipts: 0.25,
             durability: Durability::Fsync,
             coalesce: false,
+            keep_versions: None,
+            reclaim_mb: None,
             seed: 7,
         }
     }
@@ -73,7 +77,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: chat-load (--db PATH | --addr HOST:PORT) [--rooms N] [--users N] [--per-user N] \
          [--clients N] [--posters N] [--seconds S] [--rate POSTS_PER_SEC] [--history N] \
-         [--receipts FRACTION] [--durability fsync|buffered] [--coalesce] [--seed N]"
+         [--receipts FRACTION] [--durability fsync|buffered] [--coalesce] \
+         [--keep-versions N] [--reclaim-mb N] [--seed N]"
     );
     std::process::exit(2)
 }
@@ -97,6 +102,12 @@ fn parse() -> Args {
             "--receipts" => args.receipts = value().parse().unwrap_or_else(|_| usage()),
             "--seed" => args.seed = value().parse().unwrap_or_else(|_| usage()),
             "--coalesce" => args.coalesce = true,
+            "--keep-versions" => {
+                args.keep_versions = Some(value().parse().unwrap_or_else(|_| usage()));
+            }
+            "--reclaim-mb" => {
+                args.reclaim_mb = Some(value().parse().unwrap_or_else(|_| usage()));
+            }
             "--durability" => {
                 args.durability = match value().as_str() {
                     "fsync" => Durability::Fsync,
@@ -359,10 +370,15 @@ async fn run(args: Args) {
         None => {
             let path = args.db.clone().unwrap_or_else(|| usage());
             let _ = std::fs::remove_file(&path);
+            let defaults = Config::default();
             let config = Config {
                 durability: args.durability,
                 coalesce: args.coalesce,
-                ..Config::default()
+                keep_versions: args.keep_versions,
+                reclaim_bytes: args
+                    .reclaim_mb
+                    .map_or(defaults.reclaim_bytes, |megabytes| megabytes << 20),
+                ..defaults
             };
             let db = open_db(&path, &config).expect("open db");
             let app = build(db, &config);
@@ -381,7 +397,7 @@ async fn run(args: Args) {
         }
     };
     println!(
-        "chat-load rooms={} users={} per_user={} clients={} posters={} seconds={} rate={} history={} receipts={} durability={:?} coalesce={}",
+        "chat-load rooms={} users={} per_user={} clients={} posters={} seconds={} rate={} history={} receipts={} durability={:?} coalesce={} keep_versions={:?}",
         args.rooms,
         args.users,
         args.per_user,
@@ -392,7 +408,8 @@ async fn run(args: Args) {
         args.history,
         args.receipts,
         args.durability,
-        args.coalesce
+        args.coalesce,
+        args.keep_versions
     );
     let plan = Arc::new(plan(&args));
     let memberships: usize = plan.members.iter().map(Vec::len).sum();

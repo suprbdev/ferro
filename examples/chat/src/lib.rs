@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use axum::serve::ListenerExt;
-use ferro::{Committed, Db, Durability, Keep, Options};
+use ferro::{Committed, Db, Durability, Keep, Options, Reclaim};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -24,6 +24,7 @@ pub struct Config {
     pub durability: Durability,
     pub coalesce: bool,
     pub keep_versions: Option<usize>,
+    pub reclaim_bytes: u64,
     pub feed_buffer: usize,
     pub max_changes: usize,
 }
@@ -34,6 +35,7 @@ impl Default for Config {
             durability: Durability::Fsync,
             coalesce: false,
             keep_versions: None,
+            reclaim_bytes: Reclaim::default().every_bytes,
             feed_buffer: 16,
             max_changes: 2000,
         }
@@ -45,7 +47,9 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Chat>> {
         .durability(config.durability)
         .coalesce(config.coalesce);
     let options = match config.keep_versions {
-        Some(count) => options.history(Keep::Last(count)),
+        Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {
+            every_bytes: config.reclaim_bytes,
+        }),
         None => options,
     };
     options.open::<Chat>(path)
