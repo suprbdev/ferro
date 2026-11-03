@@ -776,9 +776,16 @@ This is an experiment, not a production database.
   file, so commit throughput across branches stops scaling at the cost of encoding, and on one
   branch, unless you opt in to `coalesce`, at the cost of the closure and encoding, with only the
   fsync shared. A reclamation cycle and `receive` wait for the closure running on every branch
-  before they hold up all of them. Calling `update`, `fork` or `drop_branch` from inside a closure
-  can deadlock. With `coalesce`, so does a closure that waits for another thread's commit to be
-  acknowledged.
+  before they hold up all of them.
+- A write from inside a closure fails with `Error::Reentrant` wherever it could deadlock, rather
+  than hanging. That covers merge closures, a watcher test run inside a closure, and a `Drop` that
+  runs under a writer lock too. A closure may write to another file, and without `coalesce` to a
+  branch of its own file whose name sorts after its own, since cycles and `receive` take branches
+  in name order. Everything else on its own file is refused, and so is a write into another file
+  while a closure there is writing back into this one. A closure that waits on a channel or a
+  watcher for another thread's commit can still deadlock, because ferro cannot see the wait: on its
+  own branch, on a branch that sorts before its own while a cycle or `receive` waits for this
+  closure, and with `coalesce` also when that commit's closure has already run.
 - A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
   new writer can open once the last `Db` handle is gone. If a reclamation cycle has replaced that
   file since, its disk space comes back only when the last such handle is dropped.
