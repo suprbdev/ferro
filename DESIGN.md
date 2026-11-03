@@ -262,10 +262,10 @@ So each `Link::Stored` carries a write-once memo of the node it points at, in a 
   reference and writes no shared memory, which took eight readers from 9M to 60M reads a second. A
   fourth level added nothing. A `Map` pins about 73 nodes whatever its size, outside `cache_bytes`,
   until the `Map` is dropped.
-- Deeper links memoize a `Weak`, and only when the child was found in the cache. The cache stays
-  the owner, so eviction still frees the node, and the memo keeps only the node's `Arc` allocation,
-  about 150 bytes, until its parent goes. A child just read from disk is not memoized, so a one-off read
-  leaves nothing behind.
+- Deeper links memoize a `Weak` when the child was found in the cache, or when `flush` wrote it
+  beside a sibling, as described below. The cache stays the owner, so eviction still frees the
+  node, and the memo keeps only the node's `Arc` allocation, about 150 bytes, until its parent goes.
+  A child just read from disk is not memoized, so a one-off read leaves nothing behind.
 - A memo is never replaced. Once its child is evicted the link falls back to the cache, whose `get`
   restores the recency that memo hits skip, so eviction keeps seeing nodes that are really in use.
   A replaceable `ArcSwap` memo made cold gets 44% slower, because a small cache evicts constantly
@@ -281,6 +281,60 @@ Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row 
 This cut peak RSS by 28% and bulk load time by 4 to 14%. `Node` is `repr(C)` with `keys` and
 `children` first, so the first cache line of its allocation holds both pointers a walk follows,
 which took 12% off `contains_key` and 6% off `get`.
+
+### Prefetching the next level
+
+Memos took the cache lookups out of a get and left the misses. Below the pinned levels a get still
+waited, level after level, for the link, then the node header that `Weak::upgrade` reads, then the
+key array behind that header, and then the link its search picked. A `Weak` memo now also carries a
+`Hint`: where its node keeps its keys and, for an interior node, its child links, or for a leaf its
+value column, as two 32 bit offsets from the node with a count of cache lines in their low four
+bits. `reach` prefetches those lines before it upgrades, so the header, the keys and the links of
+the next level arrive together, and a get waits about once a level instead of three times. The
+offsets fit beside the `Weak` in space the enum already had, so `Memo` is still 16 bytes and `Link`
+72. A hint comes from a live node, and once that node is evicted a stale hint prefetches a line
+nobody wants and nothing more, since a prefetch never faults. That call is the crate's one `unsafe`
+block, and it does nothing on targets other than x86_64.
+
+On 1M `u64` keys, median of 15 alternating rounds in one process holding two such maps, in
+nanoseconds, the last two per key:
+
+| Memo holds | `get`, string value | `contains_key` | `get`, then read it | `get`, `u64` value | Scan | 1000-key range |
+| --- | --- | --- | --- | --- | --- | --- |
+| The node | 549 | 471 | 642 | 578 | 33 | 48 |
+| The node and a hint | 325 | 276 | 334 | 293 | 22 | 35 |
+
+The price is a few dozen instructions a level and lines fetched that a read may not use. Gets on
+10,000 keys, which stay in L2, were 6 to 12% slower until the linear search below won that back,
+and walking an index's keys alone, at about 6 ns a key, is 7 to 15% slower.
+
+Measured and left out:
+
+- Prefetching from a node once it is reached, out of its header: every line of its links and its
+  column took L1 misses from 24 to 112 a get and gained nothing, and a leaf's column alone gained at
+  most 3%. The lines have to be asked for before the header arrives.
+- Fewer lines. A hint of the keys alone, which fits in one word, was 1 to 6% slower than keys and
+  column. Child links only for nodes of level 1, whose children are leaves, were 7 to 11% slower
+  than for every interior node, and no child links at all a further 11 to 14%. The column's header
+  line alone, without its values, was 13% slower for `u64` gets and 21% for gets that read a string.
+- `_MM_HINT_T1`, which stops in L2: 1 to 20% slower at 1M keys and 4% at 10,000.
+- Full addresses in place of offsets: no faster, and `Link` grew from 72 to 80 bytes.
+- Pinning every level, which is unbounded and was only a probe: with hints it was no faster than
+  `Weak` memos, so their reference counts are no longer what a get waits on, and `PIN_DEPTH` stays.
+
+A node of at most 16 keys, each at most 16 bytes with no destructor, is searched by counting the
+keys below the target instead of by binary search, which leaves no chain of dependent loads. That
+took 7 to 11% off gets and `contains_key` at 10,000 keys and up to 5% at 1M. Keys that own heap
+keep the binary search, since every comparison would chase a pointer.
+
+`flush` leaves every node it writes in the cache, but it used to hand back links with empty memos,
+so the first read of each node after a bulk load went through a cache lookup: the first pass of gets
+after loading 1M keys took 460 ns against 365 ns warm. A link it writes now gets a `Weak` memo and
+its hint when the node sits below the pinned levels and its parent rewrote more than one child, and
+that first pass takes 335 ns. A single-key commit rewrites one child a level and memoizes nothing.
+Memoizing every written node grew the live heap of `heap`'s commits and reads case by 4%, from 46.5
+to 48.4 MiB with a 64 MiB cache, because the old paths of single-key commits kept the `Arc`
+allocations of their evicted children. With the rule it is 46.7 MiB.
 
 ### Values
 

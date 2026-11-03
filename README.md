@@ -578,14 +578,15 @@ the rows and their indexes, and re-encodes each path under the writer lock. In o
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`. Each is a single run on an otherwise idle machine.
+`ferro-bench`. Random `get`, full scan and range read are medians of seven runs on a machine shared
+with other jobs. The rest are single runs on an otherwise idle machine.
 
 | Operation | Result |
 | --- | --- |
 | Bulk insert in one commit | 1.4 s |
-| Random `get` | 0.37 µs |
-| Full scan | 33 ns per key |
-| Range read | 36 ns per key |
+| Random `get` | 0.34 µs |
+| Full scan | 22 ns per key |
+| Range read | 33 ns per key |
 | Single-key commit, fsync | 430 µs, about 2,300 per second |
 | Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
 | Reads per second with those writers running | 38M |
@@ -594,17 +595,18 @@ Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short strin
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.5 µs per changed key |
 
-Against other embedded stores on the same workload, with 3 rounds and 1 GiB of cache each:
+Against other embedded stores on the same workload, with 1 GiB of cache each, medians of five runs
+of 3 rounds on a machine shared with other jobs:
 
 | Engine | Get | Scan | Durable commit | 8 writers, commits/s | File size |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ferro | 0.53 µs | 35 ns | 0.40 ms | 9,502 | 23 MiB |
-| redb | 0.27 µs | 49 ns | 0.42 ms | 2,155 | 65 MiB |
-| SQLite, `synchronous=FULL` | 0.90 µs | 51 ns | 0.47 ms | 1,027 | 57 MiB |
-| fjall | 1.19 µs | 83 ns | 0.50 ms | 1,982 | 64 MiB |
+| ferro | 0.35 µs | 23 ns | 0.43 ms | 8,592 | 23 MiB |
+| redb | 0.31 µs | 51 ns | 0.45 ms | 2,132 | 65 MiB |
+| SQLite, `synchronous=FULL` | 1.23 µs | 58 ns | 0.58 ms | 979 | 57 MiB |
+| fjall | 1.42 µs | 97 ns | 0.54 ms | 1,930 | 64 MiB |
 
 ferro keeps every version and re-hashes objects as it reads them, and the others do neither.
-SQLite and fjall bulk load about 2 times faster, and redb's `get` is about 2 times faster. These
+SQLite and fjall bulk load 1.4 to 1.8 times faster, and redb's `get` is about 10% faster. These
 numbers come from a warm cache, on a workload with few overwrites. Full results, including
 caveats about sled, are in `benchmarks/compare/RESULTS.md`.
 
