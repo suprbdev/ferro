@@ -233,7 +233,7 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
     let mut dropped = 0;
     for (name, branch) in refs.try_entries()? {
         let log = branch.log.pruned(store, keep)?;
-        dropped += (branch.log.len() - log.len()) as u64;
+        dropped = u64::saturating_add(dropped, (branch.log.len() - log.len()) as u64);
         let mut next = branch;
         next.log = log;
         pruned.insert(name, next);

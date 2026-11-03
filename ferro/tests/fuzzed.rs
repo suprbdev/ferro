@@ -163,3 +163,9 @@ fn admin_reads_close_the_file_when_they_fail() {
     corrupt(admin::layout(&path, Keep::Last(2)));
     assert_eq!(open_handles(&path), 0);
 }
+
+#[test]
+fn compact_counts_the_commits_it_drops_without_overflow() {
+    let (_dir, path) = fixture("compact-dropped");
+    corrupt(admin::compact(&path, Keep::Last(3)));
+}
