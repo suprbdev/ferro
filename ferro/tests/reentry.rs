@@ -188,7 +188,7 @@ fn inside_b<R: Send + 'static>(
     })
 }
 
-fn check(kind: &str, results: &Results, allowed: &[&str]) {
+fn check(kind: &str, results: &[(&'static str, ferro::Result<()>)], allowed: &[&str]) {
     for (what, result) in results {
         match allowed.contains(what) {
             true => assert!(result.is_ok(), "{kind}: {what}: {result:?}"),
@@ -520,7 +520,7 @@ fn writes_up_the_lane_order_survive_cycles_and_each_other() {
             thread::spawn(move || {
                 let mut n = 0u64;
                 while !stop.load(Ordering::SeqCst) {
-                    let keep = if n % 2 == 0 { Keep::All } else { Keep::Last(3) };
+                    let keep = if n.is_multiple_of(2) { Keep::All } else { Keep::Last(3) };
                     files.main.compact(keep).unwrap();
                     n += 1;
                 }
