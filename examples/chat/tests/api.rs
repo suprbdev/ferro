@@ -820,6 +820,47 @@ async fn history_and_feeds_survive_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn long_messages_count_as_unread_across_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("chat.ferro");
+    let server = Server::start(&path, Config::default()).await;
+    let mut client = server.client().await;
+    let ann = make_user(&mut client, "ann").await;
+    let bob = make_user(&mut client, "bob").await;
+    let room = make_room(&mut client, ann, "general").await;
+    join(&mut client, bob, room).await;
+    let mut seqs = Vec::new();
+    for n in 0..6 {
+        let text = format!("long {n} {}", "word ".repeat(700));
+        seqs.push(post(&mut client, ann, room, &text).await.0);
+        post(&mut client, ann, room, &format!("short {n}")).await;
+    }
+    assert_eq!(unread_of(&mut client, bob, room).await, 12);
+    client
+        .act(ann, "DELETE", &format!("/rooms/{room}/messages/{}", seqs[1]), None)
+        .await
+        .unwrap();
+    client
+        .act(bob, "POST", &format!("/rooms/{room}/read?seq={}", seqs[3]), None)
+        .await
+        .unwrap();
+    assert_eq!(unread_of(&mut client, bob, room).await, 5);
+    drop(client);
+    server.shutdown().await;
+    let server = Server::start(&path, Config::default()).await;
+    let mut client = server.client().await;
+    assert_eq!(unread_of(&mut client, bob, room).await, 5);
+    let view = get_json(&mut client, &format!("/rooms/{room}")).await;
+    assert_eq!(view["messages"], json!(11));
+    client
+        .act(ann, "DELETE", &format!("/rooms/{room}/messages/{}", seqs[5]), None)
+        .await
+        .unwrap();
+    assert_eq!(unread_of(&mut client, bob, room).await, 4);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_rooms_count_unread_like_a_scan() {
     let dir = TempDir::new().unwrap();
     let server = Server::start(&dir.path().join("chat.ferro"), buffered()).await;
