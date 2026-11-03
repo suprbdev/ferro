@@ -3,9 +3,8 @@ mod common;
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, ThreadId};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use ferro::db::Hook;
@@ -63,6 +62,15 @@ fn wait_for(flag: &AtomicBool, what: &str) {
     }
 }
 
+fn joined<R>(handle: JoinHandle<R>, what: &str) -> R {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !handle.is_finished() {
+        assert!(Instant::now() < deadline, "{what} deadlocked");
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.join().unwrap()
+}
+
 fn a_test_commits_while(what: &str, during: fn(&Db<Root>)) -> bool {
     let _turn = serial();
     let dir = tempfile::tempdir().unwrap();
@@ -112,29 +120,20 @@ fn a_test_commits_while(what: &str, during: fn(&Db<Root>)) -> bool {
         thread::spawn(move || put(&watched, 1, 1))
     };
     thread::sleep(Duration::from_millis(30));
-    let (done, finished) = channel();
     let runner = {
         let db = db.clone();
-        thread::spawn(move || {
-            during(&db);
-            let _ = done.send(());
-        })
+        thread::spawn(move || during(&db))
     };
     if what == "compact" {
         wait_for(&synced, "the cycle's copy");
     }
     thread::sleep(Duration::from_millis(50));
     SYNC_RELEASED.store(true, Ordering::SeqCst);
-    match finished.recv_timeout(Duration::from_secs(20)) {
-        Ok(()) => {}
-        Err(RecvTimeoutError::Timeout) => panic!("{what} deadlocked with a test that commits"),
-        Err(RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
-    }
     let runner_id = runner.thread().id();
-    runner.join().unwrap();
-    member.join().unwrap();
-    leader.join().unwrap();
-    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+    joined(runner, what);
+    joined(member, "the member's commit");
+    joined(leader, "the leader's commit");
+    assert_eq!(joined(parked_thread, "the watcher").unwrap(), 2);
     let deadline = Instant::now() + Duration::from_secs(20);
     while !db.read().contains_key(&9) {
         assert!(Instant::now() < deadline, "the test's own commit never landed");

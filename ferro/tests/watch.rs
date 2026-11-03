@@ -496,9 +496,41 @@ fn a_test_may_commit_while_its_commit_publishes() {
     thread::sleep(Duration::from_millis(30));
     let writer = db.clone();
     within("a commit whose test commits", move || put(&writer, 1, 1));
-    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()).unwrap(), 2);
     assert_eq!(db.version(), 2);
     assert!(fired.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn a_slow_test_holds_up_only_the_commit_that_ran_it() {
+    let (_dir, db) = opened();
+    let (calls, hold) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(1)));
+    let watcher = {
+        let (calls, hold) = (calls.clone(), hold.clone());
+        db.watch_when(move |snapshot| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            while !snapshot.contains_key(&2) && hold.load(Ordering::SeqCst) == 1 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            false
+        })
+    };
+    let parked_thread = thread::spawn(move || watcher.recv().is_err());
+    thread::sleep(Duration::from_millis(30));
+    let before = calls.load(Ordering::SeqCst);
+    let leader = {
+        let db = db.clone();
+        thread::spawn(move || put(&db, 1, 1))
+    };
+    parked(&calls, before);
+    let writer = db.clone();
+    within("a commit behind a slow test", move || put(&writer, 2, 2));
+    assert_eq!(db.version(), 2);
+    assert!(!leader.is_finished());
+    hold.store(0, Ordering::SeqCst);
+    within("the slow commit", move || leader.join().unwrap());
+    drop(db);
+    assert!(within("the watcher", move || parked_thread.join().unwrap()));
 }
 
 #[test]
@@ -519,7 +551,7 @@ fn a_read_only_test_may_refresh_while_refresh_runs_it() {
     put(&db, 2, 2);
     let refresher = reader.clone();
     assert!(within("a refresh whose test refreshes", move || refresher.refresh().unwrap()));
-    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()).unwrap(), 2);
     assert_eq!(reader.version(), 2);
 }
 
