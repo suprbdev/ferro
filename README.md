@@ -334,8 +334,9 @@ crash leaves the previous head.
 A pulled commit keeps the version, time, message and hash it had. A fast-forward adopts the other
 branch, so afterwards `head_hash` is the same in both files. A merge commits at this branch's next
 version, and the other side's commits stay on the `phone` branch under their own numbers, so after
-a divergence compare commits across files by hash, not by version. Each pull replaces the `phone`
-branch, so do not commit to it.
+a divergence compare commits across files by hash, not by version. A pull that brings new commits
+replaces the `phone` branch, so do not commit to it. A bundle that arrives late or twice changes
+nothing.
 
 Devices converge only if your closure gives the same result whichever side is `ours`, as
 last-writer-wins on a clock does. `examples/notes` is an offline-first notes app built this way:

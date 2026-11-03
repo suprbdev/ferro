@@ -1124,8 +1124,9 @@ A notes edit rewrites a path of four or five nodes in the rows and, for a tag, i
   receiver's branches plus log n, times the sender's branches, times log n.
 - A subtree that moved more than one level deeper than where the receiver holds it is sent again.
 - A value that holds a `Ptr` into pruned history cannot be sent.
-- Each pull replaces `remote`, including commits made on it here. If the remote branch's history no
-  longer contains what was landed before, records under that name are dropped.
+- Each pull that brings a head `remote` does not hold replaces `remote`, including commits made on it
+  here. If the remote branch's history no longer contains what was landed before, records under that
+  name are dropped.
 - The receiver decodes each new root as its own `T`, so peers need schemas that decode each other's
   roots. A root that has to rebuild a table index as it decodes, because the sender's schema lacks
   that index, can be rejected, since the rows it would read are not written yet.
