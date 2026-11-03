@@ -410,7 +410,7 @@ impl Checked {
 
     pub(crate) fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
         let entry = self.seen.entry((hash, kind.id));
-        entry.or_insert((shape, Vec::new())).1.push(kind.clone());
+        entry.or_insert_with(|| (shape, Vec::with_capacity(1))).1.push(kind.clone());
     }
 }
 
