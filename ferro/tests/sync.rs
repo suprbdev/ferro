@@ -10,8 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{Rng, cases, fast, text};
+use ferro::codec::{Encoder, HashSink, Object};
 use ferro::store::{Op, Trace};
-use ferro::{Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Pulled, Snapshot};
+use ferro::{
+    Bundle, Commit, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Snapshot,
+};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -977,4 +980,110 @@ fn a_watch_test_may_commit_and_pull_while_a_merge_publishes() {
         a_test_commits_while_a_pull_publishes(false, true),
         Outcome::Merged
     );
+}
+
+fn varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn link_to(object: &Object) -> Ptr {
+    Ptr {
+        hash: object.hash(),
+        offset: 0,
+    }
+}
+
+fn object_of<D: Data>(value: &D) -> Object {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder).unwrap();
+    encoder.into_object()
+}
+
+fn entry_of(version: u64, root: &Object, prev: Option<Ptr>, skip: Option<Ptr>) -> Object {
+    let commit = Commit {
+        version,
+        time_ms: version,
+        message: String::new(),
+        root: Some(link_to(root)),
+        restored: None,
+    };
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    commit.encode(&mut encoder).unwrap();
+    encoder.u8(u8::from(prev.is_some()) + 2 * u8::from(skip.is_some()));
+    for chained in prev.into_iter().chain(skip) {
+        encoder.link(chained);
+    }
+    encoder.into_object()
+}
+
+fn forged(tip: &Object, version: u64, objects: &[&Object]) -> Bundle {
+    let mut out = b"FERROBDL".to_vec();
+    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&tip.hash());
+    varint(&mut out, version);
+    for _ in 0..3 {
+        varint(&mut out, 0);
+    }
+    varint(&mut out, objects.len() as u64);
+    for object in objects {
+        varint(&mut out, (object.body.len() as u64) << 1);
+        out.extend_from_slice(&object.body);
+        varint(&mut out, object.links.len() as u64);
+        for linked in &object.links {
+            out.extend_from_slice(&linked.hash);
+            varint(&mut out, 0);
+        }
+    }
+    Bundle::from(out)
+}
+
+fn untouched(_: &mut u64, _: &Snapshot<u64>, _: &Snapshot<u64>) -> (String, ()) {
+    panic!("no merge expected");
+}
+
+#[test]
+fn a_bundle_whose_commit_skips_to_another_commit_is_rejected() {
+    for into_a_value in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
+        let size = b.size_on_disk();
+        let roots: Vec<Object> = (0..=10u64).map(|value| object_of(&value)).collect();
+        let other_root = object_of(&40u64);
+        let mut entries: Vec<Object> = Vec::new();
+        let mut impostor = None;
+        for version in 1..=10u64 {
+            let prev = entries.last().map(link_to);
+            let skip = match version {
+                6 if !into_a_value => {
+                    let other = entry_of(4, &other_root, Some(link_to(&entries[2])), None);
+                    let skip = link_to(&other);
+                    impostor = Some(other);
+                    Some(skip)
+                }
+                10 if into_a_value => Some(link_to(&roots[8])),
+                10 => Some(link_to(&entries[7])),
+                _ => None,
+            };
+            entries.push(entry_of(version, &roots[version as usize], prev, skip));
+        }
+        let mut objects: Vec<&Object> = roots[1..].iter().collect();
+        objects.push(&other_root);
+        objects.extend(&entries[..3]);
+        objects.extend(&impostor);
+        objects.extend(&entries[3..]);
+        let bundle = forged(&entries[9], 10, &objects);
+        match b.receive("evil", &bundle, untouched) {
+            Err(Error::Bundle(_)) => {}
+            other => panic!("accepted a forged skip link: {other:?}"),
+        }
+        assert_eq!(b.version(), 0);
+        assert_eq!(b.branches(), vec!["main".to_string()]);
+        assert_eq!(b.size_on_disk(), size);
+    }
 }

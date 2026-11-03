@@ -877,17 +877,21 @@ fn land<T: Data>(
         let entry = entries.get(&slot);
         let mut links = Vec::with_capacity(wire.links.len());
         for (hash, reference) in &wire.links {
-            let ptr = if *reference == 0 {
-                if let Some(ptr) = written.get(hash) {
-                    used[index[hash]] = true;
-                    *ptr
-                } else if let Some(version) = entry.and_then(|entry| chain_version(entry, *hash)) {
-                    chain_link(*hash, version)?
-                } else {
+            let chained = entry.and_then(|entry| chain_version(entry, *hash));
+            let ptr = if let Some(version) = chained.filter(|version| *version < low) {
+                chain_link(*hash, version)?
+            } else if chained.is_some_and(|version| versions.get(&version) != Some(hash)) {
+                return Err(bad(
+                    "a commit links to one that is not the commit at that version",
+                ));
+            } else if *reference == 0 {
+                let Some(ptr) = written.get(hash) else {
                     return Err(bad(
                         "an object links to one that was neither sent nor known",
                     ));
-                }
+                };
+                used[index[hash]] = true;
+                *ptr
             } else if *reference <= roots.len() {
                 roots[*reference - 1]
             } else {

@@ -1024,8 +1024,10 @@ as in the file.
   commit, the way a pruned chain does.
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
-  hash, or to offset 0 below the landed branch's `first`, which nothing follows. Anything else
-  rejects the bundle, and so does an object nothing links to.
+  hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
+  `prev` or `skip` that lands on a sent commit must name the one at that version, so a lookup through
+  skip links cannot reach a commit the `prev` chain does not hold. Anything else rejects the bundle,
+  and so does an object nothing links to.
 - The root of every new commit decodes as `T`.
 
 All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
