@@ -4,8 +4,11 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use ferro::{Closer, Watcher};
+
 use crate::model::Job;
 use crate::queue::{Lease, Queue};
+use crate::state::State;
 
 pub type Handler = Arc<dyn Fn(&Job) -> Result<(), String> + Send + Sync>;
 
@@ -40,8 +43,8 @@ struct Counters {
 }
 
 pub struct Runner {
-    queue: Queue,
     stop: Arc<AtomicBool>,
+    closers: Vec<Closer<State>>,
     counters: Arc<Counters>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -51,30 +54,34 @@ impl Runner {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
         let mut threads = Vec::new();
+        let ready = queue.watch_ready(config.queues.clone());
+        let sooner_than = Arc::new(AtomicU64::new(u64::MAX));
+        let due = queue.watch_due(sooner_than.clone());
+        let closers = vec![ready.closer(), due.closer()];
         for index in 0..config.workers {
             let queue = queue.clone();
             let config = config.clone();
             let handler = handler.clone();
             let stop = stop.clone();
             let counters = counters.clone();
+            let ready = ready.clone();
             let handle = thread::Builder::new()
                 .name(format!("{}-{index}", config.name))
-                .spawn(move || work(queue, config, index, handler, stop, counters))
+                .spawn(move || work(queue, ready, config, index, handler, stop, counters))
                 .expect("spawn worker");
             threads.push(handle);
         }
         {
-            let queue = queue.clone();
             let stop = stop.clone();
             let handle = thread::Builder::new()
                 .name("reaper".into())
-                .spawn(move || reap(queue, stop))
+                .spawn(move || reap(queue, due, sooner_than, stop))
                 .expect("spawn reaper");
             threads.push(handle);
         }
         Runner {
-            queue,
             stop,
+            closers,
             counters,
             threads,
         }
@@ -94,7 +101,9 @@ impl Runner {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self.queue.poke();
+        for closer in &self.closers {
+            closer.close();
+        }
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -103,13 +112,13 @@ impl Runner {
 
 fn work(
     queue: Queue,
+    ready: Watcher<State>,
     config: RunnerConfig,
     index: usize,
     handler: Handler,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
 ) {
-    let watcher = queue.watch();
     let name = format!("{}-{index}", config.name);
     while !stop.load(Ordering::SeqCst) {
         let mut busy = false;
@@ -149,18 +158,23 @@ fn work(
                 Err(_) => return,
             }
         }
-        if !busy && watcher.recv_timeout(config.idle_wait).is_err_and(|e| {
-            matches!(e, std::sync::mpsc::RecvTimeoutError::Disconnected)
-        }) {
+        if !busy && closed(&ready, config.idle_wait) {
             return;
         }
     }
 }
 
-fn reap(queue: Queue, stop: Arc<AtomicBool>) {
-    let watcher = queue.watch();
+fn closed(watcher: &Watcher<State>, wait: Duration) -> bool {
+    watcher
+        .recv_timeout(wait)
+        .is_err_and(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Disconnected))
+}
+
+fn reap(queue: Queue, due: Watcher<State>, sooner_than: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
-        let wait = match queue.next_due() {
+        let next = queue.next_due();
+        sooner_than.store(next.unwrap_or(u64::MAX), Ordering::Release);
+        let wait = match next {
             Some(at) => {
                 let now = queue.now();
                 if at <= now {
@@ -173,10 +187,7 @@ fn reap(queue: Queue, stop: Arc<AtomicBool>) {
             }
             None => Duration::from_secs(3600),
         };
-        if watcher
-            .recv_timeout(wait)
-            .is_err_and(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Disconnected))
-        {
+        if closed(&due, wait) {
             return;
         }
     }

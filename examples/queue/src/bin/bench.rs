@@ -257,6 +257,46 @@ fn wake(args: &HashMap<String, String>) {
     }
 }
 
+fn voluntary_switches() -> u64 {
+    let mut total = 0;
+    for task in fs::read_dir("/proc/self/task").unwrap().flatten() {
+        let status = fs::read_to_string(task.path().join("status")).unwrap_or_default();
+        total += status
+            .lines()
+            .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|count| count.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+    }
+    total
+}
+
+fn idle(args: &HashMap<String, String>) {
+    let commits = arg(args, "commits", 3000);
+    for workers in [0usize, 8, 32] {
+        let path = fresh("idle.ferro");
+        let queue = open(&path);
+        let handler: queue::runner::Handler = Arc::new(|_| Ok(()));
+        let mut config = RunnerConfig::new(vec!["q".into()], workers);
+        config.idle_wait = Duration::from_secs(600);
+        let runner = Runner::start(queue.clone(), config, handler);
+        thread::sleep(Duration::from_millis(200));
+        let before = voluntary_switches();
+        let start = Instant::now();
+        for i in 0..commits {
+            queue.enqueue(NewJob::new("elsewhere", format!("{i}"))).unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let switches = voluntary_switches() - before;
+        println!(
+            "idle workers={workers} commits_per_s={:.0} commit_us={:.1} switches_per_commit={:.2}",
+            commits as f64 / elapsed,
+            elapsed * 1e6 / commits as f64,
+            switches as f64 / commits as f64
+        );
+        runner.stop();
+    }
+}
+
 fn batching(args: &HashMap<String, String>) {
     let total = arg(args, "jobs", 100_000);
     for batch in [1usize, 4, 16, 64] {
@@ -480,7 +520,7 @@ fn split(args: &HashMap<String, String>) {
             t.elapsed().as_micros() as f64 / rounds as f64
         );
     };
-    measure("epoch only (root struct + log entry)", &|state, _| state.epoch += 1);
+    measure("next_id only (root struct + log entry)", &|state, _| state.next_id += 1);
     measure("jobs map only (one job record rewritten)", &|state, i| {
         let id = 7 + (i * 13) % (depth - 20);
         let mut job = (*state.jobs.get(&id).unwrap()).clone();
@@ -517,6 +557,7 @@ fn main() {
         "throughput" => throughput(&args),
         "growth" => growth(&args),
         "wake" => wake(&args),
+        "idle" => idle(&args),
         "batching" => batching(&args),
         "day" => day(&args),
         "cycle" => cycle(&args),

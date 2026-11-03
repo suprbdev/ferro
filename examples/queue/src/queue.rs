@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -148,6 +149,16 @@ impl Queue {
         self.db.watch()
     }
 
+    pub fn watch_ready(&self, queues: Vec<String>) -> Watcher<State> {
+        self.db.watch_when(move |state| queues.iter().any(|name| state.ready_in(name)))
+    }
+
+    pub fn watch_due(&self, sooner_than: Arc<AtomicU64>) -> Watcher<State> {
+        self.db.watch_when(move |state| {
+            state.due_at().is_some_and(|at| at < sooner_than.load(Ordering::Acquire))
+        })
+    }
+
     pub fn refresh(&self) -> Result<bool> {
         Ok(self.db.refresh()?)
     }
@@ -166,11 +177,6 @@ impl Queue {
 
     pub fn version(&self) -> u64 {
         self.db.version()
-    }
-
-    pub fn poke(&self) -> Result<()> {
-        self.db.update(|state| state.epoch += 1)?;
-        Ok(())
     }
 
     pub fn next_due(&self) -> Option<u64> {

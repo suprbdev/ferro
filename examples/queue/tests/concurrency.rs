@@ -222,3 +222,40 @@ fn stop_returns_promptly_when_idle() {
     handle.join().unwrap();
     assert!(start.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn stopping_an_idle_runner_commits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let queue = open(&dir);
+    queue.enqueue(NewJob::new("elsewhere", "x")).unwrap();
+    let before = queue.version();
+    let mut config = RunnerConfig::new(vec!["jobs".into()], 4);
+    config.idle_wait = Duration::from_secs(600);
+    let runner = Runner::start(queue.clone(), config, Arc::new(|_| Ok(())));
+    thread::sleep(Duration::from_millis(50));
+    runner.stop();
+    assert_eq!(queue.version(), before);
+}
+
+#[test]
+fn a_parked_reaper_wakes_for_something_due_sooner() {
+    let dir = tempfile::tempdir().unwrap();
+    let queue = open(&dir);
+    queue.enqueue(NewJob::new("jobs", "much later").delay_ms(3_600_000)).unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let handler = {
+        let seen = seen.clone();
+        Arc::new(move |job: &queue::Job| {
+            seen.lock().unwrap().push(String::from_utf8(job.payload.to_vec()).unwrap());
+            Ok(())
+        })
+    };
+    let mut config = RunnerConfig::new(vec!["jobs".into()], 2);
+    config.idle_wait = Duration::from_secs(600);
+    let runner = Runner::start(queue.clone(), config, handler);
+    thread::sleep(Duration::from_millis(100));
+    queue.enqueue(NewJob::new("jobs", "soon").delay_ms(150)).unwrap();
+    assert!(wait_for(Duration::from_secs(5), || seen.lock().unwrap().len() == 1));
+    assert_eq!(seen.lock().unwrap()[0], "soon");
+    runner.stop();
+}

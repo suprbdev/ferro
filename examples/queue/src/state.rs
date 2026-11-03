@@ -24,7 +24,6 @@ impl Tick {
 #[derive(Clone, Debug, Default, Data)]
 pub struct State {
     pub next_id: u64,
-    pub epoch: u64,
     pub jobs: Map<u64, Job>,
     pub ready: Set<ReadyKey>,
     pub delayed: Set<(u64, String, u64)>,
