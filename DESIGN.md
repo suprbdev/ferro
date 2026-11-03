@@ -13,8 +13,9 @@ of `T`, and all earlier versions stay readable.
   the handle reads return. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
-- `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
-- `watch.rs`: `Watcher<T>` and the per-branch feed behind it.
+- `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`
+  and `history_of_range`.
+- `watch.rs`: `Watcher<T>`, `Closer<T>` and the per-branch feed behind them.
 - `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share.
 
 ## Objects and links
@@ -486,20 +487,22 @@ A setting carried over from before that holds about a quarter of what it did. `m
 
 ## File format and durability
 
-Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, and records
-the size the file had when this generation began and how much of the previous one survived. The log
-is a run of frames, one per commit. A frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by the records
-the commit wrote. The check covers the header and every record, so a frame proves by itself that
-it reached the disk whole. A commit does this:
+Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, records the
+size the file had when this generation began and how much of the previous one survived, and carries
+an anchor, the newest position known to be durable. The log is a run of frames, one per commit. A
+frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by
+the records the commit wrote. The check covers the header and every record, so a frame proves by
+itself that it reached the disk whole. A commit does this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.
 3. Write the superblock to the other slot, without syncing it.
 
-The superblock is written only after its frame is durable, so it never names anything a crash can
-lose, and the next fdatasync carries it to disk. A crash leaves it at most one sync behind.
+In `Durability::Fsync` the superblock is written only after its frame is durable, so it anchors
+itself and never names anything a crash can lose, and the next fdatasync carries it to disk. A crash
+leaves it at most one sync behind.
 
-Open picks the valid slot with the highest sequence and scans forward from its log end. A frame
+Open picks the valid slot with the highest sequence and scans forward from its anchor. A frame
 counts only if its magic, sequence (the previous one plus 1), end offset and check are all right,
 and the first that is not ends the log. A torn tail, zeroes and garbage all stop the scan, and an
 acknowledged commit survives a stale or torn superblock. A writer then syncs the frames it
@@ -507,12 +510,40 @@ accepted, truncates the rest, and rewrites the superblock, in that order. The tr
 before any new frame is written, so a frame stranded past a torn one can never line up with the
 log later.
 
+`Durability::Buffered` skips step 2, so a power cut can keep a superblock and lose the frames it
+names, and open used to fail on that file. It may lose recent commits by contract, but it must
+always open. So a Buffered superblock keeps the anchor of the last checkpoint: a position an
+fdatasync has covered. The leader of the batch that takes the log past `Options::checkpoint_bytes`
+of unsynced frames, 64 MiB by default, syncs once it has published and woken that batch, so only its
+own commit waits for the disk, and a clean close syncs as well. A scan from the anchor ends at the first frame the power
+cut damaged, whatever the superblock claims. Only frames past the anchor can roll back, so a
+superblock that anchors itself still reports a hole in its log as corruption, not as a short log.
+
+A rollback rewrites both slots, syncing between them, so a reader that opens beside the new writer
+trusts a superblock that names only surviving frames. A read-only open cannot rewrite anything. It
+scans from the anchor when no writer holds the lock, and remembers the superblock it refused so
+that `refresh` ignores it until a writer replaces it. Keeping the anchor in the superblock rather
+than dedicating one slot to it means neither slot has to be synced on its own: every superblock
+that survives names an anchor that was durable before that superblock was written.
+
+Recovery reads what lies between the anchor and the tail. With the frames still in the page cache,
+that took 13 ms for 64 MiB and 54 ms for 256 MiB, where a clean open takes 0.02 ms. The checkpoint
+is the cost: the commit that crosses the line waits 27 ms for 64 MiB to reach the disk here, which
+averages out to 1.4 µs on every Buffered commit of `ferro-bench`, 25.8 to 27.3 µs, while p99 does
+not move. The anchor adds 44 bytes to a superblock, one more BLAKE3 block per commit. Syncing on every
+Buffered commit would have closed the bug too, and made it Fsync. Writing the superblock only at
+checkpoints would have left followers a checkpoint behind, because `refresh` must not scan past a
+superblock while a writer is alive. The fix was tested only against modelled power cuts: every
+prefix of the recorded writes with all, none, a random half or torn sectors of the unsynced ones
+kept, and the superblocks kept without their frames.
+
 A frame past the superblock may not be durable while a writer is alive, so `refresh` reads only
-the superblock and never scans. A read-only open scans only when a frame follows the superblock
-and it can take a shared lock, which proves no writer is alive. It holds that lock for the scan
-and syncs what it accepted, since a dead writer's frames may exist only in the page cache. If a
-writer holds the lock, the superblock is current and the reader uses it. A writer opening during
-that short scan retries for a few milliseconds before reporting `Error::Locked`.
+the superblock and never scans. A read-only open scans only when a frame follows the superblock or
+the superblock does not anchor itself, and it can take a shared lock, which proves no writer is
+alive. It holds that lock for the scan and syncs what it accepted, since a dead writer's frames may
+exist only in the page cache. If a writer holds the lock, the superblock is current and the reader
+uses it. A writer opening during that short scan retries for a few milliseconds before reporting
+`Error::Locked`.
 
 fdatasync after extending a file has to commit the ext4 journal, which took 620 µs against 360 µs
 for overwriting allocated blocks on the test NVMe. So in `Durability::Fsync` the log grows in
@@ -582,10 +613,170 @@ A `Branch` closes its feed when it drops, which is when the last `Db` handle goe
 holds only the feed, so a parked one keeps neither the file nor the writer lock. The price is that
 a snapshot nobody had taken by then is lost.
 
+`Watcher::closer` returns a `Closer`, a cloneable handle that ends that watcher and its clones from
+any thread. It sets a flag under the feed's mutex and wakes the parked, so stopping a set of workers
+no longer takes a commit. `recv` then fails the way it does when the feed closes, and any other
+watcher of the branch carries on. A closer holds only the feed as well.
+
+`Db::watch_when(test)` is a watcher that sleeps through commits that do not concern it. A filtered
+watcher and its clones park on a condvar of their own, listed in the feed by a `Weak`. Publishing
+finds the lists with someone parked and runs `test` on the new snapshot, and wakes them only if it
+passes, so a commit nobody wants costs one evaluation per filter and no thread switch, and a filter
+with nobody parked costs nothing. The test runs on the thread that leads the batch, after the frame
+is durable and outside the writer lock, so a writer's closure can run while it does, but it holds up
+that batch's acknowledgement: it should be a quick read. A panic is caught there and counts as a
+pass, so that the watcher wakes and hits the same panic on its own thread. A woken watcher tests the
+snapshot again, since what passed may be gone, and it tests whatever it finds when it next looks, so
+nothing that landed while it was busy is missed.
+
+`queue` used to wake every idle worker on every commit, and to commit a dummy `epoch` change at
+shutdown. Now workers filter on a ready job in their own queues, and the reaper on something falling
+due sooner than it planned, against a value it stores before it parks. With 8 and 32 idle workers a
+commit used to cost 12 and 47 voluntary context switches, and now costs 2, as with no workers at
+all. The time from enqueue to handler stayed within run-to-run noise, 2.0 to 2.5 ms at the median.
+
+Evaluating the test on each watcher's own thread was rejected, since that is a wake per commit per
+watcher, which is the cost this removes. Waking one member of a filter to test for the rest would
+keep user code off the commit path, at one wake per commit forever. A wake with no close has no user
+here: a timeout already covers what it would do, and the queue only ever needed the end.
+
 A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
 does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them also keep the
 writer lock held after the `Db` is dropped, so a new writer gets `Error::Locked` until they are gone.
-A closure works on a clone of the tip, so a panic or an `Err` discards its changes.
+A closure works on a clone of the tip, or of its group's working copy, so a panic or an `Err`
+discards its changes.
+
+### Coalescing
+
+Closures run one at a time, but each still encoded, hashed and compressed a whole tree path and wrote a
+frame, though the next closure rewrote the same paths. On `queue` at 8 writers the lock was held for
+37 µs a commit: 5 for the closure, 20 to encode and hash the tree, and 12 for the log entry, the
+refs, the frame and reloading the tip. At 32 writers, with more cache misses, it was 64 µs, which is
+what capped commits at about 15,000 a second, and bytes per job grew with the writers because more
+rows were in flight.
+
+`Options::coalesce(true)` lets closures that queue up behind one another share a flush, a frame and
+a version. It is off by default, because it gives up what ferro otherwise promises, a version for
+every closure:
+
+- A version is a group. `Committed::version` is the group's, so several closures can return the same
+  one. `at` cannot show the state between two closures of a group, because it was never written.
+- `Commit::message` holds the group's messages, one per line, and `Commit::messages` lists them.
+  This needs no format change, and a commit made alone reads as it always did.
+- `history_of` and `Log` see groups. A row changed twice in a group shows once, with its last value,
+  and a change undone inside a group does not show at all.
+- Closures still run in order, each seeing what the ones before it did.
+- `Committed::changed` says the group moved the version. A closure that changed nothing, in a group
+  where another did, reports `true`. Telling them apart needs a hash of the dirty tree after every
+  closure, which is the cost this removes. A group of no-ops writes nothing and reports `false`.
+- `restore` and `merge_with` commit alone, since `restored` and `merged` belong to one version.
+  They, `fork`, `drop_branch` and a reclamation cycle flush the open group before they start, and a
+  closure on another branch flushes it before starting its own.
+
+The combiner is a lock passed between waiters. The group's working copy lives in `Shared` between
+closures and each closure takes it under the `tip` mutex on its own thread. So there is no `Send`
+bound, `update` closures keep borrowing local state, and a panic unwinds where it should. Cloning
+the working copy first is the checkpoint, O(1) per collection, and an `Err` or a panic puts it back.
+That closure still waits for the group, since it may have read state that never becomes durable,
+except that a panic does not wait, as it never did.
+
+A closure ending under the lock does not flush if someone else will finish the group: either a
+thread has announced it is on its way to the lock, or a sync is running, whose leader wakes one
+member when it ends. Otherwise it flushes. So a group closes when nobody is coming or a sync ends,
+which gives one flush per fsync however many writers there are, and a lone writer flushes at once,
+down the same path as before. A group stops at 256 closures, which bounds what the first of them
+waits for.
+
+Members park on the group's seal and the leader unparks each one. The first version waited on a
+condvar, and notifying a condvar moves its waiters to the mutex and wakes them one at a time: that
+chain alone held 32 `queue` writers to 11,600 jobs a second with a p99 of 1,107 µs, against 15,600
+and 753 µs once members were unparked directly, median of three. The same change on the plain path
+gained 3% at 8 writers and nothing at 32, where the writer lock is the bottleneck, so it was left
+out.
+
+If the group cannot be written, every closure in it gets `Error::GroupFailed`, or `Error::Poisoned`
+if the store is, and its changes are gone, including those of closures that did nothing wrong. A
+panic in `Data::encode` is one of those failures: it cannot be charged to one closure, so it is
+caught and reported to all of them. Nothing else about failure changes: a failed sync fails the
+group behind it, and a closure that waits for another thread's commit to be acknowledged now
+deadlocks, because that commit may be waiting for this closure to end.
+
+`queue-bench throughput`, fsync, each job an enqueue, a lease and an ack, median of five
+alternating runs against the tree before this change:
+
+| Jobs waiting | Writers | Jobs/s | Bytes per job | Ack p50 | Ack p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 862 → 894 | 1,185 → 1,173 | 386 → 354 µs | 454 → 425 µs |
+| 1 | 8 | 3,457 → 5,707 | 1,848 → 283 | 763 → 453 µs | 862 → 797 µs |
+| 1 | 32 | 9,721 → 16,926 | 2,691 → 146 | 959 → 611 µs | 2,270 → 796 µs |
+| 1,000 | 8 | 3,529 → 5,306 | 4,293 → 647 | 742 → 485 µs | 882 → 615 µs |
+| 1,000 | 32 | 5,930 → 15,286 | 4,972 → 234 | 1,786 → 659 µs | 3,755 → 857 µs |
+
+That is one version for every 8 closures at 8 writers and every 32 at 32, so bytes per job fall by
+85 to 95%, against 93% for batching ten jobs a commit by hand. `shop-load` against `shop --coalesce`, with its 32 writer
+threads, median of three:
+
+| Mix of reads, cart adds and orders | Connections | Writes/s | Write p99 | Bytes per write |
+| --- | --- | --- | --- | --- |
+| 90, 8, 2 | 32 | 10,267 → 12,531 | 5.4 → 3.7 ms | 2,905 → 1,104 |
+| 90, 8, 2 | 128 | 10,909 → 12,592 | 16.3 → 14.3 ms | 2,891 → 900 |
+| 0, 70, 30 | 32 | 12,034 → 14,223 | 5.4 → 3.4 ms | 2,967 → 973 |
+| 0, 70, 30 | 128 | 14,616 → 14,579 | 14.7 → 13.4 ms | 3,041 → 970 |
+
+At 128 connections throughput stays where it was, so something besides the writer lock bounds it
+there. Read p99 rose from 0.15 to 0.21 ms at 32 connections. `ferro-bench`'s concurrent metric, 8
+writers and 8 readers on 1M keys, went from 10,300 to 15,650 commits a second, median of five, and
+with the option off it measured 9,900, within that run-to-run spread. A writer alone costs the same
+with the option on: 2,550 fsync commits a second against 2,390 with it off and 2,590 before, and
+46,000 Buffered against 45,900 and 47,900, a difference the Buffered checkpoint accounts for.
+
+`ferro-bench`'s `group` tool, single-key updates spread over 100,000 keys, median of three:
+
+| Durability | Closure | Writers | Closures/s | Bytes per closure | p99 |
+| --- | --- | --- | --- | --- | --- |
+| fsync | empty | 8 | 10,300 → 14,800 | 2,308 → 1,536 | 995 → 699 µs |
+| fsync | empty | 32 | 31,300 → 36,200 | 2,427 → 1,279 | 2,783 → 2,550 µs |
+| fsync | 50 µs | 8 | 9,980 → 8,350 | 2,306 → 1,510 | 1,214 → 1,151 µs |
+| fsync | 50 µs | 32 | 12,360 → 12,100 | 2,345 → 1,209 | 4,769 → 4,782 µs |
+| Buffered | empty | 8 | 40,900 → 49,900 | 2,400 → 1,610 | 3,204 → 292 µs |
+| Buffered | empty | 32 | 32,700 → 48,200 | 2,435 → 1,304 | 8,673 → 818 µs |
+| Buffered | 50 µs | 32 | 11,400 → 13,000 | 2,343 → 1,212 | 33,287 → 2,679 µs |
+
+Random keys share only the top of each path, so a flush saves less than on `queue`. With a 50 µs
+closure and fsync it does not win: 8 writers lost 16% of their throughput. Every writer ends up in
+the one group, so all of them run their closures, 400 µs between them, while the disk sits idle,
+and then all of them wait for the same sync, where the plain path runs one writer's closure while
+another's frame syncs. Buffered commits gain at every size, and their p99 falls by an order of
+magnitude, because the leader no longer serializes a flush per writer.
+
+Measured and left out:
+
+- One version per closure in a shared frame. That keeps history and needs no option, but only the
+  frame write, the refs and the reload of the tip, 10 of those 37 µs, happen once per frame, and the
+  tree path is the rest. Bytes barely move, since a frame header and the refs are about 130 of the
+  233 bytes that a commit of one field costs. An upper bound of +37% on throughput, where coalescing
+  gave 50 to 158% on `queue`, did not justify an open transaction that has to read its own unwritten
+  objects.
+- Sharing intermediate nodes between versions. There is nothing left to share: objects are
+  addressed by hash, so a commit already writes only what differs from the version before. Every
+  intermediate version must reference a root, and that root every node on the paths it changed. A
+  root cannot be recovered without writing it, since a closure is code, not data, and `T` has no
+  generic diff, so the only way to keep the bytes down is to store them smaller. Compressing each
+  group's frames as one LZ4 block instead of object by object, simulated over 60,000 real `queue`
+  frames, took 1,537 bytes per closure to 464 at 8 closures a block and 356 at 32. That keeps history
+  and saves no CPU, because each intermediate root must still be hashed, and a read would have to
+  decompress the block, so offsets would stop naming records. It was not built.
+- A combiner thread that runs other threads' closures. It saves the lock hand-over, which costs
+  more than most closures here, but needs `Send` on every closure and its result.
+- Spinning on arrival before parking. 2,000 spins, about 25 µs, gained 8% on `queue` at 8 writers
+  and 6% at 32, and 3 and 10% on `group`, median of four alternating runs, with p99 better in three
+  cases and 30% worse in one. That is not clear enough to burn a core in every waiting writer.
+- Other rules for closing a group. Sealing whenever no other thread is on its way, even with a
+  sync running, cost `queue` 39% of its throughput at 8 writers and 14% at 32, with 53 to 72% more
+  bytes. Sealing as soon as no sync is running, unless Buffered, cost it 37 and 21%. Sealing once a
+  group had been open for half the last sync, though more closures were coming, helped 50 µs
+  closures by 10% at 8 writers and 38% at 32, and cost `queue` 7% and 19% of its throughput and up
+  to 75% more bytes. Nothing tried won everywhere, so the simplest rule stays.
 
 ## History
 
@@ -622,6 +813,33 @@ genesis value, and a pruned chain reports its oldest retained commit, since what
 gone. `History` is not double ended, because reversing it would need the whole walk. Callers that
 show changes oldest first collect and reverse, so the cost is in plain sight.
 
+`Db::history_of_range(versions, project)` is the same walk between two versions. It finds its top
+through skip links and reads one version below its bottom as a baseline, so it yields exactly what
+filtering `history_of` by version would, for O(log n) plus the span. `history_of` is that with no
+bounds. Both load nothing until the first `next`.
+
+`Db::bisect(versions, test)` finds where a monotone test turns true, in about log2(n) probes of a
+root each. A probe is a version lookup, so that is O(log^2 n) entry loads. Following skip links from
+the tip was worked out and not built: it takes two probes a level for the sake of the entry loads,
+and the probes are what cost.
+
+`Db::bisect_changes(versions, project)` uses the probes the walk cannot trust. It compares the ends
+of a span, stops if they agree, and otherwise cuts the span in two, so it costs O(changes × log n)
+probes, not the span, and it can miss a change and its reversal that fall between two probes. It is
+for a projection that never returns to an earlier value in that range, such as a row with a
+revision or an attempt count, or `value_hash` of one. A row that appears and later goes is not one:
+its absence comes back, so the range has to stop short of the row's end. A pruned chain and genesis
+behave as in `history_of`, and results come oldest first.
+
+`queue` carried 90 lines of its own bisection and now has none. On a 305,000 commit file, for one job
+out of 100,000, `queue history` takes 1.2 ms, as the old bisection did, against 2.0 to 3.9 s for
+`history_of`, which walks back to the start of the log because the job is absent at the tip. The two
+`bisect` calls that find where the job begins and ends take 0.1 to 0.2 ms. For a job alive through
+the whole file, `bisect_changes` takes 0.26 ms and `history_of_range` over its 304,734 versions takes
+1.0 s. A job that stays alive is where the walk still costs, which is why `queue`
+uses `bisect_changes` and not `history_of_range`. `shop` starts `GET /orders/:id/history` from the
+request's snapshot, so it no longer walks commits newer than the one it answers for.
+
 A value's item is ready only when the walk reaches the start of that value's run. A row's creation
 is followed by a run of `None` back to version 1 that reports nothing, so `Iterator::take_while`
 would read the rest of the log to learn that no older item exists. `History::take_while` is an
@@ -629,7 +847,8 @@ inherent method for that reason. It tests the predicate against each older value
 enters its run, paired with the commit last reported, and stops there. Its items match the
 `Iterator` adaptor for a predicate on the value, on the commit, or on the conjunction of the two.
 The predicate is `Fn` because it can run twice per item. The run at the tip has no commit to pair
-with, so a row that is absent at the tip costs the age of that absence; check with `get` first.
+with, so a row that is absent at the tip costs the age of that absence; find where it ended with
+`bisect` and start `history_of_range` there.
 
 A step loads one `Entry`, loads and decodes the root `T`, and runs the projection. Measured on a
 50,000-commit shop in a fresh process: 0.8 µs for the entry, 1.3 µs for the root, then 1.3 µs for

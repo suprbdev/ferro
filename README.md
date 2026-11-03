@@ -212,6 +212,24 @@ walked: for that `take_while`, the age of the row, not the length of the log. To
 oldest first, collect and reverse. `log().iter()` runs in version order like any collection, and
 `.rev()` walks newest first the same lazy way.
 
+Three forms take a range of versions, for when you know where to look or can find out:
+
+```rust
+let created = db.bisect(.., |shop| shop.orders.contains(&order_id))?.expect("placed");
+let ended = db.bisect(created.., |shop| !shop.orders.contains(&order_id))?;
+let alive = created..ended.unwrap_or(u64::MAX);
+
+let week: Vec<_> = db.history_of_range(from..=to, |shop| shop.orders.get(&order_id)).collect();
+let edits = db.bisect_changes(alive, |shop| shop.orders.get(&order_id))?;
+```
+
+`bisect` finds the first version where a test holds, for a test that stays true once it turns true,
+in about log2 of the log's length in probes. `history_of_range` is `history_of` between two versions
+and costs the span. `bisect_changes` cuts the range in half until the ends agree, so it costs the
+changes instead of the span, but it can miss a change and its reversal that fall between two probes,
+so use it only for a value that never returns to an earlier one in that range. A row's absence comes
+back when the row goes, which is why `alive` stops short of `ended`. It returns oldest first.
+
 ```rust
 let what_if = db.fork("what-if")?;
 what_if.commit("try a price change", |shop| { /* ... */ })?;
@@ -248,6 +266,24 @@ consumer skips versions, costs the writers nothing and uses no memory, and `diff
 it skipped. `recv_timeout` and `try_recv` work like `std::sync::mpsc`. A watcher ends when the last
 `Db` handle goes, and it does not keep the file open: a snapshot it had not taken by then is lost.
 A read-only handle fires its watchers on `refresh`.
+
+```rust
+let watcher = db.watch_when(|shop| shop.stock.get("anvil").is_some_and(|left| *left == 0));
+let closer = watcher.closer();
+let worker = watcher.clone();
+std::thread::spawn(move || {
+    for snapshot in worker {
+        handle(&snapshot);
+    }
+});
+closer.close();
+```
+
+`watch_when` sleeps through commits whose snapshot fails the test. The test runs as the commit is
+published, outside the writer lock, only while a watcher is parked, and that commit's writers wait
+for it, so keep it to a quick read. `closer` gives a cloneable handle that ends a watcher and its
+clones from any thread without a commit. Clones share the closer and the test and keep their own
+place.
 
 `db.head_hash()` is a hash over the whole history of a branch, for publishing somewhere an attacker
 cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows
@@ -292,6 +328,28 @@ which `space.retired_bytes` shows. Committing a `Map` held from before a cycle w
 value, under the writer lock, so `restore` of a snapshot held across a cycle costs time proportional
 to its size.
 
+## Sharing a version between writers
+
+```rust
+let db = Options::new().coalesce(true).open::<Jobs>("jobs.ferro")?;
+```
+
+Every closure normally gets a version of its own, and with it its own write of every tree path it
+touched. With `coalesce`, closures that queue up while a sync is running share one write and one
+version. They still run one at a time, each on its caller's thread, so they need not be `Send`, and
+each sees what the ones before it did. An `Err` or a panic rolls back that closure alone.
+On `examples/queue` at 32 workers that took jobs from 9,700 to 16,900 a second, bytes per job from
+2,691 to 146 and p99 from 2.3 to 0.8 ms. A closure that runs long against an fsync does not gain:
+at 50 µs and 8 writers it lost 16% of its throughput. See `DESIGN.md`.
+
+What you give up is a version per closure. `Committed::version` is the group's, `at` cannot show
+the state between two closures of a group, and `history_of` reports the group's net change once.
+The commit's `message` holds every closure's message, one per line, and `messages()` lists them.
+`changed` says the group made a new version, so a closure that changed nothing reports `true` if
+another closure in its group did. If the group cannot be written, every closure in it gets
+`Error::GroupFailed`. `restore` and `merge_with` always commit alone, and a writer alone behaves as
+without the option. `examples/queue` uses it.
+
 ## Changing your types
 
 Your struct is the schema. Fields are stored by name hash, so old data keeps loading after you
@@ -312,6 +370,10 @@ slots. A commit writes one checksummed frame holding its objects, fsyncs once, a
 the superblock without syncing it. Open starts from the newest valid superblock, walks forward over
 every complete frame, and truncates the rest, so a crash loses at most a commit that was never
 acknowledged. Concurrent writers share a sync: one leader's fsync covers everything queued.
+
+`Options::durability(Durability::Buffered)` skips the fsync. A power cut can then lose recent
+commits, back to the last checkpoint at worst, and never the whole file: a checkpoint is an fsync
+every `Options::checkpoint_bytes` of log, 64 MiB by default, and on clean close.
 
 Every read re-hashes the object against the pointer it came from, so corruption surfaces as an
 error, not wrong data. The whole database is a Merkle tree, and `verify` re-hashes all of it.
@@ -366,7 +428,8 @@ Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short strin
 | Single-key commit, fsync | 430 µs, about 2,300 per second |
 | Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
 | Reads per second with those writers running | 38M |
-| Single-key commit, `Durability::Buffered` | 26 µs |
+| The same 8 writers with `coalesce`, median of five runs | about 15,600 per second |
+| Single-key commit, `Durability::Buffered` | 27 µs |
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.5 µs per changed key |
 
@@ -395,8 +458,10 @@ This is an experiment, not a production database.
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
   miss the node cache are slower for a moment after each swap.
 - One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
-  every branch. Only the fsync is shared, so commit throughput stops scaling at the cost of the
-  closure and encoding. Calling `update`, `fork` or `drop_branch` from inside it deadlocks.
+  every branch. Unless you opt in to `coalesce`, only the fsync is shared, so commit throughput
+  stops scaling at the cost of the closure and encoding. Calling `update`, `fork` or `drop_branch`
+  from inside it deadlocks. With `coalesce`, so does a closure that waits for another thread's commit
+  to be acknowledged.
 - A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
   `Error::Locked`.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
