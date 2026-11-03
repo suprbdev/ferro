@@ -78,6 +78,15 @@ impl Staged<'_> {
     }
 }
 
+pub trait Cached: Any + Send + Sync {
+    fn hold(&self) {}
+    fn release(&self) -> bool {
+        false
+    }
+}
+
+impl<T: Data> Cached for T {}
+
 pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
     fn packs(&self) -> bool {
@@ -93,7 +102,7 @@ pub trait Sink {
     fn check_link(&self, _ptr: Ptr) -> Result<()> {
         Ok(())
     }
-    fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Any + Send + Sync>, _weight: u32) {}
+    fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Cached>, _weight: u32) {}
     fn store_id(&self) -> u64;
     fn store(&self) -> Option<Store> {
         None

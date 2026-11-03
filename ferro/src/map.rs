@@ -7,12 +7,15 @@ use std::fmt;
 use std::hash;
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::mem::needs_drop;
+use std::sync::atomic::{AtomicBool, Ordering as Atomic};
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
 
 use crate::codec::{
-    Data, Decoder, Encoder, Hash, HashSink, Kind, Object, Ptr, Shape, Sink, Staged, try_hash_of,
+    Cached, Data, Decoder, Encoder, Hash, HashSink, Kind, Object, Ptr, Shape, Sink, Staged,
+    try_hash_of,
 };
+use crate::epoch::{self, Guard};
 use crate::error::{Error, Result};
 use crate::store::{MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
@@ -569,6 +572,8 @@ struct Node<K, V, S> {
     cells: Cells<V, S>,
     count: u64,
     level: u8,
+    cached: AtomicBool,
+    lent: AtomicBool,
     origin: Option<Ptr>,
     prefix: Option<Arc<Prefix>>,
 }
@@ -581,9 +586,22 @@ impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
             cells: self.cells.clone(),
             children: self.children.clone(),
             count: self.count,
+            cached: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
             origin: self.origin,
             prefix: self.prefix.clone(),
         }
+    }
+}
+
+impl<K: Data, V: Data, S: Data> Cached for Node<K, V, S> {
+    fn hold(&self) {
+        self.cached.store(true, Atomic::SeqCst);
+    }
+
+    fn release(&self) -> bool {
+        self.cached.store(false, Atomic::SeqCst);
+        self.lent.load(Atomic::SeqCst)
     }
 }
 
@@ -769,6 +787,8 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
             cells,
             children,
             count: total,
+            cached: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
             origin: Some(origin),
             prefix: None,
         })
@@ -962,18 +982,34 @@ fn held_node<K: Data + Ord, V: Data, S: Data>(
     })
 }
 
-enum Reach<'a, K, V, S> {
+enum Reach<'a, 'g, K, V, S> {
     Absent,
     Borrowed(&'a Arc<Node<K, V, S>>),
     Owned(Arc<Node<K, V, S>>),
+    Held(&'g Node<K, V, S>),
 }
 
 #[inline]
-fn reach<'a, K: Data, V: Data, S: Data>(
+fn held<'g, K, V, S>(weak: &Weak<Node<K, V, S>>, _guard: &'g Guard) -> Option<&'g Node<K, V, S>> {
+    let node = weak.as_ptr();
+    unsafe {
+        if !(*node).cached.load(Atomic::SeqCst) {
+            return None;
+        }
+        if !(*node).lent.load(Atomic::SeqCst) {
+            (*node).lent.store(true, Atomic::SeqCst);
+        }
+        (*node).cached.load(Atomic::SeqCst).then(|| &*node)
+    }
+}
+
+#[inline]
+fn reach<'a, 'g, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &'a Link<K, V, S>,
     depth: usize,
-) -> Result<Reach<'a, K, V, S>> {
+    guard: Option<&'g Guard>,
+) -> Result<Reach<'a, 'g, K, V, S>> {
     let memo = match link {
         Link::Empty => return Ok(Reach::Absent),
         Link::Mem(node, _) => return Ok(Reach::Borrowed(node)),
@@ -983,6 +1019,9 @@ fn reach<'a, K: Data, V: Data, S: Data>(
         Some(Memo::Pinned(node)) => return Ok(Reach::Borrowed(node)),
         Some(Memo::Weak(weak, hint)) => {
             hint.prefetch(weak);
+            if let Some(node) = guard.and_then(|guard| held(weak, guard)) {
+                return Ok(Reach::Held(node));
+            }
             if let Some(node) = weak.upgrade() {
                 return Ok(Reach::Owned(node));
             }
@@ -992,13 +1031,48 @@ fn reach<'a, K: Data, V: Data, S: Data>(
     fetch_link(store, link, depth)
 }
 
+enum At<'g, K, V, S> {
+    Ref(&'g Node<K, V, S>),
+    Arc(Arc<Node<K, V, S>>),
+}
+
+impl<'g, K, V, S> At<'g, K, V, S> {
+    #[inline]
+    fn of(reached: Reach<'g, 'g, K, V, S>) -> Option<Self> {
+        match reached {
+            Reach::Absent => None,
+            Reach::Borrowed(node) => Some(At::Ref(node)),
+            Reach::Held(node) => Some(At::Ref(node)),
+            Reach::Owned(node) => Some(At::Arc(node)),
+        }
+    }
+
+    #[inline]
+    fn owned(reached: Reach<'_, 'g, K, V, S>) -> Option<Self> {
+        match reached {
+            Reach::Absent => None,
+            Reach::Borrowed(node) => Some(At::Arc(node.clone())),
+            Reach::Held(node) => Some(At::Ref(node)),
+            Reach::Owned(node) => Some(At::Arc(node)),
+        }
+    }
+
+    #[inline]
+    fn node(&self) -> &Node<K, V, S> {
+        match self {
+            At::Ref(node) => node,
+            At::Arc(node) => node,
+        }
+    }
+}
+
 #[cold]
 #[inline(never)]
-fn fetch_link<'a, K: Data, V: Data, S: Data>(
+fn fetch_link<'a, 'g, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &'a Link<K, V, S>,
     depth: usize,
-) -> Result<Reach<'a, K, V, S>> {
+) -> Result<Reach<'a, 'g, K, V, S>> {
     let Link::Stored {
         ptr,
         count,
@@ -1027,10 +1101,11 @@ fn resident<K: Data, V: Data, S: Data>(
     link: &Link<K, V, S>,
     depth: usize,
 ) -> Result<Option<Arc<Node<K, V, S>>>> {
-    Ok(match reach(store, link, depth)? {
+    Ok(match reach(store, link, depth, None)? {
         Reach::Absent => None,
         Reach::Borrowed(node) => Some(node.clone()),
         Reach::Owned(node) => Some(node),
+        Reach::Held(_) => unreachable!("an unguarded reach holds no node"),
     })
 }
 
@@ -1106,6 +1181,8 @@ fn link_from<K, V, S>(
         cells: Cells::Slots(slots),
         children,
         count: 0,
+        cached: AtomicBool::new(false),
+        lent: AtomicBool::new(false),
         origin,
         prefix: None,
     };
@@ -1536,6 +1613,8 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
             cells: node.cells.settled(spilled, checked),
             children: stored,
             count: node.count,
+            cached: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
             origin: None,
             prefix: None,
         }),
@@ -2326,6 +2405,7 @@ type Cut<'a, K> = Option<&'a dyn Fn(&K) -> bool>;
 
 fn gather<K: Data, V: Data, S: Summary<K, V>>(
     store: Option<&Store>,
+    guard: Option<&Guard>,
     link: &Link<K, V, S>,
     depth: usize,
     start: Cut<'_, K>,
@@ -2338,11 +2418,12 @@ fn gather<K: Data, V: Data, S: Summary<K, V>>(
             None => total,
         });
     }
-    let reached = reach(store, link, depth)?;
+    let reached = reach(store, link, depth, guard)?;
     let node = match &reached {
         Reach::Absent => return Ok(total),
         Reach::Borrowed(node) => &***node,
         Reach::Owned(node) => &**node,
+        Reach::Held(node) => *node,
     };
     let low = start.map_or(0, |below| node.keys.partition_point(below));
     let high = end.map_or(node.keys.len(), |within| node.keys.partition_point(within));
@@ -2350,13 +2431,13 @@ fn gather<K: Data, V: Data, S: Summary<K, V>>(
         return Ok(total);
     }
     if low == high {
-        return gather(store, node.child(low), depth + 1, start, end, total);
+        return gather(store, guard, node.child(low), depth + 1, start, end, total);
     }
-    let mut total = gather(store, node.child(low), depth + 1, start, None, total)?;
+    let mut total = gather(store, guard, node.child(low), depth + 1, start, None, total)?;
     for index in low..high {
         total = fold(total, &node.entry_summary(index));
         let last = if index + 1 == high { end } else { None };
-        total = gather(store, node.child(index + 1), depth + 1, None, last, total)?;
+        total = gather(store, guard, node.child(index + 1), depth + 1, None, last, total)?;
     }
     Ok(total)
 }
@@ -2374,11 +2455,12 @@ where
     V: Data,
     S: Data,
 {
-    let reached = reach(store, link, depth)?;
+    let reached = reach(store, link, depth, None)?;
     let node = match &reached {
         Reach::Absent => return Ok(ControlFlow::Continue(())),
         Reach::Borrowed(node) => &***node,
         Reach::Owned(node) => &**node,
+        Reach::Held(node) => *node,
     };
     let low = start.map_or(0, |below| node.keys.partition_point(below));
     let high = end.map_or(node.keys.len(), |within| node.keys.partition_point(within));
@@ -2469,30 +2551,27 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V, S>) -> Visit<R>) -> Result<Option<R>> {
         let store = self.store();
-        let mut link = &self.root;
+        let guard = epoch::pin();
+        let guard = guard.as_ref();
         let mut depth = 0;
-        let mut current = loop {
-            let node = match reach(store, link, depth)? {
-                Reach::Absent => return Ok(None),
-                Reach::Borrowed(node) => node,
-                Reach::Owned(node) => break Some(node),
-            };
-            depth += 1;
-            match visit(node) {
-                Visit::Done(result) => return Ok(Some(result)),
-                Visit::Descend(position) => link = node.child(position),
-            }
+        let Some(mut at) = At::of(reach(store, &self.root, depth, guard)?) else {
+            return Ok(None);
         };
-        while let Some(node) = current {
+        loop {
             depth += 1;
-            match visit(&node) {
+            let position = match visit(at.node()) {
                 Visit::Done(result) => return Ok(Some(result)),
-                Visit::Descend(position) => {
-                    current = resident(store, node.child(position), depth)?;
-                }
+                Visit::Descend(position) => position,
+            };
+            let next = match &at {
+                At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
+                At::Arc(node) => At::owned(reach(store, node.child(position), depth, guard)?),
+            };
+            match next {
+                Some(next) => at = next,
+                None => return Ok(None),
             }
         }
-        Ok(None)
     }
 
     pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val<V>>>
@@ -2719,43 +2798,28 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         let entry = |node: &Node<K, V, S>, index: usize| -> Result<(K, Val<V>)> {
             Ok((node.keys[index].clone(), node.value(store, index)?))
         };
-        let mut link = &self.root;
+        let guard = epoch::pin();
+        let guard = guard.as_ref();
         let mut depth = 0;
-        let mut pinned = None;
-        let mut current = loop {
-            let node = match reach(store, link, depth)? {
-                Reach::Absent => break None,
-                Reach::Borrowed(node) => node,
-                Reach::Owned(node) => break Some(node),
+        let mut best = None;
+        let mut current = At::of(reach(store, &self.root, depth, guard)?);
+        while let Some(at) = current {
+            depth += 1;
+            let position = match at.node().search(key) {
+                Ok(index) => return entry(at.node(), index).map(Some),
+                Err(position) => position,
             };
-            depth += 1;
-            match node.search(key) {
-                Ok(index) => return entry(node, index).map(Some),
-                Err(position) => {
-                    if position > 0 {
-                        pinned = Some((node, position - 1));
-                    }
-                    link = node.child(position);
-                }
-            }
-        };
-        let mut owned = None;
-        while let Some(node) = current {
-            depth += 1;
-            match node.search(key) {
-                Ok(index) => return entry(&node, index).map(Some),
-                Err(position) => {
-                    current = resident(store, node.child(position), depth)?;
-                    if position > 0 {
-                        owned = Some((node, position - 1));
-                    }
-                }
+            current = match &at {
+                At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
+                At::Arc(node) => At::owned(reach(store, node.child(position), depth, guard)?),
+            };
+            if position > 0 {
+                best = Some((at, position - 1));
             }
         }
-        match (owned, pinned) {
-            (Some((node, index)), _) => entry(&node, index).map(Some),
-            (None, Some((node, index))) => entry(node, index).map(Some),
-            (None, None) => Ok(None),
+        match best {
+            Some((at, index)) => entry(at.node(), index).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -2908,7 +2972,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         below: impl Fn(&K) -> bool,
         within: impl Fn(&K) -> bool,
     ) -> Option<S> {
-        fatal(gather(self.store(), &self.root, 0, Some(&below), Some(&within), None))
+        let guard = epoch::pin();
+        let store = self.store();
+        fatal(gather(store, guard.as_ref(), &self.root, 0, Some(&below), Some(&within), None))
     }
 
     pub fn range_summary<Q, R>(&self, range: R) -> Option<S>

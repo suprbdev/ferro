@@ -17,7 +17,9 @@ use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::codec::{ARC_HEADER, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, Staged, push_varint};
+use crate::codec::{
+    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, Staged, push_varint,
+};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
@@ -98,16 +100,50 @@ pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
     u32::try_from(weight).unwrap_or(u32::MAX)
 }
 
-#[derive(Clone)]
 struct CacheEntry {
-    value: Arc<dyn Any + Send + Sync>,
+    value: Option<Arc<dyn Cached>>,
     weight: u32,
+    owned: bool,
+}
+
+impl CacheEntry {
+    fn new(value: Arc<dyn Cached>, weight: u32) -> CacheEntry {
+        value.hold();
+        CacheEntry {
+            value: Some(value),
+            weight,
+            owned: true,
+        }
+    }
+}
+
+impl Clone for CacheEntry {
+    fn clone(&self) -> Self {
+        CacheEntry {
+            value: self.value.clone(),
+            weight: self.weight,
+            owned: false,
+        }
+    }
+}
+
+impl Drop for CacheEntry {
+    fn drop(&mut self) {
+        if self.owned
+            && let Some(value) = self.value.take()
+            && value.release()
+        {
+            crate::epoch::retire(value, self.weight as usize);
+        }
+    }
 }
 
 struct Located<T> {
     offset: u64,
     value: Arc<T>,
 }
+
+impl<T: Send + Sync + 'static> Cached for Located<T> {}
 
 #[derive(Clone)]
 struct EntryWeight;
@@ -995,14 +1031,15 @@ impl Store {
         Ok((object, len, packed))
     }
 
-    pub(crate) fn fetch<T: Send + Sync + 'static>(
+    pub(crate) fn fetch<T: Cached>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
         weigh: impl FnOnce(&T, usize, usize) -> u32,
     ) -> Result<(Arc<T>, bool)> {
-        if let Some(entry) = self.inner.cache.get(&ptr.hash)
-            && let Ok(value) = entry.value.downcast::<T>()
+        if let Some(mut entry) = self.inner.cache.get(&ptr.hash)
+            && let Some(value) = entry.value.take()
+            && let Ok(value) = (value as Arc<dyn Any + Send + Sync>).downcast::<T>()
         {
             return Ok((value, true));
         }
@@ -1014,13 +1051,7 @@ impl Store {
         let value = Arc::new(decode(&mut decoder)?);
         let weight = weigh(&value, object.body.len(), decoder.heap());
         if !self.inner.closed.load(Ordering::SeqCst) {
-            self.inner.cache.insert(
-                ptr.hash,
-                CacheEntry {
-                    value: value.clone(),
-                    weight,
-                },
-            );
+            self.inner.cache.insert(ptr.hash, CacheEntry::new(value.clone(), weight));
             if self.inner.closed.load(Ordering::SeqCst) {
                 self.inner.cache.clear();
             }
@@ -1032,6 +1063,7 @@ impl Store {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
         inner.cache.clear();
+        crate::epoch::flush();
         if closed || inner.options.read_only {
             return;
         }
@@ -1243,8 +1275,8 @@ impl Sink for Txn {
         Ok(self.record(hash, staged))
     }
 
-    fn remember(&mut self, ptr: Ptr, value: Arc<dyn Any + Send + Sync>, weight: u32) {
-        self.remembered.push((ptr.hash, CacheEntry { value, weight }));
+    fn remember(&mut self, ptr: Ptr, value: Arc<dyn Cached>, weight: u32) {
+        self.remembered.push((ptr.hash, CacheEntry::new(value, weight)));
     }
 
     fn store_id(&self) -> u64 {
