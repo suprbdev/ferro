@@ -35,6 +35,9 @@ path = "src/bin/delta.rs"
 name = "merge"
 path = "src/bin/merge.rs"
 
+[features]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 booking = { path = "../examples/booking" }
 fastrand = "2"
@@ -42,5 +45,6 @@ ferro = { path = "../ferro" }
 ledger = { path = "../examples/ledger" }
 libc = "0.2"
 metrics = { path = "../examples/metrics" }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 tempfile = "3"
 wiki = { path = "../examples/wiki" }

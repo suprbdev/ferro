@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use ferro::{Data, Db, Durability, Map, Options, Record, Table};
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const WARM_CACHE: u64 = 1 << 30;
 const SMALL_CACHE: u64 = 16 << 20;
 const RANGE_KEYS: u64 = 100;
