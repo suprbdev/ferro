@@ -17,6 +17,7 @@ of `T`, and all earlier versions stay readable.
   and `history_of_range`.
 - `watch.rs`: `Watcher<T>`, `Closer<T>` and the per-branch feed behind them.
 - `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share.
+- `platform.rs`: the file calls that differ between Unix and Windows, described under Windows.
 - `sync.rs`: `Have`, `Bundle`, and `Db::pull`, `push` and `receive`, which copy a branch between files.
 
 ## Objects and links
@@ -642,7 +643,8 @@ itself that it reached the disk whole. A commit does this:
 
 In `Durability::Fsync` the superblock is written only after its frame is durable, so it anchors
 itself and never names anything a crash can lose, and the next fdatasync carries it to disk. A crash
-leaves it at most one sync behind.
+leaves it at most one sync behind. On Windows every fdatasync here is a `FlushFileBuffers`, as
+described under Windows.
 
 Open picks the valid slot with the highest sequence and scans forward from its anchor. A frame
 counts only if its magic, sequence (the previous one plus 1), end offset and check are all right,
@@ -857,9 +859,9 @@ voluntary switch with no watchers and one with 8 or 32.
 A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
 does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them hold the
 `Store`, and so the open file, but not the writer lock. The lock is a `flock` on the writer's file
-descriptor, and closing a writer's store, when the last `Db` handle drops or a cycle retires a
-generation, truncates the reservation and then unlocks, in that order, so a new writer can open while
-they live. They read what they read before. The new writer's open truncates only past the last
+descriptor, or on Windows a one-byte `LockFileEx` range on its handle, and closing a writer's
+store, when the last `Db` handle drops or a cycle retires a generation, truncates the reservation
+and then unlocks, in that order, so a new writer can open while they live. They read what they read before. The new writer's open truncates only past the last
 valid frame, and every published object lies before it. It appends after that, and a cycle writes a
 new file and renames it over the path, so the old inode stays whole for whoever holds it. A closed
 store writes nothing more, and a second close does nothing, so it never truncates under the new
@@ -2166,8 +2168,8 @@ is larger, so the copying stays proportional to what was written.
 3. Sync, with no lock, so the pause does not pay for it.
 4. Swap, under the `tip` mutex. This is the only pause. Wait for queued commits, copy what is left,
    write both superblock slots and sync. Open the new file, which takes its writer lock, and read
-   every branch's tip and root from it. Rename it over the old one, sync the directory, and rebind
-   every branch.
+   every branch's tip and root from it. Rename it over the old one, sync the directory (on Windows,
+   flush the renamed file), and rebind every branch.
 5. Retire, with no lock. Clear the old generation's cache. Its file goes when the last handle does.
 
 The new file continues the frame sequence, so group commit tickets stay in order. It has no frames
@@ -2211,8 +2213,8 @@ with `Error::StalePointer` if it is not there. A pointer read back from the curr
 fine, because the copy rewrote it. One held in memory across a cycle is refused.
 
 A read-only handle keeps its view, in the old file if need be, and `refresh` notices that the path
-names a new inode, opens it, and rebinds. Its watchers fire only if the version moved. A process that
-never refreshes never fails, and holds the old file open instead.
+names a new inode, or a new file index on Windows, opens it, and rebinds. Its watchers fire only if
+the version moved. A process that never refreshes never fails, and holds the old file open instead.
 
 ### Crashes
 
@@ -2227,8 +2229,9 @@ commits yet.
 
 A failed copy, a full disk or a failed rename removes the temp file and reports the error from
 `Db::compact` or in `Space::last_error`, and commits never notice. A store poisoned while a cycle
-copied stays poisoned, because the swap checks first. The new file takes the old one's mode and owner,
-and a path through a symlink stays a symlink.
+copied stays poisoned, because the swap checks first. On Unix the new file takes the old one's mode
+and owner, and a path through a symlink stays a symlink. Windows changes how the rename and its sync
+work, but not this order, as described under Windows.
 
 ### Measurements
 
@@ -2311,6 +2314,105 @@ then scaled by the share that survived the last cycle. Before the first cycle it
 in a private copy of the refs and needs no user types. The copy is iterative, because a chain is as
 deep as the number of commits. A read-only handle follows it on `refresh` the same way it follows a
 cycle.
+
+## Windows
+
+`platform.rs` holds everything the store asks of the OS that differs between Unix and Windows:
+positioned reads and writes, the writer lock, the identity of a file, a reader's sync, the directory
+sync and the owner of a new generation. The rest of the store is shared.
+
+### Reads, writes and the lock
+
+Positioned I/O loops over `seek_read` and `seek_write`, which can return short counts as `pread`
+and `pwrite` can. They also move the handle's file pointer, which nothing reads. Windows serialises
+requests on a handle opened without `FILE_FLAG_OVERLAPPED`, which `std` never sets, so readers in one
+process queue behind each other and behind frame writes, where `pread` lets them run side by side.
+That costs throughput, not correctness.
+
+`File::lock` would shut readers out. On Windows it is `LockFileEx` over the whole file, and Windows
+byte-range locks are mandatory: any other handle, in this process or another, fails to read a locked
+range with `ERROR_LOCK_VIOLATION`, so no read-only open could read beside a writer. The writer lock is
+`LockFileEx` on the single byte at offset 2^62 instead, past the end of any real file, exclusive for
+a writer and shared for a reader's scan, and always with `LOCKFILE_FAIL_IMMEDIATELY`, so it behaves
+as `try_lock` does. A lock belongs to its handle, so a second writer in the same process conflicts,
+as with `flock`, and closing the handle releases it. `Store::close` unlocks explicitly, because
+Windows documents that it releases the locks of a process that dies after a delay that "depends upon
+available system resources", so a writer that opens right after another was killed can get
+`Error::Locked`.
+
+The identity that `open_locked` checks after locking, and that `refresh` compares to notice a cycle,
+is the 64-bit file index from `GetFileInformationByHandle`, read through a handle opened with no
+access rights, as `std::fs::metadata` does. `std` keeps the index behind the unstable
+`windows_by_handle` feature. On NTFS it is unique on the volume and survives a rename, which is all
+both checks need. ReFS ids are 128 bits, and this 64-bit index is not guaranteed to tell two files
+apart there.
+
+### Durability
+
+`sync_data` and `sync_all` both call `FlushFileBuffers`, which writes the file's cached data and
+metadata and then flushes the device's write cache. Every commit therefore pays for an fsync, not an
+fdatasync, and the durability point does not move: once the flush returns, the frame survives a
+power cut, unless the disk ignores flushes or Windows was told not to send them ("Turn off Windows
+write-cache buffer flushing on the device"), the same caveat as a Linux disk mounted without
+barriers.
+
+The flush needs a handle with write access. A read-only open that has to sync the frames a dead
+writer left, as described under File format and durability, reopens the same file object with
+`ReOpenFile` and write access and flushes that. A process that may not write the file gets
+`PermissionDenied` there, rather than reading frames that a power cut could still take back. It
+opens normally once a writer has recovered the file.
+
+Windows has no directory sync. A directory opens only with `FILE_FLAG_BACKUP_SEMANTICS`, and nothing
+documents what `FlushFileBuffers` does to one. Where Unix syncs the parent directory, after creating
+a file and after a cycle's rename, Windows opens the path for writing and flushes the file it names.
+NTFS logs a create or a rename as one transaction in its metadata journal, so after a crash the name
+points at the old file or the new one, never at neither. The rename also changed the renamed file's
+own record, and ferro relies on a flush of that file committing the journal through the rename.
+PostgreSQL's `durable_rename` relies on the same thing, since it too skips the directory on Windows
+and flushes the file under its new name, but no Win32 document promises it. With the directory sync
+read as this flush, the argument under Reclamation holds unchanged: writers stay paused until it
+returns, and a failed flush poisons the store. FAT32 and exFAT keep no journal and are not
+supported.
+
+### Renaming over an open file
+
+A cycle renames a new file over one that is still open, since the old generation stays open for
+every snapshot, `Log` and follower that holds it, and Windows normally refuses that. It works when
+two things hold. Every handle on the file must share delete: `std` opens files with
+`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` unless told otherwise, and ferro never
+tells it otherwise. And the rename must use POSIX semantics: when `MoveFileExW` is refused,
+`std::fs::rename` retries with `SetFileInformationByHandle(FileRenameInfoEx)` and
+`FILE_RENAME_FLAG_POSIX_SEMANTICS`, on Windows 10 1607 and later where the file system supports it,
+as NTFS does. The name then moves to the new file at once, and the old file loses its name but stays
+whole for every handle until the last one closes, as an unlinked inode does on Unix. Snapshots keep
+reading the old generation, its space comes back when the last of them drops, and `refresh` finds a
+new file index at the path. `admin::compact` renames the same way.
+
+If either does not hold, because another program holds the file open without `FILE_SHARE_DELETE` or
+the file system has no POSIX rename, the rename fails before anything has changed. The cycle then
+fails like any failed rename: the temp file goes, the error lands in `Db::compact` or
+`Space::last_error`, commits carry on in the old file, and the next trigger tries again. Nothing is
+lost, but the file does not shrink. The cycle is the retry, so the rename does not loop on its own,
+which would hold the `tip` mutex and stall commits.
+
+Two other designs were weighed. Generation-numbered files, with a small file naming the current
+one, never rename over an open file and work on any file system, but the path would stop being the
+database, so copying or backing up one file would no longer work, and the small file needs its own
+atomic, durable update, which is a rename again. Deleting the old file and then renaming the new one
+into place needs no POSIX semantics, but a crash between the two leaves no database at the path.
+
+A new generation keeps the old file's read-only attribute, which is all `set_permissions` carries on
+Windows, and takes its ACL from the directory rather than from the old file. The owner is not
+copied.
+
+### Tests
+
+CI runs the library's tests on `windows-latest`. Tests that interpose libc symbols through `dlsym`
+(`fdatasync`, `fsync`, `pread64`, `pwrite64`, `rename`, `clock_gettime`), run a child under `sh`
+with `ulimit -f`, kill or abort a child process, or make symlinks or check mode bits are
+`#[cfg(unix)]`. The traced crash simulations replay ferro's own writes and run on both. So on Windows
+failed syncs, failed renames and process death go unexercised, and as on Unix, power loss was never
+tested on hardware.
 
 ## Schema evolution
 

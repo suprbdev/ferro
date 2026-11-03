@@ -742,7 +742,13 @@ including caveats about sled, are in `benchmarks/compare/RESULTS.md`.
 This is an experiment, not a production database.
 
 - The file format is not stable and may change without migration.
-- It runs on Unix only.
+- It runs on Unix and Windows. On Windows the file must be on NTFS: a reclamation cycle renames the
+  new file over one that snapshots still hold open, which needs POSIX rename semantics, and Windows
+  cannot sync a directory, so the rename is made durable by flushing the renamed file, which relies
+  on the NTFS journal. Every sync is a `FlushFileBuffers`, which flushes metadata too, like fsync
+  rather than fdatasync. Performance on Windows was never measured, and CI skips the tests that
+  intercept libc calls or kill processes there, so failed syncs and process death are tested on Unix
+  only.
 - A single-key commit writes about 3.5 KB at this size, so batch related changes into one commit.
   Secondary indexes add to that. Without retention the file only grows.
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
