@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, JoinHandle, Thread};
+use std::thread::{self, JoinHandle, LocalKey, Thread};
 use std::time::{Duration, Instant};
 
 use ferro::codec::{Decoder, Encoder};
@@ -520,7 +520,11 @@ fn writes_up_the_lane_order_survive_cycles_and_each_other() {
             thread::spawn(move || {
                 let mut n = 0u64;
                 while !stop.load(Ordering::SeqCst) {
-                    let keep = if n.is_multiple_of(2) { Keep::All } else { Keep::Last(3) };
+                    let keep = if n.is_multiple_of(2) {
+                        Keep::All
+                    } else {
+                        Keep::Last(3)
+                    };
                     files.main.compact(keep).unwrap();
                     n += 1;
                 }
@@ -704,16 +708,30 @@ fn a_watcher_test_on_the_watch_thread_may_write_its_branch() {
     }
 }
 
+type Slot = RefCell<Option<Box<dyn FnOnce()>>>;
+
 thread_local! {
-    static ON_DROP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static ON_DROP: Slot = const { RefCell::new(None) };
+    static ON_DECODE: Slot = const { RefCell::new(None) };
+    static ON_DRAFT: Slot = const { RefCell::new(None) };
 }
 
-fn arm(run: impl FnOnce() + 'static) {
-    ON_DROP.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+fn arm(slot: &'static LocalKey<Slot>, run: impl FnOnce() + 'static) {
+    slot.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
 }
 
-fn fired() -> bool {
-    ON_DROP.with(|slot| slot.borrow_mut().take().is_none())
+fn run_armed(slot: &'static LocalKey<Slot>) {
+    let armed = slot
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some(run) = armed {
+        run();
+    }
+}
+
+fn fired(slot: &'static LocalKey<Slot>) -> bool {
+    slot.with(|slot| slot.borrow_mut().take().is_none())
 }
 
 #[derive(Clone, Default)]
@@ -721,13 +739,7 @@ struct Probe;
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        let armed = ON_DROP
-            .try_with(|slot| slot.borrow_mut().take())
-            .ok()
-            .flatten();
-        if let Some(run) = armed {
-            run();
-        }
+        run_armed(&ON_DROP);
     }
 }
 
@@ -739,6 +751,7 @@ impl Data for Probe {
 
     fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
         r.u8()?;
+        run_armed(&ON_DECODE);
         Ok(Probe)
     }
 }
@@ -751,8 +764,12 @@ struct Probed {
 
 type Seen = Arc<Mutex<Results>>;
 
-fn probed(options: fn() -> Options, dir: &TempDir) -> (Db<Probed>, Db<Probed>, Db<Probed>) {
-    let main: Db<Probed> = options().open(dir.path().join("probed.ferro")).unwrap();
+fn row(db: &Db<Probed>, key: u64) -> Option<u64> {
+    db.read().rows.get(&key).map(|value| *value)
+}
+
+fn probed(options: Options, dir: &TempDir) -> (Db<Probed>, Db<Probed>, Db<Probed>) {
+    let main: Db<Probed> = options.open(dir.path().join("probed.ferro")).unwrap();
     for i in 0..20 {
         main.update(|root| {
             root.rows.insert(i, i);
@@ -768,13 +785,13 @@ fn probed(options: fn() -> Options, dir: &TempDir) -> (Db<Probed>, Db<Probed>, D
 fn a_value_dropped_in_a_cycle_pause_cannot_deadlock_a_write() {
     for (kind, options) in kinds() {
         let dir = dir();
-        let (main, b, c) = probed(options, &dir);
+        let (main, b, c) = probed(options(), &dir);
         let seen: Seen = Arc::default();
         let dropped = {
             let (main, b, c, seen) = (main.clone(), b.clone(), c.clone(), seen.clone());
             finishes(kind, move || {
                 let inner = main.clone();
-                arm(move || {
+                arm(&ON_DROP, move || {
                     let mut seen = seen.lock();
                     seen.push(("update", b.update(|_| ())));
                     seen.push(("update_async", block_on(c.update_async(|_| ()))));
@@ -782,7 +799,7 @@ fn a_value_dropped_in_a_cycle_pause_cannot_deadlock_a_write() {
                     seen.push(("fork", c.fork("z").map(drop)));
                 });
                 main.compact(Keep::All).unwrap();
-                fired()
+                fired(&ON_DROP)
             })
         };
         assert!(dropped, "{kind}: nothing was dropped in the pause");
@@ -800,28 +817,76 @@ fn a_value_dropped_in_a_cycle_pause_cannot_deadlock_a_write() {
 fn a_value_dropped_inside_a_commit_cannot_deadlock_a_write() {
     for (kind, options) in kinds() {
         let dir = dir();
-        let (main, b, c) = probed(options, &dir);
+        let (main, b, c) = probed(options(), &dir);
         let seen: Seen = Arc::default();
         let dropped = {
             let (b, c, seen) = (b.clone(), c.clone(), seen.clone());
             finishes(kind, move || {
                 let inner = b.clone();
-                arm(move || {
+                arm(&ON_DROP, move || {
                     let mut seen = seen.lock();
                     seen.push(("own branch", inner.update(|_| ())));
                     seen.push(("later branch", c.update(|_| ())));
                 });
                 b.update(|_| ()).unwrap();
-                fired()
+                fired(&ON_DROP)
             })
         };
         assert!(dropped, "{kind}: nothing was dropped");
+        check(kind, &seen.lock(), &[]);
+        main.verify().unwrap();
+    }
+}
+
+#[test]
+fn user_code_run_under_tip_when_a_draft_moves_cannot_deadlock_a_write() {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let hook = |step: &'static str| {
+            if step == "drafted" {
+                run_armed(&ON_DRAFT);
+            }
+        };
+        let (main, b, c) = probed(options().hook(Hook(Arc::new(hook))), &dir);
+        let a = main.fork("a").unwrap();
+        let seen: Seen = Arc::default();
+        let armed = {
+            let (a, b, c, seen) = (a.clone(), b.clone(), c.clone(), seen.clone());
+            finishes(kind, move || {
+                arm(&ON_DRAFT, move || {
+                    thread::scope(|scope| {
+                        let landed = scope.spawn(|| {
+                            a.update(|root| {
+                                root.rows.insert(500, 500);
+                            })
+                        });
+                        landed.join().unwrap().unwrap();
+                    });
+                    let decoding = (c.clone(), seen.clone());
+                    arm(&ON_DECODE, move || {
+                        let (c, seen) = decoding;
+                        seen.lock().push(("decode", c.update(|_| ())));
+                    });
+                    arm(&ON_DROP, move || {
+                        seen.lock().push(("drop", c.update(|_| ())));
+                    });
+                });
+                b.update(|root| {
+                    root.rows.insert(600, 600);
+                })
+                .unwrap();
+                [fired(&ON_DRAFT), fired(&ON_DECODE), fired(&ON_DROP)]
+            })
+        };
+        assert_eq!(armed, [true; 3], "{kind}: the draft did not move");
         let seen = seen.lock();
-        reentrant(&format!("{kind}: own branch"), &seen[0].1);
-        let later = &seen[1].1;
-        assert!(
-            later.is_ok() || matches!(later, Err(Error::Reentrant)),
-            "{kind}: later branch: {later:?}"
+        let order: Vec<&str> = seen.iter().map(|(what, _)| *what).collect();
+        assert_eq!(order, ["decode", "drop"], "{kind}");
+        check(kind, &seen, &[]);
+        assert_eq!(
+            (row(&a, 500), row(&b, 600)),
+            (Some(500), Some(600)),
+            "{kind}"
         );
         main.verify().unwrap();
     }

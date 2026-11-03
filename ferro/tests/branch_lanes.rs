@@ -1202,7 +1202,10 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
                 }
                 let mut other = other.lock();
                 let (db, edits) = other.as_mut().expect("the other branch is ready");
-                db.update(|root| edits.apply(root)).unwrap();
+                thread::scope(|scope| {
+                    let committed = scope.spawn(|| db.update(|root| edits.apply(root)));
+                    committed.join().unwrap().unwrap();
+                });
             }
         };
         let moved: Db<Mixed> = mixed_options(options)
