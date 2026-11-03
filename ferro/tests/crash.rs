@@ -15,7 +15,7 @@ type Model = BTreeMap<u64, String>;
 
 const LOG_START: usize = 8192;
 const SLOT: usize = 4096;
-const SUPER: usize = 100;
+const SUPER: usize = 144;
 const FRAME_CHECKED: usize = 32 + HASH_BYTES;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 
@@ -521,7 +521,7 @@ fn foreign_files_are_rejected_and_left_alone() {
         b"hello world".to_vec(),
         vec![7u8; 100],
         vec![7u8; 20_000],
-        b"FERRODB2".to_vec(),
+        b"FERRODB3".to_vec(),
     ] {
         fs::write(&path, &body).unwrap();
         assert_clear_error(fast().open::<Root>(&path), "foreign file");

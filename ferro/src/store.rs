@@ -20,12 +20,14 @@ use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::reclaim::sibling;
 
-const MAGIC: &[u8; 8] = b"FERRODB2";
+const MAGIC: &[u8; 8] = b"FERRODB3";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
-const FRAME_CHECKED: usize = 32 + HASH_BYTES;
-const SUPER_CHECKED: usize = FRAME_CHECKED + 16;
+const MARK_BYTES: usize = 24 + HASH_BYTES;
+const FRAME_CHECKED: usize = 8 + MARK_BYTES;
+const ANCHOR_AT: usize = FRAME_CHECKED + 16;
+const SUPER_CHECKED: usize = ANCHOR_AT + MARK_BYTES;
 const SUPER_BYTES: usize = SUPER_CHECKED + 32;
 const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
@@ -69,6 +71,7 @@ pub struct StoreOptions {
     pub durability: Durability,
     pub cache_bytes: u64,
     pub read_only: bool,
+    pub checkpoint_bytes: u64,
     #[doc(hidden)]
     pub trace: Option<Trace>,
 }
@@ -79,6 +82,7 @@ impl Default for StoreOptions {
             durability: Durability::Fsync,
             cache_bytes: 1 << 30,
             read_only: false,
+            checkpoint_bytes: 64 << 20,
             trace: None,
         }
     }
@@ -123,44 +127,85 @@ impl Basis {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    seq: u64,
+    log_end: u64,
+    head: Option<Ptr>,
+}
+
+impl Mark {
+    fn fill(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.seq.to_le_bytes());
+        out[8..16].copy_from_slice(&self.log_end.to_le_bytes());
+        if let Some(head) = self.head {
+            out[16..24].copy_from_slice(&head.offset.to_le_bytes());
+            out[24..MARK_BYTES].copy_from_slice(&head.hash);
+        }
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Mark> {
+        let seq = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let log_end = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let offset = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        let hash: Hash = bytes[24..MARK_BYTES].try_into().ok()?;
+        let head = (offset != 0).then_some(Ptr { hash, offset });
+        Some(Mark { seq, log_end, head })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Super {
     seq: u64,
     log_end: u64,
     head: Option<Ptr>,
     basis: Basis,
+    anchor: Mark,
 }
 
 impl Super {
-    fn fill(&self, magic: &[u8; 8], out: &mut [u8]) {
-        out[0..8].copy_from_slice(magic);
-        out[8..16].copy_from_slice(&self.seq.to_le_bytes());
-        out[16..24].copy_from_slice(&self.log_end.to_le_bytes());
-        if let Some(head) = self.head {
-            out[24..32].copy_from_slice(&head.offset.to_le_bytes());
-            out[32..32 + HASH_BYTES].copy_from_slice(&head.hash);
+    fn new(mark: Mark, anchor: Mark, basis: Basis) -> Super {
+        Super {
+            seq: mark.seq,
+            log_end: mark.log_end,
+            head: mark.head,
+            basis,
+            anchor,
         }
     }
 
+    fn mark(&self) -> Mark {
+        Mark {
+            seq: self.seq,
+            log_end: self.log_end,
+            head: self.head,
+        }
+    }
+
+    fn settled(&self) -> bool {
+        self.anchor == self.mark()
+    }
+
+    fn from_anchor(&self) -> Super {
+        Super::new(self.anchor, self.anchor, self.basis)
+    }
+
+    fn fill(&self, magic: &[u8; 8], out: &mut [u8]) {
+        out[0..8].copy_from_slice(magic);
+        self.mark().fill(&mut out[8..]);
+    }
+
     fn fields(bytes: &[u8]) -> Option<Super> {
-        let seq = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-        let log_end = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-        let offset = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
-        let hash: Hash = bytes[32..32 + HASH_BYTES].try_into().ok()?;
-        let head = (offset != 0).then_some(Ptr { hash, offset });
-        Some(Super {
-            seq,
-            log_end,
-            head,
-            basis: Basis::default(),
-        })
+        let mark = Mark::parse(&bytes[8..])?;
+        Some(Super::new(mark, mark, Basis::default()))
     }
 
     fn encode(&self) -> [u8; SUPER_BYTES] {
         let mut out = [0u8; SUPER_BYTES];
         self.fill(MAGIC, &mut out);
         out[FRAME_CHECKED..FRAME_CHECKED + 8].copy_from_slice(&self.basis.bytes.to_le_bytes());
-        out[FRAME_CHECKED + 8..SUPER_CHECKED].copy_from_slice(&self.basis.survival.to_le_bytes());
+        out[FRAME_CHECKED + 8..ANCHOR_AT].copy_from_slice(&self.basis.survival.to_le_bytes());
+        self.anchor.fill(&mut out[ANCHOR_AT..]);
         let check = blake3::hash(&out[..SUPER_CHECKED]);
         out[SUPER_CHECKED..SUPER_BYTES].copy_from_slice(check.as_bytes());
         out
@@ -175,13 +220,14 @@ impl Super {
             return None;
         }
         let bytes_at = bytes[FRAME_CHECKED..FRAME_CHECKED + 8].try_into().ok()?;
-        let survival = bytes[FRAME_CHECKED + 8..SUPER_CHECKED].try_into().ok()?;
+        let survival = bytes[FRAME_CHECKED + 8..ANCHOR_AT].try_into().ok()?;
         let basis = Basis {
             bytes: u64::from_le_bytes(bytes_at),
             survival: u64::from_le_bytes(survival),
         };
         Some(Super {
             basis,
+            anchor: Mark::parse(&bytes[ANCHOR_AT..])?,
             ..Super::fields(bytes)?
         })
     }
@@ -197,7 +243,9 @@ fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
         let mut bytes = [0u8; SUPER_BYTES];
         file.read_exact_at(&mut bytes, start)?;
         if let Some(candidate) = Super::decode(&bytes)
-            && best.as_ref().is_none_or(|b| candidate.seq > b.0.seq)
+            && best.as_ref().is_none_or(|b| {
+                (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq)
+            })
         {
             best = Some((candidate, slot));
         }
@@ -257,10 +305,11 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
 }
 
 fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
-    let before = sb.seq;
-    let tip = scan(file, sb, len)?;
-    let moved = tip.seq != before;
+    let mut tip = scan(file, sb.from_anchor(), len)?;
+    let moved = tip.seq != sb.seq || !sb.settled();
+    let rolled_back = tip.seq < sb.seq;
     let shrink = len > tip.log_end;
+    tip.anchor = tip.mark();
     if moved {
         file.sync_data()?;
     }
@@ -274,18 +323,23 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
     if moved || shrink {
         file.sync_all()?;
     }
+    if rolled_back {
+        file.write_all_at(&tip.encode(), (1 - slot) * SLOT_BYTES)?;
+        file.sync_all()?;
+    }
     Ok((tip, slot))
 }
 
 fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
-    if read_frame(file, &sb, len)?.is_none() || file.try_lock_shared().is_err() {
+    let settled = sb.settled() && read_frame(file, &sb, len)?.is_none();
+    if settled || file.try_lock_shared().is_err() {
         return Ok(sb);
     }
-    let before = sb.seq;
+    let before = sb.anchor.seq;
     let scanned = file
         .metadata()
         .map_err(Error::from)
-        .and_then(|meta| scan(file, sb, meta.len()))
+        .and_then(|meta| scan(file, sb.from_anchor(), meta.len()))
         .and_then(|tip| {
             if tip.seq != before {
                 file.sync_data()?;
@@ -406,12 +460,12 @@ impl RecordReader<'_> {
 
 pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basis) -> Result<()> {
     file.sync_data()?;
-    let sb = Super {
+    let mark = Mark {
         seq,
         log_end,
         head: Some(head),
-        basis,
     };
+    let sb = Super::new(mark, mark, basis);
     file.write_all_at(&sb.encode(), 0)?;
     file.write_all_at(&sb.encode(), SLOT_BYTES)?;
     file.sync_all()?;
@@ -459,10 +513,26 @@ pub(crate) struct Frame {
     head: Ptr,
 }
 
+impl Frame {
+    fn mark(&self) -> Mark {
+        Mark {
+            seq: self.seq,
+            log_end: self.end,
+            head: Some(self.head),
+        }
+    }
+}
+
 struct Cursor {
     seq: u64,
     reserved: u64,
     reserve: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Marks {
+    latest: Mark,
+    anchor: Mark,
 }
 
 pub(crate) struct Traced {
@@ -534,6 +604,9 @@ struct Inner {
     written: AtomicU64,
     cursor: Mutex<Cursor>,
     slot: AtomicU64,
+    marks: Mutex<Marks>,
+    checkpointing: AtomicBool,
+    ignored: Option<Mark>,
     cache: Cache<Hash, CacheEntry, EntryWeight>,
     dedupe: Cache<Hash, u64>,
     basis: Basis,
@@ -564,13 +637,14 @@ impl Store {
         }
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
+        let named = existing.map(|(sb, _)| sb.mark());
         let (sb, slot) = match existing {
             Some((sb, slot)) => {
                 let len = file.metadata()?.len();
-                if len < sb.log_end {
+                if len < sb.anchor.log_end {
                     return Err(Error::Corrupt(format!(
                         "file is {len} bytes but superblock expects {}",
-                        sb.log_end
+                        sb.anchor.log_end
                     )));
                 }
                 if options.read_only {
@@ -591,12 +665,12 @@ impl Store {
                 if len > LOG_START || probe.iter().any(|b| *b != 0) {
                     return Err(Error::NotFerro(path.display().to_string()));
                 }
-                let sb = Super {
+                let empty = Mark {
                     seq: 0,
                     log_end: LOG_START,
                     head: None,
-                    basis: Basis::default(),
                 };
+                let sb = Super::new(empty, empty, Basis::default());
                 file.set_len(LOG_START)?;
                 file.write_all_at(&sb.encode(), 0)?;
                 file.sync_all()?;
@@ -624,6 +698,12 @@ impl Store {
                     reserve: 0,
                 }),
                 slot: AtomicU64::new(slot),
+                marks: Mutex::new(Marks {
+                    latest: sb.mark(),
+                    anchor: sb.mark(),
+                }),
+                checkpointing: AtomicBool::new(false),
+                ignored: named.filter(|mark| mark.seq > sb.seq),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
                 dedupe: Cache::new(dedupe),
                 basis: sb.basis,
@@ -685,7 +765,7 @@ impl Store {
         let len = opened.len();
         let (sb, _) = read_supers(&self.inner.file, len)?
             .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
-        if sb.seq < cursor.seq {
+        if sb.seq < cursor.seq || self.inner.ignored == Some(sb.mark()) {
             return Ok(None);
         }
         cursor.seq = sb.seq;
@@ -712,12 +792,16 @@ impl Store {
             if durable {
                 inner.file.sync_data()?;
             }
-            let sb = Super {
-                seq: frame.seq,
-                log_end: frame.end,
-                head: Some(frame.head),
-                basis: inner.basis,
+            let mark = frame.mark();
+            let anchor = {
+                let mut marks = inner.marks.lock();
+                marks.latest = mark;
+                if durable {
+                    marks.anchor = mark;
+                }
+                marks.anchor
             };
+            let sb = Super::new(mark, anchor, inner.basis);
             let slot = 1 - inner.slot.load(Ordering::Relaxed);
             inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
             inner.slot.store(slot, Ordering::Relaxed);
@@ -728,6 +812,35 @@ impl Store {
             return Err(error);
         }
         inner.tail.store(frame.end, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self, frame: Frame) {
+        let inner = &self.inner;
+        let anchored = inner.marks.lock().anchor.log_end;
+        if frame.end.saturating_sub(anchored) < inner.options.checkpoint_bytes.max(1)
+            || inner.checkpointing.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        match inner.file.sync_data() {
+            Ok(()) => inner.marks.lock().anchor = frame.mark(),
+            Err(_) => self.poison(),
+        }
+        inner.checkpointing.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn settle_anchor(&self) -> Result<()> {
+        let inner = &self.inner;
+        let marks = *inner.marks.lock();
+        if inner.options.read_only || marks.anchor == marks.latest || self.check_healthy().is_err() {
+            return Ok(());
+        }
+        inner.file.sync_data()?;
+        let sb = Super::new(marks.latest, marks.latest, inner.basis);
+        let slot = inner.slot.load(Ordering::Relaxed);
+        inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+        inner.marks.lock().anchor = marks.latest;
         Ok(())
     }
 
@@ -955,13 +1068,8 @@ impl Txn {
             end,
             head,
         };
-        let header = Super {
-            seq: frame.seq,
-            log_end: end,
-            head: Some(head),
-            basis: inner.basis,
-        };
-        header.fill(FRAME_MAGIC, &mut self.buf);
+        self.buf[0..8].copy_from_slice(FRAME_MAGIC);
+        frame.mark().fill(&mut self.buf[8..]);
         let mut hasher = Xxh3::new();
         hasher.update(&self.buf[..FRAME_CHECKED]);
         hasher.update(&self.buf[FRAME_BYTES..]);

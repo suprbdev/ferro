@@ -316,7 +316,9 @@ struct Shared<T> {
 
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
-        self.store.load().close();
+        let store = self.store.load();
+        let _ = store.settle_anchor();
+        store.close();
     }
 }
 
@@ -382,6 +384,11 @@ impl Options {
 
     pub fn cache_bytes(mut self, bytes: u64) -> Self {
         self.store.cache_bytes = bytes;
+        self
+    }
+
+    pub fn checkpoint_bytes(mut self, bytes: u64) -> Self {
+        self.store.checkpoint_bytes = bytes;
         self
     }
 
@@ -614,7 +621,8 @@ impl<T: Data> Shared<T> {
         drop(queue);
         let last = batch.last().expect("a leader has queued commits");
         let (frame, refs) = (last.frame, last.refs.clone());
-        let outcome = self.store().sync(frame);
+        let store = self.store();
+        let outcome = store.sync(frame);
         if outcome.is_ok() {
             *self.published.lock() = refs;
             for pending in batch {
@@ -631,6 +639,7 @@ impl<T: Data> Shared<T> {
         }
         drop(queue);
         self.done.notify_all();
+        store.checkpoint(frame);
         if self.automatic {
             let base = self.signal.base.load(Ordering::Relaxed);
             let goal = base.max(self.reclaim.every_bytes);

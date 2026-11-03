@@ -1,0 +1,324 @@
+mod common;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+
+use common::{Rng, text};
+use ferro::store::{Op, Trace};
+use ferro::{Db, Durability, Map, Options, Reclaim};
+use parking_lot::Mutex;
+use tempfile::TempDir;
+
+type Root = Map<u64, String>;
+type Model = BTreeMap<u64, String>;
+
+const SECTOR: usize = 512;
+const LOG_START: u64 = 8192;
+const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+
+fn dir() -> TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
+fn dump(root: &Root) -> Model {
+    root.iter().map(|(k, v)| (k, (*v).clone())).collect()
+}
+
+fn buffered() -> Options {
+    Options::new().durability(Durability::Buffered).reclaim(MANUAL)
+}
+
+struct Recording {
+    base: Vec<u8>,
+    start: u64,
+    ops: Vec<Op>,
+    models: BTreeMap<u64, Model>,
+}
+
+fn commit(db: &Db<Root>, models: &mut BTreeMap<u64, Model>, key: u64, seed: u64) {
+    db.update(|root| {
+        root.insert(key, text(seed, 60));
+    })
+    .unwrap();
+    models.insert(db.version(), dump(&db.read()));
+    db.trace_op(Op::Acked(db.version()));
+}
+
+fn record(path: &Path, sessions: u64, commits: u64, options: impl Fn() -> Options) -> Recording {
+    let mut models = BTreeMap::new();
+    models.insert(0, Model::new());
+    {
+        let db: Db<Root> = options().open(path).unwrap();
+        for i in 0..commits {
+            commit(&db, &mut models, i % 7, i);
+        }
+    }
+    let base = fs::read(path).unwrap();
+    let start = commits;
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    for session in 0..sessions {
+        let db: Db<Root> = options().trace(trace.clone()).open(path).unwrap();
+        for i in 0..commits {
+            commit(&db, &mut models, i % 7, (session + 1) * 1000 + i);
+        }
+    }
+    let ops = trace.lock().clone();
+    Recording {
+        base,
+        start,
+        ops,
+        models,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Loss {
+    Everything,
+    Nothing,
+    Some,
+    Torn,
+    SuperblocksOnly,
+    SuperblocksOverZeroes,
+    FramesOnly,
+}
+
+fn apply(image: &mut Vec<u8>, op: &Op) {
+    match op {
+        Op::Write(_, at, bytes) => {
+            let end = *at as usize + bytes.len();
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            image[*at as usize..end].copy_from_slice(bytes);
+        }
+        Op::SetLen(_, len) => image.resize(*len as usize, 0),
+        _ => {}
+    }
+}
+
+fn torn(image: &mut Vec<u8>, op: &Op, rng: &mut Rng) {
+    let Op::Write(_, at, bytes) = op else {
+        return;
+    };
+    let start = *at as usize;
+    let end = start + bytes.len();
+    if image.len() < end {
+        image.resize(end, 0);
+    }
+    let mut offset = start;
+    while offset < end {
+        let stop = ((offset / SECTOR + 1) * SECTOR).min(end);
+        if rng.chance(50) {
+            image[offset..stop].copy_from_slice(&bytes[offset - start..stop - start]);
+        }
+        offset = stop;
+    }
+}
+
+fn is_superblock(op: &Op) -> bool {
+    matches!(op, Op::Write(_, at, _) if *at < LOG_START)
+}
+
+fn hollow(image: &mut Vec<u8>, op: &Op) {
+    if let Op::Write(_, at, bytes) = op {
+        let end = *at as usize + bytes.len();
+        if image.len() < end {
+            image.resize(end, 0);
+        }
+    }
+}
+
+struct Crash {
+    image: Vec<u8>,
+    floor: u64,
+    newest: u64,
+}
+
+fn crash(recording: &Recording, cut: usize, loss: Loss, rng: &mut Rng) -> Crash {
+    let mut image = recording.base.clone();
+    let mut pending: Vec<&Op> = Vec::new();
+    let (mut floor, mut newest) = (recording.start, recording.start);
+    for op in &recording.ops[..cut] {
+        match op {
+            Op::Write(..) | Op::SetLen(..) => pending.push(op),
+            Op::Sync(_) => {
+                for done in pending.drain(..) {
+                    apply(&mut image, done);
+                }
+                floor = newest;
+            }
+            Op::Acked(version) => newest = *version,
+            _ => {}
+        }
+    }
+    for op in pending {
+        match loss {
+            Loss::Everything => {}
+            Loss::Nothing => apply(&mut image, op),
+            Loss::Some => {
+                if rng.chance(50) {
+                    apply(&mut image, op);
+                }
+            }
+            Loss::Torn => torn(&mut image, op, rng),
+            Loss::SuperblocksOnly if is_superblock(op) => apply(&mut image, op),
+            Loss::SuperblocksOverZeroes if is_superblock(op) => apply(&mut image, op),
+            Loss::SuperblocksOverZeroes => hollow(&mut image, op),
+            Loss::FramesOnly if !is_superblock(op) => apply(&mut image, op),
+            Loss::SuperblocksOnly | Loss::FramesOnly => {}
+        }
+    }
+    Crash { image, floor, newest }
+}
+
+fn check(path: &Path, recording: &Recording, state: &Crash, context: &str) {
+    let reader: Db<Root> = Options::new()
+        .read_only()
+        .cache_bytes(1)
+        .open(path)
+        .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
+    assert!(reader.version() >= state.floor, "{context}: read-only lost {}", state.floor);
+    assert!(reader.version() <= state.newest + 1, "{context}: read-only is ahead");
+    assert_eq!(dump(&reader.read()), recording.models[&reader.version()], "{context}");
+    let seen = reader.version();
+    reader.refresh().unwrap_or_else(|error| panic!("{context}: refresh: {error}"));
+    assert_eq!(reader.version(), seen, "{context}: refresh moved a stopped database");
+    let db: Db<Root> = buffered()
+        .cache_bytes(1)
+        .open(path)
+        .unwrap_or_else(|error| panic!("{context}: open: {error}"));
+    assert_eq!(db.version(), seen, "{context}: writer and reader disagree");
+    assert_eq!(dump(&db.read()), recording.models[&db.version()], "{context}");
+    let follower: Db<Root> = Options::new()
+        .read_only()
+        .cache_bytes(1)
+        .open(path)
+        .unwrap_or_else(|error| panic!("{context}: follower open: {error}"));
+    assert_eq!(follower.version(), seen, "{context}: a follower saw lost commits");
+    drop(follower);
+    db.verify().unwrap_or_else(|error| panic!("{context}: verify: {error}"));
+    db.update(|root| {
+        root.insert(u64::MAX, "after".into());
+    })
+    .unwrap_or_else(|error| panic!("{context}: commit: {error}"));
+    let after = db.version();
+    reader.refresh().unwrap_or_else(|error| panic!("{context}: refresh after: {error}"));
+    assert_eq!(reader.version(), after, "{context}: reader did not follow the recovery");
+    drop((db, reader));
+    let again: Db<Root> = buffered()
+        .open(path)
+        .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
+    assert_eq!(again.version(), after, "{context}");
+    again.verify().unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
+}
+
+fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
+    let dir = dir();
+    let path = dir.path().join("image.ferro");
+    let mut rng = Rng::new(seed);
+    let mut images = 0;
+    let mut cut = 0;
+    while cut <= recording.ops.len() {
+        for loss in [
+            Loss::Everything,
+            Loss::Nothing,
+            Loss::Some,
+            Loss::Torn,
+            Loss::SuperblocksOnly,
+            Loss::SuperblocksOverZeroes,
+            Loss::FramesOnly,
+        ] {
+            let state = crash(recording, cut, loss, &mut rng);
+            fs::write(&path, &state.image).unwrap();
+            let context = format!("cut {cut} of {} {loss:?}", recording.ops.len());
+            check(&path, recording, &state, &context);
+            images += 1;
+        }
+        cut += stride.max(1);
+    }
+    images
+}
+
+#[test]
+fn a_power_cut_never_leaves_a_buffered_database_that_will_not_open() {
+    let dir = dir();
+    let recording = record(&dir.path().join("trace.ferro"), 2, 12, buffered);
+    assert!(replay(&recording, 3, 41) > 100);
+}
+
+#[test]
+fn fsync_commits_survive_the_same_cuts() {
+    let dir = dir();
+    let fsync = || Options::new().reclaim(MANUAL);
+    let recording = record(&dir.path().join("trace.ferro"), 2, 8, fsync);
+    assert!(replay(&recording, 3, 42) > 100);
+}
+
+#[test]
+fn a_clean_close_leaves_nothing_to_lose() {
+    let dir = dir();
+    let recording = record(&dir.path().join("trace.ferro"), 1, 12, buffered);
+    let mut rng = Rng::new(43);
+    let state = crash(&recording, recording.ops.len(), Loss::Everything, &mut rng);
+    assert_eq!(state.floor, 24);
+    let path = dir.path().join("image.ferro");
+    fs::write(&path, &state.image).unwrap();
+    check(&path, &recording, &state, "after close");
+}
+
+#[test]
+fn checkpoints_bound_what_a_power_cut_can_lose() {
+    let dir = dir();
+    let small = || buffered().checkpoint_bytes(4096);
+    let recording = record(&dir.path().join("trace.ferro"), 1, 40, small);
+    let syncs = recording.ops.iter().filter(|op| matches!(op, Op::Sync(_))).count();
+    assert!(syncs >= 4, "only {syncs} syncs in {} ops", recording.ops.len());
+    assert!(replay(&recording, 4, 44) > 100);
+}
+
+#[test]
+fn nothing_before_a_checkpoint_is_rolled_back() {
+    let dir = dir();
+    let path = dir.path().join("live.ferro");
+    let copy = dir.path().join("image.ferro");
+    let db: Db<Root> = buffered().checkpoint_bytes(4096).open(&path).unwrap();
+    let start = fs::metadata(&path).unwrap().len() as usize;
+    let mut models = BTreeMap::new();
+    for i in 0..40 {
+        commit(&db, &mut models, i % 7, i);
+    }
+    let mut image = fs::read(&path).unwrap();
+    image[start] ^= 0x40;
+    fs::write(&copy, &image).unwrap();
+    let reader: Db<Root> = Options::new().read_only().cache_bytes(1).open(&copy).unwrap();
+    assert!(reader.version() > 30, "rolled back to v{}", reader.version());
+    drop(reader);
+    let writer: Db<Root> = buffered().cache_bytes(1).open(&copy).unwrap();
+    assert!(writer.version() > 30, "rolled back to v{}", writer.version());
+    assert_eq!(dump(&writer.read()), models[&writer.version()]);
+}
+
+#[test]
+fn recovery_settles_either_slot_and_never_scans_old_frames_again() {
+    for commits in [7, 8] {
+        let dir = dir();
+        let path = dir.path().join("live.ferro");
+        let copy = dir.path().join("image.ferro");
+        let db: Db<Root> = buffered().open(&path).unwrap();
+        let start = fs::metadata(&path).unwrap().len() as usize;
+        let mut models = BTreeMap::new();
+        for i in 0..commits {
+            commit(&db, &mut models, i % 7, i);
+        }
+        fs::copy(&path, &copy).unwrap();
+        drop(db);
+        drop(buffered().open::<Root>(&copy).unwrap());
+        let mut image = fs::read(&copy).unwrap();
+        image[start] ^= 0x40;
+        fs::write(&copy, &image).unwrap();
+        let reopened: Db<Root> = buffered().cache_bytes(1).open(&copy).unwrap();
+        assert_eq!(reopened.version(), commits, "rolled back");
+    }
+}
