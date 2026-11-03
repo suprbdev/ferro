@@ -472,6 +472,34 @@ cargo run --release -p tracker -- history 1
 cargo run --release -p tracker -- undo
 ```
 
+## A chat server
+
+`examples/chat` is an axum service for multi-room chat: rooms, joining and leaving, posts, edits
+and deletes by their author, reactions, read receipts, unread counts, newest-first history and word
+search within a room.
+
+Each room is a `Table` row holding its members, its messages and a word index. The messages are a
+`Map<u64, Message, Live>` whose summary counts the ones not deleted, so an unread count is one
+`range_summary` past the user's receipt, O(log n) however long the room's history. A history page
+is a reversed `range` before a cursor.
+
+Live updates are Server-Sent Events. Each subscriber has a `watch_when` watcher that wakes only when
+one of its rooms or its own membership changed, and a `diff` between the last snapshot it delivered
+and the new one gives the events. The event id is the version, so a client reconnecting with
+`Last-Event-ID` gets one diff from that version, or a reset if that version is no longer retained.
+
+```sh
+cargo run --release -p chat -- --db chat.ferro
+cargo run --release -p chat --bin chat-load -- --db load.ferro --rate 1000
+```
+
+`chat-load` seeds 1,000 rooms and 10,000 users in 5 rooms each, opens 300 feeds and posts from 32
+connections, and a quarter of the deliveries send a read receipt. With fsync, at 1,000 posts a
+second, a post took 0.9 ms at p50 and 2.7 ms at p99 and reached each member's feed in 0.8 ms and
+2.5 ms. Flat out it took about 2,700 posts and 1,900 receipts a second at 11 ms p50, and 4,200 posts
+with `coalesce`. These ran on a machine shared with other work. Every watcher's test runs on the
+committing thread, so each commit pays for every connected feed.
+
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
