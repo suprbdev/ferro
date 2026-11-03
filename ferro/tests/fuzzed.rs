@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -700,7 +699,8 @@ fn swapping_in_a_compacted_file_reports_a_damaged_branch_table() {
             let mut bytes = Vec::new();
             (&file).read_to_end(&mut bytes).unwrap();
             let at = bytes.windows(4).position(|window| window == b"main").unwrap();
-            file.write_all_at(&[bytes[at] ^ 1], at as u64).unwrap();
+            (&file).seek(SeekFrom::Start(at as u64)).unwrap();
+            (&file).write_all(&[bytes[at] ^ 1]).unwrap();
         }
     };
     let db = manual().hook(Hook(Arc::new(hook))).open::<Root>(&path).unwrap();
