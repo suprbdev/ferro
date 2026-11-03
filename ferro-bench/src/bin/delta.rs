@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,8 +14,24 @@ use ferro::{Db, Durability, Map, Options, Ptr, hash_of};
 
 const FRAME_BYTES: usize = 68;
 
+#[cfg(target_os = "linux")]
 struct Counter(Option<i32>);
 
+#[cfg(not(target_os = "linux"))]
+struct Counter;
+
+#[cfg(not(target_os = "linux"))]
+impl Counter {
+    fn instructions() -> Counter {
+        Counter
+    }
+
+    fn read(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Counter {
     fn instructions() -> Counter {
         let mut attr = [0u64; 16];
@@ -40,6 +56,12 @@ impl Counter {
     }
 }
 
+#[cfg(not(unix))]
+fn cpu_ns() -> u64 {
+    0
+}
+
+#[cfg(unix)]
 fn cpu_ns() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -231,9 +253,10 @@ struct Framed {
     parts: Parts,
 }
 
-fn frame_of(file: &File, start: u64, end: u64) -> Framed {
+fn frame_of(mut file: &File, start: u64, end: u64) -> Framed {
     let mut frame = vec![0u8; (end - start) as usize];
-    file.read_exact_at(&mut frame, start).unwrap();
+    file.seek(SeekFrom::Start(start)).unwrap();
+    file.read_exact(&mut frame).unwrap();
     let recs = records(&frame, start);
     let n = recs.len();
     assert!(n >= 4, "a commit frame holds at least four records");
