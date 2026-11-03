@@ -2,12 +2,26 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ferro::{Db, Error, Map, Options};
+use ferro::codec::{Decoder, Encoder};
+use ferro::{Data, Db, Error, Map, Options};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
 
 const SLOT: usize = 4096;
+
+#[derive(Clone, Default)]
+struct Opaque;
+
+impl Data for Opaque {
+    fn encode(&self, _w: &mut Encoder<'_>) -> ferro::Result<()> {
+        Ok(())
+    }
+
+    fn decode(_r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Opaque)
+    }
+}
 
 fn fixture(name: &str) -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -70,6 +84,19 @@ fn a_record_length_that_overflows_the_offset_is_corrupt() {
     header.extend([len as u8, 0]);
     bytes[head..head + header.len()].copy_from_slice(&header);
     fs::write(&path, &bytes).unwrap();
+    corrupt(read_only().open::<Root>(&path));
+    corrupt(Db::<Root>::open(&path));
+}
+
+#[test]
+fn a_branch_that_keeps_versions_out_of_order_is_corrupt() {
+    let (_dir, path) = fixture("chain-len");
+    corrupt(read_only().open::<Opaque>(&path));
+}
+
+#[test]
+fn a_branch_whose_first_version_is_past_its_last_is_corrupt() {
+    let (_dir, path) = fixture("chain-bounds");
     corrupt(read_only().open::<Root>(&path));
     corrupt(Db::<Root>::open(&path));
 }

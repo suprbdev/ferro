@@ -373,6 +373,13 @@ impl Chain {
         }
     }
 
+    pub(crate) fn bounded(tip: Option<Ptr>, first: u64, last: u64) -> Result<Chain> {
+        if tip.is_some() && (first == 0 || first > last) {
+            return Err(corrupt(&format!("keeps versions {first} to {last}")));
+        }
+        Ok(Chain { tip, first, last })
+    }
+
     pub(crate) fn len(&self) -> usize {
         match self.tip {
             Some(_) => (self.last - self.first + 1) as usize,

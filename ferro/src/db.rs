@@ -211,11 +211,7 @@ impl Data for Head {
         Ok(Head {
             version,
             root,
-            log: Chain {
-                tip,
-                first,
-                last: version,
-            },
+            log: Chain::bounded(tip, first, version)?,
             merged,
         })
     }
