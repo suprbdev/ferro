@@ -2119,6 +2119,10 @@ key, and copies of an ordinary tree node, which are interchangeable, would stop 
 Resolving links by hash when they are followed needs the index from hash to offset that `ferro`
 does not keep.
 
+The combined model now verifies each device's refreshed reader after every step, and its three
+devices run with caches of 1 MiB, 16 KiB and 2 KiB. Before the fix the reader check failed at seed
+212 of the pruned sweep at a scale of 20.
+
 ### Checking trees
 
 A `Map` decodes lazily, so decoding a root as `T` says nothing about the nodes under it. A bundle

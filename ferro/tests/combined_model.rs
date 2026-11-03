@@ -18,6 +18,7 @@ type Events = Map<u32, i64>;
 type Counts = BTreeMap<u32, i64>;
 
 const LOCAL: [&str; 2] = ["main", "side"];
+const CACHES: [u64; 3] = [1 << 20, 16 << 10, 2 << 10];
 
 struct Flag {
     thread: Thread,
@@ -132,6 +133,7 @@ impl Graph {
 struct Device {
     path: PathBuf,
     keep: Keep,
+    cache: u64,
     coalesce: bool,
     dbs: [Option<Db<Events>>; 2],
     heads: [usize; 2],
@@ -142,6 +144,7 @@ struct Device {
 impl Device {
     fn options(&self) -> Options {
         fast()
+            .cache_bytes(self.cache)
             .history(self.keep)
             .reclaim(Reclaim { every_bytes: 0 })
             .coalesce(self.coalesce)
@@ -477,6 +480,9 @@ impl World {
             reader
                 .refresh()
                 .unwrap_or_else(|error| panic!("{when}: d{index} refresh: {error}"));
+            reader
+                .verify_typed()
+                .unwrap_or_else(|error| panic!("{when}: d{index} reader: {error}"));
             let cold: Db<Events> = Options::new().read_only().open(&device.path).unwrap();
             cold.verify_typed()
                 .unwrap_or_else(|error| panic!("{when}: d{index} cold: {error}"));
@@ -569,6 +575,7 @@ fn execute(seed: u64, setup: &Setup, acts: &[Act]) -> BTreeMap<&'static str, usi
         let mut device = Device {
             path: dir.path().join(format!("d{index}.ferro")),
             keep: *keep,
+            cache: CACHES[index % CACHES.len()],
             coalesce: setup.coalesce[index],
             dbs: [None, None],
             heads: [0, 0],
