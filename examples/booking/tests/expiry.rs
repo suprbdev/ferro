@@ -34,6 +34,10 @@ fn a_hold_blocks_others_until_the_moment_it_expires() {
     assert_eq!(h.holder(2, night + 1), Some(second.id));
     assert_eq!(h.loads.get(&(1, night)), None);
     drop(h);
+    let trail = booking::history::audit(w.svc.db(), first.id).unwrap();
+    let last = trail.last().unwrap();
+    assert_eq!(last.booking.status, Status::Expired);
+    assert!(last.message.ends_with(&format!("releasing lapsed #{}", first.id)), "{}", last.message);
     assert_clean(&w.svc);
 }
 

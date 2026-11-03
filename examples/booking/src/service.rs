@@ -131,7 +131,7 @@ impl Reservations {
     pub fn hold(&self, request: &HoldRequest) -> Result<Held> {
         self.write(|h, now| {
             let held = h.hold(now, request)?;
-            let message = format!(
+            let mut message = format!(
                 "hold #{} room {} {} x{} for customer {}",
                 held.id,
                 request.room,
@@ -139,6 +139,10 @@ impl Reservations {
                 request.nights,
                 request.customer
             );
+            if !held.released.is_empty() {
+                let released: Vec<String> = held.released.iter().map(|id| format!("#{id}")).collect();
+                message.push_str(&format!(", releasing lapsed {}", released.join(" ")));
+            }
             Ok((message, held))
         })
     }

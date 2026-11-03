@@ -28,15 +28,19 @@ pub fn audit(db: &Db<Hotels>, id: u64) -> Result<Vec<Event>> {
     Ok(events)
 }
 
+fn mentions(line: &str, id: u64) -> bool {
+    let tag = format!("#{id}");
+    line.match_indices(&tag).any(|(at, _)| {
+        !line[at + tag.len()..].starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
 fn event(commit: Commit, booking: Booking) -> Event {
+    let line = commit.messages().find(|line| mentions(line, booking.id));
     Event {
         version: commit.version,
         time_ms: commit.time_ms,
-        message: commit
-            .messages()
-            .find(|line| line.contains(&format!("#{} ", booking.id)) || line.ends_with(&format!("#{}", booking.id)))
-            .unwrap_or(&commit.message)
-            .to_string(),
+        message: line.unwrap_or(&commit.message).to_string(),
         booking,
     }
 }

@@ -416,7 +416,10 @@ pub fn walk(db: &Db<Hotels>, full_every: u64) -> Result<Walked> {
     };
     walked.first = first;
     walked.last = last;
-    let mut prev: Snapshot<Hotels> = db.at(first - 1).or_else(|_| db.at(first))?;
+    let mut prev: Snapshot<Hotels> = match db.at(first - 1) {
+        Err(ferro::Error::NoVersion(_)) => db.at(first)?,
+        other => other?,
+    };
     for version in first..=last {
         let cur = db.at(version)?;
         let mut messages = Vec::new();
