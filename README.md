@@ -635,12 +635,12 @@ the rows and their indexes, and re-encodes each path under the writer lock. In o
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`. Random `get`, full scan and range read are medians of seven runs on a machine shared
-with other jobs. The rest are single runs on an otherwise idle machine.
+`ferro-bench`. Random `get`, full scan and range read are medians of seven runs, and bulk insert of
+five, on a machine shared with other jobs. The rest are single runs on an otherwise idle machine.
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 1.4 s |
+| Bulk insert in one commit | 1.1 s |
 | Random `get` | 0.34 µs |
 | Full scan | 22 ns per key |
 | Range read | 33 ns per key |
@@ -663,9 +663,9 @@ of 3 rounds on a machine shared with other jobs:
 | fjall | 1.42 µs | 97 ns | 0.54 ms | 1,930 | 64 MiB |
 
 ferro keeps every version and re-hashes objects as it reads them, and the others do neither.
-SQLite and fjall bulk load 1.4 to 1.8 times faster, and redb's `get` is about 10% faster. These
-numbers come from a warm cache, on a workload with few overwrites. Full results, including
-caveats about sled, are in `benchmarks/compare/RESULTS.md`.
+SQLite bulk loads about 1.6 times faster and fjall about 8% faster, and redb's `get` is about 10%
+faster. These numbers come from a warm cache, on a workload with few overwrites. Full results,
+including caveats about sled, are in `benchmarks/compare/RESULTS.md`.
 
 ## Limitations
 

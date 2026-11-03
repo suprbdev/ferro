@@ -115,14 +115,52 @@ links only mean something inside their own store.
 Mutation is copy-on-write through `Arc::make_mut`, so a node is copied once per transaction and
 then mutated in place. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one.
 `flush` writes dirty nodes bottom
-up during `Data::encode` and seeds the node cache with the nodes it wrote. It clones the in-memory
-node unless a value held a dirty or foreign collection, in which case it decodes the written bytes
-instead, so nested collections always come back clean and a foreign store is never pinned. Values
-inserted or mutated since the node was loaded are decoded once as a check before they become
-durable; unchanged values are not.
+up during `Data::encode` and seeds the node cache with the nodes it wrote. Values inserted or
+mutated since the node was loaded are decoded once as a check before they become durable;
+unchanged values are not. When at least half of a node's values are fresh, the cached copy is
+decoded from the written bytes, which is that check and the copy in one pass; otherwise the node is
+cloned. A value holding a dirty or foreign collection also forces the decode, so nested
+collections always come back clean and a foreign store is never pinned.
+
+A dirty node of at least 4096 keys with two or more dirty children is flushed in three phases.
+First, every dirty subtree under 4096 keys is encoded, hashed and LZ4 compressed on up to 16 scoped
+threads, each into its own buffer, and the nodes above them on the calling thread. Second, the
+calling thread appends the records to the transaction in the order a one-thread flush would, so
+the file comes out byte for byte the same. Third, the threads decode the cached copies from those
+buffers, which also checks every value and leaves the same `Weak` memos and hints a one-thread
+flush leaves, as described under Read path, and the calling thread hands them to the cache in the
+same order. The first phase encodes against a sink that refuses writes and links, so a value that
+holds a dirty collection or a raw `Ptr` sends the node back to the one-thread path. The threads
+are scoped and the caller blocks on them: a commit holds the branch lock, and a work-stealing pool
+thread waiting on a join could pick up another task that commits to the same database and
+deadlock. At 1M keys the commit went from 476 to 98 ms and `root_hash` on a dirty map from 209 to
+32 ms. The decoded copies land on the threads' heaps, so where they are built matters: building
+them in the first phase, next to scratch buffers that are freed later, spread them over 2.5 times
+as many pages and made the next scans 10 to 15% slower. Built in the third phase, after each
+subtree's buffers are released, the first pass of gets, scans and ranges after a bulk load is as
+fast as before or up to 7% faster, and peak memory rose 2%, from 362 to 371 MiB at 1M keys. Each
+phase spawns its threads, so a 10,000-row table commit, with little to share out, gains up to 5%
+for 50% more CPU time.
+
+Most of a 1M-key bulk load is still the per-key inserts, about 60%, which miss the CPU cache a few
+times per level, and dropping the in-memory tree after the commit, about 25%. Measured and
+rejected:
+
+- Dropping the old tree on a background thread. It took about 300 ms off a 1M-key load, but its
+  frees contend with every other allocation in the process: the gets right after the load were
+  about 25% slower, reopen 0.2 ms slower, and a table loaded in 50,000-row commits up to 25%
+  slower unless each commit first waited for the last drop.
+- Freeing in parallel. Dropping 1M `Arc<String>` in random order took 192 ms on one thread and
+  310 to 900 ms on 2 to 16, since every free takes the lock of the arena that allocated it.
+- rayon. As fast as the scoped threads, but it can deadlock as above, and its `par_sort_by` did
+  not beat the standard stable sort on 1M shuffled pairs, about 33 ms either way.
+- Reserving the transaction buffer up front, and keeping LZ4 off when it does not pay. The first
+  changed nothing measurable, and without LZ4 a 1M-key load is 17% larger and a table row 80%
+  larger, so compression stays and runs on the threads.
 
 `Extend`, `FromIterator` and `apply`, which also takes deletes, sort the batch and keep the last
-edit per key. An empty map is assembled bottom-up in one pass, which gives the same tree as
+edit per key. Batches of 16,384 keys or more hash their key levels on the scoped threads described
+above. An empty map is assembled bottom-up in one pass, which gives the same tree as
 inserting key by key. A non-empty map takes the batch in one descent: each node sorts the edits
 into its gaps, applies the ones at its own level in place, and passes each group to one child, so a
 subtree no edit falls in stays shared and a node is walked once however many edits it receives.

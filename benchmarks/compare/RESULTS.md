@@ -13,7 +13,7 @@ Settings: all engines get a 1 GiB cache (ferro `cache_bytes`, redb `set_cache_si
 
 | engine | durability | bulk load (s) | get (us) | scan (ns/key) | range 1000 keys (us) | durable commit (ms) | 8W+8R commits/s | 8W+8R reads/s (M) | size (MiB) | reopen (ms) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| ferro | fdatasync per commit, group commit | 1.49 | 0.35 | 23 | 31 | 0.43 | 8592 | 19.05 | 23 | 0.1 |
+| ferro | fdatasync per commit, group commit | 1.25 | 0.35 | 23 | 31 | 0.43 | 8592 | 19.05 | 23 | 0.1 |
 | redb | Durability::Immediate (fsync per commit) | 1.53 | 0.31 | 51 | 52 | 0.45 | 2132 | 15.91 | 65 | 0.6 |
 | sqlite-full | WAL, synchronous=FULL | 0.85 | 1.23 | 58 | 60 | 0.58 | 979 | 0.69 | 57 | 0.3 |
 | sqlite-normal | WAL, synchronous=NORMAL (commit not fsynced) | 0.80 | 1.32 | 61 | 62 | 0.02 | 9294 | 0.46 | 57 | 0.2 |
@@ -21,5 +21,12 @@ Settings: all engines get a 1 GiB cache (ferro `cache_bytes`, redb `set_cache_si
 | fjall | PersistMode::SyncAll after each write | 1.09 | 1.42 | 97 | 98 | 0.54 | 1930 | 5.50 | 64 | 15.3 |
 
 The get here is the first pass of reads right after the bulk load, in the same process. The read path changes for issue #9 took ferro's get from 0.73 to 0.33 us against 0.30 us for redb, its scan from 42 to 22 ns a key and its 1000-key range from 43 to 30 us, in 7 alternating runs of the ferro child built before and after those changes and the redb child. Bulk load, commit, size and reopen did not change beyond noise.
+
+ferro's bulk load is from five later runs of the harness, after the bulk-load changes for issue #10,
+at a load average of 20 to 50; before them it was the 1.49 s measured with the rest of the table.
+In those runs ferro took 1.25 s against 0.79 s for sqlite-full, 1.16 s for fjall and 1.55 s for
+redb, and its get, scan and range were 0.36 us, 23 ns and 32 us, within noise of its row. In 5
+alternating runs of `ferro-bench` against the build before those changes, bulk insert went from
+1.44 to 1.07 us a key.
 
 Caveats: sled's 0.07 ms commit and 45k commits/s are implausibly fast for a real fsync per commit; its `flush()` durability was not independently verified, so treat the sled commit rows as unreliable. sled and fjall file sizes include uncompacted logs. SQLite NORMAL does not fsync at commit. Ferro keeps full history and verifies the hash of every object it reads; the others do neither, so ferro's get, scan and commit numbers include that work. Reopen for ferro is a superblock read; sled and fjall do recovery work.
