@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Cursor, Diff, Iter, Keys, Map, Val, Values};
+use crate::map::{Conflict, Diff, Finder, Iter, Keys, Map, Val, Values};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -514,14 +514,14 @@ impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
 }
 
 pub struct IndexIter<T: Record> {
-    rows: Cursor<T::Key, T>,
+    rows: Finder<T::Key, T>,
     keys: Box<dyn KeyCursor<T::Key>>,
 }
 
 impl<T: Record> IndexIter<T> {
     fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
         IndexIter {
-            rows: rows.cursor(),
+            rows: rows.finder(),
             keys: Box::new(Entries(entries.into_keys())),
         }
     }
@@ -531,7 +531,7 @@ impl<T: Record> IndexIter<T> {
     }
 
     fn row(&mut self, key: &T::Key) -> Option<Val<T>> {
-        self.rows.seek(key).then(|| self.rows.value()).flatten()
+        self.rows.get(key)
     }
 }
 

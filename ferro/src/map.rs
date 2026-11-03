@@ -2771,6 +2771,15 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.range_by(|_| false, |_| true)
     }
 
+    pub(crate) fn finder(&self) -> Finder<K, V, S> {
+        Finder {
+            store: self.store.clone(),
+            root: self.root.with_memo(),
+            leaf: None,
+            parent: None,
+        }
+    }
+
     pub fn cursor(&self) -> Cursor<K, V, S> {
         Cursor {
             store: self.store.clone(),
@@ -3570,6 +3579,114 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         let index = self.index?;
         let node = &self.path.last()?.node;
         Some(fatal(node.read(self.store.as_ref(), index, |value| f(&node.keys[index], value))))
+    }
+}
+
+pub(crate) struct Finder<K, V, S = ()> {
+    store: Option<Store>,
+    root: Link<K, V, S>,
+    leaf: Option<Arc<Node<K, V, S>>>,
+    parent: Parent<K, V, S>,
+}
+
+type Parent<K, V, S> = Option<(Arc<Node<K, V, S>>, usize)>;
+
+type Found<K, V, S> = (Option<Val<V>>, Option<Arc<Node<K, V, S>>>, Parent<K, V, S>);
+
+fn strong<K, V, S>(link: &Link<K, V, S>) -> Option<Arc<Node<K, V, S>>> {
+    match link {
+        Link::Empty => None,
+        Link::Mem(node, _) => Some(node.clone()),
+        Link::Stored { memo, .. } => match memo.get()? {
+            Memo::Pinned(node) => Some(node.clone()),
+            Memo::Weak(node, _) => node.upgrade(),
+        },
+    }
+}
+
+fn spans<K, V, S, Q>(node: &Node<K, V, S>, key: &Q) -> bool
+where
+    K: Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    node.keys.first().is_some_and(|first| first.borrow() <= key)
+        && node.keys.last().is_some_and(|last| key <= last.borrow())
+}
+
+impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
+    pub(crate) fn get<Q>(&mut self, key: &Q) -> Option<Val<V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if let Some(leaf) = &self.leaf
+            && spans(leaf, key)
+        {
+            let index = leaf.search(key).ok()?;
+            return Some(fatal(leaf.value(self.store.as_ref(), index)));
+        }
+        let start = match &self.parent {
+            Some((parent, depth)) if spans(parent, key) => Some((&**parent, *depth)),
+            _ => None,
+        };
+        let (found, leaf, parent) = fatal(self.descend(start, key));
+        if leaf.is_some() {
+            self.leaf = leaf;
+        }
+        if parent.is_some() {
+            self.parent = parent;
+        }
+        found
+    }
+
+    fn descend<Q>(&self, start: Option<(&Node<K, V, S>, usize)>, key: &Q) -> Result<Found<K, V, S>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let store = self.store.as_ref();
+        let guard = epoch::pin();
+        let guard = guard.as_ref();
+        let (mut at, mut depth) = match start {
+            Some((node, depth)) => (At::Ref(node), depth),
+            None => match At::of(reach(store, &self.root, 0, guard)?) {
+                Some(at) => (at, 0),
+                None => return Ok((None, None, None)),
+            },
+        };
+        let mut leaf = None;
+        let mut parent = None;
+        loop {
+            depth += 1;
+            let node = at.node();
+            let position = match node.search(key) {
+                Ok(index) => return Ok((Some(node.value(store, index)?), leaf, parent)),
+                Err(_) if node.children.is_empty() => return Ok((None, leaf, parent)),
+                Err(position) => position,
+            };
+            let link = node.child(position);
+            let next = match &at {
+                At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
+                At::Arc(_) => At::owned(reach(store, link, depth, guard)?),
+            };
+            let Some(next) = next else {
+                return Ok((None, leaf, parent));
+            };
+            let child = next.node();
+            if child.children.is_empty() {
+                leaf = match &next {
+                    At::Arc(node) => Some(node.clone()),
+                    At::Ref(_) => strong(link),
+                };
+            } else if child.level <= 1 {
+                parent = match &next {
+                    At::Arc(node) => Some(node.clone()),
+                    At::Ref(_) => strong(link),
+                }
+                .map(|node| (node, depth));
+            }
+            at = next;
+        }
     }
 }
 
