@@ -445,7 +445,9 @@ let pulled = phone.receive_from("laptop", BufReader::new(download), merge)?;
 
 `bundle` and `receive` are the same calls on a byte buffer, and `pull` streams between the two
 files. Cloning a 330 MB file of a million keys took 65 MiB at peak and 2.3 s, where the in-memory
-version took 1.1 GB and 2.6 s, and a pull of three small commits takes as long as it did.
+version took 1.1 GB and 2.6 s, and a pull of three small commits takes as long as it did. Staging
+the bundle in a scratch file, so that commits go on while it arrives, added about a seventh to a
+clone and nothing to its memory.
 
 A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
 it lacks and the objects their trees reach that it does not hold, so it costs what changed: three
@@ -454,19 +456,21 @@ everything. `receive` hashes every object and checks every link as it reads, and
 object it is sent as the type that will read it: each map node, spilled value, nested collection,
 table index and summary decodes, and each node's count, level and key range agree with its parent.
 It costs about half again the time of applying a bundle, and nothing for the objects it already
-holds. Objects go into the file past its end as they arrive, where nothing can find them, and only
-once the whole bundle has passed does one frame point the remote branch at them, so a crash leaves
-the previous head. A damaged or forged bundle is rejected with `Error::Bundle`, and what it had written
-past the end is cut off again. `receive` uses a fixed buffer, the object it is reading and under
-500 bytes for each object the bundle carries, not memory for its bytes or for what it claims, and
-refuses commits dated more than a day past this machine's clock. It holds every branch's writer
-lock while it reads, so commits on the receiving file wait for the transfer: write a slow download
-to a file first and receive from that if they must not.
+holds. Objects go to a scratch file beside the database as they arrive, and `receive` holds no
+writer lock while it reads, so commits on every branch go on however slowly the bundle comes. Only
+once the whole bundle has passed are its objects copied into the file, beside those commits, where
+nothing can find them until one frame points the remote branch at them, so a crash leaves the
+previous head. Only that frame takes the writer locks, and it checks again that the commits the
+bundle builds on are still here. A damaged or forged bundle is rejected with `Error::Bundle` and
+never reaches the file. `receive` uses a fixed buffer, the object it is reading and under 500 bytes
+for each object the bundle carries, not memory for its bytes or for what it claims, and refuses
+commits dated more than a day past this machine's clock.
 
 If this file does not hold the commit a bundle builds on, because the bundle was built for another
-file, or this one pruned or dropped that commit after sending its have, `receive` returns
-`Error::StaleHave` and changes nothing: build a new bundle from a fresh have and try again. `pull`
-returns the same error rather than retrying, so call it again, as `examples/notes` does once.
+file, or this one pruned or dropped that commit after sending its have, even while the bundle was
+arriving, `receive` returns `Error::StaleHave` and lands nothing: build a new bundle from a fresh
+have and try again. `pull` returns the same error rather than retrying, so call it again, as
+`examples/notes` does once.
 
 A pulled commit keeps the version, time, message and hash it had. A fast-forward adopts the other
 branch, so afterwards `head_hash` is the same in both files. A merge commits at this branch's next
@@ -784,8 +788,8 @@ This is an experiment, not a production database.
   the same time. Encoding each commit and writing its frame still take one lock for the whole
   file, so commit throughput across branches stops scaling at the cost of encoding, and on one
   branch, unless you opt in to `coalesce`, at the cost of the closure and encoding, with only the
-  fsync shared. A reclamation cycle and `receive` wait for the closure running on every branch
-  before they hold up all of them.
+  fsync shared. A reclamation cycle, and `receive` once its bundle has arrived, wait for the
+  closure running on every branch before they hold up all of them.
 - A write from inside a closure fails with `Error::Reentrant` wherever it could deadlock, rather
   than hanging. That covers merge closures, a watcher test run inside a closure, and a `Drop` that
   runs under a writer lock too. A closure may write to another file, and without `coalesce` to a
@@ -813,8 +817,11 @@ This is an experiment, not a production database.
   your current `Default`.
 - Sync streams, but keeps under 500 bytes per object received and 110 per object sent, and holds
   each object whole, so a clone of tens of millions of objects or of one huge value still needs
-  memory to match. `receive` holds every branch's writer lock while it reads. Files that share no
-  commit send everything on their first pull.
+  memory to match. A bundle over 1 MiB is written twice, to a scratch file beside the database
+  while it arrives and then into the file, so it needs disk for both until it lands. A crash while
+  it is copied in, or a bundle refused because this file pruned what it builds on while it
+  arrived, leaves the copy in the file until the next reclamation cycle. Files that share no commit
+  send everything on their first pull.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
   You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 

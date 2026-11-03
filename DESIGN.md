@@ -1645,7 +1645,7 @@ under `tip` that its branch is live, since that is where its frame is decided. A
 our lane only: it copies the refs under `tip`, then finds the base and runs the closure without it,
 and its commit checks under `tip` that the other branch is live too. So a merge from a branch that
 was dropped while the closure ran fails with `NoBranch` instead of writing that name back into a
-merge record. A reclamation cycle's prune and its pause, and the frame `receive` writes, replace
+merge record. A reclamation cycle's prune and its pause, and the frame landing a `receive`, replace
 the tip of every branch, so they take every attached branch's lane in name order, sealing each open
 group, and then `tip`. Attaching a branch for the first time takes `tip`, so once they hold it no
 branch can appear that they have not locked. They check under `tip` that the set has not changed
@@ -1720,9 +1720,9 @@ six runs, and the same cells, on code that is the same for one branch, came out 
 
 Left open:
 
-- A cycle or `receive` that waits for a long closure holds the lanes it has already taken, those
-  that sort before that closure's branch, so those branches wait for the rest of that closure, as
-  every branch did before.
+- A cycle, or a `receive` about to land, that waits for a long closure holds the lanes it has
+  already taken, those that sort before that closure's branch, so those branches wait for the rest
+  of that closure, as every branch did before.
 - A closure may commit on a branch whose name sorts after its own. One that sorts before it could
   deadlock against a cycle, which takes lanes in name order, so it fails with `Error::Reentrant`,
   as described under writes from inside a closure below.
@@ -1865,7 +1865,8 @@ and fails with `Error::Reentrant` where waiting could deadlock. Taking a lane re
 its branch's name, and dropping the lane removes them. A file is the `Shared` behind every handle
 of one `open`, numbered when it opens, since two opens of one path have separate locks. Each place
 that holds `tip` while user code may run records the whole file: a commit's hold of `tip` after its
-draft, a cycle's or `receive`'s hold of every lane, attaching a branch, `refresh` and `drop_branch`.
+draft, a cycle's or `receive`'s hold of every lane, each piece of a bundle that `receive` places,
+attaching a branch, `refresh` and `drop_branch`.
 The commit's record is taken by its callers rather than inside `commit_locked`, so it also covers
 the draft that `commit_locked` drops when it returns early. A
 write is refused when its thread holds:
@@ -1874,6 +1875,12 @@ write is refused when its thread holds:
 - with `coalesce`, any lane of that file;
 - any lane of that file, for `compact`, `pull`, `push` and `receive`, which take every lane;
 - a lane of that file whose name sorts at or after the one the write takes.
+
+`pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
+scratch file, as described under Where checked objects wait. They make the check before they read
+anything, so a call that will be refused reads no stream, but the edge into the receiving file
+described below is listed only from the end of the stream to the merge, and a pull's edge into the
+sending file only while it plans the bundle.
 
 Without `coalesce`, then, a closure may write to a branch whose name sorts after its own, including
 `fork` from it and `drop_branch` of it, and those writes may nest further up the order. Cycles and
@@ -1888,8 +1895,11 @@ between any of its lanes and any other, so the file is the unit. A write made wh
 a lane of another file adds an edge from each file it holds to the one it writes, to a process-wide
 list, for as long as it runs, and is refused if the file it writes already reaches one it holds
 through the edges listed. Of two closures that write into each other's files at once, exactly one
-fails. Only a write made while its thread holds something takes that list's mutex, and a closure
-that only ever writes one way between two files is never refused.
+fails. While a closure on one file receives into another and its peer is slow, a closure on the
+receiving file may write into the first, because the receive holds nothing there yet. If that write
+still runs when the stream ends, the receive fails with `Reentrant` at its landing, having read its
+bundle for nothing. Only a write made while its thread holds something takes that list's mutex,
+and a closure that only ever writes one way between two files is never refused.
 
 An awaited write checks at every poll. Before its closure has run it needs the lane, as a blocking
 write does. After, it only waits for an acknowledgement, which a closure on its file may do without
@@ -2632,9 +2642,10 @@ a second thread once it sends 256 objects, with eight chunks in flight between t
   and the branch starts at the oldest sent commit, the way a pruned chain does.
 - Every commit the bundle says the receiver holds must still be in one of its chains, and so must
   the head of an empty bundle, which the have named. If the receiver pruned or dropped one after it
-  sent its have, `receive` returns `Error::StaleHave`, writes nothing, and a bundle built from a
-  fresh have lands. `pull` returns it as well rather than retrying, so a caller sees the same error
-  whether it pulls in one process or over a network, and decides itself whether to try again.
+  sent its have, even while the bundle was streaming, `receive` returns `Error::StaleHave`, lands
+  nothing, and a bundle built from a fresh have lands. `pull` returns it as well rather than
+  retrying, so a caller sees the same error whether it pulls in one process or over a network, and
+  decides itself whether to try again.
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
@@ -2658,61 +2669,106 @@ a second thread once it sends 256 objects, with eight chunks in flight between t
   be pulled from until the puller's clock catches up.
 - Every object the bundle sends is checked as the type it will be read as, below.
 
-All the objects and a `Refs` that points `remote` at the new head are then one frame, synced like a
-commit, so a crash leaves the previous head: a torn frame is not replayed. Branch handles on
-`remote` are rebound and its watchers fire. Their notices drop once the pull has released `tip`, so
-a `watch_when` test may commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
-was. Flipping every byte of a 3,358 byte bundle with three masks gave 10,073 rejections and one flip
-inside an LZ4 body that decoded to the same bytes, and so landed the same commit.
+These checks run with no writer lock held, against the heads `receive` started from, as described
+under Where checked objects wait. Under the writer locks, the ones that depend on what this file
+holds run again against the heads found there, and the sent commits and a `Refs` that points
+`remote` at the new head go into one frame, synced like a commit, so a crash leaves the previous
+head: a torn frame is not replayed. Branch handles on `remote` are rebound and its watchers fire.
+Their notices drop once the pull has released `tip`, so a `watch_when` test may commit or pull. A
+bad bundle is `Error::Bundle` and leaves the file as it was. Flipping every byte of a 3,358 byte
+bundle with three masks gave 10,073 rejections and one flip inside an LZ4 body that decoded to the
+same bytes, and so landed the same commit.
 
 ### Where checked objects wait
 
 A bundle is read once and not kept, so its objects have to be somewhere between being hashed and
-being published. They go into the frame that will publish them, before that frame has a header.
+being published. They wait in a scratch file beside the database while the bundle streams and is
+checked, and go into the log only once every check has passed. No writer lock is held while the
+bundle is read, so a slow or stalled peer holds up no commit on the receiving file (#42).
 
-`receive` reads the bundle's header, then takes the `tip` mutex and resolves the anchors and hints
-against this file, so a stale have fails before any object is read. A frame is a header at the end
-of the log followed by records, and the header names the frame's end, the refs it publishes and a
-hash over the whole frame. The transaction that will become the landing frame starts at the end of
-the log with its header left as zeros. Each object is appended to it as it is hashed, with its links
-resolved to offsets: to an object sent earlier, to an anchor or hint, or, where a link names
-something not sent, to offset 0 for now. Whenever 1 MiB has built up, the transaction writes it to
-the file past the end of the log. The checks above read the objects back, from the file or from what
-is still buffered, without hashing them again, since they were hashed on the way in.
+`receive` reads the bundle's header, then resolves the anchors and hints against the published refs,
+so a stale have fails before any object is read. It keeps the `Store` of that generation for the
+rest of the transfer, so a reclamation cycle that swaps the file meanwhile leaves every object it
+resolved readable. Each object is hashed as it arrives and appended to a staging buffer, behind its
+hash, in the log's record format, with its links resolved to offsets: to an object sent earlier, by
+its offset in the staging, to an anchor or hint, by its offset in the file, or, where a link names
+something not sent, to offset 0 for now. Before a record would take the buffer past 1 MiB, the
+buffer goes to the scratch file. The first spill creates it in the database's directory as
+`<file>.receiving.<pid>.<n>` and unlinks it at once, or on Windows opens it to be deleted on close,
+so neither a crash nor a failed receive leaves it behind, and a bundle under 1 MiB never creates
+one. The checks above read the sent objects back from the staging without hashing them again, and
+what the receiver holds from the generation `receive` started in. A bundle that fails any of them,
+or a stream that errors or ends early, has written nothing to the database.
 
 Only a commit may link to something not sent, and an object that does and is not one of the new
 commits rejects the bundle. Which commit such a link names is only known once the chains are walked,
-so after the checks each sent commit whose links differ from what the walk resolved is appended
-again with the right ones, in generation order so that its parents' final copies come first. A clone
-into an empty file rewrites none, and an incremental pull rewrites its few commits. The first copies
-stay in the frame with nothing linking to them, and the next reclamation cycle drops them. The refs
-that point `remote` at the head go last. Then the header is written over the zeros, with a hash that
-reads the part already on disk back in 1 MiB chunks. A bundle smaller than 1 MiB never reaches the
-file before that, and its frame is written in one piece like a commit's.
+so each sent commit whose links differ from what the walk resolved is appended again with the right
+ones, in generation order so that its parents' final copies come first. A clone into an empty file
+rewrites none, and an incremental pull rewrites its few commits.
 
-Until the header lands, nothing can find the objects. Readers bound every offset by the published
-end of the log, nothing outside the frame links into it, and the dedupe cache learns its objects
-only once the frame is written. A crash leaves zeros where the header goes, or a header whose hash
-does not cover what reached the disk, so `open` stops scanning there and truncates the rest: the
-previous head comes back and the partial bundle is gone. A refused or failed receive, including one
-that filled the disk, cuts the file back to where the frame began and does not poison the store. A
-power cut at every write of a receive that spilled several times, keeping or dropping each write not
-yet synced, always opened at the previous head, the landed remote or the forwarded branch, with
-nothing past the end of the log.
+Placing copies the staged records into the log. Each is encoded again at its offset there, keeping
+its stored body, LZ4 bytes and all, so nothing is compressed twice. A link to a sent object takes
+the offset it was placed at, and a link to an anchor or hint the offset of that object in the
+generation now current. A bundle that never spilled is placed in the frame that lands it, under the
+writer locks, which is written in one piece like a commit's. A larger one is placed first, in
+pieces of 256 KiB, each a frame of its own that keeps the refs as they were, so nothing can find its
+objects yet. A piece takes only the `tip` mutex, for about as long as a commit's encode, and commits
+on every branch go on between pieces. The dedupe cache learns a piece's objects when the piece is
+written, except its commits: until the landing, a sent commit may still link its parent at offset 0,
+and a local commit that hashed the same would have reused that copy.
 
-The `tip` mutex is held from the bundle's header to the end of the stream. Commits on the receiving
-file wait for the transfer, and so does reclamation, which needs the mutex to prune and to swap: a
-cycle waits at whichever it reaches first, so the offsets the frame hands out stay in this
-generation, and pruning cannot take away a commit the frame links to. A slow peer therefore stalls
-writers on the receiving file. A caller that cannot have that writes the download to a file and
-receives from it.
+Under `Durability::Fsync` the pieces are synced before the landing, with no lock held, so the
+landing's own sync has only its frame left to flush. The landing then takes every branch's lane and
+`tip`, as before, and checks again against the heads it finds there what depends on this file:
+every base must still be in one of its chains, or `receive` returns `StaleHave`, the commit below
+the oldest one sent is looked up again, and every sent commit's links, generation and merge numbers
+are worked out and checked against the commits this file holds now. A check that passed against the
+old heads passes against newer ones unless a commit it relied on has been pruned, which only leaves
+less to check. The landing frame holds the copies of the commits whose links changed and the refs
+that point `remote` at the head, and goes to the file 1 MiB at a time as the old frame did, with a
+header written last whose hash reads back the part already written. Type checks and hashes are not
+repeated: they depend only on the bundle and on objects whose hashes do not change.
 
-The receiver holds a 64 KiB read buffer, up to 1 MiB of frame not yet written, the object being
-read, and for each object its hash, its offset in the frame and the types it was checked as, under
-500 bytes an object. An object is held whole, about three times over while it is read, hashed and
-copied into the frame, so the largest value sent bounds memory too. A hostile stream gets no more:
-48 distinct objects of 1 MiB took 2.1 MiB of heap, and were cut off the file when the stream ended
-early.
+A reclamation cycle can prune, swap the file and retire the old one while the bundle streams.
+Before placing, `receive` resolves the anchors again in the generation now current: each base by
+hash and version, and each hint by following its path again from the anchors' roots, one read per
+parent as when it was first resolved, which must end at the same hash. Placing holds the cycle
+mutex from the first piece to the landing, so no swap can move the pieces from under the frame that
+links them. A cycle that comes due meanwhile waits for the copy, which runs at the speed of the disk
+and not of the peer, and a cycle already running when the bundle has been checked finishes before
+placing starts. A bundle that never spilled needs no such hold, because it is placed under the locks
+a swap takes.
+
+Until the landing frame is durable, nothing names the placed objects. Readers bound every offset by
+the published end of the log, and the pieces are whole frames that keep the previous refs, so a
+crash anywhere leaves the previous head, and pieces that reached the disk stay in the log until the
+next cycle drops them. A landing refused under the locks, because a base was pruned or dropped while
+the bundle streamed, leaves its pieces the same way and writes nothing else: a 3 MB bundle refused
+there left the file 3 MB larger until the next cycle. A piece whose write fails, as when the disk
+fills, fails the receive without poisoning the store, and the next frame is written over what
+reached the file. A power cut at every write of a receive that placed a 3 MB bundle in pieces, with
+a commit on the pulling branch while the stream was stalled and another on a second branch between
+placing and landing, keeping or dropping each write not yet synced, always opened at the previous
+head, that first commit, the landed remote or the merge, never lost a commit acknowledged before the
+cut, and had nothing past the end of the log.
+
+The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written, the object being
+read, and for each object its offset in the staging and the types it was checked as, under 500 bytes
+an object. Placing drops the staging's index and the types first, and holds each object's offset in
+the log, one piece and a window on the scratch file. An object is held whole, about three times over
+while it is read, hashed and copied, so the largest value sent bounds memory too. A hostile stream
+gets no more: 48 distinct objects of 1 MiB took 2.1 MiB of heap and never reached the database. A 33
+MB stream of 4,549 objects took 2.79 MB, where the frame it used to fill took 2.80 MB, and 256
+commits with 64 KiB messages, 17 MB, took 2.3 MB.
+
+Three other places were weighed. Writing the staged objects into the log as frames of their own
+while the bundle streams writes each byte once, but a cycle that swaps the file meanwhile copies
+only what the refs reach, so it would drop them, and holding the swap off until the stream ends lets
+a slow peer stall reclamation instead of commits. It would also leave a refused bundle's bytes in
+the file until the next cycle, so a hostile peer could grow the file with every attempt, where a
+refusal now costs the database nothing. Copying from the scratch file inside the landing frame keeps
+the crash story as it was, with no pieces, but holds every writer for a copy as large as the bundle.
+Holding the checked objects in memory loses the bound above.
 
 ### Commits stored twice
 
@@ -2958,14 +3014,36 @@ got faster mostly because neither side compresses a body the file already holds 
 so the frame is written in one piece, and the planning reads that streaming added are served from
 the links the tree comparison kept.
 
+Receiving through a scratch file was measured the same way, with a `receive-busy` step that commits
+one key on another branch of the receiving file every millisecond while it receives the bundle from
+a file. Each case ran with fsync six times, alternating with the build that held the writer locks
+for the stream, on a faster machine that other work was sharing, and these are the medians:
+
+| Case | Locks held for the stream | Scratch file |
+| --- | --- | --- |
+| `pull` into an empty file | 0.82 s, 64 MiB RSS, 55.6 MiB heap | 0.92 s, 64 MiB RSS, 55.6 MiB heap |
+| `receive` from a file into an empty one | 0.66 s, 63 MiB RSS, 55.6 MiB heap | 0.78 s, 63 MiB RSS, 55.6 MiB heap |
+| Commits on another branch during that `receive` | 1, which waited 0.67 s | 454, median 0.38 ms, p99 4.1 ms, slowest 6 to 12 ms |
+| `pull` of three one-key commits into the clone, 200 times | median 1.31 ms, fastest 1.05 ms | median 1.32 ms, fastest 1.07 ms |
+| The same with `Durability::Buffered` | median 0.54 ms, fastest 0.35 ms | median 0.57 ms, fastest 0.37 ms |
+
+A clone costs about a seventh more, the second write and read of its bytes, and no more memory. A
+small pull still lands in one frame, but copies its bundle once more and checks its chains twice,
+about 25 µs.
+
 ### Limits
 
 - A bundle streams, but the receiver keeps under 500 bytes for each object and the sender about 110,
   so the first pull of a file of tens of millions of objects still needs gigabytes. Each object is
   held whole, so one huge value needs a few times its size. A hostile stream costs the same, for what
   it carries and not for what it claims.
-- `receive` holds the `tip` mutex for the whole transfer, so a slow or stalled peer stalls commits on
-  the receiving file until the reader errors or times out.
+- `receive` writes a bundle over 1 MiB twice, to the scratch file as it arrives and then into the
+  log, so it needs free disk for both until it lands and costs a second write and read of the
+  bundle. A crash while it places the bundle, or a landing refused because a base went while the
+  bundle streamed, leaves what was placed in the log until the next reclamation cycle.
+- Placing a large bundle holds the cycle mutex, so a cycle that is running when the bundle has been
+  checked delays the landing until it ends, and one that comes due waits for the copy. The landing
+  waits for the closure running on each branch, as a cycle's pause does.
 - Files that share no commit share no anchors, so their first pull sends everything, even trees both
   happen to hold.
 - Each commit in a have is looked up in every branch of the sender, so recognising them costs the
