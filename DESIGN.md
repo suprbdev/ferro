@@ -1837,3 +1837,39 @@ as a bad hash. Turning it into an `Error` would put a `Result` on every `get`, i
 comparison for a case a healthy file cannot reach, and the read would have nothing better to do than
 stop. `try_get` and `try_for_each` surface it as an `Error` for a caller reading a file it does not
 trust, and `verify_typed` finds it before any read does.
+
+`Db::verify`, `common_ancestor` and the `admin` functions return `Result`, so they walk the branch
+table and merge records through a crate-internal `try_entries` that returns a read or decode error,
+not through `Map::iter`, which would panic on one.
+
+## Fuzzing
+
+`fuzz/` holds `cargo-fuzz` targets. It is its own workspace, excluded from the main one, and needs a
+nightly toolchain:
+
+```
+cargo install cargo-fuzz
+cd fuzz
+cargo run --release --example seeds -- corpus/seeds [files or directories of captured databases]
+cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -malloc_limit_mb=1024
+```
+
+- `open` and `admin` take one mode byte and a file image. The mode picks the root type (one of
+  six, or a type that decodes nothing so that any file opens), read-only or read-write, and whether
+  to repair the image first: recompute every object hash bottom-up, then the frame checks and the
+  superblock checksums, so that a mutation gets past the hash checks to the code behind them.
+  `open` then reads the value, the log, `at`, `as_of`, `history_of`, `bisect`, branches,
+  `common_ancestor`, `verify`, `space` and `refresh`, and scans every map it reaches. `admin` runs
+  `info`, `log`, `verify`, `space`, `layout` and, for one mode, `compact`.
+- `log_entry` writes a log of crafted entries with valid hashes, mostly coherent and with fields
+  perturbed by the input, plus branch heads that point into it, then runs the `open` reads over it
+  and, for half the inputs, the `admin` functions.
+- `map_node` writes crafted map nodes with valid hashes for six key, value and summary types,
+  including a value with a `Table`, loads the map and reads, scans and edits it.
+
+The harness treats a panic whose message starts with `ferro:` as expected inside the infallible
+reads, which panic on corruption by design, and as a failure anywhere else. The `seeds` example
+writes a corpus from databases it builds and from any files passed to it; files captured while
+`cargo test --workspace` and the examples ran make a broader one. `cargo run --example fixture --
+<target> <crash> <out.db>` turns a crashing input into the file it opens, which is how the fixtures
+behind `ferro/tests/fuzzed.rs` were made.
