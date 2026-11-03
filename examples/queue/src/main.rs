@@ -320,8 +320,8 @@ fn run(cli: Cli) -> Result<(), QueueError> {
                 }
                 let _ = watcher.recv_timeout(Duration::from_millis(250));
             }
-            println!("done={} failed={} lost={}", runner.done(), runner.failed(), runner.lost());
-            runner.stop();
+            let (done, failed, lost) = runner.stop();
+            println!("done={done} failed={failed} lost={lost}");
         }
         Cmd::Tick => {
             let tick = open()?.tick()?;

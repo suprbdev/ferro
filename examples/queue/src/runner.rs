@@ -99,7 +99,7 @@ impl Runner {
         self.counters.lost.load(Ordering::Relaxed)
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> (u64, u64, u64) {
         self.stop.store(true, Ordering::SeqCst);
         for closer in &self.closers {
             closer.close();
@@ -107,6 +107,7 @@ impl Runner {
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
+        (self.done(), self.failed(), self.lost())
     }
 }
 
