@@ -897,12 +897,12 @@ the working copy first is the checkpoint, O(1) per collection, and an `Err` or a
 That closure still waits for the group, since it may have read state that never becomes durable,
 except that a panic does not wait, as it never did.
 
-A closure ending under the lock does not flush if someone else will finish the group: either a
-thread has announced it is on its way to the lock, or a sync is running, whose leader wakes one
-member when it ends. Otherwise it flushes. So a group closes when nobody is coming or a sync ends,
-which gives one flush per fsync however many writers there are, and a lone writer flushes at once,
-down the same path as before. A group stops at 256 closures, which bounds what the first of them
-waits for.
+A closure ending under the lock does not flush if someone else will finish the group: either a sync
+is running, whose leader wakes one member when it ends, or a thread has announced it is on its way
+to the lock and waiting for it has lately been worth it, which is described below. Otherwise it
+flushes. So a group closes when nobody is coming or a sync ends, which gives one flush per fsync
+however many writers there are, and a lone writer flushes at once, down the same path as before. A
+group stops at 256 closures, which bounds what the first of them waits for.
 
 Members park on the group's seal and the leader unparks each one. The first version waited on a
 condvar, and notifying a condvar moves its waiters to the mutex and wakes them one at a time: that
@@ -910,6 +910,75 @@ chain alone held 32 `queue` writers to 11,600 jobs a second with a p99 of 1,107 
 and 753 µs once members were unparked directly, median of three. The same change on the plain path
 gained 3% at 8 writers and nothing at 32, where the writer lock is the bottleneck, so it was left
 out.
+
+Waiting for a thread on its way to the lock used to be unconditional, and where a sync is nearly
+free that made `coalesce` far slower than plain group commit (#29). The thread on its way is
+usually parked in the mutex, so the group can close only once the scheduler runs it, and the
+closure that waits for it parks too, so nothing uses the lock in between. Every closure then pays
+at least one wake-up to save a version. On a quiet machine a wake-up costs a few µs and the trade
+still pays, since writing a version of one closure took about 16 µs in the benchmark below. When
+the cores are busy a wake-up waits for a time slice, about a millisecond, while a sync on tmpfs or
+with `Buffered` takes 1 to 2 µs. Counters in a build of the `group` benchmark, `Buffered` on tmpfs
+with 8 writers on 4 cores shared with other work, showed it: 29% of closures waited for a
+follower, a parked member waited 2.5 ms on average, the writer lock was held 19% of the time, and
+a sync took 1.6 µs. Sampling `/proc` put the coalesced writers asleep in `futex_wait` 53% of the
+time against 16% without the option, and `schedstat` gave about 1 ms of run-queue wait per time
+slice.
+
+`Shared` now keeps three costs: a running mean of how long a sync takes, one of how long a group's
+version takes to write under the lock, and an estimate of how long a thread on its way takes to
+pick up a group handed to it, timed from the handover to its `join_group`. A closure waits for a
+thread on its way only while that estimate is below the other two together, which is what the
+thread costs if it writes a version of its own instead. A running sync is waited for as before,
+since its leader wakes a member when it ends and the members would wait for it anyway. The means
+move an eighth of the way to each sample. The estimate jumps to any slower sample and moves an
+eighth of the way to a faster one, so one slow handover stops the waiting. While it stops it,
+each closure that declines to wait takes 1/1024 off it, so on a busy machine about one closure in
+four thousand waits again and measures, and a machine that has gone quiet is noticed within as
+many closures. Taking 1/256 off instead let the waits come back four times as often, and at 2
+writers on busy cores raised p99 from 78 to 682 µs. On NVMe a sync takes about 400 µs, so
+groups still hold every writer.
+
+`ferro-bench --concurrent-only`, 8 writers of 200 commits beside 8 readers that never sleep, commits
+a second, median of 15 alternating runs:
+
+| Where | Plain | `coalesce` before | After |
+| --- | ---: | ---: | ---: |
+| tmpfs, the readers and writers on 8 cores | 34,974 | 2,549 | 31,486 |
+| tmpfs, all 32 cores | 41,716 | 78,310 | 67,546 |
+| NVMe, all 32 cores | 9,866 | 15,729 | 15,710 |
+
+The `group` benchmark, closures a second, median of three alternating runs, with the closures per
+version before and after:
+
+| Where | Writers | Plain | `coalesce` before | After | Per version |
+| --- | ---: | ---: | ---: | ---: | --- |
+| tmpfs, 4 cores beside 4 busy loops | 2 | 26,575 | 4,455 | 29,012 | 1.1 → 1.0 |
+| | 8 | 28,698 | 7,610 | 31,758 | 1.3 → 1.0 |
+| | 32 | 24,284 | 25,388 | 26,808 | 1.3 → 1.0 |
+| NVMe, `Buffered`, the same | 2 | 32,798 | 7,541 | 33,978 | 1.1 → 1.0 |
+| | 8 | 29,970 | 8,133 | 28,664 | 1.3 → 1.0 |
+| | 32 | 29,469 | 22,788 | 28,674 | 1.4 → 1.0 |
+| NVMe, the same | 8 | 5,041 | 6,773 | 6,499 | 4.6 → 4.1 |
+| | 32 | 7,228 | 20,570 | 19,229 | 16.6 → 16.4 |
+| tmpfs, all 32 cores | 8 | 42,942 | 55,672 | 54,532 | 8.0 → 6.2 |
+| | 32 | 35,656 | 49,257 | 54,960 | 32.0 → 31.9 |
+| NVMe, `Buffered`, the same | 8 | 42,299 | 55,809 | 55,309 | 8.0 → 6.2 |
+| | 32 | 35,816 | 49,339 | 49,348 | 31.9 → 31.4 |
+| NVMe, the same | 8 | 10,111 | 14,884 | 14,267 | 8.0 → 8.0 |
+| | 32 | 32,354 | 34,949 | 34,874 | 31.4 → 31.9 |
+
+One writer, and 2 writers on NVMe, moved by less than the noise. What the rule gives up is some of
+the gain on a quiet machine, where one slow handover, a thread that happened to be descheduled,
+stops the waiting for some thousands of closures. Of 12 counted runs of the concurrent benchmark
+on 32 cores, the four that came out under 53,000 commits a second each had exactly one handover
+over 100 µs, and the other eight had none. On 4 idle cores the `group` benchmark gave 62,985 and
+72,145 closures a second at 8 and 32 writers before, against 55,719 and 62,418 after, though later
+runs put the after figures within 6%. Feeding the estimate the lesser of the last two handovers,
+so that one slow one is ignored, kept that gain but fell to 54% of plain with the concurrent
+benchmark on 8 cores, which suggests that handovers there come fast and slow by turns. A running
+mean of the handovers fell to 79% of plain at 8 writers on 4 busy cores with a weight of an eighth,
+and to 56% with a weight of a sixty-fourth.
 
 If the group cannot be written, every closure in it gets `Error::GroupFailed`, or `Error::Poisoned`
 if the store is, and its changes are gone, including those of closures that did nothing wrong. A

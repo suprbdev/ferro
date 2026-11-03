@@ -502,7 +502,11 @@ version. They still run one at a time, each on its caller's thread, so they need
 each sees what the ones before it did. An `Err` or a panic rolls back that closure alone.
 On `examples/queue` at 32 workers that took jobs from 9,700 to 16,900 a second, bytes per job from
 2,691 to 146 and p99 from 2.3 to 0.8 ms. A closure that runs long against an fsync does not gain:
-at 50 µs and 8 writers it lost 16% of its throughput. See `DESIGN.md`.
+at 50 µs and 8 writers it lost 16% of its throughput. A closure waits for another that is still on
+its way to the lock only while handing over has lately cost less than writing and syncing a
+version. So where a sync is nearly free, on tmpfs or with `Durability::Buffered`, and the cores are
+busy, `coalesce` runs at about the speed of plain group commit; it used to run up to ten times
+slower there. See `DESIGN.md`.
 
 What you give up is a version per closure. `Committed::version` and `time_ms` are the group's, `at`
 cannot show the state between two closures of a group, and `history_of` reports the group's net
