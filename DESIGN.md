@@ -948,9 +948,10 @@ move an eighth of the way to each sample. The estimate jumps to any slower sampl
 eighth of the way to a faster one, so one slow handover stops the waiting. While it stops it,
 each closure that declines to wait takes 1/1024 off it, so on a busy machine about one closure in
 four thousand waits again and measures, and a machine that has gone quiet is noticed within as
-many closures. Taking 1/256 off instead let the waits come back four times as often, and at 2
-writers on busy cores raised p99 from 78 to 682 µs. On NVMe a sync takes about 400 µs, so
-groups still hold every writer.
+many closures. Each of these updates is a compare-and-swap loop on the current value, so a sample
+from a thread that finishes at the same moment as another is not lost. Taking 1/256 off instead let
+the waits come back four times as often, and at 2 writers on busy cores raised p99 from 78 to
+682 µs. On NVMe a sync takes about 400 µs, so groups still hold every writer.
 
 `ferro-bench --concurrent-only`, 8 writers of 200 commits beside 8 readers that never sleep, commits
 a second, median of 15 alternating runs:

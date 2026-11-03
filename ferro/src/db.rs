@@ -466,9 +466,13 @@ fn nanos(took: Duration) -> u64 {
     u64::try_from(took.as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn adjust(slot: &AtomicU64, next: impl Fn(u64) -> u64) {
+    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(next(current)));
+}
+
 fn average(slot: &AtomicU64, took: Duration) {
-    let mean = slot.load(Ordering::Relaxed);
-    slot.store(mean - mean / 8 + nanos(took) / 8, Ordering::Relaxed);
+    let sample = nanos(took);
+    adjust(slot, |mean| mean - mean / 8 + sample / 8);
 }
 
 impl Costs {
@@ -482,13 +486,13 @@ impl Costs {
 
     fn handed_over(&self, took: Duration) {
         let sample = nanos(took);
-        let estimate = self.handoff.load(Ordering::Relaxed);
-        let next = if sample >= estimate {
-            sample
-        } else {
-            estimate - (estimate - sample) / 8
-        };
-        self.handoff.store(next, Ordering::Relaxed);
+        adjust(&self.handoff, |estimate| {
+            if sample >= estimate {
+                sample
+            } else {
+                estimate - (estimate - sample) / 8
+            }
+        });
     }
 
     fn worth_waiting(&self) -> bool {
@@ -497,7 +501,7 @@ impl Costs {
         if handoff < saved {
             return true;
         }
-        self.handoff.store(handoff - handoff / 1024, Ordering::Relaxed);
+        adjust(&self.handoff, |estimate| estimate - estimate / 1024);
         false
     }
 }
