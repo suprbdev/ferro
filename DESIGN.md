@@ -839,7 +839,15 @@ are gone. Those links are hashes nothing follows, and a copy into a new file wri
 offset 0.
 `Options::history(Keep::Last(n))` raises `first` as part of each commit, which costs no extra bytes.
 `Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each reclamation cycle.
-`as_of` a time before the oldest retained commit returns `NoVersion`.
+
+Everything that names a version of a branch follows one rule: a version below `first` is gone.
+`at` returns `NoVersion` for it, `as_of` a time before the oldest retained commit returns
+`NoVersion`, `history_of` and `bisect_changes` report the oldest retained commit as a change
+because there is nothing left to compare it with, and a fork copies `first`, so it answers the
+same. Version 0, the value before the first commit, is not stored, and it counts as retained for
+exactly as long as version 1 is. `at(0)` used to return the current `Default` even after pruning,
+while `as_of` for the same moment returned `NoVersion`. The rule depends only on `first`, never on
+whether a reclamation cycle has removed the bytes yet, so an answer does not change when one runs.
 
 The log used to be a `Map<u64, Commit>`, which rewrote a tree path per commit and was about 20%
 of the bytes of a single-key commit. `Db::log()` now returns a `Log` handle with `len`, `get`,

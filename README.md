@@ -375,7 +375,10 @@ cycle. `compact` runs one cycle now, with writers still running, and can prune h
 does. A cycle copies what is retained to a new file and swaps it in. Writers wait a few milliseconds
 for the swap, and readers do not wait at all.
 
-A pruned version is gone: `at` returns `NoVersion` and `log` stops at the oldest retained commit.
+A pruned version is gone, whether or not a cycle has reclaimed its bytes yet: `at` returns
+`NoVersion`, so does `as_of` a time before the oldest retained commit, `log` and `history_of` stop
+at the oldest retained commit, and a fork answers the same. Version 0, your `Default` before the
+first commit, goes when version 1 does.
 `head_hash` does not change, because retained commits are not rewritten, and `merge_with` uses the other
 branch's merge record if that is still retained, then the fork point, and returns
 `NoCommonAncestor` only when none of them is.
@@ -594,7 +597,8 @@ This is an experiment, not a production database.
 - Only direct merges are recorded. A change that arrives through a third branch, or through a
   fork of an already merged branch, is seen again. Nothing is lost, but a merge closure that is
   not idempotent, such as one adding a counter delta, applies it twice.
-- Version 0 is not stored. `at(0)` and forks of an empty database use your current `Default`.
+- Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
+  your current `Default`.
 - Sync builds and applies a bundle in memory, so the first pull of a large file needs its size in
   memory on both sides. Files that share no commit send everything on their first pull.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.

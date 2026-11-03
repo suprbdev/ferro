@@ -1258,7 +1258,7 @@ impl<T: Data> Db<T> {
         let base = match choose_base(&store, &ours, &their_head, record)? {
             Base::Theirs(version) => tracking.at(version)?,
             Base::Ours(version) => self.at(version)?,
-            Base::Genesis => self.at(0)?,
+            Base::Genesis => self.genesis(),
         };
         if base.commit().root.map(|ptr| ptr.hash) == theirs.commit().root.map(|ptr| ptr.hash) {
             let name = self.branch_name().to_string();

@@ -1453,14 +1453,21 @@ impl<T: Data> Db<T> {
         })
     }
 
-    pub fn at(&self, version: u64) -> Result<Snapshot<T>> {
-        if version == 0 {
-            return Ok(Snapshot {
-                value: self.shared.genesis.clone(),
-                commit: Arc::new(Commit::genesis()),
-            });
+    pub(crate) fn genesis(&self) -> Snapshot<T> {
+        Snapshot {
+            value: self.shared.genesis.clone(),
+            commit: Arc::new(Commit::genesis()),
         }
+    }
+
+    pub fn at(&self, version: u64) -> Result<Snapshot<T>> {
         let state = self.branch.state.load_full();
+        if version == 0 {
+            if state.log.first > 1 {
+                return Err(Error::NoVersion(0));
+            }
+            return Ok(self.genesis());
+        }
         let entry = state
             .log
             .get(&state.store, version)?
@@ -1639,7 +1646,7 @@ impl<T: Data> Db<T> {
         }
         let (ours, theirs) = (self.branch.state.load_full(), other.branch.state.load_full());
         if ours.log.tip.is_none() || theirs.log.tip.is_none() {
-            return self.at(0);
+            return Ok(self.genesis());
         }
         let start = ours.log.first.max(theirs.log.first);
         let same = |version: &u64| -> Result<bool> {
@@ -1651,7 +1658,7 @@ impl<T: Data> Db<T> {
         };
         if !same(&start)? {
             return if start == 1 {
-                self.at(0)
+                Ok(self.genesis())
             } else {
                 Err(Error::NoCommonAncestor)
             };
