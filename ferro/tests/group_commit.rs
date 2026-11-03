@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 mod common;
 
 use std::ffi::{c_char, c_int, c_void};

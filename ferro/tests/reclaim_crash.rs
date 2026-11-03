@@ -2,7 +2,6 @@ mod common;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -76,7 +75,6 @@ fn record(cycles: u64, commits: u64, keys: u64, keep: usize) -> Recording {
     }
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
     let base = fs::read(&path).unwrap();
-    let inode = fs::metadata(&path).unwrap().ino();
     let slot: Slot = Arc::new(Mutex::new(None));
     let shared: Shared = Arc::new(Mutex::new((rng, models)));
     let hook = {
@@ -104,6 +102,13 @@ fn record(cycles: u64, commits: u64, keys: u64, keep: usize) -> Recording {
     slot.lock().take();
     drop(db);
     let ops = trace.lock().clone();
+    let inode = ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Write(inode, ..) => Some(*inode),
+            _ => None,
+        })
+        .unwrap();
     let models = shared.lock().1.clone();
     Recording {
         base,

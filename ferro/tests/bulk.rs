@@ -2,8 +2,8 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 use std::ops::Bound;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,9 +58,10 @@ fn remove_range_never_reads_the_removed_subtrees() {
     let path = dir.path().join("r.ferro");
     let n = 200_000;
     let size = filled(&path, n).size_on_disk();
-    let file = OpenOptions::new().write(true).open(&path).unwrap();
+    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
     let garbage = vec![0xa5u8; (size / 5) as usize];
-    file.write_all_at(&garbage, size * 2 / 5).unwrap();
+    file.seek(SeekFrom::Start(size * 2 / 5)).unwrap();
+    file.write_all(&garbage).unwrap();
     drop(file);
     let db = uncached().open::<Map<u64, u64>>(&path).unwrap();
     let removed = db

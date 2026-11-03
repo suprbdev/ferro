@@ -826,6 +826,7 @@ fn a_commit_or_pointer_held_across_a_cycle_cannot_be_written_back() {
     admin::verify(&path).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_leftover_temp_file_behind_a_symlink_is_cleared_on_open() {
     let dir = dir();
@@ -888,6 +889,7 @@ fn a_trigger_raised_during_a_cycle_does_not_run_another() {
     slot.lock().unwrap().take();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cycle_keeps_the_mode_of_the_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -900,6 +902,7 @@ fn a_cycle_keeps_the_mode_of_the_file() {
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cycle_through_a_symlink_replaces_the_file_it_names() {
     let dir = dir();

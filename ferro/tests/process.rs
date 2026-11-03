@@ -5,7 +5,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Rng, fast};
+#[cfg(unix)]
+use common::Rng;
+use common::fast;
 use ferro::{Data, Db, Map, Options};
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
@@ -193,6 +195,7 @@ fn reader_race(role: &str) {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn sigkill_during_group_commit_keeps_every_acknowledged_version() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -238,6 +241,7 @@ fn sigkill_during_group_commit_keeps_every_acknowledged_version() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn sigkill_in_a_commit_loop_always_reopens_on_a_committed_version() {
     let dir = tempfile::tempdir().unwrap();
