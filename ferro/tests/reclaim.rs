@@ -160,6 +160,29 @@ fn the_live_estimate_tracks_growth_between_cycles_and_survives_reopening() {
 }
 
 #[test]
+fn recovery_past_a_stale_superblock_keeps_the_live_estimate() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Root> = options().open(&path).unwrap();
+    fill(&db, 500, 20);
+    db.compact(Keep::Last(1)).unwrap();
+    fill(&db, 500, 20);
+    db.compact(Keep::Last(1)).unwrap();
+    fill(&db, 5, 20);
+    let header = std::fs::read(&path).unwrap()[..8192].to_vec();
+    fill(&db, 100, 20);
+    let version = db.version();
+    let want = db.space().unwrap().live_bytes;
+    drop(db);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[..8192].copy_from_slice(&header);
+    std::fs::write(&path, bytes).unwrap();
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(db.version(), version);
+    assert_eq!(db.space().unwrap().live_bytes, want);
+}
+
+#[test]
 fn a_held_snapshot_keeps_reading_and_its_file_until_it_drops() {
     let dir = dir();
     let db: Db<Root> = uncached().reclaim(MANUAL).open(path_in(&dir)).unwrap();
@@ -638,12 +661,16 @@ fn shutting_down_during_a_copy_abandons_it_and_leaves_no_temp_file() {
     let path = path_in(&dir);
     let reached = Arc::new(Barrier::new(2));
     let once = Arc::new(AtomicBool::new(false));
+    let finished_copying = Arc::new(AtomicBool::new(false));
     let hook = {
-        let (reached, once) = (reached.clone(), once.clone());
+        let (reached, once, finished) = (reached.clone(), once.clone(), finished_copying.clone());
         move |name: &'static str| {
             if name == "created" && !once.swap(true, Ordering::SeqCst) {
                 reached.wait();
                 thread::sleep(Duration::from_millis(100));
+            }
+            if name == "copied" {
+                finished.store(true, Ordering::SeqCst);
             }
         }
     };
@@ -659,6 +686,7 @@ fn shutting_down_during_a_copy_abandons_it_and_leaves_no_temp_file() {
     reached.wait();
     let want = dump(&db.read());
     drop(db);
+    assert!(!finished_copying.load(Ordering::SeqCst));
     let mut temp = path.clone().into_os_string();
     temp.push(".compacting");
     assert!(!Path::new(&temp).exists());
@@ -902,6 +930,29 @@ fn a_cycle_on_an_empty_database_does_nothing() {
     assert_eq!(none.objects, 0);
     assert_eq!(empty.version(), 0);
     assert_eq!(empty.space().unwrap().retired_bytes, 0);
+}
+
+#[test]
+fn as_of_stops_at_the_oldest_retained_commit_across_a_pruned_skip_link() {
+    let dir = dir();
+    let db: Db<Root> = options().open(path_in(&dir)).unwrap();
+    for i in 0..100 {
+        db.update(|root| {
+            root.insert(i % 5, text(i, 20));
+        })
+        .unwrap();
+        if i >= 96 {
+            thread::sleep(Duration::from_millis(3));
+        }
+    }
+    assert_eq!(db.version(), 100);
+    let times: Vec<u64> = (98..=100).map(|v| db.log().get(&v).unwrap().time_ms).collect();
+    db.compact(Keep::Last(3)).unwrap();
+    assert_eq!(db.log().first().unwrap().0, 98);
+    assert_eq!(db.as_of(times[2]).unwrap().version(), 100);
+    assert_eq!(db.as_of(times[1]).unwrap().version(), 99);
+    assert_eq!(db.as_of(times[0]).unwrap().version(), 98);
+    assert!(matches!(db.as_of(times[0] - 1), Err(Error::NoVersion(97))));
 }
 
 #[test]
