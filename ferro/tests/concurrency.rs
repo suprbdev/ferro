@@ -512,12 +512,14 @@ fn refresh_tracks_a_writer_in_the_same_process() {
     let db = fast().open::<Ledger>(&path).unwrap();
     seeded(&db);
     let target = 3000;
+    let opened = Arc::new(Barrier::new(5));
     let mut readers = Vec::new();
     for cache in 0..4 {
-        let path = path.clone();
+        let (path, opened) = (path.clone(), opened.clone());
         readers.push(thread::spawn(move || {
             let options = if cache % 2 == 0 { fast() } else { uncached() };
             let reader = options.read_only().open::<Ledger>(&path).unwrap();
+            opened.wait();
             let mut last = reader.version();
             let mut changes = 0;
             while last < target {
@@ -534,6 +536,7 @@ fn refresh_tracks_a_writer_in_the_same_process() {
             changes
         }));
     }
+    opened.wait();
     let mut rng = Rng::new(5);
     for _ in 0..target {
         db.update(|root| transfer(root, &mut rng)).unwrap();
