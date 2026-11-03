@@ -1,7 +1,10 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use ferro::{Durability, Map, Options};
@@ -30,6 +33,26 @@ fn percentile(sorted: &[u64], fraction: f64) -> f64 {
     sorted[index] as f64 / 1000.0
 }
 
+struct Unpark(Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        thread::park();
+    }
+}
+
 fn spin(work: Duration) {
     let until = Instant::now() + work;
     while Instant::now() < until {
@@ -47,6 +70,7 @@ fn main() {
     let keys: u64 = argument("--keys").and_then(|v| v.parse().ok()).unwrap_or(100_000);
     let work = Duration::from_micros(argument("--closure-us").and_then(|v| v.parse().ok()).unwrap_or(0));
     let coalesce = argument("--coalesce").is_some_and(|v| v == "1");
+    let awaited = argument("--async").is_some_and(|v| v == "1");
     let durability = match argument("--durability").as_deref() {
         Some("buffered") => Durability::Buffered,
         _ => Durability::Fsync,
@@ -80,13 +104,17 @@ fn main() {
                         i += 1;
                         let key = mix(i) % keys;
                         let started = Instant::now();
-                        db.update(|root| {
+                        let write = |root: &mut Root| {
                             if !work.is_zero() {
                                 spin(work);
                             }
                             root.insert(key, format!("v-{i}"));
-                        })
-                        .unwrap();
+                        };
+                        if awaited {
+                            block_on(db.update_async(write)).unwrap();
+                        } else {
+                            db.update(write).unwrap();
+                        }
                         samples.push(started.elapsed().as_nanos() as u64);
                     }
                     samples
