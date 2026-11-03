@@ -2590,11 +2590,32 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
+        let store = self.store();
         let mut entries = Vec::new();
-        let _ = scan(self.store(), &self.root, 0, None, None, &mut |key: &K, value: &V| {
-            entries.push((key.clone(), value.clone()));
-            ControlFlow::<()>::Continue(())
-        })?;
+        let mut path: Vec<(Arc<Node<K, V, S>>, usize)> = Vec::new();
+        if let Some(root) = resident(store, &self.root, 0)? {
+            path.push((root, 0));
+        }
+        loop {
+            let depth = path.len();
+            let Some((node, position)) = path.last_mut() else {
+                break;
+            };
+            let at = *position;
+            if at > 2 * node.keys.len() {
+                path.pop();
+                continue;
+            }
+            *position += 1;
+            if at % 2 == 1 {
+                let value = node.read(store, at / 2, V::clone)?;
+                entries.push((node.keys[at / 2].clone(), value));
+                continue;
+            }
+            if let Some(child) = resident(store, node.child(at / 2), depth)? {
+                path.push((child, 0));
+            }
+        }
         Ok(entries)
     }
 

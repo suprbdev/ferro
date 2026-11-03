@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferro::admin::{self, Keep};
-use ferro::codec::{Decoder, Encoder};
-use ferro::{Data, Db, Error, Map, Options};
+use ferro::codec::{Decoder, Encoder, Ptr};
+use ferro::store::{Store, StoreOptions};
+use ferro::{Data, Db, Durability, Error, Map, Options};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
@@ -162,6 +163,47 @@ fn admin_reads_close_the_file_when_they_fail() {
     corrupt(admin::layout(&path, Keep::All));
     corrupt(admin::layout(&path, Keep::Last(2)));
     assert_eq!(open_handles(&path), 0);
+}
+
+#[test]
+fn info_walks_a_deep_branch_table_without_recursing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deep.ferro");
+    let options = StoreOptions {
+        durability: Durability::Buffered,
+        ..StoreOptions::default()
+    };
+    let (store, _) = Store::open(&path, options).unwrap();
+    let mut txn = store.begin().unwrap();
+    let depth = 50_000;
+    let mut below: Option<Ptr> = None;
+    for at in 0..depth {
+        let name = format!("b{at}");
+        let mut node = Encoder::new(&mut txn);
+        node.u8(0);
+        node.varint(1);
+        node.varint(name.len() as u64);
+        node.raw(name.as_bytes());
+        node.u8(0);
+        node.raw(&[0; 5]);
+        match below {
+            Some(ptr) => {
+                node.varint(at);
+                node.link(ptr);
+            }
+            None => node.varint(0),
+        }
+        node.varint(0);
+        below = Some(node.finish().unwrap());
+    }
+    let mut refs = Encoder::new(&mut txn);
+    refs.varint(depth);
+    refs.link(below.unwrap());
+    let head = refs.finish().unwrap();
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    assert_eq!(admin::info(&path).unwrap().branches.len(), depth as usize);
 }
 
 #[test]
