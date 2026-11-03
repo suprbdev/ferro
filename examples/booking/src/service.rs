@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferro::{Db, Durability, Options, Snapshot};
+use ferro::{Db, Durability, Keep, Options, Reclaim, Snapshot};
 
 use crate::date::{format_night, now_ms};
 use crate::error::Result;
@@ -15,6 +15,7 @@ pub struct Config {
     pub coalesce: bool,
     pub read_only: bool,
     pub buffered: bool,
+    pub keep_last: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -31,6 +32,11 @@ impl Reservations {
         }
         if config.buffered {
             options = options.durability(Durability::Buffered);
+        }
+        if let Some(versions) = config.keep_last {
+            options = options.history(Keep::Last(versions)).reclaim(Reclaim {
+                every_bytes: 32 << 20,
+            });
         }
         Ok(Reservations::new(options.open(path)?))
     }

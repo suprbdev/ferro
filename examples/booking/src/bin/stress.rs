@@ -56,6 +56,8 @@ struct Args {
     #[arg(long)]
     buffered: bool,
     #[arg(long)]
+    keep_last: Option<usize>,
+    #[arg(long)]
     ack_log: Option<PathBuf>,
     #[arg(long, default_value_t = 7)]
     seed: u64,
@@ -265,7 +267,11 @@ fn worker(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool
                     confirmed.push(held.id);
                     world.ack('C', held.id);
                 }
-                Err(BookingError::HoldExpired { .. }) => tally.late += 1,
+                Err(BookingError::HoldExpired { .. })
+                | Err(BookingError::WrongStatus {
+                    status: Status::Expired,
+                    ..
+                }) => tally.late += 1,
                 Err(BookingError::InsufficientFunds { .. }) => {
                     tally.broke += 1;
                     tally.attempts += 1;
@@ -370,12 +376,14 @@ struct Outcome {
     walked: Option<booking::Walked>,
     held_left: usize,
     occupancy: String,
+    space: Option<ferro::Space>,
 }
 
 fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outcome, BookingError> {
     let config = Config {
         coalesce,
         buffered: args.buffered,
+        keep_last: args.keep_last,
         ..Config::default()
     };
     let svc = Reservations::open(path, config)?;
@@ -430,6 +438,10 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
         .join(" ");
     drop(snapshot);
     let walked = if args.no_check { None } else { Some(walk(svc.db(), args.every)?) };
+    let space = args.keep_last.map(|_| svc.db().space()).transpose()?;
+    if args.keep_last.is_some() {
+        svc.db().verify()?;
+    }
     Ok(Outcome {
         label: if coalesce { "coalesce".to_string() } else { "alone".to_string() },
         secs,
@@ -439,6 +451,7 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
         walked,
         held_left,
         occupancy,
+        space,
     })
 }
 
@@ -478,6 +491,16 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
         pct(&t.sweep_ns, 0.99),
         pct(&t.sweep_ns, 1.0)
     );
+    if let Some(space) = &outcome.space {
+        println!(
+            "  file {:.1} MiB, about {:.1} MiB live, {} reclamation cycles, longest pause {:?}, last error {:?}",
+            space.file_bytes as f64 / 1048576.0,
+            space.live_bytes as f64 / 1048576.0,
+            space.cycles,
+            space.longest_pause,
+            space.last_error
+        );
+    }
     if !t.errors.is_empty() {
         println!("  other errors {:?}", t.errors);
     }
