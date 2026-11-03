@@ -1138,9 +1138,10 @@ impl Dedupe {
 
     fn get(&self, hash: &Hash) -> Option<u64> {
         let (chunk, set) = self.index(hash);
-        let ways = *self.chunks[chunk].get()?[set].0.lock();
-        let way = ways.iter().find(|way| way.hash == *hash)?;
-        Some(u64::from_le_bytes(way.offset)).filter(|offset| *offset != 0)
+        let mut ways = self.chunks[chunk].get()?[set].0.lock();
+        let at = ways.iter().position(|way| way.hash == *hash)?;
+        ways[..=at].rotate_right(1);
+        Some(u64::from_le_bytes(ways[0].offset)).filter(|offset| *offset != 0)
     }
 
     fn insert(&self, hash: Hash, offset: u64) {
