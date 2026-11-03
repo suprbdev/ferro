@@ -579,6 +579,10 @@ impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
 
 impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 
+pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
+    rows.try_values()
+}
+
 pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Val<T>>
 where
     I: Data + Ord + Borrow<Q>,

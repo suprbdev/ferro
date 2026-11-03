@@ -46,7 +46,7 @@ const DEDUPE_WAYS: usize = 2;
 const DEDUPE_CHUNK: usize = 64;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
-const MAX_RATIO: usize = 255;
+pub(crate) const MAX_RATIO: usize = 255;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -749,6 +749,10 @@ impl Store {
 
     pub fn size(&self) -> u64 {
         self.inner.tail.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn written(&self) -> u64 {
+        self.inner.written.load(Ordering::Acquire)
     }
 
     pub fn is_read_only(&self) -> bool {

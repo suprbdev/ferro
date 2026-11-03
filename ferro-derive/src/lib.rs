@@ -957,7 +957,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let mut __table = #table { #(#idents: #values),* };
                 if __rebuild {
                     #(__table.#index_idents = ::std::default::Default::default();)*
-                    let __rows: ::std::vec::Vec<::ferro::Val<#name>> = __table.rows.values().collect();
+                    let __rows = ::ferro::table::stored_rows::<#name>(&__table.rows)?;
                     for __row in __rows {
                         if let ::std::option::Option::Some(__taken) = ::ferro::TableData::<#name>::conflict(&__table, &*__row, ::std::option::Option::None) {
                             return ::std::result::Result::Err(::ferro::Error::Decode(::std::format!(

@@ -585,7 +585,7 @@ fn shared_prefix(store: &Store, a: &Chain, b: &Chain) -> Result<Option<u64>> {
 
 fn locate(store: &Store, refs: &Refs, mark: Mark) -> Result<Option<(Ptr, Chain)>> {
     let mut found: Option<(Ptr, Chain)> = None;
-    for (_, head) in refs.iter() {
+    for (_, head) in refs.try_entries()? {
         if found.is_some_and(|(_, chain)| chain.first <= head.log.first) {
             continue;
         }
@@ -1790,7 +1790,7 @@ impl<T: Data> Db<T> {
     pub fn have(&self) -> Result<Have> {
         let (store, refs) = self.published_refs();
         let mut marks = Vec::new();
-        for (_, head) in refs.iter() {
+        for (_, head) in refs.try_entries()? {
             if let Some(tip) = head.log.tip {
                 marks.push(Mark {
                     hash: tip.hash,

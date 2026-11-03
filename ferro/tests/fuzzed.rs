@@ -1,11 +1,13 @@
 use std::fmt::Debug;
 use std::fs;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferro::admin::{self, Keep};
 use ferro::codec::{Decoder, Encoder, Ptr};
-use ferro::store::{Store, StoreOptions};
-use ferro::{Data, Db, Durability, Error, Map, Options};
+use ferro::store::{Store, StoreOptions, Txn};
+use ferro::{Data, Db, Durability, Error, Map, Options, Record, Table};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
@@ -134,6 +136,71 @@ fn newest_head(bytes: &[u8]) -> usize {
     field(slot + 24) as usize
 }
 
+fn buffered() -> StoreOptions {
+    StoreOptions {
+        durability: Durability::Buffered,
+        ..StoreOptions::default()
+    }
+}
+
+fn failure(f: impl FnOnce()) -> Option<String> {
+    let payload = panic::catch_unwind(AssertUnwindSafe(f)).err()?;
+    Some(match payload.downcast::<String>() {
+        Ok(text) => *text,
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map_or_else(String::new, |text| text.to_string()),
+    })
+}
+
+fn fails_as_corrupt(f: impl FnOnce()) {
+    let message = failure(f);
+    assert!(
+        message.as_deref().is_some_and(|text| text.starts_with("ferro:")),
+        "expected a ferro panic, got {message:?}"
+    );
+}
+
+fn crafted(build: impl FnOnce(&mut Txn) -> Ptr) -> (TempDir, Store, Arc<Root>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = Store::open(&dir.path().join("crafted.ferro"), buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let head = build(&mut txn);
+    txn.commit(head).unwrap();
+    let map = store.load::<Root>(head).unwrap();
+    (dir, store, map)
+}
+
+fn node(txn: &mut Txn, level: u8, keys: &[u64], children: &[(usize, u64, Ptr)]) -> Ptr {
+    let mut w = Encoder::new(txn);
+    w.u8(level);
+    w.varint(keys.len() as u64);
+    for key in keys {
+        key.encode(&mut w).unwrap();
+    }
+    for key in keys {
+        w.u8(0);
+        key.to_string().encode(&mut w).unwrap();
+    }
+    for position in 0..=keys.len() {
+        match children.iter().find(|(at, _, _)| *at == position) {
+            Some(&(_, count, child)) => {
+                w.varint(count);
+                w.link(child);
+            }
+            None => w.varint(0),
+        }
+    }
+    w.finish().unwrap()
+}
+
+fn map_root(txn: &mut Txn, count: u64, top: Ptr) -> Ptr {
+    let mut w = Encoder::new(txn);
+    w.varint(count);
+    w.link(top);
+    w.finish().unwrap()
+}
+
 #[test]
 fn a_superblock_at_the_last_sequence_number_ends_the_scan_without_overflow() {
     let (_dir, path) = fixture("seq-overflow");
@@ -238,7 +305,7 @@ fn admin_reads_close_the_file_when_they_fail() {
 }
 
 #[test]
-fn info_walks_a_deep_branch_table_without_recursing() {
+fn info_rejects_a_branch_table_deeper_than_its_levels() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deep.ferro");
     let options = StoreOptions {
@@ -275,7 +342,8 @@ fn info_walks_a_deep_branch_table_without_recursing() {
     txn.commit(head).unwrap();
     store.close();
     drop(store);
-    assert_eq!(admin::info(&path).unwrap().branches.len(), depth as usize);
+    let info = admin::info(&path).map(|info| info.branches.len());
+    assert!(matches!(info, Err(Error::Decode(_))), "{info:?}");
 }
 
 #[test]
@@ -344,4 +412,195 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
 fn compact_counts_the_commits_it_drops_without_overflow() {
     let (_dir, path) = fixture("compact-dropped");
     corrupt(admin::compact(&path, Keep::Last(3)));
+}
+
+#[test]
+fn a_node_whose_child_counts_overflow_is_rejected() {
+    let (_dir, _store, map) = crafted(|txn| {
+        let low = node(txn, 0, &[1], &[]);
+        let high = node(txn, 0, &[3], &[]);
+        let half = 1 << 63;
+        let top = node(txn, 1, &[2], &[(0, half, low), (1, half, high)]);
+        map_root(txn, 1, top)
+    });
+    let found = map.try_get(&2);
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+}
+
+#[test]
+fn inserting_under_a_crafted_count_does_not_overflow() {
+    let (_dir, _store, map) = crafted(|txn| {
+        let low = node(txn, 0, &[1], &[]);
+        let top = node(txn, 1, &[2], &[(0, u64::MAX - 1, low)]);
+        map_root(txn, u64::MAX, top)
+    });
+    let mut edited = (*map).clone();
+    fails_as_corrupt(|| {
+        edited.insert(0, "zero".into());
+    });
+}
+
+#[test]
+fn a_link_whose_count_disagrees_with_its_node_is_rejected() {
+    let (_dir, _store, map) = crafted(|txn| {
+        let leaf = node(txn, 0, &[1, 2], &[]);
+        map_root(txn, 5, leaf)
+    });
+    let found = map.try_get(&1);
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+    let (_dir, _store, map) = crafted(|txn| {
+        let leaf = node(txn, 0, &[1], &[]);
+        let top = node(txn, 1, &[2], &[(0, 7, leaf)]);
+        map_root(txn, 8, top)
+    });
+    assert_eq!(map.try_get(&2).unwrap().as_deref(), Some(&"2".to_string()));
+    let found = map.try_get(&1);
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+}
+
+#[test]
+fn a_chain_of_nodes_at_one_level_is_rejected_before_it_overflows_the_stack() {
+    const DEPTH: u64 = 100_000;
+    let (_dir, _store, map) = crafted(|txn| {
+        let mut below = node(txn, 0, &[DEPTH - 1], &[]);
+        for key in (0..DEPTH - 1).rev() {
+            below = node(txn, 0, &[key], &[(1, DEPTH - 1 - key, below)]);
+        }
+        map_root(txn, DEPTH, below)
+    });
+    let found = map.try_get(&(DEPTH - 1));
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            fails_as_corrupt(|| map.for_each(|_, _| {}));
+            fails_as_corrupt(|| {
+                map.range_summary(1..DEPTH - 1);
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn shared_children_cannot_claim_more_entries_than_the_file_holds() {
+    let (_dir, _store, map) = crafted(|txn| {
+        let mut below = node(txn, 0, &[1, 2], &[]);
+        let mut count = 2u64;
+        for level in 1..=20u8 {
+            let low = u64::from(level) * 10;
+            let shared = [(0, count, below), (1, count, below), (2, count, below)];
+            below = node(txn, level, &[low, low + 1], &shared);
+            count = 2 + 3 * count;
+        }
+        map_root(txn, count, below)
+    });
+    assert!(map.len() as u64 > 1 << 33);
+    let found = map.try_get(&200);
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+    fails_as_corrupt(|| {
+        map.iter().next();
+    });
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Plain {
+    #[key]
+    id: u32,
+    slug: String,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Indexed {
+    #[key]
+    id: u32,
+    #[index]
+    slug: String,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct PlainRows {
+    rows: Table<Plain>,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct IndexedRows {
+    rows: Table<Indexed>,
+}
+
+#[test]
+fn rebuilding_an_index_over_a_damaged_row_fails_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.ferro");
+    let marker = "Qv8-damaged-row-Zk3";
+    let db = Db::<PlainRows>::open(&path).unwrap();
+    db.update(|root| {
+        root.rows.insert(Plain {
+            id: 1,
+            slug: marker.to_string(),
+        });
+    })
+    .unwrap();
+    drop(db);
+    let mut bytes = fs::read(&path).unwrap();
+    let found: Vec<usize> = bytes
+        .windows(marker.len())
+        .enumerate()
+        .filter(|(_, window)| *window == marker.as_bytes())
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(found.len(), 1);
+    bytes[found[0]] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    assert!(Db::<PlainRows>::open(&path).is_ok());
+    let opened = panic::catch_unwind(|| Db::<IndexedRows>::open(&path).map(drop));
+    assert!(matches!(opened, Ok(Err(Error::Corrupt(_)))), "{opened:?}");
+}
+
+#[test]
+fn sync_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refs.ferro");
+    let (store, _) = Store::open(&path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let tip = Entry {
+        version: 1,
+        time_ms: 100,
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let mut w = Encoder::new(&mut txn);
+    w.u8(1);
+    w.varint(1);
+    "main".to_string().encode(&mut w).unwrap();
+    w.u8(0);
+    Head {
+        version: 1,
+        first: 1,
+        tip,
+    }
+    .encode(&mut w)
+    .unwrap();
+    w.varint(1);
+    w.link(Ptr {
+        hash: [7; 20],
+        offset: tip.offset,
+    });
+    w.varint(0);
+    let top = w.finish().unwrap();
+    let head = map_root(&mut txn, 2, top);
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    let honest = Db::<Root>::open(dir.path().join("honest.ferro")).unwrap();
+    honest
+        .commit("one", |root| {
+            root.insert(1, "one".into());
+        })
+        .unwrap();
+    let have = honest.have().unwrap();
+    let db = read_only().open::<Root>(&path).unwrap();
+    corrupt(db.have().map(drop));
+    corrupt(db.bundle(&have).map(drop));
 }

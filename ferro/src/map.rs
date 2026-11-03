@@ -14,11 +14,12 @@ use crate::codec::{
     Data, Decoder, Encoder, Hash, HashSink, Kind, Object, Ptr, Shape, Sink, Staged, try_hash_of,
 };
 use crate::error::{Error, Result};
-use crate::store::{Store, compressed, heap_weight};
+use crate::store::{MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub(crate) const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
+const LEVELS: u8 = (u64::BITS / LEVEL_BITS) as u8 + 1;
 const PIN_DEPTH: usize = 3;
 const ARC_HEADER: usize = 16;
 const ALLOCATION_BYTES: usize = 16;
@@ -402,6 +403,7 @@ enum Link<K, V, S> {
     Stored {
         ptr: Ptr,
         count: u64,
+        ceiling: u8,
         summary: S,
         memo: OnceLock<Memo<K, V, S>>,
     },
@@ -415,9 +417,10 @@ impl<K, V, S: Clone> Clone for Link<K, V, S> {
             Link::Stored {
                 ptr,
                 count,
+                ceiling,
                 summary,
                 ..
-            } => Link::stored(*ptr, *count, summary.clone()),
+            } => Link::under(*ptr, *count, *ceiling, summary.clone()),
             Link::Mem(node) => Link::Mem(node.clone()),
         }
     }
@@ -425,9 +428,14 @@ impl<K, V, S: Clone> Clone for Link<K, V, S> {
 
 impl<K, V, S> Link<K, V, S> {
     fn stored(ptr: Ptr, count: u64, summary: S) -> Self {
+        Link::under(ptr, count, LEVELS, summary)
+    }
+
+    fn under(ptr: Ptr, count: u64, ceiling: u8, summary: S) -> Self {
         Link::Stored {
             ptr,
             count,
+            ceiling,
             summary,
             memo: OnceLock::new(),
         }
@@ -441,11 +449,13 @@ impl<K, V, S> Link<K, V, S> {
             Link::Stored {
                 ptr,
                 count,
+                ceiling,
                 summary,
                 memo,
             } => Link::Stored {
                 ptr: *ptr,
                 count: *count,
+                ceiling: *ceiling,
                 summary: summary.clone(),
                 memo: memo.clone(),
             },
@@ -681,30 +691,65 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
         }
         let cells = Cells::spliced(column.into(), spilled);
         let mut children = Vec::new();
+        let mut total = n as u64;
         for position in 0..=n {
             let count = decoder.varint()?;
             if count != 0 {
                 children.reserve_exact(n + 1 - children.len());
                 children.resize_with(position, || Link::Empty);
                 let summary = S::decode(decoder)?;
-                children.push(Link::stored(decoder.link()?, count, summary));
+                children.push(Link::under(decoder.link()?, count, level, summary));
+                total = total
+                    .checked_add(count)
+                    .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
             }
         }
         if !children.is_empty() {
             children.resize_with(n + 1, || Link::Empty);
         }
-        let mut node = Node {
+        Ok(Node {
             level,
             keys,
             cells,
             children,
-            count: 0,
+            count: total,
             origin: Some(origin),
             prefix: None,
-        };
-        node.recount();
-        Ok(node)
+        })
     }
+}
+
+type Fetched<K, V, S> = (Arc<Node<K, V, S>>, bool);
+
+fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetched<K, V, S>> {
+    let decode = |decoder: &mut Decoder<'_>| {
+        let node = Node::decode(decoder, ptr)?;
+        let written = store.written();
+        if node.count > written.saturating_mul(MAX_RATIO as u64) {
+            return Err(Error::Decode(format!(
+                "a map node claims {} entries, more than a log of {written} bytes holds",
+                node.count
+            )));
+        }
+        Ok(node)
+    };
+    store.fetch(ptr, decode, Node::weight)
+}
+
+fn admit<K, V, S>(node: &Node<K, V, S>, count: u64, ceiling: u8) -> Result<()> {
+    if node.level >= ceiling {
+        return Err(Error::Decode(format!(
+            "a map node at level {} is not below level {ceiling}",
+            node.level
+        )));
+    }
+    if node.count != count {
+        return Err(Error::Decode(format!(
+            "a map link claims {count} entries for a node that holds {}",
+            node.count
+        )));
+    }
+    Ok(())
 }
 
 type Span<K> = (Option<K>, Option<K>);
@@ -841,8 +886,7 @@ fn held_node<K: Data + Ord, V: Data, S: Data>(
     store: &Store,
     ptr: Ptr,
 ) -> Result<Shape> {
-    let decode = |decoder: &mut Decoder<'_>| Node::<K, V, S>::decode(decoder, ptr);
-    let (node, _) = store.fetch(ptr, decode, Node::weight)?;
+    let (node, _) = fetch_node::<K, V, S>(store, ptr)?;
     let span = span_of::<K>(kind);
     if span.is_some() {
         let (first, last) = (extreme(store, &node, false)?, extreme(store, &node, true)?);
@@ -895,12 +939,19 @@ fn fetch_link<'a, K: Data, V: Data, S: Data>(
     link: &'a Link<K, V, S>,
     depth: usize,
 ) -> Result<Reach<'a, K, V, S>> {
-    let Link::Stored { ptr, memo, .. } = link else {
+    let Link::Stored {
+        ptr,
+        count,
+        ceiling,
+        memo,
+        ..
+    } = link
+    else {
         return Err(Error::Detached);
     };
-    let ptr = *ptr;
     let store = store.ok_or(Error::Detached)?;
-    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::weight)?;
+    let (node, cached) = fetch_node(store, *ptr)?;
+    admit(&node, *count, *ceiling)?;
     if depth < PIN_DEPTH {
         if let Memo::Pinned(node) = memo.get_or_init(|| Memo::Pinned(node.clone())) {
             return Ok(Reach::Borrowed(node));
@@ -930,10 +981,14 @@ fn load<K: Data, V: Data, S: Data>(
     match link {
         Link::Empty => Ok(None),
         Link::Mem(node) => Ok(Some(node.clone())),
-        Link::Stored { ptr, .. } => {
-            let store = store.ok_or(Error::Detached)?;
-            let ptr = *ptr;
-            let (node, _) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::weight)?;
+        Link::Stored {
+            ptr,
+            count,
+            ceiling,
+            ..
+        } => {
+            let (node, _) = fetch_node(store.ok_or(Error::Detached)?, *ptr)?;
+            admit(&node, *count, *ceiling)?;
             Ok(Some(node))
         }
     }
@@ -2653,9 +2708,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(scan(self.store(), &self.root, 0, None, None, &mut f))
     }
 
-    pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
+    fn try_walk(&self, mut visit: impl FnMut(&Node<K, V, S>, usize) -> Result<()>) -> Result<()> {
         let store = self.store();
-        let mut entries = Vec::new();
         let mut path = Vec::new();
         if let Some(root) = resident(store, &self.root, 0)? {
             path.push((root, 0));
@@ -2672,15 +2726,34 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             }
             *position += 1;
             if at % 2 == 1 {
-                let value = node.read(store, at / 2, V::clone)?;
-                entries.push((node.keys[at / 2].clone(), value));
+                visit(node, at / 2)?;
                 continue;
             }
             if let Some(child) = resident(store, node.child(at / 2), depth)? {
                 path.push((child, 0));
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
+        let store = self.store();
+        let mut entries = Vec::new();
+        self.try_walk(|node, index| {
+            entries.push((node.keys[index].clone(), node.read(store, index, V::clone)?));
+            Ok(())
+        })?;
         Ok(entries)
+    }
+
+    pub(crate) fn try_values(&self) -> Result<Vec<Val<V>>> {
+        let store = self.store();
+        let mut values = Vec::new();
+        self.try_walk(|node, index| {
+            values.push(node.value(store, index)?);
+            Ok(())
+        })?;
+        Ok(values)
     }
 
     pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&K, &V))
