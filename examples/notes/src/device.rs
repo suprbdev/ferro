@@ -232,7 +232,10 @@ impl Device {
     }
 
     fn pull(&self, other: &Device, synced: &mut Synced) -> Result<Outcome> {
-        let pulled = self.db.pull(&other.db, &other.name, merge)?;
+        let pulled = match self.db.pull(&other.db, &other.name, merge) {
+            Err(ferro::Error::StaleHave(_)) => self.db.pull(&other.db, &other.name, merge)?,
+            pulled => pulled?,
+        };
         let outcome = pulled.outcome;
         synced.steps.push(Step {
             from: other.name.clone(),

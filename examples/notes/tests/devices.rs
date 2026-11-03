@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use ferro::{Durability, Options, Outcome};
-use notes::{Device, Note, NotesError};
+use ferro::db::Hook;
+use ferro::{Bundle, Db, Durability, Keep, Options, Outcome};
+use notes::{Device, Note, Notes, NotesError, merge};
 use tempfile::TempDir;
 
 fn device(root: &Path, name: &str) -> Device {
@@ -322,4 +324,51 @@ fn a_sync_after_small_edits_on_a_large_notebook_moves_little() {
         vec!["phone".to_string(), "t0".to_string()]
     );
     assert_converged(&all);
+}
+
+#[test]
+fn a_pull_whose_have_went_stale_is_retried_once_and_the_devices_converge() {
+    type Armed = Option<(Db<Notes>, Bundle)>;
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<Mutex<Armed>> = Arc::new(Mutex::new(None));
+    let refused: Arc<Mutex<Option<ferro::Error>>> = Arc::new(Mutex::new(None));
+    let (armed, seen) = (slot.clone(), refused.clone());
+    let hook = Hook(Arc::new(move |step| {
+        if step != "bundled" {
+            return;
+        }
+        let held = armed.lock().unwrap().take();
+        if let Some((db, bundle)) = held {
+            db.compact(Keep::Last(3)).unwrap();
+            *seen.lock().unwrap() = db.receive("laptop", &bundle, merge).err();
+        }
+    }));
+    let laptop = device(dir.path(), "laptop");
+    let options = Options::new().durability(Durability::Buffered).hook(hook);
+    let phone = Device::open_with(dir.path().join("phone"), options).unwrap();
+    for text in ["one", "two", "three"] {
+        laptop.add(text, &[]).unwrap();
+    }
+    phone.sync(&laptop).unwrap();
+    phone.db().drop_branch("laptop").unwrap();
+    phone.add("four", &[]).unwrap();
+    phone.add("five", &[]).unwrap();
+    laptop.add("six", &[]).unwrap();
+    let stale = laptop.db().bundle(&phone.db().have().unwrap()).unwrap();
+    *slot.lock().unwrap() = Some((phone.db().clone(), stale));
+    let synced = phone.sync(&laptop).unwrap();
+    assert!(slot.lock().unwrap().is_none(), "the hook never ran");
+    assert!(
+        matches!(*refused.lock().unwrap(), Some(ferro::Error::StaleHave(_))),
+        "the first pull's have did not go stale: {:?}",
+        refused.lock().unwrap()
+    );
+    assert_eq!(synced.steps[0].from, "laptop");
+    assert_eq!(synced.steps[0].pulled.outcome, Outcome::Merged);
+    assert_eq!(
+        phone.db().log().first().map(|(version, _)| version),
+        Some(3)
+    );
+    assert_eq!(visible(&phone).len(), 6);
+    assert_converged(&[laptop, phone]);
 }
