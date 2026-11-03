@@ -376,9 +376,8 @@ async fn order_history(
         return Err(ApiError::NotFound(format!("order {id}")));
     }
     let mut versions: Vec<Value> = blocking(move || {
-        db.history_of(|shop| shop.orders.get(&id))
+        db.history_of_range(..=horizon, |shop| shop.orders.get(&id))
             .take_while(|(_, order)| order.is_some())
-            .skip_while(|(commit, _)| commit.version > horizon)
             .map(|(commit, order)| {
                 json!({
                     "version": commit.version,

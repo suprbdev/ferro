@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferro::{Compacted, Db, Durability, Hash, Keep, Options, Reclaim, Space, Watcher};
+use ferro::{Compacted, Db, Durability, Keep, Options, Reclaim, Space, Watcher};
 
 use crate::error::{QueueError, Result};
 use crate::model::{Job, JobState, NewJob, Recurring};
@@ -412,56 +412,17 @@ impl Queue {
             .collect()
     }
 
-    fn job_hash_at(&self, version: u64, id: u64) -> Result<Option<Hash>> {
-        Ok(self.db.at(version)?.jobs.value_hash(&id))
-    }
-
     pub fn history(&self, id: u64) -> Result<Vec<Event>> {
-        let tip = self.db.read();
-        if id >= tip.next_id {
+        let created = self.db.bisect(.., |state| state.next_id > id)?;
+        let created = created.ok_or(QueueError::NotFound(id))?;
+        if !self.db.at(created)?.jobs.contains_key(&id) {
             return Err(QueueError::NotFound(id));
         }
-        let last = tip.version();
-        let first = self.db.log().first().map(|(version, _)| version).unwrap_or(1);
-        let (mut low, mut high) = (first, last);
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if self.db.at(mid)?.next_id > id {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        let created = low;
-        let Some(created_hash) = self.job_hash_at(created, id)? else {
-            return Err(QueueError::NotFound(id));
-        };
-        let end = if tip.jobs.contains_key(&id) {
-            last + 1
-        } else {
-            let (mut low, mut high) = (created, last);
-            while low < high {
-                let mid = low + (high - low) / 2;
-                if self.job_hash_at(mid, id)?.is_none() {
-                    high = mid;
-                } else {
-                    low = mid + 1;
-                }
-            }
-            low
-        };
-        let mut versions = vec![created];
-        if end - 1 > created {
-            let end_hash = self.job_hash_at(end - 1, id)?;
-            self.changes(id, (created, created_hash), (end - 1, end_hash.unwrap_or(created_hash)), &mut versions)?;
-        }
-        if end <= last {
-            versions.push(end);
-        }
-        versions.sort_unstable();
-        versions.dedup();
+        let gone = self.db.bisect(created.., |state| !state.jobs.contains_key(&id))?;
+        let alive = created..gone.unwrap_or(u64::MAX);
+        let changes = self.db.bisect_changes(alive, |state| state.jobs.value_hash(&id))?;
+        let versions = changes.into_iter().map(|(commit, _)| commit.version).chain(gone);
         versions
-            .into_iter()
             .map(|version| {
                 let snapshot = self.db.at(version)?;
                 Ok(Event {
@@ -472,28 +433,6 @@ impl Queue {
                 })
             })
             .collect()
-    }
-
-    fn changes(
-        &self,
-        id: u64,
-        low: (u64, Hash),
-        high: (u64, Hash),
-        out: &mut Vec<u64>,
-    ) -> Result<()> {
-        if low.1 == high.1 {
-            return Ok(());
-        }
-        if high.0 == low.0 + 1 {
-            out.push(high.0);
-            return Ok(());
-        }
-        let mid = low.0 + (high.0 - low.0) / 2;
-        let Some(mid_hash) = self.job_hash_at(mid, id)? else {
-            return Ok(());
-        };
-        self.changes(id, low, (mid, mid_hash), out)?;
-        self.changes(id, (mid, mid_hash), high, out)
     }
 
     pub fn replay(&self, from: u64, include_pending: bool, force: bool) -> Result<Vec<Replayed>> {

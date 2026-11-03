@@ -443,17 +443,22 @@ fn hist(args: &HashMap<String, String>) {
     println!("commits={}", queue.version());
     let t = Instant::now();
     let events = queue.history(id).unwrap();
-    println!("bisect history events={} took={:.1}ms", events.len(), t.elapsed().as_secs_f64() * 1000.0);
+    println!("queue history events={} took={:.1}ms", events.len(), t.elapsed().as_secs_f64() * 1000.0);
+    let db = queue.db();
     let t = Instant::now();
-    let steps = queue
-        .db()
-        .history_of(|state| state.jobs.get(&id))
-        .take_while(|(_, job)| job.is_some())
-        .count();
-    println!("history_of take_while steps={steps} took={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let created = db.bisect(.., |state| state.next_id > id).unwrap().unwrap();
+    let gone = db.bisect(created.., |state| !state.jobs.contains_key(&id)).unwrap();
+    println!("two bisects created={created} gone={gone:?} took={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let last = gone.unwrap_or_else(|| db.version());
     let t = Instant::now();
-    let steps = queue.db().history_of(|state| state.jobs.get(&id)).take(3).count();
-    println!("history_of take(3) steps={steps} took={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let steps = db.history_of_range(created..=last, |state| state.jobs.get(&id)).count();
+    println!("history_of_range steps={steps} span={} took={:.1}ms", last - created, t.elapsed().as_secs_f64() * 1000.0);
+    let t = Instant::now();
+    let steps = db.bisect_changes(created..=last, |state| state.jobs.value_hash(&id)).unwrap().len();
+    println!("bisect_changes steps={steps} took={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let t = Instant::now();
+    let steps = db.history_of(|state| state.jobs.get(&id)).count();
+    println!("history_of steps={steps} took={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn split(args: &HashMap<String, String>) {
