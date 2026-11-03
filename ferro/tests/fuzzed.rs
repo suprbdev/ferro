@@ -37,6 +37,12 @@ fn newest_head(bytes: &[u8]) -> usize {
 }
 
 #[test]
+fn a_superblock_at_the_last_sequence_number_ends_the_scan_without_overflow() {
+    let (_dir, path) = fixture("seq-overflow");
+    corrupt(Db::<Root>::open(&path));
+}
+
+#[test]
 fn refresh_refuses_a_record_that_runs_past_the_file() {
     let (_dir, path) = fixture("refresh-alloc");
     let db = read_only().open::<Root>(&path).unwrap();

@@ -278,7 +278,8 @@ fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
         return Ok(None);
     };
     frame.basis = tip.basis;
-    if frame.seq != tip.seq + 1 || frame.log_end < body_start || frame.log_end > len {
+    let follows = tip.seq.checked_add(1) == Some(frame.seq);
+    if !follows || frame.log_end < body_start || frame.log_end > len {
         return Ok(None);
     }
     let mut hasher = Xxh3::new();
