@@ -1,0 +1,238 @@
+use ferro::codec::{Decoder, Encoder};
+use ferro::map::Summary;
+use ferro::{Bytes, Data, Map, Record, Table};
+
+use crate::guarded;
+use crate::input::Input;
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Status {
+    Pending,
+    Shipped,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+pub struct Order {
+    #[key]
+    pub id: u64,
+    #[index]
+    pub customer: String,
+    #[index]
+    pub status: Status,
+    pub total_cents: u64,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+pub struct Shop {
+    pub stock: Map<String, u32>,
+    pub orders: Table<Order>,
+    pub next_order: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Total(pub u64);
+
+impl Data for Total {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Total(u64::decode(r)?))
+    }
+}
+
+impl Summary<u64, u64> for Total {
+    fn of(_key: &u64, value: &u64) -> Self {
+        Total(*value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Total(self.0.wrapping_add(other.0))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Opaque;
+
+impl Data for Opaque {
+    fn encode(&self, _w: &mut Encoder<'_>) -> ferro::Result<()> {
+        Ok(())
+    }
+
+    fn decode(_r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Opaque)
+    }
+}
+
+impl Probe for Opaque {}
+
+pub type Root = Map<u64, String>;
+pub type Counters = Map<u8, i64>;
+pub type Docs = Map<String, Bytes>;
+pub type Nested = Map<String, Map<u64, String>>;
+pub type Summed = Map<u64, u64, Total>;
+
+pub trait Probe: Data {
+    fn probe(&self, _budget: &mut usize) {}
+
+    fn measure(&self) -> u64 {
+        0
+    }
+}
+
+impl Probe for u8 {}
+impl Probe for u32 {}
+impl Probe for u64 {}
+impl Probe for i64 {}
+impl Probe for String {}
+impl Probe for Bytes {}
+impl Probe for Order {}
+
+impl<K, V, S> Probe for Map<K, V, S>
+where
+    K: Data + Ord,
+    V: Probe,
+    S: Summary<K, V>,
+{
+    fn probe(&self, budget: &mut usize) {
+        let _ = self.len();
+        guarded(|| self.summary());
+        let mut first = None;
+        guarded(|| {
+            for (key, value) in self.iter() {
+                if *budget == 0 {
+                    break;
+                }
+                *budget -= 1;
+                value.probe(budget);
+                if first.is_none() {
+                    first = Some(key);
+                }
+            }
+        });
+        if let Some(key) = &first {
+            guarded(|| self.try_get(key));
+            guarded(|| self.range(key..).next_back());
+            guarded(|| self.floor(key));
+            guarded(|| self.range_summary(key..));
+            guarded(|| {
+                let mut cursor = self.cursor();
+                cursor.seek(key);
+                cursor.advance();
+                cursor.seek_back(key);
+                cursor.value()
+            });
+        }
+        guarded(|| self.first());
+        guarded(|| self.last());
+        guarded(|| self.nth(self.len() / 2));
+        guarded(|| self.iter().rev().take(3).count());
+    }
+
+    fn measure(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+impl Probe for Shop {
+    fn probe(&self, budget: &mut usize) {
+        self.stock.probe(budget);
+        self.orders.rows().probe(budget);
+        let _ = self.orders.len();
+        guarded(|| self.orders.by_status(&Status::Pending).take(8).count());
+        guarded(|| self.orders.by_customer("wile").take(8).count());
+        guarded(|| self.orders.first());
+        guarded(|| self.orders.get(&1));
+    }
+
+    fn measure(&self) -> u64 {
+        (self.stock.len() as u64)
+            .wrapping_add(self.orders.len() as u64)
+            .wrapping_add(self.next_order)
+    }
+}
+
+pub trait Gen: Sized {
+    fn generate(input: &mut Input<'_>) -> Self;
+}
+
+impl Gen for () {
+    fn generate(_input: &mut Input<'_>) -> Self {}
+}
+
+impl Gen for u8 {
+    fn generate(input: &mut Input<'_>) -> Self {
+        input.byte()
+    }
+}
+
+impl Gen for u32 {
+    fn generate(input: &mut Input<'_>) -> Self {
+        input.num() as u32
+    }
+}
+
+impl Gen for u64 {
+    fn generate(input: &mut Input<'_>) -> Self {
+        input.num()
+    }
+}
+
+impl Gen for i64 {
+    fn generate(input: &mut Input<'_>) -> Self {
+        input.num() as i64
+    }
+}
+
+impl Gen for String {
+    fn generate(input: &mut Input<'_>) -> Self {
+        input.text()
+    }
+}
+
+impl Gen for Total {
+    fn generate(input: &mut Input<'_>) -> Self {
+        Total(input.num())
+    }
+}
+
+impl Gen for Bytes {
+    fn generate(input: &mut Input<'_>) -> Self {
+        let len = match input.byte() % 4 {
+            0 => 600 + usize::from(input.byte()) * 8,
+            _ => usize::from(input.byte()),
+        };
+        let fill = input.byte();
+        Bytes::from(vec![fill; len])
+    }
+}
+
+impl<K: Gen + Data + Ord, V: Gen + Data> Gen for Map<K, V> {
+    fn generate(input: &mut Input<'_>) -> Self {
+        let mut map = Map::new();
+        for _ in 0..input.byte() % 4 {
+            map.insert(K::generate(input), V::generate(input));
+        }
+        map
+    }
+}
+
+impl Gen for Shop {
+    fn generate(input: &mut Input<'_>) -> Self {
+        let mut shop = Shop {
+            stock: Map::generate(input),
+            ..Shop::default()
+        };
+        for _ in 0..input.byte() % 4 {
+            shop.next_order += 1;
+            shop.orders.insert(Order {
+                id: input.num(),
+                customer: input.text(),
+                status: if input.byte() % 2 == 0 { Status::Pending } else { Status::Shipped },
+                total_cents: input.num(),
+            });
+        }
+        shop
+    }
+}

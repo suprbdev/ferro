@@ -1,0 +1,8 @@
+target/
+corpus/
+seeds/
+work/
+artifacts/
+coverage/
+logs/
+old/

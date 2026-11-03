@@ -1,0 +1,50 @@
+[package]
+name = "ferro-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+blake3 = "1"
+ferro = { path = "../ferro" }
+libfuzzer-sys = "0.4"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+tempfile = "3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin"
+path = "fuzz_targets/admin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_entry"
+path = "fuzz_targets/log_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "map_node"
+path = "fuzz_targets/map_node.rs"
+test = false
+doc = false
+bench = false
