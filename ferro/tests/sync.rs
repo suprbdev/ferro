@@ -1106,3 +1106,30 @@ fn a_bundle_whose_head_is_past_the_last_version_is_rejected() {
     b.update(|value| *value += 1).unwrap();
     assert_eq!(b.version(), 1);
 }
+
+#[test]
+fn a_revert_made_after_adopting_our_commits_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
+    put(&a, 1, "0");
+    b.pull(&a, "a", refuse).unwrap();
+    assert_eq!(a.pull(&b, "b", refuse).unwrap().outcome, Outcome::UpToDate);
+    put(&a, 1, "1");
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    put(&b, 1, "0");
+    put(&a, 2, "x");
+    assert_eq!(
+        a.pull(&b, "b", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(*a.read().get(&1).unwrap(), "0");
+    for _ in 0..2 {
+        b.pull(&a, "a", theirs_win).unwrap();
+        a.pull(&b, "b", theirs_win).unwrap();
+    }
+    assert_eq!(dump(&a.read()), dump(&b.read()));
+    assert_eq!(*b.read().get(&1).unwrap(), "0");
+}

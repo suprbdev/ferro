@@ -1075,10 +1075,8 @@ fn choose_base(
         (theirs.log.first..=theirs.log.last).contains(seen)
             && (ours.log.first..=ours.log.last).contains(at)
     });
-    let prefix = match record {
-        Some(_) => None,
-        None => shared_prefix(store, &ours.log, &theirs.log)?,
-    };
+    let prefix = shared_prefix(store, &ours.log, &theirs.log)?;
+    let record = record.filter(|(seen, _)| prefix.is_none_or(|version| *seen > version));
     let (our_low, their_low) = match (record, prefix) {
         (Some((seen, at)), _) => (at, seen),
         (None, Some(version)) => (version, version),

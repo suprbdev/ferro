@@ -1079,7 +1079,10 @@ merges B and B merges A, the two chains never share an entry past the fork again
 prefix that `common_ancestor` finds would bring changes merged long ago back as conflicts. So the base
 is the newest state both branches passed through, found by content. Our roots since our recorded
 version go into a set, and the remote chain is walked from its tip down to its recorded version for
-the first root in it. When A's merge and B's merge produced the same root, that merged state is the
+the first root in it. When the remote has since adopted our commits by fast-forward, the newest
+entry both chains hold is newer than the record, and it bounds both walks instead. Otherwise a
+remote that sets a value back to what we had before the record matches our old root, so its revert
+looks like no change and is lost. When A's merge and B's merge produced the same root, that merged state is the
 next round's base. With no match the base is the remote commit last recorded, which our branch
 already includes, then the shared prefix, then genesis. The two walks cost the commits made on each
 side since the previous pull. If the base has the same root as their tip, they have nothing we lack,
