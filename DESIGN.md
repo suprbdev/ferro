@@ -228,7 +228,7 @@ The running balance has the smallest file of the hand-kept forms because a bulk 
 row per account per block, but each backdated entry rewrites every later block. The hand-kept forms
 answer only at day boundaries and are state that can drift from the postings. A summary works on any
 key range and is computed from them. `audit` still compares the fold with the journal, because
-`verify` knows no types.
+`verify` knows no types and `verify_typed` checks a summary's type, not its value.
 
 `metrics` keeps rollups in a summarized map and folds a bucket that spans at least 8 of them, which
 is where folding starts to beat scanning. On 4.32M rollups of 1,000 series: 978 ms to 5.6 ms for one
@@ -1304,7 +1304,7 @@ as in the file.
   the generation must exceed the known parent's, and so on. The numbers are a function of the
   graph alone, so a commit hashes the same in every file, and a forged generation or merge link is
   rejected rather than landed.
-- The root of every new commit decodes as `T`.
+- Every object the bundle sends is checked as the type it will be read as, below.
 
 All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
 the `tip` mutex and synced like a commit, so a crash leaves the previous head: a torn frame is not
@@ -1318,6 +1318,62 @@ A bundle whose head `remote` already holds at that version writes nothing. Bundl
 so one can arrive late, from a slow transfer or a second pull running at the same time, or be sent
 again. Landing it would move `remote` back, drop the records under its name, and merge older state
 over newer.
+
+### Checking trees
+
+A `Map` decodes lazily, so decoding a root as `T` says nothing about the nodes under it. A bundle
+whose root decoded and whose node did not used to land, pass `verify`, and panic on the first read
+that reached the node. `receive` now checks each object it is sent, and no object it holds, as the
+type that will read it.
+
+`Data` has a `visit` method that walks one encoded value without building it. The derive implements
+it field by field, `Option`, `Vec`, tuples and the other containers forward it, and the default
+decodes and drops the value, so a hand-written `Data` gets a correct visit for free. A decoder can
+carry a list of typed links. `Map::decode` adds its root link to that list as a node of its `K`, `V`
+and `S` with the count it claims, so any value that holds a map, through a derived struct, a hand
+written impl, a `Table`, `Set` or `List`, reports where its nodes are. A node check decodes the
+keys, checks that they ascend, that each hashes to the node's level and that they fall inside the
+range the parent gives the node, visits the inline values and summaries, and reports each spilled
+value as a `V` and each child as a node one level down at most, with the separators around it as its
+range. It returns the node's count and level, which must match what the link claimed.
+
+The receive check is a worklist that starts at each new commit's root as `T`. A link to a sent object
+checks that object as the kind the link names, at most once for each type, and pushes its own links.
+A link that resolves to an object the receiver holds is not walked into: what the receiver holds is
+trusted. Its type comes from the hint path. The anchor root is a `T`, and each hint step checks the
+held parent as its kind to learn the kind of the link the step follows, one read per parent on a
+changed path, which the hint resolution already paid. A held child agrees with a sent parent when it
+has the same type and count, its trusted range lies inside the new one and its trusted parent's level
+is no higher. Otherwise the held node is loaded and its leftmost and rightmost keys are found down
+its edges, O(depth). A link that names held data of another type is accepted only if that one object
+checks as the new type and holds no typed links of its own: a string spilled in one map and the same
+bytes as `Bytes` in another are one object. Anything else rejects the bundle.
+
+The check costs the bundle, not the database: every sent object is decoded once, plus one read per
+parent on a hint path and the edges of a reused subtree whose range narrowed. A node reached again
+under a range its first check does not cover is checked again, and those rechecks may not exceed
+twice the bundle's body bytes. Cloning a `Map<u64, String>` of 400,000 keys, 36 MB in 50,143 objects,
+took 164 ms against 102 ms without the check, and a bundle editing 1,008 keys spread over it, 3.2 MB
+in 2,480 objects, took 18.8 ms against 15.5 ms.
+
+Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
+Nothing reads them as a type. Summaries are checked as `S` but not recomputed, because a summary is
+the sender's data like any value, and spilled values are not checked for the size that made them
+spill.
+
+`Db::verify_typed` runs the same check over the whole file: the refs, and the roots of every retained
+commit, as `T`, each object checked once per type. It costs a decode of everything reachable, so it
+is a separate call from `verify`, which knows no types and only re-hashes.
+
+A fuzz test parses an honest bundle with hints, applies one or two mutations to its tree objects,
+flipping, setting, cutting or inserting a byte, or dropping, swapping or retargeting a link,
+including to held objects through the hints, and re-hashes up to the head so the hash checks pass.
+Every result must be refused, or read back whole: each map's `len` equal to its iteration, every
+iterated key found by `get`, every table row found through its indexes, and `verify_typed` passing.
+Before the check, a single flipped byte landed and a read panicked. With it, 131,000 changed
+bundles over random seeds landed and read back whole one time in seven, and were refused otherwise.
+The first version checked levels and order inside a node but not the range a parent gives it, and
+the fuzz test found a flipped key byte that put a key where iteration saw it and `get` did not.
 
 ### Bringing the branch up
 
@@ -1420,9 +1476,13 @@ A notes edit rewrites a path of four or five nodes in the rows and, for a tag, i
   `NoCommonAncestor`.
 - A merged commit the receiver holds only inside another commit's merged history, not on a chain
   its have names, is sent again.
-- The receiver decodes each new root as its own `T`, so peers need schemas that decode each other's
-  roots. A root that has to rebuild a table index as it decodes, because the sender's schema lacks
-  that index, can be rejected, since the rows it would read are not written yet.
+- The receiver checks every sent object as its own `T`, so peers need schemas that decode each
+  other's trees, not only their roots. A table without one of its index fields passes, because the
+  check visits fields and does not rebuild the index. Reading it rebuilds the index, and if two rows
+  share a value of a unique index that read fails, so a peer can still send a table that does not
+  read. Checking it at receive would mean reading every row.
+- A summary is checked as an `S`, not recomputed, so a peer can send a subtree whose summary is not
+  the fold of its entries, and `summary` returns what it sent.
 
 ## Reclamation
 
@@ -1636,3 +1696,12 @@ changes.
 Collections read like native types, so `get` and iterators do not return `Result`. An I/O failure
 or corruption during a read panics. `try_get` exists for callers that need to handle it. Inside
 `update` a panic discards the transaction and leaves the database unchanged.
+
+A decode error on read stays a panic. Every object a file holds was either written by this process,
+which decodes each new key, value and root as it writes them, or checked as its type by `receive`,
+so an object
+that does not decode is a damaged file or a schema change that broke stored data, the same classes
+as a bad hash. Turning it into an `Error` would put a `Result` on every `get`, iterator step and
+comparison for a case a healthy file cannot reach, and the read would have nothing better to do than
+stop. `try_get` and `try_for_each` surface it as an `Error` for a caller reading a file it does not
+trust, and `verify_typed` finds it before any read does.

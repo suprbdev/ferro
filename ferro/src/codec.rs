@@ -1,6 +1,7 @@
-use std::any::Any;
+use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -65,6 +66,9 @@ impl Sink for HashSink {
 pub trait Data: Clone + Send + Sync + 'static {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()>;
     fn decode(r: &mut Decoder<'_>) -> Result<Self>;
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        Self::decode(r).map(drop)
+    }
     fn missing() -> Option<Self> {
         None
     }
@@ -272,6 +276,96 @@ fn allocation(bytes: usize) -> usize {
     bytes.saturating_add(8).next_multiple_of(16).max(32)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub(crate) count: u64,
+    pub(crate) level: u8,
+}
+
+#[derive(Clone)]
+pub(crate) struct Kind {
+    pub(crate) id: TypeId,
+    pub(crate) name: &'static str,
+    pub(crate) check: fn(&Kind, &mut Decoder<'_>) -> Result<Shape>,
+    pub(crate) held: fn(&Kind, &Store, Ptr) -> Result<Shape>,
+    pub(crate) within: fn(&Kind, &Kind) -> bool,
+    pub(crate) count: Option<u64>,
+    pub(crate) below: Option<u8>,
+    pub(crate) range: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+pub(crate) type Found = Vec<(usize, Kind)>;
+
+fn check_value<D: Data>(_: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
+    D::visit(r)?;
+    Ok(Shape::default())
+}
+
+fn held_value(_: &Kind, _: &Store, _: Ptr) -> Result<Shape> {
+    Ok(Shape::default())
+}
+
+fn anywhere(_: &Kind, _: &Kind) -> bool {
+    true
+}
+
+impl Kind {
+    pub(crate) fn value<D: Data>() -> Kind {
+        Kind {
+            id: TypeId::of::<D>(),
+            name: type_name::<D>(),
+            check: check_value::<D>,
+            held: held_value,
+            within: anywhere,
+            count: None,
+            below: None,
+            range: None,
+        }
+    }
+
+    pub(crate) fn fits(&self, shape: Shape) -> bool {
+        self.count.is_none_or(|count| count == shape.count)
+            && self.below.is_none_or(|below| shape.level < below)
+    }
+
+    pub(crate) fn implies(&self, want: &Kind) -> bool {
+        self.id == want.id
+            && want.count.is_none_or(|count| self.count == Some(count))
+            && want
+                .below
+                .is_none_or(|below| self.below.is_some_and(|own| own <= below))
+            && (self.within)(self, want)
+    }
+
+    pub(crate) fn check(&self, body: &[u8], links: &[Ptr]) -> Result<(Shape, Found)> {
+        let found = RefCell::new(Vec::new());
+        let mut decoder = Decoder::new(body, links, None);
+        decoder.found = Some(&found);
+        let shape = (self.check)(self, &mut decoder)?;
+        Ok((shape, found.into_inner()))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Checked {
+    seen: HashMap<(Hash, TypeId), (Shape, Vec<Kind>)>,
+}
+
+impl Checked {
+    pub(crate) fn get(&self, hash: &Hash, kind: &Kind) -> Option<Shape> {
+        let (shape, kinds) = self.seen.get(&(*hash, kind.id))?;
+        kinds
+            .iter()
+            .any(|seen| (seen.within)(seen, kind))
+            .then_some(*shape)
+    }
+
+    pub(crate) fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
+        let entry = self.seen.entry((hash, kind.id));
+        entry.or_insert((shape, Vec::new())).1.push(kind.clone());
+    }
+}
+
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -280,6 +374,8 @@ pub struct Decoder<'a> {
     store: Option<&'a Store>,
     empty_items: u64,
     heap: usize,
+    base: usize,
+    found: Option<&'a RefCell<Found>>,
 }
 
 impl<'a> Decoder<'a> {
@@ -292,6 +388,8 @@ impl<'a> Decoder<'a> {
             store,
             empty_items: 0,
             heap: 0,
+            base: 0,
+            found: None,
         }
     }
 
@@ -389,6 +487,15 @@ impl<'a> Decoder<'a> {
         Ok(ptr)
     }
 
+    pub(crate) fn typed_link(&mut self, kind: impl FnOnce() -> Kind) -> Result<Ptr> {
+        let index = self.base + self.cursor;
+        let ptr = self.link()?;
+        if let Some(found) = self.found {
+            found.borrow_mut().push((index, kind()));
+        }
+        Ok(ptr)
+    }
+
     pub fn store(&self) -> Option<Store> {
         self.store.cloned()
     }
@@ -420,6 +527,8 @@ impl<'a> Decoder<'a> {
                 store: self.store,
                 empty_items: self.empty_items,
                 heap: self.heap,
+                base: self.base + self.cursor,
+                found: self.found,
             };
             self.cursor = end;
             f(tag, &mut sub)?;
@@ -606,6 +715,12 @@ impl Data for String {
         r.allocated(1, text.capacity());
         Ok(text)
     }
+
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        let len = r.varint()? as usize;
+        std::str::from_utf8(r.take(len)?).map_err(|e| Error::Decode(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl<T: Data> Data for Option<T> {
@@ -628,6 +743,14 @@ impl<T: Data> Data for Option<T> {
         }
     }
 
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        match r.u8()? {
+            0 => Ok(()),
+            1 => T::visit(r),
+            other => Err(Error::Decode(format!("invalid option tag {other}"))),
+        }
+    }
+
     fn missing() -> Option<Self> {
         Some(None)
     }
@@ -644,6 +767,14 @@ impl<T: Data> Data for Vec<T> {
         let items = T::decode_vec(r, len)?;
         r.allocated(1, items.capacity() * size_of::<T>());
         Ok(items)
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        let len = r.varint()?;
+        for _ in 0..len {
+            r.item(T::visit)?;
+        }
+        Ok(())
     }
 
     fn missing() -> Option<Self> {
@@ -706,6 +837,11 @@ impl Data for Bytes {
         Ok(bytes)
     }
 
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        let len = r.varint()? as usize;
+        r.take(len).map(drop)
+    }
+
     fn missing() -> Option<Self> {
         Some(Bytes::new())
     }
@@ -721,6 +857,13 @@ impl<T: Data, const N: usize> Data for [T; N] {
             .try_into()
             .map_err(|_| Error::Decode("array length mismatch".into()))
     }
+
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        for _ in 0..N {
+            r.item(T::visit)?;
+        }
+        Ok(())
+    }
 }
 
 impl<T: Data> Data for Box<T> {
@@ -732,6 +875,10 @@ impl<T: Data> Data for Box<T> {
         let value = Box::new(T::decode(r)?);
         r.allocated(1, size_of::<T>());
         Ok(value)
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        T::visit(r)
     }
 
     fn missing() -> Option<Self> {
@@ -748,6 +895,10 @@ impl<T: Data> Data for Arc<T> {
         let value = Arc::new(T::decode(r)?);
         r.allocated(1, ARC_HEADER + size_of::<T>());
         Ok(value)
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        T::visit(r)
     }
 
     fn missing() -> Option<Self> {
@@ -776,6 +927,17 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
         Ok(out)
     }
 
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        let len = r.varint()?;
+        for _ in 0..len {
+            r.item(|r| {
+                K::visit(r)?;
+                V::visit(r)
+            })?;
+        }
+        Ok(())
+    }
+
     fn missing() -> Option<Self> {
         Some(BTreeMap::new())
     }
@@ -800,6 +962,14 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
         Ok(out)
     }
 
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        let len = r.varint()?;
+        for _ in 0..len {
+            r.item(T::visit)?;
+        }
+        Ok(())
+    }
+
     fn missing() -> Option<Self> {
         Some(BTreeSet::new())
     }
@@ -815,6 +985,11 @@ macro_rules! tuple {
 
             fn decode(r: &mut Decoder<'_>) -> Result<Self> {
                 Ok(($($name::decode(r)?,)+))
+            }
+
+            fn visit(r: &mut Decoder<'_>) -> Result<()> {
+                $($name::visit(r)?;)+
+                Ok(())
             }
         }
     };

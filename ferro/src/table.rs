@@ -467,6 +467,10 @@ impl<T: Record> Data for Table<T> {
         Ok(Table(T::Table::decode(r)?))
     }
 
+    fn visit(r: &mut Decoder<'_>) -> Result<()> {
+        T::Table::visit(r)
+    }
+
     fn missing() -> Option<Self> {
         Some(Table::default())
     }

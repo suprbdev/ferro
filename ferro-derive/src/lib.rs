@@ -196,6 +196,45 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
     (stmts, values)
 }
 
+fn visit_stmts(fields: &[Field]) -> TokenStream2 {
+    let stored: Vec<&Field> = fields.iter().filter(|f| f.stored()).collect();
+    let seen: Vec<Ident> = (0..stored.len()).map(|i| format_ident!("__seen{}", i)).collect();
+    let arms = stored.iter().zip(&seen).map(|(field, seen)| {
+        let tag = field.tag();
+        let ty = &field.ty;
+        quote! {
+            #tag => {
+                #seen = true;
+                <#ty as ::ferro::Data>::visit(__r)?;
+            }
+        }
+    });
+    let required = stored
+        .iter()
+        .zip(&seen)
+        .filter(|(field, _)| matches!(field.fallback, Fallback::Required))
+        .map(|(field, seen)| {
+            let ty = &field.ty;
+            let name = &field.name;
+            quote! {
+                if !#seen && <#ty as ::ferro::Data>::missing().is_none() {
+                    return ::std::result::Result::Err(::ferro::Error::MissingField(#name));
+                }
+            }
+        });
+    quote! {
+        #(let mut #seen = false;)*
+        __r.fields(|__tag, __r| {
+            match __tag {
+                #(#arms)*
+                _ => {}
+            }
+            ::std::result::Result::Ok(())
+        })?;
+        #(#required)*
+    }
+}
+
 fn construct(
     path: TokenStream2,
     fields: &[Field],
@@ -264,6 +303,7 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
         None => quote! { &self.0 },
     };
     let build = construct(quote! { Self }, &fields, &data.fields, &[quote! { __v }]);
+    let ty = &field.ty;
     Ok(quote! {
         impl #impl_generics ::ferro::Data for #name #ty_generics #where_clause {
             fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
@@ -273,6 +313,10 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
                 let __v = ::ferro::Data::decode(__r)?;
                 ::std::result::Result::Ok(#build)
+            }
+
+            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+                <#ty as ::ferro::Data>::visit(__r)
             }
 
             fn missing() -> ::std::option::Option<Self> {
@@ -289,7 +333,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let (encode, decode) = match &input.data {
+    let (encode, decode, visit) = match &input.data {
         Data::Struct(data) => {
             let fields = parse_fields(&data.fields)?;
             check_fields(&fields)?;
@@ -309,9 +353,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let vs = vars(fields.len());
             let (stmts, values) = decode_stmts(&fields, &vs);
             let build = construct(quote! { Self }, &fields, &data.fields, &values);
+            let visit = visit_stmts(&fields);
             (
                 quote! { #encode ::std::result::Result::Ok(()) },
                 quote! { #stmts ::std::result::Result::Ok(#build) },
+                quote! { #visit ::std::result::Result::Ok(()) },
             )
         }
         Data::Enum(data) => {
@@ -329,6 +375,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             )?;
             let mut encode_arms = Vec::new();
             let mut decode_arms = Vec::new();
+            let mut visit_arms = Vec::new();
             for (variant, vname) in data.variants.iter().zip(&variant_names) {
                 let vident = &variant.ident;
                 let vtag = field_tag(vname);
@@ -375,6 +422,13 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                         ::std::result::Result::Ok(#build)
                     }
                 });
+                let visit = visit_stmts(&fields);
+                visit_arms.push(quote! {
+                    #vtag => {
+                        #visit
+                        ::std::result::Result::Ok(())
+                    }
+                });
             }
             let encode_match = if data.variants.is_empty() {
                 quote! { match *self {} }
@@ -384,15 +438,25 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::std::result::Result::Ok(())
                 }
             };
+            let unknown = quote! {
+                __other => ::std::result::Result::Err(::ferro::Error::Decode(
+                    ::std::format!("unknown variant tag {} for {}", __other, ::std::stringify!(#name))
+                )),
+            };
             (
                 encode_match,
                 quote! {
                     let __variant = __r.u16()?;
                     match __variant {
                         #(#decode_arms)*
-                        __other => ::std::result::Result::Err(::ferro::Error::Decode(
-                            ::std::format!("unknown variant tag {} for {}", __other, ::std::stringify!(#name))
-                        )),
+                        #unknown
+                    }
+                },
+                quote! {
+                    let __variant = __r.u16()?;
+                    match __variant {
+                        #(#visit_arms)*
+                        #unknown
                     }
                 },
             )
@@ -412,6 +476,10 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
                 #decode
+            }
+
+            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+                #visit
             }
         }
     })
@@ -662,6 +730,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let encode = encode_stmts(&table_fields, &access);
     let vs = vars(table_fields.len());
     let (decode_ts, values) = decode_stmts(&table_fields, &vs);
+    let visit_ts = visit_stmts(&table_fields);
     let index_vars: Vec<&Ident> = vs.iter().skip(1).collect();
     let index_idents: Vec<&Ident> = idents.iter().skip(1).copied().collect();
 
@@ -901,6 +970,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     }
                 }
                 ::std::result::Result::Ok(__table)
+            }
+
+            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+                #visit_ts
+                ::std::result::Result::Ok(())
             }
         }
 

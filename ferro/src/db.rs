@@ -2045,6 +2045,16 @@ impl<T: Data> Db<T> {
         };
         crate::admin::verified(&store, head)
     }
+
+    pub fn verify_typed(&self) -> Result<Verified> {
+        let (head, refs, store) = {
+            let published = self.shared.published.lock();
+            (published.ptr, published.refs.clone(), self.shared.store())
+        };
+        let report = crate::admin::verified(&store, head)?;
+        crate::admin::typed::<T>(&store, head, &refs)?;
+        Ok(report)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

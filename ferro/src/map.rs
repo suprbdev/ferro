@@ -1,3 +1,4 @@
+use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -9,7 +10,7 @@ use std::mem::needs_drop;
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Ptr, Sink, try_hash_of};
+use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Kind, Ptr, Shape, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::store::{Store, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
@@ -676,6 +677,157 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
         node.recount();
         Ok(node)
     }
+}
+
+type Span<K> = (Option<K>, Option<K>);
+
+fn node_kind<K: Data + Ord, V: Data, S: Data>(
+    count: u64,
+    below: Option<u8>,
+    span: Option<Span<K>>,
+) -> Kind {
+    Kind {
+        id: TypeId::of::<Node<K, V, S>>(),
+        name: type_name::<Node<K, V, S>>(),
+        check: check_node::<K, V, S>,
+        held: held_node::<K, V, S>,
+        within: span_within::<K>,
+        count: Some(count),
+        below,
+        range: span.map(|span| Arc::new(span) as Arc<dyn Any + Send + Sync>),
+    }
+}
+
+fn span_of<K: 'static>(kind: &Kind) -> Option<&Span<K>> {
+    kind.range.as_ref().and_then(|range| range.downcast_ref::<Span<K>>())
+}
+
+fn span_within<K: Ord + 'static>(inner: &Kind, outer: &Kind) -> bool {
+    let Some((low, high)) = span_of::<K>(outer) else {
+        return true;
+    };
+    let (inner_low, inner_high) = match span_of::<K>(inner) {
+        Some((low, high)) => (low.as_ref(), high.as_ref()),
+        None => (None, None),
+    };
+    let above = match (low, inner_low) {
+        (None, _) => true,
+        (Some(low), Some(inner)) => low <= inner,
+        (Some(_), None) => false,
+    };
+    let under = match (high, inner_high) {
+        (None, _) => true,
+        (Some(high), Some(inner)) => inner <= high,
+        (Some(_), None) => false,
+    };
+    above && under
+}
+
+fn outside<K: Ord>(span: Option<&Span<K>>, first: &K, last: &K) -> bool {
+    span.is_some_and(|(low, high)| {
+        low.as_ref().is_some_and(|low| first <= low)
+            || high.as_ref().is_some_and(|high| last >= high)
+    })
+}
+
+fn check_node<K: Data + Ord, V: Data, S: Data>(
+    kind: &Kind,
+    r: &mut Decoder<'_>,
+) -> Result<Shape> {
+    let level = r.u8()?;
+    let n = r.varint()?;
+    if n == 0 || n > r.remaining() as u64 {
+        return Err(Error::Decode(format!("node claims {n} keys")));
+    }
+    let mut keys: Vec<K> = Vec::new();
+    for _ in 0..n {
+        let key = K::decode(r)?;
+        if level_of(&key)? != level {
+            return Err(Error::Decode("a key sits at a level it does not hash to".into()));
+        }
+        if keys.last().is_some_and(|previous| *previous >= key) {
+            return Err(Error::Decode("node keys are out of order".into()));
+        }
+        keys.push(key);
+    }
+    let span = span_of::<K>(kind);
+    if outside(span, &keys[0], &keys[keys.len() - 1]) {
+        return Err(Error::Decode(
+            "node keys fall outside the range their parent gives them".into(),
+        ));
+    }
+    for _ in 0..n {
+        match r.u8()? {
+            0 => V::visit(r)?,
+            1 => {
+                r.typed_link(Kind::value::<V>)?;
+                S::visit(r)?;
+            }
+            other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
+        }
+    }
+    let mut count = n;
+    for position in 0..keys.len() + 1 {
+        let below = r.varint()?;
+        if below != 0 {
+            S::visit(r)?;
+            r.typed_link(|| {
+                let low = match position {
+                    0 => span.and_then(|(low, _)| low.clone()),
+                    _ => Some(keys[position - 1].clone()),
+                };
+                let high = match keys.get(position) {
+                    Some(key) => Some(key.clone()),
+                    None => span.and_then(|(_, high)| high.clone()),
+                };
+                node_kind::<K, V, S>(below, Some(level), Some((low, high)))
+            })?;
+            count = count
+                .checked_add(below)
+                .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
+        }
+    }
+    Ok(Shape { count, level })
+}
+
+fn extreme<K: Data, V: Data, S: Data>(
+    store: &Store,
+    top: &Arc<Node<K, V, S>>,
+    last: bool,
+) -> Result<K> {
+    let mut node = top.clone();
+    loop {
+        let child = node.child(if last { node.keys.len() } else { 0 });
+        match load(Some(store), child)? {
+            Some(next) => node = next,
+            None => break,
+        }
+    }
+    let key = if last { node.keys.last() } else { node.keys.first() };
+    key.cloned()
+        .ok_or_else(|| Error::Corrupt("a stored map node holds no keys".into()))
+}
+
+fn held_node<K: Data + Ord, V: Data, S: Data>(
+    kind: &Kind,
+    store: &Store,
+    ptr: Ptr,
+) -> Result<Shape> {
+    let decode = |decoder: &mut Decoder<'_>| Node::<K, V, S>::decode(decoder, ptr);
+    let (node, _) = store.fetch(ptr, decode, Node::weight)?;
+    let span = span_of::<K>(kind);
+    if span.is_some() {
+        let (first, last) = (extreme(store, &node, false)?, extreme(store, &node, true)?);
+        if outside(span, &first, &last) {
+            return Err(Error::Decode(
+                "held keys fall outside the range a new parent gives them".into(),
+            ));
+        }
+    }
+    Ok(Shape {
+        count: node.count,
+        level: node.level,
+    })
 }
 
 enum Reach<'a, K, V, S> {
@@ -2175,7 +2327,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
             Link::Empty
         } else {
             let summary = S::decode(r)?;
-            Link::stored(r.link()?, count, summary)
+            Link::stored(r.typed_link(|| node_kind::<K, V, S>(count, None, None))?, count, summary)
         };
         Ok(Map {
             root,

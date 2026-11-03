@@ -3,9 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::codec::{Data, Decoder, Encoder, Ptr};
+use crate::codec::{Checked, Data, Decoder, Encoder, Kind, Ptr};
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
+use crate::log::Closures;
 use crate::map::Map;
 use crate::reclaim::{Copier, Roots, sibling, sync_parent};
 pub use crate::reclaim::{Compacted, Reclaim, Space};
@@ -110,6 +111,58 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
         })?;
     }
     Ok(report)
+}
+
+pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> Result<()> {
+    let mut roots: Vec<Ptr> = Vec::new();
+    let mut commits = HashSet::new();
+    let mut closures = Closures::default();
+    for (_, branch) in refs.iter() {
+        let chain = branch.log;
+        let after = chain.after(store)?;
+        chain.visit(store, |ptr, entry, _, _| {
+            if commits.insert(ptr.hash) {
+                roots.extend(entry.commit.root);
+            }
+            closures.mark(ptr, chain.first, after);
+            closures.seed(entry, after);
+            Ok(true)
+        })?;
+    }
+    closures.walk(store, |ptr, entry, _, _| {
+        if commits.insert(ptr.hash) {
+            roots.extend(entry.commit.root);
+        }
+        Ok(true)
+    })?;
+    let root = Kind::value::<T>();
+    let mut queue: Vec<(Ptr, Kind)> = roots.into_iter().map(|ptr| (ptr, root.clone())).collect();
+    queue.extend(head.map(|ptr| (ptr, Kind::value::<Refs>())));
+    let mut checked = Checked::default();
+    while let Some((ptr, kind)) = queue.pop() {
+        let shape = match checked.get(&ptr.hash, &kind) {
+            Some(shape) => shape,
+            None => {
+                let object = store.read_object(ptr)?;
+                let (shape, found) = kind.check(&object.body, &object.links).map_err(|error| {
+                    Error::Corrupt(format!(
+                        "the {} at {} does not decode: {error}",
+                        kind.name, ptr.offset
+                    ))
+                })?;
+                queue.extend(found.into_iter().map(|(index, child)| (object.links[index], child)));
+                checked.insert(ptr.hash, &kind, shape);
+                shape
+            }
+        };
+        if !kind.fits(shape) {
+            return Err(Error::Corrupt(format!(
+                "the {} at {} holds {} entries at level {}, not what its parent records",
+                kind.name, ptr.offset, shape.count, shape.level
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

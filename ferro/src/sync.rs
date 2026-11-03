@@ -1,6 +1,9 @@
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet, hash_map};
 
-use crate::codec::{Data, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
+use crate::codec::{
+    Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, Sink, push_varint,
+};
 use crate::db::{Db, Head, Refs, Snapshot};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
@@ -12,6 +15,7 @@ const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
 const FORMAT: u8 = 1;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
+const RECHECK_SLACK: usize = 16 << 20;
 const MAIN: &str = "main";
 const MAX_VERSION: u64 = u64::MAX >> 1;
 
@@ -1003,6 +1007,118 @@ fn decode_entry(plan: &Plan, slot: usize) -> Result<Entry> {
     Ok(entry)
 }
 
+type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
+
+struct Vetting<'a> {
+    store: &'a Store,
+    plan: &'a Plan,
+    index: &'a HashMap<Hash, usize>,
+    roots: &'a [Ptr],
+    hinted: &'a [Ptr],
+    hint_kinds: &'a [Option<Kind>],
+    root_kind: &'a Kind,
+    sent: Checked,
+    held: Checked,
+    spent: usize,
+    budget: usize,
+    queue: Vec<(Hash, usize, Kind)>,
+}
+
+fn rejected(error: Error) -> Error {
+    match error {
+        Error::Decode(message) => bad(message),
+        other => other,
+    }
+}
+
+impl Vetting<'_> {
+    fn run(&mut self) -> Result<()> {
+        while let Some((hash, reference, kind)) = self.queue.pop() {
+            let shape = match reference {
+                0 => self.sent(hash, &kind)?,
+                _ => match self.held(hash, reference, &kind)? {
+                    Some(shape) => shape,
+                    None => continue,
+                },
+            };
+            if !kind.fits(shape) {
+                return Err(bad(format!(
+                    "a {} it links to holds {} entries at level {}, not what the link claims",
+                    kind.name, shape.count, shape.level
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn sent(&mut self, hash: Hash, kind: &Kind) -> Result<Shape> {
+        if let Some(shape) = self.sent.get(&hash, kind) {
+            return Ok(shape);
+        }
+        let slot = *self
+            .index
+            .get(&hash)
+            .ok_or_else(|| bad("an object links to one that was neither sent nor known"))?;
+        let wire = &self.plan.objects[slot];
+        self.spent = self.spent.saturating_add(wire.body.len());
+        if self.spent > self.budget {
+            return Err(bad("it reuses its objects under too many key ranges"));
+        }
+        let links: Vec<Ptr> = wire
+            .links
+            .iter()
+            .map(|(hash, _)| Ptr {
+                hash: *hash,
+                offset: 0,
+            })
+            .collect();
+        let (shape, found) = kind
+            .check(&wire.body, &links)
+            .map_err(|error| bad(format!("a {} it carries does not decode: {error}", kind.name)))?;
+        for (index, child) in found {
+            let (hash, reference) = wire.links[index];
+            self.queue.push((hash, reference, child));
+        }
+        self.sent.insert(hash, kind, shape);
+        Ok(shape)
+    }
+
+    fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
+        let roots = self.roots.len();
+        let hint_kinds = self.hint_kinds;
+        let (ptr, known) = if reference <= roots {
+            (self.roots[reference - 1], Some(self.root_kind))
+        } else {
+            let id = reference - 1 - roots;
+            (self.hinted[id], hint_kinds[id].as_ref())
+        };
+        if ptr.hash != hash {
+            return Err(bad("a link does not match the object it names"));
+        }
+        if known.is_some_and(|known| known.implies(kind)) {
+            return Ok(None);
+        }
+        if known.is_some_and(|known| known.id == kind.id) {
+            return (kind.held)(kind, self.store, ptr).map(Some).map_err(rejected);
+        }
+        if let Some(shape) = self.held.get(&hash, kind) {
+            return Ok(Some(shape));
+        }
+        let object = self.store.read_object(ptr)?;
+        let shape = match kind.check(&object.body, &object.links) {
+            Ok((shape, found)) if found.is_empty() => shape,
+            _ => {
+                return Err(bad(format!(
+                    "it links as a {} to an object this database holds as another type",
+                    kind.name
+                )));
+            }
+        };
+        self.held.insert(hash, kind, shape);
+        Ok(Some(shape))
+    }
+}
+
 fn land<T: Data>(
     store: &Store,
     txn: &mut Txn,
@@ -1114,17 +1230,27 @@ fn land<T: Data>(
                 .ok_or_else(|| bad("a base it names has no root"))?,
         );
     }
+    let root_kind = Kind::value::<T>();
     let mut hinted: Vec<Ptr> = Vec::with_capacity(plan.hints.len());
-    let mut parents: HashMap<Ptr, Vec<Ptr>> = HashMap::new();
+    let mut hint_kinds: Vec<Option<Kind>> = Vec::with_capacity(plan.hints.len());
+    let mut parents: HashMap<(Ptr, Option<TypeId>), Parent> = HashMap::new();
     for (parent, slot) in &plan.hints {
-        let from = if *parent < roots.len() {
-            roots[*parent]
+        let (from, kind) = if *parent < roots.len() {
+            (roots[*parent], Some(&root_kind))
         } else {
-            hinted[*parent - roots.len()]
+            let id = *parent - roots.len();
+            (hinted[id], hint_kinds[id].as_ref())
         };
-        let links = match parents.entry(from) {
+        let (links, kinds) = match parents.entry((from, kind.map(|kind| kind.id))) {
             hash_map::Entry::Occupied(found) => found.into_mut(),
-            hash_map::Entry::Vacant(empty) => empty.insert(store.read_object(from)?.links),
+            hash_map::Entry::Vacant(empty) => {
+                let object = store.read_object(from)?;
+                let kinds = kind
+                    .and_then(|kind| kind.check(&object.body, &object.links).ok())
+                    .map(|(_, found)| found.into_iter().collect())
+                    .unwrap_or_default();
+                empty.insert((object.links, kinds))
+            }
         };
         let link = *links
             .get(*slot)
@@ -1133,12 +1259,30 @@ fn land<T: Data>(
             return Err(bad("a hint leads into pruned history"));
         }
         hinted.push(link);
+        hint_kinds.push(kinds.get(slot).cloned());
     }
-    let commit_roots: HashSet<Hash> = landing
-        .entries
-        .values()
-        .filter_map(|entry| entry.commit.root.map(|root| root.hash))
-        .collect();
+    let carried: usize = plan.objects.iter().map(|wire| wire.body.len()).sum();
+    let mut vetting = Vetting {
+        store,
+        plan: &plan,
+        index: &index,
+        roots: &roots,
+        hinted: &hinted,
+        hint_kinds: &hint_kinds,
+        root_kind: &root_kind,
+        sent: Checked::default(),
+        held: Checked::default(),
+        spent: 0,
+        budget: carried.saturating_mul(2).saturating_add(RECHECK_SLACK),
+        queue: Vec::new(),
+    };
+    for (slot, entry) in &landing.entries {
+        if entry.commit.root.is_some() {
+            let (hash, reference) = plan.objects[*slot].links[0];
+            vetting.queue.push((hash, reference, root_kind.clone()));
+        }
+    }
+    vetting.run()?;
     let based: HashMap<Hash, Ptr> = bases.iter().map(|(ptr, _)| (ptr.hash, *ptr)).collect();
     let mut written: HashMap<Hash, Ptr> = HashMap::with_capacity(plan.objects.len());
     let mut used = vec![false; plan.objects.len()];
@@ -1173,11 +1317,6 @@ fn land<T: Data>(
                 body: wire.body,
                 links,
             };
-            if commit_roots.contains(&wire.hash) {
-                T::decode(&mut Decoder::new(&object.body, &object.links, Some(store))).map_err(
-                    |error| bad(format!("a commit's root is not this database's type: {error}")),
-                )?;
-            }
             written.insert(wire.hash, txn.put(object, wire.hash)?);
             continue;
         };

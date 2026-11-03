@@ -1639,3 +1639,250 @@ fn a_stale_bundle_does_not_move_the_remote_back() {
     assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
     assert_eq!((b.head_hash(), b.size_on_disk()), before);
 }
+
+fn forged_with(
+    tip: &Object,
+    version: u64,
+    bases: &[(ferro::Hash, u64)],
+    roots: &[u64],
+    hints: &[(u64, u64)],
+    objects: &[(&Object, &[u64])],
+) -> Bundle {
+    let mut out = b"FERROBDL".to_vec();
+    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&tip.hash());
+    varint(&mut out, version);
+    varint(&mut out, bases.len() as u64);
+    for (hash, at) in bases {
+        out.extend_from_slice(hash);
+        varint(&mut out, *at);
+    }
+    varint(&mut out, roots.len() as u64);
+    for root in roots {
+        varint(&mut out, *root);
+    }
+    varint(&mut out, hints.len() as u64);
+    for (parent, index) in hints {
+        varint(&mut out, *parent);
+        varint(&mut out, *index);
+    }
+    varint(&mut out, objects.len() as u64);
+    for (object, references) in objects {
+        varint(&mut out, (object.body.len() as u64) << 1);
+        out.extend_from_slice(&object.body);
+        varint(&mut out, object.links.len() as u64);
+        for (linked, reference) in object.links.iter().zip(references.iter()) {
+            out.extend_from_slice(&linked.hash);
+            varint(&mut out, *reference);
+        }
+    }
+    Bundle::from(out)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn key_at_level(level: u32) -> u64 {
+    (0..).find(|key| common::level_of(key) == level).unwrap()
+}
+
+fn node_of(key: u64, slot: &[u8], links: Vec<Ptr>) -> Object {
+    let mut body = vec![common::level_of(&key) as u8, 1];
+    varint(&mut body, key);
+    body.extend_from_slice(slot);
+    body.extend_from_slice(&[0, 0]);
+    Object { body, links }
+}
+
+fn map_root(count: u64, node: &Object) -> Object {
+    let mut body = Vec::new();
+    varint(&mut body, count);
+    let links = if count == 0 { Vec::new() } else { vec![link_to(node)] };
+    Object { body, links }
+}
+
+fn inline_string(text: &str) -> Vec<u8> {
+    let mut slot = vec![0];
+    varint(&mut slot, text.len() as u64);
+    slot.extend_from_slice(text.as_bytes());
+    slot
+}
+
+type Received<T> = (Db<T>, ferro::Result<Pulled<()>>, TempDir);
+
+fn receive_tree<T: Data + Default>(objects: &[&Object]) -> Received<T> {
+    let dir = tempfile::tempdir().unwrap();
+    let db: Db<T> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let root = objects.last().unwrap();
+    let tip = entry_of(1, root, None, None);
+    let mut all = objects.to_vec();
+    all.push(&tip);
+    let result = db.receive("evil", &forged(&tip, 1, &all), |_: &mut T, _, _| -> (String, ()) {
+        panic!("no merge expected")
+    });
+    (db, result, dir)
+}
+
+fn assert_refused<T: Data>(db: &Db<T>, result: ferro::Result<Pulled<()>>) {
+    match result {
+        Err(Error::Bundle(_)) => {}
+        other => panic!("accepted a tree that does not read: {other:?}"),
+    }
+    assert_eq!(db.version(), 0);
+    assert_eq!(db.branches(), vec!["main".to_string()]);
+    db.verify_typed().unwrap();
+}
+
+#[test]
+fn a_bundle_whose_tree_does_not_decode_is_rejected() {
+    let node = Object {
+        body: vec![0xff, 0xff, 0xff],
+        links: Vec::new(),
+    };
+    let root = map_root(1, &node);
+    let (b, result, _dir) = receive_tree::<Root>(&[&node, &root]);
+    assert_refused(&b, result);
+    assert!(b.read().is_empty());
+}
+
+#[test]
+fn a_bundle_whose_map_count_disagrees_with_its_nodes_is_rejected() {
+    let key = key_at_level(0);
+    let node = node_of(key, &inline_string("one"), Vec::new());
+    let honest = map_root(1, &node);
+    let (b, result, _dir) = receive_tree::<Root>(&[&node, &honest]);
+    assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+    assert_eq!(dump(&b.read()), BTreeMap::from([(key, "one".to_string())]));
+    b.verify_typed().unwrap();
+    for count in [2, 1 << 40] {
+        let lying = map_root(count, &node);
+        let (b, result, _dir) = receive_tree::<Root>(&[&node, &lying]);
+        assert_refused(&b, result);
+    }
+}
+
+#[test]
+fn a_bundle_whose_keys_sit_at_the_wrong_level_or_out_of_order_is_rejected() {
+    let high = key_at_level(1);
+    let mut misplaced = node_of(high, &inline_string("x"), Vec::new());
+    misplaced.body[0] = 0;
+    let root = map_root(1, &misplaced);
+    let (b, result, _dir) = receive_tree::<Root>(&[&misplaced, &root]);
+    assert_refused(&b, result);
+
+    let low: Vec<u64> = (0..).filter(|key| common::level_of(key) == 0).take(2).collect();
+    let mut body = vec![0, 2];
+    varint(&mut body, low[1]);
+    varint(&mut body, low[0]);
+    body.extend_from_slice(&inline_string("a"));
+    body.extend_from_slice(&inline_string("b"));
+    body.extend_from_slice(&[0, 0, 0]);
+    let unordered = Object {
+        body,
+        links: Vec::new(),
+    };
+    let root = map_root(2, &unordered);
+    let (b, result, _dir) = receive_tree::<Root>(&[&unordered, &root]);
+    assert_refused(&b, result);
+}
+
+#[test]
+fn a_bundle_whose_spilled_value_or_nested_map_does_not_decode_is_rejected() {
+    let key = key_at_level(0);
+    let spill = Object {
+        body: vec![2, 0xff, 0xfe],
+        links: Vec::new(),
+    };
+    let node = node_of(key, &[1], vec![link_to(&spill)]);
+    let root = map_root(1, &node);
+    let (b, result, _dir) = receive_tree::<Root>(&[&spill, &node, &root]);
+    assert_refused(&b, result);
+
+    let inner = Object {
+        body: vec![0, 1, 0x80],
+        links: Vec::new(),
+    };
+    let outer = node_of(key, &[0, 1], vec![link_to(&inner)]);
+    let root = map_root(1, &outer);
+    let (b, result, _dir) = receive_tree::<Map<u64, Map<u64, u64>>>(&[&inner, &outer, &root]);
+    assert_refused(&b, result);
+}
+
+#[test]
+fn a_bundle_that_reuses_held_data_as_another_type_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = open(&dir, "b.ferro");
+    let key = key_at_level(0);
+    let long = "x".repeat(600);
+    put(&b, key, &long);
+    let spill = object_of(&long);
+    let node = node_of(key, &[1], vec![link_to(&spill)]);
+    assert_eq!(b.read().root_hash(), Some(node.hash()));
+    let v1 = b.log().hash_at(&1).unwrap();
+    let size = b.size_on_disk();
+    let before = b.head_hash();
+    for (count, held_as) in [(1u8, 3u64), (4, 2), (1, 2)] {
+        let target = if held_as == 3 { &spill } else { &node };
+        let root = Object {
+            body: vec![count],
+            links: vec![link_to(target)],
+        };
+        let tip = forged_entry(
+            &root,
+            Forged {
+                version: 2,
+                time: now_ms(),
+                prev: Some(Ptr { hash: v1, offset: 0 }),
+                merged: None,
+                graph: None,
+            },
+        );
+        let bundle = forged_with(
+            &tip,
+            2,
+            &[(v1, 1)],
+            &[0],
+            &[(0, 0), (1, 0)],
+            &[(&root, &[held_as]), (&tip, &[0, 0])],
+        );
+        let result = b.receive("evil", &bundle, refuse);
+        if (count, held_as) == (1, 2) {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            assert_eq!(*b.read().get(&key).unwrap(), long);
+            continue;
+        }
+        match result {
+            Err(Error::Bundle(_)) => {}
+            other => panic!("accepted a link to held data of another type: {other:?}"),
+        }
+        assert_eq!(b.head_hash(), before);
+        assert_eq!(b.size_on_disk(), size);
+    }
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn verify_typed_finds_nodes_that_do_not_decode_as_the_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("numbers.ferro");
+    let numbers: Db<Map<u64, u64>> = fast().open(&path).unwrap();
+    numbers
+        .commit("seed", |root| {
+            for key in 0..100 {
+                root.insert(key, 200 + key);
+            }
+        })
+        .unwrap();
+    numbers.verify_typed().unwrap();
+    drop(numbers);
+    let words: Db<Root> = fast().open(&path).unwrap();
+    words.verify().unwrap();
+    match words.verify_typed() {
+        Err(Error::Corrupt(message)) => assert!(message.contains("decode"), "{message}"),
+        other => panic!("typed verify passed a file whose nodes do not decode: {other:?}"),
+    }
+}
