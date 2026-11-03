@@ -1072,8 +1072,7 @@ fn choose_base(
     record: Option<(u64, u64)>,
 ) -> Result<Base> {
     let record = record.filter(|(seen, at)| {
-        (theirs.log.first..=theirs.log.last).contains(seen)
-            && (ours.log.first..=ours.log.last).contains(at)
+        (theirs.log.first..=theirs.log.last).contains(seen) && *at <= ours.log.last
     });
     let prefix = shared_prefix(store, &ours.log, &theirs.log)?;
     let record = record.filter(|(seen, _)| prefix.is_none_or(|version| *seen > version));

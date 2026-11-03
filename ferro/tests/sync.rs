@@ -1133,3 +1133,30 @@ fn a_revert_made_after_adopting_our_commits_is_not_lost() {
     assert_eq!(dump(&a.read()), dump(&b.read()));
     assert_eq!(*b.read().get(&1).unwrap(), "0");
 }
+
+#[test]
+fn a_pruned_branch_ahead_of_an_idle_remote_stays_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open(&dir, "a.ferro");
+    let b: Db<Root> = fast()
+        .history(Keep::Last(3))
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    for key in 0..5 {
+        put(&a, key, "a");
+    }
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    b.commit("drop 0", |root| {
+        root.remove(&0);
+    })
+    .unwrap();
+    for key in 10..15 {
+        put(&b, key, "b");
+    }
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::Ahead);
+    assert!(!b.read().contains_key(&0));
+    assert_eq!(dump(&b.read()).len(), 9);
+}
