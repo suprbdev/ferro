@@ -428,7 +428,7 @@ impl RecordReader<'_> {
         if upto <= self.bytes.len() {
             return Ok(());
         }
-        if self.start + upto as u64 > self.tail {
+        if (upto as u64).checked_add(self.start).is_none_or(|end| end > self.tail) {
             return Err(Error::Corrupt(format!(
                 "record at {} runs past end of log",
                 self.start
@@ -437,6 +437,12 @@ impl RecordReader<'_> {
         let have = self.bytes.len();
         let want = (upto - have).max(READ_AHEAD);
         let want = want.min((self.tail - self.start) as usize - have);
+        if want > SCAN_CHUNK && self.start + (have + want) as u64 > self.file.metadata()?.len() {
+            return Err(Error::Corrupt(format!(
+                "record at {} runs past end of file",
+                self.start
+            )));
+        }
         let bytes = self.bytes.to_mut();
         bytes.resize(have + want, 0);
         self.file
