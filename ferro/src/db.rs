@@ -1,13 +1,16 @@
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::mem;
-use std::ops::{Deref, RangeBounds};
+use std::ops::{Deref, DerefMut, RangeBounds};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -360,12 +363,19 @@ struct Pending<T> {
     seal: Option<Arc<Seal>>,
 }
 
+struct Task {
+    ticket: u64,
+    id: u64,
+    waker: Waker,
+}
+
 struct Queue<T> {
     waiting: Vec<Pending<T>>,
     open: Option<Arc<Seal>>,
     settled: u64,
     syncing: bool,
     failed: bool,
+    tasks: Vec<Task>,
 }
 
 #[derive(Clone, Copy)]
@@ -376,24 +386,56 @@ struct Sealed {
     framed: bool,
 }
 
+enum Waiter {
+    Thread(Thread),
+    Task(u64, Waker),
+}
+
+impl Waiter {
+    fn wake(self) {
+        match self {
+            Waiter::Thread(thread) => thread.unpark(),
+            Waiter::Task(_, waker) => waker.wake(),
+        }
+    }
+
+    fn is(&self, id: u64) -> bool {
+        matches!(self, Waiter::Task(task, _) if *task == id)
+    }
+}
+
 #[derive(Default)]
 struct Seal {
     outcome: OnceLock<std::result::Result<Sealed, String>>,
     settled: AtomicBool,
-    parked: Mutex<Vec<Thread>>,
+    parked: Mutex<Vec<Waiter>>,
 }
 
 impl Seal {
     fn wake_all(&self) {
-        for thread in mem::take(&mut *self.parked.lock()) {
-            thread.unpark();
+        let parked = mem::take(&mut *self.parked.lock());
+        for waiter in parked {
+            waiter.wake();
         }
     }
 
     fn wake_one(&self) {
-        if let Some(thread) = self.parked.lock().pop() {
-            thread.unpark();
+        let waiter = self.parked.lock().pop();
+        if let Some(waiter) = waiter {
+            waiter.wake();
         }
+    }
+
+    fn listen(&self, id: u64, waker: &Waker) {
+        let mut parked = self.parked.lock();
+        match parked.iter_mut().find(|waiter| waiter.is(id)) {
+            Some(Waiter::Task(_, held)) => held.clone_from(waker),
+            _ => parked.push(Waiter::Task(id, waker.clone())),
+        }
+    }
+
+    fn forget(&self, id: u64) {
+        self.parked.lock().retain(|waiter| !waiter.is(id));
     }
 }
 
@@ -406,6 +448,11 @@ struct Group<T> {
     seal: Arc<Seal>,
     time: OnceCell<u64>,
     handed: Option<Instant>,
+}
+
+enum Grouped {
+    Settled(u64, u64),
+    Unframed(u64, u64, u64),
 }
 
 #[derive(Default)]
@@ -489,6 +536,7 @@ impl Signal {
 struct Keeper {
     signal: Arc<Signal>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    syncer: Mutex<Option<(Arc<Signal>, JoinHandle<()>)>>,
 }
 
 impl Drop for Keeper {
@@ -497,6 +545,13 @@ impl Drop for Keeper {
         self.signal.raise();
         if let Some(thread) = self.thread.lock().take() {
             let _ = thread.join();
+        }
+        if let Some((signal, thread)) = self.syncer.lock().take() {
+            signal.stop.store(true, Ordering::Release);
+            signal.raise();
+            if thread.thread().id() != thread::current().id() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -526,10 +581,46 @@ struct Shared<T> {
     log: Mutex<CycleLog>,
     retired: Mutex<Vec<Retired>>,
     signal: Arc<Signal>,
+    syncer: OnceLock<Arc<Signal>>,
+    gate: Mutex<VecDeque<(u64, Waker)>>,
+    gated: AtomicUsize,
+    ids: AtomicU64,
+    flush: fn(&Shared<T>),
+}
+
+struct Tip<'a, T> {
+    guard: Option<MutexGuard<'a, RefState>>,
+    shared: &'a Shared<T>,
+}
+
+impl<T> Deref for Tip<'_, T> {
+    type Target = RefState;
+
+    fn deref(&self) -> &RefState {
+        self.guard.as_ref().expect("ferro: the writer lock is held")
+    }
+}
+
+impl<T> DerefMut for Tip<'_, T> {
+    fn deref_mut(&mut self) -> &mut RefState {
+        self.guard.as_mut().expect("ferro: the writer lock is held")
+    }
+}
+
+impl<T> Drop for Tip<'_, T> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.shared.open_gate();
+    }
 }
 
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
+        if let Some(syncer) = self.syncer.get() {
+            (self.flush)(self);
+            syncer.stop.store(true, Ordering::Release);
+            syncer.raise();
+        }
         let store = self.store.load();
         let _ = store.settle_anchor();
         store.close();
@@ -539,6 +630,210 @@ impl<T> Drop for Shared<T> {
 impl<T> Shared<T> {
     fn store(&self) -> Store {
         (**self.store.load()).clone()
+    }
+
+    fn rouse(&self) {
+        if let Some(syncer) = self.syncer.get() {
+            syncer.raise();
+        }
+    }
+
+    fn forget(&self, id: u64) {
+        self.queue.lock().tasks.retain(|task| task.id != id);
+    }
+
+    fn hold<'a>(&'a self, guard: MutexGuard<'a, RefState>) -> Tip<'a, T> {
+        Tip {
+            guard: Some(guard),
+            shared: self,
+        }
+    }
+
+    fn open_gate(&self) {
+        fence(Ordering::SeqCst);
+        if self.gated.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let next = {
+            let mut gate = self.gate.lock();
+            let next = gate.pop_front();
+            self.gated.store(gate.len(), Ordering::Relaxed);
+            next
+        };
+        if let Some((_, waker)) = next {
+            waker.wake();
+        }
+    }
+
+    fn enter(&self, id: u64, waker: &Waker, again: bool) -> Option<Tip<'_, T>> {
+        if let Some(guard) = self.tip.try_lock() {
+            if again {
+                self.quit_gate(id);
+            }
+            return Some(self.hold(guard));
+        }
+        let mut gate = self.gate.lock();
+        match gate.iter_mut().find(|(other, _)| *other == id) {
+            Some((_, held)) => held.clone_from(waker),
+            None if again => gate.push_front((id, waker.clone())),
+            None => gate.push_back((id, waker.clone())),
+        }
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let guard = self.tip.try_lock()?;
+        gate.retain(|(other, _)| *other != id);
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        drop(gate);
+        Some(self.hold(guard))
+    }
+
+    fn quit_gate(&self, id: u64) -> bool {
+        let mut gate = self.gate.lock();
+        let before = gate.len();
+        gate.retain(|(other, _)| *other != id);
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        gate.len() != before
+    }
+
+    fn on_the_way(&self) -> bool {
+        self.arriving.load(Ordering::Acquire) > 0 || self.gated.load(Ordering::Acquire) > 0
+    }
+}
+
+struct Staged<R, E> {
+    result: std::result::Result<(R, u64, u64), E>,
+    ticket: u64,
+    before: u64,
+}
+
+impl<R, E> Staged<R, E> {
+    fn finish(self) -> std::result::Result<Committed<R>, E> {
+        let (value, version, time_ms) = self.result?;
+        Ok(Committed {
+            value,
+            version,
+            time_ms,
+            changed: version != self.before,
+        })
+    }
+}
+
+struct Joined<R, E> {
+    result: std::result::Result<R, E>,
+    seal: Arc<Seal>,
+    before: u64,
+}
+
+impl<R, E> Joined<R, E> {
+    fn finish(self, version: u64, time_ms: u64) -> std::result::Result<Committed<R>, E> {
+        Ok(Committed {
+            value: self.result?,
+            version,
+            time_ms,
+            changed: version != self.before,
+        })
+    }
+
+    fn unframed(self, ticket: u64, version: u64, time_ms: u64) -> Staged<R, E> {
+        Staged {
+            result: self.result.map(|value| (value, version, time_ms)),
+            ticket,
+            before: self.before,
+        }
+    }
+}
+
+enum Wait<R, E> {
+    Ticket(Staged<R, E>),
+    Group(Joined<R, E>),
+}
+
+struct Writing<'a, T, F, R, E> {
+    db: &'a Db<T>,
+    id: u64,
+    start: Option<F>,
+    gated: bool,
+    wait: Option<Wait<R, E>>,
+}
+
+impl<T, F, R, E> Unpin for Writing<'_, T, F, R, E> {}
+
+impl<T: Data, F, R, E> Future for Writing<'_, T, F, R, E>
+where
+    F: FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
+    E: From<Error>,
+{
+    type Output = std::result::Result<Committed<R>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let db = this.db;
+        if let Some(f) = this.start.take() {
+            db.shared.start_syncer(&db.keeper);
+            let Some(tip) = db.shared.enter(this.id, cx.waker(), this.gated) else {
+                this.start = Some(f);
+                this.gated = true;
+                return Poll::Pending;
+            };
+            this.gated = false;
+            match db.begin(tip, f) {
+                Ok(wait) => this.wait = Some(wait),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        loop {
+            let wait = this.wait.take().expect("ferro: a write was polled after it finished");
+            match wait {
+                Wait::Ticket(staged) => {
+                    match db.shared.poll_settle(staged.ticket, this.id, cx.waker()) {
+                        Poll::Pending => {
+                            this.wait = Some(Wait::Ticket(staged));
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                        Poll::Ready(Ok(())) => return Poll::Ready(staged.finish()),
+                    }
+                }
+                Wait::Group(joined) => {
+                    match db.shared.poll_group(&joined.seal, this.id, cx.waker()) {
+                        Poll::Pending => {
+                            this.wait = Some(Wait::Group(joined));
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                        Poll::Ready(Ok(Grouped::Settled(version, time_ms))) => {
+                            return Poll::Ready(joined.finish(version, time_ms));
+                        }
+                        Poll::Ready(Ok(Grouped::Unframed(ticket, version, time_ms))) => {
+                            joined.seal.forget(this.id);
+                            this.wait = Some(Wait::Ticket(joined.unframed(ticket, version, time_ms)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T, F, R, E> Drop for Writing<'_, T, F, R, E> {
+    fn drop(&mut self) {
+        let shared = &self.db.shared;
+        if self.gated {
+            if !shared.quit_gate(self.id) {
+                shared.open_gate();
+            }
+            shared.rouse();
+        }
+        match &self.wait {
+            Some(Wait::Ticket(_)) => shared.forget(self.id),
+            Some(Wait::Group(joined)) => {
+                joined.seal.forget(self.id);
+                if !joined.seal.settled.load(Ordering::Acquire) {
+                    shared.rouse();
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -709,6 +1004,7 @@ impl Options {
                 settled,
                 syncing: false,
                 failed: false,
+                tasks: Vec::new(),
             }),
             done: Condvar::new(),
             genesis,
@@ -723,6 +1019,11 @@ impl Options {
             log: Mutex::new(CycleLog::default()),
             retired: Mutex::new(Vec::new()),
             signal: signal.clone(),
+            syncer: OnceLock::new(),
+            gate: Mutex::new(VecDeque::new()),
+            gated: AtomicUsize::new(0),
+            ids: AtomicU64::new(0),
+            flush: Shared::<T>::flush,
         });
         let branch = {
             let state = shared.published.lock();
@@ -732,6 +1033,7 @@ impl Options {
         let keeper = Arc::new(Keeper {
             signal,
             thread: Mutex::new(thread),
+            syncer: Mutex::new(None),
         });
         Ok(Db {
             shared,
@@ -807,9 +1109,9 @@ impl<T: Data> Shared<T> {
         Ok(branch)
     }
 
-    fn lock_tip(&self) -> MutexGuard<'_, RefState> {
+    fn lock_tip(&self) -> Tip<'_, T> {
         if !self.coalesce {
-            return self.tip.lock();
+            return self.hold(self.tip.lock());
         }
         let mut tip = self.arrive();
         let open = self.open.lock().take();
@@ -823,14 +1125,15 @@ impl<T: Data> Shared<T> {
         let seal = group.seal.clone();
         self.seal_group(tip, group);
         seal.wake_one();
+        self.rouse();
     }
 
-    fn arrive(&self) -> MutexGuard<'_, RefState> {
+    fn arrive(&self) -> Tip<'_, T> {
         self.arriving.fetch_add(1, Ordering::AcqRel);
         self.step("arriving");
         let tip = self.tip.lock();
         self.arriving.fetch_sub(1, Ordering::AcqRel);
-        tip
+        self.hold(tip)
     }
 
     fn join_group(&self, tip: &mut RefState, branch: &Arc<Branch<T>>) -> Group<T> {
@@ -863,7 +1166,7 @@ impl<T: Data> Shared<T> {
             return None;
         }
         let mut queue = self.queue.lock();
-        let arriving = self.arriving.load(Ordering::Acquire) > 0;
+        let arriving = self.on_the_way();
         let handed_on = queue.syncing || (arriving && self.costs.worth_waiting());
         if handed_on && group.members < MAX_GROUP {
             group.handed = arriving.then(Instant::now);
@@ -966,9 +1269,152 @@ impl<T: Data> Shared<T> {
                 }
                 _ => {}
             }
-            seal.parked.lock().push(thread::current());
+            seal.parked.lock().push(Waiter::Thread(thread::current()));
             drop(queue);
             thread::park();
+        }
+    }
+
+    fn poll_settle(&self, ticket: u64, id: u64, waker: &Waker) -> Poll<Result<()>> {
+        let mut queue = self.queue.lock();
+        if queue.settled >= ticket {
+            return Poll::Ready(Ok(()));
+        }
+        if queue.failed {
+            return Poll::Ready(Err(Error::Poisoned));
+        }
+        if !queue.syncing && queue.waiting.is_empty() {
+            queue.tasks.retain(|task| task.id != id);
+            return Poll::Ready(Ok(()));
+        }
+        match queue.tasks.iter_mut().find(|task| task.id == id) {
+            Some(task) => task.waker.clone_from(waker),
+            None => queue.tasks.push(Task {
+                ticket,
+                id,
+                waker: waker.clone(),
+            }),
+        }
+        let idle = !queue.syncing;
+        drop(queue);
+        if idle {
+            self.rouse();
+        }
+        Poll::Pending
+    }
+
+    fn poll_group(&self, seal: &Arc<Seal>, id: u64, waker: &Waker) -> Poll<Result<Grouped>> {
+        if seal.settled.load(Ordering::Acquire)
+            && let Some(Ok(sealed)) = seal.outcome.get()
+        {
+            return Poll::Ready(Ok(Grouped::Settled(sealed.version, sealed.time_ms)));
+        }
+        let queue = self.queue.lock();
+        if queue.failed {
+            return Poll::Ready(Err(Error::Poisoned));
+        }
+        match seal.outcome.get() {
+            Some(Err(failure)) => {
+                self.store().check_healthy()?;
+                return Poll::Ready(Err(Error::GroupFailed(failure.clone())));
+            }
+            Some(Ok(sealed)) if queue.settled >= sealed.ticket => {
+                return Poll::Ready(Ok(Grouped::Settled(sealed.version, sealed.time_ms)));
+            }
+            Some(Ok(sealed)) if !sealed.framed => {
+                let Sealed {
+                    version,
+                    time_ms,
+                    ticket,
+                    ..
+                } = *sealed;
+                return Poll::Ready(Ok(Grouped::Unframed(ticket, version, time_ms)));
+            }
+            _ => {}
+        }
+        seal.listen(id, waker);
+        let idle = !queue.syncing;
+        drop(queue);
+        if idle {
+            self.rouse();
+        }
+        Poll::Pending
+    }
+
+    fn start_syncer(self: &Arc<Self>, keeper: &Keeper) {
+        if self.syncer.get().is_some() {
+            return;
+        }
+        let mut slot = keeper.syncer.lock();
+        if self.syncer.get().is_some() {
+            return;
+        }
+        let signal = Arc::new(Signal::default());
+        let weak = Arc::downgrade(self);
+        let wake = signal.clone();
+        let thread = thread::Builder::new()
+            .name("ferro-sync".to_string())
+            .spawn(move || {
+                while wake.wait() {
+                    let Some(shared) = weak.upgrade() else {
+                        return;
+                    };
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| shared.drain()));
+                }
+            })
+            .expect("ferro: start the sync thread");
+        let _ = self.syncer.set(signal.clone());
+        *slot = Some((signal, thread));
+    }
+
+    fn drain(&self) {
+        let mut notices = Vec::new();
+        loop {
+            let mut queue = self.queue.lock();
+            if queue.failed {
+                return;
+            }
+            if queue.syncing {
+                self.done.wait(&mut queue);
+                continue;
+            }
+            if !queue.waiting.is_empty() {
+                let _ = self.lead(queue, &mut notices);
+                notices.clear();
+                continue;
+            }
+            let stranded = queue.open.is_some() && !self.on_the_way();
+            drop(queue);
+            if !stranded || !self.close_stranded() {
+                return;
+            }
+        }
+    }
+
+    fn close_stranded(&self) -> bool {
+        let mut tip = self.arrive();
+        if self.queue.lock().syncing {
+            return false;
+        }
+        let open = self.open.lock().take();
+        let Some(group) = open else {
+            return false;
+        };
+        self.seal_group(&mut tip, group);
+        true
+    }
+
+    fn flush(&self) {
+        let mut notices = Vec::new();
+        let mut tip = self.tip.lock();
+        let open = self.open.lock().take();
+        if let Some(group) = open {
+            self.seal_group(&mut tip, group);
+        }
+        drop(tip);
+        let queue = self.queue.lock();
+        if !queue.syncing && !queue.failed && !queue.waiting.is_empty() {
+            let _ = self.lead(queue, &mut notices);
         }
     }
 
@@ -1065,14 +1511,26 @@ impl<T: Data> Shared<T> {
             seals.extend(queue.open.clone());
         }
         let settled = !queue.failed;
+        let upto = queue.settled;
+        let ready: Vec<Task> = queue
+            .tasks
+            .extract_if(.., |task| !settled || task.ticket <= upto)
+            .collect();
+        let rouse = !queue.waiting.is_empty() || queue.open.is_some();
         drop(queue);
         self.done.notify_all();
         for seal in seals {
             seal.settled.store(settled, Ordering::Release);
             seal.wake_all();
         }
+        for task in ready {
+            task.waker.wake();
+        }
         if let Some(seal) = next {
             seal.wake_one();
+        }
+        if rouse {
+            self.rouse();
         }
         if outcome.is_ok() {
             store.checkpoint(frame);
@@ -1503,16 +1961,88 @@ impl<T: Data> Db<T> {
         })
     }
 
+    pub async fn update_async<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        self.commit_async("", f).await
+    }
+
+    pub async fn commit_async<R>(
+        &self,
+        message: impl Into<String>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R> {
+        let message = message.into();
+        let done = self.writing::<R, Error, _>(|root, _| Ok((message, f(root)))).await?;
+        Ok(done.value)
+    }
+
+    pub async fn commit_with_async<R, S: Into<String>>(
+        &self,
+        f: impl FnOnce(&mut T) -> (S, R),
+    ) -> Result<Committed<R>> {
+        self.writing::<R, Error, _>(|root, _| {
+            let (message, value) = f(root);
+            Ok((message.into(), value))
+        })
+        .await
+    }
+
+    pub async fn try_update_async<R, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+    ) -> std::result::Result<R, E> {
+        self.try_commit_async("", f).await
+    }
+
+    pub async fn try_commit_async<R, E: From<Error>>(
+        &self,
+        message: impl Into<String>,
+        f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+    ) -> std::result::Result<R, E> {
+        let message = message.into();
+        let done = self.writing(|root, _| f(root).map(|value| (message, value))).await?;
+        Ok(done.value)
+    }
+
+    pub async fn try_commit_with_async<R, S: Into<String>, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        self.writing(|root, _| {
+            let (message, value) = f(root)?;
+            Ok((message.into(), value))
+        })
+        .await
+    }
+
     fn transact<R, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        if self.shared.coalesce {
-            return self.combine(f);
+        let tip = match self.shared.coalesce {
+            true => self.shared.arrive(),
+            false => self.shared.lock_tip(),
+        };
+        match self.begin(tip, f)? {
+            Wait::Ticket(staged) => self.settle(staged),
+            Wait::Group(joined) => {
+                let (version, time_ms) = self.shared.await_group(&joined.seal)?;
+                joined.finish(version, time_ms)
+            }
         }
-        self.alone(|_, _, root, stamp| {
+    }
+
+    fn begin<R, E: From<Error>>(
+        &self,
+        tip: Tip<'_, T>,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
+    ) -> std::result::Result<Wait<R, E>, E> {
+        if self.shared.coalesce {
+            return self.stage_group(tip, f).map(Wait::Group);
+        }
+        let staged = self.stage_alone(tip, |_, _, root, stamp| {
             f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
-        })
+        });
+        staged.map(Wait::Ticket)
     }
 
     fn alone<R, E: From<Error>>(
@@ -1524,8 +2054,29 @@ impl<T: Data> Db<T> {
             &Stamp<'_>,
         ) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
+        let staged = self.stage_alone(self.shared.lock_tip(), f)?;
+        self.settle(staged)
+    }
+
+    fn settle<R, E: From<Error>>(
+        &self,
+        staged: Staged<R, E>,
+    ) -> std::result::Result<Committed<R>, E> {
         let mut notices = Vec::new();
-        let mut tip = self.shared.lock_tip();
+        self.shared.settle(staged.ticket, &mut notices)?;
+        staged.finish()
+    }
+
+    fn stage_alone<R, E: From<Error>>(
+        &self,
+        mut tip: Tip<'_, T>,
+        f: impl FnOnce(
+            &RefState,
+            &State<T>,
+            &mut T,
+            &Stamp<'_>,
+        ) -> std::result::Result<(String, R, Intent), E>,
+    ) -> std::result::Result<Staged<R, E>, E> {
         self.branch.check_live()?;
         let state = self.branch.tip.load_full();
         let mut working = (*state.snapshot.value).clone();
@@ -1554,22 +2105,19 @@ impl<T: Data> Db<T> {
         });
         let ticket = self.shared.store().last_seq();
         drop(tip);
-        self.shared.settle(ticket, &mut notices)?;
-        let (value, version, time_ms) = result?;
-        Ok(Committed {
-            value,
-            version,
-            time_ms,
-            changed: version != before,
+        Ok(Staged {
+            result,
+            ticket,
+            before,
         })
     }
 
-    fn combine<R, E: From<Error>>(
+    fn stage_group<R, E: From<Error>>(
         &self,
+        mut tip: Tip<'_, T>,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
-    ) -> std::result::Result<Committed<R>, E> {
+    ) -> std::result::Result<Joined<R, E>, E> {
         let shared = &self.shared;
-        let mut tip = shared.arrive();
         if let Err(error) = self.branch.check_live() {
             let open = shared.open.lock().take();
             if let Some(group) = open.and_then(|group| shared.pass_on(group)) {
@@ -1620,13 +2168,24 @@ impl<T: Data> Db<T> {
             shared.seal_group(&mut tip, group);
         }
         drop(tip);
-        let (version, time_ms) = shared.await_group(&seal)?;
-        Ok(Committed {
-            value: result?,
-            version,
-            time_ms,
-            changed: version != before,
+        Ok(Joined {
+            result,
+            seal,
+            before,
         })
+    }
+
+    fn writing<R, E: From<Error>, F>(&self, f: F) -> Writing<'_, T, F, R, E>
+    where
+        F: FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
+    {
+        Writing {
+            db: self,
+            id: self.shared.ids.fetch_add(1, Ordering::Relaxed),
+            start: Some(f),
+            gated: false,
+            wait: None,
+        }
     }
 
     pub(crate) fn genesis(&self) -> Snapshot<T> {
@@ -2034,7 +2593,7 @@ impl<T: Data> Db<T> {
             return Ok(false);
         }
         let mut notices = Vec::new();
-        let mut tip = self.shared.tip.lock();
+        let mut tip = self.shared.lock_tip();
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
             Err(Error::Replaced) => {
