@@ -135,7 +135,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     let mut roots: Vec<Ptr> = Vec::new();
     let mut commits = HashSet::new();
     let mut closures = Closures::default();
-    for (_, branch) in refs.iter() {
+    for (_, branch) in refs.try_entries()? {
         let chain = branch.log;
         let after = chain.after(store)?;
         chain.visit(store, |ptr, entry, _, _| {

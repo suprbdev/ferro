@@ -1202,12 +1202,10 @@ impl<T: Data> Shared<T> {
         let mut tip = self.lock_tip();
         let mut next = tip.refs.clone();
         let mut dropped = 0;
-        let heads: Vec<_> = tip.refs.iter().collect();
-        for (name, head) in heads {
+        for (name, mut head) in tip.refs.try_entries()? {
             let log = head.log.pruned(&store, keep)?;
             if log != head.log {
                 dropped += (head.log.len() - log.len()) as u64;
-                let mut head = (*head).clone();
                 head.log = log;
                 next.insert(name, head);
             }
@@ -1330,7 +1328,7 @@ impl<T: Data> Shared<T> {
         let refs = (*fresh.load::<Refs>(head)?).clone();
         let mut published = self.published.lock();
         let branches = self.branches.lock();
-        for (_, found) in refs.iter() {
+        for (_, found) in refs.try_entries()? {
             for ptr in found.root.iter().chain(&found.log.tip) {
                 fresh.read_object(*ptr)?;
             }
@@ -1984,10 +1982,8 @@ impl<T: Data> Db<T> {
         let txn = store.begin()?;
         let mut next = tip.refs.clone();
         next.remove(name);
-        let branches: Vec<_> = next.iter().collect();
-        for (branch, head) in branches {
+        for (branch, mut head) in next.try_entries()? {
             if head.merged.try_get(name)?.is_some() {
-                let mut head = (*head).clone();
                 head.merged.remove(name);
                 next.insert(branch, head);
             }

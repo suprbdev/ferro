@@ -282,7 +282,7 @@ impl<'a> Copier<'a> {
         let mut retained = HashSet::new();
         let mut edge = Vec::new();
         let mut closures = Closures::default();
-        for (_, branch) in refs.iter() {
+        for (_, branch) in refs.try_entries()? {
             let after = branch.log.after(&sink.source)?;
             branch.log.visit(&sink.source, |ptr, entry, _, _| {
                 if sink.copied.contains_key(&ptr.hash) {

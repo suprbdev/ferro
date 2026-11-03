@@ -1711,10 +1711,8 @@ fn land<T: Data, R: Read>(
         },
     };
     if !continues {
-        let heads: Vec<_> = next.iter().collect();
-        for (name, head) in heads {
+        for (name, mut head) in next.try_entries()? {
             if head.merged.try_get(remote)?.is_some() {
-                let mut head = (*head).clone();
                 head.merged.remove(remote);
                 next.insert(name, head);
             }

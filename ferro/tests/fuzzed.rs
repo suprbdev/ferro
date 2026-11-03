@@ -1,13 +1,16 @@
 use std::fmt::Debug;
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ferro::admin::{self, Keep};
 use ferro::codec::{Decoder, Encoder, Ptr};
+use ferro::db::Hook;
 use ferro::store::{Store, StoreOptions, Txn};
-use ferro::{Data, Db, Durability, Error, Map, Options, Record, Table};
+use ferro::{Data, Db, Durability, Error, Map, Options, Reclaim, Record, Table};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
@@ -579,11 +582,8 @@ fn rebuilding_an_index_over_a_damaged_row_fails_the_open() {
     assert!(matches!(opened, Ok(Err(Error::Corrupt(_)))), "{opened:?}");
 }
 
-#[test]
-fn sync_reports_a_damaged_branch_table() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("refs.ferro");
-    let (store, _) = Store::open(&path, buffered()).unwrap();
+fn damaged_branch_table(path: &Path, aside: Option<&str>) {
+    let (store, _) = Store::open(path, buffered()).unwrap();
     let mut txn = store.begin().unwrap();
     let tip = Entry {
         version: 1,
@@ -591,29 +591,57 @@ fn sync_reports_a_damaged_branch_table() {
         ..Entry::default()
     }
     .write(&mut txn);
+    let head = Head {
+        version: 1,
+        first: 1,
+        tip,
+    };
+    let leaf = aside.map(|name| {
+        let mut w = Encoder::new(&mut txn);
+        w.u8(0);
+        w.varint(1);
+        name.to_string().encode(&mut w).unwrap();
+        w.u8(0);
+        head.encode(&mut w).unwrap();
+        w.varint(0);
+        w.varint(0);
+        w.finish().unwrap()
+    });
     let mut w = Encoder::new(&mut txn);
     w.u8(1);
     w.varint(1);
     "main".to_string().encode(&mut w).unwrap();
     w.u8(0);
-    Head {
-        version: 1,
-        first: 1,
-        tip,
+    head.encode(&mut w).unwrap();
+    match leaf {
+        Some(leaf) => {
+            w.varint(1);
+            w.link(leaf);
+        }
+        None => w.varint(0),
     }
-    .encode(&mut w)
-    .unwrap();
     w.varint(1);
     w.link(Ptr {
         hash: [7; 20],
         offset: tip.offset,
     });
-    w.varint(0);
     let top = w.finish().unwrap();
-    let head = map_root(&mut txn, 2, top);
+    let count = if aside.is_some() { 3 } else { 2 };
+    let head = map_root(&mut txn, count, top);
     txn.commit(head).unwrap();
     store.close();
     drop(store);
+}
+
+fn manual() -> Options {
+    Options::new().reclaim(Reclaim { every_bytes: 0 })
+}
+
+#[test]
+fn sync_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refs.ferro");
+    damaged_branch_table(&path, None);
     let honest = Db::<Root>::open(dir.path().join("honest.ferro")).unwrap();
     honest
         .commit("one", |root| {
@@ -624,6 +652,56 @@ fn sync_reports_a_damaged_branch_table() {
     let db = read_only().open::<Root>(&path).unwrap();
     corrupt(db.have().map(drop));
     corrupt(db.bundle(&have).map(drop));
+}
+
+#[test]
+fn pruning_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prune.ferro");
+    damaged_branch_table(&path, None);
+    let db = manual().open::<Root>(&path).unwrap();
+    corrupt(db.compact(Keep::Last(1)));
+}
+
+#[test]
+fn copying_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.ferro");
+    damaged_branch_table(&path, None);
+    let db = manual().open::<Root>(&path).unwrap();
+    corrupt(db.compact(Keep::All));
+}
+
+#[test]
+fn dropping_a_branch_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drop.ferro");
+    damaged_branch_table(&path, Some("aside"));
+    let db = manual().open::<Root>(&path).unwrap();
+    db.branch("aside").unwrap();
+    corrupt(db.drop_branch("aside"));
+}
+
+#[test]
+fn swapping_in_a_compacted_file_reports_a_damaged_branch_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swap.ferro");
+    let temp = dir.path().join("swap.ferro.compacting");
+    let hook = move |step: &'static str| {
+        if step == "synced" {
+            let file = fs::OpenOptions::new().read(true).write(true).open(&temp).unwrap();
+            let mut bytes = Vec::new();
+            (&file).read_to_end(&mut bytes).unwrap();
+            let at = bytes.windows(4).position(|window| window == b"main").unwrap();
+            file.write_all_at(&[bytes[at] ^ 1], at as u64).unwrap();
+        }
+    };
+    let db = manual().hook(Hook(Arc::new(hook))).open::<Root>(&path).unwrap();
+    db.commit("one", |root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    corrupt(db.compact(Keep::All));
 }
 
 #[test]
