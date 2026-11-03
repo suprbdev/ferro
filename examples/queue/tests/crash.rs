@@ -51,6 +51,7 @@ fn kill_nine_producer_and_worker_lose_nothing() {
     let produced = dir.path().join("produced.log");
     let done = dir.path().join("done.log");
     let exec = format!("echo $QUEUE_JOB_ID >> {}; sleep 0.003", done.display());
+    let mut unacked = BTreeSet::new();
 
     for round in 0..3 {
         let before = ids(&produced).len();
@@ -74,11 +75,15 @@ fn kill_nine_producer_and_worker_lose_nothing() {
                     "round {round}: acknowledged enqueue {id} is missing"
                 );
             }
-            let extra = state.next_id as usize - acked.len();
+            let fresh: Vec<u64> = (0..state.next_id)
+                .filter(|id| !acked.contains(id) && !unacked.contains(id))
+                .collect();
+            let in_flight: Vec<u64> = (state.next_id.saturating_sub(BATCH as u64)..state.next_id).collect();
             assert!(
-                extra == 0 || extra == BATCH,
-                "round {round}: the unacknowledged batch is partly present ({extra} extra ids)"
+                fresh.is_empty() || fresh == in_flight,
+                "round {round}: unacknowledged ids {fresh:?} are not the one batch in flight {in_flight:?}"
             );
+            unacked.extend(fresh);
         }
 
         let worker = spawn(
