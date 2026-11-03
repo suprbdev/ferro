@@ -739,6 +739,15 @@ long as ferro and redb 1.9 times, and redb's `get` is about 15% faster. These nu
 warm cache, on a workload with few overwrites. Full results, including caveats about sled, are in
 `benchmarks/compare/RESULTS.md`.
 
+When many threads read through a cache smaller than the data, the allocator decides. Each read then
+decodes nodes and evicts others that other threads allocated, and glibc keeps only seven freed
+blocks of each size per thread, returning the rest to the arena that allocated them, most under its
+lock. With a 16 MiB cache over 1M keys, 32 threads did 3.0M gets a second with the default glibc,
+4.7M with `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024` in the environment, 4.6M with jemalloc and
+4.1M with mimalloc, and index lookups went from 108,000 a second to between 181,000 and 195,000. One
+thread gains 9 to 13%. ferro does not choose an allocator, so an application with that workload
+should set one, or the tunable, itself.
+
 ## Development
 
 The Makefile wraps the common commands, and `make help` lists every target. `make ci` runs clippy
