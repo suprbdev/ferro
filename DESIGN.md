@@ -2075,6 +2075,16 @@ by the offset it was read from, so every branch keeps the links it was written w
 as in the old. `verify` names a branch whose entries do not reach its `first`: `commit log keeps
 versions from 2 but v3 links pruned history`.
 
+The branch table links entries too, through each head's tip, so two tables with one hash can name
+different copies. A remote that was dropped and then landed again from the same head gets a table
+equal to the one it had before, except that its head is the new copy. `Txn::put` found the old table
+in `dedupe` and the frame named it, while the handle kept the table it had encoded: `verify` walked
+the branch from the new copy and the file's table from the old one, and failed on an offset 0 that
+only the old copy carries, and a reopen read the old copy. The branch table is now written without
+looking in `dedupe`. Only the nodes a change touches are written, and they hash like earlier ones
+only when the branches return to a state they had before, so this writes nothing more in ordinary
+use.
+
 The other way was to land onto the receiver's existing record and start the landed branch where that
 record's parent link stops. That throws away history the bundle brought, here v2, and it needs to
 find the existing record, which for a commit held only in a merge's history takes an index from hash

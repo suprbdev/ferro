@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{Rng, cases, fast, text};
 use ferro::codec::{Encoder, HashSink, Object};
+use ferro::db::Clock;
 use ferro::store::{Op, Trace};
 use ferro::{
     Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Snapshot,
@@ -2196,4 +2197,50 @@ fn pruned_devices_syncing_in_any_order_apply_every_change_once_or_refuse() {
     assert!(tally["fast-forward"] > 100, "{tally:?}");
     assert!(tally["refused"] > 100, "{tally:?}");
     assert!(tally["synced"] > 100, "{tally:?}");
+}
+
+#[test]
+fn a_remote_landed_again_after_a_drop_keeps_the_links_it_landed_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = Arc::new(AtomicU64::new(1_000_000));
+    let open = |name: &str, keep: Keep| -> Db<Events> {
+        let now = now.clone();
+        fast()
+            .history(keep)
+            .reclaim(Reclaim { every_bytes: 0 })
+            .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))))
+            .open(dir.path().join(name))
+            .unwrap()
+    };
+    let (a, b, c) = (
+        open("a.ferro", Keep::Last(2)),
+        open("b.ferro", Keep::All),
+        open("c.ferro", Keep::All),
+    );
+    let pull = |to: &Db<Events>, from: &Db<Events>, remote: &str| {
+        match to.pull(from, remote, add_deltas) {
+            Ok(pulled) => Some(pulled.outcome),
+            Err(Error::NoCommonAncestor) => None,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    event(&b, 1);
+    assert_eq!(pull(&a, &b, "b"), Some(Outcome::FastForward));
+    event(&a, 2);
+    event(&a, 3);
+    event(&c, 4);
+    assert_eq!(pull(&c, &b, "b"), Some(Outcome::Merged));
+    assert_eq!(pull(&b, &c, "c"), Some(Outcome::Merged));
+    assert_eq!(pull(&a, &b, "b"), Some(Outcome::Merged));
+    event(&a, 5);
+    assert_eq!(pull(&c, &a, "a"), None);
+    c.drop_branch("a").unwrap();
+    assert_eq!(pull(&a, &c, "c"), Some(Outcome::Ahead));
+    assert_eq!(pull(&c, &a, "a"), None);
+    c.verify_typed().unwrap();
+    let landed = c.branch("a").unwrap().head_hash();
+    drop(c);
+    let c = open("c.ferro", Keep::All);
+    c.verify_typed().unwrap();
+    assert_eq!(c.branch("a").unwrap().head_hash(), landed);
 }

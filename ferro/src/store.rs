@@ -1063,6 +1063,7 @@ impl Store {
             buf: vec![0u8; FRAME_BYTES],
             seen: HashMap::default(),
             remembered: Vec::new(),
+            unshared: false,
         })
     }
 
@@ -1157,6 +1158,7 @@ pub struct Txn {
     buf: Vec<u8>,
     seen: HashMap<Hash, u64, BuildHasherDefault<Prehashed>>,
     remembered: Vec<(Hash, CacheEntry)>,
+    unshared: bool,
 }
 
 impl Drop for Txn {
@@ -1235,12 +1237,15 @@ impl Txn {
         if u32::try_from(raw).is_err() {
             return Err(Error::TooLarge(raw as u64));
         }
-        let offset = self
-            .seen
-            .get(&hash)
-            .copied()
-            .or_else(|| self.store.inner.dedupe.get(&hash));
+        let offset = self.seen.get(&hash).copied().or_else(|| match self.unshared {
+            true => None,
+            false => self.store.inner.dedupe.get(&hash),
+        });
         Ok(offset.map(|offset| Ptr { hash, offset }))
+    }
+
+    pub(crate) fn unshared(&mut self) {
+        self.unshared = true;
     }
 
     fn record(&mut self, hash: Hash, staged: Staged<'_>) -> Ptr {

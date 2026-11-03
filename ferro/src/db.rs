@@ -1465,6 +1465,7 @@ impl<T: Data> Shared<T> {
         branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
     ) -> Result<()> {
+        txn.unshared();
         let (ptr, refs) = write_decoded(&refs, &mut txn, &self.store())?;
         let frame = txn.write(ptr)?;
         let update = branch.map(|(branch, state)| {
