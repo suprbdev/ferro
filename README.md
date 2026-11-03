@@ -314,9 +314,11 @@ println!("{:?}, {} bytes in", pulled.outcome, pulled.received_bytes);
 
 `pull` copies the other file's branch into this one as the branch `phone`, then brings this branch up
 to it. The outcome is `UpToDate`, `Ahead` when this branch already has all of it, `FastForward` when
-this branch has nothing it lacks, or `Merged`. Only a merge calls your closure, which works as in
-`merge_with`, against the newest state both branches have passed through. `push` is `pull` from the
-other side.
+this branch has nothing it lacks, or `Merged`. Only a merge calls your closure. It works as in
+`merge_with`: the merge commit links the remote commit it merged, and the base is a best common
+ancestor over the merge graph of every file the commits passed through, so a change that reaches
+you through a third device is merged once, and a revert routed through one is not lost. `push` is
+`pull` from the other side.
 
 Over a network the same pull is three calls, and only bytes cross: the phone sends its `have`, the
 laptop answers with a `bundle`, and the phone applies it with `receive`.
@@ -339,7 +341,10 @@ branch, so afterwards `head_hash` is the same in both files. A merge commits at 
 version, and the other side's commits stay on the `phone` branch under their own numbers, so after
 a divergence compare commits across files by hash, not by version. A pull that brings new commits
 replaces the `phone` branch, so do not commit to it. A bundle that arrives late or twice changes
-nothing.
+nothing. With bounded history, keep at least what each device commits between syncs: a pull whose
+base only pruned history could show, such as one from a device that has pruned past the commit you
+last shared, lands the other branch and returns `NoCommonAncestor` instead of merging against
+nothing, which would bring back what the other device deleted.
 
 Devices converge only if your closure gives the same result whichever side is `ours`, as
 last-writer-wins on a clock does. `examples/notes` is an offline-first notes app built this way:

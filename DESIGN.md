@@ -1099,6 +1099,14 @@ that adds or removes a level moves the unchanged subtrees one level up or down. 
 before the new side looks, so a subtree that sits one level deeper in the old tree is still found,
 and only one moved further is sent again.
 
+A sent merge commit links the commit it merged, and the receiver needs that commit to find later
+merge bases. If the receiver named it in its have, its mark goes into the bundle's list of commits
+the receiver holds, and the link resolves to it there. Otherwise the merged commit is sent, with its
+chain down to the newest entry a recognised commit's chain shares with it, and the same for the
+merges inside it, so far as the sender keeps them under the retention rule for merges. A merged
+commit the sender has let go is not sent, and the receiver writes the link with offset 0, which the
+merge-base search treats as pruned history.
+
 A sent object that links a known one names it with a hint: the anchor or earlier hint it hangs from,
 and the index of the link there. The receiver follows the path in its own file and checks that it
 ends at the same hash, which costs one read of each parent on a changed path. A link to a sent object
@@ -1123,6 +1131,17 @@ as in the file.
   `prev` or `skip` that lands on a sent commit must name the one at that version, so a lookup through
   skip links cannot reach a commit the `prev` chain does not hold. Anything else rejects the bundle,
   and so does an object nothing links to.
+- A sent commit's merge link resolves to a commit in the bundle, which must decode as a commit, to a
+  commit the bundle says the receiver holds, or to offset 0. Each merged chain in the bundle is
+  checked like the landed branch: versions descend one at a time, and every `prev` and `skip`
+  names the commit at that version, in the bundle or in the receiver's chain it joins. A commit
+  must use exactly the links it declares.
+- Every sent commit's generation, reach, last merge and bounded bit are recomputed from its parents
+  and must match, its time must not be before either parent's, and its merge floor must not be past
+  the merged commit's version. Where a parent lies in pruned history, only what can be checked is:
+  the generation must exceed the known parent's, and so on. The numbers are a function of the
+  graph alone, so a commit hashes the same in every file, and a forged generation or merge link is
+  rejected rather than landed.
 - The root of every new commit decodes as `T`.
 
 All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
@@ -1147,13 +1166,18 @@ A second step compares the pulling branch with `remote`:
   in a frame with no commit. The chains share our entries, so versions carry on from ours, and
   `head_hash` is now the same in both files.
 - Their tip is our entry at their version: `Ahead`.
-- Otherwise the branches diverged, and `merge` runs as in `merge_with`, against the base below, as a
-  commit on our branch.
+- Otherwise the merge-base search of `merge_with` runs under the writer lock against our tip and
+  the landed `remote`. If their tip is the base, we already hold it through a merge: `Ahead`.
+  Otherwise `merge` runs against that base as a commit on our branch that links their tip as its
+  second parent.
 
-Each outcome records `(their version, our version)` under `remote` in our head's `merged` map, the
-record `merge_with` keeps, and a merge records it through the same intent. A crash between the
-landing and this step leaves `remote` landed and our branch as it was. The next pull's have names
-the landed tip, so its bundle is empty and the step runs again.
+Each outcome that shows their tip is an ancestor of ours records `(their version, our version)`
+under `remote` in our head's `merged` map. The merge link says the same thing, but a record survives
+our side of it being pruned, and the search treats it as a known ancestor of our tip, so a branch
+pruned past its last sync with an idle remote still finds itself `Ahead`. Equal roots without that
+ancestry record nothing, since a record there would make the remote's history look like ours. A crash between the landing and this step leaves `remote` landed and
+our branch as it was. The next pull's have names the landed tip, so its bundle is empty and the step
+runs again.
 
 ### Commit identity
 
@@ -1173,19 +1197,25 @@ reading until our clock passes it.
 
 ### The merge base
 
-An entry has one parent, so a merge on one device is an ancestor of nothing on the other. After A
-merges B and B merges A, the two chains never share an entry past the fork again, and the shared
-prefix that `common_ancestor` finds would bring changes merged long ago back as conflicts. So the base
-is the newest state both branches passed through, found by content. Our roots since our recorded
-version go into a set, and the remote chain is walked from its tip down to its recorded version for
-the first root in it. When the remote has since adopted our commits by fast-forward, the newest
-entry both chains hold is newer than the record, and it bounds both walks instead. Otherwise a
-remote that sets a value back to what we had before the record matches our old root, so its revert
-looks like no change and is lost. When A's merge and B's merge produced the same root, that merged
-state is the next round's base. With no match the base is the remote commit last recorded, which our
-branch already includes even after pruning dropped our side of the record, then the shared prefix,
-then genesis. The two walks cost the commits made on each side since the previous pull. If the base has the same root as their tip, they have nothing we lack,
-and the pull reports `Ahead` and records it.
+A sync merge links the remote commit it merged, and pulled commits carry their merge links, so after
+A merges B and B merges A each side's merge is an ancestor of the other's next commit, in every file
+that holds them. The base is therefore the one `merge_with` finds, a best common ancestor over the
+whole merge graph, with the records under our head as known ancestors of our tip. It replaces a
+search by content: our roots since the last record went into a set, and the remote chain was walked
+for the first root in it, then the record, then the shared prefix, then genesis. Matching by content
+lost a revert routed through a third device. If A took B's change by a merge, and C took it by
+fast-forward and set the value back, C's commit had the same root as one of A's older commits, so
+it looked like a state A already held, and the revert was dropped on A's first pull from C. The
+graph base is B's commit, which both have, and the revert applies. A change that reaches us through
+a third device is a common ancestor once it is, so it is merged once, and a remote that has
+nothing we lack is found to be an ancestor of our tip and reported `Ahead`.
+
+When the base could lie in pruned history, the search returns `NoCommonAncestor` and the pull
+leaves our branch alone, with `remote` landed. That happens when the remote has pruned past the
+commit we last shared with it: its bundle no longer connects to anything we hold, and merging
+against genesis, as before, made every key on our side look like our own addition and brought
+back what the remote had deleted since. A device with bounded history therefore needs to keep what
+it commits between syncs.
 
 A pull is not symmetric: the closure gets `ours` and `theirs`. Devices converge only if it gives the
 same result whichever side is ours, as last-writer-wins on a Lamport clock does. `examples/notes`
@@ -1219,7 +1249,10 @@ A notes edit rewrites a path of four or five nodes in the rows and, for a tag, i
 - A value that holds a `Ptr` into pruned history cannot be sent.
 - Each pull that brings a head `remote` does not hold replaces `remote`, including commits made on it
   here. If the remote branch's history no longer contains what was landed before, records under that
-  name are dropped.
+  name are dropped, and if nothing retained connects the two branches the pull refuses with
+  `NoCommonAncestor`.
+- A merged commit the receiver holds only inside another commit's merged history, not on a chain
+  its have names, is sent again.
 - The receiver decodes each new root as its own `T`, so peers need schemas that decode each other's
   roots. A root that has to rebuild a table index as it decodes, because the sender's schema lacks
   that index, can be rejected, since the rows it would read are not written yet.

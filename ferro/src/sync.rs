@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, hash_map};
 use crate::codec::{Data, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::db::{Db, Head, Refs, Snapshot};
 use crate::error::{Error, Result};
-use crate::log::{Chain, Entry};
+use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
 use crate::store::{Store, Txn};
 
@@ -654,17 +654,14 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Plan> {
         out.roots.push(base_slot(slot, &mut out.bases));
         old_roots.push(root);
     }
+    let extra = closures(store, &chain, &entries, &known, &mut out.bases)?;
     let mut new_roots = Vec::new();
-    for (_, object, entry) in entries.iter().rev() {
-        for link in &object.links {
-            if Some(*link) != entry.prev && Some(*link) != entry.skip {
-                new_roots.push(*link);
-            }
-        }
+    for (_, _, entry) in entries.iter().rev().chain(&extra) {
+        new_roots.extend(entry.commit.root);
     }
     let Difference { known: old, send } = difference(store, &old_roots, new_roots)?;
     let mut pool = send;
-    for (ptr, object, _) in entries {
+    for (ptr, object, _) in entries.into_iter().chain(extra) {
         pool.insert(ptr.hash, object);
     }
     let order = post_order(&pool, tip.hash);
@@ -704,6 +701,75 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Plan> {
     Ok(out)
 }
 
+fn closures(
+    store: &Store,
+    chain: &Chain,
+    entries: &[(Ptr, Object, Entry)],
+    known: &[Known],
+    bases: &mut Vec<Mark>,
+) -> Result<Vec<(Ptr, Object, Entry)>> {
+    let after = chain.after(store)?;
+    let mut sending: HashSet<Hash> = entries.iter().map(|(ptr, _, _)| ptr.hash).collect();
+    let mut seeds: Vec<(Merged, Option<u64>)> = entries
+        .iter()
+        .filter_map(|(_, _, entry)| entry.merged.map(|merged| (merged, after)))
+        .collect();
+    let mut extra = Vec::new();
+    while let Some((merged, path)) = seeds.pop() {
+        let (ptr, after) = (merged.ptr, merged.after(path));
+        let marked = |hash: &Hash| bases.iter().any(|mark| mark.hash == *hash);
+        if ptr.offset == 0 || sending.contains(&ptr.hash) || marked(&ptr.hash) {
+            continue;
+        }
+        let node = Node::load(store, ptr)?;
+        let version = node.version();
+        if known.iter().any(|held| held.mark.hash == ptr.hash) {
+            bases.push(Mark {
+                hash: ptr.hash,
+                version,
+            });
+            continue;
+        }
+        let bare = after.is_some_and(|after| node.time() < after);
+        let low = match after {
+            _ if bare => version,
+            Some(after) => {
+                node.lowest_kept(store, merged.floor, |entry| entry.commit.time_ms >= after)?
+            }
+            None => node.lowest_kept(store, merged.floor, |_| true)?,
+        };
+        let reach = Chain {
+            tip: Some(ptr),
+            first: low,
+            last: version,
+        };
+        let mut held = None;
+        for base in known {
+            held = held.max(shared_prefix(store, &reach, &base.chain)?);
+        }
+        let stop = held.map_or(low, |held| low.max(held + 1)).min(version);
+        let mut next = Some(ptr);
+        while let Some(at) = next.take() {
+            if at.offset == 0 || sending.contains(&at.hash) {
+                break;
+            }
+            let object = store.read_object(at)?;
+            let entry = read_entry(&object)?;
+            let version = entry.commit.version;
+            if version < stop {
+                break;
+            }
+            sending.insert(at.hash);
+            if let Some(nested) = entry.merged.filter(|_| !bare) {
+                seeds.push((nested, after));
+            }
+            next = entry.prev.filter(|_| version > stop);
+            extra.push((at, object, entry));
+        }
+    }
+    Ok(extra)
+}
+
 fn hint_for(
     hash: Hash,
     old: &HashMap<Hash, Origin>,
@@ -735,15 +801,206 @@ fn hint_for(
     ids[&hash]
 }
 
-fn chain_version(entry: &Entry, hash: Hash) -> Option<u64> {
-    let version = entry.commit.version;
-    if entry.prev.is_some_and(|prev| prev.hash == hash) {
-        Some(version - 1)
-    } else if entry.skip.is_some_and(|skip| skip.hash == hash) {
-        Some(skip_version(version))
-    } else {
-        None
+#[derive(Clone, Copy)]
+struct Facts {
+    version: u64,
+    time: u64,
+    generation: u64,
+    reach: u64,
+    last_merge: u64,
+    bounded: bool,
+}
+
+impl Facts {
+    fn of(entry: &Entry) -> Facts {
+        Facts {
+            version: entry.commit.version,
+            time: entry.commit.time_ms,
+            generation: entry.generation(),
+            reach: entry.graph.reach,
+            last_merge: entry.graph.last_merge,
+            bounded: entry.graph.bounded,
+        }
     }
+}
+
+fn check_graph(
+    entry: &Entry,
+    prev: Option<Option<Facts>>,
+    merged: Option<Option<Facts>>,
+) -> Result<()> {
+    let own = Facts::of(entry);
+    let known = prev.is_none_or(|facts| facts.is_some()) && merged.is_none_or(|f| f.is_some());
+    let (prev, linked) = (prev.flatten(), merged.flatten());
+    let generation = |facts: Option<Facts>| facts.map_or(0, |facts| facts.generation);
+    let parents = generation(prev).max(generation(linked));
+    let reach = prev.map_or(0, |facts| facts.reach).max(linked.map_or(0, |facts| facts.generation));
+    let link = entry.merged;
+    let bounded = prev.is_some_and(|facts| facts.bounded)
+        || link.is_some_and(|link| link.floor > 1 || link.after.is_some())
+        || linked.is_some_and(|facts| facts.bounded);
+    let last_merge = match (link, prev) {
+        (Some(_), _) => Some(own.version),
+        (None, Some(prev)) => Some(prev.last_merge),
+        (None, None) if known => Some(0),
+        (None, None) => None,
+    };
+    let consistent = if known {
+        own.generation == parents + 1 && own.reach == reach && own.bounded == bounded
+    } else {
+        own.generation > parents && own.reach >= reach && (own.bounded || !bounded)
+    };
+    let later = prev.is_none_or(|facts| own.time >= facts.time)
+        && linked.is_none_or(|facts| own.time >= facts.time);
+    let floored = match (link, linked) {
+        (Some(link), Some(facts)) => link.floor <= facts.version,
+        _ => true,
+    };
+    if !consistent || !later || !floored || last_merge.is_some_and(|last| own.last_merge != last) {
+        return Err(bad(format!(
+            "v{} does not agree with the commits it links to",
+            own.version
+        )));
+    }
+    Ok(())
+}
+
+enum Below {
+    Joins(Hash),
+    Chain(Chain),
+    Gone,
+}
+
+struct Segment {
+    versions: HashMap<u64, Hash>,
+    bottom: u64,
+    below: Below,
+}
+
+enum Found {
+    Sent(Hash),
+    Held(Ptr),
+    Gone,
+}
+
+struct Landing<'a> {
+    store: &'a Store,
+    segments: Vec<Segment>,
+    decoded: HashMap<Hash, (usize, usize)>,
+    entries: HashMap<usize, Entry>,
+}
+
+impl Landing<'_> {
+    fn find(&self, mut segment: usize, version: u64) -> Result<Found> {
+        loop {
+            let seg = &self.segments[segment];
+            if version >= seg.bottom {
+                return seg
+                    .versions
+                    .get(&version)
+                    .map(|hash| Found::Sent(*hash))
+                    .ok_or_else(|| bad("a commit links past the top of its chain"));
+            }
+            match &seg.below {
+                Below::Joins(hash) => segment = self.decoded[hash].1,
+                Below::Chain(chain) => {
+                    let found = entry_at(self.store, chain, version)?;
+                    return Ok(found.map_or(Found::Gone, Found::Held));
+                }
+                Below::Gone => return Ok(Found::Gone),
+            }
+        }
+    }
+
+    fn facts(&self, ptr: Ptr) -> Result<Option<Facts>> {
+        if ptr.offset == 0 {
+            return Ok(None);
+        }
+        match self.decoded.get(&ptr.hash) {
+            Some((slot, _)) => Ok(Some(Facts::of(&self.entries[slot]))),
+            None => Ok(Some(Facts::of(&*self.store.load::<Entry>(ptr)?))),
+        }
+    }
+
+    fn segment(
+        &mut self,
+        refs: &Refs,
+        plan: &Plan,
+        index: &HashMap<Hash, usize>,
+        top: Hash,
+    ) -> Result<Vec<Hash>> {
+        let id = self.segments.len();
+        let mut versions = HashMap::new();
+        let mut merged = Vec::new();
+        let (mut at, mut expected) = (top, None);
+        let below = loop {
+            let slot = index[&at];
+            let entry = decode_entry(plan, slot)?;
+            let version = entry.commit.version;
+            let skipped = expected.is_some_and(|want| want != version);
+            if version == 0 || version > MAX_VERSION || skipped {
+                return Err(bad("a merged chain's versions do not descend one at a time"));
+            }
+            versions.insert(version, at);
+            self.decoded.insert(at, (slot, id));
+            merged.extend(entry.merged.map(|link| link.ptr.hash));
+            let prev = entry.prev;
+            self.entries.insert(slot, entry);
+            let Some(prev) = prev else {
+                if version != 1 {
+                    return Err(bad(format!("v{version} has no parent")));
+                }
+                break Below::Gone;
+            };
+            if let Some((slot, _)) = self.decoded.get(&prev.hash) {
+                if self.entries[slot].commit.version != version - 1 {
+                    return Err(bad("a merged chain joins another at the wrong version"));
+                }
+                break Below::Joins(prev.hash);
+            }
+            if index.contains_key(&prev.hash) {
+                (at, expected) = (prev.hash, Some(version - 1));
+                continue;
+            }
+            let mark = Mark {
+                hash: prev.hash,
+                version: version - 1,
+            };
+            break match locate(self.store, refs, mark)? {
+                Some((_, chain)) => Below::Chain(chain),
+                None => Below::Gone,
+            };
+        };
+        let bottom = versions.keys().copied().min().unwrap_or(1);
+        self.segments.push(Segment {
+            versions,
+            bottom,
+            below,
+        });
+        Ok(merged)
+    }
+}
+
+fn decode_entry(plan: &Plan, slot: usize) -> Result<Entry> {
+    let wire = &plan.objects[slot];
+    let links: Vec<Ptr> = wire
+        .links
+        .iter()
+        .map(|(hash, _)| Ptr {
+            hash: *hash,
+            offset: 0,
+        })
+        .collect();
+    let entry = Entry::decode(&mut Decoder::new(&wire.body, &links, None))
+        .map_err(|error| bad(format!("an object it links as a commit is not one: {error}")))?;
+    let used = usize::from(entry.commit.root.is_some())
+        + usize::from(entry.prev.is_some())
+        + usize::from(entry.skip.is_some())
+        + usize::from(entry.merged.is_some());
+    if used != links.len() {
+        return Err(bad("a commit carries links it does not use"));
+    }
+    Ok(entry)
 }
 
 fn land<T: Data>(
@@ -780,22 +1037,14 @@ fn land<T: Data>(
         }
     }
     let mut entries: HashMap<usize, Entry> = HashMap::new();
+    let mut decoded: HashMap<Hash, (usize, usize)> = HashMap::new();
     let mut versions: HashMap<u64, Hash> = HashMap::new();
     let mut below = Some(tip);
     while let Some(mark) = below {
         let Some(&slot) = index.get(&mark.hash) else {
             break;
         };
-        let wire = &plan.objects[slot];
-        let links: Vec<Ptr> = wire
-            .links
-            .iter()
-            .map(|(hash, _)| Ptr {
-                hash: *hash,
-                offset: 0,
-            })
-            .collect();
-        let entry = Entry::decode(&mut Decoder::new(&wire.body, &links, None))
+        let entry = decode_entry(&plan, slot)
             .map_err(|error| bad(format!("v{} is not a commit: {error}", mark.version)))?;
         if mark.version == 0 || entry.commit.version != mark.version {
             return Err(bad("its commit versions do not descend one at a time"));
@@ -809,6 +1058,7 @@ fn land<T: Data>(
             None => return Err(bad(format!("v{} has no parent", mark.version))),
         };
         versions.insert(mark.version, mark.hash);
+        decoded.insert(mark.hash, (slot, 0));
         entries.insert(slot, entry);
     }
     let low = tip
@@ -833,20 +1083,27 @@ fn land<T: Data>(
             None => {}
         }
     }
-    let chain_link = |hash: Hash, version: u64| -> Result<Ptr> {
-        if version < first {
-            return Ok(Ptr { hash, offset: 0 });
-        }
-        let found = match &prefix {
-            Some(chain) => entry_at(store, chain, version)?,
-            None => None,
-        };
-        found.filter(|ptr| ptr.hash == hash).ok_or_else(|| {
-            bad(format!(
-                "v{version}, which it builds on, does not match this database"
-            ))
-        })
+    let mut landing = Landing {
+        store,
+        segments: vec![Segment {
+            versions,
+            bottom: low,
+            below: prefix.map_or(Below::Gone, Below::Chain),
+        }],
+        decoded,
+        entries,
     };
+    let mut pending: Vec<Hash> = landing
+        .entries
+        .values()
+        .filter_map(|entry| entry.merged.map(|link| link.ptr.hash))
+        .collect();
+    while let Some(top) = pending.pop() {
+        if landing.decoded.contains_key(&top) || !index.contains_key(&top) {
+            continue;
+        }
+        pending.extend(landing.segment(refs, &plan, &index, top)?);
+    }
     let mut roots = Vec::with_capacity(plan.roots.len());
     for slot in &plan.roots {
         let entry = store.load::<Entry>(bases[*slot].0)?;
@@ -877,60 +1134,119 @@ fn land<T: Data>(
         }
         hinted.push(link);
     }
-    let commit_roots: HashSet<Hash> = entries
+    let commit_roots: HashSet<Hash> = landing
+        .entries
         .values()
         .filter_map(|entry| entry.commit.root.map(|root| root.hash))
         .collect();
+    let based: HashMap<Hash, Ptr> = bases.iter().map(|(ptr, _)| (ptr.hash, *ptr)).collect();
     let mut written: HashMap<Hash, Ptr> = HashMap::with_capacity(plan.objects.len());
     let mut used = vec![false; plan.objects.len()];
     let mut tip_root = None;
     for (slot, wire) in plan.objects.into_iter().enumerate() {
-        let entry = entries.get(&slot);
         let mut links = Vec::with_capacity(wire.links.len());
-        for (hash, reference) in &wire.links {
-            let chained = entry.and_then(|entry| chain_version(entry, *hash));
-            let ptr = if let Some(version) = chained.filter(|version| *version < low) {
-                chain_link(*hash, version)?
-            } else if chained.is_some_and(|version| versions.get(&version) != Some(hash)) {
-                return Err(bad(
-                    "a commit links to one that is not the commit at that version",
-                ));
-            } else if *reference == 0 {
-                let Some(ptr) = written.get(hash) else {
-                    return Err(bad(
-                        "an object links to one that was neither sent nor known",
-                    ));
-                };
-                used[index[hash]] = true;
-                *ptr
-            } else if *reference <= roots.len() {
-                roots[*reference - 1]
-            } else {
-                hinted[*reference - 1 - roots.len()]
+        let sent = |hash: &Hash, used: &mut Vec<bool>| -> Result<Ptr> {
+            let ptr = written
+                .get(hash)
+                .copied()
+                .ok_or_else(|| bad("an object links to one that was neither sent nor known"))?;
+            used[index[hash]] = true;
+            Ok(ptr)
+        };
+        let value = |hash: &Hash, reference: usize, used: &mut Vec<bool>| -> Result<Ptr> {
+            let ptr = match reference {
+                0 => sent(hash, used)?,
+                _ if reference <= roots.len() => roots[reference - 1],
+                _ => hinted[reference - 1 - roots.len()],
             };
             if ptr.hash != *hash {
                 return Err(bad("a link does not match the object it names"));
             }
+            Ok(ptr)
+        };
+        let commit = landing.decoded.get(&wire.hash).filter(|(found, _)| *found == slot);
+        let Some(&(_, segment)) = commit else {
+            for (hash, reference) in &wire.links {
+                links.push(value(hash, *reference, &mut used)?);
+            }
+            let object = Object {
+                body: wire.body,
+                links,
+            };
+            if commit_roots.contains(&wire.hash) {
+                T::decode(&mut Decoder::new(&object.body, &object.links, Some(store))).map_err(
+                    |error| bad(format!("a commit's root is not this database's type: {error}")),
+                )?;
+            }
+            written.insert(wire.hash, txn.put(object, wire.hash)?);
+            continue;
+        };
+        let entry = &landing.entries[&slot];
+        let version = entry.commit.version;
+        let mut wires = wire.links.iter();
+        if entry.commit.root.is_some() {
+            let (hash, reference) = wires.next().ok_or_else(|| bad("a commit lost its root"))?;
+            links.push(value(hash, *reference, &mut used)?);
+        }
+        let chained = |want: Ptr, at: u64, used: &mut Vec<bool>| -> Result<Ptr> {
+            match landing.find(segment, at)? {
+                Found::Sent(hash) if hash == want.hash => {
+                    let ptr = written
+                        .get(&hash)
+                        .copied()
+                        .ok_or_else(|| bad("a commit links to one sent after it"))?;
+                    used[index[&hash]] = true;
+                    Ok(ptr)
+                }
+                Found::Held(ptr) if ptr.hash == want.hash => Ok(ptr),
+                Found::Gone => Ok(Ptr {
+                    hash: want.hash,
+                    offset: 0,
+                }),
+                Found::Held(_) if segment == 0 && at < low => Err(bad(format!(
+                    "v{at}, which it builds on, does not match this database"
+                ))),
+                _ => Err(bad(
+                    "a commit links to one that is not the commit at that version",
+                )),
+            }
+        };
+        let mut prev_facts = None;
+        if let Some(prev) = entry.prev {
+            let ptr = chained(prev, version - 1, &mut used)?;
+            prev_facts = Some(landing.facts(ptr)?);
             links.push(ptr);
         }
+        if let Some(skip) = entry.skip {
+            links.push(chained(skip, skip_version(version), &mut used)?);
+        }
+        let mut merged_facts = None;
+        if let Some(link) = entry.merged {
+            let hash = link.ptr.hash;
+            let ptr = if landing.decoded.contains_key(&hash) {
+                let ptr = written
+                    .get(&hash)
+                    .copied()
+                    .ok_or_else(|| bad("a merge links to a commit sent after it"))?;
+                used[index[&hash]] = true;
+                ptr
+            } else {
+                based.get(&hash).copied().unwrap_or(Ptr { hash, offset: 0 })
+            };
+            merged_facts = Some(landing.facts(ptr)?);
+            links.push(ptr);
+        }
+        check_graph(entry, prev_facts, merged_facts)?;
         if wire.hash == tip.hash {
-            let root = entry.and_then(|entry| entry.commit.root);
-            tip_root =
-                root.and_then(|root| links.iter().copied().find(|link| link.hash == root.hash));
+            tip_root = entry
+                .commit
+                .root
+                .and_then(|root| links.iter().copied().find(|link| link.hash == root.hash));
         }
         let object = Object {
             body: wire.body,
             links,
         };
-        if commit_roots.contains(&wire.hash) {
-            T::decode(&mut Decoder::new(&object.body, &object.links, Some(store))).map_err(
-                |error| {
-                    bad(format!(
-                        "a commit's root is not this database's type: {error}"
-                    ))
-                },
-            )?;
-        }
         let ptr = txn.put(object, wire.hash)?;
         written.insert(wire.hash, ptr);
     }
@@ -971,8 +1287,11 @@ fn land<T: Data>(
         .and_then(|old| old.log.tip.map(|ptr| (ptr.hash, old.log.last)))
     {
         None => false,
-        Some((hash, version)) if version >= low => versions.get(&version) == Some(&hash),
-        Some((hash, version)) => chain_link(hash, version).is_ok_and(|ptr| ptr.offset != 0),
+        Some((hash, version)) => match landing.find(0, version) {
+            Ok(Found::Sent(found)) => found == hash,
+            Ok(Found::Held(ptr)) => ptr.hash == hash,
+            _ => false,
+        },
     };
     if !continues {
         let heads: Vec<_> = next.iter().collect();
@@ -998,6 +1317,7 @@ fn hex(hash: &Hash) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Decision {
     UpToDate,
+    Equal,
     Ahead,
     FastForward,
     Diverged,
@@ -1021,7 +1341,7 @@ fn decide(store: &Store, ours: Option<&Head>, theirs: &Head) -> Result<Decision>
         return Ok(Decision::Ahead);
     }
     if ours.root.map(|ptr| ptr.hash) == theirs.root.map(|ptr| ptr.hash) {
-        return Ok(Decision::UpToDate);
+        return Ok(Decision::Equal);
     }
     Ok(Decision::Diverged)
 }
@@ -1040,70 +1360,6 @@ fn fast_forward(ours: Option<&Head>, theirs: &Head) -> Head {
         },
         merged: ours.map(|ours| ours.merged.clone()).unwrap_or_default(),
     }
-}
-
-enum Base {
-    Theirs(u64),
-    Ours(u64),
-    Genesis,
-}
-
-fn roots_from(
-    store: &Store,
-    chain: &Chain,
-    low: u64,
-    mut each: impl FnMut(u64, Hash) -> bool,
-) -> Result<()> {
-    let mut walk = chain.walk(store);
-    while let Some(entry) = walk.step()? {
-        let version = entry.commit.version;
-        if version < low {
-            break;
-        }
-        if let Some(root) = entry.commit.root
-            && !each(version, root.hash)
-        {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn choose_base(
-    store: &Store,
-    ours: &Head,
-    theirs: &Head,
-    record: Option<(u64, u64)>,
-) -> Result<Base> {
-    let record = record.filter(|(seen, at)| {
-        (theirs.log.first..=theirs.log.last).contains(seen) && *at <= ours.log.last
-    });
-    let prefix = shared_prefix(store, &ours.log, &theirs.log)?;
-    let record = record.filter(|(seen, _)| prefix.is_none_or(|version| *seen > version));
-    let (our_low, their_low) = match (record, prefix) {
-        (Some((seen, at)), _) => (at, seen),
-        (None, Some(version)) => (version, version),
-        (None, None) => (ours.log.first, theirs.log.first),
-    };
-    let mut ours_by_root: HashMap<Hash, u64> = HashMap::new();
-    roots_from(store, &ours.log, our_low, |version, hash| {
-        ours_by_root.entry(hash).or_insert(version);
-        true
-    })?;
-    let mut matched = None;
-    roots_from(store, &theirs.log, their_low, |version, hash| {
-        if ours_by_root.contains_key(&hash) {
-            matched = Some(version);
-            return false;
-        }
-        true
-    })?;
-    Ok(match (matched, record, prefix) {
-        (Some(version), _, _) => Base::Theirs(version),
-        (None, Some((seen, _)), _) => Base::Theirs(seen),
-        (None, None, Some(version)) => Base::Ours(version),
-        (None, None, None) => Base::Genesis,
-    })
 }
 
 fn check_remote(remote: &str, branch: &str) -> Result<()> {
@@ -1219,7 +1475,7 @@ impl<T: Data> Db<T> {
             let ours = refs.try_get(&name)?;
             let decision = decide(store, ours.as_deref(), &theirs)?;
             let head = match decision {
-                Decision::Diverged => return Ok((None, decision)),
+                Decision::Diverged | Decision::Equal => return Ok((None, decision)),
                 Decision::FastForward => fast_forward(ours.as_deref(), &theirs),
                 Decision::UpToDate | Decision::Ahead => match ours {
                     Some(ours) => (*ours).clone(),
@@ -1232,7 +1488,7 @@ impl<T: Data> Db<T> {
             ))
         })?;
         let outcome = match decision {
-            Decision::UpToDate => Outcome::UpToDate,
+            Decision::UpToDate | Decision::Equal => Outcome::UpToDate,
             Decision::Ahead => Outcome::Ahead,
             Decision::FastForward => Outcome::FastForward,
             Decision::Diverged => return self.merge_remote(remote, merge),
@@ -1246,35 +1502,18 @@ impl<T: Data> Db<T> {
         merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<(Outcome, Option<R>)> {
         let tracking = self.branch(remote)?;
-        let theirs = tracking.read();
-        let (store, refs) = self.published_refs();
-        let ours = refs
-            .try_get(self.branch_name())?
-            .ok_or_else(|| Error::NoBranch(self.branch_name().to_string()))?;
-        let their_head = refs
-            .try_get(remote)?
-            .ok_or_else(|| Error::NoBranch(remote.to_string()))?;
-        let record = ours.merged.try_get(remote)?.map(|seen| *seen);
-        let base = match choose_base(&store, &ours, &their_head, record)? {
-            Base::Theirs(version) => tracking.at(version)?,
-            Base::Ours(version) => self.at(version)?,
-            Base::Genesis => self.genesis(),
+        let seen = match self.merge_tracking(&tracking, merge)? {
+            Ok(committed) => return Ok((Outcome::Merged, Some(committed.value))),
+            Err(seen) => seen,
         };
-        if base.commit().root.map(|ptr| ptr.hash) == theirs.commit().root.map(|ptr| ptr.hash) {
-            let name = self.branch_name().to_string();
-            self.rewrite_refs(|_, _, refs| {
-                let Some(ours) = refs.try_get(&name)? else {
-                    return Ok((None, ()));
-                };
-                Ok((
-                    recorded(refs, &name, (*ours).clone(), remote, theirs.version())?,
-                    (),
-                ))
-            })?;
-            return Ok((Outcome::Ahead, None));
-        }
-        let committed = self.merge_onto(&tracking, base, theirs, merge)?;
-        Ok((Outcome::Merged, Some(committed.value)))
+        let name = self.branch_name().to_string();
+        self.rewrite_refs(|_, _, refs| {
+            let Some(ours) = refs.try_get(&name)? else {
+                return Ok((None, ()));
+            };
+            Ok((recorded(refs, &name, (*ours).clone(), remote, seen)?, ()))
+        })?;
+        Ok((Outcome::Ahead, None))
     }
 }
 

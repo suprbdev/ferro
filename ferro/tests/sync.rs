@@ -623,11 +623,11 @@ fn watchers_and_held_handles_see_what_a_pull_lands() {
 fn pruned_histories_still_sync() {
     let dir = tempfile::tempdir().unwrap();
     let a: Db<Root> = fast()
-        .history(Keep::Last(3))
+        .history(Keep::Last(8))
         .open(dir.path().join("a.ferro"))
         .unwrap();
     let b: Db<Root> = fast()
-        .history(Keep::Last(2))
+        .history(Keep::Last(8))
         .open(dir.path().join("b.ferro"))
         .unwrap();
     for key in 0..10 {
@@ -637,26 +637,293 @@ fn pruned_histories_still_sync() {
         b.pull(&a, "a", refuse).unwrap().outcome,
         Outcome::FastForward
     );
-    assert_eq!(b.log().len(), 3);
-    for key in 10..20 {
+    assert_eq!(b.log().len(), 8);
+    a.commit("drop 0", |root| {
+        root.remove(&0);
+    })
+    .unwrap();
+    b.commit("drop 1", |root| {
+        root.remove(&1);
+    })
+    .unwrap();
+    for key in 10..13 {
         put(&a, key, "a");
         put(&b, key + 100, "b");
     }
-    b.compact(Keep::Last(2)).unwrap();
-    a.compact(Keep::Last(3)).unwrap();
+    b.compact(Keep::Last(8)).unwrap();
+    a.compact(Keep::Last(8)).unwrap();
+    assert!(b.log().first().unwrap().0 > 1);
     let pulled = b.pull(&a, "a", theirs_win).unwrap();
     assert_eq!(pulled.outcome, Outcome::Merged);
-    assert_eq!(dump(&b.read()).len(), 30);
+    let merged = dump(&b.read());
+    assert_eq!(merged.len(), 14);
+    assert!(!merged.contains_key(&0) && !merged.contains_key(&1));
     b.verify().unwrap();
-    b.compact(Keep::Last(2)).unwrap();
+    b.compact(Keep::Last(8)).unwrap();
     b.verify().unwrap();
     let back = a.pull(&b, "b", theirs_win).unwrap();
     assert_eq!(back.outcome, Outcome::Merged);
-    assert_eq!(dump(&a.read()), dump(&b.read()));
+    assert_eq!(dump(&a.read()), merged);
     drop((a, b));
     let b = open(&dir, "b.ferro");
     b.verify().unwrap();
-    assert_eq!(dump(&b.read()).len(), 30);
+    assert_eq!(dump(&b.read()), merged);
+}
+
+#[test]
+fn a_pull_from_a_remote_pruned_past_our_tip_refuses_instead_of_bringing_deletions_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Root> = fast().history(Keep::Last(3)).open(dir.path().join("a.ferro")).unwrap();
+    let b = open(&dir, "b.ferro");
+    for key in 0..5 {
+        put(&a, key, "a");
+    }
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::FastForward);
+    a.commit("drop 0", |root| {
+        root.remove(&0);
+    })
+    .unwrap();
+    for key in 5..10 {
+        put(&a, key, "a");
+    }
+    let before = (b.head_hash(), dump(&b.read()));
+    match b.pull(&a, "a", theirs_win) {
+        Err(Error::NoCommonAncestor) => {}
+        other => panic!("merged a remote that shares nothing retained: {other:?}"),
+    }
+    assert!(matches!(b.pull(&a, "a", refuse), Err(Error::NoCommonAncestor)));
+    assert_eq!((b.head_hash(), dump(&b.read())), before);
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    b.verify().unwrap();
+}
+
+#[test]
+fn a_revert_routed_through_a_third_device_survives_the_first_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"), open(&dir, "c.ferro"));
+    put(&a, 1, "1");
+    b.pull(&a, "a", refuse).unwrap();
+    c.pull(&a, "a", refuse).unwrap();
+    put(&a, 2, "9");
+    put(&b, 1, "2");
+    assert_eq!(a.pull(&b, "b", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(*a.read().get(&1).unwrap(), "2");
+    assert_eq!(c.pull(&b, "b", refuse).unwrap().outcome, Outcome::FastForward);
+    put(&c, 1, "1");
+    assert_eq!(c.read().root_hash(), b.at(1).unwrap().root_hash());
+    let pulled = a.pull(&c, "c", theirs_win).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    assert_eq!(*a.read().get(&1).unwrap(), "1");
+    assert_eq!(*a.read().get(&2).unwrap(), "9");
+}
+
+type Events = Map<u32, i64>;
+
+fn add_deltas(
+    root: &mut Events,
+    base: &Snapshot<Events>,
+    theirs: &Snapshot<Events>,
+) -> (String, ()) {
+    let mut keys: Vec<u32> = base.keys().chain(theirs.keys()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        let delta = theirs.get(&key).map_or(0, |v| *v) - base.get(&key).map_or(0, |v| *v);
+        if delta != 0 {
+            let next = root.get(&key).map_or(0, |v| *v) + delta;
+            root.insert(key, next);
+        }
+    }
+    ("merge".to_string(), ())
+}
+
+fn event(db: &Db<Events>, event: u32) {
+    db.commit(format!("e{event}"), |root| {
+        root.insert(event, 1);
+    })
+    .unwrap();
+}
+
+struct Node {
+    counts: BTreeMap<u32, i64>,
+    ancestors: Vec<bool>,
+    generation: u64,
+    exact: bool,
+}
+
+struct Model(Vec<Node>);
+
+impl Model {
+    fn push(&mut self, parents: &[usize], counts: BTreeMap<u32, i64>, exact: bool) -> usize {
+        let id = self.0.len();
+        let mut ancestors = vec![false; id + 1];
+        for parent in parents {
+            for (at, held) in self.0[*parent].ancestors.iter().enumerate() {
+                ancestors[at] |= *held;
+            }
+        }
+        ancestors[id] = true;
+        let generation = parents.iter().map(|parent| self.0[*parent].generation + 1).max();
+        self.0.push(Node {
+            counts,
+            ancestors,
+            generation: generation.unwrap_or(0),
+            exact,
+        });
+        id
+    }
+
+    fn holds(&self, node: usize, ancestor: usize) -> bool {
+        self.0[node].ancestors.get(ancestor).copied().unwrap_or(false)
+    }
+
+    fn best(&self, a: usize, b: usize) -> Vec<usize> {
+        let common: Vec<usize> =
+            (0..self.0.len()).filter(|c| self.holds(a, *c) && self.holds(b, *c)).collect();
+        common
+            .iter()
+            .copied()
+            .filter(|c| !common.iter().any(|d| d != c && self.holds(*d, *c)))
+            .collect()
+    }
+
+    fn events(&self, node: usize) -> BTreeMap<u32, i64> {
+        let mut events = BTreeMap::new();
+        for (at, held) in self.0[node].ancestors.iter().enumerate() {
+            if *held {
+                for event in self.0[at].counts.keys() {
+                    events.insert(*event, 1);
+                }
+            }
+        }
+        events
+    }
+}
+
+fn id_in(snapshot: &Snapshot<Events>) -> usize {
+    snapshot.commit().message.strip_prefix('n').map_or(0, |id| id.parse().unwrap())
+}
+
+fn counted(db: &Db<Events>) -> BTreeMap<u32, i64> {
+    db.read().iter().map(|(k, v)| (k, *v)).collect()
+}
+
+#[test]
+fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
+    for seed in 0..cases(40) as u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let devices: Vec<Db<Events>> = (0..4)
+            .map(|device| fast().open(dir.path().join(format!("d{device}.ferro"))).unwrap())
+            .collect();
+        let mut model = Model(Vec::new());
+        model.push(&[], BTreeMap::new(), true);
+        let mut heads = [0usize; 4];
+        let mut rng = Rng::new(seed + 7);
+        let mut next_event = 0u32;
+        for _ in 0..60 {
+            let to = rng.below(4) as usize;
+            if rng.chance(40) {
+                let id = model.0.len();
+                let event = next_event;
+                next_event += 1;
+                devices[to]
+                    .commit(format!("n{id}"), |root| {
+                        root.insert(event, 1);
+                    })
+                    .unwrap();
+                let mut counts = model.0[heads[to]].counts.clone();
+                counts.insert(event, 1);
+                let exact = model.0[heads[to]].exact;
+                heads[to] = model.push(&[heads[to]], counts, exact);
+                continue;
+            }
+            let from = (to + 1 + rng.below(3) as usize) % 4;
+            let (ours, theirs) = (heads[to], heads[from]);
+            let best = model.best(ours, theirs);
+            let id = model.0.len();
+            let mut seen = None;
+            let pulled = devices[to]
+                .pull(&devices[from], &format!("d{from}"), |root, base, incoming| {
+                    seen = Some(id_in(base));
+                    add_deltas(root, base, incoming);
+                    (format!("n{id}"), ())
+                })
+                .unwrap();
+            match pulled.outcome {
+                Outcome::FastForward => {
+                    assert!(model.holds(theirs, ours), "seed {seed}");
+                    heads[to] = theirs;
+                }
+                Outcome::Ahead => assert!(model.holds(ours, theirs), "seed {seed}"),
+                Outcome::UpToDate => {
+                    let same = model.0[ours].counts == model.0[theirs].counts;
+                    assert!(same || model.holds(ours, theirs), "seed {seed}");
+                }
+                Outcome::Merged => {
+                    let base = seen.unwrap();
+                    assert!(best.contains(&base), "seed {seed}: base {base} not in {best:?}");
+                    let top = best.iter().map(|node| model.0[*node].generation).max();
+                    assert_eq!(Some(model.0[base].generation), top, "seed {seed}");
+                    let mut counts = model.0[ours].counts.clone();
+                    for (event, count) in &model.0[theirs].counts {
+                        *counts.entry(*event).or_default() += count;
+                    }
+                    for (event, count) in &model.0[base].counts {
+                        *counts.entry(*event).or_default() -= count;
+                    }
+                    counts.retain(|_, count| *count != 0);
+                    let exact = model.0[ours].exact && model.0[theirs].exact && best.len() == 1;
+                    heads[to] = model.push(&[ours, theirs], counts, exact);
+                }
+            }
+            for (device, db) in devices.iter().enumerate() {
+                let node = &model.0[heads[device]];
+                assert_eq!(counted(db), node.counts, "seed {seed} device {device}");
+                if node.exact {
+                    assert_eq!(node.counts, model.events(heads[device]), "seed {seed}");
+                }
+            }
+        }
+        for db in &devices {
+            db.verify().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_change_that_reaches_us_through_a_third_device_is_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let devices: Vec<Db<Events>> = ["a", "b", "c"]
+        .iter()
+        .map(|name| fast().open(dir.path().join(format!("{name}.ferro"))).unwrap())
+        .collect();
+    let (a, b, c) = (&devices[0], &devices[1], &devices[2]);
+    event(a, 0);
+    b.pull(a, "a", add_deltas).unwrap();
+    c.pull(a, "a", add_deltas).unwrap();
+    event(c, 1);
+    assert_eq!(b.pull(c, "c", add_deltas).unwrap().outcome, Outcome::FastForward);
+    event(b, 2);
+    event(a, 3);
+    assert_eq!(a.pull(b, "b", add_deltas).unwrap().outcome, Outcome::Merged);
+    assert_eq!(a.pull(c, "c", add_deltas).unwrap().outcome, Outcome::Ahead);
+    event(c, 4);
+    assert_eq!(a.pull(c, "c", add_deltas).unwrap().outcome, Outcome::Merged);
+    let counts: Vec<(u32, i64)> = a.read().iter().map(|(k, v)| (k, *v)).collect();
+    assert_eq!(counts, vec![(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)]);
+    for device in [b, c] {
+        device.pull(a, "a", add_deltas).unwrap();
+        assert_eq!(device.read().root_hash(), a.read().root_hash());
+        device.verify().unwrap();
+    }
+    let fresh: Db<Events> = fast().open(dir.path().join("d.ferro")).unwrap();
+    fresh.pull(b, "b", add_deltas).unwrap();
+    event(&fresh, 5);
+    event(c, 6);
+    fresh.pull(c, "c", add_deltas).unwrap();
+    let counts: Vec<(u32, i64)> = fresh.read().iter().map(|(k, v)| (k, *v)).collect();
+    assert_eq!(counts, (0..7).map(|event| (event, 1)).collect::<Vec<_>>());
+    fresh.verify().unwrap();
 }
 
 #[test]
@@ -1081,6 +1348,96 @@ fn a_bundle_whose_commit_skips_to_another_commit_is_rejected() {
         }
         assert_eq!(b.version(), 0);
         assert_eq!(b.branches(), vec!["main".to_string()]);
+        assert_eq!(b.size_on_disk(), size);
+    }
+}
+
+struct Forged {
+    version: u64,
+    time: u64,
+    prev: Option<Ptr>,
+    merged: Option<(Ptr, u64)>,
+    graph: Option<(u64, u64, u64)>,
+}
+
+fn forged_entry(root: &Object, forged: Forged) -> Object {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    forged.version.encode(&mut encoder).unwrap();
+    forged.time.encode(&mut encoder).unwrap();
+    String::new().encode(&mut encoder).unwrap();
+    Some(link_to(root)).encode(&mut encoder).unwrap();
+    None::<u64>.encode(&mut encoder).unwrap();
+    let flags = u8::from(forged.prev.is_some())
+        + 16 * u8::from(forged.merged.is_some())
+        + 32 * u8::from(forged.graph.is_some());
+    encoder.u8(flags);
+    if let Some((_, floor)) = forged.merged {
+        encoder.varint(floor);
+        encoder.varint(0);
+    }
+    if let Some((lift, reach, last_merge)) = forged.graph {
+        encoder.varint(lift);
+        encoder.varint(reach);
+        encoder.varint(last_merge);
+    }
+    for linked in forged.prev.into_iter().chain(forged.merged.map(|(ptr, _)| ptr)) {
+        encoder.link(linked);
+    }
+    encoder.into_object()
+}
+
+#[test]
+fn a_bundle_with_a_forged_merge_link_or_generation_is_rejected() {
+    let roots: Vec<Object> = (0..4u64).map(|value| object_of(&value)).collect();
+    let side_root = object_of(&50u64);
+    let plain = |version: u64, prev: Option<Ptr>| Forged {
+        version,
+        time: version,
+        prev,
+        merged: None,
+        graph: None,
+    };
+    let first = forged_entry(&roots[1], plain(1, None));
+    let second = forged_entry(&roots[2], plain(2, Some(link_to(&first))));
+    let side = forged_entry(&side_root, plain(1, None));
+    let honest = Forged {
+        version: 3,
+        time: 3,
+        prev: Some(link_to(&second)),
+        merged: Some((link_to(&side), 1)),
+        graph: Some((0, 1, 3)),
+    };
+    let cases: Vec<(&str, Forged)> = vec![
+        ("honest", Forged { ..honest }),
+        ("generation", Forged { graph: Some((4, 1, 3)), ..honest }),
+        ("reach", Forged { graph: Some((0, 2, 3)), ..honest }),
+        ("floor", Forged { merged: Some((link_to(&side), 2)), ..honest }),
+        ("value", Forged { merged: Some((link_to(&roots[1]), 1)), ..honest }),
+        ("unlinked", Forged { merged: None, ..honest }),
+    ];
+    for (name, claim) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
+        let size = b.size_on_disk();
+        let merge = forged_entry(&roots[3], Forged { time: 60, ..claim });
+        let objects: Vec<&Object> = vec![
+            &roots[1], &first, &roots[2], &second, &side_root, &side, &roots[3], &merge,
+        ];
+        let bundle = forged(&merge, 3, &objects);
+        let received = b.receive("evil", &bundle, untouched);
+        if name == "honest" {
+            let pulled = received.unwrap();
+            assert_eq!(pulled.outcome, Outcome::FastForward);
+            assert_eq!(*b.read(), 3);
+            b.verify().unwrap();
+            continue;
+        }
+        match received {
+            Err(Error::Bundle(_)) => {}
+            other => panic!("accepted a forged {name} merge: {other:?}"),
+        }
+        assert_eq!(b.version(), 0);
         assert_eq!(b.size_on_disk(), size);
     }
 }

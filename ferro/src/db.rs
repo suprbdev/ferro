@@ -1625,25 +1625,41 @@ impl<T: Data> Db<T> {
         })
     }
 
-    pub(crate) fn merge_onto<R, S: Into<String>>(
+    pub(crate) fn merge_tracking<R, S: Into<String>>(
         &self,
         other: &Db<T>,
-        base: Snapshot<T>,
-        theirs: Snapshot<T>,
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<Committed<R>> {
-        let advanced = base.commit.root.map(|ptr| ptr.hash) != theirs.commit.root.map(|ptr| ptr.hash);
-        let record = (advanced && !Arc::ptr_eq(&self.branch, &other.branch))
-            .then(|| (other.branch.name.clone(), theirs.version()));
-        self.alone::<R, Error>(|_, _, root| {
+    ) -> Result<std::result::Result<Committed<R>, u64>> {
+        let done = self.alone::<std::result::Result<R, u64>, Error>(|tip, ours, root| {
             other.branch.check_live()?;
-            let (message, value) = f(root, &base, &theirs);
+            let theirs = other.branch.state.load_full();
+            let store = self.shared.store();
+            let found = Self::merge_base(
+                &tip.refs,
+                &store,
+                (&self.branch.name, ours),
+                (&other.branch.name, &theirs),
+            )?;
+            let base = found.as_ref().map(|(_, node)| node.ptr.hash);
+            let Some(ptr) = theirs.log.tip.filter(|ptr| base != Some(ptr.hash)) else {
+                return Ok((String::new(), Err(theirs.log.last), Intent::default()));
+            };
+            let link = Self::link_to(tip, other, &theirs, ptr)?;
+            let base = self.snapshot_at(found)?;
+            let (message, value) = f(root, &base, &theirs.snapshot);
             let intent = Intent {
-                record,
+                merged: link,
+                record: Some((other.branch.name.clone(), theirs.log.last)),
                 ..Intent::default()
             };
-            Ok((message.into(), value, intent))
-        })
+            Ok((message.into(), Ok(value), intent))
+        })?;
+        let (version, changed) = (done.version, done.changed);
+        Ok(done.value.map(|value| Committed {
+            value,
+            version,
+            changed,
+        }))
     }
 
     fn link_to(
