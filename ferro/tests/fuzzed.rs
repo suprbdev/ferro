@@ -65,9 +65,9 @@ impl Entry {
         let wide = self.graph != (0, 0, 0);
         w.u8(
             u8::from(self.prev.is_some()) * HAS_PREV
-                | u8::from(self.skip.is_some()) * HAS_SKIP
-                | u8::from(self.merged.is_some()) * MERGED
-                | u8::from(wide) * GRAPH,
+                + u8::from(self.skip.is_some()) * HAS_SKIP
+                + u8::from(self.merged.is_some()) * MERGED
+                + u8::from(wide) * GRAPH,
         );
         if let Some((_, floor, after)) = self.merged {
             w.varint(floor);

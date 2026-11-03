@@ -2592,7 +2592,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
         let store = self.store();
         let mut entries = Vec::new();
-        let mut path: Vec<(Arc<Node<K, V, S>>, usize)> = Vec::new();
+        let mut path = Vec::new();
         if let Some(root) = resident(store, &self.root, 0)? {
             path.push((root, 0));
         }
