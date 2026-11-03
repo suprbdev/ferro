@@ -179,7 +179,9 @@ that `a`, ordered by `b`.
 `by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
 index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,
 `update` and `get_mut` have no error channel, so they panic, which discards the transaction.
-`Table::merge` passes a clash to your `resolve` closure.
+`Table::merge` passes a clash to your `resolve` closure with `ours` set to the row holding the value,
+and asks about each key once at most. A row that still clashes after that keeps our row for its key,
+so a merge never panics on a clash.
 
 ## History, diffs and branches
 

@@ -1140,10 +1140,17 @@ transaction, which is the honest result when a constraint the schema states does
 `RowMut` dropped while its thread is already panicking keeps the old row, since a second panic would
 abort the process. A row may replace itself, and a row changing key may keep the value it holds.
 
-`Table::merge` treats a clash as data, not a bug. It holds a clashing row back until the rest of the
-diff is applied, since a chain of renames clashes only on the way through, then gives what is left
-to `resolve` with `ours` set to the row holding the value. Two rows that swap values reach `resolve`
-too, because neither can move first.
+`Table::merge` treats a clash as data, not a bug, and calls `resolve` once at most for each key. An
+answer is the row for that key: `None` removes it, and a row with another key keeps our row. The
+merge holds a clashing row back, and the key keeps its current row and values, until the rest of
+the diff is applied, since a chain of renames clashes only on the way through. Held rows then go in
+lowest key first as their values come free. A held row taken from theirs that still clashes goes to
+`resolve` with `ours` set to the row holding the value, so returning `ours` keeps both of our rows.
+Two rows that swap values reach `resolve` too, because neither can move first. A row that `resolve`
+has already answered for, because both sides changed the key or because it answered a clash, is not
+offered again. If it still clashes when nothing else can move, the key keeps our row. So a merge
+never panics on a clash, the indexes always match the rows, and a row is removed only when theirs
+removed it or `resolve` returned `None` for its key.
 
 The index field is named `unique_x`, not `by_x`, so turning an `#[index]` into a `#[unique]` rebuilds
 it instead of reading the old map with new types. The rebuild on decode covers unique indexes. If

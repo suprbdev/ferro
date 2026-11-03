@@ -1,12 +1,13 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Cursor, Diff, Iter, Keys, Map, Val, Values, three_way};
+use crate::map::{Conflict, Cursor, Diff, Iter, Keys, Map, Val, Values};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -268,56 +269,126 @@ impl<T: Record> Table<T> {
     where
         T: PartialEq,
     {
-        let mut clashes: Vec<(T::Key, T)> = Vec::new();
-        let written = three_way(
-            self,
-            base.0.rows(),
-            theirs.0.rows(),
-            |table, key| table.get(key),
-            |table, key, value| match value {
-                Some(row) if table.0.conflict(&row, None).is_some() => clashes.push((key, row)),
-                Some(row) => {
-                    table.put(row);
-                }
-                None => {
-                    table.remove(&key);
-                }
-            },
-            &mut resolve,
-        );
-        let mut settling = true;
-        while settling {
-            settling = false;
-            for (key, row) in std::mem::take(&mut clashes) {
-                if self.0.conflict(&row, None).is_some() {
-                    clashes.push((key, row));
-                } else {
-                    self.put(row);
-                    settling = true;
-                }
+        let mut held = Pending::default();
+        let mut written = 0;
+        for change in base.0.rows().diff(theirs.0.rows()) {
+            let key = change.key().clone();
+            let before = change.before().cloned();
+            let after = change.after().cloned();
+            let ours = self.get(&key);
+            if ours == after {
+                continue;
             }
-        }
-        for (key, row) in clashes {
-            let holder = self
-                .0
-                .conflict(&row, None)
-                .and_then(|taken| self.get(&taken.holder));
-            let resolved = resolve(Conflict {
-                key: key.clone(),
-                base: base.get(&key),
-                ours: holder,
-                theirs: Some(Val::new(row)),
-            });
-            match resolved {
-                Some(row) => {
-                    self.insert(row);
-                }
+            written += 1;
+            let (row, asked) = if ours == before {
+                (after.map(|row| (*row).clone()), false)
+            } else {
+                let conflict = Conflict {
+                    key: key.clone(),
+                    base: before,
+                    ours,
+                    theirs: after,
+                };
+                (resolve(conflict), true)
+            };
+            match row {
                 None => {
                     self.remove(&key);
                 }
+                Some(row) if row.key() != key => {}
+                Some(row) if self.0.conflict(&row, None).is_none() => {
+                    self.put(row);
+                }
+                Some(row) => held.hold(key, row, asked),
+            }
+        }
+        held.queue.extend(held.rows.keys().cloned());
+        loop {
+            self.settle(&mut held);
+            let Some((key, row)) = held.next_unasked() else {
+                break;
+            };
+            let ours = self.0.conflict(&row, None).and_then(|taken| self.get(&taken.holder));
+            let resolved = resolve(Conflict {
+                key: key.clone(),
+                base: base.get(&key),
+                ours,
+                theirs: Some(Val::new(row)),
+            });
+            match resolved {
+                None => {
+                    self.remove(&key);
+                    held.freed(&key);
+                }
+                Some(row) if row.key() == key => {
+                    held.hold(key.clone(), row, true);
+                    held.queue.insert(key);
+                }
+                Some(_) => {}
             }
         }
         written
+    }
+
+    fn settle(&mut self, held: &mut Pending<T>) {
+        while let Some(key) = held.queue.pop_first() {
+            let Some((row, _)) = held.rows.get(&key) else {
+                continue;
+            };
+            match self.0.conflict(row, None) {
+                Some(taken) => held.waiting.entry(taken.holder).or_default().push(key),
+                None => {
+                    if let Some((row, _)) = held.rows.remove(&key) {
+                        self.put(row);
+                    }
+                    held.freed(&key);
+                }
+            }
+        }
+    }
+}
+
+struct Pending<T: Record> {
+    rows: BTreeMap<T::Key, (T, bool)>,
+    unasked: BTreeSet<T::Key>,
+    queue: BTreeSet<T::Key>,
+    waiting: BTreeMap<T::Key, Vec<T::Key>>,
+}
+
+impl<T: Record> Default for Pending<T> {
+    fn default() -> Self {
+        Pending {
+            rows: BTreeMap::new(),
+            unasked: BTreeSet::new(),
+            queue: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Record> Pending<T> {
+    fn hold(&mut self, key: T::Key, row: T, asked: bool) {
+        if !asked {
+            self.unasked.insert(key.clone());
+        }
+        self.rows.insert(key, (row, asked));
+    }
+
+    fn freed(&mut self, key: &T::Key) {
+        if let Some(blocked) = self.waiting.remove(key) {
+            self.queue.extend(blocked);
+        }
+    }
+
+    fn next_unasked(&mut self) -> Option<(T::Key, T)> {
+        while let Some(key) = self.unasked.pop_first() {
+            if let Some((_, false)) = self.rows.get(&key)
+                && let Some((row, _)) = self.rows.remove(&key)
+            {
+                return Some((key, row));
+            }
+        }
+        None
     }
 }
 
