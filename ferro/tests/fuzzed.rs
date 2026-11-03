@@ -46,6 +46,15 @@ fn read_only() -> Options {
     Options::new().read_only()
 }
 
+fn open_handles(path: &Path) -> usize {
+    let real = fs::canonicalize(path).unwrap();
+    fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == real))
+        .count()
+}
+
 fn newest_head(bytes: &[u8]) -> usize {
     let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     let slot = if field(SLOT + 8) > field(8) { SLOT } else { 0 };
@@ -144,4 +153,13 @@ fn common_ancestor_reports_a_damaged_merge_record() {
         }
     }
     assert!(failures > 0);
+}
+
+#[test]
+fn admin_reads_close_the_file_when_they_fail() {
+    let (_dir, path) = fixture("info-refs");
+    corrupt(admin::info(&path));
+    corrupt(admin::layout(&path, Keep::All));
+    corrupt(admin::layout(&path, Keep::Last(2)));
+    assert_eq!(open_handles(&path), 0);
 }

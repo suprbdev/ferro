@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
 
@@ -35,14 +36,31 @@ pub struct Info {
     pub branches: Vec<BranchInfo>,
 }
 
-fn read_only(path: &Path) -> Result<(Store, Option<Ptr>)> {
-    Store::open(
+struct Closing(Store);
+
+impl Deref for Closing {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn read_only(path: &Path) -> Result<(Closing, Option<Ptr>)> {
+    let (store, head) = Store::open(
         path,
         StoreOptions {
             read_only: true,
             ..StoreOptions::default()
         },
-    )
+    )?;
+    Ok((Closing(store), head))
 }
 
 fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
