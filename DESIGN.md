@@ -17,6 +17,7 @@ of `T`, and all earlier versions stay readable.
   and `history_of_range`.
 - `watch.rs`: `Watcher<T>`, `Closer<T>` and the per-branch feed behind them.
 - `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share.
+- `sync.rs`: `Have`, `Bundle`, and `Db::pull`, `push` and `receive`, which copy a branch between files.
 
 ## Objects and links
 
@@ -964,6 +965,158 @@ Counting handles and refusing the drop while others exist was rejected: a clone 
 thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
 handle learns of the drop on `refresh`, and retires its `Branch` the same way instead of falling
 back to the genesis value.
+
+## Sync
+
+`Db::pull(&other, remote, merge)` copies the branch of `other`, usually a handle on another file,
+into this file as the branch `remote`, then brings this handle's branch up to it. It is three steps
+that a transport can split: `have` on the pulling side lists what it holds, `bundle` on the other
+side packs what that lacks, and `receive` checks and applies it. `Have` and `Bundle` are byte
+buffers, so the same code runs over a file, a socket or HTTP. `pull` runs the three in one process,
+and `push` is `pull` called from the other side.
+
+### Negotiation
+
+A have lists commits as entry hash and version: the tip of every branch, then the pulling branch at
+`last - 1`, `last - 3`, `last - 7` and so on down to `first`, about log2 of its length. The two-branch
+file in the measurements below sends 137 bytes. The sender looks each one up in each of its own
+chains at that version, O(log n) through skip links, and keeps those whose hash matches. Entries
+link their parents, so a commit with the same hash in both files has the same history below it.
+For each recognised commit the sender binary-searches the newest version its branch shares with
+that commit's chain, O(log^2 n), and the newest of those is the floor: its commits above the floor
+are new. Commits are matched by hash. A version alone means nothing across files.
+
+### What is sent
+
+The new commits' entries, and the objects their roots reach that the receiver lacks. ferro has no
+index from hash to offset, so what the receiver lacks is found by comparing trees. The roots of the
+recognised tips, and of the commit that set the floor, are anchors: trees the receiver is known to
+hold. Each new root, oldest first, is compared with the root before it, and the first with the
+anchors, one level at a time. The old side expands a level and records each object it reaches as
+known. Then the new side expands a level, and a new object that is known or already sent is not
+followed. An old object that the new tree still links is common to both and is not expanded.
+
+The first version compared every new root with the anchors at once, and sent 185 objects and 95 KB
+for two commits that changed one key each in a 5,000 key map. An old node that the first commit kept
+and the second replaced counted as common, so nothing under it was known and the second commit's
+copy went whole. Root by root it sends 12 objects and 7 KB.
+
+A `Map`'s shape depends only on its contents, so consecutive roots line up level by level. A change
+that adds or removes a level moves the unchanged subtrees one level up or down. The old side expands
+before the new side looks, so a subtree that sits one level deeper in the old tree is still found,
+and only one moved further is sent again.
+
+A sent object that links a known one names it with a hint: the anchor or earlier hint it hangs from,
+and the index of the link there. The receiver follows the path in its own file and checks that it
+ends at the same hash, which costs one read of each parent on a changed path. A link to a sent object
+needs nothing, because objects go children first. Bodies are LZ4 compressed when that is smaller,
+as in the file.
+
+### Applying
+
+`receive` checks everything before it writes anything:
+
+- Every object is hashed as the bundle is parsed.
+- The new commits are walked from the head through `prev`, and their versions must descend one at a
+  time. The commit below the oldest one sent is looked up in the receiver's chains by hash and
+  version. Found, the landed branch continues into the receiver's copy of it and keeps that chain's
+  `first`. Not found, the link is written with offset 0 and the branch starts at the oldest sent
+  commit, the way a pruned chain does.
+- Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
+  hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
+  hash, or to offset 0 below the landed branch's `first`, which nothing follows. Anything else
+  rejects the bundle, and so does an object nothing links to.
+- The root of every new commit decodes as `T`.
+
+All the objects and a `Refs` that points `remote` at the new head are then one frame, written under
+the `tip` mutex and synced like a commit, so a crash leaves the previous head: a torn frame is not
+replayed. Branch handles on `remote` are rebound and its watchers fire. Their notices drop once
+the pull has released `tip`, so a `watch_when` test may commit or pull. A bad bundle is
+`Error::Bundle` and writes nothing. Flipping every byte of a 3,358 byte bundle with three masks gave
+10,073 rejections and one flip inside an LZ4 body that decoded to the same bytes, and so landed the
+same commit.
+
+### Bringing the branch up
+
+A second step compares the pulling branch with `remote`:
+
+- The same tip, or the same root: `UpToDate`.
+- Our tip is the remote chain's entry at our version: `FastForward`. Our head takes the remote chain
+  in a frame with no commit. The chains share our entries, so versions carry on from ours, and
+  `head_hash` is now the same in both files.
+- Their tip is our entry at their version: `Ahead`.
+- Otherwise the branches diverged, and `merge` runs as in `merge_with`, against the base below, as a
+  commit on our branch.
+
+Each outcome records `(their version, our version)` under `remote` in our head's `merged` map, the
+record `merge_with` keeps, and a merge records it through the same intent. A crash between the
+landing and this step leaves `remote` landed and our branch as it was. The next pull's have names
+the landed tip, so its bundle is empty and the step runs again.
+
+### Commit identity
+
+An entry's hash covers its version, time, message and root, and its parent's hash, so a pulled
+commit can only be the same commit in both files if it keeps its version. It lands verbatim, with
+the version and time the other file gave it, and `remote` mirrors the other file's branch. A pulled
+commit joins our branch only by fast-forward, and then sits at the version it has there. A merge
+adds one commit at our next version, timed by our clock and never before our previous commit, and
+the commits it merged stay on `remote` under their own numbers. So a version never changes meaning on
+a branch: a pull appends to our chain or adopts one that extends it. After a divergence, `at(7)` on
+main and on `remote` can be different commits, so compare across files by hash, with `head_hash`
+and `Log::hash_at`.
+
+Each commit's time is `max(now, previous)`, so time never goes back along a chain and `as_of` works
+after a fast-forward. A device whose clock runs ahead holds the times of our later commits at its
+reading until our clock passes it.
+
+### The merge base
+
+An entry has one parent, so a merge on one device is an ancestor of nothing on the other. After A
+merges B and B merges A, the two chains never share an entry past the fork again, and the shared
+prefix that `common_ancestor` finds would bring changes merged long ago back as conflicts. So the base
+is the newest state both branches passed through, found by content. Our roots since our recorded
+version go into a set, and the remote chain is walked from its tip down to its recorded version for
+the first root in it. When A's merge and B's merge produced the same root, that merged state is the
+next round's base. With no match the base is the remote commit last recorded, which our branch
+already includes, then the shared prefix, then genesis. The two walks cost the commits made on each
+side since the previous pull. If the base has the same root as their tip, they have nothing we lack,
+and the pull reports `Ahead` and records it.
+
+A pull is not symmetric: the closure gets `ours` and `theirs`. Devices converge only if it gives the
+same result whichever side is ours, as last-writer-wins on a Lamport clock does. `examples/notes`
+syncs with a pull each way, and a third pull when the second merged, so that each side has recorded
+the other's last commit. A sync after that sends two empty bundles and writes nothing.
+
+### Measurements
+
+On one NVMe SSD with ext4, in release:
+
+| Case | Sent |
+| --- | --- |
+| `Map<u64, String>`, 100,000 keys, 9.0 MB file: first pull into an empty file | 8.95 MB, 12,680 objects |
+| The same, three commits of one key each | 15.2 KB, 22 objects, and a 137 byte have |
+| `notes-scale`, 100,000 notes, 14.4 MB file: first sync | 14.3 MB, 41,093 objects, 220 to 240 ms |
+| The same after 6 edits on one device and 8 commits on the other, one note edited on both | 106 KB, 139 objects, 11 to 13 ms, both ways and a merge on each side |
+| The same, synced again | 430 bytes, no objects, nothing written |
+
+A notes edit rewrites a path of four or five nodes in the rows and, for a tag, in the index, 6 to
+8 KB a commit, and every commit since the last sync is sent, not only the final state.
+
+### Limits
+
+- A bundle is built and applied in memory, and the first pull into an empty file carries all of the
+  retained history, so it needs that much memory on both sides.
+- Files that share no commit share no anchors, so their first pull sends everything, even trees both
+  happen to hold.
+- Each commit in a have is looked up in every branch of the sender, so recognising them costs the
+  receiver's branches plus log n, times the sender's branches, times log n.
+- A subtree that moved more than one level deeper than where the receiver holds it is sent again.
+- A value that holds a `Ptr` into pruned history cannot be sent.
+- Each pull replaces `remote`, including commits made on it here. If the remote branch's history no
+  longer contains what was landed before, records under that name are dropped.
+- The receiver decodes each new root as its own `T`, so peers need schemas that decode each other's
+  roots. A root that has to rebuild a table index as it decodes, because the sender's schema lacks
+  that index, can be rejected, since the rows it would read are not written yet.
 
 ## Reclamation
 

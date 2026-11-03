@@ -293,6 +293,60 @@ cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verif
 that version and everything before it are unchanged. It is not a signature and says nothing about
 later commits, other branches or whether timestamps were true. See `DESIGN.md`.
 
+## Syncing between files
+
+Two files that share a history, or have none yet, can exchange commits, so each device works offline
+and catches up later.
+
+```rust
+let laptop = Db::<Shop>::open("laptop.ferro")?;
+let phone = Db::<Shop>::open("phone.ferro")?;
+
+let pulled = laptop.pull(&phone, "phone", |shop, base, theirs| {
+    let applied = shop.orders.merge(&base.orders, &theirs.orders, |conflict| newer(conflict));
+    ("sync from the phone", applied)
+})?;
+println!("{:?}, {} bytes in", pulled.outcome, pulled.received_bytes);
+```
+
+`pull` copies the other file's branch into this one as the branch `phone`, then brings this branch up
+to it. The outcome is `UpToDate`, `Ahead` when this branch already has all of it, `FastForward` when
+this branch has nothing it lacks, or `Merged`. Only a merge calls your closure, which works as in
+`merge_with`, against the newest state both branches have passed through. `push` is `pull` from the
+other side.
+
+Over a network the same pull is three calls, and only bytes cross: the phone sends its `have`, the
+laptop answers with a `bundle`, and the phone applies it with `receive`.
+
+```rust
+let have: Vec<u8> = phone.have()?.into();
+let bundle: Vec<u8> = laptop.bundle(&Have::from(have))?.into();
+phone.receive("laptop", &Bundle::from(bundle), merge)?;
+```
+
+A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
+it lacks and the objects their trees reach that it does not hold, so it costs what changed: three
+commits on a 9 MB file of 100,000 keys sent 15 KB. The first pull into an empty file carries
+everything. `receive` hashes every object and checks every link before it writes, rejects a damaged
+or foreign bundle with `Error::Bundle` without touching the file, and applies it in one frame, so a
+crash leaves the previous head.
+
+A pulled commit keeps the version, time, message and hash it had. A fast-forward adopts the other
+branch, so afterwards `head_hash` is the same in both files. A merge commits at this branch's next
+version, and the other side's commits stay on the `phone` branch under their own numbers, so after
+a divergence compare commits across files by hash, not by version. Each pull replaces the `phone`
+branch, so do not commit to it.
+
+Devices converge only if your closure gives the same result whichever side is `ours`, as
+last-writer-wins on a clock does. `examples/notes` is an offline-first notes app built this way:
+each device directory holds its own file, and `sync` exchanges changes both ways.
+
+```sh
+cargo run --release -p notes -- --device laptop add "buy milk" --tag home
+cargo run --release -p notes -- --device phone sync laptop
+cargo run --release -p notes --bin notes-scale
+```
+
 ## Keeping history bounded
 
 Every version stays readable by default, so the file grows with every commit. Most programs want
@@ -479,6 +533,8 @@ This is an experiment, not a production database.
   fork of an already merged branch, is seen again. Nothing is lost, but a merge closure that is
   not idempotent, such as one adding a counter delta, applies it twice.
 - Version 0 is not stored. `at(0)` and forks of an empty database use your current `Default`.
+- Sync builds and applies a bundle in memory, so the first pull of a large file needs its size in
+  memory on both sides. Files that share no commit send everything on their first pull.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
   You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 
