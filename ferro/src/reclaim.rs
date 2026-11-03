@@ -9,7 +9,7 @@ use crate::db::Refs;
 use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry};
 use crate::platform::copy_owner;
-pub(crate) use crate::platform::sync_parent;
+pub(crate) use crate::platform::{rename, sync_parent};
 use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;

@@ -24,7 +24,7 @@ use crate::graph::{self, Start};
 use crate::history::History;
 use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
-use crate::reclaim::{Compacted, Copier, Reclaim, Space, sibling, sync_parent};
+use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
 use crate::watch::{Feed, Filter, Notice, Watcher};
 
@@ -1835,7 +1835,7 @@ impl<T: Data> Shared<T> {
             let found = refs.try_get(&branch.name)?;
             states.push((branch, Arc::new(self.state_of(fresh, found.as_deref())?)));
         }
-        fs::rename(temp, &self.file)?;
+        rename(temp, &self.file)?;
         fresh.trace_rename();
         if let Err(error) = sync_parent(&self.file) {
             old.poison();

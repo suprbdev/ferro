@@ -2390,13 +2390,17 @@ A cycle renames a new file over one that is still open, since the old generation
 every snapshot, `Log` and follower that holds it, and Windows normally refuses that. It works when
 two things hold. Every handle on the file must share delete: `std` opens files with
 `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` unless told otherwise, and ferro never
-tells it otherwise. And the rename must use POSIX semantics: when `MoveFileExW` is refused,
-`std::fs::rename` retries with `SetFileInformationByHandle(FileRenameInfoEx)` and
-`FILE_RENAME_FLAG_POSIX_SEMANTICS`, on Windows 10 1607 and later where the file system supports it,
-as NTFS does. The name then moves to the new file at once, and the old file loses its name but stays
-whole for every handle until the last one closes, as an unlinked inode does on Unix. Snapshots keep
-reading the old generation, its space comes back when the last of them drops, and `refresh` finds a
-new file index at the path. `admin::compact` renames the same way.
+tells it otherwise. And the rename must use POSIX semantics. `platform::rename` opens the new file
+with `DELETE` access and calls `SetFileInformationByHandle(FileRenameInfoEx)` with
+`FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`, which Windows 10 1607 and
+later accept where the file system supports it, as NTFS does. Only when that call is refused as
+unsupported does it fall back to `std::fs::rename`. That tries `MoveFileExW` first, which an open
+target refuses, and today retries with the same POSIX rename, but `std` documents that its choice of
+calls may change, so ferro makes the call itself. The name then moves to the new file at once, and
+the old file loses its name but stays whole for every handle until the last one closes, as an
+unlinked inode does on Unix. Snapshots keep reading the old generation, its space comes back when
+the last of them drops, and `refresh` finds a new file index at the path. `admin::compact` renames
+the same way.
 
 If either does not hold, because another program holds the file open without `FILE_SHARE_DELETE` or
 the file system has no POSIX rename, the rename fails before anything has changed. The cycle then

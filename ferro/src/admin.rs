@@ -9,7 +9,7 @@ use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
 use crate::log::Closures;
 use crate::map::Map;
-use crate::reclaim::{Copier, Roots, sibling, sync_parent};
+use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::store::{Store, StoreOptions};
 
@@ -258,7 +258,7 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     let refs = load_refs(&store, Some(head))?;
     let temp = sibling(path);
     let result = write_copy(&store, &refs, keep, &temp, before_bytes).and_then(|mut report| {
-        fs::rename(&temp, path)?;
+        rename(&temp, path)?;
         sync_parent(path)?;
         report.before_bytes = before_bytes;
         Ok(report)

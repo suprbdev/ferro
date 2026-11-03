@@ -31,6 +31,10 @@ mod imp {
         file.sync_data()
     }
 
+    pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
     pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
         match path
             .parent()
@@ -50,16 +54,26 @@ mod imp {
 mod imp {
     use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io::{self, ErrorKind};
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{FileExt as _, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
+    use std::{mem, ptr};
 
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED};
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED,
+        ERROR_NOT_SUPPORTED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, LOCK_FILE_FLAGS,
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        FileRenameInfoEx, GetFileInformationByHandle, LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, SYNCHRONIZE, SetFileInformationByHandle,
+        UnlockFileEx,
     };
     use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
 
     const LOCK_AT: u64 = 1 << 62;
 
@@ -180,6 +194,52 @@ mod imp {
             Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
+    }
+
+    pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+        match posix_rename(from, to) {
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER)
+                ) =>
+            {
+                std::fs::rename(from, to)
+            }
+            renamed => renamed,
+        }
+    }
+
+    fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
+        let source = OpenOptions::new()
+            .access_mode(DELETE | SYNCHRONIZE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(from)?;
+        let name: Vec<u16> = std::path::absolute(to)?
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect();
+        let at = mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let size = u32::try_from(at + name.len() * 2)
+            .map_err(|_| io::Error::from(ErrorKind::InvalidFilename))?;
+        let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*info).Anonymous.Flags =
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            (*info).FileNameLength = size - at as u32 - 2;
+            ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (&raw mut (*info).FileName).cast(),
+                name.len(),
+            );
+        }
+        let handle = source.as_raw_handle();
+        if unsafe { SetFileInformationByHandle(handle, FileRenameInfoEx, info.cast(), size) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
