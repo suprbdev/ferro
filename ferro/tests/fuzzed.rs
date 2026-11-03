@@ -14,6 +14,9 @@ type Root = Map<u64, String>;
 type Counters = Map<u8, i64>;
 
 const SLOT: usize = 4096;
+const LOG_START: u64 = 2 * SLOT as u64;
+const ANCHOR: usize = 68;
+const SUPER_CHECKED: usize = 112;
 
 const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
@@ -130,10 +133,22 @@ fn open_handles(path: &Path) -> usize {
         .count()
 }
 
+fn field(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+fn newest_slot(bytes: &[u8]) -> usize {
+    if field(bytes, SLOT + 8) > field(bytes, 8) { SLOT } else { 0 }
+}
+
 fn newest_head(bytes: &[u8]) -> usize {
-    let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    let slot = if field(SLOT + 8) > field(8) { SLOT } else { 0 };
-    field(slot + 24) as usize
+    field(bytes, newest_slot(bytes) + 24) as usize
+}
+
+fn reseal(bytes: &mut [u8], slot: usize, edit: impl FnOnce(&mut [u8])) {
+    edit(&mut bytes[slot..slot + SUPER_CHECKED]);
+    let check = blake3::hash(&bytes[slot..slot + SUPER_CHECKED]);
+    bytes[slot + SUPER_CHECKED..slot + SUPER_CHECKED + 32].copy_from_slice(check.as_bytes());
 }
 
 fn buffered() -> StoreOptions {
@@ -210,6 +225,12 @@ fn a_superblock_at_the_last_sequence_number_ends_the_scan_without_overflow() {
 #[test]
 fn refresh_refuses_a_record_that_runs_past_the_file() {
     let (_dir, path) = fixture("refresh-alloc");
+    corrupt(read_only().open::<Root>(&path));
+    let mut bytes = fs::read(&path).unwrap();
+    reseal(&mut bytes, 0, |sb| {
+        sb[ANCHOR + 8..ANCHOR + 16].copy_from_slice(&LOG_START.to_le_bytes());
+    });
+    fs::write(&path, &bytes).unwrap();
     let db = read_only().open::<Root>(&path).unwrap();
     corrupt(db.refresh());
 }
@@ -603,4 +624,98 @@ fn sync_reports_a_damaged_branch_table() {
     let db = read_only().open::<Root>(&path).unwrap();
     corrupt(db.have().map(drop));
     corrupt(db.bundle(&have).map(drop));
+}
+
+#[test]
+fn a_superblock_whose_log_ends_inside_the_header_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.ferro");
+    let db = Db::<Root>::open(&path).unwrap();
+    db.commit("one", |root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    drop(db);
+    let mut bytes = fs::read(&path).unwrap();
+    let short = (LOG_START / 2).to_le_bytes();
+    let slot = newest_slot(&bytes);
+    reseal(&mut bytes, slot, |sb| {
+        for mark in [8, ANCHOR] {
+            sb[mark + 8..mark + 16].copy_from_slice(&short);
+            sb[mark + 16..mark + 24].fill(0);
+        }
+    });
+    fs::write(&path, &bytes).unwrap();
+    corrupt(read_only().open::<Root>(&path));
+    corrupt(Db::<Root>::open(&path));
+    assert!(fs::read(&path).unwrap() == bytes, "open rewrote the file");
+}
+
+#[test]
+fn a_commit_after_the_last_version_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("last.ferro");
+    let (store, _) = Store::open(&path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let tip = Entry {
+        version: u64::MAX,
+        time_ms: 100,
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let mut refs: Map<String, Head> = Map::new();
+    refs.insert(
+        "main".into(),
+        Head {
+            version: u64::MAX,
+            first: u64::MAX,
+            tip,
+        },
+    );
+    let mut encoder = Encoder::new(&mut txn);
+    refs.encode(&mut encoder).unwrap();
+    let head = encoder.finish().unwrap();
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    let db = Db::<Root>::open(&path).unwrap();
+    assert_eq!(db.version(), u64::MAX);
+    corrupt(db.commit("next", |root| {
+        root.insert(1, "one".into());
+    }));
+    corrupt(db.update(|root| {
+        root.insert(2, "two".into());
+    }));
+    drop(db);
+    let db = read_only().open::<Root>(&path).unwrap();
+    assert_eq!(db.version(), u64::MAX);
+    assert!(db.read().is_empty());
+}
+
+#[test]
+fn a_commit_after_the_last_sequence_number_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seq.ferro");
+    let db = Db::<Root>::open(&path).unwrap();
+    db.commit("one", |root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    drop(db);
+    let mut bytes = fs::read(&path).unwrap();
+    let last = u64::MAX.to_le_bytes();
+    let slot = newest_slot(&bytes);
+    reseal(&mut bytes, slot, |sb| {
+        sb[8..16].copy_from_slice(&last);
+        sb[ANCHOR..ANCHOR + 8].copy_from_slice(&last);
+    });
+    fs::write(&path, &bytes).unwrap();
+    let db = Db::<Root>::open(&path).unwrap();
+    assert!(db.read().contains_key(&1));
+    corrupt(db.commit("two", |root| {
+        root.insert(2, "two".into());
+    }));
+    drop(db);
+    let db = read_only().open::<Root>(&path).unwrap();
+    assert_eq!(db.read().len(), 1);
 }

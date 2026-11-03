@@ -586,11 +586,16 @@ impl Chain {
             None
         };
         let below = self.tip_entry(store)?;
-        let mut generation = below.as_ref().map_or(0, |entry| entry.generation()) + 1;
+        let after = |generation: u64| {
+            generation
+                .checked_add(1)
+                .ok_or_else(|| corrupt("generation overflows"))
+        };
+        let mut generation = after(below.as_ref().map_or(0, |entry| entry.generation()))?;
         let mut graph = below.as_ref().map_or(Graph::default(), |entry| entry.graph);
         if let Some(merged) = merged {
             let other = store.load::<Entry>(merged.ptr)?;
-            generation = generation.max(other.generation() + 1);
+            generation = generation.max(after(other.generation())?);
             graph.reach = graph.reach.max(other.generation());
             graph.last_merge = version;
             graph.bounded |= merged.floor > 1 || merged.after.is_some() || other.graph.bounded;

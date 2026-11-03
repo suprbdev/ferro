@@ -665,6 +665,12 @@ impl Store {
         let (sb, slot) = match existing {
             Some((sb, slot)) => {
                 let len = file.metadata()?.len();
+                if sb.anchor.log_end < LOG_START {
+                    return Err(Error::Corrupt(format!(
+                        "superblock ends the log at {}, inside the {LOG_START} byte header",
+                        sb.anchor.log_end
+                    )));
+                }
                 if len < sb.anchor.log_end {
                     return Err(Error::Corrupt(format!(
                         "file is {len} bytes but superblock expects {}",
@@ -1319,11 +1325,11 @@ impl Txn {
         if inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
-        let frame = Frame {
-            seq: cursor.seq + 1,
-            end,
-            head,
-        };
+        let seq = cursor
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("the log has used its last sequence number".into()))?;
+        let frame = Frame { seq, end, head };
         let spilled = self.start != self.origin;
         let mut header = [0u8; FRAME_BYTES];
         header[0..8].copy_from_slice(FRAME_MAGIC);

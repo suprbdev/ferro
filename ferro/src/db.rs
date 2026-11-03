@@ -1042,7 +1042,12 @@ impl<T: Data> Shared<T> {
         let mut txn = store.begin()?;
         let (root, value) = write_decoded(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
-        let version = state.snapshot.commit.version + 1;
+        let version = state
+            .snapshot
+            .commit
+            .version
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("the branch has reached the last version".into()))?;
         let mut merged = tip
             .refs
             .try_get(&branch.name)?
@@ -1466,7 +1471,7 @@ impl<T: Data> Db<T> {
         let before = state.snapshot.commit.version;
         let time = OnceCell::new();
         let stamp = Stamp {
-            version: before + 1,
+            version: before.saturating_add(1),
             floor: state.snapshot.commit.floor(),
             time: &time,
             clock: self.shared.clock.as_ref(),
@@ -1517,7 +1522,7 @@ impl<T: Data> Db<T> {
         let seal = group.seal.clone();
         let timed = group.time.get().is_some();
         let stamp = Stamp {
-            version: before + 1,
+            version: before.saturating_add(1),
             floor: group.state.snapshot.commit.floor(),
             time: &group.time,
             clock: shared.clock.as_ref(),
