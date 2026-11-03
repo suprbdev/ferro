@@ -23,9 +23,16 @@ path = "src/bin/watchers.rs"
 name = "clone"
 path = "src/bin/clone.rs"
 
+[[bin]]
+name = "tables"
+path = "src/bin/tables.rs"
+
 [dependencies]
+booking = { path = "../examples/booking" }
+fastrand = "2"
 ferro = { path = "../ferro" }
 ledger = { path = "../examples/ledger" }
+libc = "0.2"
 metrics = { path = "../examples/metrics" }
 tempfile = "3"
 wiki = { path = "../examples/wiki" }

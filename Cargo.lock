@@ -421,8 +421,11 @@ dependencies = [
 name = "ferro-bench"
 version = "0.1.0"
 dependencies = [
+ "booking",
+ "fastrand",
  "ferro",
  "ledger",
+ "libc",
  "metrics",
  "tempfile",
  "wiki",
