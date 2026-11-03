@@ -163,7 +163,7 @@ fn stream(feed: Feed) -> impl Stream<Item = Result<Event, std::convert::Infallib
                     if frame.version <= feed.last {
                         continue;
                     }
-                    if frame.from > feed.last {
+                    if frame.from != feed.last {
                         match catch_up(&feed.app, feed.last).await {
                             Ok(Some(frame)) => {
                                 feed.last = frame.version;
