@@ -794,38 +794,44 @@ and a path through a symlink stays a symlink.
 ### Measurements
 
 Four workloads ran for 15 seconds each on the test NVMe with ext4, with fsync, keeping the last 100
-versions and starting a cycle every 64 MiB. These are medians of three runs, alternated with the
-alternatives below on a machine other work was sharing:
+versions and starting a cycle every 64 MiB. These are medians of three runs, alternated on a machine
+other work was sharing:
 
 | Workload | Commits/s without cycles | With cycles | Longest pause | File after a cycle | Live | Grows to without cycles |
 | --- | --- | --- | --- | --- | --- | --- |
-| `metrics`, one commit per scrape | 5,200 | 5,230 | 2.9 ms | 1.6 MiB | 1.5 MiB | 245 MiB |
-| `ledger`, single entries | 4,920 | 4,720 | 4.4 ms | 4.9 MiB | 4.3 MiB | 427 MiB |
-| `wiki`, edits of 64 KiB pages | 670 | 700 | 4.0 ms | 7.2 MiB | 7.1 MiB | 100 MiB |
-| Table updates, 200,000 rows | 5,190 | 4,900 | 3.1 ms | 13.2 MiB | 12.2 MiB | 339 MiB |
+| `metrics`, one commit per scrape | 5,240 | 5,190 | 2.8 ms | 1.3 MiB | 1.4 MiB | 248 MiB |
+| `ledger`, single entries | 4,810 | 4,820 | 3.5 ms | 4.6 MiB | 4.5 MiB | 443 MiB |
+| `wiki`, edits of 64 KiB pages | 670 | 680 | 4.8 ms | 7.2 MiB | 7.1 MiB | 100 MiB |
+| Table updates, 200,000 rows | 5,090 | 5,090 | 3.2 ms | 13.2 MiB | 12.2 MiB | 332 MiB |
 
-The difference in commits per second is within what the same mode varied between runs. p99 commit
-latency was 0.9 to 1.6 ms, and 4.6 ms on `wiki`, against 0.9 to 1.1 ms and 5.0 ms without cycles. The
-file saws between what is live and 64 MiB above it. While both files exist the peak is higher by what
-has been copied, which came to 76 MiB on `ledger` and 96 MiB on table updates.
+p99 commit latency moved from 0.93 to 0.94 ms, 1.21 to 1.33 ms, 4.51 to 4.59 ms and 0.95 to 1.01 ms.
+The file saws between what is live and 64 MiB above it. While both files exist the peak is higher by
+what has been copied, which came to 77 MiB on `ledger` and 95 MiB on table updates.
 
-With 8 readers on a 1M row table and 60 MiB live, at 3,100 commits a second with or without cycles,
-reads went from 1.05M a second to 0.96M, because every swap empties the node cache. p99 read latency
-stayed at 96 µs. Each cycle took 1.4 s in the background and the longest pause was 5.6 ms. In one run
-of `Durability::Buffered` at 19,000 commits a second the longest pause was 6.4 ms.
+`metrics load` at 20,000 points a second with one commit per scrape grew to 190 MB without cycles.
+With them the file sawed between 3 and 62 MB with two cycles in 30 seconds, and the longest pause was
+1.8 ms. It used to stall writers for 0.34 to 0.74 s, dropping the database each time.
 
-Three alternatives were built or simulated on the same workloads, and left out:
+With 8 readers on a 1M row table and 60 MiB live, at 4,200 commits a second with or without cycles,
+reads went from 1.67M a second to 1.54M, because every swap empties the node cache. p99 read latency
+went from 53 to 55 µs. Each cycle took about 1.1 s in the background and the longest pause was 5 ms.
+In `Durability::Buffered` the longest pause was 7.2 ms at 18,000 commits a second on `metrics`, 7.6 ms
+at 11,700 on `ledger`, and 8.5 ms at 15,800 on table updates.
+
+Three alternatives were built or simulated and left out. Hole punching and segments were worked out
+from the real layout of live records in each workload's file. Relocation ran live, and that
+comparison was made on one base, before value columns landed:
 
 | | Reclaimed per cycle | File after a cycle, 1M rows | Pause | Buffered commits/s | Reads/s, 1M rows | Copied, 1M rows | Lines in `ferro/src` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Copy and swap | 100% | 62 MiB | 2.9 to 5.6 ms | 11,900 to 19,400 | 0.96M | 564 MiB | +961 -251 |
-| Hole punching alone | 44 to 91% | not run | 2 to 3.5 ms | not run | not run | 0 | see below |
+| Copy and swap | 100% | 62 MiB | 2.9 to 5.6 ms | 11,900 to 19,400 | 0.96M | 564 MiB | +1,000 -250 |
+| Hole punching alone | 44 to 91% | not run | 2 to 3.5 ms | not run | not run | 0 | not separate |
 | Copying sparse runs to the tail, then punching | 64 to 96% | 87 MiB | 2 to 3.9 ms | 10,500 to 16,000 | 0.99M | 136 MiB | +1,345 -88 |
-| Fixed segments, dropped when dead | 0 to 89% | simulated | none | not run | not run | 0 | not built |
+| Fixed segments, dropped when dead | 0 to 90% | simulated | none | not run | not run | 0 | not built |
 
 - Hole punching needs no pointer changes at all, because offsets stay valid. But a hole frees whole
-  blocks, and one live record pins its block. Over a whole run of 0.2 to 2.3 GB it freed 99.9% of the
-  garbage in `metrics`, whose live data clusters by time, but 71 to 90% elsewhere, leaving 8 to 17
+  blocks, and one live record pins its block. Over a whole run of 0.2 to 2.6 GB it freed 99.9% of the
+  garbage in `metrics`, whose live data clusters by time, but 70 to 90% elsewhere, leaving 8 to 17
   times the live size. Per 64 MiB cycle it freed 44 to 91%, because the same live records sit in less
   garbage. Each commit scatters survivors across the log, so this decides it.
 - Copying only the records in sparse runs to the tail and punching the rest copies a quarter as much
@@ -840,12 +846,9 @@ Three alternatives were built or simulated on the same workloads, and left out:
   every path had to get right, and here an old object is simply never freed while anything can reach
   it.
 - A segmented log drops a segment only when nothing in it is live. At 1 MiB or more that freed 0 to
-  1% of the garbage in `ledger`, `wiki` and table updates, and 89% to 99.7% in `metrics`. Live data
+  1% of the garbage in `ledger`, `wiki` and table updates, and 90 to 99.8% in `metrics`. Live data
   would have to move, which needs the same table or rewritten parents, and a directory gives up the
   single file.
-
-The numbers for hole punching and segments come from the real layout of live records in each
-workload's file. Only the relocation design ran live.
 
 ### Limits
 
