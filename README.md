@@ -355,23 +355,34 @@ cargo run --release -p tracker -- undo
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`, as the median of five runs alternating with the build before.
+`ferro-bench`. Each is a single run on an otherwise idle machine.
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 1.5 s |
-| Random `get` | 0.41 µs |
-| Full scan | 35 ns per key |
-| Range read | 39 ns per key |
-| Single-key commit, fsync | 480 to 650 µs, about 1,500 to 2,000 per second |
-| Single-key commits, fsync, 8 writers | about 9,500 per second |
-| Single-key commit, `Durability::Buffered` | 27 µs |
+| Bulk insert in one commit | 1.4 s |
+| Random `get` | 0.37 µs |
+| Full scan | 33 ns per key |
+| Range read | 36 ns per key |
+| Single-key commit, fsync | 430 µs, about 2,300 per second |
+| Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
+| Reads per second with those writers running | 38M |
+| Single-key commit, `Durability::Buffered` | 26 µs |
 | Bytes written per single-key commit | 3.5 KB |
-| `diff` | 4.4 µs per changed key |
+| `diff` | 3.5 µs per changed key |
 
-The tracker with 100,000 issues in a 39 MB file, as whole process runs including open: seeding in
-845 ms, indexed `list` in 2 ms, `show` in 1 ms, durable `close` in 1 ms, `stats` in 3 ms,
-`history` of an issue in 3 ms, and a full text scan in 111 ms.
+Against other embedded stores on the same workload, with 3 rounds and 1 GiB of cache each:
+
+| Engine | Get | Scan | Durable commit | 8 writers, commits/s | File size |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ferro | 0.53 µs | 35 ns | 0.40 ms | 9,502 | 23 MiB |
+| redb | 0.27 µs | 49 ns | 0.42 ms | 2,155 | 65 MiB |
+| SQLite, `synchronous=FULL` | 0.90 µs | 51 ns | 0.47 ms | 1,027 | 57 MiB |
+| fjall | 1.19 µs | 83 ns | 0.50 ms | 1,982 | 64 MiB |
+
+ferro keeps every version and re-hashes objects as it reads them, and the others do neither.
+SQLite and fjall bulk load about 2 times faster, and redb's `get` is about 2 times faster. These
+numbers come from a warm cache, on a workload with few overwrites. Full results, including
+caveats about sled, are in `benchmarks/compare/RESULTS.md`.
 
 ## Limitations
 

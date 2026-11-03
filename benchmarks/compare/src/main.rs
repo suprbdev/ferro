@@ -632,7 +632,7 @@ fn parent(n: u64) {
     table.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for name in ENGINES {
         let dur = match name {
-            "ferro" => "fsync data then superblock per commit",
+            "ferro" => "fdatasync per commit, group commit",
             "redb" => "Durability::Immediate (fsync per commit)",
             "sqlite-full" => "WAL, synchronous=FULL",
             "sqlite-normal" => "WAL, synchronous=NORMAL (commit not fsynced)",

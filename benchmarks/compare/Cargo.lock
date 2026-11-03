@@ -222,9 +222,11 @@ dependencies = [
  "arc-swap",
  "blake3",
  "ferro-derive",
+ "lz4_flex",
  "parking_lot 0.12.5",
  "quick_cache",
  "thiserror",
+ "xxhash-rust",
 ]
 
 [[package]]
