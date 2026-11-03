@@ -2,6 +2,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ferro::admin::{self, Keep};
 use ferro::codec::{Decoder, Encoder};
 use ferro::{Data, Db, Error, Map, Options};
 use tempfile::TempDir;
@@ -99,4 +100,10 @@ fn a_branch_whose_first_version_is_past_its_last_is_corrupt() {
     let (_dir, path) = fixture("chain-bounds");
     corrupt(read_only().open::<Root>(&path));
     corrupt(Db::<Root>::open(&path));
+}
+
+#[test]
+fn keeping_history_since_a_time_reaches_the_last_version_without_overflow() {
+    let (_dir, path) = fixture("first-since");
+    corrupt(admin::layout(&path, Keep::Since(1)));
 }

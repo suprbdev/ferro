@@ -518,7 +518,7 @@ impl Chain {
 
     fn first_since(&self, store: &Store, time_ms: u64) -> Result<u64> {
         let older = self.at_time(store, time_ms.saturating_sub(1))?;
-        Ok(older.map_or(self.first, |entry| entry.commit.version + 1))
+        Ok(older.map_or(self.first, |entry| entry.commit.version.saturating_add(1)))
     }
 
     pub(crate) fn retained_skip(&self, entry: &Entry) -> Option<Ptr> {
