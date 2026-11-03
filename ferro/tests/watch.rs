@@ -348,7 +348,7 @@ fn a_panicking_test_cannot_wedge_commits() {
     let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
     put(&db, 1, 1);
     let mut value = 0;
-    while calls.load(Ordering::SeqCst) < 2 {
+    while calls.load(Ordering::SeqCst) < 2 && !parked_thread.is_finished() {
         value += 1;
         put(&db, 2, value);
     }
