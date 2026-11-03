@@ -15,7 +15,7 @@ FUZZ_TIME ?= 600
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt doc ci act \
-	bench bench-reads bench-heap bench-tables bench-bulk bench-merge bench-compare \
+	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds clean clean-tmp
 
@@ -67,6 +67,9 @@ bench: ## Run the main benchmark and append to target/bench/results.jsonl
 
 bench-reads: ## Benchmark reads
 	$(RUN) run --release -p ferro-bench --bin reads -- $(ARGS)
+
+bench-scaling: ## Measure reads from 1 to 32 threads on shared snapshots
+	$(RUN) run --release -p ferro-bench --bin scaling -- $(ARGS)
 
 bench-heap: ## Measure memory held by the cache and working trees
 	$(RUN) run --release -p ferro-bench --bin heap -- $(ARGS)
