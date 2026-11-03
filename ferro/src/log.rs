@@ -106,6 +106,9 @@ impl Data for Entry {
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let mut commit = Commit::decode(r)?;
+        if commit.version == 0 {
+            return Err(Error::Decode("log entry claims version 0".into()));
+        }
         let flags = r.u8()?;
         if flags & (WHOLE | JOINED) == WHOLE | JOINED {
             return Err(Error::Decode(format!("invalid log entry flags {flags}")));

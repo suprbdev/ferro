@@ -13,6 +13,78 @@ type Counters = Map<u8, i64>;
 
 const SLOT: usize = 4096;
 
+const HAS_PREV: u8 = 1;
+const HAS_SKIP: u8 = 2;
+const MERGED: u8 = 16;
+const GRAPH: u8 = 32;
+
+#[derive(Clone)]
+struct Head {
+    version: u64,
+    first: u64,
+    tip: Ptr,
+}
+
+impl Data for Head {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.version.encode(w)?;
+        self.first.encode(w)?;
+        w.u8(0);
+        w.u8(1);
+        w.link(self.tip);
+        w.varint(0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let version = u64::decode(r)?;
+        let first = u64::decode(r)?;
+        Option::<Ptr>::decode(r)?;
+        let tip = Option::<Ptr>::decode(r)?.ok_or(Error::Decode("no tip".into()))?;
+        Map::<String, (u64, u64)>::decode(r)?;
+        Ok(Head { version, first, tip })
+    }
+}
+
+#[derive(Default)]
+struct Entry {
+    version: u64,
+    time_ms: u64,
+    prev: Option<Ptr>,
+    skip: Option<Ptr>,
+    merged: Option<(Ptr, u64, u64)>,
+    graph: (u64, u64, u64),
+}
+
+impl Entry {
+    fn write(&self, txn: &mut ferro::store::Txn) -> Ptr {
+        let mut w = Encoder::new(txn);
+        w.varint(self.version);
+        w.varint(self.time_ms);
+        w.raw(&[0, 0, 0]);
+        let wide = self.graph != (0, 0, 0);
+        w.u8(
+            u8::from(self.prev.is_some()) * HAS_PREV
+                | u8::from(self.skip.is_some()) * HAS_SKIP
+                | u8::from(self.merged.is_some()) * MERGED
+                | u8::from(wide) * GRAPH,
+        );
+        if let Some((_, floor, after)) = self.merged {
+            w.varint(floor);
+            w.varint(after + 1);
+        }
+        if wide {
+            w.varint(self.graph.0);
+            w.varint(self.graph.1);
+            w.varint(self.graph.2);
+        }
+        for link in [self.prev, self.skip, self.merged.map(|(ptr, _, _)| ptr)].into_iter().flatten() {
+            w.link(link);
+        }
+        w.finish().unwrap()
+    }
+}
+
 #[derive(Clone, Default)]
 struct Opaque;
 
@@ -204,6 +276,68 @@ fn info_walks_a_deep_branch_table_without_recursing() {
     store.close();
     drop(store);
     assert_eq!(admin::info(&path).unwrap().branches.len(), depth as usize);
+}
+
+#[test]
+fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zero.ferro");
+    let options = StoreOptions {
+        durability: Durability::Buffered,
+        ..StoreOptions::default()
+    };
+    let (store, _) = Store::open(&path, options).unwrap();
+    let mut txn = store.begin().unwrap();
+    let at = |version, time_ms| Entry {
+        version,
+        time_ms,
+        ..Entry::default()
+    };
+    let other = at(1, 300).write(&mut txn);
+    let zero = Entry {
+        merged: Some((other, 1, 0)),
+        graph: (1, 0, 0),
+        ..at(0, 100)
+    }
+    .write(&mut txn);
+    let one = Entry {
+        prev: Some(zero),
+        ..at(1, 100)
+    }
+    .write(&mut txn);
+    let old = Entry {
+        prev: Some(one),
+        ..at(2, 10)
+    }
+    .write(&mut txn);
+    let merged = Entry {
+        prev: Some(zero),
+        skip: Some(old),
+        ..at(3, 100)
+    }
+    .write(&mut txn);
+    let base = at(1, 100).write(&mut txn);
+    let main = Entry {
+        prev: Some(base),
+        merged: Some((merged, 1, 50)),
+        graph: (2, 3, 2),
+        ..at(2, 100)
+    }
+    .write(&mut txn);
+    let side = at(1, 200).write(&mut txn);
+    let mut refs: Map<String, Head> = Map::new();
+    refs.insert("main".into(), Head { version: 2, first: 1, tip: main });
+    refs.insert("side".into(), Head { version: 1, first: 1, tip: side });
+    let mut encoder = Encoder::new(&mut txn);
+    refs.encode(&mut encoder).unwrap();
+    let head = encoder.finish().unwrap();
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    let db = read_only().open::<Root>(&path).unwrap();
+    let side = db.branch("side").unwrap();
+    let found = db.common_ancestor(&side);
+    assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
 }
 
 #[test]
