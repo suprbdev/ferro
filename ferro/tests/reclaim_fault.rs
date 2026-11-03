@@ -225,14 +225,14 @@ fn a_cycle_does_not_heal_a_store_poisoned_during_it() {
     db.verify().unwrap();
 }
 
-fn base_then_fork(db: &Db<Root>) -> Db<Root> {
+fn base_then_fork(db: &Db<Root>, name: &str) -> Db<Root> {
     for i in 0..3u64 {
         db.commit("base", |root| {
             root.insert(i, format!("v{i}"));
         })
         .unwrap();
     }
-    let side = db.fork("side").unwrap();
+    let side = db.fork(name).unwrap();
     CLOCK_BACK_SECONDS.store(3600, Ordering::SeqCst);
     side.commit("sync", |root| {
         root.insert(9, "same".into());
@@ -265,7 +265,7 @@ fn a_commit_with_the_hash_of_a_pruned_entry_during_a_cycle_is_copied() {
             }
         };
         let db: Db<Root> = options().hook(Hook(Arc::new(hook))).open(&path).unwrap();
-        let side = base_then_fork(&db);
+        let side = base_then_fork(&db, "side");
         *slot.lock().unwrap() = Some(db.clone());
         db.compact(Keep::Last(1)).unwrap();
         *slot.lock().unwrap() = None;
@@ -292,7 +292,7 @@ fn a_commit_with_the_hash_of_a_tombstone_does_not_stop_later_cycles() {
     let dir = dir();
     let path = dir.path().join("db.ferro");
     let db: Db<Root> = options().open(&path).unwrap();
-    let side = base_then_fork(&db);
+    let side = base_then_fork(&db, "a");
     db.compact(Keep::Last(1)).unwrap();
     db.commit("sync", |root| {
         root.insert(9, "same".into());
@@ -395,7 +395,7 @@ fn a_failed_rename_fails_the_cycle_and_commits_continue() {
 fn a_failed_sync_at_any_point_in_a_cycle_loses_nothing() {
     let _turn = serial();
     let mut failed = 0;
-    for failing in 0..12 {
+    for (failing, cache) in (0..12).flat_map(|failing| [(failing, 1), (failing, 1 << 20)]) {
         let dir = dir();
         let path = dir.path().join("db.ferro");
         let hook = move |name: &'static str| {
@@ -404,7 +404,7 @@ fn a_failed_sync_at_any_point_in_a_cycle_loses_nothing() {
             }
         };
         let db: Db<Root> = Options::new()
-            .cache_bytes(1)
+            .cache_bytes(cache)
             .reclaim(MANUAL)
             .hook(Hook(Arc::new(hook)))
             .open(&path)

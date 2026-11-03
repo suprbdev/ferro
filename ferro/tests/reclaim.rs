@@ -819,23 +819,45 @@ fn a_leftover_temp_file_behind_a_symlink_is_cleared_on_open() {
 }
 
 #[test]
-fn one_trigger_runs_one_cycle() {
+fn a_trigger_raised_during_a_cycle_does_not_run_another() {
     let dir = dir();
     let path = path_in(&dir);
-    let db: Db<Root> = fast()
+    let slot: Arc<Mutex<Option<Db<Root>>>> = Arc::new(Mutex::new(None));
+    let armed = Arc::new(AtomicBool::new(true));
+    let hook = {
+        let (slot, armed) = (slot.clone(), armed.clone());
+        move |name: &'static str| {
+            if name == "copied" && armed.swap(false, Ordering::SeqCst) {
+                let db = slot.lock().unwrap().clone().unwrap();
+                for key in 0..3u64 {
+                    db.update(|root| {
+                        root.insert(key, key.to_string().repeat(5000));
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    };
+    let db: Db<Root> = Options::new()
+        .durability(Durability::Buffered)
         .history(Keep::Last(1))
         .reclaim(Reclaim { every_bytes: 64 << 10 })
+        .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
+    *slot.lock().unwrap() = Some(db.clone());
     let started = Instant::now();
+    let mut next = 100;
     while db.space().unwrap().cycles == 0 && started.elapsed() < Duration::from_secs(20) {
-        fill(&db, 20, 10);
+        next += 1;
+        db.update(|root| {
+            root.insert(next, next.to_string().repeat(4000));
+        })
+        .unwrap();
     }
-    thread::sleep(Duration::from_millis(100));
-    let settled = db.space().unwrap();
-    assert!(settled.cycles >= 1, "{settled:?}");
-    thread::sleep(Duration::from_millis(200));
-    assert_eq!(db.space().unwrap().cycles, settled.cycles);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(db.space().unwrap().cycles, 1);
+    slot.lock().unwrap().take();
 }
 
 #[test]
