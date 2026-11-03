@@ -30,6 +30,7 @@ pub struct QueueOptions {
     pub cache_bytes: Option<u64>,
     pub history: Keep,
     pub reclaim: Reclaim,
+    pub coalesce: bool,
 }
 
 impl Default for QueueOptions {
@@ -41,6 +42,7 @@ impl Default for QueueOptions {
             cache_bytes: None,
             history: Keep::All,
             reclaim: Reclaim::default(),
+            coalesce: true,
         }
     }
 }
@@ -110,7 +112,8 @@ impl Queue {
             let mut opened = Options::new()
                 .durability(options.durability)
                 .history(options.history)
-                .reclaim(options.reclaim);
+                .reclaim(options.reclaim)
+                .coalesce(options.coalesce);
             if let Some(bytes) = options.cache_bytes {
                 opened = opened.cache_bytes(bytes);
             }

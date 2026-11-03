@@ -25,6 +25,7 @@ pub struct Config {
     pub feed_capacity: usize,
     pub keep_versions: Option<usize>,
     pub reclaim_bytes: u64,
+    pub coalesce: bool,
 }
 
 impl Default for Config {
@@ -38,12 +39,15 @@ impl Default for Config {
             feed_capacity: 1024,
             keep_versions: None,
             reclaim_bytes: Reclaim::default().every_bytes,
+            coalesce: false,
         }
     }
 }
 
 pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
-    let options = Options::new().durability(config.durability);
+    let options = Options::new()
+        .durability(config.durability)
+        .coalesce(config.coalesce);
     let options = match config.keep_versions {
         _ if config.replica => options.read_only(),
         Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {

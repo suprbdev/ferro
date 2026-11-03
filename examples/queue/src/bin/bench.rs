@@ -46,7 +46,8 @@ fn summary(label: &str, mut samples: Vec<u64>) -> String {
 }
 
 fn open(path: &PathBuf) -> Queue {
-    Queue::open(path, QueueOptions::default()).unwrap()
+    let coalesce = std::env::var("COALESCE").map_or(true, |value| value != "0");
+    Queue::open(path, QueueOptions { coalesce, ..QueueOptions::default() }).unwrap()
 }
 
 fn prefill(queue: &Queue, depth: u64) {

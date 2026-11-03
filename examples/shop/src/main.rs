@@ -9,7 +9,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: shop --db PATH [--addr HOST:PORT] [--replica] [--reads inline|blocking] \
          [--writes inline|blocking|pool:N] [--durability fsync|buffered] [--refresh-ms N] \
-         [--workers N] [--keep-versions N] [--reclaim-mb N]"
+         [--workers N] [--keep-versions N] [--reclaim-mb N] [--coalesce]"
     );
     std::process::exit(2)
 }
@@ -26,6 +26,7 @@ fn main() {
             "--db" => db = Some(PathBuf::from(value())),
             "--addr" => addr = value(),
             "--replica" => config.replica = true,
+            "--coalesce" => config.coalesce = true,
             "--reads" => config.reads = value().parse().unwrap_or_else(|_| usage()),
             "--writes" => config.writes = value().parse().unwrap_or_else(|_| usage()),
             "--refresh-ms" => config.refresh_ms = value().parse().unwrap_or_else(|_| usage()),
