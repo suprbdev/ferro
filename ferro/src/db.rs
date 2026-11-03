@@ -691,20 +691,14 @@ impl Options {
     }
 }
 
-fn write_value<D: Data>(value: &D, txn: &mut Txn) -> Result<Ptr> {
-    let mut encoder = Encoder::new(txn);
-    value.encode(&mut encoder)?;
-    encoder.finish()
-}
-
-fn write_root<T: Data>(value: &T, txn: &mut Txn, store: &Store) -> Result<Ptr> {
+fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Ptr, D)> {
     let mut encoder = Encoder::new(txn);
     value.encode(&mut encoder)?;
     let object = encoder.into_object();
     let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
-    T::decode(&mut decoder)?;
+    let decoded = D::decode(&mut decoder)?;
     let hash = object.hash();
-    txn.put(object, hash)
+    Ok((txn.put(object, hash)?, decoded))
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -922,13 +916,16 @@ impl<T: Data> Shared<T> {
         tip: &mut RefState,
         refs: Refs,
         mut txn: Txn,
-        branch: Option<&Arc<Branch<T>>>,
+        branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
     ) -> Result<()> {
-        let ptr = write_value(&refs, &mut txn)?;
+        let (ptr, refs) = write_decoded(&refs, &mut txn, &self.store())?;
         let frame = txn.write(ptr)?;
-        let loaded = self.load_tip(ptr, branch);
-        let (refs, update) = loaded.inspect_err(|_| self.store().poison())?;
+        let update = branch.map(|(branch, state)| {
+            let state = Arc::new(state);
+            branch.tip.store(state.clone());
+            (branch.clone(), state)
+        });
         tip.refs = refs;
         tip.ptr = Some(ptr);
         let refs = tip.clone();
@@ -949,18 +946,6 @@ impl<T: Data> Shared<T> {
             seal,
         });
         Ok(())
-    }
-
-    fn load_tip(&self, ptr: Ptr, branch: Option<&Arc<Branch<T>>>) -> Result<(Refs, Update<T>)> {
-        let store = self.store();
-        let refs = (*store.load::<Refs>(ptr)?).clone();
-        let Some(branch) = branch else {
-            return Ok((refs, None));
-        };
-        let head = refs.try_get(&branch.name)?;
-        let state = Arc::new(self.state_of(&store, head.as_deref())?);
-        branch.tip.store(state.clone());
-        Ok((refs, Some((branch.clone(), state))))
     }
 
     fn settle(&self, ticket: u64, notices: &mut Vec<Notice<T>>) -> Result<()> {
@@ -1055,7 +1040,7 @@ impl<T: Data> Shared<T> {
         } = change;
         let store = &self.store();
         let mut txn = store.begin()?;
-        let root = write_root(working, &mut txn, store)?;
+        let (root, value) = write_decoded(working, &mut txn, store)?;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let version = state.snapshot.commit.version + 1;
         let mut merged = tip
@@ -1090,6 +1075,10 @@ impl<T: Data> Shared<T> {
             parts,
             stamped: intent.time.is_some(),
         };
+        let snapshot = Snapshot {
+            value: Arc::new(value),
+            commit: Arc::new(commit.clone()),
+        };
         let log = state.log.append(store, &mut txn, commit, intent.merged)?;
         let log = match self.history {
             Keep::Last(_) => log.pruned(store, self.history)?,
@@ -1105,7 +1094,12 @@ impl<T: Data> Shared<T> {
                 merged,
             },
         );
-        self.stage(tip, next, txn, Some(branch), seal.map(|seal| (seal, version, time_ms)))?;
+        let state = State {
+            snapshot,
+            log,
+            store: store.clone(),
+        };
+        self.stage(tip, next, txn, Some((branch, state)), seal.map(|seal| (seal, version, time_ms)))?;
         Ok((version, time_ms))
     }
 
