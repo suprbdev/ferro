@@ -7,8 +7,24 @@ use booking::seed::{Plan, seed};
 use booking::{BookingError, Hotels, HoldRequest, Reservations, Why};
 use ferro::{Db, Durability, Options};
 
+#[cfg(target_os = "linux")]
 struct Counter(Option<i32>);
 
+#[cfg(not(target_os = "linux"))]
+struct Counter;
+
+#[cfg(not(target_os = "linux"))]
+impl Counter {
+    fn instructions() -> Counter {
+        Counter
+    }
+
+    fn read(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Counter {
     fn instructions() -> Counter {
         let mut attr = [0u64; 16];
@@ -33,6 +49,12 @@ impl Counter {
     }
 }
 
+#[cfg(not(unix))]
+fn cpu_ns() -> u64 {
+    0
+}
+
+#[cfg(unix)]
 fn cpu_ns() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
