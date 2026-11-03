@@ -1,9 +1,15 @@
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
 use booking::ops::scaled;
+use booking::seed::Plan;
 use booking::whatif::{self, PREFIX};
-use booking::{BookingError, Scenario, Status};
-use common::{assert_clean, days, world};
+use booking::{BookingError, HoldRequest, Scenario, Status};
+use common::{assert_clean, days, world, world_with};
 
 #[test]
 fn a_reprice_is_previewed_on_a_branch_then_merged_onto_a_moving_main() {
@@ -131,5 +137,84 @@ fn a_bad_proposal_leaves_no_branch_and_a_failing_merge_commits_nothing() {
     }
     assert_eq!(w.svc.db().version(), version);
     assert_eq!(whatif::list(&w.svc).unwrap().len(), 1);
+    assert_clean(&w.svc);
+}
+
+#[test]
+fn what_ifs_fork_and_merge_while_coalesced_writers_keep_booking() {
+    let w = world_with(
+        Plan {
+            venues: 3,
+            rooms: 6,
+            customers: 30,
+            credit: 10_000_000,
+            ..Plan::default()
+        },
+        true,
+    );
+    let today = w.clock.today();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..8u32)
+        .map(|i| {
+            let (svc, stop) = (w.svc.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut rng = fastrand::Rng::with_seed(u64::from(i));
+                let mut done = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let request = HoldRequest {
+                        customer: 1 + rng.u32(0..30),
+                        room: 1 + rng.u32(0..18),
+                        first: today + 1 + rng.u32(0..20),
+                        nights: 1 + rng.u32(0..3),
+                        ttl_ms: days(1),
+                    };
+                    match svc.hold(&request) {
+                        Ok(held) if rng.bool() => {
+                            match svc.confirm(held.id, None) {
+                                Ok(_) => done += 1,
+                                Err(BookingError::WrongStatus {
+                                    status: Status::Cancelled,
+                                    ..
+                                }) => assert!(request.room > 12),
+                                Err(other) => panic!("{other:?}"),
+                            }
+                        }
+                        Ok(_) => done += 1,
+                        Err(BookingError::Unavailable { .. } | BookingError::VenueClosed(_)) => {}
+                        Err(other) => panic!("{other:?}"),
+                    }
+                }
+                done
+            })
+        })
+        .collect();
+    for round in 0..6u32 {
+        let name = format!("round{round}");
+        let scenario = if round == 5 {
+            Scenario::Close { venue: 3 }
+        } else {
+            Scenario::Reprice {
+                venue: Some(1 + round % 2),
+                percent: 5,
+            }
+        };
+        whatif::propose(&w.svc, &name, scenario).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        if round == 2 {
+            whatif::discard(&w.svc, &name).unwrap();
+        } else {
+            whatif::apply(&w.svc, &name).unwrap();
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let booked: u32 = writers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(booked > 0);
+    let h = w.svc.read();
+    assert!(h.venues.get(&3).unwrap().closed_from.is_some());
+    assert_eq!(h.rooms.get(&1).unwrap().rate, scaled(scaled(12_000, 5), 5));
+    assert_eq!(h.rooms.get(&7).unwrap().rate, scaled(scaled(13_000, 5), 5));
+    assert!(h.active_at(3, today).is_empty());
+    drop(h);
+    assert!(whatif::list(&w.svc).unwrap().is_empty());
     assert_clean(&w.svc);
 }
