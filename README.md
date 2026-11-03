@@ -264,7 +264,7 @@ use ferro::{Keep, Options, Reclaim};
 
 let db = Options::new()
     .history(Keep::Last(1000))
-    .reclaim(Reclaim { every_bytes: 64 << 20, ..Reclaim::default() })
+    .reclaim(Reclaim { every_bytes: 64 << 20 })
     .open::<Shop>("shop.ferro")?;
 
 let space = db.space()?;
