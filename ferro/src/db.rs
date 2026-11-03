@@ -5,9 +5,9 @@ use std::mem;
 use std::ops::{Deref, RangeBounds};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -26,6 +26,7 @@ use crate::watch::{Feed, Watcher};
 const MAIN: &str = "main";
 const MAX_PASSES: u32 = 6;
 const QUIET_BYTES: u64 = 256 << 10;
+const MAX_GROUP: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct Commit {
@@ -47,6 +48,10 @@ impl PartialEq for Commit {
 }
 
 impl Commit {
+    pub fn messages(&self) -> impl Iterator<Item = &str> {
+        self.message.split('\n').filter(|message| !message.is_empty())
+    }
+
     fn genesis() -> Self {
         Commit {
             version: 0,
@@ -215,6 +220,15 @@ struct Intent<T> {
     merged: Option<(Arc<Branch<T>>, u64)>,
 }
 
+struct Change<'a, T> {
+    branch: &'a Arc<Branch<T>>,
+    state: &'a State<T>,
+    working: &'a T,
+    message: String,
+    intent: Intent<T>,
+    seal: Option<&'a Arc<Seal>>,
+}
+
 impl<T> Default for Intent<T> {
     fn default() -> Self {
         Intent {
@@ -264,13 +278,52 @@ struct Pending<T> {
     frame: Frame,
     refs: RefState,
     update: Update<T>,
+    seal: Option<Arc<Seal>>,
 }
 
 struct Queue<T> {
     waiting: Vec<Pending<T>>,
+    open: Option<Arc<Seal>>,
     settled: u64,
     syncing: bool,
     failed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Sealed {
+    version: u64,
+    ticket: u64,
+    framed: bool,
+}
+
+#[derive(Default)]
+struct Seal {
+    outcome: OnceLock<std::result::Result<Sealed, String>>,
+    settled: AtomicBool,
+    parked: Mutex<Vec<Thread>>,
+}
+
+impl Seal {
+    fn wake_all(&self) {
+        for thread in mem::take(&mut *self.parked.lock()) {
+            thread.unpark();
+        }
+    }
+
+    fn wake_one(&self) {
+        if let Some(thread) = self.parked.lock().pop() {
+            thread.unpark();
+        }
+    }
+}
+
+struct Group<T> {
+    branch: Arc<Branch<T>>,
+    state: Arc<State<T>>,
+    working: T,
+    messages: Vec<String>,
+    members: usize,
+    seal: Arc<Seal>,
 }
 
 #[derive(Default)]
@@ -324,6 +377,9 @@ struct Shared<T> {
     path: PathBuf,
     file: PathBuf,
     options: StoreOptions,
+    coalesce: bool,
+    arriving: AtomicUsize,
+    open: Mutex<Option<Group<T>>>,
     tip: Mutex<RefState>,
     published: Mutex<RefState>,
     queue: Mutex<Queue<T>>,
@@ -396,6 +452,7 @@ pub struct Options {
     store: StoreOptions,
     history: Keep,
     reclaim: Reclaim,
+    coalesce: bool,
     hook: Option<Hook>,
 }
 
@@ -431,6 +488,11 @@ impl Options {
 
     pub fn reclaim(mut self, reclaim: Reclaim) -> Self {
         self.reclaim = reclaim;
+        self
+    }
+
+    pub fn coalesce(mut self, coalesce: bool) -> Self {
+        self.coalesce = coalesce;
         self
     }
 
@@ -480,6 +542,9 @@ impl Options {
                 options.read_only = read_only;
                 options
             },
+            coalesce: self.coalesce && !read_only,
+            arriving: AtomicUsize::new(0),
+            open: Mutex::new(None),
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
                 ptr: head,
@@ -487,6 +552,7 @@ impl Options {
             published: Mutex::new(RefState { refs, ptr: head }),
             queue: Mutex::new(Queue {
                 waiting: Vec::new(),
+                open: None,
                 settled,
                 syncing: false,
                 failed: false,
@@ -593,12 +659,157 @@ impl<T: Data> Shared<T> {
         Ok(branch)
     }
 
+    fn lock_tip(&self) -> MutexGuard<'_, RefState> {
+        if !self.coalesce {
+            return self.tip.lock();
+        }
+        let mut tip = self.arrive();
+        let open = self.open.lock().take();
+        if let Some(group) = open {
+            self.seal_for_others(&mut tip, group);
+        }
+        tip
+    }
+
+    fn seal_for_others(&self, tip: &mut RefState, group: Group<T>) {
+        let seal = group.seal.clone();
+        self.seal_group(tip, group);
+        seal.wake_one();
+    }
+
+    fn arrive(&self) -> MutexGuard<'_, RefState> {
+        self.arriving.fetch_add(1, Ordering::AcqRel);
+        let tip = self.tip.lock();
+        self.arriving.fetch_sub(1, Ordering::AcqRel);
+        tip
+    }
+
+    fn join_group(&self, tip: &mut RefState, branch: &Arc<Branch<T>>) -> Group<T> {
+        let open = self.open.lock().take();
+        match open {
+            Some(group) if Arc::ptr_eq(&group.branch, branch) => return group,
+            Some(group) => self.seal_for_others(tip, group),
+            None => {}
+        }
+        let state = branch.tip.load_full();
+        Group {
+            branch: branch.clone(),
+            working: (*state.snapshot.value).clone(),
+            state,
+            messages: Vec::new(),
+            members: 0,
+            seal: Arc::new(Seal::default()),
+        }
+    }
+
+    fn pass_on(&self, group: Group<T>) -> Option<Group<T>> {
+        if group.members == 0 {
+            return None;
+        }
+        let mut queue = self.queue.lock();
+        let handed_on = queue.syncing || self.arriving.load(Ordering::Acquire) > 0;
+        if handed_on && group.members < MAX_GROUP {
+            queue.open = Some(group.seal.clone());
+            *self.open.lock() = Some(group);
+            return None;
+        }
+        Some(group)
+    }
+
+    fn seal_group(&self, tip: &mut RefState, group: Group<T>) {
+        let Group {
+            branch,
+            state,
+            working,
+            messages,
+            seal,
+            ..
+        } = group;
+        let message = messages.join("\n");
+        let written = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.commit_locked(
+                tip,
+                Change {
+                    branch: &branch,
+                    state: &state,
+                    working: &working,
+                    message,
+                    intent: Intent::default(),
+                    seal: Some(&seal),
+                },
+            )
+        }));
+        let ticket = self.store().last_seq();
+        let mut queue = self.queue.lock();
+        if queue.open.as_ref().is_some_and(|open| Arc::ptr_eq(open, &seal)) {
+            queue.open = None;
+        }
+        let _ = seal.outcome.set(match written {
+            Ok(Ok(version)) => Ok(Sealed {
+                version,
+                ticket,
+                framed: false,
+            }),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("a value panicked while it was written".to_string()),
+        });
+        let framed = matches!(seal.outcome.get(), Some(Ok(sealed)) if sealed.framed);
+        drop(queue);
+        if !framed {
+            seal.wake_all();
+        }
+    }
+
+    fn await_group(&self, seal: &Arc<Seal>) -> Result<u64> {
+        loop {
+            if seal.settled.load(Ordering::Acquire)
+                && let Some(Ok(sealed)) = seal.outcome.get()
+            {
+                return Ok(sealed.version);
+            }
+            let queue = self.queue.lock();
+            if queue.failed {
+                return Err(Error::Poisoned);
+            }
+            match seal.outcome.get() {
+                Some(Err(failure)) => {
+                    self.store().check_healthy()?;
+                    return Err(Error::GroupFailed(failure.clone()));
+                }
+                Some(Ok(sealed)) if queue.settled >= sealed.ticket => return Ok(sealed.version),
+                Some(Ok(sealed)) if !sealed.framed => {
+                    drop(queue);
+                    self.settle(sealed.ticket)?;
+                    return Ok(sealed.version);
+                }
+                Some(Ok(_)) if !queue.syncing && !queue.waiting.is_empty() => {
+                    self.lead(queue)?;
+                    continue;
+                }
+                None if !queue.syncing && self.arriving.load(Ordering::Acquire) == 0 => {
+                    drop(queue);
+                    let mut tip = self.arrive();
+                    let open = self.open.lock().take();
+                    if let Some(group) = open {
+                        self.seal_group(&mut tip, group);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            seal.parked.lock().push(thread::current());
+            drop(queue);
+            thread::park();
+        }
+    }
+
     fn stage(
         &self,
         tip: &mut RefState,
         refs: Refs,
         mut txn: Txn,
         branch: Option<&Arc<Branch<T>>>,
+        seal: Option<(&Arc<Seal>, u64)>,
     ) -> Result<()> {
         let ptr = write_value(&refs, &mut txn)?;
         let frame = txn.write(ptr)?;
@@ -607,7 +818,21 @@ impl<T: Data> Shared<T> {
         tip.refs = refs;
         tip.ptr = Some(ptr);
         let refs = tip.clone();
-        self.queue.lock().waiting.push(Pending { frame, refs, update });
+        let mut queue = self.queue.lock();
+        if let Some((seal, version)) = seal {
+            let _ = seal.outcome.set(Ok(Sealed {
+                version,
+                ticket: frame.seq,
+                framed: true,
+            }));
+        }
+        let seal = seal.map(|(seal, _)| seal.clone());
+        queue.waiting.push(Pending {
+            frame,
+            refs,
+            update,
+            seal,
+        });
         Ok(())
     }
 
@@ -650,12 +875,14 @@ impl<T: Data> Shared<T> {
         let (frame, refs) = (last.frame, last.refs.clone());
         let store = self.store();
         let outcome = store.sync(frame);
+        let mut seals = Vec::new();
         if outcome.is_ok() {
             *self.published.lock() = refs;
-            for pending in batch {
-                if let Some((branch, state)) = pending.update {
-                    branch.publish(state);
-                }
+        }
+        for pending in batch {
+            seals.extend(pending.seal);
+            if let (true, Some((branch, state))) = (outcome.is_ok(), pending.update) {
+                branch.publish(state);
             }
         }
         let mut queue = self.queue.lock();
@@ -664,9 +891,25 @@ impl<T: Data> Shared<T> {
             Ok(()) => queue.settled = frame.seq,
             Err(_) => queue.failed = true,
         }
+        let next = queue.waiting.first().and_then(|pending| pending.seal.clone());
+        let next = next.or_else(|| queue.open.clone());
+        if queue.failed {
+            seals.extend(queue.waiting.iter().filter_map(|pending| pending.seal.clone()));
+            seals.extend(queue.open.clone());
+        }
+        let settled = !queue.failed;
         drop(queue);
         self.done.notify_all();
-        store.checkpoint(frame);
+        for seal in seals {
+            seal.settled.store(settled, Ordering::Release);
+            seal.wake_all();
+        }
+        if let Some(seal) = next {
+            seal.wake_one();
+        }
+        if outcome.is_ok() {
+            store.checkpoint(frame);
+        }
         if self.automatic {
             let base = self.signal.base.load(Ordering::Relaxed);
             let goal = base.max(self.reclaim.every_bytes);
@@ -675,6 +918,63 @@ impl<T: Data> Shared<T> {
             }
         }
         outcome
+    }
+
+    fn commit_locked(&self, tip: &mut RefState, change: Change<'_, T>) -> Result<u64> {
+        let Change {
+            branch,
+            state,
+            working,
+            message,
+            intent,
+            seal,
+        } = change;
+        let store = &self.store();
+        let mut txn = store.begin()?;
+        let root = write_root(working, &mut txn, store)?;
+        let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
+        let version = state.snapshot.commit.version + 1;
+        let mut merged = tip
+            .refs
+            .try_get(&branch.name)?
+            .map(|head| head.merged.clone())
+            .unwrap_or_default();
+        let recorded = match intent.merged {
+            Some((other, theirs))
+                if merged.try_get(&other.name)?.map(|seen| seen.0) != Some(theirs) =>
+            {
+                merged.insert(other.name.clone(), (theirs, version));
+                true
+            }
+            _ => false,
+        };
+        if !recorded && previous.unwrap_or(self.genesis_hash) == root.hash {
+            return Ok(state.snapshot.commit.version);
+        }
+        let commit = Commit {
+            version,
+            time_ms: now_ms().max(state.snapshot.commit.time_ms),
+            message,
+            root: Some(root),
+            restored: intent.restored,
+        };
+        let log = state.log.append(store, &mut txn, commit)?;
+        let log = match self.history {
+            Keep::Last(_) => log.pruned(store, self.history)?,
+            _ => log,
+        };
+        let mut next = tip.refs.clone();
+        next.insert(
+            branch.name.clone(),
+            Head {
+                version,
+                root: Some(root),
+                log,
+                merged,
+            },
+        );
+        self.stage(tip, next, txn, Some(branch), seal.map(|seal| (seal, version)))?;
+        Ok(version)
     }
 
     fn step(&self, name: &'static str) {
@@ -705,7 +1005,7 @@ impl<T: Data> Shared<T> {
             return Ok(0);
         }
         let store = self.store();
-        let mut tip = self.tip.lock();
+        let mut tip = self.lock_tip();
         let mut next = tip.refs.clone();
         let mut dropped = 0;
         let heads: Vec<_> = tip.refs.iter().collect();
@@ -722,7 +1022,7 @@ impl<T: Data> Shared<T> {
             return Ok(0);
         }
         let txn = store.begin()?;
-        self.stage(&mut tip, next, txn, None)?;
+        self.stage(&mut tip, next, txn, None, None)?;
         self.settle(store.last_seq())?;
         let refs = tip.refs.clone();
         for branch in self.branches.lock().values() {
@@ -791,7 +1091,7 @@ impl<T: Data> Shared<T> {
         copier.sync()?;
         self.step("synced");
         let paused = Instant::now();
-        let mut tip = self.tip.lock();
+        let mut tip = self.lock_tip();
         self.settle(store.last_seq())?;
         store.check_healthy()?;
         let basis = store.basis();
@@ -989,7 +1289,10 @@ impl<T: Data> Db<T> {
         intent: Intent<T>,
         f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        let mut tip = self.shared.tip.lock();
+        if self.shared.coalesce && intent.restored.is_none() && intent.merged.is_none() {
+            return self.combine(f);
+        }
+        let mut tip = self.shared.lock_tip();
         self.branch.check_live()?;
         if let Some((other, _)) = &intent.merged {
             other.check_live()?;
@@ -998,7 +1301,15 @@ impl<T: Data> Db<T> {
         let mut working = (*state.snapshot.value).clone();
         let before = state.snapshot.commit.version;
         let result = f(&mut working).and_then(|(message, value)| {
-            let version = self.commit_locked(&mut tip, &state, message, intent, &working)?;
+            let change = Change {
+                branch: &self.branch,
+                state: &state,
+                working: &working,
+                message,
+                intent,
+                seal: None,
+            };
+            let version = self.shared.commit_locked(&mut tip, change)?;
             Ok((value, version))
         });
         let ticket = self.shared.store().last_seq();
@@ -1012,60 +1323,57 @@ impl<T: Data> Db<T> {
         })
     }
 
-    fn commit_locked(
+    fn combine<R, E: From<Error>>(
         &self,
-        tip: &mut RefState,
-        state: &State<T>,
-        message: String,
-        intent: Intent<T>,
-        working: &T,
-    ) -> Result<u64> {
-        let store = &self.shared.store();
-        let mut txn = store.begin()?;
-        let root = write_root(working, &mut txn, store)?;
-        let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
-        let version = state.snapshot.commit.version + 1;
-        let mut merged = tip
-            .refs
-            .try_get(&self.branch.name)?
-            .map(|head| head.merged.clone())
-            .unwrap_or_default();
-        let recorded = match intent.merged {
-            Some((branch, theirs))
-                if merged.try_get(&branch.name)?.map(|seen| seen.0) != Some(theirs) =>
-            {
-                merged.insert(branch.name.clone(), (theirs, version));
-                true
+        f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        let shared = &self.shared;
+        let mut tip = shared.arrive();
+        if let Err(error) = self.branch.check_live() {
+            let open = shared.open.lock().take();
+            if let Some(group) = open.and_then(|group| shared.pass_on(group)) {
+                shared.seal_for_others(&mut tip, group);
             }
-            _ => false,
-        };
-        if !recorded && previous.unwrap_or(self.shared.genesis_hash) == root.hash {
-            return Ok(state.snapshot.commit.version);
+            return Err(error.into());
         }
-        let commit = Commit {
+        let mut group = shared.join_group(&mut tip, &self.branch);
+        let checkpoint = (group.members > 0).then(|| group.working.clone());
+        let before = group.state.snapshot.commit.version;
+        let seal = group.seal.clone();
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(&mut group.working)));
+        if !matches!(ran, Ok(Ok(_))) {
+            group.working = match checkpoint {
+                Some(checkpoint) => checkpoint,
+                None => (*group.state.snapshot.value).clone(),
+            };
+        }
+        let result = match ran {
+            Err(panicked) => {
+                if let Some(group) = shared.pass_on(group) {
+                    shared.seal_for_others(&mut tip, group);
+                }
+                drop(tip);
+                panic::resume_unwind(panicked);
+            }
+            Ok(Err(error)) => Err(error),
+            Ok(Ok((message, value))) => {
+                if !message.is_empty() {
+                    group.messages.push(message);
+                }
+                Ok(value)
+            }
+        };
+        group.members += 1;
+        if let Some(group) = shared.pass_on(group) {
+            shared.seal_group(&mut tip, group);
+        }
+        drop(tip);
+        let version = shared.await_group(&seal)?;
+        Ok(Committed {
+            value: result?,
             version,
-            time_ms: now_ms().max(state.snapshot.commit.time_ms),
-            message,
-            root: Some(root),
-            restored: intent.restored,
-        };
-        let log = state.log.append(store, &mut txn, commit)?;
-        let log = match self.shared.history {
-            Keep::Last(_) => log.pruned(store, self.shared.history)?,
-            _ => log,
-        };
-        let mut next = tip.refs.clone();
-        next.insert(
-            self.branch.name.clone(),
-            Head {
-                version,
-                root: Some(root),
-                log,
-                merged,
-            },
-        );
-        self.shared.stage(tip, next, txn, Some(&self.branch))?;
-        Ok(version)
+            changed: version != before,
+        })
     }
 
     pub fn at(&self, version: u64) -> Result<Snapshot<T>> {
@@ -1279,7 +1587,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
-        let mut tip = self.shared.tip.lock();
+        let mut tip = self.shared.lock_tip();
         self.branch.check_live()?;
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
@@ -1303,7 +1611,7 @@ impl<T: Data> Db<T> {
         );
         let store = self.shared.store();
         let txn = store.begin()?;
-        self.shared.stage(&mut tip, next, txn, None)?;
+        self.shared.stage(&mut tip, next, txn, None, None)?;
         let ticket = store.last_seq();
         drop(tip);
         self.shared.settle(ticket)?;
@@ -1324,7 +1632,7 @@ impl<T: Data> Db<T> {
         if name == MAIN || name == self.branch.name {
             return Err(Error::BranchInUse(name.to_string()));
         }
-        let mut tip = self.shared.tip.lock();
+        let mut tip = self.shared.lock_tip();
         if tip.refs.try_get(name)?.is_none() {
             return Err(Error::NoBranch(name.to_string()));
         }
@@ -1340,7 +1648,7 @@ impl<T: Data> Db<T> {
                 next.insert(branch, head);
             }
         }
-        self.shared.stage(&mut tip, next, txn, None)?;
+        self.shared.stage(&mut tip, next, txn, None, None)?;
         let ticket = store.last_seq();
         self.shared.settle(ticket)?;
         let published = self.shared.published.lock();

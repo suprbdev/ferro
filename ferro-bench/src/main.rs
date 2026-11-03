@@ -214,6 +214,7 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
 
 fn concurrent_workload(report: &mut Report, dir: &Path, n: u64) {
     let db = Options::new()
+        .coalesce(std::env::args().any(|arg| arg == "--coalesce"))
         .open::<Map<u64, u64>>(dir.join("concurrent.ferro"))
         .unwrap();
     db.update(|root| {
@@ -296,8 +297,10 @@ fn main() {
     std::fs::create_dir_all(&parent).unwrap();
     let dir = tempfile::tempdir_in(&parent).unwrap();
     let mut report = Report(BTreeMap::new());
-    map_workload(&mut report, dir.path(), n);
-    table_workload(&mut report, dir.path(), n / 5);
+    if !std::env::args().any(|arg| arg == "--concurrent-only") {
+        map_workload(&mut report, dir.path(), n);
+        table_workload(&mut report, dir.path(), n / 5);
+    }
     concurrent_workload(&mut report, dir.path(), n);
     report.set("peak_rss_mib", peak_rss_mib());
     println!("{label}");

@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "reclaim"
 path = "src/bin/reclaim.rs"
 
+[[bin]]
+name = "group"
+path = "src/bin/group.rs"
+
 [dependencies]
 ferro = { path = "../ferro" }
 ledger = { path = "../examples/ledger" }
