@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 
 use common::{Rng, cases, fast, roomy, text, uncached};
 use ferro::codec::{Decoder, Encoder};
-use ferro::{Data, Db, Error, List, Map, Options, Set};
+use ferro::{Data, Db, Error, Keep, List, Map, Options, Set};
 
 type Flat = Map<u64, String>;
 type Nested = Map<u64, Map<u64, String>>;
@@ -301,18 +301,14 @@ fn retained_map_works_after_its_database_is_dropped() {
     edited.remove(&0);
     edited.update(&5, |value| value.push('!'));
     assert_eq!(map.diff(&edited).count(), 3);
-    assert!(matches!(
-        fast().open::<Flat>(&path),
-        Err(Error::Locked)
-    ));
-    drop(map);
-    drop(edited);
     let db = fast().open::<Flat>(&path).unwrap();
     assert_flat(&db.read(), &model);
+    assert_flat(&map, &model);
+    assert_eq!(map.diff(&edited).count(), 3);
 }
 
 #[test]
-fn lock_is_released_after_every_handle_is_gone() {
+fn lock_is_released_with_the_last_writer_handle() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("l.ferro");
     let db = fast().open::<Flat>(&path).unwrap();
@@ -327,18 +323,55 @@ fn lock_is_released_after_every_handle_is_gone() {
     })
     .unwrap();
     assert!(inner.get(&5).is_some());
+    let side = db.fork("side").unwrap();
     drop(db);
+    assert!(matches!(fast().open::<Flat>(&path), Err(Error::Locked)));
+    drop(side);
+    assert_unlocked::<Flat>(&path);
     assert!(snapshot.get(&5).is_some());
     assert_eq!(log.len(), 1);
-    assert!(matches!(fast().open::<Flat>(&path), Err(Error::Locked)));
-    drop(snapshot);
-    assert!(matches!(fast().open::<Flat>(&path), Err(Error::Locked)));
     assert!(old.get(&5).is_some());
-    drop(old);
-    drop(inner);
+    assert!(inner.get(&5).is_some());
     assert!(events.try_recv().is_err());
-    drop(log);
-    assert_unlocked::<Flat>(&path);
+}
+
+#[test]
+fn a_held_snapshot_keeps_its_version_while_a_new_writer_appends_and_swaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h.ferro");
+    let db = uncached().open::<Flat>(&path).unwrap();
+    let model = fill(&db, 1500);
+    let snapshot = db.read();
+    let map = (*snapshot).clone();
+    let log = db.log();
+    drop(db);
+    let db = uncached().open::<Flat>(&path).unwrap();
+    assert!(matches!(fast().open::<Flat>(&path), Err(Error::Locked)));
+    assert_flat(&db.read(), &model);
+    db.update(|root| {
+        for key in 0..1500 {
+            root.insert(key, text(key + 7, 40));
+        }
+    })
+    .unwrap();
+    assert_flat(&snapshot, &model);
+    db.compact(Keep::Last(1)).unwrap();
+    db.update(|root| {
+        root.insert(5000, "after".into());
+    })
+    .unwrap();
+    assert_flat(&snapshot, &model);
+    assert_flat(&map, &model);
+    assert_eq!(log.len(), 1);
+    assert_eq!(snapshot.version(), 1);
+    db.update(|root| *root = map.clone()).unwrap();
+    assert_flat(&db.read(), &model);
+    db.verify().unwrap();
+    drop(db);
+    let db = uncached().open::<Flat>(&path).unwrap();
+    assert_flat(&db.read(), &model);
+    assert_flat(&snapshot, &model);
+    db.verify().unwrap();
 }
 
 #[test]

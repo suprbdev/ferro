@@ -645,9 +645,16 @@ keep user code off the commit path, at one wake per commit forever. A wake with 
 here: a timeout already covers what it would do, and the queue only ever needed the end.
 
 A `Snapshot<T>` keeps its version readable for as long as it is held, even past pruning, and so
-does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them also keep the
-writer lock held after the `Db` is dropped, so a new writer gets `Error::Locked` until they are gone,
-unless a reclamation cycle has replaced the file since: then they hold only the old, unlinked file.
+does any `Map` or `Table` cloned from it, and a `Log` or `History` handle. All of them hold the
+`Store`, and so the open file, but not the writer lock. The lock is a `flock` on the writer's file
+descriptor, and closing a writer's store, when the last `Db` handle drops or a cycle retires a
+generation, truncates the reservation and then unlocks, in that order, so a new writer can open while
+they live. They read what they read before. The new writer's open truncates only past the last
+valid frame, and every published object lies before it. It appends after that, and a cycle writes a
+new file and renames it over the path, so the old inode stays whole for whoever holds it. A closed
+store writes nothing more, and a second close does nothing, so it never truncates under the new
+writer. A `Map` from the old writer is foreign to the new one, since store ids differ, and is
+rebuilt if committed there.
 A closure works on a clone of the tip, or of its group's working copy, so a panic or an `Err`
 discards its changes.
 

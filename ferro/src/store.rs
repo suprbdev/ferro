@@ -942,15 +942,18 @@ impl Store {
 
     pub fn close(&self) {
         let inner = &self.inner;
-        inner.closed.store(true, Ordering::SeqCst);
+        let closed = inner.closed.swap(true, Ordering::SeqCst);
         inner.cache.clear();
-        if inner.options.read_only || inner.poisoned.load(Ordering::Acquire) {
+        if closed || inner.options.read_only {
             return;
         }
         let end = inner.written.load(Ordering::Acquire);
-        if inner.file.metadata().is_ok_and(|meta| meta.len() > end) {
+        if !inner.poisoned.load(Ordering::Acquire)
+            && inner.file.metadata().is_ok_and(|meta| meta.len() > end)
+        {
             let _ = inner.file.set_len(end);
         }
+        let _ = inner.file.unlock();
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {

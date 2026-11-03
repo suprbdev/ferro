@@ -464,9 +464,9 @@ This is an experiment, not a production database.
   stops scaling at the cost of the closure and encoding. Calling `update`, `fork` or `drop_branch`
   from inside it deadlocks. With `coalesce`, so does a closure that waits for another thread's commit
   to be acknowledged.
-- A held `Snapshot` or `Map` keeps the file open. Reopening as a writer in that state gives
-  `Error::Locked`, unless a reclamation cycle has replaced the file since, because the handle then
-  holds only the old, unlinked file.
+- A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
+  new writer can open once the last `Db` handle is gone. If a reclamation cycle has replaced that
+  file since, its disk space comes back only when the last such handle is dropped.
 - Crash safety was tested with simulated crash images, killed processes and a traced syscall
   order, and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never
   tested on real hardware.
