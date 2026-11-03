@@ -26,6 +26,8 @@ const LINE_BYTES: usize = 64;
 const SPAN_LINES: i32 = 15;
 const LINEAR_KEYS: usize = 16;
 const LINEAR_KEY_BYTES: usize = 16;
+const PARALLEL_ITEMS: usize = 1 << 14;
+const MAX_WORKERS: usize = 16;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -1324,6 +1326,44 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
     Ok(written)
 }
 
+fn workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |cores| cores.get().min(MAX_WORKERS))
+    })
+}
+
+fn parallel<T: Send, R: Send>(tasks: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let threads = workers().min(tasks.len());
+    if threads < 2 {
+        return tasks.into_iter().map(work).collect();
+    }
+    let queue = parking_lot::Mutex::new(tasks.into_iter().enumerate());
+    let drain = || {
+        let mut done = Vec::new();
+        loop {
+            let next = queue.lock().next();
+            let Some((index, task)) = next else {
+                return done;
+            };
+            done.push((index, work(task)));
+        }
+    };
+    let mut done = std::thread::scope(|scope| {
+        let helpers: Vec<_> = (1..threads).map(|_| scope.spawn(drain)).collect();
+        let mut done = drain();
+        for helper in helpers {
+            match helper.join() {
+                Ok(more) => done.extend(more),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        done
+    });
+    done.sort_unstable_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, result)| result).collect()
+}
+
 struct Edit<K, V> {
     key: K,
     level: u8,
@@ -1338,8 +1378,33 @@ struct Open<K, V, S> {
 }
 
 impl<K, V, S> Open<K, V, S> {
+    fn new(level: u8) -> Self {
+        Open {
+            level,
+            keys: Vec::new(),
+            slots: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    fn adopt(&mut self, child: Link<K, V, S>) {
+        if self.children.is_empty() {
+            if matches!(child, Link::Empty) {
+                return;
+            }
+            self.children.resize_with(self.keys.len(), || Link::Empty);
+        }
+        self.children.push(child);
+    }
+
+    fn push(&mut self, carry: Link<K, V, S>, key: K, value: Arc<V>) {
+        self.adopt(carry);
+        self.keys.push(key);
+        self.slots.push(Slot::Fresh(value));
+    }
+
     fn close(mut self, last: Link<K, V, S>) -> Link<K, V, S> {
-        self.children.push(last);
+        self.adopt(last);
         link_from(self.level, self.keys, self.slots, self.children, None)
     }
 }
@@ -1487,17 +1552,12 @@ fn build_sorted<K: Data + Ord, V: Data, S: Data>(
             }
         }
         match stack.last_mut() {
-            Some(top) if top.level == level => {
-                top.children.push(carry);
-                top.keys.push(key);
-                top.slots.push(Slot::Fresh(value));
+            Some(top) if top.level == level => top.push(carry, key, value),
+            _ => {
+                let mut open = Open::new(level);
+                open.push(carry, key, value);
+                stack.push(open);
             }
-            _ => stack.push(Open {
-                level,
-                keys: vec![key],
-                slots: vec![Slot::Fresh(value)],
-                children: vec![carry],
-            }),
         }
     }
     let mut carry = Link::Empty;
@@ -1512,14 +1572,24 @@ fn sorted_unique<K: Ord, T>(mut items: Vec<(K, T)>) -> Vec<(K, T)> {
         return items;
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut unique: Vec<(K, T)> = Vec::with_capacity(items.len());
-    for item in items {
-        match unique.last_mut() {
-            Some(last) if last.0 == item.0 => *last = item,
-            _ => unique.push(item),
+    items.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            std::mem::swap(later, kept);
         }
+        same
+    });
+    items
+}
+
+fn levels<K: Data, T: Sync>(items: &[(K, T)]) -> Vec<u8> {
+    let chunk = |chunk: &[(K, T)]| -> Vec<u8> {
+        chunk.iter().map(|(key, _)| fatal(level_of(key))).collect()
+    };
+    if items.len() < PARALLEL_ITEMS {
+        return chunk(items);
     }
-    unique
+    parallel(items.chunks(PARALLEL_ITEMS).collect(), chunk).concat()
 }
 
 fn below<K, Q>(key: &K, start: Bound<&Q>) -> bool
@@ -2200,13 +2270,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     fn batch(&mut self, items: Vec<(K, Option<Arc<V>>)>) {
         let items = sorted_unique(items);
         let count = items.len();
+        let levels = levels(&items);
         let mut edits: vec::IntoIter<Edit<K, V>> = items
             .into_iter()
-            .map(|(key, value)| Edit {
-                level: fatal(level_of(&key)),
-                key,
-                value,
-            })
+            .zip(levels)
+            .map(|((key, value), level)| Edit { key, level, value })
             .collect::<Vec<_>>()
             .into_iter();
         let store = self.store.as_ref();
@@ -2366,9 +2434,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Extend<(K, V)> for Map<K, V, S> {
             return;
         }
         let items = sorted_unique(items.into_iter().collect());
-        self.root = build_sorted(items.into_iter().map(|(key, value)| Edit {
-            level: fatal(level_of(&key)),
+        let levels = levels(&items);
+        self.root = build_sorted(items.into_iter().zip(levels).map(|((key, value), level)| Edit {
             key,
+            level,
             value: Some(Arc::new(value)),
         }));
     }
