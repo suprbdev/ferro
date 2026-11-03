@@ -1,7 +1,6 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::fs;
 use std::future::Future;
 use std::mem;
 use std::ops::{Deref, DerefMut, RangeBounds};
@@ -24,6 +23,7 @@ use crate::graph::{self, Start};
 use crate::history::History;
 use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
+use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
 use crate::watch::{Feed, Filter, Notice, Watcher};
@@ -983,7 +983,7 @@ impl Options {
             base: AtomicU64::new(store.basis().bytes),
             ..Signal::default()
         });
-        let file = fs::canonicalize(path.as_ref())?;
+        let file = canonicalize(path.as_ref())?;
         let mut options = options;
         let shared = Arc::new(Shared {
             store: ArcSwap::from_pointee(store),

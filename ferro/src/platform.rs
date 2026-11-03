@@ -1,9 +1,9 @@
 #[cfg(unix)]
 mod imp {
-    use std::fs::{File, Metadata, TryLockError};
+    use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io;
     use std::os::unix::fs::{MetadataExt, fchown};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     pub(crate) use std::os::unix::fs::FileExt;
 
@@ -13,6 +13,14 @@ mod imp {
 
     pub(crate) fn path_id(path: &Path) -> io::Result<u64> {
         Ok(std::fs::metadata(path)?.ino())
+    }
+
+    pub(crate) fn open(options: &OpenOptions, path: &Path) -> io::Result<File> {
+        options.open(path)
+    }
+
+    pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
     }
 
     pub(crate) fn try_lock(file: &File) -> Result<(), TryLockError> {
@@ -57,12 +65,14 @@ mod imp {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{FileExt as _, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::Duration;
     use std::{mem, ptr};
 
     use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED,
-        ERROR_NOT_SUPPORTED,
+        ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION,
+        ERROR_NOT_LOCKED, ERROR_NOT_SUPPORTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
@@ -76,6 +86,7 @@ mod imp {
     };
 
     const LOCK_AT: u64 = 1 << 62;
+    const RACE_RETRIES: u32 = 20;
 
     pub(crate) trait FileExt {
         fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
@@ -133,7 +144,38 @@ mod imp {
     }
 
     pub(crate) fn path_id(path: &Path) -> io::Result<u64> {
-        file_id(&OpenOptions::new().access_mode(0).open(path)?)
+        file_id(&open(OpenOptions::new().access_mode(0), path)?)
+    }
+
+    fn racing<T>(
+        lost: impl Fn(&io::Error) -> bool,
+        mut attempt: impl FnMut() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut retries = 0;
+        loop {
+            match attempt() {
+                Err(error) if retries < RACE_RETRIES && lost(&error) => {
+                    retries += 1;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                done => return done,
+            }
+        }
+    }
+
+    fn delete_pending(error: &io::Error) -> bool {
+        error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+    }
+
+    pub(crate) fn open(options: &OpenOptions, path: &Path) -> io::Result<File> {
+        racing(delete_pending, || options.open(path))
+    }
+
+    pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+        racing(
+            |error| delete_pending(error) || error.kind() == ErrorKind::NotFound,
+            || std::fs::canonicalize(path),
+        )
     }
 
     fn lock_range() -> OVERLAPPED {
@@ -190,7 +232,7 @@ mod imp {
         }
         let id = file_id(file)?;
         match path_id(path) {
-            Ok(named) if named == id => OpenOptions::new().write(true).open(path)?.sync_data(),
+            Ok(named) if named == id => open(OpenOptions::new().write(true), path)?.sync_data(),
             Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
@@ -243,7 +285,7 @@ mod imp {
     }
 
     pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
-        OpenOptions::new().write(true).open(path)?.sync_all()
+        open(OpenOptions::new().write(true), path)?.sync_all()
     }
 
     pub(crate) fn copy_owner(_file: &File, _source: &Metadata) {}

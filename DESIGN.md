@@ -2402,6 +2402,16 @@ unlinked inode does on Unix. Snapshots keep reading the old generation, its spac
 the last of them drops, and `refresh` finds a new file index at the path. `admin::compact` renames
 the same way.
 
+An open of the path that races the rename can still fail, which on Unix it cannot. If the lookup
+found the old file just as it lost its name, Windows refuses the open with access denied, because
+that file is now waiting to be deleted. `canonicalize` opens the path and then asks the handle for
+its name, so if the handle reached the old file it fails with not found. Both last only for the
+instant of a swap, after which the path names the new file. So on Windows every open of the path,
+and the `canonicalize` in `Db::open`, retries those two errors up to 20 times a millisecond apart,
+and a real permission error is reported about 20 ms late. CI found this: a reader opening in a loop
+beside 60 cycles failed in about one run in two, and a probe saw about one `canonicalize` in 80
+fail and one read-only open in 150.
+
 If either does not hold, because another program holds the file open without `FILE_SHARE_DELETE` or
 the file system has no POSIX rename, the rename fails before anything has changed. The cycle then
 fails like any failed rename: the temp file goes, the error lands in `Db::compact` or

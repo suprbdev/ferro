@@ -499,18 +499,12 @@ pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basi
 fn open_locked(path: &Path, read_only: bool) -> Result<File> {
     let mut retries = 0;
     loop {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!read_only)
-            .create(!read_only)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound if read_only => {
-                    Error::NoDatabase(path.display().to_string())
-                }
-                _ => error.into(),
-            })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(!read_only).create(!read_only).truncate(false);
+        let file = platform::open(&options, path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound if read_only => Error::NoDatabase(path.display().to_string()),
+            _ => error.into(),
+        })?;
         if read_only {
             return Ok(file);
         }
