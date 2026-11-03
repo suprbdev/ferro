@@ -22,6 +22,8 @@ const ITEM_BYTES: usize = 32;
 const PATH_FRAMES: usize = 8;
 const LINE_BYTES: usize = 64;
 const SPAN_LINES: i32 = 15;
+const LINEAR_KEYS: usize = 16;
+const LINEAR_KEY_BYTES: usize = 16;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -505,6 +507,14 @@ impl<K, V, S> Node<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let small = !needs_drop::<K>() && size_of::<K>() <= LINEAR_KEY_BYTES;
+        if small && self.keys.len() <= LINEAR_KEYS {
+            let position = self.keys.iter().filter(|probe| (*probe).borrow() < key).count();
+            return match self.keys.get(position) {
+                Some(probe) if probe.borrow() == key => Ok(position),
+                _ => Err(position),
+            };
+        }
         self.keys.binary_search_by(|probe| probe.borrow().cmp(key))
     }
 
