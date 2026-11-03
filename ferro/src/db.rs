@@ -1057,6 +1057,41 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     Ok((txn.put(object, hash)?, decoded))
 }
 
+fn holds(found: &[Start], ptr: Ptr) -> bool {
+    found.iter().any(|start| start.node.ptr.hash == ptr.hash)
+}
+
+fn recorded((refs, store): (&Refs, &Store), starts: &[Start]) -> Result<Vec<Start>> {
+    let mut out = starts.to_vec();
+    for (_, head) in refs.try_entries()? {
+        if head.merged.is_empty() {
+            continue;
+        }
+        for start in starts {
+            let version = start.node.version();
+            let on = head.log.node_at(store, version)?;
+            if on.is_none_or(|node| node.ptr.hash != start.node.ptr.hash) {
+                continue;
+            }
+            for (other, (theirs, ours)) in head.merged.try_entries()? {
+                let Some(found) = refs.try_get(&other)?.filter(|_| ours <= version) else {
+                    continue;
+                };
+                if let Some(node) = found.log.node_at(store, theirs)? {
+                    out.push(Start {
+                        store: store.clone(),
+                        node,
+                        low: found.log.first,
+                        after: found.log.after(store)?,
+                        bare: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2335,7 +2370,7 @@ impl<T: Data> Db<T> {
     pub fn merge_with<R, S: Into<String>>(
         &self,
         other: &Db<T>,
-        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+        mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
         self.try_merge_with::<R, S, Error>(other, |ours, base, theirs| Ok(f(ours, base, theirs)))
     }
@@ -2343,7 +2378,7 @@ impl<T: Data> Db<T> {
     pub fn try_merge_with<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
-        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         self.alone(|tip, ours, root, _| {
             other.branch.check_live()?;
@@ -2355,12 +2390,11 @@ impl<T: Data> Db<T> {
                 (&self.branch.name, ours),
                 (&other.branch.name, &theirs),
             )?;
-            let base = found.as_ref().map(|(_, node)| node.ptr.hash);
             let link = match theirs.log.tip {
-                Some(ptr) if base != Some(ptr.hash) => Self::link_to(tip, other, &theirs, ptr)?,
+                Some(ptr) if !holds(&found, ptr) => Self::link_to(tip, other, &theirs, ptr)?,
                 _ => None,
             };
-            let base = self.snapshot_at(found)?;
+            let base = self.base_of((&tip.refs, &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -2373,7 +2407,7 @@ impl<T: Data> Db<T> {
     pub(crate) fn merge_tracking<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
-        f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
         let done = self.alone::<std::result::Result<R, u64>, E>(|tip, ours, root, _| {
             other.branch.check_live()?;
@@ -2385,12 +2419,11 @@ impl<T: Data> Db<T> {
                 (&self.branch.name, ours),
                 (&other.branch.name, &theirs),
             )?;
-            let base = found.as_ref().map(|(_, node)| node.ptr.hash);
-            let Some(ptr) = theirs.log.tip.filter(|ptr| base != Some(ptr.hash)) else {
+            let Some(ptr) = theirs.log.tip.filter(|ptr| !holds(&found, *ptr)) else {
                 return Ok((String::new(), Err(theirs.log.last), Intent::default()));
             };
             let link = Self::link_to(tip, other, &theirs, ptr)?;
-            let base = self.snapshot_at(found)?;
+            let base = self.base_of((&tip.refs, &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -2406,6 +2439,46 @@ impl<T: Data> Db<T> {
             time_ms,
             changed,
         }))
+    }
+
+    fn base_of<R, S: Into<String>, E: From<Error>>(
+        &self,
+        file: (&Refs, &Store),
+        found: Vec<Start>,
+        f: &mut impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Snapshot<T>, E> {
+        let mut found = found.into_iter();
+        let Some(first) = found.next() else {
+            return Ok(self.genesis());
+        };
+        let mut base = Self::snapshot_of(&first.store, &first.node.entry.commit)?;
+        let mut merged = vec![first];
+        for next in found {
+            let ours = recorded(file, &merged)?;
+            let below = graph::best(ours, recorded(file, std::slice::from_ref(&next))?)?;
+            if holds(&below, next.node.ptr) {
+                continue;
+            }
+            let under = self.base_of(file, below, f)?;
+            let theirs = Self::snapshot_of(&next.store, &next.node.entry.commit)?;
+            let mut working = (*base.value).clone();
+            let (message, _) = f(&mut working, &under, &theirs)?;
+            let commit = Commit {
+                version: 0,
+                time_ms: base.commit.time_ms.max(theirs.commit.time_ms),
+                message: message.into(),
+                root: None,
+                restored: None,
+                parts: Parts::Whole,
+                stamped: false,
+            };
+            base = Snapshot {
+                value: Arc::new(working),
+                commit: Arc::new(commit),
+            };
+            merged.push(next);
+        }
+        Ok(base)
     }
 
     fn link_to(
@@ -2428,25 +2501,36 @@ impl<T: Data> Db<T> {
     }
 
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
+        let first = self.common_starts(other)?.into_iter().next();
+        match first {
+            Some(start) => Self::snapshot_of(&start.store, &start.node.entry.commit),
+            None => Ok(self.genesis()),
+        }
+    }
+
+    pub fn common_ancestors(&self, other: &Db<T>) -> Result<Vec<Snapshot<T>>> {
+        let found = self.common_starts(other)?;
+        if found.is_empty() {
+            return Ok(vec![self.genesis()]);
+        }
+        found
+            .iter()
+            .map(|start| Self::snapshot_of(&start.store, &start.node.entry.commit))
+            .collect()
+    }
+
+    fn common_starts(&self, other: &Db<T>) -> Result<Vec<Start>> {
         let (refs, store, ours, theirs) = {
             let published = self.shared.published.lock();
             let states = (self.branch.state.load_full(), other.branch.state.load_full());
             (published.refs.clone(), self.shared.store(), states.0, states.1)
         };
-        let found = Self::merge_base(
+        Self::merge_base(
             &refs,
             &store,
             (&self.branch.name, &ours),
             (&other.branch.name, &theirs),
-        )?;
-        self.snapshot_at(found)
-    }
-
-    fn snapshot_at(&self, found: Option<(Store, Node)>) -> Result<Snapshot<T>> {
-        match found {
-            Some((store, node)) => Self::snapshot_of(&store, &node.entry.commit),
-            None => Ok(self.genesis()),
-        }
+        )
     }
 
     fn merge_base(
@@ -2454,9 +2538,9 @@ impl<T: Data> Db<T> {
         store: &Store,
         ours: (&str, &State<T>),
         theirs: (&str, &State<T>),
-    ) -> Result<Option<(Store, Node)>> {
+    ) -> Result<Vec<Start>> {
         if ours.1.log.tip.is_none() || theirs.1.log.tip.is_none() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let starts = |(name, state): (&str, &State<T>)| -> Result<Vec<Start>> {
             let mut starts = Vec::new();
@@ -2466,6 +2550,7 @@ impl<T: Data> Db<T> {
                     node: Node::load(&state.store, tip)?,
                     low: state.log.first,
                     after: state.log.after(&state.store)?,
+                    bare: false,
                 });
             }
             let Some(head) = refs.try_get(name)? else {
@@ -2481,6 +2566,7 @@ impl<T: Data> Db<T> {
                         node,
                         low: found.log.first,
                         after: found.log.after(store)?,
+                        bare: false,
                     });
                 }
             }

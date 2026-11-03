@@ -68,3 +68,28 @@ fn a_merge_recorded_before_merge_links_still_sets_the_base() {
     main.verify().unwrap();
     assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "merge side again");
 }
+
+fn bump(db: &Db<Counters>, key: u8, by: i64) {
+    db.update(|root| {
+        let current = root.get(&key).map_or(0, |v| *v);
+        root.insert(key, current + by);
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_criss_cross_over_a_merge_recorded_before_merge_links_applies_each_change_once() {
+    let (_dir, path) = legacy();
+    let main: Db<Counters> = Db::open(&path).unwrap();
+    let side = main.branch("side").unwrap();
+    let ours = main.fork("ours").unwrap();
+    let theirs = side.fork("theirs").unwrap();
+    assert_eq!(counter_merge(&ours, &theirs, "ours <- theirs"), "side one");
+    assert_eq!(counter_merge(&theirs, &main, "theirs <- main"), "side one");
+    bump(&ours, 0, 10_000);
+    bump(&theirs, 2, 20_000);
+    assert_eq!(ours.common_ancestors(&theirs).unwrap().len(), 2);
+    counter_merge(&ours, &theirs, "ours <- theirs again");
+    assert_eq!(values(&ours), vec![(0, 10_003), (1, 1010), (2, 20_100)]);
+    main.verify().unwrap();
+}

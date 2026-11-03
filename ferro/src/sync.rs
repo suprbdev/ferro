@@ -1836,7 +1836,7 @@ impl<T: Data> Db<T> {
         &self,
         from: &Db<T>,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
         self.try_pull::<R, S, Error>(from, remote, infallible(merge))
     }
@@ -1845,7 +1845,7 @@ impl<T: Data> Db<T> {
         &self,
         from: &Db<T>,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
         let have = self.have()?;
@@ -1873,7 +1873,7 @@ impl<T: Data> Db<T> {
         &self,
         to: &Db<T>,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
         to.pull(self, remote, merge)
     }
@@ -1882,7 +1882,7 @@ impl<T: Data> Db<T> {
         &self,
         to: &Db<T>,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         to.try_pull(self, remote, merge)
     }
@@ -1891,7 +1891,7 @@ impl<T: Data> Db<T> {
         &self,
         remote: &str,
         bundle: &Bundle,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
         self.try_receive::<R, S, Error>(remote, bundle, infallible(merge))
     }
@@ -1900,7 +1900,7 @@ impl<T: Data> Db<T> {
         &self,
         remote: &str,
         bundle: &Bundle,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         self.try_receive_from(remote, bundle.as_bytes(), merge)
     }
@@ -1909,7 +1909,7 @@ impl<T: Data> Db<T> {
         &self,
         remote: &str,
         input: impl Read,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Pulled<R>> {
         self.try_receive_from::<R, S, Error>(remote, input, infallible(merge))
     }
@@ -1918,7 +1918,7 @@ impl<T: Data> Db<T> {
         &self,
         remote: &str,
         input: impl Read,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
         let mut input = Input::open(input, BUNDLE_MAGIC)?;
@@ -1951,7 +1951,7 @@ impl<T: Data> Db<T> {
     fn integrate<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<(Outcome, Option<R>), E> {
         let name = self.branch_name().to_string();
         let decision = self.rewrite_refs(|store, _, refs| {
@@ -1985,7 +1985,7 @@ impl<T: Data> Db<T> {
     fn merge_remote<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
-        merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<(Outcome, Option<R>), E> {
         let tracking = self.branch(remote)?;
         let seen = match self.merge_tracking(&tracking, merge)? {
@@ -2004,9 +2004,9 @@ impl<T: Data> Db<T> {
 }
 
 fn infallible<T, R, S>(
-    merge: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-) -> impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> Result<(S, R)> {
-    |ours, base, theirs| Ok(merge(ours, base, theirs))
+    mut merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
+) -> impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> Result<(S, R)> {
+    move |ours, base, theirs| Ok(merge(ours, base, theirs))
 }
 
 fn recorded(

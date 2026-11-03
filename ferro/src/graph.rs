@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use crate::error::{Error, Result};
 use crate::log::{Entry, Merged, Node};
 use crate::store::Store;
@@ -7,11 +9,13 @@ const TWO: u8 = 2;
 const BOTH: u8 = ONE | TWO;
 const STALE: u8 = 4;
 
+#[derive(Clone)]
 pub(crate) struct Start {
     pub(crate) store: Store,
     pub(crate) node: Node,
     pub(crate) low: u64,
     pub(crate) after: Option<u64>,
+    pub(crate) bare: bool,
 }
 
 #[derive(Clone)]
@@ -71,12 +75,12 @@ impl Item {
 
 struct Search {
     items: Vec<Item>,
-    found: Vec<(Store, Node)>,
+    found: Vec<Start>,
     cut: [Vec<Mark>; 2],
     painted: [Vec<Mark>; 2],
 }
 
-pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Option<(Store, Node)>> {
+pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
     let mut search = Search {
         items: Vec::new(),
         found: Vec::new(),
@@ -92,7 +96,7 @@ pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Option<(Store
                 low: start.low.max(1),
                 after: start.after,
                 merges: None,
-                bare: false,
+                bare: start.bare,
             });
         }
     }
@@ -112,7 +116,7 @@ fn index(colors: u8) -> Option<usize> {
 }
 
 impl Search {
-    fn run(mut self) -> Result<Option<(Store, Node)>> {
+    fn run(mut self) -> Result<Vec<Start>> {
         loop {
             let live = |color: u8| {
                 self.items.iter().any(|item| item.live() && item.colors & color != 0)
@@ -148,10 +152,14 @@ impl Search {
         if !self.cut[0].is_empty() && !self.cut[1].is_empty() {
             return Err(Error::NoCommonAncestor);
         }
-        let key = |(_, node): &(Store, Node)| {
-            (node.entry.generation(), node.time(), node.ptr.hash)
+        let key = |start: &Start| {
+            let node = &start.node;
+            Reverse((node.entry.generation(), node.time(), node.ptr.hash))
         };
-        Ok(self.found.into_iter().max_by_key(key))
+        let mut found = self.found;
+        found.sort_by_key(key);
+        found.dedup_by_key(|start| start.node.ptr.hash);
+        Ok(found)
     }
 
     fn push(&mut self, item: Item) {
@@ -189,7 +197,13 @@ impl Search {
 
     fn advance(&mut self, mut item: Item) -> Result<()> {
         if item.colors & BOTH == BOTH && item.live() {
-            self.found.push((item.store.clone(), item.node.clone()));
+            self.found.push(Start {
+                store: item.store.clone(),
+                node: item.node.clone(),
+                low: item.low,
+                after: item.after,
+                bare: item.bare,
+            });
             item.colors |= STALE;
         }
         let at = item.node.version();

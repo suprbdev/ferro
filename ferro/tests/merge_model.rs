@@ -3,8 +3,10 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::fast;
-use ferro::{Conflict, Data, Db, Keep, Map, Options, Reclaim, Record, Snapshot, Table};
+use ferro::{Conflict, Data, Db, Keep, Map, Options, Outcome, Reclaim, Record, Snapshot, Table};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Row {
@@ -236,7 +238,7 @@ fn counter_merge(db: &Db<Counters>, other: &Db<Counters>) -> ferro::Committed<()
     .unwrap()
 }
 
-fn run_branches(steps: Vec<Step>, exact: bool) -> Result<(), TestCaseError> {
+fn run_branches(steps: Vec<Step>, paired: bool) -> Result<(), TestCaseError> {
     let dir = tempfile::tempdir().unwrap();
     let main: Db<Counters> = fast().open(dir.path().join("m.ferro")).unwrap();
     let mut world = World {
@@ -246,7 +248,7 @@ fn run_branches(steps: Vec<Step>, exact: bool) -> Result<(), TestCaseError> {
         events: 0,
     };
     world.logs[0] = Some(vec![]);
-    if exact {
+    if paired {
         world.dbs[1] = Some(main.fork(NAMES[1]).unwrap());
         world.logs[1] = Some(vec![]);
     }
@@ -289,21 +291,6 @@ fn run_branches(steps: Vec<Step>, exact: bool) -> Result<(), TestCaseError> {
                 let before = da.version();
                 let (ha, hb) = (world.head(a).unwrap(), world.head(b).unwrap());
                 let done = counter_merge(&da, &db);
-                if !exact {
-                    let mut mask = mask_of(&world.nodes[ha].mask);
-                    for (k, v) in mask_of(&world.nodes[hb].mask) {
-                        let slot = mask.get_mut(&k).unwrap();
-                        *slot = (*slot).max(v);
-                    }
-                    let got = values(&da);
-                    for k in 0..KEYS {
-                        prop_assert!(got[&k] >= mask[&k], "lost a change merging {} <- {}", a, b);
-                    }
-                    if done.version != before {
-                        world.push(a, got);
-                    }
-                    continue;
-                }
                 let mut mask = mask_of(&world.nodes[ha].mask);
                 for (k, v) in mask_of(&world.nodes[hb].mask) {
                     *mask.get_mut(&k).unwrap() |= v;
@@ -347,7 +334,7 @@ proptest! {
     }
 
     #[test]
-    fn many_branch_merges_never_lose_a_change(steps in prop::collection::vec(step(), 1..30)) {
+    fn many_branch_counter_merges_apply_each_change_exactly_once(steps in prop::collection::vec(step(), 1..30)) {
         run_branches(steps, false)?;
     }
 }
@@ -490,6 +477,7 @@ enum Op {
     Fork(usize),
     Drop(usize),
     Compact,
+    Cross(usize, usize),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -499,14 +487,13 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (0..SLOTS).prop_map(Op::Fork),
         1 => (1..SLOTS).prop_map(Op::Drop),
         1 => Just(Op::Compact),
+        3 => (0..SLOTS, 0..SLOTS).prop_map(|(a, b)| Op::Cross(a, b)),
     ]
 }
 
 struct Version {
     generation: u64,
-    counts: Counts,
     event: Option<u32>,
-    exact: bool,
     ancestors: Vec<u64>,
 }
 
@@ -517,15 +504,13 @@ fn has(bits: &[u64], id: usize) -> bool {
 struct Graph(Vec<Version>);
 
 impl Graph {
-    fn push(
-        &mut self,
-        parents: &[usize],
-        generation: u64,
-        counts: Counts,
-        event: Option<u32>,
-        exact: bool,
-    ) {
+    fn push(&mut self, parents: &[usize], event: Option<u32>) -> usize {
         let id = self.0.len();
+        let generation = parents
+            .iter()
+            .map(|parent| self.0[*parent].generation + 1)
+            .max()
+            .unwrap_or(0);
         let mut ancestors = vec![0u64; id / 64 + 1];
         for parent in parents {
             for (word, bits) in ancestors.iter_mut().zip(&self.0[*parent].ancestors) {
@@ -535,16 +520,19 @@ impl Graph {
         ancestors[id / 64] |= 1 << (id % 64);
         self.0.push(Version {
             generation,
-            counts,
             event,
-            exact,
             ancestors,
         });
+        id
+    }
+
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        has(&self.0[from].ancestors, to)
     }
 
     fn best(&self, a: usize, b: usize) -> Vec<usize> {
         let common: Vec<usize> = (0..self.0.len())
-            .filter(|id| has(&self.0[a].ancestors, *id) && has(&self.0[b].ancestors, *id))
+            .filter(|id| self.reaches(a, *id) && self.reaches(b, *id))
             .collect();
         let mut below = vec![0u64; self.0.len() / 64 + 1];
         for d in &common {
@@ -558,7 +546,7 @@ impl Graph {
 
     fn events(&self, id: usize) -> Counts {
         (0..self.0.len())
-            .filter(|v| has(&self.0[id].ancestors, *v))
+            .filter(|v| self.reaches(id, *v))
             .filter_map(|v| self.0[v].event)
             .map(|e| (e, 1))
             .collect()
@@ -592,22 +580,170 @@ fn add_deltas(root: &mut Events, base: &Events, theirs: &Events) {
     }
 }
 
-fn event_merge(db: &Db<Events>, other: &Db<Events>, id: usize) -> ferro::Committed<usize> {
-    db.merge_with(other, |root, base, theirs| {
-        add_deltas(root, base, theirs);
-        (format!("n{id}"), id_of(base))
-    })
-    .unwrap()
+fn ancestor_ids(db: &Db<Events>, other: &Db<Events>) -> ferro::Result<Vec<usize>> {
+    Ok(db.common_ancestors(other)?.iter().map(id_of).collect())
 }
 
-fn bases(dbs: &[Db<Events>]) -> Vec<Option<usize>> {
+fn bases(dbs: &[Db<Events>]) -> Vec<Option<Vec<usize>>> {
     let mut out = Vec::new();
     for a in dbs {
         for b in dbs {
-            out.push(a.common_ancestor(b).as_ref().map(id_of).ok());
+            out.push(ancestor_ids(a, b).ok());
         }
     }
     out
+}
+
+#[derive(Default)]
+struct Crossed {
+    merges: usize,
+    calls: usize,
+}
+
+impl Crossed {
+    fn check(&mut self, bases: usize, calls: &[u64]) -> Result<(), TestCaseError> {
+        if bases == 1 {
+            prop_assert_eq!(calls.len(), 1);
+            return Ok(());
+        }
+        prop_assert!(calls.len() >= 2, "{} bases, {} calls", bases, calls.len());
+        prop_assert_eq!(calls.last().copied(), Some(0));
+        self.merges += 1;
+        self.calls = self.calls.max(calls.len());
+        Ok(())
+    }
+
+    fn add(&mut self, other: Crossed) {
+        self.merges += other.merges;
+        self.calls = self.calls.max(other.calls);
+    }
+}
+
+fn counted_merge(
+    ours: &Db<Events>,
+    theirs: &Db<Events>,
+    id: usize,
+) -> (ferro::Result<ferro::Committed<usize>>, Vec<u64>) {
+    let mut calls = Vec::new();
+    let merged = ours.merge_with(theirs, |root, base, other| {
+        add_deltas(root, base, other);
+        calls.push(base.version());
+        (format!("n{id}"), id_of(base))
+    });
+    (merged, calls)
+}
+
+struct Run {
+    main: Db<Events>,
+    graph: Graph,
+    heads: Vec<Option<usize>>,
+    dbs: Vec<Option<Db<Events>>>,
+    events: u32,
+    keep: Keep,
+    pruned: bool,
+    crossed: Crossed,
+}
+
+impl Run {
+    fn live(&self) -> Vec<usize> {
+        (0..SLOTS).filter(|slot| self.dbs[*slot].is_some()).collect()
+    }
+
+    fn inc(&mut self, slot: usize) {
+        let db = self.dbs[slot].clone().unwrap();
+        let (id, event, head) = (self.graph.0.len(), self.events, self.heads[slot].unwrap());
+        self.events += 1;
+        db.commit(format!("n{id}"), |root| {
+            root.insert(event, 1);
+        })
+        .unwrap();
+        self.graph.push(&[head], Some(event));
+        self.heads[slot] = Some(id);
+    }
+
+    fn fork(&mut self, from: usize) -> Option<usize> {
+        let slot = (1..SLOTS).find(|slot| self.dbs[*slot].is_none())?;
+        let db = self.dbs[from].as_ref().unwrap();
+        self.dbs[slot] = Some(db.fork(&format!("b{slot}")).unwrap());
+        self.heads[slot] = self.heads[from];
+        Some(slot)
+    }
+
+    fn drop_slot(&mut self, slot: usize) {
+        self.dbs[slot] = None;
+        self.heads[slot] = None;
+        self.main.drop_branch(&format!("b{slot}")).unwrap();
+    }
+
+    fn compact(&mut self) -> Result<(), TestCaseError> {
+        let open: Vec<Db<Events>> = self.dbs.iter().flatten().cloned().collect();
+        let before = bases(&open);
+        self.main.compact(self.keep).unwrap();
+        prop_assert_eq!(bases(&open), before);
+        Ok(())
+    }
+
+    fn merge(&mut self, a: usize, b: usize) -> Result<(), TestCaseError> {
+        if a == b {
+            return Ok(());
+        }
+        let (ours, theirs) = (self.dbs[a].clone().unwrap(), self.dbs[b].clone().unwrap());
+        let (ha, hb) = (self.heads[a].unwrap(), self.heads[b].unwrap());
+        let best = self.graph.best(ha, hb);
+        let found = ancestor_ids(&ours, &theirs);
+        let back = ancestor_ids(&theirs, &ours);
+        prop_assert_eq!(found.as_ref().ok(), back.as_ref().ok());
+        let seen = match found {
+            Ok(seen) => seen,
+            Err(ferro::Error::NoCommonAncestor) if self.pruned => {
+                let failed = ours.merge_with(&theirs, |_, _, _| ("never", ()));
+                prop_assert!(matches!(failed, Err(ferro::Error::NoCommonAncestor)));
+                return Ok(());
+            }
+            Err(error) => panic!("{error}"),
+        };
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        prop_assert_eq!(&sorted, &best, "bases {:?}", seen);
+        let generation = |id: &usize| self.graph.0[*id].generation;
+        prop_assert!(seen.windows(2).all(|pair| generation(&pair[0]) >= generation(&pair[1])));
+        prop_assert_eq!(id_of(&ours.common_ancestor(&theirs).unwrap()), seen[0]);
+        let id = self.graph.0.len();
+        let before = ours.version();
+        let (merged, calls) = counted_merge(&ours, &theirs, id);
+        let done = match merged {
+            Ok(done) => done,
+            Err(ferro::Error::NoCommonAncestor) if self.pruned && best.len() > 1 => {
+                prop_assert_eq!(ours.version(), before);
+                return Ok(());
+            }
+            Err(error) => panic!("{error}"),
+        };
+        self.crossed.check(best.len(), &calls)?;
+        if best.len() == 1 {
+            prop_assert_eq!(done.value, seen[0]);
+        }
+        if best == vec![hb] {
+            prop_assert!(!done.changed);
+            prop_assert_eq!(ours.version(), before);
+            return Ok(());
+        }
+        prop_assert!(done.changed);
+        self.graph.push(&[ha, hb], None);
+        self.heads[a] = Some(id);
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), TestCaseError> {
+        for slot in 0..SLOTS {
+            let Some(db) = &self.dbs[slot] else {
+                continue;
+            };
+            let head = self.heads[slot].unwrap();
+            prop_assert_eq!(counts(db), self.graph.events(head), "slot {}", slot);
+        }
+        Ok(())
+    }
 }
 
 fn run_graph(
@@ -615,121 +751,230 @@ fn run_graph(
     options: Options,
     keep: Keep,
     pruned: bool,
-) -> Result<(), TestCaseError> {
+) -> Result<Crossed, TestCaseError> {
     let dir = tempfile::tempdir().unwrap();
     let main: Db<Events> = options.open(dir.path().join("g.ferro")).unwrap();
-    let mut graph = Graph(Vec::new());
-    graph.push(&[], 0, Counts::new(), None, true);
-    let mut heads: Vec<Option<usize>> = vec![None; SLOTS];
-    let mut dbs: Vec<Option<Db<Events>>> = vec![None; SLOTS];
-    heads[0] = Some(0);
-    dbs[0] = Some(main.clone());
-    let mut events = 0u32;
+    let mut run = Run {
+        main: main.clone(),
+        graph: Graph(Vec::new()),
+        heads: vec![None; SLOTS],
+        dbs: vec![None; SLOTS],
+        events: 0,
+        keep,
+        pruned,
+        crossed: Crossed::default(),
+    };
+    run.graph.push(&[], None);
+    run.heads[0] = Some(0);
+    run.dbs[0] = Some(main);
     for op in ops {
-        let live: Vec<usize> = (0..SLOTS).filter(|slot| dbs[*slot].is_some()).collect();
+        let live = run.live();
         let pick = |index: usize| live[index % live.len()];
         match op {
-            Op::Inc(index) => {
-                let slot = pick(index);
-                let db = dbs[slot].clone().unwrap();
-                let (id, event, head) = (graph.0.len(), events, heads[slot].unwrap());
-                events += 1;
-                db.commit(format!("n{id}"), |root| {
-                    root.insert(event, 1);
-                })
-                .unwrap();
-                let mut counts = graph.0[head].counts.clone();
-                counts.insert(event, 1);
-                let (generation, exact) = (graph.0[head].generation + 1, graph.0[head].exact);
-                graph.push(&[head], generation, counts, Some(event), exact);
-                heads[slot] = Some(id);
-            }
+            Op::Inc(index) => run.inc(pick(index)),
             Op::Fork(index) => {
-                let from = pick(index);
-                let Some(slot) = (1..SLOTS).find(|slot| dbs[*slot].is_none()) else {
-                    continue;
-                };
-                dbs[slot] = Some(dbs[from].as_ref().unwrap().fork(&format!("b{slot}")).unwrap());
-                heads[slot] = heads[from];
+                run.fork(pick(index));
             }
             Op::Drop(index) => {
                 let others: Vec<usize> = live.iter().copied().filter(|slot| *slot != 0).collect();
-                if others.is_empty() {
-                    continue;
+                if !others.is_empty() {
+                    run.drop_slot(others[index % others.len()]);
                 }
-                let slot = others[index % others.len()];
-                dbs[slot] = None;
-                heads[slot] = None;
-                main.drop_branch(&format!("b{slot}")).unwrap();
             }
-            Op::Compact => {
-                let open: Vec<Db<Events>> = dbs.iter().flatten().cloned().collect();
-                let before = bases(&open);
-                main.compact(keep).unwrap();
-                prop_assert_eq!(bases(&open), before);
-            }
-            Op::Merge(a, b) => {
+            Op::Compact => run.compact()?,
+            Op::Merge(a, b) => run.merge(pick(a), pick(b))?,
+            Op::Cross(a, b) => {
                 let (a, b) = (pick(a), pick(b));
-                if a == b {
-                    continue;
+                if a != b
+                    && let Some(copy) = run.fork(a)
+                {
+                    run.merge(a, b)?;
+                    run.merge(b, copy)?;
+                    run.drop_slot(copy);
                 }
-                let (ours, theirs) = (dbs[a].clone().unwrap(), dbs[b].clone().unwrap());
-                let (ha, hb) = (heads[a].unwrap(), heads[b].unwrap());
-                let best = graph.best(ha, hb);
-                let found = ours.common_ancestor(&theirs);
-                prop_assert_eq!(
-                    found.as_ref().map(id_of).ok(),
-                    theirs.common_ancestor(&ours).as_ref().map(id_of).ok()
-                );
-                let seen = match found {
-                    Ok(base) => id_of(&base),
-                    Err(ferro::Error::NoCommonAncestor) if pruned => {
-                        let failed = ours.merge_with(&theirs, |_, _, _| ("never", ()));
-                        prop_assert!(matches!(failed, Err(ferro::Error::NoCommonAncestor)));
-                        continue;
-                    }
-                    Err(error) => panic!("{error}"),
-                };
-                prop_assert!(best.contains(&seen), "base {} is not one of {:?}", seen, best);
-                let top = best.iter().map(|v| graph.0[*v].generation).max().unwrap();
-                prop_assert_eq!(graph.0[seen].generation, top);
-                let id = graph.0.len();
-                let before = ours.version();
-                let done = event_merge(&ours, &theirs, id);
-                prop_assert_eq!(done.value, seen);
-                if best == vec![hb] {
-                    prop_assert!(!done.changed);
-                    prop_assert_eq!(ours.version(), before);
-                    continue;
-                }
-                prop_assert!(done.changed);
-                let mut counts = graph.0[ha].counts.clone();
-                for (event, count) in &graph.0[hb].counts {
-                    *counts.entry(*event).or_default() += count;
-                }
-                for (event, count) in &graph.0[seen].counts {
-                    *counts.entry(*event).or_default() -= count;
-                }
-                counts.retain(|_, count| *count != 0);
-                let generation = 1 + graph.0[ha].generation.max(graph.0[hb].generation);
-                let exact = graph.0[ha].exact && graph.0[hb].exact && best.len() == 1;
-                graph.push(&[ha, hb], generation, counts, None, exact);
-                heads[a] = Some(id);
             }
         }
-        for slot in 0..SLOTS {
-            let Some(db) = &dbs[slot] else {
-                continue;
-            };
-            let head = heads[slot].unwrap();
-            prop_assert_eq!(counts(db), graph.0[head].counts.clone(), "slot {}", slot);
-            if graph.0[head].exact {
-                prop_assert_eq!(graph.0[head].counts.clone(), graph.events(head), "slot {}", slot);
-            }
-        }
+        run.check()?;
     }
-    main.verify().unwrap();
-    Ok(())
+    run.main.verify().unwrap();
+    Ok(run.crossed)
+}
+
+const DEVICES: usize = 3;
+const LOCAL: [&str; 2] = ["main", "side"];
+
+#[derive(Clone, Debug)]
+enum Act {
+    Inc(usize, usize),
+    Fork(usize),
+    Merge(usize, bool),
+    Pull(usize, usize, usize, usize),
+    Sync(usize, usize),
+    Cross(usize, usize),
+}
+
+fn act() -> impl Strategy<Value = Act> {
+    prop_oneof![
+        6 => (0..DEVICES, 0..2usize).prop_map(|(d, s)| Act::Inc(d, s)),
+        1 => (0..DEVICES).prop_map(Act::Fork),
+        2 => (0..DEVICES, any::<bool>()).prop_map(|(d, back)| Act::Merge(d, back)),
+        6 => (0..DEVICES, 0..2usize, 0..DEVICES, 0..2usize)
+            .prop_map(|(a, s, b, t)| Act::Pull(a, s, b, t)),
+        2 => (0..DEVICES, 0..DEVICES).prop_map(|(a, b)| Act::Sync(a, b)),
+        2 => (0..DEVICES, 0..DEVICES).prop_map(|(a, b)| Act::Cross(a, b)),
+    ]
+}
+
+struct Devices {
+    graph: Graph,
+    dbs: Vec<[Option<Db<Events>>; 2]>,
+    heads: Vec<[usize; 2]>,
+    events: u32,
+    crossed: Crossed,
+}
+
+impl Devices {
+    fn inc(&mut self, device: usize, slot: usize) {
+        let Some(db) = &self.dbs[device][slot] else {
+            return;
+        };
+        let (id, event) = (self.graph.0.len(), self.events);
+        self.events += 1;
+        db.commit(format!("n{id}"), |root| {
+            root.insert(event, 1);
+        })
+        .unwrap();
+        self.graph.push(&[self.heads[device][slot]], Some(event));
+        self.heads[device][slot] = id;
+    }
+
+    fn merge(&mut self, device: usize, back: bool) -> Result<(), TestCaseError> {
+        let [Some(main), Some(side)] = self.dbs[device].clone() else {
+            return Ok(());
+        };
+        let (a, b) = if back { (1, 0) } else { (0, 1) };
+        let (ours, theirs) = if back { (side, main) } else { (main, side) };
+        let (ha, hb) = (self.heads[device][a], self.heads[device][b]);
+        let best = self.graph.best(ha, hb);
+        let id = self.graph.0.len();
+        let (merged, calls) = counted_merge(&ours, &theirs, id);
+        let done = merged.unwrap();
+        self.crossed.check(best.len(), &calls)?;
+        if best == vec![hb] {
+            prop_assert!(!done.changed);
+            return Ok(());
+        }
+        prop_assert!(done.changed);
+        self.graph.push(&[ha, hb], None);
+        self.heads[device][a] = id;
+        Ok(())
+    }
+
+    fn pull(&mut self, a: usize, s: usize, b: usize, t: usize) -> Result<bool, TestCaseError> {
+        let (Some(ours), Some(theirs)) = (self.dbs[a][s].clone(), self.dbs[b][t].clone()) else {
+            return Ok(false);
+        };
+        if a == b {
+            return Ok(false);
+        }
+        let (ha, hb) = (self.heads[a][s], self.heads[b][t]);
+        let best = self.graph.best(ha, hb);
+        let id = self.graph.0.len();
+        let mut calls = Vec::new();
+        let remote = format!("d{b}{}", LOCAL[t]);
+        let pulled = ours
+            .pull(&theirs, &remote, |root, base, other| {
+                add_deltas(root, base, other);
+                calls.push(base.version());
+                (format!("n{id}"), ())
+            })
+            .unwrap();
+        match pulled.outcome {
+            Outcome::Merged => {
+                prop_assert!(!self.graph.reaches(ha, hb));
+                self.crossed.check(best.len(), &calls)?;
+                self.graph.push(&[ha, hb], None);
+                self.heads[a][s] = id;
+            }
+            Outcome::FastForward => {
+                prop_assert!(self.graph.reaches(hb, ha));
+                prop_assert!(calls.is_empty());
+                self.heads[a][s] = hb;
+            }
+            Outcome::Ahead => {
+                prop_assert!(self.graph.reaches(ha, hb));
+                prop_assert!(calls.is_empty());
+            }
+            Outcome::UpToDate => {
+                let same = self.graph.events(ha) == self.graph.events(hb);
+                prop_assert!(self.graph.reaches(ha, hb) || same);
+                prop_assert!(calls.is_empty());
+            }
+        }
+        Ok(pulled.outcome == Outcome::Merged)
+    }
+
+    fn check(&self) -> Result<(), TestCaseError> {
+        for (device, dbs) in self.dbs.iter().enumerate() {
+            for (slot, db) in dbs.iter().enumerate() {
+                let Some(db) = db else {
+                    continue;
+                };
+                let head = self.heads[device][slot];
+                prop_assert_eq!(counts(db), self.graph.events(head), "d{} {}", device, LOCAL[slot]);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn run_devices(acts: Vec<Act>) -> Result<Crossed, TestCaseError> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut devices = Devices {
+        graph: Graph(Vec::new()),
+        dbs: Vec::new(),
+        heads: vec![[0, 0]; DEVICES],
+        events: 0,
+        crossed: Crossed::default(),
+    };
+    devices.graph.push(&[], None);
+    for device in 0..DEVICES {
+        let db: Db<Events> = fast().open(dir.path().join(format!("d{device}.ferro"))).unwrap();
+        devices.dbs.push([Some(db), None]);
+    }
+    for act in acts {
+        match act {
+            Act::Inc(device, slot) => devices.inc(device, slot),
+            Act::Fork(device) => {
+                if devices.dbs[device][1].is_none() {
+                    let main = devices.dbs[device][0].clone().unwrap();
+                    devices.dbs[device][1] = Some(main.fork(LOCAL[1]).unwrap());
+                    devices.heads[device][1] = devices.heads[device][0];
+                }
+            }
+            Act::Merge(device, back) => devices.merge(device, back)?,
+            Act::Pull(a, s, b, t) => {
+                devices.pull(a, s, b, t)?;
+            }
+            Act::Sync(a, b) => {
+                devices.pull(a, 0, b, 0)?;
+                if devices.pull(b, 0, a, 0)? {
+                    devices.pull(a, 0, b, 0)?;
+                }
+            }
+            Act::Cross(a, b) => {
+                let c = (0..DEVICES).find(|c| *c != a && *c != b).unwrap();
+                devices.pull(c, 0, a, 0)?;
+                devices.pull(a, 0, b, 0)?;
+                devices.pull(b, 0, c, 0)?;
+            }
+        }
+        devices.check()?;
+    }
+    for db in devices.dbs.iter().flatten().flatten() {
+        db.verify().unwrap();
+    }
+    Ok(devices.crossed)
 }
 
 proptest! {
@@ -748,6 +993,28 @@ proptest! {
         let options = fast().history(Keep::Last(keep)).reclaim(Reclaim { every_bytes: 0 });
         run_graph(ops, options, Keep::Last(keep), true)?;
     }
+
+    #[test]
+    fn devices_that_branch_merge_and_sync_apply_every_delta_exactly_once(
+        acts in prop::collection::vec(act(), 1..60),
+    ) {
+        run_devices(acts)?;
+    }
+}
+
+#[test]
+fn random_histories_cross_often_and_each_delta_is_still_applied_once() {
+    let mut runner = TestRunner::deterministic();
+    let (mut graphs, mut devices) = (Crossed::default(), Crossed::default());
+    for _ in 0..common::cases(100) {
+        let ops = prop::collection::vec(op(), 1..80).new_tree(&mut runner).unwrap().current();
+        graphs.add(run_graph(ops, fast(), Keep::All, false).unwrap());
+        let acts = prop::collection::vec(act(), 1..80).new_tree(&mut runner).unwrap().current();
+        devices.add(run_devices(acts).unwrap());
+    }
+    assert!(graphs.merges >= 50, "{} criss-cross merges", graphs.merges);
+    assert!(devices.merges >= 50, "{} criss-cross merges", devices.merges);
+    assert!(graphs.calls >= 3 && devices.calls >= 3);
 }
 
 #[test]
@@ -896,30 +1163,186 @@ fn a_fork_of_a_merged_branch_does_not_bring_its_changes_back() {
     main.verify().unwrap();
 }
 
+fn messages(snapshots: &[Snapshot<Events>]) -> Vec<String> {
+    snapshots.iter().map(|s| s.commit().message.clone()).collect()
+}
+
+fn sorted_messages(snapshots: &[Snapshot<Events>]) -> Vec<String> {
+    let mut out = messages(snapshots);
+    out.sort();
+    out
+}
+
+type Call = (u64, String, String);
+
+fn traced_merge(
+    db: &Db<Events>,
+    other: &Db<Events>,
+    name: &str,
+) -> (ferro::Committed<()>, Vec<Call>) {
+    let mut calls = Vec::new();
+    let merged = db
+        .merge_with(other, |root, base, theirs| {
+            add_deltas(root, base, theirs);
+            let message = |s: &Snapshot<Events>| s.commit().message.clone();
+            calls.push((base.version(), message(base), message(theirs)));
+            (name.to_string(), ())
+        })
+        .unwrap();
+    (merged, calls)
+}
+
+fn call(version: u64, base: &str, theirs: &str) -> Call {
+    (version, base.to_string(), theirs.to_string())
+}
+
+fn criss_cross(path: &std::path::Path) -> (Db<Events>, Db<Events>) {
+    let main: Db<Events> = fast().open(path).unwrap();
+    event(&main, "m0", 0);
+    let side = main.fork("side").unwrap();
+    event(&main, "m1", 1);
+    event(&side, "s1", 2);
+    event(&side, "s2", 3);
+    let copy = main.fork("copy").unwrap();
+    assert_eq!(merge_named(&main, &side, "main <- side").value, "m0");
+    assert_eq!(merge_named(&side, &copy, "side <- copy").value, "m0");
+    main.drop_branch("copy").unwrap();
+    (main, side)
+}
+
 #[test]
-fn criss_cross_merges_take_the_best_base_with_the_highest_generation() {
+fn criss_cross_merges_merge_the_best_ancestors_into_a_virtual_base_first() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("x.ferro");
     {
-        let main: Db<Events> = fast().open(&path).unwrap();
-        event(&main, "m0", 0);
-        let side = main.fork("side").unwrap();
-        event(&main, "m1", 1);
-        event(&side, "s1", 2);
-        event(&side, "s2", 3);
-        let copy = main.fork("copy").unwrap();
-        assert_eq!(merge_named(&main, &side, "main <- side").value, "m0");
-        assert_eq!(merge_named(&side, &copy, "side <- copy").value, "m0");
-        main.drop_branch("copy").unwrap();
+        let (main, side) = criss_cross(&path);
         assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "s2");
-        assert_eq!(side.common_ancestor(&main).unwrap().commit().message, "s2");
+        assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
+        assert_eq!(messages(&side.common_ancestors(&main).unwrap()), ["s2", "m1"]);
     }
     let main: Db<Events> = fast().open(&path).unwrap();
     let side = main.branch("side").unwrap();
-    assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "s2");
-    let merged = merge_named(&main, &side, "main <- side again");
-    assert_eq!(merged.value, "s2");
-    assert_eq!(counts(&main), [(0, 1), (1, 2), (2, 1), (3, 1)].into_iter().collect());
+    assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
+    let before = main.version();
+    let (merged, calls) = traced_merge(&main, &side, "main <- side again");
+    assert_eq!(
+        calls,
+        [call(1, "m0", "m1"), call(0, "main <- side again", "side <- copy")]
+    );
+    assert_eq!(counts(&main), ones(&[0, 1, 2, 3]));
+    assert_eq!(merged.version, before + 1);
+    let log: Vec<String> = main.log().values().map(|commit| commit.message.clone()).collect();
+    assert_eq!(log, ["m0", "m1", "main <- side", "main <- side again"]);
+    let (_, calls) = traced_merge(&side, &main, "side <- main");
+    assert_eq!(calls, [call(4, "side <- copy", "main <- side again")]);
+    assert_eq!(counts(&side), ones(&[0, 1, 2, 3]));
+    main.verify().unwrap();
+}
+
+#[test]
+fn a_revert_of_what_only_one_best_ancestor_carries_survives_a_criss_cross_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (main, side) = criss_cross(&dir.path().join("v.ferro"));
+    main.commit("revert m1", |root| {
+        root.remove(&1);
+    })
+    .unwrap();
+    main.merge_with(&side, |root, base, theirs| {
+        root.merge(base, theirs, |conflict| conflict.ours.map(|v| *v));
+        ("main <- side again", ())
+    })
+    .unwrap();
+    assert_eq!(counts(&main), ones(&[0, 2, 3]));
+}
+
+#[test]
+fn an_error_while_building_the_virtual_base_discards_the_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (main, side) = criss_cross(&dir.path().join("e.ferro"));
+    let (before, head) = (main.version(), main.head_hash());
+    let mut calls = 0;
+    let failed = main.try_merge_with(&side, |root, base, theirs| {
+        calls += 1;
+        if base.version() != 0 && theirs.commit().message == "m1" {
+            return Err(ferro::Error::BranchInUse("an ancestor".into()));
+        }
+        add_deltas(root, base, theirs);
+        Ok(("never", ()))
+    });
+    assert!(matches!(failed, Err(ferro::Error::BranchInUse(_))));
+    assert_eq!(calls, 1);
+    assert_eq!((main.version(), main.head_hash()), (before, head));
+    assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
+    let (_, calls) = traced_merge(&main, &side, "main <- side again");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(counts(&main), ones(&[0, 1, 2, 3]));
+}
+
+#[test]
+fn a_criss_cross_of_criss_crosses_builds_its_virtual_base_recursively() {
+    let dir = tempfile::tempdir().unwrap();
+    let main: Db<Events> = fast().open(dir.path().join("r.ferro")).unwrap();
+    event(&main, "m0", 0);
+    let side = main.fork("side").unwrap();
+    event(&main, "m1", 1);
+    event(&side, "s1", 2);
+    let copy = main.fork("copy").unwrap();
+    merge_named(&main, &side, "a1");
+    merge_named(&side, &copy, "b1");
+    main.drop_branch("copy").unwrap();
+    event(&main, "m2", 3);
+    event(&side, "s2", 4);
+    let copy = main.fork("copy").unwrap();
+    merge_named(&main, &side, "a2");
+    merge_named(&side, &copy, "b2");
+    main.drop_branch("copy").unwrap();
+    assert_eq!(sorted_messages(&main.common_ancestors(&side).unwrap()), ["m2", "s2"]);
+    let (_, calls) = traced_merge(&main, &side, "a3");
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let first = [call(1, "m0", "m1"), call(1, "m0", "s1")];
+    assert!(first.contains(&calls[0]), "{calls:?}");
+    assert!([call(0, "a3", "m2"), call(0, "a3", "s2")].contains(&calls[1]), "{calls:?}");
+    assert_eq!(calls[2], call(0, "a3", "b2"));
+    assert_eq!(counts(&main), ones(&[0, 1, 2, 3, 4]));
+    let (_, calls) = traced_merge(&side, &main, "b3");
+    assert_eq!(calls, [call(5, "b2", "a3")]);
+    assert_eq!(counts(&side), ones(&[0, 1, 2, 3, 4]));
+}
+
+fn pull_named(db: &Db<Events>, from: &Db<Events>, remote: &str, name: &str) -> (Outcome, usize) {
+    let mut calls = 0;
+    let pulled = db
+        .pull(from, remote, |root, base, theirs| {
+            calls += 1;
+            add_deltas(root, base, theirs);
+            (name.to_string(), ())
+        })
+        .unwrap();
+    (pulled.outcome, calls)
+}
+
+#[test]
+fn a_criss_cross_made_by_syncs_between_three_files_applies_each_change_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str| -> Db<Events> { fast().open(dir.path().join(name)).unwrap() };
+    let (a, b, c) = (open("a.ferro"), open("b.ferro"), open("c.ferro"));
+    event(&a, "a0", 0);
+    assert_eq!(pull_named(&b, &a, "a", "b <- a"), (Outcome::FastForward, 0));
+    event(&a, "a1", 1);
+    event(&b, "b1", 2);
+    assert_eq!(pull_named(&c, &a, "a", "c <- a"), (Outcome::FastForward, 0));
+    assert_eq!(pull_named(&a, &b, "b", "a <- b"), (Outcome::Merged, 1));
+    assert_eq!(pull_named(&b, &c, "c", "b <- c"), (Outcome::Merged, 1));
+    assert_eq!(counts(&a), ones(&[0, 1, 2]));
+    assert_eq!(counts(&b), ones(&[0, 1, 2]));
+    event(&a, "a2", 3);
+    event(&b, "b2", 4);
+    assert_eq!(pull_named(&a, &b, "b", "a <- b again"), (Outcome::Merged, 2));
+    assert_eq!(counts(&a), ones(&[0, 1, 2, 3, 4]));
+    assert_eq!(pull_named(&b, &a, "a", "b <- a again"), (Outcome::Merged, 1));
+    assert_eq!(counts(&b), ones(&[0, 1, 2, 3, 4]));
+    assert_eq!(pull_named(&a, &b, "b", "a <- b last"), (Outcome::UpToDate, 0));
+    assert_eq!(pull_named(&b, &a, "a", "b <- a last"), (Outcome::UpToDate, 0));
 }
 
 fn pairs(dbs: &[Db<Events>]) -> Vec<String> {
@@ -953,7 +1376,7 @@ fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
     let merge = |db: &Db<Events>, other: &Db<Events>, name: String| {
         let merged = db.merge_with(other, |root, base, theirs| {
             add_deltas(root, base, theirs);
-            (name, ())
+            (name.clone(), ())
         });
         match merged {
             Ok(_) | Err(ferro::Error::NoCommonAncestor) => {}

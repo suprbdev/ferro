@@ -748,13 +748,12 @@ struct Node {
     counts: BTreeMap<u32, i64>,
     ancestors: Vec<bool>,
     generation: u64,
-    exact: bool,
 }
 
 struct Model(Vec<Node>);
 
 impl Model {
-    fn push(&mut self, parents: &[usize], counts: BTreeMap<u32, i64>, exact: bool) -> usize {
+    fn push(&mut self, parents: &[usize], counts: BTreeMap<u32, i64>) -> usize {
         let id = self.0.len();
         let mut ancestors = vec![false; id + 1];
         for parent in parents {
@@ -768,7 +767,6 @@ impl Model {
             counts,
             ancestors,
             generation: generation.unwrap_or(0),
-            exact,
         });
         id
     }
@@ -816,7 +814,7 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
             .map(|device| fast().open(dir.path().join(format!("d{device}.ferro"))).unwrap())
             .collect();
         let mut model = Model(Vec::new());
-        model.push(&[], BTreeMap::new(), true);
+        model.push(&[], BTreeMap::new());
         let mut heads = [0usize; 4];
         let mut rng = Rng::new(seed + 7);
         let mut next_event = 0u32;
@@ -833,18 +831,17 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
                     .unwrap();
                 let mut counts = model.0[heads[to]].counts.clone();
                 counts.insert(event, 1);
-                let exact = model.0[heads[to]].exact;
-                heads[to] = model.push(&[heads[to]], counts, exact);
+                heads[to] = model.push(&[heads[to]], counts);
                 continue;
             }
             let from = (to + 1 + rng.below(3) as usize) % 4;
             let (ours, theirs) = (heads[to], heads[from]);
             let best = model.best(ours, theirs);
             let id = model.0.len();
-            let mut seen = None;
+            let mut seen = Vec::new();
             let pulled = devices[to]
                 .pull(&devices[from], &format!("d{from}"), |root, base, incoming| {
-                    seen = Some(id_in(base));
+                    seen.push((base.version(), id_in(base)));
                     add_deltas(root, base, incoming);
                     (format!("n{id}"), ())
                 })
@@ -860,28 +857,21 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
                     assert!(same || model.holds(ours, theirs), "seed {seed}");
                 }
                 Outcome::Merged => {
-                    let base = seen.unwrap();
-                    assert!(best.contains(&base), "seed {seed}: base {base} not in {best:?}");
-                    let top = best.iter().map(|node| model.0[*node].generation).max();
-                    assert_eq!(Some(model.0[base].generation), top, "seed {seed}");
+                    let (version, base) = *seen.last().unwrap();
+                    if let [only] = best[..] {
+                        assert_eq!((seen.len(), base), (1, only), "seed {seed}");
+                    } else {
+                        assert!(seen.len() >= 2 && version == 0, "seed {seed}: {seen:?}");
+                    }
                     let mut counts = model.0[ours].counts.clone();
-                    for (event, count) in &model.0[theirs].counts {
-                        *counts.entry(*event).or_default() += count;
-                    }
-                    for (event, count) in &model.0[base].counts {
-                        *counts.entry(*event).or_default() -= count;
-                    }
-                    counts.retain(|_, count| *count != 0);
-                    let exact = model.0[ours].exact && model.0[theirs].exact && best.len() == 1;
-                    heads[to] = model.push(&[ours, theirs], counts, exact);
+                    counts.extend(model.0[theirs].counts.clone());
+                    heads[to] = model.push(&[ours, theirs], counts);
                 }
             }
             for (device, db) in devices.iter().enumerate() {
                 let node = &model.0[heads[device]];
                 assert_eq!(counted(db), node.counts, "seed {seed} device {device}");
-                if node.exact {
-                    assert_eq!(node.counts, model.events(heads[device]), "seed {seed}");
-                }
+                assert_eq!(node.counts, model.events(heads[device]), "seed {seed}");
             }
         }
         for db in &devices {
