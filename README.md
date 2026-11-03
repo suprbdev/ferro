@@ -245,8 +245,11 @@ db.merge_with(&what_if, |shop, base, theirs| {
 ```
 
 A fork is one small commit whatever the database size. Merges are three-way and cost O(changes).
-You decide conflicts in Rust, and you merge each collection in your root yourself. Repeat merges
-between two branches, in either direction, do not apply a change twice.
+You decide conflicts in Rust, and you merge each collection in your root yourself. A merge
+commit links the commit it merged, and the base is found over the whole merge graph, as git
+does, so a change is merged once however it arrives: directly, back and forth, through a third
+branch or through a fork of a branch that was already merged. Finding the base costs about two
+binary searches over the log, plus a step for each merge made since the base.
 
 `db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
 the handle you call it on. Other handles on that branch keep reading what they had, commits through
@@ -378,10 +381,10 @@ for the swap, and readers do not wait at all.
 A pruned version is gone, whether or not a cycle has reclaimed its bytes yet: `at` returns
 `NoVersion`, so does `as_of` a time before the oldest retained commit, `log` and `history_of` stop
 at the oldest retained commit, and a fork answers the same. Version 0, your `Default` before the
-first commit, goes when version 1 does.
-`head_hash` does not change, because retained commits are not rewritten, and `merge_with` uses the other
-branch's merge record if that is still retained, then the fork point, and returns
-`NoCommonAncestor` only when none of them is.
+first commit, goes when version 1 does. `head_hash` does not change, because retained commits are
+not rewritten. A branch also keeps the commits its retained merges brought in, back to its oldest
+retained commit, so `merge_with` finds its base in what is retained and returns
+`NoCommonAncestor` when the answer could depend on what was pruned.
 
 Nothing you hold ever breaks. A `Snapshot`, a `Map` cloned from one, a `Log` or a `History` keeps
 reading the file it came from, even past pruning, and a read-only process does the same until it
@@ -594,9 +597,11 @@ This is an experiment, not a production database.
 - A frame past the superblock that is damaged cannot be told from a torn write, so open stops
   there and truncates it, losing at most the commits of the last sync. Bit rot further back is
   reported by the hash checks, not truncated.
-- Only direct merges are recorded. A change that arrives through a third branch, or through a
-  fork of an already merged branch, is seen again. Nothing is lost, but a merge closure that is
-  not idempotent, such as one adding a counter delta, applies it twice.
+- When two branches have each merged an older state of the other, through any route, they have
+  several best common ancestors (a criss-cross). `merge_with` uses the one with the highest
+  generation, then the newest, then the highest hash, so the choice is stable, but what only the
+  others have is seen again, and a merge closure that is not idempotent, such as one adding a
+  counter delta, applies it twice. Nothing is lost.
 - Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
   your current `Default`.
 - Sync builds and applies a bundle in memory, so the first pull of a large file needs its size in

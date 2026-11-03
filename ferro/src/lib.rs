@@ -4,6 +4,7 @@ pub mod admin;
 pub mod codec;
 pub mod db;
 pub mod error;
+mod graph;
 pub mod history;
 pub mod list;
 pub mod log;

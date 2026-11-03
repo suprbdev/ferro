@@ -825,7 +825,8 @@ Measured and left out:
 
 Each branch head holds a commit log stored as a chain of entries, newest first. An entry holds
 the `Commit`, a link to the previous entry, and for even versions a second link to the entry at
-`version - lowest_set_bit(version)`. Appending a commit writes one small object and finds its
+`version - lowest_set_bit(version)`. A merge's entry also links the other branch's tip entry, as
+described under Merging. Appending a commit writes one small object and finds its
 skip target by following skip links from the tip, which is O(1) amortized. Looking up a version
 or a time follows skip links while they do not overshoot, which is O(log n). The head records the
 tip pointer, the first retained version, and the head version. `Refs` is `Map<String, Head>` and
@@ -927,43 +928,123 @@ described under Objects and links. That is all it shows:
   was taken: a chain forged first and anchored afterwards verifies.
 - `time_ms` and `message` are what the writer recorded. The hash shows they were not changed, not
   that they were true.
-- It covers one branch's chain. Other branches, and the `merged` records in the head, are outside
-  it, and `verify` is what checks those objects.
+- It covers one branch's chain and, through merge links, the commits merged into it. Other
+  branches, and the old `merged` records in the head, are outside it, and `verify` is what checks
+  those objects.
 - An anchor for a pruned version can no longer be checked, since `hash_at` returns `None` for it.
   An anchor for a retained version still matches.
 
 ## Merging
 
-`Db::common_ancestor` finds the newest commit two branches share. Forking shares the log, so the
-logs agree up to the fork and differ after it, which makes this a binary search that compares
-commits at a version. Each probe is a version lookup, so it costs O(log^2 n). `Map::merge` and
-`Table::merge` then do a three-way merge driven by `diff(base, theirs)`, costing O(changes). A
-key changed only by theirs is applied. A key changed the same way on both sides is left alone.
-A key changed differently on both sides goes to a `resolve` closure. Merging runs inside an
-ordinary commit, so a root with several collections merges each one in plain Rust.
+`Map::merge` and `Table::merge` do a three-way merge driven by `diff(base, theirs)`, costing
+O(changes). A key changed only by theirs is applied. A key changed the same way on both sides is
+left alone. A key changed differently on both sides goes to a `resolve` closure. Merging runs
+inside an ordinary commit, so a root with several collections merges each one in plain Rust.
 
-`Db::merge_with` wraps this and records in the head the other branch's merged version and the
-version the merge became. `common_ancestor` prefers a recorded version over the fork point. When
-each branch has recorded a merge of the other, it takes the one that contains the other. So
-repeated merges, and merges back and forth between two branches, do not apply a change twice. A
-merge that keeps only our side still commits, so the record is not lost.
+`Db::merge_with` finds the base, runs the closure on our tip with the base and their snapshot, and
+commits. The log entry it writes has a second link, to the entry of the other branch's tip: the
+merge's second parent. Commits are then a graph, as in git, and `common_ancestor` returns a best
+common ancestor in it: a commit both tips reach through `prev` and merge links that is not an
+ancestor of another such commit. Because it follows merge links, a change counts as shared however
+it arrived, directly, through a third branch (A merges B after B merged C, then A merges C), or
+through a fork of a branch that was already merged, so a closure that adds counter deltas applies
+each delta once. The base is computed under the writer lock against the tip the closure runs on.
+A merge that keeps only our side still commits, so the link is not lost, and merging a branch
+whose tip we already contain writes nothing.
 
-Only direct merges are recorded. A change that reaches a branch through a third branch (A merges
-B after B merged C, then A merges C), or through a fork of a branch that was already merged, is
-not recognised. A merge closure that is not idempotent, such as one that adds a counter delta,
-applies it again, and the built-in merges may report a conflict for it. If pruning removed the
-recorded version, `common_ancestor` uses the other branch's merge record if that is still
-retained, then the fork point, and returns `NoCommonAncestor` only when none of them is.
+Only direct merges used to be recorded, as `(their version, our version)` per branch name in the
+head, and the base was the fork point found by binary search unless a record said otherwise. A
+change that came through a third branch was seen again.
+
+### Finding the base
+
+Each entry carries three numbers for the search. Its generation is one more than the larger of
+its parents' generations, so a parent always has a lower one. Its reach is the highest generation
+among the merged parents of the merge entries on its chain, at or below it. Its last merge is the
+version of the nearest merge entry on its chain. On a chain with no merges they are the version, 0
+and 0, which entries written before merge links existed already mean, so they are stored only once
+a chain has a merge, as three varints.
+
+The search paints down from both tips, as git's merge-base does, but in jumps. An item is a place
+on a chain and the sides that reach it. Items are taken in generation order, so when one is taken
+every path into it has arrived and its sides are final. A chain item does not step one commit at a
+time. It moves down to the highest place where anything could still join it: where its chain meets
+another item's, found by a binary search on versions that compares entry hashes, or the highest
+entry whose generation is at most the reach of any item, since nothing that has not yet been
+opened can arrive above that. The merge entries it passes become a separate item whose level is
+their reach, opened from the top only when nothing higher is left. A place reached from both sides
+is a candidate. It and everything below it is stale, and the search stops once one side has
+nothing left that is not stale.
+
+So a merge whose chains have no merges since they parted costs two binary searches, O(log^2 n),
+like the old fork-point search. Merge entries are opened only while their merged parents could
+still matter: when `main` has taken a side branch a thousand times, the next base is found after
+opening the latest merge, not all of them. What is opened is roughly the merges made since the
+base, since each of those could have brought in something the other side has. Measured with
+`Durability::Buffered`, the first call and then the mean of 100 more:
+
+| Shape | First | Then |
+| --- | --- | --- |
+| Fork at 10,000, then 10,000 and 1,000 commits | 0.15 ms | 49 µs |
+| `main` took a side branch 1,000 times among 21,000 commits | 46 µs | 44 µs |
+| A side branch took `main` 1,000 times | 46 µs | 44 µs |
+| 1,000 features merged since a branch forked | 31 ms | 30 ms |
+| The same branch after syncing, with 200 features merged since | 1.3 ms | 1.3 ms |
+
+When the tips have several best common ancestors, a criss-cross, `common_ancestor` returns the one
+with the highest generation, then the latest `time_ms`, then the highest entry hash. The rule
+depends only on the set, so both sides and every run agree, and a stale candidate can never win,
+since it is below a best one and so has a lower generation. What the other best ancestors have and
+the chosen one lacks is then seen again, so a closure that is not idempotent applies it twice.
+Git's recursive strategy first merges the best ancestors into a virtual base. That needs the
+closure more than once, which `FnOnce` does not allow, and it was left out.
+
+### Merges and pruning
+
+A branch keeps its retained versions and, through every merge entry among them, the commits that
+merge brought in: the merged chain from the merged tip down to the oldest version the other branch
+had retained when the merge was made, and no older than either that version's commit or the oldest
+retained commit of the branch that keeps the merge. The version and its time are stored in the
+merge entry. Merge entries reached that way bring in theirs under the later of the two time
+limits. A reclamation cycle copies exactly that. Every limit only rises, and a merge never claims
+more than the other branch still had, so a commit that has gone never comes back through a later
+merge: a nested merge does not take the looser limit of whichever branch reached it, which would
+let a branch that never pruned reach, through a merge of a pruned branch, commits that branch had
+already let go. The merged tip itself is kept whatever its age, with its value but nothing below
+it, because it is the base the next merge of that branch is most likely to need, and it was
+retained when the merge was made. Without pruning nothing is cut, and the commits of a dropped
+branch stay as long as a merge brought them in.
+
+The search reads only what that rule keeps, never whatever bytes are still on disk, so its answer
+does not change when a cycle runs, and every path it follows was copied. When a path that is not
+stale runs into pruned history, what is hidden there is older than where it stopped, since a merge
+commit takes the later of its parents' times, and of lower generation. The search then runs on
+until nothing that is not stale is left, and returns `NoCommonAncestor` if the other side reached
+anything that old and that low, or if both sides ran into pruned history, because the base could be
+hidden there. Otherwise its answer is the one the whole history would give.
+
+### Format
+
+Log entries have three more flag bits: the merge link, followed by its floor version and time; the
+three numbers; and a bit saying that some merge below has a limit, which tells the search when it
+may stop early.
+Entries written before carry none of them and read as a chain without merges. The head still
+holds the old `merged` map, so files written before stay readable, but nothing new is recorded in
+it. A record left from before still counts: the recorded version of the named branch is treated as
+reachable from the head that holds it, which is what the old merge meant. A build from before this
+change rejects entries with the new bits.
 
 ## Dropping a branch
 
-`Db::drop_branch` writes one frame: a `Refs` without the branch, and with its name removed from the
-`merged` map of every other head, including records a fork inherited. Records are keyed by name,
-so one left behind would match any later branch of that name. Its version would then be read
-against the new branch's log, which gives a base older than the real fork point, and merges would
-report conflicts and re-apply old changes. The branch's own head and records go with it. Commits
-read `merged` from the head in `tip.refs` rather than from a copy in the branch state, so nothing
-in memory can write a removed record back.
+`Db::drop_branch` writes one frame: a `Refs` without the branch. Merge links name entries, not
+branches, so a merge of the dropped branch still knows what it took, and those commits stay as
+described under Merges and pruning. The frame also removes the branch's name from the old
+`merged` map of every other head, including records a fork inherited. Those records are keyed by
+name, so one left behind would match any later branch of that name. Its version would then be read
+against the new branch's log, which gives a wrong base, and merges would report conflicts and
+re-apply old changes. The branch's own head and records go with it. Commits read `merged` from the
+head in `tip.refs` rather than from a copy in the branch state, so nothing in memory can write a
+removed record back.
 
 A commit writes its head by name, so a handle on a dropped branch would quietly recreate it. Each
 `Branch` therefore has a `retired` flag, which commits, forks and merges from that branch check
@@ -1155,8 +1236,9 @@ is larger, so the copying stays proportional to what was written.
    `at` stops serving a version before its objects are left behind.
 2. Copy, with no lock. Walk the published refs and write each reachable object to
    `<file>.compacting`, re-emitting links with new offsets, verifying each object's hash and
-   compressing again. Chain entries are copied like anything else, but a link past `first` is written
-   with offset 0 instead of being followed. Copies are keyed by hash, so a later pass from newer refs
+   compressing again. Chain entries are copied like anything else, but a link to an entry that is
+   past `first` and was not brought in by a retained merge, as described under Merges and pruning,
+   is written with offset 0 instead of being followed. Copies are keyed by hash, so a later pass from newer refs
    visits only what is new. Data is immutable, so no write barrier is needed. Passes repeat, up to
    six, until one copies less than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.

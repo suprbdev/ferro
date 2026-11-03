@@ -33,3 +33,38 @@ fn messages_written_before_groups_were_recorded_still_split_on_newlines() {
     assert_eq!(log.get(&2).unwrap().messages().count(), 2);
     db.verify().unwrap();
 }
+
+fn counter_merge(db: &Db<Counters>, other: &Db<Counters>, message: &str) -> String {
+    db.merge_with(other, |root, base, theirs| {
+        for key in 0..3u8 {
+            let delta = theirs.get(&key).map_or(0, |v| *v) - base.get(&key).map_or(0, |v| *v);
+            if delta != 0 {
+                let current = root.get(&key).map_or(0, |v| *v);
+                root.insert(key, current + delta);
+            }
+        }
+        (message.to_string(), base.commit().message.clone())
+    })
+    .unwrap()
+    .value
+}
+
+fn values(db: &Db<Counters>) -> Vec<(u8, i64)> {
+    db.read().iter().map(|(k, v)| (k, *v)).collect()
+}
+
+#[test]
+fn a_merge_recorded_before_merge_links_still_sets_the_base() {
+    let (_dir, path) = legacy();
+    let main: Db<Counters> = Db::open(&path).unwrap();
+    let side = main.branch("side").unwrap();
+    assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "side one");
+    assert_eq!(side.common_ancestor(&main).unwrap().commit().message, "side one");
+    assert_eq!(counter_merge(&main, &side, "merge side again"), "side one");
+    assert_eq!(values(&main), vec![(0, 3), (1, 1010), (2, 100)]);
+    assert_eq!(counter_merge(&side, &main, "merge main"), "side two");
+    assert_eq!(values(&side), vec![(0, 3), (1, 1010), (2, 100)]);
+    main.compact(ferro::Keep::All).unwrap();
+    main.verify().unwrap();
+    assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "merge side again");
+}

@@ -16,8 +16,9 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
+use crate::graph::{self, Start};
 use crate::history::History;
-use crate::log::{Chain, Log};
+use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, sibling, sync_parent};
 use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
@@ -274,9 +275,11 @@ fn changes_between<V: PartialEq>(
     changes_between((middle, &value), high, value_at, out)
 }
 
-struct Intent<T> {
+#[derive(Default)]
+struct Intent {
     restored: Option<u64>,
-    merged: Option<(Arc<Branch<T>>, u64)>,
+    merged: Option<Merged>,
+    record: Option<(String, u64)>,
 }
 
 struct Change<'a, T> {
@@ -285,17 +288,8 @@ struct Change<'a, T> {
     working: &'a T,
     message: String,
     parts: Parts,
-    intent: Intent<T>,
+    intent: Intent,
     seal: Option<&'a Arc<Seal>>,
-}
-
-impl<T> Default for Intent<T> {
-    fn default() -> Self {
-        Intent {
-            restored: None,
-            merged: None,
-        }
-    }
 }
 
 struct Branch<T> {
@@ -1006,27 +1000,32 @@ impl<T: Data> Shared<T> {
             .try_get(&branch.name)?
             .map(|head| head.merged.clone())
             .unwrap_or_default();
-        let recorded = match intent.merged {
-            Some((other, theirs))
-                if merged.try_get(&other.name)?.map(|seen| seen.0) != Some(theirs) =>
-            {
-                merged.insert(other.name.clone(), (theirs, version));
+        let recorded = match intent.record {
+            Some((other, theirs)) if merged.try_get(&other)?.map(|seen| seen.0) != Some(theirs) => {
+                merged.insert(other, (theirs, version));
                 true
             }
             _ => false,
         };
-        if !recorded && previous.unwrap_or(self.genesis_hash) == root.hash {
+        if !recorded
+            && intent.merged.is_none()
+            && previous.unwrap_or(self.genesis_hash) == root.hash
+        {
             return Ok(state.snapshot.commit.version);
+        }
+        let mut time_ms = now_ms().max(state.snapshot.commit.time_ms);
+        if let Some(link) = intent.merged {
+            time_ms = time_ms.max(store.load::<Entry>(link.ptr)?.commit.time_ms);
         }
         let commit = Commit {
             version,
-            time_ms: now_ms().max(state.snapshot.commit.time_ms),
+            time_ms,
             message,
             root: Some(root),
             restored: intent.restored,
             parts,
         };
-        let log = state.log.append(store, &mut txn, commit)?;
+        let log = state.log.append(store, &mut txn, commit, intent.merged)?;
         let log = match self.history {
             Keep::Last(_) => log.pruned(store, self.history)?,
             _ => log,
@@ -1316,7 +1315,7 @@ impl<T: Data> Db<T> {
 
     pub fn commit<R>(&self, message: impl Into<String>, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         let message = message.into();
-        let done = self.transact::<R, Error>(Intent::default(), |root| Ok((message, f(root))))?;
+        let done = self.transact::<R, Error>(|root| Ok((message, f(root))))?;
         Ok(done.value)
     }
 
@@ -1324,7 +1323,7 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> (S, R),
     ) -> Result<Committed<R>> {
-        self.transact::<R, Error>(Intent::default(), |root| {
+        self.transact::<R, Error>(|root| {
             let (message, value) = f(root);
             Ok((message.into(), value))
         })
@@ -1343,7 +1342,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
         let message = message.into();
-        let done = self.transact::<R, E>(Intent::default(), |root| {
+        let done = self.transact::<R, E>(|root| {
             f(root).map(|value| (message, value))
         })?;
         Ok(done.value)
@@ -1353,7 +1352,7 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        self.transact(Intent::default(), |root| {
+        self.transact(|root| {
             let (message, value) = f(root)?;
             Ok((message.into(), value))
         })
@@ -1361,22 +1360,25 @@ impl<T: Data> Db<T> {
 
     fn transact<R, E: From<Error>>(
         &self,
-        intent: Intent<T>,
         f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        if self.shared.coalesce && intent.restored.is_none() && intent.merged.is_none() {
+        if self.shared.coalesce {
             return self.combine(f);
         }
+        self.alone(|_, _, root| f(root).map(|(message, value)| (message, value, Intent::default())))
+    }
+
+    fn alone<R, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&RefState, &State<T>, &mut T) -> std::result::Result<(String, R, Intent), E>,
+    ) -> std::result::Result<Committed<R>, E> {
         let mut notices = Vec::new();
         let mut tip = self.shared.lock_tip();
         self.branch.check_live()?;
-        if let Some((other, _)) = &intent.merged {
-            other.check_live()?;
-        }
         let state = self.branch.tip.load_full();
         let mut working = (*state.snapshot.value).clone();
         let before = state.snapshot.commit.version;
-        let result = f(&mut working).and_then(|(message, value)| {
+        let result = f(&tip, &state, &mut working).and_then(|(message, value, intent)| {
             let change = Change {
                 branch: &self.branch,
                 state: &state,
@@ -1506,11 +1508,11 @@ impl<T: Data> Db<T> {
         let message = message.into();
         let intent = Intent {
             restored: Some(snapshot.commit.version),
-            merged: None,
+            ..Intent::default()
         };
-        self.transact::<(), Error>(intent, move |root| {
+        self.alone::<(), Error>(move |_, _, root| {
             *root = value;
-            Ok((message, ()))
+            Ok((message, (), intent))
         })
     }
 
@@ -1598,8 +1600,29 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
-        let base = self.common_ancestor(other)?;
-        self.merge_onto(other, base, other.read(), f)
+        self.alone::<R, Error>(|tip, ours, root| {
+            other.branch.check_live()?;
+            let theirs = other.branch.state.load_full();
+            let store = self.shared.store();
+            let found = Self::merge_base(
+                &tip.refs,
+                &store,
+                (&self.branch.name, ours),
+                (&other.branch.name, &theirs),
+            )?;
+            let base = found.as_ref().map(|(_, node)| node.ptr.hash);
+            let link = match theirs.log.tip {
+                Some(ptr) if base != Some(ptr.hash) => Self::link_to(tip, other, &theirs, ptr)?,
+                _ => None,
+            };
+            let base = self.snapshot_at(found)?;
+            let (message, value) = f(root, &base, &theirs.snapshot);
+            let intent = Intent {
+                merged: link,
+                ..Intent::default()
+            };
+            Ok((message.into(), value, intent))
+        })
     }
 
     pub(crate) fn merge_onto<R, S: Into<String>>(
@@ -1610,73 +1633,98 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
         let advanced = base.commit.root.map(|ptr| ptr.hash) != theirs.commit.root.map(|ptr| ptr.hash);
-        let intent = Intent {
-            restored: None,
-            merged: (advanced && !Arc::ptr_eq(&self.branch, &other.branch))
-                .then(|| (other.branch.clone(), theirs.version())),
-        };
-        self.transact::<R, Error>(intent, |root| {
+        let record = (advanced && !Arc::ptr_eq(&self.branch, &other.branch))
+            .then(|| (other.branch.name.clone(), theirs.version()));
+        self.alone::<R, Error>(|_, _, root| {
+            other.branch.check_live()?;
             let (message, value) = f(root, &base, &theirs);
-            Ok((message.into(), value))
+            let intent = Intent {
+                record,
+                ..Intent::default()
+            };
+            Ok((message.into(), value, intent))
         })
     }
 
+    fn link_to(
+        tip: &RefState,
+        other: &Db<T>,
+        theirs: &State<T>,
+        ptr: Ptr,
+    ) -> Result<Option<Merged>> {
+        let head = tip.refs.try_get(&other.branch.name)?;
+        let floor = head.map_or(1, |head| head.log.first).max(theirs.log.first).max(1);
+        if floor > theirs.log.last {
+            return Ok(None);
+        }
+        let kept = Chain {
+            first: floor,
+            ..theirs.log
+        };
+        let after = kept.after(&theirs.store)?;
+        Ok(Some(Merged { ptr, floor, after }))
+    }
+
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
-        let recorded = |db: &Db<T>, from: &Db<T>| -> Result<Option<(Snapshot<T>, u64)>> {
-            let head = db.shared.published.lock().refs.try_get(&db.branch.name)?;
-            let seen = match head {
-                Some(head) => head.merged.try_get(&from.branch.name)?,
-                None => None,
-            };
-            let Some(seen) = seen else {
-                return Ok(None);
-            };
-            match from.at(seen.0) {
-                Ok(snapshot) => Ok(Some((snapshot, seen.1))),
-                Err(Error::NoVersion(_)) => Ok(None),
-                Err(error) => Err(error),
-            }
+        let (refs, store, ours, theirs) = {
+            let published = self.shared.published.lock();
+            let states = (self.branch.state.load_full(), other.branch.state.load_full());
+            (published.refs.clone(), self.shared.store(), states.0, states.1)
         };
-        match (recorded(self, other)?, recorded(other, self)?) {
-            (Some((mine, merged_at)), Some((yours, _))) => {
-                return Ok(if merged_at <= yours.version() { yours } else { mine });
+        let found = Self::merge_base(
+            &refs,
+            &store,
+            (&self.branch.name, &ours),
+            (&other.branch.name, &theirs),
+        )?;
+        self.snapshot_at(found)
+    }
+
+    fn snapshot_at(&self, found: Option<(Store, Node)>) -> Result<Snapshot<T>> {
+        match found {
+            Some((store, node)) => Self::snapshot_of(&store, &node.entry.commit),
+            None => Ok(self.genesis()),
+        }
+    }
+
+    fn merge_base(
+        refs: &Refs,
+        store: &Store,
+        ours: (&str, &State<T>),
+        theirs: (&str, &State<T>),
+    ) -> Result<Option<(Store, Node)>> {
+        if ours.1.log.tip.is_none() || theirs.1.log.tip.is_none() {
+            return Ok(None);
+        }
+        let starts = |(name, state): (&str, &State<T>)| -> Result<Vec<Start>> {
+            let mut starts = Vec::new();
+            if let Some(tip) = state.log.tip {
+                starts.push(Start {
+                    store: state.store.clone(),
+                    node: Node::load(&state.store, tip)?,
+                    low: state.log.first,
+                    after: state.log.after(&state.store)?,
+                });
             }
-            (Some((snapshot, _)), None) | (None, Some((snapshot, _))) => return Ok(snapshot),
-            (None, None) => {}
-        }
-        let (ours, theirs) = (self.branch.state.load_full(), other.branch.state.load_full());
-        if ours.log.tip.is_none() || theirs.log.tip.is_none() {
-            return Ok(self.genesis());
-        }
-        let start = ours.log.first.max(theirs.log.first);
-        let same = |version: &u64| -> Result<bool> {
-            let (a, b) = (
-                ours.log.get(&ours.store, *version)?,
-                theirs.log.get(&theirs.store, *version)?,
-            );
-            Ok(matches!((a, b), (Some(a), Some(b)) if a.commit == b.commit))
-        };
-        if !same(&start)? {
-            return if start == 1 {
-                Ok(self.genesis())
-            } else {
-                Err(Error::NoCommonAncestor)
+            let Some(head) = refs.try_get(name)? else {
+                return Ok(starts);
             };
-        }
-        let mut low = start;
-        let mut high = self.version().min(other.version());
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            if same(&middle)? {
-                low = middle;
-            } else {
-                high = middle - 1;
+            for (other, seen) in head.merged.iter() {
+                let Some(found) = refs.try_get(&other)? else {
+                    continue;
+                };
+                if let Some(node) = found.log.node_at(store, seen.0)? {
+                    starts.push(Start {
+                        store: store.clone(),
+                        node,
+                        low: found.log.first,
+                        after: found.log.after(store)?,
+                    });
+                }
             }
-        }
-        self.at(low).map_err(|error| match error {
-            Error::NoVersion(_) => Error::NoCommonAncestor,
-            other => other,
-        })
+            Ok(starts)
+        };
+        graph::best(starts(ours)?, starts(theirs)?)
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {

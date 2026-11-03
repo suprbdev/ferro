@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::Refs;
 use crate::error::{Error, Result};
-use crate::log::Chain;
+use crate::log::{Chain, Closures, Entry};
 use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;
@@ -44,6 +44,11 @@ pub struct Space {
     pub cycles: u64,
     pub longest_pause: Duration,
     pub last_error: Option<String>,
+}
+
+fn links_of(entry: &Entry) -> Vec<Hash> {
+    let merged = entry.merged.map(|merged| merged.ptr);
+    entry.prev.iter().chain(&entry.skip).chain(&merged).map(|link| link.hash).collect()
 }
 
 pub(crate) fn sibling(path: &Path) -> PathBuf {
@@ -82,16 +87,27 @@ impl Roots {
     ) -> Result<()> {
         let mut stack = Vec::new();
         let mut entries = HashSet::new();
+        let mut closures = Closures::default();
         for chain in &self.chains {
+            let after = chain.after(store)?;
             chain.visit(store, |ptr, entry, object, len| {
                 if entries.insert(ptr.offset) && fresh(ptr) {
                     visit(ptr, object, len);
                 }
                 stack.extend(entry.commit.root);
                 stack.extend(chain.retained_skip(entry));
+                closures.mark(ptr, chain.first, after);
+                closures.seed(entry, after);
                 Ok(true)
             })?;
         }
+        closures.walk(store, |ptr, entry, object, len| {
+            if entries.insert(ptr.offset) && fresh(ptr) {
+                visit(ptr, object, len);
+            }
+            stack.extend(entry.commit.root);
+            Ok(true)
+        })?;
         stack.extend(&self.trees);
         while let Some(ptr) = stack.pop() {
             if entries.contains(&ptr.offset) || !fresh(ptr) {
@@ -265,16 +281,28 @@ impl<'a> Copier<'a> {
         let sink = &mut self.sink;
         let mut retained = HashSet::new();
         let mut edge = Vec::new();
+        let mut closures = Closures::default();
         for (_, branch) in refs.iter() {
+            let after = branch.log.after(&sink.source)?;
             branch.log.visit(&sink.source, |ptr, entry, _, _| {
                 if sink.copied.contains_key(&ptr.hash) {
                     return Ok(false);
                 }
                 retained.insert(ptr.hash);
-                edge.extend(entry.prev.iter().chain(&entry.skip).map(|link| link.hash));
+                edge.extend(links_of(entry));
+                closures.mark(ptr, branch.log.first, after);
+                closures.seed(entry, after);
                 Ok(true)
             })?;
         }
+        closures.walk(&sink.source, |ptr, entry, _, _| {
+            if sink.copied.contains_key(&ptr.hash) {
+                return Ok(false);
+            }
+            retained.insert(ptr.hash);
+            edge.extend(links_of(entry));
+            Ok(true)
+        })?;
         for hash in &retained {
             sink.pruned.remove(hash);
         }

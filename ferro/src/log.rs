@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -12,13 +13,45 @@ const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
 const WHOLE: u8 = 4;
 const JOINED: u8 = 8;
-const KNOWN: u8 = HAS_PREV | HAS_SKIP | WHOLE | JOINED;
+const MERGED: u8 = 16;
+const GRAPH: u8 = 32;
+const BOUNDED: u8 = 64;
+const KNOWN: u8 = HAS_PREV | HAS_SKIP | WHOLE | JOINED | MERGED | GRAPH | BOUNDED;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Merged {
+    pub(crate) ptr: Ptr,
+    pub(crate) floor: u64,
+    pub(crate) after: Option<u64>,
+}
+
+impl Merged {
+    pub(crate) fn after(&self, path: Option<u64>) -> Option<u64> {
+        path.max(self.after)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Graph {
+    pub(crate) lift: u64,
+    pub(crate) reach: u64,
+    pub(crate) last_merge: u64,
+    pub(crate) bounded: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub(crate) commit: Arc<Commit>,
     pub(crate) prev: Option<Ptr>,
     pub(crate) skip: Option<Ptr>,
+    pub(crate) merged: Option<Merged>,
+    pub(crate) graph: Graph,
+}
+
+impl Entry {
+    pub(crate) fn generation(&self) -> u64 {
+        self.commit.version + self.graph.lift
+    }
 }
 
 impl Data for Entry {
@@ -29,7 +62,13 @@ impl Data for Entry {
             Parts::Whole => WHOLE,
             Parts::Joined(_) => JOINED,
         };
-        let flags = u8::from(self.prev.is_some()) * HAS_PREV + u8::from(self.skip.is_some()) * HAS_SKIP;
+        let graph = self.graph;
+        let wide = (graph.lift, graph.reach, graph.last_merge) != (0, 0, 0);
+        let flags = u8::from(self.prev.is_some()) * HAS_PREV
+            + u8::from(self.skip.is_some()) * HAS_SKIP
+            + u8::from(self.merged.is_some()) * MERGED
+            + u8::from(wide) * GRAPH
+            + u8::from(graph.bounded) * BOUNDED;
         w.u8(flags | parts);
         if let Parts::Joined(lengths) = &self.commit.parts {
             w.varint(lengths.len() as u64);
@@ -37,11 +76,23 @@ impl Data for Entry {
                 w.varint(*len as u64);
             }
         }
+        if let Some(merged) = self.merged {
+            w.varint(merged.floor);
+            w.varint(merged.after.map_or(0, |after| after.saturating_add(1)));
+        }
+        if wide {
+            w.varint(graph.lift);
+            w.varint(graph.reach);
+            w.varint(graph.last_merge);
+        }
         if let Some(prev) = self.prev {
             w.link(prev);
         }
         if let Some(skip) = self.skip {
             w.link(skip);
+        }
+        if let Some(merged) = self.merged {
+            w.link(merged.ptr);
         }
         Ok(())
     }
@@ -66,13 +117,223 @@ impl Data for Entry {
             commit.parts = Parts::Joined(lengths);
             commit.parts.check(&commit.message)?;
         }
+        let floor = match flags & MERGED {
+            0 => None,
+            _ => Some((r.varint()?, r.varint()?.checked_sub(1))),
+        };
+        let mut graph = Graph {
+            bounded: flags & BOUNDED != 0,
+            ..Graph::default()
+        };
+        if flags & GRAPH != 0 {
+            graph.lift = r.varint()?;
+            graph.reach = r.varint()?;
+            graph.last_merge = r.varint()?;
+        }
+        let version = commit.version;
+        let generation = version.checked_add(graph.lift);
+        let merge_here = graph.last_merge == version;
+        if generation.is_none_or(|generation| graph.reach >= generation)
+            || graph.last_merge > version
+            || floor.is_some() != merge_here
+            || floor.is_some_and(|(floor, _)| floor == 0)
+        {
+            return Err(Error::Decode(format!("invalid merge graph in log entry {version}")));
+        }
         let prev = if flags & HAS_PREV != 0 { Some(r.link()?) } else { None };
         let skip = if flags & HAS_SKIP != 0 { Some(r.link()?) } else { None };
+        let merged = match floor {
+            Some((floor, after)) => Some(Merged {
+                ptr: r.link()?,
+                floor,
+                after,
+            }),
+            None => None,
+        };
         Ok(Entry {
             commit: Arc::new(commit),
             prev,
             skip,
+            merged,
+            graph,
         })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Node {
+    pub(crate) ptr: Ptr,
+    pub(crate) entry: Arc<Entry>,
+}
+
+impl Node {
+    pub(crate) fn load(store: &Store, ptr: Ptr) -> Result<Node> {
+        Ok(Node {
+            ptr,
+            entry: store.load::<Entry>(ptr)?,
+        })
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.entry.commit.version
+    }
+
+    pub(crate) fn time(&self) -> u64 {
+        self.entry.commit.time_ms
+    }
+
+    fn below(&self, store: &Store, link: Option<Ptr>) -> Result<Node> {
+        let node = Node::load(store, link.ok_or_else(|| corrupt("chain ends early"))?)?;
+        if node.version() >= self.version() {
+            return Err(corrupt("versions do not descend"));
+        }
+        Ok(node)
+    }
+
+    pub(crate) fn down_to(&self, store: &Store, version: u64) -> Result<Node> {
+        let mut node = self.clone();
+        while node.version() > version {
+            let link = match node.entry.skip {
+                Some(skip) if skip_version(node.version()) >= version => Some(skip),
+                _ => node.entry.prev,
+            };
+            node = node.below(store, link)?;
+        }
+        if node.version() != version {
+            return Err(corrupt("skips a version"));
+        }
+        Ok(node)
+    }
+
+    pub(crate) fn last_where(
+        &self,
+        store: &Store,
+        floor: u64,
+        too_high: impl Fn(&Entry) -> bool,
+    ) -> Result<Option<Node>> {
+        let mut node = self.clone();
+        while too_high(&node.entry) {
+            let at = node.version();
+            if at <= floor {
+                return Ok(None);
+            }
+            if let Some(skip) = node.entry.skip
+                && skip_version(at) >= floor
+            {
+                let far = node.below(store, Some(skip))?;
+                if too_high(&far.entry) {
+                    node = far;
+                    continue;
+                }
+            }
+            node = node.below(store, node.entry.prev)?;
+        }
+        Ok(Some(node))
+    }
+
+    pub(crate) fn lowest_kept(
+        &self,
+        store: &Store,
+        floor: u64,
+        kept: impl Fn(&Entry) -> bool,
+    ) -> Result<u64> {
+        let mut node = self.clone();
+        loop {
+            let at = node.version();
+            if at <= floor {
+                return Ok(at);
+            }
+            let far = node.entry.skip.filter(|skip| skip.offset != 0 && skip_version(at) >= floor);
+            if let Some(far) = far.map(|skip| node.below(store, Some(skip))).transpose()?
+                && kept(&far.entry)
+            {
+                node = far;
+                continue;
+            }
+            match node.entry.prev.filter(|prev| prev.offset != 0) {
+                Some(prev) => {
+                    let next = node.below(store, Some(prev))?;
+                    if !kept(&next.entry) {
+                        return Ok(at);
+                    }
+                    node = next;
+                }
+                None => return Ok(at),
+            }
+        }
+    }
+}
+
+type Seed = (u64, Option<u64>, Hash, u64);
+
+#[derive(Default)]
+pub(crate) struct Closures {
+    queue: BinaryHeap<Reverse<Seed>>,
+    walked: HashMap<Hash, Vec<(u64, Option<u64>)>>,
+}
+
+impl Closures {
+    pub(crate) fn seed(&mut self, entry: &Entry, after: Option<u64>) {
+        if let Some(merged) = entry.merged {
+            let Ptr { hash, offset } = merged.ptr;
+            self.queue.push(Reverse((merged.floor, merged.after(after), hash, offset)));
+        }
+    }
+
+    pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
+        self.walked.entry(ptr.hash).or_default().push((floor, after));
+    }
+
+    fn covered(&self, hash: &Hash, floor: u64, after: Option<u64>) -> bool {
+        let walks = self.walked.get(hash).map_or(&[][..], Vec::as_slice);
+        walks.iter().any(|(walked, bound)| {
+            *walked <= floor
+                && match (bound, after) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(bound), Some(after)) => bound <= &after,
+                }
+        })
+    }
+
+    pub(crate) fn walk(
+        &mut self,
+        store: &Store,
+        mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
+    ) -> Result<()> {
+        while let Some(Reverse((floor, after, hash, offset))) = self.queue.pop() {
+            let mut next = Some(Ptr { hash, offset });
+            let mut above = u64::MAX;
+            while let Some(ptr) = next.take() {
+                if ptr.offset == 0 || self.covered(&ptr.hash, floor, after) {
+                    break;
+                }
+                let (object, len) = store.read_record(ptr)?;
+                let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+                let at = entry.commit.version;
+                if at >= above {
+                    return Err(corrupt("versions do not descend"));
+                }
+                let first = above == u64::MAX;
+                above = at;
+                if at < floor {
+                    break;
+                }
+                if after.is_some_and(|after| entry.commit.time_ms < after) {
+                    if first {
+                        each(ptr, &entry, &object, len)?;
+                    }
+                    break;
+                }
+                self.walked.entry(ptr.hash).or_default().push((floor, after));
+                if !each(ptr, &entry, &object, len)? {
+                    break;
+                }
+                self.seed(&entry, after);
+                next = entry.prev.filter(|_| at > floor);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -137,6 +398,21 @@ impl Chain {
             Some(ptr) => Ok(Some(store.load::<Entry>(ptr)?)),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn node_at(&self, store: &Store, version: u64) -> Result<Option<Node>> {
+        let Some(tip) = self.tip.filter(|_| version >= self.first && version <= self.last) else {
+            return Ok(None);
+        };
+        Node::load(store, tip)?.down_to(store, version).map(Some)
+    }
+
+    pub(crate) fn after(&self, store: &Store) -> Result<Option<u64>> {
+        if self.first <= 1 {
+            return Ok(None);
+        }
+        let first = self.get(store, self.first)?.ok_or_else(|| corrupt("lost its first entry"))?;
+        Ok(Some(first.commit.time_ms))
     }
 
     pub(crate) fn get(&self, store: &Store, version: u64) -> Result<Option<Arc<Entry>>> {
@@ -272,7 +548,13 @@ impl Chain {
         Ok(())
     }
 
-    pub(crate) fn append(&self, store: &Store, sink: &mut dyn Sink, commit: Commit) -> Result<Chain> {
+    pub(crate) fn append(
+        &self,
+        store: &Store,
+        sink: &mut dyn Sink,
+        commit: Commit,
+        merged: Option<Merged>,
+    ) -> Result<Chain> {
         let version = commit.version;
         let first = if self.tip.is_some() { self.first } else { version };
         let target = skip_version(version);
@@ -281,10 +563,25 @@ impl Chain {
         } else {
             None
         };
+        let below = self.tip_entry(store)?;
+        let mut generation = below.as_ref().map_or(0, |entry| entry.generation()) + 1;
+        let mut graph = below.as_ref().map_or(Graph::default(), |entry| entry.graph);
+        if let Some(merged) = merged {
+            let other = store.load::<Entry>(merged.ptr)?;
+            generation = generation.max(other.generation() + 1);
+            graph.reach = graph.reach.max(other.generation());
+            graph.last_merge = version;
+            graph.bounded |= merged.floor > 1 || merged.after.is_some() || other.graph.bounded;
+        }
+        graph.lift = generation
+            .checked_sub(version)
+            .ok_or_else(|| corrupt("generation below version"))?;
         let entry = Entry {
             commit: Arc::new(commit),
             prev: self.tip,
             skip,
+            merged,
+            graph,
         };
         let mut encoder = Encoder::new(sink);
         entry.encode(&mut encoder)?;
