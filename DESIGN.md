@@ -701,10 +701,29 @@ node, for as long as it likes.
 
 The first version retired every evicted node. Gets with the 16 MiB cache fell by 44% at 16 and 32
 threads, and a profile put 40% of the time in freeing the batches of 128 cold nodes, most of them
-allocated by other threads. Retiring only lent nodes brought that back to within noise. An owner beside each
-cache entry, holding a second `Arc`, doubled the entry from 24 to 48 bytes and grew the heap per key
-by 3 to 5%; the entry now marks the copy the cache owns with a flag and gives up its value with
-`Option::take` on a hit.
+allocated by other threads. Retiring only lent nodes brought that back to within noise. An owner
+beside each cache entry, holding a second `Arc`, doubled the entry from 24 to 48 bytes and grew the
+heap per key by 3 to 5%; the entry now marks the copy the cache owns with a flag and gives up its
+value with `Option::take` on a hit. `flush` also waits for nodes another thread has taken from a
+batch and is still dropping, so that two stores closing at once cannot return before a retired
+node holding the other's file is gone.
+
+The flags made `Node` contain an `UnsafeCell`, so a `&Node` no longer tells the compiler that the
+node cannot change, and loops that call out per item reloaded the node's fields after every call:
+`iter()` scans went from 79 to 88 instructions a key and `for_each` stayed at 49. The folds of
+`Iter` and `Values` now take the keys as a slice and a clone of the column once per run, and `scan`
+walks a leaf's keys and values as two slices, which brought `iter()` scans to 64 instructions a key
+and `for_each` to 30, 9 to 28% faster than before this work at 1 to 32 threads.
+
+The protocol is checked four ways. `tests/epoch_stress.rs` runs eight readers doing gets, `floor`,
+`summary_by`, row gets and index lookups through the `Finder` against a model of every version,
+on handles with caches of 12 KiB to 1 MiB that read-only readers refresh and reopen, beside two
+writers on a 12 KiB cache with reclamation cycles every 96 KiB and compaction, while the writer's
+`Db` is dropped and reopened four times. It runs under AddressSanitizer and ThreadSanitizer clean,
+and with `release` changed to free lent nodes at once both report the use after free within the
+default four seconds. Unit tests in `epoch.rs`, `map.rs` and `store.rs` race a reader's borrow with
+an eviction and check that only the cache's own entry releases its value; they pass under Miri
+with stacked borrows and with tree borrows over 16 schedules.
 
 Index rows. `IndexIter` fetches rows through a `Finder` that keeps the last leaf it found and that
 leaf's parent. A key within the leaf's first and last keys is in that leaf or nowhere, so rows in
@@ -739,8 +758,9 @@ for a value with a destructor costs a shared reference count per item, which `fo
 Each iterator still clones the store and the root, two counts every reader of a map shares, which
 holds ranges near 16 times one thread at 32. A get on one thread is 1 to 4% slower than before,
 about what the pin costs, since the same build with an unguarded walk was as fast as before.
-`iter()` scans from two threads up came out 4 to 6% slower in every build of this work, the
-unguarded ones included, and the cause is not found.
+`iter()` scans from two threads up still came out 4 to 8% slower than before in a quiet run after
+the loops were hoisted, with fewer instructions a key than before, and equal in a rerun on a busier
+machine, so a remaining cause is not found.
 
 ### What is left, on `examples/graph`
 
