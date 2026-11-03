@@ -8,8 +8,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use ferro::Durability;
-use ferro::admin::{self, Keep};
+use ferro::{Durability, Keep};
 use metrics::ingest::{IngestOptions, ingest};
 use metrics::load::{self, LoadOptions};
 use metrics::model::{BUCKET_MS, now_ms};
@@ -210,10 +209,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
                 "dropped {} points in {} partitions in {:.3}s",
                 dropped.points_dropped, dropped.partitions_dropped, delete_secs
             )?;
-            drop(tsdb);
             if !no_compact {
                 let started = Instant::now();
-                let done = admin::compact(path, keep)?;
+                let done = tsdb.db.compact(keep)?;
                 writeln!(
                     out,
                     "compacted {} -> {} in {:.2}s, {} objects, {} commits dropped",

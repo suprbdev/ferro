@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
@@ -12,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use ferro::Snapshot;
+use ferro::{Snapshot, Val};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -165,7 +164,7 @@ async fn list_products(
 fn products_page(shop: &Shop, query: &ListQuery) -> Value {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let after = query.after.unwrap_or(0);
-    let candidates: Box<dyn Iterator<Item = Arc<Product>>> = match &query.category {
+    let candidates: Box<dyn Iterator<Item = Val<Product>>> = match &query.category {
         Some(category) => Box::new(shop.products.by_category_after(category.as_str(), &after)),
         None => Box::new(
             shop.products
@@ -297,12 +296,13 @@ async fn customer_orders(
                 let limit = query.limit.unwrap_or(50).clamp(1, 200);
                 let before = query.before.unwrap_or(u64::MAX);
                 let status: Option<OrderStatus> = query.status.map(Into::into);
-                let mut orders: Vec<Arc<Order>> = shop
-                    .orders
-                    .by_customer(&id)
+                let rows = match status {
+                    Some(status) => shop.orders.by_customer_status(&(id, status)),
+                    None => shop.orders.by_customer(&id),
+                };
+                let mut orders: Vec<Val<Order>> = rows
                     .rev()
                     .filter(|order| order.id < before)
-                    .filter(|order| status.is_none_or(|status| order.status == status))
                     .take(limit + 1)
                     .collect();
                 let next = if orders.len() > limit {

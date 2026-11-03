@@ -1,9 +1,8 @@
 use std::fmt;
-use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder};
 use crate::error::Result;
-use crate::map::{Map, Values};
+use crate::map::{Map, Val, Values};
 
 pub struct List<T>(Map<u64, T>);
 
@@ -40,12 +39,12 @@ impl<T: Data> List<T> {
         self.0.insert(self.0.len() as u64, value);
     }
 
-    pub fn pop(&mut self) -> Option<Arc<T>> {
+    pub fn pop(&mut self) -> Option<Val<T>> {
         let last = self.0.len().checked_sub(1)? as u64;
         self.0.remove(&last)
     }
 
-    pub fn get(&self, index: usize) -> Option<Arc<T>> {
+    pub fn get(&self, index: usize) -> Option<Val<T>> {
         self.0.get(&(index as u64))
     }
 
@@ -53,7 +52,7 @@ impl<T: Data> List<T> {
         self.0.get_mut(&(index as u64))
     }
 
-    pub fn set(&mut self, index: usize, value: T) -> Option<Arc<T>> {
+    pub fn set(&mut self, index: usize, value: T) -> Option<Val<T>> {
         let key = index as u64;
         assert!(
             index < self.len(),
@@ -63,18 +62,16 @@ impl<T: Data> List<T> {
         self.0.insert(key, value)
     }
 
-    pub fn first(&self) -> Option<Arc<T>> {
+    pub fn first(&self) -> Option<Val<T>> {
         self.get(0)
     }
 
-    pub fn last(&self) -> Option<Arc<T>> {
+    pub fn last(&self) -> Option<Val<T>> {
         self.get(self.len().checked_sub(1)?)
     }
 
     pub fn truncate(&mut self, len: usize) {
-        while self.len() > len {
-            self.pop();
-        }
+        self.0.remove_range(len as u64..);
     }
 
     pub fn iter(&self) -> Values<u64, T> {
@@ -126,7 +123,7 @@ impl<T: Data> FromIterator<T> for List<T> {
 }
 
 impl<T: Data> IntoIterator for &List<T> {
-    type Item = Arc<T>;
+    type Item = Val<T>;
     type IntoIter = Values<u64, T>;
 
     fn into_iter(self) -> Values<u64, T> {

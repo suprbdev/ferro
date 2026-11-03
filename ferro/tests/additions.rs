@@ -45,7 +45,7 @@ fn filled(path: &std::path::Path) -> Db<Store> {
     db
 }
 
-fn ids(rows: impl Iterator<Item = std::sync::Arc<Item>>) -> Vec<u64> {
+fn ids(rows: impl Iterator<Item = ferro::Val<Item>>) -> Vec<u64> {
     rows.map(|row| row.id).collect()
 }
 

@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use ferro::codec::{Decoder, Encoder, HashSink};
-use ferro::{Data, Db, Record, Set, Table};
+use ferro::{Bytes, Data, Db, Record, Set, Table};
 
 fn bytes<T: Data>(value: &T) -> Vec<u8> {
     let mut sink = HashSink;
@@ -105,6 +104,49 @@ struct V2 {
     #[ferro(default = "seven")]
     added: u32,
     id: u64,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+#[ferro(transparent)]
+struct Blob(Bytes);
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+#[ferro(transparent)]
+struct Named {
+    inner: Vec<u8>,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct HoldsBlob {
+    kept: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct GrewBlob {
+    kept: u8,
+    blob: Blob,
+    named: Named,
+}
+
+#[test]
+fn transparent_newtypes_encode_as_their_field() {
+    let raw = Bytes::from(vec![1u8, 2, 3, 4]);
+    assert_eq!(bytes(&Blob(raw.clone())), bytes(&raw));
+    assert_eq!(bytes(&Named { inner: raw.to_vec() }), bytes(&raw));
+    roundtrip(Blob(raw.clone()));
+    roundtrip(Named { inner: raw.to_vec() });
+    let mut encoded = Vec::new();
+    {
+        let mut sink = HashSink;
+        let mut w = Encoder::new(&mut sink);
+        HoldsBlob { kept: 7 }.encode(&mut w).unwrap();
+        encoded.extend_from_slice(w.bytes());
+    }
+    let mut r = Decoder::new(&encoded, &[], None);
+    let grown = GrewBlob::decode(&mut r).unwrap();
+    assert_eq!(grown.kept, 7);
+    assert_eq!(grown.blob, Blob::default());
+    assert_eq!(grown.named, Named::default());
 }
 
 #[test]
@@ -301,8 +343,52 @@ fn issue(id: u64, status: Status, labels: &[&str]) -> Issue {
     }
 }
 
-fn ids(iter: impl Iterator<Item = Arc<Issue>>) -> Vec<u64> {
+fn ids(iter: impl Iterator<Item = ferro::Val<Issue>>) -> Vec<u64> {
     iter.map(|row| row.id).collect()
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+#[index(tenant, created)]
+struct Event {
+    #[key]
+    id: u64,
+    tenant: String,
+    created: u32,
+}
+
+#[test]
+fn composite_index_orders_by_each_field_in_turn() {
+    let mut table: Table<Event> = Table::new();
+    let event = |id, tenant: &str, created| Event {
+        id,
+        tenant: tenant.to_string(),
+        created,
+    };
+    table.insert(event(1, "b", 30));
+    table.insert(event(2, "a", 20));
+    table.insert(event(3, "a", 10));
+    table.insert(event(4, "a", 20));
+    let listed = |rows: ferro::table::IndexIter<Event>| -> Vec<u64> {
+        rows.map(|row| row.id).collect()
+    };
+    assert_eq!(listed(table.by_tenant_created(&("a".to_string(), 20))), [2, 4]);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [3, 2, 4]);
+    assert_eq!(listed(table.by_tenant_created_prefix("b")), [1]);
+    assert_eq!(listed(table.by_tenant_created_prefix("c")), [0u64; 0]);
+    let span = ("a".to_string(), 15)..("b".to_string(), 0);
+    assert_eq!(listed(table.by_tenant_created_range(span)), [2, 4]);
+    assert_eq!(
+        table.by_tenant_created_counts(),
+        [
+            (("a".to_string(), 10), 1),
+            (("a".to_string(), 20), 2),
+            (("b".to_string(), 30), 1),
+        ]
+    );
+    table.update(&2, |row| row.created = 5);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [2, 3, 4]);
+    table.remove(&3);
+    assert_eq!(listed(table.by_tenant_created_prefix("a")), [2, 4]);
 }
 
 #[test]
@@ -417,7 +503,7 @@ fn each_with_set_types() {
         set: ["x".to_string(), "y".to_string()].into_iter().collect(),
         rank: 5,
     });
-    let names = |iter: Box<dyn Iterator<Item = Arc<Doc>>>| -> Vec<String> {
+    let names = |iter: Box<dyn Iterator<Item = ferro::Val<Doc>>>| -> Vec<String> {
         iter.map(|row| row.name.clone()).collect()
     };
     assert_eq!(names(Box::new(table.by_tags(&2))), vec!["a", "b"]);

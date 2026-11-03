@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferro::{Data, Map, Record, Table};
+use ferro::{Data, Map, Record, Summary, Table};
 
 use crate::chunk::Chunk;
 
@@ -20,6 +20,7 @@ pub fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Data, Record)]
+#[unique(metric, labels)]
 pub struct SeriesRec {
     #[key]
     pub id: u64,
@@ -72,10 +73,6 @@ impl SeriesKey {
     pub fn new(metric: String, mut labels: Vec<(String, String)>) -> SeriesKey {
         labels.sort();
         SeriesKey { metric, labels }
-    }
-
-    pub fn canonical(&self) -> String {
-        self.to_string()
     }
 }
 
@@ -159,13 +156,30 @@ impl Rollup {
     }
 }
 
+impl Summary<(u64, u64), Rollup> for Rollup {
+    fn of(_key: &(u64, u64), rollup: &Rollup) -> Self {
+        *rollup
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Rollup {
+            count: self.count + other.count,
+            sum: self.sum + other.sum,
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+            first: self.first,
+            last: other.last,
+        }
+    }
+}
+
 #[derive(Clone, Default, Data)]
 pub struct Metrics {
     pub series: Table<SeriesRec>,
-    pub by_key: Map<String, u64>,
     pub next_id: u64,
     pub chunks: Map<u64, Map<u64, Chunk>>,
-    pub rollups: Map<u64, Map<(u64, u64), Rollup>>,
+    pub part_points: Map<u64, u64>,
+    pub rollups: Map<u64, Map<(u64, u64), Rollup, Rollup>>,
     pub raw_floor: u64,
     pub points: u64,
 }

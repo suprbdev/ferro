@@ -178,12 +178,15 @@ pub fn audit(db: &Db<Ledger>, samples: usize) -> Result<AuditReport> {
                 format_amount(sum, &account.currency)
             ));
         }
-        if ledger.names.get(account.name.as_str()).map(|id| *id) != Some(account.id) {
-            problems.push(format!("name index disagrees for account {}", account.name));
+        let folded = ledger.sum_postings(account.id, i32::MIN, i32::MAX);
+        if folded != sum {
+            problems.push(format!(
+                "account {} postings fold to {} but journal recomputes {}",
+                account.name,
+                format_amount(folded, &account.currency),
+                format_amount(sum, &account.currency)
+            ));
         }
-    }
-    if ledger.names.len() != ledger.accounts.len() {
-        problems.push("name index and account table differ in size".to_string());
     }
     if ledger.next_entry != last_id || ledger.next_entry != entries {
         problems.push(format!(

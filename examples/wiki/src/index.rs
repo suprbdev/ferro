@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+
+use ferro::{Map, Set, Val};
 
 use crate::chunk;
 use crate::model::{Page, Wiki};
@@ -45,12 +46,12 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub fn page(&self, id: u64) -> Option<Arc<Page>> {
+    pub fn page(&self, id: u64) -> Option<Val<Page>> {
         self.w.pages.get(&id)
     }
 
-    pub fn by_slug(&self, slug: &str) -> Option<Arc<Page>> {
-        self.w.slugs.get(slug).and_then(|id| self.w.pages.get(&id))
+    pub fn by_slug(&self, slug: &str) -> Option<Val<Page>> {
+        self.w.pages.by_slug(slug)
     }
 
     pub fn allocate(&mut self) -> u64 {
@@ -79,7 +80,7 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub fn put(&mut self, new: Page) -> Option<Arc<Page>> {
+    pub fn put(&mut self, new: Page) -> Option<Val<Page>> {
         let old = self.page(new.id);
         let unchanged_text = old.as_ref().is_some_and(|old| {
             old.body == new.body && old.title == new.title && old.slug == new.slug
@@ -89,76 +90,33 @@ impl<'a> Tx<'a> {
             let after = analyze(&new);
             self.record(new.id, before, Some(after));
         }
-        if let Some(old) = &old
-            && old.slug != new.slug
-            && self.w.slugs.get(&old.slug).as_deref() == Some(&new.id)
-        {
-            self.w.slugs.remove(&old.slug);
-        }
-        self.w.slugs.insert(new.slug.clone(), new.id);
         self.w.pages.insert(new);
         old
     }
 
-    pub fn remove(&mut self, id: u64) -> Option<Arc<Page>> {
+    pub fn remove(&mut self, id: u64) -> Option<Val<Page>> {
         let old = self.page(id)?;
         let before = analyze(&old);
         self.record(id, Some(before), None);
-        if self.w.slugs.get(&old.slug).as_deref() == Some(&id) {
-            self.w.slugs.remove(&old.slug);
-        }
         self.w.pages.remove(&id);
         Some(old)
     }
 
     pub fn finish(self) {
         let Tx { w, terms, links } = self;
-        let mut terms: Vec<_> = terms.into_iter().collect();
-        terms.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut links: Vec<_> = links.into_iter().collect();
-        links.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut postings = Vec::with_capacity(terms.len());
         for (term, updates) in terms {
-            let emptied = {
-                let posting = w.terms.get_or_insert_with(term.clone(), Default::default);
-                if updates.iter().all(|(_, count)| count.is_some()) {
-                    posting.extend(
-                        updates
-                            .into_iter()
-                            .filter_map(|(id, count)| Some((id, count?))),
-                    );
-                } else {
-                    for (id, count) in updates {
-                        match count {
-                            Some(count) => {
-                                posting.insert(id, count);
-                            }
-                            None => {
-                                posting.remove(&id);
-                            }
-                        }
-                    }
-                }
-                posting.is_empty()
-            };
-            if emptied {
-                w.terms.remove(&term);
-            }
+            let mut posting = w.terms.get(&term).map_or_else(Map::new, |list| (*list).clone());
+            posting.apply(updates);
+            postings.push((term, (!posting.is_empty()).then_some(posting)));
         }
+        w.terms.apply(postings);
+        let mut backlinks = Vec::with_capacity(links.len());
         for (target, updates) in links {
-            let emptied = {
-                let sources = w.links.get_or_insert_with(target.clone(), Default::default);
-                for (id, present) in updates {
-                    if present {
-                        sources.insert(id);
-                    } else {
-                        sources.remove(&id);
-                    }
-                }
-                sources.is_empty()
-            };
-            if emptied {
-                w.links.remove(&target);
-            }
+            let mut sources = w.links.get(&target).map_or_else(Set::new, |set| (*set).clone());
+            sources.apply(updates);
+            backlinks.push((target, (!sources.is_empty()).then_some(sources)));
         }
+        w.links.apply(backlinks);
     }
 }

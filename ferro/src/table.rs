@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Iter, Keys, Map, Values, three_way};
+use crate::map::{Conflict, Cursor, Diff, Iter, Keys, Map, Val, Values, three_way};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -15,10 +15,31 @@ pub trait Record: Data {
     fn key(&self) -> Self::Key;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Taken<K> {
+    pub index: &'static str,
+    pub holder: K,
+}
+
+impl<K: fmt::Debug> fmt::Display for Taken<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unique index {} already holds this value for {:?}", self.index, self.holder)
+    }
+}
+
+impl<K: fmt::Debug> std::error::Error for Taken<K> {}
+
 pub trait TableData<T: Record>: Data + Default {
     fn rows(&self) -> &Map<T::Key, T>;
     fn rows_mut(&mut self) -> &mut Map<T::Key, T>;
     fn reindex(&mut self, old: Option<&T>, new: Option<&T>);
+    fn conflict(&self, _row: &T, _moving: Option<&T::Key>) -> Option<Taken<T::Key>> {
+        None
+    }
+}
+
+fn clash<K>(taken: Taken<K>) -> ! {
+    panic!("ferro: unique index {} already holds this value", taken.index)
 }
 
 pub struct Table<T: Record>(T::Table);
@@ -64,7 +85,7 @@ impl<T: Record> Table<T> {
         self.0.rows().is_empty()
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<Arc<T>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -84,6 +105,19 @@ impl<T: Record> Table<T> {
         self.0.rows().values()
     }
 
+    pub fn for_each(&self, mut f: impl FnMut(&T)) {
+        self.0.rows().for_each(|_, row| f(row));
+    }
+
+    pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&T))
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.0.rows().for_each_range::<Q, R>(range, |_, row| f(row));
+    }
+
     pub fn range<Q, R>(&self, range: R) -> Iter<T::Key, T>
     where
         T::Key: Borrow<Q>,
@@ -93,15 +127,26 @@ impl<T: Record> Table<T> {
         self.0.rows().range::<Q, R>(range)
     }
 
-    pub fn first(&self) -> Option<Arc<T>> {
+    pub fn first(&self) -> Option<Val<T>> {
         self.0.rows().first().map(|(_, row)| row)
     }
 
-    pub fn last(&self) -> Option<Arc<T>> {
+    pub fn last(&self) -> Option<Val<T>> {
         self.0.rows().last().map(|(_, row)| row)
     }
 
-    pub fn insert(&mut self, row: T) -> Option<Arc<T>> {
+    pub fn insert(&mut self, row: T) -> Option<Val<T>> {
+        self.try_insert(row).unwrap_or_else(|taken| clash(taken))
+    }
+
+    pub fn try_insert(&mut self, row: T) -> std::result::Result<Option<Val<T>>, Taken<T::Key>> {
+        if let Some(taken) = self.0.conflict(&row, None) {
+            return Err(taken);
+        }
+        Ok(self.put(row))
+    }
+
+    fn put(&mut self, row: T) -> Option<Val<T>> {
         let key = row.key();
         let row = Arc::new(row);
         let old = self.0.rows_mut().insert_shared(key, row.clone());
@@ -109,7 +154,20 @@ impl<T: Record> Table<T> {
         old
     }
 
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<Arc<T>>
+    fn replace(&mut self, old: &T, row: T) {
+        let old_key = old.key();
+        let new_key = row.key();
+        if old_key == new_key {
+            self.0.reindex(Some(old), Some(&row));
+            self.0.rows_mut().insert(new_key, row);
+        } else {
+            self.0.rows_mut().remove(&old_key);
+            self.0.reindex(Some(old), None);
+            self.put(row);
+        }
+    }
+
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -147,6 +205,27 @@ impl<T: Record> Table<T> {
         }
     }
 
+    pub fn try_update<Q>(
+        &mut self,
+        key: &Q,
+        f: impl FnOnce(&mut T),
+    ) -> std::result::Result<bool, Taken<T::Key>>
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let Some(old) = self.0.rows().get(key) else {
+            return Ok(false);
+        };
+        let mut row = (*old).clone();
+        f(&mut row);
+        if let Some(taken) = self.0.conflict(&row, Some(&old.key())) {
+            return Err(taken);
+        }
+        self.replace(&old, row);
+        Ok(true)
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let doomed: Vec<T::Key> = self
             .0
@@ -160,6 +239,19 @@ impl<T: Record> Table<T> {
         }
     }
 
+    pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Val<T>>
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let drained: Vec<Val<T>> = self.0.rows_mut().take_range::<Q, R>(range).values().collect();
+        for row in &drained {
+            self.0.reindex(Some(row), None);
+        }
+        drained
+    }
+
     pub fn diff(&self, newer: &Table<T>) -> Diff<T::Key, T>
     where
         T: PartialEq,
@@ -171,32 +263,67 @@ impl<T: Record> Table<T> {
         &mut self,
         base: &Table<T>,
         theirs: &Table<T>,
-        resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
+        mut resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
     ) -> usize
     where
         T: PartialEq,
     {
-        three_way(
+        let mut clashes: Vec<(T::Key, T)> = Vec::new();
+        let written = three_way(
             self,
             base.0.rows(),
             theirs.0.rows(),
             |table, key| table.get(key),
             |table, key, value| match value {
+                Some(row) if table.0.conflict(&row, None).is_some() => clashes.push((key, row)),
                 Some(row) => {
-                    table.insert(row);
+                    table.put(row);
                 }
                 None => {
                     table.remove(&key);
                 }
             },
-            resolve,
-        )
+            &mut resolve,
+        );
+        let mut settling = true;
+        while settling {
+            settling = false;
+            for (key, row) in std::mem::take(&mut clashes) {
+                if self.0.conflict(&row, None).is_some() {
+                    clashes.push((key, row));
+                } else {
+                    self.put(row);
+                    settling = true;
+                }
+            }
+        }
+        for (key, row) in clashes {
+            let holder = self
+                .0
+                .conflict(&row, None)
+                .and_then(|taken| self.get(&taken.holder));
+            let resolved = resolve(Conflict {
+                key: key.clone(),
+                base: base.get(&key),
+                ours: holder,
+                theirs: Some(Val::new(row)),
+            });
+            match resolved {
+                Some(row) => {
+                    self.insert(row);
+                }
+                None => {
+                    self.remove(&key);
+                }
+            }
+        }
+        written
     }
 }
 
 pub struct RowMut<'a, T: Record> {
     table: &'a mut Table<T>,
-    old: Arc<T>,
+    old: Val<T>,
     row: Option<T>,
 }
 
@@ -219,15 +346,10 @@ impl<T: Record> Drop for RowMut<'_, T> {
         let Some(row) = self.row.take() else {
             return;
         };
-        let old_key = self.old.key();
-        let new_key = row.key();
-        if old_key == new_key {
-            self.table.0.reindex(Some(&self.old), Some(&row));
-            self.table.0.rows_mut().insert(new_key, row);
-        } else {
-            self.table.0.rows_mut().remove(&old_key);
-            self.table.0.reindex(Some(&self.old), None);
-            self.table.insert(row);
+        match self.table.0.conflict(&row, Some(&self.old.key())) {
+            None => self.table.replace(&self.old, row),
+            Some(_) if std::thread::panicking() => {}
+            Some(taken) => clash(taken),
         }
     }
 }
@@ -284,25 +406,33 @@ impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
 }
 
 pub struct IndexIter<T: Record> {
-    rows: Map<T::Key, T>,
+    rows: Cursor<T::Key, T>,
     keys: Box<dyn KeyCursor<T::Key>>,
 }
 
 impl<T: Record> IndexIter<T> {
     fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
         IndexIter {
-            rows: rows.clone(),
+            rows: rows.cursor(),
             keys: Box::new(Entries(entries.into_keys())),
         }
+    }
+
+    pub fn keys(self) -> IndexKeys<T> {
+        IndexKeys(self.keys)
+    }
+
+    fn row(&mut self, key: &T::Key) -> Option<Val<T>> {
+        self.rows.seek(key).then(|| self.rows.value()).flatten()
     }
 }
 
 impl<T: Record> Iterator for IndexIter<T> {
-    type Item = Arc<T>;
+    type Item = Val<T>;
 
-    fn next(&mut self) -> Option<Arc<T>> {
+    fn next(&mut self) -> Option<Val<T>> {
         let key = self.keys.forward()?;
-        self.rows.get(&key)
+        self.row(&key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -311,13 +441,60 @@ impl<T: Record> Iterator for IndexIter<T> {
 }
 
 impl<T: Record> DoubleEndedIterator for IndexIter<T> {
-    fn next_back(&mut self) -> Option<Arc<T>> {
+    fn next_back(&mut self) -> Option<Val<T>> {
         let key = self.keys.backward()?;
-        self.rows.get(&key)
+        self.row(&key)
     }
 }
 
 impl<T: Record> ExactSizeIterator for IndexIter<T> {}
+
+pub struct IndexKeys<T: Record>(Box<dyn KeyCursor<T::Key>>);
+
+impl<T: Record> Iterator for IndexKeys<T> {
+    type Item = T::Key;
+
+    fn next(&mut self) -> Option<T::Key> {
+        self.0.forward()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.left(), Some(self.0.left()))
+    }
+}
+
+impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
+    fn next_back(&mut self) -> Option<T::Key> {
+        self.0.backward()
+    }
+}
+
+impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
+
+pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Val<T>>
+where
+    I: Data + Ord + Borrow<Q>,
+    T: Record,
+    Q: Ord + ?Sized,
+{
+    rows.get(&*index.get(value)?)
+}
+
+pub fn index_where<I, T>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), ()>,
+    below: impl Fn(&I) -> bool,
+    within: impl Fn(&I) -> bool,
+) -> IndexIter<T>
+where
+    I: Data + Ord,
+    T: Record,
+{
+    IndexIter::over(
+        rows,
+        index.range_by(|entry| below(&entry.0), |entry| within(&entry.0)),
+    )
+}
 
 pub fn index_eq<I, T, Q>(
     rows: &Map<T::Key, T>,

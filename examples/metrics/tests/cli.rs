@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin_cmd;
+use ferro::Summary;
+use metrics::model::Rollup;
 use tempfile::TempDir;
 
 const T0: u64 = 1_699_999_200_000;
@@ -456,6 +458,62 @@ fn rollup_aggregates_match_raw_aggregates() {
 }
 
 #[test]
+fn rollup_folds_match_raw_aggregates() {
+    let env = Env::new();
+    env.seed();
+    env.ok(&["downsample", "--step", "10m"]);
+    let from = (T0 + 1_800_000).to_string();
+    let to = (T0 + 6_000_000).to_string();
+    let spans: [&[&str]; 6] = [
+        &[],
+        &["--step", "2h"],
+        &["--step", "80m"],
+        &["--from", &from, "--to", &to],
+        &["--from", &from, "--to", &to, "--step", "2h"],
+        &["--from", &from, "--to", &to, "--step", "80m"],
+    ];
+    let parse = |text: &str| -> Vec<(String, f64)> {
+        text.lines()
+            .map(|l| (format!("{}{}", field(l, 0), field(l, 1)), field(l, 2).parse().unwrap()))
+            .collect()
+    };
+    for func in ["sum", "avg", "min", "max", "count"] {
+        for span in spans {
+            let mut args = vec!["aggregate", "http_requests", "--fn", func, "--by", "host"];
+            args.extend_from_slice(span);
+            let raw = parse(&env.ok(&args));
+            args.extend_from_slice(&["--rollup", "10m"]);
+            let rolled = parse(&env.ok(&args));
+            assert!(!raw.is_empty(), "{func} {span:?}");
+            assert_eq!(raw.len(), rolled.len(), "{func} {span:?}");
+            for (a, b) in raw.iter().zip(rolled.iter()) {
+                assert_eq!(a.0, b.0, "{func} {span:?}");
+                assert!((a.1 - b.1).abs() < 1e-6, "{func} {span:?}: {a:?} {b:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_rollup_fold_matches_adding_the_points_in_order() {
+    let points = [4.0, -3.0, 9.5, 0.25, -7.0, 2.0, 12.0, 1.0];
+    for split in 1..points.len() {
+        let mut whole = Rollup::of(points[0]);
+        for point in &points[1..] {
+            whole.add(*point);
+        }
+        let roll = |part: &[f64]| {
+            part.iter()
+                .map(|point| Rollup::of(*point))
+                .reduce(|total, next| total.combine(&next))
+                .unwrap()
+        };
+        let folded = roll(&points[..split]).combine(&roll(&points[split..]));
+        assert_eq!(folded, whole, "split at {split}");
+    }
+}
+
+#[test]
 fn rollup_rejects_rate_and_bad_step() {
     let env = Env::new();
     env.seed();
@@ -531,6 +589,31 @@ fn retain_trims_the_boundary_partition_exactly() {
     let first: u64 = lines[0].rsplit(' ').next().unwrap().parse().unwrap();
     assert!(first >= hour0 + 3 * HOUR + 1_200_000, "{first}");
     env.ok(&["verify"]);
+}
+
+#[test]
+fn retain_inside_a_partition_keeps_its_counter_right() {
+    let env = Env::new();
+    let start = T0 / 600_000 * 600_000;
+    env.ingest_text(&format!(
+        "m{{host=\"a\"}} 1 {}\nm{{host=\"a\"}} 2 {}\nm{{host=\"b\"}} 3 {}\n",
+        start + 1_000,
+        start + 300_000,
+        start + 2_000,
+    ));
+    let now = (start + 200_000 + HOUR).to_string();
+    let out = env.ok(&["retain", "--older-than", "1h", "--now", &now]);
+    assert!(out.contains("dropped 2 points in 0 partitions"), "{out}");
+    assert_eq!(env.lines(&["query", r#"m{host="a"}"#, "--from", "0"]).len(), 1);
+    env.ok(&["verify"]);
+    env.ingest_text(&format!("m{{host=\"a\"}} 4 {}\n", start + 400_000));
+    env.ok(&["verify"]);
+    let now = (start + 500_000 + HOUR).to_string();
+    let out = env.ok(&["retain", "--older-than", "1h", "--now", &now]);
+    assert!(out.contains("dropped 2 points in 0 partitions"), "{out}");
+    env.ok(&["verify"]);
+    let stats = env.ok(&["stats"]);
+    assert!(stats.contains("partitions   0 "), "{stats}");
 }
 
 #[test]

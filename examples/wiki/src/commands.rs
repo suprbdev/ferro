@@ -1,10 +1,9 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
-use ferro::Db;
+use ferro::{Db, Val};
 use similar::{ChangeTag, TextDiff};
 
 use crate::Res;
@@ -18,7 +17,7 @@ use crate::query;
 use crate::render::{bytes, timestamp};
 use crate::text::{query_terms, slugify};
 
-fn find_page(w: &Wiki, slug: &str) -> Res<Arc<Page>> {
+fn find_page(w: &Wiki, slug: &str) -> Res<Val<Page>> {
     query::find(w, &clean_slug(slug)?).ok_or_else(|| format!("no such page {slug}").into())
 }
 
@@ -179,7 +178,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
             if before.is_none() && after.is_none() {
                 return Err(format!("{slug} exists in neither v{v1} nor v{v2}").into());
             }
-            let body = |page: &Option<Arc<Page>>| {
+            let body = |page: &Option<Val<Page>>| {
                 page.as_ref()
                     .map(|page| chunk::text(&page.body))
                     .unwrap_or_default()
@@ -237,7 +236,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
                 None => db.read(),
             };
             let mut count = 0usize;
-            for (slug, id) in snapshot.slugs.iter() {
+            for (slug, id) in snapshot.pages.unique_slug().iter() {
                 let Some(page) = snapshot.pages.get(&id) else {
                     continue;
                 };
@@ -323,7 +322,7 @@ fn history(w: &mut dyn Write, db: &Db<Wiki>, slug: &str) -> Res<()> {
         .take_while(|(_, page)| page.is_some())
         .collect();
     changes.reverse();
-    let mut previous: Option<Arc<Page>> = None;
+    let mut previous: Option<Val<Page>> = None;
     for (commit, page) in changes {
         let page = page.flatten();
         let summary = match (&previous, &page) {

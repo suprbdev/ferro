@@ -510,6 +510,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "ferro",
+ "predicates",
+ "tempfile",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -841,6 +852,18 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "queue"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "ferro",
+ "predicates",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -82,6 +82,33 @@ blocks, never changes, and stays valid for as long as you hold it. Collections w
 standard library counterparts: `get`, `iter`, `range`, `keys`, `values`, `first`, `last`, with
 `DoubleEndedIterator` and `ExactSizeIterator`. Filtering, grouping and joining are iterator code.
 
+`get` and the iterators hand out a `Val<V>`, which derefs to `V`. A small value with no heap of its
+own, such as an integer, a `()` or a struct of integers, is copied into it. Any other `Val` shares
+its node's column of values and keeps that column alive, so call `into_owned` before holding many of
+them for long.
+
+**Reads in bulk.** `sum`, `count`, `for_each` and other folds on the plain iterators take whole
+nodes at a time. `Map::for_each`, `try_for_each`, `for_each_range` and `try_for_each_range` lend
+`&K` and `&V`, so they clone nothing, and the `try_` forms stop on `ControlFlow::Break`.
+`Map::cursor` gives a `Cursor` that keeps its path through the tree, so `seek` and `seek_back` cost
+the distance moved instead of a walk from the root, which suits sorted lookups and merge joins.
+`get_many` and `contains_many` run a cursor over an iterator of keys, and keys out of order still
+give the right answer, at the cost of a fresh walk each. `Map::floor` finds the last key at or
+before a key in one walk.
+
+```rust
+frontier.sort_unstable();
+let reached: u64 = degrees
+    .get_many(&frontier)
+    .filter_map(|(_, count)| count)
+    .map(|count| u64::from(*count))
+    .sum();
+
+let mut shared = 0;
+let mut other = right.cursor();
+left.for_each(|key, _| shared += usize::from(other.seek(key)));
+```
+
 **Writes are closures.** `update`, `commit` and `commit_with` give you `&mut T`. When the closure
 returns, the change commits atomically. If it panics or `try_update` returns `Err`, nothing
 happens. Writers run one at a time, so a transaction is serializable by construction.
@@ -95,9 +122,47 @@ hash of any `Data` value, which makes an ETag one line.
 | Type | Use it for |
 | --- | --- |
 | `Map<K, V>` | Ordered map, with `get_mut` handing out a real `&mut V` |
-| `Set<T>` | Ordered set |
+| `Map<K, V, S>` | The same, keeping a `Summary` of every subtree for O(log n) range totals |
+| `Set<T>` | Ordered set, whose `range` has a `len` like the rest |
 | `List<T>` | Append-mostly sequence with indexed access |
 | `Table<T>` | Keyed rows with secondary indexes kept up to date for you |
+| `Bytes` | Byte buffer value with `Deref<Target = [u8]>` and O(1) clone |
+
+`Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and
+join trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range
+and returns the rows, which is O(rows) because every index has to be updated. `Map::apply` takes a
+batch of puts and deletes and merges it in one descent of the tree, as `extend` does for puts.
+
+A `Summary` folds entries in key order, and `Map<K, V, S>` keeps that fold for every subtree, so a
+total over any key range takes O(log n) instead of a scan. A plain `Map<K, V>` pays nothing for this.
+
+```rust
+#[derive(Clone, Copy, Data)]
+#[ferro(transparent)]
+struct Net(i128);
+
+impl Summary<(u32, i32), i64> for Net {
+    fn of(_key: &(u32, i32), amount: &i64) -> Self {
+        Net(i128::from(*amount))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Net(self.0 + other.0)
+    }
+}
+
+let postings: Map<(u32, i32), i64, Net> = Map::default();
+let balance = postings
+    .range_summary((account, i32::MIN)..=(account, date))
+    .map_or(0, |net| net.0);
+```
+
+`combine` must be associative and is applied in key order, so it need not be commutative: first,
+last, min and max work. `of` must depend only on what the key and value encode. An empty range gives
+`None`. `summary` reads the whole map's fold in O(1), and `summary_by` takes predicates, as
+`range_by` does. A summary costs bytes on each commit, 8% for an `i64` total and more as it widens, so
+keep it small. Use a tuple rather than a `derive(Data)` struct, whose field tags repeat on every
+link.
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
 `by_status_range(range)` and `by_status_counts()`, which needs no row reads.
@@ -105,6 +170,16 @@ hash of any `Data` value, which makes an ETag one line.
 costs a seek, not a walk over the rows already shown. An `Option<T>` index also gets
 `by_field_some(&value)` and `by_field_some_after(&value, &key)`, and `#[index(each)]` indexes every
 element of a collection field.
+
+`#[index(a, b)]` on the struct indexes a combination of fields in that order. It gets the same
+`by_a_b(&(a, b))`, `by_a_b_range` and `by_a_b_counts`, and `by_a_b_prefix(&a)` for every row with
+that `a`, ordered by `b`.
+
+`#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
+`by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
+index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,
+`update` and `get_mut` have no error channel, so they panic, which discards the transaction.
+`Table::merge` passes a clash to your `resolve` closure.
 
 ## History, diffs and branches
 
@@ -280,19 +355,19 @@ cargo run --release -p tracker -- undo
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`. Each is a single run.
+`ferro-bench`, as the median of five runs alternating with the build before.
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 1.6 s |
-| Random `get` | 1.0 µs |
-| Full scan | 53 ns per key |
-| Range read | 54 ns per key |
-| Single-key commit, fsync | 460 µs, about 2,200 per second |
-| Single-key commits, fsync, 8 writers | about 9,800 per second |
-| Single-key commit, `Durability::Buffered` | 72 µs |
-| Bytes written per single-key commit | 8.5 KB |
-| `diff` | 5.7 µs per changed key |
+| Bulk insert in one commit | 1.5 s |
+| Random `get` | 0.41 µs |
+| Full scan | 35 ns per key |
+| Range read | 39 ns per key |
+| Single-key commit, fsync | 480 to 650 µs, about 1,500 to 2,000 per second |
+| Single-key commits, fsync, 8 writers | about 9,500 per second |
+| Single-key commit, `Durability::Buffered` | 27 µs |
+| Bytes written per single-key commit | 3.5 KB |
+| `diff` | 4.4 µs per changed key |
 
 The tracker with 100,000 issues in a 39 MB file, as whole process runs including open: seeding in
 845 ms, indexed `list` in 2 ms, `show` in 1 ms, durable `close` in 1 ms, `stats` in 3 ms,
@@ -304,7 +379,7 @@ This is an experiment, not a production database.
 
 - The file format is not stable and may change without migration.
 - It runs on Unix only.
-- A single-key commit writes about 8.5 KB at this size, so batch related changes into one commit.
+- A single-key commit writes about 3.5 KB at this size, so batch related changes into one commit.
   Secondary indexes add to that. Without retention the file only grows.
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
   miss the node cache are slower for a moment after each swap.
@@ -324,6 +399,6 @@ This is an experiment, not a production database.
   not idempotent, such as one adding a counter delta, applies it twice.
 - Version 0 is not stored. `at(0)` and forks of an empty database use your current `Default`.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
-  You choose the index.
+  You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 
 See `DESIGN.md` for how it works.

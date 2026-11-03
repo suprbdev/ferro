@@ -1,5 +1,5 @@
-use std::sync::Arc;
 
+use ferro::Val;
 use crate::error::{LedgerError, Result};
 use crate::model::{Account, Entry, Kind, Ledger, Line, PostingKey};
 use crate::money::{format_amount, format_date};
@@ -77,16 +77,14 @@ fn bucket(sums: &mut Vec<(String, i128, i128)>, currency: &str) -> usize {
 
 impl Ledger {
     pub fn account_id(&self, name: &str) -> Result<u32> {
-        self.names
-            .get(name)
-            .map(|id| *id)
+        self.accounts
+            .key_by_name(name)
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
     }
 
-    pub fn account(&self, name: &str) -> Result<Arc<Account>> {
-        let id = self.account_id(name)?;
+    pub fn account(&self, name: &str) -> Result<Val<Account>> {
         self.accounts
-            .get(&id)
+            .by_name(name)
             .ok_or_else(|| LedgerError::NoAccount(name.to_string()))
     }
 
@@ -99,20 +97,18 @@ impl Ledger {
                 "invalid currency `{currency}`, expected three capital letters"
             )));
         }
-        if self.names.contains_key(name) {
-            return Err(LedgerError::AccountExists(name.to_string()));
-        }
-        self.next_account += 1;
-        let id = self.next_account;
-        self.names.insert(name.to_string(), id);
-        self.accounts.insert(Account {
-            id,
-            name: name.to_string(),
-            kind,
-            currency: currency.to_string(),
-            closed: false,
-            balance: 0,
-        });
+        let id = self.next_account + 1;
+        self.accounts
+            .try_insert(Account {
+                id,
+                name: name.to_string(),
+                kind,
+                currency: currency.to_string(),
+                closed: false,
+                balance: 0,
+            })
+            .map_err(|_| LedgerError::AccountExists(name.to_string()))?;
+        self.next_account = id;
         Ok(id)
     }
 
@@ -288,9 +284,8 @@ impl Ledger {
         let low: PostingKey = (account, from, 0, 0);
         let high: PostingKey = (account, to, u64::MAX, u16::MAX);
         self.postings
-            .range::<PostingKey, _>(low..=high)
-            .map(|(_, amount)| i128::from(*amount))
-            .sum()
+            .range_summary::<PostingKey, _>(low..=high)
+            .map_or(0, |net| net.0)
     }
 
     pub fn balance_at(&self, account: &Account, as_of: Option<i32>) -> i128 {
@@ -300,7 +295,7 @@ impl Ledger {
         }
     }
 
-    pub fn trial_balance(&self, as_of: Option<i32>) -> Vec<(Arc<Account>, i128)> {
+    pub fn trial_balance(&self, as_of: Option<i32>) -> Vec<(Val<Account>, i128)> {
         self.accounts
             .iter()
             .map(|account| {
@@ -345,7 +340,7 @@ impl Ledger {
     }
 }
 
-pub fn net_by_currency(balances: &[(Arc<Account>, i128)]) -> Vec<(String, i128)> {
+pub fn net_by_currency(balances: &[(Val<Account>, i128)]) -> Vec<(String, i128)> {
     let mut totals: Vec<(String, i128)> = Vec::new();
     for (account, balance) in balances {
         match totals

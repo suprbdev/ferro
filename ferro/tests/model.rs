@@ -3,10 +3,10 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use common::{Rng, fast, level_of, text, uncached};
-use ferro::{Data, Db, List, Map, Options, Set};
+use ferro::{Data, Db, List, Map, Options, Set, Val};
 use proptest::prelude::*;
 
 trait TestKey: Data + Ord + Debug {
@@ -62,6 +62,13 @@ enum Op {
     PopFirst,
     PopLast,
     Retain(u64, u64),
+    RemoveRange(Bound<u32>, Bound<u32>),
+    TakeRange(Bound<u32>, Bound<u32>),
+    SplitOff(u32),
+    SplitRejoin(u32),
+    AppendMap(Vec<(u32, u64, usize)>),
+    Extend(Vec<(u32, u64, usize)>),
+    ApplyEdits(Vec<(u32, Option<(u64, usize)>)>),
     Range(Bound<u32>, Bound<u32>, Vec<Step>),
     Walk(Vec<Step>),
     KeysWalk(Vec<Step>),
@@ -112,6 +119,14 @@ fn op(keys: u32, durable: bool) -> impl Strategy<Value = Op> {
         2 => Just(Op::PopFirst),
         2 => Just(Op::PopLast),
         1 => (any::<u64>(), 2..7u64).prop_map(|(s, m)| Op::Retain(s, m)),
+        2 => (bound(keys), bound(keys)).prop_map(|(a, b)| Op::RemoveRange(a, b)),
+        1 => (bound(keys), bound(keys)).prop_map(|(a, b)| Op::TakeRange(a, b)),
+        1 => (0..keys).prop_map(Op::SplitOff),
+        2 => (0..keys).prop_map(Op::SplitRejoin),
+        2 => prop::collection::vec((0..keys, any::<u64>(), sizes()), 0..12).prop_map(Op::AppendMap),
+        3 => prop::collection::vec((0..keys, any::<u64>(), sizes()), 0..40).prop_map(Op::Extend),
+        3 => prop::collection::vec((0..keys, prop::option::of((any::<u64>(), sizes()))), 0..40)
+            .prop_map(Op::ApplyEdits),
         4 => (bound(keys), bound(keys), steps()).prop_map(|(a, b, s)| Op::Range(a, b, s)),
         2 => steps().prop_map(Op::Walk),
         1 => steps().prop_map(Op::KeysWalk),
@@ -185,11 +200,19 @@ where
     assert_eq!(iter.len(), 0);
 }
 
-fn pairs<K: Clone>(model: &BTreeMap<K, String>) -> VecDeque<(K, Arc<String>)> {
+fn pairs<K: Clone>(model: &BTreeMap<K, String>) -> VecDeque<(K, Val<String>)> {
     model
         .iter()
-        .map(|(key, value)| (key.clone(), Arc::new(value.clone())))
+        .map(|(key, value)| (key.clone(), Val::new(value.clone())))
         .collect()
+}
+
+fn fresh<K: TestKey>(model: &BTreeMap<K, String>) -> Map<K, String> {
+    let mut map = Map::new();
+    for (key, value) in model.iter().rev() {
+        map.insert(key.clone(), value.clone());
+    }
+    map
 }
 
 fn apply<K: TestKey>(
@@ -278,17 +301,91 @@ fn apply<K: TestKey>(
             assert_eq!(visited, all);
             model.retain(|key, _| !doomed.contains(key));
         }
+        Op::RemoveRange(low, high) => {
+            let low = map_bound(*low, resolve);
+            let high = map_bound(*high, resolve);
+            let before = model.len();
+            model.retain(|key, _| !in_range(key, &low, &high));
+            assert_eq!(map.remove_range::<K, _>((low, high)), before - model.len());
+        }
+        Op::TakeRange(low, high) => {
+            let low = map_bound(*low, resolve);
+            let high = map_bound(*high, resolve);
+            let wanted: BTreeMap<K, String> = model
+                .iter()
+                .filter(|(key, _)| in_range(*key, &low, &high))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            model.retain(|key, _| !in_range(key, &low, &high));
+            let taken = map.take_range::<K, _>((low, high));
+            check_full(&taken, &wanted);
+            assert_eq!(taken.root_hash(), fresh(&wanted).root_hash());
+        }
+        Op::SplitOff(seed) => {
+            let key = resolve(*seed);
+            let wanted = model.split_off(&key);
+            let tail = map.split_off(&key);
+            check_full(&tail, &wanted);
+            assert_eq!(tail.root_hash(), fresh(&wanted).root_hash());
+        }
+        Op::SplitRejoin(seed) => {
+            let key = resolve(*seed);
+            let mut tail = map.split_off(&key);
+            map.append(&mut tail);
+            assert!(tail.is_empty());
+        }
+        Op::AppendMap(entries) => {
+            let mut other = Map::new();
+            let mut wanted = BTreeMap::new();
+            for (seed, salt, len) in entries {
+                let key = resolve(*seed);
+                let value = text(*salt, *len);
+                other.insert(key.clone(), value.clone());
+                wanted.insert(key, value);
+            }
+            map.append(&mut other);
+            assert!(other.is_empty());
+            model.append(&mut wanted);
+        }
+        Op::Extend(entries) => {
+            let items: Vec<(K, String)> = entries
+                .iter()
+                .map(|(seed, salt, len)| (resolve(*seed), text(*salt, *len)))
+                .collect();
+            map.extend(items.clone());
+            model.extend(items);
+        }
+        Op::ApplyEdits(edits) => {
+            let items: Vec<(K, Option<String>)> = edits
+                .iter()
+                .map(|(seed, edit)| {
+                    let value = edit.map(|(salt, len)| text(salt, len));
+                    (resolve(*seed), value)
+                })
+                .collect();
+            map.apply(items.clone());
+            for (key, value) in items {
+                match value {
+                    Some(value) => {
+                        model.insert(key, value);
+                    }
+                    None => {
+                        model.remove(&key);
+                    }
+                }
+            }
+        }
         Op::Range(low, high, steps) => {
             let low = map_bound(*low, resolve);
             let high = map_bound(*high, resolve);
-            let expected: VecDeque<(K, Arc<String>)> = model
+            let expected: VecDeque<(K, Val<String>)> = model
                 .iter()
                 .filter(|(key, _)| in_range(*key, &low, &high))
-                .map(|(key, value)| (key.clone(), Arc::new(value.clone())))
+                .map(|(key, value)| (key.clone(), Val::new(value.clone())))
                 .collect();
-            let reversed: Vec<(K, Arc<String>)> = expected.iter().rev().cloned().collect();
+            let reversed: Vec<(K, Val<String>)> = expected.iter().rev().cloned().collect();
             let bounds = (low, high);
-            let got: Vec<(K, Arc<String>)> = map.range::<K, _>(bounds.clone()).rev().collect();
+            let got: Vec<(K, Val<String>)> = map.range::<K, _>(bounds.clone()).rev().collect();
             assert_eq!(got, reversed);
             walk(map.range::<K, _>(bounds), expected, steps);
         }
@@ -296,7 +393,7 @@ fn apply<K: TestKey>(
         Op::KeysWalk(steps) => walk(map.keys(), model.keys().cloned().collect(), steps),
         Op::ValuesWalk(steps) => walk(
             map.values(),
-            model.values().map(|v| Arc::new(v.clone())).collect(),
+            model.values().map(|v| Val::new(v.clone())).collect(),
             steps,
         ),
         Op::Nth(index) => {
@@ -312,15 +409,15 @@ fn apply<K: TestKey>(
 
 fn check_full<K: TestKey>(map: &Map<K, String>, model: &BTreeMap<K, String>) {
     assert_eq!(map.len(), model.len());
-    let forward: Vec<(K, Arc<String>)> = map.iter().collect();
+    let forward: Vec<(K, Val<String>)> = map.iter().collect();
     assert_eq!(forward, Vec::from(pairs(model)));
-    let mut backward: Vec<(K, Arc<String>)> = map.iter().rev().collect();
+    let mut backward: Vec<(K, Val<String>)> = map.iter().rev().collect();
     backward.reverse();
     assert_eq!(backward, forward);
     let keys: Vec<K> = map.keys().collect();
     assert_eq!(keys, model.keys().cloned().collect::<Vec<K>>());
-    let values: Vec<Arc<String>> = map.values().rev().collect();
-    let wanted: Vec<Arc<String>> = model.values().rev().map(|v| Arc::new(v.clone())).collect();
+    let values: Vec<Val<String>> = map.values().rev().collect();
+    let wanted: Vec<Val<String>> = model.values().rev().map(|v| Val::new(v.clone())).collect();
     assert_eq!(values, wanted);
     assert_eq!(map.first().map(|p| p.0), model.keys().next().cloned());
     assert_eq!(map.last().map(|p| p.0), model.keys().next_back().cloned());
@@ -329,6 +426,7 @@ fn check_full<K: TestKey>(map: &Map<K, String>, model: &BTreeMap<K, String>) {
         assert_eq!(map.nth(index).map(|p| p.0).as_ref(), Some(key));
     }
     assert_eq!(map.nth(model.len()).map(|p| p.0), None);
+    assert_eq!(map.root_hash(), fresh(model).root_hash());
 }
 
 fn memory_run<K: TestKey>(ops: &[Op], resolve: impl Fn(u32) -> K) {

@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::table::IndexIter;
-use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim, Result, Snapshot};
+use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim, Result, Snapshot, Val};
 
 use crate::chunk::{Chunk, merge_points};
 use crate::model::{BUCKET_MS, Metrics, Rollup, SeriesKey, SeriesRec, SeriesRef, bucket_of};
@@ -99,14 +98,13 @@ fn normalized(points: &[(u64, f64)]) -> Vec<(u64, f64)> {
 }
 
 fn register(m: &mut Metrics, key: &SeriesKey) -> u64 {
-    let canonical = key.canonical();
-    if let Some(id) = m.by_key.get(&canonical) {
-        return *id;
+    let series = (key.metric.clone(), key.labels.clone());
+    if let Some(id) = m.series.key_by_metric_labels(&series) {
+        return id;
     }
     m.next_id += 1;
     let id = m.next_id;
     m.series.insert(SeriesRec::new(id, key));
-    m.by_key.insert(canonical, id);
     id
 }
 
@@ -149,16 +147,20 @@ impl Writer {
             while index < work.len() {
                 let bucket = work[index].0;
                 let part = m.chunks.get_or_insert_with(bucket, Map::new);
+                let mut growth = 0i64;
                 while index < work.len() && work[index].0 == bucket {
                     let (_, sid, pts) = &work[index];
                     let (chunk, before) = match part.get(sid) {
                         Some(old) => (old.merged(pts)?, old.len()),
                         None => (Chunk::encode_points(&normalized(pts)), 0),
                     };
-                    added += chunk.len() as i64 - before as i64;
+                    growth += chunk.len() as i64 - before as i64;
                     part.insert(*sid, chunk);
                     index += 1;
                 }
+                let held = m.part_points.get_or_insert_with(bucket, || 0);
+                *held = (*held as i64 + growth) as u64;
+                added += growth;
             }
             m.points = (m.points as i64 + added) as u64;
             Ok(learned)
@@ -175,7 +177,7 @@ impl Writer {
     }
 }
 
-pub fn select(m: &Metrics, selector: &Selector) -> Vec<Arc<SeriesRec>> {
+pub fn select(m: &Metrics, selector: &Selector) -> Vec<Val<SeriesRec>> {
     let mut best: Option<IndexIter<SeriesRec>> = None;
     let mut consider = |candidate: IndexIter<SeriesRec>| {
         if best.as_ref().is_none_or(|b| candidate.len() < b.len()) {
@@ -191,7 +193,7 @@ pub fn select(m: &Metrics, selector: &Selector) -> Vec<Arc<SeriesRec>> {
             consider(m.series.by_pairs(pair.as_str()));
         }
     }
-    let mut rows: Vec<Arc<SeriesRec>> = match best {
+    let mut rows: Vec<Val<SeriesRec>> = match best {
         Some(rows) => rows.filter(|rec| selector.matches(rec)).collect(),
         None => m.series.iter().filter(|rec| selector.matches(rec)).collect(),
     };
@@ -289,6 +291,18 @@ impl Cell {
         }
     }
 
+    fn absorb(&mut self, roll: &Rollup) {
+        if self.count == 0 {
+            self.min = roll.min;
+            self.max = roll.max;
+        } else {
+            self.min = self.min.min(roll.min);
+            self.max = self.max.max(roll.max);
+        }
+        self.count += roll.count;
+        self.sum += roll.sum;
+    }
+
     fn merge(&mut self, other: Cell) {
         if other.count == 0 {
             return;
@@ -332,6 +346,7 @@ struct RateState {
 }
 
 const MAX_CELLS: u64 = 5_000_000;
+const FOLD_ROWS: u64 = 8;
 
 struct Grid {
     from: u64,
@@ -389,6 +404,11 @@ impl Grid {
         }
     }
 
+    fn bucket_span(&self, index: usize, from: u64, to: u64) -> (u64, u64) {
+        let start = self.first_bucket + index as u64 * self.step;
+        (start.max(from), (start + self.step).min(to))
+    }
+
     fn bucket_start(&self, index: usize) -> u64 {
         if self.buckets == 1 && self.first_bucket == self.from {
             self.from
@@ -418,7 +438,7 @@ impl Grid {
     }
 }
 
-fn group_assignment(rows: &[Arc<SeriesRec>], by: Option<&str>) -> (Vec<String>, Vec<usize>) {
+fn group_assignment(rows: &[Val<SeriesRec>], by: Option<&str>) -> (Vec<String>, Vec<usize>) {
     let Some(by) = by else {
         return (vec![String::new()], vec![0; rows.len()]);
     };
@@ -623,22 +643,20 @@ pub fn aggregate_rollups(
     let mut grid = Grid::new(from, to, step, names)?;
     let buckets = grid.buckets;
     let mut merged: Vec<Cell> = (0..grid.cells.len()).map(|_| Cell::default()).collect();
+    let folding = grid.step / rollup_step >= FOLD_ROWS;
     for (index, rec) in rows.iter().enumerate() {
         let group = assignment[index];
-        for ((_, start), roll) in table.range((rec.id, bucket_floor(from, rollup_step))..(rec.id, to)) {
-            if start < from {
-                continue;
+        if folding {
+            for bucket in 0..buckets {
+                let (low, high) = grid.bucket_span(bucket, from, to);
+                if let Some(roll) = table.range_summary((rec.id, low)..(rec.id, high)) {
+                    merged[group * buckets + bucket].absorb(&roll);
+                }
             }
-            let cell = &mut merged[group * buckets + grid.bucket_index(start)];
-            if cell.count == 0 {
-                cell.min = roll.min;
-                cell.max = roll.max;
-            } else {
-                cell.min = cell.min.min(roll.min);
-                cell.max = cell.max.max(roll.max);
+        } else {
+            for ((_, start), roll) in table.range((rec.id, from)..(rec.id, to)) {
+                merged[group * buckets + grid.bucket_index(start)].absorb(&roll);
             }
-            cell.count += roll.count;
-            cell.sum += roll.sum;
         }
     }
     grid.cells = merged;
@@ -720,7 +738,7 @@ pub fn downsample(
     let entries: Vec<((u64, u64), Rollup)> = per_series.into_iter().flatten().collect();
     let rollups = entries.len();
     db.commit(format!("downsample {step}ms"), |m| {
-        m.rollups.get_or_insert_with(step, Map::new).extend(entries);
+        m.rollups.get_or_insert_with(step, Map::default).extend(entries);
     })?;
     Ok(Downsampled {
         series: sids.len(),
@@ -739,33 +757,31 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
     db.try_commit::<_, Error>("retain", |m| {
         let mut report = Retained::default();
         let boundary = bucket_of(cutoff);
-        let doomed: Vec<u64> = m.chunks.range(..boundary).map(|(bucket, _)| bucket).collect();
-        for bucket in doomed {
-            if let Some(part) = m.chunks.remove(&bucket) {
-                report.partitions_dropped += 1;
-                report.points_dropped += part.values().map(|chunk| chunk.len() as u64).sum::<u64>();
-            }
-        }
+        report.partitions_dropped = m.chunks.remove_range(..boundary);
+        report.points_dropped = m.part_points.take_range(..boundary).values().map(|n| *n).sum();
         if cutoff > boundary
             && let Some(part) = m.chunks.get_mut(&boundary)
         {
-            let sids: Vec<u64> = part.keys().collect();
-            for sid in sids {
-                let chunk = part.get(&sid).expect("key was just listed");
+            let mut trimmed = Vec::new();
+            let mut left = 0;
+            for (sid, chunk) in part.iter() {
                 let kept: Vec<(u64, f64)> = chunk
                     .decode_points()?
                     .into_iter()
                     .filter(|point| point.0 >= cutoff)
                     .collect();
                 report.points_dropped += (chunk.len() - kept.len()) as u64;
-                if kept.is_empty() {
-                    part.remove(&sid);
-                } else {
-                    part.insert(sid, Chunk::encode_points(&kept));
-                }
+                left += kept.len() as u64;
+                trimmed.push((sid, (!kept.is_empty()).then(|| Chunk::encode_points(&kept))));
             }
+            part.apply(trimmed);
             if part.is_empty() {
                 m.chunks.remove(&boundary);
+            }
+            if left == 0 {
+                m.part_points.remove(&boundary);
+            } else {
+                m.part_points.insert(boundary, left);
             }
         }
         m.points -= report.points_dropped.min(m.points);
@@ -827,19 +843,8 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
         ..Verification::default()
     };
     let m = db.read();
-    if m.series.len() != m.by_key.len() {
-        report.problems.push(format!(
-            "series table has {} rows but key index has {}",
-            m.series.len(),
-            m.by_key.len()
-        ));
-    }
-    for rec in m.series.iter() {
-        if m.by_key.get(&rec.key().canonical()).as_deref() != Some(&rec.id) {
-            report.problems.push(format!("series {} missing from key index", rec.id));
-        }
-    }
     for (bucket, part) in m.chunks.iter() {
+        let before = report.points;
         for (sid, chunk) in part.iter() {
             report.chunks += 1;
             if !m.series.contains(&sid) {
@@ -864,6 +869,19 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
                 }
             }
         }
+        let held = report.points - before;
+        if m.part_points.get(&bucket).as_deref() != Some(&held) {
+            report
+                .problems
+                .push(format!("bucket {bucket} holds {held} points but its counter disagrees"));
+        }
+    }
+    if m.part_points.len() != m.chunks.len() {
+        report.problems.push(format!(
+            "{} partition counters for {} partitions",
+            m.part_points.len(),
+            m.chunks.len()
+        ));
     }
     if report.points != m.points {
         report.problems.push(format!(

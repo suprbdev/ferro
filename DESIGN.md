@@ -9,7 +9,8 @@ of `T`, and all earlier versions stay readable.
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls.
 - `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
   recovery, object reads with hash verification, node cache.
-- `map.rs`: `Map<K, V>`, the persistent ordered tree. `Set` and `List` wrap it.
+- `map.rs`: `Map<K, V>`, the persistent ordered tree, its optional summaries, `Cursor`, and `Val`,
+  the handle reads return. `Set` and `List` wrap it.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, commits, branches.
 - `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`.
@@ -99,28 +100,159 @@ Consequences that the rest of the system relies on:
 - A commit that changes nothing has the same root hash and is skipped.
 - `diff` skips any subtree with matching hashes, so it costs O(changes), not O(size).
 
-Insert and remove use treap-style `split` and `merge`. Mutation is copy-on-write through
-`Arc::make_mut`, so a node is copied once per transaction and then mutated in place. `Link::Mem`
-is a dirty in-memory node, and `Link::Stored` a persisted one. `flush` writes dirty nodes bottom
+Insert and remove use treap-style `split` and `merge`, and so do the range operations:
+`take_range`, `remove_range` and `split_off` cut the tree along one or two paths and `append` joins
+two maps whose key ranges do not overlap, so each touches O(log n) nodes. `remove_range` returns
+the count stored on the cut-out subtree links and never reads those subtrees. At 1M keys it took
+0.8 to 2.5 ms where collecting the keys and removing them one by one took 5 to 260 ms, for the same
+bytes written. A cut that moves nothing keeps each node's `origin`, so it writes nothing back.
+`Table::drain_range` has to update every index for every row, so it is O(rows) and returns them.
+`append` across two stores, or with overlapping keys, copies `other` entry by entry, since
+links only mean something inside their own store.
+
+Mutation is copy-on-write through `Arc::make_mut`, so a node is copied once per transaction and
+then mutated in place. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one.
+`flush` writes dirty nodes bottom
 up during `Data::encode` and seeds the node cache with the nodes it wrote. It clones the in-memory
 node unless a value held a dirty or foreign collection, in which case it decodes the written bytes
 instead, so nested collections always come back clean and a foreign store is never pinned. Values
 inserted or mutated since the node was loaded are decoded once as a check before they become
 durable; unchanged values are not.
 
-`Extend` and `FromIterator` sort the batch, keep the last value per key, and for an empty map
-assemble the tree bottom-up in one pass, which gives the same tree as inserting key by key.
+`Extend`, `FromIterator` and `apply`, which also takes deletes, sort the batch and keep the last
+edit per key. An empty map is assembled bottom-up in one pass, which gives the same tree as
+inserting key by key. A non-empty map takes the batch in one descent: each node sorts the edits
+into its gaps, applies the ones at its own level in place, and passes each group to one child, so a
+subtree no edit falls in stays shared and a node is walked once however many edits it receives.
+Editing the node in place, not rebuilding its vectors from the old and new entries, is what makes
+this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is modest, because
+a touched node has to be read and copied either way and `flush` costs three to four times the tree
+work. At 1M keys the closure takes 5 to 25% less time than sorted per-key inserts from 1,000 to
+100,000 edits and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less, and batches
+under 1,000 edits show no difference. A 50,000 page wiki import, 20M posting entries, gained 4% in
+its posting phase. The metrics load test gained nothing measurable, since chunk merging dominates
+there, so its ingest keeps plain inserts. `retain` collects its deletes and applies them the same
+way. A disjoint batch needs no special case, since the same descent walks one edge of the tree.
 
 Values over 512 encoded bytes spill to their own object, so a large value does not bloat its
 node or get rewritten when a neighbour changes. Lower thresholds were measured and rejected:
 spilling interior-node values over 64 bytes cut table update bytes by 19% but grew bulk size by
 14% and slowed table reads by 20 to 50%, once compression was already shrinking interior nodes.
 
+`Vec<u8>` and `[u8; N]` copy their bytes in one go, through the `encode_slice` and `decode_vec` hooks
+on `Data` that `u8` overrides, which took a 1 MiB value from 5.3 ms to 0.49 ms to commit and from
+2.0 ms to 0.16 ms for a cold read. `Bytes` has the same encoding and adds an O(1) clone and
+`Borrow<[u8]>`, so `Map<Bytes, V>` looks up by slice. It copies once on decode. Sharing the object
+buffer instead gained 8% on a cold read at 1 MiB and under 4% at 64 KiB and 1 KiB, where `pread` and
+BLAKE3 dominate, for a wider handle, a change to the read path, and a small value that pins the
+whole node it was decoded from. `#[ferro(transparent)]` gives a newtype the encoding of its field.
+
+## Summaries
+
+`Map<K, V, S>` with `S: Summary<K, V>` keeps a fold of every subtree. `of` summarizes one entry and
+`combine` joins two neighbours, left then right, so `S` needs only to be associative: min, max,
+first, last and concatenation work, not just sums. There is no identity element, because an empty
+range is `None`. `range_summary` and `summary_by` fold a range in O(log n), and `summary` reads the
+root in O(1). Rank in a range is a difference of two prefixes, but a general summary has no
+subtraction, so a fold walks both edges of the range and combines the links between them.
+
+Nothing ever updates a summary. `flush` computes each node's from its entries and its children's
+links, bottom up in key order, and stores it on the link in the parent next to `count`. So a summary
+is a function of the tree below it, the tree is a function of the key set, and root hashes stay
+independent of history. A `combine` that is not quite associative keeps that property: a float sum
+rounds the same way for the same contents, whatever edits led there. `split`, `merge`, `absorb` and
+the rest move links without looking at them, and any node they change is dirty, so none of them
+needed to know. Applying a delta to the old summary would have been cheaper per edit and would have
+broken canonical form for floats, so it is not done even for sums.
+
+`of` must depend only on the encoded key and value, so a `#[ferro(skip)]` field must not feed it. A
+read of a dirty tree has no stored summary for the nodes changed in this transaction and folds them
+on demand, stopping at stored links, so it costs O(log n) plus the dirty nodes in the range. A
+spilled value keeps its summary in the slot, so neither a fold nor a commit reads the value. Without
+that, a commit would read every spilled neighbour on its path.
+
+`S` defaults to `()`, a zero sized type, so the plain `Map<K, V>` has the layout, the bytes and the
+speed it had. `()` encodes to nothing, `a_plain_map_keeps_its_format` pins a root hash from before
+summaries existed, and alternating `ferro-bench` runs moved no byte metric and no timing beyond
+noise. A default type parameter takes no part in inference, which is why `HashMap::new` exists only
+for the default hasher, and `Map::new` is the same: it is defined for `S = ()` alone, so
+`Map::new()` still infers, and no caller in the workspace changed. A summarized map starts from
+`Map::default()` or `collect`.
+
+Changing `S` changes a map's encoding under the same field tag, as changing `V` does. Rename the
+field to rebuild it.
+
+The summary is on the link, not in the child, because a parent can then be rebuilt and a covered
+child skipped without reading that child. Inside the node a commit saves bytes, but `flush` has to
+read every clean sibling on the path. At 1M `u64` keys with an `i64` sum, against 3,095 bytes for a
+plain single-key commit:
+
+| Summary stored | Bytes per commit | Commit, 1 MiB cache | Fold, 1 MiB cache |
+| --- | --- | --- | --- |
+| On the link | 3,333 (+7.7%) | 28 µs | 11 µs |
+| In the node | 3,125 (+1.0%) | 80 µs | 57 µs |
+
+Bytes follow the width of `S`, since a rewritten interior node repeats about nine summaries. Bulk
+bytes barely move, because every node has one link either way. `ferro-bench`'s `summary` tool, at 1M
+keys:
+
+| Summary | Bytes per commit | Commit | Bulk bytes per key |
+| --- | --- | --- | --- |
+| None | 3,095 | 33 µs | 17.8 |
+| `i64` | 3,333 (+7.7%) | 36 µs | 18.1 |
+| `i128` | 3,403 (+10%) | 37 µs | 18.3 |
+| Four integers in a tuple | 3,874 (+25%) | 41 µs | 19.0 |
+| The same four in a `derive(Data)` struct | 4,623 (+49%) | 51 µs | 20.5 |
+
+Field tags repeat on every link, which is the last row, so a wide summary should be a tuple. `i128`
+is the natural total for `i64` values and was 16 fixed bytes, so it now encodes as two zigzag
+varints, which took the ledger's file growth from 10.3% to 5.6%. Against a plain map over five
+runs, full scans took 0% more with the `i64` total and 5% more with the others, and gets 1% more
+with a total and 9% more with four fields. Many short scans of a map with a wide summary pay more:
+56 bytes on each link cost `metrics` 25% on its scan path, which folds avoid.
+
+Hand-kept alternatives were built into `ledger` and measured at 1M entries. Every row gave the same
+balances:
+
+| Approach | Added lines | File | Bytes per commit | Backdated commit | Balance as of | Trial balance | Cold trial balance |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Scan postings | 0 | 151 MB | 12,178 | 11,492 | 16 ms | 440 ms | 328 ms |
+| Summary | 15 | 160 MB | 13,144 | 12,362 | 0.7 µs | 30 µs | 0.8 ms |
+| Daily rollup | 10 | 176 MB | 15,544 | 14,905 | 16 µs | 0.7 ms | 5.6 ms |
+| Running balance every 32 days | 37 | 157 MB | 14,210 | 14,017 | 85 µs | 1.6 ms | 9.3 ms |
+| Rollups by 1, 32 and 1024 days | 28 | 184 MB | 17,224 | 18,037 | 2.6 µs | 65 µs | 0.8 ms |
+
+The running balance has the smallest file of the hand-kept forms because a bulk commit touches one
+row per account per block, but each backdated entry rewrites every later block. The hand-kept forms
+answer only at day boundaries and are state that can drift from the postings. A summary works on any
+key range and is computed from them. `audit` still compares the fold with the journal, because
+`verify` knows no types.
+
+`metrics` keeps rollups in a summarized map and folds a bucket that spans at least 8 of them, which
+is where folding starts to beat scanning. On 4.32M rollups of 1,000 series: 978 ms to 5.6 ms for one
+bucket, 1,067 ms to 79 ms at one day per bucket, and 889 ms to 192 ms at six hours, for 9% more
+bytes per rollup. `Rollup` is a fold of its own points, so it needed one `combine`.
+
+Measured and left out:
+
+- A `#[sum]` attribute on `Record`. A summary needs the value in the tree, and an index holds only
+  keys, so this means a second tree with one entry per row. For total balance by country on 200k
+  rows that was 7,333 bytes per update against 4,765 and a 22% larger file, and 0.75 µs a read. A
+  hand-kept `Map<country, i128>` costs 4,887 bytes and 0.02 µs, against 16 ms to walk the index.
+  A summary only wins on sub-ranges of an ordered key, and for those a `Map<(group, key), V, S>`
+  with `summary_by` is a few lines.
+- A summary on `Table` rows. It adds a type parameter to `Record`, `IndexIter` and every table
+  iterator, for sums over primary key ranges that nothing here needs.
+- A cached summary on dirty nodes. It would need invalidating on every path through `Arc::make_mut`,
+  to speed up reads inside a transaction, which are rare.
+
 ## Read path
 
 A warm get at 1M keys walks about seven levels, and nearly all of its time is CPU cache misses, not
 logic. One node cache lookup per level was 55% of the get. Reference counts on nodes near the root,
-written by every reader, held eight readers to about 10M reads a second.
+written by every reader, held eight readers to about 10M reads a second. At 10,000 keys, which fit
+in L2, a scan costs 2 ns a key and a get 67 ns. At 1M keys the same code costs 6 to 8 ns and 240 to
+340 ns, so memory, not instructions, is what the read path has to save.
 
 So each `Link::Stored` carries a write-once memo of the node it points at, in a `OnceLock`:
 
@@ -144,20 +276,161 @@ with an empty memo, since copying one touches the child's header, a cache miss p
 
 Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row of `Link::Empty`.
 `Node::child` reads through that and `Node::children_mut` fills it in when a leaf gains a child.
-This cut peak RSS by 28% and bulk load time by 4 to 14%.
+This cut peak RSS by 28% and bulk load time by 4 to 14%. `Node` is `repr(C)` with `keys` and
+`children` first, so the first cache line of its allocation holds both pointers a walk follows,
+which took 12% off `contains_key` and 6% off `get`.
 
-`range_by` builds each edge and its rank in one walk, and iterators read their top frame in place
-instead of cloning an `Arc<Node>` per item. A node flushed by this process shares the values of the
-in-memory tree, and those sit in insertion order, so a scan in key order would take one miss per
-value in turn. `Node::warm_values` reads every value's reference count on entering a node, so those
-misses overlap instead of queueing. That cut scans by 38% with no cost to writes, where moving
-values into node order during `flush` cost 22% of bulk load speed and 16% more memory for less gain.
-`Keys` and index iterators skip it, since they never touch a value.
+### Values
+
+A node holds its values in one `Arc<[V]>` column in key order, beside its keys. There used to be one
+`Arc<V>` per value behind a 40 byte `Slot`, which is 72 bytes and a separate allocation for each
+`u32`, and even for the `()` of a `Set` or an index entry. A `Slot` now exists only for what a column
+cannot say: `Fresh` for a value changed since it was read, `Spilled` for a value in its own object,
+and `Packed` for an unchanged value in a node that has one of those. `Cells::slots` turns a column
+into slots at the first edit of that node's values, which takes one reference count per value and
+copies none. A node on the path to an edit only gains a new child, so it keeps its column, and
+copying it costs one reference count where it used to cost one per value. That is why commits got
+cheaper: 34% for small values at 1M keys and 18% for short strings.
+
+`flush` leaves a column behind for every node it writes, cloning the values of a changed node into
+key order. So a process reads what it wrote exactly as it reads what it opened, and no `Fresh` slot
+outlives its commit. The price is a clone, and later a free, per value in a bulk load.
+
+A column cannot hand out an `Arc<V>`, so `get`, the iterators, `Change` and `Conflict` return a
+`Val<V>`, which derefs to `V`. It is one of three things:
+
+- The value itself, when `V` has no destructor and is at most 16 bytes. Only this case takes no
+  atomic operation.
+- The column and an index, for any other value. One value keeps the other values of its node alive
+  for as long as it is held, which is outside `cache_bytes`. `into_owned` and `into_arc` end that.
+- An `Arc<V>`, for a spilled or uncommitted value.
+
+A `NodeRef<V>` holding the node's `Arc` was not built. It would need `K` and `S` in its type or a
+virtual call on every deref, and it would pin keys and child links as well. One more allocation per
+node buys a handle with a single type parameter that only pins values.
+
+Reopened and read twice at 1M `u64` keys, median of three alternating runs, in nanoseconds per key
+except for heap:
+
+| Values held in | `u64` heap per key | `u64` fold | `u64` get | String heap per key | String fold | String get |
+| --- | --- | --- | --- | --- | --- | --- |
+| One `Arc<V>` each | 123 bytes | 27 | 614 | 171 bytes | 36 | 614 |
+| A column, for values with no destructor | 61 bytes | 13 | 375 | 170 bytes | 29 | 656 |
+| A column, for all values | 61 bytes | 13 | 383 | 109 bytes | 24 | 490 |
+
+Half the heap matters more than the missing pointer. A million keys now nearly fit in the last level
+cache, so a fold over keys alone, which never touches a value, went from 23 to 7 ns. Stopping there
+left the process that wrote the data with the old slots, and `ferro-bench` reads in that process.
+Median of three alternating runs:
+
+| After `flush` | Bulk load | Get | Scan | Range | Table get | Table filter | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| One `Arc<V>` each | 1,164 ns | 568 ns | 48 ns | 46 ns | 340 ns | 70 ns | 343 MiB |
+| Slots that share each `Arc` | 1,295 ns | 673 ns | 47 ns | 55 ns | 400 ns | 41 ns | 343 MiB |
+| A column | 1,500 ns | 486 ns | 39 ns | 44 ns | 207 ns | 22 ns | 362 MiB |
+
+The bulk figure is the worst case, a short `String` per key, and building the column without
+copying the slots first won most of it back. Over five alternating runs of `reads`, a bulk load
+through `extend` took 24% longer for short strings and 2 to 5% longer for values with no destructor,
+and `ferro-bench` could not tell its bulk loads apart from noise.
+
+### Scans
+
+`Iterator::fold` is overridden on `Iter`, `Keys` and `Values` to take a run of a node's entries in
+one loop, which `sum`, `count`, `for_each`, `filter` and `map` reach with no new API. `try_fold`
+cannot be overridden, because naming `Try` needs a nightly compiler, so `find`, `any` and `Take` go
+through `next`, as do `for` loops and `collect`. A fold still builds an item, so it clones the key
+and, for a value held by column, takes a reference count. `Map::for_each`, `try_for_each`,
+`for_each_range` and `try_for_each_range` lend `&K` and `&V` instead and pay one reference count per
+node, not per item, with a `ControlFlow` for early exit. In nanoseconds per key at 1M keys, reopened,
+median of five alternating runs:
+
+| Map | `for` before | `for` | `fold` before | `fold` | `for_each` | Keys `fold` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `u64` to `u64` | 27 | 15 | 26 | 8 | 8 | 7 |
+| `u64` to `()` | 27 | 13 | 26 | 6 | 6 | 6 |
+| `u64` to short string | 36 | 37 | 35 | 24 | 19 | 12 |
+| String key to `u64` | 49 | 34 | 48 | 28 | 20 | |
+| Table rows | 37 | 29 | 35 | 14 | 9 | |
+
+For values with no destructor a fold is as good as `for_each`, so the fold is the one to use.
+`for_each` stays for what a fold has to clone: it takes 20 to 37% off strings and rows, and over a
+value held by column it removes the atomic pair per item, which is 8 of the 11 ns at 10,000 keys.
+With memory out of the picture at that size, the floor is 2 ns a key for a fold or `for_each` and
+9 ns for a `for` loop. A `for` loop over strings gained nothing, because the same two atomic
+operations now act on a wider handle.
+
+### Sorted lookups and cursors
+
+A `Cursor` keeps the path to its position, one `Arc<Node>` per level. `seek` climbs only until a
+node's key span holds the target and searches down from there, so it costs the distance moved, not
+the height of the tree. Both ends of the span are checked, so a seek backwards is as cheap as one
+forwards and sorted input is not an obligation. `seek_back` finds the last key at or before the
+target, and `advance` steps in key order. `value` returns a `Val`. `read` lends the entry, loading a
+spilled value first.
+
+`get_many` and `contains_many` run a cursor over an iterator of keys. They yield each key with its
+result, so they compose like `map`, and keys may be owned or borrowed. On 1M `u64` keys, median of
+five alternating runs, in nanoseconds per key:
+
+| Keys, sorted unless noted | `get` before | `get` | `get_many` | `contains_many` |
+| --- | --- | --- | --- | --- |
+| Every second key | 115 | 85 | 26 | 28 |
+| Every 16th key | 464 | 233 | 153 | 97 |
+| Random order | 586 | 342 | 363 | |
+
+Unsorted input costs 6% more than plain `get`, which is the price of keeping the path. A batch that
+recursed through the tree, cutting a sorted slice at each node as `absorb` does, was 6% faster at the
+densest and 7 to 26% slower when sparse, and needs a slice, a callback and sorted input, so the
+cursor replaced it. A cursor also serves merge joins, which a batch cannot.
+
+`range_by` used to walk its two edges separately, adding a rank at each level to learn its length.
+They now share one walk until they part and count only the links between them, so a narrow range
+reads each node once and sums almost nothing, and `range(key..).next()` went from 860 to 565 ns.
+`floor` is one walk that remembers the last node with a key before the target. Built on a cursor it
+was 20% slower than `get`, and it would have written the reference counts of pinned nodes. `Set::range`
+returns the named `Keys`, so it has `len` and `next_back`, and the set operations probe through
+`contains_many`.
+
+`IndexIter` fetches rows through a cursor. Rows of one index value sit in key order, so those went
+from 163 to 60 ns each, and rows scattered across the table from 208 to 161 ns. `IndexIter::keys`
+stops before the rows and takes 5 ns a key.
+
+### What is left, on `examples/graph`
+
+`bench overhead` at 1M users and 46M edges, median of seven alternating runs:
+
+| Operation | Before | After | `Vec` |
+| --- | --- | --- | --- |
+| Point `contains` | 1,403 ns | 927 ns | 108 ns |
+| Neighbour fetch | 1,718 ns | 1,089 ns | 128 ns |
+| Sequential edge scan | 6.7 ns per edge | 3.3 ns | 0.12 ns |
+| Pagerank per iteration | 0.40 s | 0.22 s | 0.042 s |
+| Reach, 3 hops | 40.6 ms | 21.1 ms | 9.5 ms |
+| Recommend, 20 users | 1.7 ms | 1.2 ms | 1.1 ms |
+| Peak RSS, including 368 MiB of `Vec` | 955 MiB | 805 MiB | |
+
+Half of a scan is now varint decoding, 1.6 ns per edge, which is what storing an edge in 2.9 bytes
+costs, even with a decode loop that has no branch per byte. A decoder that took eight bytes at a time
+was 24% slower, because each block ends in a tail it has to take byte by byte. The other half, 1.7 ns
+per edge or 75 ns per block of 44 edges, is walking keys and reaching each block's bytes, which has
+no counterpart in a `Vec`. `Vec`'s 0.12 ns is a SIMD sum that does no work per edge: pagerank's real
+work is 0.9 ns per edge on `Vec` and ferro pays the same on top of its scan. A random seek is 1.1 µs
+because seven levels, in a heap far larger than the last level cache and the reach of the TLB, take
+several DRAM misses where a `Vec` takes two. Neither the walk nor the decoding goes away without a
+different structure. What a `Vec` cannot do at any price is take a commit or keep an old version.
+
+### Measured and left out
 
 A node miss is dominated by BLAKE3, at roughly 500 to 900 ns on an interior node against 130 to
 190 ns for `pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits
-most records. Measured and left out:
+most records. `Decoder::varint` takes a one byte varint inline, which took `Vec<u64>` of small
+numbers from 6.1 to 1.5 ns an item and cold scans down about 7%.
 
+- Bulk decode hooks for keys. `Vec<f64>`, eight raw bytes an item, decodes at 1.4 ns, and a random
+  `u64` varint at 8.8 ns, so raw keys would save at most 7 ns in a cold scan of about 100 ns a key.
+  That needs fixed-width keys on disk, which would change every root hash and grow every node. For
+  varints, a `decode_vec` override has nothing left to skip.
 - Lazy value decoding. Decoding one value on demand made cold gets 6 to 13% faster, but cold scans
   25% slower and fully read nodes 24% larger. Decoding a node's values together on first use was
   slower than eager decoding once only leaves were missing from the cache.
@@ -168,35 +441,48 @@ most records. Measured and left out:
 - Cheaper cache keys. A hash prefix in place of ahash gained 1.4% with memos in place, since memo
   hits skip the cache. Keying by offset with a hash compare was no better than that prefix even
   before memos, because the cost was misses, not hashing.
+- A chunked or trie `List`. `List<T>` stays a `Map<u64, T>`, and a push rewrites the right spine with
+  the values held at each level: 1.6 KB for a `u64` and 3.2 KB for a 60 byte string at 1M items, or
+  1.3 and 2.5 KB at 100k. Chunks in a `Map<u64, Vec<T>>` did not win clearly. At 1M, 16 per chunk took
+  the string case to 2.4 KB but the `u64` case to 2.9 KB, and 64 per chunk to 5.9 KB, because a node
+  then holds several chunks just under the spill limit, while cold gets rose up to six times. A
+  vector trie of fanout 8 with values only in its leaves came to about 1.0 and 1.2 KB in a simulation
+  built from real record sizes, but at that fanout it has as many levels as the `Map`, so it would
+  read no faster, and fanout 32, which would, gave the bytes back at 2.0 and 2.5 KB. It helps one
+  shape, a long list appended to one item per commit, and costs a second tree beside `Map` with its
+  own nodes, flush, memos, diff and foreign store handling. Bulk appends already go down one edge
+  in one descent.
 - Scan admission control. `quick_cache` starts new entries in a small cold section, so a full scan
   leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger
   than the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator
   that avoided that saved only 6 to 8%.
 
+### Cache weight
+
 `cache_bytes` is an approximate bound on the decoded heap of cached objects. An entry weighs its
 body bytes, which stand for the strings and vectors inside it, plus what decoding allocates around
-them: the `size_of` of the object, of each key, slot and child link, an `Arc` header and allocation
-per value held in the node, and a flat allowance per key and value for the rounding of small
-allocations. There is no size hook on `Data`, because walking every value on load would cost more
-than the accuracy is worth. Heap measured by `ferro-bench`'s `heap` tool with a counting allocator,
-after two scans of data larger than the cache, as a multiple of the setting at 1 to 256 MiB:
+them: the `size_of` of the object, of each key and child link, and of the column with its `Arc`
+header. A key or value that owns heap adds a flat allowance for the rounding of small allocations,
+and a value also counts its `size_of` twice, because a wider value holds more allocations. One with
+no destructor adds nothing, so a million `u64` keys now take half the budget they did. There is no
+size hook on `Data`, because walking every value on load would cost more than the accuracy is worth.
+Heap measured by `ferro-bench`'s `heap` tool with a counting allocator, after two scans of data
+larger than the cache, as a multiple of the setting at 1 to 256 MiB:
 
-| Values | Weight tracking disk size | Now |
-| --- | --- | --- |
-| Short strings | 3.8 to 3.9 | 0.76 to 0.83 |
-| 300 byte strings | 1.4 to 1.5 | 0.89 to 0.93 |
-| 2 KiB spilled strings | 1.0 to 1.7 | 1.0 to 1.1 |
-| Table rows and their indexes | 3.1 to 4.6 | 1.25 to 1.3 |
+| Values | Weight tracking disk size | With one `Arc` per value | Now |
+| --- | --- | --- | --- |
+| Short strings | 3.8 to 3.9 | 0.76 to 0.83 | 0.70 to 0.80 |
+| 300 byte strings | 1.4 to 1.5 | 0.89 to 0.93 | 0.90 to 1.0 |
+| 2 KiB spilled strings | 1.0 to 1.7 | 1.0 to 1.1 | 1.0 to 1.1 |
+| Table rows and their indexes | 3.1 to 4.6 | 1.25 to 1.3 | 1.05 to 1.1 |
 
-Rows land above 1 because a row of small strings makes more allocations than the allowance covers.
-Outside the bound are pinned nodes, the `Arc` allocations memos keep, nodes held by live snapshots
-and dirty trees, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it
-up to 65,536 entries.
+Outside the bound are pinned nodes, the `Arc` allocations memos keep, the column of any `Val` still
+held, nodes held by live snapshots and dirty trees, and on a writer the `dedupe` cache, which scales
+with the setting at about 2% of it up to 65,536 entries.
 
-The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full, and
-`peak_rss_mib` stays at 343 MiB. A setting carried over from before now holds about a quarter of what
-it did. `map_get_cold_ns` at 1 MiB went from 4.5 to 6.4 µs for that reason, and 5 MiB, which
-holds what 1 MiB used to, gives 4.6 µs.
+The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full.
+A setting carried over from before that holds about a quarter of what it did. `map_get_cold_ns` is 5.4 µs at 1 MiB and 3.8 µs at
+5 MiB, against 7.4 and 5.2 µs with one `Arc` per value, because the same bytes now hold twice the keys.
 
 ## File format and durability
 
@@ -590,6 +876,33 @@ The derive macro writes structs as `(tag, length, payload)` fields, where the ta
 FNV-1a hash of the field name. Fields are sorted by tag, so reordering a struct does not change
 its hash. Unknown fields are skipped. Missing fields use `Data::missing`, or `#[ferro(default)]`.
 `#[ferro(rename = "old")]` keeps the old tag.
+
+## Unique indexes
+
+`#[unique]` on a field, or `#[unique(a, b)]` on the struct for a combination of fields, adds a
+`Map<value, key>` to the generated table, with `by_x(&value)` for the row, `key_by_x(&value)` for
+the key alone, and `unique_x()` for the whole map. On an `Option<T>` field `None` is not indexed, so
+any number of rows can leave it empty.
+
+A clash cannot be repaired where it is found. `Table::insert` returns the old row and has no error
+channel, and the two ways of carrying on are both wrong: last writer wins deletes a row nobody
+named, and overwriting the index leaves a row that `by_x` cannot find. So `try_insert` and
+`try_update` return `Taken { index, holder }` and leave the table as it was, and `insert`, `update`
+and dropping a `RowMut` panic before changing anything. Inside a commit that discards the
+transaction, which is the honest result when a constraint the schema states does not hold. A
+`RowMut` dropped while its thread is already panicking keeps the old row, since a second panic would
+abort the process. A row may replace itself, and a row changing key may keep the value it holds.
+
+`Table::merge` treats a clash as data, not a bug. It holds a clashing row back until the rest of the
+diff is applied, since a chain of renames clashes only on the way through, then gives what is left
+to `resolve` with `ours` set to the row holding the value. Two rows that swap values reach `resolve`
+too, because neither can move first.
+
+The index field is named `unique_x`, not `by_x`, so turning an `#[index]` into a `#[unique]` rebuilds
+it instead of reading the old map with new types. The rebuild on decode covers unique indexes. If
+two existing rows share a value it fails with `Error::Decode` naming the index, because a constraint
+the data breaks cannot be honoured, so that version does not open until the data or the attribute
+changes.
 
 ## Errors
 

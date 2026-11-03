@@ -1,21 +1,8 @@
-use ferro::codec::{Decoder, Encoder};
-use ferro::{Data, Error, Result};
+use ferro::{Bytes, Data, Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Chunk(pub Vec<u8>);
-
-impl Data for Chunk {
-    fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        w.varint(self.0.len() as u64);
-        w.raw(&self.0);
-        Ok(())
-    }
-
-    fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let len = r.varint()? as usize;
-        Ok(Chunk(r.take(len)?.to_vec()))
-    }
-}
+#[derive(Clone, Debug, PartialEq, Eq, Default, Data)]
+#[ferro(transparent)]
+pub struct Chunk(pub Bytes);
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -59,7 +46,7 @@ impl Chunk {
         let mut out = Vec::with_capacity(8 + points.len() * 3);
         push_varint(&mut out, points.len() as u64);
         let Some(first) = points.first() else {
-            return Chunk(out);
+            return Chunk(out.into());
         };
         push_varint(&mut out, first.0);
         let mut prev_ts = first.0;
@@ -90,7 +77,7 @@ impl Chunk {
             let shifted = x >> (u32::from(trail) * 8);
             out.extend_from_slice(&shifted.to_le_bytes()[..len as usize]);
         }
-        Chunk(out)
+        Chunk(out.into())
     }
 
     pub fn len(&self) -> usize {

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use clap::ValueEnum;
-use ferro::{Data, Map, Record, Table};
+use ferro::{Data, Map, Record, Summary, Table};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Data, ValueEnum)]
 pub enum Kind {
@@ -38,6 +38,7 @@ impl fmt::Display for Kind {
 pub struct Account {
     #[key]
     pub id: u32,
+    #[unique]
     pub name: String,
     pub kind: Kind,
     pub currency: String,
@@ -65,12 +66,25 @@ pub struct Entry {
 
 pub type PostingKey = (u32, i32, u64, u16);
 
+#[derive(Clone, Copy, Debug, PartialEq, Data)]
+#[ferro(transparent)]
+pub struct Net(pub i128);
+
+impl Summary<PostingKey, i64> for Net {
+    fn of(_key: &PostingKey, amount: &i64) -> Self {
+        Net(i128::from(*amount))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Net(self.0 + other.0)
+    }
+}
+
 #[derive(Clone, Default, Data)]
 pub struct Ledger {
     pub accounts: Table<Account>,
-    pub names: Map<String, u32>,
     pub entries: Table<Entry>,
-    pub postings: Map<PostingKey, i64>,
+    pub postings: Map<PostingKey, i64, Net>,
     pub reversed: Map<u64, u64>,
     pub locked_through: Option<i32>,
     pub next_account: u32,

@@ -1,23 +1,22 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use ferro::Map;
+use ferro::{Map, Val};
 
 use crate::chunk;
 use crate::index::analyze;
 use crate::model::{Page, Wiki};
 
-pub fn find(w: &Wiki, slug: &str) -> Option<Arc<Page>> {
-    w.slugs.get(slug).and_then(|id| w.pages.get(&id))
+pub fn find(w: &Wiki, slug: &str) -> Option<Val<Page>> {
+    w.pages.by_slug(slug)
 }
 
 pub struct Hit {
     pub score: u32,
-    pub page: Arc<Page>,
+    pub page: Val<Page>,
 }
 
 pub fn search(w: &Wiki, terms: &[String], limit: usize) -> (usize, Vec<Hit>) {
-    let mut postings: Vec<Arc<Map<u64, u32>>> = Vec::new();
+    let mut postings: Vec<Val<Map<u64, u32>>> = Vec::new();
     for term in terms {
         match w.terms.get(term.as_str()) {
             Some(posting) => postings.push(posting),
@@ -62,8 +61,8 @@ pub fn snippet(page: &Page, terms: &[String]) -> Option<String> {
     None
 }
 
-pub fn backlinks(w: &Wiki, slug: &str) -> Vec<Arc<Page>> {
-    let mut pages: Vec<Arc<Page>> = w
+pub fn backlinks(w: &Wiki, slug: &str) -> Vec<Val<Page>> {
+    let mut pages: Vec<Val<Page>> = w
         .links
         .get(slug)
         .map(|sources| sources.iter().filter_map(|id| w.pages.get(&id)).collect())
@@ -73,18 +72,18 @@ pub fn backlinks(w: &Wiki, slug: &str) -> Vec<Arc<Page>> {
 }
 
 pub fn orphans(w: &Wiki) -> Vec<String> {
-    w.slugs
-        .iter()
-        .filter(|(slug, _)| w.links.get(slug.as_str()).is_none_or(|s| s.is_empty()))
-        .map(|(slug, _)| slug)
+    w.pages
+        .unique_slug()
+        .keys()
+        .filter(|slug| w.links.get(slug.as_str()).is_none_or(|s| s.is_empty()))
         .collect()
 }
 
-pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> Vec<Arc<Page>> {
+pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> Vec<Val<Page>> {
     let wanted = |page: &Page| prefix.is_none_or(|prefix| page.slug.starts_with(prefix));
     match tag {
         Some(tag) => {
-            let mut pages: Vec<Arc<Page>> = w
+            let mut pages: Vec<Val<Page>> = w
                 .pages
                 .by_tags(tag.to_lowercase().as_str())
                 .filter(|page| wanted(page))
@@ -94,7 +93,8 @@ pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> 
             pages
         }
         None => w
-            .slugs
+            .pages
+            .unique_slug()
             .iter()
             .filter(|(slug, _)| prefix.is_none_or(|prefix| slug.starts_with(prefix)))
             .filter_map(|(_, id)| w.pages.get(&id))
@@ -165,24 +165,11 @@ fn check_group(
 pub fn check_indexes(w: &Wiki) -> Vec<String> {
     const GROUP: usize = 5000;
     let mut problems = Vec::new();
-    if w.slugs.len() != w.pages.len() {
-        problems.push(format!(
-            "slugs has {} entries for {} pages",
-            w.slugs.len(),
-            w.pages.len()
-        ));
-    }
     let mut expected_postings = 0usize;
     let mut expected_links = 0usize;
     let mut group: BTreeMap<String, Vec<(u64, u32)>> = BTreeMap::new();
     let (mut lo, mut hi, mut in_group) = (0u64, 0u64, 0usize);
     for page in w.pages.iter() {
-        if w.slugs.get(page.slug.as_str()).as_deref() != Some(&page.id) {
-            problems.push(format!(
-                "slug {} does not map to page {}",
-                page.slug, page.id
-            ));
-        }
         let analysis = analyze(&page);
         if in_group == 0 {
             lo = page.id;

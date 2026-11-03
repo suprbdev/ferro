@@ -1,5 +1,5 @@
-use std::sync::Arc;
 
+use ferro::Val;
 use crate::Res;
 use crate::chunk::{self, DEFAULT};
 use crate::index::Tx;
@@ -92,7 +92,7 @@ pub fn put(tx: &mut Tx, edit: Edit, now: u64) -> Res<Outcome> {
     }
 }
 
-pub fn delete(tx: &mut Tx, slug: &str) -> Res<Arc<Page>> {
+pub fn delete(tx: &mut Tx, slug: &str) -> Res<Val<Page>> {
     let slug = clean_slug(slug)?;
     let page = tx
         .by_slug(&slug)
@@ -153,11 +153,7 @@ pub fn revert(tx: &mut Tx, slug: &str, past: &Wiki, now: u64) -> Res<Outcome> {
     let then = current
         .as_ref()
         .and_then(|page| past.pages.get(&page.id))
-        .or_else(|| {
-            past.slugs
-                .get(slug.as_str())
-                .and_then(|id| past.pages.get(&id))
-        })
+        .or_else(|| past.pages.by_slug(slug.as_str()))
         .ok_or_else(|| format!("{slug} did not exist at that version"))?;
     let id = match &current {
         Some(page) => page.id,

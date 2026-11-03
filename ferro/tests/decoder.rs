@@ -197,6 +197,14 @@ proptest! {
 }
 
 #[test]
+fn small_i128_values_stay_small() {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    (-1_000_000i128).encode(&mut encoder).unwrap();
+    assert_eq!(encoder.bytes().len(), 4);
+}
+
+#[test]
 fn edge_integers_round_trip() {
     for value in [0u64, 1, 127, 128, 16383, 16384, u64::MAX - 1, u64::MAX] {
         roundtrip(value);
@@ -208,7 +216,9 @@ fn edge_integers_round_trip() {
     roundtrip(i16::MIN);
     roundtrip(i32::MIN);
     roundtrip(u128::MAX);
-    roundtrip(i128::MIN);
+    for value in [0i128, 1, -1, i128::from(i64::MIN) - 1, i128::from(u64::MAX) + 1, i128::MAX, i128::MIN] {
+        roundtrip(value);
+    }
     roundtrip(char::MAX);
     roundtrip(f64::MIN_POSITIVE.to_bits());
     roundtrip(f32::INFINITY);
