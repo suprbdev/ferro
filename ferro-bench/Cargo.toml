@@ -19,6 +19,10 @@ path = "src/bin/group.rs"
 name = "watchers"
 path = "src/bin/watchers.rs"
 
+[[bin]]
+name = "clone"
+path = "src/bin/clone.rs"
+
 [dependencies]
 ferro = { path = "../ferro" }
 ledger = { path = "../examples/ledger" }
