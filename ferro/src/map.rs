@@ -1050,6 +1050,8 @@ fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -
 fn flush<K: Data, V: Data, S: Summary<K, V>>(
     link: &Link<K, V, S>,
     sink: &mut dyn Sink,
+    depth: usize,
+    dense: bool,
 ) -> Result<Link<K, V, S>> {
     let Link::Mem(node) = link else {
         return Ok(link.clone());
@@ -1102,10 +1104,11 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
         }
     }
     let branching = caching && !node.children.is_empty();
+    let rewritten = node.children.iter().filter(|child| matches!(child, Link::Mem(_))).count();
     let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
     let mut total = None;
     for position in 0..=width {
-        let flushed = flush(node.child(position), encoder.sink())?;
+        let flushed = flush(node.child(position), encoder.sink(), depth + 1, rewritten > 1)?;
         match &flushed {
             Link::Empty => encoder.varint(0),
             Link::Stored {
@@ -1152,12 +1155,20 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
     };
+    let written = Link::stored(ptr, node.count, total);
     if let Some(mut decoded) = cached {
         decoded.origin = Some(ptr);
         let weight = heap_weight(decoded.fixed_bytes(), body_bytes);
-        sink.remember(ptr, Arc::new(decoded), weight);
+        let decoded = Arc::new(decoded);
+        if dense
+            && depth >= PIN_DEPTH
+            && let Link::Stored { memo, .. } = &written
+        {
+            memo.get_or_init(|| Memo::Weak(Arc::downgrade(&decoded), Hint::of(&decoded)));
+        }
+        sink.remember(ptr, decoded, weight);
     }
-    Ok(Link::stored(ptr, node.count, total))
+    Ok(written)
 }
 
 struct Edit<K, V> {
@@ -2093,7 +2104,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             Link::Stored { ptr, .. } => Some(ptr.hash),
             Link::Mem(_) => {
                 let mut sink = HashSink;
-                match flush(&self.root, &mut sink) {
+                match flush(&self.root, &mut sink, 0, false) {
                     Ok(Link::Stored { ptr, .. }) => Some(ptr.hash),
                     Ok(_) => None,
                     Err(error) => panic!("ferro: {error}"),
@@ -2116,9 +2127,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
             w.mark_unsettled();
         }
         let stored = if foreign {
-            flush(&self.rebuilt().root, w.sink())?
+            flush(&self.rebuilt().root, w.sink(), 0, false)?
         } else {
-            flush(&self.root, w.sink())?
+            flush(&self.root, w.sink(), 0, false)?
         };
         match stored {
             Link::Empty => w.varint(0),
