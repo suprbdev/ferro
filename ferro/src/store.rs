@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -15,7 +16,7 @@ use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::codec::{ARC_HEADER, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
+use crate::codec::{ARC_HEADER, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, Staged, push_varint};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::reclaim::sibling;
@@ -367,7 +368,7 @@ fn varint_len(mut value: u64) -> usize {
     len
 }
 
-fn compressed(body: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn compressed(body: &[u8]) -> Option<Vec<u8>> {
     if body.len() < COMPRESS_MIN {
         return None;
     }
@@ -376,20 +377,29 @@ fn compressed(body: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub fn append_record(buf: &mut Vec<u8>, offset: u64, body: &[u8], links: &[Ptr]) {
-    match compressed(body) {
-        Some(packed) => {
-            push_varint(buf, packed.len() as u64);
-            push_varint(buf, (links.len() as u64) << 1 | 1);
-            push_varint(buf, body.len() as u64);
-            buf.extend_from_slice(&packed);
-        }
-        None => {
-            push_varint(buf, body.len() as u64);
-            push_varint(buf, (links.len() as u64) << 1);
-            buf.extend_from_slice(body);
-        }
+    let packed = compressed(body);
+    append_staged(buf, offset, staged(body, packed.as_deref(), links));
+}
+
+pub(crate) fn staged<'a>(body: &'a [u8], packed: Option<&'a [u8]>, links: &'a [Ptr]) -> Staged<'a> {
+    Staged {
+        raw: body.len(),
+        payload: packed.unwrap_or(body),
+        packed: packed.is_some(),
+        links,
     }
-    for link in links {
+}
+
+fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) {
+    push_varint(buf, staged.payload.len() as u64);
+    if staged.packed {
+        push_varint(buf, (staged.links.len() as u64) << 1 | 1);
+        push_varint(buf, staged.raw as u64);
+    } else {
+        push_varint(buf, (staged.links.len() as u64) << 1);
+    }
+    buf.extend_from_slice(staged.payload);
+    for link in staged.links {
         buf.extend_from_slice(&link.hash);
         push_varint(buf, zigzag(offset.wrapping_sub(link.offset) as i64));
     }
@@ -976,7 +986,7 @@ impl Store {
             store: self.clone(),
             start: self.inner.written.load(Ordering::Acquire),
             buf: vec![0u8; FRAME_BYTES],
-            seen: HashMap::new(),
+            seen: HashMap::default(),
             remembered: Vec::new(),
         })
     }
@@ -996,11 +1006,27 @@ impl Store {
     }
 }
 
+#[derive(Default)]
+struct Prehashed(u64);
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut word = [0u8; 8];
+        let take = bytes.len().min(8);
+        word[..take].copy_from_slice(&bytes[..take]);
+        self.0 ^= u64::from_le_bytes(word);
+    }
+}
+
 pub struct Txn {
     store: Store,
     start: u64,
     buf: Vec<u8>,
-    seen: HashMap<Hash, u64>,
+    seen: HashMap<Hash, u64, BuildHasherDefault<Prehashed>>,
     remembered: Vec<(Hash, CacheEntry)>,
 }
 
@@ -1017,22 +1043,22 @@ impl Sink for Txn {
     }
 
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
-        if u32::try_from(object.body.len()).is_err() {
-            return Err(Error::TooLarge(object.body.len() as u64));
+        if let Some(ptr) = self.known(hash, object.body.len())? {
+            return Ok(ptr);
         }
-        if let Some(offset) = self.seen.get(&hash) {
-            return Ok(Ptr {
-                hash,
-                offset: *offset,
-            });
+        let packed = compressed(&object.body);
+        Ok(self.record(hash, staged(&object.body, packed.as_deref(), &object.links)))
+    }
+
+    fn packs(&self) -> bool {
+        true
+    }
+
+    fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        if let Some(ptr) = self.known(hash, staged.raw)? {
+            return Ok(ptr);
         }
-        if let Some(offset) = self.store.inner.dedupe.get(&hash) {
-            return Ok(Ptr { hash, offset });
-        }
-        let offset = self.start + self.buf.len() as u64;
-        append_record(&mut self.buf, offset, &object.body, &object.links);
-        self.seen.insert(hash, offset);
-        Ok(Ptr { hash, offset })
+        Ok(self.record(hash, staged))
     }
 
     fn remember(&mut self, ptr: Ptr, value: Arc<dyn Any + Send + Sync>, weight: u32) {
@@ -1062,6 +1088,25 @@ fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
 }
 
 impl Txn {
+    fn known(&self, hash: Hash, raw: usize) -> Result<Option<Ptr>> {
+        if u32::try_from(raw).is_err() {
+            return Err(Error::TooLarge(raw as u64));
+        }
+        let offset = self
+            .seen
+            .get(&hash)
+            .copied()
+            .or_else(|| self.store.inner.dedupe.get(&hash));
+        Ok(offset.map(|offset| Ptr { hash, offset }))
+    }
+
+    fn record(&mut self, hash: Hash, staged: Staged<'_>) -> Ptr {
+        let offset = self.start + self.buf.len() as u64;
+        append_staged(&mut self.buf, offset, staged);
+        self.seen.insert(hash, offset);
+        Ptr { hash, offset }
+    }
+
     pub(crate) fn write(mut self, head: Ptr) -> Result<Frame> {
         let store = self.store.clone();
         let inner = &store.inner;

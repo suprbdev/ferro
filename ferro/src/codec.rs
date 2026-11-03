@@ -39,8 +39,36 @@ impl Object {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Staged<'a> {
+    pub raw: usize,
+    pub payload: &'a [u8],
+    pub packed: bool,
+    pub links: &'a [Ptr],
+}
+
+impl Staged<'_> {
+    pub fn body(&self) -> Result<Vec<u8>> {
+        if !self.packed {
+            return Ok(self.payload.to_vec());
+        }
+        lz4_flex::block::decompress(self.payload, self.raw)
+            .map_err(|error| Error::Corrupt(format!("bad staged body: {error}")))
+    }
+}
+
 pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
+    fn packs(&self) -> bool {
+        false
+    }
+    fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        let object = Object {
+            body: staged.body()?,
+            links: staged.links.to_vec(),
+        };
+        self.put(object, hash)
+    }
     fn check_link(&self, _ptr: Ptr) -> Result<()> {
         Ok(())
     }
@@ -55,6 +83,10 @@ pub struct HashSink;
 
 impl Sink for HashSink {
     fn put(&mut self, _object: Object, hash: Hash) -> Result<Ptr> {
+        Ok(Ptr { hash, offset: 0 })
+    }
+
+    fn put_staged(&mut self, hash: Hash, _staged: Staged<'_>) -> Result<Ptr> {
         Ok(Ptr { hash, offset: 0 })
     }
 

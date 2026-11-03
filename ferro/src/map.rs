@@ -10,9 +10,11 @@ use std::mem::needs_drop;
 use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink, Kind, Ptr, Shape, Sink, try_hash_of};
+use crate::codec::{
+    Data, Decoder, Encoder, Hash, HashSink, Kind, Object, Ptr, Shape, Sink, Staged, try_hash_of,
+};
 use crate::error::{Error, Result};
-use crate::store::{Store, heap_weight};
+use crate::store::{Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub(crate) const SPILL_BYTES: usize = 512;
@@ -22,6 +24,7 @@ const ARC_HEADER: usize = 16;
 const ALLOCATION_BYTES: usize = 16;
 const ITEM_BYTES: usize = 32;
 const PATH_FRAMES: usize = 8;
+const PARALLEL_KEYS: u64 = 4096;
 const LINE_BYTES: usize = 64;
 const SPAN_LINES: i32 = 15;
 const LINEAR_KEYS: usize = 16;
@@ -1202,29 +1205,107 @@ fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -
     T::decode(&mut decoder).map(drop)
 }
 
+struct Probe(u64);
+
+impl Sink for Probe {
+    fn put(&mut self, _object: Object, _hash: Hash) -> Result<Ptr> {
+        Err(Error::Detached)
+    }
+
+    fn check_link(&self, _ptr: Ptr) -> Result<()> {
+        Err(Error::Detached)
+    }
+
+    fn store_id(&self) -> u64 {
+        self.0
+    }
+}
+
 fn flush<K: Data, V: Data, S: Summary<K, V>>(
     link: &Link<K, V, S>,
     sink: &mut dyn Sink,
     depth: usize,
     dense: bool,
 ) -> Result<Link<K, V, S>> {
+    flush_with(link, sink, depth, dense, true)
+}
+
+fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
+    link: &Link<K, V, S>,
+    sink: &mut dyn Sink,
+    depth: usize,
+    dense: bool,
+    mut fan: bool,
+) -> Result<Link<K, V, S>> {
     let Link::Mem(node) = link else {
         return Ok(link.clone());
     };
+    if fan && fans_out(node) {
+        let stager = Stager {
+            id: sink.store_id(),
+            store: sink.store(),
+            pack: sink.packs(),
+        };
+        if let Ok(mut staged) = stage_tree(node, &stager) {
+            emit_staged(&mut staged, &mut Arena::default(), sink)?;
+            let written = Link::stored(staged.ptr, node.count, staged.total.clone());
+            if let Some(store) = &stager.store {
+                let settled = settle_tree(&mut staged, depth, store)?;
+                if dense && depth >= PIN_DEPTH {
+                    memoize(&written, &settled);
+                }
+            }
+            remember(staged, sink);
+            return Ok(written);
+        }
+        fan = false;
+    }
+    let flushed = prepare(node, sink, depth, fan)?;
+    emit(flushed, sink, depth, dense)
+}
+
+fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Arc<Node<K, V, S>>) {
+    if let Link::Stored { memo, .. } = link {
+        memo.get_or_init(|| Memo::Weak(Arc::downgrade(node), Hint::of(node)));
+    }
+}
+
+fn fans_out<K, V, S>(node: &Node<K, V, S>) -> bool {
+    node.count >= PARALLEL_KEYS
+        && node.children.iter().filter(|child| matches!(child, Link::Mem(_))).nth(1).is_some()
+}
+
+struct Flushed<K, V, S> {
+    object: Object,
+    hash: Hash,
+    cached: Option<Node<K, V, S>>,
+    count: u64,
+    total: S,
+    origin: Option<Ptr>,
+}
+
+fn prepare<K: Data, V: Data, S: Summary<K, V>>(
+    node: &Node<K, V, S>,
+    sink: &mut dyn Sink,
+    depth: usize,
+    fan: bool,
+) -> Result<Flushed<K, V, S>> {
     let store = sink.store();
     let caching = store.is_some();
     let width = node.keys.len();
+    let fresh = (0..width).filter(|&index| node.is_fresh(index)).count();
+    let decoding = caching && fresh > 0 && 2 * fresh >= width;
     let mut encoder = Encoder::with_capacity(&mut *sink, 64 + 24 * width, width + 1);
     encoder.u8(node.level);
     encoder.varint(width as u64);
     for (index, key) in node.keys.iter().enumerate() {
         let mark = encoder.mark();
         key.encode(&mut encoder)?;
-        if let (true, Some(store)) = (node.is_fresh(index), &store) {
+        if let (true, false, Some(store)) = (node.is_fresh(index), decoding, &store) {
             verify::<K>(&encoder, mark, store)?;
         }
     }
-    let mut spills: Vec<(usize, Slot<V, S>)> = Vec::new();
+    let mut spilled: Vec<(usize, Slot<V, S>)> = Vec::new();
     for (index, key) in node.keys.iter().enumerate() {
         let value = match &node.cells {
             Cells::Column(column) => &column[index],
@@ -1243,27 +1324,29 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
         encoder.u8(0);
         let body = encoder.mark();
         value.encode(&mut encoder)?;
-        if let (true, Some(store)) = (node.is_fresh(index), &store) {
+        let spill = encoder.since(mark) > SPILL_BYTES;
+        if let (true, true, Some(store)) = (node.is_fresh(index), spill || !decoding, &store) {
             verify::<V>(&encoder, body, store)?;
         }
-        if encoder.since(mark) > SPILL_BYTES {
+        if spill {
             encoder.rewind(mark);
             let ptr = encoder.child(|inner| value.encode(inner))?;
             let summary = S::of(key, value);
             encoder.u8(1);
             encoder.link(ptr);
             summary.encode(&mut encoder)?;
-            if caching {
-                spills.push((index, Slot::Spilled(ptr, summary)));
+            if caching && !decoding {
+                spilled.push((index, Slot::Spilled(ptr, summary)));
             }
         }
     }
     let branching = caching && !node.children.is_empty();
-    let rewritten = node.children.iter().filter(|child| matches!(child, Link::Mem(_))).count();
+    let rewritten = dirty(node).count();
     let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
     let mut total = None;
     for position in 0..=width {
-        let flushed = flush(node.child(position), encoder.sink(), depth + 1, rewritten > 1)?;
+        let child = node.child(position);
+        let flushed = flush_with(child, encoder.sink(), depth + 1, rewritten > 1, fan)?;
         match &flushed {
             Link::Empty => encoder.varint(0),
             Link::Stored {
@@ -1290,40 +1373,448 @@ fn flush<K: Data, V: Data, S: Summary<K, V>>(
     let unsettled = encoder.is_unsettled();
     let object = encoder.into_object();
     let hash = object.hash();
-    let body_bytes = object.body.len();
     let cached = match &store {
         None => None,
-        Some(store) if unsettled => {
+        Some(store) if unsettled || decoding => {
             let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
-            Some(Node::<K, V, S>::decode(&mut decoder, Ptr { hash, offset: 0 })?)
+            let mut decoded = Node::<K, V, S>::decode(&mut decoder, Ptr { hash, offset: 0 })?;
+            if branching && !unsettled {
+                decoded.children = stored;
+            }
+            Some(decoded)
         }
         Some(_) => Some(Node {
             level: node.level,
             keys: node.keys.clone(),
-            cells: node.cells.settled(spills),
+            cells: node.cells.settled(spilled),
             children: stored,
             count: node.count,
             origin: None,
         }),
     };
-    let ptr = match node.origin {
+    Ok(Flushed {
+        object,
+        hash,
+        cached,
+        count: node.count,
+        total,
+        origin: node.origin,
+    })
+}
+
+fn emit<K: Data, V: Data, S: Data>(
+    flushed: Flushed<K, V, S>,
+    sink: &mut dyn Sink,
+    depth: usize,
+    dense: bool,
+) -> Result<Link<K, V, S>> {
+    let Flushed {
+        object,
+        hash,
+        cached,
+        count,
+        total,
+        origin,
+    } = flushed;
+    let body_bytes = object.body.len();
+    let ptr = match origin {
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
     };
-    let written = Link::stored(ptr, node.count, total);
+    let written = Link::stored(ptr, count, total);
     if let Some(mut decoded) = cached {
         decoded.origin = Some(ptr);
         let weight = heap_weight(decoded.fixed_bytes(), body_bytes);
         let decoded = Arc::new(decoded);
-        if dense
-            && depth >= PIN_DEPTH
-            && let Link::Stored { memo, .. } = &written
-        {
-            memo.get_or_init(|| Memo::Weak(Arc::downgrade(&decoded), Hint::of(&decoded)));
+        if dense && depth >= PIN_DEPTH {
+            memoize(&written, &decoded);
         }
         sink.remember(ptr, decoded, weight);
     }
     Ok(written)
+}
+
+struct Stager {
+    id: u64,
+    store: Option<Store>,
+    pack: bool,
+}
+
+#[derive(Default)]
+struct Arena {
+    bytes: Vec<u8>,
+    links: Vec<Ptr>,
+}
+
+struct Placed {
+    hash: Hash,
+    raw: usize,
+    payload: Range<usize>,
+    packed: bool,
+    links: Range<usize>,
+}
+
+impl Arena {
+    fn place(&mut self, object: &Object, pack: bool) -> Placed {
+        let packed = if pack { compressed(&object.body) } else { None };
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(packed.as_deref().unwrap_or(&object.body));
+        let payload = start..self.bytes.len();
+        let start = self.links.len();
+        self.links.extend_from_slice(&object.links);
+        Placed {
+            hash: object.hash(),
+            raw: object.body.len(),
+            payload,
+            packed: packed.is_some(),
+            links: start..self.links.len(),
+        }
+    }
+
+    fn staged(&self, placed: &Placed) -> Staged<'_> {
+        Staged {
+            raw: placed.raw,
+            payload: &self.bytes[placed.payload.clone()],
+            packed: placed.packed,
+            links: &self.links[placed.links.clone()],
+        }
+    }
+
+    fn put(&self, placed: &Placed, sink: &mut dyn Sink) -> Result<Ptr> {
+        sink.put_staged(placed.hash, self.staged(placed))
+    }
+}
+
+type Settled<K, V, S> = (Ptr, Arc<Node<K, V, S>>, u32);
+
+struct Deferred<'a, K, V, S> {
+    node: &'a Node<K, V, S>,
+    arena: Option<Box<Arena>>,
+    placed: Placed,
+    spills: Vec<(usize, Placed)>,
+    children: Vec<(usize, usize, Deferred<'a, K, V, S>)>,
+    total: S,
+    ptr: Ptr,
+    settled: Vec<Settled<K, V, S>>,
+}
+
+fn dirty<K, V, S>(node: &Node<K, V, S>) -> impl Iterator<Item = &Node<K, V, S>> {
+    node.children.iter().filter_map(|child| match child {
+        Link::Mem(child) => Some(&**child),
+        _ => None,
+    })
+}
+
+fn frontier<'a, K, V, S>(node: &'a Node<K, V, S>, tasks: &mut Vec<&'a Node<K, V, S>>) {
+    for child in dirty(node) {
+        if child.count >= PARALLEL_KEYS {
+            frontier(child, tasks);
+        } else {
+            tasks.push(child);
+        }
+    }
+}
+
+fn stage_tree<'a, K: Data, V: Data, S: Summary<K, V>>(
+    node: &'a Node<K, V, S>,
+    stager: &Stager,
+) -> Result<Deferred<'a, K, V, S>> {
+    let mut tasks = Vec::new();
+    frontier(node, &mut tasks);
+    let mut staged = parallel(tasks, |task| {
+        let mut arena = Arena::default();
+        let mut staged = stage(task, stager, &mut arena)?;
+        staged.arena = Some(Box::new(arena));
+        Ok(staged)
+    })
+    .into_iter();
+    let mut arena = Arena::default();
+    let mut root = stage_spine(node, stager, &mut arena, &mut staged)?;
+    root.arena = Some(Box::new(arena));
+    Ok(root)
+}
+
+fn stage_spine<'a, K: Data, V: Data, S: Summary<K, V>>(
+    node: &'a Node<K, V, S>,
+    stager: &Stager,
+    arena: &mut Arena,
+    staged: &mut impl Iterator<Item = Result<Deferred<'a, K, V, S>>>,
+) -> Result<Deferred<'a, K, V, S>> {
+    let mut children = Vec::new();
+    for child in dirty(node) {
+        children.push(if child.count >= PARALLEL_KEYS {
+            stage_spine(child, stager, arena, staged)?
+        } else {
+            staged.next().ok_or(Error::Detached)??
+        });
+    }
+    seal(node, children, stager, arena)
+}
+
+fn stage<'a, K: Data, V: Data, S: Summary<K, V>>(
+    node: &'a Node<K, V, S>,
+    stager: &Stager,
+    arena: &mut Arena,
+) -> Result<Deferred<'a, K, V, S>> {
+    let children = dirty(node)
+        .map(|child| stage(child, stager, arena))
+        .collect::<Result<Vec<_>>>()?;
+    seal(node, children, stager, arena)
+}
+
+fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
+    node: &'a Node<K, V, S>,
+    mut children: Vec<Deferred<'a, K, V, S>>,
+    stager: &Stager,
+    arena: &mut Arena,
+) -> Result<Deferred<'a, K, V, S>> {
+    children.reverse();
+    let mut probe = Probe(stager.id);
+    let width = node.keys.len();
+    let mut encoder = Encoder::with_capacity(&mut probe, 64 + 24 * width, width + 1);
+    encoder.u8(node.level);
+    encoder.varint(width as u64);
+    for key in &node.keys {
+        key.encode(&mut encoder)?;
+    }
+    let mut spills = Vec::new();
+    for (index, key) in node.keys.iter().enumerate() {
+        let value = match &node.cells {
+            Cells::Column(column) => &column[index],
+            Cells::Slots(slots) => match &slots[index] {
+                Slot::Spilled(ptr, summary) => {
+                    encoder.u8(1);
+                    encoder.link(*ptr);
+                    summary.encode(&mut encoder)?;
+                    continue;
+                }
+                Slot::Packed(column, position) => &column[*position as usize],
+                Slot::Fresh(value) => &**value,
+            },
+        };
+        let mark = encoder.mark();
+        encoder.u8(0);
+        value.encode(&mut encoder)?;
+        if encoder.since(mark) > SPILL_BYTES {
+            encoder.rewind(mark);
+            let mut inner = Probe(stager.id);
+            let mut spill = Encoder::new(&mut inner);
+            value.encode(&mut spill)?;
+            let object = spill.into_object();
+            if let (true, Some(store)) = (node.is_fresh(index), &stager.store) {
+                V::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+            }
+            let placed = arena.place(&object, stager.pack);
+            encoder.u8(1);
+            spills.push((encoder.links().len(), placed));
+            encoder.link(Ptr {
+                hash: object.hash(),
+                offset: 0,
+            });
+            S::of(key, value).encode(&mut encoder)?;
+        }
+    }
+    let mut linked = Vec::with_capacity(children.len());
+    let mut total = None;
+    for position in 0..=width {
+        match node.child(position) {
+            Link::Empty => encoder.varint(0),
+            Link::Stored {
+                ptr,
+                count,
+                summary,
+                ..
+            } => {
+                encoder.varint(*count);
+                summary.encode(&mut encoder)?;
+                encoder.link(*ptr);
+                total = fold(total, summary);
+            }
+            Link::Mem(child) => {
+                let deferred = children.pop().ok_or(Error::Detached)?;
+                encoder.varint(child.count);
+                deferred.total.encode(&mut encoder)?;
+                total = fold(total, &deferred.total);
+                let hash = deferred.placed.hash;
+                linked.push((encoder.links().len(), position, deferred));
+                encoder.link(Ptr { hash, offset: 0 });
+            }
+        }
+        if position < width {
+            total = fold(total, &node.entry_summary(position));
+        }
+    }
+    if encoder.is_unsettled() {
+        return Err(Error::Detached);
+    }
+    let object = encoder.into_object();
+    let placed = arena.place(&object, stager.pack);
+    Ok(Deferred {
+        node,
+        arena: None,
+        ptr: Ptr {
+            hash: placed.hash,
+            offset: 0,
+        },
+        placed,
+        spills,
+        children: linked,
+        total: total.ok_or(Error::Detached)?,
+        settled: Vec::new(),
+    })
+}
+
+fn emit_staged<K, V, S>(
+    deferred: &mut Deferred<'_, K, V, S>,
+    outer: &mut Arena,
+    sink: &mut dyn Sink,
+) -> Result<()> {
+    let Deferred {
+        node,
+        arena,
+        placed,
+        spills,
+        children,
+        ptr,
+        ..
+    } = deferred;
+    let arena = arena.as_deref_mut().unwrap_or(outer);
+    let base = placed.links.start;
+    for (at, spill) in spills.iter() {
+        arena.links[base + at] = arena.put(spill, sink)?;
+    }
+    for (at, _, child) in children.iter_mut() {
+        emit_staged(child, arena, sink)?;
+        arena.links[base + *at] = child.ptr;
+    }
+    *ptr = match node.origin {
+        Some(origin) if origin.hash == placed.hash => origin,
+        _ => arena.put(placed, sink)?,
+    };
+    Ok(())
+}
+
+fn settle_tree<K: Data, V: Data, S: Data>(
+    root: &mut Deferred<'_, K, V, S>,
+    depth: usize,
+    store: &Store,
+) -> Result<Arc<Node<K, V, S>>> {
+    let mut tasks = Vec::new();
+    for (_, _, child) in &mut root.children {
+        owned(child, depth + 1, &mut tasks);
+    }
+    parallel(tasks, |(task, depth)| settle_owned(task, depth, store))
+        .into_iter()
+        .collect::<Result<()>>()?;
+    let arena = root.arena.take().ok_or(Error::Detached)?;
+    settle_spine(root, depth, &arena, store, &mut Vec::new())
+}
+
+fn owned<'t, 'a, K, V, S>(
+    deferred: &'t mut Deferred<'a, K, V, S>,
+    depth: usize,
+    tasks: &mut Vec<(&'t mut Deferred<'a, K, V, S>, usize)>,
+) {
+    if deferred.arena.is_some() {
+        tasks.push((deferred, depth));
+    } else {
+        for (_, _, child) in &mut deferred.children {
+            owned(child, depth + 1, tasks);
+        }
+    }
+}
+
+fn settle_owned<K: Data, V: Data, S: Data>(
+    task: &mut Deferred<'_, K, V, S>,
+    depth: usize,
+    store: &Store,
+) -> Result<()> {
+    let arena = task.arena.take().ok_or(Error::Detached)?;
+    let mut settled = Vec::new();
+    let outcome = settle(task, depth, &arena, store, &mut Vec::new(), &mut settled);
+    task.arena = Some(Box::default());
+    task.children = Vec::new();
+    task.settled = settled;
+    outcome.map(drop)
+}
+
+fn settle<K: Data, V: Data, S: Data>(
+    deferred: &Deferred<'_, K, V, S>,
+    depth: usize,
+    arena: &Arena,
+    store: &Store,
+    scratch: &mut Vec<u8>,
+    settled: &mut Vec<Settled<K, V, S>>,
+) -> Result<Arc<Node<K, V, S>>> {
+    let mut below = Vec::with_capacity(deferred.children.len());
+    for (_, position, child) in &deferred.children {
+        below.push((*position, settle(child, depth + 1, arena, store, scratch, settled)?));
+    }
+    let entry = decoded(deferred, depth, &below, arena, store, scratch)?;
+    let node = entry.1.clone();
+    settled.push(entry);
+    Ok(node)
+}
+
+fn settle_spine<K: Data, V: Data, S: Data>(
+    deferred: &mut Deferred<'_, K, V, S>,
+    depth: usize,
+    arena: &Arena,
+    store: &Store,
+    scratch: &mut Vec<u8>,
+) -> Result<Arc<Node<K, V, S>>> {
+    let mut below = Vec::with_capacity(deferred.children.len());
+    for (_, position, child) in &mut deferred.children {
+        let node = if child.arena.is_none() {
+            settle_spine(child, depth + 1, arena, store, scratch)?
+        } else {
+            let last = child.settled.last().ok_or(Error::Detached)?;
+            last.1.clone()
+        };
+        below.push((*position, node));
+    }
+    let entry = decoded(deferred, depth, &below, arena, store, scratch)?;
+    let node = entry.1.clone();
+    deferred.settled = vec![entry];
+    Ok(node)
+}
+
+fn decoded<K: Data, V: Data, S: Data>(
+    deferred: &Deferred<'_, K, V, S>,
+    depth: usize,
+    below: &[(usize, Arc<Node<K, V, S>>)],
+    arena: &Arena,
+    store: &Store,
+    scratch: &mut Vec<u8>,
+) -> Result<Settled<K, V, S>> {
+    let placed = &deferred.placed;
+    let payload = &arena.bytes[placed.payload.clone()];
+    let body = if placed.packed {
+        scratch.resize(placed.raw, 0);
+        let filled = lz4_flex::block::decompress_into(payload, scratch)
+            .map_err(|error| Error::Corrupt(format!("bad staged body: {error}")))?;
+        &scratch[..filled]
+    } else {
+        payload
+    };
+    let mut decoder = Decoder::new(body, &arena.links[placed.links.clone()], Some(store));
+    let node = Node::<K, V, S>::decode(&mut decoder, deferred.ptr)?;
+    if below.len() > 1 && depth + 1 >= PIN_DEPTH {
+        for (position, child) in below {
+            memoize(node.child(*position), child);
+        }
+    }
+    let weight = heap_weight(node.fixed_bytes(), placed.raw);
+    Ok((deferred.ptr, Arc::new(node), weight))
+}
+
+fn remember<K: Data, V: Data, S: Data>(deferred: Deferred<'_, K, V, S>, sink: &mut dyn Sink) {
+    for (_, _, child) in deferred.children {
+        remember(child, sink);
+    }
+    for (ptr, node, weight) in deferred.settled {
+        sink.remember(ptr, node, weight);
+    }
 }
 
 fn workers() -> usize {
