@@ -1,12 +1,14 @@
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use booking::date::{night_of, now_ms};
-use booking::history::{as_paid, audit, paid_version, price_history};
+use booking::history::{as_paid, audit, price_history};
 use booking::seed::{Plan, seed};
-use booking::{HoldRequest, Status};
+use booking::{Config, HoldRequest, Hotels, Reservations, Status};
 use common::{days, open, world};
 
 #[test]
@@ -90,7 +92,7 @@ fn a_receipt_shows_the_booking_and_rates_as_they_were_when_paid() {
     assert_eq!(receipt.credit_before, 225_000);
     assert_eq!(receipt.credit_after, 225_000 - held.total);
     assert_eq!(receipt.venue, "Alpine Lodge");
-    assert_eq!(paid_version(svc.db(), held.id, receipt.paid_ms).unwrap(), Some(paid_in));
+    assert_eq!(receipt.now.paid_version, Some(paid_in));
 }
 
 #[test]
@@ -135,4 +137,90 @@ fn as_of_reads_the_hotels_at_a_wall_clock_time() {
     assert!(then.bookings.get(&held.id).is_none());
     assert_eq!(svc.db().as_of(now_ms()).unwrap().holder(1, night), Some(held.id));
     assert_eq!(svc.db().as_of(before_anything).unwrap().version(), 0);
+}
+
+fn paid_in(h: &Hotels, id: u64) -> bool {
+    h.bookings.get(&id).is_some_and(|b| b.paid_ms.is_some())
+}
+
+fn receipts_while_rates_change(coalesce: bool, bookings: u32, buyers: u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        coalesce,
+        buffered: true,
+        ..Config::default()
+    };
+    let svc = Reservations::open(dir.path().join("p.ferro"), config).unwrap();
+    let plan = Plan {
+        venues: 1,
+        rooms: 40,
+        customers: 50,
+        credit: 100_000_000,
+        rate: 1000,
+    };
+    seed(&svc, &plan).unwrap();
+    let first = night_of(now_ms()) + 1;
+    let stop = Arc::new(AtomicBool::new(false));
+    let noise = {
+        let (svc, stop) = (svc.clone(), stop.clone());
+        thread::spawn(move || {
+            let mut changes = 0;
+            while !stop.load(Ordering::Relaxed) {
+                changes += 1;
+                svc.set_rate(40, 1000 + changes % 50).unwrap();
+            }
+            changes
+        })
+    };
+    let workers: Vec<_> = (0..buyers)
+        .map(|buyer| {
+            let svc = svc.clone();
+            thread::spawn(move || {
+                let mut paid = Vec::new();
+                for i in (buyer..bookings).step_by(buyers as usize) {
+                    let request = HoldRequest {
+                        customer: 1 + i % 50,
+                        room: 1 + i % 39,
+                        first: first + i / 39,
+                        nights: 1,
+                        ttl_ms: 60_000,
+                    };
+                    let held = svc.hold(&request).unwrap();
+                    svc.confirm(held.id, None).unwrap();
+                    paid.push(held.id);
+                }
+                paid
+            })
+        })
+        .collect();
+    let paid: Vec<u64> = workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect();
+    stop.store(true, Ordering::Relaxed);
+    assert!(noise.join().unwrap() > 0);
+    assert_eq!(paid.len(), bookings as usize);
+
+    let db = svc.db();
+    for id in paid {
+        let receipt = as_paid(db, id).unwrap();
+        assert_eq!(db.bisect(.., |h| paid_in(h, id)).unwrap(), Some(receipt.version));
+        let past = db.at(receipt.version).unwrap();
+        assert!(paid_in(&past, id) && !paid_in(&db.at(receipt.version - 1).unwrap(), id));
+        let confirm = format!("confirm #{id} paid");
+        assert!(past.commit().messages().any(|line| line.starts_with(&confirm)));
+        assert_eq!(receipt.then.status, Status::Confirmed);
+        assert_eq!(receipt.then.paid_version, Some(receipt.version));
+        let room = past.rooms.get(&receipt.then.room).unwrap();
+        assert_eq!(receipt.rates_then, vec![past.price(&room, receipt.then.first)]);
+    }
+    let walked = booking::walk(db, 0).unwrap();
+    assert!(walked.ok(), "{:#?}", &walked.violations[..walked.violations.len().min(5)]);
+}
+
+#[test]
+fn a_receipt_lands_on_its_payment_while_another_writer_keeps_changing_rates() {
+    receipts_while_rates_change(false, 1_500, 1);
+}
+
+#[test]
+fn a_coalesced_receipt_lands_on_the_group_that_paid() {
+    receipts_while_rates_change(true, 800, 4);
 }

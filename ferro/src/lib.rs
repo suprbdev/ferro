@@ -18,7 +18,7 @@ pub mod watch;
 
 pub use admin::{Compacted, Keep, Reclaim, Space};
 pub use codec::{Bytes, Data, Hash, Ptr, hash_of};
-pub use db::{Commit, Committed, Db, Options, Snapshot, Verified};
+pub use db::{Commit, Committed, Db, Options, Snapshot, Stamp, Verified};
 pub use error::{Error, Result};
 pub use ferro_derive::{Data, Record};
 pub use history::History;

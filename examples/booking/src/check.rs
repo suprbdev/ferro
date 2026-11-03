@@ -72,6 +72,9 @@ fn booking_alone(b: &Booking, out: &mut Report<'_>) {
     out.check(b.hold_until == held_until, || {
         format!("booking #{id} is {} with hold_until {:?}", b.status, b.hold_until)
     });
+    out.check(b.paid_version.is_some() == b.paid_ms.is_some(), || {
+        format!("booking #{id} was paid at {:?} in version {:?}", b.paid_ms, b.paid_version)
+    });
     match b.status {
         Status::Held => {
             out.check(b.paid == 0 && b.refunded == 0 && b.paid_ms.is_none(), || {
@@ -309,7 +312,22 @@ fn quoted(prev: &Hotels, cur: &Hotels, b: &Booking) -> bool {
     })
 }
 
-fn check_step(prev: &Hotels, cur: &Hotels, out: &mut Report<'_>, step: &mut Step) {
+fn paid_here(version: Option<u64>, before: Option<u64>, b: &Booking, out: &mut Report<'_>) {
+    let Some(version) = version.filter(|_| before.is_none() && b.paid_version.is_some()) else {
+        return;
+    };
+    out.check(b.paid_version == Some(version), || {
+        format!("booking #{} was paid in v{version} but recorded {:?}", b.id, b.paid_version)
+    });
+}
+
+fn check_step(
+    prev: &Hotels,
+    cur: &Hotels,
+    version: Option<u64>,
+    out: &mut Report<'_>,
+    step: &mut Step,
+) {
     for change in prev.bookings.diff(&cur.bookings) {
         match change {
             Change::Removed(id, _) => out.check(false, || format!("booking #{id} was deleted")),
@@ -318,10 +336,16 @@ fn check_step(prev: &Hotels, cur: &Hotels, out: &mut Report<'_>, step: &mut Step
                 out.check(quoted(prev, cur, &b), || {
                     format!("booking #{id} was quoted {:?}, not the rates in force", b.prices)
                 });
+                paid_here(version, None, &b, out);
                 booking_in(cur, &b, out);
             }
             Change::Changed(id, a, b) => {
                 out.check(same_terms(&a, &b), || format!("booking #{id} changed its terms"));
+                out.check(a.paid_version.is_none() || a.paid_version == b.paid_version, || {
+                    let (was, now) = (a.paid_version, b.paid_version);
+                    format!("booking #{id} moved its paid version from {was:?} to {now:?}")
+                });
+                paid_here(version, a.paid_version, &b, out);
                 let legal = matches!(
                     (a.status, b.status),
                     (Status::Held, Status::Confirmed)
@@ -402,7 +426,7 @@ fn check_step(prev: &Hotels, cur: &Hotels, out: &mut Report<'_>, step: &mut Step
 
 pub fn check_pair(prev: &Hotels, cur: &Hotels) -> Vec<String> {
     let mut messages = Vec::new();
-    check_step(prev, cur, &mut Report { out: &mut messages }, &mut Step::default());
+    check_step(prev, cur, None, &mut Report { out: &mut messages }, &mut Step::default());
     messages
 }
 
@@ -425,7 +449,7 @@ pub fn walk(db: &Db<Hotels>, full_every: u64) -> Result<Walked> {
         let mut messages = Vec::new();
         let mut step = Step::default();
         if cur.version() != prev.version() {
-            check_step(&prev, &cur, &mut Report { out: &mut messages }, &mut step);
+            check_step(&prev, &cur, Some(version), &mut Report { out: &mut messages }, &mut step);
             walked.steps += 1;
         }
         let sampled = full_every > 0 && (version % full_every == 0 || version == last);

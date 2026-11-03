@@ -820,6 +820,10 @@ every closure:
 - `Committed::changed` says the group moved the version. A closure that changed nothing, in a group
   where another did, reports `true`. Telling them apart needs a hash of the dirty tree after every
   closure, which is the cost this removes. A group of no-ops writes nothing and reports `false`.
+- A `Stamp` is the group's. Its version is the group's base version plus one, and its time lives in
+  the group: the first closure to call `time_ms` fixes it, and later closures read the same value.
+  A closure that fails or panics puts the time back unset if it was the one that set it, as it puts
+  back the working copy, so a group whose only reader failed keeps no claim on its millisecond.
 - `restore` and `merge_with` commit alone, since `restored` and `merged` belong to one version.
   They, `fork`, `drop_branch` and a reclamation cycle flush the open group before they start, and a
   closure on another branch flushes it before starting its own.
@@ -1041,6 +1045,41 @@ described under Objects and links. That is all it shows:
   those objects.
 - An anchor for a pruned version can no longer be checked, since `hash_at` returns `None` for it.
   An anchor for a retained version still matches.
+
+### Commit times
+
+A commit's `time_ms` is the later of the clock and a floor: the previous commit's time, plus one if
+that commit is stamped, and for a merge also the time of the entry it links. So times never go back
+along a chain, a clock that steps back makes commits share a millisecond until it catches up, and a
+merge is never older than either parent, which the merge-base search relies on. `as_of(t)` follows
+skip links from the tip to the newest entry whose time is at most `t`, so of several commits in one
+millisecond it returns the last.
+
+A time a closure reads from the clock says little about its commit. The commit takes its time after
+the closure returns, and later commits can share that millisecond, so `as_of` of the reading can
+land before the commit, on it, or on a later commit. `examples/booking` recorded the time of each
+payment that way and found all three among 1,500 payments, 773 of them on a later commit.
+
+`commit_stamped` and `try_commit_stamped` pass the closure a `Stamp`. Its version is the tip's plus
+one, the version the commit gets since it is made under the same lock. The first call to `time_ms`
+fixes the commit's time at the later of the clock and the floor, and the commit is then stamped:
+its entry carries a flag, and the next commit's floor is one past its time, so no later commit on
+the chain shares its millisecond and `as_of` of that time returns it. A commit whose closure reads
+only the version is not stamped, so writers that do not ask keep the times they had. The flag lives
+in the entry, so the rule holds after a reopen, on a fork, which shares the entry, and after a pull
+that fast-forwards onto it. A closure that returns `Err`, panics or changes nothing writes no entry
+and claims nothing.
+
+The cost is drift. A branch that stamps more than 1,000 commits a second takes times ahead of the
+clock by a millisecond for each one past that rate, and the clock catches up once the rate falls.
+Stamping every commit would make `as_of` exact for any commit's time without asking, but a plain
+commit takes 27 µs with buffered durability, so a busy writer would run seconds ahead within a
+minute and `as_of(now)` would stop returning the head.
+
+The flag byte of an entry had one bit left. Bit 128 now says a varint of further flags follows the
+byte, and bit 1 of that varint is the stamp, so the next flag needs no change to the byte. A varint
+of 0, or one with an unknown bit, is rejected, so an entry has one encoding. Entries written before
+have no such bit and read as not stamped. A build from before this change rejects a stamped entry.
 
 ## Merging
 
@@ -1301,9 +1340,11 @@ a branch: a pull appends to our chain or adopts one that extends it. After a div
 main and on `remote` can be different commits, so compare across files by hash, with `head_hash`
 and `Log::hash_at`.
 
-Each commit's time is `max(now, previous)`, so time never goes back along a chain and `as_of` works
-after a fast-forward. A device whose clock runs ahead holds the times of our later commits at its
-reading until our clock passes it.
+Each commit's time is at least its previous commit's, as described under Commit times, so time
+never goes back along a chain and `as_of` works after a fast-forward. A pulled entry keeps its stamp
+flag, so the next commit after a fast-forward onto a stamped commit takes a later millisecond. A
+device whose clock runs ahead holds the times of our later commits at its reading until our clock
+passes it.
 
 ### The merge base
 

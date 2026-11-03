@@ -112,6 +112,27 @@ left.for_each(|key, _| shared += usize::from(other.seek(key)));
 **Writes are closures.** `update`, `commit` and `commit_with` give you `&mut T`. When the closure
 returns, the change commits atomically. If it panics or `try_update` returns `Err`, nothing
 happens. Writers run one at a time, so a transaction is serializable by construction.
+`commit_with` and its `try_` form return a `Committed` with your value and the `version` and
+`time_ms` of the commit that holds the change, or of the head it ran on if it changed nothing.
+
+`commit_stamped` and `try_commit_stamped` also hand the closure a `Stamp`, so a row can record
+the commit that writes it:
+
+```rust
+db.try_commit_stamped(|shop, stamp| {
+    let mut order = shop.orders.get_mut(&id).ok_or(ShopError::NoOrder(id))?;
+    order.paid = Some((stamp.version(), stamp.time_ms()));
+    Ok(("pay", ()))
+})?;
+```
+
+`stamp.version()` is the version this commit will get, so `db.at(version)` later shows the state
+it wrote. `stamp.time_ms()` is its time, fixed by the first call, and the commit keeps that
+millisecond to itself: the next commit on the branch gets a later time, so `db.as_of(time_ms)`
+returns exactly this commit. A branch that makes more than 1,000 such commits a second runs ahead
+of the clock until the rate drops, so read the time only when you need it. A stamp describes the
+commit that would hold the closure's changes. If the closure returns `Err`, panics or changes
+nothing, no commit holds them, and its reading of the time claims nothing.
 
 **Collections are values too.** `Map`, `Set`, `List` and `Table` nest freely inside your types.
 Cloning one is O(1), and `==` compares root hashes in O(1) because the tree shape depends only on
@@ -206,6 +227,15 @@ db.restore(&old)?;
 
 `diff` skips identical subtrees by hash, so it costs O(changes), not O(size). `restore` commits
 an old value as a new version, so history is never rewritten.
+
+`as_of(t)` returns the newest commit on the branch whose `time_ms` is at most `t`, or version 0
+before the first. A commit's time is the later of the clock and a floor, so times never go back
+along a branch. The floor is the time of the commit before it on the branch, one millisecond more if
+that commit read its `Stamp::time_ms`, and for a merge also the time of the commit it merges. A
+clock that steps back therefore makes commits share a millisecond until it catches up, and `as_of`
+returns the last commit of a shared millisecond. So `as_of(stamp.time_ms())` returns the commit
+that stamp belongs to for as long as it is retained, while a time the closure reads from the clock
+itself can fall before, on or after its commit's time.
 
 `history_of` walks the log newest first and yields `(commit, value)` for each commit that changed
 the projection, including a change back to an earlier value. It reads nothing until you ask and
@@ -438,8 +468,11 @@ On `examples/queue` at 32 workers that took jobs from 9,700 to 16,900 a second, 
 2,691 to 146 and p99 from 2.3 to 0.8 ms. A closure that runs long against an fsync does not gain:
 at 50 µs and 8 writers it lost 16% of its throughput. See `DESIGN.md`.
 
-What you give up is a version per closure. `Committed::version` is the group's, `at` cannot show
-the state between two closures of a group, and `history_of` reports the group's net change once.
+What you give up is a version per closure. `Committed::version` and `time_ms` are the group's, `at`
+cannot show the state between two closures of a group, and `history_of` reports the group's net
+change once. A `Stamp` names the group's version and time too, the same for every closure in it, so
+`at(stamp.version())` shows closures that ran after yours. The first closure to read `time_ms`
+fixes the group's time, and if that closure then fails, the next one to read it fixes it again.
 The commit's `message` holds every closure's message joined by newlines, and `messages()` lists
 them, each whole even if it has newlines of its own. `changed` says the group made a new version,
 so a closure that changed nothing reports `true` if another closure in its group did. If the
@@ -548,12 +581,12 @@ ran on a machine shared with other work.
 `examples/booking` sells hotel rooms by the night. A hold claims each night through a
 `#[unique(room, night)]` index, so a second claim fails inside the commit and names the holder. A
 hold blocks everyone until it is paid or lapses, and a sweeper or the next buyer releases it once
-it lapses. Every write is a `try_commit_with` closure that returns a typed error. The till, each
+it lapses. Every write is a `try_commit_stamped` closure that returns a typed error. The till, each
 customer's credit and the per-night counters move in the same commit as the rows they sum.
 
-Receipts come from `as_of` checked against `bisect`, audit trails and price history from
-`history_of`. A what-if reprice or venue closure runs on a fork, which you preview, then merge
-with `merge_with` or drop.
+A confirm records its own version from the `Stamp`, so a receipt is `at` that version. Audit trails
+and price history come from `history_of`. A what-if reprice or venue closure runs on a fork, which
+you preview, then merge with `merge_with` or drop.
 
 ```sh
 cargo run --release -p booking -- seed

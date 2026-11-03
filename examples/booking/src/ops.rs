@@ -254,6 +254,7 @@ impl Hotels {
             paid: 0,
             refunded: 0,
             paid_ms: None,
+            paid_version: None,
             ended_ms: None,
             reason: None,
         });
@@ -354,7 +355,13 @@ impl Hotels {
         due.into_iter().filter(|id| self.expire(*id, now)).collect()
     }
 
-    pub fn confirm(&mut self, now: u64, id: u64, expected: Option<Cents>) -> Result<Cents> {
+    pub fn confirm(
+        &mut self,
+        now: u64,
+        version: u64,
+        id: u64,
+        expected: Option<Cents>,
+    ) -> Result<Cents> {
         let mut booking = self.booking(id)?;
         if booking.status != Status::Held {
             return Err(BookingError::WrongStatus {
@@ -400,6 +407,7 @@ impl Hotels {
         booking.hold_until = None;
         booking.paid = booking.total;
         booking.paid_ms = Some(now);
+        booking.paid_version = Some(version);
         let total = booking.total;
         self.bookings.insert(booking);
         Ok(total)

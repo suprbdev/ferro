@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferro::{Db, Durability, Keep, Options, Reclaim, Snapshot};
+use ferro::{Db, Durability, Keep, Options, Reclaim, Snapshot, Stamp};
 
 use crate::date::{format_night, now_ms};
 use crate::error::Result;
@@ -80,8 +80,15 @@ impl Reservations {
         &self,
         f: impl FnOnce(&mut Hotels, u64) -> Result<(String, R)>,
     ) -> Result<R> {
+        self.write_stamped(|hotels, now, _| f(hotels, now))
+    }
+
+    pub fn write_stamped<R>(
+        &self,
+        f: impl FnOnce(&mut Hotels, u64, &Stamp<'_>) -> Result<(String, R)>,
+    ) -> Result<R> {
         let clock = &self.clock;
-        let done = self.db.try_commit_with(|hotels| f(hotels, clock()))?;
+        let done = self.db.try_commit_stamped(|hotels, stamp| f(hotels, clock(), stamp))?;
         Ok(done.value)
     }
 
@@ -148,8 +155,8 @@ impl Reservations {
     }
 
     pub fn confirm(&self, id: u64, expected: Option<Cents>) -> Result<Cents> {
-        self.write(|h, now| {
-            let total = h.confirm(now, id, expected)?;
+        self.write_stamped(|h, now, stamp| {
+            let total = h.confirm(now, stamp.version(), id, expected)?;
             Ok((format!("confirm #{id} paid {total}"), total))
         })
     }

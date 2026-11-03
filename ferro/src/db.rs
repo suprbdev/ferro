@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -37,6 +38,7 @@ pub struct Commit {
     pub root: Option<Ptr>,
     pub restored: Option<u64>,
     pub(crate) parts: Parts,
+    pub(crate) stamped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +86,7 @@ impl PartialEq for Commit {
             && self.time_ms == other.time_ms
             && self.message == other.message
             && self.parts == other.parts
+            && self.stamped == other.stamped
             && self.restored == other.restored
             && self.root.map(|ptr| ptr.hash) == other.root.map(|ptr| ptr.hash)
     }
@@ -118,7 +121,12 @@ impl Commit {
             root: None,
             restored: None,
             parts: Parts::Whole,
+            stamped: false,
         }
+    }
+
+    fn floor(&self) -> u64 {
+        self.time_ms.saturating_add(u64::from(self.stamped))
     }
 }
 
@@ -126,7 +134,26 @@ impl Commit {
 pub struct Committed<R> {
     pub value: R,
     pub version: u64,
+    pub time_ms: u64,
     pub changed: bool,
+}
+
+#[derive(Debug)]
+pub struct Stamp<'a> {
+    version: u64,
+    floor: u64,
+    time: &'a OnceCell<u64>,
+    clock: Option<&'a Clock>,
+}
+
+impl Stamp<'_> {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn time_ms(&self) -> u64 {
+        *self.time.get_or_init(|| read_clock(self.clock).max(self.floor))
+    }
 }
 
 impl Data for Commit {
@@ -146,6 +173,7 @@ impl Data for Commit {
             root: Option::<Ptr>::decode(r)?,
             restored: Option::<u64>::decode(r)?,
             parts: Parts::Lines,
+            stamped: false,
         })
     }
 }
@@ -280,6 +308,7 @@ struct Intent {
     restored: Option<u64>,
     merged: Option<Merged>,
     record: Option<(String, u64)>,
+    time: Option<u64>,
 }
 
 struct Change<'a, T> {
@@ -346,6 +375,7 @@ struct Queue<T> {
 #[derive(Clone, Copy)]
 struct Sealed {
     version: u64,
+    time_ms: u64,
     ticket: u64,
     framed: bool,
 }
@@ -378,6 +408,7 @@ struct Group<T> {
     messages: Vec<String>,
     members: usize,
     seal: Arc<Seal>,
+    time: OnceCell<u64>,
 }
 
 #[derive(Default)]
@@ -445,6 +476,7 @@ struct Shared<T> {
     reclaim: Reclaim,
     automatic: bool,
     hook: Option<Hook>,
+    clock: Option<Clock>,
     cycle: Mutex<()>,
     log: Mutex<CycleLog>,
     retired: Mutex<Vec<Retired>>,
@@ -501,6 +533,20 @@ impl fmt::Debug for Hook {
     }
 }
 
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Clock(pub Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl fmt::Debug for Clock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Clock")
+    }
+}
+
+fn read_clock(clock: Option<&Clock>) -> u64 {
+    clock.map_or_else(now_ms, |clock| (clock.0)())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     store: StoreOptions,
@@ -508,6 +554,7 @@ pub struct Options {
     reclaim: Reclaim,
     coalesce: bool,
     hook: Option<Hook>,
+    clock: Option<Clock>,
 }
 
 impl Options {
@@ -553,6 +600,12 @@ impl Options {
     #[doc(hidden)]
     pub fn hook(mut self, hook: Hook) -> Self {
         self.hook = Some(hook);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn clock(mut self, clock: Clock) -> Self {
+        self.clock = Some(clock);
         self
     }
 
@@ -619,6 +672,7 @@ impl Options {
             reclaim: self.reclaim,
             automatic,
             hook: self.hook,
+            clock: self.clock,
             cycle: Mutex::new(()),
             log: Mutex::new(CycleLog::default()),
             retired: Mutex::new(Vec::new()),
@@ -753,6 +807,7 @@ impl<T: Data> Shared<T> {
             messages: Vec::new(),
             members: 0,
             seal: Arc::new(Seal::default()),
+            time: OnceCell::new(),
         }
     }
 
@@ -777,6 +832,7 @@ impl<T: Data> Shared<T> {
             working,
             messages,
             seal,
+            time,
             ..
         } = group;
         let (message, parts) = Parts::join(messages);
@@ -789,7 +845,10 @@ impl<T: Data> Shared<T> {
                     working: &working,
                     message,
                     parts,
-                    intent: Intent::default(),
+                    intent: Intent {
+                        time: time.into_inner(),
+                        ..Intent::default()
+                    },
                     seal: Some(&seal),
                 },
             )
@@ -800,8 +859,9 @@ impl<T: Data> Shared<T> {
             queue.open = None;
         }
         let _ = seal.outcome.set(match written {
-            Ok(Ok(version)) => Ok(Sealed {
+            Ok(Ok((version, time_ms))) => Ok(Sealed {
                 version,
+                time_ms,
                 ticket,
                 framed: false,
             }),
@@ -815,13 +875,13 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    fn await_group(&self, seal: &Arc<Seal>) -> Result<u64> {
+    fn await_group(&self, seal: &Arc<Seal>) -> Result<(u64, u64)> {
         let mut notices = Vec::new();
         loop {
             if seal.settled.load(Ordering::Acquire)
                 && let Some(Ok(sealed)) = seal.outcome.get()
             {
-                return Ok(sealed.version);
+                return Ok((sealed.version, sealed.time_ms));
             }
             let queue = self.queue.lock();
             if queue.failed {
@@ -832,11 +892,13 @@ impl<T: Data> Shared<T> {
                     self.store().check_healthy()?;
                     return Err(Error::GroupFailed(failure.clone()));
                 }
-                Some(Ok(sealed)) if queue.settled >= sealed.ticket => return Ok(sealed.version),
+                Some(Ok(sealed)) if queue.settled >= sealed.ticket => {
+                    return Ok((sealed.version, sealed.time_ms));
+                }
                 Some(Ok(sealed)) if !sealed.framed => {
                     drop(queue);
                     self.settle(sealed.ticket, &mut notices)?;
-                    return Ok(sealed.version);
+                    return Ok((sealed.version, sealed.time_ms));
                 }
                 Some(Ok(_)) if !queue.syncing && !queue.waiting.is_empty() => {
                     self.lead(queue, &mut notices)?;
@@ -865,7 +927,7 @@ impl<T: Data> Shared<T> {
         refs: Refs,
         mut txn: Txn,
         branch: Option<&Arc<Branch<T>>>,
-        seal: Option<(&Arc<Seal>, u64)>,
+        seal: Option<(&Arc<Seal>, u64, u64)>,
     ) -> Result<()> {
         let ptr = write_value(&refs, &mut txn)?;
         let frame = txn.write(ptr)?;
@@ -875,14 +937,15 @@ impl<T: Data> Shared<T> {
         tip.ptr = Some(ptr);
         let refs = tip.clone();
         let mut queue = self.queue.lock();
-        if let Some((seal, version)) = seal {
+        if let Some((seal, version, time_ms)) = seal {
             let _ = seal.outcome.set(Ok(Sealed {
                 version,
+                time_ms,
                 ticket: frame.seq,
                 framed: true,
             }));
         }
-        let seal = seal.map(|(seal, _)| seal.clone());
+        let seal = seal.map(|(seal, _, _)| seal.clone());
         queue.waiting.push(Pending {
             frame,
             refs,
@@ -980,7 +1043,11 @@ impl<T: Data> Shared<T> {
         outcome
     }
 
-    fn commit_locked(&self, tip: &mut RefState, change: Change<'_, T>) -> Result<u64> {
+    fn now(&self) -> u64 {
+        read_clock(self.clock.as_ref())
+    }
+
+    fn commit_locked(&self, tip: &mut RefState, change: Change<'_, T>) -> Result<(u64, u64)> {
         let Change {
             branch,
             state,
@@ -1007,13 +1074,14 @@ impl<T: Data> Shared<T> {
             }
             _ => false,
         };
+        let head = &state.snapshot.commit;
         if !recorded
             && intent.merged.is_none()
             && previous.unwrap_or(self.genesis_hash) == root.hash
         {
-            return Ok(state.snapshot.commit.version);
+            return Ok((head.version, head.time_ms));
         }
-        let mut time_ms = now_ms().max(state.snapshot.commit.time_ms);
+        let mut time_ms = intent.time.unwrap_or_else(|| self.now().max(head.floor()));
         if let Some(link) = intent.merged {
             time_ms = time_ms.max(store.load::<Entry>(link.ptr)?.commit.time_ms);
         }
@@ -1024,6 +1092,7 @@ impl<T: Data> Shared<T> {
             root: Some(root),
             restored: intent.restored,
             parts,
+            stamped: intent.time.is_some(),
         };
         let log = state.log.append(store, &mut txn, commit, intent.merged)?;
         let log = match self.history {
@@ -1040,8 +1109,8 @@ impl<T: Data> Shared<T> {
                 merged,
             },
         );
-        self.stage(tip, next, txn, Some(branch), seal.map(|seal| (seal, version)))?;
-        Ok(version)
+        self.stage(tip, next, txn, Some(branch), seal.map(|seal| (seal, version, time_ms)))?;
+        Ok((version, time_ms))
     }
 
     fn step(&self, name: &'static str) {
@@ -1315,7 +1384,7 @@ impl<T: Data> Db<T> {
 
     pub fn commit<R>(&self, message: impl Into<String>, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         let message = message.into();
-        let done = self.transact::<R, Error>(|root| Ok((message, f(root))))?;
+        let done = self.transact::<R, Error>(|root, _| Ok((message, f(root))))?;
         Ok(done.value)
     }
 
@@ -1323,8 +1392,18 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> (S, R),
     ) -> Result<Committed<R>> {
-        self.transact::<R, Error>(|root| {
+        self.transact::<R, Error>(|root, _| {
             let (message, value) = f(root);
+            Ok((message.into(), value))
+        })
+    }
+
+    pub fn commit_stamped<R, S: Into<String>>(
+        &self,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> (S, R),
+    ) -> Result<Committed<R>> {
+        self.transact::<R, Error>(|root, stamp| {
+            let (message, value) = f(root, stamp);
             Ok((message.into(), value))
         })
     }
@@ -1342,7 +1421,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
         let message = message.into();
-        let done = self.transact::<R, E>(|root| {
+        let done = self.transact::<R, E>(|root, _| {
             f(root).map(|value| (message, value))
         })?;
         Ok(done.value)
@@ -1352,25 +1431,42 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        self.transact(|root| {
+        self.transact(|root, _| {
             let (message, value) = f(root)?;
+            Ok((message.into(), value))
+        })
+    }
+
+    pub fn try_commit_stamped<R, S: Into<String>, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        self.transact(|root, stamp| {
+            let (message, value) = f(root, stamp)?;
             Ok((message.into(), value))
         })
     }
 
     fn transact<R, E: From<Error>>(
         &self,
-        f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         if self.shared.coalesce {
             return self.combine(f);
         }
-        self.alone(|_, _, root| f(root).map(|(message, value)| (message, value, Intent::default())))
+        self.alone(|_, _, root, stamp| {
+            f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
+        })
     }
 
     fn alone<R, E: From<Error>>(
         &self,
-        f: impl FnOnce(&RefState, &State<T>, &mut T) -> std::result::Result<(String, R, Intent), E>,
+        f: impl FnOnce(
+            &RefState,
+            &State<T>,
+            &mut T,
+            &Stamp<'_>,
+        ) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let mut notices = Vec::new();
         let mut tip = self.shared.lock_tip();
@@ -1378,7 +1474,16 @@ impl<T: Data> Db<T> {
         let state = self.branch.tip.load_full();
         let mut working = (*state.snapshot.value).clone();
         let before = state.snapshot.commit.version;
-        let result = f(&tip, &state, &mut working).and_then(|(message, value, intent)| {
+        let time = OnceCell::new();
+        let stamp = Stamp {
+            version: before + 1,
+            floor: state.snapshot.commit.floor(),
+            time: &time,
+            clock: self.shared.clock.as_ref(),
+        };
+        let ran = f(&tip, &state, &mut working, &stamp);
+        let result = ran.and_then(|(message, value, mut intent)| {
+            intent.time = time.get().copied();
             let change = Change {
                 branch: &self.branch,
                 state: &state,
@@ -1388,23 +1493,24 @@ impl<T: Data> Db<T> {
                 intent,
                 seal: None,
             };
-            let version = self.shared.commit_locked(&mut tip, change)?;
-            Ok((value, version))
+            let (version, time_ms) = self.shared.commit_locked(&mut tip, change)?;
+            Ok((value, version, time_ms))
         });
         let ticket = self.shared.store().last_seq();
         drop(tip);
         self.shared.settle(ticket, &mut notices)?;
-        let (value, version) = result?;
+        let (value, version, time_ms) = result?;
         Ok(Committed {
             value,
             version,
+            time_ms,
             changed: version != before,
         })
     }
 
     fn combine<R, E: From<Error>>(
         &self,
-        f: impl FnOnce(&mut T) -> std::result::Result<(String, R), E>,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let shared = &self.shared;
         let mut tip = shared.arrive();
@@ -1419,12 +1525,23 @@ impl<T: Data> Db<T> {
         let checkpoint = (group.members > 0).then(|| group.working.clone());
         let before = group.state.snapshot.commit.version;
         let seal = group.seal.clone();
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(&mut group.working)));
+        let timed = group.time.get().is_some();
+        let stamp = Stamp {
+            version: before + 1,
+            floor: group.state.snapshot.commit.floor(),
+            time: &group.time,
+            clock: shared.clock.as_ref(),
+        };
+        let working = &mut group.working;
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(working, &stamp)));
         if !matches!(ran, Ok(Ok(_))) {
             group.working = match checkpoint {
                 Some(checkpoint) => checkpoint,
                 None => (*group.state.snapshot.value).clone(),
             };
+            if !timed {
+                group.time = OnceCell::new();
+            }
         }
         let result = match ran {
             Err(panicked) => {
@@ -1447,10 +1564,11 @@ impl<T: Data> Db<T> {
             shared.seal_group(&mut tip, group);
         }
         drop(tip);
-        let version = shared.await_group(&seal)?;
+        let (version, time_ms) = shared.await_group(&seal)?;
         Ok(Committed {
             value: result?,
             version,
+            time_ms,
             changed: version != before,
         })
     }
@@ -1510,7 +1628,7 @@ impl<T: Data> Db<T> {
             restored: Some(snapshot.commit.version),
             ..Intent::default()
         };
-        self.alone::<(), Error>(move |_, _, root| {
+        self.alone::<(), Error>(move |_, _, root, _| {
             *root = value;
             Ok((message, (), intent))
         })
@@ -1600,7 +1718,7 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<Committed<R>> {
-        self.alone::<R, Error>(|tip, ours, root| {
+        self.alone::<R, Error>(|tip, ours, root, _| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -1630,7 +1748,7 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         f: impl FnOnce(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
     ) -> Result<std::result::Result<Committed<R>, u64>> {
-        let done = self.alone::<std::result::Result<R, u64>, Error>(|tip, ours, root| {
+        let done = self.alone::<std::result::Result<R, u64>, Error>(|tip, ours, root, _| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -1654,10 +1772,11 @@ impl<T: Data> Db<T> {
             };
             Ok((message.into(), Ok(value), intent))
         })?;
-        let (version, changed) = (done.version, done.changed);
+        let (version, time_ms, changed) = (done.version, done.time_ms, done.changed);
         Ok(done.value.map(|value| Committed {
             value,
             version,
+            time_ms,
             changed,
         }))
     }

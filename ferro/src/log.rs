@@ -16,7 +16,9 @@ const JOINED: u8 = 8;
 const MERGED: u8 = 16;
 const GRAPH: u8 = 32;
 const BOUNDED: u8 = 64;
-const KNOWN: u8 = HAS_PREV | HAS_SKIP | WHOLE | JOINED | MERGED | GRAPH | BOUNDED;
+const EXTRA: u8 = 128;
+const STAMPED: u64 = 1;
+const KNOWN_EXTRA: u64 = STAMPED;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Merged {
@@ -64,12 +66,17 @@ impl Data for Entry {
         };
         let graph = self.graph;
         let wide = (graph.lift, graph.reach, graph.last_merge) != (0, 0, 0);
+        let extra = u64::from(self.commit.stamped) * STAMPED;
         let flags = u8::from(self.prev.is_some()) * HAS_PREV
             + u8::from(self.skip.is_some()) * HAS_SKIP
             + u8::from(self.merged.is_some()) * MERGED
             + u8::from(wide) * GRAPH
-            + u8::from(graph.bounded) * BOUNDED;
+            + u8::from(graph.bounded) * BOUNDED
+            + u8::from(extra != 0) * EXTRA;
         w.u8(flags | parts);
+        if extra != 0 {
+            w.varint(extra);
+        }
         if let Parts::Joined(lengths) = &self.commit.parts {
             w.varint(lengths.len() as u64);
             for len in lengths.iter() {
@@ -100,12 +107,17 @@ impl Data for Entry {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let mut commit = Commit::decode(r)?;
         let flags = r.u8()?;
-        if flags & !KNOWN != 0 || flags & (WHOLE | JOINED) == WHOLE | JOINED {
+        if flags & (WHOLE | JOINED) == WHOLE | JOINED {
             return Err(Error::Decode(format!("invalid log entry flags {flags}")));
+        }
+        let extra = if flags & EXTRA != 0 { r.varint()? } else { 0 };
+        if extra & !KNOWN_EXTRA != 0 || (flags & EXTRA != 0 && extra == 0) {
+            return Err(Error::Decode(format!("invalid log entry extra flags {extra}")));
         }
         if flags & WHOLE != 0 {
             commit.parts = Parts::Whole;
         }
+        commit.stamped = extra & STAMPED != 0;
         if flags & JOINED != 0 {
             let count = r.varint()?;
             if count > commit.message.len() as u64 + 1 {

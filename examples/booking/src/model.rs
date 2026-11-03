@@ -93,6 +93,7 @@ pub struct Booking {
     pub paid: Cents,
     pub refunded: Cents,
     pub paid_ms: Option<u64>,
+    pub paid_version: Option<u64>,
     pub ended_ms: Option<u64>,
     pub reason: Option<String>,
 }

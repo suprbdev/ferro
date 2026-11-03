@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::{fast, quiet_ferro_panics};
 use ferro::codec::{Decoder, Encoder};
+use ferro::db::Clock;
 use ferro::{Committed, Data, Db, Error, Keep, Map, Options, Reclaim};
 use tempfile::TempDir;
 
@@ -1136,4 +1137,102 @@ fn a_power_cut_keeps_every_acknowledged_closure() {
     for (floor, image) in &images {
         check_image(&path, image, *floor, &keys);
     }
+}
+
+fn clocked(ms: u64) -> (TempDir, Db<Root>) {
+    let dir = on_disk();
+    let clock = Clock(Arc::new(move || ms));
+    let db = coalesced().clock(clock).open::<Root>(dir.path().join("stamp.ferro")).unwrap();
+    db.update(|root| {
+        root.insert(0, 1);
+    })
+    .unwrap();
+    (dir, db)
+}
+
+type Stamped = JoinHandle<Result<Committed<(u64, u64)>, Error>>;
+
+fn stamped(db: &Db<Root>, ran: &Ran, name: &str, refuse: bool) -> Stamped {
+    let (db, ran, name) = (db.clone(), ran.0.clone(), name.to_string());
+    thread::spawn(move || {
+        db.try_commit_stamped(|root, stamp| {
+            increment(root);
+            let at = (stamp.version(), stamp.time_ms());
+            ran.fetch_add(1, Ordering::SeqCst);
+            if refuse {
+                return Err(Error::Decode(format!("{name} refused at {at:?}")));
+            }
+            Ok((name, at))
+        })
+    })
+}
+
+#[test]
+fn stamps_in_a_group_name_the_groups_version_and_time() {
+    let _turn = serial();
+    let (_dir, db) = clocked(8_000);
+    let ran = Ran::new();
+    let leader = stall_leader(&db, &ran);
+    let first = stamped(&db, &ran, "first", false);
+    ran.reach(2);
+    let plain = bump(&db, &ran, "plain".to_string());
+    ran.reach(3);
+    let second = stamped(&db, &ran, "second", false);
+    ran.reach(4);
+    settle_queue();
+    release(false);
+    let led = leader.join().unwrap().unwrap();
+    assert_eq!((led.version, led.time_ms), (2, 8_000));
+    let plain = plain.join().unwrap().unwrap();
+    assert_eq!((plain.version, plain.time_ms), (3, 8_000));
+    for member in [first, second] {
+        let done = member.join().unwrap().unwrap();
+        assert_eq!(done.value, (3, 8_000));
+        assert_eq!((done.version, done.time_ms, done.changed), (3, 8_000, true));
+    }
+    assert_eq!(db.log().get(&3).unwrap().time_ms, 8_000);
+    assert_eq!(db.as_of(8_000).unwrap().version(), 3);
+    assert_eq!(counter(&db.as_of(8_000).unwrap()), 5);
+    let after = db.commit_with(|root| ("after", increment(root))).unwrap();
+    assert_eq!((after.version, after.time_ms), (4, 8_001));
+    assert_eq!(db.as_of(8_000).unwrap().version(), 3);
+}
+
+#[test]
+fn a_closure_that_fails_after_reading_the_time_takes_back_only_its_own_claim() {
+    let _turn = serial();
+    let (_dir, db) = clocked(9_000);
+    let ran = Ran::new();
+    let leader = stall_leader(&db, &ran);
+    let refused = stamped(&db, &ran, "refused", true);
+    ran.reach(2);
+    let member = bump(&db, &ran, "member".to_string());
+    ran.reach(3);
+    settle_queue();
+    release(false);
+    leader.join().unwrap().unwrap();
+    match refused.join().unwrap() {
+        Err(Error::Decode(message)) => assert_eq!(message, "refused refused at (3, 9000)"),
+        other => panic!("unexpected {other:?}"),
+    }
+    let member = member.join().unwrap().unwrap();
+    assert_eq!((member.version, member.time_ms), (3, 9_000));
+    let next = db.commit_with(|root| ("next", increment(root))).unwrap();
+    assert_eq!((next.version, next.time_ms), (4, 9_000));
+
+    let leader = stall_leader(&db, &ran);
+    let kept = stamped(&db, &ran, "kept", false);
+    ran.reach(5);
+    let refused = stamped(&db, &ran, "refused", true);
+    ran.reach(6);
+    settle_queue();
+    release(false);
+    assert_eq!(leader.join().unwrap().unwrap().version, 5);
+    assert_eq!(kept.join().unwrap().unwrap().value, (6, 9_000));
+    assert!(refused.join().unwrap().is_err());
+    let last = db.commit_with(|root| ("last", increment(root))).unwrap();
+    assert_eq!((last.version, last.time_ms), (7, 9_001));
+    assert_eq!(db.as_of(9_000).unwrap().version(), 6);
+    let group = db.log().get(&6).unwrap();
+    assert_eq!(group.messages().collect::<Vec<_>>(), vec!["kept"]);
 }

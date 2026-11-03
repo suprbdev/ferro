@@ -97,45 +97,6 @@ pub struct Receipt {
     pub credit_after: Cents,
 }
 
-fn paid_in(h: &Hotels, id: u64) -> bool {
-    h.bookings.get(&id).is_some_and(|b| b.paid_ms.is_some())
-}
-
-fn located(db: &Db<Hotels>, id: u64, paid_ms: u64) -> Result<Option<u64>> {
-    let near = match db.as_of(paid_ms) {
-        Ok(near) => near,
-        Err(ferro::Error::NoVersion(_)) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut version = near.version();
-    if !paid_in(&near, id) {
-        version += 1;
-    } else {
-        for _ in 0..64 {
-            if version <= 1 {
-                break;
-            }
-            let earlier = db.at(version - 1)?;
-            if !paid_in(&earlier, id) {
-                break;
-            }
-            version -= 1;
-        }
-    }
-    if version < 1 || version > db.version() {
-        return Ok(None);
-    }
-    let (at, before) = (db.at(version)?, db.at(version - 1)?);
-    Ok((paid_in(&at, id) && !paid_in(&before, id)).then_some(version))
-}
-
-pub fn paid_version(db: &Db<Hotels>, id: u64, paid_ms: u64) -> Result<Option<u64>> {
-    if let Some(version) = located(db, id, paid_ms)? {
-        return Ok(Some(version));
-    }
-    Ok(db.bisect(.., |h| paid_in(h, id))?)
-}
-
 pub fn as_paid(db: &Db<Hotels>, id: u64) -> Result<Receipt> {
     let current = db.read();
     let now = current
@@ -149,7 +110,7 @@ pub fn as_paid(db: &Db<Hotels>, id: u64) -> Result<Receipt> {
         wanted: "paid",
     };
     let paid_ms = now.paid_ms.ok_or_else(wrong)?;
-    let version = paid_version(db, id, paid_ms)?.ok_or_else(wrong)?;
+    let version = now.paid_version.ok_or_else(wrong)?;
     let past = db.at(version)?;
     let before = db.at(version - 1)?;
     let then = past
