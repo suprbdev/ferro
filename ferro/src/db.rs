@@ -3007,6 +3007,49 @@ impl<T: Data> Db<T> {
         self.shared.step(name);
     }
 
+    pub(crate) fn check_writable(&self) -> Result<()> {
+        self.branch.check_live()?;
+        let store = self.shared.store();
+        if store.is_read_only() {
+            return Err(Error::ReadOnly);
+        }
+        store.check_healthy()
+    }
+
+    pub(crate) fn hold_cycles(&self) -> MutexGuard<'_, ()> {
+        self.shared.cycle.lock()
+    }
+
+    pub(crate) fn append_frame<X>(
+        &self,
+        fill: impl FnOnce(&Store, &mut Txn) -> Result<X>,
+    ) -> Result<X> {
+        let shared = &self.shared;
+        let mut tip = shared.tip.lock();
+        let _whole = reentry::whole(shared.id);
+        let store = shared.store();
+        let mut txn = store.begin()?;
+        let out = fill(&store, &mut txn)?;
+        txn.spill()?;
+        txn.unreserved();
+        match tip.ptr {
+            Some(head) => {
+                let frame = txn.write(head)?;
+                shared.queue.lock().waiting.push(Pending {
+                    frame,
+                    refs: tip.clone(),
+                    update: None,
+                    seal: None,
+                });
+            }
+            None => {
+                let refs = tip.refs.clone();
+                shared.stage(&mut tip, refs, txn, None, None, None)?;
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn rewrite_refs<X>(
         &self,
         edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,

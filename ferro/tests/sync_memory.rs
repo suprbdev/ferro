@@ -256,3 +256,39 @@ fn a_streamed_bundle_costs_a_buffer_and_its_objects_not_its_bytes() {
         "receiving {written} bytes in {objects} objects took {received} bytes of heap"
     );
 }
+
+#[test]
+fn a_stream_of_commits_with_long_messages_costs_a_buffer_not_its_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Root> = fast().open(dir.path().join("b.ferro")).unwrap();
+    for round in 0..64u64 {
+        a.commit(format!("short {round}"), |root| {
+            root.insert(round, text(round, 16));
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    for round in 64..320u64 {
+        a.commit(text(round, 64 << 10), |root| {
+            root.insert(round, text(round, 16));
+        })
+        .unwrap();
+    }
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let len = bundle.as_bytes().len();
+    let (pulled, received) = heap_of(|| b.receive("a", &bundle, refuse).unwrap());
+    let objects = pulled.objects as usize;
+    println!("{len} bytes in {objects} objects, received with {received} bytes of heap");
+    assert!(len > 16 * MIB, "{len}");
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.head_hash(), a.head_hash());
+    assert!(
+        received < 6 * MIB + objects * 1024,
+        "receiving {len} bytes of commits took {received} bytes of heap"
+    );
+    b.verify_typed().unwrap();
+}

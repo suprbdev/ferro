@@ -2,7 +2,7 @@
 mod imp {
     use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io;
-    use std::os::unix::fs::{MetadataExt, fchown};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, fchown};
     use std::path::{Path, PathBuf};
 
     pub(crate) use std::os::unix::fs::FileExt;
@@ -56,6 +56,17 @@ mod imp {
     pub(crate) fn copy_owner(file: &File, source: &Metadata) {
         let _ = fchown(file, Some(source.uid()), Some(source.gid()));
     }
+
+    pub(crate) fn scratch(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        std::fs::remove_file(path)?;
+        Ok(file)
+    }
 }
 
 #[cfg(windows)]
@@ -75,7 +86,8 @@ mod imp {
         ERROR_NOT_LOCKED, ERROR_NOT_SUPPORTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
         FileRenameInfoEx, GetFileInformationByHandle, LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK,
         LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, SYNCHRONIZE, SetFileInformationByHandle,
         UnlockFileEx,
@@ -289,6 +301,16 @@ mod imp {
     }
 
     pub(crate) fn copy_owner(_file: &File, _source: &Metadata) {}
+
+    pub(crate) fn scratch(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)
+    }
 }
 
 pub(crate) use imp::*;

@@ -50,6 +50,7 @@ const DEDUPE_CHUNK: usize = 64;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 pub(crate) const MAX_RATIO: usize = 255;
+const REPLAY_CHUNK: usize = 256 << 10;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -461,7 +462,7 @@ pub fn record_len(offset: u64, object: &Object) -> usize {
 }
 
 struct RecordReader<'a> {
-    file: &'a File,
+    file: Option<&'a File>,
     start: u64,
     tail: u64,
     bytes: Cow<'a, [u8]>,
@@ -473,16 +474,17 @@ impl RecordReader<'_> {
         if upto <= self.bytes.len() {
             return Ok(());
         }
-        if (upto as u64).checked_add(self.start).is_none_or(|end| end > self.tail) {
+        let past = (upto as u64).checked_add(self.start).is_none_or(|end| end > self.tail);
+        let Some(file) = self.file.filter(|_| !past) else {
             return Err(Error::Corrupt(format!(
                 "record at {} runs past end of log",
                 self.start
             )));
-        }
+        };
         let have = self.bytes.len();
         let want = (upto - have).max(READ_AHEAD);
         let want = want.min((self.tail - self.start) as usize - have);
-        if want > SCAN_CHUNK && self.start + (have + want) as u64 > self.file.metadata()?.len() {
+        if want > SCAN_CHUNK && self.start + (have + want) as u64 > file.metadata()?.len() {
             return Err(Error::Corrupt(format!(
                 "record at {} runs past end of file",
                 self.start
@@ -490,8 +492,7 @@ impl RecordReader<'_> {
         }
         let bytes = self.bytes.to_mut();
         bytes.resize(have + want, 0);
-        self.file
-            .read_exact_at(&mut bytes[have..], self.start + have as u64)?;
+        file.read_exact_at(&mut bytes[have..], self.start + have as u64)?;
         Ok(())
     }
 
@@ -883,6 +884,17 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn flush(&self) -> Result<()> {
+        if self.inner.options.durability != Durability::Fsync {
+            return Ok(());
+        }
+        if let Err(error) = self.inner.file.sync_data() {
+            self.poison();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn checkpoint(&self, frame: Frame) {
         let inner = &self.inner;
         let anchored = inner.marks.lock().anchor.log_end;
@@ -918,13 +930,15 @@ impl Store {
 
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
         let tail = self.inner.written.load(Ordering::Acquire);
-        let (object, len, _) = self.read_within(ptr, tail, &[], true, false)?;
+        let file = Some(&*self.inner.file);
+        let (object, len, _) = Store::read_within(file, ptr, tail, &[], true, false)?;
         Ok((object, len))
     }
 
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
         let tail = self.inner.written.load(Ordering::Acquire);
-        let (object, _, packed) = self.read_within(ptr, tail, &[], true, true)?;
+        let file = Some(&*self.inner.file);
+        let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true)?;
         Ok((object, packed))
     }
 
@@ -937,7 +951,7 @@ impl Store {
             )));
         }
         let mut reader = RecordReader {
-            file: &self.inner.file,
+            file: Some(&*self.inner.file),
             start: ptr.offset,
             tail,
             bytes: Cow::Borrowed(&[]),
@@ -965,23 +979,31 @@ impl Store {
         Ok(links)
     }
 
-    fn read_within(&self, ptr: Ptr, tail: u64, held: &[u8], verify: bool, keep: bool) -> Result<Raw> {
+    fn read_within(
+        file: Option<&File>,
+        ptr: Ptr,
+        tail: u64,
+        held: &[u8],
+        verify: bool,
+        keep: bool,
+    ) -> Result<Raw> {
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
                 "pointer {} outside log of {tail} bytes",
                 ptr.offset
             )));
         }
-        let bytes = if held.is_empty() {
-            let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
-            let mut bytes = vec![0u8; want];
-            self.inner.file.read_exact_at(&mut bytes, ptr.offset)?;
-            Cow::Owned(bytes)
-        } else {
-            Cow::Borrowed(held)
+        let bytes = match file {
+            Some(file) if held.is_empty() => {
+                let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
+                let mut bytes = vec![0u8; want];
+                file.read_exact_at(&mut bytes, ptr.offset)?;
+                Cow::Owned(bytes)
+            }
+            _ => Cow::Borrowed(held),
         };
         let mut reader = RecordReader {
-            file: &self.inner.file,
+            file,
             start: ptr.offset,
             tail,
             bytes,
@@ -1134,6 +1156,7 @@ impl Store {
             seen: HashMap::default(),
             remembered: Vec::new(),
             unshared: false,
+            reserve: true,
         })
     }
 
@@ -1229,6 +1252,7 @@ pub struct Txn {
     seen: Seen,
     remembered: Vec<Remembered>,
     unshared: bool,
+    reserve: bool,
 }
 
 type Seen = HashMap<Hash, u64, BuildHasherDefault<Prehashed>>;
@@ -1437,6 +1461,10 @@ impl Txn {
         self.unshared = true;
     }
 
+    pub(crate) fn unreserved(&mut self) {
+        self.reserve = false;
+    }
+
     pub(crate) fn put_ref(&mut self, object: &Object, hash: Hash) -> Result<Ptr> {
         if let Some(ptr) = self.known(hash, object.body.len())? {
             return Ok(ptr);
@@ -1489,18 +1517,21 @@ impl Txn {
         Ptr { hash, offset }
     }
 
-    pub(crate) fn put_packed(
-        &mut self,
-        object: Object,
-        hash: Hash,
-        packed: Option<Vec<u8>>,
-    ) -> Result<Ptr> {
-        if let Some(ptr) = self.known(hash, object.body.len())? {
+    pub(crate) fn put_record(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        if let Some(ptr) = self.known(hash, staged.raw)? {
             self.seen.insert(hash, ptr.offset);
             return Ok(ptr);
         }
-        let staged = staged(&object.body, packed.as_deref(), &object.links);
         Ok(self.record(hash, staged))
+    }
+
+    pub(crate) fn put_unlisted(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        if let Some(ptr) = self.known(hash, staged.raw)? {
+            return Ok(ptr);
+        }
+        let offset = self.start + self.buf.len() as u64;
+        append_staged(&mut self.buf, offset, staged);
+        Ok(Ptr { hash, offset })
     }
 
     pub(crate) fn put_fresh(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
@@ -1533,7 +1564,8 @@ impl Txn {
             _ => (&[][..], self.start),
         };
         let verify = ptr.offset < self.origin;
-        let (object, _, _) = self.store.read_within(ptr, tail, held, verify, false)?;
+        let file = Some(&*self.store.inner.file);
+        let (object, _, _) = Store::read_within(file, ptr, tail, held, verify, false)?;
         Ok(object)
     }
 
@@ -1575,7 +1607,9 @@ impl Txn {
             hasher.update(&self.buf[FRAME_BYTES..]);
         }
         header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
-        reserve(inner, &mut cursor, end);
+        if self.reserve {
+            reserve(inner, &mut cursor, end);
+        }
         let written = if spilled {
             inner
                 .file
@@ -1606,6 +1640,255 @@ impl Txn {
         let store = self.store.clone();
         let frame = self.write(head)?;
         store.sync(frame)
+    }
+}
+
+static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+fn scratch(near: &Path) -> Result<File> {
+    loop {
+        let mut name = near.as_os_str().to_os_string();
+        let id = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
+        name.push(format!(".receiving.{}.{id}", std::process::id()));
+        match platform::scratch(Path::new(&name)) {
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            opened => return Ok(opened?),
+        }
+    }
+}
+
+pub(crate) struct Staging {
+    near: PathBuf,
+    limit: usize,
+    file: Option<File>,
+    start: u64,
+    buf: Vec<u8>,
+    seen: Seen,
+    count: usize,
+}
+
+pub(crate) struct Record {
+    pub(crate) hash: Hash,
+    pub(crate) raw: usize,
+    pub(crate) packed: bool,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) links: Vec<Ptr>,
+}
+
+impl Record {
+    pub(crate) fn staged<'a>(&'a self, links: &'a [Ptr]) -> Staged<'a> {
+        Staged {
+            raw: self.raw,
+            payload: &self.payload,
+            packed: self.packed,
+            links,
+        }
+    }
+}
+
+fn parse_varint(bytes: &[u8], pos: &mut usize) -> Result<Option<u64>> {
+    let mut value = 0u64;
+    for index in 0..MAX_VARINT {
+        let Some(&byte) = bytes.get(*pos) else {
+            return Ok(None);
+        };
+        *pos += 1;
+        if index == MAX_VARINT - 1 && byte > 1 {
+            break;
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+    }
+    Err(Error::Corrupt("varint overflow in a staged record".into()))
+}
+
+fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
+    let Some(hash) = bytes.get(..HASH_BYTES) else {
+        return Ok(None);
+    };
+    let hash: Hash = hash.try_into().expect("slice length is HASH_BYTES");
+    let offset = at + HASH_BYTES as u64;
+    let mut pos = HASH_BYTES;
+    let size = |value: u64| {
+        usize::try_from(value).map_err(|_| Error::Corrupt("staged record overflow".into()))
+    };
+    let Some(stored) = parse_varint(bytes, &mut pos)? else {
+        return Ok(None);
+    };
+    let stored = size(stored)?;
+    let Some(flagged) = parse_varint(bytes, &mut pos)? else {
+        return Ok(None);
+    };
+    let packed = flagged & 1 == 1;
+    let raw = match packed {
+        true => match parse_varint(bytes, &mut pos)? {
+            Some(raw) => size(raw)?,
+            None => return Ok(None),
+        },
+        false => stored,
+    };
+    let Some(payload) = bytes.get(pos..pos.saturating_add(stored)) else {
+        return Ok(None);
+    };
+    let payload = payload.to_vec();
+    pos += stored;
+    let count = size(flagged >> 1)?;
+    let mut links = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let Some(found) = bytes.get(pos..pos + HASH_BYTES) else {
+            return Ok(None);
+        };
+        let link: Hash = found.try_into().expect("slice length is HASH_BYTES");
+        pos += HASH_BYTES;
+        let Some(delta) = parse_varint(bytes, &mut pos)? else {
+            return Ok(None);
+        };
+        links.push(Ptr {
+            hash: link,
+            offset: offset.wrapping_sub(unzigzag(delta) as u64),
+        });
+    }
+    let record = Record {
+        hash,
+        raw,
+        packed,
+        payload,
+        links,
+    };
+    Ok(Some((record, pos)))
+}
+
+impl Staging {
+    pub(crate) fn new(near: &Path, limit: usize) -> Staging {
+        Staging {
+            near: near.to_path_buf(),
+            limit,
+            file: None,
+            start: LOG_START,
+            buf: Vec::new(),
+            seen: HashMap::default(),
+            count: 0,
+        }
+    }
+
+    pub(crate) fn put(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
+        let most = HASH_BYTES + staged.payload.len() + 3 * MAX_VARINT + links;
+        if !self.buf.is_empty() && self.buf.len() + most > self.limit {
+            self.spill()?;
+        }
+        self.buf.extend_from_slice(&hash);
+        let offset = self.start + self.buf.len() as u64;
+        append_staged(&mut self.buf, offset, staged);
+        self.seen.insert(hash, offset);
+        self.count += 1;
+        Ok(Ptr { hash, offset })
+    }
+
+    pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
+        self.seen.get(hash).copied()
+    }
+
+    pub(crate) fn spilled(&self) -> bool {
+        self.file.is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn spill(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let file = match &self.file {
+            Some(file) => file,
+            None => self.file.insert(scratch(&self.near)?),
+        };
+        file.write_all_at(&self.buf, self.start)?;
+        self.start += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
+    pub(crate) fn read_object(&self, ptr: Ptr) -> Result<Object> {
+        let end = self.start + self.buf.len() as u64;
+        let (held, tail) = match ptr.offset.checked_sub(self.start) {
+            Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
+            _ => (&[][..], self.start),
+        };
+        let (object, _, _) = Store::read_within(self.file.as_ref(), ptr, tail, held, false, false)?;
+        Ok(object)
+    }
+
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        self.seen = HashMap::default();
+        if self.spilled() {
+            self.spill()?;
+            self.buf = Vec::new();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay(&self) -> Replay<'_> {
+        Replay {
+            staging: self,
+            at: LOG_START,
+            window: Vec::new(),
+            window_at: LOG_START,
+        }
+    }
+}
+
+pub(crate) struct Replay<'a> {
+    staging: &'a Staging,
+    at: u64,
+    window: Vec<u8>,
+    window_at: u64,
+}
+
+impl Replay<'_> {
+    pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
+        let staging = self.staging;
+        if self.at == staging.start + staging.buf.len() as u64 {
+            return Ok(None);
+        }
+        let parsed = match self.at.checked_sub(staging.start) {
+            Some(at) => parse_record(&staging.buf[at as usize..], self.at)?,
+            None => self.spilled_record()?,
+        };
+        let (record, len) =
+            parsed.ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
+        self.at += len as u64;
+        Ok(Some(record))
+    }
+
+    fn spilled_record(&mut self) -> Result<Option<(Record, usize)>> {
+        let file = self
+            .staging
+            .file
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("a staged record was never written".into()))?;
+        loop {
+            let from = usize::try_from(self.at - self.window_at).unwrap_or(usize::MAX);
+            let have = self.window.len().saturating_sub(from);
+            if have > 0
+                && let Some(found) = parse_record(&self.window[from..], self.at)?
+            {
+                return Ok(Some(found));
+            }
+            let left = usize::try_from(self.staging.start - self.at).unwrap_or(usize::MAX);
+            let want = have.saturating_mul(2).max(REPLAY_CHUNK).min(left);
+            if want <= have {
+                return Ok(None);
+            }
+            self.window.clear();
+            self.window.resize(want, 0);
+            file.read_exact_at(&mut self.window, self.at)?;
+            self.window_at = self.at;
+        }
     }
 }
 

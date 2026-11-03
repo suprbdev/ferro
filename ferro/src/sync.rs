@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
 use crate::reentry::Needs;
-use crate::store::{Store, Txn};
+use crate::store::{Record, Staging, Store, Txn, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
 const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
@@ -31,6 +31,7 @@ const READ_BUFFER: usize = 64 << 10;
 const READ_STEP: usize = 1 << 20;
 const WRITE_CHUNK: usize = 64 << 10;
 const SPILL_AT: usize = 1 << 20;
+const PLACE_AT: usize = 256 << 10;
 const PIPE_CHUNKS: usize = 8;
 const PIPE_OBJECTS: usize = 256;
 const CACHED_LINKS: usize = 1 << 16;
@@ -1112,13 +1113,60 @@ fn decode_commit(object: &Object) -> Result<Entry> {
     Ok(entry)
 }
 
-fn sent_ptr(txn: &Txn, hash: Hash) -> Ptr {
-    let offset = txn.offset_of(&hash).expect("a sent object has an offset");
+trait Objects {
+    fn offset_of(&self, hash: &Hash) -> Option<u64>;
+    fn read_object(&self, ptr: Ptr) -> Result<Object>;
+    fn relink(&mut self, object: Object, hash: Hash) -> Result<()>;
+}
+
+impl Objects for Staging {
+    fn offset_of(&self, hash: &Hash) -> Option<u64> {
+        Staging::offset_of(self, hash)
+    }
+
+    fn read_object(&self, ptr: Ptr) -> Result<Object> {
+        Staging::read_object(self, ptr)
+    }
+
+    fn relink(&mut self, _: Object, _: Hash) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct Placed<'a> {
+    txn: &'a mut Txn,
+    earlier: &'a HashMap<Hash, u64>,
+}
+
+impl Objects for Placed<'_> {
+    fn offset_of(&self, hash: &Hash) -> Option<u64> {
+        self.txn
+            .offset_of(hash)
+            .or_else(|| self.earlier.get(hash).copied())
+    }
+
+    fn read_object(&self, ptr: Ptr) -> Result<Object> {
+        self.txn.read_object(ptr)
+    }
+
+    fn relink(&mut self, object: Object, hash: Hash) -> Result<()> {
+        self.txn.put_fresh(object, hash)?;
+        if self.txn.buffered() >= SPILL_AT {
+            self.txn.spill()?;
+        }
+        Ok(())
+    }
+}
+
+fn sent_ptr(objects: &impl Objects, hash: Hash) -> Ptr {
+    let offset = objects
+        .offset_of(&hash)
+        .expect("a sent object has an offset");
     Ptr { hash, offset }
 }
 
-fn read_commit(txn: &Txn, hash: Hash) -> Result<Entry> {
-    decode_commit(&txn.read_object(sent_ptr(txn, hash))?)
+fn read_commit(objects: &impl Objects, hash: Hash) -> Result<Entry> {
+    decode_commit(&objects.read_object(sent_ptr(objects, hash))?)
 }
 
 struct Landing<'a> {
@@ -1162,7 +1210,7 @@ impl Landing<'_> {
 
     fn chained(
         &self,
-        txn: &Txn,
+        objects: &impl Objects,
         unused: &mut HashSet<Hash>,
         segment: usize,
         want: Ptr,
@@ -1171,7 +1219,7 @@ impl Landing<'_> {
         match self.find(segment, at)? {
             Found::Sent(hash) if hash == want.hash => {
                 unused.remove(&hash);
-                Ok(sent_ptr(txn, hash))
+                Ok(sent_ptr(objects, hash))
             }
             Found::Held(ptr) if ptr.hash == want.hash => Ok(ptr),
             Found::Gone => Ok(Ptr {
@@ -1187,13 +1235,13 @@ impl Landing<'_> {
         }
     }
 
-    fn segment(&mut self, refs: &Refs, txn: &Txn, top: Hash) -> Result<Vec<Hash>> {
+    fn segment(&mut self, refs: &Refs, objects: &impl Objects, top: Hash) -> Result<Vec<Hash>> {
         let id = self.segments.len();
         let mut versions = HashMap::new();
         let mut merged = Vec::new();
         let (mut at, mut expected) = (top, None);
         let below = loop {
-            let entry = read_commit(txn, at)?;
+            let entry = read_commit(objects, at)?;
             let version = entry.commit.version;
             let skipped = expected.is_some_and(|want| want != version);
             if version == 0 || version > MAX_VERSION || skipped {
@@ -1215,7 +1263,7 @@ impl Landing<'_> {
                 }
                 break Below::Joins(prev.hash);
             }
-            if txn.offset_of(&prev.hash).is_some() {
+            if objects.offset_of(&prev.hash).is_some() {
                 (at, expected) = (prev.hash, Some(version - 1));
                 continue;
             }
@@ -1240,9 +1288,9 @@ impl Landing<'_> {
 
 type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
 
-struct Vetting<'a> {
+struct Vetting<'a, O> {
     store: &'a Store,
-    txn: &'a Txn,
+    objects: &'a O,
     held_at: &'a HashMap<Hash, usize>,
     roots: &'a [Ptr],
     hinted: &'a [Ptr],
@@ -1262,10 +1310,10 @@ fn rejected(error: Error) -> Error {
     }
 }
 
-impl Vetting<'_> {
+impl<O: Objects> Vetting<'_, O> {
     fn run(&mut self) -> Result<()> {
         while let Some((ptr, kind)) = self.queue.pop() {
-            let shape = match self.txn.offset_of(&ptr.hash) {
+            let shape = match self.objects.offset_of(&ptr.hash) {
                 Some(offset) => self.sent(
                     Ptr {
                         hash: ptr.hash,
@@ -1297,7 +1345,7 @@ impl Vetting<'_> {
         if let Some(shape) = self.sent.get(&ptr.hash, kind) {
             return Ok(shape);
         }
-        let object = self.txn.read_object(ptr)?;
+        let object = self.objects.read_object(ptr)?;
         self.spent = self.spent.saturating_add(object.body.len());
         if self.spent > self.budget {
             return Err(bad("it reuses its objects under too many key ranges"));
@@ -1349,13 +1397,24 @@ impl Vetting<'_> {
 }
 
 struct Anchors {
+    generation: u64,
     bases: Vec<(Ptr, Chain)>,
     roots: Vec<Ptr>,
     hinted: Vec<Ptr>,
     hint_kinds: Vec<Option<Kind>>,
 }
 
-fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Result<Anchors> {
+impl Anchors {
+    fn held(&self) -> HashMap<Hash, Ptr> {
+        let mut held = HashMap::with_capacity(self.roots.len() + self.hinted.len());
+        for ptr in self.roots.iter().chain(&self.hinted) {
+            held.entry(ptr.hash).or_insert(*ptr);
+        }
+        held
+    }
+}
+
+fn located_bases(store: &Store, refs: &Refs, header: &Header) -> Result<Vec<(Ptr, Chain)>> {
     let mut bases = Vec::with_capacity(header.bases.len());
     for mark in &header.bases {
         let found = locate(store, refs, *mark)?.ok_or_else(|| {
@@ -1367,6 +1426,11 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
         })?;
         bases.push(found);
     }
+    Ok(bases)
+}
+
+fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Result<Anchors> {
+    let bases = located_bases(store, refs, header)?;
     let mut roots = Vec::with_capacity(header.roots.len());
     for slot in &header.roots {
         let entry = Entry::load(store, bases[*slot].0)?;
@@ -1408,10 +1472,57 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
         hint_kinds.push(kinds.get(slot).cloned());
     }
     Ok(Anchors {
+        generation: store.id(),
         bases,
         roots,
         hinted,
         hint_kinds,
+    })
+}
+
+fn reanchor(store: &Store, refs: &Refs, header: &Header, before: &Anchors) -> Result<Anchors> {
+    let bases = located_bases(store, refs, header)?;
+    let mut roots = Vec::with_capacity(header.roots.len());
+    for (slot, was) in header.roots.iter().zip(&before.roots) {
+        let entry = Entry::load(store, bases[*slot].0)?;
+        let root = entry
+            .commit
+            .root
+            .filter(|root| root.hash == was.hash)
+            .ok_or_else(|| Error::Corrupt("a commit no longer names the root it had".into()))?;
+        roots.push(root);
+    }
+    let hinted = if store.id() == before.generation {
+        before.hinted.clone()
+    } else {
+        let mut hinted: Vec<Ptr> = Vec::with_capacity(before.hinted.len());
+        let mut parents: HashMap<Ptr, Vec<Ptr>> = HashMap::new();
+        for ((parent, slot), was) in header.hints.iter().zip(&before.hinted) {
+            let from = match parent.checked_sub(roots.len()) {
+                None => roots[*parent],
+                Some(id) => hinted[id],
+            };
+            let links = match parents.entry(from) {
+                hash_map::Entry::Occupied(found) => found.into_mut(),
+                hash_map::Entry::Vacant(empty) => empty.insert(store.read_links(from)?),
+            };
+            let link = links
+                .get(*slot)
+                .copied()
+                .filter(|link| link.hash == was.hash && link.offset != 0)
+                .ok_or_else(|| {
+                    Error::StaleHave("an object it builds on is no longer in this database".into())
+                })?;
+            hinted.push(link);
+        }
+        hinted
+    };
+    Ok(Anchors {
+        generation: store.id(),
+        bases,
+        roots,
+        hinted,
+        hint_kinds: Vec::new(),
     })
 }
 
@@ -1422,7 +1533,7 @@ struct Streamed {
 }
 
 fn stream<R: Read>(
-    txn: &mut Txn,
+    staging: &mut Staging,
     header: &Header,
     anchors: &Anchors,
     input: &mut Input<R>,
@@ -1441,7 +1552,7 @@ fn stream<R: Read>(
         for _ in 0..input.varint()? {
             let hash = input.hash()?;
             let ptr = match input.below(references)? {
-                0 => match txn.offset_of(&hash) {
+                0 => match staging.offset_of(&hash) {
                     Some(offset) => {
                         found.unused.remove(&hash);
                         Ptr { hash, offset }
@@ -1461,59 +1572,87 @@ fn stream<R: Read>(
         }
         let object = Object { body, links };
         let hash = object.hash();
-        if txn.offset_of(&hash).is_some() {
+        if staging.offset_of(&hash).is_some() {
             return Err(bad("it repeats an object"));
         }
         found.carried = found.carried.saturating_add(object.body.len());
-        txn.put_packed(object, hash, packed)?;
+        staging.put(hash, staged(&object.body, packed.as_deref(), &object.links))?;
         found.unused.insert(hash);
         if open {
             found.loose.insert(hash);
-        }
-        if txn.buffered() >= SPILL_AT {
-            txn.spill()?;
         }
     }
     input.finish()?;
     Ok(found)
 }
 
-fn land<T: Data, R: Read>(
-    store: &Store,
+fn place(
     txn: &mut Txn,
+    record: &Record,
+    placed: &mut HashMap<Hash, u64>,
+    held: &HashMap<Hash, Ptr>,
+    unlisted: bool,
+) -> Result<()> {
+    let mut links = Vec::with_capacity(record.links.len());
+    for link in &record.links {
+        links.push(match placed.get(&link.hash) {
+            _ if link.offset == 0 => *link,
+            Some(offset) => Ptr {
+                hash: link.hash,
+                offset: *offset,
+            },
+            None => *held.get(&link.hash).ok_or_else(|| {
+                Error::Corrupt("a received object links to one that was not placed".into())
+            })?,
+        });
+    }
+    let staged = record.staged(&links);
+    let ptr = match unlisted {
+        true => txn.put_unlisted(record.hash, staged)?,
+        false => txn.put_record(record.hash, staged)?,
+    };
+    placed.insert(record.hash, ptr.offset);
+    if txn.buffered() >= SPILL_AT {
+        txn.spill()?;
+    }
+    Ok(())
+}
+
+struct Vetted<'a> {
+    streamed: Streamed,
+    root_kind: &'a Kind,
+}
+
+struct Resolved {
+    refs: Option<Refs>,
+    commits: HashSet<Hash>,
+}
+
+struct Received {
+    staging: Staging,
+    anchors: Anchors,
+    commits: HashSet<Hash>,
+}
+
+fn resolve<O: Objects>(
+    store: &Store,
+    objects: &mut O,
     refs: &Refs,
     remote: &str,
     header: &Header,
-    input: &mut Input<R>,
-) -> Result<Option<Refs>> {
-    let Some(tip) = header.tip else {
-        return Ok(None);
-    };
-    if tip.version > MAX_VERSION {
-        return Err(bad(format!(
-            "its head is at v{}, past what a commit log can reach",
-            tip.version
-        )));
-    }
-    let root_kind = Kind::value::<T>();
-    let anchors = anchors(store, refs, header, &root_kind)?;
-    let Streamed {
-        mut unused,
-        loose,
-        carried,
-    } = stream(txn, header, &anchors, input)?;
-    let mut held_at: HashMap<Hash, usize> = HashMap::new();
-    for (index, ptr) in anchors.roots.iter().chain(&anchors.hinted).enumerate() {
-        held_at.entry(ptr.hash).or_insert(1 + index);
-    }
+    anchors: &Anchors,
+    vetted: Option<Vetted<'_>>,
+) -> Result<Resolved> {
+    let tip = header.tip.expect("a landing bundle has a head");
+    let checking = vetted.is_some();
     let mut commits: HashMap<Hash, Sent> = HashMap::new();
     let mut versions: HashMap<u64, Hash> = HashMap::new();
     let mut below = Some(tip);
     while let Some(mark) = below {
-        if txn.offset_of(&mark.hash).is_none() {
+        if objects.offset_of(&mark.hash).is_none() {
             break;
         }
-        let entry = read_commit(txn, mark.hash)
+        let entry = read_commit(objects, mark.hash)
             .map_err(|error| bad(format!("v{} is not a commit: {error}", mark.version)))?;
         if mark.version == 0 || entry.commit.version != mark.version {
             return Err(bad("its commit versions do not descend one at a time"));
@@ -1572,49 +1711,64 @@ fn land<T: Data, R: Read>(
         .filter_map(|sent| sent.merged.map(|link| link.ptr.hash))
         .collect();
     while let Some(top) = pending.pop() {
-        if landing.commits.contains_key(&top) || txn.offset_of(&top).is_none() {
+        if landing.commits.contains_key(&top) || objects.offset_of(&top).is_none() {
             continue;
         }
-        pending.extend(landing.segment(refs, txn, top)?);
+        pending.extend(landing.segment(refs, objects, top)?);
     }
-    let now = now_ms();
-    let horizon = now.saturating_add(MAX_AHEAD_MS);
-    if let Some(sent) = landing.commits.values().find(|sent| sent.facts.time > horizon) {
-        return Err(bad(format!(
-            "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
-            sent.facts.version,
-            sent.facts.time - now
-        )));
-    }
-    let unresolved = loose.iter().any(|hash| !landing.commits.contains_key(hash))
-        || landing
-            .commits
-            .values()
-            .any(|sent| sent.root.is_some_and(|root| root.offset == 0));
-    if unresolved {
-        return Err(bad("an object links to one that was neither sent nor known"));
-    }
-    let mut vetting = Vetting {
-        store,
-        txn,
-        held_at: &held_at,
-        roots: &anchors.roots,
-        hinted: &anchors.hinted,
-        hint_kinds: &anchors.hint_kinds,
-        root_kind: &root_kind,
-        sent: Checked::default(),
-        held: Checked::default(),
-        spent: 0,
-        budget: carried.saturating_mul(2).saturating_add(RECHECK_SLACK),
-        queue: Vec::new(),
-    };
-    for sent in landing.commits.values() {
-        if let Some(root) = sent.root {
-            vetting.queue.push((root, root_kind.clone()));
+    let mut unused = HashSet::new();
+    if let Some(Vetted {
+        streamed,
+        root_kind,
+    }) = vetted
+    {
+        let now = now_ms();
+        let horizon = now.saturating_add(MAX_AHEAD_MS);
+        if let Some(sent) = landing.commits.values().find(|sent| sent.facts.time > horizon) {
+            return Err(bad(format!(
+                "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
+                sent.facts.version,
+                sent.facts.time - now
+            )));
         }
+        let unresolved = streamed
+            .loose
+            .iter()
+            .any(|hash| !landing.commits.contains_key(hash))
+            || landing
+                .commits
+                .values()
+                .any(|sent| sent.root.is_some_and(|root| root.offset == 0));
+        if unresolved {
+            return Err(bad("an object links to one that was neither sent nor known"));
+        }
+        let mut held_at: HashMap<Hash, usize> = HashMap::new();
+        for (index, ptr) in anchors.roots.iter().chain(&anchors.hinted).enumerate() {
+            held_at.entry(ptr.hash).or_insert(1 + index);
+        }
+        let mut vetting = Vetting {
+            store,
+            objects: &*objects,
+            held_at: &held_at,
+            roots: &anchors.roots,
+            hinted: &anchors.hinted,
+            hint_kinds: &anchors.hint_kinds,
+            root_kind,
+            sent: Checked::default(),
+            held: Checked::default(),
+            spent: 0,
+            budget: streamed.carried.saturating_mul(2).saturating_add(RECHECK_SLACK),
+            queue: Vec::new(),
+        };
+        for sent in landing.commits.values() {
+            if let Some(root) = sent.root {
+                vetting.queue.push((root, root_kind.clone()));
+            }
+        }
+        vetting.run()?;
+        drop(vetting);
+        unused = streamed.unused;
     }
-    vetting.run()?;
-    drop(vetting);
     let based: HashMap<Hash, Ptr> = anchors
         .bases
         .iter()
@@ -1628,27 +1782,27 @@ fn land<T: Data, R: Read>(
     order.sort_unstable();
     let mut tip_root = None;
     for (_, _, hash) in order {
-        let object = txn.read_object(sent_ptr(txn, hash))?;
+        let object = objects.read_object(sent_ptr(objects, hash))?;
         let sent = &landing.commits[&hash];
         let version = sent.facts.version;
         let mut links = Vec::with_capacity(object.links.len());
         links.extend(sent.root);
         let mut prev_facts = None;
         if let Some(prev) = sent.prev {
-            let ptr = landing.chained(txn, &mut unused, sent.segment, prev, version - 1)?;
+            let ptr = landing.chained(objects, &mut unused, sent.segment, prev, version - 1)?;
             prev_facts = Some(landing.facts(ptr)?);
             links.push(ptr);
         }
         if let Some(skip) = sent.skip {
             let at = skip_version(version);
-            links.push(landing.chained(txn, &mut unused, sent.segment, skip, at)?);
+            links.push(landing.chained(objects, &mut unused, sent.segment, skip, at)?);
         }
         let mut merged_facts = None;
         if let Some(link) = sent.merged {
             let merged = link.ptr.hash;
             let ptr = if landing.commits.contains_key(&merged) {
                 unused.remove(&merged);
-                sent_ptr(txn, merged)
+                sent_ptr(objects, merged)
             } else {
                 based.get(&merged).copied().unwrap_or(Ptr {
                     hash: merged,
@@ -1663,7 +1817,7 @@ fn land<T: Data, R: Read>(
             tip_root = sent.root;
         }
         if links != object.links {
-            txn.put_fresh(
+            objects.relink(
                 Object {
                     body: object.body,
                     links,
@@ -1673,12 +1827,12 @@ fn land<T: Data, R: Read>(
         }
     }
     unused.remove(&tip.hash);
-    if !unused.is_empty() {
+    if checking && !unused.is_empty() {
         return Err(bad("it carries objects nothing links to"));
     }
     let tip_ptr = match tip_ptr {
         Some(ptr) => ptr,
-        None => sent_ptr(txn, tip.hash),
+        None => sent_ptr(objects, tip.hash),
     };
     let root = if landing.commits.contains_key(&tip.hash) {
         tip_root
@@ -1699,7 +1853,10 @@ fn land<T: Data, R: Read>(
     if let Some(old) = &existing
         && (old.log == head.log || hash_at(store, &old.log, tip.version)? == Some(tip.hash))
     {
-        return Ok(None);
+        return Ok(Resolved {
+            refs: None,
+            commits: landing.commits.into_keys().collect(),
+        });
     }
     let mut next = refs.clone();
     let continues = match existing
@@ -1722,7 +1879,10 @@ fn land<T: Data, R: Read>(
         }
     }
     next.insert(remote.to_string(), head);
-    Ok(Some(next))
+    Ok(Resolved {
+        refs: Some(next),
+        commits: landing.commits.into_keys().collect(),
+    })
 }
 
 fn hex(hash: &Hash) -> String {
@@ -1851,10 +2011,12 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
-        let _ours = self.entering(Needs::Every)?;
-        let _theirs = from.entering(Needs::Tip)?;
+        drop(self.entering(Needs::Every)?);
         let have = self.have()?;
-        let emitter = from.emitter(&have)?;
+        let emitter = {
+            let _theirs = from.entering(Needs::Tip)?;
+            from.emitter(&have)?
+        };
         self.step("bundled");
         let mut pulled = if emitter.order.len() < PIPE_OBJECTS {
             self.try_receive_from(remote, emitter, merge)?
@@ -1926,23 +2088,25 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
-        let _ours = self.entering(Needs::Every)?;
+        drop(self.entering(Needs::Every)?);
         let mut input = Input::open(input, BUNDLE_MAGIC)?;
         let header = Header::decode(&mut input)?;
-        let landing = header.tip.is_some();
-        if landing {
-            self.rewrite_refs(|store, txn, refs| {
-                Ok((land::<T, _>(store, txn, refs, remote, &header, &mut input)?, ()))
-            })?;
-        } else {
-            input.finish()?;
-        }
+        let received = match header.tip {
+            Some(_) => Some(self.stage_bundle(remote, &header, &mut input)?),
+            None => {
+                input.finish()?;
+                None
+            }
+        };
         let received_bytes = input.read;
         drop(input);
-        let (outcome, value) = if landing {
-            self.integrate(remote, merge)?
-        } else {
-            (Outcome::UpToDate, None)
+        let (outcome, value) = match received {
+            Some(received) => {
+                let _ours = self.entering(Needs::Every)?;
+                self.land_staged(remote, &header, received)?;
+                self.integrate(remote, merge)?
+            }
+            None => (Outcome::UpToDate, None),
         };
         Ok(Pulled {
             outcome,
@@ -1952,6 +2116,112 @@ impl<T: Data> Db<T> {
             sent_bytes: 0,
             received_bytes,
         })
+    }
+
+    fn stage_bundle<R: Read>(
+        &self,
+        remote: &str,
+        header: &Header,
+        input: &mut Input<R>,
+    ) -> Result<Received> {
+        let tip = header.tip.expect("a landing bundle has a head");
+        if tip.version > MAX_VERSION {
+            return Err(bad(format!(
+                "its head is at v{}, past what a commit log can reach",
+                tip.version
+            )));
+        }
+        self.check_writable()?;
+        let (store, refs) = self.published_refs();
+        let root_kind = Kind::value::<T>();
+        let anchors = anchors(&store, &refs, header, &root_kind)?;
+        let mut staging = Staging::new(store.path(), SPILL_AT);
+        let streamed = stream(&mut staging, header, &anchors, input)?;
+        let vetted = Vetted {
+            streamed,
+            root_kind: &root_kind,
+        };
+        let sent = resolve(&store, &mut staging, &refs, remote, header, &anchors, Some(vetted))?;
+        staging.seal()?;
+        self.step("received");
+        Ok(Received {
+            staging,
+            anchors,
+            commits: sent.commits,
+        })
+    }
+
+    fn land_staged(&self, remote: &str, header: &Header, received: Received) -> Result<()> {
+        let Received {
+            staging,
+            mut anchors,
+            commits,
+        } = received;
+        let spilled = staging.spilled();
+        let _cycles = spilled.then(|| self.hold_cycles());
+        let mut placed = HashMap::new();
+        if spilled {
+            let (store, refs) = self.published_refs();
+            anchors = reanchor(&store, &refs, header, &anchors)?;
+            drop((store, refs));
+            placed = self.place_staged(&staging, &anchors, &commits)?;
+            self.published_refs().0.flush()?;
+            self.step("placed");
+        }
+        self.rewrite_refs(|store, txn, refs| {
+            let anchors = reanchor(store, refs, header, &anchors)?;
+            if !spilled {
+                let held = anchors.held();
+                let mut replay = staging.replay();
+                while let Some(record) = replay.next_record()? {
+                    place(txn, &record, &mut placed, &held, false)?;
+                }
+            }
+            let mut objects = Placed {
+                txn,
+                earlier: &placed,
+            };
+            let resolved = resolve(store, &mut objects, refs, remote, header, &anchors, None)?;
+            Ok((resolved.refs, ()))
+        })
+    }
+
+    fn place_staged(
+        &self,
+        staging: &Staging,
+        anchors: &Anchors,
+        commits: &HashSet<Hash>,
+    ) -> Result<HashMap<Hash, u64>> {
+        let held = anchors.held();
+        let mut placed: HashMap<Hash, u64> = HashMap::with_capacity(staging.len());
+        let mut replay = staging.replay();
+        let mut batch = Vec::new();
+        loop {
+            let mut bytes = 0;
+            while bytes < PLACE_AT {
+                let Some(record) = replay.next_record()? else {
+                    break;
+                };
+                bytes += record.payload.len() + record.links.len() * (HASH_BYTES + 2);
+                batch.push(record);
+            }
+            if batch.is_empty() {
+                return Ok(placed);
+            }
+            self.append_frame(|store, txn| {
+                if store.id() != anchors.generation {
+                    return Err(Error::Corrupt(
+                        "the file was replaced while a bundle was placed in it".into(),
+                    ));
+                }
+                for record in &batch {
+                    let unlisted = commits.contains(&record.hash);
+                    place(txn, record, &mut placed, &held, unlisted)?;
+                }
+                Ok(())
+            })?;
+            batch.clear();
+        }
     }
 
     fn integrate<R, S: Into<String>, E: From<Error>>(
