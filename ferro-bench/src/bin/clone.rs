@@ -2,8 +2,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ferro::{Db, Durability, Have, Map, Options, Pulled, Snapshot};
 
@@ -193,6 +195,43 @@ fn receive(dir: &Path) {
     );
 }
 
+fn receive_busy(dir: &Path) {
+    let clone: Db<Root> = options().open(fresh(dir, "busy.ferro")).unwrap();
+    let side = clone.fork("side").unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = done.clone();
+    let writer = thread::spawn(move || {
+        let mut latencies = Vec::new();
+        let mut key = 0u64;
+        while !stop.load(Ordering::Acquire) {
+            let began = Instant::now();
+            side.commit("side", |root| {
+                root.insert(key, "x".repeat(32));
+            })
+            .unwrap();
+            latencies.push(began.elapsed().as_secs_f64() * 1000.0);
+            key += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+        latencies
+    });
+    let started = Instant::now();
+    let pulled = read_bundle(&clone, &dir.join("bundle.bin"));
+    let seconds = started.elapsed().as_secs_f64();
+    done.store(true, Ordering::Release);
+    let mut latencies = writer.join().unwrap();
+    latencies.sort_by(f64::total_cmp);
+    report("receive beside commits on another branch", &pulled, seconds);
+    let at = |share: f64| latencies[((latencies.len() - 1) as f64 * share) as usize];
+    println!(
+        "commits on another branch: {}, median {:.2} ms, p99 {:.2} ms, slowest {:.1} ms",
+        latencies.len(),
+        at(0.5),
+        at(0.99),
+        at(1.0)
+    );
+}
+
 fn write_bundle(source: &Db<Root>, have: &Have, path: &Path) -> u64 {
     let out = BufWriter::new(File::create(path).unwrap());
     source.bundle_to(have, out).unwrap()
@@ -249,7 +288,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(command), Some(dir)) = (args.get(1), args.get(2)) else {
         eprintln!(
-            "usage: clone build|pull|send|receive|incremental <dir> [--keys N] [--value BYTES] [--commits N] [--rounds N]"
+            "usage: clone build|pull|send|receive|receive-busy|incremental <dir> [--keys N] [--value BYTES] [--commits N] [--rounds N]"
         );
         std::process::exit(2);
     };
@@ -259,6 +298,7 @@ fn main() {
         "pull" => pull(&dir),
         "send" => send(&dir),
         "receive" => receive(&dir),
+        "receive-busy" => receive_busy(&dir),
         "incremental" => incremental(&dir, &args[3..]),
         other => panic!("unknown command {other}"),
     }
