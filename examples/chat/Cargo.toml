@@ -1,0 +1,23 @@
+[package]
+name = "chat"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "chat"
+path = "src/main.rs"
+
+[[bin]]
+name = "chat-load"
+path = "src/bin/load.rs"
+
+[dependencies]
+ferro = { path = "../../ferro" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
