@@ -8,7 +8,7 @@ use std::mem;
 use std::ops::Deref;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -42,6 +42,8 @@ const READ_AHEAD: usize = 1024;
 const ENTRY_BYTES: usize = 96;
 const MIN_DEDUPE: u64 = 1 << 10;
 const MAX_DEDUPE: u64 = 1 << 16;
+const DEDUPE_WAYS: usize = 2;
+const DEDUPE_CHUNK: usize = 64;
 const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
@@ -630,7 +632,7 @@ struct Inner {
     checkpointing: AtomicBool,
     ignored: Option<Mark>,
     cache: Cache<Hash, CacheEntry, EntryWeight>,
-    dedupe: Cache<Hash, u64>,
+    dedupe: Dedupe,
     basis: Basis,
     poisoned: AtomicBool,
     closed: AtomicBool,
@@ -727,7 +729,7 @@ impl Store {
                 checkpointing: AtomicBool::new(false),
                 ignored: named.filter(|mark| mark.seq > sb.seq),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
-                dedupe: Cache::new(dedupe),
+                dedupe: Dedupe::new(dedupe),
                 basis: sb.basis,
                 poisoned: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -1090,6 +1092,58 @@ impl Hasher for Prehashed {
         let take = bytes.len().min(8);
         word[..take].copy_from_slice(&bytes[..take]);
         self.0 ^= u64::from_le_bytes(word);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Way {
+    hash: Hash,
+    offset: [u8; 8],
+}
+
+#[derive(Default)]
+#[repr(align(64))]
+struct Set(Mutex<[Way; DEDUPE_WAYS]>);
+
+struct Dedupe {
+    chunks: Box<[OnceLock<Box<[Set]>>]>,
+    mask: usize,
+}
+
+impl Dedupe {
+    fn new(entries: usize) -> Dedupe {
+        let sets = (entries / DEDUPE_WAYS).next_power_of_two().max(DEDUPE_CHUNK);
+        Dedupe {
+            chunks: (0..sets / DEDUPE_CHUNK).map(|_| OnceLock::new()).collect(),
+            mask: sets - 1,
+        }
+    }
+
+    fn index(&self, hash: &Hash) -> (usize, usize) {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&hash[..8]);
+        let set = u64::from_le_bytes(word) as usize & self.mask;
+        (set / DEDUPE_CHUNK, set % DEDUPE_CHUNK)
+    }
+
+    fn get(&self, hash: &Hash) -> Option<u64> {
+        let (chunk, set) = self.index(hash);
+        let ways = *self.chunks[chunk].get()?[set].0.lock();
+        let way = ways.iter().find(|way| way.hash == *hash)?;
+        Some(u64::from_le_bytes(way.offset)).filter(|offset| *offset != 0)
+    }
+
+    fn insert(&self, hash: Hash, offset: u64) {
+        let (chunk, set) = self.index(&hash);
+        let chunk = self.chunks[chunk]
+            .get_or_init(|| (0..DEDUPE_CHUNK).map(|_| Set::default()).collect());
+        let mut ways = chunk[set].0.lock();
+        let at = ways.iter().position(|way| way.hash == hash).unwrap_or(DEDUPE_WAYS - 1);
+        ways.copy_within(0..at, 1);
+        ways[0] = Way {
+            hash,
+            offset: offset.to_le_bytes(),
+        };
     }
 }
 
