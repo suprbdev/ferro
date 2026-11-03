@@ -1786,23 +1786,26 @@ commit may be in this closure's group. Reads that take the published refs, such 
 `verify` and `have`, are not checked either, so a `Drop` that reads during a cycle's swap still
 waits for itself.
 
-A commit pays the check before its lane and four updates of the record: the lane and the whole file
-under `tip`, each added and removed. On their own, in a loop pinned to one core, those take 18 ns,
-against about 24 µs for a single-key Buffered commit. On a 32-core machine shared with other work,
-the binaries before and after this change were compared three ways:
+A commit pays the check before its lane and four updates of the record: the lane, and the whole
+file around `tip`, each added and removed. On their own, in a loop pinned to one core, those take
+18 ns, against about 24 µs for a single-key Buffered commit. On a 32-core machine shared with other
+work, the binaries before and after this change, both drafting outside `tip`, were compared two
+ways, twenty rounds each:
 
-- `tables`, before and after running at the same time on two pinned cores, swapped each round,
-  median of twenty rounds: CPU time outside the closure went from 73.2 to 72.8 µs for a hold, 85.8
-  to 85.7 for a confirm and 113.6 to 113.5 for a cancel, with every round's ratio between 0.979
-  and 1.015. Instructions outside the closure rose by 0.15 to 0.19%, or 860 to 1,270, but inside
-  the closure, which runs none of this, they rose by 0.7 to 1.0%, so most of that is code
-  generation rather than the check.
+- `tables`, before and after running at the same time on two pinned cores, swapped each round:
+  CPU time outside the closure went from 78.5 to 78.3 µs for a hold, 92.4 to 92.1 for a confirm
+  and 122.5 to 122.1 for a cancel, with paired ratios at medians of 1.001 to 1.004 and every round
+  between 0.972 and 1.018. Instructions outside the closure moved by 10, 95 and 230 at the median,
+  under 0.03%, and inside it by none.
 - `ferro-bench`'s single-key commits on tmpfs, one after the other on four pinned cores in ABBA
-  order, twenty rounds: Buffered went from 24.8 to 24.2 µs, Fsync from 26.3 to 26.5 µs and a table
-  row update from 38.3 to 38.4 µs, with paired ratios at medians of 1.004, 1.010 and 1.001.
-- The same on NVMe, twelve rounds: Buffered went from 26.1 to 26.4 µs, paired median 1.003, and
-  the Fsync commit and row update, which wait on the disk, from 439 to 449 µs and 471 to 448 µs,
-  paired medians 0.991 and 0.951.
+  order: paired ratios at medians of 1.000 for Buffered, 0.994 for Fsync and 0.994 for a table row
+  update, though single rounds ranged from 0.63 to 1.72 while other work loaded the machine.
+
+The same comparisons against the tree before drafting moved out of `tip` gave the same picture:
+`tables` within 0.6% of before, single-key commits on tmpfs at paired medians of 1.001 to 1.010,
+and on NVMe, twelve rounds, Buffered at 1.003, with the Fsync commit and row update waiting on the
+disk at 0.991 and 0.951. There the instructions inside the closure, which runs none of the check,
+had moved by 0.7 to 1.0% with the rest of the code generation.
 
 Run one after the other without pinning, whichever binary ran second in a pair took about 25%
 longer, so an unpinned first try showed `tables` 10 to 16% slower after. That is why these runs
