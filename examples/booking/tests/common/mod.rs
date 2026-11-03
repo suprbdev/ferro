@@ -55,7 +55,7 @@ impl World {
 }
 
 pub fn open(path: &Path, coalesce: bool) -> Reservations {
-    Reservations::open(path, Config { coalesce, read_only: false }).unwrap()
+    Reservations::open(path, Config { coalesce, ..Config::default() }).unwrap()
 }
 
 pub fn world_with(plan: Plan, coalesce: bool) -> World {

@@ -16,6 +16,7 @@ fn run(cli: Cli) -> Result<(), BookingError> {
         Config {
             coalesce: cli.coalesce,
             read_only,
+            buffered: false,
         },
     )?;
     let stdout = io::stdout();

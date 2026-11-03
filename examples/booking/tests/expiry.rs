@@ -102,7 +102,7 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
         );
         let path = w.path();
         drop(w.svc);
-        let svc = Reservations::open(&path, Config { coalesce, read_only: false }).unwrap();
+        let svc = Reservations::open(&path, Config { coalesce, ..Config::default() }).unwrap();
         let first = booking::date::night_of(svc.now()) + 2;
         let stop = Arc::new(AtomicBool::new(false));
         let sweeper = {

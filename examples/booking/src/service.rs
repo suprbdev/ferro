@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferro::{Db, Options, Snapshot};
+use ferro::{Db, Durability, Options, Snapshot};
 
 use crate::date::{format_night, now_ms};
 use crate::error::Result;
@@ -14,6 +14,7 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 pub struct Config {
     pub coalesce: bool,
     pub read_only: bool,
+    pub buffered: bool,
 }
 
 #[derive(Clone)]
@@ -27,6 +28,9 @@ impl Reservations {
         let mut options = Options::new().coalesce(config.coalesce);
         if config.read_only {
             options = options.read_only();
+        }
+        if config.buffered {
+            options = options.durability(Durability::Buffered);
         }
         Ok(Reservations::new(options.open(path)?))
     }

@@ -39,6 +39,8 @@ struct Args {
     think_us: u64,
     #[arg(long, default_value_t = 10)]
     blind: u32,
+    #[arg(long, default_value_t = 1)]
+    late: u32,
     #[arg(long, value_parser = ["compare", "on", "off"], default_value = "compare")]
     coalesce: String,
     #[arg(long)]
@@ -51,6 +53,8 @@ struct Args {
     rounds: usize,
     #[arg(long)]
     progress: bool,
+    #[arg(long)]
+    buffered: bool,
     #[arg(long)]
     ack_log: Option<PathBuf>,
     #[arg(long, default_value_t = 7)]
@@ -273,7 +277,7 @@ fn worker(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool
                 }
                 Err(error) => tally.error(&error),
             }
-        } else if roll < 64 {
+        } else if roll < 60 + args.late {
             thread::sleep(Duration::from_millis(held.expires_ms.saturating_sub(svc.now()) + 1));
             tally.attempts += 1;
             match svc.confirm(held.id, Some(held.total)) {
@@ -369,7 +373,12 @@ struct Outcome {
 }
 
 fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outcome, BookingError> {
-    let svc = Reservations::open(path, Config { coalesce, read_only: false })?;
+    let config = Config {
+        coalesce,
+        buffered: args.buffered,
+        ..Config::default()
+    };
+    let svc = Reservations::open(path, config)?;
     let world = Arc::new(world(&svc, args)?);
     let stop = Arc::new(AtomicBool::new(false));
     let version_before = svc.db().version();
@@ -459,9 +468,10 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
         t.takeovers, t.swept, t.sweeps
     );
     println!(
-        "  hold p50 {:.2} ms p99 {:.2} ms   confirm p50 {:.2} ms p99 {:.2} ms   sweep p50 {:.2} ms p99 {:.2} ms max {:.2} ms",
+        "  hold p50 {:.2} ms p99 {:.2} ms max {:.2} ms   confirm p50 {:.2} ms p99 {:.2} ms   sweep p50 {:.2} ms p99 {:.2} ms max {:.2} ms",
         pct(&t.hold_ns, 0.5),
         pct(&t.hold_ns, 0.99),
+        pct(&t.hold_ns, 1.0),
         pct(&t.confirm_ns, 0.5),
         pct(&t.confirm_ns, 0.99),
         pct(&t.sweep_ns, 0.5),
@@ -536,7 +546,12 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let svc = Reservations::open(&path, Config { coalesce, read_only: true }).expect("reopen");
+            let config = Config {
+                coalesce,
+                read_only: true,
+                ..Config::default()
+            };
+            let svc = Reservations::open(&path, config).expect("reopen");
             if args.rounds > 1 {
                 outcome.label = format!("{} round {}", outcome.label, round + 1);
             }
