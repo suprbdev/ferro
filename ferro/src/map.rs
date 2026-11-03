@@ -525,6 +525,10 @@ impl<K, V, S> Node<K, V, S> {
             + self.children.capacity() * size_of::<Link<K, V, S>>()
             + values
     }
+
+    fn weight(&self, body_bytes: usize, _heap: usize) -> u32 {
+        heap_weight(self.fixed_bytes(), body_bytes)
+    }
 }
 
 impl<K, V: Data, S> Node<K, V, S> {
@@ -628,7 +632,7 @@ fn reach<'a, K: Data, V: Data, S: Data>(
         None => {}
     }
     let store = store.ok_or(Error::Detached)?;
-    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::fixed_bytes)?;
+    let (node, cached) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::weight)?;
     if depth < PIN_DEPTH {
         if let Memo::Pinned(node) = memo.get_or_init(|| Memo::Pinned(node.clone())) {
             return Ok(Reach::Borrowed(node));
@@ -661,7 +665,7 @@ fn load<K: Data, V: Data, S: Data>(
         Link::Stored { ptr, .. } => {
             let store = store.ok_or(Error::Detached)?;
             let ptr = *ptr;
-            let (node, _) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::fixed_bytes)?;
+            let (node, _) = store.fetch(ptr, |decoder| Node::decode(decoder, ptr), Node::weight)?;
             Ok(Some(node))
         }
     }

@@ -15,7 +15,7 @@ use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::codec::{Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
+use crate::codec::{ARC_HEADER, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, push_varint};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::reclaim::sibling;
@@ -911,7 +911,7 @@ impl Store {
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
-        fixed_bytes: impl FnOnce(&T) -> usize,
+        weigh: impl FnOnce(&T, usize, usize) -> u32,
     ) -> Result<(Arc<T>, bool)> {
         if let Some(entry) = self.inner.cache.get(&ptr.hash)
             && let Ok(value) = entry.value.downcast::<T>()
@@ -924,7 +924,7 @@ impl Store {
         }
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = Arc::new(decode(&mut decoder)?);
-        let weight = heap_weight(fixed_bytes(&value), object.body.len());
+        let weight = weigh(&value, object.body.len(), decoder.heap());
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(
                 ptr.hash,
@@ -957,7 +957,11 @@ impl Store {
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
-        let (value, _) = self.fetch(ptr, |decoder| T::decode(decoder), |_| size_of::<T>())?;
+        let (value, _) = self.fetch(
+            ptr,
+            |decoder| T::decode(decoder),
+            |_, body, heap| heap_weight(ARC_HEADER + size_of::<T>(), body.max(heap)),
+        )?;
         Ok(value)
     }
 

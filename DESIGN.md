@@ -477,9 +477,22 @@ larger than the cache, as a multiple of the setting at 1 to 256 MiB:
 | 2 KiB spilled strings | 1.0 to 1.7 | 1.0 to 1.1 | 1.0 to 1.1 |
 | Table rows and their indexes | 3.1 to 4.6 | 1.25 to 1.3 | 1.05 to 1.1 |
 
-Outside the bound are pinned nodes, the `Arc` allocations memos keep, the column of any `Val` still
-held, nodes held by live snapshots and dirty trees, and on a writer the `dedupe` cache, which scales
-with the setting at about 2% of it up to 65,536 entries.
+A root, a log entry or a spilled value is one decoded value rather than a node, so it weighs what
+decoding it allocated, or its body bytes if those are more. The decoder counts that as it builds
+each string, vector, `Box`, `Arc`, `Bytes` and std tree, rounded the way the counting allocator
+rounds. Weighing a root by its body alone counted a short string at its length and nothing for the
+vector holding it, so walking history in a fresh process kept roots whose heap was nearly four
+times their weight. The `history_heap` test walks 20,000 versions of a root holding a table, a map
+and 200 strings. At a setting of 2 MiB the heap peaked at 7.1 MiB reading every version and at
+4.4 MiB through `history_of`, and at 32 MiB at 93 and 74 MiB. It now peaks at 1.1 and 1.3 times
+the setting at 2 MiB, and at 1.05 times at 32 MiB. Counting costs an add per allocation on a cache
+miss and nothing on a hit.
+
+Outside the bound are pinned nodes, including those the maps of a cached root pin, the `Arc`
+allocations memos keep, the column of any `Val` still held, nodes held by live snapshots and dirty
+trees, and on a writer the `dedupe` cache, which scales with the setting at about 2% of it up to
+65,536 entries. A history walk that reads sixteen maps in every version peaks at 1.2 to 1.4 times
+the setting, mostly from those pins.
 
 The default rose from 256 MiB to 1 GiB, which is about what the old setting held once full.
 A setting carried over from before that holds about a quarter of what it did. `map_get_cold_ns` is 5.4 µs at 1 MiB and 3.8 µs at

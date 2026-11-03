@@ -263,6 +263,14 @@ impl<'a> Encoder<'a> {
 }
 
 const MAX_EMPTY_ITEMS: u64 = 1 << 24;
+pub(crate) const ARC_HEADER: usize = 2 * size_of::<usize>();
+const TREE_HEADER: usize = 16;
+const TREE_FILL: usize = 6;
+const TREE_CAPACITY: usize = 11;
+
+fn allocation(bytes: usize) -> usize {
+    bytes.saturating_add(8).next_multiple_of(16).max(32)
+}
 
 pub struct Decoder<'a> {
     buf: &'a [u8],
@@ -271,6 +279,7 @@ pub struct Decoder<'a> {
     cursor: usize,
     store: Option<&'a Store>,
     empty_items: u64,
+    heap: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -282,11 +291,27 @@ impl<'a> Decoder<'a> {
             cursor: 0,
             store,
             empty_items: 0,
+            heap: 0,
         }
     }
 
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
+    }
+
+    pub(crate) fn heap(&self) -> usize {
+        self.heap
+    }
+
+    fn allocated(&mut self, count: usize, bytes: usize) {
+        if count > 0 && bytes > 0 {
+            self.heap = self.heap.saturating_add(count.saturating_mul(allocation(bytes)));
+        }
+    }
+
+    fn tree<K, V>(&mut self, len: usize) {
+        let node = TREE_HEADER + TREE_CAPACITY * (size_of::<K>() + size_of::<V>());
+        self.allocated(len.div_ceil(TREE_FILL), node);
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -394,10 +419,12 @@ impl<'a> Decoder<'a> {
                 cursor: 0,
                 store: self.store,
                 empty_items: self.empty_items,
+                heap: self.heap,
             };
             self.cursor = end;
             f(tag, &mut sub)?;
             self.empty_items = sub.empty_items;
+            self.heap = sub.heap;
         }
         Ok(())
     }
@@ -575,7 +602,9 @@ impl Data for String {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let len = r.varint()? as usize;
         let bytes = r.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|e| Error::Decode(e.to_string()))
+        let text = String::from_utf8(bytes.to_vec()).map_err(|e| Error::Decode(e.to_string()))?;
+        r.allocated(1, text.capacity());
+        Ok(text)
     }
 }
 
@@ -612,7 +641,9 @@ impl<T: Data> Data for Vec<T> {
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let len = r.varint()? as usize;
-        T::decode_vec(r, len)
+        let items = T::decode_vec(r, len)?;
+        r.allocated(1, items.capacity() * size_of::<T>());
+        Ok(items)
     }
 
     fn missing() -> Option<Self> {
@@ -670,7 +701,9 @@ impl Data for Bytes {
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let len = r.varint()? as usize;
-        Ok(Bytes(r.take(len)?.into()))
+        let bytes = Bytes(r.take(len)?.into());
+        r.allocated(1, ARC_HEADER + len);
+        Ok(bytes)
     }
 
     fn missing() -> Option<Self> {
@@ -696,7 +729,9 @@ impl<T: Data> Data for Box<T> {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        Ok(Box::new(T::decode(r)?))
+        let value = Box::new(T::decode(r)?);
+        r.allocated(1, size_of::<T>());
+        Ok(value)
     }
 
     fn missing() -> Option<Self> {
@@ -710,7 +745,9 @@ impl<T: Data> Data for Arc<T> {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        Ok(Arc::new(T::decode(r)?))
+        let value = Arc::new(T::decode(r)?);
+        r.allocated(1, ARC_HEADER + size_of::<T>());
+        Ok(value)
     }
 
     fn missing() -> Option<Self> {
@@ -735,6 +772,7 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
             let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
             out.insert(key, value);
         }
+        r.tree::<K, V>(out.len());
         Ok(out)
     }
 
@@ -758,6 +796,7 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
         for _ in 0..len {
             out.insert(r.item(T::decode)?);
         }
+        r.tree::<T, ()>(out.len());
         Ok(out)
     }
 
