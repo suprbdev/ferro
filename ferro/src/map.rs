@@ -1486,6 +1486,7 @@ impl Arena {
 }
 
 type Settled<K, V, S> = (Ptr, Arc<Node<K, V, S>>, u32);
+type Written<K, V, S> = (usize, Arc<Node<K, V, S>>);
 
 struct Deferred<'a, K, V, S> {
     node: &'a Node<K, V, S>,
@@ -1782,7 +1783,7 @@ fn settle_spine<K: Data, V: Data, S: Data>(
 fn decoded<K: Data, V: Data, S: Data>(
     deferred: &Deferred<'_, K, V, S>,
     depth: usize,
-    below: &[(usize, Arc<Node<K, V, S>>)],
+    below: &[Written<K, V, S>],
     arena: &Arena,
     store: &Store,
     scratch: &mut Vec<u8>,
