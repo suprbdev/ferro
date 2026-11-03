@@ -21,7 +21,7 @@ use crate::log::{Chain, Log};
 use crate::map::Map;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, sibling, sync_parent};
 use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
-use crate::watch::{Feed, Watcher};
+use crate::watch::{Feed, Notice, Watcher};
 
 const MAIN: &str = "main";
 const MAX_PASSES: u32 = 6;
@@ -247,10 +247,10 @@ struct Branch<T> {
 }
 
 impl<T> Branch<T> {
-    fn publish(&self, state: Arc<State<T>>) {
+    fn publish(&self, state: Arc<State<T>>) -> Notice<T> {
         let snapshot = state.snapshot.clone();
         self.state.store(state);
-        self.feed.publish(snapshot);
+        self.feed.publish(snapshot)
     }
 
     fn retire(&self) {
@@ -761,6 +761,7 @@ impl<T: Data> Shared<T> {
     }
 
     fn await_group(&self, seal: &Arc<Seal>) -> Result<u64> {
+        let mut notices = Vec::new();
         loop {
             if seal.settled.load(Ordering::Acquire)
                 && let Some(Ok(sealed)) = seal.outcome.get()
@@ -779,11 +780,11 @@ impl<T: Data> Shared<T> {
                 Some(Ok(sealed)) if queue.settled >= sealed.ticket => return Ok(sealed.version),
                 Some(Ok(sealed)) if !sealed.framed => {
                     drop(queue);
-                    self.settle(sealed.ticket)?;
+                    self.settle(sealed.ticket, &mut notices)?;
                     return Ok(sealed.version);
                 }
                 Some(Ok(_)) if !queue.syncing && !queue.waiting.is_empty() => {
-                    self.lead(queue)?;
+                    self.lead(queue, &mut notices)?;
                     continue;
                 }
                 None if !queue.syncing && self.arriving.load(Ordering::Acquire) == 0 => {
@@ -848,7 +849,7 @@ impl<T: Data> Shared<T> {
         Ok((refs, Some((branch.clone(), state))))
     }
 
-    fn settle(&self, ticket: u64) -> Result<()> {
+    fn settle(&self, ticket: u64, notices: &mut Vec<Notice<T>>) -> Result<()> {
         let mut queue = self.queue.lock();
         loop {
             if queue.settled >= ticket {
@@ -861,13 +862,17 @@ impl<T: Data> Shared<T> {
                 if queue.waiting.is_empty() {
                     return Ok(());
                 }
-                return self.lead(queue);
+                return self.lead(queue, notices);
             }
             self.done.wait(&mut queue);
         }
     }
 
-    fn lead(&self, mut queue: MutexGuard<'_, Queue<T>>) -> Result<()> {
+    fn lead(
+        &self,
+        mut queue: MutexGuard<'_, Queue<T>>,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<()> {
         queue.syncing = true;
         let batch = mem::take(&mut queue.waiting);
         drop(queue);
@@ -882,7 +887,7 @@ impl<T: Data> Shared<T> {
         for pending in batch {
             seals.extend(pending.seal);
             if let (true, Some((branch, state))) = (outcome.is_ok(), pending.update) {
-                branch.publish(state);
+                notices.push(branch.publish(state));
             }
         }
         let mut queue = self.queue.lock();
@@ -1000,7 +1005,7 @@ impl<T: Data> Shared<T> {
         })
     }
 
-    fn prune(&self, keep: Keep) -> Result<u64> {
+    fn prune(&self, keep: Keep, notices: &mut Vec<Notice<T>>) -> Result<u64> {
         if keep == Keep::All {
             return Ok(0);
         }
@@ -1023,7 +1028,7 @@ impl<T: Data> Shared<T> {
         }
         let txn = store.begin()?;
         self.stage(&mut tip, next, txn, None, None)?;
-        self.settle(store.last_seq())?;
+        self.settle(store.last_seq(), notices)?;
         let refs = tip.refs.clone();
         for branch in self.branches.lock().values() {
             if let Some(head) = refs.try_get(&branch.name)? {
@@ -1044,9 +1049,10 @@ impl<T: Data> Shared<T> {
         if self.options.read_only {
             return Err(Error::ReadOnly);
         }
+        let mut notices = Vec::new();
         let _only = self.cycle.lock();
         let store = self.store();
-        let outcome = self.run_cycle(&store, keep, stop);
+        let outcome = self.run_cycle(&store, keep, stop, &mut notices);
         let mut log = self.log.lock();
         log.cycles += 1;
         match &outcome {
@@ -1065,10 +1071,16 @@ impl<T: Data> Shared<T> {
         outcome
     }
 
-    fn run_cycle(&self, store: &Store, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
+    fn run_cycle(
+        &self,
+        store: &Store,
+        keep: Keep,
+        stop: Option<&AtomicBool>,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<Compacted> {
         let mut report = Compacted {
             before_bytes: store.size(),
-            commits_dropped: self.prune(keep)?,
+            commits_dropped: self.prune(keep, notices)?,
             ..Compacted::default()
         };
         let mut refs = self.published.lock().refs.clone();
@@ -1092,7 +1104,7 @@ impl<T: Data> Shared<T> {
         self.step("synced");
         let paused = Instant::now();
         let mut tip = self.lock_tip();
-        self.settle(store.last_seq())?;
+        self.settle(store.last_seq(), notices)?;
         store.check_healthy()?;
         let basis = store.basis();
         let (head, objects) = {
@@ -1292,6 +1304,7 @@ impl<T: Data> Db<T> {
         if self.shared.coalesce && intent.restored.is_none() && intent.merged.is_none() {
             return self.combine(f);
         }
+        let mut notices = Vec::new();
         let mut tip = self.shared.lock_tip();
         self.branch.check_live()?;
         if let Some((other, _)) = &intent.merged {
@@ -1314,7 +1327,7 @@ impl<T: Data> Db<T> {
         });
         let ticket = self.shared.store().last_seq();
         drop(tip);
-        self.shared.settle(ticket)?;
+        self.shared.settle(ticket, &mut notices)?;
         let (value, version) = result?;
         Ok(Committed {
             value,
@@ -1587,6 +1600,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
+        let mut notices = Vec::new();
         let mut tip = self.shared.lock_tip();
         self.branch.check_live()?;
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
@@ -1614,7 +1628,7 @@ impl<T: Data> Db<T> {
         self.shared.stage(&mut tip, next, txn, None, None)?;
         let ticket = store.last_seq();
         drop(tip);
-        self.shared.settle(ticket)?;
+        self.shared.settle(ticket, &mut notices)?;
         self.branch(name)
     }
 
@@ -1632,6 +1646,7 @@ impl<T: Data> Db<T> {
         if name == MAIN || name == self.branch.name {
             return Err(Error::BranchInUse(name.to_string()));
         }
+        let mut notices = Vec::new();
         let mut tip = self.shared.lock_tip();
         if tip.refs.try_get(name)?.is_none() {
             return Err(Error::NoBranch(name.to_string()));
@@ -1650,7 +1665,7 @@ impl<T: Data> Db<T> {
         }
         self.shared.stage(&mut tip, next, txn, None, None)?;
         let ticket = store.last_seq();
-        self.shared.settle(ticket)?;
+        self.shared.settle(ticket, &mut notices)?;
         let published = self.shared.published.lock();
         let retired = self.shared.branches.lock().remove(name);
         drop(published);
@@ -1686,6 +1701,7 @@ impl<T: Data> Db<T> {
         if !self.shared.options.read_only {
             return Ok(false);
         }
+        let mut notices = Vec::new();
         let mut tip = self.shared.tip.lock();
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
@@ -1726,7 +1742,7 @@ impl<T: Data> Db<T> {
                 branch.feed.rebind(state.snapshot.clone());
                 branch.state.store(state);
             } else {
-                branch.publish(state);
+                notices.push(branch.publish(state));
             }
         }
         let mut branches = self.shared.branches.lock();

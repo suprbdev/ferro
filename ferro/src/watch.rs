@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::fmt;
+use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
@@ -58,6 +59,26 @@ impl<T> Slot<T> {
     }
 }
 
+#[must_use]
+pub(crate) struct Notice<T> {
+    shown: Option<Snapshot<T>>,
+    gates: Vec<Arc<Gate<T>>>,
+    replaced: Option<Snapshot<T>>,
+}
+
+impl<T> Drop for Notice<T> {
+    fn drop(&mut self) {
+        if let Some(shown) = &self.shown {
+            for gate in mem::take(&mut self.gates) {
+                if gate.admits(shown) {
+                    gate.passed.notify_all();
+                }
+            }
+        }
+        self.replaced.take();
+    }
+}
+
 pub(crate) struct Feed<T> {
     slot: Mutex<Slot<T>>,
     fresh: Condvar,
@@ -76,31 +97,32 @@ impl<T> Feed<T> {
         }
     }
 
-    pub(crate) fn publish(&self, snapshot: Snapshot<T>) {
+    pub(crate) fn publish(&self, snapshot: Snapshot<T>) -> Notice<T> {
         let mut slot = self.slot.lock();
         if slot.closed {
-            return;
+            return Notice {
+                shown: None,
+                gates: Vec::new(),
+                replaced: Some(snapshot),
+            };
         }
-        let waiting = if slot.gates.is_empty() {
+        let gates = if slot.gates.is_empty() {
             Vec::new()
         } else {
             let mut live = slot.live_gates();
             live.retain(|gate| gate.parked.load(Ordering::Relaxed) > 0);
             live
         };
-        let shown = (!waiting.is_empty()).then(|| snapshot.clone());
+        let shown = (!gates.is_empty()).then(|| snapshot.clone());
         let replaced = slot.latest.replace(snapshot);
         slot.published += 1;
         drop(slot);
         self.fresh.notify_all();
-        if let Some(shown) = shown {
-            for gate in waiting {
-                if gate.admits(&shown) {
-                    gate.passed.notify_all();
-                }
-            }
+        Notice {
+            shown,
+            gates,
+            replaced,
         }
-        drop(replaced);
     }
 
     pub(crate) fn rebind(&self, snapshot: Snapshot<T>) {

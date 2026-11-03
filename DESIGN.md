@@ -625,13 +625,21 @@ watcher and its clones park on a condvar of their own, listed in the feed by a `
 finds the lists with someone parked and runs `test` on the new snapshot, and wakes them only if it
 passes, so a commit nobody wants costs one evaluation per filter and no thread switch, and a filter
 with nobody parked costs nothing. The test runs on the thread that leads the batch, after the frame
-is durable. Normally that is outside the writer lock, so a writer's closure can run while it does,
-but it holds up that batch's acknowledgement: it should be a quick read. When `drop_branch` or a
-reclamation cycle leads the batch it holds `tip`, and a read-only `refresh` also runs tests under
-its `tip` mutex, so a test must never commit. A panic is caught there and counts as a
-pass, so that the watcher wakes and hits the same panic on its own thread. A woken watcher tests the
-snapshot again, since what passed may be gone, and it tests whatever it finds when it next looks, so
-nothing that landed while it was busy is missed.
+is durable, but not while that thread holds anything. Publishing stores the snapshot, bumps the
+count, wakes unfiltered watchers and lists the filtered ones with someone parked, all under the
+leader's locks, and returns a `Notice` that runs the tests when it drops. Every caller makes its
+list of notices before it takes a lock, so the list drops after the last guard: for a group commit
+once `syncing` has cleared and the batch is acknowledged, for `drop_branch` once `tip` is released,
+for a reclamation cycle once `tip` and the cycle mutex are, and for a read-only `refresh` once its
+`tip` is. A test may therefore commit, refresh or drop a branch. Before this, a committing test
+deadlocked on the leader's own `syncing` flag, or on `tip` when `drop_branch`, a cycle or `refresh`
+held it, and a slow test held up every writer behind it. Running tests late cannot reorder what a watcher
+sees, since snapshots are stored in commit order and a test only decides whether to wake: two
+leaders may test out of order, and the woken watcher tests the newest snapshot itself. The call that
+led still returns only after its tests, so a slow test delays that call and no other. A panic is
+caught there and counts as a pass, so that the watcher wakes and hits the same panic on its own
+thread. A woken watcher tests the snapshot again, since what passed may be gone, and it tests
+whatever it finds when it next looks, so nothing that landed while it was busy is missed.
 
 `queue` used to wake every idle worker on every commit, and to commit a dummy `epoch` change at
 shutdown. Now workers filter on a ready job in their own queues, and the reaper on something falling

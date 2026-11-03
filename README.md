@@ -280,11 +280,11 @@ closer.close();
 ```
 
 `watch_when` sleeps through commits whose snapshot fails the test. The test runs as the commit is
-published, only while a watcher is parked, and that commit's writers wait for it, so keep it to a
-quick read. It usually runs outside the writer lock, but when `drop_branch`, a reclamation cycle or
-a read-only `refresh` publishes, it runs under that operation's lock, so it must never commit. `closer` gives a cloneable handle that ends a watcher and its
-clones from any thread without a commit. Clones share the closer and the test and keep their own
-place.
+published, only while a watcher is parked, on the publishing thread once it holds no lock, so a test
+may read, commit or refresh. The `update`, `drop_branch`, `compact` or `refresh` call that published
+returns only after its tests have run, so keep them quick. `closer` gives a cloneable handle that
+ends a watcher and its clones from any thread without a commit. Clones share the closer and the test
+and keep their own place.
 
 `db.head_hash()` is a hash over the whole history of a branch, for publishing somewhere an attacker
 cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows

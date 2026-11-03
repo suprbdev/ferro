@@ -467,6 +467,62 @@ fn a_read_only_test_may_open_a_branch_while_refresh_runs_it() {
     assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
 }
 
+fn within<R: Send + 'static>(what: &str, run: impl FnOnce() -> R + Send + 'static) -> R {
+    let (done, finished) = channel();
+    thread::spawn(move || {
+        let _ = done.send(run());
+    });
+    match finished.recv_timeout(Duration::from_secs(20)) {
+        Ok(value) => value,
+        Err(RecvTimeoutError::Timeout) => panic!("{what} deadlocked"),
+        Err(RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
+    }
+}
+
+#[test]
+fn a_test_may_commit_while_its_commit_publishes() {
+    let (_dir, db) = opened();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let watcher = {
+        let (db, fired) = (db.clone(), fired.clone());
+        db.clone().watch_when(move |snapshot| {
+            if snapshot.contains_key(&1) && fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                put(&db, 2, 2);
+            }
+            snapshot.contains_key(&2)
+        })
+    };
+    let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
+    thread::sleep(Duration::from_millis(30));
+    let writer = db.clone();
+    within("a commit whose test commits", move || put(&writer, 1, 1));
+    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+    assert_eq!(db.version(), 2);
+    assert!(fired.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn a_read_only_test_may_refresh_while_refresh_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watch.ferro");
+    let db = common::fast().open::<Root>(&path).unwrap();
+    put(&db, 1, 1);
+    let reader = common::fast().read_only().open::<Root>(&path).unwrap();
+    let watcher = {
+        let reader = reader.clone();
+        reader.clone().watch_when(move |snapshot| {
+            reader.refresh().is_ok() && snapshot.contains_key(&2)
+        })
+    };
+    let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
+    thread::sleep(Duration::from_millis(30));
+    put(&db, 2, 2);
+    let refresher = reader.clone();
+    assert!(within("a refresh whose test refreshes", move || refresher.refresh().unwrap()));
+    assert_eq!(parked_thread.join().unwrap().unwrap(), 2);
+    assert_eq!(reader.version(), 2);
+}
+
 #[test]
 fn a_test_costs_commits_nothing_while_nobody_is_parked() {
     let (_dir, db) = opened();
