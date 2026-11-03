@@ -151,12 +151,12 @@ let order = db
     .await?;
 ```
 
-The closure runs in the poll that finds the writer lock free, on the thread that polls, under the
-same lock as a blocking write. So it need not be `Send` or `'static`, the future is `Send` when the
-closure and its result are, a panic unwinds out of that poll, and awaited and blocking writers
-share one sync. If the lock is taken, the future waits in line and the writer that lets go wakes
-the first in line, so futures get the lock in the order they asked for it, though a blocking writer
-can get in ahead of them. A write dropped before its closure ran, polled or not, writes nothing.
+The closure runs in the poll that finds its branch's writer lock free, on the thread that polls,
+under the same lock as a blocking write. So it need not be `Send` or `'static`, the future is
+`Send` when the closure and its result are, a panic unwinds out of that poll, and awaited and
+blocking writers share one sync. If the lock is taken, the future waits in line and the writer
+that lets go wakes the first in line, so futures get the lock in the order they asked for it,
+though a blocking writer can get in ahead of them. A write dropped before its closure ran, polled or not, writes nothing.
 Once the closure has run its outcome is decided: dropping the future gives up only the answer, the
 commit lands as if awaited, and closing the database first writes and syncs it. So whether a
 dropped write landed is exactly whether its closure ran. With `coalesce`, awaited closures join the
@@ -459,9 +459,9 @@ once the whole bundle has passed does one frame point the remote branch at them,
 the previous head. A damaged or forged bundle is rejected with `Error::Bundle`, and what it had written
 past the end is cut off again. `receive` uses a fixed buffer, the object it is reading and under
 500 bytes for each object the bundle carries, not memory for its bytes or for what it claims, and
-refuses commits dated more than a day past this machine's clock. It holds the writer lock while it
-reads, so commits on the receiving file wait for the transfer: write a slow download to a file
-first and receive from that if they must not.
+refuses commits dated more than a day past this machine's clock. It holds every branch's writer
+lock while it reads, so commits on the receiving file wait for the transfer: write a slow download
+to a file first and receive from that if they must not.
 
 If this file does not hold the commit a bundle builds on, because the bundle was built for another
 file, or this one pruned or dropped that commit after sending its have, `receive` returns
@@ -537,9 +537,10 @@ let db = Options::new().coalesce(true).open::<Jobs>("jobs.ferro")?;
 ```
 
 Every closure normally gets a version of its own, and with it its own write of every tree path it
-touched. With `coalesce`, closures that queue up while a sync is running share one write and one
-version. They still run one at a time, each on its caller's thread, so they need not be `Send`, and
-each sees what the ones before it did. An `Err` or a panic rolls back that closure alone.
+touched. With `coalesce`, closures on one branch that queue up while a sync is running share one
+write and one version. They still run one at a time, each on its caller's thread, so they need not
+be `Send`, and each sees what the ones before it did. Each branch groups its own closures. An `Err`
+or a panic rolls back that closure alone.
 On `examples/queue` at 32 workers that took jobs from 9,700 to 16,900 a second, bytes per job from
 2,691 to 146 and p99 from 2.3 to 0.8 ms. A closure that runs long against an fsync does not gain:
 at 50 µs and 8 writers it lost 16% of its throughput. A closure waits for another that is still on
@@ -769,11 +770,15 @@ This is an experiment, not a production database.
   Secondary indexes add to that. Without retention the file only grows.
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
   miss the node cache are slower for a moment after each swap.
-- One writer closure at a time. The closure runs under the writer lock, so a long closure blocks
-  every branch. Unless you opt in to `coalesce`, only the fsync is shared, so commit throughput
-  stops scaling at the cost of the closure and encoding. Calling `update`, `fork` or `drop_branch`
-  from inside it deadlocks. With `coalesce`, so does a closure that waits for another thread's commit
-  to be acknowledged.
+- One writer closure at a time on each branch. A closure runs under its branch's writer lock, so a
+  long closure holds up the writers on that branch only, and closures on different branches run at
+  the same time. Encoding each commit and writing its frame still take one lock for the whole
+  file, so commit throughput across branches stops scaling at the cost of encoding, and on one
+  branch, unless you opt in to `coalesce`, at the cost of the closure and encoding, with only the
+  fsync shared. A reclamation cycle and `receive` wait for the closure running on every branch
+  before they hold up all of them. Calling `update`, `fork` or `drop_branch` from inside a closure
+  can deadlock. With `coalesce`, so does a closure that waits for another thread's commit to be
+  acknowledged.
 - A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
   new writer can open once the last `Db` handle is gone. If a reclamation cycle has replaced that
   file since, its disk space comes back only when the last such handle is dropped.
@@ -792,8 +797,8 @@ This is an experiment, not a production database.
   your current `Default`.
 - Sync streams, but keeps under 500 bytes per object received and 110 per object sent, and holds
   each object whole, so a clone of tens of millions of objects or of one huge value still needs
-  memory to match. `receive` holds the writer lock while it reads. Files that share no commit send
-  everything on their first pull.
+  memory to match. `receive` holds every branch's writer lock while it reads. Files that share no
+  commit send everything on their first pull.
 - Each `Table` lookup through an index reads the row separately, and no query planning happens.
   You choose the index. `IndexIter::keys` gives the primary keys without reading any row.
 

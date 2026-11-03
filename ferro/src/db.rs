@@ -320,6 +320,7 @@ struct Change<'a, T> {
     parts: Parts,
     intent: Intent,
     seal: Option<&'a Arc<Seal>>,
+    from: Option<&'a Branch<T>>,
 }
 
 struct Branch<T> {
@@ -328,9 +329,112 @@ struct Branch<T> {
     tip: ArcSwap<State<T>>,
     feed: Arc<Feed<T>>,
     retired: AtomicBool,
+    lane: Mutex<Option<Group<T>>>,
+    arriving: AtomicUsize,
+    gate: Mutex<VecDeque<(u64, Waker)>>,
+    gated: AtomicUsize,
+    framed: AtomicU64,
+}
+
+struct Lane<'a, T> {
+    guard: Option<MutexGuard<'a, Option<Group<T>>>>,
+    branch: &'a Branch<T>,
+}
+
+impl<T> Deref for Lane<'_, T> {
+    type Target = Option<Group<T>>;
+
+    fn deref(&self) -> &Option<Group<T>> {
+        self.guard.as_ref().expect("ferro: the branch lock is held")
+    }
+}
+
+impl<T> DerefMut for Lane<'_, T> {
+    fn deref_mut(&mut self) -> &mut Option<Group<T>> {
+        self.guard.as_mut().expect("ferro: the branch lock is held")
+    }
+}
+
+impl<T> Drop for Lane<'_, T> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.branch.open_gate();
+    }
 }
 
 impl<T> Branch<T> {
+    fn new(name: &str, state: Arc<State<T>>) -> Branch<T> {
+        Branch {
+            name: name.to_string(),
+            feed: Arc::new(Feed::new(state.snapshot.clone())),
+            state: ArcSwap::new(state.clone()),
+            tip: ArcSwap::new(state),
+            retired: AtomicBool::new(false),
+            lane: Mutex::new(None),
+            arriving: AtomicUsize::new(0),
+            gate: Mutex::new(VecDeque::new()),
+            gated: AtomicUsize::new(0),
+            framed: AtomicU64::new(0),
+        }
+    }
+
+    fn hold<'a>(&'a self, guard: MutexGuard<'a, Option<Group<T>>>) -> Lane<'a, T> {
+        Lane {
+            guard: Some(guard),
+            branch: self,
+        }
+    }
+
+    fn open_gate(&self) {
+        fence(Ordering::SeqCst);
+        if self.gated.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let next = {
+            let mut gate = self.gate.lock();
+            let next = gate.pop_front();
+            self.gated.store(gate.len(), Ordering::Relaxed);
+            next
+        };
+        if let Some((_, waker)) = next {
+            waker.wake();
+        }
+    }
+
+    fn enter(&self, id: u64, waker: &Waker, again: bool) -> Option<Lane<'_, T>> {
+        if let Some(guard) = self.lane.try_lock() {
+            if again {
+                self.quit_gate(id);
+            }
+            return Some(self.hold(guard));
+        }
+        let mut gate = self.gate.lock();
+        match gate.iter_mut().find(|(other, _)| *other == id) {
+            Some((_, held)) => held.clone_from(waker),
+            None if again => gate.push_front((id, waker.clone())),
+            None => gate.push_back((id, waker.clone())),
+        }
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let guard = self.lane.try_lock()?;
+        gate.retain(|(other, _)| *other != id);
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        drop(gate);
+        Some(self.hold(guard))
+    }
+
+    fn quit_gate(&self, id: u64) -> bool {
+        let mut gate = self.gate.lock();
+        let before = gate.len();
+        gate.retain(|(other, _)| *other != id);
+        self.gated.store(gate.len(), Ordering::Relaxed);
+        gate.len() != before
+    }
+
+    fn on_the_way(&self) -> bool {
+        self.arriving.load(Ordering::Acquire) > 0 || self.gated.load(Ordering::Acquire) > 0
+    }
+
     fn publish(&self, state: Arc<State<T>>) -> Notice<T> {
         let snapshot = state.snapshot.clone();
         self.state.store(state);
@@ -373,7 +477,7 @@ struct Task {
 
 struct Queue<T> {
     waiting: Vec<Pending<T>>,
-    open: Option<Arc<Seal>>,
+    open: Vec<(Arc<Seal>, Arc<Branch<T>>)>,
     settled: u64,
     syncing: bool,
     failed: bool,
@@ -442,7 +546,6 @@ impl Seal {
 }
 
 struct Group<T> {
-    branch: Arc<Branch<T>>,
     state: Arc<State<T>>,
     working: T,
     messages: Vec<String>,
@@ -568,9 +671,7 @@ struct Shared<T> {
     file: PathBuf,
     options: StoreOptions,
     coalesce: bool,
-    arriving: AtomicUsize,
     costs: Costs,
-    open: Mutex<Option<Group<T>>>,
     tip: Mutex<RefState>,
     published: Mutex<RefState>,
     queue: Mutex<Queue<T>>,
@@ -588,36 +689,8 @@ struct Shared<T> {
     retired: Mutex<Vec<Retired>>,
     signal: Arc<Signal>,
     syncer: OnceLock<Arc<Signal>>,
-    gate: Mutex<VecDeque<(u64, Waker)>>,
-    gated: AtomicUsize,
     ids: AtomicU64,
     flush: fn(&Shared<T>),
-}
-
-struct Tip<'a, T> {
-    guard: Option<MutexGuard<'a, RefState>>,
-    shared: &'a Shared<T>,
-}
-
-impl<T> Deref for Tip<'_, T> {
-    type Target = RefState;
-
-    fn deref(&self) -> &RefState {
-        self.guard.as_ref().expect("ferro: the writer lock is held")
-    }
-}
-
-impl<T> DerefMut for Tip<'_, T> {
-    fn deref_mut(&mut self) -> &mut RefState {
-        self.guard.as_mut().expect("ferro: the writer lock is held")
-    }
-}
-
-impl<T> Drop for Tip<'_, T> {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        self.shared.open_gate();
-    }
 }
 
 impl<T> Drop for Shared<T> {
@@ -646,63 +719,6 @@ impl<T> Shared<T> {
 
     fn forget(&self, id: u64) {
         self.queue.lock().tasks.retain(|task| task.id != id);
-    }
-
-    fn hold<'a>(&'a self, guard: MutexGuard<'a, RefState>) -> Tip<'a, T> {
-        Tip {
-            guard: Some(guard),
-            shared: self,
-        }
-    }
-
-    fn open_gate(&self) {
-        fence(Ordering::SeqCst);
-        if self.gated.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        let next = {
-            let mut gate = self.gate.lock();
-            let next = gate.pop_front();
-            self.gated.store(gate.len(), Ordering::Relaxed);
-            next
-        };
-        if let Some((_, waker)) = next {
-            waker.wake();
-        }
-    }
-
-    fn enter(&self, id: u64, waker: &Waker, again: bool) -> Option<Tip<'_, T>> {
-        if let Some(guard) = self.tip.try_lock() {
-            if again {
-                self.quit_gate(id);
-            }
-            return Some(self.hold(guard));
-        }
-        let mut gate = self.gate.lock();
-        match gate.iter_mut().find(|(other, _)| *other == id) {
-            Some((_, held)) => held.clone_from(waker),
-            None if again => gate.push_front((id, waker.clone())),
-            None => gate.push_back((id, waker.clone())),
-        }
-        self.gated.store(gate.len(), Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        let guard = self.tip.try_lock()?;
-        gate.retain(|(other, _)| *other != id);
-        self.gated.store(gate.len(), Ordering::Relaxed);
-        drop(gate);
-        Some(self.hold(guard))
-    }
-
-    fn quit_gate(&self, id: u64) -> bool {
-        let mut gate = self.gate.lock();
-        let before = gate.len();
-        gate.retain(|(other, _)| *other != id);
-        self.gated.store(gate.len(), Ordering::Relaxed);
-        gate.len() != before
-    }
-
-    fn on_the_way(&self) -> bool {
-        self.arriving.load(Ordering::Acquire) > 0 || self.gated.load(Ordering::Acquire) > 0
     }
 }
 
@@ -776,13 +792,13 @@ where
         let db = this.db;
         if let Some(f) = this.start.take() {
             db.shared.start_syncer(&db.keeper);
-            let Some(tip) = db.shared.enter(this.id, cx.waker(), this.gated) else {
+            let Some(lane) = db.branch.enter(this.id, cx.waker(), this.gated) else {
                 this.start = Some(f);
                 this.gated = true;
                 return Poll::Pending;
             };
             this.gated = false;
-            match db.begin(tip, f) {
+            match db.begin(lane, f) {
                 Ok(wait) => this.wait = Some(wait),
                 Err(error) => return Poll::Ready(Err(error)),
             }
@@ -825,8 +841,9 @@ impl<T, F, R, E> Drop for Writing<'_, T, F, R, E> {
     fn drop(&mut self) {
         let shared = &self.db.shared;
         if self.gated {
-            if !shared.quit_gate(self.id) {
-                shared.open_gate();
+            let branch = &self.db.branch;
+            if !branch.quit_gate(self.id) {
+                branch.open_gate();
             }
             shared.rouse();
         }
@@ -996,9 +1013,7 @@ impl Options {
                 options
             },
             coalesce: self.coalesce && !read_only,
-            arriving: AtomicUsize::new(0),
             costs: Costs::default(),
-            open: Mutex::new(None),
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
                 ptr: head,
@@ -1006,7 +1021,7 @@ impl Options {
             published: Mutex::new(RefState { refs, ptr: head }),
             queue: Mutex::new(Queue {
                 waiting: Vec::new(),
-                open: None,
+                open: Vec::new(),
                 settled,
                 syncing: false,
                 failed: false,
@@ -1026,8 +1041,6 @@ impl Options {
             retired: Mutex::new(Vec::new()),
             signal: signal.clone(),
             syncer: OnceLock::new(),
-            gate: Mutex::new(VecDeque::new()),
-            gated: AtomicUsize::new(0),
             ids: AtomicU64::new(0),
             flush: Shared::<T>::flush,
         });
@@ -1139,59 +1152,76 @@ impl<T: Data> Shared<T> {
             return Err(Error::NoBranch(name.to_string()));
         }
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
-        let branch = Arc::new(Branch {
-            name: name.to_string(),
-            feed: Arc::new(Feed::new(state.snapshot.clone())),
-            state: ArcSwap::new(state.clone()),
-            tip: ArcSwap::new(state),
-            retired: AtomicBool::new(false),
-        });
+        let branch = Arc::new(Branch::new(name, state));
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
     }
 
-    fn lock_tip(&self) -> Tip<'_, T> {
-        if !self.coalesce {
-            return self.hold(self.tip.lock());
+    fn attached(&self, name: &str) -> Result<Arc<Branch<T>>> {
+        if let Some(branch) = self.branches.lock().get(name) {
+            return Ok(branch.clone());
         }
-        let mut tip = self.arrive();
-        let open = self.open.lock().take();
-        if let Some(group) = open {
-            self.seal_for_others(&mut tip, group);
-        }
-        tip
+        let _tip = self.tip.lock();
+        let published = self.published.lock();
+        self.attach(name, &published.refs)
     }
 
-    fn seal_for_others(&self, tip: &mut RefState, group: Group<T>) {
+    fn lane<'a>(&self, branch: &'a Arc<Branch<T>>) -> Lane<'a, T> {
+        if !self.coalesce {
+            return branch.hold(branch.lane.lock());
+        }
+        let mut lane = self.arrive(branch);
+        if let Some(group) = lane.take() {
+            self.seal_for_others(branch, group);
+        }
+        lane
+    }
+
+    fn exclusively<R>(&self, f: impl FnOnce(&mut RefState) -> R) -> R {
+        loop {
+            let mut branches: Vec<_> = self.branches.lock().values().cloned().collect();
+            branches.sort_by(|a, b| a.name.cmp(&b.name));
+            let lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
+            let mut tip = self.tip.lock();
+            let attached = self.branches.lock();
+            let same = attached.len() == branches.len()
+                && branches.iter().all(|branch| {
+                    attached.get(&branch.name).is_some_and(|now| Arc::ptr_eq(now, branch))
+                });
+            drop(attached);
+            if same {
+                let out = f(&mut tip);
+                drop(tip);
+                drop(lanes);
+                return out;
+            }
+        }
+    }
+
+    fn seal_for_others(&self, branch: &Arc<Branch<T>>, group: Group<T>) {
         let seal = group.seal.clone();
-        self.seal_group(tip, group);
+        self.seal_group(branch, group);
         seal.wake_one();
         self.rouse();
     }
 
-    fn arrive(&self) -> Tip<'_, T> {
-        self.arriving.fetch_add(1, Ordering::AcqRel);
+    fn arrive<'a>(&self, branch: &'a Branch<T>) -> Lane<'a, T> {
+        branch.arriving.fetch_add(1, Ordering::AcqRel);
         self.step("arriving");
-        let tip = self.tip.lock();
-        self.arriving.fetch_sub(1, Ordering::AcqRel);
-        self.hold(tip)
+        let guard = branch.lane.lock();
+        branch.arriving.fetch_sub(1, Ordering::AcqRel);
+        branch.hold(guard)
     }
 
-    fn join_group(&self, tip: &mut RefState, branch: &Arc<Branch<T>>) -> Group<T> {
-        let open = self.open.lock().take();
-        match open {
-            Some(mut group) if Arc::ptr_eq(&group.branch, branch) => {
-                if let Some(handed) = group.handed.take() {
-                    self.costs.handed_over(handed.elapsed());
-                }
-                return group;
+    fn join_group(&self, lane: &mut Lane<'_, T>, branch: &Branch<T>) -> Group<T> {
+        if let Some(mut group) = lane.take() {
+            if let Some(handed) = group.handed.take() {
+                self.costs.handed_over(handed.elapsed());
             }
-            Some(group) => self.seal_for_others(tip, group),
-            None => {}
+            return group;
         }
         let state = branch.tip.load_full();
         Group {
-            branch: branch.clone(),
             working: (*state.snapshot.value).clone(),
             state,
             messages: Vec::new(),
@@ -1202,25 +1232,38 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    fn pass_on(&self, mut group: Group<T>) -> Option<Group<T>> {
+    fn pass_on(
+        &self,
+        lane: &mut Lane<'_, T>,
+        branch: &Arc<Branch<T>>,
+        mut group: Group<T>,
+        others: &mut Vec<Arc<Branch<T>>>,
+    ) -> Option<Group<T>> {
         if group.members == 0 {
             return None;
         }
         let mut queue = self.queue.lock();
-        let arriving = self.on_the_way();
+        let arriving = branch.on_the_way();
         let handed_on = queue.syncing || (arriving && self.costs.worth_waiting());
         if handed_on && group.members < MAX_GROUP {
             group.handed = arriving.then(Instant::now);
-            queue.open = Some(group.seal.clone());
-            *self.open.lock() = Some(group);
+            others.extend(Self::other_groups(&queue, branch));
+            if !queue.open.iter().any(|(open, _)| Arc::ptr_eq(open, &group.seal)) {
+                queue.open.push((group.seal.clone(), branch.clone()));
+            }
+            **lane = Some(group);
             return None;
         }
         Some(group)
     }
 
-    fn seal_group(&self, tip: &mut RefState, group: Group<T>) {
+    fn other_groups(queue: &Queue<T>, branch: &Arc<Branch<T>>) -> Vec<Arc<Branch<T>>> {
+        let others = queue.open.iter().filter(|(_, other)| !Arc::ptr_eq(other, branch));
+        others.map(|(_, other)| other.clone()).collect()
+    }
+
+    fn seal_group(&self, branch: &Arc<Branch<T>>, group: Group<T>) {
         let Group {
-            branch,
             state,
             working,
             messages,
@@ -1231,10 +1274,11 @@ impl<T: Data> Shared<T> {
         let (message, parts) = Parts::join(messages);
         let started = Instant::now();
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut tip = self.tip.lock();
             self.commit_locked(
-                tip,
+                &mut tip,
                 Change {
-                    branch: &branch,
+                    branch,
                     state: &state,
                     working: &working,
                     message,
@@ -1244,15 +1288,14 @@ impl<T: Data> Shared<T> {
                         ..Intent::default()
                     },
                     seal: Some(&seal),
+                    from: None,
                 },
             )
         }));
         self.costs.sealed(started.elapsed());
-        let ticket = self.store().last_seq();
+        let ticket = branch.framed.load(Ordering::Acquire);
         let mut queue = self.queue.lock();
-        if queue.open.as_ref().is_some_and(|open| Arc::ptr_eq(open, &seal)) {
-            queue.open = None;
-        }
+        queue.open.retain(|(open, _)| !Arc::ptr_eq(open, &seal));
         let _ = seal.outcome.set(match written {
             Ok(Ok((version, time_ms))) => Ok(Sealed {
                 version,
@@ -1270,7 +1313,7 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    fn await_group(&self, seal: &Arc<Seal>) -> Result<(u64, u64)> {
+    fn await_group(&self, branch: &Arc<Branch<T>>, seal: &Arc<Seal>) -> Result<(u64, u64)> {
         let mut notices = Vec::new();
         loop {
             if seal.settled.load(Ordering::Acquire)
@@ -1296,15 +1339,24 @@ impl<T: Data> Shared<T> {
                     return Ok((sealed.version, sealed.time_ms));
                 }
                 Some(Ok(_)) if !queue.syncing && !queue.waiting.is_empty() => {
-                    self.lead(queue, &mut notices)?;
+                    let others = Self::other_groups(&queue, branch);
+                    if others.is_empty() {
+                        self.lead(queue, &mut notices)?;
+                        continue;
+                    }
+                    drop(queue);
+                    self.seal_idle(&others);
+                    let queue = self.queue.lock();
+                    if !queue.syncing && !queue.waiting.is_empty() {
+                        self.lead(queue, &mut notices)?;
+                    }
                     continue;
                 }
-                None if !queue.syncing && self.arriving.load(Ordering::Acquire) == 0 => {
+                None if !queue.syncing && branch.arriving.load(Ordering::Acquire) == 0 => {
                     drop(queue);
-                    let mut tip = self.arrive();
-                    let open = self.open.lock().take();
-                    if let Some(group) = open {
-                        self.seal_group(&mut tip, group);
+                    let mut lane = self.arrive(branch);
+                    if let Some(group) = lane.take() {
+                        self.seal_group(branch, group);
                     }
                     continue;
                 }
@@ -1419,40 +1471,69 @@ impl<T: Data> Shared<T> {
                 self.done.wait(&mut queue);
                 continue;
             }
-            if !queue.waiting.is_empty() {
-                let _ = self.lead(queue, &mut notices);
-                notices.clear();
-                continue;
+            let stranded: Vec<_> = queue
+                .open
+                .iter()
+                .filter(|(_, branch)| !branch.on_the_way())
+                .map(|(_, branch)| branch.clone())
+                .collect();
+            if !stranded.is_empty() {
+                drop(queue);
+                if self.close_stranded(&stranded) {
+                    continue;
+                }
+                queue = self.queue.lock();
+                if queue.failed || queue.syncing {
+                    continue;
+                }
             }
-            let stranded = queue.open.is_some() && !self.on_the_way();
-            drop(queue);
-            if !stranded || !self.close_stranded() {
+            if queue.waiting.is_empty() {
                 return;
             }
+            let _ = self.lead(queue, &mut notices);
+            notices.clear();
         }
     }
 
-    fn close_stranded(&self) -> bool {
-        let mut tip = self.arrive();
-        if self.queue.lock().syncing {
-            return false;
+    fn close_stranded(&self, stranded: &[Arc<Branch<T>>]) -> bool {
+        let mut closed = false;
+        for branch in stranded {
+            let mut lane = self.arrive(branch);
+            if self.queue.lock().syncing {
+                return closed;
+            }
+            if let Some(group) = lane.take() {
+                self.seal_group(branch, group);
+                closed = true;
+            }
         }
-        let open = self.open.lock().take();
-        let Some(group) = open else {
-            return false;
-        };
-        self.seal_group(&mut tip, group);
-        true
+        closed
+    }
+
+    fn seal_idle(&self, open: &[Arc<Branch<T>>]) {
+        for branch in open {
+            if branch.on_the_way() {
+                continue;
+            }
+            let Some(guard) = branch.lane.try_lock() else {
+                continue;
+            };
+            let mut lane = branch.hold(guard);
+            if let Some(group) = lane.take() {
+                self.seal_group(branch, group);
+            }
+        }
     }
 
     fn flush(&self) {
         let mut notices = Vec::new();
-        let mut tip = self.tip.lock();
-        let open = self.open.lock().take();
-        if let Some(group) = open {
-            self.seal_group(&mut tip, group);
+        let branches: Vec<_> = self.branches.lock().values().cloned().collect();
+        for branch in &branches {
+            let mut lane = branch.lane.lock();
+            if let Some(group) = lane.take() {
+                self.seal_group(branch, group);
+            }
         }
-        drop(tip);
         let queue = self.queue.lock();
         if !queue.syncing && !queue.failed && !queue.waiting.is_empty() {
             let _ = self.lead(queue, &mut notices);
@@ -1473,6 +1554,7 @@ impl<T: Data> Shared<T> {
         let update = branch.map(|(branch, state)| {
             let state = Arc::new(state);
             branch.tip.store(state.clone());
+            branch.framed.store(frame.seq, Ordering::Release);
             (branch.clone(), state)
         });
         tip.refs = refs;
@@ -1547,10 +1629,10 @@ impl<T: Data> Shared<T> {
             Err(_) => queue.failed = true,
         }
         let next = queue.waiting.first().and_then(|pending| pending.seal.clone());
-        let next = next.or_else(|| queue.open.clone());
+        let next = next.or_else(|| queue.open.first().map(|(seal, _)| seal.clone()));
         if queue.failed {
             seals.extend(queue.waiting.iter().filter_map(|pending| pending.seal.clone()));
-            seals.extend(queue.open.clone());
+            seals.extend(queue.open.iter().map(|(seal, _)| seal.clone()));
         }
         let settled = !queue.failed;
         let upto = queue.settled;
@@ -1558,7 +1640,7 @@ impl<T: Data> Shared<T> {
             .tasks
             .extract_if(.., |task| !settled || task.ticket <= upto)
             .collect();
-        let rouse = !queue.waiting.is_empty() || queue.open.is_some();
+        let rouse = !queue.waiting.is_empty() || !queue.open.is_empty();
         drop(queue);
         self.done.notify_all();
         for seal in seals {
@@ -1600,7 +1682,12 @@ impl<T: Data> Shared<T> {
             parts,
             intent,
             seal,
+            from,
         } = change;
+        branch.check_live()?;
+        if let Some(from) = from {
+            from.check_live()?;
+        }
         let store = &self.store();
         let mut txn = store.begin()?;
         let (root, value) = write_decoded(working, &mut txn, store)?;
@@ -1699,37 +1786,38 @@ impl<T: Data> Shared<T> {
             return Ok(0);
         }
         let store = self.store();
-        let mut tip = self.lock_tip();
-        let mut next = tip.refs.clone();
-        let mut dropped = 0;
-        for (name, mut head) in tip.refs.try_entries()? {
-            let log = head.log.pruned(&store, keep)?;
-            if log != head.log {
-                dropped += (head.log.len() - log.len()) as u64;
-                head.log = log;
-                next.insert(name, head);
+        self.exclusively(|tip| {
+            let mut next = tip.refs.clone();
+            let mut dropped = 0;
+            for (name, mut head) in tip.refs.try_entries()? {
+                let log = head.log.pruned(&store, keep)?;
+                if log != head.log {
+                    dropped += (head.log.len() - log.len()) as u64;
+                    head.log = log;
+                    next.insert(name, head);
+                }
             }
-        }
-        if dropped == 0 {
-            return Ok(0);
-        }
-        let txn = store.begin()?;
-        self.stage(&mut tip, next, txn, None, None)?;
-        self.settle(store.last_seq(), notices)?;
-        let refs = tip.refs.clone();
-        for branch in self.branches.lock().values() {
-            if let Some(head) = refs.try_get(&branch.name)? {
-                let state = branch.tip.load_full();
-                let next = Arc::new(State {
-                    snapshot: state.snapshot.clone(),
-                    log: head.log,
-                    store: state.store.clone(),
-                });
-                branch.tip.store(next.clone());
-                branch.state.store(next);
+            if dropped == 0 {
+                return Ok(0);
             }
-        }
-        Ok(dropped)
+            let txn = store.begin()?;
+            self.stage(tip, next, txn, None, None)?;
+            self.settle(store.last_seq(), notices)?;
+            let refs = tip.refs.clone();
+            for branch in self.branches.lock().values() {
+                if let Some(head) = refs.try_get(&branch.name)? {
+                    let state = branch.tip.load_full();
+                    let next = Arc::new(State {
+                        snapshot: state.snapshot.clone(),
+                        log: head.log,
+                        store: state.store.clone(),
+                    });
+                    branch.tip.store(next.clone());
+                    branch.state.store(next);
+                }
+            }
+            Ok(dropped)
+        })
     }
 
     fn compact(&self, keep: Keep, stop: Option<&AtomicBool>) -> Result<Compacted> {
@@ -1790,20 +1878,22 @@ impl<T: Data> Shared<T> {
         copier.sync()?;
         self.step("synced");
         let paused = Instant::now();
-        let mut tip = self.lock_tip();
-        self.settle(store.last_seq(), notices)?;
-        store.check_healthy()?;
-        let basis = store.basis();
-        let (head, objects) = {
-            let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
-            let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
-            copier.finish(&tip.refs, store.last_seq(), survival)?
-        };
-        let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
-        let swapped = self.swap_in(&mut tip, store, &fresh, &temp, head);
-        swapped.inspect_err(|_| fresh.close())?;
-        self.signal.base.store(fresh.size(), Ordering::Relaxed);
-        drop(tip);
+        let (fresh, objects) = self.exclusively(|tip| -> Result<(Store, u64)> {
+            self.step("paused");
+            self.settle(store.last_seq(), notices)?;
+            store.check_healthy()?;
+            let basis = store.basis();
+            let (head, objects) = {
+                let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
+                let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
+                copier.finish(&tip.refs, store.last_seq(), survival)?
+            };
+            let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
+            let swapped = self.swap_in(tip, store, &fresh, &temp, head);
+            swapped.inspect_err(|_| fresh.close())?;
+            self.signal.base.store(fresh.size(), Ordering::Relaxed);
+            Ok((fresh, objects))
+        })?;
         report.pause = paused.elapsed();
         self.step("swapped");
         report.after_bytes = fresh.size();
@@ -2060,14 +2150,14 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        let tip = match self.shared.coalesce {
-            true => self.shared.arrive(),
-            false => self.shared.lock_tip(),
+        let lane = match self.shared.coalesce {
+            true => self.shared.arrive(&self.branch),
+            false => self.shared.lane(&self.branch),
         };
-        match self.begin(tip, f)? {
+        match self.begin(lane, f)? {
             Wait::Ticket(staged) => self.settle(staged),
             Wait::Group(joined) => {
-                let (version, time_ms) = self.shared.await_group(&joined.seal)?;
+                let (version, time_ms) = self.shared.await_group(&self.branch, &joined.seal)?;
                 joined.finish(version, time_ms)
             }
         }
@@ -2075,13 +2165,13 @@ impl<T: Data> Db<T> {
 
     fn begin<R, E: From<Error>>(
         &self,
-        tip: Tip<'_, T>,
+        lane: Lane<'_, T>,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Wait<R, E>, E> {
         if self.shared.coalesce {
-            return self.stage_group(tip, f).map(Wait::Group);
+            return self.stage_group(lane, f).map(Wait::Group);
         }
-        let staged = self.stage_alone(tip, |_, _, root, stamp| {
+        let staged = self.stage_alone(lane, None, |_, root, stamp| {
             f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
         });
         staged.map(Wait::Ticket)
@@ -2089,14 +2179,18 @@ impl<T: Data> Db<T> {
 
     fn alone<R, E: From<Error>>(
         &self,
+        from: Option<&Branch<T>>,
         f: impl FnOnce(
             &RefState,
             &State<T>,
             &mut T,
-            &Stamp<'_>,
         ) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        let staged = self.stage_alone(self.shared.lock_tip(), f)?;
+        let lane = self.shared.lane(&self.branch);
+        let staged = self.stage_alone(lane, from, |state, root, _| {
+            let tip = self.shared.tip.lock().clone();
+            f(&tip, state, root)
+        })?;
         self.settle(staged)
     }
 
@@ -2111,9 +2205,9 @@ impl<T: Data> Db<T> {
 
     fn stage_alone<R, E: From<Error>>(
         &self,
-        mut tip: Tip<'_, T>,
+        lane: Lane<'_, T>,
+        from: Option<&Branch<T>>,
         f: impl FnOnce(
-            &RefState,
             &State<T>,
             &mut T,
             &Stamp<'_>,
@@ -2130,7 +2224,7 @@ impl<T: Data> Db<T> {
             time: &time,
             clock: self.shared.clock.as_ref(),
         };
-        let ran = f(&tip, &state, &mut working, &stamp);
+        let ran = f(&state, &mut working, &stamp);
         let result = ran.and_then(|(message, value, mut intent)| {
             intent.time = time.get().copied();
             let change = Change {
@@ -2141,12 +2235,14 @@ impl<T: Data> Db<T> {
                 parts: Parts::Whole,
                 intent,
                 seal: None,
+                from,
             };
+            let mut tip = self.shared.tip.lock();
             let (version, time_ms) = self.shared.commit_locked(&mut tip, change)?;
             Ok((value, version, time_ms))
         });
-        let ticket = self.shared.store().last_seq();
-        drop(tip);
+        let ticket = self.branch.framed.load(Ordering::Acquire);
+        drop(lane);
         Ok(Staged {
             result,
             ticket,
@@ -2156,18 +2252,18 @@ impl<T: Data> Db<T> {
 
     fn stage_group<R, E: From<Error>>(
         &self,
-        mut tip: Tip<'_, T>,
+        mut lane: Lane<'_, T>,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Joined<R, E>, E> {
         let shared = &self.shared;
-        if let Err(error) = self.branch.check_live() {
-            let open = shared.open.lock().take();
-            if let Some(group) = open.and_then(|group| shared.pass_on(group)) {
-                shared.seal_for_others(&mut tip, group);
+        let branch = &self.branch;
+        if let Err(error) = branch.check_live() {
+            if let Some(group) = lane.take() {
+                shared.seal_for_others(branch, group);
             }
             return Err(error.into());
         }
-        let mut group = shared.join_group(&mut tip, &self.branch);
+        let mut group = shared.join_group(&mut lane, branch);
         let checkpoint = (group.members > 0).then(|| group.working.clone());
         let before = group.state.snapshot.commit.version;
         let seal = group.seal.clone();
@@ -2189,12 +2285,13 @@ impl<T: Data> Db<T> {
                 group.time = OnceCell::new();
             }
         }
+        let mut others = Vec::new();
         let result = match ran {
             Err(panicked) => {
-                if let Some(group) = shared.pass_on(group) {
-                    shared.seal_for_others(&mut tip, group);
+                if let Some(group) = shared.pass_on(&mut lane, branch, group, &mut others) {
+                    shared.seal_for_others(branch, group);
                 }
-                drop(tip);
+                drop(lane);
                 panic::resume_unwind(panicked);
             }
             Ok(Err(error)) => Err(error),
@@ -2206,10 +2303,13 @@ impl<T: Data> Db<T> {
             }
         };
         group.members += 1;
-        if let Some(group) = shared.pass_on(group) {
-            shared.seal_group(&mut tip, group);
+        if let Some(group) = shared.pass_on(&mut lane, branch, group, &mut others) {
+            shared.seal_group(branch, group);
         }
-        drop(tip);
+        drop(lane);
+        if !others.is_empty() {
+            shared.seal_idle(&others);
+        }
         Ok(Joined {
             result,
             seal,
@@ -2285,7 +2385,7 @@ impl<T: Data> Db<T> {
             restored: Some(snapshot.commit.version),
             ..Intent::default()
         };
-        self.alone::<(), Error>(move |_, _, root, _| {
+        self.alone::<(), Error>(None, move |_, _, root| {
             *root = value;
             Ok((message, (), intent))
         })
@@ -2383,7 +2483,7 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
-        self.alone(|tip, ours, root, _| {
+        self.alone(Some(&other.branch), |tip, ours, root| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -2412,7 +2512,8 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
-        let done = self.alone::<std::result::Result<R, u64>, E>(|tip, ours, root, _| {
+        let from = Some(&*other.branch);
+        let done = self.alone::<std::result::Result<R, u64>, E>(from, |tip, ours, root| {
             other.branch.check_live()?;
             let theirs = other.branch.state.load_full();
             let store = self.shared.store();
@@ -2580,8 +2681,9 @@ impl<T: Data> Db<T> {
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
         let mut notices = Vec::new();
-        let mut tip = self.shared.lock_tip();
+        let lane = self.shared.lane(&self.branch);
         self.branch.check_live()?;
+        let mut tip = self.shared.tip.lock();
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
@@ -2607,13 +2709,13 @@ impl<T: Data> Db<T> {
         self.shared.stage(&mut tip, next, txn, None, None)?;
         let ticket = store.last_seq();
         drop(tip);
+        drop(lane);
         self.shared.settle(ticket, &mut notices)?;
         self.branch(name)
     }
 
     pub fn branch(&self, name: &str) -> Result<Db<T>> {
-        let refs = self.shared.published.lock();
-        let branch = self.shared.attach(name, &refs.refs)?;
+        let branch = self.shared.attached(name)?;
         Ok(Db {
             shared: self.shared.clone(),
             branch,
@@ -2626,31 +2728,40 @@ impl<T: Data> Db<T> {
             return Err(Error::BranchInUse(name.to_string()));
         }
         let mut notices = Vec::new();
-        let mut tip = self.shared.lock_tip();
-        if tip.refs.try_get(name)?.is_none() {
-            return Err(Error::NoBranch(name.to_string()));
-        }
-        let store = self.shared.store();
-        let txn = store.begin()?;
-        let mut next = tip.refs.clone();
-        next.remove(name);
-        for (branch, mut head) in next.try_entries()? {
-            if head.merged.try_get(name)?.is_some() {
-                head.merged.remove(name);
-                next.insert(branch, head);
+        loop {
+            let doomed = self.shared.branches.lock().get(name).cloned();
+            let lane = doomed.as_ref().map(|branch| self.shared.lane(branch));
+            let mut tip = self.shared.tip.lock();
+            let attached = self.shared.branches.lock().get(name).cloned();
+            if attached.as_ref().map(Arc::as_ptr) != doomed.as_ref().map(Arc::as_ptr) {
+                continue;
             }
+            if tip.refs.try_get(name)?.is_none() {
+                return Err(Error::NoBranch(name.to_string()));
+            }
+            let store = self.shared.store();
+            let txn = store.begin()?;
+            let mut next = tip.refs.clone();
+            next.remove(name);
+            for (branch, mut head) in next.try_entries()? {
+                if head.merged.try_get(name)?.is_some() {
+                    head.merged.remove(name);
+                    next.insert(branch, head);
+                }
+            }
+            self.shared.stage(&mut tip, next, txn, None, None)?;
+            let ticket = store.last_seq();
+            self.shared.settle(ticket, &mut notices)?;
+            let published = self.shared.published.lock();
+            let retired = self.shared.branches.lock().remove(name);
+            drop(published);
+            if let Some(branch) = &retired {
+                branch.retire();
+            }
+            drop(tip);
+            drop(lane);
+            return Ok(());
         }
-        self.shared.stage(&mut tip, next, txn, None, None)?;
-        let ticket = store.last_seq();
-        self.shared.settle(ticket, &mut notices)?;
-        let published = self.shared.published.lock();
-        let retired = self.shared.branches.lock().remove(name);
-        drop(published);
-        if let Some(branch) = &retired {
-            branch.retire();
-        }
-        drop(tip);
-        Ok(())
     }
 
     pub fn branches(&self) -> Vec<String> {
@@ -2686,7 +2797,7 @@ impl<T: Data> Db<T> {
             return Ok(false);
         }
         let mut notices = Vec::new();
-        let mut tip = self.shared.lock_tip();
+        let mut tip = self.shared.tip.lock();
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
             Err(Error::Replaced) => {
@@ -2786,38 +2897,39 @@ impl<T: Data> Db<T> {
     ) -> Result<X> {
         let shared = &self.shared;
         let mut notices = Vec::new();
-        let mut tip = shared.lock_tip();
-        self.branch.check_live()?;
-        let store = shared.store();
-        let mut txn = store.begin()?;
-        let (next, out) = edit(&store, &mut txn, &tip.refs)?;
-        let Some(next) = next else {
-            return Ok(out);
-        };
-        let before = tip.refs.clone();
-        shared.stage(&mut tip, next, txn, None, None)?;
-        shared.settle(store.last_seq(), &mut notices)?;
-        let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
-        let mut states = Vec::new();
-        for branch in attached {
-            let old = before.try_get(&branch.name)?;
-            let new = tip.refs.try_get(&branch.name)?;
-            let moved = match (&old, &new) {
-                (Some(old), Some(new)) => {
-                    old.log != new.log || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
-                }
-                (None, None) => false,
-                _ => true,
+        shared.exclusively(|tip| {
+            self.branch.check_live()?;
+            let store = shared.store();
+            let mut txn = store.begin()?;
+            let (next, out) = edit(&store, &mut txn, &tip.refs)?;
+            let Some(next) = next else {
+                return Ok(out);
             };
-            if moved {
-                states.push((branch, Arc::new(shared.state_of(&store, new.as_deref())?)));
+            let before = tip.refs.clone();
+            shared.stage(tip, next, txn, None, None)?;
+            shared.settle(store.last_seq(), &mut notices)?;
+            let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
+            let mut states = Vec::new();
+            for branch in attached {
+                let old = before.try_get(&branch.name)?;
+                let new = tip.refs.try_get(&branch.name)?;
+                let moved = match (&old, &new) {
+                    (Some(old), Some(new)) => {
+                        old.log != new.log
+                            || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
+                    }
+                    (None, None) => false,
+                    _ => true,
+                };
+                if moved {
+                    states.push((branch, Arc::new(shared.state_of(&store, new.as_deref())?)));
+                }
             }
-        }
-        for (branch, state) in states {
-            branch.tip.store(state.clone());
-            notices.push(branch.publish(state));
-        }
-        drop(tip);
-        Ok(out)
+            for (branch, state) in states {
+                branch.tip.store(state.clone());
+                notices.push(branch.publish(state));
+            }
+            Ok(out)
+        })
     }
 }

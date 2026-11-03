@@ -780,13 +780,16 @@ one missed stayed behind until another commit landed.
 
 ## Concurrency
 
-Writers run their closures one at a time under the `tip` mutex and sync outside it. Each branch
-has two states: `state`, the published one that readers load through `ArcSwap`, and `tip`, the
-newest one written. Under the mutex a writer clones the tip, runs the closure, flushes, writes its
-frame to the page cache, queues it, and releases the mutex. The next writer builds on that tip
-even though it is not durable yet. Object reads are bounded by `written`, the end of the frames in
-the file, rather than `tail`, the published end, so unpublished objects stay readable to writers.
-Published pointers never reach past `tail`.
+Each branch has a writer lock of its own, its lane, and the database has one more, the `tip`
+mutex, which orders frames. Writers run their closures one at a time on a branch under its lane,
+encode and write one at a time under `tip`, and sync outside both. Each branch has two states:
+`state`, the published one that readers load through `ArcSwap`, and `tip`, the newest one
+written. Under its lane a writer clones the branch's tip and runs the closure, then under `tip` it
+flushes, writes its frame to the page cache and queues it, and it releases both. The next writer
+on the branch builds on that tip even though it is not durable yet, and a writer on another branch
+runs its closure meanwhile, as described under a lock per branch below. Object reads are bounded
+by `written`, the end of the frames in the file, rather than `tail`, the published end, so
+unpublished objects stay readable to writers. Published pointers never reach past `tail`.
 
 Each writer then waits for its frame. The first to find no sync running becomes the leader: it
 takes the whole queue, fdatasyncs, writes one superblock for the last frame, publishes the batch
@@ -803,9 +806,10 @@ Under `Durability::Buffered` the superblock can name frames that are not yet syn
 read-only follower that refreshes may adopt commits that a power cut later takes back. A closure
 that ends without a frame, because nothing changed or it returned `Err`, may still have read an
 unpublished tip, so it waits for that tip before returning, and reports the failure instead if the
-tip never became durable. `fork` copies the tip and waits the same way, so the new branch appears
-in `branches` only once durable. `branch`, `branches` and `verify` use the published refs and do
-not touch the mutex.
+tip never became durable. That is the frame that last moved its own branch's tip, not the newest
+frame of any branch. `fork` copies the tip and waits the same way, so the new branch appears in
+`branches` only once durable. `branches` and `verify` use the published refs and do not touch the
+mutex, and `branch` takes it only to attach a branch for the first time.
 
 If a sync fails, the store poisons, nothing in the batch is published, the leader gets the I/O
 error, and every queued writer gets `Error::Poisoned`. A failed commit's frame may still be on disk
@@ -972,11 +976,14 @@ every closure:
   A closure that fails or panics puts the time back unset if it was the one that set it, as it puts
   back the working copy, so a group whose only reader failed keeps no claim on its millisecond.
 - `restore` and `merge_with` commit alone, since `restored` and `merged` belong to one version.
-  They, `fork`, `drop_branch` and a reclamation cycle flush the open group before they start, and a
-  closure on another branch flushes it before starting its own.
+  They and `fork` flush their branch's open group before they start, `drop_branch` flushes the
+  dropped branch's, and a reclamation cycle flushes every branch's.
+- A group belongs to one branch, and each branch can have one open. A closure on another branch
+  that leaves its own group open seals any other branch's group that nobody is on the way to, as
+  described under a lock per branch below.
 
-The combiner is a lock passed between waiters. The group's working copy lives in `Shared` between
-closures and each closure takes it under the `tip` mutex on its own thread. So there is no `Send`
+The combiner is a lock passed between waiters. The group's working copy lives in its branch's lane
+between closures and each closure takes it under that lane on its own thread. So there is no `Send`
 bound, `update` closures keep borrowing local state, and a panic unwinds where it should. Cloning
 the working copy first is the checkpoint, O(1) per collection, and an `Err` or a panic puts it back.
 That closure still waits for the group, since it may have read state that never becomes durable,
@@ -1186,7 +1193,9 @@ waiting for a woken one to be polled. Blocking writers still park in `parking_lo
 the lock between a release and that poll. A future waiting at the gate counts as on its way to the
 lock, so a coalescing group is handed to it as to a thread blocked in `arrive`. The waiter count is
 stored before a second `try_lock`, and read after the release, with a `SeqCst` fence on each side,
-so a release and a future queuing at the same moment cannot both miss each other.
+so a release and a future queuing at the same moment cannot both miss each other. The lock a
+future waits for is now its branch's lane, so each branch has a gate of its own, as described under
+a lock per branch below.
 
 The sync goes to a `ferro-sync` thread, one per open database, started by the first awaited write
 and holding only a `Weak` to the database. A future never calls fdatasync. After its closure runs it
@@ -1275,6 +1284,151 @@ the next sync, and here each wake unparks a thread where on an executor it queue
 p99 at 8 writers fell from 1.4 to 2.1 ms to 0.4 ms. Leading a Buffered batch from the poll itself
 would save the lone writer's 2 µs, but its checkpoint can fdatasync 64 MiB on an executor thread,
 so it was left out.
+
+### A lock per branch
+
+Every branch used to share the `tip` mutex for the whole of a write, so a closure on one branch
+stalled commits on every other, and closures on different branches never overlapped though they
+touch independent state (#37). Each `Branch` now has a lane, a mutex held while a closure runs on a
+copy of that branch's tip, which also holds the branch's open coalescing group. `tip` is taken
+after the closure, only to encode the working copy, append the log entry, write the refs and the
+frame and queue it. Locks are always taken in the order lane, `tip`, `published`, the attached
+branches, the queue, and nothing waits for a lane while it holds `tip`.
+
+A commit has to know where its frame starts before it encodes its first record. A record names
+each link by offset, stored as the distance back from the record itself, and the flush leaves
+those offsets in the cached copies of the nodes it wrote and in the new tip. So encoding stays
+under `tip`, and only the closure runs in parallel. Three ways to move encoding out were
+considered. Relocating a finished frame changes the distance to every object outside it, and with
+it the length of its varint, so every record after it moves: that is encoding again, and the cached
+nodes would need patching too. Encoding at the current end and starting again when another frame
+got there first wastes the work under exactly the contention this is for. Reserving a region per
+writer and padding what it leaves would change the format. The parallel flush already encodes,
+hashes and compresses subtrees before it knows their offsets and appends them in a second pass,
+which is the shape a first phase that needs no position would take, but it lives in the map's
+flush and was not extended. Sequence numbers, the dedupe table, the superblock and the queue were
+already ordered by `tip` or the queue's mutex and did not change.
+
+The queue is shared, so frames from every branch wait for one fdatasync as before, and the leader
+publishes them in frame order. Coalescing is per branch. A group's working copy lives in its
+branch's lane, so that lane is the lock passed between its closures, and each branch can have a
+group open, which writes its own frame and version. Arrivals and gated futures are counted per
+branch, since only they can join a group, and the costs that decide whether to wait for them stay
+shared.
+
+Leaving every group open until its sync ended lost throughput. The groups were sealed when the sync
+ended, so their encodes queued on `tip` in the gap before the next sync instead of running during
+the last one. The first version also woke a member of every open group, and the first to finish
+led a sync of its own frame alone, so the rest waited a second sync: with one writer on each of 8
+branches, 50 µs closures and Fsync, commits took 1.5 ms at p50 against 0.8 ms, and 38% fewer went
+through than with the single group. Now a closure that leaves its own group open seals any other
+branch's group that nobody is on the way to, taking that lane only if it is free, so those encodes
+run during the sync, as they did when a closure on another branch flushed the single group. A group
+with a writer at its lane or its gate is left to grow. A writer about to lead first seals the idle
+groups of other branches, the sync thread those of every branch, and when a sync ends with no frame
+waiting the leader wakes one member of the first open group, as it woke the member of the only one
+before, so all the groups a sync left open go into the next one. On one branch a closure and a
+leading writer find no other branch's group, in a list taken while they already hold the queue's
+mutex, and do what they did before. Only the sync thread's order changed there: it closes a
+stranded group before it leads rather than after, so the two share a sync.
+
+An awaited write waits at its branch's gate, so it queues only behind writers of its branch. After
+its closure it takes `tip` with a plain `lock()` in the same poll, since a guard cannot be kept
+across polls. `tip` is held for one encode at a time, a few tens of microseconds, and through one
+fsync by `drop_branch`, so an executor thread can wait that long behind other branches' commits,
+but never behind a closure.
+
+`fork` takes its branch's lane, which seals its open group, then `tip`, and copies the tip the
+next commit would build on. `drop_branch` takes the dropped branch's lane, sealing its group, then
+`tip`, and holds both through its frame's sync and until the branch is retired, so a closure on
+that branch either committed before the drop or gets `Error::NoBranch`. Every commit checks again
+under `tip` that its branch is live, since that is where its frame is decided. A merge runs under
+our lane only: it copies the refs under `tip`, then finds the base and runs the closure without it,
+and its commit checks under `tip` that the other branch is live too. So a merge from a branch that
+was dropped while the closure ran fails with `NoBranch` instead of writing that name back into a
+merge record. A reclamation cycle's prune and its pause, and the frame `receive` writes, replace
+the tip of every branch, so they take every attached branch's lane in name order, sealing each open
+group, and then `tip`. Attaching a branch for the first time takes `tip`, so once they hold it no
+branch can appear that they have not locked. They check under `tip` that the set has not changed
+since they listed it, and start again if it has. With attaching left outside `tip`, a test that
+attaches a branch during the pause saw it load its tip from the old file and run its closure, and
+its commit linked its log entry to an offset in the old file, which came back after the swap as
+`pointer 21643 outside log of 16147 bytes`.
+
+Each frame's refs are built under `tip` from the refs of the frame before, so every frame and every
+superblock names one consistent set of heads, and a read-only follower's `refresh` sees whole
+commits on every branch as before. In the process, the leader publishes the refs of its batch's
+last frame and each branch's state in frame order, and notices still drop after every lock is
+released.
+
+`ferro-bench`'s `group` tool takes `--branches own`, which forks a branch for every writer. Each
+writer commits single-key updates spread over 100,000 keys from a closure that spins for the given
+time. On a 32-core machine shared with other work, median of three alternating runs against the
+tree before, closures a second:
+
+| Durability | Closure | 4 branches, before | After | 8 branches, before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Buffered | none | 40,601 | 43,148 | 35,399 | 38,287 |
+| Buffered | 10 µs | 30,981 | 43,936 | 28,743 | 35,370 |
+| Buffered | 50 µs | 13,624 | 42,431 | 13,077 | 35,541 |
+| Buffered | 200 µs | 4,414 | 17,432 | 4,223 | 30,040 |
+| Fsync | none | 5,134 | 5,080 | 9,836 | 9,910 |
+| Fsync | 10 µs | 5,090 | 5,214 | 9,958 | 10,226 |
+| Fsync | 50 µs | 5,498 | 5,084 | 9,712 | 9,794 |
+| Fsync | 200 µs | 4,208 | 5,559 | 4,154 | 9,567 |
+
+Before, every closure queued on the one lock, so throughput was the inverse of a closure and its
+encode however many branches wrote. Buffered p99 at 8 branches fell from 7.8 to 0.53 ms with 50 µs
+closures and from 11.6 to 0.57 ms with 200 µs, while p50 with no closure rose from 27 to 184 µs:
+one writer used to take the lock again and again while the others waited, and now each branch
+takes its turn at `tip`. Encodes still queue on `tip`, so 8 branches with short closures commit
+more slowly than 4, and Fsync gains only once closures are long enough that the lock, not the disk,
+was the limit. A prototype that changed only the plain path measured the same before the rest was
+built: 3.27 and 2.62 times at 50 µs, 4.17 and 6.83 at 200 µs, and 1.34 and 2.19 for Fsync at 200 µs.
+
+One branch, median of five alternating runs, before and after:
+
+| Durability | Closure | 1 writer | 8 writers | 32 writers |
+| --- | ---: | ---: | ---: | ---: |
+| Buffered | none | 49,096 → 49,946 | 42,650 → 42,861 | 36,588 → 37,463 |
+| Buffered | 50 µs | 14,451 → 14,410 | 13,807 → 13,756 | 12,355 → 12,129 |
+| Fsync | none | 2,440 → 2,581 | 10,427 → 10,330 | 23,303 → 23,812 |
+| Fsync | 50 µs | 2,208 → 2,246 | 9,886 → 9,937 | 11,055 → 12,686 |
+
+The Fsync figure for 32 writers with no closure is the median of ten more alternating runs, since
+the first five gave 0.79 of before while the disk swung between 25,000 and 33,000 a second for both
+trees. Single-writer p50 stayed at 18 µs Buffered. `tables`, one Buffered writer, median of five:
+outside the closure a hold ran 579,253 instructions before and 579,426 after, a confirm 724,272 and
+724,005, and a cancel 913,797 and 913,634, and thread CPU time moved from 70.8 to 70.6, 84.3 to 84.0
+and 111.6 to 111.2 µs. On one branch the second lock is never contended, and it costs nothing that
+these runs can see.
+
+Awaited writes on their own branches, Buffered, gained as blocking ones did: 13,227 to 41,727 a
+second at 4 branches with 50 µs closures and 12,423 to 34,837 at 8. On one branch they stayed within
+4%, and Fsync at 8 branches with 50 µs closures went from 9,961 to 10,024 over ten alternating runs.
+
+With `coalesce` and a branch per writer, median of six alternating runs, Buffered went from 34,525
+to 41,418 a second at 4 branches with no closure and from 28,552 to 35,066 at 8, and from 12,695
+to 37,468 and 10,790 to 35,754 with 50 µs closures. Fsync went from 3,980 to 5,222 and 8,942 to
+9,435 with no closure, and from 3,702 to 4,800 and 8,060 to 8,570 with 50 µs, where leaving every
+group open to the end of its sync had given 0.62 of before at 8 branches. Coalesced awaited writes
+with 50 µs closures went from 12,634 to 39,240 and 10,964 to 32,224 Buffered, and from 3,787 to
+4,882 and 8,985 to 9,404 under Fsync. On one branch with `coalesce`, Buffered stayed within 4% at 1,
+8 and 32 writers with and without a closure, and closures per version stayed where they were, about
+8 at 8 writers and 32 at 32 under Fsync. Fsync cells there ranged from 0.83 to 1.20 of before over
+six runs, and the same cells, on code that is the same for one branch, came out at 1.04, 1.02 and
+1.01 in five runs the hour before: a lone Fsync writer waits on a disk that other work shares.
+
+Left open:
+
+- Encoding under `tip`, which bounds commits across all branches at one encode at a time. Moving
+  it out needs the position-free first phase described above.
+- A cycle or `receive` that waits for a long closure holds the lanes it has already taken, those
+  that sort before that closure's branch, so those branches wait for the rest of that closure, as
+  every branch did before.
+- A closure that commits on another branch no longer deadlocks by itself, but it can deadlock
+  against a cycle, which takes lanes in name order, so it is still not allowed.
+- An awaited write takes `tip` without a gate after its closure.
 
 ### Commits of a few rows
 
@@ -1671,7 +1825,7 @@ common ancestor in it: a commit both tips reach through `prev` and merge links t
 ancestor of another such commit. Because it follows merge links, a change counts as shared however
 it arrived, directly, through a third branch (A merges B after B merged C, then A merges C), or
 through a fork of a branch that was already merged, so a closure that adds counter deltas applies
-each delta once. The base is computed under the writer lock against the tip the closure runs on.
+each delta once. The base is computed under our branch's lane against the tip the closure runs on.
 A merge that keeps only our side still commits, so the link is not lost, and merging a branch
 whose tip we already contain writes nothing.
 
@@ -1679,7 +1833,7 @@ whose tip we already contain writes nothing.
 panic, and `examples/booking` caught the panic and turned its payload back into a message.
 `try_merge_with` is the same merge with a closure that returns `Result<(S, R), E>` for any
 `E: From<Error>`, like `try_commit_with`, and `merge_with` is now that with a closure that cannot
-fail. The closure runs on a copy of our tip under the writer lock, and the merge link and the
+fail. The closure runs on a copy of our tip under our branch's lane, and the merge link and the
 `merged` record are only written by the commit after it returns, so an `Err` drops the copy and
 nothing reaches the file: the next merge finds the same base and runs again. The errors of the merge
 itself, such as `NoBranch` for a dropped branch, come back through `E::from`. `Map::try_merge` and
@@ -1860,9 +2014,11 @@ removed record back.
 A commit writes its head by name, so a handle on a dropped branch would quietly recreate it. Each
 `Branch` therefore has a `retired` flag, which commits, forks and merges from that branch check
 under the `tip` mutex, returning `Error::NoBranch`. `drop_branch` holds the mutex through its sync
-and until the flag is set, so no commit fits between the frame and the flag. That stalls writers for
-one fsync, on an operation that is rare. Retiring also closes the feed, which ends the branch's
-watchers. Reads through an old handle still work, because state is a value and its objects are
+and until the flag is set, so no commit fits between the frame and the flag. That stalls the
+encoding of writers on every branch for one fsync, on an operation that is rare. It also holds the
+dropped branch's lane, so a closure on it either ran and committed before the drop or fails.
+Retiring also closes the feed, which ends the branch's watchers. Reads through an old handle still
+work, because state is a value and its objects are
 there at least until a cycle, and after one the handle keeps the old file open. A later fork of the same name is a new `Branch`, so old handles stay dead.
 
 Counting handles and refusing the drop while others exist was rejected: a clone parked on another
@@ -2343,10 +2499,10 @@ is larger, so the copying stays proportional to what was written.
    Data is immutable, so no write barrier is needed. Passes repeat, up to six, until one copies less
    than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.
-4. Swap, under the `tip` mutex. This is the only pause. Wait for queued commits, copy what is left,
-   write both superblock slots and sync. Open the new file, which takes its writer lock, and read
-   every branch's tip and root from it. Rename it over the old one, sync the directory (on Windows,
-   flush the renamed file), and rebind every branch.
+4. Swap, under every branch's lane and the `tip` mutex. This is the only pause. Wait for queued
+   commits, copy what is left, write both superblock slots and sync. Open the new file, which
+   takes its writer lock, and read every branch's tip and root from it. Rename it over the old one,
+   sync the directory (on Windows, flush the renamed file), and rebind every branch.
 5. Retire, with no lock. Clear the old generation's cache. Its file goes when the last handle does.
 
 The new file continues the frame sequence, so group commit tickets stay in order. It has no frames

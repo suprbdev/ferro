@@ -949,6 +949,33 @@ fn a_closure_on_another_branch_flushes_the_open_group() {
 }
 
 #[test]
+fn groups_left_open_on_many_branches_share_the_next_sync() {
+    let _turn = serial();
+    let (_dir, _path, db) = database();
+    let sides: Vec<_> = (0..4).map(|i| db.fork(&format!("side-{i}")).unwrap()).collect();
+    let ran = Ran::new();
+    let leader = stall_leader(&db, &ran);
+    let members: Vec<_> = sides
+        .iter()
+        .enumerate()
+        .map(|(i, side)| bump(side, &ran, format!("side {i}")))
+        .collect();
+    ran.reach(5);
+    settle_queue();
+    let before = hook().calls;
+    release(false);
+    leader.join().unwrap().unwrap();
+    for member in members {
+        assert_eq!(member.join().unwrap().unwrap().version, 2);
+    }
+    assert_eq!(hook().calls - before, 1, "the open groups took more than one sync");
+    for side in &sides {
+        assert_eq!((side.version(), counter(&side.read())), (2, 2));
+    }
+    db.verify().unwrap();
+}
+
+#[test]
 fn a_dead_branch_cannot_strand_the_open_group() {
     let _turn = serial();
     let (_dir, _path, db) = database();
