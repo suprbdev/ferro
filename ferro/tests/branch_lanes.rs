@@ -11,8 +11,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use common::{Rng, text};
-use ferro::db::Hook;
+use common::{Rng, cases, text};
+use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Trace};
 use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim};
 use parking_lot::Mutex;
@@ -1091,4 +1091,153 @@ fn every_acknowledged_commit_counts_once_across_branches() {
         assert_eq!(branch.version(), 601);
     }
     db.verify().unwrap();
+}
+
+type Mixed = (Map<u64, String>, Map<u64, Map<u64, u64>>);
+
+const SEED_ROWS: u64 = 6_000;
+
+struct Edits {
+    rng: Rng,
+    half: u64,
+    tag: &'static str,
+    round: u64,
+}
+
+impl Edits {
+    fn new(half: u64, tag: &'static str) -> Edits {
+        Edits {
+            rng: Rng::new(half + 1),
+            half,
+            tag,
+            round: 0,
+        }
+    }
+
+    fn row(&mut self) -> u64 {
+        self.half * SEED_ROWS / 2 + self.rng.below(SEED_ROWS / 2)
+    }
+
+    fn apply(&mut self, root: &mut Mixed) {
+        self.round += 1;
+        let inserts = if self.round % 10 == 7 { 3_000 } else { 24 };
+        for _ in 0..inserts {
+            let key = 4 * self.row() + 1;
+            let value = match self.rng.chance(15) {
+                true => format!("{}-{}", self.tag, text(self.rng.next(), 600)),
+                false => format!("{}-{}", self.tag, self.rng.next()),
+            };
+            root.0.insert(key, value);
+        }
+        let shared = 4 * self.row() + 2;
+        root.0.insert(shared, text(self.round, 650));
+        for _ in 0..3 {
+            let key = 4 * self.row();
+            root.0.remove(&key);
+        }
+        for _ in 0..6 {
+            let outer = self.half * 500 + self.rng.below(500);
+            let mut inner = root.1.get(&outer).map(|inner| (*inner).clone()).unwrap_or_default();
+            inner.insert(100 + self.rng.below(1 << 20), self.rng.next());
+            if self.rng.chance(30) {
+                inner.remove(&self.rng.below(7));
+            }
+            root.1.insert(outer, inner);
+        }
+    }
+}
+
+fn mixed_options(options: fn() -> Options) -> Options {
+    options()
+        .cache_bytes(1 << 30)
+        .clock(Clock(Arc::new(|| 1_700_000_000_000)))
+}
+
+fn mixed_seed(db: &Db<Mixed>) -> Db<Mixed> {
+    db.update(|root| {
+        for row in 0..SEED_ROWS {
+            let value = match row % 13 {
+                0 => text(row, 700),
+                _ => format!("seed-{row}"),
+            };
+            root.0.insert(4 * row, value);
+        }
+        for outer in 0..1_000u64 {
+            root.1.insert(outer, (0..outer % 7).map(|key| (key, outer * key)).collect());
+        }
+    })
+    .unwrap();
+    db.fork("other").unwrap()
+}
+
+type Entries = (Vec<(u64, String)>, Vec<(u64, Vec<(u64, u64)>)>);
+
+type Other = Arc<Mutex<Option<(Db<Mixed>, Edits)>>>;
+
+fn entries(db: &Db<Mixed>) -> Entries {
+    let root = db.read();
+    let plain = root.0.iter().map(|(key, value)| (key, (*value).clone())).collect();
+    let nested = root
+        .1
+        .iter()
+        .map(|(key, inner)| (key, inner.iter().map(|(key, value)| (key, *value)).collect()))
+        .collect();
+    (plain, nested)
+}
+
+#[test]
+fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
+    let rounds = cases(30) as u64;
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let moved_path = dir.path().join("moved.ferro");
+        let placed_path = dir.path().join("placed.ferro");
+        let armed = Arc::new(AtomicBool::new(false));
+        let other: Other = Arc::default();
+        let hook = {
+            let (armed, other) = (armed.clone(), other.clone());
+            move |step: &'static str| {
+                if step != "drafted" || !armed.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let mut other = other.lock();
+                let (db, edits) = other.as_mut().expect("the other branch is ready");
+                db.update(|root| edits.apply(root)).unwrap();
+            }
+        };
+        let moved: Db<Mixed> = mixed_options(options)
+            .hook(Hook(Arc::new(hook)))
+            .open(&moved_path)
+            .unwrap();
+        *other.lock() = Some((mixed_seed(&moved), Edits::new(1, "other")));
+        let mut main = Edits::new(0, "main");
+        for round in 0..rounds {
+            armed.store(true, Ordering::SeqCst);
+            moved.update(|root| main.apply(root)).unwrap();
+            assert!(!armed.load(Ordering::SeqCst), "{kind}: round {round} moved nothing");
+        }
+        let placed: Db<Mixed> = mixed_options(options).open(&placed_path).unwrap();
+        let placed_other = mixed_seed(&placed);
+        let (mut main, mut second) = (Edits::new(0, "main"), Edits::new(1, "other"));
+        for _ in 0..rounds {
+            placed_other.update(|root| second.apply(root)).unwrap();
+            placed.update(|root| main.apply(root)).unwrap();
+        }
+        let moved_other = other.lock().take().expect("the other branch is held").0;
+        assert!(entries(&moved) == entries(&placed), "{kind}: main reads differently");
+        assert!(
+            entries(&moved_other) == entries(&placed_other),
+            "{kind}: other reads differently"
+        );
+        moved.verify().unwrap();
+        drop((moved, moved_other, placed, placed_other));
+        assert!(
+            fs::read(&moved_path).unwrap() == fs::read(&placed_path).unwrap(),
+            "{kind}: a moved frame left different bytes"
+        );
+        let reopened: Db<Mixed> = options().cache_bytes(1).open(&moved_path).unwrap();
+        let placed: Db<Mixed> = options().cache_bytes(1).open(&placed_path).unwrap();
+        assert!(entries(&reopened) == entries(&placed), "{kind}: reopened reads differently");
+        reopened.verify().unwrap();
+    }
 }

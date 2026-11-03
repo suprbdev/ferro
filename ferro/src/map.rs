@@ -12,7 +12,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::vec;
 
 use crate::codec::{
-    Cached, Data, Decoder, Encoder, Hash, HashSink, Kind, Object, Ptr, Shape, Sink, Staged,
+    Cached, Data, Decoder, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape, Sink,
+    Staged,
     try_hash_of,
 };
 use crate::epoch::{self, Guard};
@@ -1515,6 +1516,49 @@ fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Arc<Node<K, V, S>>) {
     }
 }
 
+fn relocate<K: Data, V: Data, S: Data>(
+    old: &Arc<dyn Cached>,
+    links: usize,
+    moves: &Moves,
+    moved: &Moved,
+) -> Option<Arc<dyn Cached>> {
+    let old = (&**old as &dyn Any).downcast_ref::<Node<K, V, S>>()?;
+    let children = old.children.iter().filter(|child| matches!(child, Link::Stored { .. }));
+    let slots = match &old.cells {
+        Cells::Slots(slots) => slots.as_slice(),
+        Cells::Column(_) => &[],
+    };
+    let spilled = slots.iter().filter(|slot| matches!(slot, Slot::Spilled(..)));
+    if children.count() + spilled.count() != links {
+        return None;
+    }
+    let mut node = old.clone();
+    node.origin = Some(moves.ptr(old.origin?)?);
+    for child in &mut node.children {
+        if let Link::Stored { ptr, .. } = child {
+            *ptr = moves.ptr(*ptr)?;
+        }
+    }
+    if let Cells::Slots(slots) = &mut node.cells {
+        for slot in slots {
+            if let Slot::Spilled(ptr, _) = slot {
+                *ptr = moves.ptr(*ptr)?;
+            }
+        }
+    }
+    let node = Arc::new(node);
+    for (link, was) in node.children.iter().zip(&old.children) {
+        if let Link::Stored { memo, .. } = was
+            && let Some(Memo::Weak(child, _)) = memo.get()
+            && let Some(child) = moved.get(&child.as_ptr().addr())
+            && let Ok(child) = (child.clone() as Arc<dyn Any + Send + Sync>).downcast()
+        {
+            memoize(link, &child);
+        }
+    }
+    Some(node)
+}
+
 fn fans_out<K, V, S>(node: &Node<K, V, S>) -> bool {
     let mut budget = PARALLEL_NODES;
     node.count >= PARALLEL_KEYS
@@ -1710,6 +1754,7 @@ fn emit<K: Data, V: Data, S: Data>(
         origin,
     } = flushed;
     let body_bytes = object.body.len();
+    let links = object.links.len();
     let ptr = match origin {
         Some(origin) if origin.hash == hash => origin,
         _ => sink.put(object, hash)?,
@@ -1722,7 +1767,7 @@ fn emit<K: Data, V: Data, S: Data>(
         if dense && depth >= PIN_DEPTH {
             memoize(&written, &decoded);
         }
-        sink.remember(ptr, decoded, weight);
+        sink.remember_moving(ptr, decoded, weight, (relocate::<K, V, S>, links));
     }
     Ok(written)
 }

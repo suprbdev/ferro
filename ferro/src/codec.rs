@@ -87,6 +87,40 @@ pub trait Cached: Any + Send + Sync {
 
 impl<T: Data> Cached for T {}
 
+#[doc(hidden)]
+pub struct Moves {
+    from: u64,
+    old: Vec<u64>,
+    new: Vec<u64>,
+}
+
+impl Moves {
+    pub(crate) fn new(from: u64, old: Vec<u64>, new: Vec<u64>) -> Moves {
+        Moves { from, old, new }
+    }
+
+    pub(crate) fn offset(&self, offset: u64) -> Option<u64> {
+        if offset < self.from {
+            return Some(offset);
+        }
+        self.old.binary_search(&offset).ok().map(|at| self.new[at])
+    }
+
+    pub(crate) fn ptr(&self, ptr: Ptr) -> Option<Ptr> {
+        Some(Ptr {
+            hash: ptr.hash,
+            offset: self.offset(ptr.offset)?,
+        })
+    }
+}
+
+#[doc(hidden)]
+pub type Moved = HashMap<usize, Arc<dyn Cached>>;
+
+#[doc(hidden)]
+pub type Relocate =
+    fn(&Arc<dyn Cached>, usize, &Moves, &Moved) -> Option<Arc<dyn Cached>>;
+
 pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
     fn packs(&self) -> bool {
@@ -103,6 +137,16 @@ pub trait Sink {
         Ok(())
     }
     fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Cached>, _weight: u32) {}
+    #[doc(hidden)]
+    fn remember_moving(
+        &mut self,
+        ptr: Ptr,
+        value: Arc<dyn Cached>,
+        weight: u32,
+        _relocate: (Relocate, usize),
+    ) {
+        self.remember(ptr, value, weight);
+    }
     fn store_id(&self) -> u64;
     fn store(&self) -> Option<Store> {
         None

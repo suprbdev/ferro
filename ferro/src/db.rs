@@ -17,7 +17,7 @@ use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::admin::Keep;
-use crate::codec::{Data, Decoder, Encoder, Hash, Ptr, Sink, try_hash_of};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::graph::{self, Start};
 use crate::history::History;
@@ -25,7 +25,7 @@ use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
 use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
-use crate::store::{Durability, Frame, Op, Retired, Store, StoreOptions, Trace, Txn};
+use crate::store::{Durability, Frame, Op, Retired, Settling, Store, StoreOptions, Trace, Txn};
 use crate::watch::{Feed, Filter, Notice, Watcher};
 
 const MAIN: &str = "main";
@@ -1072,6 +1072,32 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     Ok((txn.put(object, hash)?, decoded))
 }
 
+type Placed = (u64, u64, Option<(Settling, Store)>);
+
+struct Draft<T> {
+    txn: Txn,
+    store: Store,
+    root: Ptr,
+    value: T,
+    object: Object,
+}
+
+fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
+    let mut txn = store.begin()?;
+    let mut encoder = Encoder::new(&mut txn);
+    working.encode(&mut encoder)?;
+    let object = encoder.into_object();
+    let value = T::decode(&mut Decoder::new(&object.body, &object.links, Some(&store)))?;
+    let root = txn.put_ref(&object, object.hash())?;
+    Ok(Draft {
+        txn,
+        store,
+        root,
+        value,
+        object,
+    })
+}
+
 fn holds(found: &[Start], ptr: Ptr) -> bool {
     found.iter().any(|start| start.node.ptr.hash == ptr.hash)
 }
@@ -1274,8 +1300,9 @@ impl<T: Data> Shared<T> {
         let (message, parts) = Parts::join(messages);
         let started = Instant::now();
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
+            let drafted = self.draft(branch, &working)?;
             let mut tip = self.tip.lock();
-            self.commit_locked(
+            let committed = self.commit_locked(
                 &mut tip,
                 Change {
                     branch,
@@ -1290,7 +1317,14 @@ impl<T: Data> Shared<T> {
                     seal: Some(&seal),
                     from: None,
                 },
-            )
+                drafted,
+            );
+            drop(tip);
+            let (version, time_ms, settling) = committed?;
+            if let Some((settling, store)) = settling {
+                settling.finish(&store);
+            }
+            Ok::<_, Error>((version, time_ms))
         }));
         self.costs.sealed(started.elapsed());
         let ticket = branch.framed.load(Ordering::Acquire);
@@ -1547,9 +1581,13 @@ impl<T: Data> Shared<T> {
         mut txn: Txn,
         branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
+        settling: Option<&mut Settling>,
     ) -> Result<()> {
         txn.unshared();
         let (ptr, refs) = write_decoded(&refs, &mut txn, &self.store())?;
+        if let Some(settling) = settling {
+            settling.take_seen(&mut txn);
+        }
         let frame = txn.write(ptr)?;
         let update = branch.map(|(branch, state)| {
             let state = Arc::new(state);
@@ -1673,7 +1711,19 @@ impl<T: Data> Shared<T> {
         read_clock(self.clock.as_ref())
     }
 
-    fn commit_locked(&self, tip: &mut RefState, change: Change<'_, T>) -> Result<(u64, u64)> {
+    fn draft(&self, branch: &Branch<T>, working: &T) -> Result<Draft<T>> {
+        branch.check_live()?;
+        let drafted = write_draft(working, self.store())?;
+        self.step("drafted");
+        Ok(drafted)
+    }
+
+    fn commit_locked(
+        &self,
+        tip: &mut RefState,
+        change: Change<'_, T>,
+        drafted: Draft<T>,
+    ) -> Result<Placed> {
         let Change {
             branch,
             state,
@@ -1688,9 +1738,17 @@ impl<T: Data> Shared<T> {
         if let Some(from) = from {
             from.check_live()?;
         }
-        let store = &self.store();
-        let mut txn = store.begin()?;
-        let (root, value) = write_decoded(working, &mut txn, store)?;
+        let drafted = match drafted.store.id() == state.store.id() {
+            true => drafted,
+            false => write_draft(working, self.store())?,
+        };
+        let Draft {
+            mut txn,
+            store,
+            mut root,
+            mut value,
+            object,
+        } = drafted;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let version = state
             .snapshot
@@ -1715,11 +1773,19 @@ impl<T: Data> Shared<T> {
             && intent.merged.is_none()
             && previous.unwrap_or(self.genesis_hash) == root.hash
         {
-            return Ok((head.version, head.time_ms));
+            return Ok((head.version, head.time_ms, None));
+        }
+        let mut settling = txn.rebase()?;
+        if let Some(moves) = settling.moves() {
+            let corrupt = || Error::Corrupt("a drafted root links a record its frame lost".into());
+            root = moves.ptr(root).ok_or_else(corrupt)?;
+            let links = object.links.iter().map(|link| moves.ptr(*link));
+            let links = links.collect::<Option<Vec<_>>>().ok_or_else(corrupt)?;
+            value = T::decode(&mut Decoder::new(&object.body, &links, Some(&store)))?;
         }
         let mut time_ms = intent.time.unwrap_or_else(|| self.now().max(head.floor()));
         if let Some(link) = intent.merged {
-            time_ms = time_ms.max(Entry::load(store, link.ptr)?.commit.time_ms);
+            time_ms = time_ms.max(Entry::load(&store, link.ptr)?.commit.time_ms);
         }
         let commit = Commit {
             version,
@@ -1734,9 +1800,9 @@ impl<T: Data> Shared<T> {
             value: Arc::new(value),
             commit: Arc::new(commit.clone()),
         };
-        let log = state.log.append(store, &mut txn, commit, intent.merged)?;
+        let log = state.log.append(&store, &mut txn, commit, intent.merged)?;
         let log = match self.history {
-            Keep::Last(_) => log.pruned(store, self.history)?,
+            Keep::Last(_) => log.pruned(&store, self.history)?,
             _ => log,
         };
         let mut next = tip.refs.clone();
@@ -1754,8 +1820,9 @@ impl<T: Data> Shared<T> {
             log,
             store: store.clone(),
         };
-        self.stage(tip, next, txn, Some((branch, state)), seal.map(|seal| (seal, version, time_ms)))?;
-        Ok((version, time_ms))
+        let seal = seal.map(|seal| (seal, version, time_ms));
+        self.stage(tip, next, txn, Some((branch, state)), seal, Some(&mut settling))?;
+        Ok((version, time_ms, Some((settling, store))))
     }
 
     fn step(&self, name: &'static str) {
@@ -1801,7 +1868,7 @@ impl<T: Data> Shared<T> {
                 return Ok(0);
             }
             let txn = store.begin()?;
-            self.stage(tip, next, txn, None, None)?;
+            self.stage(tip, next, txn, None, None, None)?;
             self.settle(store.last_seq(), notices)?;
             let refs = tip.refs.clone();
             for branch in self.branches.lock().values() {
@@ -2237,8 +2304,14 @@ impl<T: Data> Db<T> {
                 seal: None,
                 from,
             };
+            let drafted = self.shared.draft(&self.branch, &working)?;
             let mut tip = self.shared.tip.lock();
-            let (version, time_ms) = self.shared.commit_locked(&mut tip, change)?;
+            let committed = self.shared.commit_locked(&mut tip, change, drafted);
+            drop(tip);
+            let (version, time_ms, settling) = committed?;
+            if let Some((settling, store)) = settling {
+                settling.finish(&store);
+            }
             Ok((value, version, time_ms))
         });
         let ticket = self.branch.framed.load(Ordering::Acquire);
@@ -2706,7 +2779,7 @@ impl<T: Data> Db<T> {
         );
         let store = self.shared.store();
         let txn = store.begin()?;
-        self.shared.stage(&mut tip, next, txn, None, None)?;
+        self.shared.stage(&mut tip, next, txn, None, None, None)?;
         let ticket = store.last_seq();
         drop(tip);
         drop(lane);
@@ -2749,7 +2822,7 @@ impl<T: Data> Db<T> {
                     next.insert(branch, head);
                 }
             }
-            self.shared.stage(&mut tip, next, txn, None, None)?;
+            self.shared.stage(&mut tip, next, txn, None, None, None)?;
             let ticket = store.last_seq();
             self.shared.settle(ticket, &mut notices)?;
             let published = self.shared.published.lock();
@@ -2906,7 +2979,7 @@ impl<T: Data> Db<T> {
                 return Ok(out);
             };
             let before = tip.refs.clone();
-            shared.stage(tip, next, txn, None, None)?;
+            shared.stage(tip, next, txn, None, None, None)?;
             shared.settle(store.last_seq(), &mut notices)?;
             let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
             let mut states = Vec::new();

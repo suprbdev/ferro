@@ -18,7 +18,8 @@ use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::codec::{
-    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, Staged, push_varint,
+    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
+    Staged, push_varint,
 };
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
@@ -1225,9 +1226,122 @@ pub struct Txn {
     origin: u64,
     start: u64,
     buf: Vec<u8>,
-    seen: HashMap<Hash, u64, BuildHasherDefault<Prehashed>>,
-    remembered: Vec<(Hash, CacheEntry)>,
+    seen: Seen,
+    remembered: Vec<Remembered>,
     unshared: bool,
+}
+
+type Seen = HashMap<Hash, u64, BuildHasherDefault<Prehashed>>;
+
+type Remembered = (Hash, CacheEntry, Option<(Relocate, usize)>);
+
+pub(crate) struct Settling {
+    moves: Option<Moves>,
+    remembered: Vec<Remembered>,
+    seen: Seen,
+}
+
+impl Settling {
+    pub(crate) fn moves(&self) -> Option<&Moves> {
+        self.moves.as_ref()
+    }
+
+    pub(crate) fn take_seen(&mut self, txn: &mut Txn) {
+        self.seen = mem::take(&mut txn.seen);
+    }
+
+    pub(crate) fn finish(self, store: &Store) {
+        let cache = &store.inner.cache;
+        for (hash, offset) in self.seen {
+            store.inner.dedupe.insert(hash, offset);
+        }
+        let Some(moves) = &self.moves else {
+            for (hash, entry, _) in self.remembered {
+                cache.insert(hash, entry);
+            }
+            return;
+        };
+        let mut moved = Moved::new();
+        for (hash, entry, relocate) in self.remembered {
+            let (Some((relocate, links)), Some(old)) = (relocate, &entry.value) else {
+                continue;
+            };
+            let Some(value) = relocate(old, links, moves, &moved) else {
+                continue;
+            };
+            moved.insert(Arc::as_ptr(old).cast::<()>().addr(), value.clone());
+            cache.insert(hash, CacheEntry::new(value, entry.weight));
+        }
+    }
+}
+
+fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    for index in 0..MAX_VARINT {
+        let byte = *bytes
+            .get(*at)
+            .ok_or_else(|| Error::Corrupt("a drafted record runs past its frame".into()))?;
+        *at += 1;
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(Error::Corrupt("varint overflow in a drafted record".into()))
+}
+
+fn relayout(
+    old: &[u8],
+    from: u64,
+    to: u64,
+    hashes: &[(u64, Hash)],
+    known: impl Fn(&Hash) -> Option<u64>,
+) -> Result<(Vec<u8>, Moves)> {
+    let mut out = Vec::with_capacity(old.len() + old.len() / 32);
+    out.extend_from_slice(&old[..FRAME_BYTES]);
+    let mut olds = Vec::with_capacity(hashes.len());
+    let mut news = Vec::with_capacity(hashes.len());
+    let mut at = FRAME_BYTES;
+    let missing = || Error::Corrupt("a drafted record links one its frame does not hold".into());
+    while at < old.len() {
+        let was = from + at as u64;
+        let now = to + out.len() as u64;
+        let begun = at;
+        let stored = usize::try_from(take_varint(old, &mut at)?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        let flagged = take_varint(old, &mut at)?;
+        if flagged & 1 == 1 {
+            take_varint(old, &mut at)?;
+        }
+        at += stored;
+        let hash = match hashes.get(olds.len()) {
+            Some((offset, hash)) if *offset == was => hash,
+            _ => return Err(Error::Corrupt("a drafted record has no hash".into())),
+        };
+        if let Some(found) = known(hash) {
+            for _ in 0..flagged >> 1 {
+                at += HASH_BYTES;
+                take_varint(old, &mut at)?;
+            }
+            olds.push(was);
+            news.push(found);
+            continue;
+        }
+        out.extend_from_slice(old.get(begun..at).ok_or_else(missing)?);
+        for _ in 0..flagged >> 1 {
+            out.extend_from_slice(old.get(at..at + HASH_BYTES).ok_or_else(missing)?);
+            at += HASH_BYTES;
+            let target = was.wrapping_sub(unzigzag(take_varint(old, &mut at)?) as u64);
+            let target = match target >= from {
+                true => news[olds.binary_search(&target).map_err(|_| missing())?],
+                false => target,
+            };
+            push_varint(&mut out, zigzag(now.wrapping_sub(target) as i64));
+        }
+        olds.push(was);
+        news.push(now);
+    }
+    Ok((out, Moves::new(from, olds, news)))
 }
 
 impl Drop for Txn {
@@ -1257,11 +1371,7 @@ impl Sink for Txn {
     }
 
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
-        if let Some(ptr) = self.known(hash, object.body.len())? {
-            return Ok(ptr);
-        }
-        let packed = compressed(&object.body);
-        Ok(self.record(hash, staged(&object.body, packed.as_deref(), &object.links)))
+        self.put_ref(&object, hash)
     }
 
     fn packs(&self) -> bool {
@@ -1276,7 +1386,17 @@ impl Sink for Txn {
     }
 
     fn remember(&mut self, ptr: Ptr, value: Arc<dyn Cached>, weight: u32) {
-        self.remembered.push((ptr.hash, CacheEntry::new(value, weight)));
+        self.remembered.push((ptr.hash, CacheEntry::new(value, weight), None));
+    }
+
+    fn remember_moving(
+        &mut self,
+        ptr: Ptr,
+        value: Arc<dyn Cached>,
+        weight: u32,
+        relocate: (Relocate, usize),
+    ) {
+        self.remembered.push((ptr.hash, CacheEntry::new(value, weight), Some(relocate)));
     }
 
     fn store_id(&self) -> u64 {
@@ -1308,13 +1428,58 @@ impl Txn {
         }
         let offset = self.seen.get(&hash).copied().or_else(|| match self.unshared {
             true => None,
-            false => self.store.inner.dedupe.get(&hash),
+            false => self.store.inner.dedupe.get(&hash).filter(|offset| *offset < self.origin),
         });
         Ok(offset.map(|offset| Ptr { hash, offset }))
     }
 
     pub(crate) fn unshared(&mut self) {
         self.unshared = true;
+    }
+
+    pub(crate) fn put_ref(&mut self, object: &Object, hash: Hash) -> Result<Ptr> {
+        if let Some(ptr) = self.known(hash, object.body.len())? {
+            return Ok(ptr);
+        }
+        let packed = compressed(&object.body);
+        Ok(self.record(hash, staged(&object.body, packed.as_deref(), &object.links)))
+    }
+
+    pub(crate) fn rebase(&mut self) -> Result<Settling> {
+        let remembered = mem::take(&mut self.remembered);
+        let now = self.store.inner.written.load(Ordering::Acquire);
+        if now != self.origin && self.start != self.origin {
+            return Err(Error::Corrupt("a draft that spilled cannot move".into()));
+        }
+        let moves = match now == self.origin {
+            true => None,
+            false => {
+                let mut hashes: Vec<(u64, Hash)> = self
+                    .seen
+                    .iter()
+                    .filter(|(_, offset)| **offset >= self.origin)
+                    .map(|(hash, offset)| (*offset, *hash))
+                    .collect();
+                hashes.sort_unstable_by_key(|(offset, _)| *offset);
+                let dedupe = (!self.unshared).then_some(&self.store.inner.dedupe);
+                let known = |hash: &Hash| dedupe?.get(hash).filter(|offset| *offset < now);
+                let (buf, moves) = relayout(&self.buf, self.origin, now, &hashes, known)?;
+                for offset in self.seen.values_mut() {
+                    *offset = moves
+                        .offset(*offset)
+                        .ok_or_else(|| Error::Corrupt("a drafted object has no record".into()))?;
+                }
+                self.buf = buf;
+                self.origin = now;
+                self.start = now;
+                Some(moves)
+            }
+        };
+        Ok(Settling {
+            moves,
+            remembered,
+            seen: Seen::default(),
+        })
     }
 
     fn record(&mut self, hash: Hash, staged: Staged<'_>) -> Ptr {
@@ -1431,7 +1596,7 @@ impl Txn {
         for (hash, offset) in mem::take(&mut self.seen) {
             inner.dedupe.insert(hash, offset);
         }
-        for (hash, entry) in mem::take(&mut self.remembered) {
+        for (hash, entry, _) in mem::take(&mut self.remembered) {
             inner.cache.insert(hash, entry);
         }
         Ok(frame)
