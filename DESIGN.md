@@ -1018,7 +1018,8 @@ as in the file.
 
 - Every object is hashed as the bundle is parsed.
 - The new commits are walked from the head through `prev`, and their versions must descend one at a
-  time. The commit below the oldest one sent is looked up in the receiver's chains by hash and
+  time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to wrap
+  the version past `u64::MAX`. The commit below the oldest one sent is looked up in the receiver's chains by hash and
   version. Found, the landed branch continues into the receiver's copy of it and keeps that chain's
   `first`. Not found, the link is written with offset 0 and the branch starts at the oldest sent
   commit, the way a pruned chain does.

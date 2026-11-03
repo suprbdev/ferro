@@ -1087,3 +1087,22 @@ fn a_bundle_whose_commit_skips_to_another_commit_is_rejected() {
         assert_eq!(b.size_on_disk(), size);
     }
 }
+
+#[test]
+fn a_bundle_whose_head_is_past_the_last_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let root = object_of(&7u64);
+    let parent = Ptr {
+        hash: [9; 20],
+        offset: 0,
+    };
+    let tip = entry_of(u64::MAX, &root, Some(parent), None);
+    match b.receive("evil", &forged(&tip, u64::MAX, &[&root, &tip]), untouched) {
+        Err(Error::Bundle(_)) => {}
+        other => panic!("accepted a head at the last version: {other:?}"),
+    }
+    assert_eq!(b.branches(), vec!["main".to_string()]);
+    b.update(|value| *value += 1).unwrap();
+    assert_eq!(b.version(), 1);
+}

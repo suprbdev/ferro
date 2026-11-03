@@ -13,6 +13,7 @@ const FORMAT: u8 = 1;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
 const MAIN: &str = "main";
+const MAX_VERSION: u64 = u64::MAX >> 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Have(Vec<u8>);
@@ -751,6 +752,12 @@ fn land<T: Data>(
     let Some(tip) = plan.tip else {
         return Ok(None);
     };
+    if tip.version > MAX_VERSION {
+        return Err(bad(format!(
+            "its head is at v{}, past what a commit log can reach",
+            tip.version
+        )));
+    }
     let mut bases = Vec::with_capacity(plan.bases.len());
     for mark in &plan.bases {
         let found = locate(store, refs, *mark)?.ok_or_else(|| {
