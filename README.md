@@ -134,6 +134,34 @@ of the clock until the rate drops, so read the time only when you need it. A sta
 commit that would hold the closure's changes. If the closure returns `Err`, panics or changes
 nothing, no commit holds them, and its reading of the time claims nothing.
 
+**Writes can be awaited.** `update_async`, `commit_async`, `commit_with_async`, `try_update_async`,
+`try_commit_async` and `try_commit_with_async` return a future that resolves once the commit is
+published, which under `Durability::Fsync` means durable. It holds no thread while it waits for the
+writer lock or the sync: one `ferro-sync` thread per open database, started by the first awaited
+write, syncs each batch and wakes the futures in it through `std::task::Waker`, so any executor
+works and ferro depends on no runtime.
+
+```rust
+let order = db
+    .try_commit_with_async(|shop| {
+        let left = shop.stock.get_mut(&id).ok_or(ShopError::NoProduct(id))?;
+        *left = left.checked_sub(qty).ok_or(ShopError::SoldOut(id))?;
+        Ok((format!("order {id}"), *left))
+    })
+    .await?;
+```
+
+The closure runs in the poll that finds the writer lock free, on the thread that polls, under the
+same lock as a blocking write. So it need not be `Send` or `'static`, the future is `Send` when the
+closure and its result are, a panic unwinds out of that poll, and awaited and blocking writers
+share one sync. If the lock is taken, the future waits in line and the writer that lets go wakes
+the first in line, so futures get the lock in the order they asked for it, though a blocking writer
+can get in ahead of them. A write dropped before its closure ran, polled or not, writes nothing.
+Once the closure has run its outcome is decided: dropping the future gives up only the answer, the
+commit lands as if awaited, and closing the database first writes and syncs it. So whether a
+dropped write landed is exactly whether its closure ran. With `coalesce`, awaited closures join the
+same groups as blocking ones. The stamped forms, `restore` and the merges have no awaited form.
+
 **Collections are values too.** `Map`, `Set`, `List` and `Table` nest freely inside your types.
 Cloning one is O(1), and `==` compares root hashes in O(1) because the tree shape depends only on
 the contents. A commit that changes nothing is skipped. `Map::root_hash` and `Table::root_hash`
@@ -602,8 +630,9 @@ is a reversed `range` before a cursor.
 Live updates are Server-Sent Events. Each subscriber is a `watch_changes` watcher whose test
 compares its rooms and its own membership between the snapshot it delivered last and the new one,
 and a `diff` between those two gives the events. The stream awaits `changed()`, so a subscriber
-holds no thread, and dropping the stream when the client goes drops the watcher. The event id is
-the version, so a client reconnecting with `Last-Event-ID` gets one diff from that version, or a
+holds no thread, and dropping the stream when the client goes drops the watcher. Posts and the
+other writes are awaited with `try_commit_with_async`, so they hold no thread either. The event id
+is the version, so a client reconnecting with `Last-Event-ID` gets one diff from that version, or a
 reset if that version is no longer retained.
 
 ```sh
@@ -614,11 +643,12 @@ cargo run --release -p chat --bin chat-load -- --db load.ferro --rate 1000
 `chat-load` seeds 1,000 rooms and 10,000 users in 5 rooms each, opens 300 feeds and posts from 32
 connections, and a quarter of the deliveries send a read receipt. With fsync, at 1,000 posts a
 second, a post took 0.18 ms at p50 and 0.41 ms at p99 and reached each member's feed in 0.47 ms and
-1.0 ms. Flat out it took about 3,500 posts and 2,500 receipts a second at 9 ms p50, and 5,800 posts
-with `coalesce`. With `--clients 3000` it took 700 posts and 5,300 receipts a second at 43 ms p50,
-where running every test on the committing thread had managed 126 posts at 206 ms. Without
-receipts, 3,000 feeds took 1,000 posts a second at 0.35 ms per post and 2.1 ms to delivery. These
-ran on a machine shared with other work.
+1.0 ms. Flat out it took about 5,200 posts a second at 6.5 ms p50 and 10 ms p99 on 35 threads,
+where writing through `spawn_blocking` took 3,900 at 8.2 and 15.7 ms on up to 131. With
+`--clients 3000` it took 700 posts and 5,300 receipts a second at 43 ms p50, where running every
+test on the committing thread had managed 126 posts at 206 ms. Without receipts, 3,000 feeds took
+1,000 posts a second at 0.35 ms per post and 2.1 ms to delivery. These ran on a machine shared with
+other work.
 
 ## A booking system under contention
 
