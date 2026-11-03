@@ -127,13 +127,19 @@ fn read_only() -> Options {
     Options::new().read_only()
 }
 
-fn open_handles(path: &Path) -> usize {
+#[cfg(target_os = "linux")]
+fn closed(path: &Path) -> bool {
     let real = fs::canonicalize(path).unwrap();
-    fs::read_dir("/proc/self/fd")
+    !fs::read_dir("/proc/self/fd")
         .unwrap()
         .flatten()
-        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == real))
-        .count()
+        .any(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == real))
+}
+
+#[cfg(windows)]
+fn closed(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok()
 }
 
 fn field(bytes: &[u8], at: usize) -> u64 {
@@ -319,13 +325,14 @@ fn common_ancestor_reports_a_damaged_merge_record() {
     assert!(failures > 0);
 }
 
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn admin_reads_close_the_file_when_they_fail() {
     let (_dir, path) = fixture("info-refs");
     corrupt(admin::info(&path));
     corrupt(admin::layout(&path, Keep::All));
     corrupt(admin::layout(&path, Keep::Last(2)));
-    assert_eq!(open_handles(&path), 0);
+    assert!(closed(&path));
 }
 
 #[test]
