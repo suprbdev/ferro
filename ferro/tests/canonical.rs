@@ -626,3 +626,109 @@ fn commit_cost_does_not_grow_with_nested_map_size() {
     let late: u64 = costs[2900..].iter().sum::<u64>() / 100;
     assert!(late < 400, "commit encoded {late} values on average");
 }
+
+static TALLIED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, PartialEq)]
+struct Tallied(u64);
+
+impl Data for Tallied {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        TALLIED.fetch_add(1, Ordering::Relaxed);
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Tallied(u64::decode(r)?))
+    }
+}
+
+#[test]
+fn a_commit_encodes_only_the_values_it_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = roomy()
+        .open::<Map<u64, Tallied>>(dir.path().join("t.ferro"))
+        .unwrap();
+    db.update(|root| root.extend((0..20_000u64).map(|key| (key * 2, Tallied(key)))))
+        .unwrap();
+    let mut rng = Rng::new(5);
+    for _ in 0..50 {
+        let key = rng.below(40_000) | 1;
+        db.update(|root| root.insert(key, Tallied(key))).unwrap();
+    }
+    let start = TALLIED.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        let key = rng.below(40_000) | 1;
+        db.update(|root| root.insert(key, Tallied(key))).unwrap();
+    }
+    let each = (TALLIED.load(Ordering::Relaxed) - start) / 200;
+    assert!(each < 24, "a single insert encoded {each} values");
+}
+
+#[test]
+fn commits_along_cached_paths_hash_as_a_fresh_build() {
+    type Nested = BTreeMap<u32, BTreeMap<u32, String>>;
+    fn build(model: &Nested) -> Map<u32, Map<u32, String>> {
+        model
+            .iter()
+            .map(|(key, inner)| (*key, inner.iter().map(|(k, v)| (*k, v.clone())).collect()))
+            .collect()
+    }
+    for options in [roomy, uncached] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.ferro");
+        let mut db = options().open::<Map<u32, Map<u32, String>>>(&path).unwrap();
+        let mut model = Nested::new();
+        let mut rng = Rng::new(11);
+        for round in 0..400u64 {
+            let edits = 1 + rng.below(3);
+            let mut planned = Vec::new();
+            for _ in 0..edits {
+                let outer = rng.below(300) as u32;
+                let inner = rng.below(40) as u32;
+                let len = if rng.chance(10) { 600 } else { rng.below(20) as usize };
+                planned.push((rng.below(6), outer, inner, text(rng.next(), len)));
+            }
+            db.update(|root| {
+                for (kind, outer, inner, value) in &planned {
+                    match kind {
+                        0 => {
+                            root.remove(outer);
+                            model.remove(outer);
+                        }
+                        1 => {
+                            let fresh: Map<u32, String> = [(*inner, value.clone())].into_iter().collect();
+                            root.insert(*outer, fresh);
+                            model.insert(*outer, [(*inner, value.clone())].into_iter().collect());
+                        }
+                        2 => {
+                            if let Some(nested) = root.get_mut(outer) {
+                                nested.remove(inner);
+                                model.get_mut(outer).unwrap().remove(inner);
+                            }
+                        }
+                        3 => {
+                            if root.get_mut(outer).is_some() {
+                                model.get_mut(outer).unwrap();
+                            }
+                        }
+                        _ => {
+                            root.get_or_insert_with(*outer, Map::new).insert(*inner, value.clone());
+                            model.entry(*outer).or_default().insert(*inner, value.clone());
+                        }
+                    }
+                }
+            })
+            .unwrap();
+            let snapshot = db.read();
+            assert_eq!(snapshot.root_hash(), build(&model).root_hash(), "round {round}");
+            if round % 100 == 99 {
+                drop(snapshot);
+                drop(db);
+                db = options().open(&path).unwrap();
+            }
+        }
+        db.verify().unwrap();
+        assert_eq!(db.read().root_hash(), build(&model).root_hash());
+    }
+}

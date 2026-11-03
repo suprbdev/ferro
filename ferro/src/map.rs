@@ -485,6 +485,24 @@ impl<K, V, S> Link<K, V, S> {
     }
 }
 
+struct Prefix {
+    bytes: Box<[u8]>,
+    links: Box<[Ptr]>,
+}
+
+impl Prefix {
+    fn of(object: &Object, at: (usize, usize)) -> Arc<Prefix> {
+        Arc::new(Prefix {
+            bytes: object.body[..at.0].into(),
+            links: object.links[..at.1].into(),
+        })
+    }
+
+    fn heap(&self) -> usize {
+        ARC_HEADER + 2 * ALLOCATION_BYTES + self.bytes.len() + size_of_val(&*self.links)
+    }
+}
+
 #[repr(C)]
 struct Node<K, V, S> {
     keys: Vec<K>,
@@ -493,6 +511,7 @@ struct Node<K, V, S> {
     count: u64,
     level: u8,
     origin: Option<Ptr>,
+    prefix: Option<Arc<Prefix>>,
 }
 
 impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
@@ -504,6 +523,7 @@ impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
             children: self.children.clone(),
             count: self.count,
             origin: self.origin,
+            prefix: self.prefix.clone(),
         }
     }
 }
@@ -602,6 +622,7 @@ impl<K, V, S> Node<K, V, S> {
             + self.keys.capacity() * (size_of::<K>() + inner(needs_drop::<K>(), ITEM_BYTES))
             + self.children.capacity() * size_of::<Link<K, V, S>>()
             + values
+            + self.prefix.as_ref().map_or(0, |prefix| prefix.heap())
     }
 
     fn weight(&self, body_bytes: usize, _heap: usize) -> u32 {
@@ -678,6 +699,7 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
             children,
             count: 0,
             origin: Some(origin),
+            prefix: None,
         };
         node.recount();
         Ok(node)
@@ -955,6 +977,7 @@ fn link_from<K, V, S>(
         children,
         count: 0,
         origin,
+        prefix: None,
     };
     node.recount();
     Link::Mem(Arc::new(node))
@@ -1295,51 +1318,23 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     let width = node.keys.len();
     let fresh = (0..width).filter(|&index| node.is_fresh(index)).count();
     let decoding = caching && fresh > 0 && 2 * fresh >= width;
-    let mut encoder = Encoder::with_capacity(&mut *sink, 64 + 24 * width, width + 1);
-    encoder.u8(node.level);
-    encoder.varint(width as u64);
-    for (index, key) in node.keys.iter().enumerate() {
-        let mark = encoder.mark();
-        key.encode(&mut encoder)?;
-        if let (true, false, Some(store)) = (node.is_fresh(index), decoding, &store) {
-            verify::<K>(&encoder, mark, store)?;
-        }
-    }
-    let mut spilled: Vec<(usize, Slot<V, S>)> = Vec::new();
-    for (index, key) in node.keys.iter().enumerate() {
-        let value = match &node.cells {
-            Cells::Column(column) => &column[index],
-            Cells::Slots(slots) => match &slots[index] {
-                Slot::Spilled(ptr, summary) => {
-                    encoder.u8(1);
-                    encoder.link(*ptr);
-                    summary.encode(&mut encoder)?;
-                    continue;
-                }
-                Slot::Packed(column, position) => &column[*position as usize],
-                Slot::Fresh(value) => &**value,
-            },
-        };
-        let mark = encoder.mark();
-        encoder.u8(0);
-        let body = encoder.mark();
-        value.encode(&mut encoder)?;
-        let spill = encoder.since(mark) > SPILL_BYTES;
-        if let (true, true, Some(store)) = (node.is_fresh(index), spill || !decoding, &store) {
-            verify::<V>(&encoder, body, store)?;
-        }
-        if spill {
-            encoder.rewind(mark);
-            let ptr = encoder.child(|inner| value.encode(inner))?;
-            let summary = S::of(key, value);
-            encoder.u8(1);
-            encoder.link(ptr);
-            summary.encode(&mut encoder)?;
-            if caching && !decoding {
-                spilled.push((index, Slot::Spilled(ptr, summary)));
+    let reused = match (&node.cells, &node.prefix) {
+        (Cells::Column(_), Some(prefix)) => Some(prefix.clone()),
+        _ => None,
+    };
+    let bytes = reused.as_ref().map_or(64 + 24 * width, |prefix| prefix.bytes.len() + 24 * (width + 1));
+    let mut encoder = Encoder::with_capacity(&mut *sink, bytes, width + 1);
+    let spilled = match &reused {
+        Some(prefix) => {
+            encoder.raw(&prefix.bytes);
+            for link in &prefix.links {
+                encoder.link(*link);
             }
+            Vec::new()
         }
-    }
+        None => entries(node, &mut encoder, store.as_ref(), caching, decoding)?,
+    };
+    let entries_end = encoder.mark();
     let branching = caching && !node.children.is_empty();
     let rewritten = dirty(node).count();
     let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
@@ -1390,8 +1385,15 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
             children: stored,
             count: node.count,
             origin: None,
+            prefix: None,
         }),
     };
+    let cached = cached.map(|mut cached| {
+        if let Cells::Column(_) = cached.cells {
+            cached.prefix = Some(reused.unwrap_or_else(|| Prefix::of(&object, entries_end)));
+        }
+        cached
+    });
     Ok(Flushed {
         object,
         hash,
@@ -1400,6 +1402,60 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
         total,
         origin: node.origin,
     })
+}
+
+fn entries<K: Data, V: Data, S: Summary<K, V>>(
+    node: &Node<K, V, S>,
+    encoder: &mut Encoder<'_>,
+    store: Option<&Store>,
+    caching: bool,
+    decoding: bool,
+) -> Result<Vec<(usize, Slot<V, S>)>> {
+    encoder.u8(node.level);
+    encoder.varint(node.keys.len() as u64);
+    for (index, key) in node.keys.iter().enumerate() {
+        let mark = encoder.mark();
+        key.encode(encoder)?;
+        if let (true, false, Some(store)) = (node.is_fresh(index), decoding, store) {
+            verify::<K>(encoder, mark, store)?;
+        }
+    }
+    let mut spilled = Vec::new();
+    for (index, key) in node.keys.iter().enumerate() {
+        let value = match &node.cells {
+            Cells::Column(column) => &column[index],
+            Cells::Slots(slots) => match &slots[index] {
+                Slot::Spilled(ptr, summary) => {
+                    encoder.u8(1);
+                    encoder.link(*ptr);
+                    summary.encode(encoder)?;
+                    continue;
+                }
+                Slot::Packed(column, position) => &column[*position as usize],
+                Slot::Fresh(value) => &**value,
+            },
+        };
+        let mark = encoder.mark();
+        encoder.u8(0);
+        let body = encoder.mark();
+        value.encode(encoder)?;
+        let spill = encoder.since(mark) > SPILL_BYTES;
+        if let (true, true, Some(store)) = (node.is_fresh(index), spill || !decoding, store) {
+            verify::<V>(encoder, body, store)?;
+        }
+        if spill {
+            encoder.rewind(mark);
+            let ptr = encoder.child(|inner| value.encode(inner))?;
+            let summary = S::of(key, value);
+            encoder.u8(1);
+            encoder.link(ptr);
+            summary.encode(encoder)?;
+            if caching && !decoding {
+                spilled.push((index, Slot::Spilled(ptr, summary)));
+            }
+        }
+    }
+    Ok(spilled)
 }
 
 fn emit<K: Data, V: Data, S: Data>(
