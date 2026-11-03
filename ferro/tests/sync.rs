@@ -13,7 +13,7 @@ use common::{Rng, cases, fast, text};
 use ferro::codec::{Encoder, HashSink, Object};
 use ferro::store::{Op, Trace};
 use ferro::{
-    Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Snapshot,
+    Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Snapshot,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -1938,4 +1938,262 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     }
     assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
     assert_eq!(b.head_hash(), before.0);
+}
+
+fn pruned_events(path: &Path, keep: usize) -> Db<Events> {
+    fast()
+        .history(Keep::Last(keep))
+        .reclaim(Reclaim { every_bytes: 0 })
+        .open(path)
+        .unwrap()
+}
+
+fn checked(devices: &[Db<Events>], when: &str) {
+    for (device, db) in devices.iter().enumerate() {
+        db.verify().unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
+        db.verify_typed().unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
+        for name in db.branches() {
+            let branch = db.branch(&name).unwrap();
+            let log = branch.log();
+            assert_eq!(log.iter().count(), log.len(), "{when}: d{device} {name}");
+        }
+    }
+}
+
+fn relayed_pruned_syncs(compact: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let devices: Vec<Db<Events>> = (0..3)
+        .map(|device| pruned_events(&dir.path().join(format!("d{device}.ferro")), 3))
+        .collect();
+    let mut next = 0u32;
+    let mut commit = |device: usize| {
+        event(&devices[device], next);
+        next += 1;
+    };
+    let pull = |to: usize, from: usize| {
+        let pulled = devices[to].pull(&devices[from], &format!("d{from}main"), add_deltas);
+        let merged = match pulled {
+            Ok(pulled) => pulled.outcome == Outcome::Merged,
+            Err(Error::NoCommonAncestor) => false,
+            Err(error) => panic!("d{to} <- d{from}: {error}"),
+        };
+        if compact {
+            for db in &devices {
+                db.compact(Keep::Last(3)).unwrap();
+            }
+        }
+        checked(&devices, &format!("d{to} <- d{from}"));
+        for db in &devices {
+            assert!(counted(db).values().all(|count| *count == 1), "{:?}", counted(db));
+        }
+        merged
+    };
+    commit(0);
+    commit(1);
+    pull(2, 0);
+    commit(2);
+    commit(2);
+    pull(1, 0);
+    pull(0, 2);
+    pull(2, 1);
+    commit(0);
+    pull(0, 1);
+    if pull(1, 0) {
+        pull(0, 1);
+    }
+    pull(1, 2);
+    pull(2, 0);
+    pull(0, 1);
+}
+
+#[test]
+fn a_landed_chain_holds_every_version_it_claims_when_devices_relay_pruned_history() {
+    relayed_pruned_syncs(false);
+}
+
+#[test]
+fn reclamation_keeps_a_landed_chain_that_shares_commits_with_a_shorter_one() {
+    relayed_pruned_syncs(true);
+}
+
+#[test]
+fn a_remote_whose_head_we_pruned_below_a_commit_it_knows_still_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, s, y) = (open(&dir, "a.ferro"), open(&dir, "s.ferro"), open(&dir, "y.ferro"));
+    put(&y, 1, "y");
+    assert_eq!(s.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    put(&y, 2, "y");
+    put(&y, 3, "y");
+    assert_eq!(a.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    put(&a, 4, "a");
+    a.compact(Keep::Last(2)).unwrap();
+    match s.pull(&a, "a", theirs_win) {
+        Err(Error::NoCommonAncestor) => {}
+        other => panic!("s merged a branch it shares nothing retained with: {other:?}"),
+    }
+    assert_eq!(s.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    a.drop_branch("y").unwrap();
+    put(&a, 5, "a");
+    a.compact(Keep::Last(2)).unwrap();
+    assert_eq!(a.log().first().unwrap().0, 4);
+    let before = (a.head_hash(), dump(&a.read()));
+    for _ in 0..2 {
+        match a.pull(&s, "s", theirs_win) {
+            Err(Error::NoCommonAncestor) => {}
+            other => panic!("a pull that a fresh have cannot fix: {other:?}"),
+        }
+    }
+    assert_eq!(a.branch("s").unwrap().head_hash(), s.head_hash());
+    assert_eq!((a.head_hash(), dump(&a.read())), before);
+    a.verify_typed().unwrap();
+}
+
+struct Mesh {
+    dir: TempDir,
+    keeps: Vec<usize>,
+    devices: Vec<Db<Events>>,
+    model: Model,
+    heads: Vec<usize>,
+    tally: BTreeMap<&'static str, usize>,
+}
+
+impl Mesh {
+    fn pull(&mut self, to: usize, from: usize, when: &str) -> Option<Outcome> {
+        let (ours, theirs) = (self.heads[to], self.heads[from]);
+        let id = self.model.0.len();
+        let before = (self.devices[to].head_hash(), counted(&self.devices[to]));
+        let pulled = self.devices[to].pull(
+            &self.devices[from],
+            &format!("d{from}"),
+            |root, base, incoming| {
+                add_deltas(root, base, incoming);
+                (format!("n{id}"), ())
+            },
+        );
+        let outcome = match pulled {
+            Ok(pulled) => pulled.outcome,
+            Err(Error::NoCommonAncestor) => {
+                let after = (self.devices[to].head_hash(), counted(&self.devices[to]));
+                assert_eq!(after, before, "{when}: a refused pull changed d{to}");
+                *self.tally.entry("refused").or_default() += 1;
+                return None;
+            }
+            Err(error) => panic!("{when}: d{to} <- d{from}: {error}"),
+        };
+        match outcome {
+            Outcome::FastForward => {
+                assert!(self.model.holds(theirs, ours), "{when}: fast-forward");
+                self.heads[to] = theirs;
+            }
+            Outcome::Ahead => assert!(self.model.holds(ours, theirs), "{when}: ahead"),
+            Outcome::UpToDate => {
+                let same = self.model.0[ours].counts == self.model.0[theirs].counts;
+                assert!(same || self.model.holds(ours, theirs), "{when}: up to date");
+            }
+            Outcome::Merged => {
+                let mut counts = self.model.0[ours].counts.clone();
+                counts.extend(self.model.0[theirs].counts.clone());
+                self.heads[to] = self.model.push(&[ours, theirs], counts);
+            }
+        }
+        let name = match outcome {
+            Outcome::UpToDate => "up to date",
+            Outcome::Ahead => "ahead",
+            Outcome::FastForward => "fast-forward",
+            Outcome::Merged => "merged",
+        };
+        *self.tally.entry(name).or_default() += 1;
+        Some(outcome)
+    }
+
+    fn check(&self, when: &str) {
+        checked(&self.devices, when);
+        for (device, db) in self.devices.iter().enumerate() {
+            let node = &self.model.0[self.heads[device]];
+            assert_eq!(counted(db), node.counts, "{when}: d{device}");
+            assert_eq!(node.counts, self.model.events(self.heads[device]), "{when}");
+        }
+    }
+}
+
+#[test]
+fn pruned_devices_syncing_in_any_order_apply_every_change_once_or_refuse() {
+    let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for seed in 0..cases(60) as u64 {
+        let mut rng = Rng::new(seed + 36);
+        let count = 3 + rng.below(2) as usize;
+        let keeps: Vec<usize> = (0..count).map(|_| 2 + rng.below(4) as usize).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let devices = (0..count)
+            .map(|device| pruned_events(&dir.path().join(format!("d{device}.ferro")), keeps[device]))
+            .collect();
+        let mut model = Model(Vec::new());
+        model.push(&[], BTreeMap::new());
+        let mut mesh = Mesh {
+            dir,
+            keeps,
+            devices,
+            model,
+            heads: vec![0; count],
+            tally: BTreeMap::new(),
+        };
+        let mut next_event = 0u32;
+        for step in 0..80 {
+            let when = format!("seed {seed} step {step}");
+            let to = rng.below(count as u64) as usize;
+            let from = (to + 1 + rng.below(count as u64 - 1) as usize) % count;
+            match rng.below(100) {
+                0..35 => {
+                    let id = mesh.model.0.len();
+                    let event = next_event;
+                    next_event += 1;
+                    mesh.devices[to]
+                        .commit(format!("n{id}"), |root| {
+                            root.insert(event, 1);
+                        })
+                        .unwrap();
+                    let mut counts = mesh.model.0[mesh.heads[to]].counts.clone();
+                    counts.insert(event, 1);
+                    mesh.heads[to] = mesh.model.push(&[mesh.heads[to]], counts);
+                }
+                35..45 => {
+                    mesh.devices[to].compact(Keep::Last(mesh.keeps[to])).unwrap();
+                }
+                45..50 => {
+                    let path = mesh.dir.path().join(format!("d{to}.ferro"));
+                    drop(mesh.devices.remove(to));
+                    mesh.devices.insert(to, pruned_events(&path, mesh.keeps[to]));
+                }
+                50..75 => {
+                    mesh.pull(to, from, &when);
+                }
+                _ => {
+                    let synced = mesh.pull(to, from, &when).is_some()
+                        && match mesh.pull(from, to, &when) {
+                            Some(Outcome::Merged) => mesh.pull(to, from, &when).is_some(),
+                            other => other.is_some(),
+                        };
+                    if synced {
+                        mesh.check(&when);
+                        for (into, out) in [(to, from), (from, to)] {
+                            let again = mesh.pull(into, out, &when);
+                            assert!(
+                                again.is_some_and(|outcome| outcome != Outcome::Merged),
+                                "{when}: d{into} <- d{out} right after a sync: {again:?}"
+                            );
+                        }
+                        *mesh.tally.entry("synced").or_default() += 1;
+                    }
+                }
+            }
+            mesh.check(&when);
+        }
+        for (name, seen) in mesh.tally {
+            *tally.entry(name).or_default() += seen;
+        }
+    }
+    assert!(tally["merged"] > 100, "{tally:?}");
+    assert!(tally["fast-forward"] > 100, "{tally:?}");
+    assert!(tally["refused"] > 100, "{tally:?}");
+    assert!(tally["synced"] > 100, "{tally:?}");
 }

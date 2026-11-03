@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::Refs;
 use crate::error::{Error, Result};
-use crate::log::{Chain, Closures, Entry};
+use crate::log::{Chain, Closures, Entry, skip_version};
 use crate::platform::copy_owner;
 pub(crate) use crate::platform::{rename, sync_parent};
 use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
@@ -120,17 +120,47 @@ struct CopySink<'a> {
     file: Traced,
     buf: Vec<u8>,
     end: u64,
-    copied: HashMap<Hash, u64>,
+    copied: HashMap<Hash, Copied>,
+    entries: HashSet<Hash>,
+    records: HashMap<u64, u64>,
+    reach: HashMap<u64, u64>,
     pruned: HashSet<Hash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
 }
 
+#[derive(Clone, Copy)]
+enum Copied {
+    Object(u64),
+    Entry,
+}
+
 struct Pending {
-    hash: Hash,
+    from: Ptr,
     object: Object,
     next: usize,
     links: Vec<Ptr>,
+    entry: Option<Rungs>,
+}
+
+#[derive(Clone, Copy)]
+struct Rungs {
+    version: u64,
+    prev: Option<usize>,
+    skip: Option<usize>,
+}
+
+impl Rungs {
+    fn of(object: &Object) -> Result<Rungs> {
+        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+        let prev = usize::from(entry.commit.root.is_some());
+        let skip = prev + usize::from(entry.prev.is_some());
+        Ok(Rungs {
+            version: entry.commit.version,
+            prev: entry.prev.map(|_| prev),
+            skip: entry.skip.map(|_| skip),
+        })
+    }
 }
 
 impl CopySink<'_> {
@@ -141,12 +171,27 @@ impl CopySink<'_> {
         Ok(())
     }
 
-    fn emit(&mut self, hash: Hash, object: &Object, links: &[Ptr]) -> Result<Ptr> {
-        let offset = self.end;
+    fn emit(
+        &mut self,
+        from: Ptr,
+        object: &Object,
+        links: &[Ptr],
+        reach: Option<u64>,
+    ) -> Result<Ptr> {
+        let (hash, offset) = (from.hash, self.end);
         let before = self.buf.len();
         append_record(&mut self.buf, offset, &object.body, links);
         self.end += (self.buf.len() - before) as u64;
-        self.copied.insert(hash, offset);
+        match reach {
+            Some(reach) => {
+                self.copied.insert(hash, Copied::Entry);
+                self.records.insert(from.offset, offset);
+                self.reach.insert(offset, reach);
+            }
+            None => {
+                self.copied.insert(hash, Copied::Object(offset));
+            }
+        }
         self.objects += 1;
         if self.buf.len() >= FLUSH_BYTES {
             self.drain()?;
@@ -155,9 +200,13 @@ impl CopySink<'_> {
     }
 
     fn remap(&self, ptr: Ptr) -> Option<Ptr> {
-        self.copied.get(&ptr.hash).map(|offset| Ptr {
+        let offset = match self.copied.get(&ptr.hash)? {
+            Copied::Object(offset) => *offset,
+            Copied::Entry => *self.records.get(&ptr.offset)?,
+        };
+        Some(Ptr {
             hash: ptr.hash,
-            offset: *offset,
+            offset,
         })
     }
 
@@ -173,15 +222,28 @@ impl CopySink<'_> {
             .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
     }
 
+    fn reached(&self, links: &[Ptr], rungs: Rungs) -> u64 {
+        let prev = rungs.prev.map(|index| links[index]).filter(|prev| prev.offset != 0);
+        prev.and_then(|prev| self.reach.get(&prev.offset).copied())
+            .unwrap_or(rungs.version)
+    }
+
     fn read(&self, ptr: Ptr) -> Result<Pending> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
         }
+        let object = self.source.read_object(ptr)?;
+        let entry = if self.entries.contains(&ptr.hash) {
+            Some(Rungs::of(&object)?)
+        } else {
+            None
+        };
         Ok(Pending {
-            hash: ptr.hash,
-            object: self.source.read_object(ptr)?,
+            from: ptr,
+            object,
             next: 0,
             links: Vec::new(),
+            entry,
         })
     }
 
@@ -194,7 +256,21 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.object.links.len() {
                 let link = top.object.links[top.next];
-                if let Some(done) = self.settled(link) {
+                let jumps = top
+                    .entry
+                    .filter(|rungs| rungs.skip == Some(top.next))
+                    .is_some_and(|rungs| {
+                        self.reached(&top.links, rungs) > skip_version(rungs.version)
+                    });
+                let settled = if jumps {
+                    Some(Ptr {
+                        hash: link.hash,
+                        offset: 0,
+                    })
+                } else {
+                    self.settled(link)
+                };
+                if let Some(done) = settled {
                     let top = stack.last_mut().expect("stack is not empty");
                     top.links.push(done);
                     top.next += 1;
@@ -205,7 +281,8 @@ impl CopySink<'_> {
                 continue;
             }
             let done = stack.pop().expect("stack is not empty");
-            let ptr = self.emit(done.hash, &done.object, &done.links)?;
+            let reach = done.entry.map(|rungs| self.reached(&done.links, rungs));
+            let ptr = self.emit(done.from, &done.object, &done.links, reach)?;
             match stack.last_mut() {
                 Some(parent) => {
                     parent.links.push(ptr);
@@ -226,7 +303,7 @@ impl Sink for CopySink<'_> {
         for link in &object.links {
             links.push(self.copy(*link)?);
         }
-        self.emit(hash, &object, &links)
+        self.emit(Ptr { hash, offset: 0 }, &object, &links, None)
     }
 
     fn store_id(&self) -> u64 {
@@ -264,6 +341,9 @@ impl<'a> Copier<'a> {
                 buf: Vec::new(),
                 end: LOG_START,
                 copied: HashMap::new(),
+                entries: HashSet::new(),
+                records: HashMap::new(),
+                reach: HashMap::new(),
                 pruned: HashSet::new(),
                 objects: 0,
                 stop,
@@ -279,7 +359,7 @@ impl<'a> Copier<'a> {
         for (_, branch) in refs.try_entries()? {
             let after = branch.log.after(&sink.source)?;
             branch.log.visit(&sink.source, |ptr, entry, _, _| {
-                if sink.copied.contains_key(&ptr.hash) {
+                if sink.records.contains_key(&ptr.offset) {
                     return Ok(false);
                 }
                 retained.insert(ptr.hash);
@@ -290,7 +370,7 @@ impl<'a> Copier<'a> {
             })?;
         }
         closures.walk(&sink.source, |ptr, entry, _, _| {
-            if sink.copied.contains_key(&ptr.hash) {
+            if sink.records.contains_key(&ptr.offset) {
                 return Ok(false);
             }
             retained.insert(ptr.hash);
@@ -299,8 +379,10 @@ impl<'a> Copier<'a> {
         })?;
         for hash in &retained {
             sink.pruned.remove(hash);
+            sink.entries.insert(*hash);
         }
         for hash in edge {
+            sink.entries.insert(hash);
             if !retained.contains(&hash) && !sink.copied.contains_key(&hash) {
                 sink.pruned.insert(hash);
             }

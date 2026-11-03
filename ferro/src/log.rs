@@ -4,10 +4,10 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use crate::admin::Keep;
-use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
+use crate::codec::{ARC_HEADER, Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::{Commit, Parts, now_ms};
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Store, heap_weight};
 
 const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
@@ -54,6 +54,34 @@ impl Entry {
     pub(crate) fn generation(&self) -> u64 {
         self.commit.version + self.graph.lift
     }
+
+    pub(crate) fn load(store: &Store, ptr: Ptr) -> Result<Arc<Entry>> {
+        let offset = ptr.offset;
+        let (found, _) = store.fetch(
+            ptr,
+            |decoder| {
+                Ok(Located {
+                    offset,
+                    entry: Arc::new(Entry::decode(decoder)?),
+                })
+            },
+            |_, body, heap| {
+                let fixed = 2 * ARC_HEADER + size_of::<Located>() + size_of::<Entry>();
+                heap_weight(fixed, body.max(heap))
+            },
+        )?;
+        if found.offset == offset {
+            return Ok(found.entry.clone());
+        }
+        let object = store.read_object(ptr)?;
+        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+        Ok(Arc::new(entry))
+    }
+}
+
+struct Located {
+    offset: u64,
+    entry: Arc<Entry>,
 }
 
 impl Data for Entry {
@@ -185,7 +213,7 @@ impl Node {
     pub(crate) fn load(store: &Store, ptr: Ptr) -> Result<Node> {
         Ok(Node {
             ptr,
-            entry: store.load::<Entry>(ptr)?,
+            entry: Entry::load(store, ptr)?,
         })
     }
 
@@ -209,7 +237,9 @@ impl Node {
         let mut node = self.clone();
         while node.version() > version {
             let link = match node.entry.skip {
-                Some(skip) if skip_version(node.version()) >= version => Some(skip),
+                Some(skip) if skip.offset != 0 && skip_version(node.version()) >= version => {
+                    Some(skip)
+                }
                 _ => node.entry.prev,
             };
             node = node.below(store, link)?;
@@ -233,6 +263,7 @@ impl Node {
                 return Ok(None);
             }
             if let Some(skip) = node.entry.skip
+                && skip.offset != 0
                 && skip_version(at) >= floor
             {
                 let far = node.below(store, Some(skip))?;
@@ -352,7 +383,7 @@ impl Closures {
     }
 }
 
-fn skip_version(version: u64) -> u64 {
+pub(crate) fn skip_version(version: u64) -> u64 {
     version - (version & version.wrapping_neg())
 }
 
@@ -398,7 +429,7 @@ impl Chain {
         let Some(mut ptr) = self.tip else {
             return Ok(None);
         };
-        let mut entry = store.load::<Entry>(ptr)?;
+        let mut entry = Entry::load(store, ptr)?;
         loop {
             let next = match step(&entry) {
                 Step::Found => return Ok(Some(entry)),
@@ -407,7 +438,10 @@ impl Chain {
                 Step::Prev => entry.prev,
             };
             ptr = next.ok_or_else(|| corrupt("chain ends early"))?;
-            let loaded = store.load::<Entry>(ptr)?;
+            if ptr.offset == 0 {
+                return Err(self.cut(entry.commit.version));
+            }
+            let loaded = Entry::load(store, ptr)?;
             if loaded.commit.version >= entry.commit.version {
                 return Err(corrupt("versions do not descend"));
             }
@@ -417,7 +451,7 @@ impl Chain {
 
     pub(crate) fn tip_entry(&self, store: &Store) -> Result<Option<Arc<Entry>>> {
         match self.tip {
-            Some(ptr) => Ok(Some(store.load::<Entry>(ptr)?)),
+            Some(ptr) => Ok(Some(Entry::load(store, ptr)?)),
             None => Ok(None),
         }
     }
@@ -459,19 +493,19 @@ impl Chain {
         let Some(tip) = self.tip else {
             return Ok(None);
         };
-        let mut entry = store.load::<Entry>(tip)?;
+        let mut entry = Entry::load(store, tip)?;
         while entry.commit.time_ms > time_ms {
             let at = entry.commit.version;
             let Some(prev) = entry.prev.filter(|_| at > self.first) else {
                 return Ok(None);
             };
             let far = match entry.skip {
-                Some(skip) if skip_version(at) >= self.first => Some(store.load::<Entry>(skip)?),
+                Some(skip) if skip_version(at) >= self.first => Some(Entry::load(store, skip)?),
                 _ => None,
             };
             let loaded = match far {
                 Some(far) if far.commit.time_ms > time_ms => far,
-                _ => store.load::<Entry>(prev)?,
+                _ => Entry::load(store, prev)?,
             };
             if loaded.commit.version >= entry.commit.version {
                 return Err(corrupt("versions do not descend"));
@@ -565,9 +599,23 @@ impl Chain {
             if !each(ptr, &entry, &object, len)? {
                 break;
             }
-            next = entry.prev.filter(|_| at > self.first);
+            let skip = entry.skip.filter(|_| skip_version(at) >= self.first);
+            next = match entry.prev {
+                _ if at <= self.first => None,
+                Some(prev) if prev.offset != 0 && skip.is_none_or(|skip| skip.offset != 0) => {
+                    Some(prev)
+                }
+                _ => return Err(self.cut(at)),
+            };
         }
         Ok(())
+    }
+
+    fn cut(&self, at: u64) -> Error {
+        corrupt(&format!(
+            "keeps versions from {} but v{at} links pruned history",
+            self.first
+        ))
     }
 
     pub(crate) fn append(
@@ -594,7 +642,7 @@ impl Chain {
         let mut generation = after(below.as_ref().map_or(0, |entry| entry.generation()))?;
         let mut graph = below.as_ref().map_or(Graph::default(), |entry| entry.graph);
         if let Some(merged) = merged {
-            let other = store.load::<Entry>(merged.ptr)?;
+            let other = Entry::load(store, merged.ptr)?;
             generation = generation.max(after(other.generation())?);
             graph.reach = graph.reach.max(other.generation());
             graph.last_merge = version;
@@ -623,7 +671,7 @@ impl Chain {
     fn pointer_to(&self, store: &Store, version: u64) -> Result<Option<Ptr>> {
         let mut ptr = self.tip.ok_or_else(|| corrupt("is empty"))?;
         loop {
-            let entry = store.load::<Entry>(ptr)?;
+            let entry = Entry::load(store, ptr)?;
             let at = entry.commit.version;
             if at == version {
                 return Ok(Some(ptr));
@@ -659,7 +707,7 @@ impl Walk {
         let Some(ptr) = self.next else {
             return Ok(None);
         };
-        let entry = self.store.load::<Entry>(ptr)?;
+        let entry = Entry::load(&self.store, ptr)?;
         if entry.commit.version >= self.above {
             return Err(corrupt("versions do not descend"));
         }

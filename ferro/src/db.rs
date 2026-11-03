@@ -1629,7 +1629,7 @@ impl<T: Data> Shared<T> {
         }
         let mut time_ms = intent.time.unwrap_or_else(|| self.now().max(head.floor()));
         if let Some(link) = intent.merged {
-            time_ms = time_ms.max(store.load::<Entry>(link.ptr)?.commit.time_ms);
+            time_ms = time_ms.max(Entry::load(store, link.ptr)?.commit.time_ms);
         }
         let commit = Commit {
             version,

@@ -534,7 +534,7 @@ fn entry_at(store: &Store, chain: &Chain, version: u64) -> Result<Option<Ptr>> {
         return Ok(None);
     }
     loop {
-        let entry = store.load::<Entry>(ptr)?;
+        let entry = Entry::load(store, ptr)?;
         let at = entry.commit.version;
         if at == version {
             return Ok(Some(ptr));
@@ -543,7 +543,7 @@ fn entry_at(store: &Store, chain: &Chain, version: u64) -> Result<Option<Ptr>> {
             return Err(corrupt("skipped a version"));
         }
         ptr = match entry.skip {
-            Some(skip) if skip_version(at) >= version => skip,
+            Some(skip) if skip.offset != 0 && skip_version(at) >= version => skip,
             _ => entry.prev.ok_or_else(|| corrupt("chain ends early"))?,
         };
     }
@@ -810,9 +810,11 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
             prefix = Some((version, slot));
         }
     }
+    let named = have.marks.iter().any(|mark| mark.hash == tip.hash);
     let floor = prefix
         .map_or(0, |(version, _)| version)
-        .max(chain.first.saturating_sub(1));
+        .max(chain.first.saturating_sub(1))
+        .min(if named { chain.last } else { chain.last - 1 });
     let mut entries = Vec::new();
     let mut next = Some(tip);
     while let Some(ptr) = next {
@@ -840,7 +842,7 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         if !base.tip && prefix.map(|(_, chosen)| chosen) != Some(slot) {
             continue;
         }
-        let entry = store.load::<Entry>(base.ptr)?;
+        let entry = Entry::load(store, base.ptr)?;
         let Some(root) = entry.commit.root else {
             continue;
         };
@@ -1153,7 +1155,7 @@ impl Landing<'_> {
         }
         match self.commits.get(&ptr.hash) {
             Some(sent) => Ok(Some(sent.facts)),
-            None => Ok(Some(Facts::of(&*self.store.load::<Entry>(ptr)?))),
+            None => Ok(Some(Facts::of(&*Entry::load(self.store, ptr)?))),
         }
     }
 
@@ -1366,7 +1368,7 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
     }
     let mut roots = Vec::with_capacity(header.roots.len());
     for slot in &header.roots {
-        let entry = store.load::<Entry>(bases[*slot].0)?;
+        let entry = Entry::load(store, bases[*slot].0)?;
         roots.push(
             entry
                 .commit
@@ -1680,7 +1682,7 @@ fn land<T: Data, R: Read>(
     let root = if landing.commits.contains_key(&tip.hash) {
         tip_root
     } else {
-        store.load::<Entry>(tip_ptr)?.commit.root
+        Entry::load(store, tip_ptr)?.commit.root
     };
     let head = Head {
         version: tip.version,
