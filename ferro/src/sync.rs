@@ -12,6 +12,7 @@ use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
+use crate::reentry::Needs;
 use crate::store::{Store, Txn};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -1850,6 +1851,8 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
+        let _ours = self.entering(Needs::Every)?;
+        let _theirs = from.entering(Needs::Tip)?;
         let have = self.have()?;
         let emitter = from.emitter(&have)?;
         self.step("bundled");
@@ -1923,6 +1926,7 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
+        let _ours = self.entering(Needs::Every)?;
         let mut input = Input::open(input, BUNDLE_MAGIC)?;
         let header = Header::decode(&mut input)?;
         let landing = header.tip.is_some();

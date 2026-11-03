@@ -25,6 +25,7 @@ use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
 use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
+use crate::reentry::{self, Crossing, Needs};
 use crate::store::{Durability, Frame, Op, Retired, Settling, Store, StoreOptions, Trace, Txn};
 use crate::watch::{Feed, Filter, Notice, Watcher};
 
@@ -325,6 +326,7 @@ struct Change<'a, T> {
 
 struct Branch<T> {
     name: String,
+    db: u64,
     state: ArcSwap<State<T>>,
     tip: ArcSwap<State<T>>,
     feed: Arc<Feed<T>>,
@@ -358,14 +360,16 @@ impl<T> DerefMut for Lane<'_, T> {
 impl<T> Drop for Lane<'_, T> {
     fn drop(&mut self) {
         drop(self.guard.take());
+        reentry::release(self.branch.db, self.branch.key());
         self.branch.open_gate();
     }
 }
 
 impl<T> Branch<T> {
-    fn new(name: &str, state: Arc<State<T>>) -> Branch<T> {
+    fn new(name: &str, db: u64, state: Arc<State<T>>) -> Branch<T> {
         Branch {
             name: name.to_string(),
+            db,
             feed: Arc::new(Feed::new(state.snapshot.clone())),
             state: ArcSwap::new(state.clone()),
             tip: ArcSwap::new(state),
@@ -378,7 +382,12 @@ impl<T> Branch<T> {
         }
     }
 
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
     fn hold<'a>(&'a self, guard: MutexGuard<'a, Option<Group<T>>>) -> Lane<'a, T> {
+        reentry::hold(self.db, self.key(), &self.name);
         Lane {
             guard: Some(guard),
             branch: self,
@@ -666,6 +675,7 @@ impl Drop for Keeper {
 }
 
 struct Shared<T> {
+    id: u64,
     store: ArcSwap<Store>,
     path: PathBuf,
     file: PathBuf,
@@ -776,6 +786,7 @@ struct Writing<'a, T, F, R, E> {
     start: Option<F>,
     gated: bool,
     wait: Option<Wait<R, E>>,
+    crossing: Option<Crossing>,
 }
 
 impl<T, F, R, E> Unpin for Writing<'_, T, F, R, E> {}
@@ -790,6 +801,14 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let db = this.db;
+        let needs = match this.start {
+            Some(_) => Needs::Lane(&db.branch.name),
+            None => Needs::Ack,
+        };
+        match db.entering(needs) {
+            Ok(crossing) => this.crossing = crossing,
+            Err(error) => return Poll::Ready(Err(error.into())),
+        }
         if let Some(f) = this.start.take() {
             db.shared.start_syncer(&db.keeper);
             let Some(lane) = db.branch.enter(this.id, cx.waker(), this.gated) else {
@@ -1005,6 +1024,7 @@ impl Options {
         let file = canonicalize(path.as_ref())?;
         let mut options = options;
         let shared = Arc::new(Shared {
+            id: reentry::next_db(),
             store: ArcSwap::from_pointee(store),
             path: path.as_ref().to_path_buf(),
             file,
@@ -1178,7 +1198,7 @@ impl<T: Data> Shared<T> {
             return Err(Error::NoBranch(name.to_string()));
         }
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
-        let branch = Arc::new(Branch::new(name, state));
+        let branch = Arc::new(Branch::new(name, self.id, state));
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
     }
@@ -1188,6 +1208,7 @@ impl<T: Data> Shared<T> {
             return Ok(branch.clone());
         }
         let _tip = self.tip.lock();
+        let _whole = reentry::whole(self.id);
         let published = self.published.lock();
         self.attach(name, &published.refs)
     }
@@ -1216,11 +1237,15 @@ impl<T: Data> Shared<T> {
                 });
             drop(attached);
             if same {
+                let whole = reentry::whole(self.id);
                 let out = f(&mut tip);
+                drop(whole);
                 drop(tip);
-                drop(lanes);
+                lanes.into_iter().rev().for_each(drop);
                 return out;
             }
+            drop(tip);
+            lanes.into_iter().rev().for_each(drop);
         }
     }
 
@@ -1302,6 +1327,7 @@ impl<T: Data> Shared<T> {
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
             let drafted = self.draft(branch, &working)?;
             let mut tip = self.tip.lock();
+            let whole = reentry::whole(self.id);
             let committed = self.commit_locked(
                 &mut tip,
                 Change {
@@ -1319,6 +1345,7 @@ impl<T: Data> Shared<T> {
                 },
                 drafted,
             );
+            drop(whole);
             drop(tip);
             let (version, time_ms, settling) = committed?;
             if let Some((settling, store)) = settling {
@@ -2059,6 +2086,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn compact(&self, keep: Keep) -> Result<Compacted> {
+        let _crossing = self.entering(Needs::Every)?;
         self.shared.compact(keep, None)
     }
 
@@ -2217,6 +2245,7 @@ impl<T: Data> Db<T> {
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
+        let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let lane = match self.shared.coalesce {
             true => self.shared.arrive(&self.branch),
             false => self.shared.lane(&self.branch),
@@ -2253,6 +2282,7 @@ impl<T: Data> Db<T> {
             &mut T,
         ) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
+        let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let lane = self.shared.lane(&self.branch);
         let staged = self.stage_alone(lane, from, |state, root, _| {
             let tip = self.shared.tip.lock().clone();
@@ -2306,7 +2336,9 @@ impl<T: Data> Db<T> {
             };
             let drafted = self.shared.draft(&self.branch, &working)?;
             let mut tip = self.shared.tip.lock();
+            let whole = reentry::whole(self.shared.id);
             let committed = self.shared.commit_locked(&mut tip, change, drafted);
+            drop(whole);
             drop(tip);
             let (version, time_ms, settling) = committed?;
             if let Some((settling, store)) = settling {
@@ -2400,6 +2432,7 @@ impl<T: Data> Db<T> {
             start: Some(f),
             gated: false,
             wait: None,
+            crossing: None,
         }
     }
 
@@ -2753,6 +2786,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
+        let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let mut notices = Vec::new();
         let lane = self.shared.lane(&self.branch);
         self.branch.check_live()?;
@@ -2788,6 +2822,7 @@ impl<T: Data> Db<T> {
     }
 
     pub fn branch(&self, name: &str) -> Result<Db<T>> {
+        let _crossing = self.entering(Needs::Tip)?;
         let branch = self.shared.attached(name)?;
         Ok(Db {
             shared: self.shared.clone(),
@@ -2800,11 +2835,13 @@ impl<T: Data> Db<T> {
         if name == MAIN || name == self.branch.name {
             return Err(Error::BranchInUse(name.to_string()));
         }
+        let _crossing = self.entering(Needs::Lane(name))?;
         let mut notices = Vec::new();
         loop {
             let doomed = self.shared.branches.lock().get(name).cloned();
             let lane = doomed.as_ref().map(|branch| self.shared.lane(branch));
             let mut tip = self.shared.tip.lock();
+            let _whole = reentry::whole(self.shared.id);
             let attached = self.shared.branches.lock().get(name).cloned();
             if attached.as_ref().map(Arc::as_ptr) != doomed.as_ref().map(Arc::as_ptr) {
                 continue;
@@ -2869,8 +2906,10 @@ impl<T: Data> Db<T> {
         if !self.shared.options.read_only {
             return Ok(false);
         }
+        let _crossing = self.entering(Needs::Tip)?;
         let mut notices = Vec::new();
         let mut tip = self.shared.tip.lock();
+        let _whole = reentry::whole(self.shared.id);
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
             Err(Error::Replaced) => {
@@ -2955,6 +2994,10 @@ pub struct Verified {
 }
 
 impl<T: Data> Db<T> {
+    pub(crate) fn entering(&self, needs: Needs<'_>) -> Result<Option<Crossing>> {
+        reentry::check(self.shared.id, self.shared.coalesce, needs)
+    }
+
     pub(crate) fn published_refs(&self) -> (Store, Refs) {
         let published = self.shared.published.lock();
         (self.shared.store(), published.refs.clone())

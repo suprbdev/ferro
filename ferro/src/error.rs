@@ -42,6 +42,8 @@ pub enum Error {
     TooLarge(u64),
     #[error("the coalesced group this closure joined was not written: {0}")]
     GroupFailed(String),
+    #[error("this write would deadlock on a writer lock held by this thread or by a write waiting on it")]
+    Reentrant,
     #[error("sync bundle rejected: {0}")]
     Bundle(String),
     #[error("sync bundle is stale: {0}; build a new one from a fresh have")]

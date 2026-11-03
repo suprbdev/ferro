@@ -12,6 +12,7 @@ pub mod log;
 pub mod map;
 mod platform;
 mod reclaim;
+mod reentry;
 pub mod set;
 pub mod store;
 pub mod sync;
