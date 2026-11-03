@@ -9,6 +9,7 @@ pub mod history;
 pub mod list;
 pub mod log;
 pub mod map;
+mod platform;
 mod reclaim;
 pub mod set;
 pub mod store;

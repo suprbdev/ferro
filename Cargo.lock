@@ -414,6 +414,7 @@ dependencies = [
  "quick_cache",
  "tempfile",
  "thiserror",
+ "windows-sys",
  "xxhash-rust",
 ]
 

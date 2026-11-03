@@ -6,7 +6,6 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::ErrorKind;
 use std::mem;
 use std::ops::Deref;
-use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +20,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::codec::{ARC_HEADER, Decoder, HASH_BYTES, Hash, Object, Ptr, Sink, Staged, push_varint};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
+use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
 
 const MAGIC: &[u8; 8] = b"FERRODB3";
@@ -338,7 +338,7 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
 
 fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
     let settled = sb.settled() && read_frame(file, &sb, len)?.is_none();
-    if settled || file.try_lock_shared().is_err() {
+    if settled || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
     }
     let before = sb.anchor.seq;
@@ -348,11 +348,11 @@ fn observe(file: &File, sb: Super, len: u64) -> Result<Super> {
         .and_then(|meta| scan(file, sb.at_anchor(), meta.len()))
         .and_then(|tip| {
             if tip.seq != before {
-                file.sync_data()?;
+                platform::sync_reader(file)?;
             }
             Ok(tip)
         });
-    file.unlock()?;
+    platform::unlock(file)?;
     scanned
 }
 
@@ -514,7 +514,7 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
         if read_only {
             return Ok(file);
         }
-        match file.try_lock() {
+        match platform::try_lock(&file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) if retries == LOCK_RETRIES => return Err(Error::Locked),
             Err(TryLockError::WouldBlock) => {
@@ -524,7 +524,7 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
             }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
-        if std::fs::metadata(path).is_ok_and(|on_disk| on_disk.ino() == file.metadata().map(|m| m.ino()).unwrap_or(0)) {
+        if platform::path_id(path).is_ok_and(|on_disk| platform::file_id(&file).is_ok_and(|id| id == on_disk)) {
             return Ok(file);
         }
     }
@@ -567,7 +567,7 @@ pub(crate) struct Traced {
 
 impl Traced {
     pub(crate) fn new(file: File, trace: Option<Trace>) -> Result<Traced> {
-        let inode = file.metadata()?.ino();
+        let inode = platform::file_id(&file)?;
         Ok(Traced { file, trace, inode })
     }
 
@@ -704,9 +704,7 @@ impl Store {
                 file.set_len(LOG_START)?;
                 file.write_all_at(&sb.encode(), 0)?;
                 file.sync_all()?;
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    File::open(parent)?.sync_all()?;
-                }
+                platform::sync_parent(path)?;
                 (sb, 0)
             }
         };
@@ -793,7 +791,7 @@ impl Store {
     pub fn refresh(&self) -> Result<Option<Ptr>> {
         let mut cursor = self.inner.cursor.lock();
         let opened = self.inner.file.metadata()?;
-        if std::fs::metadata(&self.inner.path)?.ino() != opened.ino() {
+        if platform::path_id(&self.inner.path)? != self.inner.file.inode {
             return Err(Error::Replaced);
         }
         let len = opened.len();
@@ -1044,7 +1042,7 @@ impl Store {
         {
             let _ = inner.file.set_len(end);
         }
-        let _ = inner.file.unlock();
+        let _ = platform::unlock(&inner.file);
     }
 
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {

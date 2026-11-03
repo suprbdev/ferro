@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, fchown};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,6 +8,8 @@ use crate::codec::{Data, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::Refs;
 use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry};
+use crate::platform::copy_owner;
+pub(crate) use crate::platform::sync_parent;
 use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;
@@ -55,13 +56,6 @@ pub(crate) fn sibling(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".compacting");
     PathBuf::from(name)
-}
-
-pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
-    match path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        Some(parent) => File::open(parent)?.sync_all(),
-        None => Ok(()),
-    }
 }
 
 #[derive(Default)]
@@ -259,7 +253,7 @@ impl<'a> Copier<'a> {
             .open(temp)?;
         let source = store.metadata()?;
         file.set_permissions(source.permissions())?;
-        let _ = fchown(&file, Some(source.uid()), Some(source.gid()));
+        copy_owner(&file, &source);
         let file = Traced::new(file, options.trace.clone())?;
         file.created();
         file.set_len(LOG_START)?;
