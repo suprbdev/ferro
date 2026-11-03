@@ -33,6 +33,7 @@ const LINEAR_KEYS: usize = 16;
 const LINEAR_KEY_BYTES: usize = 16;
 const PARALLEL_ITEMS: usize = 1 << 14;
 const MAX_WORKERS: usize = 16;
+const HINTED_LEVEL: u8 = 3;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -351,8 +352,21 @@ struct Hint {
 }
 
 impl Hint {
+    const NONE: Hint = Hint { keys: 0, rest: 0 };
+
     fn of<K, V, S>(node: &Arc<Node<K, V, S>>) -> Hint {
-        let base = Arc::as_ptr(node).addr();
+        Hint::spans(node, false)
+    }
+
+    fn dirty<K, V, S>(node: &Node<K, V, S>) -> Hint {
+        if node.level >= HINTED_LEVEL {
+            return Hint::NONE;
+        }
+        Hint::spans(node, true)
+    }
+
+    fn spans<K, V, S>(node: &Node<K, V, S>, dirty: bool) -> Hint {
+        let base = std::ptr::from_ref(node).addr();
         let span = |start: usize, bytes: usize| -> i32 {
             let Ok(offset) = i32::try_from(start.wrapping_sub(base) as isize) else {
                 return 0;
@@ -372,6 +386,9 @@ impl Hint {
                 column.as_ptr().addr().wrapping_sub(ARC_HEADER),
                 ARC_HEADER + column.len() * size_of::<V>(),
             ),
+            Cells::Slots(slots) if dirty => {
+                span(slots.as_ptr().addr(), slots.len() * size_of::<Slot<V, S>>())
+            }
             Cells::Slots(_) => 0,
         };
         Hint {
@@ -380,9 +397,19 @@ impl Hint {
         }
     }
 
+    fn renew<K, V, S>(&mut self, node: &Node<K, V, S>, before: [usize; 3]) {
+        if node.buffers() != before {
+            *self = Hint::dirty(node);
+        }
+    }
+
     #[inline]
     fn prefetch<T>(self, node: &Weak<T>) {
-        let base = node.as_ptr().addr();
+        self.prefetch_at(node.as_ptr().addr());
+    }
+
+    #[inline]
+    fn prefetch_at(self, base: usize) {
         for span in [self.keys, self.rest] {
             let start = base.wrapping_add_signed((span & !SPAN_LINES) as isize);
             for line in 0..(span & SPAN_LINES) as usize {
@@ -412,7 +439,7 @@ enum Link<K, V, S> {
         summary: S,
         memo: OnceLock<Memo<K, V, S>>,
     },
-    Mem(Arc<Node<K, V, S>>),
+    Mem(Arc<Node<K, V, S>>, Hint),
 }
 
 impl<K, V, S: Clone> Clone for Link<K, V, S> {
@@ -426,12 +453,17 @@ impl<K, V, S: Clone> Clone for Link<K, V, S> {
                 summary,
                 ..
             } => Link::under(*ptr, *count, *ceiling, summary.clone()),
-            Link::Mem(node) => Link::Mem(node.clone()),
+            Link::Mem(node, hint) => Link::Mem(node.clone(), *hint),
         }
     }
 }
 
 impl<K, V, S> Link<K, V, S> {
+    fn mem(node: Arc<Node<K, V, S>>) -> Self {
+        let hint = Hint::dirty(&node);
+        Link::Mem(node, hint)
+    }
+
     fn stored(ptr: Ptr, count: u64, summary: S) -> Self {
         Link::under(ptr, count, LEVELS, summary)
     }
@@ -472,7 +504,7 @@ impl<K, V, S> Link<K, V, S> {
         match self {
             Link::Empty => 0,
             Link::Stored { count, .. } => *count,
-            Link::Mem(node) => node.count,
+            Link::Mem(node, _) => node.count,
         }
     }
 
@@ -483,7 +515,7 @@ impl<K, V, S> Link<K, V, S> {
         match self {
             Link::Empty => None,
             Link::Stored { summary, .. } => Some(summary.clone()),
-            Link::Mem(node) => node.summary(),
+            Link::Mem(node, _) => node.summary(),
         }
     }
 
@@ -495,7 +527,7 @@ impl<K, V, S> Link<K, V, S> {
         match (self, other) {
             (Link::Empty, Link::Empty) => true,
             (Link::Stored { ptr: a, .. }, Link::Stored { ptr: b, .. }) => a.hash == b.hash,
-            (Link::Mem(a), Link::Mem(b)) => Arc::ptr_eq(a, b),
+            (Link::Mem(a, _), Link::Mem(b, _)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -559,6 +591,14 @@ impl<K, V, S> Node<K, V, S> {
             };
         }
         self.keys.binary_search_by(|probe| probe.borrow().cmp(key))
+    }
+
+    fn buffers(&self) -> [usize; 3] {
+        let slots = match &self.cells {
+            Cells::Slots(slots) => slots.as_ptr().addr(),
+            Cells::Column(_) => 0,
+        };
+        [self.keys.as_ptr().addr(), self.children.as_ptr().addr(), slots]
     }
 
     fn child(&self, position: usize) -> &Link<K, V, S> {
@@ -921,7 +961,7 @@ fn reach<'a, K: Data, V: Data, S: Data>(
 ) -> Result<Reach<'a, K, V, S>> {
     let memo = match link {
         Link::Empty => return Ok(Reach::Absent),
-        Link::Mem(node) => return Ok(Reach::Borrowed(node)),
+        Link::Mem(node, _) => return Ok(Reach::Borrowed(node)),
         Link::Stored { memo, .. } => memo,
     };
     match memo.get() {
@@ -985,7 +1025,7 @@ fn load<K: Data, V: Data, S: Data>(
 ) -> Result<Option<Arc<Node<K, V, S>>>> {
     match link {
         Link::Empty => Ok(None),
-        Link::Mem(node) => Ok(Some(node.clone())),
+        Link::Mem(node, _) => Ok(Some(node.clone())),
         Link::Stored {
             ptr,
             count,
@@ -1008,12 +1048,26 @@ fn node_mut<'a, K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &'a mut Link<K, V, S>,
 ) -> Result<&'a mut Node<K, V, S>> {
+    dirty_mut(store, link).map(|(node, _)| node)
+}
+
+fn dirty_mut<'a, K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &'a mut Link<K, V, S>,
+) -> Result<(&'a mut Node<K, V, S>, &'a mut Hint)> {
     if let Link::Stored { .. } = link {
         let node = load(store, link)?.ok_or(Error::Detached)?;
-        *link = Link::Mem(node);
+        *link = Link::Mem(node, Hint::NONE);
     }
     match link {
-        Link::Mem(node) => Ok(Arc::make_mut(node)),
+        Link::Mem(node, hint) => {
+            let shared = Arc::as_ptr(node);
+            let node = Arc::make_mut(node);
+            if !std::ptr::eq(shared, node) {
+                *hint = Hint::dirty(node);
+            }
+            Ok((node, hint))
+        }
         _ => Err(Error::Detached),
     }
 }
@@ -1041,7 +1095,7 @@ fn link_from<K, V, S>(
         prefix: None,
     };
     node.recount();
-    Link::Mem(Arc::new(node))
+    Link::mem(Arc::new(node))
 }
 
 type Parts<K, V, S> = (Link<K, V, S>, Link<K, V, S>);
@@ -1102,7 +1156,7 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
             let last = node.children_mut().pop().ok_or(Error::Detached)?;
             node.children.push(merge(store, last, b)?);
             node.recount();
-            Ok(Link::Mem(Arc::new(node)))
+            Ok(Link::mem(Arc::new(node)))
         }
         Ordering::Less => {
             drop(b);
@@ -1110,7 +1164,7 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
             let first = node.children_mut()[0].take();
             node.children[0] = merge(store, a, first)?;
             node.recount();
-            Ok(Link::Mem(Arc::new(node)))
+            Ok(Link::mem(Arc::new(node)))
         }
         Ordering::Equal => {
             drop(a);
@@ -1125,7 +1179,7 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
             left.cells.slots().append(right.cells.slots());
             left.origin = None;
             left.recount();
-            Ok(Link::Mem(Arc::new(left)))
+            Ok(Link::mem(Arc::new(left)))
         }
     }
 }
@@ -1139,16 +1193,10 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
 ) -> Result<Option<Slot<V, S>>> {
     if let Link::Stored { .. } = link {
         let node = load(store, link)?.ok_or(Error::Detached)?;
-        *link = Link::Mem(node);
+        *link = Link::Mem(node, Hint::NONE);
     }
-    let Link::Mem(current) = &*link else {
-        *link = link_from(
-            level,
-            vec![key],
-            vec![Slot::Fresh(value)],
-            vec![Link::Empty, Link::Empty],
-            None,
-        );
+    let Link::Mem(current, _) = &*link else {
+        *link = link_from(level, vec![key], vec![Slot::Fresh(value)], Vec::new(), None);
         return Ok(None);
     };
     if level > current.level {
@@ -1162,31 +1210,39 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
         );
         return Ok(None);
     }
-    let node = node_mut(store, link)?;
+    let (node, hint) = dirty_mut(store, link)?;
     match node.search(&key) {
-        Ok(index) => Ok(Some(std::mem::replace(
-            &mut node.cells.slots()[index],
-            Slot::Fresh(value),
-        ))),
+        Ok(index) => {
+            let before = node.buffers();
+            let replaced = std::mem::replace(&mut node.cells.slots()[index], Slot::Fresh(value));
+            hint.renew(node, before);
+            Ok(Some(replaced))
+        }
         Err(position) if level == node.level => {
-            if node.children.is_empty() {
-                node.keys.insert(position, key);
-                node.cells.slots().insert(position, Slot::Fresh(value));
-                node.count += 1;
-                return Ok(None);
+            let before = node.buffers();
+            if !node.children.is_empty() {
+                let (left, right) =
+                    split(store, node.children[position].take(), &|probe: &K| probe.cmp(&key))?;
+                node.children[position] = left;
+                node.children.insert(position + 1, right);
             }
-            let (left, right) =
-                split(store, node.children[position].take(), &|probe: &K| probe.cmp(&key))?;
             node.keys.insert(position, key);
             node.cells.slots().insert(position, Slot::Fresh(value));
-            node.children[position] = left;
-            node.children.insert(position + 1, right);
             node.count += 1;
+            hint.renew(node, before);
             Ok(None)
         }
         Err(position) => {
-            let replaced =
-                insert_at(store, &mut node.children_mut()[position], key, level, value)?;
+            if node.children.is_empty() {
+                node.children_mut();
+                *hint = Hint::dirty(node);
+            }
+            if node.level <= HINTED_LEVEL
+                && let Link::Mem(child, hint) = &node.children[position]
+            {
+                hint.prefetch_at(Arc::as_ptr(child).addr());
+            }
+            let replaced = insert_at(store, &mut node.children[position], key, level, value)?;
             if replaced.is_none() {
                 node.count += 1;
             }
@@ -1321,7 +1377,7 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
     dense: bool,
     mut fan: bool,
 ) -> Result<Link<K, V, S>> {
-    let Link::Mem(node) = link else {
+    let Link::Mem(node, _) = link else {
         return Ok(link.clone());
     };
     if fan && fans_out(node) {
@@ -1357,7 +1413,7 @@ fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Arc<Node<K, V, S>>) {
 fn fans_out<K, V, S>(node: &Node<K, V, S>) -> bool {
     let mut budget = PARALLEL_NODES;
     node.count >= PARALLEL_KEYS
-        && node.children.iter().filter(|child| matches!(child, Link::Mem(_))).nth(1).is_some()
+        && node.children.iter().filter(|child| matches!(child, Link::Mem(..))).nth(1).is_some()
         && busy(node, &mut budget)
 }
 
@@ -1423,7 +1479,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
                 encoder.link(*ptr);
                 total = fold(total, summary);
             }
-            Link::Mem(_) => return Err(Error::Detached),
+            Link::Mem(..) => return Err(Error::Detached),
         }
         if branching {
             stored.push(flushed);
@@ -1631,7 +1687,7 @@ struct Deferred<'a, K, V, S> {
 
 fn dirty<K, V, S>(node: &Node<K, V, S>) -> impl Iterator<Item = &Node<K, V, S>> {
     node.children.iter().filter_map(|child| match child {
-        Link::Mem(child) => Some(&**child),
+        Link::Mem(child, _) => Some(&**child),
         _ => None,
     })
 }
@@ -1761,7 +1817,7 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
                 encoder.link(*ptr);
                 total = fold(total, summary);
             }
-            Link::Mem(child) => {
+            Link::Mem(child, _) => {
                 let deferred = children.pop().ok_or(Error::Detached)?;
                 encoder.varint(child.count);
                 deferred.total.encode(&mut encoder)?;
@@ -2077,14 +2133,14 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
         return Ok(());
     }
     if let Link::Stored { .. } = link {
-        *link = Link::Mem(load(store, link)?.ok_or(Error::Detached)?);
+        *link = Link::Mem(load(store, link)?.ok_or(Error::Detached)?, Hint::NONE);
     }
     let top = edits.as_slice()[..count]
         .iter()
         .filter(|edit| edit.value.is_some())
         .map(|edit| edit.level)
         .max();
-    if let (Link::Mem(current), Some(level)) = (&*link, top)
+    if let (Link::Mem(current, _), Some(level)) = (&*link, top)
         && level > current.level
     {
         return rise(store, link, level, edits, count);
@@ -2372,7 +2428,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     pub fn is_dirty(&self) -> bool {
-        matches!(self.root, Link::Mem(_))
+        matches!(self.root, Link::Mem(..))
     }
 
     pub fn clear(&mut self) {
@@ -3013,7 +3069,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         match &self.root {
             Link::Empty => None,
             Link::Stored { ptr, .. } => Some(ptr.hash),
-            Link::Mem(_) => {
+            Link::Mem(..) => {
                 let mut sink = HashSink;
                 match flush(&self.root, &mut sink, 0, false) {
                     Ok(Link::Stored { ptr, .. }) => Some(ptr.hash),
@@ -3034,7 +3090,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
         let target = w.store_id();
         let foreign =
             target != 0 && self.store.as_ref().is_some_and(|store| store.id() != target);
-        if foreign || matches!(self.root, Link::Mem(_)) {
+        if foreign || matches!(self.root, Link::Mem(..)) {
             w.mark_unsettled();
         }
         let stored = if foreign {
@@ -3054,7 +3110,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
                 summary.encode(w)?;
                 w.link(ptr);
             }
-            Link::Mem(_) => return Err(Error::Detached),
+            Link::Mem(..) => return Err(Error::Detached),
         }
         Ok(())
     }
