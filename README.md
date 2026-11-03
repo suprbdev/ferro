@@ -646,14 +646,19 @@ and three 5 second rounds, the median rose from 5,300 writes a second alone to 1
 16 threads, where the writer was less busy, the gain was 9%. No round found a violation.
 
 Without `coalesce` the limit is CPU, not the fsync. A booking write changes about ten small trees,
-the rows and their indexes, and re-encodes each path under the writer lock. In one run with
-`Durability::Buffered` the writes alone managed 4,800 a second, and with `coalesce` 17,300.
+the rows and their indexes, and re-encodes each path under the writer lock. A node on such a path
+now copies the encoded entries it did not change, and outside its closure a hold costs 21% less CPU
+than it did, a confirm 37% less and a cancel 31% less, as DESIGN.md describes. With
+`Durability::Buffered` and 64 threads, median of three interleaved rounds, the writes alone went
+from 5,100 to 6,100 a second, and with `coalesce` from 14,500 to 15,600.
 
 ## Performance
 
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
 `ferro-bench`. Random `get`, full scan and range read are medians of seven runs, and bulk insert of
-five, on a machine shared with other jobs. The rest are single runs on an otherwise idle machine.
+five, on a machine shared with other jobs. The fsync commit is a median of three runs and the
+coalesced writers of eight on a machine shared with other jobs, and the booking commits come from
+`ferro-bench`'s `tables` tool the same way. The rest are single runs on an otherwise idle machine.
 
 | Operation | Result |
 | --- | --- |
@@ -661,13 +666,15 @@ five, on a machine shared with other jobs. The rest are single runs on an otherw
 | Random `get` | 0.34 µs |
 | Full scan | 22 ns per key |
 | Range read | 33 ns per key |
-| Single-key commit, fsync | 430 µs, about 2,300 per second |
+| Single-key commit, fsync | 410 µs, about 2,400 per second |
 | Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
 | Reads per second with those writers running | 38M |
-| The same 8 writers with `coalesce`, median of five runs | about 15,600 per second |
+| The same 8 writers with `coalesce` | about 14,600 per second, 12,800 before in the same runs |
 | Single-key commit, `Durability::Buffered` | 27 µs |
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.5 µs per changed key |
+| Booking hold commit, `Durability::Buffered` | 85 µs of CPU, 13 µs of it in the closure |
+| Booking confirm commit, `Durability::Buffered` | 97 µs of CPU, 12 µs of it in the closure |
 
 Against other embedded stores on the same workload, with 1 GiB of cache each, medians of five runs
 of 3 rounds on a machine shared with other jobs:

@@ -58,7 +58,7 @@ decoder rejects a claimed expansion beyond LZ4's 255:1 limit before allocating.
 
 ## Deduplication
 
-`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded cache from hash to offset.
+`Txn::put` skips an object whose hash it finds in `dedupe`, a bounded table from hash to offset.
 It holds what this process wrote and what it read, for objects of at least `SPILL_BYTES`, the size
 at which a value becomes its own object. Smaller objects are cheap to write again, and registering
 every read cost 3 to 11% on cold gets through a writer. Only objects read are registered, after
@@ -82,6 +82,17 @@ It does not close the gap for code that replaces a collection without reading it
 
 A rebuild reads nothing, so nothing is registered. Finding an unread object by hash would need an
 index on disk or a scan at open, and neither is justified by one write pattern that can read first.
+
+The table is two-way set associative. A set is one 64-byte line holding two full hashes and their
+offsets behind a one-byte lock, so a lookup or an insert touches one line. A hit moves to the front
+of its set and a new entry pushes out the older way. It has one entry for every 4 KiB of
+`cache_bytes`, between 1,024 and 65,536, and is allocated in 4 KiB chunks as entries first land in
+them, so an open costs nothing and a writer that has made a few thousand commits holds about 2 MiB.
+It was a `quick_cache`, and a booking commit registers and looks up about 36 objects. Once that
+cache held its 65,536 entries every insert evicted through its clock lists, and every insert and
+lookup took several cache misses in its shard map and slab: 14% of a booking commit's time went
+there. With the table, thread CPU time outside the closure fell 7 to 12% for a booking hold and 4 to
+9% for a confirm, and the hit rate held: bytes per write went from 12,210 to 12,208.
 
 ## Canonical tree
 
@@ -122,7 +133,15 @@ decoded from the written bytes, which is that check and the copy in one pass; ot
 cloned. A value holding a dirty or foreign collection also forces the decode, so nested
 collections always come back clean and a foreign store is never pinned.
 
-A dirty node of at least 4096 keys with two or more dirty children is flushed in three phases.
+A node that `flush` writes or decodes keeps the bytes and links of its level, keys and values while
+its values are still one column, which they stop being at the first edit of a key or value, since
+every such edit goes through `Cells::slots`. A node on the path to a change has a new child and the
+same entries, so the next flush copies those bytes and encodes only its child links. The kept bytes
+count toward the node's cache weight, and the file comes out byte for byte the same. The parallel
+flush below keeps none, so a bulk load holds no more memory than before.
+
+A dirty node of at least 4096 keys with two or more dirty children and at least 256 dirty nodes
+under it is flushed in three phases.
 First, every dirty subtree under 4096 keys is encoded, hashed and LZ4 compressed on up to 16 scoped
 threads, each into its own buffer, and the nodes above them on the calling thread. Second, the
 calling thread appends the records to the transaction in the order a one-thread flush would, so
@@ -140,7 +159,12 @@ as many pages and made the next scans 10 to 15% slower. Built in the third phase
 subtree's buffers are released, the first pass of gets, scans and ranges after a bulk load is as
 fast as before or up to 7% faster, and peak memory rose 2%, from 362 to 371 MiB at 1M keys. Each
 phase spawns its threads, so a 10,000-row table commit, with little to share out, gains up to 5%
-for 50% more CPU time.
+for 50% more CPU time. The rule first stopped at two dirty children, so a commit that changed two
+keys under different children of a large tree's root spawned threads in both phases to flush a
+handful of nodes. A booking confirm, which moves a booking from one status to another in an index
+of several thousand entries, did that on every commit, and lost a third of its CPU time outside the
+closure and nearly half of its wall time to it. 256 dirty nodes are about a millisecond of work on
+one thread.
 
 Most of a 1M-key bulk load is still the per-key inserts, about 60%, which miss the CPU cache a few
 times per level, and dropping the in-memory tree after the commit, about 25%. Measured and
@@ -970,6 +994,112 @@ Measured and left out:
   group had been open for half the last sync, though more closures were coming, helped 50 µs
   closures by 10% at 8 writers and 38% at 32, and cost `queue` 7% and 19% of its throughput and up
   to 75% more bytes. Nothing tried won everywhere, so the simplest rule stays.
+
+### Commits of a few rows
+
+A booking write in `examples/booking` changes about ten small trees, the rows and their indexes,
+and spent six to ten times as long outside its closure as in it, all under the writer lock.
+`ferro-bench`'s `tables` tool runs the example's hold, confirm and cancel closures one commit at a
+time against a Buffered file, after 4,000 warm-up pairs, and reads thread CPU time and user-space
+instructions, through `perf_event_open`, for the commit and for its closure. A hold writes 36
+objects, 7.3 KB of bodies before LZ4 and 5.1 KB after, and encodes 274 keys on 34 nodes, of which
+20 to 23 only gained a new child.
+
+Instructions for a hold, in thousands, by phase. The phases were taken with counters around each
+one, which add about 6%; the totals are without them.
+
+| Phase | Before | After |
+| --- | ---: | ---: |
+| Closure | 63 | 64 |
+| Encoding keys, values and child links | 324 | 200 |
+| BLAKE3 | 142 | 96 |
+| LZ4 | 168 | 167 |
+| Appending records and looking up `dedupe` | 43 | 41 |
+| Registering in `dedupe` | 20 | 4 |
+| Node cache inserts | 16 | 19 |
+| Building the cached copies | 45 | 42 |
+| Decoding the root as a check | 12 | 12 |
+| Reading the refs, root and log entry back | 26 | 0 |
+| Log entry, refs, frame, superblock and publish | 17 | 17 |
+| Dropping the old tree | 14 | 15 |
+| Setup and the decode of fresh values as a check | 17 | 19 |
+| Outside the closure, total | 794 | 575 |
+
+Time did not follow instructions. In a sampling profile of the same run before, leaving out time
+inside libc, encoding took 30% of a commit, inserts into the node cache and `dedupe` 21%, the
+closure 15%, LZ4 11%, appending records and `dedupe` lookups 7% and reading the tip back 4%: the
+inserts and lookups run few instructions and wait on cache misses. Five changes, each measured on
+its own:
+
+- A node on the path to a change copies the bytes of its unchanged entries, as described under
+  Canonical tree: 16% fewer instructions outside the closure. A single-key insert into a
+  20,000-key map encoded 58 values and now fewer than 24.
+- The new tip is the root the commit decoded as a check and the commit it wrote, and the refs are
+  decoded from their encoded bytes, instead of three reads, hash checks and decodes from the file:
+  4% fewer instructions and 6 to 10% less CPU time.
+- `dedupe` became the set-associative table described under Deduplication: 3% fewer instructions and
+  7 to 12% less CPU time for a hold.
+- `Object::hash` copies an object of up to 4 KiB and its link hashes into a per-thread buffer and
+  hashes it in one call. Each small update had cost about 140 instructions of buffering, so a node
+  with nine links paid more for its links than for its body: a 100-byte node with nine links took
+  2,285 instructions against 3,542. The bytes hashed are the same. 6% fewer instructions.
+- The parallel flush needs 256 dirty nodes, as described under Canonical tree: a third less CPU time
+  for a confirm and a quarter less for a cancel.
+
+Median of five interleaved runs on a 32-core machine while other work on it was light, in thread
+CPU time:
+
+| Commit | Closure | Outside the closure, before | After | Instructions outside, before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hold | 13 to 15 µs | 90 µs | 71 µs (-21%) | 794,000 | 575,000 (-28%) |
+| Confirm | 12 to 13 µs | 136 µs | 85 µs (-37%) | 1,024,000 | 718,000 (-30%) |
+| Cancel | 24 to 26 µs | 163 µs | 112 µs (-31%) | 1,257,000 | 908,000 (-28%) |
+
+The figures before for a confirm and a cancel leave out the threads the parallel flush spawned, so
+their real fall is larger, and a confirm's wall time outside the closure fell from 140 to 85 µs.
+With heavy other work on the machine the same comparison gave -24%, -43% and -36%. Bytes per write
+went from 12,210 to 12,208. `booking-stress --buffered` at 64 threads, median of three interleaved
+rounds, went from 5,097 to 6,055 writes a second alone, with hold p99 from 23 to 20 ms, and from
+14,459 to 15,551 with `coalesce`. Under heavy other work it went from 2,031 to 2,858 alone and from
+3,418 to 4,833 with `coalesce`, and at 16 threads from 2,366 to 3,142 and from 2,906 to 4,780.
+
+What is left is spread out. LZ4 is now the largest phase by instructions, 29% of what is outside the
+closure, then encoding at 35%, which is mostly the leaves that a change lands in and the
+per-node work of building records and cached copies, and BLAKE3 at 17%. Of the nodes a commit puts
+in the node cache, 98.3% are read again, 61% by the very next commit, so the inserts stay. The
+`heap` tool's commits and reads case ends with 154.8 MiB of live heap against 170.9 before at a
+256 MiB setting, and its other cases moved by under 1%.
+
+Measured and left out:
+
+- Encoding, hashing and compressing outside the writer lock. A closure is `FnOnce` and has to run
+  on the tip, so it cannot run before the lock is taken and again if the tip moved. What is left is
+  to let the next closure run on this one's dirty tree while this one flushes, which bounds the gain
+  by the closure's share of the lock: (13 + 71) / 71, at most 1.18 times the writes a second for
+  a hold. It needs a flushed-link memo on every shared dirty node so the next flush does not encode
+  it again, a second lock to keep frames in order, and a failed flush would fail closures that
+  already ran on it, which is what `coalesce` already does for 2.6 times as many writes.
+- Copying the unchanged entries of a node whose values changed too, through offsets kept per
+  entry and the column they came from. 3 to 5% fewer instructions outside the closure, but a
+  cancel's closure took 21% more instructions and CPU time came out 3 to 5% worse, since most
+  leaves a commit touches were last written by a bulk load or read from the file and keep nothing.
+- An LZ4 block compressor of our own, with a table sized to the input and reused per thread, which
+  saves `lz4_flex`'s zeroed 8 KiB table and output vector on every call. 7% more instructions per
+  commit, the same CPU time over five rounds, and 0.1% more bytes.
+- `lz4_flex` without `safe-encode`: 27% fewer LZ4 instructions, 6% fewer per commit and the same
+  bytes, but it brings unsafe code into the write path.
+- No LZ4 under 128 or 192 bytes: 2 or 5% fewer instructions for 0.35 or 1.2% more bytes, and CPU
+  time within noise. Bodies under 128 bytes compressed in 53 to 70% of cases, saving 11 to 16% of
+  their bytes.
+- Compressing into a reused buffer, and leaving a leaf's link vector unallocated: 1% fewer
+  instructions, CPU time within noise.
+- Hashing several nodes in one SIMD pass. BLAKE3's multi-input path is only reachable through an
+  unstable hidden module, takes inputs of one block-aligned length, and a parent needs its
+  children's hashes first, so at most BLAKE3's 17% could shrink. Not built.
+- Decoding just-written nodes for the cache, and the log entry itself, are about 1% each.
+- Cheaper index maintenance: the derived `reindex` already skips an index whose fields did not
+  change, and the whole closure is a tenth of a commit's instructions and under a fifth of its
+  time.
 
 ## History
 
