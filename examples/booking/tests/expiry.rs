@@ -98,7 +98,7 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
             Plan {
                 venues: 1,
                 rooms: 3,
-                customers: 24,
+                customers: 25,
                 credit: 1_000_000,
                 ..Plan::default()
             },
@@ -120,9 +120,9 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
         let sweeper = {
             let (svc, stop) = (svc.clone(), stop.clone());
             thread::spawn(move || {
-                let mut swept = 0;
+                let mut swept = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
-                    swept += svc.sweep().unwrap().len();
+                    swept.extend(svc.sweep().unwrap());
                     thread::sleep(Duration::from_millis(2));
                 }
                 swept
@@ -133,7 +133,7 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
                 let svc = svc.clone();
                 thread::spawn(move || {
                     let mut rng = fastrand::Rng::with_seed(u64::from(i));
-                    let mut confirmed = 0;
+                    let mut taken = Vec::new();
                     for _ in 0..60 {
                         let request = HoldRequest {
                             customer: 1 + i * 2 + rng.u32(0..2),
@@ -145,8 +145,8 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
                         let Ok(held) = svc.hold(&request) else {
                             continue;
                         };
+                        taken.extend(held.released);
                         if rng.u32(0..3) == 0 && svc.confirm(held.id, None).is_ok() {
-                            confirmed += 1;
                             if rng.bool() {
                                 svc.cancel(held.id).unwrap();
                             }
@@ -154,21 +154,43 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
                             thread::sleep(Duration::from_millis(rng.u64(0..4)));
                         }
                     }
-                    confirmed
+                    taken
                 })
             })
             .collect();
-        let confirmed: u32 = workers.into_iter().map(|h| h.join().unwrap()).sum();
-        thread::sleep(Duration::from_millis(20));
+        let taken: Vec<u64> = workers.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let tail = |room, ttl_ms| {
+            svc.hold(&HoldRequest {
+                customer: 25,
+                room,
+                first: first + 3,
+                nights: 1,
+                ttl_ms,
+            })
+            .unwrap()
+        };
+        let kept = tail(1, 60_000);
+        svc.confirm(kept.id, None).unwrap();
+        let lapsing = tail(2, 20);
+        while svc.now() < lapsing.expires_ms {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut swept = svc.sweep().unwrap();
         stop.store(true, Ordering::Relaxed);
-        let swept = sweeper.join().unwrap();
-        svc.sweep().unwrap();
+        swept.extend(sweeper.join().unwrap());
+        assert!(swept.contains(&lapsing.id), "coalesce={coalesce}: swept {swept:?}");
         let h = svc.read();
         assert_eq!(h.bookings.by_status(&Status::Held).len(), 0);
-        assert!(h.bookings.by_status(&Status::Expired).len() > 0);
+        assert_eq!(
+            h.bookings.by_status(&Status::Expired).len(),
+            swept.len() + taken.len(),
+            "coalesce={coalesce}: swept {}, taken over {}",
+            swept.len(),
+            taken.len()
+        );
+        assert_eq!(h.bookings.get(&kept.id).unwrap().status, Status::Confirmed);
         drop(h);
         let walked = assert_clean(&svc);
-        assert!(confirmed > 0 && swept > 0, "coalesce={coalesce}: confirmed {confirmed}, swept {swept}");
         assert!(walked.expired > 0);
     }
 }

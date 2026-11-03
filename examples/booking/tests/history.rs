@@ -1,7 +1,7 @@
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -161,10 +161,13 @@ fn receipts_while_rates_change(coalesce: bool, bookings: u32, buyers: u32) {
     seed(&svc, &plan).unwrap();
     let first = night_of(now_ms()) + 1;
     let stop = Arc::new(AtomicBool::new(false));
+    let (started, noise_started) = mpsc::channel();
     let noise = {
         let (svc, stop) = (svc.clone(), stop.clone());
         thread::spawn(move || {
-            let mut changes = 0;
+            let mut changes = 1;
+            svc.set_rate(40, 1000 + changes).unwrap();
+            started.send(()).unwrap();
             while !stop.load(Ordering::Relaxed) {
                 changes += 1;
                 svc.set_rate(40, 1000 + changes % 50).unwrap();
@@ -172,6 +175,7 @@ fn receipts_while_rates_change(coalesce: bool, bookings: u32, buyers: u32) {
             changes
         })
     };
+    noise_started.recv().unwrap();
     let workers: Vec<_> = (0..buyers)
         .map(|buyer| {
             let svc = svc.clone();

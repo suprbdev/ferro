@@ -1,7 +1,7 @@
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -154,9 +154,11 @@ fn what_ifs_fork_and_merge_while_coalesced_writers_keep_booking() {
     );
     let today = w.clock.today();
     let stop = Arc::new(AtomicBool::new(false));
+    let (booked_once, first_booking) = mpsc::channel();
     let writers: Vec<_> = (0..8u32)
         .map(|i| {
             let (svc, stop) = (w.svc.clone(), stop.clone());
+            let mut booked_once = Some(booked_once.clone());
             thread::spawn(move || {
                 let mut rng = fastrand::Rng::with_seed(u64::from(i));
                 let mut done = 0;
@@ -183,11 +185,16 @@ fn what_ifs_fork_and_merge_while_coalesced_writers_keep_booking() {
                         Err(BookingError::Unavailable { .. } | BookingError::VenueClosed(_)) => {}
                         Err(other) => panic!("{other:?}"),
                     }
+                    if let Some(booked_once) = booked_once.take_if(|_| done > 0) {
+                        booked_once.send(()).unwrap();
+                    }
                 }
                 done
             })
         })
         .collect();
+    drop(booked_once);
+    first_booking.recv().unwrap();
     for round in 0..6u32 {
         let name = format!("round{round}");
         let scenario = if round == 5 {
