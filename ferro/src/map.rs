@@ -37,6 +37,7 @@ const TEARDOWN_KEYS: u64 = 4096;
 const TEARDOWN_AHEAD: usize = 16;
 const TEARDOWN_PATHS: usize = 4;
 const HINTED_LEVEL: u8 = 3;
+const LEAF_CAPACITY: usize = 8;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -1110,6 +1111,15 @@ fn link_from<K, V, S>(
 
 type Parts<K, V, S> = (Link<K, V, S>, Link<K, V, S>);
 
+fn tail<T>(items: &mut Vec<T>, at: usize) -> Vec<T> {
+    if at == items.len() {
+        return Vec::new();
+    }
+    let mut tail = Vec::with_capacity((items.len() - at).max(LEAF_CAPACITY));
+    tail.extend(items.drain(at..));
+    tail
+}
+
 fn split<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: Link<K, V, S>,
@@ -1132,8 +1142,8 @@ fn split<K: Data + Ord, V: Data, S: Data>(
         .binary_search_by(side)
         .err()
         .ok_or_else(|| Error::Corrupt("key found at a level it does not hash to".into()))?;
-    let right_keys = keys.split_off(position);
-    let right_slots = slots.split_off(position);
+    let right_keys = tail(&mut keys, position);
+    let right_slots = tail(&mut slots, position);
     if children.is_empty() {
         return Ok((
             link_from(level, keys, slots, children, origin),
@@ -1206,7 +1216,11 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
         *link = Link::Mem(node, Hint::NONE);
     }
     let Link::Mem(current, _) = &*link else {
-        *link = link_from(level, vec![key], vec![Slot::Fresh(value)], Vec::new(), None);
+        let mut keys = Vec::with_capacity(LEAF_CAPACITY);
+        keys.push(key);
+        let mut slots = Vec::with_capacity(LEAF_CAPACITY);
+        slots.push(Slot::Fresh(value));
+        *link = link_from(level, keys, slots, Vec::new(), None);
         return Ok(None);
     };
     if level > current.level {
