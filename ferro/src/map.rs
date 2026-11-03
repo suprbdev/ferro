@@ -1074,7 +1074,7 @@ fn dirty_mut<'a, K: Data, V: Data, S: Data>(
             let shared = Arc::as_ptr(node);
             let node = Arc::make_mut(node);
             if !std::ptr::eq(shared, node) {
-                *hint = Hint::dirty(node);
+                *hint = Hint::NONE;
             }
             Ok((node, hint))
         }
