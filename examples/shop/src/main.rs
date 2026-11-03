@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 fn usage() -> ! {
     eprintln!(
         "usage: shop --db PATH [--addr HOST:PORT] [--replica] [--reads inline|blocking] \
-         [--writes inline|blocking|pool:N] [--durability fsync|buffered] [--refresh-ms N] \
+         [--writes async|inline|blocking|pool:N] [--durability fsync|buffered] [--refresh-ms N] \
          [--workers N] [--keep-versions N] [--reclaim-mb N] [--coalesce]"
     );
     std::process::exit(2)

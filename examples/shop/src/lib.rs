@@ -33,7 +33,7 @@ impl Default for Config {
         Config {
             replica: false,
             reads: ReadMode::Inline,
-            writes: WriteMode::Pool(32),
+            writes: WriteMode::Async,
             durability: Durability::Fsync,
             refresh_ms: 5,
             feed_capacity: 1024,

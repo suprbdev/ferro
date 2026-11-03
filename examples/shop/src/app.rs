@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ferro::{Db, Snapshot};
+use ferro::{Committed, Db, Snapshot};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -55,6 +55,7 @@ pub enum ReadMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteMode {
+    Async,
     Inline,
     Blocking,
     Pool(usize),
@@ -77,6 +78,7 @@ impl FromStr for WriteMode {
 
     fn from_str(text: &str) -> Result<Self, String> {
         match text {
+            "async" => Ok(WriteMode::Async),
             "inline" => Ok(WriteMode::Inline),
             "blocking" => Ok(WriteMode::Blocking),
             other => match other.strip_prefix("pool:") {
@@ -203,6 +205,18 @@ pub type Shared = Arc<App>;
 impl App {
     pub fn read_snapshot(&self) -> Snapshot<Shop> {
         self.db.read()
+    }
+
+    pub async fn commit<R, F>(&self, work: F) -> Result<Committed<R>, ApiError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Shop) -> Result<(String, R), ApiError> + Send + 'static,
+    {
+        if self.bridge.writes == WriteMode::Async {
+            return self.db.try_commit_with_async(work).await;
+        }
+        let db = self.db.clone();
+        self.bridge.write(move || db.try_commit_with(work)).await?
     }
 
     pub fn writable(&self) -> Result<(), ApiError> {

@@ -71,13 +71,9 @@ pub type Shared = Arc<App>;
 impl App {
     pub async fn write<R, F>(&self, work: F) -> Result<Committed<R>, ApiError>
     where
-        R: Send + 'static,
-        F: FnOnce(&mut Chat) -> Result<(String, R), ApiError> + Send + 'static,
+        F: FnOnce(&mut Chat) -> Result<(String, R), ApiError>,
     {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.try_commit_with(work))
-            .await
-            .map_err(|error| ApiError::Internal(format!("writer failed: {error}")))?
+        self.db.try_commit_with_async(work).await
     }
 
     pub fn subscribe(&self, scope: Scope, since: Option<u64>) -> Result<Subscription, ApiError> {

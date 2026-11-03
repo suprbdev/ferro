@@ -475,25 +475,21 @@ async fn create_product(
     if new.name.trim().is_empty() || new.category.trim().is_empty() {
         return Err(ApiError::Bad("name and category are required".into()));
     }
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                shop.next_product += 1;
-                let id = shop.next_product;
-                shop.products.insert(Product {
-                    id,
-                    name: new.name,
-                    category: new.category,
-                    price_cents: new.price_cents,
-                    active: true,
-                });
-                shop.stock.insert(id, new.stock);
-                Ok((format!("add product {id}"), id))
-            })
+        .commit(move |shop| -> Result<_, ApiError> {
+            shop.next_product += 1;
+            let id = shop.next_product;
+            shop.products.insert(Product {
+                id,
+                name: new.name,
+                category: new.category,
+                price_cents: new.price_cents,
+                active: true,
+            });
+            shop.stock.insert(id, new.stock);
+            Ok((format!("add product {id}"), id))
         })
-        .await??;
+        .await?;
     app.counters.writes.fetch_add(1, Ordering::Relaxed);
     let view = json!({"id": done.value, "version": done.version});
     Ok((StatusCode::CREATED, Json(view)).into_response())
@@ -516,46 +512,42 @@ async fn patch_product(
 ) -> Result<Response, ApiError> {
     app.writable()?;
     let id = id_of(&params)?;
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                if !shop.products.contains(&id) {
-                    return Err(ApiError::NotFound(format!("product {id}")));
+        .commit(move |shop| -> Result<_, ApiError> {
+            if !shop.products.contains(&id) {
+                return Err(ApiError::NotFound(format!("product {id}")));
+            }
+            if let Some(stock) = patch.stock {
+                shop.stock.insert(id, stock);
+            }
+            if let Some(delta) = patch.stock_delta {
+                let current = i64::from(stock_of(shop, id));
+                let next = current + delta;
+                if !(0..=i64::from(u32::MAX)).contains(&next) {
+                    return Err(ApiError::Conflict(
+                        json!({"error": "stock would leave range", "stock": current}),
+                    ));
                 }
-                if let Some(stock) = patch.stock {
-                    shop.stock.insert(id, stock);
+                shop.stock.insert(id, next as u32);
+            }
+            shop.products.update(&id, |product| {
+                if let Some(name) = patch.name {
+                    product.name = name;
                 }
-                if let Some(delta) = patch.stock_delta {
-                    let current = i64::from(stock_of(shop, id));
-                    let next = current + delta;
-                    if !(0..=i64::from(u32::MAX)).contains(&next) {
-                        return Err(ApiError::Conflict(
-                            json!({"error": "stock would leave range", "stock": current}),
-                        ));
-                    }
-                    shop.stock.insert(id, next as u32);
+                if let Some(category) = patch.category {
+                    product.category = category;
                 }
-                shop.products.update(&id, |product| {
-                    if let Some(name) = patch.name {
-                        product.name = name;
-                    }
-                    if let Some(category) = patch.category {
-                        product.category = category;
-                    }
-                    if let Some(price) = patch.price_cents {
-                        product.price_cents = price;
-                    }
-                    if let Some(active) = patch.active {
-                        product.active = active;
-                    }
-                });
-                let view = product_view(&shop.products.get(&id).expect("exists"), stock_of(shop, id));
-                Ok((format!("patch product {id}"), view))
-            })
+                if let Some(price) = patch.price_cents {
+                    product.price_cents = price;
+                }
+                if let Some(active) = patch.active {
+                    product.active = active;
+                }
+            });
+            let view = product_view(&shop.products.get(&id).expect("exists"), stock_of(shop, id));
+            Ok((format!("patch product {id}"), view))
         })
-        .await??;
+        .await?;
     app.counters.writes.fetch_add(1, Ordering::Relaxed);
     Ok(Json(json!({"product": done.value, "version": done.version})).into_response())
 }
@@ -571,25 +563,21 @@ async fn create_customer(
     Json(new): Json<NewCustomer>,
 ) -> Result<Response, ApiError> {
     app.writable()?;
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                if shop.customers.by_email(new.email.as_str()).next().is_some() {
-                    return Err(ApiError::Conflict(json!({"error": "email taken"})));
-                }
-                shop.next_customer += 1;
-                let id = shop.next_customer;
-                shop.customers.insert(Customer {
-                    id,
-                    name: new.name,
-                    email: new.email,
-                });
-                Ok((format!("add customer {id}"), id))
-            })
+        .commit(move |shop| -> Result<_, ApiError> {
+            if shop.customers.by_email(new.email.as_str()).next().is_some() {
+                return Err(ApiError::Conflict(json!({"error": "email taken"})));
+            }
+            shop.next_customer += 1;
+            let id = shop.next_customer;
+            shop.customers.insert(Customer {
+                id,
+                name: new.name,
+                email: new.email,
+            });
+            Ok((format!("add customer {id}"), id))
         })
-        .await??;
+        .await?;
     app.counters.writes.fetch_add(1, Ordering::Relaxed);
     Ok((
         StatusCode::CREATED,
@@ -614,22 +602,18 @@ async fn add_cart_item(
     if item.qty == 0 || item.qty > 1000 {
         return Err(ApiError::Bad("qty must be 1..=1000".into()));
     }
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                if !shop.products.contains(&item.product_id) {
-                    return Err(ApiError::NotFound(format!("product {}", item.product_id)));
-                }
-                let cart = shop.carts.get_or_insert_with(id, Cart::default);
-                let line = cart.items.get_or_insert_with(item.product_id, || 0);
-                *line = (*line + item.qty).min(1000);
-                cart.updated_ms = now_ms();
-                Ok((format!("cart {id} add"), cart_view(cart)))
-            })
+        .commit(move |shop| -> Result<_, ApiError> {
+            if !shop.products.contains(&item.product_id) {
+                return Err(ApiError::NotFound(format!("product {}", item.product_id)));
+            }
+            let cart = shop.carts.get_or_insert_with(id, Cart::default);
+            let line = cart.items.get_or_insert_with(item.product_id, || 0);
+            *line = (*line + item.qty).min(1000);
+            cart.updated_ms = now_ms();
+            Ok((format!("cart {id} add"), cart_view(cart)))
         })
-        .await??;
+        .await?;
     app.counters.writes.fetch_add(1, Ordering::Relaxed);
     Ok((
         StatusCode::CREATED,
@@ -728,11 +712,7 @@ async fn create_order(
     Json(request): Json<NewOrder>,
 ) -> Result<Response, ApiError> {
     app.writable()?;
-    let db = app.db.clone();
-    let outcome = app
-        .bridge
-        .write(move || db.try_commit_with(move |shop| place_order(shop, request)))
-        .await?;
+    let outcome = app.commit(move |shop| place_order(shop, request)).await;
     match outcome {
         Ok(done) => {
             app.counters.orders_ok.fetch_add(1, Ordering::Relaxed);
@@ -763,31 +743,27 @@ async fn patch_order(
     app.writable()?;
     let id = id_of(&params)?;
     let target: OrderStatus = patch.status.into();
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                let order = shop
-                    .orders
-                    .get(&id)
-                    .ok_or_else(|| ApiError::NotFound(format!("order {id}")))?;
-                if order.status != OrderStatus::Placed || target == OrderStatus::Placed {
-                    return Err(ApiError::Conflict(
-                        json!({"error": "invalid transition", "status": order.status}),
-                    ));
+        .commit(move |shop| -> Result<_, ApiError> {
+            let order = shop
+                .orders
+                .get(&id)
+                .ok_or_else(|| ApiError::NotFound(format!("order {id}")))?;
+            if order.status != OrderStatus::Placed || target == OrderStatus::Placed {
+                return Err(ApiError::Conflict(
+                    json!({"error": "invalid transition", "status": order.status}),
+                ));
+            }
+            if target == OrderStatus::Cancelled {
+                for line in &order.lines {
+                    let stock = shop.stock.get_or_insert_with(line.product_id, || 0);
+                    *stock += line.qty;
                 }
-                if target == OrderStatus::Cancelled {
-                    for line in &order.lines {
-                        let stock = shop.stock.get_or_insert_with(line.product_id, || 0);
-                        *stock += line.qty;
-                    }
-                }
-                shop.orders.update(&id, |order| order.status = target);
-                Ok((format!("order {id} {target:?}"), id))
-            })
+            }
+            shop.orders.update(&id, |order| order.status = target);
+            Ok((format!("order {id} {target:?}"), id))
         })
-        .await??;
+        .await?;
     app.counters.writes.fetch_add(1, Ordering::Relaxed);
     Ok(Json(json!({"id": done.value, "version": done.version})).into_response())
 }
@@ -805,50 +781,46 @@ struct Seed {
 
 async fn seed(State(app): State<Shared>, Json(seed): Json<Seed>) -> Result<Response, ApiError> {
     app.writable()?;
-    let db = app.db.clone();
     let done = app
-        .bridge
-        .write(move || {
-            db.try_commit_with(move |shop| -> Result<_, ApiError> {
-                const CATEGORIES: [&str; 8] = [
-                    "tools", "garden", "kitchen", "toys", "books", "audio", "outdoor", "office",
-                ];
-                let mut scarce = Vec::new();
-                for _ in 0..seed.products {
-                    shop.next_product += 1;
-                    let id = shop.next_product;
-                    shop.products.insert(Product {
-                        id,
-                        name: format!("Product {id}"),
-                        category: CATEGORIES[(id % 8) as usize].to_string(),
-                        price_cents: 199 + (id * 37) % 9800,
-                        active: true,
-                    });
-                    let low = seed.scarce_every > 0 && id % seed.scarce_every == 0;
-                    if low {
-                        scarce.push(id);
-                    }
-                    shop.stock
-                        .insert(id, if low { seed.scarce_stock } else { seed.stock });
+        .commit(move |shop| -> Result<_, ApiError> {
+            const CATEGORIES: [&str; 8] = [
+                "tools", "garden", "kitchen", "toys", "books", "audio", "outdoor", "office",
+            ];
+            let mut scarce = Vec::new();
+            for _ in 0..seed.products {
+                shop.next_product += 1;
+                let id = shop.next_product;
+                shop.products.insert(Product {
+                    id,
+                    name: format!("Product {id}"),
+                    category: CATEGORIES[(id % 8) as usize].to_string(),
+                    price_cents: 199 + (id * 37) % 9800,
+                    active: true,
+                });
+                let low = seed.scarce_every > 0 && id % seed.scarce_every == 0;
+                if low {
+                    scarce.push(id);
                 }
-                let mut first_customer = 0;
-                for _ in 0..seed.customers {
-                    shop.next_customer += 1;
-                    let id = shop.next_customer;
-                    first_customer = if first_customer == 0 { id } else { first_customer };
-                    shop.customers.insert(Customer {
-                        id,
-                        name: format!("Customer {id}"),
-                        email: format!("customer{id}@example.test"),
-                    });
-                }
-                Ok((
-                    "seed".to_string(),
-                    json!({"products": seed.products, "customers": seed.customers, "scarce": scarce}),
-                ))
-            })
+                shop.stock
+                    .insert(id, if low { seed.scarce_stock } else { seed.stock });
+            }
+            let mut first_customer = 0;
+            for _ in 0..seed.customers {
+                shop.next_customer += 1;
+                let id = shop.next_customer;
+                first_customer = if first_customer == 0 { id } else { first_customer };
+                shop.customers.insert(Customer {
+                    id,
+                    name: format!("Customer {id}"),
+                    email: format!("customer{id}@example.test"),
+                });
+            }
+            Ok((
+                "seed".to_string(),
+                json!({"products": seed.products, "customers": seed.customers, "scarce": scarce}),
+            ))
         })
-        .await??;
+        .await?;
     Ok(Json(json!({"seeded": done.value, "version": done.version})).into_response())
 }
 
