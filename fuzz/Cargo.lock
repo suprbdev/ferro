@@ -117,6 +117,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "ferro-derive",
+ "hashbrown",
  "libc",
  "lz4_flex",
  "parking_lot",
