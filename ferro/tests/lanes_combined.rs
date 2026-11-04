@@ -352,7 +352,17 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
     let straddle = Arc::new(Mutex::new(None));
     let placed_tx = Arc::new(Mutex::new(None));
-    let hook = straddling_hook(straddle.clone(), placed_tx.clone(), Cell::default(), false);
+    let (committed_tx, committed_rx) = mpsc::channel();
+    let committed = Arc::new(Mutex::new(Some(committed_rx)));
+    let straddling = straddling_hook(straddle.clone(), placed_tx.clone(), Cell::default(), false);
+    let hook = Hook(Arc::new(move |step| {
+        (straddling.0)(step);
+        if step == "placed"
+            && let Some(committed) = committed.lock().take()
+        {
+            committed.recv_timeout(PATIENCE).unwrap();
+        }
+    }));
     let b: Db<Root> = durable()
         .trace(trace.clone())
         .hook(hook)
@@ -381,6 +391,7 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
                 })
                 .unwrap();
                 w.trace_op(Op::Acked(2));
+                committed_tx.send(()).unwrap();
             })
             .unwrap()
     };
@@ -425,6 +436,14 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
             assert!(side_moved || found.side == before.side, "{context}: side");
             assert!(landed || found.remote == before.remote, "{context}: remote");
             assert!(forwarded || found.main == before.main, "{context}: main");
+            assert!(
+                side_moved || !w_moved,
+                "{context}: the moved draft outlived the side commit"
+            );
+            assert!(
+                w_moved || !landed,
+                "{context}: the remote landed without the moved draft"
+            );
             assert!(
                 landed || !forwarded,
                 "{context}: main moved before the remote landed"
