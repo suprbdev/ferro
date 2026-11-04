@@ -226,6 +226,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "quick_cache",
  "thiserror",
+ "windows-sys",
  "xxhash-rust",
 ]
 
