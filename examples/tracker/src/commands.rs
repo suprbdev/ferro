@@ -250,15 +250,14 @@ fn merge(w: &mut dyn Write, db: &Db<Tracker>, branch: &str, take_theirs: bool) -
                 if let Some(row) = conflict.theirs.as_deref() {
                     collisions.push(row.clone());
                 }
-                return conflict.ours.as_deref().cloned();
+                return conflict.keep_ours();
             }
             conflicts.push(conflict.key);
-            let chosen = if take_theirs {
-                conflict.theirs
+            if take_theirs {
+                conflict.keep_theirs()
             } else {
-                conflict.ours
-            };
-            chosen.as_deref().cloned()
+                conflict.keep_ours()
+            }
         });
         let mut renumbered = Vec::new();
         for mut issue in collisions {

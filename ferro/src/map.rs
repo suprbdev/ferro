@@ -4300,6 +4300,16 @@ pub struct Conflict<K, V> {
     pub theirs: Option<Val<V>>,
 }
 
+impl<K, V: Clone> Conflict<K, V> {
+    pub fn keep_ours(self) -> Option<V> {
+        self.ours.map(Val::into_owned)
+    }
+
+    pub fn keep_theirs(self) -> Option<V> {
+        self.theirs.map(Val::into_owned)
+    }
+}
+
 pub(crate) fn three_way<T, K, V, S, E>(
     target: &mut T,
     base: &Map<K, V, S>,

@@ -6,7 +6,7 @@ what_if.commit("try a price change", |shop| { /* ... */ })?;
 
 db.merge_with(&what_if, |shop, base, theirs| {
     let applied = shop.orders.merge(&base.orders, &theirs.orders, |conflict| {
-        conflict.ours.as_deref().cloned()
+        conflict.keep_ours()
     });
     ("merge what-if", applied)
 })?;
@@ -18,6 +18,12 @@ over the whole merge graph, as git does, so a change is merged once however it a
 back and forth, through a third branch or through a fork of a branch that was already merged.
 Finding the base costs about two binary searches over the log, plus a step for each merge made since
 the base.
+
+`Map::merge` and `Table::merge` apply each change that only the other side made, and pass each key
+both sides changed differently to `resolve` as a `Conflict` holding the `base`, `ours` and `theirs`
+values, `None` where the key is absent. `resolve` returns the value to keep, or `None` to delete it.
+`keep_ours` and `keep_theirs` return one side as it stands, a deletion included, without cloning a
+value nothing else holds.
 
 ## What counts as a change
 

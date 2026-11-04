@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ferro::{Data, Record, Snapshot, Table};
+use ferro::{Data, Record, Snapshot, Table, Val};
 
 #[derive(Data, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Stamp {
@@ -98,7 +98,7 @@ pub fn merge(
     let applied = notes.notes.merge(&base.notes, &theirs.notes, |conflict| {
         match (conflict.ours, conflict.theirs) {
             (Some(ours), Some(theirs)) => Some(ours.join(&theirs)),
-            (ours, theirs) => ours.or(theirs).map(|note| (*note).clone()),
+            (ours, theirs) => ours.or(theirs).map(Val::into_owned),
         }
     });
     notes.clock = notes.clock.max(theirs.clock);

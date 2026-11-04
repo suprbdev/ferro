@@ -189,6 +189,60 @@ fn table_keys_lists_the_keys_in_order() {
     assert_eq!(Table::<Seat>::new().keys().next(), None);
 }
 
+fn sides() -> (Hall, Hall, Hall) {
+    let base = hall();
+    let mut ours = base.clone();
+    let mut theirs = base.clone();
+    ours.seats
+        .update(&1, |seat| seat.label = "ours".to_string());
+    theirs
+        .seats
+        .update(&1, |seat| seat.label = "theirs".to_string());
+    ours.seats.remove(&2);
+    theirs.seats.update(&2, |seat| seat.row = 9);
+    ours.prices.insert(3, 1);
+    theirs.prices.remove(&3);
+    theirs.prices.insert(4, 2);
+    (base, ours, theirs)
+}
+
+#[test]
+fn keep_ours_and_keep_theirs_resolve_to_one_side_deletions_included() {
+    let (base, mut ours, theirs) = sides();
+    let mut asked = Vec::new();
+    ours.seats.merge(&base.seats, &theirs.seats, |conflict| {
+        asked.push(conflict.key);
+        conflict.keep_ours()
+    });
+    ours.prices.merge(&base.prices, &theirs.prices, |conflict| {
+        conflict.keep_ours()
+    });
+    assert_eq!(asked, vec![1, 2]);
+    assert_eq!(ours.seats.get(&1).unwrap().label, "ours");
+    assert!(ours.seats.get(&2).is_none());
+    assert_eq!(ours.prices.get(&3).map(|price| *price), Some(1));
+    assert_eq!(ours.prices.get(&4).map(|price| *price), Some(2));
+
+    let (base, mut ours, theirs) = sides();
+    ours.seats.merge(&base.seats, &theirs.seats, |conflict| {
+        conflict.keep_theirs()
+    });
+    ours.prices.merge(&base.prices, &theirs.prices, |conflict| {
+        conflict.keep_theirs()
+    });
+    assert_eq!(ours.seats.get(&1).unwrap().label, "theirs");
+    assert_eq!(ours.seats.get(&2).unwrap().row, 9);
+    assert_eq!(
+        ours.seats
+            .by_row(&9)
+            .map(|seat| seat.id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(ours.prices.get(&3), None);
+    assert_eq!(ours.seats, theirs.seats);
+}
+
 #[test]
 fn map_prefix_matches_a_range_over_the_other_fields() {
     let mut rng = Rng::new(66);

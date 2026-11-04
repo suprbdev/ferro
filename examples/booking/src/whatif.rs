@@ -198,8 +198,7 @@ fn merged(
             let mut conflicts = 0;
             let rooms = ours.rooms.merge(&base.rooms, &theirs.rooms, |conflict| {
                 conflicts += 1;
-                conflict.ours.map(|room| {
-                    let mut room = room.into_owned();
+                conflict.keep_ours().map(|mut room| {
                     room.rate = scaled(room.rate, *percent);
                     room
                 })
