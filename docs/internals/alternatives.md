@@ -129,3 +129,6 @@ numbers. This index lists them by subsystem.
   indexes](schema-and-unique-indexes.md#unique-indexes).
 - Trusting indexes written before fingerprints, a wider fingerprint, storing the description, and a
   tag per index: [Index fingerprints](schema-and-unique-indexes.md#index-fingerprints).
+- The index map in every equality lookup, a run-time order flag, collecting into a set, leapfrogging
+  through `_after` lookups, and cursors on both sides: [Combining
+  lookups](schema-and-unique-indexes.md#combining-lookups).

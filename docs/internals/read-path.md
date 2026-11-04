@@ -239,7 +239,9 @@ five alternating runs, in nanoseconds per key:
 Unsorted input costs 6% more than plain `get`, which is the price of keeping the path. A batch that
 recursed through the tree, cutting a sorted slice at each node as `absorb` does, was 6% faster at
 the densest and 7 to 26% slower when sparse, and needs a slice, a callback and sorted input, so the
-cursor replaced it. A cursor also serves merge joins, which a batch cannot.
+cursor replaced it. A cursor also serves merge joins, which a batch cannot, and combined index
+lookups look keys up in their larger side through one, as described under [Combining
+lookups](schema-and-unique-indexes.md#combining-lookups).
 
 `range_by` used to walk its two edges separately, adding a rank at each level to learn its length.
 They now share one walk until they part and count only the links between them, so a narrow range

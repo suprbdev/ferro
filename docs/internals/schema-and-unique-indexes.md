@@ -2,8 +2,9 @@
 
 How the derive macros encode a struct so that it can change, how unique indexes keep their
 constraint through inserts, updates and merges, how a covering index stores fields beside its
-entries and what that costs, and how a table knows which stored indexes it can read. The API is in
-[Changing your types](../guide/schema-evolution.md) and [Tables and indexes](../guide/tables.md).
+entries and what that costs, how a table knows which stored indexes it can read, and how lookups on
+several indexes combine. The API is in [Changing your types](../guide/schema-evolution.md) and
+[Tables and indexes](../guide/tables.md).
 
 ## Schema evolution
 
@@ -377,3 +378,126 @@ it, not in a file.
 - A tag per index from its stored names. It would give back 16 bits of discrimination, but two
   indexes of a table could then share a tag, which the derive can only reject, and a user cannot fix
   that without renaming stored fields.
+
+## Combining lookups
+
+`find()`, which the derive generates on a table with a non-unique index, returns a view that borrows
+the table. Its methods are the equality lookups of each such index, `by_x`, `by_x_after`, `by_x_some`,
+`by_x_some_after` and a composite's `by_a_b`, and each returns a `Matches<T, C>`. `and` and `or` on a
+`Matches` take another `Matches` or any `IndexIter`, through `IntoMatches`, and return a `Matches`
+over the rows whose keys both lookups hold, or either does. A `Matches` yields rows in key order from
+either end, and `keys`, `covered` and `uncovered` work as they do on an `IndexIter`, with the covered
+fields of the leftmost lookup.
+
+An index entry is `(value, key)`, so the entries of one value are in key order, and two such lookups
+intersect by walking their keys, reading no row until a key is in both. A view lookup holds a clone of
+its index map beside the range `range_by` built, so that it can seek within its value later, and the
+rows map's finder, so it reads the version it was built from, as any lookup does. A lookup made on
+the table, by range, prefix or value, is an `IndexIter` without that map. It joins a combination by
+reading its keys and covered fields into a vector and sorting it, which takes one pass when the
+lookup was of one value and is sorted already.
+
+### Two plans
+
+`and` builds a node over its two sides and picks how to run it the first time it is read, from their
+lengths. A view lookup knows its length exactly from `range_by`, a collected lookup the count of its
+entries, an `and` the smaller of its sides' and an `or` their sum.
+
+- Within a factor of four, both sides are walked. Each seeks to the other's key by stepping, and
+  after 16 steps it builds its range again from the root, starting at the target, so a long gap
+  costs one descent.
+- Beyond that, the smaller side leads and steps, and each of its keys is looked up in the larger
+  with `Cursor::seek`, or `seek_back` from the back. A cursor climbs only as far as the target needs,
+  so a key nearby costs a search of one leaf. When the larger side's next key lies past the lead's,
+  the lead seeks to it as above, which skips a run of keys the larger side lacks.
+
+The larger side is only looked up, never consumed, so it keeps nothing between keys but its cursor,
+and the lead alone decides when the walk ends. `or` walks every side and yields the smallest key,
+once however many sides hold it, and when an `and` looks a key up in an `or`, every side of the `or`
+looks it up.
+
+Each walked side holds the next key at each end. When its range runs out at one end it takes the key
+the other end holds, so a key that both ends reach is yielded once. A range built again for a seek
+ends just before the key the other end holds, or just past the last key that end yielded. A
+combination that has yielded rows and is then combined again is first read to the end into a sorted
+vector, since a side that is looked up answers for its whole range.
+
+`covered()` reads the fields of the leftmost lookup. Walked, it reads them with each entry, and
+looked up, where its cursor stopped. A key it read before `covered()` was called is looked up in the
+index again, and a collected lookup keeps the fields of every entry.
+
+### What it measured
+
+`ferro-bench --bin combine`, which `make bench-combine` runs, builds 200,000 rows with two
+`#[index(each)]` fields. For each case it gives one value of each field to rows picked at random, to
+two spans apart, or, for the second, to rows the first lacks. Every strategy's keys are checked
+against a merge, and the figures are medians over three runs of three rounds on a machine shared
+with other work. Keys only, in microseconds:
+
+| Lookups | Keys in both | Merge | Set | Leapfrog, `_after` | 32 steps, then `_after` | Leapfrog, cursor | `and` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 50k and 50k | 12,557 | 1,255 | 2,190 | 13,765 | 1,409 | 2,216 | 1,609 |
+| 50k and 50k, none shared | 0 | 1,247 | 1,986 | 9,943 | 1,348 | 1,677 | 1,398 |
+| 50k and 50k, apart | 0 | 307 | 2,010 | 0.6 | 0.7 | 0.3 | 0.8 |
+| 25k and 50k | 6,363 | 831 | 1,603 | 9,034 | 947 | 1,361 | 1,064 |
+| 12k and 50k | 3,171 | 561 | 1,267 | 5,026 | 660 | 801 | 655 |
+| 3k and 50k | 793 | 409 | 1,042 | 1,424 | 479 | 244 | 181 |
+| 1k and 100k | 479 | 699 | 1,560 | 443 | 369 | 73 | 70 |
+| 100 and 100k | 42 | 672 | 1,717 | 39 | 37 | 8.0 | 7.9 |
+| 10 and 100k | 3 | 597 | 1,530 | 3.5 | 3.5 | 1.0 | 1.5 |
+| 20 and 20 | 0 | 0.5 | 0.9 | 5.1 | 0.5 | 0.8 | 0.7 |
+
+The merge steps the `keys()` of both lookups. The set collects the smaller lookup's keys into a
+`HashSet` and filters the larger's. The `_after` leapfrog seeks each side with a `by_x_after` lookup,
+built from the root, and the next column steps up to 32 keys before seeking that way. The cursor
+leapfrog seeks both sides with `Cursor::seek` on the index maps, as `and` looks up its larger side.
+From the back, `and` came within 5% of its figures here.
+
+`and` follows the smaller side: 10 keys against 100,000 took 1.5 µs where the merge took 597, and a
+gap between two spans of 50,000 cost one seek. The price is on even sizes, where it ran 1.28 times as
+long as the merge, 18.5M instructions against 11.1M, for reaching each key through the node and its
+sides rather than a loop over two iterators. The factor of four is where the plans cross. At 12k
+against 50k, looking keys up ran 7.9M instructions against 10.3M for walking both, and at 25k against
+50k, walking ran 12.8M and 942 µs against 13.8M and 1,054 µs. Stepping 4 times rather than 16 before
+building a range again took the even case from 18.5M to 24.0M instructions, and 64 left it unchanged.
+
+Rows come through the finder an `IndexIter` uses, which keeps the last leaf it found. The 12,557 rows
+of the first case, which lie in key order across the table, took 4.34 ms with their keys against 4.64
+ms for the keys and a `get` each, and 25.4M instructions against 30.7M. Rows scattered across the
+table took the same time either way.
+
+Plain lookups are unchanged. Over four interleaved runs of each build, a lookup of one row ran 3,174
+instructions against 3,164 before, and one of 20 rows 26,642 against 26,497, within the spread
+between processes. A page of 200 rows, `len` and `keys` ran the same, and every time came within 1%.
+
+### Left out
+
+- The index map in every equality `IndexIter`, so that `by_x` itself could combine. A clone of the
+  map takes counts on the store and on the index's root and gives them back on drop, and every
+  lookup paid for it whether it combined or not: `len` of a 20-row lookup ran 2,282 instructions
+  against 2,032 and took 24% longer, a one-row lookup ran 3,432 against 3,189 and took 15% longer,
+  and 20 rows took 4% longer. Only a page of 200 rows hid it. The view clones the map only for
+  lookups made to combine.
+- An `IndexIter` that knows whether it is in key order and is collected only when it is not. It
+  would let every lookup combine, but each `by_x` would carry the map as above.
+- Collecting one side into a set. Probing a `HashSet` costs more than a step, so it ran at least 1.6
+  times as long as the merge in every case, and since it walks the larger side whatever the sizes,
+  10 keys against 100,000 took 1,530 µs.
+- Leapfrogging through `by_x_after`. Each seek builds a lookup from the root, about 3,000
+  instructions, so even sizes took 11 times as long as the merge, and 1k against 100k six times as
+  long as a cursor. Stepping 32 keys first brought even sizes to 1.12 times the merge and left the
+  skewed cases three to five times as slow as a cursor.
+- Seeking both sides with a cursor and walking neither, 1.8 times as long as the merge on even
+  sizes. Stepping a cursor up to 4 times before each seek came to 1.14 times the merge there and 82
+  µs at 1k against 100k, against 70 for `and`, which keeps cursors for the side it only looks up.
+
+### What is left
+
+- Even sizes run 1.3 times as long as a merge written for them. A seek inside the range iterator,
+  climbing its frames as a cursor does, would let a walked side skip without building its range
+  again, and both that and a cursor that steps backwards would live in `map.rs`.
+- A range or prefix lookup is read in full and sorted before it combines. A unique index has no
+  lookup in the view, since `key_by_x` gives its one key.
+- `Matches` knows only an upper bound on its length, through `size_hint`.
+- Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
+  against 0.5 for the merge.
