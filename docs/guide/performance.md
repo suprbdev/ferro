@@ -73,22 +73,23 @@ apart from 8 Buffered branches at 139,600 a second, 7% fewer.
 core at a time, so 8 fill one CCD, 16 both, and 32 add the second thread of every core. A lookup
 reads about 20 rows by a range of an index, and a page 200 rows in key order, through a plain index
 and through a twin whose index covers the field read. Operations a second, medians of five rounds
-of a pass with no writer:
+of a pass with no writer, measured again after the fixes below on 2026-11-04 with nothing else
+running:
 
 | Workload | Cache | 1 thread | 8 threads | 16 threads | 32 threads |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `get` | 1 GiB | 3.2M | 24.8M | 45.5M | 68.8M |
-| `get` | 16 MiB | 342k | 1.8M | 2.0M | 2.8M |
-| `for_each` scan, keys | 1 GiB | 91M | 504M | 991M | 1,564M |
+| `get` | 1 GiB | 3.0M | 23.2M | 42.6M | 66.8M |
+| `get` | 16 MiB | 342k | 1.8M | 2.1M | 2.9M |
+| `for_each` scan, keys | 1 GiB | 88M | 488M | 961M | 1,478M |
 | `for_each` scan, keys | 16 MiB | 7.8M | 39M | 42M | 72M |
-| 100-key range | 1 GiB | 411k | 2.9M | 5.0M | 7.7M |
-| 100-key range | 16 MiB | 54k | 265k | 277k | 379k |
-| Index lookup | 1 GiB | 240k | 1.6M | 1.9M | 2.8M |
-| Index lookup, covered | 1 GiB | 2.3M | 10.4M | 9.4M | 14.9M |
-| Index lookup | 16 MiB | 14k | 68k | 77k | 106k |
-| Index lookup, covered | 16 MiB | 2.0M | 9.9M | 9.2M | 15.3M |
-| Page of 200 rows | 1 GiB | 179k | 803k | 722k | 986k |
-| Page of 200 rows, covered | 1 GiB | 754k | 3.0M | 2.7M | 3.3M |
+| 100-key range | 1 GiB | 422k | 3.1M | 5.1M | 7.8M |
+| 100-key range | 16 MiB | 54k | 264k | 277k | 382k |
+| Index lookup | 1 GiB | 229k | 1.6M | 1.9M | 2.8M |
+| Index lookup, covered | 1 GiB | 2.4M | 11.6M | 9.7M | 15.4M |
+| Index lookup | 16 MiB | 14k | 68k | 77k | 107k |
+| Index lookup, covered | 16 MiB | 2.1M | 9.9M | 8.9M | 13.9M |
+| Page of 200 rows | 1 GiB | 175k | 805k | 722k | 987k |
+| Page of 200 rows, covered | 1 GiB | 882k | 3.4M | 2.8M | 3.4M |
 
 In a pass of its own beside one thread committing single-key updates as fast as it can, gets at 32
 threads ran 60M a second with the 1 GiB cache and 2.6M with the 16 MiB one, and index lookups 2.5M
@@ -153,7 +154,7 @@ called the index cursor through its vtable for every row. The constructors are n
 into the code that reads them, and in alternating runs a covered page ran 810,000 a second on one
 thread against 742,000 and 3.27M at eight threads against 2.98M, as [Covering
 indexes](../internals/schema-and-unique-indexes.md#covering-indexes) describes. The table under
-[Reads from many threads](#reads-from-many-threads) was measured before both fixes.
+[Reads from many threads](#reads-from-many-threads) was measured again after both fixes.
 
 ## More measurements
 
