@@ -1333,6 +1333,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             let prefix = format_ident!("{}_prefix", field);
             let first = &ix.fields[0].1;
             methods.push(quote! {
+                #[inline]
                 pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #first: ::std::borrow::Borrow<__Q>,
@@ -1353,6 +1354,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             let some = format_ident!("{}_some", field);
             let some_after = format_ident!("{}_some_after", field);
             methods.push(quote! {
+                #[inline]
                 pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
@@ -1361,6 +1363,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::ferro::table::index_eq_some::<#inner, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
                 }
 
+                #[inline]
                 pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
@@ -1377,6 +1380,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_counts(&self.#field)
             }
 
+            #[inline]
             pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
@@ -1385,6 +1389,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_eq::<#vt, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
             }
 
+            #[inline]
             pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
@@ -1395,6 +1400,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_after::<#vt, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
             }
 
+            #[inline]
             pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,

@@ -528,10 +528,12 @@ struct Entries<I, K, S, C> {
 }
 
 impl<I: Data + Ord, K: Data + Ord, S: Data, C> KeyCursor<K> for Entries<I, K, S, C> {
+    #[inline]
     fn forward(&mut self) -> Option<K> {
         self.iter.next_key_with(|entry| entry.1.clone())
     }
 
+    #[inline]
     fn backward(&mut self) -> Option<K> {
         self.iter.next_back_key_with(|entry| entry.1.clone())
     }
@@ -542,12 +544,14 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C> KeyCursor<K> for Entries<I, K, S,
 }
 
 impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for Entries<I, K, S, C> {
+    #[inline]
     fn forward_covered(&mut self) -> Option<(K, C)> {
         let project = self.project;
         self.iter
             .next_with(|entry, stored| (entry.1.clone(), project(&entry.0, stored.clone())))
     }
 
+    #[inline]
     fn backward_covered(&mut self) -> Option<(K, C)> {
         let project = self.project;
         self.iter
@@ -587,6 +591,7 @@ pub struct IndexIter<T: Record, C = ()> {
 }
 
 impl<T: Record, C: 'static> IndexIter<T, C> {
+    #[inline(always)]
     fn over<I: Data + Ord, S: Data>(
         rows: &Map<T::Key, T>,
         entries: Iter<(I, T::Key), S>,
@@ -601,14 +606,17 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
         }
     }
 
+    #[inline]
     pub fn keys(self) -> IndexKeys<T> {
         IndexKeys(self.entries)
     }
 
+    #[inline]
     pub fn covered(self) -> IndexCovered<T, C> {
         IndexCovered(self.entries)
     }
 
+    #[inline]
     pub fn uncovered(self) -> IndexIter<T> {
         IndexIter {
             rows: self.rows,
@@ -620,6 +628,7 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
 impl<T: Record, C> Iterator for IndexIter<T, C> {
     type Item = Val<T>;
 
+    #[inline]
     fn next(&mut self) -> Option<Val<T>> {
         let key = self.entries.forward()?;
         self.rows.get(&key)
@@ -631,6 +640,7 @@ impl<T: Record, C> Iterator for IndexIter<T, C> {
 }
 
 impl<T: Record, C> DoubleEndedIterator for IndexIter<T, C> {
+    #[inline]
     fn next_back(&mut self) -> Option<Val<T>> {
         let key = self.entries.backward()?;
         self.rows.get(&key)
@@ -644,6 +654,7 @@ pub struct IndexCovered<T: Record, C = ()>(Box<dyn EntryCursor<T::Key, C>>);
 impl<T: Record, C> Iterator for IndexCovered<T, C> {
     type Item = (T::Key, C);
 
+    #[inline]
     fn next(&mut self) -> Option<(T::Key, C)> {
         self.0.forward_covered()
     }
@@ -654,6 +665,7 @@ impl<T: Record, C> Iterator for IndexCovered<T, C> {
 }
 
 impl<T: Record, C> DoubleEndedIterator for IndexCovered<T, C> {
+    #[inline]
     fn next_back(&mut self) -> Option<(T::Key, C)> {
         self.0.backward_covered()
     }
@@ -666,6 +678,7 @@ pub struct IndexKeys<T: Record>(Box<dyn KeyCursor<T::Key>>);
 impl<T: Record> Iterator for IndexKeys<T> {
     type Item = T::Key;
 
+    #[inline]
     fn next(&mut self) -> Option<T::Key> {
         self.0.forward()
     }
@@ -676,6 +689,7 @@ impl<T: Record> Iterator for IndexKeys<T> {
 }
 
 impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
+    #[inline]
     fn next_back(&mut self) -> Option<T::Key> {
         self.0.backward()
     }
@@ -751,6 +765,7 @@ where
     rows.get(&*index.get(value)?)
 }
 
+#[inline(always)]
 pub fn index_where<I, T, S, C>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -771,6 +786,7 @@ where
     )
 }
 
+#[inline(always)]
 pub fn index_eq<I, T, S, C, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -794,6 +810,7 @@ where
     )
 }
 
+#[inline(always)]
 pub fn index_eq_some<X, T, S, C, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(Option<X>, T::Key), S>,
@@ -817,6 +834,7 @@ where
     )
 }
 
+#[inline(always)]
 pub fn index_range<I, T, S, C, Q, R>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -859,6 +877,7 @@ where
     key.borrow() <= after
 }
 
+#[inline(always)]
 pub fn index_after<I, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -889,6 +908,7 @@ where
     )
 }
 
+#[inline(always)]
 pub fn index_after_some<X, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
     index: &Map<(Option<X>, T::Key), S>,

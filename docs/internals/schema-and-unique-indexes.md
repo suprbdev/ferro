@@ -65,6 +65,33 @@ in place in the leaf, clones it and builds the projection with a function the de
 takes no count on the leaf's value column. `uncovered` wraps the cursor so the iterator's type no
 longer names the projection. A plain index passes a projection that is never called.
 
+The trait object costs a call through its vtable for every entry unless the compiler can see which
+cursor the box holds, which it can when the lookup is built in the function that reads it. So the
+generated lookup methods are `#[inline]`, the `index_*` functions behind them and `IndexIter::over`
+are `#[inline(always)]`, and the cursor's methods and the iterators' `next` and `next_back` are
+`#[inline]`. They used to be plain generic functions, which rustc compiles into one codegen unit of
+the crate that uses them, so whether a read loop could inline them depended on where each landed.
+Commit 2ba667f added `same_stored` and its helpers to the `ferro::table` functions that `scaling`
+compiles. At its parent, the objects `-C save-temps` keeps show `index_range` and `IndexIter::over`
+inlined into the benchmark's read loop and the cursor's methods in the loop's unit. After it, rustc
+put all of them in one unit with `same_stored`, apart from the read loop, and every covered row went
+through the vtable: a page of 200 took 31,870 instructions where it had taken 29,850, and ran 11%
+fewer pages a second (#58), with no change to the read path. Inlined, a covered page takes 29,850
+instructions again and a covered lookup 5,054 against 5,248, in `scaling` and in a separate program
+that builds the same lookups in a function of its own, where the hints alone had left
+`IndexIter::over` out of line. Over four runs of `scaling` alternating with the build before, with
+the 1 GiB cache, a covered page ran 810,000 a second on one thread against 742,000 and 3.27M at
+eight threads against 2.98M, and a covered lookup 2.32M against 2.26M on one thread.
+
+The larger read loop then stopped inlining the drop of each row's `Val`, whose glue held the row's
+own drop for a value held by copy, and a plain page took 82,880 instructions against 78,900. A value
+is held by copy only when it has no destructor, so it is now held in a `ManuallyDrop`, which drops
+nothing either way, and the glue is two reference counts. A plain page takes 79,400 instructions,
+as it did when the cursor was last devirtualized, and a `for` loop over table rows 158 a row
+against 187. It moved map folds over strings both ways: `iter()` scans in `scaling` take 61
+instructions a key against 58, still under the 63 before [Scans](read-path.md#scans) changed, its
+100-key ranges 8,612 against 8,288, and a filtered fold 58 against 61.
+
 The covered fields an index stores are part of its fingerprint, in list order under the names their
 rows store them by, each with its type. A table that adds, drops or reorders a covered field, or
 stores one under another name or type, finds no stored map with that index's fingerprint on decode

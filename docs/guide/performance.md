@@ -147,6 +147,14 @@ The filtered scan is fixed. A fold called its closure from a loop for each kind 
 compiler stopped inlining a closure over table rows, and the scan now takes 18.7 ns a row against
 32.6 in alternating runs, as [Scans](../internals/read-path.md#scans) describes.
 
+The covered page is fixed too. Its commit changed no read code, but its new functions moved the
+index lookup's constructors into another codegen unit than the benchmark's read loop, which then
+called the index cursor through its vtable for every row. The constructors are now always inlined
+into the code that reads them, and in alternating runs a covered page ran 810,000 a second on one
+thread against 742,000 and 3.27M at eight threads against 2.98M, as [Covering
+indexes](../internals/schema-and-unique-indexes.md#covering-indexes) describes. The table under
+[Reads from many threads](#reads-from-many-threads) was measured before both fixes.
+
 ## More measurements
 
 - [Example apps](examples.md) has load-test figures for `chat` and `booking`, measured on 2026-11-03

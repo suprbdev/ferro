@@ -187,7 +187,7 @@ operations now act on a wider handle.
 A fold calls the closure it is given from one place. When each kind of run had a loop of its own,
 a column held by copy, a column of values with destructors and a node's slots, the closure had two
 or three call sites, and the compiler stopped inlining one that drops a `Val` of a table row, whose
-drop glue holds the row's. Out of line, the closure took the 120-byte `Val` through memory and
+drop glue then held the row's. Out of line, the closure took the 120-byte `Val` through memory and
 copied it with 16-byte loads that straddled the caller's 8-byte stores, which the core cannot
 forward. `ferro-bench`'s filtered scan of 200,000 rows took 101 instructions and 32.6 ns a row,
 against 68 and 17.8 ns before the folds split (#56). Folds over maps kept their gain, because a

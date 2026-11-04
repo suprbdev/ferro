@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::hash;
 use std::marker::PhantomData;
-use std::mem::needs_drop;
+use std::mem::{ManuallyDrop, needs_drop};
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
@@ -94,7 +94,7 @@ const fn by_copy<V>() -> bool {
 pub struct Val<V>(Held<V>);
 
 enum Held<V> {
-    Copied(V),
+    Copied(ManuallyDrop<V>),
     Column(Arc<[V]>, u32),
     Single(Arc<V>),
 }
@@ -103,7 +103,7 @@ impl<V: Clone> Val<V> {
     #[inline]
     fn of_column(column: &Arc<[V]>, index: usize) -> Self {
         if by_copy::<V>() {
-            Val(Held::Copied(column[index].clone()))
+            Val(Held::Copied(ManuallyDrop::new(column[index].clone())))
         } else {
             Val(Held::Column(column.clone(), index as u32))
         }
@@ -112,7 +112,7 @@ impl<V: Clone> Val<V> {
     #[inline]
     fn of_single(value: &Arc<V>) -> Self {
         if by_copy::<V>() {
-            Val(Held::Copied((**value).clone()))
+            Val(Held::Copied(ManuallyDrop::new((**value).clone())))
         } else {
             Val(Held::Single(value.clone()))
         }
@@ -120,7 +120,7 @@ impl<V: Clone> Val<V> {
 
     pub fn new(value: V) -> Self {
         if by_copy::<V>() {
-            Val(Held::Copied(value))
+            Val(Held::Copied(ManuallyDrop::new(value)))
         } else {
             Val(Held::Single(Arc::new(value)))
         }
@@ -128,7 +128,7 @@ impl<V: Clone> Val<V> {
 
     pub fn into_owned(self) -> V {
         match self.0 {
-            Held::Copied(value) => value,
+            Held::Copied(value) => ManuallyDrop::into_inner(value),
             Held::Column(column, index) => column[index as usize].clone(),
             Held::Single(value) => Arc::unwrap_or_clone(value),
         }
@@ -3999,7 +3999,7 @@ impl<'a, V: Data, S> Run<'a, V, S> {
     fn value(&self, store: Option<&Store>, offset: usize) -> Val<V> {
         match self {
             Run::Column(_, values, _) if by_copy::<V>() => {
-                Val(Held::Copied(values[offset].clone()))
+                Val(Held::Copied(ManuallyDrop::new(values[offset].clone())))
             }
             Run::Column(column, _, start) => {
                 Val(Held::Column(Arc::clone(column), (start + offset) as u32))
