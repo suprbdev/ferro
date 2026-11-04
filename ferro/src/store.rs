@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
@@ -631,6 +631,13 @@ impl Frame {
             head: Some(self.head),
         }
     }
+
+    fn header(&self) -> [u8; FRAME_BYTES] {
+        let mut header = [0u8; FRAME_BYTES];
+        header[0..8].copy_from_slice(FRAME_MAGIC);
+        self.mark().fill(&mut header[8..]);
+        header
+    }
 }
 
 struct Cursor {
@@ -643,6 +650,12 @@ struct Cursor {
 struct Marks {
     latest: Mark,
     anchor: Mark,
+}
+
+#[derive(Default)]
+struct Arrivals {
+    early: Vec<(u64, u64)>,
+    waiters: usize,
 }
 
 pub(crate) struct Traced {
@@ -714,6 +727,9 @@ struct Inner {
     file: Traced,
     tail: AtomicU64,
     written: AtomicU64,
+    placed: AtomicU64,
+    arrivals: Mutex<Arrivals>,
+    landed: Condvar,
     cursor: Mutex<Cursor>,
     slot: AtomicU64,
     marks: Mutex<Marks>,
@@ -808,6 +824,9 @@ impl Store {
                 file,
                 tail: AtomicU64::new(sb.log_end),
                 written: AtomicU64::new(sb.log_end),
+                placed: AtomicU64::new(sb.log_end),
+                arrivals: Mutex::new(Arrivals::default()),
+                landed: Condvar::new(),
                 cursor: Mutex::new(Cursor {
                     seq: sb.seq,
                     reserved: sb.log_end,
@@ -890,12 +909,57 @@ impl Store {
         }
         cursor.seq = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
+        self.inner.placed.fetch_max(sb.log_end, Ordering::AcqRel);
         self.inner.written.fetch_max(sb.log_end, Ordering::AcqRel);
         Ok(sb.head)
     }
 
     pub(crate) fn poison(&self) {
         self.inner.poisoned.store(true, Ordering::Release);
+        let _arrivals = self.inner.arrivals.lock();
+        self.inner.landed.notify_all();
+    }
+
+    fn arrived(&self, start: u64, end: u64) {
+        let inner = &self.inner;
+        let mut arrivals = inner.arrivals.lock();
+        if inner.written.load(Ordering::Relaxed) != start {
+            arrivals.early.push((start, end));
+            return;
+        }
+        let mut written = end;
+        while let Some(index) = arrivals.early.iter().position(|(at, _)| *at == written) {
+            written = arrivals.early.swap_remove(index).1;
+        }
+        inner.written.store(written, Ordering::Release);
+        if arrivals.waiters > 0 {
+            inner.landed.notify_all();
+        }
+    }
+
+    fn landed_past(&self, offset: u64) -> u64 {
+        let inner = &self.inner;
+        let written = inner.written.load(Ordering::Acquire);
+        if offset < written || offset >= inner.placed.load(Ordering::Acquire) {
+            return written;
+        }
+        let mut arrivals = inner.arrivals.lock();
+        loop {
+            let written = inner.written.load(Ordering::Acquire);
+            if offset < written
+                || offset >= inner.placed.load(Ordering::Acquire)
+                || inner.poisoned.load(Ordering::Acquire)
+            {
+                return written;
+            }
+            arrivals.waiters += 1;
+            inner.landed.wait(&mut arrivals);
+            arrivals.waiters -= 1;
+        }
+    }
+
+    pub(crate) fn landed_to(&self, end: u64) -> u64 {
+        self.landed_past(end.saturating_sub(1))
     }
 
     pub(crate) fn check_healthy(&self) -> Result<()> {
@@ -907,6 +971,9 @@ impl Store {
 
     pub(crate) fn sync(&self, frame: Frame) -> Result<()> {
         let inner = &self.inner;
+        if self.landed_to(frame.end) < frame.end {
+            return Err(Error::Poisoned);
+        }
         let durable = inner.options.durability == Durability::Fsync;
         let attempt = (|| -> Result<()> {
             if durable {
@@ -981,21 +1048,21 @@ impl Store {
     }
 
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
-        let tail = self.inner.written.load(Ordering::Acquire);
+        let tail = self.landed_past(ptr.offset);
         let file = Some(&*self.inner.file);
         let (object, len, _) = Store::read_within(file, ptr, tail, &[], true, false)?;
         Ok((object, len))
     }
 
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
-        let tail = self.inner.written.load(Ordering::Acquire);
+        let tail = self.landed_past(ptr.offset);
         let file = Some(&*self.inner.file);
         let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true)?;
         Ok((object, packed))
     }
 
     pub(crate) fn read_links(&self, ptr: Ptr) -> Result<Vec<Ptr>> {
-        let tail = self.inner.written.load(Ordering::Acquire);
+        let tail = self.landed_past(ptr.offset);
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
                 "pointer {} outside log of {tail} bytes",
@@ -1239,7 +1306,7 @@ impl Store {
         if self.inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
-        let start = self.inner.written.load(Ordering::Acquire);
+        let start = self.inner.placed.load(Ordering::Acquire);
         Ok(Txn {
             store: self.clone(),
             origin: start,
@@ -1584,7 +1651,7 @@ impl Txn {
 
     pub(crate) fn rebase(&mut self) -> Result<Settling> {
         let remembered = mem::take(&mut self.remembered);
-        let now = self.store.inner.written.load(Ordering::Acquire);
+        let now = self.store.inner.placed.load(Ordering::Acquire);
         if now != self.origin && self.start != self.origin {
             return Err(Error::Corrupt("a draft that spilled cannot move".into()));
         }
@@ -1670,6 +1737,9 @@ impl Txn {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
+            _ if ptr.offset < self.origin => {
+                (&[][..], self.store.landed_past(ptr.offset).min(self.start))
+            }
             _ => (&[][..], self.start),
         };
         let verify = ptr.offset < self.origin;
@@ -1693,7 +1763,7 @@ impl Txn {
         Ok(())
     }
 
-    pub(crate) fn write(mut self, head: Ptr) -> Result<Frame> {
+    pub(crate) fn place(mut self, head: Ptr) -> Result<Landing> {
         let store = self.store.clone();
         let inner = &store.inner;
         let end = self.start + self.buf.len() as u64;
@@ -1701,50 +1771,68 @@ impl Txn {
         if inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
+        if self.origin != inner.placed.load(Ordering::Acquire) {
+            return Err(Error::Corrupt(
+                "a frame was placed away from the end of the log".into(),
+            ));
+        }
         let seq = cursor
             .seq
             .checked_add(1)
             .ok_or_else(|| Error::Corrupt("the log has used its last sequence number".into()))?;
         let frame = Frame { seq, end, head };
-        let spilled = self.start != self.origin;
-        let mut header = [0u8; FRAME_BYTES];
-        header[0..8].copy_from_slice(FRAME_MAGIC);
-        frame.mark().fill(&mut header[8..]);
-        let mut hasher = Xxh3::new();
-        hasher.update(&header[..FRAME_CHECKED]);
-        if spilled {
+        let mut landing = Landing {
+            store: store.clone(),
+            frame,
+            at: self.origin,
+            buf: Vec::new(),
+            pending: false,
+        };
+        if self.start == self.origin {
+            if self.reserve {
+                reserve(inner, &mut cursor, end);
+            }
+            landing.buf = mem::take(&mut self.buf);
+            landing.pending = true;
+        } else {
+            let mut header = frame.header();
+            let mut hasher = Xxh3::new();
+            hasher.update(&header[..FRAME_CHECKED]);
             self.hash_spilled(&mut hasher)?;
             hasher.update(&self.buf);
-        } else {
-            hasher.update(&self.buf[FRAME_BYTES..]);
-        }
-        header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
-        if self.reserve {
-            reserve(inner, &mut cursor, end);
-        }
-        let written = if spilled {
-            inner
+            header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+            if self.reserve {
+                reserve(inner, &mut cursor, end);
+            }
+            let written = inner
                 .file
                 .write_all_at(&self.buf, self.start)
-                .and_then(|()| inner.file.write_all_at(&header, self.origin))
-        } else {
-            self.buf[..FRAME_BYTES].copy_from_slice(&header);
-            inner.file.write_all_at(&self.buf, self.start)
-        };
-        if let Err(error) = written {
-            inner.poisoned.store(true, Ordering::Release);
-            return Err(error.into());
+                .and_then(|()| inner.file.write_all_at(&header, self.origin));
+            if let Err(error) = written {
+                store.poison();
+                return Err(error.into());
+            }
+            self.origin = self.start;
         }
-        self.origin = self.start;
         cursor.seq = frame.seq;
-        inner.written.store(end, Ordering::Release);
+        inner.placed.store(end, Ordering::Release);
         drop(cursor);
+        if !landing.pending {
+            store.arrived(landing.at, end);
+        }
         for (hash, offset) in mem::take(&mut self.seen) {
             inner.dedupe.insert(hash, offset);
         }
         for (hash, entry, _) in mem::take(&mut self.remembered) {
             inner.cache.insert(hash, entry);
         }
+        Ok(landing)
+    }
+
+    pub(crate) fn write(self, head: Ptr) -> Result<Frame> {
+        let landing = self.place(head)?;
+        let frame = landing.frame;
+        landing.land()?;
         Ok(frame)
     }
 
@@ -1752,6 +1840,47 @@ impl Txn {
         let store = self.store.clone();
         let frame = self.write(head)?;
         store.sync(frame)
+    }
+}
+
+pub(crate) struct Landing {
+    store: Store,
+    frame: Frame,
+    at: u64,
+    buf: Vec<u8>,
+    pending: bool,
+}
+
+impl Landing {
+    pub(crate) fn frame(&self) -> Frame {
+        self.frame
+    }
+
+    pub(crate) fn land(mut self) -> Result<()> {
+        if !self.pending {
+            return Ok(());
+        }
+        self.pending = false;
+        let mut header = self.frame.header();
+        let mut hasher = Xxh3::new();
+        hasher.update(&header[..FRAME_CHECKED]);
+        hasher.update(&self.buf[FRAME_BYTES..]);
+        header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+        self.buf[..FRAME_BYTES].copy_from_slice(&header);
+        if let Err(error) = self.store.inner.file.write_all_at(&self.buf, self.at) {
+            self.store.poison();
+            return Err(error.into());
+        }
+        self.store.arrived(self.at, self.frame.end);
+        Ok(())
+    }
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        if self.pending {
+            self.store.poison();
+        }
     }
 }
 

@@ -7,12 +7,12 @@ transaction is serializable by construction.
 
 A closure runs under its branch's writer lock, so a long closure holds up the writers on that branch
 only, and closures on different branches run at the same time. Each commit drafts its records under
-that lock. Placing them, writing the log entry and refs, and writing the frame to the page cache
-take one lock for the whole file, so commit throughput across branches stops scaling at the cost of
-that step, and on one branch, unless you opt in to `coalesce`, at the cost of the closure and
-encoding, with only the fsync shared: one leader's fsync covers every frame queued. A reclamation
-cycle, and `receive` once its bundle has arrived, wait for the closure running on every branch
-before they hold up all of them.
+that lock and writes its frame to the page cache under it too. Placing the records and writing the
+log entry and refs take one lock for the whole file, so commit throughput across branches stops
+scaling at the cost of that step, and on one branch, unless you opt in to `coalesce`, at the cost of
+the closure and encoding, with only the fsync shared: one leader's fsync covers every frame queued.
+A reclamation cycle, and `receive` once its bundle has arrived, wait for the closure running on
+every branch before they hold up all of them.
 
 ## Awaited writes
 

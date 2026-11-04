@@ -1172,6 +1172,192 @@ fn a_power_cut_leaves_buffered_branches_whole() {
     }
 }
 
+struct Held {
+    placed: AtomicBool,
+    released: AtomicBool,
+    landed: AtomicUsize,
+}
+
+fn holding_landings() -> (Arc<Held>, Hook) {
+    let held = Arc::new(Held {
+        placed: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+        landed: AtomicUsize::new(0),
+    });
+    let seen = held.clone();
+    let hook = Hook(Arc::new(move |step| {
+        match (thread::current().name(), step) {
+            (Some("held"), "landing") => {
+                seen.placed.store(true, Ordering::SeqCst);
+                wait_until("the held frame's release", || {
+                    seen.released.load(Ordering::SeqCst)
+                });
+            }
+            (Some("ahead"), "landed") => {
+                seen.landed.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }));
+    (held, hook)
+}
+
+fn commit_named(db: &Db<Text>, branch: u64, n: u64, name: &str) -> JoinHandle<()> {
+    let db = db.branch(&branch_name(branch)).unwrap();
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let done = db
+                .commit_with(|root| {
+                    root.insert(n, text(branch * 1000 + n, 40));
+                    ("", ())
+                })
+                .unwrap();
+            assert_eq!(done.version, n + 1);
+            db.trace_op(Op::Acked(branch * SPREAD + done.version));
+        })
+        .unwrap()
+}
+
+fn record_out_of_order(path: &Path, options: fn() -> Options, commits: u64) -> Recording {
+    let writers = 3;
+    {
+        let db: Db<Text> = options().open(path).unwrap();
+        db.update(|root| {
+            root.insert(0, "base".to_string());
+        })
+        .unwrap();
+        for branch in 0..writers {
+            db.fork(&branch_name(branch)).unwrap();
+        }
+    }
+    let base = fs::read(path).unwrap();
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    let (held, hook) = holding_landings();
+    {
+        let db: Db<Text> = options()
+            .trace(trace.clone())
+            .hook(hook)
+            .open(path)
+            .unwrap();
+        for n in 1..=commits {
+            held.placed.store(false, Ordering::SeqCst);
+            held.released.store(false, Ordering::SeqCst);
+            held.landed.store(0, Ordering::SeqCst);
+            let first = commit_named(&db, 0, n, "held");
+            wait_until("the held frame to be placed", || {
+                held.placed.load(Ordering::SeqCst)
+            });
+            let later: Vec<_> = (1..writers)
+                .map(|branch| commit_named(&db, branch, n, "ahead"))
+                .collect();
+            wait_until("the later frames to land", || {
+                held.landed.load(Ordering::SeqCst) == later.len()
+            });
+            held.released.store(true, Ordering::SeqCst);
+            first.join().unwrap();
+            for handle in later {
+                handle.join().unwrap();
+            }
+        }
+    }
+    let ops = trace.lock().clone();
+    Recording {
+        base,
+        ops,
+        writers,
+        commits,
+    }
+}
+
+fn landed_behind(ops: &[Op]) -> usize {
+    let mut highest = 0;
+    let mut behind = 0;
+    for op in ops {
+        if let Op::Write(_, at, bytes) = op
+            && *at >= LOG_START
+            && bytes.starts_with(b"FERROFRM")
+        {
+            behind += usize::from(*at < highest);
+            highest = highest.max(*at);
+        }
+    }
+    behind
+}
+
+#[test]
+fn a_power_cut_between_frames_that_landed_out_of_order_keeps_a_prefix() {
+    let small: fn() -> Options = || buffered().checkpoint_bytes(4096);
+    let modes: [Kind; 2] = [("fsync", fsync), ("buffered", small)];
+    for (seed, (kind, options)) in modes.into_iter().enumerate() {
+        let durable = kind == "fsync";
+        let dir = dir();
+        let commits = 8;
+        let recording = record_out_of_order(&dir.path().join("trace.ferro"), options, commits);
+        let behind = landed_behind(&recording.ops);
+        assert!(
+            behind >= commits as usize,
+            "{kind}: only {behind} frames landed behind a later one"
+        );
+        assert!(
+            replay(&recording, options, durable, 30 + seed as u64) > 100,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn a_commit_that_reads_a_frame_not_landed_yet_waits_for_it() {
+    for (kind, options) in [("fsync", fsync as fn() -> Options), ("buffered", buffered)] {
+        let dir = dir();
+        let path = dir.path().join("db.ferro");
+        let (held, hook) = holding_landings();
+        let db = seeded(options().cache_bytes(1).hook(hook), &path);
+        let side = db.fork("side").unwrap();
+        let merging = db.fork("merged").unwrap();
+        let first = {
+            let side = side.clone();
+            thread::Builder::new()
+                .name("held".to_string())
+                .spawn(move || put(&side, 1, 1))
+                .unwrap()
+        };
+        wait_until("the held frame to be placed", || {
+            held.placed.load(Ordering::SeqCst)
+        });
+        let second = spawn_put(&db, 2, 2);
+        let merged = {
+            let (db, side) = (merging, side.clone());
+            thread::spawn(move || {
+                db.merge_with(&side, |root, base, theirs| {
+                    root.merge(base, theirs, |conflict| conflict.theirs.map(|value| *value));
+                    ("merge", ())
+                })
+                .unwrap();
+                db
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !second.is_finished(),
+            "{kind}: a commit finished before the frame ahead of it landed"
+        );
+        held.released.store(true, Ordering::SeqCst);
+        first.join().unwrap();
+        second.join().unwrap();
+        let merged = merged.join().unwrap();
+        assert_eq!(value(&side, 1), Some(1), "{kind}");
+        assert_eq!(value(&db, 2), Some(2), "{kind}");
+        assert_eq!(value(&merged, 0), Some(0), "{kind}");
+        db.verify().unwrap();
+        drop((db, side, merged));
+        let again: Db<Root> = options().cache_bytes(1).open(&path).unwrap();
+        assert_eq!(value(&again, 2), Some(2), "{kind}");
+        assert_eq!(value(&again.branch("side").unwrap(), 1), Some(1), "{kind}");
+        again.verify().unwrap();
+    }
+}
+
 #[test]
 fn every_acknowledged_commit_counts_once_across_branches() {
     let dir = dir();

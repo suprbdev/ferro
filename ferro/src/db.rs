@@ -26,7 +26,9 @@ use crate::map::Map;
 use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
-use crate::store::{Durability, Frame, Op, Retired, Settling, Store, StoreOptions, Trace, Txn};
+use crate::store::{
+    Durability, Frame, Landing, Op, Retired, Settling, Store, StoreOptions, Trace, Txn,
+};
 use crate::watch::{Feed, Filter, Notice, Watcher};
 
 const MAIN: &str = "main";
@@ -1112,7 +1114,7 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     Ok((txn.put(object, hash)?, decoded))
 }
 
-type Placed = (u64, u64, Option<(Settling, Store)>);
+type Placed = (u64, u64, Option<(Settling, Store, Landing)>);
 
 struct Draft<T> {
     txn: Txn,
@@ -1353,6 +1355,7 @@ impl<T: Data> Shared<T> {
         } = group;
         let (message, parts) = Parts::join(messages);
         let started = Instant::now();
+        let framed = branch.framed.load(Ordering::Acquire);
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
             let drafted = self.draft(branch, &working)?;
             let mut tip = self.tip.lock();
@@ -1377,7 +1380,8 @@ impl<T: Data> Shared<T> {
             drop(whole);
             drop(tip);
             let (version, time_ms, settling) = committed?;
-            if let Some((settling, store)) = settling {
+            if let Some((settling, store, landing)) = settling {
+                self.land(branch, &state, framed, landing)?;
                 settling.finish(&store);
             }
             Ok::<_, Error>((version, time_ms))
@@ -1638,13 +1642,14 @@ impl<T: Data> Shared<T> {
         branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
         settling: Option<&mut Settling>,
-    ) -> Result<()> {
+    ) -> Result<Landing> {
         txn.unshared();
         let (ptr, refs) = write_decoded(&refs, &mut txn, &self.store())?;
         if let Some(settling) = settling {
             settling.take_seen(&mut txn);
         }
-        let frame = txn.write(ptr)?;
+        let landing = txn.place(ptr)?;
+        let frame = landing.frame();
         let update = branch.map(|(branch, state)| {
             let state = Arc::new(state);
             branch.tip.store(state.clone());
@@ -1670,7 +1675,7 @@ impl<T: Data> Shared<T> {
             update,
             seal,
         });
-        Ok(())
+        Ok(landing)
     }
 
     fn settle(&self, ticket: u64, notices: &mut Vec<Notice<T>>) -> Result<()> {
@@ -1698,29 +1703,48 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
         queue.syncing = true;
-        let batch = mem::take(&mut queue.waiting);
+        let mut batch = mem::take(&mut queue.waiting);
         drop(queue);
-        let last = batch.last().expect("a leader has queued commits");
-        let (frame, refs) = (last.frame, last.refs.clone());
         let store = self.store();
+        let end = batch.last().expect("a leader has queued commits").frame.end;
+        let landed = store.landed_to(end);
+        let kept = batch
+            .iter()
+            .take_while(|pending| pending.frame.end <= landed)
+            .count();
+        let cut = batch.split_off(kept);
         let started = Instant::now();
-        let outcome = store.sync(frame);
+        let outcome = match batch.last() {
+            Some(last) => store
+                .sync(last.frame)
+                .map(|()| (last.frame, last.refs.clone())),
+            None => Err(Error::Poisoned),
+        };
         self.costs.synced(started.elapsed());
+        let synced = outcome.is_ok();
         let mut seals = Vec::new();
-        if outcome.is_ok() {
-            *self.published.lock() = refs;
+        if let Ok((_, refs)) = &outcome {
+            *self.published.lock() = refs.clone();
         }
         for pending in batch {
-            seals.extend(pending.seal);
-            if let (true, Some((branch, state))) = (outcome.is_ok(), pending.update) {
+            seals.extend(pending.seal.map(|seal| (seal, synced)));
+            if let (true, Some((branch, state))) = (synced, pending.update) {
                 notices.push(branch.publish(state));
             }
         }
+        let lost = !cut.is_empty();
+        seals.extend(
+            cut.into_iter()
+                .filter_map(|pending| pending.seal.map(|seal| (seal, false))),
+        );
         let mut queue = self.queue.lock();
         queue.syncing = false;
-        match outcome {
-            Ok(()) => queue.settled = frame.seq,
+        match &outcome {
+            Ok((frame, _)) => queue.settled = frame.seq,
             Err(_) => queue.failed = true,
+        }
+        if lost {
+            queue.failed = true;
         }
         let next = queue
             .waiting
@@ -1732,9 +1756,10 @@ impl<T: Data> Shared<T> {
                 queue
                     .waiting
                     .iter()
-                    .filter_map(|pending| pending.seal.clone()),
+                    .filter_map(|pending| pending.seal.clone())
+                    .map(|seal| (seal, false)),
             );
-            seals.extend(queue.open.iter().map(|(seal, _)| seal.clone()));
+            seals.extend(queue.open.iter().map(|(seal, _)| (seal.clone(), false)));
         }
         let settled = !queue.failed;
         let upto = queue.settled;
@@ -1745,7 +1770,7 @@ impl<T: Data> Shared<T> {
         let rouse = !queue.waiting.is_empty() || !queue.open.is_empty();
         drop(queue);
         self.done.notify_all();
-        for seal in seals {
+        for (seal, settled) in seals {
             seal.settled.store(settled, Ordering::Release);
             seal.wake_all();
         }
@@ -1758,21 +1783,37 @@ impl<T: Data> Shared<T> {
         if rouse {
             self.rouse();
         }
-        if outcome.is_ok() {
-            store.checkpoint(frame);
+        if let Ok((frame, _)) = &outcome {
+            store.checkpoint(*frame);
         }
         if self.automatic {
             let base = self.signal.base.load(Ordering::Relaxed);
             let goal = base.max(self.reclaim.every_bytes);
-            if frame.end.saturating_sub(base) >= goal {
+            if end.saturating_sub(base) >= goal {
                 self.signal.raise();
             }
         }
-        outcome
+        outcome.map(|_| ())
     }
 
     fn now(&self) -> u64 {
         read_clock(self.clock.as_ref())
+    }
+
+    fn land(
+        &self,
+        branch: &Branch<T>,
+        state: &Arc<State<T>>,
+        framed: u64,
+        landing: Landing,
+    ) -> Result<()> {
+        self.step("landing");
+        landing.land().inspect_err(|_| {
+            branch.tip.store(state.clone());
+            branch.framed.store(framed, Ordering::Release);
+        })?;
+        self.step("landed");
+        Ok(())
     }
 
     fn draft(&self, branch: &Branch<T>, working: &T) -> Result<Draft<T>> {
@@ -1886,7 +1927,7 @@ impl<T: Data> Shared<T> {
             store: store.clone(),
         };
         let seal = seal.map(|seal| (seal, version, time_ms));
-        self.stage(
+        let landing = self.stage(
             tip,
             next,
             txn,
@@ -1894,7 +1935,7 @@ impl<T: Data> Shared<T> {
             seal,
             Some(&mut settling),
         )?;
-        Ok((version, time_ms, Some((settling, store))))
+        Ok((version, time_ms, Some((settling, store, landing))))
     }
 
     fn step(&self, name: &'static str) {
@@ -1940,7 +1981,7 @@ impl<T: Data> Shared<T> {
                 return Ok(0);
             }
             let txn = store.begin()?;
-            self.stage(tip, next, txn, None, None, None)?;
+            self.stage(tip, next, txn, None, None, None)?.land()?;
             self.settle(store.last_seq(), notices)?;
             let refs = tip.refs.clone();
             for branch in self.branches.lock().values() {
@@ -2353,6 +2394,7 @@ impl<T: Data> Db<T> {
     ) -> std::result::Result<Staged<R, E>, E> {
         self.branch.check_live()?;
         let state = self.branch.tip.load_full();
+        let framed = self.branch.framed.load(Ordering::Acquire);
         let mut working = (*state.snapshot.value).clone();
         let before = state.snapshot.commit.version;
         let time = OnceCell::new();
@@ -2382,12 +2424,16 @@ impl<T: Data> Db<T> {
             drop(whole);
             drop(tip);
             let (version, time_ms, settling) = committed?;
-            if let Some((settling, store)) = settling {
+            if let Some((settling, store, landing)) = settling {
+                self.shared.land(&self.branch, &state, framed, landing)?;
                 settling.finish(&store);
             }
             Ok((value, version, time_ms))
         });
-        let ticket = self.branch.framed.load(Ordering::Acquire);
+        let ticket = match &result {
+            Ok(_) => self.branch.framed.load(Ordering::Acquire),
+            Err(_) => framed,
+        };
         drop(lane);
         Ok(Staged {
             result,
@@ -2870,7 +2916,9 @@ impl<T: Data> Db<T> {
         );
         let store = self.shared.store();
         let txn = store.begin()?;
-        self.shared.stage(&mut tip, next, txn, None, None, None)?;
+        self.shared
+            .stage(&mut tip, next, txn, None, None, None)?
+            .land()?;
         let ticket = store.last_seq();
         drop(tip);
         drop(lane);
@@ -2916,7 +2964,9 @@ impl<T: Data> Db<T> {
                     next.insert(branch, head);
                 }
             }
-            self.shared.stage(&mut tip, next, txn, None, None, None)?;
+            self.shared
+                .stage(&mut tip, next, txn, None, None, None)?
+                .land()?;
             let ticket = store.last_seq();
             self.shared.settle(ticket, &mut notices)?;
             let published = self.shared.published.lock();
@@ -3099,7 +3149,9 @@ impl<T: Data> Db<T> {
             }
             None => {
                 let refs = tip.refs.clone();
-                shared.stage(&mut tip, refs, txn, None, None, None)?;
+                shared
+                    .stage(&mut tip, refs, txn, None, None, None)?
+                    .land()?;
             }
         }
         Ok(out)
@@ -3120,7 +3172,7 @@ impl<T: Data> Db<T> {
                 return Ok(out);
             };
             let before = tip.refs.clone();
-            shared.stage(tip, next, txn, None, None, None)?;
+            shared.stage(tip, next, txn, None, None, None)?.land()?;
             shared.settle(store.last_seq(), &mut notices)?;
             let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
             let mut states = Vec::new();

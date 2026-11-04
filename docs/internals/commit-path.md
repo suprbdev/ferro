@@ -8,24 +8,27 @@ rules are in [Writers and concurrency](../guide/concurrency.md).
 
 Each branch has a writer lock of its own, its lane, and the database has one more, the `tip` mutex,
 which orders frames. Writers run their closures and encode what they changed one at a time on a
-branch under its lane, place and write their frames one at a time under `tip`, and sync outside
-both. Each branch has two states: `state`, the published one that readers load through `ArcSwap`,
-and `tip`, the newest one written. Under its lane a writer clones the branch's tip, runs the closure
-and drafts its records, then under `tip` it places them, writes its frame to the page cache and
-queues it, and it releases both. The next writer on the branch builds on that tip even though it is
-not durable yet, and a writer on another branch runs its closure meanwhile, as described under [A
-lock per branch](#a-lock-per-branch) below. Object reads are bounded by `written`, the end of the
-frames in the file, rather than `tail`, the published end, so unpublished objects stay readable to
-writers. Published pointers never reach past `tail`.
+branch under its lane, place their frames one at a time under `tip`, write them to the page cache
+under the lane alone, and sync outside both. Each branch has two states: `state`, the published one
+that readers load through `ArcSwap`, and `tip`, the newest one written. Under its lane a writer
+clones the branch's tip, runs the closure and drafts its records, then under `tip` it places them,
+appends the log entry, writes the refs and queues the frame, and after releasing `tip` it writes the
+frame to the page cache and releases its lane. The next writer on the branch builds on that tip even
+though it is not durable yet, and a writer on another branch runs its closure meanwhile, as
+described under [A lock per branch](#a-lock-per-branch) below. Object reads are bounded by
+`written`, the end of the run of frames already in the page cache, rather than `tail`, the published
+end, so unpublished objects stay readable to writers, and a read inside a frame that is placed but
+not yet written waits for it, as described under [Writing frames after
+`tip`](#writing-frames-after-tip). Published pointers never reach past `tail`.
 
 Each writer then waits for its frame. The first to find no sync running becomes the leader: it takes
-the whole queue, fdatasyncs, writes one superblock for the last frame, publishes the batch in order,
-and wakes the others. Writers that arrive during the sync form the next batch, and one of them leads
-it. A lone writer leads its own one-frame batch, which adds no syscall and no thread switch.
-`Durability::Buffered` takes the same path without the fdatasync. A dedicated sync thread for
-blocking writers was measured and rejected: it adds a wakeup to every uncontended commit and gained
-nothing under contention. Awaited writes, which must not wait on a thread, do use one, as described
-under [Awaited writes](async-writes.md).
+the whole queue, waits until every frame in it is in the page cache, fdatasyncs, writes one
+superblock for the last frame, publishes the batch in order, and wakes the others. Writers that
+arrive during the sync form the next batch, and one of them leads it. A lone writer leads its own
+one-frame batch, which adds no syscall and no thread switch. `Durability::Buffered` takes the same
+path without the fdatasync. A dedicated sync thread for blocking writers was measured and rejected:
+it adds a wakeup to every uncontended commit and gained nothing under contention. Awaited writes,
+which must not wait on a thread, do use one, as described under [Awaited writes](async-writes.md).
 
 ## What is published, and when
 
@@ -46,7 +49,8 @@ If a sync fails, the store poisons, nothing in the batch is published, the leade
 error, and every queued writer gets `Error::Poisoned`. A failed commit's frame may still be on disk
 and reappear after reopen: an error means not acknowledged, not guaranteed absent. A failed frame
 write poisons the same way, but frames queued ahead of it are whole, so they still sync and
-acknowledge.
+acknowledge. Frames placed after it fail with `Error::Poisoned` even when their own bytes were
+written, since recovery keeps only a prefix of frames.
 
 ## Direct I/O, rejected
 
@@ -80,8 +84,8 @@ stalled commits on every other, and closures on different branches never overlap
 touch independent state (#37). Each `Branch` now has a lane, a mutex held while a closure runs on a
 copy of that branch's tip, which also holds the branch's open coalescing group. `tip` is taken after
 the closure and its draft, only to place the drafted records, append the log entry, write the refs
-and the frame and queue it. Locks are always taken in the order lane, `tip`, `published`, the
-attached branches, the queue, and nothing waits for a lane while it holds `tip`.
+and queue the frame. Locks are always taken in the order lane, `tip`, `published`, the attached
+branches, the queue, and nothing waits for a lane while it holds `tip`.
 
 When the lanes were added, a commit had to know where its frame started before it encoded its first
 record. A record names each link by offset, stored as the distance back from the record itself, and
@@ -123,9 +127,9 @@ group before it leads rather than after, so the two share a sync.
 
 An awaited write waits at its branch's gate, so it queues only behind writers of its branch. After
 its closure it takes `tip` with a plain `lock()` in the same poll, since a guard cannot be kept
-across polls. `tip` is held for one frame's placement and write at a time, a few microseconds, and
-through one fsync by `drop_branch`, so an executor thread can wait that long behind other branches'
-commits, but never behind a closure.
+across polls. `tip` is held for one frame's placement at a time, a few microseconds, and through one
+fsync by `drop_branch`, so an executor thread can wait that long behind other branches' commits, but
+never behind a closure.
 
 `fork` takes its branch's lane, which seals its open group, then `tip`, and copies the tip the next
 commit would build on. `drop_branch` takes the dropped branch's lane, sealing its group, then `tip`,
@@ -307,8 +311,89 @@ Left open:
 
 - The log entry, a fifth of what is left under `tip`, depends only on the branch's own chain except
   when a merge records what it merged, so it could be drafted too.
-- The frame's write to the page cache is the largest part left. Writing it after `tip` would need
-  frames written out of order and `written` advanced only over a contiguous run of them.
+- The frame's write to the page cache is the largest part left. It is now written after `tip`, as
+  described under [Writing frames after `tip`](#writing-frames-after-tip).
 - A frame that moves loses the cached copies of nodes holding nested collections and of a parallel
   flush, so the next commit on the branch reads those back.
 - The thousand instructions a single-key commit gained, and the 4 MiB of a 1M-key commit.
+
+## Writing frames after `tip`
+
+After the draft moved out, a booking hold still held `tip` for about 8 µs, and the largest part of
+it was writing the frame: its xxh3 check and the copy into the page cache, about 4 µs of a 13 KB
+frame (#51). A commit now only places its frame under `tip`. It takes the next sequence number and
+the frame's range of the file, moves `placed`, the end of the last placed frame, to the frame's end,
+and queues the frame, so the order of frames, their sequence numbers and the refs each one names are
+still decided in one place. After releasing `tip`, still under its lane, the writer computes the
+check and writes the frame. `written`, the end below which every frame is in the page cache, only
+moves over a contiguous run: a frame written while one before it is still being written is noted,
+and whoever writes the one before carries `written` over both. `fork`, `drop_branch`, the frames of
+pruning and of `receive`, and a draft that spilled write their frames before releasing `tip`, as
+before.
+
+Nothing reads a frame before it is written. A draft lays itself out from `placed`, and takes offsets
+from `dedupe` only below it, so it may link into a frame that is still being written but never reads
+one. A read between `written` and `placed` waits for `written` to pass it: a commit on another
+branch that loads a node of the refs the frame before named, once the cache has dropped it, or a
+merge that loads the other branch's newest entry. The writer it waits for holds no lock but its own
+lane and runs no user code before it writes, so the wait ends. A read past `placed` fails as before.
+The next commit on the same branch needs the lane, which the writer releases only after writing.
+
+The leader of a sync waits until `written` reaches the end of the last frame it took before it
+fdatasyncs or writes a superblock, so a superblock never names a frame that is not in the page
+cache, and under `Durability::Fsync` never one that is not durable. Frames reach the page cache, and
+so the disk, out of order, but recovery keeps only frames that follow each other from the anchor: a
+power cut that keeps a later frame and loses an earlier one rolls back to before the earlier one,
+and neither was acknowledged, since acknowledging waits for the sync, which waited for both. Each
+frame's refs were built from those of the frame before under `tip`, so every prefix is a consistent
+set of heads. Under `Durability::Buffered` the anchor still names only what an fdatasync covered,
+and a read-only follower reads only what a superblock names, all of it written before the superblock
+was. A reclamation cycle and a landing `receive` take every lane before `tip`, so no frame is being
+written while they copy or swap. The Fsync preallocation zero-fills past the end of the newest
+placed frame, under `tip`, so it never overwrites a frame being written.
+
+If a frame's write fails, the store poisons and every waiter wakes. The leader syncs and
+acknowledges the frames of its batch before the failed one and fails the rest with
+`Error::Poisoned`, including frames placed after it whose bytes were written, since recovery would
+not keep them. The writer whose write failed puts its branch's tip back to the frame before and
+reports the I/O error, as when the write failed under `tip`. A writer that panics between placing
+and writing poisons the store the same way.
+`a_power_cut_between_frames_that_landed_out_of_order_keeps_a_prefix` holds one branch's writer
+between placing and writing while two other branches place and write the frames after it, so every
+round writes three frames out of order, and replays prefixes of the recorded writes under both
+durabilities with all, none, half, torn sectors, the superblocks only or the frames only of what was
+not synced. With a leader that does not wait for `written`, it fails on the first image whose
+superblock names a frame that was never written.
+`a_commit_that_reads_a_frame_not_landed_yet_waits_for_it` has a commit and a merge on other branches
+read through the held frame with the node cache off.
+
+`tables`, one Buffered writer, median of three interleaved runs, with counters around the time `tip`
+is held across holds, confirms and cancels: 7.86 µs at the median before and 3.70 µs after (-53%),
+and 33,461 instructions before and 22,917 after (-32%). The commit as a whole costs what it did:
+outside the closure a hold ran 566,604 instructions before and 567,379 after, a confirm 732,782 and
+733,176, and a cancel 900,867 and 901,360, with thread CPU time of 75.6 and 75.7, 96.5 and 96.6, and
+124.8 and 124.5 µs, and bytes per write stayed at 13,297.
+
+`group` with `--branches own`, median of four alternating runs on the 32-core machine, closures a
+second:
+
+| Durability | Closure | Branches | Before | After |
+| --- | ---: | ---: | ---: | ---: |
+| Buffered | none | 4 | 88,493 | 91,606 (1.04x) |
+| Buffered | none | 8 | 70,154 | 77,003 (1.10x) |
+| Buffered | none | 16 | 58,494 | 60,496 (1.03x) |
+| Buffered | 10 µs | 4 | 79,018 | 80,198 (1.01x) |
+| Buffered | 10 µs | 8 | 70,437 | 74,616 (1.06x) |
+| Buffered | 10 µs | 16 | 58,266 | 62,304 (1.07x) |
+| Fsync | none | 4 | 5,292 | 5,472 |
+| Fsync | none | 8 | 9,934 | 10,144 |
+| Fsync | none | 16 | 18,038 | 17,822 |
+| Fsync | 10 µs | 4 | 5,471 | 5,165 |
+| Fsync | 10 µs | 8 | 10,296 | 9,720 |
+| Fsync | 10 µs | 16 | 17,864 | 18,326 |
+
+A single-key frame is about 2.5 KB, so its check and copy are about 1.5 µs, and under contention the
+section shrank by less: with no closure, `tip` was held for 11.3 µs at the median before and after
+at 8 branches, and 13.4 and 12.3 µs at 16, where the refs, the relayout and the log entry are most
+of it. Fsync waits on the disk and moved within its runs: an earlier set of three gave 0.71 to 1.35
+of before for the same cells.

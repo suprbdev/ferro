@@ -108,6 +108,12 @@ itself that it reached the disk whole. A commit does this:
 2. fdatasync. This is the durability point.
 3. Write the superblock to the other slot, without syncing it.
 
+Frames are placed at the tail in order, but each commit writes its own after releasing the lock that
+placed it, so they can reach the file out of order. A sync waits until every frame up to the one it
+covers is written before step 2, and the scan below keeps only frames that follow each other, so a
+frame written ahead of one that was lost is lost with it. [Writing frames after
+`tip`](commit-path.md#writing-frames-after-tip) has the rest.
+
 In `Durability::Fsync` the superblock is written only after its frame is durable, so it anchors
 itself and never names anything a crash can lose, and the next fdatasync carries it to disk. A crash
 leaves it at most one sync behind. On Windows every fdatasync here is a `FlushFileBuffers`, as
