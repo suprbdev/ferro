@@ -51,6 +51,9 @@ numbers. This index lists them by subsystem.
   out](read-scaling.md#measured-and-left-out).
 - Retiring every evicted node, and an owner beside each cache entry: [Guarded gets and the epoch
   scheme](read-scaling.md#guarded-gets-and-the-epoch-scheme).
+- Deferring every memoized eviction, the flags in an allocation of their own, moving nodes out with
+  `Arc::try_unwrap`, and a `!Unpin` node: [Where the flags
+  live](read-scaling.md#where-the-flags-live).
 - A frame flag beside the pointer, and an inlined step: [Iterator
   frames](read-scaling.md#iterator-frames).
 - A private lease for `Val`, a lazier row finder, building the column in place, and decoding from

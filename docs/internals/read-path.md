@@ -16,13 +16,13 @@ in L2, a scan costs 2 ns a key and a get 67 ns. At 1M keys the same code costs 6
 
 So each `Link::Stored` carries a write-once memo of the node it points at, in a `OnceLock`:
 
-- The first `PIN_DEPTH` (3) levels of a tree memoize a strong `Arc`. `Map::walk` follows those by
+- The first `PIN_DEPTH` (3) levels of a tree memoize a strong count. `Map::walk` follows those by
   reference and writes no shared memory, which took eight readers from 9M to 60M reads a second. A
   fourth level added nothing. A `Map` pins about 73 nodes whatever its size, outside `cache_bytes`,
   until the `Map` is dropped.
 - Deeper links memoize a `Weak` when the child was found in the cache, or when `flush` wrote it
   beside a sibling, as described below. The cache stays the owner, so eviction still frees the node,
-  and the memo keeps only the node's `Arc` allocation, about 150 bytes, until its parent goes. A
+  and the memo keeps only the node's allocation, about 150 bytes, until its parent goes. A
   child just read from disk is not memoized, so a one-off read leaves nothing behind. A get reads
   through these memos without upgrading them, under an epoch guard, as described under [Reading from
   many threads](read-scaling.md#guarded-gets-and-the-epoch-scheme).
@@ -57,9 +57,11 @@ times. The offsets fit beside the `Weak` in space the enum already had, so `Memo
 bytes and `Link` 72. A hint comes from a live node, and once that node is evicted a stale hint
 prefetches a line nobody wants and nothing more, since a prefetch never faults. That call, the
 guarded borrow described under [Reading from many
-threads](read-scaling.md#guarded-gets-and-the-epoch-scheme) and the tagged pointers of iterator
-frames, described under [Iterator frames](read-scaling.md#iterator-frames), are the tree's only
-`unsafe` code, and the prefetch does nothing on targets other than x86_64.
+threads](read-scaling.md#guarded-gets-and-the-epoch-scheme), `Shared`, the reference count that
+holds nodes, described under [Where the flags live](read-scaling.md#where-the-flags-live), and the
+tagged pointers of iterator frames, described under [Iterator
+frames](read-scaling.md#iterator-frames), are the tree's only `unsafe` code, and the prefetch does
+nothing on targets other than x86_64.
 
 On 1M `u64` keys, median of 15 alternating rounds in one process holding two such maps, in
 nanoseconds, the last two per key:

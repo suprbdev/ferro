@@ -12,7 +12,7 @@ lists them with what each covers.
 The library is `ferro/src`:
 
 - `lib.rs`: the crate root. It declares the modules and re-exports the public API; `epoch`, `graph`,
-  `platform`, `reclaim` and `reentry` are private.
+  `platform`, `reclaim`, `reentry` and `shared` are private.
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls, and `Object`, `Ptr`,
   `hash_of` and `Bytes`.
 - `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
@@ -31,6 +31,8 @@ The library is `ferro/src`:
 - `watch.rs`: `Watcher<T>`, `Closer<T>` and the per-branch feed behind them.
 - `epoch.rs`: deferred freeing of nodes lent to guarded readers, described under [Guarded gets and
   the epoch scheme](read-scaling.md#guarded-gets-and-the-epoch-scheme).
+- `shared.rs`: `Shared`, the reference count that holds map nodes, with the node cache's flags in
+  the same allocation, described under [Where the flags live](read-scaling.md#where-the-flags-live).
 - `reentry.rs`: the per-thread record of the locks a thread holds, behind `Error::Reentrant`,
   described under [Writes from inside a closure](reentrancy.md).
 - `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share, and

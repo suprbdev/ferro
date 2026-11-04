@@ -37,15 +37,15 @@ their own store.
 
 ## Copy-on-write and flush
 
-Mutation is copy-on-write through `Arc::make_mut`, so a node is copied once per transaction and then
-mutated in place. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one. `flush`
-writes dirty nodes bottom up during `Data::encode` and seeds the node cache with the nodes it wrote.
-Values inserted or mutated since the node was loaded are decoded once as a check before they become
-durable; unchanged values are not. When at least half of a node's values are fresh, the cached copy
-is decoded from the written bytes, which is that check and the copy in one pass; otherwise the node
-is cloned and each fresh value is the one its check decoded. A value holding a dirty or foreign
-collection also forces the decode, so nested collections always come back clean and a foreign store
-is never pinned.
+Mutation is copy-on-write through `Shared::make_mut`, so a node is copied once per transaction and
+then mutated in place. `Link::Mem` is a dirty in-memory node, and `Link::Stored` a persisted one.
+`flush` writes dirty nodes bottom up during `Data::encode` and seeds the node cache with the nodes
+it wrote. Values inserted or mutated since the node was loaded are decoded once as a check before
+they become durable; unchanged values are not. When at least half of a node's values are fresh, the
+cached copy is decoded from the written bytes, which is that check and the copy in one pass;
+otherwise the node is cloned and each fresh value is the one its check decoded. A value holding a
+dirty or foreign collection also forces the decode, so nested collections always come back clean
+and a foreign store is never pinned.
 
 A node that `flush` writes or decodes keeps the bytes and links of its level, keys and values while
 its values are still one column, which they stop being at the first edit of a key or value, since

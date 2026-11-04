@@ -40,8 +40,8 @@ The `Makefile` wraps the last two steps: `make fuzz-seeds` builds `corpus/seeds`
 
 Tests are described next to what they test:
 
-- The epoch protocol's stress test, sanitizers and Miri: [Guarded gets and the epoch
-  scheme](read-scaling.md#guarded-gets-and-the-epoch-scheme).
+- The epoch protocol's stress test, sanitizers and Miri, with the commands: [How the protocol is
+  checked](read-scaling.md#how-the-protocol-is-checked).
 - `history_heap`: [Cache weight](read-scaling.md#cache-weight).
 - Modelled power cuts on Buffered checkpoints: [Buffered durability and
   checkpoints](storage.md#buffered-durability-and-checkpoints).

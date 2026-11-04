@@ -92,7 +92,9 @@ What held scaling back:
 when it pinned, or zero. `Map::walk`, which serves `get`, `contains_key`, `value_hash` and `nth`,
 `floor` and `summary_by` pin for the length of one descent, an exchange on the thread's own slot,
 and read through a `Weak` memo by reference when its node is flagged as held by the cache, so a get
-writes no shared memory at any level. A `Node` carries two flags. `cached` is set when a cache entry
+writes no shared memory at any level. Nodes are counted by `Shared`, a reference count of the
+crate's own, and each node's allocation carries two flags behind the node, as described under
+[Where the flags live](#where-the-flags-live). `cached` is set when a cache entry
 takes the node and cleared when that entry is dropped by eviction, replacement or `clear`; the
 entry's clones that `get` hands out are not owners, and the flag is cleared before the entry lets go
 of its reference. `lent` is set by the first reader that borrows the node. An evicted node that was
@@ -102,7 +104,7 @@ or 64 KiB, and on `Store::close`, which waits for readers pinned before it so th
 holding nested maps do not keep the file open. A reader stores `lent` before it reads `cached`
 again, and the cache clears `cached` before it reads `lent`, all sequentially consistent, so either
 the reader sees the flag cleared or the cache sees the loan and defers the free. Iterators and
-cursors still hold `Arc`s, since they live across the caller's code, and so does `for_each`, whose
+cursors still hold counts, since they live across the caller's code, and so does `for_each`, whose
 callback could hold a pin, and with it every retired node, for as long as it likes.
 
 The first version retired every evicted node. Gets with the 16 MiB cache fell by 44% at 16 and 32
@@ -121,21 +123,151 @@ node cannot change, and loops that call out per item reloaded the node's fields 
 walks a leaf's keys and values as two slices, which brought `iter()` scans to 64 instructions a key
 and `for_each` to 30, 9 to 28% faster than before this work at 1 to 32 threads.
 
+### Where the flags live
+
+The flags used to be fields of `Node`, and under Miri's stacked borrows
+`epoch_borrows_survive_an_eviction_that_races_them` failed on about one schedule in 16. An eviction
+that found a node not yet lent dropped it in place while a reader holding its `Weak` made its first
+load of `cached`. `Arc` drops its value through a `&mut Node`, and under stacked borrows a `&mut`
+claims every byte it covers, `UnsafeCell` fields included, so the compiler may read or write them
+speculatively; Miri reported that retag as a write racing the reader's atomic load. Tree borrows let
+a `&mut` to interior-mutable bytes coexist with other accesses, so they passed.
+
+Ordering the eviction differently could not fix it. A reader loads `cached` before it knows anything
+about the node, and a `Weak` memo outlives the node for as long as its parent does, so a reader that
+pins after an eviction can be making that load while any later drop of the node runs, including the
+epoch's free of a node that was lent and retired.
+`epoch_readers_after_an_eviction_race_the_free_of_what_it_retired` does that, and with the flags in
+`Node` it failed under stacked borrows on 4 of 32 schedules, inside `epoch::flush`. Deferring every
+drop would have cost the 44% above and still raced.
+
+So the flags left the node. `Shared<T>` in `shared.rs` holds the strong count at the front of its
+allocation, the value right after it, and behind the value a 32-bit weak count and the two flags, so
+a node's allocation stays 152 bytes. A reader reaches the flags from its `Weak` without making a
+reference to the node, and no reference to them is ever exclusive: the last owner drops only the
+value, through a `&mut` to the value alone, and `get_mut`, `make_mut` and `unwrap_or_clone` lend or
+move the value alone. The allocation is freed when the last `Weak` goes, and a reader's `Weak` sits
+in a parent that its own guard or count keeps alive. That leaves the node itself, which a reader
+touches only once the protocol above has shown it safe: it borrows only after it stored or saw
+`lent` and then still saw `cached`, so the cache had not yet cleared `cached`, the cache's later
+load of `lent` sees the loan, and the node waits in the epoch until the reader unpins. A node
+dropped in place, at eviction or by whoever holds its last count, is one that no reader has borrowed
+or can still borrow, and a reader that looks at it afterwards reads only its flags. The argument
+does not depend on what a `&mut` claims about interior-mutable bytes, so it holds under stacked and
+tree borrows alike, and the flags are only ever accessed atomically, so there is no data race in the
+C++ memory model either.
+
+The first layout kept `Arc`'s order, with the flags beside the counts in a 16-byte header. Index
+lookups then pulled 22 to 26 lines a lookup from the other CCX at 16 and 32 threads, against 18 to
+22, because the flags every guarded descent reads shared a line with the strong count that the row
+finder's upgrades write. Behind the value the flags sit 148 bytes from the count, where before they
+sat 97 bytes into the allocation, and lookups pull 19 to 21 lines from the other CCX against 18 to
+22, at the price of about 20 more lines a lookup from the local L3, 127 against 105 on one thread,
+which did not show in the rate.
+
+`Shared` takes the place of `Arc` for nodes everywhere. A cache entry holds a node as `Erased`, a
+pointer and a static table of its type's offsets and drop, and any other object as
+`Arc<dyn Cached>`, in an enum that is still 24 bytes. Before freeing, `Shared` acquires the counts
+with a load rather than a fence, as `Arc` does when built for ThreadSanitizer, which does not model
+fences: with the fence, ThreadSanitizer reported the final drop of a node that an iterator had just
+read.
+
+Measured on the machine and data of the tables above, alternating the two builds six times in one
+session, medians of the runs during which other work kept at most two cores busy. Operations a
+second with the 1 GiB cache and no writer:
+
+| Workload | | 1 thread | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- |
+| `get` | before | 2.9M | 43.6M | 69.7M |
+| `get` | after | 3.0M | 44.4M | 69.6M |
+| `iter()` scan | before | 52.2M | 374.9M | 818.0M |
+| `iter()` scan | after | 53.7M | 377.9M | 825.3M |
+| `for_each` scan | before | 86.1M | 946.0M | 1423.3M |
+| `for_each` scan | after | 88.7M | 957.7M | 1436.4M |
+| 100-key range | before | 385k | 4.9M | 7.6M |
+| 100-key range | after | 396k | 5.0M | 7.5M |
+| Index lookup | before | 224k | 1.9M | 2.8M |
+| Index lookup | after | 226k | 2.1M | 3.2M |
+
+With the 16 MiB cache and no writer:
+
+| Workload | | 1 thread | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- |
+| `get` | before | 349k | 2.1M | 2.9M |
+| `get` | after | 350k | 2.1M | 2.9M |
+| `iter()` scan | before | 7.4M | 41.5M | 69.6M |
+| `iter()` scan | after | 7.4M | 41.6M | 69.7M |
+| `for_each` scan | before | 7.9M | 42.4M | 71.3M |
+| `for_each` scan | after | 7.9M | 42.0M | 71.9M |
+| 100-key range | before | 54k | 276k | 380k |
+| 100-key range | after | 54k | 274k | 381k |
+| Index lookup | before | 14k | 75k | 102k |
+| Index lookup | after | 14k | 76k | 106k |
+
+Index lookups at 16 and 32 threads still fall into the two modes described under [Iterator
+frames](#iterator-frames) in both builds, about 1.8M and 2.1M a second at 16 threads. The base build
+landed in the slower one in four of six runs here and the new one in two, and in the session with
+the first layout the other way round, so the gap between the medians is that and not the change.
+With no `UnsafeCell` left in `Node`, one thread with the 1 GiB cache runs 1,223 instructions a get
+where it ran 1,281, 63 a key in an `iter()` scan where it ran 65, 29 in `for_each` where it ran 30,
+and 3% fewer in ranges and index lookups. In `reads`, medians of four alternating runs, the heap per
+key did not move in any case, 60.5 bytes for `u64` values and 108.5 for strings, bulk loads, commits
+and cold scans stayed within 4%, and random and sorted gets, scans and walks over keys on one thread
+were up to 10% faster. Gets and batches over every 256th or 4096th key varied by up to a factor of
+two between runs of the same build. One of them, `get_many` over every 4096th key of the string map,
+came out 24% slower in every run, but with the same counters added to both builds it took 99 to 103
+ns a key against 100 to 101, on 4% fewer instructions, so that was where the code landed in that
+binary.
+
+Measured and left out:
+
+- Deferring the drop of every evicted node that has a `Weak` memo, not only the lent ones, with the
+  flags still in `Node`. With the 16 MiB cache memoized evictions outnumbered lent ones 3 and 9
+  times for gets on 1 and 16 threads and 9 and 13 times for index lookups, and ranges, which never
+  lend, evicted a memoized node 11 to 12% of the time. Gets were 4% slower at 16 threads and 7% at
+  32, and index lookups 6% and 7%, medians of four and three alternating runs, and drops by other
+  owners would still race.
+- An `Arc` of the two flags beside each `Weak` memo. It is sound under both models, but every
+  memoized node gains a 32-byte allocation and every `Link` grows from 72 to 80 bytes, about 6 bytes
+  a key on a 1M-key `Map<u64, u64>` held in the cache, against 61. Not built.
+- Moving a node out with `Arc::try_unwrap` instead of dropping it in place, so that no `&mut` covers
+  it. The current `try_unwrap` reads through a shared reference, but `into_inner` and `Drop` take a
+  `&mut`, and `Weak::as_ptr` promises nothing once no strong count is left, so it would rest on
+  `std`'s internals.
+- Making `Node` `!Unpin`, which Miri's stacked borrows exempt from the uniqueness of a `&mut`. That
+  silences the report without giving a reason the code is sound, and drops `noalias` from every
+  `&mut Node`.
+
+### How the protocol is checked
+
 The protocol is checked four ways. `tests/epoch_stress.rs` runs eight readers doing gets, `floor`,
 `summary_by`, row gets, index lookups through the `Finder`, and ranges both ways and cursor seeks
 through the frames described under [Iterator frames](#iterator-frames), against a model of every
 version, on handles with caches of 12 KiB to 1 MiB that read-only readers refresh and reopen, beside
 two writers on a 12 KiB cache with reclamation cycles every 96 KiB and compaction, while the
 writer's `Db` is dropped and reopened four times. It runs under AddressSanitizer and ThreadSanitizer
-clean, and with `release` changed to free lent nodes at once both report the use after free within
-the default four seconds. Unit tests in `epoch.rs`, `map.rs` and `store.rs` race a reader's borrow
-with an eviction, check that only the cache's own entry releases its value, and walk iterators and a
-cursor over pinned and borrowed nodes after their map is dropped or edited. They pass under Miri
-with tree borrows over 16 schedules. Under stacked borrows all but one pass over 16 schedules:
-`epoch_borrows_survive_an_eviction_that_races_them` fails on one schedule in 16, as it did before
-the frames, because an eviction that finds a node not yet lent drops it in place while a reader
-holding its `Weak` makes its first load of `cached`, and stacked borrows count the drop's `&mut` as
-a write to every field.
+clean with its default seed and three others, and with `Shared::release` changed to report no loan,
+so that lent nodes are freed at once, AddressSanitizer reports a use after free and ThreadSanitizer
+data races within the default four seconds. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and
+`shared.rs` race a reader's borrow with an eviction, race readers that pin after an eviction with
+the epoch's free of the node it retired, check that only the cache's own entry releases its value,
+walk iterators and a cursor over pinned and borrowed nodes after their map is dropped or edited, and
+drive `Shared`'s counts, moves, erasure, layout and flags, including flags read after the value is
+dropped. They pass under Miri with stacked borrows and with tree borrows over 32 schedules each.
+
+Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
+the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
+seed and its four seconds:
+
+```
+MIRIFLAGS="-Zmiri-many-seeds=0..32" cargo +nightly miri test -p ferro --lib -- epoch_ shared_
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-many-seeds=0..32" \
+    cargo +nightly miri test -p ferro --lib -- epoch_ shared_
+RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR=target/asan cargo +nightly test -Zbuild-std \
+    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress
+RUSTFLAGS="-Zsanitizer=thread" CARGO_TARGET_DIR=target/tsan cargo +nightly test -Zbuild-std \
+    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress
+```
 
 ## Index rows
 
@@ -224,11 +356,11 @@ An iterator or cursor held an `Arc` for each node on its path, so building the t
 took three counts on the root and two on each pinned node below it, and gave them back when it
 dropped: locked operations on the nodes every reader shares, on the line that holds their `keys` and
 `children`. A frame now holds a tagged pointer. A node the frame reached by upgrading a memo or by a
-load is an `Arc`, as before. A node reached through a pinned memo or an in-memory link of a node the
-iterator already borrows this way is a plain pointer with its low bit set, and the iterator keeps
-one `Arc` of the root, which owns those links. A shared node is never changed in place, since
-`Arc::make_mut` copies it first, and a memo is never replaced, so those pointers stay valid for as
-long as the iterator holds the root. Frames drop before it. A cursor anchors to the root link it
+load holds a count, as before. A node reached through a pinned memo or an in-memory link of a node
+the iterator already borrows this way is a plain pointer with its low bit set, and the iterator
+keeps one count on the root, which owns those links. A shared node is never changed in place, since
+`Shared::make_mut` copies it first, and a memo is never replaced, so those pointers stay valid for
+as long as the iterator holds the root. Frames drop before it. A cursor anchors to the root link it
 already owns. An iterator over a dirty map takes no count at all, and one over a stored map takes
 one on the root and one on each node below the pinned levels. Ranges went from 5.8M to 7.4M a second
 at 32 threads and from 3.8M to 4.7M at 16, with one thread unchanged, and pages of rows on one
@@ -302,7 +434,7 @@ default and was used only for the last column.
 ### What is left
 
 A `Val` for a value with a destructor still costs a shared count per item from `iter()`, and any
-iterator, cursor or finder holds an `Arc` on each node below the pinned levels, a shared count per
+iterator, cursor or finder holds a count on each node below the pinned levels, a shared count per
 leaf it passes. That is what pages of the same 200 rows meet: each page passes about 25 index leaves
 and 50 row leaves that every thread also passes. Each iterator still clones the store and the root.
 With a cache smaller than the data the allocator decides, and the library leaves that to the
@@ -339,7 +471,7 @@ at 2 MiB, and at 1.05 times at 32 MiB. The test itself runs settings of 2 and 8 
 that the heap left after the walk stays under 1.5 times the setting and the peak under twice it.
 Counting costs an add per allocation on a cache miss and nothing on a hit.
 
-Outside the bound are pinned nodes, including those the maps of a cached root pin, the `Arc`
+Outside the bound are pinned nodes, including those the maps of a cached root pin, the node
 allocations memos keep, the column of any `Val` still held, nodes held by live snapshots and dirty
 trees, evicted nodes a guarded read may still be using, which wait in batches of up to 128 nodes or
 64 KiB a thread, and on a writer the `dedupe` table, 32 bytes for every 4 KiB of the setting,
