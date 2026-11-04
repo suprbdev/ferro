@@ -12,9 +12,11 @@ none. A merge's entry also links the other branch's tip entry, as described unde
 [Merging](merging.md#three-way-merges). Appending a commit writes one small object and finds its
 skip target by following skip links from the tip, which is O(1) amortized. Looking up a version or a
 time follows skip links while they do not overshoot, which is O(log n). The head records the tip
-pointer, the first retained version, and the head version. `Refs` is `Map<String, Head>` and the
-superblock points at it. Forking a branch copies one `Head`, so the chain is shared and nothing is
-rewritten. `restore` commits an old value as a new version, so history is never rewritten.
+pointer, the first retained version, and the head version. `Refs` is `Map<String, Head>`, and the
+superblock points at it, or at a chain of steps over it that each carry one branch's new head, as
+described under [Branch-table steps](commit-path.md#branch-table-steps). Forking a branch copies one
+`Head`, so the chain is shared and nothing is rewritten. `restore` commits an old value as a new
+version, so history is never rewritten.
 
 Pruning only raises `first`. Walks stop there, and lookups below it return `NoVersion`. Retained
 entries are not rewritten, so the entry at `first` still links `prev` and perhaps `skip` entries

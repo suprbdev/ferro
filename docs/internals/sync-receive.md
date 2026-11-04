@@ -127,9 +127,10 @@ equal to the one it had before, except that its head is the new copy. `Txn::put`
 in `dedupe` and the frame named it, while the handle kept the table it had encoded: `verify` walked
 the branch from the new copy and the file's table from the old one, and failed on an offset 0 that
 only the old copy carries, and a reopen read the old copy. The branch table is now written without
-looking in `dedupe`. Only the nodes a change touches are written, and they hash like earlier ones
-only when the branches return to a state they had before, so this writes nothing more in ordinary
-use.
+looking in `dedupe`, and so is each step a commit writes on it, as described under [Branch-table
+steps](commit-path.md#branch-table-steps). Only the nodes a change touches are written, and they
+hash like earlier ones only when the branches return to a state they had before, so this writes
+nothing more in ordinary use.
 
 A commit's own entry went through `dedupe` too, and two branches that make the same commit over two
 copies of its parent write entries with one hash. With a fixed clock, a branch that kept only v6

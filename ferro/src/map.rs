@@ -2761,6 +2761,18 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         replaced.map(|slot| fatal(read_slot(store, &slot)))
     }
 
+    pub(crate) fn try_insert(&mut self, key: K, value: V) -> Result<()> {
+        let level = level_of(&key)?;
+        insert_at(
+            self.store.as_ref(),
+            &mut self.root,
+            key,
+            level,
+            Arc::new(value),
+        )?;
+        Ok(())
+    }
+
     pub fn remove<Q>(&mut self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,

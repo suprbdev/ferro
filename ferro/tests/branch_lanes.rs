@@ -1153,8 +1153,8 @@ fn a_power_cut_keeps_every_acknowledged_commit_on_every_branch() {
 
 #[test]
 fn a_power_cut_leaves_buffered_branches_whole() {
-    let small: fn() -> Options = || buffered().checkpoint_bytes(4096);
-    let coalesced: fn() -> Options = || buffered().checkpoint_bytes(4096).coalesce(true);
+    let small: fn() -> Options = || buffered().checkpoint_bytes(2048);
+    let coalesced: fn() -> Options = || buffered().checkpoint_bytes(2048).coalesce(true);
     let lossy: [Kind; 2] = [("buffered", small), ("buffered coalesced", coalesced)];
     for (seed, (kind, options)) in lossy.into_iter().enumerate() {
         let dir = dir();
@@ -1303,6 +1303,93 @@ fn a_power_cut_between_frames_that_landed_out_of_order_keeps_a_prefix() {
             replay(&recording, options, durable, 30 + seed as u64) > 100,
             "{kind}"
         );
+    }
+}
+
+fn record_in_turn(path: &Path, options: fn() -> Options, writers: u64, rounds: u64) -> Recording {
+    {
+        let db: Db<Text> = options().open(path).unwrap();
+        db.update(|root| {
+            root.insert(0, "base".to_string());
+        })
+        .unwrap();
+        for branch in 0..writers {
+            db.fork(&branch_name(branch)).unwrap();
+        }
+    }
+    let base = fs::read(path).unwrap();
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    {
+        let db: Db<Text> = options().trace(trace.clone()).open(path).unwrap();
+        let branches: Vec<_> = (0..writers)
+            .map(|branch| db.branch(&branch_name(branch)).unwrap())
+            .collect();
+        for n in 1..=rounds {
+            for (branch, handle) in (0..writers).zip(&branches) {
+                let done = handle
+                    .commit_with(|root| {
+                        root.insert(n, text(branch * 1000 + n, 40));
+                        ("", ())
+                    })
+                    .unwrap();
+                handle.trace_op(Op::Acked(branch * SPREAD + done.version));
+            }
+            if n % 25 == 0 {
+                let name = format!("extra-{n}");
+                db.fork(&name).unwrap();
+                db.drop_branch(&name).unwrap();
+            }
+        }
+    }
+    let ops = trace.lock().clone();
+    Recording {
+        base,
+        ops,
+        writers,
+        commits: rounds,
+    }
+}
+
+fn one_prefix(db: &Db<Text>, recording: &Recording, context: &str) {
+    let versions: Vec<u64> = (0..recording.writers)
+        .map(|branch| db.branch(&branch_name(branch)).unwrap().version())
+        .collect();
+    let last = versions[versions.len() - 1];
+    assert!(
+        versions.windows(2).all(|pair| pair[0] >= pair[1]) && versions[0] <= last + 1,
+        "{context}: heads {versions:?} name no single prefix of the commits"
+    );
+}
+
+#[test]
+fn a_power_cut_across_branch_table_steps_keeps_one_set_of_heads() {
+    let small: fn() -> Options = || buffered().checkpoint_bytes(4096);
+    let modes: [Kind; 2] = [("fsync", fsync), ("buffered", small)];
+    for (seed, (kind, options)) in modes.into_iter().enumerate() {
+        let dir = dir();
+        let rounds = 40 * u64::from(cases(1));
+        let recording = record_in_turn(&dir.path().join("trace.ferro"), options, 4, rounds);
+        let image = dir.path().join("image.ferro");
+        let mut rng = Rng::new(60 + seed as u64);
+        let stride = (recording.ops.len() / 80).max(1);
+        let mut images = 0;
+        for cut in (0..=recording.ops.len()).step_by(stride) {
+            for loss in [Loss::Everything, Loss::Nothing, Loss::Some, Loss::Torn] {
+                let state = crash(&recording, cut, loss, kind == "fsync", &mut rng);
+                fs::write(&image, &state.image).unwrap();
+                let context = format!("{kind}: cut {cut} of {} {loss:?}", recording.ops.len());
+                let reader: Db<Text> = Options::new()
+                    .read_only()
+                    .cache_bytes(1)
+                    .open(&image)
+                    .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
+                one_prefix(&reader, &recording, &context);
+                drop(reader);
+                check(&image, &recording, &state, options, &context);
+                images += 1;
+            }
+        }
+        assert!(images > 200, "{kind}: only {images} images");
     }
 }
 

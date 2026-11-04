@@ -1,0 +1,312 @@
+use std::collections::HashSet;
+
+use crate::codec::{Data, Decoder, Encoder, Kind, Ptr, Sink};
+use crate::db::{Head, Refs};
+use crate::error::{Error, Result};
+use crate::log::Chain;
+use crate::map::Map;
+use crate::store::{Store, Txn};
+
+const STEP: u8 = 0x7f;
+pub(crate) const STEPS: usize = 64;
+const MAX_STEPS: usize = 1024;
+
+#[derive(Clone)]
+pub(crate) struct Step {
+    prev: Ptr,
+    name: String,
+    head: Head,
+}
+
+#[derive(Clone)]
+pub(crate) enum Root {
+    Table(Refs),
+    Step(Step),
+}
+
+fn encode_step(w: &mut Encoder<'_>, prev: Ptr, name: &str, head: &Head) -> Result<()> {
+    w.u8(STEP);
+    w.link(prev);
+    w.varint(name.len() as u64);
+    w.raw(name.as_bytes());
+    head.encode(w)
+}
+
+impl Data for Root {
+    const LOCATED: bool = true;
+
+    fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
+        match self {
+            Root::Table(refs) => refs.encode(w),
+            Root::Step(step) => encode_step(w, step.prev, &step.name, &step.head),
+        }
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> Result<Self> {
+        if r.lone_varint() {
+            return Ok(Root::Table(Refs::decode(r)?));
+        }
+        let tag = r.u8()?;
+        if tag != STEP {
+            return Err(Error::Decode(format!("invalid branch table tag {tag}")));
+        }
+        let prev = r.typed_link(Kind::value::<Root>)?;
+        let name = String::decode(r)?;
+        let head = Head::decode(r)?;
+        if r.remaining() != 0 {
+            return Err(Error::Decode(format!(
+                "a branch table step has {} bytes after its head",
+                r.remaining()
+            )));
+        }
+        Ok(Root::Step(Step { prev, name, head }))
+    }
+}
+
+pub(crate) fn write_step(
+    txn: &mut Txn,
+    store: &Store,
+    prev: Ptr,
+    name: &str,
+    head: &Head,
+) -> Result<(Ptr, Head)> {
+    let mut encoder = Encoder::new(txn);
+    encode_step(&mut encoder, prev, name, head)?;
+    let object = encoder.into_object();
+    let decoded = Root::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+    let Root::Step(step) = decoded else {
+        return Err(Error::Corrupt(
+            "a branch table step decoded as a table".into(),
+        ));
+    };
+    let hash = object.hash();
+    Ok((txn.put(object, hash)?, step.head))
+}
+
+struct Layers {
+    steps: Vec<Step>,
+    base: Refs,
+    depth: usize,
+}
+
+fn layers(store: &Store, head: Ptr, since: Option<(Ptr, &Refs, usize)>) -> Result<Layers> {
+    let mut steps = Vec::new();
+    let mut at = head;
+    loop {
+        if let Some((known, refs, depth)) = since
+            && known == at
+        {
+            return Ok(Layers {
+                depth: depth + steps.len(),
+                steps,
+                base: refs.clone(),
+            });
+        }
+        match store.decode_at(at, Root::decode)? {
+            Root::Table(base) => {
+                return Ok(Layers {
+                    depth: steps.len(),
+                    steps,
+                    base,
+                });
+            }
+            Root::Step(step) => {
+                if steps.len() >= MAX_STEPS {
+                    return Err(Error::Corrupt(format!(
+                        "the branch table at {} runs back more than {MAX_STEPS} steps",
+                        head.offset
+                    )));
+                }
+                at = step.prev;
+                steps.push(step);
+            }
+        }
+    }
+}
+
+pub(crate) fn load(
+    store: &Store,
+    head: Option<Ptr>,
+    since: Option<(Ptr, &Refs, usize)>,
+) -> Result<(Refs, usize)> {
+    let Some(head) = head else {
+        return Ok((Map::new(), 0));
+    };
+    let Layers {
+        steps,
+        mut base,
+        depth,
+    } = layers(store, head, since)?;
+    if depth > MAX_STEPS {
+        return Err(Error::Corrupt(format!(
+            "the branch table at {} runs back more than {MAX_STEPS} steps",
+            head.offset
+        )));
+    }
+    for step in steps.into_iter().rev() {
+        base.try_insert(step.name, step.head)?;
+    }
+    Ok((base, depth))
+}
+
+pub(crate) struct Heads {
+    pub(crate) current: Vec<Chain>,
+    pub(crate) superseded: Vec<Chain>,
+}
+
+pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
+    let Layers { steps, base, .. } = layers(store, head, None)?;
+    let mut named = HashSet::new();
+    let mut heads = Heads {
+        current: Vec::new(),
+        superseded: Vec::new(),
+    };
+    let found = steps.into_iter().map(|step| (step.name, step.head));
+    for (name, head) in found.chain(base.try_entries()?) {
+        match named.insert(name) {
+            true => heads.current.push(head.log),
+            false => heads.superseded.push(head.log),
+        }
+    }
+    Ok(heads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Durability, StoreOptions};
+
+    fn open(dir: &tempfile::TempDir) -> Store {
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            ..StoreOptions::default()
+        };
+        Store::open(&dir.path().join("refs.ferro"), options)
+            .unwrap()
+            .0
+    }
+
+    fn head(version: u64) -> Head {
+        Head {
+            version,
+            root: None,
+            log: Chain::empty(),
+            merged: Map::new(),
+        }
+    }
+
+    fn table(store: &Store, branches: u64) -> Ptr {
+        let mut refs: Refs = Map::new();
+        for branch in 0..branches {
+            refs.insert(format!("b{branch}"), head(branch));
+        }
+        let mut txn = store.begin().unwrap();
+        let mut encoder = Encoder::new(&mut txn);
+        refs.encode(&mut encoder).unwrap();
+        let ptr = encoder.finish().unwrap();
+        txn.commit(ptr).unwrap();
+        ptr
+    }
+
+    fn step(store: &Store, prev: Ptr, name: &str, version: u64) -> Ptr {
+        let mut txn = store.begin().unwrap();
+        let (ptr, _) = write_step(&mut txn, store, prev, name, &head(version)).unwrap();
+        txn.commit(ptr).unwrap();
+        ptr
+    }
+
+    fn versions(refs: &Refs) -> Vec<(String, u64)> {
+        let entries = refs.try_entries().unwrap().into_iter();
+        entries.map(|(name, head)| (name, head.version)).collect()
+    }
+
+    #[test]
+    fn steps_resolve_over_their_table_newest_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let base = table(&store, 2);
+        let one = step(&store, base, "b1", 10);
+        let two = step(&store, one, "b0", 20);
+        let three = step(&store, two, "b1", 30);
+        let new = step(&store, three, "b2", 40);
+        let (refs, depth) = load(&store, Some(new), None).unwrap();
+        assert_eq!(depth, 4);
+        let expected: Vec<_> = [("b0", 20), ("b1", 30), ("b2", 40)]
+            .map(|(name, version)| (name.to_string(), version))
+            .into();
+        assert_eq!(versions(&refs), expected);
+        let (older, depth) = load(&store, Some(two), None).unwrap();
+        assert_eq!(depth, 2);
+        let (caught_up, depth) = load(&store, Some(new), Some((two, &older, 2))).unwrap();
+        assert_eq!(depth, 4);
+        assert_eq!(versions(&caught_up), expected);
+    }
+
+    #[test]
+    fn a_reader_from_before_steps_fails_on_a_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let base = table(&store, 3);
+        let one = step(&store, base, "b0", 7);
+        let two = step(&store, one, "b1", 8);
+        for head in [one, two] {
+            let old = store.load::<Refs>(head).unwrap();
+            assert!(old.try_entries().is_err());
+            assert!(old.try_get("b0").is_err());
+        }
+        assert_eq!(versions(&store.load::<Refs>(base).unwrap()).len(), 3);
+    }
+
+    #[test]
+    fn a_table_whose_count_is_the_step_tag_reads_as_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        for branches in [126, 127, 128] {
+            let base = table(&store, branches);
+            let (refs, depth) = load(&store, Some(base), None).unwrap();
+            assert_eq!((refs.len(), depth), (branches as usize, 0));
+            let top = step(&store, base, "b5", 99);
+            let (refs, depth) = load(&store, Some(top), None).unwrap();
+            assert_eq!((refs.len(), depth), (branches as usize, 1));
+            assert_eq!(refs.try_get("b5").unwrap().unwrap().version, 99);
+        }
+    }
+
+    #[test]
+    fn a_chain_of_steps_past_the_limit_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let mut top = table(&store, 1);
+        for version in 1..=MAX_STEPS as u64 {
+            top = step(&store, top, "b0", version);
+        }
+        assert_eq!(load(&store, Some(top), None).unwrap().1, MAX_STEPS);
+        top = step(&store, top, "b0", 0);
+        assert!(matches!(
+            load(&store, Some(top), None),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_step_must_carry_its_tag_and_nothing_after_its_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let base = table(&store, 1);
+        for (tag, extra) in [(STEP, true), (STEP - 1, false), (STEP + 1, false)] {
+            let mut txn = store.begin().unwrap();
+            let mut encoder = Encoder::new(&mut txn);
+            encoder.u8(tag);
+            encoder.link(base);
+            encoder.varint(2);
+            encoder.raw(b"b0");
+            head(3).encode(&mut encoder).unwrap();
+            if extra {
+                encoder.u8(0);
+            }
+            let ptr = encoder.finish().unwrap();
+            txn.commit(ptr).unwrap();
+            assert!(load(&store, Some(ptr), None).is_err());
+        }
+    }
+}

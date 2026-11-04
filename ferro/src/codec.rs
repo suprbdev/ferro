@@ -612,6 +612,12 @@ impl<'a> Decoder<'a> {
         self.buf.len() - self.pos
     }
 
+    pub(crate) fn lone_varint(&self) -> bool {
+        let rest = &self.buf[self.pos..];
+        let end = rest.iter().position(|byte| byte & 0x80 == 0);
+        end.is_some() && end == rest.len().checked_sub(1)
+    }
+
     pub(crate) fn heap(&self) -> usize {
         self.heap
     }

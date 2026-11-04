@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry, skip_version};
 use crate::platform::copy_owner;
 pub(crate) use crate::platform::{rename, sync_parent};
+use crate::refs;
 use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
 
 const FLUSH_BYTES: usize = 1 << 20;
@@ -68,18 +69,16 @@ pub(crate) fn sibling(path: &Path) -> PathBuf {
 pub(crate) struct Roots {
     pub(crate) trees: Vec<Ptr>,
     pub(crate) chains: Vec<Chain>,
+    pub(crate) superseded: Vec<Chain>,
 }
 
 impl Roots {
-    pub(crate) fn of(head: Ptr, refs: &Refs) -> Result<Roots> {
-        let chains = refs
-            .try_entries()?
-            .into_iter()
-            .map(|(_, branch)| branch.log)
-            .collect();
+    pub(crate) fn of(store: &Store, head: Ptr) -> Result<Roots> {
+        let heads = refs::heads(store, head)?;
         Ok(Roots {
             trees: vec![head],
-            chains,
+            chains: heads.current,
+            superseded: heads.superseded,
         })
     }
 
@@ -91,10 +90,19 @@ impl Roots {
     ) -> Result<()> {
         let mut stack = Vec::new();
         let mut entries = HashSet::new();
+        let mut floors: HashMap<u64, u64> = HashMap::new();
         let mut closures = Closures::default();
-        for chain in &self.chains {
+        let mut superseded: Vec<&Chain> = self.superseded.iter().collect();
+        superseded.sort_by_key(|chain| chain.first);
+        let chains = self.chains.iter().map(|chain| (chain, false));
+        for (chain, replaced) in chains.chain(superseded.into_iter().map(|chain| (chain, true))) {
             let after = chain.after(store)?;
             chain.visit(store, |ptr, entry, object, len| {
+                let floor = floors.entry(ptr.offset).or_insert(u64::MAX);
+                if replaced && *floor <= chain.first {
+                    return Ok(false);
+                }
+                *floor = (*floor).min(chain.first);
                 if entries.insert(ptr.offset) && fresh(ptr) {
                     visit(ptr, object, len);
                 }

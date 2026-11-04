@@ -26,6 +26,7 @@ use crate::map::Map;
 use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
+use crate::refs;
 use crate::store::{
     Durability, Frame, Landing, Op, Retired, Settling, Store, StoreOptions, Trace, Txn,
 };
@@ -242,6 +243,12 @@ pub(crate) type Refs = Map<String, Head>;
 struct RefState {
     refs: Refs,
     ptr: Option<Ptr>,
+    depth: usize,
+}
+
+enum Next {
+    Table(Refs),
+    Head(String, Head),
 }
 
 pub struct Snapshot<T> {
@@ -1033,10 +1040,7 @@ impl Options {
         let (store, head) = Store::open(path.as_ref(), self.store)?;
         let genesis = Arc::new(init());
         let genesis_hash = try_hash_of(&*genesis)?;
-        let refs = match head {
-            Some(ptr) => (*store.load::<Refs>(ptr)?).clone(),
-            None => Map::new(),
-        };
+        let (refs, depth) = refs::load(&store, head, None).inspect_err(|_| store.close())?;
         let settled = store.last_seq();
         let automatic = !read_only && self.history != Keep::All && self.reclaim.every_bytes > 0;
         let signal = Arc::new(Signal {
@@ -1059,8 +1063,13 @@ impl Options {
             tip: Mutex::new(RefState {
                 refs: refs.clone(),
                 ptr: head,
+                depth,
             }),
-            published: Mutex::new(RefState { refs, ptr: head }),
+            published: Mutex::new(RefState {
+                refs,
+                ptr: head,
+                depth,
+            }),
             queue: Mutex::new(Queue {
                 waiting: Vec::new(),
                 open: Vec::new(),
@@ -1636,14 +1645,34 @@ impl<T: Data> Shared<T> {
     fn stage(
         &self,
         tip: &mut RefState,
-        refs: Refs,
+        next: Next,
         mut txn: Txn,
         branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
         settling: Option<&mut Settling>,
     ) -> Result<Landing> {
         txn.unshared();
-        let (ptr, refs) = write_decoded(&refs, &mut txn, &self.store())?;
+        let store = self.store();
+        let (ptr, refs, depth) = match (next, tip.ptr) {
+            (Next::Head(name, head), Some(prev)) if tip.depth < refs::STEPS => {
+                let (ptr, head) = refs::write_step(&mut txn, &store, prev, &name, &head)?;
+                let mut refs = tip.refs.clone();
+                refs.try_insert(name, head)?;
+                (ptr, refs, tip.depth + 1)
+            }
+            (next, _) => {
+                let refs = match next {
+                    Next::Table(refs) => refs,
+                    Next::Head(name, head) => {
+                        let mut refs = tip.refs.clone();
+                        refs.try_insert(name, head)?;
+                        refs
+                    }
+                };
+                let (ptr, refs) = write_decoded(&refs, &mut txn, &store)?;
+                (ptr, refs, 0)
+            }
+        };
         if let Some(settling) = settling {
             settling.take_seen(&mut txn);
         }
@@ -1657,6 +1686,7 @@ impl<T: Data> Shared<T> {
         });
         tip.refs = refs;
         tip.ptr = Some(ptr);
+        tip.depth = depth;
         let refs = tip.clone();
         let mut queue = self.queue.lock();
         if let Some((seal, version, time_ms)) = seal {
@@ -1987,8 +2017,7 @@ impl<T: Data> Shared<T> {
             value: Arc::new(value),
             commit: Arc::new(commit),
         };
-        let mut next = tip.refs.clone();
-        next.insert(
+        let next = Next::Head(
             branch.name.clone(),
             Head {
                 version,
@@ -2057,7 +2086,8 @@ impl<T: Data> Shared<T> {
                 return Ok(0);
             }
             let txn = store.begin()?;
-            self.stage(tip, next, txn, None, None, None)?.land()?;
+            self.stage(tip, Next::Table(next), txn, None, None, None)?
+                .land()?;
             self.settle(store.last_seq(), notices)?;
             let refs = tip.refs.clone();
             for branch in self.branches.lock().values() {
@@ -2173,7 +2203,7 @@ impl<T: Data> Shared<T> {
         temp: &Path,
         head: Ptr,
     ) -> Result<()> {
-        let refs = (*fresh.load::<Refs>(head)?).clone();
+        let (refs, depth) = refs::load(fresh, Some(head), None)?;
         let mut published = self.published.lock();
         let branches = self.branches.lock();
         for (_, found) in refs.try_entries()? {
@@ -2195,6 +2225,7 @@ impl<T: Data> Shared<T> {
         fresh.trace(Op::SyncDir);
         tip.refs = refs;
         tip.ptr = Some(head);
+        tip.depth = depth;
         self.store.store(Arc::new(fresh.clone()));
         *published = tip.clone();
         for (branch, state) in states {
@@ -2993,7 +3024,7 @@ impl<T: Data> Db<T> {
         let store = self.shared.store();
         let txn = store.begin()?;
         self.shared
-            .stage(&mut tip, next, txn, None, None, None)?
+            .stage(&mut tip, Next::Table(next), txn, None, None, None)?
             .land()?;
         let ticket = store.last_seq();
         drop(tip);
@@ -3041,7 +3072,7 @@ impl<T: Data> Db<T> {
                 }
             }
             self.shared
-                .stage(&mut tip, next, txn, None, None, None)?
+                .stage(&mut tip, Next::Table(next), txn, None, None, None)?
                 .land()?;
             let ticket = store.last_seq();
             self.shared.settle(ticket, &mut notices)?;
@@ -3105,7 +3136,15 @@ impl<T: Data> Db<T> {
         let Some(ptr) = head else {
             return Ok(false);
         };
-        let refs = (*store.load::<Refs>(ptr)?).clone();
+        let since = tip
+            .ptr
+            .filter(|_| !replaced)
+            .map(|known| (known, &tip.refs, tip.depth));
+        let (refs, depth) = refs::load(&store, Some(ptr), since).inspect_err(|_| {
+            if replaced {
+                store.close();
+            }
+        })?;
         let mut published = self.shared.published.lock();
         let attached: Vec<_> = self.shared.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
@@ -3121,6 +3160,7 @@ impl<T: Data> Db<T> {
         }
         tip.refs = refs;
         tip.ptr = Some(ptr);
+        tip.depth = depth;
         if replaced {
             self.shared.store.store(Arc::new(store.clone()));
         }
@@ -3226,7 +3266,7 @@ impl<T: Data> Db<T> {
             None => {
                 let refs = tip.refs.clone();
                 shared
-                    .stage(&mut tip, refs, txn, None, None, None)?
+                    .stage(&mut tip, Next::Table(refs), txn, None, None, None)?
                     .land()?;
             }
         }
@@ -3248,7 +3288,9 @@ impl<T: Data> Db<T> {
                 return Ok(out);
             };
             let before = tip.refs.clone();
-            shared.stage(tip, next, txn, None, None, None)?.land()?;
+            shared
+                .stage(tip, Next::Table(next), txn, None, None, None)?
+                .land()?;
             shared.settle(store.last_seq(), &mut notices)?;
             let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
             let mut states = Vec::new();

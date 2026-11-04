@@ -26,9 +26,10 @@ copying stays proportional to what was written.
    less than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.
 4. Swap, under every branch's lane and the `tip` mutex. This is the only pause. Wait for queued
-   commits, copy what is left, write both superblock slots and sync. Open the new file, which takes
-   its writer lock, and read every branch's tip and root from it. Rename it over the old one, sync
-   the directory (on Windows, flush the renamed file), and rebind every branch.
+   commits, copy what is left, write the branch table whole and both superblock slots, and sync, so
+   the new file starts with no [steps](commit-path.md#branch-table-steps) on its table. Open the new
+   file, which takes its writer lock, and read every branch's tip and root from it. Rename it over
+   the old one, sync the directory (on Windows, flush the renamed file), and rebind every branch.
 5. Retire, with no lock. Clear the old generation's cache. Its file goes when the last handle does.
 
 The new file continues the frame sequence, so group commit tickets stay in order. It has no frames

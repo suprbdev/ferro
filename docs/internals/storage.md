@@ -102,7 +102,14 @@ size the file had when this generation began and how much of the previous one su
 an anchor, the newest position known to be durable. The log is a run of frames, one per commit. A
 frame is a 68-byte header (magic, sequence, end offset, head pointer, xxh3-128 check) followed by
 the records the commit wrote. The check covers the header and every record, so a frame proves by
-itself that it reached the disk whole. A commit does this:
+itself that it reached the disk whole. The head pointer names the branch table, or a step that puts
+one branch's new head on the table or step the frame before named, as described under [Branch-table
+steps](commit-path.md#branch-table-steps). A table's body is the varint count of its branches and
+its one link the root of the `Map`, as it always was. A step's body is the byte `0x7f`, the branch's
+name as a varint length and its bytes, and the `Head` as the table stores it: the version, the first
+version kept, the root and the log's tip each as a flag byte and, when set, a link, and the map of
+merge records. Its first link is the table or step before it, followed by the head's links. A commit
+does this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.

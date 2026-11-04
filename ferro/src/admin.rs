@@ -11,6 +11,7 @@ use crate::log::Closures;
 use crate::map::Map;
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
+use crate::refs::{self, Root};
 use crate::store::{Store, StoreOptions};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,10 +65,7 @@ fn read_only(path: &Path) -> Result<(Closing, Option<Ptr>)> {
 }
 
 fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
-    match head {
-        Some(ptr) => Ok((*store.load::<Refs>(ptr)?).clone()),
-        None => Ok(Map::new()),
-    }
+    Ok(refs::load(store, head, None)?.0)
 }
 
 pub fn info(path: impl AsRef<Path>) -> Result<Info> {
@@ -125,7 +123,7 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
     };
     if let Some(ptr) = head {
         let mut seen = HashSet::new();
-        let roots = Roots::of(ptr, &load_refs(store, head)?)?;
+        let roots = Roots::of(store, ptr)?;
         roots.walk(
             store,
             |ptr| seen.insert(ptr),
@@ -162,7 +160,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     })?;
     let root = Kind::value::<T>();
     let mut queue: Vec<(Ptr, Kind)> = roots.into_iter().map(|ptr| (ptr, root.clone())).collect();
-    queue.extend(head.map(|ptr| (ptr, Kind::value::<Refs>())));
+    queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>())));
     let mut checked = Checked::default();
     while let Some((ptr, kind)) = queue.pop() {
         let shape = match checked.get(&ptr.hash, &kind) {
@@ -204,9 +202,8 @@ pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let (store, head) = read_only(path.as_ref())?;
     let mut extents = Vec::new();
     if let Some(ptr) = head {
-        let refs = load_refs(&store, head)?;
-        let mut roots = Roots::of(ptr, &refs)?;
-        for chain in &mut roots.chains {
+        let mut roots = Roots::of(&store, ptr)?;
+        for chain in roots.chains.iter_mut().chain(&mut roots.superseded) {
             *chain = chain.pruned(&store, keep)?;
         }
         let mut seen = HashSet::new();
@@ -269,7 +266,7 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
             ..Compacted::default()
         });
     };
-    let refs = load_refs(&store, Some(head))?;
+    let refs = load_refs(&store, Some(head)).inspect_err(|_| store.close())?;
     let temp = sibling(path);
     let result = write_copy(&store, &refs, keep, &temp, before_bytes).and_then(|mut report| {
         rename(&temp, path)?;

@@ -47,6 +47,8 @@ Tests are described next to what they test:
   checkpoints](storage.md#buffered-durability-and-checkpoints).
 - A frame that another branch moves, compared byte for byte: [Drafting outside
   `tip`](commit-path.md#drafting-outside-tip).
+- Power cuts across branch-table steps, a reader from before steps, and a file written before them:
+  [Branch-table steps](commit-path.md#branch-table-steps).
 - Awaited writes, dropped futures and crash images: [Tests](async-writes.md#tests).
 - Writes from inside a closure, `ferro/tests/reentry.rs` and `reentry_sync.rs`: [Writes from inside
   a closure](reentrancy.md#the-cases).

@@ -72,6 +72,9 @@ numbers. This index lists them by subsystem.
   branch](commit-path.md#a-lock-per-branch).
 - Keeping moved-node records in a vector of their own: [Drafting outside
   `tip`](commit-path.md#drafting-outside-tip).
+- Head records linked from a table of links, the branch table without LZ4, merge records outside
+  the head, and a table every 16, 32 or 128 steps: [Branch-table
+  steps](commit-path.md#branch-table-steps).
 - Encoding outside the writer lock, copying unchanged entries of changed nodes, an LZ4 compressor of
   our own, no LZ4 for small bodies, reused buffers, SIMD hashing and cheaper index maintenance:
   [Measured and left out](commit-cost.md#measured-and-left-out).

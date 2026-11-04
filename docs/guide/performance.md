@@ -3,8 +3,9 @@
 Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
 `ferro-bench`. Random `get`, full scan and range read are medians of seven runs, and bulk insert of
 five, on a machine shared with other jobs. The fsync commit is a median of three runs and the
-coalesced writers of eight on a machine shared with other jobs, and the booking commits come from
-`ferro-bench`'s `tables` tool the same way. The rest are single runs on an otherwise idle machine.
+coalesced writers of eight on a machine shared with other jobs, the commits on 16 branches of four
+from `ferro-bench`'s `group` tool, and the booking commits come from `ferro-bench`'s `tables` tool
+the same way. The rest are single runs on an otherwise idle machine.
 
 | Operation | Result |
 | --- | --- |
@@ -16,6 +17,7 @@ coalesced writers of eight on a machine shared with other jobs, and the booking 
 | Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
 | Reads per second with those writers running | 38M |
 | The same 8 writers with `coalesce` | about 14,600 per second, 12,800 before in the same runs |
+| Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 125,000 per second |
 | Single-key commit, `Durability::Buffered` | 27 µs |
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.5 µs per changed key |

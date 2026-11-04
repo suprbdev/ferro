@@ -478,7 +478,179 @@ Left open:
 
 - The leaf of the branch table that holds a commit's head is encoded again on every commit, with the
   nodes above it, and at 16 branches inserting into and writing the refs are more than half of what
-  a commit does under `tip`. A format that kept each head in a record of its own, drafted with the
-  commit, would leave only the nodes that link the heads to write under `tip`.
+  a commit does under `tip`. A commit now writes one small record in their place, as described
+  under [Branch-table steps](#branch-table-steps).
 - Moving a draft runs 13,000 instructions for a 2.5 KB frame, about a fifth of a commit's
   instructions under `tip` at 16 branches.
+
+## Branch-table steps
+
+After the log entry was drafted, writing the refs was over half of what a commit did under `tip` at
+16 branches (#53). The refs are the branch table, a `Map` from branch name to head, which is a
+Merkle tree like any other, so a commit already rewrote only the path to its own head: the leaf
+that holds it and the node above, 1.9 nodes a commit at 16 branches and 1.8 larger ones at 64. A
+loop that inserts one head and writes the table as a commit does, 20,000 times, counted where that
+work goes at 16 branches, per commit:
+
+| Part | Instructions |
+| --- | ---: |
+| Encoding the leaf that holds the new head | 4,200 |
+| Hashing the nodes | 5,600 |
+| The cached copy of each node, for the next insert | 7,300 |
+| Appending the records, 3,300 of it LZ4 | 8,100 |
+| Handing each copy to the cache | 1,700 |
+
+No one part is the cost. Each node on the path is encoded whole, hashed, compressed, appended and
+copied for the cache, and the nodes grow with the number of branches: in the same loop writing and
+placing the table took 10,700 instructions with one branch, 33,400 with 16 and 50,000 with 64. Each
+alternative was measured against the work it would leave under `tip`, the prototypes with
+`Durability::Buffered` on tmpfs, alternating with the tree before:
+
+- Each head as a record of its own, drafted with the commit outside `tip`, and the table holding a
+  link to it in place of the head. The nodes on the path hold one link per head instead of a head
+  with two, and writing the table took 24,200 instructions instead of 33,400 at 16 branches and
+  35,800 instead of 50,000 at 64. A prototype that kept such a table and wrote it under `tip`,
+  without drafting or writing the head records at all, ran 110,011 and 109,178 commits a second at 8
+  branches against 87,398 and 80,022 for the table of heads, and 77,326 and 75,250 at 16 against
+  66,780 and 67,422. That is its ceiling, since the head records it left out cost a draft and bytes
+  of their own, and a path of nodes is still written under `tip` for every commit.
+- Writing the table without LZ4 saves the 3,300 instructions of compressing it, 10% at 16 branches
+  and 14% at 64 in the loop. In the same runs it gave 90,812 and 81,384 commits a second at 8
+  branches and 69,295 and 54,240 at 16, within what the table of heads did, for 2% more bytes per
+  commit at 8 and 16 branches and 4% at 64, the trade it was when last measured.
+- Moving merge records out of the head. With none, which is the case in these runs, the `merged`
+  map is one byte of each head. With one record in every head writing the table took 11% more at 16
+  branches and 10% more at 64, so moving them out saves that on branches that pull from peers, and
+  nothing elsewhere.
+- Writing under `tip` only the head that changed, linked to the table the frame before named. A
+  prototype that wrote that record in place of the table ran 153,869 and 152,084 commits a second at
+  8 branches against 87,416 and 86,310, and 129,321 and 127,544 at 16 against 57,001 and 68,156.
+  This is what was kept.
+
+### Steps and tables
+
+A frame's head pointer, and the superblock's, now names either a table, the `Map` as it was, or a
+step: a record of a tag byte, one branch's name and that branch's `Head` encoded as the table
+encodes it, whose first link is the table or step that the frame before named. The heads a step
+names are those of the object it links, with its own put in, so a chain of steps over a table gives
+every branch's head, the newest step for each name winning. A commit writes a step under `tip` where
+it wrote the table path: one record of about 90 bytes, three links and a body too short to compress,
+and a fourth link when the branch holds merge records. It decodes the head back from what it
+encoded, as the table's heads were, so a merge record map is a link and the branch's next step does
+not write it again, and puts it into the table kept in memory, which every reader of `published` and
+`tip` uses as before. Forks, `drop_branch`, pruning, a cycle, the landing of a `receive` and the
+records a pull writes all write a table, as they did, and so does the commit that would put a 65th
+step on one. That table carries every node the steps since the last one changed, in one frame, so
+its cost comes back once every 64 commits: about 83,000 instructions at 16 branches and 220,000 at
+64, by the difference between a step's own 3,900 and the average under `tip`.
+
+Open, `refresh`, the swap of a cycle and the admin tools follow the steps back to their table and
+apply them oldest first. A writer keeps at most 64 on a table, and a reader refuses a chain of more
+than 1,024, so a damaged or hostile file cannot make it walk without end. A follower's `refresh`
+stops at the head it already holds, so it reads only the steps since its last refresh. The object at
+the head says which it is by its body alone: a table's body is the varint count of its branches and
+nothing more, and a step's continues past its tag, so a table of 127 branches, whose count is the
+tag's byte, still reads as a table (`a_table_whose_count_is_the_step_tag_reads_as_a_table`).
+Applying the steps reads nodes of the table into the cache, and a cached head holds a map that holds
+the store, so an open that failed on a later step kept the store, and with it the writer's lock,
+alive. The `open` fuzz target found it as a leak. Open, `refresh` of a replaced file and offline
+compaction now close the store before they return the error
+(`an_open_that_fails_on_the_table_under_its_steps_releases_the_file`).
+
+The format of a table did not change, and neither did the magic. A file written before this change
+has a table at its head, which reads as it did, and its next commit writes a step on it
+(`a_file_whose_heads_all_sit_in_one_table_opens_and_moves_on_to_steps` opens a fixture of that
+format with merge records, a dropped branch and a cycle behind it, reads it read-only and
+read-write, commits on it, follows it and compacts it). A build from before this change still opens
+a file whose head is a table, which a fork, `drop_branch`, a pull or a cycle leaves, and refuses one
+whose head is a step: it reads the step as a table whose root is the object the step links first,
+which is a table's body, too short for a node, or a step, which if it reads as a node at all reads
+as one at level 127, past the deepest level a node may have. So it fails with a decode error instead
+of reading wrong heads (`a_reader_from_before_steps_fails_on_a_step`).
+
+Every guarantee the table gave still holds:
+
+- Each frame names one consistent set of heads. A step is built under `tip` on the head the frame
+  before named, as the table was.
+- Recovery keeps a prefix of frames. A step links only records of frames placed before its own, so
+  every prefix resolves. `a_power_cut_across_branch_table_steps_keeps_one_set_of_heads` commits on
+  four branches in turn, so the heads after each frame are known, crosses the 64-step bound twice
+  with a fork and a drop between, and checks that every image of a cut, with all, none, half or torn
+  sectors of what was not synced, opens with the heads of one prefix of the commits. The power-cut
+  tests with frames written out of order now write steps too.
+- `verify` walks the steps and their table as objects, and every head they hold as a chain: the
+  heads in use as before, then those a later step replaced, the lowest `first` first, each down to
+  its own `first` and only until it meets an entry already walked down to a `first` at or below its
+  own. So a replaced head's tip and root are read and checked, every skip link it follows lands on
+  an entry some walk read, and the history a cycle cut below it is not followed. Walked like any
+  other object instead, a replaced head led `verify` into history a cycle had cut, and it failed on
+  `pointer 0 outside log` (`verify_reads_heads_that_steps_replaced_down_to_their_own_first`).
+  Stopping at the first entry already read did the same through a skip link that jumped past where
+  the walk stopped, which the model of pruned devices that sync found at five times its scale, and
+  `verify_holds_while_pruned_branches_fork_drop_and_cycle` finds in its first four seeds.
+  `verify_typed` checks a step as a typed object, and its first link as a table or a step. `layout`
+  walks the same objects.
+- A reclamation cycle copies the table kept in memory, so the new file starts with a table and no
+  steps. Entries are still copied by the offset they were read from, as described under [Commits
+  stored twice](sync-receive.md#commits-stored-twice), and steps are written without looking in
+  `dedupe`, as the table is.
+- Sync builds haves and bundles from the published heads in memory, and its merge records and the
+  merge graph live in heads and entries that did not change.
+
+`group` with `--branches own`, single-key commits into 100,000 keys with no closure, median of four
+alternating runs on the NVMe drive of the 32-core machine, commits a second, bytes per commit and
+p50:
+
+| Durability | Branches | Before | After | Bytes, before | After | p50, before | After |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Buffered | 1 | 48,106 | 50,050 (1.04x) | 2,306 | 2,301 | 19 µs | 18 µs |
+| Buffered | 4 | 94,371 | 109,704 (1.16x) | 2,532 | 2,348 | 40 µs | 34 µs |
+| Buffered | 8 | 89,781 | 150,017 (1.67x) | 2,726 | 2,350 | 88 µs | 50 µs |
+| Buffered | 16 | 69,546 | 125,360 (1.80x) | 2,902 | 2,344 | 239 µs | 123 µs |
+| Buffered | 64 | 37,909 | 55,438 (1.46x) | 3,518 | 2,372 | 1,765 µs | 1,150 µs |
+| Fsync | 1 | 2,514 | 2,583 | 2,266 | 2,258 | 396 µs | 380 µs |
+| Fsync | 4 | 5,396 | 5,284 | 2,471 | 2,284 | 730 µs | 758 µs |
+| Fsync | 8 | 9,844 | 10,314 | 2,674 | 2,294 | 807 µs | 776 µs |
+| Fsync | 16 | 18,704 | 18,238 | 2,875 | 2,306 | 838 µs | 870 µs |
+| Fsync | 64 | 29,568 | 45,328 (1.53x) | 3,510 | 2,368 | 2,140 µs | 1,269 µs |
+
+Buffered p99 at 16 branches fell from 630 to 350 µs. Fsync waits on the disk, one fdatasync per
+round of branches, and moved within its runs up to 16 branches, where single runs ranged from 0.92
+to 1.09 of before. At 64 branches it was `tip` again, and the gain shows. With counters around the
+time `tip` is held, Buffered, the mean of two runs of each:
+
+| Part | 1 branch, before | After | 16 branches, before | After | 64 branches, before | After |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| All of it | 3.4 µs, 16,449 | 2.5 µs, 10,354 | 13.4 µs, 58,370 | 7.3 µs, 29,523 | 21.0 µs, 85,910 | 11.3 µs, 41,395 |
+| Writing the refs | 0.8 µs, 7,795 | 0.4 µs, 3,889 | 4.4 µs, 27,921 | 0.9 µs, 5,201 | 7.3 µs, 43,172 | 1.4 µs, 7,332 |
+| Inserting the head | 0.3 µs, 2,781 | 0.2 µs, 1,836 | 1.2 µs, 5,600 | 1.0 µs, 4,591 | 1.9 µs, 7,836 | 1.6 µs, 7,384 |
+| Moving the draft | 0.0 µs, 411 | 0.0 µs, 414 | 1.6 µs, 13,095 | 1.8 µs, 13,130 | 1.8 µs, 13,133 | 1.8 µs, 13,324 |
+| Placing and queueing | 0.6 µs, 2,188 | 0.2 µs, 1,474 | 3.4 µs, 6,653 | 1.2 µs, 3,511 | 6.9 µs, 15,376 | 4.0 µs, 10,104 |
+| Checking the branch, reading its head | 0.2 µs, 1,342 | 0.1 µs, 894 | 0.8 µs, 1,970 | 0.5 µs, 1,143 | 0.9 µs, 2,060 | 0.6 µs, 1,295 |
+
+Placing got cheaper because it no longer hands the table nodes it just wrote to the cache, and
+reading a head because the table in memory holds the nodes the steps changed rather than links the
+cache has to resolve. `tables`, one Buffered writer, median of five interleaved runs: outside the
+closure a hold ran 570,145 instructions before and 565,637 after, a confirm 736,902 and 732,681, and
+a cancel 906,589 and 900,022, with thread CPU time of 74.6 and 73.0, 95.0 and 93.5, and 123.0 and
+121.0 µs, and bytes per write went from 13,367 to 13,362.
+
+What it costs is open. A read-only open read the table in one object, 5 to 7 µs here whatever the
+branches, and now reads every step on it too, about half a microsecond each: 37 µs with 63 steps on
+one branch, 42 µs at 16 branches and 55 µs at 64, and with every branch's state loaded 59 µs
+against 26 µs at 16 branches and 131 µs against 92 µs at 64. A `refresh` after one commit took 3.2,
+10.2 and 33.3 µs at 1, 16 and 64 branches, against 3.3, 11.3 and 34.6 µs before, whatever the
+depth. Writing a table every 16, 32 or 128 steps instead of 64, median of three alternating runs,
+gave 0.97, 0.98 and 1.00 of the commits a second at 8 branches, 0.89, 0.97 and 1.02 at 16 and 0.95,
+0.97 and 1.02 at 64, and 128 would double what open pays, so the bound stays at 64.
+
+Left open:
+
+- Inserting the head into the table kept in memory, 1.0 µs at 16 branches and 1.6 µs at 64, is
+  still under `tip`, and so is moving the draft, now the largest part at 16 branches.
+- A fork, `drop_branch` and a pull write a table, with every node the steps since the last one
+  changed, under `tip`.
+- Open reads the steps one record at a time, up to 64 reads. They sit in the frames written since
+  their table, so one read over that stretch of the log would serve them all.
+- Placing and queueing grows to 4.0 µs and 10,100 instructions at 64 branches, against 1.2 µs and
+  3,500 at 16, which looks like contention on the queue's mutex and was not looked into.
