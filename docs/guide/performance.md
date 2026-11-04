@@ -143,6 +143,10 @@ more work for a `wiki` commit than before: the example's tokenizer had compiled 
 with it rewritten `wiki` commits 1,004 times a second against 548 before the fix and 638 before
 `Shared`, medians of three alternating runs on a machine that other work was sharing.
 
+The filtered scan is fixed. A fold called its closure from a loop for each kind of run, so the
+compiler stopped inlining a closure over table rows, and the scan now takes 18.7 ns a row against
+32.6 in alternating runs, as [Scans](../internals/read-path.md#scans) describes.
+
 ## More measurements
 
 - [Example apps](examples.md) has load-test figures for `chat` and `booking`, measured on 2026-11-03

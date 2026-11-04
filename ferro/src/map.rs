@@ -3981,6 +3981,34 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
     }
 }
 
+enum Run<'a, V, S> {
+    Column(&'a Arc<[V]>, &'a [V], usize),
+    Slots(&'a [Slot<V, S>]),
+}
+
+impl<'a, V: Data, S> Run<'a, V, S> {
+    #[inline]
+    fn of(cells: &'a Cells<V, S>, run: Range<usize>) -> Self {
+        match cells {
+            Cells::Column(column) => Run::Column(column, &column[run.clone()], run.start),
+            Cells::Slots(slots) => Run::Slots(&slots[run]),
+        }
+    }
+
+    #[inline(always)]
+    fn value(&self, store: Option<&Store>, offset: usize) -> Val<V> {
+        match self {
+            Run::Column(_, values, _) if by_copy::<V>() => {
+                Val(Held::Copied(values[offset].clone()))
+            }
+            Run::Column(column, _, start) => {
+                Val(Held::Column(Arc::clone(column), (start + offset) as u32))
+            }
+            Run::Slots(slots) => fatal(read_slot(store, &slots[offset])),
+        }
+    }
+}
+
 pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
     front: Vec<Frame<K, V, S>>,
@@ -4128,28 +4156,15 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
 
     fn fold<B, F: FnMut(B, Self::Item) -> B>(mut self, init: B, mut f: F) -> B {
         let store = self.store.clone();
-        self.drain(init, |mut total, node, run| {
-            if let Cells::Column(column) = &node.cells
-                && by_copy::<V>()
-            {
-                for (key, value) in node.keys[run.clone()].iter().zip(&column[run]) {
-                    total = f(total, (key.clone(), Val(Held::Copied(value.clone()))));
-                }
-                return total;
-            }
+        self.drain(init, |total, node, run| {
             let keys = &node.keys[run.clone()];
-            if let Cells::Column(column) = &node.cells {
-                let column = column.clone();
-                for (key, index) in keys.iter().zip(run) {
-                    total = f(total, (key.clone(), Val::of_column(&column, index)));
-                }
-                return total;
-            }
-            for (key, index) in keys.iter().zip(run) {
-                let value = fatal(node.value(store.as_ref(), index));
-                total = f(total, (key.clone(), value));
-            }
-            total
+            let values = Run::of(&node.cells, run);
+            (0..keys.len()).fold(total, |total, offset| {
+                f(
+                    total,
+                    (keys[offset].clone(), values.value(store.as_ref(), offset)),
+                )
+            })
         })
     }
 }
@@ -4215,18 +4230,11 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
 
     fn fold<B, F: FnMut(B, Val<V>) -> B>(mut self, init: B, mut f: F) -> B {
         let store = self.0.store.clone();
-        self.0.drain(init, |mut total, node, run| {
-            if let Cells::Column(column) = &node.cells {
-                let column = column.clone();
-                for index in run {
-                    total = f(total, Val::of_column(&column, index));
-                }
-                return total;
-            }
-            for index in run {
-                total = f(total, fatal(node.value(store.as_ref(), index)));
-            }
-            total
+        self.0.drain(init, |total, node, run| {
+            let values = Run::of(&node.cells, run.clone());
+            (0..run.len()).fold(total, |total, offset| {
+                f(total, values.value(store.as_ref(), offset))
+            })
         })
     }
 }

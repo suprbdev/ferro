@@ -184,6 +184,39 @@ With memory out of the picture at that size, the floor is 2 ns a key for a fold 
 ns for a `for` loop. A `for` loop over strings gained nothing, because the same two atomic
 operations now act on a wider handle.
 
+A fold calls the closure it is given from one place. When each kind of run had a loop of its own,
+a column held by copy, a column of values with destructors and a node's slots, the closure had two
+or three call sites, and the compiler stopped inlining one that drops a `Val` of a table row, whose
+drop glue holds the row's. Out of line, the closure took the 120-byte `Val` through memory and
+copied it with 16-byte loads that straddled the caller's 8-byte stores, which the core cannot
+forward. `ferro-bench`'s filtered scan of 200,000 rows took 101 instructions and 32.6 ns a row,
+against 68 and 17.8 ns before the folds split (#56). Folds over maps kept their gain, because a
+closure that drops a `Val` of a string or a `u64` is small enough to inline more than once.
+
+A run now decides once how it reads its values, from a column it borrows or from its slots, and one
+loop asks it for each value. The compiler unswitches that loop on the kind of run, so a column of
+rows is read by a loop of about 20 instructions with the column's address in a register. Borrowing
+the column also drops the count a clone of it took per run. Instructions per item, counted through
+`perf_event_open` in a reduced copy of each fold, and for the filtered scan the time a row in
+`ferro-bench`, median of seven alternating runs:
+
+| Fold | Instructions before | Instructions after | Time before | Time after |
+| --- | --- | --- | --- | --- |
+| Filtered scan of 200,000 table rows | 101 | 62 | 32.6 ns | 18.7 ns |
+| `range(..)` over the same rows | 102 | 59 | | |
+| `iter()` over 1M `u64` to string | 63 | 58 | | |
+| `iter()` over 1M `u64` to `u64` | 45 | 44 | | |
+| `values()` over 1M `u64` to `u64` | 45 | 43 | | |
+| `iter()` over 1M `u64` to `u64`, never flushed | 86 | 47 | | |
+| Filtered scan of 200,000 rows, never flushed | 96 | 54 | | |
+
+A map that was never flushed holds its values in slots, and those folds gained most, since the
+slot path is now inlined beside the column path rather than called per value. `rows_iter_sum` in
+`reads` went from 21.8 to 13.4 ns a row, and the 100-key ranges of `scaling` from 8,733 to 8,288
+instructions. `iter().count()` over values held by copy is the one fold that costs more, 41
+instructions a key against 38: the compiler adds up each run at once but leaves the emptied loop
+behind.
+
 ## Sorted lookups and cursors
 
 A `Cursor` keeps the path to its position, one frame per level, which holds its node as described

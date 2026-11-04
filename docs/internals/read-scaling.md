@@ -120,9 +120,11 @@ holding the other's file is gone.
 The flags made `Node` contain an `UnsafeCell`, so a `&Node` no longer tells the compiler that the
 node cannot change, and loops that call out per item reloaded the node's fields after every call:
 `iter()` scans went from 79 to 88 instructions a key and `for_each` stayed at 49. The folds of
-`Iter` and `Values` now take the keys as a slice and a clone of the column once per run, and `scan`
+`Iter` and `Values` then took the keys as a slice and a clone of the column once per run, and `scan`
 walks a leaf's keys and values as two slices, which brought `iter()` scans to 64 instructions a key
-and `for_each` to 30, 9 to 28% faster than before this work at 1 to 32 threads.
+and `for_each` to 30, 9 to 28% faster than before this work at 1 to 32 threads. The folds now borrow
+the column and call their closure from one place, as described under [Scans](read-path.md#scans),
+and `iter()` scans take 58.
 
 ### Where the flags live
 
