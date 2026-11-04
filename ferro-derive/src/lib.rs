@@ -573,11 +573,16 @@ impl Indexed {
         quote! { true #(&& #same)* }
     }
 
-    fn tag_name(&self) -> String {
+    fn tag_name(&self, stored_as: &[(Ident, String)]) -> String {
         let stored: Vec<String> = self
             .stored()
             .iter()
-            .map(|(ident, _)| ident.to_string())
+            .map(|(ident, _)| {
+                stored_as
+                    .iter()
+                    .find(|(field, _)| field == ident)
+                    .map_or_else(|| ident.to_string(), |(_, name)| name.clone())
+            })
             .collect();
         if stored.is_empty() {
             self.field().to_string()
@@ -887,10 +892,19 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     };
     let mut skipped = Vec::new();
+    let mut stored_as = Vec::new();
     for field in &named.named {
-        if matches!(parse_attrs(&field.attrs)?.fallback, Fallback::Skip) {
-            skipped.extend(field.ident.clone());
+        let attrs = parse_attrs(&field.attrs)?;
+        let Some(ident) = &field.ident else {
+            continue;
+        };
+        if matches!(attrs.fallback, Fallback::Skip) {
+            skipped.push(ident.clone());
         }
+        stored_as.push((
+            ident.clone(),
+            attrs.rename.unwrap_or_else(|| ident.to_string()),
+        ));
     }
     for ix in &indexes {
         check_cover(ix, &key_ident, &skipped)?;
@@ -916,7 +930,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         };
         table_fields.push(Field {
             ty,
-            name: ix.tag_name(),
+            name: ix.tag_name(&stored_as),
             ident: Some(field),
             span: ix.span,
             fallback: Fallback::Required,

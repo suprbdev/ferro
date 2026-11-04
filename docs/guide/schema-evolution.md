@@ -17,10 +17,10 @@ Changing a summary type `S` changes a map's encoding under the same field tag, a
 so rename the field to rebuild it. Turning an `#[index]` into a `#[unique]` rebuilds the index, and
 fails to open if two rows share a value, as described under [Unique
 indexes](../internals/schema-and-unique-indexes.md#unique-indexes). Adding, removing or reordering
-the fields in an index's `cover(...)` list rebuilds the table's indexes from the rows when the table
-is read, and the next commit stores them, as described under [Covering
-indexes](../internals/schema-and-unique-indexes.md#covering-indexes). A list naming only the
-index's own fields stores nothing and rebuilds nothing.
+the fields in an index's `cover(...)` list, or storing a covered field under another name, rebuilds
+the table's indexes from the rows when the table is read, and the next commit stores them, as
+described under [Covering indexes](../internals/schema-and-unique-indexes.md#covering-indexes). A
+list naming only the index's own fields stores nothing and rebuilds nothing.
 
 [Schema evolution](../internals/schema-and-unique-indexes.md#schema-evolution) describes the
 encoding.

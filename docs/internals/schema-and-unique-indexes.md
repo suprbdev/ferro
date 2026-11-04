@@ -63,12 +63,14 @@ in place in the leaf, clones it and builds the projection with a function the de
 takes no count on the leaf's value column. `uncovered` wraps the cursor so the iterator's type no
 longer names the projection. A plain index passes a projection that is never called.
 
-The index's field tag is a hash of `by_x cover(a,b)`, the stored fields in order, instead of
-`by_x`. A table that adds, drops or reorders a covered field finds its index field missing on
-decode and rebuilds every index of that table from the rows, as it does when an index is added, and
-the next commit writes the rebuilt maps. The old field is skipped as unknown and not written again.
-Naming only the index's own fields stores nothing, keeps the plain tag, and is not rebuilt. A
-covering unique index rebuilds under the same check for two rows sharing a value.
+The index's field tag is a hash of `by_x cover(a,b)`, the stored fields in order under the names
+their rows store them by, instead of `by_x`. A table that adds, drops or reorders a covered field,
+or stores one under another name, finds its index field missing on decode and rebuilds every index
+of that table from the rows, as it does when an index is added, and the next commit writes the
+rebuilt maps. A field renamed in Rust that keeps its stored name with `#[ferro(rename)]` keeps the
+tag. The old field is skipped as unknown and not written again. Naming only the index's own fields
+stores nothing, keeps the plain tag, and is not rebuilt. A covering unique index rebuilds under the
+same check for two rows sharing a value.
 
 Keeping the entries costs a comparison. An update that leaves the indexed value and the key alone
 but changes a covered field overwrites the entry in place, where a plain index does nothing, and an
