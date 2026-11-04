@@ -220,8 +220,38 @@ came out 24% slower in every run, but with the same counters added to both build
 ns a key against 100 to 101, on 4% fewer instructions, so that was where the code landed in that
 binary.
 
+Two regressions found later were bisected to this change. A 1M-key `bulk` load ran 3,092
+instructions a key in its inserts against 2,978 (#59). `Arc::make_mut` is inlined and
+`Shared::make_mut` was not, so every level of an insert called out to it and spilled around the
+call. Its fast path, the exchange on the strong count, the load of the weak count and the store
+back, is now inlined, and the copy for a shared node and the move for one with a `Weak` stay out of
+line, marked cold. The inserts run 2,941 instructions a key. With the values formatted before the
+loop they run 2,204 against 2,202 before `Shared` and 2,342 with `make_mut` out of line, at 2,375
+cycles a key against 2,414 and 2,420, medians of seven alternating runs. Gets, scans, ranges and
+the commit and drop after the inserts did not move.
+
+`wiki` commits in `reclaim live` fell from about 691 a second to 564 at this change (#57), but the
+store did no more work for them. With counters around each step of a single-writer edit, the slug
+lookup, the update of the page's body and the comparison took the same cycles before and after and
+the commit the same instructions, and nearly all of the 2.1M extra cycles a commit were in the
+example's tokenizer, which runs twice an edit. It ran 8.9M instructions and 3.3 to 3.6M cycles over
+a 64 KiB page where it had run 8.6M and 2.6M, even when timed before the database was opened. The
+wiki's source had not changed, but the code rustc built for it had, most likely because its codegen
+units also hold the `ferro` generics it instantiates, which this change resized.
+`token.extend(c.to_lowercase())` was no longer inlined, and the out-of-line `String::extend` read
+the lowercase characters with a 16-byte load from an 8-byte and a 4-byte store, which store
+forwarding cannot serve, once for every letter and digit. The tokenizer now pushes ASCII letters
+and digits lowercased itself and leaves other characters to `to_lowercase`, and takes 5.3M
+instructions and 1.5M cycles in either tree. With it in both trees an edit costs the same
+instructions before and after `Shared`, at cycles within 2%, and `wiki` commits 1,004 times a second
+against 548 without it, medians of three alternating runs on a machine other work was sharing.
+
 Measured and left out:
 
+- Moving the weak count to the front beside the strong count, both 32-bit so that the allocation
+  stays 152 bytes, so that `make_mut` reads one line of the allocation rather than two. Inserts ran
+  2,433 cycles a key against 2,375 with the weak count behind the value, medians of seven
+  alternating runs.
 - Deferring the drop of every evicted node that has a `Weak` memo, not only the lent ones, with the
   flags still in `Node`. With the 16 MiB cache memoized evictions outnumbered lent ones 3 and 9
   times for gets on 1 and 16 threads and 9 and 13 times for index lookups, and ranges, which never

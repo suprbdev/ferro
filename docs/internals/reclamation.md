@@ -173,7 +173,10 @@ p99 commit latency moved from 0.92 to 0.93 ms, 1.14 to 1.33 ms, 5.17 to 5.20 ms 
 The file saws between what is live and 64 MiB above it. While both files exist the peak is higher by
 what has been copied, which came to 77 MiB on `ledger` and 94 MiB on table updates. The same table
 measured on 2026-11-03, on a machine other work was sharing, had `wiki` at 670 and 680 commits a
-second, and issue #57 tracks the drop.
+second. The drop, #57, was in the example's tokenizer and not in the store, as [Where the flags
+live](read-scaling.md#where-the-flags-live) describes, and with the tokenizer rewritten `wiki` ran
+1,004 commits a second without cycles against 548, medians of three alternating runs on a machine
+other work was sharing.
 
 The rest of this section was measured on 2026-11-03. `metrics load` at 20,000 points a second with
 one commit per scrape grew to 190 MB without cycles. With them the file sawed between 3 and 62 MB
