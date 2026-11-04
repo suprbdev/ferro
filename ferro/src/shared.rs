@@ -115,6 +115,7 @@ impl<T> Shared<T> {
             .then(|| unsafe { &mut (*this.ptr.as_ptr()).data })
     }
 
+    #[inline]
     pub(crate) fn make_mut(this: &mut Self) -> &mut T
     where
         T: Clone,
@@ -124,16 +125,30 @@ impl<T> Shared<T> {
             .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            let fresh = Shared::new((**this).clone());
-            *this = fresh;
+            Shared::clone_out(this);
         } else if this.weak().load(Ordering::Relaxed) != 1 {
-            let data = unsafe { ptr::read(&raw const (*this.ptr.as_ptr()).data) };
-            let old = ManuallyDrop::new(mem::replace(this, Shared::new(data)));
-            drop(Weak { ptr: old.ptr });
+            Shared::move_out(this);
         } else {
             this.strong().store(1, Ordering::Release);
         }
         unsafe { &mut (*this.ptr.as_ptr()).data }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clone_out(this: &mut Self)
+    where
+        T: Clone,
+    {
+        *this = Shared::new((**this).clone());
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn move_out(this: &mut Self) {
+        let data = unsafe { ptr::read(&raw const (*this.ptr.as_ptr()).data) };
+        let old = ManuallyDrop::new(mem::replace(this, Shared::new(data)));
+        drop(Weak { ptr: old.ptr });
     }
 
     pub(crate) fn unwrap_or_clone(this: Self) -> T
