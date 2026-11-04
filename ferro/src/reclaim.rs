@@ -28,8 +28,8 @@ use crate::store::{
 const FLUSH_BYTES: usize = 1 << 20;
 const BATCH_BYTES: usize = 256 << 10;
 const BATCH_RECORDS: usize = 4096;
-const SPARE: usize = 256;
-const SPARE_BYTES: usize = 256 << 10;
+const SPARE: usize = 64;
+const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 4;
 
 type ByHash = BuildHasherDefault<Prehashed>;
