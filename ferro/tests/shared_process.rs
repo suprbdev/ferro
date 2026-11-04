@@ -81,6 +81,10 @@ fn shared_child() {
         waiters(Path::new(&path), count);
         return;
     }
+    if role == "mixed" {
+        mixed(Path::new(&path), count);
+        return;
+    }
     let mut options = options();
     if let Ok(step) = std::env::var("FERRO_SHARED_ABORT") {
         options = options.hook(abort_at(step, number("FERRO_SHARED_NTH")));
@@ -213,6 +217,199 @@ fn waiters(path: &Path, count: u64) {
     }
     assert_eq!(a.read().n, count + 1);
     println!("WAITERS {before} {during}");
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Padded {
+    n: u64,
+    pad: Vec<u64>,
+}
+
+fn padded(coalesce: bool) -> Options {
+    Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(1 << 20)
+        .history(Keep::Last(3))
+        .reclaim(Reclaim {
+            every_bytes: 128 << 10,
+        })
+        .coalesce(coalesce)
+        .shared(true)
+}
+
+fn bump_padded(root: &mut Padded, i: u64) -> u64 {
+    root.n += 1;
+    root.pad = vec![i; (i % 5) as usize * 40];
+    root.n
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if let std::task::Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        std::thread::park_timeout(Duration::from_millis(5));
+    }
+}
+
+fn mixed_round(dir: &Path, round: u64, each: u64) -> Vec<String> {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    let path = dir.join(format!("mixed-{round}.ferro"));
+    let a: Db<Padded> = padded(round.is_multiple_of(2)).open(&path).unwrap();
+    let b: Db<Padded> = padded(!round.is_multiple_of(2)).open(&path).unwrap();
+    let mut owned = Vec::new();
+    for (h, db) in [&a, &b].into_iter().enumerate() {
+        for t in 0..3 {
+            owned.push(db.fork(&format!("w{h}{t}")).unwrap());
+        }
+    }
+    let names: Vec<String> = owned
+        .iter()
+        .map(|db| db.branch_name().to_string())
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let main_acks = Arc::new(AtomicU64::new(0));
+    let failures: Arc<Mutex<Vec<String>>> = Arc::default();
+    let fail =
+        |failures: &Mutex<Vec<String>>, failure: String| failures.lock().unwrap().push(failure);
+    let writers: Vec<_> = owned
+        .into_iter()
+        .map(|db| {
+            let failures = failures.clone();
+            std::thread::spawn(move || {
+                let name = db.branch_name().to_string();
+                let mut last = 0;
+                for i in 1..=each {
+                    let done = match i % 3 {
+                        0 => block_on(db.update_async(|root| bump_padded(root, i))),
+                        _ => db.update(|root| bump_padded(root, i)),
+                    };
+                    match done {
+                        Ok(n) if n == last + 1 => last = n,
+                        Ok(n) => fail(&failures, format!("{name} {i}: n={n} after {last}")),
+                        Err(error) => {
+                            fail(&failures, format!("{name} {i}: {error:?}"));
+                            return;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let mut others = Vec::new();
+    for db in [a.clone(), b.clone()] {
+        let (stop, main_acks, failures) = (stop.clone(), main_acks.clone(), failures.clone());
+        others.push(std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Acquire) {
+                i += 1;
+                let done = match i % 2 {
+                    0 => block_on(db.update_async(|root| bump_padded(root, i))),
+                    _ => db.update(|root| bump_padded(root, i)),
+                };
+                match done {
+                    Ok(_) => {
+                        main_acks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        fail(&failures, format!("main {i}: {error:?}"));
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+    {
+        let (b, stop, failures) = (b.clone(), stop.clone(), failures.clone());
+        others.push(std::thread::spawn(move || {
+            let mut k = 0;
+            while !stop.load(Ordering::Acquire) {
+                k += 1;
+                let name = format!("tmp{}", k % 4);
+                match b.fork(&name) {
+                    Ok(_) | Err(ferro::Error::BranchExists(_)) => {}
+                    Err(error) => fail(&failures, format!("fork {name}: {error:?}")),
+                }
+                match b.drop_branch(&name) {
+                    Ok(()) | Err(ferro::Error::NoBranch(_)) => {}
+                    Err(error) => fail(&failures, format!("drop {name}: {error:?}")),
+                }
+            }
+        }));
+    }
+    {
+        let (a, stop, failures) = (a.clone(), stop.clone(), failures.clone());
+        others.push(std::thread::spawn(move || {
+            let mut k = 0;
+            while !stop.load(Ordering::Acquire) {
+                k += 1;
+                let name = format!("tmp{}", k % 4);
+                let attached = match a.branch(&name) {
+                    Ok(db) => db,
+                    Err(ferro::Error::NoBranch(_)) => continue,
+                    Err(error) => {
+                        fail(&failures, format!("attach {name}: {error:?}"));
+                        continue;
+                    }
+                };
+                match attached.update(|root| root.n += 1) {
+                    Ok(()) | Err(ferro::Error::NoBranch(_)) => {}
+                    Err(ferro::Error::GroupFailed(message))
+                        if message.contains("no such branch") => {}
+                    Err(error) => fail(&failures, format!("commit {name}: {error:?}")),
+                }
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    for other in others {
+        other.join().unwrap();
+    }
+    let cycles = a.space().unwrap().cycles + b.space().unwrap().cycles;
+    drop((a, b));
+    let db: Db<Padded> = Options::new().reclaim(MANUAL).open(&path).unwrap();
+    for name in &names {
+        let n = db.branch(name).unwrap().read().n;
+        if n != each {
+            fail(&failures, format!("{name} reopened at {n}"));
+        }
+    }
+    let acked = main_acks.load(Ordering::Relaxed);
+    if db.read().n != acked {
+        fail(
+            &failures,
+            format!("main reopened at {} after {acked} acks", db.read().n),
+        );
+    }
+    if let Err(error) = db.verify() {
+        fail(&failures, format!("verify {error:?}"));
+    }
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let mut failed = std::mem::take(&mut *failures.lock().unwrap());
+    if failed.is_empty() {
+        println!("MIXED {round} ok {cycles}");
+    }
+    failed.truncate(10);
+    failed
+}
+
+fn mixed(dir: &Path, rounds: u64) {
+    let each = std::env::var("FERRO_SHARED_EACH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    for round in 0..rounds {
+        let failed = mixed_round(dir, round, each);
+        assert!(failed.is_empty(), "round {round}: {failed:?}");
+    }
 }
 
 struct Spawned {
@@ -351,6 +548,45 @@ fn child_output(path: &Path, role: &str, count: u64) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{role}: {stdout}{stderr}");
     stdout
+}
+
+fn child_within(path: &Path, role: &str, count: u64, limit: Duration) -> String {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "shared_child", "--nocapture", "--test-threads=1"])
+        .env("FERRO_SHARED_ROLE", role)
+        .env("FERRO_SHARED_PATH", path)
+        .env("FERRO_SHARED_WRITER", "0")
+        .env("FERRO_SHARED_FIRST", "1")
+        .env("FERRO_SHARED_COUNT", count.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > limit {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            panic!("{role} did not finish in {limit:?}: {stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{role}: {stdout}{stderr}");
+    stdout
+}
+
+#[test]
+fn a_mix_of_threads_awaits_cycles_and_branch_churn_in_two_handles_loses_nothing() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let rounds = u64::from(common::cases(40));
+    let limit = Duration::from_secs(120 + 2 * rounds);
+    let out = child_within(dir.path(), "mixed", rounds, limit);
+    let clean = out.lines().filter(|line| line.contains("MIXED ")).count() as u64;
+    assert_eq!(clean, rounds, "{out}");
 }
 
 #[test]
