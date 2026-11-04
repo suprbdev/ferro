@@ -17,7 +17,7 @@ use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
 use crate::db::Refs;
 use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry, skip_version};
-use crate::platform::copy_owner;
+use crate::platform::{copy_owner, start_writeback};
 pub(crate) use crate::platform::{rename, sync_parent};
 use crate::refs;
 use crate::store::{
@@ -530,6 +530,7 @@ impl CopySink<'_> {
     fn drain(&mut self) -> Result<()> {
         let start = self.end - self.buf.len() as u64;
         self.file.write_all_at(&self.buf, start)?;
+        start_writeback(&self.file, start, self.buf.len() as u64);
         self.buf.clear();
         Ok(())
     }

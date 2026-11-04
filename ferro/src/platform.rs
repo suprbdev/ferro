@@ -380,6 +380,17 @@ mod ranges {
         let lock = ofd(file, libc::F_OFD_GETLK, libc::F_WRLCK, at, len)?;
         Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
     }
+
+    pub(crate) fn start_writeback(file: &File, at: u64, len: u64) {
+        unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                at as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
@@ -388,6 +399,8 @@ mod ranges {
     use std::io;
 
     pub(crate) const RANGES: bool = false;
+
+    pub(crate) fn start_writeback(_file: &File, _at: u64, _len: u64) {}
 
     pub(crate) fn lock_range(
         _file: &File,
