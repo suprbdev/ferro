@@ -131,6 +131,17 @@ looking in `dedupe`. Only the nodes a change touches are written, and they hash 
 only when the branches return to a state they had before, so this writes nothing more in ordinary
 use.
 
+A commit's own entry went through `dedupe` too, and two branches that make the same commit over two
+copies of its parent write entries with one hash. With a fixed clock, a branch that kept only v6
+after a cycle and a branch that had landed v1 to v6 again from a peer each committed the same change
+as v7. The second commit took the first one's entry, so its chain ran into the copy of v6 whose
+parent link is offset 0: `at(3)` and `verify` failed with `commit log keeps versions from 1 but v6
+links pruned history`, and so did every reclamation cycle after it. An entry is now written without
+looking in `dedupe`, like the branch table. Two entries hash alike only when their version, time,
+message, root and links all do, so this too writes nothing more in ordinary use, and
+`a_commit_equal_to_one_on_another_branch_keeps_the_history_of_its_own` in `ferro/tests/dedupe.rs`
+checks it.
+
 The other way was to land onto the receiver's existing record and start the landed branch where that
 record's parent link stops. That throws away history the bundle brought, here v2, and it needs to
 find the existing record, which for a commit held only in a merge's history takes an index from hash

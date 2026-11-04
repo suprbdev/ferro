@@ -1827,6 +1827,7 @@ impl<T: Data> Shared<T> {
             value: Arc::new(value),
             commit: Arc::new(commit.clone()),
         };
+        txn.unshared();
         let log = state.log.append(&store, &mut txn, commit, intent.merged)?;
         let log = match self.history {
             Keep::Last(_) => log.pruned(&store, self.history)?,
