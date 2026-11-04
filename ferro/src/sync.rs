@@ -749,9 +749,30 @@ impl Difference {
             if fresh.is_empty() {
                 return Ok(());
             }
+            if old.is_empty() {
+                return self.reach(store, fresh);
+            }
+            old.sort_unstable_by_key(|ptr| ptr.hash);
+            old.dedup_by_key(|ptr| ptr.hash);
+            let mut linked = vec![false; old.len()];
+            let mut starts = Vec::with_capacity(fresh.len() + 1);
+            let mut next = Vec::new();
+            for ptr in &fresh {
+                starts.push(next.len());
+                if ptr.offset == 0 {
+                    continue;
+                }
+                for link in store.read_links(*ptr)? {
+                    if let Ok(at) = old.binary_search_by_key(&link.hash, |ptr| ptr.hash) {
+                        linked[at] = true;
+                    }
+                    next.push(link);
+                }
+            }
+            starts.push(next.len());
             let mut deeper = Vec::new();
-            for ptr in old.drain(..) {
-                if seen.contains(&ptr.hash) || !expanded.insert(ptr.hash) {
+            for (at, ptr) in old.drain(..).enumerate() {
+                if linked[at] || seen.contains(&ptr.hash) || !expanded.insert(ptr.hash) {
                     continue;
                 }
                 let links = match self.links.get(&ptr.hash) {
@@ -781,24 +802,40 @@ impl Difference {
                 }
             }
             old = deeper;
-            let mut next = Vec::new();
-            for ptr in fresh.drain(..) {
+            let tracking = !old.is_empty();
+            let mut kept = 0;
+            for (at, ptr) in fresh.drain(..).enumerate() {
+                let (start, end) = (starts[at], starts[at + 1]);
                 if self.classified(&ptr.hash) {
                     continue;
                 }
-                let links = match ptr.offset {
-                    0 => Vec::new(),
-                    _ => store.read_links(ptr)?,
-                };
-                self.send_object(ptr, &links)?;
-                for link in links {
-                    if seen.insert(link.hash) {
-                        next.push(link);
+                self.send_object(ptr, &next[start..end])?;
+                for index in start..end {
+                    let link = next[index];
+                    if !tracking || seen.insert(link.hash) {
+                        next[kept] = link;
+                        kept += 1;
                     }
                 }
             }
+            next.truncate(kept);
             fresh = next;
         }
+    }
+
+    fn reach(&mut self, store: &Store, mut stack: Vec<Ptr>) -> Result<()> {
+        while let Some(ptr) = stack.pop() {
+            if self.classified(&ptr.hash) {
+                continue;
+            }
+            let links = match ptr.offset {
+                0 => Vec::new(),
+                _ => store.read_links(ptr)?,
+            };
+            self.send_object(ptr, &links)?;
+            stack.extend(links);
+        }
+        Ok(())
     }
 
     fn send_object(&mut self, ptr: Ptr, links: &[Ptr]) -> Result<()> {
