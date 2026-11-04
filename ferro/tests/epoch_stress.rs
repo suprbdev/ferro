@@ -256,7 +256,10 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
                     .range(low..high)
                     .map(|(key, value)| (key, *value))
                     .collect();
-                assert_eq!(got, want, "{context}: range {low}..{high} after {values} edits");
+                assert_eq!(
+                    got, want,
+                    "{context}: range {low}..{high} after {values} edits"
+                );
                 let mut back: Vec<(u64, u64)> = root
                     .values
                     .range(low..high)

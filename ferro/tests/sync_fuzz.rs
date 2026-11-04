@@ -72,7 +72,9 @@ fn row(id: u64, round: u64) -> Row {
 
 fn fill(world: &mut World, round: u64) {
     for key in (0..300).step_by(1 + round as usize * 7) {
-        world.names.insert(key, text(key + round, 20 + (key % 50) as usize));
+        world
+            .names
+            .insert(key, text(key + round, 20 + (key % 50) as usize));
         world.totals.insert(key, key * (round + 1));
     }
     for outer in (0..30).step_by(1 + round as usize * 3) {
@@ -297,7 +299,13 @@ impl Parsed {
                 continue;
             };
             if commits.insert(slot) {
-                stack.extend(self.objects[slot].links.iter().skip(1).map(|(hash, _)| *hash));
+                stack.extend(
+                    self.objects[slot]
+                        .links
+                        .iter()
+                        .skip(1)
+                        .map(|(hash, _)| *hash),
+                );
             }
         }
         (0..self.objects.len())
@@ -467,7 +475,10 @@ fn setup() -> (Target, Parsed) {
     let path = dir.path().join("b.ferro");
     let b: Db<World> = fast().open(&path).unwrap();
     a.update(|world| fill(world, 0)).unwrap();
-    assert_eq!(b.pull(&a, "a", merge).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        b.pull(&a, "a", merge).unwrap().outcome,
+        Outcome::FastForward
+    );
     a.update(|world| fill(world, 1)).unwrap();
     a.update(|world| {
         world.names.remove(&3);
@@ -512,7 +523,9 @@ fn attempt(target: &mut Target, bundle: &Bundle) -> std::result::Result<bool, St
     }));
     let outcome = match read {
         Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => Err(format!("typed verify failed after receive accepted: {error}")),
+        Ok(Err(error)) => Err(format!(
+            "typed verify failed after receive accepted: {error}"
+        )),
         Err(payload) => Err(format!("a read panicked: {}", panic_text(&*payload))),
     };
     target.restore();
@@ -525,7 +538,10 @@ fn mutated_bundles_are_refused_or_read_back_whole() {
     let (target, honest) = setup();
     assert!(!honest.bases.is_empty() && !honest.hints.is_empty());
     let target = RefCell::new(target);
-    assert_eq!(attempt(&mut target.borrow_mut(), &honest.encode()), Ok(true));
+    assert_eq!(
+        attempt(&mut target.borrow_mut(), &honest.encode()),
+        Ok(true)
+    );
     let config = ProptestConfig {
         cases: cases(512),
         failure_persistence: None,

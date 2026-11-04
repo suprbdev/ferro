@@ -54,8 +54,14 @@ fn main() -> ferro::Result<()> {
 
     let shop = db.read();
     println!("anvils left: {}", shop.stock.get("anvil").unwrap());
-    println!("pending now: {}", shop.orders.by_status(&Status::Pending).len());
-    println!("pending then: {}", before_shipping.orders.by_status(&Status::Pending).len());
+    println!(
+        "pending now: {}",
+        shop.orders.by_status(&Status::Pending).len()
+    );
+    println!(
+        "pending then: {}",
+        before_shipping.orders.by_status(&Status::Pending).len()
+    );
 
     let big: Vec<_> = shop
         .orders

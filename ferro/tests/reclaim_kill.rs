@@ -67,7 +67,12 @@ fn killing_the_process_at_every_stage_keeps_every_acknowledged_commit() {
             let dir = dir();
             let path = dir.path().join("killed.ferro");
             let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "process_child", "--nocapture", "--test-threads=1"])
+                .args([
+                    "--exact",
+                    "process_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .env("FERRO_RECLAIM_PATH", &path)
                 .env("FERRO_RECLAIM_STAGE", stage)
                 .stdout(Stdio::piped())
@@ -85,11 +90,18 @@ fn killing_the_process_at_every_stage_keeps_every_acknowledged_commit() {
                 let key: u64 = fields.next().unwrap().parse().unwrap();
                 acked.insert(version, (key, fields.next().unwrap().to_string()));
             }
-            assert!(!child.wait().unwrap().success(), "{stage}: the hook never fired");
+            assert!(
+                !child.wait().unwrap().success(),
+                "{stage}: the hook never fired"
+            );
             assert!(acked.len() >= 120, "{stage} {attempt}: {}", acked.len());
             let last = *acked.keys().max().unwrap();
             let db: Db<Root> = Options::new().reclaim(MANUAL).open(&path).unwrap();
-            assert!(db.version() >= last, "{stage}: {} below {last}", db.version());
+            assert!(
+                db.version() >= last,
+                "{stage}: {} below {last}",
+                db.version()
+            );
             let want: Model = acked.values().cloned().collect::<BTreeMap<_, _>>();
             let root = db.at(last).unwrap();
             assert_eq!(dump(&root), want, "{stage}");

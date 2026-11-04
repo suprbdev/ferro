@@ -71,7 +71,11 @@ fn child_entry() {
     let path = Path::new(&path);
     match role.as_str() {
         "writer" | "durable-writer" => {
-            let options = if role == "writer" { fast() } else { Options::new() };
+            let options = if role == "writer" {
+                fast()
+            } else {
+                Options::new()
+            };
             let db: Db<Root> = options.open(path).unwrap();
             let millis: u64 = std::env::var("FERRO_MS").unwrap().parse().unwrap();
             let start = Instant::now();

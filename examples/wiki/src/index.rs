@@ -106,14 +106,20 @@ impl<'a> Tx<'a> {
         let Tx { w, terms, links } = self;
         let mut postings = Vec::with_capacity(terms.len());
         for (term, updates) in terms {
-            let mut posting = w.terms.get(&term).map_or_else(Map::new, |list| (*list).clone());
+            let mut posting = w
+                .terms
+                .get(&term)
+                .map_or_else(Map::new, |list| (*list).clone());
             posting.apply(updates);
             postings.push((term, (!posting.is_empty()).then_some(posting)));
         }
         w.terms.apply(postings);
         let mut backlinks = Vec::with_capacity(links.len());
         for (target, updates) in links {
-            let mut sources = w.links.get(&target).map_or_else(Set::new, |set| (*set).clone());
+            let mut sources = w
+                .links
+                .get(&target)
+                .map_or_else(Set::new, |set| (*set).clone());
             sources.apply(updates);
             backlinks.push((target, (!sources.is_empty()).then_some(sources)));
         }

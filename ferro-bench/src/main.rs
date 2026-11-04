@@ -60,7 +60,8 @@ fn account(i: u64) -> Account {
             1 | 2 => Tier::Pro,
             _ => Tier::Free,
         },
-        country: ["nz", "au", "de", "us", "jp", "br", "ca", "fr"][(seed >> 8) as usize % 8].to_string(),
+        country: ["nz", "au", "de", "us", "jp", "br", "ca", "fr"][(seed >> 8) as usize % 8]
+            .to_string(),
         email: format!("user{i}@example.com"),
         name: format!("Account Holder {}", seed % 100_000),
         balance: (seed % 1_000_000) as i64,
@@ -96,7 +97,10 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
             })
             .unwrap();
         });
-        report.set("map_bulk_bytes_per_key", db.size_on_disk() as f64 / n as f64);
+        report.set(
+            "map_bulk_bytes_per_key",
+            db.size_on_disk() as f64 / n as f64,
+        );
         let snapshot = db.read();
         for _ in 0..2 {
             report.timed("map_get_warm", READ_SAMPLES, || {
@@ -123,7 +127,10 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
             }
         });
         let after = db.size_on_disk();
-        report.set("map_bytes_per_commit", (after - before) as f64 / FSYNC_COMMITS as f64);
+        report.set(
+            "map_bytes_per_commit",
+            (after - before) as f64 / FSYNC_COMMITS as f64,
+        );
         let old = db.at(1).unwrap();
         let new = db.read();
         let changes = old.diff(&new).count() as u64;
@@ -147,9 +154,23 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
             }
         });
     }
-    cold_gets(report, "map_get_cold", Options::new().read_only().cache_bytes(COLD_CACHE), &path, n);
-    cold_gets(report, "map_get_cold_5m", Options::new().read_only().cache_bytes(5 << 20), &path, n);
-    let writer = Options::new().durability(Durability::Buffered).cache_bytes(COLD_CACHE);
+    cold_gets(
+        report,
+        "map_get_cold",
+        Options::new().read_only().cache_bytes(COLD_CACHE),
+        &path,
+        n,
+    );
+    cold_gets(
+        report,
+        "map_get_cold_5m",
+        Options::new().read_only().cache_bytes(5 << 20),
+        &path,
+        n,
+    );
+    let writer = Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(COLD_CACHE);
     cold_gets(report, "map_get_cold_writer", writer, &path, n);
 }
 
@@ -184,13 +205,20 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
         }
     });
     report.timed("table_scan_filter", n, || {
-        let rich = snapshot.accounts.iter().filter(|row| row.balance > 500_000).count();
+        let rich = snapshot
+            .accounts
+            .iter()
+            .filter(|row| row.balance > 500_000)
+            .count();
         assert!(rich > 0);
     });
     report.timed("table_index_page", 2_000, || {
         for i in 0..2_000u64 {
             let country = ["nz", "au", "de", "us"][i as usize % 4];
-            assert_eq!(snapshot.accounts.by_country(country).rev().take(20).count(), 20);
+            assert_eq!(
+                snapshot.accounts.by_country(country).rev().take(20).count(),
+                20
+            );
         }
     });
     report.timed("table_group_counts", 1_000, || {
@@ -209,7 +237,10 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
         }
     });
     let after = db.size_on_disk();
-    report.set("table_bytes_per_update", (after - before) as f64 / FSYNC_COMMITS as f64);
+    report.set(
+        "table_bytes_per_update",
+        (after - before) as f64 / FSYNC_COMMITS as f64,
+    );
 }
 
 fn concurrent_workload(report: &mut Report, dir: &Path, n: u64) {
@@ -291,7 +322,9 @@ fn argument(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let n: u64 = argument("--n").and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: u64 = argument("--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let label = argument("--label").unwrap_or_else(|| "run".to_string());
     let parent = PathBuf::from(argument("--dir").unwrap_or_else(|| "target/bench".to_string()));
     std::fs::create_dir_all(&parent).unwrap();
@@ -307,7 +340,11 @@ fn main() {
     for (name, value) in &report.0 {
         println!("  {name:<28} {value:>14.1}");
     }
-    let body: Vec<String> = report.0.iter().map(|(k, v)| format!("\"{k}\":{v:.1}")).collect();
+    let body: Vec<String> = report
+        .0
+        .iter()
+        .map(|(k, v)| format!("\"{k}\":{v:.1}"))
+        .collect();
     let mut out = OpenOptions::new()
         .create(true)
         .append(true)

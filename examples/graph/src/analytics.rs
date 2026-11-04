@@ -221,8 +221,7 @@ pub fn lpa(g: &Graph, threads: usize, iterations: usize) -> (Vec<u32>, usize) {
                         if ins.peek().is_some_and(|b| b.0 == user) {
                             gathered.extend(ins.next().unwrap().1);
                         }
-                        slice[user as usize - low] =
-                            mode(old, &mut gathered, old[user as usize]);
+                        slice[user as usize - low] = mode(old, &mut gathered, old[user as usize]);
                     }
                 });
             }

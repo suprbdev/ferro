@@ -30,13 +30,16 @@ enum Command {
     #[command(about = "Rewrite the file, optionally dropping old versions")]
     Compact {
         path: PathBuf,
-        #[arg(long, conflicts_with = "since_ms", help = "Keep this many newest commits per branch")]
+        #[arg(
+            long,
+            conflicts_with = "since_ms",
+            help = "Keep this many newest commits per branch"
+        )]
         keep_last: Option<usize>,
         #[arg(long, help = "Keep commits at or after this unix time in milliseconds")]
         since_ms: Option<u64>,
     },
 }
-
 
 fn mib(bytes: u64) -> String {
     format!("{:.2} MiB", bytes as f64 / 1048576.0)

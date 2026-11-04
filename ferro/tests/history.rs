@@ -286,7 +286,9 @@ fn restore_from_another_branch_copies_contents() {
 #[test]
 fn as_of_returns_latest_commit_at_or_before_time() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast().open::<Map<u64, u64>>(dir.path().join("t.ferro")).unwrap();
+    let db = fast()
+        .open::<Map<u64, u64>>(dir.path().join("t.ferro"))
+        .unwrap();
     for n in 0..40 {
         db.update(|root| {
             root.insert(n, n);
@@ -295,7 +297,10 @@ fn as_of_returns_latest_commit_at_or_before_time() {
     }
     assert_eq!(db.as_of(0).unwrap().version(), 0);
     let log: Vec<_> = db.log().iter().map(|(_, commit)| commit).collect();
-    assert!(log.windows(2).any(|pair| pair[0].time_ms == pair[1].time_ms));
+    assert!(
+        log.windows(2)
+            .any(|pair| pair[0].time_ms == pair[1].time_ms)
+    );
     for commit in &log {
         let wanted = log
             .iter()
@@ -305,7 +310,9 @@ fn as_of_returns_latest_commit_at_or_before_time() {
             .unwrap();
         assert_eq!(db.as_of(commit.time_ms).unwrap().version(), wanted);
         assert_eq!(
-            db.as_of(commit.time_ms.saturating_sub(1)).unwrap().version(),
+            db.as_of(commit.time_ms.saturating_sub(1))
+                .unwrap()
+                .version(),
             log.iter()
                 .filter(|other| other.time_ms < commit.time_ms)
                 .map(|other| other.version)

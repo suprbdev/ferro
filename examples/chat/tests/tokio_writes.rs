@@ -135,12 +135,13 @@ async fn async_tasks_and_blocking_writers_share_one_database() {
             }));
             tasks.push(tokio::task::spawn_blocking(move || {
                 for i in 0..50 {
-                    blocking.update(|root| {
-                        let count = root.get(&u64::MAX).map_or(0, |count| *count);
-                        root.insert(u64::MAX, count + 1);
-                        root.insert(100_000 + writer * 1000 + i, i);
-                    })
-                    .expect("blocking write");
+                    blocking
+                        .update(|root| {
+                            let count = root.get(&u64::MAX).map_or(0, |count| *count);
+                            root.insert(u64::MAX, count + 1);
+                            root.insert(100_000 + writer * 1000 + i, i);
+                        })
+                        .expect("blocking write");
                 }
             }));
         }
@@ -148,7 +149,11 @@ async fn async_tasks_and_blocking_writers_share_one_database() {
             task.await.expect("writer");
         }
         let snapshot = db.read();
-        assert_eq!(snapshot.get(&u64::MAX).as_deref(), Some(&800), "{durability:?} {coalesce}");
+        assert_eq!(
+            snapshot.get(&u64::MAX).as_deref(),
+            Some(&800),
+            "{durability:?} {coalesce}"
+        );
         assert_eq!(snapshot.len(), 801, "{durability:?} {coalesce}");
         db.verify().expect("verify");
     }

@@ -255,7 +255,10 @@ fn a_dropped_waiting_watcher_lets_go_of_its_test() {
     drop(watcher);
     let deadline = Instant::now() + Duration::from_secs(20);
     while Arc::strong_count(&held) > 1 {
-        assert!(Instant::now() < deadline, "the feed kept a dropped watcher's test");
+        assert!(
+            Instant::now() < deadline,
+            "the feed kept a dropped watcher's test"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     for value in 2..20 {

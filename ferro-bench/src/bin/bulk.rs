@@ -121,7 +121,9 @@ fn print(name: &str, sample: &Sample, per: f64) {
 }
 
 fn main() {
-    let n: u64 = argument("--n").and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: u64 = argument("--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let split = std::env::args().any(|arg| arg == "--split");
     let sorted = std::env::args().any(|arg| arg == "--sorted");
     let batch = std::env::args().any(|arg| arg == "--extend");
@@ -168,7 +170,11 @@ fn main() {
         let began = Instant::now();
         let start = Sample::take(&counter, began);
         drop(kept);
-        print("drop", &Sample::take(&counter, began).since(&start), n as f64);
+        print(
+            "drop",
+            &Sample::take(&counter, began).since(&start),
+            n as f64,
+        );
     } else {
         print("commit_and_drop", &rest, n as f64);
     }
@@ -180,20 +186,36 @@ fn main() {
     for j in 0..gets {
         assert!(snapshot.get(&key(mix(j ^ (1 << 50)) % n)).is_some());
     }
-    print("get", &Sample::take(&counter, began).since(&start), gets as f64);
+    print(
+        "get",
+        &Sample::take(&counter, began).since(&start),
+        gets as f64,
+    );
     let began = Instant::now();
     let start = Sample::take(&counter, began);
     assert_eq!(snapshot.iter().count() as u64, n);
-    print("scan", &Sample::take(&counter, began).since(&start), n as f64);
+    print(
+        "scan",
+        &Sample::take(&counter, began).since(&start),
+        n as f64,
+    );
     let began = Instant::now();
     let start = Sample::take(&counter, began);
     let mut read = 0;
     for j in 0..1000u64 {
-        let from = if sorted { mix(j ^ (1 << 51)) % (n - 1000) } else { mix(j ^ (1 << 51)) >> 1 };
+        let from = if sorted {
+            mix(j ^ (1 << 51)) % (n - 1000)
+        } else {
+            mix(j ^ (1 << 51)) >> 1
+        };
         read += snapshot.range(from..).take(1000).count();
     }
     assert!(read > 990_000);
-    print("range", &Sample::take(&counter, began).since(&start), 1000.0);
+    print(
+        "range",
+        &Sample::take(&counter, began).since(&start),
+        1000.0,
+    );
     drop(snapshot);
     let commits = 2000;
     let began = Instant::now();
@@ -204,7 +226,11 @@ fn main() {
         })
         .unwrap();
     }
-    print("commit_fsync", &Sample::take(&counter, began).since(&start), commits as f64);
+    print(
+        "commit_fsync",
+        &Sample::take(&counter, began).since(&start),
+        commits as f64,
+    );
     drop(db);
     let db = Options::new()
         .durability(Durability::Buffered)
@@ -219,6 +245,10 @@ fn main() {
         })
         .unwrap();
     }
-    print("commit_buffered", &Sample::take(&counter, began).since(&start), commits as f64);
+    print(
+        "commit_buffered",
+        &Sample::take(&counter, began).since(&start),
+        commits as f64,
+    );
     println!("peak_rss_mib={:.1}", peak_rss_mib());
 }

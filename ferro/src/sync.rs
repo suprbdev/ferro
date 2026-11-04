@@ -125,7 +125,10 @@ fn skip_version(version: u64) -> u64 {
 }
 
 fn affordable(bodies: usize, read: usize) -> bool {
-    bodies <= read.saturating_mul(EXPANSION).saturating_add(EXPANSION_SLACK)
+    bodies
+        <= read
+            .saturating_mul(EXPANSION)
+            .saturating_add(EXPANSION_SLACK)
 }
 
 fn varint_len(mut value: u64) -> usize {
@@ -455,7 +458,13 @@ impl Emitter {
             let (object, packed) = self.store.read_packed(self.order[self.next])?;
             self.next += 1;
             let before = self.sent;
-            put_body(&mut self.out, &object.body, packed, &mut self.bodies, before);
+            put_body(
+                &mut self.out,
+                &object.body,
+                packed,
+                &mut self.bodies,
+                before,
+            );
             push_varint(&mut self.out, object.links.len() as u64);
             for link in &object.links {
                 self.out.extend_from_slice(&link.hash);
@@ -1030,7 +1039,9 @@ fn check_graph(
     let (prev, linked) = (prev.flatten(), merged.flatten());
     let generation = |facts: Option<Facts>| facts.map_or(0, |facts| facts.generation);
     let parents = generation(prev).max(generation(linked));
-    let reach = prev.map_or(0, |facts| facts.reach).max(linked.map_or(0, |facts| facts.generation));
+    let reach = prev
+        .map_or(0, |facts| facts.reach)
+        .max(linked.map_or(0, |facts| facts.generation));
     let bounded = prev.is_some_and(|facts| facts.bounded)
         || link.is_some_and(|link| link.floor > 1 || link.after.is_some())
         || linked.is_some_and(|facts| facts.bounded);
@@ -1101,8 +1112,12 @@ impl Sent {
 }
 
 fn decode_commit(object: &Object) -> Result<Entry> {
-    let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))
-        .map_err(|error| bad(format!("an object it links as a commit is not one: {error}")))?;
+    let entry =
+        Entry::decode(&mut Decoder::new(&object.body, &object.links, None)).map_err(|error| {
+            bad(format!(
+                "an object it links as a commit is not one: {error}"
+            ))
+        })?;
     let used = usize::from(entry.commit.root.is_some())
         + usize::from(entry.prev.is_some())
         + usize::from(entry.skip.is_some())
@@ -1245,7 +1260,9 @@ impl Landing<'_> {
             let version = entry.commit.version;
             let skipped = expected.is_some_and(|want| want != version);
             if version == 0 || version > MAX_VERSION || skipped {
-                return Err(bad("a merged chain's versions do not descend one at a time"));
+                return Err(bad(
+                    "a merged chain's versions do not descend one at a time",
+                ));
             }
             versions.insert(version, at);
             merged.extend(entry.merged.map(|link| link.ptr.hash));
@@ -1350,9 +1367,12 @@ impl<O: Objects> Vetting<'_, O> {
         if self.spent > self.budget {
             return Err(bad("it reuses its objects under too many key ranges"));
         }
-        let (shape, found) = kind
-            .check(&object.body, &object.links)
-            .map_err(|error| bad(format!("a {} it carries does not decode: {error}", kind.name)))?;
+        let (shape, found) = kind.check(&object.body, &object.links).map_err(|error| {
+            bad(format!(
+                "a {} it carries does not decode: {error}",
+                kind.name
+            ))
+        })?;
         for (index, child) in found {
             self.queue.push((object.links[index], child));
         }
@@ -1376,7 +1396,9 @@ impl<O: Objects> Vetting<'_, O> {
             return Ok(None);
         }
         if known.is_some_and(|known| known.id == kind.id) {
-            return (kind.held)(kind, self.store, ptr).map(Some).map_err(rejected);
+            return (kind.held)(kind, self.store, ptr)
+                .map(Some)
+                .map_err(rejected);
         }
         if let Some(shape) = self.held.get(&hash, kind) {
             return Ok(Some(shape));
@@ -1724,7 +1746,11 @@ fn resolve<O: Objects>(
     {
         let now = now_ms();
         let horizon = now.saturating_add(MAX_AHEAD_MS);
-        if let Some(sent) = landing.commits.values().find(|sent| sent.facts.time > horizon) {
+        if let Some(sent) = landing
+            .commits
+            .values()
+            .find(|sent| sent.facts.time > horizon)
+        {
             return Err(bad(format!(
                 "v{} is dated {} ms past this machine's clock, more than the {MAX_AHEAD_MS} it allows",
                 sent.facts.version,
@@ -1740,7 +1766,9 @@ fn resolve<O: Objects>(
                 .values()
                 .any(|sent| sent.root.is_some_and(|root| root.offset == 0));
         if unresolved {
-            return Err(bad("an object links to one that was neither sent nor known"));
+            return Err(bad(
+                "an object links to one that was neither sent nor known",
+            ));
         }
         let mut held_at: HashMap<Hash, usize> = HashMap::new();
         for (index, ptr) in anchors.roots.iter().chain(&anchors.hinted).enumerate() {
@@ -1757,7 +1785,10 @@ fn resolve<O: Objects>(
             sent: Checked::default(),
             held: Checked::default(),
             spent: 0,
-            budget: streamed.carried.saturating_mul(2).saturating_add(RECHECK_SLACK),
+            budget: streamed
+                .carried
+                .saturating_mul(2)
+                .saturating_add(RECHECK_SLACK),
             queue: Vec::new(),
         };
         for sent in landing.commits.values() {
@@ -2141,7 +2172,15 @@ impl<T: Data> Db<T> {
             streamed,
             root_kind: &root_kind,
         };
-        let sent = resolve(&store, &mut staging, &refs, remote, header, &anchors, Some(vetted))?;
+        let sent = resolve(
+            &store,
+            &mut staging,
+            &refs,
+            remote,
+            header,
+            &anchors,
+            Some(vetted),
+        )?;
         staging.seal()?;
         self.step("received");
         Ok(Received {

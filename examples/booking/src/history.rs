@@ -30,9 +30,8 @@ pub fn audit(db: &Db<Hotels>, id: u64) -> Result<Vec<Event>> {
 
 fn mentions(line: &str, id: u64) -> bool {
     let tag = format!("#{id}");
-    line.match_indices(&tag).any(|(at, _)| {
-        !line[at + tag.len()..].starts_with(|c: char| c.is_ascii_digit())
-    })
+    line.match_indices(&tag)
+        .any(|(at, _)| !line[at + tag.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 fn event(commit: Commit, booking: Booking) -> Event {
@@ -118,10 +117,19 @@ pub fn as_paid(db: &Db<Hotels>, id: u64) -> Result<Receipt> {
         .get(&id)
         .ok_or(BookingError::NoBooking(id))?
         .into_owned();
-    let room = past.rooms.get(&then.room).ok_or(BookingError::NoRoom(then.room))?;
-    let rates_then = then.nights().map(|night| past.price(&room, night)).collect();
+    let room = past
+        .rooms
+        .get(&then.room)
+        .ok_or(BookingError::NoRoom(then.room))?;
+    let rates_then = then
+        .nights()
+        .map(|night| past.price(&room, night))
+        .collect();
     let rates_now = match current.rooms.get(&now.room) {
-        Some(room) => now.nights().map(|night| current.price(&room, night)).collect(),
+        Some(room) => now
+            .nights()
+            .map(|night| current.price(&room, night))
+            .collect(),
         None => Vec::new(),
     };
     let venue = past

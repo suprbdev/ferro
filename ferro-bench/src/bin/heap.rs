@@ -80,7 +80,11 @@ fn account(i: u64) -> Account {
     let seed = mix(i);
     Account {
         id: i,
-        tier: if seed.is_multiple_of(3) { Tier::Pro } else { Tier::Free },
+        tier: if seed.is_multiple_of(3) {
+            Tier::Pro
+        } else {
+            Tier::Free
+        },
         country: ["nz", "au", "de", "us"][(seed >> 8) as usize % 4].to_string(),
         email: format!("user{i}@example.com"),
         name: format!("Account Holder {}", seed % 100_000),
@@ -113,7 +117,9 @@ fn built<T: Data + Default>(path: &Path, fill: impl FnOnce(&Db<T>)) {
 }
 
 fn main() {
-    let parent = std::env::args().nth(1).unwrap_or_else(|| "target/bench".to_string());
+    let parent = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "target/bench".to_string());
     std::fs::create_dir_all(&parent).unwrap();
     let dir = tempfile::tempdir_in(&parent).unwrap();
     let sizes = [1, 4, 16, 64, 256];

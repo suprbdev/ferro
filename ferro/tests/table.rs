@@ -1,10 +1,10 @@
 mod common;
 
+use ferro::Val;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::panic::{self, AssertUnwindSafe};
-use ferro::Val;
 
 use common::{Rng, fast};
 use ferro::table::IndexIter;

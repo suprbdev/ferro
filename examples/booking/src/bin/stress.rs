@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 
 use booking::date::{format_money, night_of};
 use booking::seed::{Plan, seed};
-use booking::{BookingError, Config, Hotels, HoldRequest, Line, Night, Reservations, Status, walk};
+use booking::{BookingError, Config, HoldRequest, Hotels, Line, Night, Reservations, Status, walk};
 use clap::Parser;
 
 #[derive(Parser, Clone, Debug)]
-#[command(name = "booking-stress", about = "Contend for the same rooms and nights from many threads")]
+#[command(
+    name = "booking-stress",
+    about = "Contend for the same rooms and nights from many threads"
+)]
 struct Args {
     #[arg(long, default_value_t = 16)]
     threads: usize,
@@ -124,7 +127,11 @@ impl Tally {
 
     fn error(&mut self, error: &BookingError) {
         let kind = format!("{error:?}");
-        let kind = kind.split([' ', '(', '{']).next().unwrap_or("?").to_string();
+        let kind = kind
+            .split([' ', '(', '{'])
+            .next()
+            .unwrap_or("?")
+            .to_string();
         *self.errors.entry(kind).or_default() += 1;
     }
 }
@@ -148,7 +155,8 @@ impl World {
     fn ack(&self, kind: char, id: u64) {
         if let Some(file) = &self.acks {
             let mut file = file.lock().expect("ack log");
-            file.write_all(format!("{kind} {id}\n").as_bytes()).expect("write ack log");
+            file.write_all(format!("{kind} {id}\n").as_bytes())
+                .expect("write ack log");
         }
     }
 }
@@ -193,23 +201,44 @@ fn free(h: &Hotels, room: u32, first: Night, nights: u32, now: u64) -> bool {
     (first..first + nights).all(|night| h.holder(room, night).is_none_or(|id| h.lapsed(id, now)))
 }
 
-fn choose(svc: &Reservations, world: &World, args: &Args, rng: &mut fastrand::Rng) -> Option<HoldRequest> {
+fn choose(
+    svc: &Reservations,
+    world: &World,
+    args: &Args,
+    rng: &mut fastrand::Rng,
+) -> Option<HoldRequest> {
     let hot = rng.u32(0..100) < args.hot;
     let nights = rng.u32(1..=3).min(args.span);
     let start = if hot {
-        rng.u32(0..=args.hot_nights.saturating_sub(nights).min(args.span - nights))
+        rng.u32(
+            0..=args
+                .hot_nights
+                .saturating_sub(nights)
+                .min(args.span - nights),
+        )
     } else {
         rng.u32(0..=args.span - nights)
     };
     let first = world.first + start;
-    let home = if hot { 0 } else { rng.usize(0..world.rooms.len()) };
+    let home = if hot {
+        0
+    } else {
+        rng.usize(0..world.rooms.len())
+    };
     let h = svc.read();
     let now = svc.now();
     let mut room = None;
     for step in 0..world.rooms.len() {
         let venue = &world.rooms[(home + step) % world.rooms.len()];
-        let mut open = venue.iter().copied().filter(|room| free(&h, *room, first, nights, now));
-        room = if rng.u32(0..100) < 80 { open.next() } else { open.nth(rng.usize(0..venue.len())) };
+        let mut open = venue
+            .iter()
+            .copied()
+            .filter(|room| free(&h, *room, first, nights, now));
+        room = if rng.u32(0..100) < 80 {
+            open.next()
+        } else {
+            open.nth(rng.usize(0..venue.len()))
+        };
         if room.is_some() {
             break;
         }
@@ -231,8 +260,15 @@ fn choose(svc: &Reservations, world: &World, args: &Args, rng: &mut fastrand::Rn
     })
 }
 
-fn worker(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool>, index: usize) -> Tally {
-    let mut rng = fastrand::Rng::with_seed(args.seed.wrapping_mul(1_000_003).wrapping_add(index as u64));
+fn worker(
+    svc: Reservations,
+    world: Arc<World>,
+    args: Args,
+    stop: Arc<AtomicBool>,
+    index: usize,
+) -> Tally {
+    let mut rng =
+        fastrand::Rng::with_seed(args.seed.wrapping_mul(1_000_003).wrapping_add(index as u64));
     let mut tally = Tally::default();
     let mut confirmed: Vec<u64> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
@@ -295,10 +331,14 @@ fn worker(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool
                 Err(error) => tally.error(&error),
             }
         } else if roll < 60 + args.late {
-            thread::sleep(Duration::from_millis(held.expires_ms.saturating_sub(svc.now()) + 1));
+            thread::sleep(Duration::from_millis(
+                held.expires_ms.saturating_sub(svc.now()) + 1,
+            ));
             tally.attempts += 1;
             match svc.confirm(held.id, Some(held.total)) {
-                Err(BookingError::HoldExpired { .. }) | Err(BookingError::WrongStatus { .. }) => tally.late += 1,
+                Err(BookingError::HoldExpired { .. }) | Err(BookingError::WrongStatus { .. }) => {
+                    tally.late += 1
+                }
                 Ok(_) => panic!("confirmed #{} after its hold ran out", held.id),
                 Err(error) => tally.error(&error),
             }
@@ -352,8 +392,15 @@ fn sweeper(svc: Reservations, stop: Arc<AtomicBool>) -> Tally {
     tally
 }
 
-fn browser(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool>, index: usize) -> Tally {
-    let mut rng = fastrand::Rng::with_seed(args.seed ^ 0xb0b ^ (index as u64).wrapping_mul(0x9e37_79b9));
+fn browser(
+    svc: Reservations,
+    world: Arc<World>,
+    args: Args,
+    stop: Arc<AtomicBool>,
+    index: usize,
+) -> Tally {
+    let mut rng =
+        fastrand::Rng::with_seed(args.seed ^ 0xb0b ^ (index as u64).wrapping_mul(0x9e37_79b9));
     let mut tally = Tally::default();
     while !stop.load(Ordering::Relaxed) {
         let customer = world.customers[rng.usize(0..world.customers.len())];
@@ -439,13 +486,19 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
     }
     for index in 0..args.browsers {
         let (svc, world, args, stop) = (svc.clone(), world.clone(), args.clone(), stop.clone());
-        handles.push(thread::spawn(move || browser(svc, world, args, stop, index)));
+        handles.push(thread::spawn(move || {
+            browser(svc, world, args, stop, index)
+        }));
     }
     let deadline = Duration::from_secs_f64(args.secs);
     while started.elapsed() < deadline {
         thread::sleep(Duration::from_millis(200).min(deadline.saturating_sub(started.elapsed())));
         if progress {
-            println!("progress v{} {:.1}s", svc.db().version(), started.elapsed().as_secs_f64());
+            println!(
+                "progress v{} {:.1}s",
+                svc.db().version(),
+                started.elapsed().as_secs_f64()
+            );
             io::stdout().flush().ok();
         }
     }
@@ -466,19 +519,32 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
     let occupancy = (0..args.span.min(args.hot_nights + 3))
         .map(|offset| {
             let night = world.first + offset;
-            let sold: u32 = snapshot.venues.iter().filter_map(|v| snapshot.loads.get(&(v.id, night))).map(|l| l.sold).sum();
+            let sold: u32 = snapshot
+                .venues
+                .iter()
+                .filter_map(|v| snapshot.loads.get(&(v.id, night)))
+                .map(|l| l.sold)
+                .sum();
             sold.to_string()
         })
         .collect::<Vec<_>>()
         .join(" ");
     drop(snapshot);
-    let walked = if args.no_check { None } else { Some(walk(svc.db(), args.every)?) };
+    let walked = if args.no_check {
+        None
+    } else {
+        Some(walk(svc.db(), args.every)?)
+    };
     let space = args.keep_last.map(|_| svc.db().space()).transpose()?;
     if args.keep_last.is_some() {
         svc.db().verify()?;
     }
     Ok(Outcome {
-        label: if coalesce { "coalesce".to_string() } else { "alone".to_string() },
+        label: if coalesce {
+            "coalesce".to_string()
+        } else {
+            "alone".to_string()
+        },
         secs,
         tally,
         versions,
@@ -510,7 +576,16 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
     );
     println!(
         "  holds {} lost races {} sold out {} confirms {} late {} broke {} abandoned {} cancels {} refunds {} reprices {}",
-        t.holds, t.conflicts, t.soldout, t.confirms, t.late, t.broke, t.abandoned, t.cancels, t.refunds, t.reprices
+        t.holds,
+        t.conflicts,
+        t.soldout,
+        t.confirms,
+        t.late,
+        t.broke,
+        t.abandoned,
+        t.cancels,
+        t.refunds,
+        t.reprices
     );
     println!(
         "  lapsed holds taken over in place {}, released by the sweeper {} in {} sweeps",
@@ -573,7 +648,11 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
             walked.elapsed
         );
         if let Some((lag, version, id)) = walked.slowest_expiry {
-            let message = svc.db().at(version).map(|s| s.commit().message.replace('\n', " | ")).unwrap_or_default();
+            let message = svc
+                .db()
+                .at(version)
+                .map(|s| s.commit().message.replace('\n', " | "))
+                .unwrap_or_default();
             let message: String = message.chars().take(160).collect();
             println!("  slowest release: #{id} {lag} ms late, in v{version}: {message}");
         }
@@ -584,7 +663,10 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
 }
 
 fn scratch() -> PathBuf {
-    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/booking-stress"));
+    let path = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/booking-stress"
+    ));
     fs::create_dir_all(&path).expect("create target/booking-stress");
     path
 }
@@ -603,7 +685,10 @@ fn main() {
             let path = match &args.path {
                 Some(path) => path.clone(),
                 None => {
-                    let path = scratch().join(format!("stress-{}.ferro", if coalesce { "on" } else { "off" }));
+                    let path = scratch().join(format!(
+                        "stress-{}.ferro",
+                        if coalesce { "on" } else { "off" }
+                    ));
                     let _ = fs::remove_file(&path);
                     path
                 }

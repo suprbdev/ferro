@@ -93,7 +93,11 @@ fn fork_far(dir: &Path) {
     for _ in 0..1_000 {
         bump(&side, 1);
     }
-    ancestor("Fork at 10,000, then 10,000 and 1,000 commits", &main, &side);
+    ancestor(
+        "Fork at 10,000, then 10,000 and 1,000 commits",
+        &main,
+        &side,
+    );
 }
 
 fn took_side(dir: &Path, into_main: bool) {
@@ -129,7 +133,11 @@ fn features(dir: &Path) {
         merge(&main, &feature);
         main.drop_branch(&format!("f{i}")).unwrap();
     }
-    ancestor("1,000 features merged since a branch forked", &main, &branch);
+    ancestor(
+        "1,000 features merged since a branch forked",
+        &main,
+        &branch,
+    );
     merge(&branch, &main);
     bump(&branch, 1);
     for i in 1_000..1_200u64 {
@@ -162,7 +170,11 @@ fn criss_cross(dir: &Path) {
     bump(&main, 0);
     bump(&side, 1);
     ancestor("Criss-cross after 11,000 commits: the search", &main, &side);
-    refused("The same: the whole merge, without its commit", &main, &side);
+    refused(
+        "The same: the whole merge, without its commit",
+        &main,
+        &side,
+    );
 }
 
 fn main() {

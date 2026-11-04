@@ -71,11 +71,22 @@ async fn make_customer(client: &mut Client, name: &str) -> u64 {
         )
         .await
         .unwrap();
-    assert_eq!(response.status, 201, "{}", String::from_utf8_lossy(&response.body));
+    assert_eq!(
+        response.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
     response.json()["id"].as_u64().unwrap()
 }
 
-async fn make_product(client: &mut Client, name: &str, category: &str, price: u64, stock: u32) -> u64 {
+async fn make_product(
+    client: &mut Client,
+    name: &str,
+    category: &str,
+    price: u64,
+    stock: u32,
+) -> u64 {
     let response = client
         .json(
             "POST",
@@ -141,17 +152,27 @@ async fn product_crud_filters_and_cursor_pagination() {
     assert_eq!(pages, 6);
     assert_eq!(seen, (1..=40).collect::<Vec<u64>>());
 
-    let page = client.get("/products?category=tools&limit=100").await.unwrap().json();
+    let page = client
+        .get("/products?category=tools&limit=100")
+        .await
+        .unwrap()
+        .json();
     let items = page["items"].as_array().unwrap();
     assert_eq!(items.len(), 5);
     assert!(items.iter().all(|item| item["category"] == "tools"));
-    let ids: Vec<u64> = items.iter().map(|item| item["id"].as_u64().unwrap()).collect();
+    let ids: Vec<u64> = items
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect();
     let mut sorted = ids.clone();
     sorted.sort();
     assert_eq!(ids, sorted);
 
     let page = client
-        .get(&format!("/products?category=tools&limit=2&after={}", ids[1]))
+        .get(&format!(
+            "/products?category=tools&limit=2&after={}",
+            ids[1]
+        ))
         .await
         .unwrap()
         .json();
@@ -164,9 +185,17 @@ async fn product_crud_filters_and_cursor_pagination() {
     assert_eq!(after, vec![ids[2], ids[3]]);
     assert_eq!(page["next_cursor"], ids[3]);
 
-    let page = client.get("/products?in_stock=false&limit=100").await.unwrap().json();
+    let page = client
+        .get("/products?in_stock=false&limit=100")
+        .await
+        .unwrap()
+        .json();
     assert_eq!(page["items"].as_array().unwrap().len(), 4);
-    let page = client.get("/products?min_price=5000&max_price=6000&limit=100").await.unwrap().json();
+    let page = client
+        .get("/products?min_price=5000&max_price=6000&limit=100")
+        .await
+        .unwrap()
+        .json();
     for item in page["items"].as_array().unwrap() {
         let price = item["price_cents"].as_u64().unwrap();
         assert!((5000..=6000).contains(&price));
@@ -181,7 +210,11 @@ async fn product_crud_filters_and_cursor_pagination() {
     assert_eq!(product.json()["stock"], 3);
 
     let patched = client
-        .json("PATCH", "/products/41", &json!({"price_cents": 1999, "name": "Desk lamp", "stock_delta": -1, "active": false}))
+        .json(
+            "PATCH",
+            "/products/41",
+            &json!({"price_cents": 1999, "name": "Desk lamp", "stock_delta": -1, "active": false}),
+        )
         .await
         .unwrap();
     assert_eq!(patched.status, 200);
@@ -199,9 +232,23 @@ async fn product_crud_filters_and_cursor_pagination() {
     assert_eq!(stock_of(&mut client, 41).await, 2);
 
     assert_eq!(client.get("/products/9999").await.unwrap().status, 404);
-    assert_eq!(client.json("PATCH", "/products/9999", &json!({"name": "x"})).await.unwrap().status, 404);
+    assert_eq!(
+        client
+            .json("PATCH", "/products/9999", &json!({"name": "x"}))
+            .await
+            .unwrap()
+            .status,
+        404
+    );
     assert_eq!(client.get("/products/abc").await.unwrap().status, 422);
-    let bad = client.json("POST", "/products", &json!({"name": " ", "category": "x", "price_cents": 1})).await.unwrap();
+    let bad = client
+        .json(
+            "POST",
+            "/products",
+            &json!({"name": " ", "category": "x", "price_cents": 1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(bad.status, 422);
     server.shutdown().await;
 }
@@ -216,42 +263,85 @@ async fn carts_and_orders_from_items_and_cart() {
     let rope = make_product(&mut client, "Rope", "tools", 700, 4).await;
 
     let response = client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": anvil, "qty": 2}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": anvil, "qty": 2}),
+        )
         .await
         .unwrap();
     assert_eq!(response.status, 201);
     client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": anvil, "qty": 1}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": anvil, "qty": 1}),
+        )
         .await
         .unwrap();
     client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": rope, "qty": 4}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": rope, "qty": 4}),
+        )
         .await
         .unwrap();
-    let cart = client.get(&format!("/carts/{customer}")).await.unwrap().json();
-    assert_eq!(cart["items"], json!([{"product_id": anvil, "qty": 3}, {"product_id": rope, "qty": 4}]));
+    let cart = client
+        .get(&format!("/carts/{customer}"))
+        .await
+        .unwrap()
+        .json();
+    assert_eq!(
+        cart["items"],
+        json!([{"product_id": anvil, "qty": 3}, {"product_id": rope, "qty": 4}])
+    );
     let missing = client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": 999, "qty": 1}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": 999, "qty": 1}),
+        )
         .await
         .unwrap();
     assert_eq!(missing.status, 404);
     let zero = client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": anvil, "qty": 0}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": anvil, "qty": 0}),
+        )
         .await
         .unwrap();
     assert_eq!(zero.status, 422);
 
     let order = client
-        .json("POST", "/orders", &json!({"customer_id": customer, "cart_id": customer}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "cart_id": customer}),
+        )
         .await
         .unwrap();
-    assert_eq!(order.status, 201, "{}", String::from_utf8_lossy(&order.body));
+    assert_eq!(
+        order.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&order.body)
+    );
     let order = order.json();
     assert_eq!(order["total_cents"], 3 * 5000 + 4 * 700);
     assert_eq!(order["status"], "placed");
     assert_eq!(stock_of(&mut client, anvil).await, 7);
     assert_eq!(stock_of(&mut client, rope).await, 0);
-    assert_eq!(client.get(&format!("/carts/{customer}")).await.unwrap().status, 404);
+    assert_eq!(
+        client
+            .get(&format!("/carts/{customer}"))
+            .await
+            .unwrap()
+            .status,
+        404
+    );
 
     let id = order["id"].as_u64().unwrap();
     let fetched = client.get(&format!("/orders/{id}")).await.unwrap().json();
@@ -264,23 +354,54 @@ async fn carts_and_orders_from_items_and_cart() {
     assert_eq!(second.status, 201);
     assert_eq!(second.json()["lines"][0]["qty"], 2);
 
-    let list = client.get(&format!("/customers/{customer}/orders")).await.unwrap().json();
-    let ids: Vec<u64> = list["items"].as_array().unwrap().iter().map(|o| o["id"].as_u64().unwrap()).collect();
+    let list = client
+        .get(&format!("/customers/{customer}/orders"))
+        .await
+        .unwrap()
+        .json();
+    let ids: Vec<u64> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_u64().unwrap())
+        .collect();
     assert_eq!(ids, vec![2, 1]);
-    let list = client.get(&format!("/customers/{customer}/orders?limit=1")).await.unwrap().json();
+    let list = client
+        .get(&format!("/customers/{customer}/orders?limit=1"))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
     assert_eq!(list["next_cursor"], 2);
-    let list = client.get(&format!("/customers/{customer}/orders?before=2")).await.unwrap().json();
+    let list = client
+        .get(&format!("/customers/{customer}/orders?before=2"))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(list["items"][0]["id"], 1);
-    assert_eq!(client.get("/customers/77/orders").await.unwrap().status, 404);
+    assert_eq!(
+        client.get("/customers/77/orders").await.unwrap().status,
+        404
+    );
     assert_eq!(client.get("/orders/77").await.unwrap().status, 404);
 
     let nobody = client
-        .json("POST", "/orders", &json!({"customer_id": 77, "items": [{"product_id": anvil, "qty": 1}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": 77, "items": [{"product_id": anvil, "qty": 1}]}),
+        )
         .await
         .unwrap();
     assert_eq!(nobody.status, 404);
-    let empty = client.json("POST", "/orders", &json!({"customer_id": customer, "items": []})).await.unwrap();
+    let empty = client
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": []}),
+        )
+        .await
+        .unwrap();
     assert_eq!(empty.status, 422);
     server.shutdown().await;
 }
@@ -293,7 +414,9 @@ async fn short_stock_refuses_whole_order_with_409() {
     let customer = make_customer(&mut client, "road").await;
     let plenty = make_product(&mut client, "Plenty", "toys", 100, 100).await;
     let scarce = make_product(&mut client, "Scarce", "toys", 100, 2).await;
-    let version = client.get("/health").await.unwrap().json()["version"].as_u64().unwrap();
+    let version = client.get("/health").await.unwrap().json()["version"]
+        .as_u64()
+        .unwrap();
 
     let response = client
         .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": plenty, "qty": 10}, {"product_id": scarce, "qty": 3}]}))
@@ -301,10 +424,16 @@ async fn short_stock_refuses_whole_order_with_409() {
         .unwrap();
     assert_eq!(response.status, 409);
     let body = response.json();
-    assert_eq!(body["short"], json!([{"product_id": scarce, "requested": 3, "available": 2}]));
+    assert_eq!(
+        body["short"],
+        json!([{"product_id": scarce, "requested": 3, "available": 2}])
+    );
     assert_eq!(stock_of(&mut client, plenty).await, 100);
     assert_eq!(stock_of(&mut client, scarce).await, 2);
-    assert_eq!(client.get("/health").await.unwrap().json()["version"], version);
+    assert_eq!(
+        client.get("/health").await.unwrap().json()["version"],
+        version
+    );
     let stats = client.get("/admin/stats").await.unwrap().json();
     assert_eq!(stats["orders"], 0);
     assert_eq!(stats["orders_conflict"], 1);
@@ -328,7 +457,11 @@ async fn concurrent_orders_for_last_unit_have_one_winner() {
         tasks.push(tokio::spawn(async move {
             let mut client = Client::connect(addr).await.unwrap();
             client
-                .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": last, "qty": 1}]}))
+                .json(
+                    "POST",
+                    "/orders",
+                    &json!({"customer_id": customer, "items": [{"product_id": last, "qty": 1}]}),
+                )
                 .await
                 .unwrap()
                 .status
@@ -373,7 +506,11 @@ async fn many_orders_never_oversell_and_conserve_units() {
                     json!([{"product_id": a, "qty": 1}, {"product_id": b, "qty": qty}])
                 };
                 let response = client
-                    .json("POST", "/orders", &json!({"customer_id": customer, "items": items}))
+                    .json(
+                        "POST",
+                        "/orders",
+                        &json!({"customer_id": customer, "items": items}),
+                    )
                     .await
                     .unwrap();
                 match response.status {
@@ -393,7 +530,10 @@ async fn many_orders_never_oversell_and_conserve_units() {
     let stats = client.get("/admin/stats").await.unwrap().json();
     assert_eq!(stats["orders"].as_u64().unwrap(), won);
     assert_eq!(report["live_orders"].as_u64().unwrap(), won);
-    assert_eq!(report["consumed_units"].as_u64().unwrap() + report["stock_units"].as_u64().unwrap(), 65);
+    assert_eq!(
+        report["consumed_units"].as_u64().unwrap() + report["stock_units"].as_u64().unwrap(),
+        65
+    );
     server.shutdown().await;
 }
 
@@ -405,13 +545,24 @@ async fn order_history_lists_each_version_of_the_order() {
     let customer = make_customer(&mut client, "hist").await;
     let item = make_product(&mut client, "Item", "books", 100, 5).await;
     let order = client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 2}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 2}]}),
+        )
         .await
         .unwrap()
         .json();
     let id = order["id"].as_u64().unwrap();
     make_product(&mut client, "Noise", "books", 100, 5).await;
-    let shipped = client.json("PATCH", &format!("/orders/{id}"), &json!({"status": "shipped"})).await.unwrap();
+    let shipped = client
+        .json(
+            "PATCH",
+            &format!("/orders/{id}"),
+            &json!({"status": "shipped"}),
+        )
+        .await
+        .unwrap();
     assert_eq!(shipped.status, 200);
     make_product(&mut client, "Noise2", "books", 100, 5).await;
 
@@ -424,18 +575,36 @@ async fn order_history_lists_each_version_of_the_order() {
     assert!(entries[0]["version"].as_u64().unwrap() < entries[1]["version"].as_u64().unwrap());
     assert_eq!(entries[0]["message"], format!("order {id}"));
 
-    let again = client.json("PATCH", &format!("/orders/{id}"), &json!({"status": "cancelled"})).await.unwrap();
+    let again = client
+        .json(
+            "PATCH",
+            &format!("/orders/{id}"),
+            &json!({"status": "cancelled"}),
+        )
+        .await
+        .unwrap();
     assert_eq!(again.status, 409);
     assert_eq!(client.get("/orders/999/history").await.unwrap().status, 404);
 
     let second = client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 1}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 1}]}),
+        )
         .await
         .unwrap()
         .json();
     let second_id = second["id"].as_u64().unwrap();
     assert_eq!(stock_of(&mut client, item).await, 2);
-    client.json("PATCH", &format!("/orders/{second_id}"), &json!({"status": "cancelled"})).await.unwrap();
+    client
+        .json(
+            "PATCH",
+            &format!("/orders/{second_id}"),
+            &json!({"status": "cancelled"}),
+        )
+        .await
+        .unwrap();
     assert_eq!(stock_of(&mut client, item).await, 3);
     server.shutdown().await;
 }
@@ -447,40 +616,111 @@ async fn time_travel_serves_old_versions_read_only() {
     let mut client = server.client().await;
     let customer = make_customer(&mut client, "tt").await;
     let item = make_product(&mut client, "Item", "books", 1000, 5).await;
-    let before = client.get("/health").await.unwrap().json()["version"].as_u64().unwrap();
-    client.json("PATCH", &format!("/products/{item}"), &json!({"price_cents": 2000})).await.unwrap();
+    let before = client.get("/health").await.unwrap().json()["version"]
+        .as_u64()
+        .unwrap();
+    client
+        .json(
+            "PATCH",
+            &format!("/products/{item}"),
+            &json!({"price_cents": 2000}),
+        )
+        .await
+        .unwrap();
     let order = client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 2}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 2}]}),
+        )
         .await
         .unwrap()
         .json();
     let order_id = order["id"].as_u64().unwrap();
 
-    let old = client.get(&format!("/admin/snapshot/{before}/products/{item}")).await.unwrap();
+    let old = client
+        .get(&format!("/admin/snapshot/{before}/products/{item}"))
+        .await
+        .unwrap();
     assert_eq!(old.status, 200);
     assert_eq!(old.json()["price_cents"], 1000);
     assert_eq!(old.json()["stock"], 5);
     assert_eq!(old.header("x-version"), Some(before.to_string().as_str()));
     assert!(old.header("cache-control").unwrap().contains("immutable"));
-    let now = client.get(&format!("/products/{item}")).await.unwrap().json();
+    let now = client
+        .get(&format!("/products/{item}"))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(now["price_cents"], 2000);
     assert_eq!(now["stock"], 3);
 
-    assert_eq!(client.get(&format!("/admin/snapshot/{before}/orders/{order_id}")).await.unwrap().status, 404);
-    let list = client.get(&format!("/admin/snapshot/{before}/products")).await.unwrap().json();
+    assert_eq!(
+        client
+            .get(&format!("/admin/snapshot/{before}/orders/{order_id}"))
+            .await
+            .unwrap()
+            .status,
+        404
+    );
+    let list = client
+        .get(&format!("/admin/snapshot/{before}/products"))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(list["items"][0]["price_cents"], 1000);
-    let orders = client.get(&format!("/admin/snapshot/{before}/customers/{customer}/orders")).await.unwrap().json();
+    let orders = client
+        .get(&format!(
+            "/admin/snapshot/{before}/customers/{customer}/orders"
+        ))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(orders["items"].as_array().unwrap().len(), 0);
-    let health = client.get(&format!("/admin/snapshot/{before}/health")).await.unwrap().json();
+    let health = client
+        .get(&format!("/admin/snapshot/{before}/health"))
+        .await
+        .unwrap()
+        .json();
     assert_eq!(health["version"], before);
-    let history = client.get(&format!("/admin/snapshot/{before}/orders/{order_id}/history")).await.unwrap();
+    let history = client
+        .get(&format!(
+            "/admin/snapshot/{before}/orders/{order_id}/history"
+        ))
+        .await
+        .unwrap();
     assert_eq!(history.status, 404);
 
-    assert_eq!(client.get("/admin/snapshot/99999/products").await.unwrap().status, 404);
-    assert_eq!(client.get("/admin/snapshot/xyz/products").await.unwrap().status, 422);
-    let write = client.json("POST", &format!("/admin/snapshot/{before}/products"), &json!({"name": "x", "category": "y", "price_cents": 1})).await.unwrap();
+    assert_eq!(
+        client
+            .get("/admin/snapshot/99999/products")
+            .await
+            .unwrap()
+            .status,
+        404
+    );
+    assert_eq!(
+        client
+            .get("/admin/snapshot/xyz/products")
+            .await
+            .unwrap()
+            .status,
+        422
+    );
+    let write = client
+        .json(
+            "POST",
+            &format!("/admin/snapshot/{before}/products"),
+            &json!({"name": "x", "category": "y", "price_cents": 1}),
+        )
+        .await
+        .unwrap();
     assert!(write.status == 404 || write.status == 405);
-    let genesis = client.get("/admin/snapshot/0/products").await.unwrap().json();
+    let genesis = client
+        .get("/admin/snapshot/0/products")
+        .await
+        .unwrap()
+        .json();
     assert_eq!(genesis["items"].as_array().unwrap().len(), 0);
     server.shutdown().await;
 }
@@ -499,46 +739,100 @@ async fn etag_gives_304_and_survives_unrelated_writes() {
     let one = client.get(&format!("/products/{item}")).await.unwrap();
     let one_tag = one.header("etag").unwrap().to_string();
 
-    let again = client.send("GET", "/products", &[("if-none-match", &list_tag)], None).await.unwrap();
+    let again = client
+        .send("GET", "/products", &[("if-none-match", &list_tag)], None)
+        .await
+        .unwrap();
     assert_eq!(again.status, 304);
     assert!(again.body.is_empty());
     assert_eq!(again.header("etag"), Some(list_tag.as_str()));
 
     let item_path = format!("/products/{item}");
     client
-        .json("POST", &format!("/carts/{customer}/items"), &json!({"product_id": item, "qty": 1}))
+        .json(
+            "POST",
+            &format!("/carts/{customer}/items"),
+            &json!({"product_id": item, "qty": 1}),
+        )
         .await
         .unwrap();
-    client.json("PATCH", &format!("/products/{other}"), &json!({"name": "Renamed"})).await.unwrap();
-    let still = client.send("GET", &item_path, &[("if-none-match", &one_tag)], None).await.unwrap();
+    client
+        .json(
+            "PATCH",
+            &format!("/products/{other}"),
+            &json!({"name": "Renamed"}),
+        )
+        .await
+        .unwrap();
+    let still = client
+        .send("GET", &item_path, &[("if-none-match", &one_tag)], None)
+        .await
+        .unwrap();
     assert_eq!(still.status, 304);
-    let stale_list = client.send("GET", "/products", &[("if-none-match", &list_tag)], None).await.unwrap();
+    let stale_list = client
+        .send("GET", "/products", &[("if-none-match", &list_tag)], None)
+        .await
+        .unwrap();
     assert_eq!(stale_list.status, 200);
 
-    client.json("PATCH", &item_path, &json!({"price_cents": 1})).await.unwrap();
-    let changed = client.send("GET", &item_path, &[("if-none-match", &one_tag)], None).await.unwrap();
+    client
+        .json("PATCH", &item_path, &json!({"price_cents": 1}))
+        .await
+        .unwrap();
+    let changed = client
+        .send("GET", &item_path, &[("if-none-match", &one_tag)], None)
+        .await
+        .unwrap();
     assert_eq!(changed.status, 200);
     assert_ne!(changed.header("etag").unwrap(), one_tag);
 
     let multi = client
-        .send("GET", &item_path, &[("if-none-match", &format!("W/\"nope\", {}", changed.header("etag").unwrap()))], None)
+        .send(
+            "GET",
+            &item_path,
+            &[(
+                "if-none-match",
+                &format!("W/\"nope\", {}", changed.header("etag").unwrap()),
+            )],
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(multi.status, 304);
 
     let order = client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 1}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 1}]}),
+        )
         .await
         .unwrap();
     let order_id = order.json()["id"].as_u64().unwrap();
     let order_path = format!("/orders/{order_id}");
     let first = client.get(&order_path).await.unwrap();
     let tag = first.header("etag").unwrap().to_string();
-    client.json("PATCH", &format!("/products/{other}"), &json!({"name": "Again"})).await.unwrap();
-    let second = client.send("GET", &order_path, &[("if-none-match", &tag)], None).await.unwrap();
+    client
+        .json(
+            "PATCH",
+            &format!("/products/{other}"),
+            &json!({"name": "Again"}),
+        )
+        .await
+        .unwrap();
+    let second = client
+        .send("GET", &order_path, &[("if-none-match", &tag)], None)
+        .await
+        .unwrap();
     assert_eq!(second.status, 304);
-    client.json("PATCH", &order_path, &json!({"status": "shipped"})).await.unwrap();
-    let third = client.send("GET", &order_path, &[("if-none-match", &tag)], None).await.unwrap();
+    client
+        .json("PATCH", &order_path, &json!({"status": "shipped"}))
+        .await
+        .unwrap();
+    let third = client
+        .send("GET", &order_path, &[("if-none-match", &tag)], None)
+        .await
+        .unwrap();
     assert_eq!(third.status, 200);
 
     let stats = client.get("/admin/stats").await.unwrap().json();
@@ -572,10 +866,16 @@ async fn event_stream_sends_only_what_changed() {
     assert_eq!(stream.status, 200);
     let hello = stream.next().await.unwrap().unwrap();
     assert_eq!(hello.event, "hello");
-    let start = serde_json::from_str::<Value>(&hello.data).unwrap()["version"].as_u64().unwrap();
+    let start = serde_json::from_str::<Value>(&hello.data).unwrap()["version"]
+        .as_u64()
+        .unwrap();
 
     client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": 7, "qty": 3}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": 7, "qty": 3}]}),
+        )
         .await
         .unwrap();
     let change = next_change(&mut stream).await;
@@ -591,7 +891,10 @@ async fn event_stream_sends_only_what_changed() {
     assert_eq!(order["op"], "added");
     assert_eq!(order["after"]["customer"], customer);
 
-    client.json("PATCH", "/products/3", &json!({"name": "Renamed"})).await.unwrap();
+    client
+        .json("PATCH", "/products/3", &json!({"name": "Renamed"}))
+        .await
+        .unwrap();
     let change = next_change(&mut stream).await;
     let changes = change["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1);
@@ -600,9 +903,15 @@ async fn event_stream_sends_only_what_changed() {
     assert_eq!(changes[0]["before"]["name"], "P2");
     assert_eq!(changes[0]["after"]["name"], "Renamed");
 
-    let noop = client.json("PATCH", "/products/3", &json!({"name": "Renamed"})).await.unwrap();
+    let noop = client
+        .json("PATCH", "/products/3", &json!({"name": "Renamed"}))
+        .await
+        .unwrap();
     assert_eq!(noop.status, 200);
-    client.json("PATCH", "/products/4", &json!({"active": false})).await.unwrap();
+    client
+        .json("PATCH", "/products/4", &json!({"active": false}))
+        .await
+        .unwrap();
     let change = next_change(&mut stream).await;
     assert_eq!(change["changes"][0]["id"], 4);
     server.shutdown().await;
@@ -614,18 +923,34 @@ async fn event_stream_resumes_from_version_with_coalesced_diff() {
     let server = Server::start(&dir.path().join("shop.ferro"), buffered()).await;
     let mut client = server.client().await;
     make_product(&mut client, "A", "toys", 100, 10).await;
-    let version = client.get("/health").await.unwrap().json()["version"].as_u64().unwrap();
-    client.json("PATCH", "/products/1", &json!({"stock": 9})).await.unwrap();
-    client.json("PATCH", "/products/1", &json!({"stock": 8})).await.unwrap();
+    let version = client.get("/health").await.unwrap().json()["version"]
+        .as_u64()
+        .unwrap();
+    client
+        .json("PATCH", "/products/1", &json!({"stock": 9}))
+        .await
+        .unwrap();
+    client
+        .json("PATCH", "/products/1", &json!({"stock": 8}))
+        .await
+        .unwrap();
     make_product(&mut client, "B", "toys", 100, 1).await;
 
-    let mut stream = SseStream::open(server.addr, &format!("/events?since={version}"), &[]).await.unwrap();
+    let mut stream = SseStream::open(server.addr, &format!("/events?since={version}"), &[])
+        .await
+        .unwrap();
     let hello = stream.next().await.unwrap().unwrap();
     assert_eq!(hello.event, "hello");
     let change = next_change(&mut stream).await;
     assert_eq!(change["from"], version);
     assert_eq!(change["version"], version + 3);
-    let stock = change["changes"].as_array().unwrap().iter().find(|c| c["table"] == "stock" && c["id"] == 1).unwrap().clone();
+    let stock = change["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["table"] == "stock" && c["id"] == 1)
+        .unwrap()
+        .clone();
     assert_eq!(stock["before"], 10);
     assert_eq!(stock["after"], 8);
 
@@ -633,7 +958,13 @@ async fn event_stream_resumes_from_version_with_coalesced_diff() {
     let change = next_change(&mut stream).await;
     assert_eq!(change["from"], version + 3);
 
-    let mut header_stream = SseStream::open(server.addr, "/events", &[("last-event-id", &version.to_string())]).await.unwrap();
+    let mut header_stream = SseStream::open(
+        server.addr,
+        "/events",
+        &[("last-event-id", &version.to_string())],
+    )
+    .await
+    .unwrap();
     header_stream.next().await.unwrap().unwrap();
     let change = next_change(&mut header_stream).await;
     assert_eq!(change["from"], version);
@@ -653,13 +984,19 @@ async fn slow_event_consumer_does_not_stall_writers_and_catches_up() {
     make_product(&mut client, "A", "toys", 100, 100000).await;
     let mut slow = SseStream::open(server.addr, "/events", &[]).await.unwrap();
     let hello = slow.next().await.unwrap().unwrap();
-    let start = serde_json::from_str::<Value>(&hello.data).unwrap()["version"].as_u64().unwrap();
+    let start = serde_json::from_str::<Value>(&hello.data).unwrap()["version"]
+        .as_u64()
+        .unwrap();
 
     let began = std::time::Instant::now();
     let bulk = "x".repeat(16 * 1024);
     for round in 0..400 {
         let response = client
-            .json("PATCH", "/products/1", &json!({"stock_delta": -1, "name": format!("{round}{bulk}")}))
+            .json(
+                "PATCH",
+                "/products/1",
+                &json!({"stock_delta": -1, "name": format!("{round}{bulk}")}),
+            )
             .await
             .unwrap();
         assert_eq!(response.status, 200);
@@ -735,7 +1072,10 @@ async fn retention_reclaims_under_load_and_the_replica_keeps_following() {
     }
     assert!(cycles >= 2, "only {cycles} cycles");
     let stats = writer.get("/admin/stats").await.unwrap().json();
-    assert!(stats["db_bytes"].as_u64().unwrap() < sold * 8 * 1024 / 2, "{stats}");
+    assert!(
+        stats["db_bytes"].as_u64().unwrap() < sold * 8 * 1024 / 2,
+        "{stats}"
+    );
     assert_eq!(stock_of(&mut writer, item).await, 100_000 - sold);
     let mut seen = 0;
     for _ in 0..200 {
@@ -771,7 +1111,11 @@ async fn replica_serves_reads_follows_primary_and_refuses_writes() {
 
     let customer = make_customer(&mut writer, "rep").await;
     writer
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 4}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 4}]}),
+        )
         .await
         .unwrap();
     let mut seen = 0;
@@ -784,14 +1128,28 @@ async fn replica_serves_reads_follows_primary_and_refuses_writes() {
     }
     assert_eq!(seen, 5);
 
-    let refused = reader.json("POST", "/products", &json!({"name": "x", "category": "y", "price_cents": 1})).await.unwrap();
+    let refused = reader
+        .json(
+            "POST",
+            "/products",
+            &json!({"name": "x", "category": "y", "price_cents": 1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(refused.status, 403);
     let health = reader.get("/health").await.unwrap().json();
     assert_eq!(health["replica"], true);
 
     let mut stream = SseStream::open(replica.addr, "/events", &[]).await.unwrap();
     stream.next().await.unwrap().unwrap();
-    writer.json("PATCH", &format!("/products/{item}"), &json!({"name": "Live"})).await.unwrap();
+    writer
+        .json(
+            "PATCH",
+            &format!("/products/{item}"),
+            &json!({"name": "Live"}),
+        )
+        .await
+        .unwrap();
     let change = next_change(&mut stream).await;
     assert_eq!(change["changes"][0]["after"]["name"], "Live");
 
@@ -808,10 +1166,16 @@ async fn restart_keeps_data_and_history() {
     let customer = make_customer(&mut client, "restart").await;
     let item = make_product(&mut client, "Item", "books", 100, 9).await;
     client
-        .json("POST", "/orders", &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 4}]}))
+        .json(
+            "POST",
+            "/orders",
+            &json!({"customer_id": customer, "items": [{"product_id": item, "qty": 4}]}),
+        )
         .await
         .unwrap();
-    let version = client.get("/health").await.unwrap().json()["version"].as_u64().unwrap();
+    let version = client.get("/health").await.unwrap().json()["version"]
+        .as_u64()
+        .unwrap();
     drop(client);
     server.shutdown().await;
 

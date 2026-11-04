@@ -41,7 +41,10 @@ fn kill9(mut child: Child) {
 }
 
 fn ids(path: &Path) -> BTreeSet<u64> {
-    lines(path).iter().filter_map(|line| line.trim().parse().ok()).collect()
+    lines(path)
+        .iter()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
 }
 
 #[test]
@@ -58,11 +61,21 @@ fn kill_nine_producer_and_worker_lose_nothing() {
         let producer = spawn(
             &db,
             &[
-                "produce", "jobs", "--count", "1000000", "--batch", &BATCH.to_string(),
-                "--log", produced.to_str().unwrap(), "--sleep-ms", "1",
+                "produce",
+                "jobs",
+                "--count",
+                "1000000",
+                "--batch",
+                &BATCH.to_string(),
+                "--log",
+                produced.to_str().unwrap(),
+                "--sleep-ms",
+                "1",
             ],
         );
-        wait_until(Duration::from_secs(20), || ids(&produced).len() >= before + 60);
+        wait_until(Duration::from_secs(20), || {
+            ids(&produced).len() >= before + 60
+        });
         kill9(producer);
 
         let acked = ids(&produced);
@@ -78,7 +91,8 @@ fn kill_nine_producer_and_worker_lose_nothing() {
             let fresh: Vec<u64> = (0..state.next_id)
                 .filter(|id| !acked.contains(id) && !unacked.contains(id))
                 .collect();
-            let in_flight: Vec<u64> = (state.next_id.saturating_sub(BATCH as u64)..state.next_id).collect();
+            let in_flight: Vec<u64> =
+                (state.next_id.saturating_sub(BATCH as u64)..state.next_id).collect();
             assert!(
                 fresh.is_empty() || fresh == in_flight,
                 "round {round}: unacknowledged ids {fresh:?} are not the one batch in flight {in_flight:?}"
@@ -88,10 +102,23 @@ fn kill_nine_producer_and_worker_lose_nothing() {
 
         let worker = spawn(
             &db,
-            &["work", "jobs", "--workers", "4", "--batch", "2", "--ttl-ms", "400", "--exec", &exec],
+            &[
+                "work",
+                "jobs",
+                "--workers",
+                "4",
+                "--batch",
+                "2",
+                "--ttl-ms",
+                "400",
+                "--exec",
+                &exec,
+            ],
         );
         let finished_before = ids(&done).len();
-        wait_until(Duration::from_secs(30), || ids(&done).len() >= finished_before + 40);
+        wait_until(Duration::from_secs(30), || {
+            ids(&done).len() >= finished_before + 40
+        });
         kill9(worker);
 
         let ran = ids(&done);
@@ -99,10 +126,16 @@ fn kill_nine_producer_and_worker_lose_nothing() {
         let snapshot = queue.db().read();
         for id in &acked {
             match snapshot.jobs.get(id) {
-                None => assert!(ran.contains(id), "round {round}: job {id} vanished without running"),
+                None => assert!(
+                    ran.contains(id),
+                    "round {round}: job {id} vanished without running"
+                ),
                 Some(job) => {
                     assert!(
-                        matches!(job.state, JobState::Ready | JobState::Leased | JobState::Delayed),
+                        matches!(
+                            job.state,
+                            JobState::Ready | JobState::Leased | JobState::Delayed
+                        ),
                         "round {round}: job {id} is {:?}",
                         job.state
                     );
@@ -116,7 +149,19 @@ fn kill_nine_producer_and_worker_lose_nothing() {
     let finisher = Command::new(assert_cmd::cargo::cargo_bin("queue"))
         .arg("--db")
         .arg(&db)
-        .args(["work", "jobs", "--workers", "4", "--batch", "4", "--ttl-ms", "400", "--exit-when-idle", "--exec", &exec])
+        .args([
+            "work",
+            "jobs",
+            "--workers",
+            "4",
+            "--batch",
+            "4",
+            "--ttl-ms",
+            "400",
+            "--exit-when-idle",
+            "--exec",
+            &exec,
+        ])
         .stdout(Stdio::null())
         .status()
         .unwrap();
@@ -153,7 +198,18 @@ fn kill_nine_leaves_leased_jobs_redeliverable_after_expiry() {
     let exec = format!("echo $QUEUE_JOB_ID >> {}; sleep 5", done.display());
     let worker = spawn(
         &db,
-        &["work", "jobs", "--workers", "4", "--batch", "3", "--ttl-ms", "300", "--exec", &exec],
+        &[
+            "work",
+            "jobs",
+            "--workers",
+            "4",
+            "--batch",
+            "3",
+            "--ttl-ms",
+            "300",
+            "--exec",
+            &exec,
+        ],
     );
     wait_until(Duration::from_secs(20), || ids(&done).len() >= 4);
     kill9(worker);
@@ -173,6 +229,12 @@ fn kill_nine_leaves_leased_jobs_redeliverable_after_expiry() {
     let stats = &queue.stats(Some("jobs"))[0];
     assert_eq!(stats.leased, 0);
     assert_eq!(stats.ready + stats.delayed, 30);
-    let redelivered = queue.db().read().jobs.values().filter(|job| job.attempts == 1).count();
+    let redelivered = queue
+        .db()
+        .read()
+        .jobs
+        .values()
+        .filter(|job| job.attempts == 1)
+        .count();
     assert!(redelivered >= 4);
 }

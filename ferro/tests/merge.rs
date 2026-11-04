@@ -57,16 +57,22 @@ fn a_multi_line_message_is_one_message() {
     let path = dir.path().join("b.ferro");
     {
         let db = Db::<Board>::open(&path).unwrap();
-        db.commit("title\n\nbody line\n", |b| b.tasks.insert(task(1, None, "open", &[])))
+        db.commit("title\n\nbody line\n", |b| {
+            b.tasks.insert(task(1, None, "open", &[]))
+        })
+        .unwrap();
+        db.commit("", |b| b.tasks.insert(task(2, None, "open", &[])))
             .unwrap();
-        db.commit("", |b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
         assert_eq!(db.read().commit().messages().count(), 0);
     }
     let db = Db::<Board>::open(&path).unwrap();
     let log = db.log();
     let first = log.get(&1).unwrap();
     assert_eq!(first.message, "title\n\nbody line\n");
-    assert_eq!(first.messages().collect::<Vec<_>>(), vec!["title\n\nbody line\n"]);
+    assert_eq!(
+        first.messages().collect::<Vec<_>>(),
+        vec!["title\n\nbody line\n"]
+    );
     assert_eq!(log.get(&2).unwrap().messages().count(), 0);
 }
 
@@ -74,8 +80,10 @@ fn a_multi_line_message_is_one_message() {
 fn restore_records_its_source_and_reports_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
-    db.update(|board| board.tasks.insert(task(1, None, "open", &[]))).unwrap();
-    db.update(|board| board.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    db.update(|board| board.tasks.insert(task(1, None, "open", &[])))
+        .unwrap();
+    db.update(|board| board.tasks.insert(task(2, None, "open", &[])))
+        .unwrap();
     let done = db.restore(&db.at(1).unwrap()).unwrap();
     assert!(done.changed);
     assert_eq!(done.version, 3);
@@ -90,7 +98,9 @@ fn index_counts_and_option_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
     db.update(|board| {
-        board.tasks.insert(task(1, Some("ann"), "open", &["a", "b"]));
+        board
+            .tasks
+            .insert(task(1, Some("ann"), "open", &["a", "b"]));
         board.tasks.insert(task(2, Some("ann"), "done", &["b"]));
         board.tasks.insert(task(3, Some("bob"), "open", &[]));
         board.tasks.insert(task(4, None, "open", &["c"]));
@@ -127,7 +137,8 @@ fn index_counts_and_option_lookup() {
 fn index_iterators_share_one_type() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
-    db.update(|board| board.tasks.insert(task(1, Some("ann"), "open", &["a"]))).unwrap();
+    db.update(|board| board.tasks.insert(task(1, Some("ann"), "open", &["a"])))
+        .unwrap();
     let snapshot = db.read();
     let mut sources = vec![
         snapshot.tasks.by_state("open"),
@@ -142,8 +153,10 @@ fn index_iterators_share_one_type() {
 fn history_of_reports_only_versions_where_the_projection_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
-    db.commit("create", |b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
-    db.commit("unrelated", |b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    db.commit("create", |b| b.tasks.insert(task(1, None, "open", &[])))
+        .unwrap();
+    db.commit("unrelated", |b| b.tasks.insert(task(2, None, "open", &[])))
+        .unwrap();
     db.commit("close", |b| {
         b.tasks.get_mut(&1).unwrap().state = "done".to_string();
     })
@@ -174,13 +187,19 @@ fn history_of_reports_only_versions_where_the_projection_changed() {
 fn common_ancestor_is_the_fork_point() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
-    db.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
-    db.update(|b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    db.update(|b| b.tasks.insert(task(1, None, "open", &[])))
+        .unwrap();
+    db.update(|b| b.tasks.insert(task(2, None, "open", &[])))
+        .unwrap();
     let other = db.fork("other").unwrap();
     assert_eq!(db.common_ancestor(&other).unwrap().version(), 2);
-    other.update(|b| b.tasks.insert(task(3, None, "open", &[]))).unwrap();
-    db.update(|b| b.tasks.insert(task(4, None, "open", &[]))).unwrap();
-    db.update(|b| b.tasks.insert(task(5, None, "open", &[]))).unwrap();
+    other
+        .update(|b| b.tasks.insert(task(3, None, "open", &[])))
+        .unwrap();
+    db.update(|b| b.tasks.insert(task(4, None, "open", &[])))
+        .unwrap();
+    db.update(|b| b.tasks.insert(task(5, None, "open", &[])))
+        .unwrap();
     assert_eq!(db.common_ancestor(&other).unwrap().version(), 2);
     assert_eq!(other.common_ancestor(&db).unwrap().version(), 2);
 }
@@ -269,7 +288,10 @@ fn map_merge_matches_table_semantics_and_read_only_error_is_clear() {
     theirs.insert(3, 3);
     theirs.remove(&2);
     ours.insert(1, 9);
-    assert_eq!(ours.merge(&base, &theirs, |_| panic!("no conflict expected")), 2);
+    assert_eq!(
+        ours.merge(&base, &theirs, |_| panic!("no conflict expected")),
+        2
+    );
     assert_eq!(ours.len(), 2);
     assert_eq!(*ours.get(&1).unwrap(), 9);
     assert_eq!(*ours.get(&3).unwrap(), 3);
@@ -283,23 +305,29 @@ fn map_merge_matches_table_semantics_and_read_only_error_is_clear() {
 fn merge_with_remembers_what_it_already_took() {
     let dir = tempfile::tempdir().unwrap();
     let main = open(&dir);
-    main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+    main.update(|b| b.tasks.insert(task(1, None, "open", &[])))
+        .unwrap();
     let side = main.fork("side").unwrap();
-    side.update(|b| b.tasks.update(&1, |t| t.state = "side".to_string())).unwrap();
+    side.update(|b| b.tasks.update(&1, |t| t.state = "side".to_string()))
+        .unwrap();
     let take = |main: &Db<Board>, side: &Db<Board>| {
         main.merge_with(side, |b, base, theirs| {
-            let written = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+            let written = b
+                .tasks
+                .merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
             ("merge", written)
         })
         .unwrap()
     };
     assert_eq!(take(&main, &side).value, 1);
-    main.update(|b| b.tasks.update(&1, |t| t.state = "main".to_string())).unwrap();
+    main.update(|b| b.tasks.update(&1, |t| t.state = "main".to_string()))
+        .unwrap();
     let again = take(&main, &side);
     assert_eq!(again.value, 0);
     assert!(!again.changed);
     assert_eq!(main.read().tasks.get(&1).unwrap().state, "main");
-    side.update(|b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    side.update(|b| b.tasks.insert(task(2, None, "open", &[])))
+        .unwrap();
     assert_eq!(take(&main, &side).value, 1);
     assert_eq!(main.read().tasks.len(), 2);
     assert_eq!(main.read().tasks.get(&1).unwrap().state, "main");
@@ -311,10 +339,13 @@ fn merge_keeping_only_ours_still_records_progress_and_survives_reopen() {
     let path = dir.path().join("k.ferro");
     {
         let main = Db::<Board>::open(&path).unwrap();
-        main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+        main.update(|b| b.tasks.insert(task(1, None, "open", &[])))
+            .unwrap();
         let side = main.fork("side").unwrap();
-        side.update(|b| b.tasks.update(&1, |t| t.state = "theirs".to_string())).unwrap();
-        main.update(|b| b.tasks.update(&1, |t| t.state = "ours".to_string())).unwrap();
+        side.update(|b| b.tasks.update(&1, |t| t.state = "theirs".to_string()))
+            .unwrap();
+        main.update(|b| b.tasks.update(&1, |t| t.state = "ours".to_string()))
+            .unwrap();
         let done = main
             .merge_with(&side, |b, base, theirs| {
                 let mut seen = 0;
@@ -330,7 +361,10 @@ fn merge_keeping_only_ours_still_records_progress_and_survives_reopen() {
     }
     let main = Db::<Board>::open(&path).unwrap();
     let side = main.branch("side").unwrap();
-    assert_eq!(main.common_ancestor(&side).unwrap().version(), side.version());
+    assert_eq!(
+        main.common_ancestor(&side).unwrap().version(),
+        side.version()
+    );
     let done = main
         .merge_with(&side, |b, base, theirs| {
             let mut seen = 0;
@@ -349,19 +383,29 @@ fn merge_keeping_only_ours_still_records_progress_and_survives_reopen() {
 fn merging_back_uses_the_reverse_record() {
     let dir = tempfile::tempdir().unwrap();
     let main = open(&dir);
-    main.update(|b| b.tasks.insert(task(1, None, "open", &[]))).unwrap();
+    main.update(|b| b.tasks.insert(task(1, None, "open", &[])))
+        .unwrap();
     let side = main.fork("side").unwrap();
-    main.update(|b| b.tasks.insert(task(2, None, "open", &[]))).unwrap();
+    main.update(|b| b.tasks.insert(task(2, None, "open", &[])))
+        .unwrap();
     side.merge_with(&main, |b, base, theirs| {
-        let written = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+        let written = b
+            .tasks
+            .merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
         ("sync", written)
     })
     .unwrap();
-    side.update(|b| b.tasks.insert(task(3, None, "open", &[]))).unwrap();
-    assert_eq!(main.common_ancestor(&side).unwrap().version(), main.version());
+    side.update(|b| b.tasks.insert(task(3, None, "open", &[])))
+        .unwrap();
+    assert_eq!(
+        main.common_ancestor(&side).unwrap().version(),
+        main.version()
+    );
     let written = main
         .merge_with(&side, |b, base, theirs| {
-            let n = b.tasks.merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
+            let n = b
+                .tasks
+                .merge(&base.tasks, &theirs.tasks, |c| c.ours.as_deref().cloned());
             ("back", n)
         })
         .unwrap();

@@ -50,7 +50,9 @@ fn count(db: &Db<Root>, key: u64, value: i64) {
 }
 
 fn take_theirs(ours: &mut Root, base: &Root, theirs: &Root) -> usize {
-    ours.counts.merge(&base.counts, &theirs.counts, |conflict| conflict.theirs.map(|v| *v))
+    ours.counts.merge(&base.counts, &theirs.counts, |conflict| {
+        conflict.theirs.map(|v| *v)
+    })
 }
 
 fn diverged(db: &Db<Root>) -> (Db<Root>, u64) {
@@ -94,7 +96,10 @@ fn an_err_from_try_merge_with_discards_the_merge_and_returns_the_typed_error() {
             Ok(("merge side", taken))
         })
         .unwrap();
-    assert_eq!((done.value, done.version, done.changed), (2, version + 1, true));
+    assert_eq!(
+        (done.value, done.version, done.changed),
+        (2, version + 1, true)
+    );
     assert_eq!(done.time_ms, db.log().get(&done.version).unwrap().time_ms);
     assert_eq!(db.common_ancestor(&side).unwrap().version(), side.version());
     let merged: Vec<(u64, i64)> = db.read().counts.iter().map(|(k, v)| (k, *v)).collect();
@@ -124,7 +129,10 @@ fn try_merge_with_hands_ferro_errors_back_in_the_callers_type() {
 #[test]
 fn an_err_merge_under_coalesce_writes_nothing_and_leaves_writers_running() {
     let dir = tempfile::tempdir().unwrap();
-    let db: Db<Root> = Options::new().coalesce(true).open(dir.path().join("c.ferro")).unwrap();
+    let db: Db<Root> = Options::new()
+        .coalesce(true)
+        .open(dir.path().join("c.ferro"))
+        .unwrap();
     let (side, forked) = diverged(&db);
     let version = db.version();
     let refused = db.try_merge_with(&side, |ours, base, theirs| {
@@ -207,7 +215,10 @@ fn table_try_merge_leaves_the_table_as_it_was_on_err_in_either_pass() {
     assert!(matches!(clash, Err(Refusal::Clash(4))));
     assert_eq!(asked, vec![(1, Some(1)), (4, Some(3))]);
     assert!(ours == before);
-    assert!(ours.by_holder(&"cat".to_string()).is_some_and(|row| row.id == 3));
+    assert!(
+        ours.by_holder(&"cat".to_string())
+            .is_some_and(|row| row.id == 3)
+    );
     assert!(ours.contains(&2));
 
     let done = ours.try_merge(&base, &theirs, |conflict| {
@@ -225,7 +236,9 @@ fn shared_pair(dir: &Path) -> (Db<Root>, Db<Root>, u64) {
     let laptop = open(&dir.join("laptop.ferro"));
     let phone = open(&dir.join("phone.ferro"));
     count(&laptop, 1, 1);
-    let pulled = phone.pull(&laptop, "laptop", |_, _, _| ("never", ())).unwrap();
+    let pulled = phone
+        .pull(&laptop, "laptop", |_, _, _| ("never", ()))
+        .unwrap();
     assert_eq!(pulled.outcome, Outcome::FastForward);
     let shared = laptop.version();
     count(&laptop, 2, 2);
@@ -248,13 +261,20 @@ fn a_refused_pull_merges_nothing_and_a_retry_merges_against_the_same_base() {
     assert!(matches!(refused, Err(Refusal::Clash(3))));
     assert_eq!((laptop.version(), laptop.head_hash()), (version, head));
     assert_eq!(*laptop.read(), *before);
-    assert_eq!(laptop.branch("phone").unwrap().head_hash(), phone.head_hash());
+    assert_eq!(
+        laptop.branch("phone").unwrap().head_hash(),
+        phone.head_hash()
+    );
 
     let pulled = laptop
-        .try_pull(&phone, "phone", |ours, base, theirs| -> Result<_, Refusal> {
-            assert_eq!(base.version(), shared);
-            Ok(("sync from the phone", take_theirs(ours, base, theirs)))
-        })
+        .try_pull(
+            &phone,
+            "phone",
+            |ours, base, theirs| -> Result<_, Refusal> {
+                assert_eq!(base.version(), shared);
+                Ok(("sync from the phone", take_theirs(ours, base, theirs)))
+            },
+        )
         .unwrap();
     assert_eq!(pulled.outcome, Outcome::Merged);
     assert_eq!(pulled.value, Some(2));
@@ -262,7 +282,9 @@ fn a_refused_pull_merges_nothing_and_a_retry_merges_against_the_same_base() {
     let merged: Vec<(u64, i64)> = laptop.read().counts.iter().map(|(k, v)| (k, *v)).collect();
     assert_eq!(merged, vec![(1, 7), (2, 2), (3, 3)]);
 
-    let again = laptop.try_pull(&phone, "phone", |_, _, _| Err::<(&str, ()), _>(Refusal::Clash(0)));
+    let again = laptop.try_pull(&phone, "phone", |_, _, _| {
+        Err::<(&str, ()), _>(Refusal::Clash(0))
+    });
     assert_eq!(again.unwrap().outcome, Outcome::Ahead);
 }
 
@@ -291,12 +313,19 @@ fn a_refused_receive_or_push_merges_nothing() {
     let bad = phone.try_receive("laptop", &Bundle::from(vec![1, 2, 3]), |_, _, _| {
         Ok::<(&str, ()), Refusal>(("never", ()))
     });
-    assert!(matches!(bad, Err(Refusal::Ferro(Error::Bundle(_)))), "{bad:?}");
+    assert!(
+        matches!(bad, Err(Refusal::Ferro(Error::Bundle(_)))),
+        "{bad:?}"
+    );
 
     let received = phone
-        .try_receive("laptop", &Bundle::from(bundle), |ours, base, theirs| -> Result<_, Refusal> {
-            Ok(("from the laptop", take_theirs(ours, base, theirs)))
-        })
+        .try_receive(
+            "laptop",
+            &Bundle::from(bundle),
+            |ours, base, theirs| -> Result<_, Refusal> {
+                Ok(("from the laptop", take_theirs(ours, base, theirs)))
+            },
+        )
         .unwrap();
     assert_eq!(received.outcome, Outcome::Merged);
     assert_eq!(phone.version(), version + 1);

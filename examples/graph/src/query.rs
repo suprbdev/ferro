@@ -81,10 +81,18 @@ pub fn reach(g: &Graph, start: UserId, hops: usize, dir: Dir) -> Vec<usize> {
         frontier.sort_unstable();
         for &user in &frontier {
             if matches!(dir, Dir::Out | Dir::Both) {
-                next.extend(out.neighbours(user, usize::MAX).iter().filter(|&&id| seen.set(id)));
+                next.extend(
+                    out.neighbours(user, usize::MAX)
+                        .iter()
+                        .filter(|&&id| seen.set(id)),
+                );
             }
             if matches!(dir, Dir::In | Dir::Both) {
-                next.extend(inn.neighbours(user, usize::MAX).iter().filter(|&&id| seen.set(id)));
+                next.extend(
+                    inn.neighbours(user, usize::MAX)
+                        .iter()
+                        .filter(|&&id| seen.set(id)),
+                );
             }
         }
         levels.push(next.len());

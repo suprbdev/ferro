@@ -1,10 +1,9 @@
-
-use ferro::Val;
 use crate::Res;
 use crate::chunk::{self, DEFAULT};
 use crate::index::Tx;
 use crate::model::{Page, Wiki};
 use crate::text::{heading, rewrite_links, slugify};
+use ferro::Val;
 
 #[derive(Clone, Debug, Default)]
 pub struct Edit {

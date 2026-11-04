@@ -60,7 +60,11 @@ impl Chunker {
 }
 
 pub fn build(text: &str, chunker: &Chunker) -> Body {
-    chunker.split(text).into_iter().map(str::to_string).collect()
+    chunker
+        .split(text)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn text(body: &Body) -> String {

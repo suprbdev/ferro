@@ -5,9 +5,9 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::path::Path;
 use std::pin::pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,7 +31,9 @@ fn dir() -> TempDir {
 }
 
 fn dump(root: &Root) -> BTreeMap<u64, String> {
-    root.iter().map(|(key, value)| (key, (*value).clone())).collect()
+    root.iter()
+        .map(|(key, value)| (key, (*value).clone()))
+        .collect()
 }
 
 fn merge_in(ours: &mut Root, base: &Snapshot<Root>, theirs: &Snapshot<Root>) -> (String, ()) {
@@ -119,7 +121,10 @@ fn straddling_hook(
 fn draft_straddling_pieces(stale: bool) {
     let dir = dir();
     let path = dir.path().join("b.ferro");
-    let a: Db<Root> = fast().reclaim(MANUAL).open(dir.path().join("a.ferro")).unwrap();
+    let a: Db<Root> = fast()
+        .reclaim(MANUAL)
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     let straddle = Arc::new(Mutex::new(None));
     let placed_tx = Arc::new(Mutex::new(None));
     let cell: Cell = Arc::default();
@@ -128,10 +133,18 @@ fn draft_straddling_pieces(stale: bool) {
         .cache_bytes(1 << 28)
         .reclaim(MANUAL)
         .history(history)
-        .hook(straddling_hook(straddle.clone(), placed_tx.clone(), cell.clone(), stale));
+        .hook(straddling_hook(
+            straddle.clone(),
+            placed_tx.clone(),
+            cell.clone(),
+            stale,
+        ));
     let b: Db<Root> = options.clone().open(&path).unwrap();
     fill(&a, 0, 10, 1_500);
-    assert_eq!(b.pull(&a, "a", merge_in).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        b.pull(&a, "a", merge_in).unwrap().outcome,
+        Outcome::FastForward
+    );
     let w = b.fork("w").unwrap();
     w.commit("start", |root| {
         root.insert(OURS, "w".to_string());
@@ -182,19 +195,34 @@ fn draft_straddling_pieces(stale: bool) {
         grew < bundle.as_bytes().len() as u64 + (256 << 10),
         "stale {stale}: the moved draft kept its own copies, {grew} bytes"
     );
-    assert_eq!(dump(&w.read()), want_w, "stale {stale}: the moved commit reads differently");
+    assert_eq!(
+        dump(&w.read()),
+        want_w,
+        "stale {stale}: the moved commit reads differently"
+    );
     if !stale {
         assert_eq!(dump(&b.read()), dump(&a.read()));
     }
     b.verify_typed().unwrap();
     let before = every_branch(&b);
     let cold = reread(&path, fast().read_only().cache_bytes(1));
-    assert_eq!(cold, before, "stale {stale}: a cold reader sees other branches");
+    assert_eq!(
+        cold, before,
+        "stale {stale}: a cold reader sees other branches"
+    );
     b.compact(Keep::All).unwrap();
-    assert_eq!(every_branch(&b), before, "stale {stale}: a cycle changed a branch");
+    assert_eq!(
+        every_branch(&b),
+        before,
+        "stale {stale}: a cycle changed a branch"
+    );
     b.verify_typed().unwrap();
     drop((w, b));
-    assert_eq!(reread(&path, fast().cache_bytes(1)), before, "stale {stale}: reopened");
+    assert_eq!(
+        reread(&path, fast().cache_bytes(1)),
+        before,
+        "stale {stale}: reopened"
+    );
 }
 
 #[test]
@@ -292,7 +320,10 @@ fn heads(db: &Db<Root>) -> Heads {
 fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledged_commit() {
     let dir = dir();
     let path = dir.path().join("b.ferro");
-    let a: Db<Root> = fast().reclaim(MANUAL).open(dir.path().join("a.ferro")).unwrap();
+    let a: Db<Root> = fast()
+        .reclaim(MANUAL)
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     let durable = || Options::new().cache_bytes(1 << 28).reclaim(MANUAL);
     fill(&a, 0, 10, 1_500);
     let bundle;
@@ -300,12 +331,17 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
     let before_w;
     {
         let b: Db<Root> = durable().open(&path).unwrap();
-        assert_eq!(b.pull(&a, "a", merge_in).unwrap().outcome, Outcome::FastForward);
+        assert_eq!(
+            b.pull(&a, "a", merge_in).unwrap().outcome,
+            Outcome::FastForward
+        );
         for name in ["side", "w"] {
-            b.fork(name).unwrap().commit("start", |root| {
-                root.insert(OURS, name.to_string());
-            })
-            .unwrap();
+            b.fork(name)
+                .unwrap()
+                .commit("start", |root| {
+                    root.insert(OURS, name.to_string());
+                })
+                .unwrap();
         }
         fill(&a, 10, 2_000, 1_500);
         bundle = a.bundle(&b.have().unwrap()).unwrap();
@@ -317,7 +353,11 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
     let straddle = Arc::new(Mutex::new(None));
     let placed_tx = Arc::new(Mutex::new(None));
     let hook = straddling_hook(straddle.clone(), placed_tx.clone(), Cell::default(), false);
-    let b: Db<Root> = durable().trace(trace.clone()).hook(hook).open(&path).unwrap();
+    let b: Db<Root> = durable()
+        .trace(trace.clone())
+        .hook(hook)
+        .open(&path)
+        .unwrap();
     let (drafted_tx, drafted_rx) = mpsc::channel();
     let (placed_send, placed_rx) = mpsc::channel();
     *straddle.lock() = Some(Straddle {
@@ -374,7 +414,8 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
                 .cache_bytes(1)
                 .open(&target)
                 .unwrap_or_else(|error| panic!("{context}: {error}"));
-            db.verify().unwrap_or_else(|error| panic!("{context}: {error}"));
+            db.verify()
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
             let found = heads(&db);
             let w_moved = found.w == after.w;
             let side_moved = found.side == after.side;
@@ -384,15 +425,25 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
             assert!(side_moved || found.side == before.side, "{context}: side");
             assert!(landed || found.remote == before.remote, "{context}: remote");
             assert!(forwarded || found.main == before.main, "{context}: main");
-            assert!(landed || !forwarded, "{context}: main moved before the remote landed");
+            assert!(
+                landed || !forwarded,
+                "{context}: main moved before the remote landed"
+            );
             assert!(cut < first || side_moved, "{context}: lost the side commit");
             assert!(cut < second || w_moved, "{context}: lost the moved draft");
-            assert!(cut < third || (landed && forwarded), "{context}: lost the pull");
+            assert!(
+                cut < third || (landed && forwarded),
+                "{context}: lost the pull"
+            );
             if w_moved {
                 assert_eq!(dump(&db.branch("w").unwrap().read()), want_w, "{context}");
             }
             if side_moved {
-                assert_eq!(dump(&db.branch("side").unwrap().read()), want_side, "{context}");
+                assert_eq!(
+                    dump(&db.branch("side").unwrap().read()),
+                    want_side,
+                    "{context}"
+                );
             }
             if forwarded {
                 assert_eq!(dump(&db.read()), want_main, "{context}");
@@ -404,7 +455,8 @@ fn a_power_cut_while_a_draft_straddles_a_receives_pieces_keeps_every_acknowledge
                     root.insert(u64::MAX, "after".to_string());
                 })
                 .unwrap_or_else(|error| panic!("{context}: {error}"));
-            db.verify().unwrap_or_else(|error| panic!("{context}: {error}"));
+            db.verify()
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
         }
     }
     assert!(seen.len() >= 4, "{seen:?}");
@@ -490,7 +542,11 @@ fn apply(root: &mut Mixed, edits: &[Edit]) {
                 root.0.remove(key);
             }
             Edit::Nest(outer, key, value) => {
-                let mut inner = root.1.get(outer).map(|inner| (*inner).clone()).unwrap_or_default();
+                let mut inner = root
+                    .1
+                    .get(outer)
+                    .map(|inner| (*inner).clone())
+                    .unwrap_or_default();
                 inner.insert(*key, *value);
                 root.1.insert(*outer, inner);
             }
@@ -521,18 +577,35 @@ fn apply_plain(plain: &mut Plain, edits: &[Edit]) {
 }
 
 fn plain(root: &Mixed) -> Plain {
-    let flat = root.0.iter().map(|(key, value)| (key, (*value).clone())).collect();
+    let flat = root
+        .0
+        .iter()
+        .map(|(key, value)| (key, (*value).clone()))
+        .collect();
     let nested = root
         .1
         .iter()
-        .map(|(key, inner)| (key, inner.iter().map(|(key, value)| (key, *value)).collect()))
+        .map(|(key, inner)| {
+            (
+                key,
+                inner.iter().map(|(key, value)| (key, *value)).collect(),
+            )
+        })
         .collect();
     (flat, nested)
 }
 
 fn within_space(plain: &Plain, low: u64, high: u64) -> Plain {
-    let flat = plain.0.range(low..high).map(|(key, value)| (*key, value.clone())).collect();
-    let nested = plain.1.range(low..high).map(|(key, inner)| (*key, inner.clone())).collect();
+    let flat = plain
+        .0
+        .range(low..high)
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    let nested = plain
+        .1
+        .range(low..high)
+        .map(|(key, inner)| (*key, inner.clone()))
+        .collect();
     (flat, nested)
 }
 
@@ -577,7 +650,10 @@ impl Models {
 
     fn at(&mut self, thread: u64, steps: u64) -> &Plain {
         let (done, model) = self.cache.entry(thread).or_insert((0, Plain::default()));
-        assert!(*done <= steps, "thread {thread} went back from {done} to {steps} commits");
+        assert!(
+            *done <= steps,
+            "thread {thread} went back from {done} to {steps} commits"
+        );
         while *done < steps {
             apply_plain(model, &writer_edits(thread, *done));
             *done += 1;
@@ -863,7 +939,10 @@ fn run_forks(run: &Run, main: &Db<Mixed>, writers: &[Db<Mixed>], per_branch: u64
             .unwrap();
         let mut want = start.clone();
         want.0.insert(TEMP + round, "temp".to_string());
-        assert!(plain(&forked.read()) == want, "a commit on a fork reads differently");
+        assert!(
+            plain(&forked.read()) == want,
+            "a commit on a fork reads differently"
+        );
         drop(forked);
         main.drop_branch("tmp").unwrap();
         run.count("fork and drop");
@@ -931,7 +1010,9 @@ fn check_all(local: &Db<Mixed>, peer: &Db<Mixed>, expected: &Expected<'_>, conte
     for branch in 0..BRANCHES {
         let writer = local.branch(&format!("w{branch}")).unwrap();
         let got = plain(&writer.read());
-        let owned: Vec<u64> = (0..expected.config.per_branch).map(|t| branch * 4 + t).collect();
+        let owned: Vec<u64> = (0..expected.config.per_branch)
+            .map(|t| branch * 4 + t)
+            .collect();
         for &thread in &owned {
             assert_eq!(
                 steps_of(&got, thread),
@@ -943,10 +1024,15 @@ fn check_all(local: &Db<Mixed>, peer: &Db<Mixed>, expected: &Expected<'_>, conte
         let mut rest = got.clone();
         for &thread in &owned {
             let low = space(thread);
-            rest.0.retain(|key, _| !(low..low + (1 << THREAD_BITS)).contains(key));
-            rest.1.retain(|key, _| !(low..low + (1 << THREAD_BITS)).contains(key));
+            rest.0
+                .retain(|key, _| !(low..low + (1 << THREAD_BITS)).contains(key));
+            rest.1
+                .retain(|key, _| !(low..low + (1 << THREAD_BITS)).contains(key));
         }
-        assert!(rest == expected.start, "{name} {context}: branch w{branch} holds foreign keys");
+        assert!(
+            rest == expected.start,
+            "{name} {context}: branch w{branch} holds foreign keys"
+        );
     }
     let zz_keys: BTreeSet<u64> = local
         .branch("zz")
@@ -958,7 +1044,10 @@ fn check_all(local: &Db<Mixed>, peer: &Db<Mixed>, expected: &Expected<'_>, conte
         .collect();
     let mut want_zz: BTreeSet<u64> = expected.start.0.keys().copied().collect();
     want_zz.extend(expected.audit.iter().copied());
-    assert!(zz_keys == want_zz, "{name} {context}: the audit branch differs");
+    assert!(
+        zz_keys == want_zz,
+        "{name} {context}: the audit branch differs"
+    );
     let peer_plain = plain(&peer.read());
     assert!(
         plain(&local.branch("peer").unwrap().read()) == peer_plain,
@@ -983,9 +1072,13 @@ fn combined(config: &Config) -> BTreeMap<&'static str, u64> {
             .reclaim(MANUAL)
     };
     let local: Db<Mixed> = options().open(&path).unwrap();
-    let peer: Db<Mixed> = fast().reclaim(MANUAL).open(dir.path().join("peer.ferro")).unwrap();
+    let peer: Db<Mixed> = fast()
+        .reclaim(MANUAL)
+        .open(dir.path().join("peer.ferro"))
+        .unwrap();
     let other: Db<Mixed> = options().open(dir.path().join("other.ferro")).unwrap();
-    peer.update(|root| apply(root, &peer_edits(1_000_000, 3))).unwrap();
+    peer.update(|root| apply(root, &peer_edits(1_000_000, 3)))
+        .unwrap();
     assert_eq!(
         local.pull(&peer, "peer", merge_mixed).unwrap().outcome,
         Outcome::FastForward
@@ -1067,18 +1160,34 @@ fn combined(config: &Config) -> BTreeMap<&'static str, u64> {
     };
     check_all(&local, &peer, &expected, "after the run");
     let other_keys: BTreeSet<u64> = other.read().0.iter().map(|(key, _)| key).collect();
-    assert!(other_keys == *run.other.lock(), "{name}: the other file differs");
+    assert!(
+        other_keys == *run.other.lock(),
+        "{name}: the other file differs"
+    );
     other.verify_typed().unwrap();
     let before = every_mixed(&local);
-    let cold: Db<Mixed> = (config.options)().read_only().cache_bytes(1).open(&path).unwrap();
-    assert!(every_mixed(&cold) == before, "{name}: a cold reader differs");
+    let cold: Db<Mixed> = (config.options)()
+        .read_only()
+        .cache_bytes(1)
+        .open(&path)
+        .unwrap();
+    assert!(
+        every_mixed(&cold) == before,
+        "{name}: a cold reader differs"
+    );
     drop(cold);
     drop((writers, zz, local));
     let local: Db<Mixed> = options().cache_bytes(1).open(&path).unwrap();
-    assert!(every_mixed(&local) == before, "{name}: the reopened file differs");
+    assert!(
+        every_mixed(&local) == before,
+        "{name}: the reopened file differs"
+    );
     check_all(&local, &peer, &expected, "after reopening");
     local.compact(Keep::Last(2)).unwrap();
-    assert!(every_mixed(&local) == before, "{name}: compaction changed a branch");
+    assert!(
+        every_mixed(&local) == before,
+        "{name}: compaction changed a branch"
+    );
     check_all(&local, &peer, &expected, "after compacting");
     let events = run.events.into_inner();
     println!("{name}: {events:?}");

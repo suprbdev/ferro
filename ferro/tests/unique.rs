@@ -35,10 +35,7 @@ type Fields = (String, Option<String>, u8, u8, u8);
 fn fields() -> impl Strategy<Value = Fields> {
     (
         (0..6u8).prop_map(|n| format!("s{n}")),
-        prop_oneof![
-            Just(None),
-            (0..4u8).prop_map(|n| Some(format!("e{n}"))),
-        ],
+        prop_oneof![Just(None), (0..4u8).prop_map(|n| Some(format!("e{n}"))),],
         0..3u8,
         0..3u8,
         0..3u8,
@@ -124,10 +121,8 @@ fn check(table: &Table<Item>, model: &BTreeMap<u32, Item>) {
         .values()
         .filter_map(|r| Some((r.email.clone()?, r.id)))
         .collect();
-    let pairs: BTreeMap<(u8, u8), u32> = model
-        .values()
-        .map(|r| ((r.tenant, r.code), r.id))
-        .collect();
+    let pairs: BTreeMap<(u8, u8), u32> =
+        model.values().map(|r| ((r.tenant, r.code), r.id)).collect();
     let got: Vec<(String, u32)> = table.unique_slug().iter().map(|(k, v)| (k, *v)).collect();
     assert_eq!(got, slugs.clone().into_iter().collect::<Vec<_>>());
     let got: Vec<(String, u32)> = table.unique_email().iter().map(|(k, v)| (k, *v)).collect();
@@ -141,8 +136,14 @@ fn check(table: &Table<Item>, model: &BTreeMap<u32, Item>) {
     for row in model.values() {
         assert_eq!(table.by_slug(row.slug.as_str()).as_deref(), Some(row));
         assert_eq!(table.key_by_slug(row.slug.as_str()), Some(row.id));
-        assert_eq!(table.by_tenant_code(&(row.tenant, row.code)).as_deref(), Some(row));
-        assert_eq!(table.key_by_tenant_code(&(row.tenant, row.code)), Some(row.id));
+        assert_eq!(
+            table.by_tenant_code(&(row.tenant, row.code)).as_deref(),
+            Some(row)
+        );
+        assert_eq!(
+            table.key_by_tenant_code(&(row.tenant, row.code)),
+            Some(row.id)
+        );
         if let Some(email) = &row.email {
             assert_eq!(table.by_email(email.as_str()).as_deref(), Some(row));
         }
@@ -480,7 +481,10 @@ fn rebuilding_over_duplicates_reports_a_decode_error() {
     }
     match fast().open::<NewRoot>(&path) {
         Err(ferro::Error::Decode(message)) => {
-            assert_eq!(message, "two rows of NewItem share a value of unique index slug");
+            assert_eq!(
+                message,
+                "two rows of NewItem share a value of unique index slug"
+            );
         }
         Err(other) => panic!("wrong error {other}"),
         Ok(_) => panic!("duplicates passed the rebuild"),

@@ -837,11 +837,21 @@ async fn long_messages_count_as_unread_across_a_restart() {
     }
     assert_eq!(unread_of(&mut client, bob, room).await, 12);
     client
-        .act(ann, "DELETE", &format!("/rooms/{room}/messages/{}", seqs[1]), None)
+        .act(
+            ann,
+            "DELETE",
+            &format!("/rooms/{room}/messages/{}", seqs[1]),
+            None,
+        )
         .await
         .unwrap();
     client
-        .act(bob, "POST", &format!("/rooms/{room}/read?seq={}", seqs[3]), None)
+        .act(
+            bob,
+            "POST",
+            &format!("/rooms/{room}/read?seq={}", seqs[3]),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(unread_of(&mut client, bob, room).await, 5);
@@ -853,7 +863,12 @@ async fn long_messages_count_as_unread_across_a_restart() {
     let view = get_json(&mut client, &format!("/rooms/{room}")).await;
     assert_eq!(view["messages"], json!(11));
     client
-        .act(ann, "DELETE", &format!("/rooms/{room}/messages/{}", seqs[5]), None)
+        .act(
+            ann,
+            "DELETE",
+            &format!("/rooms/{room}/messages/{}", seqs[5]),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(unread_of(&mut client, bob, room).await, 4);

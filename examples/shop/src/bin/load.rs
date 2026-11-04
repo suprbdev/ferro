@@ -96,7 +96,9 @@ async fn worker(plan: std::sync::Arc<Plan>, seed: u64) -> Tally {
             } else {
                 format!("/orders/{}", 1 + rng.below(2000))
             };
-            let tag = (rng.below(10) < 4).then(|| etags.get(&path).cloned()).flatten();
+            let tag = (rng.below(10) < 4)
+                .then(|| etags.get(&path).cloned())
+                .flatten();
             let headers: Vec<(&str, &str)> = match &tag {
                 Some(tag) => vec![("if-none-match", tag.as_str())],
                 None => Vec::new(),
@@ -138,7 +140,10 @@ async fn worker(plan: std::sync::Arc<Plan>, seed: u64) -> Tally {
         } else if roll < plan.mix.0 + plan.mix.1 {
             let cart = 1 + rng.below(plan.customers);
             let body = json!({"product_id": 1 + rng.below(plan.products), "qty": 1 + rng.below(3)});
-            match writer.json("POST", &format!("/carts/{cart}/items"), &body).await {
+            match writer
+                .json("POST", &format!("/carts/{cart}/items"), &body)
+                .await
+            {
                 Ok(response) => {
                     if response.status != 201 {
                         tally.errors += 1;
@@ -216,7 +221,10 @@ async fn stock_map(client: &mut Client) -> HashMap<u64, u64> {
             .expect("list")
             .json();
         for item in page["items"].as_array().into_iter().flatten() {
-            stock.insert(item["id"].as_u64().unwrap(), item["stock"].as_u64().unwrap());
+            stock.insert(
+                item["id"].as_u64().unwrap(),
+                item["stock"].as_u64().unwrap(),
+            );
         }
         match page["next_cursor"].as_u64() {
             Some(next) => after = next,
@@ -237,13 +245,27 @@ fn addr(text: &str) -> SocketAddr {
 
 async fn run(args: Vec<String>) {
     let write = addr(&arg(&args, "--addr").unwrap_or_else(|| "127.0.0.1:8080".into()));
-    let read = arg(&args, "--read-addr").map(|text| addr(&text)).unwrap_or(write);
-    let conns: usize = arg(&args, "--conns").and_then(|v| v.parse().ok()).unwrap_or(16);
-    let secs: f64 = arg(&args, "--secs").and_then(|v| v.parse().ok()).unwrap_or(10.0);
-    let products: u64 = arg(&args, "--products").and_then(|v| v.parse().ok()).unwrap_or(2000);
-    let customers: u64 = arg(&args, "--customers").and_then(|v| v.parse().ok()).unwrap_or(500);
-    let scarce_every: u64 = arg(&args, "--scarce-every").and_then(|v| v.parse().ok()).unwrap_or(20);
-    let scarce_stock: u32 = arg(&args, "--scarce-stock").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let read = arg(&args, "--read-addr")
+        .map(|text| addr(&text))
+        .unwrap_or(write);
+    let conns: usize = arg(&args, "--conns")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let secs: f64 = arg(&args, "--secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10.0);
+    let products: u64 = arg(&args, "--products")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let customers: u64 = arg(&args, "--customers")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let scarce_every: u64 = arg(&args, "--scarce-every")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let scarce_stock: u32 = arg(&args, "--scarce-stock")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
     let mix: Vec<u64> = arg(&args, "--mix")
         .unwrap_or_else(|| "90,8,2".into())
         .split(',')
@@ -329,9 +351,19 @@ async fn run(args: Vec<String>) {
         ));
     }
     println!("{line}");
-    let mut refused_micros: Vec<u32> = all.samples.iter().filter(|s| s.kind == Kind::Order && s.status == 409).map(|s| s.micros).collect();
+    let mut refused_micros: Vec<u32> = all
+        .samples
+        .iter()
+        .filter(|s| s.kind == Kind::Order && s.status == 409)
+        .map(|s| s.micros)
+        .collect();
     refused_micros.sort_unstable();
-    let mut placed_micros: Vec<u32> = all.samples.iter().filter(|s| s.kind == Kind::Order && s.status == 201).map(|s| s.micros).collect();
+    let mut placed_micros: Vec<u32> = all
+        .samples
+        .iter()
+        .filter(|s| s.kind == Kind::Order && s.status == 201)
+        .map(|s| s.micros)
+        .collect();
     placed_micros.sort_unstable();
     println!(
         "  order 201 p50={:.2} p99={:.2} | order 409 p50={:.2} p99={:.2}",
@@ -373,8 +405,10 @@ async fn run(args: Vec<String>) {
             ));
         }
     }
-    let server_orders = after_stats["orders"].as_u64().unwrap() - before_stats["orders"].as_u64().unwrap();
-    let server_ok = after_stats["orders_ok"].as_u64().unwrap() - before_stats["orders_ok"].as_u64().unwrap();
+    let server_orders =
+        after_stats["orders"].as_u64().unwrap() - before_stats["orders"].as_u64().unwrap();
+    let server_ok =
+        after_stats["orders_ok"].as_u64().unwrap() - before_stats["orders_ok"].as_u64().unwrap();
     if server_orders != all.orders_ok || server_ok != all.orders_ok {
         failures.push(format!(
             "orders: client ok={} server table delta={server_orders} server counter delta={server_ok}",
@@ -384,13 +418,21 @@ async fn run(args: Vec<String>) {
     if all.errors > 0 {
         failures.push(format!("{} request errors", all.errors));
     }
-    let report = admin.get("/admin/invariants").await.expect("invariants").json();
+    let report = admin
+        .get("/admin/invariants")
+        .await
+        .expect("invariants")
+        .json();
     println!(
         "  check: units consumed={consumed_total} server live_orders={} consumed_units={} min_stock_ok={} => {}",
         report["live_orders"],
         report["consumed_units"],
         after.values().all(|stock| *stock < u64::from(u32::MAX)),
-        if failures.is_empty() { "PASS".to_string() } else { format!("FAIL {failures:?}") }
+        if failures.is_empty() {
+            "PASS".to_string()
+        } else {
+            format!("FAIL {failures:?}")
+        }
     );
     println!(
         "  server: db_bytes={} version={} events_lagged={}",
@@ -404,13 +446,19 @@ async fn run(args: Vec<String>) {
 async fn replica_lag(args: Vec<String>) {
     let write = addr(&arg(&args, "--addr").expect("--addr"));
     let read = addr(&arg(&args, "--read-addr").expect("--read-addr"));
-    let rounds: usize = arg(&args, "--rounds").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let rounds: usize = arg(&args, "--rounds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let mut primary = Client::connect(write).await.expect("connect");
     let mut replica = Client::connect(read).await.expect("connect");
     let mut lags = Vec::new();
     for round in 0..rounds {
         let response = primary
-            .json("PATCH", "/products/1", &json!({"name": format!("lag {round}")}))
+            .json(
+                "PATCH",
+                "/products/1",
+                &json!({"name": format!("lag {round}")}),
+            )
             .await
             .expect("patch");
         let version = response.json()["version"].as_u64().unwrap();
@@ -438,9 +486,15 @@ async fn replica_lag(args: Vec<String>) {
 
 async fn slow_sse(args: Vec<String>) {
     let write = addr(&arg(&args, "--addr").expect("--addr"));
-    let slow: usize = arg(&args, "--slow").and_then(|v| v.parse().ok()).unwrap_or(10);
-    let writes: usize = arg(&args, "--writes").and_then(|v| v.parse().ok()).unwrap_or(2000);
-    let payload: usize = arg(&args, "--payload").and_then(|v| v.parse().ok()).unwrap_or(4096);
+    let slow: usize = arg(&args, "--slow")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let writes: usize = arg(&args, "--writes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let payload: usize = arg(&args, "--payload")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
     let mut client = Client::connect(write).await.expect("connect");
     let mut streams = Vec::new();
     for _ in 0..slow {
@@ -454,7 +508,11 @@ async fn slow_sse(args: Vec<String>) {
     for round in 0..writes {
         let at = Instant::now();
         let response = client
-            .json("PATCH", "/products/1", &json!({"name": format!("{round}{bulk}")}))
+            .json(
+                "PATCH",
+                "/products/1",
+                &json!({"name": format!("{round}{bulk}")}),
+            )
             .await
             .expect("patch");
         assert_eq!(response.status, 200);
@@ -494,7 +552,9 @@ async fn slow_sse(args: Vec<String>) {
 
 async fn crash_writer(args: Vec<String>) {
     let write = addr(&arg(&args, "--addr").expect("--addr"));
-    let conns: usize = arg(&args, "--conns").and_then(|v| v.parse().ok()).unwrap_or(32);
+    let conns: usize = arg(&args, "--conns")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
     let out = arg(&args, "--out").expect("--out");
     let mut admin = Client::connect(write).await.expect("connect");
     let seeded = admin
@@ -506,8 +566,13 @@ async fn crash_writer(args: Vec<String>) {
         .await
         .expect("seed");
     assert_eq!(seeded.status, 200);
-    let start = admin.get("/admin/invariants").await.expect("invariants").json();
-    let total_units = start["stock_units"].as_u64().unwrap() + start["consumed_units"].as_u64().unwrap();
+    let start = admin
+        .get("/admin/invariants")
+        .await
+        .expect("invariants")
+        .json();
+    let total_units =
+        start["stock_units"].as_u64().unwrap() + start["consumed_units"].as_u64().unwrap();
     println!("seeded, total units {total_units}; kill the server now");
     let mut tasks = Vec::new();
     for index in 0..conns {
@@ -538,19 +603,28 @@ async fn crash_writer(args: Vec<String>) {
 async fn crash_verify(args: Vec<String>) {
     let write = addr(&arg(&args, "--addr").expect("--addr"));
     let input = arg(&args, "--out").expect("--out");
-    let saved: Value = serde_json::from_slice(&std::fs::read(&input).expect("read ids")).expect("json");
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(&input).expect("read ids")).expect("json");
     let mut client = Client::connect(write).await.expect("connect");
     let acked = saved["acked"].as_array().unwrap();
     let mut missing = 0;
     for id in acked {
-        let response = client.get(&format!("/orders/{}", id.as_u64().unwrap())).await.expect("get");
+        let response = client
+            .get(&format!("/orders/{}", id.as_u64().unwrap()))
+            .await
+            .expect("get");
         if response.status != 200 {
             missing += 1;
         }
     }
-    let report = client.get("/admin/invariants").await.expect("invariants").json();
+    let report = client
+        .get("/admin/invariants")
+        .await
+        .expect("invariants")
+        .json();
     let stats = client.get("/admin/stats").await.expect("stats").json();
-    let units = report["stock_units"].as_u64().unwrap() + report["consumed_units"].as_u64().unwrap();
+    let units =
+        report["stock_units"].as_u64().unwrap() + report["consumed_units"].as_u64().unwrap();
     let orders = stats["orders"].as_u64().unwrap();
     println!(
         "acked={} missing_after_restart={missing} orders_in_db={orders} durable_but_unacked={} units_conserved={}",

@@ -207,7 +207,8 @@ impl Rep for Bucketed {
     }
 
     fn has(&self, a: u32, b: u32) -> bool {
-        self.find(a, b).is_some_and(|(_, ids)| ids.binary_search(&b).is_ok())
+        self.find(a, b)
+            .is_some_and(|(_, ids)| ids.binary_search(&b).is_ok())
     }
 
     fn add(&mut self, a: u32, b: u32) {
@@ -250,7 +251,12 @@ fn rss_mib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let kib: u64 = rest.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+            let kib: u64 = rest
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse()
+                .unwrap_or(0);
             return kib / 1024;
         }
     }
@@ -335,7 +341,10 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
             if i % 2 == 0 {
                 edges[rng.below(edges.len() as u64) as usize]
             } else {
-                (rng.below(users as u64) as u32, rng.below(users as u64) as u32)
+                (
+                    rng.below(users as u64) as u32,
+                    rng.below(users as u64) as u32,
+                )
             }
         })
         .collect();
@@ -350,9 +359,17 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
     drop(snap);
     drop(db);
 
-    let db: Db<R> = Options::new().durability(Durability::Buffered).open(&path).unwrap();
+    let db: Db<R> = Options::new()
+        .durability(Durability::Buffered)
+        .open(&path)
+        .unwrap();
     let fresh: Vec<(u32, u32)> = (0..50_000)
-        .map(|_| (rng.below(users as u64) as u32, rng.below(users as u64) as u32))
+        .map(|_| {
+            (
+                rng.below(users as u64) as u32,
+                rng.below(users as u64) as u32,
+            )
+        })
         .collect();
     let t = Instant::now();
     db.commit("incremental", |r| {
@@ -408,7 +425,10 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
         db.commit("celeb", |r| r.add(celebrity, next)).unwrap();
         lat.push(t.elapsed().as_secs_f64() * 1e6);
     }
-    out += &format!("celebrity row update (fsync)  median {:.0} us\n", median(&mut lat));
+    out += &format!(
+        "celebrity row update (fsync)  median {:.0} us\n",
+        median(&mut lat)
+    );
     let mut lat = Vec::new();
     for _ in 0..200 {
         let a = rng.below(users as u64) as u32;
@@ -417,7 +437,10 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
         db.commit("ordinary", |r| r.add(a, b)).unwrap();
         lat.push(t.elapsed().as_secs_f64() * 1e6);
     }
-    out += &format!("ordinary random add (fsync)  median {:.0} us\n", median(&mut lat));
+    out += &format!(
+        "ordinary random add (fsync)  median {:.0} us\n",
+        median(&mut lat)
+    );
     out += &format!("peak RSS {} MiB\n", rss_mib());
     out
 }

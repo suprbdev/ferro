@@ -21,7 +21,11 @@ fn answers(db: &Db<Root>) -> Vec<String> {
     let last = db.version();
     for version in 0..=last {
         out.push(match db.at(version) {
-            Ok(snapshot) => format!("at {version}: v{} len {}", snapshot.version(), snapshot.len()),
+            Ok(snapshot) => format!(
+                "at {version}: v{} len {}",
+                snapshot.version(),
+                snapshot.len()
+            ),
             Err(error) => format!("at {version}: {error}"),
         });
     }
@@ -34,13 +38,18 @@ fn answers(db: &Db<Root>) -> Vec<String> {
             Err(error) => format!("as_of {time}: {error}"),
         });
     }
-    let history: Vec<u64> = db.history_of(|root| root.len()).map(|(commit, _)| commit.version).collect();
+    let history: Vec<u64> = db
+        .history_of(|root| root.len())
+        .map(|(commit, _)| commit.version)
+        .collect();
     out.push(format!("history {history:?}"));
     out
 }
 
 fn reachable(db: &Db<Root>) -> Vec<u64> {
-    (0..=db.version()).filter(|version| db.at(*version).is_ok()).collect()
+    (0..=db.version())
+        .filter(|version| db.at(*version).is_ok())
+        .collect()
 }
 
 #[test]
@@ -98,7 +107,10 @@ fn without_pruning_version_zero_stays_the_default_value() {
 #[test]
 fn a_branch_forked_before_any_commit_keeps_version_zero_while_another_prunes() {
     let dir = tempfile::tempdir().unwrap();
-    let db: Db<Root> = options().history(Keep::Last(2)).open(dir.path().join("e.ferro")).unwrap();
+    let db: Db<Root> = options()
+        .history(Keep::Last(2))
+        .open(dir.path().join("e.ferro"))
+        .unwrap();
     let early = db.fork("early").unwrap();
     for key in 1..=5 {
         put(&db, key);

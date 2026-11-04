@@ -129,7 +129,9 @@ fn readers_see_atomic_commits_during_heavy_writes() {
 #[test]
 fn panic_inside_update_discards_the_transaction() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast().open::<Map<u64, String>>(dir.path().join("p.ferro")).unwrap();
+    let db = fast()
+        .open::<Map<u64, String>>(dir.path().join("p.ferro"))
+        .unwrap();
     db.update(|root| {
         root.insert(1, "keep".into());
     })
@@ -320,7 +322,11 @@ fn contending_writers_lose_nothing() {
     let barrier = Arc::new(Barrier::new(threads));
     let mut handles = Vec::new();
     for thread in 0..threads {
-        let target = if thread % 4 == 3 { branch.clone() } else { db.clone() };
+        let target = if thread % 4 == 3 {
+            branch.clone()
+        } else {
+            db.clone()
+        };
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
@@ -355,7 +361,9 @@ fn contending_writers_lose_nothing() {
 #[test]
 fn restore_reports_its_own_version_under_contention() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast().open::<Map<u64, u64>>(dir.path().join("r.ferro")).unwrap();
+    let db = fast()
+        .open::<Map<u64, u64>>(dir.path().join("r.ferro"))
+        .unwrap();
     let threads = 8;
     for n in 0..threads {
         db.update(|root| {
@@ -390,7 +398,9 @@ fn restore_reports_its_own_version_under_contention() {
 #[test]
 fn watchers_see_newer_commits_in_order_and_end_with_the_last_handle() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast().open::<Map<u64, u64>>(dir.path().join("w.ferro")).unwrap();
+    let db = fast()
+        .open::<Map<u64, u64>>(dir.path().join("w.ferro"))
+        .unwrap();
     let early = db.watch();
     let dropped = db.watch();
     drop(dropped);
@@ -422,7 +432,12 @@ fn watchers_see_newer_commits_in_order_and_end_with_the_last_handle() {
         root.insert(1, 1);
     })
     .unwrap();
-    assert_eq!(side.recv_timeout(Duration::from_secs(10)).unwrap().version(), 1);
+    assert_eq!(
+        side.recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .version(),
+        1
+    );
     drop(db);
     drop(fork);
     assert!(matches!(
@@ -659,7 +674,10 @@ fn second_writer_is_locked_out_and_reader_is_not() {
 fn memoized_reads_stay_correct_while_a_tiny_cache_evicts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.ferro");
-    let db = fast().cache_bytes(2048).open::<Map<u64, String>>(&path).unwrap();
+    let db = fast()
+        .cache_bytes(2048)
+        .open::<Map<u64, String>>(&path)
+        .unwrap();
     db.update(|root| {
         for key in 0..4000 {
             root.insert(key, format!("value-{key}"));

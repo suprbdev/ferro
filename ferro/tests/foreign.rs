@@ -122,10 +122,7 @@ fn nested_maps_are_rebuilt_in_the_target() {
     let snapshot = b.read();
     assert_eq!(snapshot.get(&0).unwrap().len(), 200);
     assert_eq!(snapshot.get(&1).unwrap().len(), 201);
-    assert_eq!(
-        *snapshot.get(&0).unwrap().get(&14).unwrap(),
-        text(14, 800)
-    );
+    assert_eq!(*snapshot.get(&0).unwrap().get(&14).unwrap(), text(14, 800));
     b.verify().unwrap();
 }
 
@@ -483,11 +480,9 @@ fn spilled_value_holding_maps_moves_between_databases() {
 
 #[test]
 fn nested_map_edits_round_trip_at_every_cache_size() {
-    let options: [fn() -> Options; 3] = [
-        fast,
-        uncached,
-        || Options::new().durability(ferro::Durability::Buffered),
-    ];
+    let options: [fn() -> Options; 3] = [fast, uncached, || {
+        Options::new().durability(ferro::Durability::Buffered)
+    }];
     for open in options {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("n.ferro");

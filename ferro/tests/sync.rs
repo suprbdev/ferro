@@ -674,12 +674,18 @@ fn pruned_histories_still_sync() {
 #[test]
 fn a_pull_from_a_remote_pruned_past_our_tip_refuses_instead_of_bringing_deletions_back() {
     let dir = tempfile::tempdir().unwrap();
-    let a: Db<Root> = fast().history(Keep::Last(3)).open(dir.path().join("a.ferro")).unwrap();
+    let a: Db<Root> = fast()
+        .history(Keep::Last(3))
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     let b = open(&dir, "b.ferro");
     for key in 0..5 {
         put(&a, key, "a");
     }
-    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     a.commit("drop 0", |root| {
         root.remove(&0);
     })
@@ -692,7 +698,10 @@ fn a_pull_from_a_remote_pruned_past_our_tip_refuses_instead_of_bringing_deletion
         Err(Error::NoCommonAncestor) => {}
         other => panic!("merged a remote that shares nothing retained: {other:?}"),
     }
-    assert!(matches!(b.pull(&a, "a", refuse), Err(Error::NoCommonAncestor)));
+    assert!(matches!(
+        b.pull(&a, "a", refuse),
+        Err(Error::NoCommonAncestor)
+    ));
     assert_eq!((b.head_hash(), dump(&b.read())), before);
     assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
     b.verify().unwrap();
@@ -701,15 +710,25 @@ fn a_pull_from_a_remote_pruned_past_our_tip_refuses_instead_of_bringing_deletion
 #[test]
 fn a_revert_routed_through_a_third_device_survives_the_first_pull() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, b, c) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"), open(&dir, "c.ferro"));
+    let (a, b, c) = (
+        open(&dir, "a.ferro"),
+        open(&dir, "b.ferro"),
+        open(&dir, "c.ferro"),
+    );
     put(&a, 1, "1");
     b.pull(&a, "a", refuse).unwrap();
     c.pull(&a, "a", refuse).unwrap();
     put(&a, 2, "9");
     put(&b, 1, "2");
-    assert_eq!(a.pull(&b, "b", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(
+        a.pull(&b, "b", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
     assert_eq!(*a.read().get(&1).unwrap(), "2");
-    assert_eq!(c.pull(&b, "b", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        c.pull(&b, "b", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     put(&c, 1, "1");
     assert_eq!(c.read().root_hash(), b.at(1).unwrap().root_hash());
     let pulled = a.pull(&c, "c", theirs_win).unwrap();
@@ -763,7 +782,10 @@ impl Model {
             }
         }
         ancestors[id] = true;
-        let generation = parents.iter().map(|parent| self.0[*parent].generation + 1).max();
+        let generation = parents
+            .iter()
+            .map(|parent| self.0[*parent].generation + 1)
+            .max();
         self.0.push(Node {
             counts,
             ancestors,
@@ -773,12 +795,17 @@ impl Model {
     }
 
     fn holds(&self, node: usize, ancestor: usize) -> bool {
-        self.0[node].ancestors.get(ancestor).copied().unwrap_or(false)
+        self.0[node]
+            .ancestors
+            .get(ancestor)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn best(&self, a: usize, b: usize) -> Vec<usize> {
-        let common: Vec<usize> =
-            (0..self.0.len()).filter(|c| self.holds(a, *c) && self.holds(b, *c)).collect();
+        let common: Vec<usize> = (0..self.0.len())
+            .filter(|c| self.holds(a, *c) && self.holds(b, *c))
+            .collect();
         common
             .iter()
             .copied()
@@ -800,7 +827,11 @@ impl Model {
 }
 
 fn id_in(snapshot: &Snapshot<Events>) -> usize {
-    snapshot.commit().message.strip_prefix('n').map_or(0, |id| id.parse().unwrap())
+    snapshot
+        .commit()
+        .message
+        .strip_prefix('n')
+        .map_or(0, |id| id.parse().unwrap())
 }
 
 fn counted(db: &Db<Events>) -> BTreeMap<u32, i64> {
@@ -812,7 +843,11 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
     for seed in 0..cases(40) as u64 {
         let dir = tempfile::tempdir().unwrap();
         let devices: Vec<Db<Events>> = (0..4)
-            .map(|device| fast().open(dir.path().join(format!("d{device}.ferro"))).unwrap())
+            .map(|device| {
+                fast()
+                    .open(dir.path().join(format!("d{device}.ferro")))
+                    .unwrap()
+            })
             .collect();
         let mut model = Model(Vec::new());
         model.push(&[], BTreeMap::new());
@@ -841,11 +876,15 @@ fn random_syncs_with_a_counting_merge_apply_every_change_exactly_once() {
             let id = model.0.len();
             let mut seen = Vec::new();
             let pulled = devices[to]
-                .pull(&devices[from], &format!("d{from}"), |root, base, incoming| {
-                    seen.push((base.version(), id_in(base)));
-                    add_deltas(root, base, incoming);
-                    (format!("n{id}"), ())
-                })
+                .pull(
+                    &devices[from],
+                    &format!("d{from}"),
+                    |root, base, incoming| {
+                        seen.push((base.version(), id_in(base)));
+                        add_deltas(root, base, incoming);
+                        (format!("n{id}"), ())
+                    },
+                )
                 .unwrap();
             match pulled.outcome {
                 Outcome::FastForward => {
@@ -888,16 +927,28 @@ fn a_merged_chain_the_sender_cut_short_reads_as_pruned_history() {
     let r = open(&dir, "r.ferro");
     let b = open(&dir, "b.ferro");
     put(&r, 100, "r");
-    assert_eq!(b.pull(&r, "r", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        b.pull(&r, "r", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     put(&r, 101, "r");
     put(&r, 102, "r");
     pause();
-    let a: Db<Root> = fast().history(Keep::Last(5)).open(dir.path().join("a.ferro")).unwrap();
+    let a: Db<Root> = fast()
+        .history(Keep::Last(5))
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     for key in 0..5 {
         put(&a, key, "a");
     }
-    assert_eq!(b.pull(&a, "a", theirs_win).unwrap().outcome, Outcome::Merged);
-    assert_eq!(a.pull(&r, "r", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(
+        b.pull(&a, "a", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(
+        a.pull(&r, "r", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
     put(&a, 5, "a");
     put(&a, 6, "a");
     assert_eq!(a.log().first().unwrap().0, 4);
@@ -929,13 +980,22 @@ fn a_merge_whose_history_the_sender_had_let_go_still_merges() {
         put(&r, key, "r");
     }
     pause();
-    let a: Db<Root> = fast().history(Keep::Last(5)).open(dir.path().join("a.ferro")).unwrap();
+    let a: Db<Root> = fast()
+        .history(Keep::Last(5))
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     let b = open(&dir, "b.ferro");
     for key in 0..5 {
         put(&a, key, "a");
     }
-    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::FastForward);
-    assert_eq!(a.pull(&r, "r", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(
+        a.pull(&r, "r", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
     put(&a, 5, "a");
     put(&a, 6, "a");
     assert_eq!(a.log().first().unwrap().0, 4);
@@ -949,7 +1009,10 @@ fn a_merge_whose_history_the_sender_had_let_go_still_merges() {
     b.compact(Keep::All).unwrap();
     b.verify().unwrap();
     put(&a, 7, "a");
-    assert_eq!(b.pull(&a, "a", theirs_win).unwrap().outcome, Outcome::Merged);
+    assert_eq!(
+        b.pull(&a, "a", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
     assert_eq!(dump(&b.read()).len(), 12);
 }
 
@@ -958,14 +1021,21 @@ fn a_change_that_reaches_us_through_a_third_device_is_counted_once() {
     let dir = tempfile::tempdir().unwrap();
     let devices: Vec<Db<Events>> = ["a", "b", "c"]
         .iter()
-        .map(|name| fast().open(dir.path().join(format!("{name}.ferro"))).unwrap())
+        .map(|name| {
+            fast()
+                .open(dir.path().join(format!("{name}.ferro")))
+                .unwrap()
+        })
         .collect();
     let (a, b, c) = (&devices[0], &devices[1], &devices[2]);
     event(a, 0);
     b.pull(a, "a", add_deltas).unwrap();
     c.pull(a, "a", add_deltas).unwrap();
     event(c, 1);
-    assert_eq!(b.pull(c, "c", add_deltas).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        b.pull(c, "c", add_deltas).unwrap().outcome,
+        Outcome::FastForward
+    );
     event(b, 2);
     event(a, 3);
     assert_eq!(a.pull(b, "b", add_deltas).unwrap().outcome, Outcome::Merged);
@@ -1444,7 +1514,11 @@ fn forged_entry(root: &Object, forged: Forged) -> Object {
         encoder.varint(reach);
         encoder.varint(last_merge);
     }
-    for linked in forged.prev.into_iter().chain(forged.merged.map(|(ptr, _)| ptr)) {
+    for linked in forged
+        .prev
+        .into_iter()
+        .chain(forged.merged.map(|(ptr, _)| ptr))
+    {
         encoder.link(linked);
     }
     encoder.into_object()
@@ -1473,11 +1547,41 @@ fn a_bundle_with_a_forged_merge_link_or_generation_is_rejected() {
     };
     let cases: Vec<(&str, Forged)> = vec![
         ("honest", Forged { ..honest }),
-        ("generation", Forged { graph: Some((4, 1, 3)), ..honest }),
-        ("reach", Forged { graph: Some((0, 2, 3)), ..honest }),
-        ("floor", Forged { merged: Some((link_to(&side), 2)), ..honest }),
-        ("value", Forged { merged: Some((link_to(&roots[1]), 1)), ..honest }),
-        ("unlinked", Forged { merged: None, ..honest }),
+        (
+            "generation",
+            Forged {
+                graph: Some((4, 1, 3)),
+                ..honest
+            },
+        ),
+        (
+            "reach",
+            Forged {
+                graph: Some((0, 2, 3)),
+                ..honest
+            },
+        ),
+        (
+            "floor",
+            Forged {
+                merged: Some((link_to(&side), 2)),
+                ..honest
+            },
+        ),
+        (
+            "value",
+            Forged {
+                merged: Some((link_to(&roots[1]), 1)),
+                ..honest
+            },
+        ),
+        (
+            "unlinked",
+            Forged {
+                merged: None,
+                ..honest
+            },
+        ),
     ];
     for (name, claim) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -1692,7 +1796,11 @@ fn node_of(key: u64, slot: &[u8], links: Vec<Ptr>) -> Object {
 fn map_root(count: u64, node: &Object) -> Object {
     let mut body = Vec::new();
     varint(&mut body, count);
-    let links = if count == 0 { Vec::new() } else { vec![link_to(node)] };
+    let links = if count == 0 {
+        Vec::new()
+    } else {
+        vec![link_to(node)]
+    };
     Object { body, links }
 }
 
@@ -1712,9 +1820,11 @@ fn receive_tree<T: Data + Default>(objects: &[&Object]) -> Received<T> {
     let tip = entry_of(1, root, None, None);
     let mut all = objects.to_vec();
     all.push(&tip);
-    let result = db.receive("evil", &forged(&tip, 1, &all), |_: &mut T, _, _| -> (String, ()) {
-        panic!("no merge expected")
-    });
+    let result = db.receive(
+        "evil",
+        &forged(&tip, 1, &all),
+        |_: &mut T, _, _| -> (String, ()) { panic!("no merge expected") },
+    );
     (db, result, dir)
 }
 
@@ -1765,7 +1875,10 @@ fn a_bundle_whose_keys_sit_at_the_wrong_level_or_out_of_order_is_rejected() {
     let (b, result, _dir) = receive_tree::<Root>(&[&misplaced, &root]);
     assert_refused(&b, result);
 
-    let low: Vec<u64> = (0..).filter(|key| common::level_of(key) == 0).take(2).collect();
+    let low: Vec<u64> = (0..)
+        .filter(|key| common::level_of(key) == 0)
+        .take(2)
+        .collect();
     let mut body = vec![0, 2];
     varint(&mut body, low[1]);
     varint(&mut body, low[0]);
@@ -1827,7 +1940,10 @@ fn a_bundle_that_reuses_held_data_as_another_type_is_rejected() {
             Forged {
                 version: 2,
                 time: now_ms(),
-                prev: Some(Ptr { hash: v1, offset: 0 }),
+                prev: Some(Ptr {
+                    hash: v1,
+                    offset: 0,
+                }),
                 merged: None,
                 graph: None,
             },
@@ -1882,7 +1998,11 @@ fn verify_typed_finds_nodes_that_do_not_decode_as_the_type() {
 fn a_bundle_dated_far_past_this_clock_is_rejected() {
     let now = now_ms();
     let day = 24 * 60 * 60 * 1000;
-    for (time, accepted) in [(u64::MAX, false), (now + 2 * day, false), (now + 60_000, true)] {
+    for (time, accepted) in [
+        (u64::MAX, false),
+        (now + 2 * day, false),
+        (now + 60_000, true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
         let root = object_of(&7u64);
@@ -1940,7 +2060,10 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     let landed = b.branch("a").unwrap();
     assert_eq!(landed.head_hash(), a.head_hash());
     assert_eq!(landed.log().first().unwrap().0, 1);
-    assert_eq!(b.common_ancestor(&landed).unwrap().commit().message, "put 3");
+    assert_eq!(
+        b.common_ancestor(&landed).unwrap().commit().message,
+        "put 3"
+    );
     let merged = [(1, "one"), (2, "two"), (3, "three")];
     let merged: BTreeMap<u64, String> = merged.map(|(k, v)| (k, v.to_string())).into();
     assert_eq!(dump(&b.read()), merged);
@@ -1957,8 +2080,10 @@ fn pruned_events(path: &Path, keep: usize) -> Db<Events> {
 
 fn checked(devices: &[Db<Events>], when: &str) {
     for (device, db) in devices.iter().enumerate() {
-        db.verify().unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
-        db.verify_typed().unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
+        db.verify()
+            .unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
+        db.verify_typed()
+            .unwrap_or_else(|error| panic!("{when}: d{device}: {error}"));
         for name in db.branches() {
             let branch = db.branch(&name).unwrap();
             let log = branch.log();
@@ -1991,7 +2116,11 @@ fn relayed_pruned_syncs(compact: bool) {
         }
         checked(&devices, &format!("d{to} <- d{from}"));
         for db in &devices {
-            assert!(counted(db).values().all(|count| *count == 1), "{:?}", counted(db));
+            assert!(
+                counted(db).values().all(|count| *count == 1),
+                "{:?}",
+                counted(db)
+            );
         }
         merged
     };
@@ -2026,19 +2155,32 @@ fn reclamation_keeps_a_landed_chain_that_shares_commits_with_a_shorter_one() {
 #[test]
 fn a_remote_whose_head_we_pruned_below_a_commit_it_knows_still_lands() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, s, y) = (open(&dir, "a.ferro"), open(&dir, "s.ferro"), open(&dir, "y.ferro"));
+    let (a, s, y) = (
+        open(&dir, "a.ferro"),
+        open(&dir, "s.ferro"),
+        open(&dir, "y.ferro"),
+    );
     put(&y, 1, "y");
-    assert_eq!(s.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        s.pull(&y, "y", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     put(&y, 2, "y");
     put(&y, 3, "y");
-    assert_eq!(a.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        a.pull(&y, "y", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     put(&a, 4, "a");
     a.compact(Keep::Last(2)).unwrap();
     match s.pull(&a, "a", theirs_win) {
         Err(Error::NoCommonAncestor) => {}
         other => panic!("s merged a branch it shares nothing retained with: {other:?}"),
     }
-    assert_eq!(s.pull(&y, "y", refuse).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        s.pull(&y, "y", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
     a.drop_branch("y").unwrap();
     put(&a, 5, "a");
     a.compact(Keep::Last(2)).unwrap();
@@ -2133,7 +2275,9 @@ fn pruned_devices_syncing_in_any_order_apply_every_change_once_or_refuse() {
         let keeps: Vec<usize> = (0..count).map(|_| 2 + rng.below(4) as usize).collect();
         let dir = tempfile::tempdir().unwrap();
         let devices = (0..count)
-            .map(|device| pruned_events(&dir.path().join(format!("d{device}.ferro")), keeps[device]))
+            .map(|device| {
+                pruned_events(&dir.path().join(format!("d{device}.ferro")), keeps[device])
+            })
             .collect();
         let mut model = Model(Vec::new());
         model.push(&[], BTreeMap::new());
@@ -2165,12 +2309,15 @@ fn pruned_devices_syncing_in_any_order_apply_every_change_once_or_refuse() {
                     mesh.heads[to] = mesh.model.push(&[mesh.heads[to]], counts);
                 }
                 35..45 => {
-                    mesh.devices[to].compact(Keep::Last(mesh.keeps[to])).unwrap();
+                    mesh.devices[to]
+                        .compact(Keep::Last(mesh.keeps[to]))
+                        .unwrap();
                 }
                 45..50 => {
                     let path = mesh.dir.path().join(format!("d{to}.ferro"));
                     drop(mesh.devices.remove(to));
-                    mesh.devices.insert(to, pruned_events(&path, mesh.keeps[to]));
+                    mesh.devices
+                        .insert(to, pruned_events(&path, mesh.keeps[to]));
                 }
                 50..75 => {
                     mesh.pull(to, from, &when);
@@ -2224,12 +2371,12 @@ fn a_remote_landed_again_after_a_drop_keeps_the_links_it_landed_with() {
         open("b.ferro", Keep::All),
         open("c.ferro", Keep::All),
     );
-    let pull = |to: &Db<Events>, from: &Db<Events>, remote: &str| {
-        match to.pull(from, remote, add_deltas) {
-            Ok(pulled) => Some(pulled.outcome),
-            Err(Error::NoCommonAncestor) => None,
-            Err(error) => panic!("{error}"),
-        }
+    let pull = |to: &Db<Events>, from: &Db<Events>, remote: &str| match to
+        .pull(from, remote, add_deltas)
+    {
+        Ok(pulled) => Some(pulled.outcome),
+        Err(Error::NoCommonAncestor) => None,
+        Err(error) => panic!("{error}"),
     };
     event(&b, 1);
     assert_eq!(pull(&a, &b, "b"), Some(Outcome::FastForward));
@@ -2263,18 +2410,30 @@ fn a_reader_verifies_a_remote_landed_again_after_a_drop() {
             .unwrap()
     };
     let (a, b) = (open("a.ferro", Keep::All), open("b.ferro", Keep::Last(2)));
-    let reader: Db<Events> = Options::new().read_only().open(dir.path().join("a.ferro")).unwrap();
+    let reader: Db<Events> = Options::new()
+        .read_only()
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
     event(&b, 0);
-    assert_eq!(a.pull(&b, "b", add_deltas).unwrap().outcome, Outcome::FastForward);
+    assert_eq!(
+        a.pull(&b, "b", add_deltas).unwrap().outcome,
+        Outcome::FastForward
+    );
     for next in 1..4 {
         event(&b, next);
     }
-    assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+    assert!(matches!(
+        a.pull(&b, "b", add_deltas),
+        Err(Error::NoCommonAncestor)
+    ));
     a.compact(Keep::All).unwrap();
     reader.refresh().unwrap();
     reader.verify().unwrap();
     a.drop_branch("b").unwrap();
-    assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+    assert!(matches!(
+        a.pull(&b, "b", add_deltas),
+        Err(Error::NoCommonAncestor)
+    ));
     a.verify().unwrap();
     reader.refresh().unwrap();
     reader.verify().unwrap();
@@ -2296,16 +2455,27 @@ fn a_writer_with_a_small_cache_verifies_a_remote_landed_again_after_a_drop() {
         let a = open("a.ferro", Keep::All, cache);
         let b = open("b.ferro", Keep::Last(2), 1 << 20);
         event(&b, 0);
-        assert_eq!(a.pull(&b, "b", add_deltas).unwrap().outcome, Outcome::FastForward);
+        assert_eq!(
+            a.pull(&b, "b", add_deltas).unwrap().outcome,
+            Outcome::FastForward
+        );
         for next in 1..4 {
             event(&b, next);
         }
-        assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
+        assert!(matches!(
+            a.pull(&b, "b", add_deltas),
+            Err(Error::NoCommonAncestor)
+        ));
         a.compact(Keep::All).unwrap();
         a.verify().unwrap();
         a.drop_branch("b").unwrap();
-        assert!(matches!(a.pull(&b, "b", add_deltas), Err(Error::NoCommonAncestor)));
-        a.verify().unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
-        a.verify_typed().unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
+        assert!(matches!(
+            a.pull(&b, "b", add_deltas),
+            Err(Error::NoCommonAncestor)
+        ));
+        a.verify()
+            .unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
+        a.verify_typed()
+            .unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
     }
 }

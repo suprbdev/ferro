@@ -184,10 +184,16 @@ pub enum Scenario {
 impl fmt::Display for Scenario {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Scenario::Reprice { venue: Some(venue), percent } => {
+            Scenario::Reprice {
+                venue: Some(venue),
+                percent,
+            } => {
                 write!(f, "reprice venue {venue} by {percent:+}%")
             }
-            Scenario::Reprice { venue: None, percent } => write!(f, "reprice every venue by {percent:+}%"),
+            Scenario::Reprice {
+                venue: None,
+                percent,
+            } => write!(f, "reprice every venue by {percent:+}%"),
             Scenario::Close { venue } => write!(f, "close venue {venue}"),
         }
     }
@@ -214,7 +220,9 @@ pub struct Hotels {
 
 impl Hotels {
     pub fn price(&self, room: &Room, night: Night) -> Cents {
-        self.rates.get(&(room.id, night)).map_or(room.rate, |rate| *rate)
+        self.rates
+            .get(&(room.id, night))
+            .map_or(room.rate, |rate| *rate)
     }
 
     pub fn capacity(&self, venue: u32, night: Night) -> u32 {
@@ -225,10 +233,15 @@ impl Hotels {
     }
 
     pub fn holder(&self, room: u32, night: Night) -> Option<u64> {
-        self.stays.key_by_room_night(&(room, night)).map(|slot| slot.0)
+        self.stays
+            .key_by_room_night(&(room, night))
+            .map(|slot| slot.0)
     }
 
-    pub fn lines_of(&self, customer: u32) -> impl DoubleEndedIterator<Item = Line> + ExactSizeIterator + use<> {
+    pub fn lines_of(
+        &self,
+        customer: u32,
+    ) -> impl DoubleEndedIterator<Item = Line> + ExactSizeIterator + use<> {
         self.bookings.by_customer(&customer).covered().map(
             |(id, (status, venue, room, first, nights, total))| Line {
                 id,

@@ -58,7 +58,9 @@ fn priority_then_fifo() {
 fn lease_batch_takes_top_n() {
     let f = fixture();
     let q = &f.queue;
-    let specs = (0..10).map(|i| job("a", format!("{i}")).priority(i as u8)).collect();
+    let specs = (0..10)
+        .map(|i| job("a", format!("{i}")).priority(i as u8))
+        .collect();
     q.enqueue_batch(specs).unwrap();
     let got = q.lease_n("a", "w", 1000, 4).unwrap();
     let priorities: Vec<u8> = got.iter().map(|l| l.job.priority).collect();
@@ -89,7 +91,10 @@ fn ack_removes_job_and_stale_ack_is_lost() {
     let leased = q.lease("a", "w", 1000).unwrap().unwrap();
     q.ack(leased.lease()).unwrap();
     assert!(q.get(id).is_none());
-    assert!(matches!(q.ack(leased.lease()), Err(QueueError::LeaseLost(_))));
+    assert!(matches!(
+        q.ack(leased.lease()),
+        Err(QueueError::LeaseLost(_))
+    ));
 }
 
 #[test]
@@ -101,17 +106,29 @@ fn nack_backs_off_exponentially_then_dead_letters() {
         .unwrap()
         .id;
     let first = q.lease("a", "w", 10_000).unwrap().unwrap();
-    assert_eq!(q.nack(first.lease(), "boom", None).unwrap(), JobState::Delayed);
-    assert_eq!(q.get(id).unwrap().run_at, f.clock.load(Ordering::SeqCst) + 1_000);
+    assert_eq!(
+        q.nack(first.lease(), "boom", None).unwrap(),
+        JobState::Delayed
+    );
+    assert_eq!(
+        q.get(id).unwrap().run_at,
+        f.clock.load(Ordering::SeqCst) + 1_000
+    );
     assert!(q.lease("a", "w", 10_000).unwrap().is_none());
     f.advance(1_000);
     let second = q.lease("a", "w", 10_000).unwrap().unwrap();
     assert_eq!(second.job.attempts, 2);
     q.nack(second.lease(), "boom", None).unwrap();
-    assert_eq!(q.get(id).unwrap().run_at, f.clock.load(Ordering::SeqCst) + 2_000);
+    assert_eq!(
+        q.get(id).unwrap().run_at,
+        f.clock.load(Ordering::SeqCst) + 2_000
+    );
     f.advance(2_000);
     let third = q.lease("a", "w", 10_000).unwrap().unwrap();
-    assert_eq!(q.nack(third.lease(), "final", None).unwrap(), JobState::Dead);
+    assert_eq!(
+        q.nack(third.lease(), "final", None).unwrap(),
+        JobState::Dead
+    );
     let dead = q.dlq_list(Some("a"), 10);
     assert_eq!(dead.len(), 1);
     assert_eq!(dead[0].error.as_deref(), Some("final"));
@@ -127,7 +144,10 @@ fn nack_with_explicit_retry_delay() {
     let id = q.enqueue(job("a", "x")).unwrap().id;
     let leased = q.lease("a", "w", 1000).unwrap().unwrap();
     q.nack(leased.lease(), "slow down", Some(250)).unwrap();
-    assert_eq!(q.get(id).unwrap().run_at, f.clock.load(Ordering::SeqCst) + 250);
+    assert_eq!(
+        q.get(id).unwrap().run_at,
+        f.clock.load(Ordering::SeqCst) + 250
+    );
 }
 
 #[test]
@@ -135,7 +155,11 @@ fn dlq_retry_one_and_all() {
     let f = fixture();
     let q = &f.queue;
     let ids: Vec<u64> = (0..3)
-        .map(|i| q.enqueue(job("a", format!("{i}")).max_attempts(1)).unwrap().id)
+        .map(|i| {
+            q.enqueue(job("a", format!("{i}")).max_attempts(1))
+                .unwrap()
+                .id
+        })
         .collect();
     for _ in 0..3 {
         let leased = q.lease("a", "w", 1000).unwrap().unwrap();
@@ -209,9 +233,13 @@ fn extend_pushes_expiry() {
 fn idempotency_key_dedupes_within_retention_only() {
     let f = fixture();
     let q = &f.queue;
-    let first = q.enqueue(job("a", "x").key("k1").key_ttl_ms(1_000)).unwrap();
+    let first = q
+        .enqueue(job("a", "x").key("k1").key_ttl_ms(1_000))
+        .unwrap();
     assert!(!first.duplicate);
-    let again = q.enqueue(job("a", "x").key("k1").key_ttl_ms(1_000)).unwrap();
+    let again = q
+        .enqueue(job("a", "x").key("k1").key_ttl_ms(1_000))
+        .unwrap();
     assert!(again.duplicate);
     assert_eq!(again.id, first.id);
     let other_queue = q.enqueue(job("b", "x").key("k1")).unwrap();
@@ -220,7 +248,9 @@ fn idempotency_key_dedupes_within_retention_only() {
     q.ack(leased.lease()).unwrap();
     assert!(q.enqueue(job("a", "x").key("k1")).unwrap().duplicate);
     f.advance(1_001);
-    let after = q.enqueue(job("a", "x").key("k1").key_ttl_ms(1_000)).unwrap();
+    let after = q
+        .enqueue(job("a", "x").key("k1").key_ttl_ms(1_000))
+        .unwrap();
     assert!(!after.duplicate);
     assert_ne!(after.id, first.id);
 }
@@ -248,7 +278,11 @@ fn batch_enqueue_is_atomic_and_dedupes_inside() {
     ));
     assert_eq!(q.db().read().jobs.len(), 0);
     let done = q
-        .enqueue_batch(vec![job("a", "1").key("k"), job("a", "2").key("k"), job("a", "3")])
+        .enqueue_batch(vec![
+            job("a", "1").key("k"),
+            job("a", "2").key("k"),
+            job("a", "3"),
+        ])
         .unwrap();
     assert!(!done[0].duplicate);
     assert!(done[1].duplicate);
@@ -386,7 +420,10 @@ fn history_lists_every_state_of_a_finished_job() {
         q.enqueue(job("noise", format!("{i}"))).unwrap();
     }
     let events = q.history(id).unwrap();
-    let states: Vec<Option<JobState>> = events.iter().map(|e| e.job.as_ref().map(|j| j.state)).collect();
+    let states: Vec<Option<JobState>> = events
+        .iter()
+        .map(|e| e.job.as_ref().map(|j| j.state))
+        .collect();
     assert_eq!(
         states,
         vec![
@@ -452,7 +489,10 @@ fn replay_skips_jobs_still_live_unless_forced() {
 fn invalid_specs_are_rejected() {
     let f = fixture();
     let q = &f.queue;
-    assert!(matches!(q.enqueue(job("", "x")), Err(QueueError::Invalid(_))));
+    assert!(matches!(
+        q.enqueue(job("", "x")),
+        Err(QueueError::Invalid(_))
+    ));
     assert!(matches!(
         q.enqueue(job("a", "x").max_attempts(0)),
         Err(QueueError::Invalid(_))
@@ -505,5 +545,9 @@ fn retention_keeps_a_busy_queue_small_without_stopping_it() {
     let job = q.enqueue(NewJob::new("work", vec![1])).unwrap().id;
     drop(q);
     let q = Queue::open(&path, QueueOptions::default()).unwrap();
-    assert!(q.lease("work", "w", 30_000).unwrap().is_some_and(|leased| leased.job.id == job));
+    assert!(
+        q.lease("work", "w", 30_000)
+            .unwrap()
+            .is_some_and(|leased| leased.job.id == job)
+    );
 }

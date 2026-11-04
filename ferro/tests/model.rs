@@ -235,8 +235,14 @@ fn apply<K: TestKey>(
         }
         Op::Get(seed) => {
             let key = resolve(*seed);
-            assert_eq!(map.get(&key).map(|v| (*v).clone()), model.get(&key).cloned());
-            assert_eq!(map.try_get(&key).unwrap().is_some(), model.contains_key(&key));
+            assert_eq!(
+                map.get(&key).map(|v| (*v).clone()),
+                model.get(&key).cloned()
+            );
+            assert_eq!(
+                map.try_get(&key).unwrap().is_some(),
+                model.contains_key(&key)
+            );
             assert_eq!(map.contains_key(&key), model.contains_key(&key));
         }
         Op::GetMut(seed, salt, len) => {
@@ -272,7 +278,9 @@ fn apply<K: TestKey>(
         Op::GetOrInsert(seed, salt, len) => {
             let key = resolve(*seed);
             let value = text(*salt, *len);
-            let a = map.get_or_insert_with(key.clone(), || value.clone()).clone();
+            let a = map
+                .get_or_insert_with(key.clone(), || value.clone())
+                .clone();
             let b = model.entry(key).or_insert(value).clone();
             assert_eq!(a, b);
         }
@@ -398,7 +406,10 @@ fn apply<K: TestKey>(
         ),
         Op::Nth(index) => {
             let got = map.nth(*index).map(|(k, v)| (k, (*v).clone()));
-            let wanted = model.iter().nth(*index).map(|(k, v)| (k.clone(), v.clone()));
+            let wanted = model
+                .iter()
+                .nth(*index)
+                .map(|(k, v)| (k.clone(), v.clone()));
             assert_eq!(got, wanted);
         }
         Op::Commit | Op::Reopen => {}

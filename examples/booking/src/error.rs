@@ -19,7 +19,11 @@ pub enum BookingError {
     #[error("email already registered to customer {holder}: {email}")]
     EmailTaken { email: String, holder: u32 },
     #[error("room {room} on {night} is taken by booking #{holder}")]
-    Unavailable { room: u32, night: String, holder: u64 },
+    Unavailable {
+        room: u32,
+        night: String,
+        holder: u64,
+    },
     #[error("a stay must be between 1 and {max} nights, not {given}")]
     BadStay { given: u32, max: u32 },
     #[error("night {night} is in the past")]
@@ -33,7 +37,11 @@ pub enum BookingError {
         wanted: &'static str,
     },
     #[error("booking #{id} costs {total} cents, not the {expected} the customer agreed to")]
-    PriceChanged { id: u64, total: Cents, expected: Cents },
+    PriceChanged {
+        id: u64,
+        total: Cents,
+        expected: Cents,
+    },
     #[error("customer {customer} has {available} cents of credit and needs {needed}")]
     InsufficientFunds {
         customer: u32,

@@ -50,7 +50,11 @@ fn exactly_once_lease_with_many_producers_and_workers() {
                     continue;
                 }
                 for item in &leased {
-                    assert!(held.lock().unwrap().insert(item.job.id), "job {} leased twice", item.job.id);
+                    assert!(
+                        held.lock().unwrap().insert(item.job.id),
+                        "job {} leased twice",
+                        item.job.id
+                    );
                     let payload = String::from_utf8(item.job.payload.to_vec()).unwrap();
                     *executions.lock().unwrap().entry(payload).or_default() += 1;
                 }
@@ -71,9 +75,16 @@ fn exactly_once_lease_with_many_producers_and_workers() {
         producers.push(thread::spawn(move || {
             let mut sent = 0;
             while sent < PER_PRODUCER {
-                let size = if sent % 2 == 0 { 1 } else { 5.min(PER_PRODUCER - sent) };
+                let size = if sent % 2 == 0 {
+                    1
+                } else {
+                    5.min(PER_PRODUCER - sent)
+                };
                 let specs = (0..size)
-                    .map(|i| NewJob::new("jobs", format!("p{p}-{}", sent + i)).priority(((sent + i) % 5) as u8))
+                    .map(|i| {
+                        NewJob::new("jobs", format!("p{p}-{}", sent + i))
+                            .priority(((sent + i) % 5) as u8)
+                    })
                     .collect();
                 let done = queue.enqueue_batch(specs).unwrap();
                 assert_eq!(done.len(), size);
@@ -111,7 +122,11 @@ fn only_expiry_causes_a_second_run() {
         let executions = executions.clone();
         Arc::new(move |job: &queue::Job| {
             let payload = String::from_utf8(job.payload.to_vec()).unwrap();
-            *executions.lock().unwrap().entry(payload.clone()).or_default() += 1;
+            *executions
+                .lock()
+                .unwrap()
+                .entry(payload.clone())
+                .or_default() += 1;
             let index: usize = payload.parse().unwrap();
             if job.attempts == 1 && index.is_multiple_of(7) {
                 stalled.lock().unwrap().insert(payload);
@@ -129,7 +144,9 @@ fn only_expiry_causes_a_second_run() {
         .collect();
     queue.enqueue_batch(specs).unwrap();
 
-    let finished = wait_for(Duration::from_secs(30), || queue.db().read().jobs.is_empty());
+    let finished = wait_for(Duration::from_secs(30), || {
+        queue.db().read().jobs.is_empty()
+    });
     assert!(finished, "queue did not drain");
     let stalled = stalled.lock().unwrap().clone();
     assert!(!stalled.is_empty());
@@ -156,7 +173,9 @@ fn runner_wakes_on_enqueue_and_on_delayed_due() {
     let handler = {
         let seen = seen.clone();
         Arc::new(move |job: &queue::Job| {
-            seen.lock().unwrap().push(String::from_utf8(job.payload.to_vec()).unwrap());
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8(job.payload.to_vec()).unwrap());
             Ok(())
         })
     };
@@ -167,11 +186,21 @@ fn runner_wakes_on_enqueue_and_on_delayed_due() {
 
     let start = Instant::now();
     queue.enqueue(NewJob::new("jobs", "now")).unwrap();
-    assert!(wait_for(Duration::from_secs(2), || seen.lock().unwrap().len() == 1));
+    assert!(wait_for(Duration::from_secs(2), || seen
+        .lock()
+        .unwrap()
+        .len()
+        == 1));
     assert!(start.elapsed() < Duration::from_secs(2));
 
-    queue.enqueue(NewJob::new("jobs", "later").delay_ms(300)).unwrap();
-    assert!(wait_for(Duration::from_secs(5), || seen.lock().unwrap().len() == 2));
+    queue
+        .enqueue(NewJob::new("jobs", "later").delay_ms(300))
+        .unwrap();
+    assert!(wait_for(Duration::from_secs(5), || seen
+        .lock()
+        .unwrap()
+        .len()
+        == 2));
     assert_eq!(seen.lock().unwrap()[1], "later");
     runner.stop();
 }
@@ -195,11 +224,20 @@ fn runner_nacks_failures_and_dead_letters_panics() {
             NewJob::new("jobs", "panic").max_attempts(1),
         ])
         .unwrap();
-    assert!(wait_for(Duration::from_secs(10), || queue.dlq_list(None, 10).len() == 2));
+    assert!(wait_for(Duration::from_secs(10), || queue
+        .dlq_list(None, 10)
+        .len()
+        == 2));
     let dead = queue.dlq_list(None, 10);
     assert!(dead.iter().all(|job| job.state == JobState::Dead));
-    assert!(dead.iter().any(|job| job.error.as_deref() == Some("handler panicked")));
-    assert!(dead.iter().any(|job| job.error.as_deref() == Some("always fails") && job.attempts == 2));
+    assert!(
+        dead.iter()
+            .any(|job| job.error.as_deref() == Some("handler panicked"))
+    );
+    assert!(
+        dead.iter()
+            .any(|job| job.error.as_deref() == Some("always fails") && job.attempts == 2)
+    );
     runner.stop();
 }
 
@@ -241,12 +279,16 @@ fn stopping_an_idle_runner_commits_nothing() {
 fn a_parked_reaper_wakes_for_something_due_sooner() {
     let dir = tempfile::tempdir().unwrap();
     let queue = open(&dir);
-    queue.enqueue(NewJob::new("jobs", "much later").delay_ms(3_600_000)).unwrap();
+    queue
+        .enqueue(NewJob::new("jobs", "much later").delay_ms(3_600_000))
+        .unwrap();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let handler = {
         let seen = seen.clone();
         Arc::new(move |job: &queue::Job| {
-            seen.lock().unwrap().push(String::from_utf8(job.payload.to_vec()).unwrap());
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8(job.payload.to_vec()).unwrap());
             Ok(())
         })
     };
@@ -254,8 +296,14 @@ fn a_parked_reaper_wakes_for_something_due_sooner() {
     config.idle_wait = Duration::from_secs(600);
     let runner = Runner::start(queue.clone(), config, handler);
     thread::sleep(Duration::from_millis(100));
-    queue.enqueue(NewJob::new("jobs", "soon").delay_ms(150)).unwrap();
-    assert!(wait_for(Duration::from_secs(5), || seen.lock().unwrap().len() == 1));
+    queue
+        .enqueue(NewJob::new("jobs", "soon").delay_ms(150))
+        .unwrap();
+    assert!(wait_for(Duration::from_secs(5), || seen
+        .lock()
+        .unwrap()
+        .len()
+        == 1));
     assert_eq!(seen.lock().unwrap()[0], "soon");
     runner.stop();
 }

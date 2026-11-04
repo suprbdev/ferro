@@ -1,8 +1,7 @@
-
-use ferro::Val;
 use crate::error::{LedgerError, Result};
 use crate::model::{Account, Entry, Kind, Ledger, Line, PostingKey};
 use crate::money::{format_amount, format_date};
+use ferro::Val;
 
 #[derive(Clone, Debug)]
 pub struct NewLine {

@@ -49,7 +49,13 @@ pub struct Space {
 
 fn links_of(entry: &Entry) -> Vec<Hash> {
     let merged = entry.merged.map(|merged| merged.ptr);
-    entry.prev.iter().chain(&entry.skip).chain(&merged).map(|link| link.hash).collect()
+    entry
+        .prev
+        .iter()
+        .chain(&entry.skip)
+        .chain(&merged)
+        .map(|link| link.hash)
+        .collect()
 }
 
 pub(crate) fn sibling(path: &Path) -> PathBuf {
@@ -66,7 +72,11 @@ pub(crate) struct Roots {
 
 impl Roots {
     pub(crate) fn of(head: Ptr, refs: &Refs) -> Result<Roots> {
-        let chains = refs.try_entries()?.into_iter().map(|(_, branch)| branch.log).collect();
+        let chains = refs
+            .try_entries()?
+            .into_iter()
+            .map(|(_, branch)| branch.log)
+            .collect();
         Ok(Roots {
             trees: vec![head],
             chains,
@@ -223,7 +233,10 @@ impl CopySink<'_> {
     }
 
     fn reached(&self, links: &[Ptr], rungs: Rungs) -> u64 {
-        let prev = rungs.prev.map(|index| links[index]).filter(|prev| prev.offset != 0);
+        let prev = rungs
+            .prev
+            .map(|index| links[index])
+            .filter(|prev| prev.offset != 0);
         prev.and_then(|prev| self.reach.get(&prev.offset).copied())
             .unwrap_or(rungs.version)
     }

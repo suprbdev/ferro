@@ -44,9 +44,7 @@ pub fn ready_key(queue: &str, priority: u8, id: u64) -> ReadyKey {
 
 fn backoff(base_ms: u64, attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(32);
-    base_ms
-        .saturating_mul(1u64 << shift)
-        .min(BACKOFF_CAP_MS)
+    base_ms.saturating_mul(1u64 << shift).min(BACKOFF_CAP_MS)
 }
 
 impl State {
@@ -99,7 +97,8 @@ impl State {
             self.delayed.insert((job.run_at, job.queue.clone(), job.id));
         } else {
             job.state = JobState::Ready;
-            self.ready.insert(ready_key(&job.queue, job.priority, job.id));
+            self.ready
+                .insert(ready_key(&job.queue, job.priority, job.id));
         }
     }
 
@@ -108,7 +107,9 @@ impl State {
             return Err(QueueError::Invalid("queue name is empty".into()));
         }
         if spec.max_attempts == 0 {
-            return Err(QueueError::Invalid("max attempts must be at least 1".into()));
+            return Err(QueueError::Invalid(
+                "max attempts must be at least 1".into(),
+            ));
         }
         if let Some(key) = &spec.key {
             let slot = (spec.queue.clone(), key.clone());
@@ -116,7 +117,8 @@ impl State {
                 if found.1 > now {
                     return Ok((found.0, true));
                 }
-                self.idem_exp.remove(&(found.1, slot.0.clone(), slot.1.clone()));
+                self.idem_exp
+                    .remove(&(found.1, slot.0.clone(), slot.1.clone()));
                 self.idem.remove(&slot);
             }
         }
@@ -166,14 +168,23 @@ impl State {
         }
         if let Some(key) = &spec.key {
             let expires = now + spec.key_ttl_ms;
-            self.idem.insert((spec.queue.clone(), key.clone()), (id, expires));
-            self.idem_exp.insert((expires, spec.queue.clone(), key.clone()));
+            self.idem
+                .insert((spec.queue.clone(), key.clone()), (id, expires));
+            self.idem_exp
+                .insert((expires, spec.queue.clone(), key.clone()));
         }
         self.jobs.insert(id, job);
         Ok((id, false))
     }
 
-    pub fn lease(&mut self, queue: &str, worker: &str, ttl_ms: u64, n: usize, now: u64) -> Vec<Job> {
+    pub fn lease(
+        &mut self,
+        queue: &str,
+        worker: &str,
+        ttl_ms: u64,
+        n: usize,
+        now: u64,
+    ) -> Vec<Job> {
         if self.paused.contains(queue) {
             return Vec::new();
         }
@@ -218,8 +229,7 @@ impl State {
 
     pub fn ack(&mut self, id: u64, attempt: u32, now: u64) -> Result<()> {
         let job = self.held(id, attempt)?;
-        self.leases
-            .remove(&(job.expires_ms, job.queue.clone(), id));
+        self.leases.remove(&(job.expires_ms, job.queue.clone(), id));
         self.jobs.remove(&id);
         self.release_children(id, now);
         Ok(())
@@ -227,8 +237,7 @@ impl State {
 
     pub fn extend(&mut self, id: u64, attempt: u32, ttl_ms: u64, now: u64) -> Result<()> {
         let mut job = self.held(id, attempt)?;
-        self.leases
-            .remove(&(job.expires_ms, job.queue.clone(), id));
+        self.leases.remove(&(job.expires_ms, job.queue.clone(), id));
         job.expires_ms = now + ttl_ms;
         self.leases.insert((job.expires_ms, job.queue.clone(), id));
         self.jobs.insert(id, job);
@@ -244,8 +253,7 @@ impl State {
         now: u64,
     ) -> Result<JobState> {
         let job = self.held(id, attempt)?;
-        self.leases
-            .remove(&(job.expires_ms, job.queue.clone(), id));
+        self.leases.remove(&(job.expires_ms, job.queue.clone(), id));
         Ok(self.fail(job, error, retry_in_ms, now))
     }
 

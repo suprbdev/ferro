@@ -66,7 +66,11 @@ pub fn seed(db: &Db<Graph>, opts: &SeedOpts, say: &mut dyn FnMut(String)) -> Res
                 .map(|(i, d)| (i as UserId, *d)),
         );
     })?;
-    say(format!("edges {} in {:.2}s", total, t.elapsed().as_secs_f64()));
+    say(format!(
+        "edges {} in {:.2}s",
+        total,
+        t.elapsed().as_secs_f64()
+    ));
 
     if opts.posts > 0 {
         let t = Instant::now();

@@ -222,7 +222,10 @@ fn closures_queued_behind_a_sync_share_one_version() {
     release(false);
     let first = leader.join().unwrap().unwrap();
     assert_eq!((first.version, first.value), (2, 2));
-    let done: Vec<_> = followers.into_iter().map(|f| f.join().unwrap().unwrap()).collect();
+    let done: Vec<_> = followers
+        .into_iter()
+        .map(|f| f.join().unwrap().unwrap())
+        .collect();
     assert!(done.iter().all(|done| done.version == 3 && done.changed));
     let mut values: Vec<u64> = done.iter().map(|done| done.value).collect();
     values.sort_unstable();
@@ -236,7 +239,13 @@ fn closures_queued_behind_a_sync_share_one_version() {
     let mut messages: Vec<&str> = commit.messages().collect();
     messages.sort_unstable();
     assert_eq!(messages, vec!["m0", "m1", "m2", "m3", "m4"]);
-    assert_eq!(events.recv_timeout(Duration::from_secs(5)).unwrap().version(), 3);
+    assert_eq!(
+        events
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .version(),
+        3
+    );
     assert!(events.try_recv().is_err());
     drop((db, log));
     let reopened = Options::new().open::<Root>(&path).unwrap();
@@ -256,7 +265,10 @@ fn multi_line_messages_stay_whole_alone_and_in_a_group() {
     let ran = Ran::new();
     let leader = stall_leader(&db, &ran);
     let names = ["one\ntwo", "three", "four\n\nfive\n", "\nsix"];
-    let followers: Vec<_> = names.iter().map(|name| bump(&db, &ran, name.to_string())).collect();
+    let followers: Vec<_> = names
+        .iter()
+        .map(|name| bump(&db, &ran, name.to_string()))
+        .collect();
     ran.reach(names.len() + 1);
     settle_queue();
     release(false);
@@ -266,26 +278,44 @@ fn multi_line_messages_stay_whole_alone_and_in_a_group() {
     }
     let read = |db: &Db<Root>| {
         let log = db.log();
-        let mut group: Vec<String> = log.get(&4).unwrap().messages().map(str::to_string).collect();
+        let mut group: Vec<String> = log
+            .get(&4)
+            .unwrap()
+            .messages()
+            .map(str::to_string)
+            .collect();
         group.sort_unstable();
-        let alone: Vec<String> = log.get(&2).unwrap().messages().map(str::to_string).collect();
+        let alone: Vec<String> = log
+            .get(&2)
+            .unwrap()
+            .messages()
+            .map(str::to_string)
+            .collect();
         (alone, group)
     };
     let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
     expected.sort_unstable();
-    assert_eq!(read(&db), (vec!["alone\nsecond line".to_string()], expected.clone()));
+    assert_eq!(
+        read(&db),
+        (vec!["alone\nsecond line".to_string()], expected.clone())
+    );
     let message = db.log().get(&4).unwrap().message.clone();
     assert_eq!(message.matches('\n').count(), 8);
     drop(db);
     let reopened = Options::new().open::<Root>(&path).unwrap();
-    assert_eq!(read(&reopened), (vec!["alone\nsecond line".to_string()], expected));
+    assert_eq!(
+        read(&reopened),
+        (vec!["alone\nsecond line".to_string()], expected)
+    );
 }
 
 #[test]
 fn without_the_option_closures_keep_a_version_each() {
     let _turn = serial();
     let dir = on_disk();
-    let db = Options::new().open::<Root>(dir.path().join("plain.ferro")).unwrap();
+    let db = Options::new()
+        .open::<Root>(dir.path().join("plain.ferro"))
+        .unwrap();
     db.update(|root| {
         root.insert(0, 1);
     })
@@ -580,7 +610,10 @@ fn a_group_of_no_ops_sealed_early_still_waits_for_the_tip_it_read() {
         thread::spawn(move || db.fork("side"))
     };
     settle_queue();
-    assert!(!reader.is_finished(), "a no-op returned before the tip it read was durable");
+    assert!(
+        !reader.is_finished(),
+        "a no-op returned before the tip it read was durable"
+    );
     release(false);
     leader.join().unwrap().unwrap();
     let done = reader.join().unwrap().unwrap();
@@ -635,12 +668,16 @@ fn closer_then_follower(db: &Db<Root>, arrivals: &Arc<AtomicUsize>) -> (u64, u64
         thread::spawn(move || {
             db.commit_with(|root| {
                 holding.store(true, Ordering::SeqCst);
-                wait_until("the follower to arrive", || arrivals.load(Ordering::SeqCst) > before);
+                wait_until("the follower to arrive", || {
+                    arrivals.load(Ordering::SeqCst) > before
+                });
                 ("closer", increment(root))
             })
         })
     };
-    wait_until("the closer to hold the lock", || holding.load(Ordering::SeqCst));
+    wait_until("the closer to hold the lock", || {
+        holding.load(Ordering::SeqCst)
+    });
     let follower = {
         let db = db.clone();
         thread::Builder::new()
@@ -685,7 +722,10 @@ fn a_closure_stops_waiting_for_followers_that_are_slow_to_reach_the_lock() {
     assert_eq!(counter(&db.read()), 5);
     let log = db.log();
     assert_eq!(log.get(&2).unwrap().messages().count(), 2);
-    assert_eq!(log.get(&3).unwrap().messages().collect::<Vec<_>>(), vec!["closer"]);
+    assert_eq!(
+        log.get(&3).unwrap().messages().collect::<Vec<_>>(),
+        vec!["closer"]
+    );
 }
 
 #[test]
@@ -915,7 +955,10 @@ fn restore_merge_fork_and_drop_flush_the_open_group_first() {
     dropper.join().unwrap().unwrap();
     assert_eq!(db.branches(), vec!["late", "main", "side"]);
     let log = db.log();
-    assert_eq!(log.get(&restored.version).unwrap().restored, Some(old.version()));
+    assert_eq!(
+        log.get(&restored.version).unwrap().restored,
+        Some(old.version())
+    );
     assert!(log.len() >= 5);
     db.verify().unwrap();
 }
@@ -952,7 +995,9 @@ fn a_closure_on_another_branch_flushes_the_open_group() {
 fn groups_left_open_on_many_branches_share_the_next_sync() {
     let _turn = serial();
     let (_dir, _path, db) = database();
-    let sides: Vec<_> = (0..4).map(|i| db.fork(&format!("side-{i}")).unwrap()).collect();
+    let sides: Vec<_> = (0..4)
+        .map(|i| db.fork(&format!("side-{i}")).unwrap())
+        .collect();
     let ran = Ran::new();
     let leader = stall_leader(&db, &ran);
     let members: Vec<_> = sides
@@ -968,7 +1013,11 @@ fn groups_left_open_on_many_branches_share_the_next_sync() {
     for member in members {
         assert_eq!(member.join().unwrap().unwrap().version, 2);
     }
-    assert_eq!(hook().calls - before, 1, "the open groups took more than one sync");
+    assert_eq!(
+        hook().calls - before,
+        1,
+        "the open groups took more than one sync"
+    );
     for side in &sides {
         assert_eq!((side.version(), counter(&side.read())), (2, 2));
     }
@@ -1047,7 +1096,11 @@ fn a_full_group_stops_growing() {
     }
     assert_eq!(seen.len(), 2, "{seen:?}");
     assert_eq!(counter(&db.read()), 302);
-    assert!(db.log().values().all(|commit| commit.messages().count() <= 256));
+    assert!(
+        db.log()
+            .values()
+            .all(|commit| commit.messages().count() <= 256)
+    );
     db.verify().unwrap();
 }
 
@@ -1120,11 +1173,19 @@ fn many_writers_lose_nothing_and_never_expose_half_a_group() {
     assert_eq!(db.read().len(), 320);
     assert!(db.version() <= 320);
     let log: Vec<_> = db.log().values().collect();
-    assert_eq!(log.iter().map(|commit| commit.messages().count()).sum::<usize>(), 320);
+    assert_eq!(
+        log.iter()
+            .map(|commit| commit.messages().count())
+            .sum::<usize>(),
+        320
+    );
     db.verify().unwrap();
     drop(log);
     drop(db);
-    assert_eq!(Options::new().open::<Root>(&path).unwrap().read().len(), 320);
+    assert_eq!(
+        Options::new().open::<Root>(&path).unwrap().read().len(),
+        320
+    );
 }
 
 #[test]
@@ -1135,7 +1196,9 @@ fn a_cycle_during_coalesced_commits_loses_nothing() {
     let db = fast()
         .coalesce(true)
         .history(Keep::Last(4))
-        .reclaim(Reclaim { every_bytes: 64 << 10 })
+        .reclaim(Reclaim {
+            every_bytes: 64 << 10,
+        })
         .open::<Root>(&path)
         .unwrap();
     let writers: Vec<_> = (0..6u64)
@@ -1208,11 +1271,19 @@ fn power_cut_run(writers: u64, rounds: u64) -> (TempDir, Vec<(u64, u64)>, Images
 fn check_image(path: &Path, image: &[u8], floor: u64, keys: &[(u64, u64)]) {
     fs::write(path, image).unwrap();
     let db = fast().open::<Root>(path).unwrap();
-    assert!(db.version() >= floor, "recovered v{} but v{floor} was acknowledged", db.version());
+    assert!(
+        db.version() >= floor,
+        "recovered v{} but v{floor} was acknowledged",
+        db.version()
+    );
     let tip = db.read();
     assert_eq!(tip.len() as u64, counter(&tip) + 1);
     for (key, version) in keys.iter().filter(|(_, version)| *version <= db.version()) {
-        assert!(tip.contains_key(key), "key {key} of v{version} is gone at v{}", db.version());
+        assert!(
+            tip.contains_key(key),
+            "key {key} of v{version} is gone at v{}",
+            db.version()
+        );
     }
     db.verify().unwrap();
 }
@@ -1232,7 +1303,10 @@ fn a_power_cut_keeps_every_acknowledged_closure() {
 fn clocked(ms: u64) -> (TempDir, Db<Root>) {
     let dir = on_disk();
     let clock = Clock(Arc::new(move || ms));
-    let db = coalesced().clock(clock).open::<Root>(dir.path().join("stamp.ferro")).unwrap();
+    let db = coalesced()
+        .clock(clock)
+        .open::<Root>(dir.path().join("stamp.ferro"))
+        .unwrap();
     db.update(|root| {
         root.insert(0, 1);
     })

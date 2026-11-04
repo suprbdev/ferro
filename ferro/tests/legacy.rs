@@ -18,7 +18,10 @@ fn messages_written_before_groups_were_recorded_still_split_on_newlines() {
     let (_dir, path) = legacy();
     let db: Db<Counters> = Db::open(&path).unwrap();
     let log = db.log();
-    assert_eq!(log.get(&1).unwrap().messages().collect::<Vec<_>>(), vec!["first"]);
+    assert_eq!(
+        log.get(&1).unwrap().messages().collect::<Vec<_>>(),
+        vec!["first"]
+    );
     let joined = log.get(&2).unwrap();
     assert_eq!(joined.message, "one\ntwo");
     assert_eq!(joined.messages().collect::<Vec<_>>(), vec!["one", "two"]);
@@ -58,15 +61,24 @@ fn a_merge_recorded_before_merge_links_still_sets_the_base() {
     let (_dir, path) = legacy();
     let main: Db<Counters> = Db::open(&path).unwrap();
     let side = main.branch("side").unwrap();
-    assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "side one");
-    assert_eq!(side.common_ancestor(&main).unwrap().commit().message, "side one");
+    assert_eq!(
+        main.common_ancestor(&side).unwrap().commit().message,
+        "side one"
+    );
+    assert_eq!(
+        side.common_ancestor(&main).unwrap().commit().message,
+        "side one"
+    );
     assert_eq!(counter_merge(&main, &side, "merge side again"), "side one");
     assert_eq!(values(&main), vec![(0, 3), (1, 1010), (2, 100)]);
     assert_eq!(counter_merge(&side, &main, "merge main"), "side two");
     assert_eq!(values(&side), vec![(0, 3), (1, 1010), (2, 100)]);
     main.compact(ferro::Keep::All).unwrap();
     main.verify().unwrap();
-    assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "merge side again");
+    assert_eq!(
+        main.common_ancestor(&side).unwrap().commit().message,
+        "merge side again"
+    );
 }
 
 fn bump(db: &Db<Counters>, key: u8, by: i64) {

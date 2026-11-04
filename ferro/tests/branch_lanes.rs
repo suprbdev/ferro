@@ -5,8 +5,8 @@ use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
@@ -103,7 +103,9 @@ fn holding(db: &Db<Root>, key: u64) -> (Arc<Latch>, JoinHandle<ferro::Result<()>
             })
         })
     };
-    wait_until("the closure to start", || latch.inside.load(Ordering::SeqCst));
+    wait_until("the closure to start", || {
+        latch.inside.load(Ordering::SeqCst)
+    });
     (latch, handle)
 }
 
@@ -154,7 +156,9 @@ fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
         thread: thread::current(),
         woken: AtomicBool::new(false),
     });
-    future.as_mut().poll(&mut Context::from_waker(&Waker::from(flag)))
+    future
+        .as_mut()
+        .poll(&mut Context::from_waker(&Waker::from(flag)))
 }
 
 fn seeded(options: Options, path: &Path) -> Db<Root> {
@@ -221,11 +225,19 @@ fn a_long_closure_holds_up_only_its_own_branch() {
         latch.release();
         held.join().unwrap().unwrap();
         behind.join().unwrap();
-        assert_eq!((value(&slow, 7), value(&slow, 8)), (Some(7), Some(8)), "{kind}");
+        assert_eq!(
+            (value(&slow, 7), value(&slow, 8)),
+            (Some(7), Some(8)),
+            "{kind}"
+        );
         assert!(slow.version() >= 2, "{kind}");
         drop((db, slow, quick, side));
         let reopened: Db<Root> = options().open(&path).unwrap();
-        assert_eq!(value(&reopened.branch("slow").unwrap(), 8), Some(8), "{kind}");
+        assert_eq!(
+            value(&reopened.branch("slow").unwrap(), 8),
+            Some(8),
+            "{kind}"
+        );
         assert_eq!(reopened.branch("quick").unwrap().version(), 21, "{kind}");
         reopened.verify().unwrap();
     }
@@ -257,7 +269,11 @@ fn an_awaited_write_waits_only_for_its_own_branch() {
         latch.release();
         held.join().unwrap().unwrap();
         block_on(behind).unwrap();
-        assert_eq!((value(&slow, 7), value(&slow, 8)), (Some(7), Some(8)), "{kind}");
+        assert_eq!(
+            (value(&slow, 7), value(&slow, 8)),
+            (Some(7), Some(8)),
+            "{kind}"
+        );
         db.verify().unwrap();
     }
 }
@@ -284,7 +300,9 @@ fn a_merge_closure_holds_up_only_its_own_branch() {
                 })
             })
         };
-        wait_until("the merge closure to start", || inside.load(Ordering::SeqCst));
+        wait_until("the merge closure to start", || {
+            inside.load(Ordering::SeqCst)
+        });
         put(&other, 6, 6);
         put(&side, 7, 7);
         let late = other.fork("late").unwrap();
@@ -324,7 +342,9 @@ fn a_merge_from_a_branch_dropped_while_it_ran_records_nothing() {
             })
         })
     };
-    wait_until("the merge closure to start", || inside.load(Ordering::SeqCst));
+    wait_until("the merge closure to start", || {
+        inside.load(Ordering::SeqCst)
+    });
     other.drop_branch("side").unwrap();
     done.store(true, Ordering::SeqCst);
     assert!(matches!(merger.join().unwrap(), Err(Error::NoBranch(_))));
@@ -364,12 +384,23 @@ fn fork_and_drop_wait_only_for_the_branch_they_touch() {
         doomed_latch.release();
         on_doomed.join().unwrap().unwrap();
         dropper.join().unwrap().unwrap();
-        assert!(matches!(doomed.update(|_| ()), Err(Error::NoBranch(_))), "{kind}");
-        assert_eq!(db.branches(), vec!["copy", "main", "other", "source"], "{kind}");
+        assert!(
+            matches!(doomed.update(|_| ()), Err(Error::NoBranch(_))),
+            "{kind}"
+        );
+        assert_eq!(
+            db.branches(),
+            vec!["copy", "main", "other", "source"],
+            "{kind}"
+        );
         db.verify().unwrap();
         drop((db, source, doomed, other, copy));
         let reopened: Db<Root> = options().open(&path).unwrap();
-        assert_eq!(value(&reopened.branch("copy").unwrap(), 7), Some(7), "{kind}");
+        assert_eq!(
+            value(&reopened.branch("copy").unwrap(), 7),
+            Some(7),
+            "{kind}"
+        );
         reopened.verify().unwrap();
     }
 }
@@ -405,7 +436,10 @@ fn a_closure_queued_behind_a_drop_of_its_branch_fails_cleanly() {
             Ok(()) => assert!(ran.load(Ordering::SeqCst), "{kind}"),
             Err(other) => panic!("{kind}: {other}"),
         }
-        assert!(matches!(doomed.update(|_| ()), Err(Error::NoBranch(_))), "{kind}");
+        assert!(
+            matches!(doomed.update(|_| ()), Err(Error::NoBranch(_))),
+            "{kind}"
+        );
         assert_eq!(db.branches(), vec!["main"], "{kind}");
         db.verify().unwrap();
     }
@@ -444,7 +478,10 @@ fn a_cycle_swaps_only_between_closures() {
         };
         wait_until("the copy", || steps.lock().contains(&"synced"));
         thread::sleep(Duration::from_millis(20));
-        assert!(!steps.lock().contains(&"paused"), "{kind}: paused under a closure");
+        assert!(
+            !steps.lock().contains(&"paused"),
+            "{kind}: paused under a closure"
+        );
         latch.release();
         held.join().unwrap().unwrap();
         let report = cycle.join().unwrap().unwrap();
@@ -465,8 +502,16 @@ fn a_cycle_swaps_only_between_closures() {
         assert_eq!(first_kept(&db), db.version() - 1, "{kind}");
         put(&slow, 8, 8);
         put(&other, 9, 9);
-        assert_eq!((value(&slow, 7), value(&slow, 8)), (Some(7), Some(8)), "{kind}");
-        assert_eq!((value(&other, 1), value(&other, 8)), (Some(100), Some(8)), "{kind}");
+        assert_eq!(
+            (value(&slow, 7), value(&slow, 8)),
+            (Some(7), Some(8)),
+            "{kind}"
+        );
+        assert_eq!(
+            (value(&other, 1), value(&other, 8)),
+            (Some(100), Some(8)),
+            "{kind}"
+        );
         db.verify().unwrap();
         drop((db, slow, other));
         let reopened: Db<Root> = options().open(&path).unwrap();
@@ -525,9 +570,16 @@ fn a_branch_attached_during_a_pause_starts_from_the_new_file() {
         let handle = attacher.lock().take().expect("the pause ran the hook");
         handle.join().unwrap().unwrap();
         assert!(ran.load(Ordering::SeqCst), "{kind}");
-        assert!(!ran_in_pause.load(Ordering::SeqCst), "{kind}: a closure ran in the pause");
+        assert!(
+            !ran_in_pause.load(Ordering::SeqCst),
+            "{kind}: a closure ran in the pause"
+        );
         let late = db.branch("late").unwrap();
-        assert_eq!((value(&late, 1), value(&late, 2)), (Some(1000), Some(2000)), "{kind}");
+        assert_eq!(
+            (value(&late, 1), value(&late, 2)),
+            (Some(1000), Some(2000)),
+            "{kind}"
+        );
         for version in first_kept(&late)..=late.version() {
             late.at(version).unwrap();
         }
@@ -558,9 +610,16 @@ fn count_of(root: &Root, branch: u64) -> u64 {
 fn assert_whole(root: &Root, branch: u64, context: &str) -> u64 {
     let count = count_of(root, branch);
     if count > 0 {
-        assert_eq!(root.get(&own_key(branch, count)).map(|value| *value), Some(count), "{context}");
+        assert_eq!(
+            root.get(&own_key(branch, count)).map(|value| *value),
+            Some(count),
+            "{context}"
+        );
     }
-    assert!(!root.contains_key(&own_key(branch, count + 1)), "{context}: a half commit");
+    assert!(
+        !root.contains_key(&own_key(branch, count + 1)),
+        "{context}: a half commit"
+    );
     count
 }
 
@@ -578,7 +637,9 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
     let db: Db<Root> = options().open(&path).unwrap();
     put(&db, 0, 0);
     let sink = db.fork("sink").unwrap();
-    let writers: Vec<_> = (1..=WRITERS).map(|i| db.fork(&format!("w{i}")).unwrap()).collect();
+    let writers: Vec<_> = (1..=WRITERS)
+        .map(|i| db.fork(&format!("w{i}")).unwrap())
+        .collect();
     let merge_into = |sink: &Db<Root>, from: &Db<Root>| {
         sink.merge_with(from, |root, base, theirs| {
             root.merge(base, theirs, |conflict| {
@@ -614,7 +675,10 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
                     let Ok(snapshot) = watcher.recv_timeout(Duration::from_millis(5)) else {
                         continue;
                     };
-                    assert!(snapshot.version() > last, "{kind}: a watcher went backwards");
+                    assert!(
+                        snapshot.version() > last,
+                        "{kind}: a watcher went backwards"
+                    );
                     last = snapshot.version();
                     let count = assert_whole(&snapshot, branch, &kind);
                     assert!(count >= seen, "{kind}: a watcher lost commits");
@@ -662,7 +726,10 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
                 assert_whole(&copy.read(), index as u64 + 1, &kind);
                 put(&copy, 7, forks);
                 db.drop_branch(&name).unwrap();
-                assert!(matches!(copy.update(|_| ()), Err(Error::NoBranch(_))), "{kind}");
+                assert!(
+                    matches!(copy.update(|_| ()), Err(Error::NoBranch(_))),
+                    "{kind}"
+                );
                 forks += 1;
             }
             forks
@@ -691,7 +758,11 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
         thread::spawn(move || {
             let mut cycles = 0;
             while !stop.load(Ordering::SeqCst) {
-                let keep = if pruning && cycles % 2 == 0 { Keep::Last(4) } else { Keep::All };
+                let keep = if pruning && cycles % 2 == 0 {
+                    Keep::Last(4)
+                } else {
+                    Keep::All
+                };
                 db.compact(keep).unwrap();
                 cycles += 1;
                 thread::sleep(Duration::from_millis(2));
@@ -725,7 +796,11 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
     assert!(busy, "{kind}: {forks} {merges} {cycles}");
     for (index, writer) in writers.iter().enumerate() {
         let branch = index as u64 + 1;
-        assert_eq!(assert_whole(&writer.read(), branch, kind), commits, "{kind}");
+        assert_eq!(
+            assert_whole(&writer.read(), branch, kind),
+            commits,
+            "{kind}"
+        );
         assert_eq!(writer.version(), commits + 1, "{kind}");
         for version in first_kept(writer)..=writer.version() {
             assert_whole(&writer.at(version).unwrap(), branch, kind);
@@ -750,7 +825,11 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
     let sink = reopened.branch("sink").unwrap();
     for branch in 1..=WRITERS {
         let writer = reopened.branch(&format!("w{branch}")).unwrap();
-        assert_eq!(assert_whole(&writer.read(), branch, kind), commits, "{kind}");
+        assert_eq!(
+            assert_whole(&writer.read(), branch, kind),
+            commits,
+            "{kind}"
+        );
         if !pruning {
             assert_eq!(assert_whole(&sink.read(), branch, kind), commits, "{kind}");
         }
@@ -795,7 +874,9 @@ fn model(branch: u64, version: u64) -> Model {
 }
 
 fn dump(root: &Text) -> Model {
-    root.iter().map(|(key, value)| (key, (*value).clone())).collect()
+    root.iter()
+        .map(|(key, value)| (key, (*value).clone()))
+        .collect()
 }
 
 fn record(path: &Path, options: fn() -> Options, writers: u64, commits: u64) -> Recording {
@@ -956,14 +1037,25 @@ fn check_branches(db: &Db<Text>, recording: &Recording, floors: &[u64], context:
             "{context}: branch {branch} at v{version} lost v{}",
             floors[branch as usize]
         );
-        assert!(version <= recording.commits + 1, "{context}: branch {branch} ran ahead");
-        assert_eq!(dump(&handle.read()), model(branch, version), "{context}: branch {branch}");
+        assert!(
+            version <= recording.commits + 1,
+            "{context}: branch {branch} ran ahead"
+        );
+        assert_eq!(
+            dump(&handle.read()),
+            model(branch, version),
+            "{context}: branch {branch}"
+        );
     }
     let main = db.read();
     assert_eq!(main.version(), 1, "{context}");
     for name in db.branches() {
         if name.starts_with("extra-") {
-            assert_eq!(dump(&db.branch(&name).unwrap().read()), model(0, 1), "{context}");
+            assert_eq!(
+                dump(&db.branch(&name).unwrap().read()),
+                model(0, 1),
+                "{context}"
+            );
         }
     }
 }
@@ -987,7 +1079,8 @@ fn check(
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: open: {error}"));
     check_branches(&db, recording, &state.floors, context);
-    db.verify().unwrap_or_else(|error| panic!("{context}: verify: {error}"));
+    db.verify()
+        .unwrap_or_else(|error| panic!("{context}: verify: {error}"));
     let first = db.branch(&branch_name(0)).unwrap();
     first
         .update(|root| {
@@ -999,8 +1092,14 @@ fn check(
     let again: Db<Text> = options()
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
-    assert_eq!(again.branch(&branch_name(0)).unwrap().version(), after, "{context}");
-    again.verify().unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
+    assert_eq!(
+        again.branch(&branch_name(0)).unwrap().version(),
+        after,
+        "{context}"
+    );
+    again
+        .verify()
+        .unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
 }
 
 fn replay(recording: &Recording, options: fn() -> Options, durable: bool, seed: u64) -> usize {
@@ -1032,14 +1131,23 @@ fn replay(recording: &Recording, options: fn() -> Options, durable: bool, seed: 
 
 #[test]
 fn a_power_cut_keeps_every_acknowledged_commit_on_every_branch() {
-    let durable: [Kind; 2] =
-        [("fsync", fsync), ("fsync coalesced", || fsync().coalesce(true))];
+    let durable: [Kind; 2] = [
+        ("fsync", fsync),
+        ("fsync coalesced", || fsync().coalesce(true)),
+    ];
     for (seed, (kind, options)) in durable.into_iter().enumerate() {
         let dir = dir();
         let recording = record(&dir.path().join("trace.ferro"), options, 4, 10);
-        let syncs = recording.ops.iter().filter(|op| matches!(op, Op::Sync(_))).count();
+        let syncs = recording
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Sync(_)))
+            .count();
         assert!(syncs > 4, "{kind}: only {syncs} syncs");
-        assert!(replay(&recording, options, true, seed as u64) > 100, "{kind}");
+        assert!(
+            replay(&recording, options, true, seed as u64) > 100,
+            "{kind}"
+        );
     }
 }
 
@@ -1047,14 +1155,20 @@ fn a_power_cut_keeps_every_acknowledged_commit_on_every_branch() {
 fn a_power_cut_leaves_buffered_branches_whole() {
     let small: fn() -> Options = || buffered().checkpoint_bytes(4096);
     let coalesced: fn() -> Options = || buffered().checkpoint_bytes(4096).coalesce(true);
-    let lossy: [Kind; 2] =
-        [("buffered", small), ("buffered coalesced", coalesced)];
+    let lossy: [Kind; 2] = [("buffered", small), ("buffered coalesced", coalesced)];
     for (seed, (kind, options)) in lossy.into_iter().enumerate() {
         let dir = dir();
         let recording = record(&dir.path().join("trace.ferro"), options, 4, 12);
-        let syncs = recording.ops.iter().filter(|op| matches!(op, Op::Sync(_))).count();
+        let syncs = recording
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Sync(_)))
+            .count();
         assert!(syncs >= 3, "{kind}: only {syncs} syncs");
-        assert!(replay(&recording, options, false, 10 + seed as u64) > 100, "{kind}");
+        assert!(
+            replay(&recording, options, false, 10 + seed as u64) > 100,
+            "{kind}"
+        );
     }
 }
 
@@ -1137,7 +1251,11 @@ impl Edits {
         }
         for _ in 0..6 {
             let outer = self.half * 500 + self.rng.below(500);
-            let mut inner = root.1.get(&outer).map(|inner| (*inner).clone()).unwrap_or_default();
+            let mut inner = root
+                .1
+                .get(&outer)
+                .map(|inner| (*inner).clone())
+                .unwrap_or_default();
             inner.insert(100 + self.rng.below(1 << 20), self.rng.next());
             if self.rng.chance(30) {
                 inner.remove(&self.rng.below(7));
@@ -1163,7 +1281,10 @@ fn mixed_seed(db: &Db<Mixed>) -> Db<Mixed> {
             root.0.insert(4 * row, value);
         }
         for outer in 0..1_000u64 {
-            root.1.insert(outer, (0..outer % 7).map(|key| (key, outer * key)).collect());
+            root.1.insert(
+                outer,
+                (0..outer % 7).map(|key| (key, outer * key)).collect(),
+            );
         }
     })
     .unwrap();
@@ -1176,11 +1297,20 @@ type Other = Arc<Mutex<Option<(Db<Mixed>, Edits)>>>;
 
 fn entries(db: &Db<Mixed>) -> Entries {
     let root = db.read();
-    let plain = root.0.iter().map(|(key, value)| (key, (*value).clone())).collect();
+    let plain = root
+        .0
+        .iter()
+        .map(|(key, value)| (key, (*value).clone()))
+        .collect();
     let nested = root
         .1
         .iter()
-        .map(|(key, inner)| (key, inner.iter().map(|(key, value)| (key, *value)).collect()))
+        .map(|(key, inner)| {
+            (
+                key,
+                inner.iter().map(|(key, value)| (key, *value)).collect(),
+            )
+        })
         .collect();
     (plain, nested)
 }
@@ -1217,7 +1347,10 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
         for round in 0..rounds {
             armed.store(true, Ordering::SeqCst);
             moved.update(|root| main.apply(root)).unwrap();
-            assert!(!armed.load(Ordering::SeqCst), "{kind}: round {round} moved nothing");
+            assert!(
+                !armed.load(Ordering::SeqCst),
+                "{kind}: round {round} moved nothing"
+            );
         }
         let placed: Db<Mixed> = mixed_options(options).open(&placed_path).unwrap();
         let placed_other = mixed_seed(&placed);
@@ -1227,7 +1360,10 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
             placed.update(|root| main.apply(root)).unwrap();
         }
         let moved_other = other.lock().take().expect("the other branch is held").0;
-        assert!(entries(&moved) == entries(&placed), "{kind}: main reads differently");
+        assert!(
+            entries(&moved) == entries(&placed),
+            "{kind}: main reads differently"
+        );
         assert!(
             entries(&moved_other) == entries(&placed_other),
             "{kind}: other reads differently"
@@ -1240,7 +1376,10 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
         );
         let reopened: Db<Mixed> = options().cache_bytes(1).open(&moved_path).unwrap();
         let placed: Db<Mixed> = options().cache_bytes(1).open(&placed_path).unwrap();
-        assert!(entries(&reopened) == entries(&placed), "{kind}: reopened reads differently");
+        assert!(
+            entries(&reopened) == entries(&placed),
+            "{kind}: reopened reads differently"
+        );
         reopened.verify().unwrap();
     }
 }

@@ -1,7 +1,7 @@
 mod common;
 
-use std::collections::BTreeMap;
 use ferro::Val;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{Rng, cases, fast, level_of, roomy, text, uncached};
@@ -133,7 +133,8 @@ fn all_hashes_agree(model: &Model, seed: u64, keys: u32) {
     assert_eq!(stored.diff(&base).count(), 0);
     assert_eq!(base.diff(&stored).count(), 0);
     let version = db.version();
-    db.update(|root| *root = churned(model, seed ^ 99, keys)).unwrap();
+    db.update(|root| *root = churned(model, seed ^ 99, keys))
+        .unwrap();
     assert_eq!(db.version(), version);
     db.update(|root| *root = reversed(model)).unwrap();
     assert_eq!(db.version(), version);
@@ -210,7 +211,13 @@ fn bulk_forms_agree(model: &Model, seed: u64) {
     assert_eq!(partial.root_hash(), hash);
     assert_eq!(partial.len(), model.len());
     let reread: Vec<(u32, String)> = ascending.iter().map(|(k, v)| (k, (*v).clone())).collect();
-    assert_eq!(reread, model.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>());
+    assert_eq!(
+        reread,
+        model
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<_>>()
+    );
 }
 
 proptest! {
@@ -332,7 +339,10 @@ fn batch_forms_agree(model: &Model, edits: &[(u32, Option<String>)]) {
 }
 
 fn batch(keys: u32, max: usize) -> impl Strategy<Value = Vec<(u32, Option<String>)>> {
-    let edit = (0..keys, prop::option::weighted(0.7, (any::<u64>(), sizes())));
+    let edit = (
+        0..keys,
+        prop::option::weighted(0.7, (any::<u64>(), sizes())),
+    );
     prop::collection::vec(edit, 0..max).prop_map(|edits| {
         edits
             .into_iter()
@@ -419,7 +429,8 @@ fn expected_changes(old: &Model, new: &Model) -> Vec<Change<u32, String>> {
                 changes.insert(*key, Change::Removed(*key, Val::new(value.clone())));
             }
             Some(other) if other != value => {
-                let change = Change::Changed(*key, Val::new(value.clone()), Val::new(other.clone()));
+                let change =
+                    Change::Changed(*key, Val::new(value.clone()), Val::new(other.clone()));
                 changes.insert(*key, change);
             }
             Some(_) => {}
@@ -686,7 +697,11 @@ fn commits_along_cached_paths_hash_as_a_fresh_build() {
             for _ in 0..edits {
                 let outer = rng.below(300) as u32;
                 let inner = rng.below(40) as u32;
-                let len = if rng.chance(10) { 600 } else { rng.below(20) as usize };
+                let len = if rng.chance(10) {
+                    600
+                } else {
+                    rng.below(20) as usize
+                };
                 planned.push((rng.below(6), outer, inner, text(rng.next(), len)));
             }
             db.update(|root| {
@@ -697,7 +712,8 @@ fn commits_along_cached_paths_hash_as_a_fresh_build() {
                             model.remove(outer);
                         }
                         1 => {
-                            let fresh: Map<u32, String> = [(*inner, value.clone())].into_iter().collect();
+                            let fresh: Map<u32, String> =
+                                [(*inner, value.clone())].into_iter().collect();
                             root.insert(*outer, fresh);
                             model.insert(*outer, [(*inner, value.clone())].into_iter().collect());
                         }
@@ -713,15 +729,23 @@ fn commits_along_cached_paths_hash_as_a_fresh_build() {
                             }
                         }
                         _ => {
-                            root.get_or_insert_with(*outer, Map::new).insert(*inner, value.clone());
-                            model.entry(*outer).or_default().insert(*inner, value.clone());
+                            root.get_or_insert_with(*outer, Map::new)
+                                .insert(*inner, value.clone());
+                            model
+                                .entry(*outer)
+                                .or_default()
+                                .insert(*inner, value.clone());
                         }
                     }
                 }
             })
             .unwrap();
             let snapshot = db.read();
-            assert_eq!(snapshot.root_hash(), build(&model).root_hash(), "round {round}");
+            assert_eq!(
+                snapshot.root_hash(),
+                build(&model).root_hash(),
+                "round {round}"
+            );
             if round % 100 == 99 {
                 drop(snapshot);
                 drop(db);

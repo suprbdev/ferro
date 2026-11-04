@@ -49,7 +49,10 @@ struct Device {
 
 impl Device {
     fn reopen(&mut self) {
-        let placeholder: Db<Root> = options(self.cache, self.keep).read_only().open(&self.path).unwrap();
+        let placeholder: Db<Root> = options(self.cache, self.keep)
+            .read_only()
+            .open(&self.path)
+            .unwrap();
         drop(std::mem::replace(&mut self.db, placeholder));
         self.db = options(self.cache, self.keep).open(&self.path).unwrap();
     }
@@ -93,7 +96,10 @@ fn checked(devices: &[Device], when: &str) -> Vec<Shape> {
         .enumerate()
         .map(|(index, device)| {
             let when = format!("{when}: d{index}");
-            device.db.verify().unwrap_or_else(|error| panic!("{when}: {error}"));
+            device
+                .db
+                .verify()
+                .unwrap_or_else(|error| panic!("{when}: {error}"));
             device
                 .db
                 .verify_typed()
@@ -163,7 +169,9 @@ fn run(seed: u64, steps: usize, tally: &mut BTreeMap<&'static str, usize>) {
                 if remote == name {
                     continue;
                 }
-                let (Some(into), Some(out)) = (devices[to].handle(&name), devices[from].handle(&source)) else {
+                let (Some(into), Some(out)) =
+                    (devices[to].handle(&name), devices[from].handle(&source))
+                else {
                     continue;
                 };
                 let outcome = if rng.chance(50) {
@@ -214,7 +222,9 @@ fn identical_commits_on_relayed_and_pruned_branches_keep_every_branch_whole() {
         run(seed, 80, &mut tally);
     }
     println!("{tally:?}");
-    for wanted in ["commit", "fork", "drop", "pulled", "refused", "compact", "reopen"] {
+    for wanted in [
+        "commit", "fork", "drop", "pulled", "refused", "compact", "reopen",
+    ] {
         assert!(tally.get(wanted).is_some_and(|n| *n > 10), "{tally:?}");
     }
 }

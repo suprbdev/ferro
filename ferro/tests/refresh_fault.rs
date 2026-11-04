@@ -58,7 +58,11 @@ fn followed(compact: bool) {
     let db = fast().open::<Root>(&path).unwrap();
     put(&db, 1, 1);
     let side = db.fork("side").unwrap();
-    let reader = fast().cache_bytes(1).read_only().open::<Root>(&path).unwrap();
+    let reader = fast()
+        .cache_bytes(1)
+        .read_only()
+        .open::<Root>(&path)
+        .unwrap();
     let reader_side = reader.branch("side").unwrap();
     put(&db, 2, 2);
     put(&side, 3, 3);

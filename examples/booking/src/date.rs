@@ -81,7 +81,9 @@ pub fn parse_time(text: &str) -> Result<u64> {
     let bad = || BookingError::BadDate(text.to_string());
     let (day, clock) = text
         .split_once(['T', ' '])
-        .map_or((text, ""), |(day, clock)| (day, clock.trim_end_matches('Z')));
+        .map_or((text, ""), |(day, clock)| {
+            (day, clock.trim_end_matches('Z'))
+        });
     let night = parse_night(day)?;
     let mut ms = u64::from(night) * DAY_MS;
     if !clock.is_empty() {
@@ -95,7 +97,10 @@ pub fn parse_time(text: &str) -> Result<u64> {
             [h, m, s] => (*h, *m, *s),
             _ => return Err(bad()),
         };
-        let millis: u64 = format!("{millis:0<3}").get(..3).and_then(|m| m.parse().ok()).ok_or_else(bad)?;
+        let millis: u64 = format!("{millis:0<3}")
+            .get(..3)
+            .and_then(|m| m.parse().ok())
+            .ok_or_else(bad)?;
         if hours > 23 || minutes > 59 || seconds > 59 {
             return Err(bad());
         }
@@ -126,7 +131,10 @@ pub fn parse_money(text: &str) -> Result<Cents> {
     } else {
         format!("{frac:0<2}").parse().map_err(|_| bad())?
     };
-    whole.checked_mul(100).and_then(|c| c.checked_add(frac)).ok_or_else(bad)
+    whole
+        .checked_mul(100)
+        .and_then(|c| c.checked_add(frac))
+        .ok_or_else(bad)
 }
 
 #[cfg(test)]

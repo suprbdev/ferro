@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferro::{Keep, Reclaim};
 use ferro::{Data, Db};
+use ferro::{Keep, Reclaim};
 use queue::{Job, NewJob, Queue, QueueOptions, Runner, RunnerConfig};
 
 fn dir() -> PathBuf {
@@ -47,7 +47,14 @@ fn summary(label: &str, mut samples: Vec<u64>) -> String {
 
 fn open(path: &PathBuf) -> Queue {
     let coalesce = std::env::var("COALESCE").map_or(true, |value| value != "0");
-    Queue::open(path, QueueOptions { coalesce, ..QueueOptions::default() }).unwrap()
+    Queue::open(
+        path,
+        QueueOptions {
+            coalesce,
+            ..QueueOptions::default()
+        },
+    )
+    .unwrap()
 }
 
 fn prefill(queue: &Queue, depth: u64) {
@@ -135,7 +142,11 @@ fn throughput(args: &HashMap<String, String>) {
         println!("  {}", summary("lease  ", lease));
         println!("  {}", summary("ack    ", ack));
     }
-    println!("final file_mib={:.1} live_jobs={}", queue.size_on_disk() as f64 / 1048576.0, queue.db().read().jobs.len());
+    println!(
+        "final file_mib={:.1} live_jobs={}",
+        queue.size_on_disk() as f64 / 1048576.0,
+        queue.db().read().jobs.len()
+    );
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Data)]
@@ -170,7 +181,9 @@ fn growth(args: &HashMap<String, String>) {
         while done < total {
             let s0 = queue.size_on_disk();
             let t = Instant::now();
-            let specs = (0..batch).map(|i| NewJob::new("q", format!("job-{}", done + i))).collect();
+            let specs = (0..batch)
+                .map(|i| NewJob::new("q", format!("job-{}", done + i)))
+                .collect();
             queue.enqueue_batch(specs).unwrap();
             enq_t += t.elapsed();
             let s1 = queue.size_on_disk();
@@ -242,7 +255,9 @@ fn wake(args: &HashMap<String, String>) {
         let mut returned = Vec::new();
         for _ in 0..samples {
             let started = epoch.elapsed().as_nanos() as u64;
-            queue.enqueue(NewJob::new("q", started.to_string())).unwrap();
+            queue
+                .enqueue(NewJob::new("q", started.to_string()))
+                .unwrap();
             returned.push((started, epoch.elapsed().as_nanos() as u64));
             thread::sleep(Duration::from_millis(15));
         }
@@ -284,7 +299,9 @@ fn idle(args: &HashMap<String, String>) {
         let before = voluntary_switches();
         let start = Instant::now();
         for i in 0..commits {
-            queue.enqueue(NewJob::new("elsewhere", format!("{i}"))).unwrap();
+            queue
+                .enqueue(NewJob::new("elsewhere", format!("{i}")))
+                .unwrap();
         }
         let elapsed = start.elapsed().as_secs_f64();
         let switches = voluntary_switches() - before;
@@ -306,7 +323,9 @@ fn batching(args: &HashMap<String, String>) {
         let mut made = 0;
         while made < total {
             let take = 10_000.min(total - made);
-            let specs = (0..take).map(|i| NewJob::new("q", format!("{}", made + i))).collect();
+            let specs = (0..take)
+                .map(|i| NewJob::new("q", format!("{}", made + i)))
+                .collect();
             queue.enqueue_batch(specs).unwrap();
             made += take;
         }
@@ -367,7 +386,9 @@ fn day(args: &HashMap<String, String>) {
         let due = (start.elapsed().as_secs_f64() * rate as f64) as u64;
         if sent < due {
             let take = due - sent;
-            let specs = (0..take).map(|i| NewJob::new("q", format!("{}", sent + i))).collect();
+            let specs = (0..take)
+                .map(|i| NewJob::new("q", format!("{}", sent + i)))
+                .collect();
             queue.enqueue_batch(specs).unwrap();
             sent += take;
             if due - sent > rate / 10 {
@@ -457,7 +478,9 @@ fn cycle(args: &HashMap<String, String>) {
         let due = (start.elapsed().as_secs_f64() * rate as f64) as u64;
         if sent < due {
             let take = due - sent;
-            let specs = (0..take).map(|i| NewJob::new("q", format!("{}", sent + i))).collect();
+            let specs = (0..take)
+                .map(|i| NewJob::new("q", format!("{}", sent + i)))
+                .collect();
             queue.enqueue_batch(specs).unwrap();
             sent += take;
         }
@@ -484,22 +507,46 @@ fn hist(args: &HashMap<String, String>) {
     println!("commits={}", queue.version());
     let t = Instant::now();
     let events = queue.history(id).unwrap();
-    println!("queue history events={} took={:.1}ms", events.len(), t.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "queue history events={} took={:.1}ms",
+        events.len(),
+        t.elapsed().as_secs_f64() * 1000.0
+    );
     let db = queue.db();
     let t = Instant::now();
     let created = db.bisect(.., |state| state.next_id > id).unwrap().unwrap();
-    let gone = db.bisect(created.., |state| !state.jobs.contains_key(&id)).unwrap();
-    println!("two bisects created={created} gone={gone:?} took={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let gone = db
+        .bisect(created.., |state| !state.jobs.contains_key(&id))
+        .unwrap();
+    println!(
+        "two bisects created={created} gone={gone:?} took={:.2}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
     let last = gone.unwrap_or_else(|| db.version());
     let t = Instant::now();
-    let steps = db.history_of_range(created..=last, |state| state.jobs.get(&id)).count();
-    println!("history_of_range steps={steps} span={} took={:.1}ms", last - created, t.elapsed().as_secs_f64() * 1000.0);
+    let steps = db
+        .history_of_range(created..=last, |state| state.jobs.get(&id))
+        .count();
+    println!(
+        "history_of_range steps={steps} span={} took={:.1}ms",
+        last - created,
+        t.elapsed().as_secs_f64() * 1000.0
+    );
     let t = Instant::now();
-    let steps = db.bisect_changes(created..=last, |state| state.jobs.value_hash(&id)).unwrap().len();
-    println!("bisect_changes steps={steps} took={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let steps = db
+        .bisect_changes(created..=last, |state| state.jobs.value_hash(&id))
+        .unwrap()
+        .len();
+    println!(
+        "bisect_changes steps={steps} took={:.2}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
     let t = Instant::now();
     let steps = db.history_of(|state| state.jobs.get(&id)).count();
-    println!("history_of steps={steps} took={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "history_of steps={steps} took={:.1}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 fn split(args: &HashMap<String, String>) {
@@ -521,7 +568,9 @@ fn split(args: &HashMap<String, String>) {
             t.elapsed().as_micros() as f64 / rounds as f64
         );
     };
-    measure("next_id only (root struct + log entry)", &|state, _| state.next_id += 1);
+    measure("next_id only (root struct + log entry)", &|state, _| {
+        state.next_id += 1
+    });
     measure("jobs map only (one job record rewritten)", &|state, i| {
         let id = 7 + (i * 13) % (depth - 20);
         let mut job = (*state.jobs.get(&id).unwrap()).clone();
@@ -552,7 +601,10 @@ fn main() {
         std::process::exit(2);
     };
     let args: HashMap<String, String> = argv
-        .filter_map(|a| a.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .filter_map(|a| {
+            a.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
         .collect();
     match name.as_str() {
         "throughput" => throughput(&args),

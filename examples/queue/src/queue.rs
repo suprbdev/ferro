@@ -153,12 +153,15 @@ impl Queue {
     }
 
     pub fn watch_ready(&self, queues: Vec<String>) -> Watcher<State> {
-        self.db.watch_when(move |state| queues.iter().any(|name| state.ready_in(name)))
+        self.db
+            .watch_when(move |state| queues.iter().any(|name| state.ready_in(name)))
     }
 
     pub fn watch_due(&self, sooner_than: Arc<AtomicU64>) -> Watcher<State> {
         self.db.watch_when(move |state| {
-            state.due_at().is_some_and(|at| at < sooner_than.load(Ordering::Acquire))
+            state
+                .due_at()
+                .is_some_and(|at| at < sooner_than.load(Ordering::Acquire))
         })
     }
 
@@ -371,7 +374,9 @@ impl Queue {
             let now = self.now();
             let ids: Vec<u64> = state
                 .dead
-                .range::<(String, u64), _>((queue.to_string(), 0u64)..=(queue.to_string(), u64::MAX))
+                .range::<(String, u64), _>(
+                    (queue.to_string(), 0u64)..=(queue.to_string(), u64::MAX),
+                )
                 .map(|key| key.1)
                 .collect();
             for id in &ids {
@@ -427,10 +432,17 @@ impl Queue {
         if !self.db.at(created)?.jobs.contains_key(&id) {
             return Err(QueueError::NotFound(id));
         }
-        let gone = self.db.bisect(created.., |state| !state.jobs.contains_key(&id))?;
+        let gone = self
+            .db
+            .bisect(created.., |state| !state.jobs.contains_key(&id))?;
         let alive = created..gone.unwrap_or(u64::MAX);
-        let changes = self.db.bisect_changes(alive, |state| state.jobs.value_hash(&id))?;
-        let versions = changes.into_iter().map(|(commit, _)| commit.version).chain(gone);
+        let changes = self
+            .db
+            .bisect_changes(alive, |state| state.jobs.value_hash(&id))?;
+        let versions = changes
+            .into_iter()
+            .map(|(commit, _)| commit.version)
+            .chain(gone);
         versions
             .map(|version| {
                 let snapshot = self.db.at(version)?;

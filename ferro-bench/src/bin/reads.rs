@@ -84,7 +84,11 @@ fn account(i: u64) -> Account {
     let seed = mix(i);
     Account {
         id: i,
-        tier: if seed.is_multiple_of(3) { Tier::Pro } else { Tier::Free },
+        tier: if seed.is_multiple_of(3) {
+            Tier::Pro
+        } else {
+            Tier::Free
+        },
         email: format!("user{i}@example.com"),
         name: format!("Account Holder {}", seed % 100_000),
         balance: (seed % 1_000_000) as i64,
@@ -151,7 +155,9 @@ fn probe_map<V: Data + Weigh>(report: &mut Report, tag: &str, map: &Map<u64, V>,
         total
     });
     report.timed(&format!("{tag}_sum"), n, || {
-        map.iter().map(|(key, value)| key ^ value.weigh()).fold(0u64, u64::wrapping_add)
+        map.iter()
+            .map(|(key, value)| key ^ value.weigh())
+            .fold(0u64, u64::wrapping_add)
     });
     report.timed(&format!("{tag}_count"), n, || map.iter().count());
     report.timed(&format!("{tag}_keys_for"), n, || {
@@ -161,9 +167,13 @@ fn probe_map<V: Data + Weigh>(report: &mut Report, tag: &str, map: &Map<u64, V>,
         }
         total
     });
-    report.timed(&format!("{tag}_keys_sum"), n, || map.keys().fold(0u64, u64::wrapping_add));
+    report.timed(&format!("{tag}_keys_sum"), n, || {
+        map.keys().fold(0u64, u64::wrapping_add)
+    });
     report.timed(&format!("{tag}_values_sum"), n, || {
-        map.values().map(|value| value.weigh()).fold(0u64, u64::wrapping_add)
+        map.values()
+            .map(|value| value.weigh())
+            .fold(0u64, u64::wrapping_add)
     });
     report.timed(&format!("{tag}_filter_count"), n, || {
         map.iter().filter(|(key, _)| key % 3 == 0).count()
@@ -187,9 +197,11 @@ fn probe_map<V: Data + Weigh>(report: &mut Report, tag: &str, map: &Map<u64, V>,
         }
         total
     });
-    report.timed(&format!("{tag}_contains_random"), sample.len() as u64, || {
-        sample.iter().filter(|key| map.contains_key(*key)).count()
-    });
+    report.timed(
+        &format!("{tag}_contains_random"),
+        sample.len() as u64,
+        || sample.iter().filter(|key| map.contains_key(*key)).count(),
+    );
     for (name, step) in STRIDES {
         let picked: Vec<u64> = sorted_all.iter().step_by(step).copied().collect();
         report.timed(&format!("{tag}_{name}_get"), picked.len() as u64, || {
@@ -232,9 +244,15 @@ fn map_extras<V: Data + Weigh>(
             }
             total
         });
-        report.timed(&format!("{tag}_{name}_contains"), picked.len() as u64, || {
-            map.contains_many(&picked).filter(|(_, found)| *found).count()
-        });
+        report.timed(
+            &format!("{tag}_{name}_contains"),
+            picked.len() as u64,
+            || {
+                map.contains_many(&picked)
+                    .filter(|(_, found)| *found)
+                    .count()
+            },
+        );
     }
     report.timed(&format!("{tag}_floor_random"), sample.len() as u64, || {
         let mut total = 0u64;
@@ -278,7 +296,10 @@ fn map_case<V: Data + Default + Weigh>(
         root.extend((0..n).map(|i| (mix(i), value(i))));
     })
     .unwrap();
-    report.set(&format!("{tag}_bulk"), start.elapsed().as_nanos() as f64 / n as f64);
+    report.set(
+        &format!("{tag}_bulk"),
+        start.elapsed().as_nanos() as f64 / n as f64,
+    );
     let start = Instant::now();
     for i in 0..2_000 {
         db.update(|root| {
@@ -286,11 +307,17 @@ fn map_case<V: Data + Default + Weigh>(
         })
         .unwrap();
     }
-    report.set(&format!("{tag}_commit"), start.elapsed().as_nanos() as f64 / 2_000.0);
+    report.set(
+        &format!("{tag}_commit"),
+        start.elapsed().as_nanos() as f64 / 2_000.0,
+    );
     drop(db);
 
     COUNTING.store(true, Ordering::Relaxed);
-    let reader = Options::new().read_only().open::<Map<u64, V>>(&path).unwrap();
+    let reader = Options::new()
+        .read_only()
+        .open::<Map<u64, V>>(&path)
+        .unwrap();
     let heap = heap_per_key(&reader, n, |root| {
         black_box(root.keys().count());
         for (key, value) in root.iter() {
@@ -304,14 +331,20 @@ fn map_case<V: Data + Default + Weigh>(
     let cold = cold.open::<Map<u64, V>>(&path).unwrap();
     let cold_view = cold.read();
     report.timed(&format!("{tag}_cold_scan"), n, || {
-        cold_view.iter().map(|(key, value)| key ^ value.weigh()).fold(0u64, u64::wrapping_add)
+        cold_view
+            .iter()
+            .map(|(key, value)| key ^ value.weigh())
+            .fold(0u64, u64::wrapping_add)
     });
     probe_map(report, tag, &snapshot, &keys);
 }
 
 fn table_case(report: &mut Report, dir: &Path, n: u64) {
     let path = dir.join("rows.ferro");
-    let db = Options::new().durability(Durability::Buffered).open::<Bank>(&path).unwrap();
+    let db = Options::new()
+        .durability(Durability::Buffered)
+        .open::<Bank>(&path)
+        .unwrap();
     for chunk in 0..n.div_ceil(100_000) {
         db.update(|bank| {
             for i in chunk * 100_000..((chunk + 1) * 100_000).min(n) {
@@ -333,7 +366,10 @@ fn table_case(report: &mut Report, dir: &Path, n: u64) {
         total
     });
     report.timed("rows_iter_sum", n, || {
-        bank.accounts.iter().map(|row| row.balance).fold(0i64, i64::wrapping_add)
+        bank.accounts
+            .iter()
+            .map(|row| row.balance)
+            .fold(0i64, i64::wrapping_add)
     });
     let pro = bank.accounts.by_tier(&Tier::Pro).len() as u64;
     report.timed("rows_index_for", pro, || {
@@ -357,23 +393,33 @@ fn table_case(report: &mut Report, dir: &Path, n: u64) {
 fn rows_extras(report: &mut Report, bank: &Bank, n: u64, pro: u64) {
     report.timed("rows_each", n, || {
         let mut total = 0i64;
-        bank.accounts.for_each(|row| total = total.wrapping_add(row.balance));
+        bank.accounts
+            .for_each(|row| total = total.wrapping_add(row.balance));
         total
     });
     report.timed("rows_index_keys", pro, || {
-        bank.accounts.by_tier(&Tier::Pro).keys().fold(0u64, u64::wrapping_add)
+        bank.accounts
+            .by_tier(&Tier::Pro)
+            .keys()
+            .fold(0u64, u64::wrapping_add)
     });
 }
 
 fn text_keys_case(report: &mut Report, dir: &Path, n: u64) {
     let path = dir.join("text.ferro");
-    let db = Options::new().durability(Durability::Buffered).open::<Map<String, u64>>(&path).unwrap();
+    let db = Options::new()
+        .durability(Durability::Buffered)
+        .open::<Map<String, u64>>(&path)
+        .unwrap();
     db.update(|root| {
         root.extend((0..n).map(|i| (format!("user-{:016x}", mix(i)), i)));
     })
     .unwrap();
     drop(db);
-    let reader = Options::new().read_only().open::<Map<String, u64>>(&path).unwrap();
+    let reader = Options::new()
+        .read_only()
+        .open::<Map<String, u64>>(&path)
+        .unwrap();
     let snapshot = reader.read();
     let map: &Map<String, u64> = &snapshot;
     black_box(map.keys().count());
@@ -385,7 +431,9 @@ fn text_keys_case(report: &mut Report, dir: &Path, n: u64) {
         total
     });
     report.timed("text_sum", n, || {
-        map.iter().map(|(key, value)| key.len() as u64 ^ *value).fold(0u64, u64::wrapping_add)
+        map.iter()
+            .map(|(key, value)| key.len() as u64 ^ *value)
+            .fold(0u64, u64::wrapping_add)
     });
     text_extras(report, map, n);
 }
@@ -410,11 +458,33 @@ fn decoded<T: Data>(report: &mut Report, name: &str, items: Vec<T>) {
 }
 
 fn decode_case(report: &mut Report) {
-    decoded(report, "decode_u64_small", (0..1_000_000u64).map(|i| i % 100).collect());
-    decoded(report, "decode_u64_medium", (0..1_000_000u64).map(|i| mix(i) >> 44).collect());
-    decoded(report, "decode_u64_large", (0..1_000_000u64).map(mix).collect());
-    decoded(report, "decode_f64", (0..1_000_000u64).map(|i| i as f64).collect());
-    decoded(report, "decode_pair", (0..1_000_000u64).map(|i| (i as u32, mix(i) as u32)).collect());
+    decoded(
+        report,
+        "decode_u64_small",
+        (0..1_000_000u64).map(|i| i % 100).collect(),
+    );
+    decoded(
+        report,
+        "decode_u64_medium",
+        (0..1_000_000u64).map(|i| mix(i) >> 44).collect(),
+    );
+    decoded(
+        report,
+        "decode_u64_large",
+        (0..1_000_000u64).map(mix).collect(),
+    );
+    decoded(
+        report,
+        "decode_f64",
+        (0..1_000_000u64).map(|i| i as f64).collect(),
+    );
+    decoded(
+        report,
+        "decode_pair",
+        (0..1_000_000u64)
+            .map(|i| (i as u32, mix(i) as u32))
+            .collect(),
+    );
 }
 
 fn argument(name: &str) -> Option<String> {
@@ -425,16 +495,23 @@ fn argument(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let n: u64 = argument("--n").and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: u64 = argument("--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let label = argument("--label").unwrap_or_else(|| "run".to_string());
     let only = argument("--only");
     let parent = PathBuf::from(argument("--dir").unwrap_or_else(|| "target/bench".to_string()));
     std::fs::create_dir_all(&parent).unwrap();
     let dir = tempfile::tempdir_in(&parent).unwrap();
-    let wanted = |tag: &str| only.as_ref().is_none_or(|list| list.split(',').any(|item| item == tag));
+    let wanted = |tag: &str| {
+        only.as_ref()
+            .is_none_or(|list| list.split(',').any(|item| item == tag))
+    };
     let mut report = Report(BTreeMap::new());
     if wanted("string") {
-        map_case(&mut report, dir.path(), "string", n, |i| format!("value-{i}"));
+        map_case(&mut report, dir.path(), "string", n, |i| {
+            format!("value-{i}")
+        });
     }
     if wanted("u64") {
         map_case(&mut report, dir.path(), "u64", n, mix);
@@ -454,7 +531,11 @@ fn main() {
     if wanted("decode") {
         decode_case(&mut report);
     }
-    let body: Vec<String> = report.0.iter().map(|(k, v)| format!("\"{k}\":{v:.2}")).collect();
+    let body: Vec<String> = report
+        .0
+        .iter()
+        .map(|(k, v)| format!("\"{k}\":{v:.2}"))
+        .collect();
     let mut out = OpenOptions::new()
         .create(true)
         .append(true)

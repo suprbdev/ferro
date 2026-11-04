@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use booking::date::DAY_MS;
 use booking::seed::{Plan, seed};
-use booking::{BookingError, Hotels, HoldRequest, Reservations, Why};
+use booking::{BookingError, HoldRequest, Hotels, Reservations, Why};
 use ferro::{Db, Durability, Options};
 
 #[cfg(target_os = "linux")]
@@ -96,9 +96,16 @@ impl Cost {
     fn report(&self, name: &str) {
         let count = self.whole.len().max(1) as f64;
         let rest = |pick: fn(&Sample) -> u64| {
-            median(self.whole.iter().zip(&self.closure).map(|(w, c)| pick(w) - pick(c)).collect())
+            median(
+                self.whole
+                    .iter()
+                    .zip(&self.closure)
+                    .map(|(w, c)| pick(w) - pick(c))
+                    .collect(),
+            )
         };
-        let mean = |samples: &[Sample]| samples.iter().map(|s| s.instructions).sum::<u64>() as f64 / count;
+        let mean =
+            |samples: &[Sample]| samples.iter().map(|s| s.instructions).sum::<u64>() as f64 / count;
         println!(
             "  {name:<8} wall {:>7.1} us (closure {:>6.1}, rest {:>7.1})  cpu {:>7.1} us (closure {:>6.1}, rest {:>7.1})  instructions {:>9.0} (closure {:>8.0}, rest {:>9.0})",
             median(self.whole.iter().map(|s| s.wall).collect()),
@@ -155,8 +162,12 @@ fn timed<R>(
 }
 
 fn main() {
-    let pairs: u64 = argument("--pairs").and_then(|v| v.parse().ok()).unwrap_or(4_000);
-    let warm: u64 = argument("--warm").and_then(|v| v.parse().ok()).unwrap_or(4_000);
+    let pairs: u64 = argument("--pairs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000);
+    let warm: u64 = argument("--warm")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000);
     let label = argument("--label").unwrap_or_else(|| "run".to_string());
     let durability = match argument("--durability").as_deref() {
         Some("fsync") => Durability::Fsync,
@@ -187,7 +198,8 @@ fn main() {
     let mut writes = 0;
     for round in 0..2 {
         let measured = round == 1;
-        let (mut hold, mut confirm, mut cancel) = (Cost::default(), Cost::default(), Cost::default());
+        let (mut hold, mut confirm, mut cancel) =
+            (Cost::default(), Cost::default(), Cost::default());
         let before = db.size_on_disk();
         let mut wrote = 0;
         for i in 0..if measured { pairs } else { warm } {
@@ -234,5 +246,8 @@ fn main() {
     costs.0.report("hold");
     costs.1.report("confirm");
     costs.2.report("cancel");
-    println!("  bytes per write {:.0}", bytes as f64 / writes.max(1) as f64);
+    println!(
+        "  bytes per write {:.0}",
+        bytes as f64 / writes.max(1) as f64
+    );
 }

@@ -138,9 +138,13 @@ impl Search {
             };
             let (level, _) = self.items[top].level();
             let mut unreached = self.hidden.iter().filter(|hidden| !hidden.reached);
-            let open = unreached.clone().any(|hidden| hidden.version.is_some_and(|v| v <= level));
+            let open = unreached
+                .clone()
+                .any(|hidden| hidden.version.is_some_and(|v| v <= level));
             let live = |color: u8| {
-                self.items.iter().any(|item| item.live() && item.colors & color != 0)
+                self.items
+                    .iter()
+                    .any(|item| item.live() && item.colors & color != 0)
             };
             let (one, two) = (live(ONE), live(TWO));
             if !one && !two && !open {
@@ -179,7 +183,10 @@ impl Search {
             return Err(Error::NoCommonAncestor);
         }
         let found = self.found.iter().map(|start| Mark::of(&start.node));
-        if stale.iter().any(|bound| found.clone().any(|base| base.under(bound))) {
+        if stale
+            .iter()
+            .any(|bound| found.clone().any(|base| base.under(bound)))
+        {
             return Err(Error::NoCommonAncestor);
         }
         let key = |start: &Start| {
@@ -343,7 +350,10 @@ impl Search {
         }
         let node = Node::load(&item.store, merged.ptr)?;
         if node.version() < merged.floor {
-            return Err(Error::Corrupt(format!("merge link below its floor {}", merged.floor)));
+            return Err(Error::Corrupt(format!(
+                "merge link below its floor {}",
+                merged.floor
+            )));
         }
         let after = merged.after(item.after);
         let bare = after.is_some_and(|after| node.time() < after);
@@ -371,12 +381,18 @@ fn meet(a: &Item, b: &Item) -> Result<Option<u64>> {
     if floor > top {
         return Ok(None);
     }
-    let (mut high_a, mut high_b) = (a.node.down_to(&a.store, top)?, b.node.down_to(&b.store, top)?);
+    let (mut high_a, mut high_b) = (
+        a.node.down_to(&a.store, top)?,
+        b.node.down_to(&b.store, top)?,
+    );
     if high_a.ptr.hash == high_b.ptr.hash {
         return Ok(Some(top));
     }
     let same = |x: &Node, y: &Node| x.ptr.hash == y.ptr.hash;
-    let (low_a, low_b) = (high_a.down_to(&a.store, floor)?, high_b.down_to(&b.store, floor)?);
+    let (low_a, low_b) = (
+        high_a.down_to(&a.store, floor)?,
+        high_b.down_to(&b.store, floor)?,
+    );
     if !same(&low_a, &low_b) {
         let parent = |node: &Node| node.entry.prev.map(|prev| prev.hash);
         let joined = a.low < floor && parent(&low_a).is_some() && parent(&low_a) == parent(&low_b);
@@ -385,7 +401,10 @@ fn meet(a: &Item, b: &Item) -> Result<Option<u64>> {
     let (mut low, mut high) = (floor, top);
     while high - low > 1 {
         let middle = low + (high - low) / 2;
-        let (x, y) = (high_a.down_to(&a.store, middle)?, high_b.down_to(&b.store, middle)?);
+        let (x, y) = (
+            high_a.down_to(&a.store, middle)?,
+            high_b.down_to(&b.store, middle)?,
+        );
         if same(&x, &y) {
             low = middle;
         } else {

@@ -154,7 +154,11 @@ fn async_writes_resolve_with_what_the_sync_api_returns() {
             ("third", 3)
         }))
         .unwrap();
-        assert_eq!((done.value, done.version, done.changed), (3, 3, true), "{kind}");
+        assert_eq!(
+            (done.value, done.version, done.changed),
+            (3, 3, true),
+            "{kind}"
+        );
         assert_eq!(done.time_ms, db.read().commit().time_ms, "{kind}");
         let same = block_on(db.commit_with_async(|root| {
             root.insert(3, 30);
@@ -221,7 +225,12 @@ fn nothing_runs_before_the_first_poll() {
 
 type Ran = Arc<Mutex<BTreeSet<u64>>>;
 
-fn marked(db: &Db<Root>, ran: &Ran, key: u64, value: u64) -> impl Future<Output = ferro::Result<()>> {
+fn marked(
+    db: &Db<Root>,
+    ran: &Ran,
+    key: u64,
+    value: u64,
+) -> impl Future<Output = ferro::Result<()>> {
     let ran = ran.clone();
     db.update_async(move |root| {
         ran.lock().insert(key);
@@ -237,7 +246,9 @@ fn a_write_whose_closure_ran_lands_even_if_dropped() {
         let db: Db<Root> = options.open(&path).unwrap();
         let watcher = db.watch();
         let ran = Ran::default();
-        let mut futures: Vec<_> = (0..20u64).map(|key| Box::pin(marked(&db, &ran, key, key))).collect();
+        let mut futures: Vec<_> = (0..20u64)
+            .map(|key| Box::pin(marked(&db, &ran, key, key)))
+            .collect();
         for future in &mut futures {
             let _ = poll_once(future);
         }
@@ -285,7 +296,10 @@ fn a_write_waits_for_the_lock_as_a_future_and_withdraws_cleanly() {
         let (flag, waker) = flag();
         let polled = waiting.as_mut().poll(&mut Context::from_waker(&waker));
         assert!(polled.is_pending(), "{kind}");
-        assert!(ran.lock().is_empty(), "{kind}: a closure ran without the lock");
+        assert!(
+            ran.lock().is_empty(),
+            "{kind}: a closure ran without the lock"
+        );
         drop(withdrawn);
         release.wait();
         holder.join().unwrap();
@@ -321,9 +335,19 @@ fn a_dropped_waiter_passes_its_turn_on() {
         let mut first = Box::pin(marked(&db, &ran, 2, 2));
         let mut second = Box::pin(marked(&db, &ran, 3, 3));
         let (woken, first_waker) = flag();
-        assert!(first.as_mut().poll(&mut Context::from_waker(&first_waker)).is_pending());
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
         let (flag, waker) = flag();
-        assert!(second.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         release.wait();
         holder.join().unwrap();
         sleep_until_woken(&woken);
@@ -425,8 +449,17 @@ fn one_thread_carries_many_writes_at_once() {
         assert_eq!(db.read().len(), 300, "{kind}");
         for done in &done {
             let snapshot = db.at(done.version).unwrap();
-            assert_eq!(snapshot.get(&done.value).as_deref(), Some(&(done.value + 1)), "{kind}");
-            assert!(snapshot.commit().messages().any(|message| message == format!("put {}", done.value)));
+            assert_eq!(
+                snapshot.get(&done.value).as_deref(),
+                Some(&(done.value + 1)),
+                "{kind}"
+            );
+            assert!(
+                snapshot
+                    .commit()
+                    .messages()
+                    .any(|message| message == format!("put {}", done.value))
+            );
         }
     }
 }
@@ -505,7 +538,10 @@ fn async_and_blocking_writers_share_the_writer() {
 #[test]
 fn coalesced_async_writes_share_versions() {
     let dir = dir();
-    let db: Db<Root> = fsync().coalesce(true).open(dir.path().join("db.ferro")).unwrap();
+    let db: Db<Root> = fsync()
+        .coalesce(true)
+        .open(dir.path().join("db.ferro"))
+        .unwrap();
     let futures: Vec<_> = (0..200u64)
         .map(|key| {
             db.commit_with_async(move |root| {
@@ -516,7 +552,11 @@ fn coalesced_async_writes_share_versions() {
         .collect();
     let done: Vec<_> = join_all(futures).into_iter().map(Result::unwrap).collect();
     let versions: BTreeSet<u64> = done.iter().map(|done| done.version).collect();
-    assert!(versions.len() < 200, "{} versions for 200 writes", versions.len());
+    assert!(
+        versions.len() < 200,
+        "{} versions for 200 writes",
+        versions.len()
+    );
     assert_eq!(db.version(), *versions.last().unwrap());
     let mut messages = 0;
     for version in 1..=db.version() {
@@ -529,7 +569,10 @@ fn coalesced_async_writes_share_versions() {
         messages += seen.len();
         seen.sort_unstable();
         for key in seen {
-            assert!(done.iter().any(|done| done.value == key && done.version == version));
+            assert!(
+                done.iter()
+                    .any(|done| done.value == key && done.version == version)
+            );
         }
     }
     assert_eq!(messages, 200);
@@ -590,7 +633,10 @@ fn the_future_is_send_when_its_closure_is() {
         future
     }
     let dir = dir();
-    let db: Db<Root> = fsync().coalesce(true).open(dir.path().join("db.ferro")).unwrap();
+    let db: Db<Root> = fsync()
+        .coalesce(true)
+        .open(dir.path().join("db.ferro"))
+        .unwrap();
     let future = sendable(db.try_commit_with_async(|root| {
         root.insert(1, 1);
         Ok::<_, Error>(("sent", 1))
@@ -609,13 +655,17 @@ fn an_async_write_to_a_dropped_branch_fails() {
         let failed = block_on(side.update_async(|root| {
             root.insert(1, 1);
         }));
-        assert!(matches!(failed, Err(Error::NoBranch(_))), "{kind}: {failed:?}");
+        assert!(
+            matches!(failed, Err(Error::NoBranch(_))),
+            "{kind}: {failed:?}"
+        );
         assert_eq!(db.version(), 0, "{kind}");
     }
 }
 
 fn last_frame_write(ops: &[Op]) -> Option<usize> {
-    ops.iter().rposition(|op| matches!(op, Op::Write(_, at, _) if *at >= 8192))
+    ops.iter()
+        .rposition(|op| matches!(op, Op::Write(_, at, _) if *at >= 8192))
 }
 
 fn last_sync(ops: &[Op]) -> Option<usize> {
@@ -820,9 +870,13 @@ fn replay(recording: &Recording, options: fn() -> Options, seed: u64) -> usize {
                 .open(&path)
                 .unwrap_or_else(|error| panic!("{context}: open: {error}"));
             let version = db.version();
-            assert!(version >= floor, "{context}: lost acknowledged v{floor}, opened v{version}");
+            assert!(
+                version >= floor,
+                "{context}: lost acknowledged v{floor}, opened v{version}"
+            );
             assert_eq!(dump(&db.read()), recording.states[&version], "{context}");
-            db.verify().unwrap_or_else(|error| panic!("{context}: verify: {error}"));
+            db.verify()
+                .unwrap_or_else(|error| panic!("{context}: verify: {error}"));
             block_on(db.update_async(|root| {
                 root.insert(u64::MAX - 1, 1);
             }))
@@ -843,7 +897,11 @@ fn a_crash_during_async_writes_keeps_every_acknowledged_version() {
         ("fsync", fsync, true),
         ("buffered", || buffered().checkpoint_bytes(4096), false),
         ("fsync coalesced", || fsync().coalesce(true), true),
-        ("buffered coalesced", || buffered().checkpoint_bytes(4096).coalesce(true), false),
+        (
+            "buffered coalesced",
+            || buffered().checkpoint_bytes(4096).coalesce(true),
+            false,
+        ),
     ];
     for (index, (kind, options, durable)) in kinds.into_iter().enumerate() {
         let dir = dir();

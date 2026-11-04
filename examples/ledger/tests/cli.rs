@@ -505,7 +505,11 @@ fn forecast_leaves_main_untouched() {
 fn an_unnamed_forecast_leaves_no_branch_behind() {
     let env = Env::new();
     env.chart();
-    let file = env.ok(&["forecast", "--transfer", "assets:bank>expense:rent=300.00@2024-06-01"]);
+    let file = env.ok(&[
+        "forecast",
+        "--transfer",
+        "assets:bank>expense:rent=300.00@2024-06-01",
+    ]);
     assert!(file.contains("1 hypothetical entries"), "{file}");
     assert!(file.contains("main unchanged"), "{file}");
     let failed = env.fail(&["forecast", "--transfer", "assets:bank>expense:nowhere=1.00"]);

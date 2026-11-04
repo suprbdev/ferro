@@ -8,8 +8,25 @@ use ferro::{Db, Options};
 
 fn spawn(db: &Path, acks: &Path, coalesce: bool, seed: u64) -> Child {
     Command::new(assert_cmd::cargo::cargo_bin("booking-stress"))
-        .args(["--threads", "8", "--secs", "600", "--no-check", "--think-us", "200"])
-        .args(["--venues", "2", "--rooms", "6", "--span", "40", "--customers", "60"])
+        .args([
+            "--threads",
+            "8",
+            "--secs",
+            "600",
+            "--no-check",
+            "--think-us",
+            "200",
+        ])
+        .args([
+            "--venues",
+            "2",
+            "--rooms",
+            "6",
+            "--span",
+            "40",
+            "--customers",
+            "60",
+        ])
         .args(["--coalesce", if coalesce { "on" } else { "off" }])
         .args(["--seed", &seed.to_string()])
         .arg("--path")
@@ -35,7 +52,10 @@ fn version_of(db: &Path) -> u64 {
 fn wait_for(db: &Path, version: u64) {
     let start = Instant::now();
     while version_of(db) < version {
-        assert!(start.elapsed() < Duration::from_secs(60), "stress made no progress");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "stress made no progress"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -62,7 +82,11 @@ fn survive(db: &Path, log: &Path, round: usize) {
         "round {round}: {:#?}",
         &walked.violations[..walked.violations.len().min(10)]
     );
-    assert!(walked.steps > 100, "round {round}: only {} versions", walked.steps);
+    assert!(
+        walked.steps > 100,
+        "round {round}: only {} versions",
+        walked.steps
+    );
     svc.db().verify().unwrap();
 
     let h = svc.read();
@@ -75,7 +99,10 @@ fn survive(db: &Path, log: &Path, round: usize) {
         } else {
             status.is_some()
         };
-        assert!(fine, "round {round}: acknowledged {kinds:?} for #{id}, found {status:?}");
+        assert!(
+            fine,
+            "round {round}: acknowledged {kinds:?} for #{id}, found {status:?}"
+        );
     }
     drop(h);
 
@@ -83,13 +110,28 @@ fn survive(db: &Path, log: &Path, round: usize) {
     let released = svc
         .write(|h: &mut Hotels, _| {
             let expired = h.expire_due(far);
-            Ok((format!("expire {} holds after restart", expired.len()), expired))
+            Ok((
+                format!("expire {} holds after restart", expired.len()),
+                expired,
+            ))
         })
         .unwrap();
     let h = svc.read();
-    assert_eq!(h.bookings.by_status(&Status::Held).len(), 0, "round {round}");
-    assert!(check_state(&h).is_empty(), "round {round}: {:?}", check_state(&h));
-    assert!(released.iter().all(|id| h.bookings.get(id).unwrap().status == Status::Expired));
+    assert_eq!(
+        h.bookings.by_status(&Status::Held).len(),
+        0,
+        "round {round}"
+    );
+    assert!(
+        check_state(&h).is_empty(),
+        "round {round}: {:?}",
+        check_state(&h)
+    );
+    assert!(
+        released
+            .iter()
+            .all(|id| h.bookings.get(id).unwrap().status == Status::Expired)
+    );
 }
 
 fn crash_rounds(coalesce: bool) {

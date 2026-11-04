@@ -35,7 +35,10 @@ fn refunds_follow_the_policy() {
         let b = h.bookings.get(&id).unwrap();
         assert_eq!(b.status, Status::Cancelled);
         assert_eq!(h.stays.range((id, 0)..=(id, u32::MAX)).count(), 0);
-        assert_eq!(h.payments.by_booking(&id).count(), 1 + usize::from(b.refunded > 0));
+        assert_eq!(
+            h.payments.by_booking(&id).count(),
+            1 + usize::from(b.refunded > 0)
+        );
     }
     assert!(h.loads.is_empty());
     drop(h);
@@ -50,11 +53,17 @@ fn a_cancelled_or_expired_booking_cannot_be_cancelled_again() {
     assert_eq!(w.svc.cancel(held.id).unwrap(), 0);
     assert!(matches!(
         w.svc.cancel(held.id),
-        Err(BookingError::WrongStatus { status: Status::Cancelled, .. })
+        Err(BookingError::WrongStatus {
+            status: Status::Cancelled,
+            ..
+        })
     ));
     assert!(matches!(
         w.svc.confirm(held.id, None),
-        Err(BookingError::WrongStatus { status: Status::Cancelled, .. })
+        Err(BookingError::WrongStatus {
+            status: Status::Cancelled,
+            ..
+        })
     ));
 
     let lapsing = w.hold(1, 1, night, 1, 1_000).unwrap();
@@ -62,7 +71,10 @@ fn a_cancelled_or_expired_booking_cannot_be_cancelled_again() {
     w.svc.sweep().unwrap();
     assert!(matches!(
         w.svc.cancel(lapsing.id),
-        Err(BookingError::WrongStatus { status: Status::Expired, .. })
+        Err(BookingError::WrongStatus {
+            status: Status::Expired,
+            ..
+        })
     ));
     assert_eq!(w.svc.read().till.refunded, 0);
     assert_clean(&w.svc);
@@ -74,7 +86,10 @@ fn cancelled_nights_go_back_on_sale_at_the_current_price() {
     let night = w.clock.today() + 30;
     let first = w.hold(1, 4, night, 3, days(1)).unwrap();
     w.svc.confirm(first.id, None).unwrap();
-    assert!(matches!(w.hold(2, 4, night, 1, days(1)), Err(BookingError::Unavailable { .. })));
+    assert!(matches!(
+        w.hold(2, 4, night, 1, days(1)),
+        Err(BookingError::Unavailable { .. })
+    ));
 
     w.svc.cancel(first.id).unwrap();
     w.svc.set_night_rate(4, night + 1, Some(30_000)).unwrap();
@@ -83,7 +98,10 @@ fn cancelled_nights_go_back_on_sale_at_the_current_price() {
     w.svc.confirm(second.id, Some(second.total)).unwrap();
 
     let h = w.svc.read();
-    assert_eq!(h.bookings.get(&second.id).unwrap().prices, vec![12_000, 30_000, 12_000]);
+    assert_eq!(
+        h.bookings.get(&second.id).unwrap().prices,
+        vec![12_000, 30_000, 12_000]
+    );
     assert_eq!(h.holder(4, night + 2), Some(second.id));
     let customer = h.customers.get(&1).unwrap();
     assert_eq!(customer.credit, customer.deposited);

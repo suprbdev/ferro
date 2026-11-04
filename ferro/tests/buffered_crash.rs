@@ -27,7 +27,9 @@ fn dump(root: &Root) -> Model {
 }
 
 fn buffered() -> Options {
-    Options::new().durability(Durability::Buffered).reclaim(MANUAL)
+    Options::new()
+        .durability(Durability::Buffered)
+        .reclaim(MANUAL)
 }
 
 struct Recording {
@@ -170,7 +172,11 @@ fn crash(recording: &Recording, cut: usize, loss: Loss, rng: &mut Rng) -> Crash 
             Loss::SuperblocksOnly | Loss::FramesOnly => {}
         }
     }
-    Crash { image, floor, newest }
+    Crash {
+        image,
+        floor,
+        newest,
+    }
 }
 
 fn check(path: &Path, recording: &Recording, state: &Crash, context: &str) {
@@ -179,39 +185,73 @@ fn check(path: &Path, recording: &Recording, state: &Crash, context: &str) {
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
-    assert!(reader.version() >= state.floor, "{context}: read-only lost {}", state.floor);
-    assert!(reader.version() <= state.newest + 1, "{context}: read-only is ahead");
-    assert_eq!(dump(&reader.read()), recording.models[&reader.version()], "{context}");
+    assert!(
+        reader.version() >= state.floor,
+        "{context}: read-only lost {}",
+        state.floor
+    );
+    assert!(
+        reader.version() <= state.newest + 1,
+        "{context}: read-only is ahead"
+    );
+    assert_eq!(
+        dump(&reader.read()),
+        recording.models[&reader.version()],
+        "{context}"
+    );
     let seen = reader.version();
-    reader.refresh().unwrap_or_else(|error| panic!("{context}: refresh: {error}"));
-    assert_eq!(reader.version(), seen, "{context}: refresh moved a stopped database");
+    reader
+        .refresh()
+        .unwrap_or_else(|error| panic!("{context}: refresh: {error}"));
+    assert_eq!(
+        reader.version(),
+        seen,
+        "{context}: refresh moved a stopped database"
+    );
     let db: Db<Root> = buffered()
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: open: {error}"));
     assert_eq!(db.version(), seen, "{context}: writer and reader disagree");
-    assert_eq!(dump(&db.read()), recording.models[&db.version()], "{context}");
+    assert_eq!(
+        dump(&db.read()),
+        recording.models[&db.version()],
+        "{context}"
+    );
     let follower: Db<Root> = Options::new()
         .read_only()
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: follower open: {error}"));
-    assert_eq!(follower.version(), seen, "{context}: a follower saw lost commits");
+    assert_eq!(
+        follower.version(),
+        seen,
+        "{context}: a follower saw lost commits"
+    );
     drop(follower);
-    db.verify().unwrap_or_else(|error| panic!("{context}: verify: {error}"));
+    db.verify()
+        .unwrap_or_else(|error| panic!("{context}: verify: {error}"));
     db.update(|root| {
         root.insert(u64::MAX, "after".into());
     })
     .unwrap_or_else(|error| panic!("{context}: commit: {error}"));
     let after = db.version();
-    reader.refresh().unwrap_or_else(|error| panic!("{context}: refresh after: {error}"));
-    assert_eq!(reader.version(), after, "{context}: reader did not follow the recovery");
+    reader
+        .refresh()
+        .unwrap_or_else(|error| panic!("{context}: refresh after: {error}"));
+    assert_eq!(
+        reader.version(),
+        after,
+        "{context}: reader did not follow the recovery"
+    );
     drop((db, reader));
     let again: Db<Root> = buffered()
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
     assert_eq!(again.version(), after, "{context}");
-    again.verify().unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
+    again
+        .verify()
+        .unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
 }
 
 fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
@@ -273,8 +313,16 @@ fn checkpoints_bound_what_a_power_cut_can_lose() {
     let dir = dir();
     let small = || buffered().checkpoint_bytes(4096);
     let recording = record(&dir.path().join("trace.ferro"), 1, 40, small);
-    let syncs = recording.ops.iter().filter(|op| matches!(op, Op::Sync(_))).count();
-    assert!(syncs >= 4, "only {syncs} syncs in {} ops", recording.ops.len());
+    let syncs = recording
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Sync(_)))
+        .count();
+    assert!(
+        syncs >= 4,
+        "only {syncs} syncs in {} ops",
+        recording.ops.len()
+    );
     assert!(replay(&recording, 4, 44) > 100);
 }
 
@@ -292,11 +340,23 @@ fn nothing_before_a_checkpoint_is_rolled_back() {
     let mut image = fs::read(&path).unwrap();
     image[start] ^= 0x40;
     fs::write(&copy, &image).unwrap();
-    let reader: Db<Root> = Options::new().read_only().cache_bytes(1).open(&copy).unwrap();
-    assert!(reader.version() > 30, "rolled back to v{}", reader.version());
+    let reader: Db<Root> = Options::new()
+        .read_only()
+        .cache_bytes(1)
+        .open(&copy)
+        .unwrap();
+    assert!(
+        reader.version() > 30,
+        "rolled back to v{}",
+        reader.version()
+    );
     drop(reader);
     let writer: Db<Root> = buffered().cache_bytes(1).open(&copy).unwrap();
-    assert!(writer.version() > 30, "rolled back to v{}", writer.version());
+    assert!(
+        writer.version() > 30,
+        "rolled back to v{}",
+        writer.version()
+    );
     assert_eq!(dump(&writer.read()), models[&writer.version()]);
 }
 

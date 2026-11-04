@@ -145,7 +145,11 @@ fn valid<K: Ord>(low: &Bound<K>, high: &Bound<K>) -> bool {
     }
 }
 
-fn apply<K: TestKey, V: TestValue>(map: &mut Map<K, V>, model: &mut BTreeMap<K, V>, edits: &[Edit]) {
+fn apply<K: TestKey, V: TestValue>(
+    map: &mut Map<K, V>,
+    model: &mut BTreeMap<K, V>,
+    edits: &[Edit],
+) {
     for edit in edits {
         match *edit {
             Edit::Put(key, seed, len) => {
@@ -165,14 +169,12 @@ fn apply<K: TestKey, V: TestValue>(map: &mut Map<K, V>, model: &mut BTreeMap<K, 
 fn entries<'a, K: 'a + Clone, V: 'a + Clone>(
     items: impl Iterator<Item = (&'a K, &'a V)>,
 ) -> Vec<(K, V)> {
-    items.map(|(key, value)| (key.clone(), value.clone())).collect()
+    items
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
-fn check_folds<K: TestKey, V: TestValue>(
-    map: &Map<K, V>,
-    model: &BTreeMap<K, V>,
-    case: &Case,
-) {
+fn check_folds<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>, case: &Case) {
     let all = entries(model.iter());
     let visited = {
         let mut seen = Vec::new();
@@ -223,7 +225,13 @@ fn check_folds<K: TestKey, V: TestValue>(
         seen.push(key);
         seen
     });
-    assert_eq!(folded, middle.iter().map(|(key, _)| key.clone()).collect::<Vec<K>>());
+    assert_eq!(
+        folded,
+        middle
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<K>>()
+    );
 
     let mut values = map.values();
     for _ in 0..front {
@@ -236,17 +244,19 @@ fn check_folds<K: TestKey, V: TestValue>(
         seen.push((*value).clone());
         seen
     });
-    assert_eq!(folded, middle.iter().map(|(_, value)| value.clone()).collect::<Vec<V>>());
+    assert_eq!(
+        folded,
+        middle
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<V>>()
+    );
 
     assert_eq!(map.iter().count(), all.len());
     assert_eq!(map.keys().filter(|_| true).count(), all.len());
 }
 
-fn check_ranges<K: TestKey, V: TestValue>(
-    map: &Map<K, V>,
-    model: &BTreeMap<K, V>,
-    case: &Case,
-) {
+fn check_ranges<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>, case: &Case) {
     for (low, high) in &case.ranges {
         let low = low.map(K::make);
         let high = high.map(K::make);
@@ -268,7 +278,11 @@ fn check_ranges<K: TestKey, V: TestValue>(
             seen
         });
         assert_eq!(folded, wanted);
-        let reversed: Vec<K> = map.range::<K, _>(bounds.clone()).rev().map(|(key, _)| key).collect();
+        let reversed: Vec<K> = map
+            .range::<K, _>(bounds.clone())
+            .rev()
+            .map(|(key, _)| key)
+            .collect();
         let expected: Vec<K> = wanted.iter().rev().map(|(key, _)| key.clone()).collect();
         assert_eq!(reversed, expected);
 
@@ -284,16 +298,16 @@ fn check_ranges<K: TestKey, V: TestValue>(
         });
         let stopped = limit <= wanted.len();
         assert_eq!(outcome == ControlFlow::Break(limit), stopped);
-        let expected: Vec<K> = wanted.iter().take(limit).map(|(key, _)| key.clone()).collect();
+        let expected: Vec<K> = wanted
+            .iter()
+            .take(limit)
+            .map(|(key, _)| key.clone())
+            .collect();
         assert_eq!(seen, expected);
     }
 }
 
-fn check_lookups<K: TestKey, V: TestValue>(
-    map: &Map<K, V>,
-    model: &BTreeMap<K, V>,
-    case: &Case,
-) {
+fn check_lookups<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>, case: &Case) {
     let scattered: Vec<K> = case.wanted.iter().copied().map(K::make).collect();
     let mut sorted = scattered.clone();
     sorted.sort();
@@ -302,8 +316,10 @@ fn check_lookups<K: TestKey, V: TestValue>(
             .get_many(keys)
             .map(|(key, value)| (key.clone(), value.map(|value| (*value).clone())))
             .collect();
-        let wanted: Vec<(K, Option<V>)> =
-            keys.iter().map(|key| (key.clone(), model.get(key).cloned())).collect();
+        let wanted: Vec<(K, Option<V>)> = keys
+            .iter()
+            .map(|key| (key.clone(), model.get(key).cloned()))
+            .collect();
         assert_eq!(found, wanted);
         let present: Vec<bool> = map.contains_many(keys).map(|(_, found)| found).collect();
         let wanted: Vec<bool> = keys.iter().map(|key| model.contains_key(key)).collect();
@@ -311,16 +327,15 @@ fn check_lookups<K: TestKey, V: TestValue>(
         for key in keys {
             let floor = map.floor(key).map(|(key, value)| (key, (*value).clone()));
             let wanted = model.range(..=key).next_back();
-            assert_eq!(floor, wanted.map(|(key, value)| (key.clone(), value.clone())));
+            assert_eq!(
+                floor,
+                wanted.map(|(key, value)| (key.clone(), value.clone()))
+            );
         }
     }
 }
 
-fn check_cursor<K: TestKey, V: TestValue>(
-    map: &Map<K, V>,
-    model: &BTreeMap<K, V>,
-    case: &Case,
-) {
+fn check_cursor<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>, case: &Case) {
     let mut cursor = map.cursor();
     assert_eq!(cursor.key(), None);
     assert_eq!(cursor.value(), None);
@@ -356,7 +371,10 @@ fn check_cursor<K: TestKey, V: TestValue>(
         let held = place.as_ref().map(|key| model[key].clone());
         assert_eq!(cursor.value().map(|value| (*value).clone()), held);
         let read = cursor.read(|key, value| (key.clone(), value.clone()));
-        assert_eq!(read, place.as_ref().map(|key| (key.clone(), model[key].clone())));
+        assert_eq!(
+            read,
+            place.as_ref().map(|key| (key.clone(), model[key].clone()))
+        );
     }
 }
 
@@ -449,7 +467,10 @@ fn large_case(seed: u64) -> Case {
     let ranges = (0..16)
         .map(|_| {
             let low = rng.below(keys) as u32;
-            (Bound::Included(low), Bound::Excluded(low + rng.below(4_000) as u32))
+            (
+                Bound::Included(low),
+                Bound::Excluded(low + rng.below(4_000) as u32),
+            )
         })
         .collect();
     let moves = (0..20_000)
@@ -481,9 +502,20 @@ fn a_large_tree_matches_the_model() {
 fn unsorted_batches_cost_a_fresh_walk_and_nothing_else() {
     let map: Map<u32, u32> = (0..10_000).map(|key| (key * 2, key)).collect();
     let keys = [19_998, 0, 19_998, 7, 8, 40_000, 6, 1];
-    let found: Vec<Option<u32>> =
-        map.get_many(keys).map(|(_, value)| value.map(|value| *value)).collect();
-    let wanted = [Some(9_999), Some(0), Some(9_999), None, Some(4), None, Some(3), None];
+    let found: Vec<Option<u32>> = map
+        .get_many(keys)
+        .map(|(_, value)| value.map(|value| *value))
+        .collect();
+    let wanted = [
+        Some(9_999),
+        Some(0),
+        Some(9_999),
+        None,
+        Some(4),
+        None,
+        Some(3),
+        None,
+    ];
     assert_eq!(found, wanted);
 }
 
@@ -519,9 +551,13 @@ fn a_value_outlives_the_map_and_its_node() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("held.ferro");
     let db = uncached().open::<Map<u32, String>>(&path).unwrap();
-    db.update(|root| root.extend((0..4_000).map(|key| (key, format!("value {key}"))))).unwrap();
+    db.update(|root| root.extend((0..4_000).map(|key| (key, format!("value {key}")))))
+        .unwrap();
     let snapshot = db.read();
-    let held: Vec<Val<String>> = (0..4_000).step_by(97).filter_map(|key| snapshot.get(&key)).collect();
+    let held: Vec<Val<String>> = (0..4_000)
+        .step_by(97)
+        .filter_map(|key| snapshot.get(&key))
+        .collect();
     drop(snapshot);
     drop(db);
     for (value, key) in held.iter().zip((0..4_000).step_by(97)) {
@@ -534,7 +570,9 @@ fn a_value_outlives_the_map_and_its_node() {
 
 #[test]
 fn set_ranges_know_their_length_from_both_ends() {
-    let set: Set<(u32, u32)> = (0..1_000).flat_map(|a| (0..8).map(move |b| (a, b * 3))).collect();
+    let set: Set<(u32, u32)> = (0..1_000)
+        .flat_map(|a| (0..8).map(move |b| (a, b * 3)))
+        .collect();
     let mut range = set.range((5, 0)..=(9, u32::MAX));
     assert_eq!(range.len(), 40);
     assert_eq!(range.next(), Some((5, 0)));
@@ -602,7 +640,10 @@ fn index_keys_match_the_rows_without_reading_them() {
     let mut seen = Vec::new();
     rows.for_each_range(100..120, |row| seen.push(row.id));
     assert_eq!(seen, (100..120).collect::<Vec<u32>>());
-    assert_eq!(rows.iter().map(|row| u64::from(row.id)).sum::<u64>(), 1_999_000);
+    assert_eq!(
+        rows.iter().map(|row| u64::from(row.id)).sum::<u64>(),
+        1_999_000
+    );
 }
 
 #[test]
@@ -647,7 +688,11 @@ fn damage_is_never_read_as_data() {
     let path = dir.path().join("whole.ferro");
     let keys: Vec<u32> = (0..3_000).map(|key| key * 3).collect();
     let value = |key: u32| {
-        let len = if key.is_multiple_of(90) { 800 } else { (key % 40) as usize };
+        let len = if key.is_multiple_of(90) {
+            800
+        } else {
+            (key % 40) as usize
+        };
         text(u64::from(key), len)
     };
     let model: BTreeMap<u32, String> = keys.iter().map(|&key| (key, value(key))).collect();
@@ -657,9 +702,14 @@ fn damage_is_never_read_as_data() {
     }
     let whole = std::fs::read(&path).unwrap();
     let all: Vec<(u32, String)> = model.clone().into_iter().collect();
-    let tail: Vec<(u32, String)> = model.range(4_500..4_800).map(|(k, v)| (*k, v.clone())).collect();
-    let floors: Vec<Option<u32>> =
-        keys.iter().map(|key| model.range(..=key + 1).next_back().map(|(k, _)| *k)).collect();
+    let tail: Vec<(u32, String)> = model
+        .range(4_500..4_800)
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    let floors: Vec<Option<u32>> = keys
+        .iter()
+        .map(|key| model.range(..=key + 1).next_back().map(|(k, _)| *k))
+        .collect();
     let mut rng = Rng::new(11);
     let mut caught = 0;
     for round in 0..300 {
@@ -668,7 +718,10 @@ fn damage_is_never_read_as_data() {
         let damaged = dir.path().join(format!("damaged-{round}.ferro"));
         std::fs::write(&damaged, &bytes).unwrap();
         let cache = 1 + rng.below(1 << 16);
-        let opened = Options::new().read_only().cache_bytes(cache).open::<Map<u32, String>>(&damaged);
+        let opened = Options::new()
+            .read_only()
+            .cache_bytes(cache)
+            .open::<Map<u32, String>>(&damaged);
         let Ok(db) = opened else {
             std::fs::remove_file(&damaged).unwrap();
             continue;
@@ -687,10 +740,12 @@ fn damage_is_never_read_as_data() {
             all.clone(),
         ));
         caught += usize::from(agree(
-            guarded(|| map.iter().fold(Vec::new(), |mut seen, (key, value)| {
-                seen.push((key, (*value).clone()));
-                seen
-            })),
+            guarded(|| {
+                map.iter().fold(Vec::new(), |mut seen, (key, value)| {
+                    seen.push((key, (*value).clone()));
+                    seen
+                })
+            }),
             all.clone(),
         ));
         caught += usize::from(agree(
@@ -709,8 +764,11 @@ fn damage_is_never_read_as_data() {
         ));
         caught += usize::from(agree(
             guarded(|| {
-                let mut seen: Vec<(u32, String)> =
-                    map.iter().rev().map(|(key, value)| (key, value.into_owned())).collect();
+                let mut seen: Vec<(u32, String)> = map
+                    .iter()
+                    .rev()
+                    .map(|(key, value)| (key, value.into_owned()))
+                    .collect();
                 seen.reverse();
                 seen
             }),

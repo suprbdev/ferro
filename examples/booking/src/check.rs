@@ -57,59 +57,89 @@ fn booking_alone(b: &Booking, out: &mut Report<'_>) {
     let id = b.id;
     out.check(b.nights >= 1, || format!("booking #{id} has no nights"));
     out.check(b.prices.len() == b.nights as usize, || {
-        format!("booking #{id} has {} prices for {} nights", b.prices.len(), b.nights)
+        format!(
+            "booking #{id} has {} prices for {} nights",
+            b.prices.len(),
+            b.nights
+        )
     });
     out.check(b.prices.iter().all(|price| *price > 0), || {
         format!("booking #{id} has a price that is not positive")
     });
     out.check(b.prices.iter().sum::<Cents>() == b.total, || {
-        format!("booking #{id} total {} is not the sum of its prices", b.total)
+        format!(
+            "booking #{id} total {} is not the sum of its prices",
+            b.total
+        )
     });
     out.check(b.created_ms <= b.expires_ms, || {
         format!("booking #{id} expires before it was created")
     });
     let held_until = (b.status == Status::Held).then_some(b.expires_ms);
     out.check(b.hold_until == held_until, || {
-        format!("booking #{id} is {} with hold_until {:?}", b.status, b.hold_until)
+        format!(
+            "booking #{id} is {} with hold_until {:?}",
+            b.status, b.hold_until
+        )
     });
     out.check(b.paid_version.is_some() == b.paid_ms.is_some(), || {
-        format!("booking #{id} was paid at {:?} in version {:?}", b.paid_ms, b.paid_version)
+        format!(
+            "booking #{id} was paid at {:?} in version {:?}",
+            b.paid_ms, b.paid_version
+        )
     });
     match b.status {
         Status::Held => {
-            out.check(b.paid == 0 && b.refunded == 0 && b.paid_ms.is_none(), || {
-                format!("held booking #{id} has money on it")
+            out.check(
+                b.paid == 0 && b.refunded == 0 && b.paid_ms.is_none(),
+                || format!("held booking #{id} has money on it"),
+            );
+            out.check(b.ended_ms.is_none(), || {
+                format!("held booking #{id} has ended")
             });
-            out.check(b.ended_ms.is_none(), || format!("held booking #{id} has ended"));
         }
         Status::Confirmed => {
             out.check(b.paid == b.total && b.refunded == 0, || {
                 format!("confirmed booking #{id} paid {} of {}", b.paid, b.total)
             });
             out.check(b.paid_ms.is_some_and(|paid| paid < b.expires_ms), || {
-                format!("booking #{id} was paid at {:?}, after its hold ran out", b.paid_ms)
-            });
-            out.check(b.ended_ms.is_none(), || format!("confirmed booking #{id} has ended"));
-        }
-        Status::Expired => {
-            out.check(b.paid == 0 && b.refunded == 0 && b.paid_ms.is_none(), || {
-                format!("expired booking #{id} has money on it")
-            });
-            out.check(b.ended_ms.is_some_and(|ended| ended >= b.expires_ms), || {
                 format!(
-                    "booking #{id} expired at {:?}, before its hold ran out at {}",
-                    b.ended_ms, b.expires_ms
+                    "booking #{id} was paid at {:?}, after its hold ran out",
+                    b.paid_ms
                 )
             });
+            out.check(b.ended_ms.is_none(), || {
+                format!("confirmed booking #{id} has ended")
+            });
+        }
+        Status::Expired => {
+            out.check(
+                b.paid == 0 && b.refunded == 0 && b.paid_ms.is_none(),
+                || format!("expired booking #{id} has money on it"),
+            );
+            out.check(
+                b.ended_ms.is_some_and(|ended| ended >= b.expires_ms),
+                || {
+                    format!(
+                        "booking #{id} expired at {:?}, before its hold ran out at {}",
+                        b.ended_ms, b.expires_ms
+                    )
+                },
+            );
         }
         Status::Cancelled => {
             out.check(b.paid == 0 || b.paid == b.total, || {
                 format!("cancelled booking #{id} paid {} of {}", b.paid, b.total)
             });
             out.check(b.refunded >= 0 && b.refunded <= b.paid, || {
-                format!("cancelled booking #{id} refunded {} of {}", b.refunded, b.paid)
+                format!(
+                    "cancelled booking #{id} refunded {} of {}",
+                    b.refunded, b.paid
+                )
             });
-            out.check(b.ended_ms.is_some(), || format!("cancelled booking #{id} has no end"));
+            out.check(b.ended_ms.is_some(), || {
+                format!("cancelled booking #{id} has no end")
+            });
         }
     }
 }
@@ -117,20 +147,32 @@ fn booking_alone(b: &Booking, out: &mut Report<'_>) {
 fn booking_in(h: &Hotels, b: &Booking, out: &mut Report<'_>) {
     let id = b.id;
     booking_alone(b, out);
-    out.check(id <= h.next_booking, || format!("booking #{id} is past next_booking"));
+    out.check(id <= h.next_booking, || {
+        format!("booking #{id} is past next_booking")
+    });
     out.check(h.customers.contains(&b.customer), || {
         format!("booking #{id} names missing customer {}", b.customer)
     });
     match h.rooms.get(&b.room) {
         Some(room) => out.check(room.venue == b.venue, || {
-            format!("booking #{id} says venue {} but room {} is in {}", b.venue, b.room, room.venue)
+            format!(
+                "booking #{id} says venue {} but room {} is in {}",
+                b.venue, b.room, room.venue
+            )
         }),
-        None => out.check(false, || format!("booking #{id} names missing room {}", b.room)),
+        None => out.check(false, || {
+            format!("booking #{id} names missing room {}", b.room)
+        }),
     }
     let stays: Vec<_> = h.stays.range((id, 0)..=(id, Night::MAX)).collect();
     if b.status.active() {
         out.check(stays.len() == b.nights as usize, || {
-            format!("{} booking #{id} holds {} of {} nights", b.status, stays.len(), b.nights)
+            format!(
+                "{} booking #{id} holds {} of {} nights",
+                b.status,
+                stays.len(),
+                b.nights
+            )
         });
         for (slot, stay) in &stays {
             let sold = b.status == Status::Confirmed;
@@ -140,11 +182,17 @@ fn booking_in(h: &Hotels, b: &Booking, out: &mut Report<'_>) {
                 && stay.night >= b.first
                 && stay.night <= b.last_night()
                 && stay.sold == sold;
-            out.check(fits, || format!("stay {slot:?} does not match booking #{id}"));
+            out.check(fits, || {
+                format!("stay {slot:?} does not match booking #{id}")
+            });
         }
     } else {
         out.check(stays.is_empty(), || {
-            format!("{} booking #{id} still holds {} nights", b.status, stays.len())
+            format!(
+                "{} booking #{id} still holds {} nights",
+                b.status,
+                stays.len()
+            )
         });
     }
 }
@@ -157,7 +205,10 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     let mut lines: BTreeMap<u32, Vec<Line>> = BTreeMap::new();
     for booking in h.bookings.iter() {
         *statuses.entry(booking.status).or_default() += 1;
-        lines.entry(booking.customer).or_default().push(Line::from(&*booking));
+        lines
+            .entry(booking.customer)
+            .or_default()
+            .push(Line::from(&*booking));
         booking_in(h, &booking, out);
     }
     for (customer, rows) in &lines {
@@ -166,9 +217,17 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
             format!("customer {customer}'s covered bookings disagree with the rows")
         });
     }
-    let covered: usize = h.bookings.by_customer_counts().iter().map(|(_, count)| count).sum();
+    let covered: usize = h
+        .bookings
+        .by_customer_counts()
+        .iter()
+        .map(|(_, count)| count)
+        .sum();
     out.check(covered == h.bookings.len(), || {
-        format!("customer index has {covered} entries for {} bookings", h.bookings.len())
+        format!(
+            "customer index has {covered} entries for {} bookings",
+            h.bookings.len()
+        )
     });
     let indexed: BTreeMap<Status, usize> = h.bookings.by_status_counts().into_iter().collect();
     out.check(indexed == statuses, || {
@@ -179,7 +238,11 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     held.sort_unstable();
     due.sort_unstable();
     out.check(held == due, || {
-        format!("hold_until index lists {} bookings, {} are held", due.len(), held.len())
+        format!(
+            "hold_until index lists {} bookings, {} are held",
+            due.len(),
+            held.len()
+        )
     });
 
     let mut units: HashMap<(u32, Night), (u64, Night)> = HashMap::new();
@@ -187,7 +250,10 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     for (slot, stay) in h.stays.rows().iter() {
         if let Some(other) = units.insert((stay.room, stay.night), slot) {
             out.check(false, || {
-                format!("room {} night {} is double-booked by {other:?} and {slot:?}", stay.room, stay.night)
+                format!(
+                    "room {} night {} is double-booked by {other:?} and {slot:?}",
+                    stay.room, stay.night
+                )
             });
         }
         let holder = h.bookings.get(&slot.0);
@@ -200,16 +266,28 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
         } else {
             load.held += 1;
         }
-        let open = h.venues.get(&stay.venue).is_some_and(|venue| venue.open_on(stay.night));
-        out.check(open, || format!("stay {slot:?} is at a venue closed that night"));
+        let open = h
+            .venues
+            .get(&stay.venue)
+            .is_some_and(|venue| venue.open_on(stay.night));
+        out.check(open, || {
+            format!("stay {slot:?} is at a venue closed that night")
+        });
     }
     let index = h.stays.unique_room_night();
     out.check(index.len() == units.len(), || {
-        format!("room-night index has {} entries for {} stays", index.len(), units.len())
+        format!(
+            "room-night index has {} entries for {} stays",
+            index.len(),
+            units.len()
+        )
     });
     for (unit, slot) in index.iter() {
         out.check(units.get(&unit) == Some(&*slot), || {
-            format!("room-night index maps {unit:?} to {:?}, rows disagree", *slot)
+            format!(
+                "room-night index maps {unit:?} to {:?}, rows disagree",
+                *slot
+            )
         });
     }
     let stored: BTreeMap<(u32, Night), Load> =
@@ -226,7 +304,10 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     for ((venue, night), load) in &loads {
         let capacity = h.capacity(*venue, *night);
         out.check(load.held + load.sold <= capacity, || {
-            format!("venue {venue} night {night} has {} stays for {capacity} rooms", load.held + load.sold)
+            format!(
+                "venue {venue} night {night} has {} stays for {capacity} rooms",
+                load.held + load.sold
+            )
         });
     }
 
@@ -236,11 +317,18 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     let mut till_charged = 0;
     let mut till_refunded = 0;
     for payment in h.payments.iter() {
-        out.check(payment.amount > 0, || format!("payment {} is not positive", payment.id));
-        out.check(payment.id <= h.next_payment, || format!("payment {} is past next_payment", payment.id));
+        out.check(payment.amount > 0, || {
+            format!("payment {} is not positive", payment.id)
+        });
+        out.check(payment.id <= h.next_payment, || {
+            format!("payment {} is past next_payment", payment.id)
+        });
         let owner = h.bookings.get(&payment.booking).map(|b| b.customer);
         out.check(owner == Some(payment.customer), || {
-            format!("payment {} is for {:?}, booking says {owner:?}", payment.id, payment.customer)
+            format!(
+                "payment {} is for {:?}, booking says {owner:?}",
+                payment.id, payment.customer
+            )
         });
         match payment.flow {
             Flow::Charge => {
@@ -265,12 +353,15 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
             )
         });
     }
-    out.check(till_charged == h.till.charged && till_refunded == h.till.refunded, || {
-        format!(
-            "till says charged {} refunded {}, payments say {till_charged} and {till_refunded}",
-            h.till.charged, h.till.refunded
-        )
-    });
+    out.check(
+        till_charged == h.till.charged && till_refunded == h.till.refunded,
+        || {
+            format!(
+                "till says charged {} refunded {}, payments say {till_charged} and {till_refunded}",
+                h.till.charged, h.till.refunded
+            )
+        },
+    );
     let mut deposits = 0;
     let mut credit = 0;
     for customer in h.customers.iter() {
@@ -278,7 +369,10 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
         credit += customer.credit;
         let spent = net.get(&customer.id).copied().unwrap_or(0);
         out.check(customer.credit >= 0, || {
-            format!("customer {} has negative credit {}", customer.id, customer.credit)
+            format!(
+                "customer {} has negative credit {}",
+                customer.id, customer.credit
+            )
         });
         out.check(customer.credit == customer.deposited - spent, || {
             format!(
@@ -288,11 +382,20 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
         });
     }
     out.check(deposits == h.till.deposits, || {
-        format!("customers deposited {deposits}, till says {}", h.till.deposits)
+        format!(
+            "customers deposited {deposits}, till says {}",
+            h.till.deposits
+        )
     });
-    out.check(credit + h.till.charged - h.till.refunded == h.till.deposits, || {
-        format!("credit {credit} plus net charges does not equal deposits {}", h.till.deposits)
-    });
+    out.check(
+        credit + h.till.charged - h.till.refunded == h.till.deposits,
+        || {
+            format!(
+                "credit {credit} plus net charges does not equal deposits {}",
+                h.till.deposits
+            )
+        },
+    );
     messages
 }
 
@@ -319,9 +422,9 @@ fn same_terms(a: &Booking, b: &Booking) -> bool {
 
 fn quoted(prev: &Hotels, cur: &Hotels, b: &Booking) -> bool {
     let at = |h: &Hotels, night: Night| h.rooms.get(&b.room).map(|room| h.price(&room, night));
-    b.nights().zip(&b.prices).all(|(night, price)| {
-        at(prev, night) == Some(*price) || at(cur, night) == Some(*price)
-    })
+    b.nights()
+        .zip(&b.prices)
+        .all(|(night, price)| at(prev, night) == Some(*price) || at(cur, night) == Some(*price))
 }
 
 fn paid_here(version: Option<u64>, before: Option<u64>, b: &Booking, out: &mut Report<'_>) {
@@ -329,7 +432,10 @@ fn paid_here(version: Option<u64>, before: Option<u64>, b: &Booking, out: &mut R
         return;
     };
     out.check(b.paid_version == Some(version), || {
-        format!("booking #{} was paid in v{version} but recorded {:?}", b.id, b.paid_version)
+        format!(
+            "booking #{} was paid in v{version} but recorded {:?}",
+            b.id, b.paid_version
+        )
     });
 }
 
@@ -344,19 +450,29 @@ fn check_step(
         match change {
             Change::Removed(id, _) => out.check(false, || format!("booking #{id} was deleted")),
             Change::Added(id, b) => {
-                out.check(id > prev.next_booking, || format!("booking #{id} reused an id"));
+                out.check(id > prev.next_booking, || {
+                    format!("booking #{id} reused an id")
+                });
                 out.check(quoted(prev, cur, &b), || {
-                    format!("booking #{id} was quoted {:?}, not the rates in force", b.prices)
+                    format!(
+                        "booking #{id} was quoted {:?}, not the rates in force",
+                        b.prices
+                    )
                 });
                 paid_here(version, None, &b, out);
                 booking_in(cur, &b, out);
             }
             Change::Changed(id, a, b) => {
-                out.check(same_terms(&a, &b), || format!("booking #{id} changed its terms"));
-                out.check(a.paid_version.is_none() || a.paid_version == b.paid_version, || {
-                    let (was, now) = (a.paid_version, b.paid_version);
-                    format!("booking #{id} moved its paid version from {was:?} to {now:?}")
+                out.check(same_terms(&a, &b), || {
+                    format!("booking #{id} changed its terms")
                 });
+                out.check(
+                    a.paid_version.is_none() || a.paid_version == b.paid_version,
+                    || {
+                        let (was, now) = (a.paid_version, b.paid_version);
+                        format!("booking #{id} moved its paid version from {was:?} to {now:?}")
+                    },
+                );
                 paid_here(version, a.paid_version, &b, out);
                 let legal = matches!(
                     (a.status, b.status),
@@ -365,7 +481,9 @@ fn check_step(
                         | (Status::Held, Status::Cancelled)
                         | (Status::Confirmed, Status::Cancelled)
                 );
-                out.check(legal, || format!("booking #{id} went from {} to {}", a.status, b.status));
+                out.check(legal, || {
+                    format!("booking #{id} went from {} to {}", a.status, b.status)
+                });
                 if b.status == Status::Expired {
                     let lag = b.ended_ms.unwrap_or(0).saturating_sub(b.expires_ms);
                     step.expired += 1;
@@ -394,13 +512,18 @@ fn check_step(
         let fair = match (loser, winner) {
             (Some(loser), Some(winner)) => match loser.status {
                 Status::Expired => loser.expires_ms <= winner.created_ms,
-                Status::Cancelled => loser.ended_ms.is_some_and(|ended| ended <= winner.created_ms),
+                Status::Cancelled => loser
+                    .ended_ms
+                    .is_some_and(|ended| ended <= winner.created_ms),
                 _ => false,
             },
             _ => false,
         };
         out.check(fair, || {
-            format!("room {room} night {night} passed from #{} to #{} while still held", old.0, new.0)
+            format!(
+                "room {room} night {night} passed from #{} to #{} while still held",
+                old.0, new.0
+            )
         });
     }
     let mut charged = 0;
@@ -408,7 +531,9 @@ fn check_step(
     for change in prev.payments.diff(&cur.payments) {
         match change {
             Change::Added(id, payment) => {
-                out.check(id > prev.next_payment, || format!("payment {id} reused an id"));
+                out.check(id > prev.next_payment, || {
+                    format!("payment {id} reused an id")
+                });
                 match payment.flow {
                     Flow::Charge => charged += payment.amount,
                     Flow::Refund => refunded += payment.amount,
@@ -418,12 +543,20 @@ fn check_step(
         }
     }
     out.check(cur.till.charged - prev.till.charged == charged, || {
-        format!("till charged moved by {} for {charged} of new charges", cur.till.charged - prev.till.charged)
+        format!(
+            "till charged moved by {} for {charged} of new charges",
+            cur.till.charged - prev.till.charged
+        )
     });
     out.check(cur.till.refunded - prev.till.refunded == refunded, || {
-        format!("till refunded moved by {} for {refunded} of new refunds", cur.till.refunded - prev.till.refunded)
+        format!(
+            "till refunded moved by {} for {refunded} of new refunds",
+            cur.till.refunded - prev.till.refunded
+        )
     });
-    out.check(cur.till.deposits >= prev.till.deposits, || "deposits went down".to_string());
+    out.check(cur.till.deposits >= prev.till.deposits, || {
+        "deposits went down".to_string()
+    });
     for change in prev.venues.diff(&cur.venues) {
         if let Change::Changed(id, a, b) = change {
             let kept = match (a.closed_from, b.closed_from) {
@@ -438,7 +571,13 @@ fn check_step(
 
 pub fn check_pair(prev: &Hotels, cur: &Hotels) -> Vec<String> {
     let mut messages = Vec::new();
-    check_step(prev, cur, None, &mut Report { out: &mut messages }, &mut Step::default());
+    check_step(
+        prev,
+        cur,
+        None,
+        &mut Report { out: &mut messages },
+        &mut Step::default(),
+    );
     messages
 }
 
@@ -461,7 +600,13 @@ pub fn walk(db: &Db<Hotels>, full_every: u64) -> Result<Walked> {
         let mut messages = Vec::new();
         let mut step = Step::default();
         if cur.version() != prev.version() {
-            check_step(&prev, &cur, Some(version), &mut Report { out: &mut messages }, &mut step);
+            check_step(
+                &prev,
+                &cur,
+                Some(version),
+                &mut Report { out: &mut messages },
+                &mut step,
+            );
             walked.steps += 1;
         }
         let sampled = full_every > 0 && (version % full_every == 0 || version == last);
@@ -478,9 +623,11 @@ pub fn walk(db: &Db<Hotels>, full_every: u64) -> Result<Walked> {
         }
         walked.expiry_lag_max_ms = walked.expiry_lag_max_ms.max(step.lag_max);
         walked.expiry_lag_total_ms += step.lag_total;
-        walked
-            .violations
-            .extend(messages.into_iter().map(|message| Violation { version, message }));
+        walked.violations.extend(
+            messages
+                .into_iter()
+                .map(|message| Violation { version, message }),
+        );
         prev = cur;
     }
     walked.elapsed = started.elapsed();

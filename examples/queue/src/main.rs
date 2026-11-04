@@ -6,16 +6,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use queue::{
-    Job, NewJob, Queue, QueueError, QueueOptions, Recurring, Runner, RunnerConfig,
-};
+use queue::{Job, NewJob, Queue, QueueError, QueueOptions, Recurring, Runner, RunnerConfig};
 
 #[derive(Parser)]
 #[command(name = "queue", about = "A durable job queue on ferro")]
 struct Cli {
     #[arg(long, default_value = "queue.ferro", global = true)]
     db: PathBuf,
-    #[arg(long, default_value_t = 10_000, global = true, help = "How long to wait for another process holding the writer lock")]
+    #[arg(
+        long,
+        default_value_t = 10_000,
+        global = true,
+        help = "How long to wait for another process holding the writer lock"
+    )]
     lock_wait_ms: u64,
     #[command(subcommand)]
     command: Cmd,
@@ -120,7 +123,11 @@ enum Cmd {
         batch: usize,
         #[arg(long, default_value_t = 30_000)]
         ttl_ms: u64,
-        #[arg(long, name = "exec", help = "Shell command; payload on stdin, QUEUE_JOB_ID, QUEUE_NAME and QUEUE_ATTEMPT in env")]
+        #[arg(
+            long,
+            name = "exec",
+            help = "Shell command; payload on stdin, QUEUE_JOB_ID, QUEUE_NAME and QUEUE_ATTEMPT in env"
+        )]
         exec: String,
         #[arg(long)]
         max_jobs: Option<u64>,
@@ -204,7 +211,11 @@ fn run(cli: Cli) -> Result<(), QueueError> {
     let open = || Queue::open(&cli.db, options.clone());
     let open_ro = || Queue::open_read_only(&cli.db, options.clone());
     match cli.command {
-        Cmd::Enqueue { queue, payload, opts } => {
+        Cmd::Enqueue {
+            queue,
+            payload,
+            opts,
+        } => {
             let mut spec = opts.spec(&queue, payload.into_bytes());
             spec.key = opts.key.clone();
             let done = open()?.enqueue(spec)?;
@@ -219,10 +230,12 @@ fn run(cli: Cli) -> Result<(), QueueError> {
                 return Err(QueueError::Invalid("--key applies to a single job".into()));
             }
             let lines: Vec<String> = match file {
-                Some(path) => std::io::BufReader::new(std::fs::File::open(path).map_err(ferro::Error::from)?)
-                    .lines()
-                    .collect::<Result<_, _>>()
-                    .map_err(ferro::Error::from)?,
+                Some(path) => {
+                    std::io::BufReader::new(std::fs::File::open(path).map_err(ferro::Error::from)?)
+                        .lines()
+                        .collect::<Result<_, _>>()
+                        .map_err(ferro::Error::from)?
+                }
                 None => std::io::stdin()
                     .lock()
                     .lines()
@@ -236,9 +249,21 @@ fn run(cli: Cli) -> Result<(), QueueError> {
                 .collect();
             let done = open()?.enqueue_batch(specs)?;
             let ids: Vec<String> = done.iter().map(|d| d.id.to_string()).collect();
-            println!("enqueued count={} first={} last={}", done.len(), ids.first().map(String::as_str).unwrap_or("-"), ids.last().map(String::as_str).unwrap_or("-"));
+            println!(
+                "enqueued count={} first={} last={}",
+                done.len(),
+                ids.first().map(String::as_str).unwrap_or("-"),
+                ids.last().map(String::as_str).unwrap_or("-")
+            );
         }
-        Cmd::Produce { queue, count, batch, log, sleep_ms, prefix } => {
+        Cmd::Produce {
+            queue,
+            count,
+            batch,
+            log,
+            sleep_ms,
+            prefix,
+        } => {
             let q = open()?;
             let mut log = match log {
                 Some(path) => Some(
@@ -254,12 +279,15 @@ fn run(cli: Cli) -> Result<(), QueueError> {
             while made < count {
                 let take = batch.min(count - made);
                 let specs = (0..take)
-                    .map(|i| NewJob::new(queue.clone(), format!("{prefix}-{}", made + i).into_bytes()))
+                    .map(|i| {
+                        NewJob::new(queue.clone(), format!("{prefix}-{}", made + i).into_bytes())
+                    })
                     .collect();
                 let done = q.enqueue_batch(specs)?;
                 if let Some(file) = log.as_mut() {
                     let text: String = done.iter().map(|d| format!("{}\n", d.id)).collect();
-                    file.write_all(text.as_bytes()).map_err(ferro::Error::from)?;
+                    file.write_all(text.as_bytes())
+                        .map_err(ferro::Error::from)?;
                 }
                 made += take;
                 if sleep_ms > 0 {
@@ -268,7 +296,12 @@ fn run(cli: Cli) -> Result<(), QueueError> {
             }
             println!("produced count={made}");
         }
-        Cmd::Lease { queue, worker, ttl_ms, n } => {
+        Cmd::Lease {
+            queue,
+            worker,
+            ttl_ms,
+            n,
+        } => {
             let leased = open()?.lease_n(&queue, &worker, ttl_ms, n)?;
             if leased.is_empty() {
                 println!("empty");
@@ -288,15 +321,32 @@ fn run(cli: Cli) -> Result<(), QueueError> {
             open()?.ack(queue::Lease { id, attempt })?;
             println!("acked job={id}");
         }
-        Cmd::Nack { id, attempt, error, retry_in_ms } => {
+        Cmd::Nack {
+            id,
+            attempt,
+            error,
+            retry_in_ms,
+        } => {
             let state = open()?.nack(queue::Lease { id, attempt }, &error, retry_in_ms)?;
             println!("nacked job={id} state={state}");
         }
-        Cmd::Extend { id, attempt, ttl_ms } => {
+        Cmd::Extend {
+            id,
+            attempt,
+            ttl_ms,
+        } => {
             open()?.extend(queue::Lease { id, attempt }, ttl_ms)?;
             println!("extended job={id}");
         }
-        Cmd::Work { queues, workers, batch, ttl_ms, exec, max_jobs, exit_when_idle } => {
+        Cmd::Work {
+            queues,
+            workers,
+            batch,
+            ttl_ms,
+            exec,
+            max_jobs,
+            exit_when_idle,
+        } => {
             let q = open()?;
             let mut config = RunnerConfig::new(queues.clone(), workers);
             config.batch = batch;
@@ -379,7 +429,15 @@ fn run(cli: Cli) -> Result<(), QueueError> {
                 }
             }
         }
-        Cmd::Recurring(Rec::Add { name, queue, payload, every_ms, priority, max_attempts, first_in_ms }) => {
+        Cmd::Recurring(Rec::Add {
+            name,
+            queue,
+            payload,
+            every_ms,
+            priority,
+            max_attempts,
+            first_in_ms,
+        }) => {
             let q = open()?;
             let next_run = q.now() + first_in_ms;
             q.recurring_add(Recurring {
@@ -419,7 +477,11 @@ fn run(cli: Cli) -> Result<(), QueueError> {
                 }
             }
         }
-        Cmd::Replay { from, include_pending, force } => {
+        Cmd::Replay {
+            from,
+            include_pending,
+            force,
+        } => {
             let done = open()?.replay(from, include_pending, force)?;
             for item in &done {
                 println!(

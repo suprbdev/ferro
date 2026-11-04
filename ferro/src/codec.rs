@@ -215,9 +215,7 @@ pub const fn field_tag(name: &str) -> u16 {
 }
 
 pub fn required<T: Data>(value: Option<T>, name: &'static str) -> Result<T> {
-    value
-        .or_else(T::missing)
-        .ok_or(Error::MissingField(name))
+    value.or_else(T::missing).ok_or(Error::MissingField(name))
 }
 
 pub struct Encoder<'a> {
@@ -481,7 +479,10 @@ impl Checked {
 
     pub(crate) fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
         let entry = self.seen.entry((hash, kind.id));
-        entry.or_insert_with(|| (shape, Vec::with_capacity(1))).1.push(kind.clone());
+        entry
+            .or_insert_with(|| (shape, Vec::with_capacity(1)))
+            .1
+            .push(kind.clone());
     }
 }
 
@@ -522,7 +523,9 @@ impl<'a> Decoder<'a> {
 
     fn allocated(&mut self, count: usize, bytes: usize) {
         if count > 0 && bytes > 0 {
-            self.heap = self.heap.saturating_add(count.saturating_mul(allocation(bytes)));
+            self.heap = self
+                .heap
+                .saturating_add(count.saturating_mul(allocation(bytes)));
         }
     }
 
@@ -581,7 +584,9 @@ impl<'a> Decoder<'a> {
             }
         }
         self.pos = self.buf.len();
-        Err(Error::Decode("varint runs off the end of its object".into()))
+        Err(Error::Decode(
+            "varint runs off the end of its object".into(),
+        ))
     }
 
     pub fn item<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
@@ -619,10 +624,7 @@ impl<'a> Decoder<'a> {
         self.store.cloned()
     }
 
-    pub fn fields(
-        &mut self,
-        mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>,
-    ) -> Result<()> {
+    pub fn fields(&mut self, mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>) -> Result<()> {
         let count = self.varint()?;
         for _ in 0..count {
             let tag = self.u16()?;

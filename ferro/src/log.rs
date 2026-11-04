@@ -121,7 +121,9 @@ impl Data for Entry {
         }
         let extra = if flags & EXTRA != 0 { r.varint()? } else { 0 };
         if extra & !KNOWN_EXTRA != 0 || (flags & EXTRA != 0 && extra == 0) {
-            return Err(Error::Decode(format!("invalid log entry extra flags {extra}")));
+            return Err(Error::Decode(format!(
+                "invalid log entry extra flags {extra}"
+            )));
         }
         if flags & WHOLE != 0 {
             commit.parts = Parts::Whole;
@@ -130,7 +132,9 @@ impl Data for Entry {
         if flags & JOINED != 0 {
             let count = r.varint()?;
             if count > commit.message.len() as u64 + 1 {
-                return Err(Error::Decode(format!("{count} parts in a short commit message")));
+                return Err(Error::Decode(format!(
+                    "{count} parts in a short commit message"
+                )));
             }
             let lengths = (0..count)
                 .map(|_| Ok(usize::try_from(r.varint()?).unwrap_or(usize::MAX)))
@@ -159,10 +163,20 @@ impl Data for Entry {
             || floor.is_some() != merge_here
             || floor.is_some_and(|(floor, _)| floor == 0)
         {
-            return Err(Error::Decode(format!("invalid merge graph in log entry {version}")));
+            return Err(Error::Decode(format!(
+                "invalid merge graph in log entry {version}"
+            )));
         }
-        let prev = if flags & HAS_PREV != 0 { Some(r.link()?) } else { None };
-        let skip = if flags & HAS_SKIP != 0 { Some(r.link()?) } else { None };
+        let prev = if flags & HAS_PREV != 0 {
+            Some(r.link()?)
+        } else {
+            None
+        };
+        let skip = if flags & HAS_SKIP != 0 {
+            Some(r.link()?)
+        } else {
+            None
+        };
         let merged = match floor {
             Some((floor, after)) => Some(Merged {
                 ptr: r.link()?,
@@ -267,7 +281,10 @@ impl Node {
             if at <= floor {
                 return Ok(at);
             }
-            let far = node.entry.skip.filter(|skip| skip.offset != 0 && skip_version(at) >= floor);
+            let far = node
+                .entry
+                .skip
+                .filter(|skip| skip.offset != 0 && skip_version(at) >= floor);
             if let Some(far) = far.map(|skip| node.below(store, Some(skip))).transpose()?
                 && kept(&far.entry)
             {
@@ -300,12 +317,16 @@ impl Closures {
     pub(crate) fn seed(&mut self, entry: &Entry, after: Option<u64>) {
         if let Some(merged) = entry.merged {
             let Ptr { hash, offset } = merged.ptr;
-            self.queue.push(Reverse((merged.floor, merged.after(after), hash, offset)));
+            self.queue
+                .push(Reverse((merged.floor, merged.after(after), hash, offset)));
         }
     }
 
     pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
-        self.walked.entry(ptr.hash).or_default().push((floor, after));
+        self.walked
+            .entry(ptr.hash)
+            .or_default()
+            .push((floor, after));
     }
 
     fn covered(&self, hash: &Hash, floor: u64, after: Option<u64>) -> bool {
@@ -349,7 +370,10 @@ impl Closures {
                     }
                     break;
                 }
-                self.walked.entry(ptr.hash).or_default().push((floor, after));
+                self.walked
+                    .entry(ptr.hash)
+                    .or_default()
+                    .push((floor, after));
                 if !each(ptr, &entry, &object, len)? {
                     break;
                 }
@@ -435,7 +459,10 @@ impl Chain {
     }
 
     pub(crate) fn node_at(&self, store: &Store, version: u64) -> Result<Option<Node>> {
-        let Some(tip) = self.tip.filter(|_| version >= self.first && version <= self.last) else {
+        let Some(tip) = self
+            .tip
+            .filter(|_| version >= self.first && version <= self.last)
+        else {
             return Ok(None);
         };
         Node::load(store, tip)?.down_to(store, version).map(Some)
@@ -445,7 +472,9 @@ impl Chain {
         if self.first <= 1 {
             return Ok(None);
         }
-        let first = self.get(store, self.first)?.ok_or_else(|| corrupt("lost its first entry"))?;
+        let first = self
+            .get(store, self.first)?
+            .ok_or_else(|| corrupt("lost its first entry"))?;
         Ok(Some(first.commit.time_ms))
     }
 
@@ -537,7 +566,9 @@ impl Chain {
     }
 
     pub(crate) fn retained_skip(&self, entry: &Entry) -> Option<Ptr> {
-        entry.skip.filter(|_| skip_version(entry.commit.version) >= self.first)
+        entry
+            .skip
+            .filter(|_| skip_version(entry.commit.version) >= self.first)
     }
 
     pub(crate) fn pruned(&self, store: &Store, keep: Keep) -> Result<Chain> {
@@ -546,7 +577,10 @@ impl Chain {
         }
         let first = match keep {
             Keep::All => self.first,
-            Keep::Last(count) => self.last.saturating_add(1).saturating_sub(count.max(1) as u64),
+            Keep::Last(count) => self
+                .last
+                .saturating_add(1)
+                .saturating_sub(count.max(1) as u64),
             Keep::Since(time_ms) => self.first_since(store, time_ms)?,
             Keep::Within(age) => {
                 let age = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
@@ -604,7 +638,11 @@ impl Chain {
         merged: Option<Merged>,
     ) -> Result<Chain> {
         let version = commit.version;
-        let first = if self.tip.is_some() { self.first } else { version };
+        let first = if self.tip.is_some() {
+            self.first
+        } else {
+            version
+        };
         let target = skip_version(version);
         let skip = if target >= first && target != version - 1 {
             self.pointer_to(store, target)?
@@ -722,7 +760,8 @@ impl Log {
     }
 
     pub fn first(&self) -> Option<(u64, Arc<Commit>)> {
-        self.get(&self.chain.first).map(|commit| (self.chain.first, commit))
+        self.get(&self.chain.first)
+            .map(|commit| (self.chain.first, commit))
     }
 
     pub fn last(&self) -> Option<(u64, Arc<Commit>)> {

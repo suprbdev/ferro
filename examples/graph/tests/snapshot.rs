@@ -14,7 +14,9 @@ fn fingerprint(g: &Graph) -> (u64, u64, usize) {
     let mut edges = 0u64;
     for (user, ids) in g.out.scan(0, n) {
         for id in ids {
-            sum = sum.wrapping_mul(31).wrapping_add(user as u64 * 1_000_003 + id as u64);
+            sum = sum
+                .wrapping_mul(31)
+                .wrapping_add(user as u64 * 1_000_003 + id as u64);
             edges += 1;
         }
     }

@@ -41,7 +41,9 @@ impl IntoResponse for ApiError {
                 StatusCode::FORBIDDEN,
                 json!({ "error": "read-only replica" }),
             ),
-            ApiError::Internal(what) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": what })),
+            ApiError::Internal(what) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": what }))
+            }
         };
         (status, Json(body)).into_response()
     }

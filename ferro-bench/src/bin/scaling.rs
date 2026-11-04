@@ -692,7 +692,11 @@ fn main() {
     let threads = list("--threads", "1,2,4,8,16,32", |item| {
         item.parse::<usize>().unwrap()
     });
-    let works = list("--work", "get,scan,each,range,index,tier,index-covered,tier-covered", Work::parse);
+    let works = list(
+        "--work",
+        "get,scan,each,range,index,tier,index-covered,tier-covered",
+        Work::parse,
+    );
     let writers = list("--writers", "0,1", |item| item.parse::<usize>().unwrap());
     let caches = list("--cache", "warm,small", |item| match item {
         "warm" => WARM_CACHE,

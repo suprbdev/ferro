@@ -83,9 +83,17 @@ fn order_commit(db: &Db<Shop>, product: u64, extra_micros: u64) {
 
 fn lock_experiment(quick: bool) {
     println!("closure lock experiment: threads x closure spin, commits/s (order-like closure)");
-    let durabilities: &[Durability] = if quick { &[Durability::Fsync] } else { &[Durability::Fsync, Durability::Buffered] };
+    let durabilities: &[Durability] = if quick {
+        &[Durability::Fsync]
+    } else {
+        &[Durability::Fsync, Durability::Buffered]
+    };
     let spins: &[u64] = if quick { &[0] } else { &[0, 50, 200, 1000] };
-    let thread_counts: &[usize] = if quick { &[1, 2, 4, 8, 16] } else { &[1, 2, 8, 32] };
+    let thread_counts: &[usize] = if quick {
+        &[1, 2, 4, 8, 16]
+    } else {
+        &[1, 2, 8, 32]
+    };
     for &durability in durabilities {
         for &spin_us in spins {
             let mut row = Vec::new();
@@ -129,13 +137,21 @@ fn lock_experiment(quick: bool) {
 
 fn snapshot_experiment() {
     println!("long-held snapshot experiment (order-like commits, buffered, single writer)");
-    let choice: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let scenarios = [("no snapshots held", 0usize), ("snapshot held every 500 commits", 500), ("snapshot held every 10 commits", 10), ("one snapshot from v1", usize::MAX)];
+    let choice: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let scenarios = [
+        ("no snapshots held", 0usize),
+        ("snapshot held every 500 commits", 500),
+        ("snapshot held every 10 commits", 10),
+        ("one snapshot from v1", usize::MAX),
+    ];
     for (label, hold_every) in [scenarios[choice]] {
         let path = fresh("probe-snap.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(64 << 20)
+            .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 2000);
@@ -187,18 +203,28 @@ fn snapshot_experiment() {
     let blocked = Db::<Shop>::open(&path).err().map(|e| e.to_string());
     drop(held);
     let freed = Db::<Shop>::open(&path).is_ok();
-    println!("reopen as writer while a Snapshot outlives the Db: {blocked:?}; after drop: ok={freed}");
+    println!(
+        "reopen as writer while a Snapshot outlives the Db: {blocked:?}; after drop: ok={freed}"
+    );
 }
 
 fn watch_experiment() {
-    println!("watch backlog experiment (order-like commits, buffered, single writer, 100k commits)");
-    let choice: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let commits: usize = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    println!(
+        "watch backlog experiment (order-like commits, buffered, single writer, 100k commits)"
+    );
+    let choice: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let commits: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
     for mode in [["no watcher", "draining watcher", "watcher that never reads"][choice]] {
         let path = fresh("probe-watch.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(64 << 20)
+            .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 2000);
@@ -250,7 +276,10 @@ fn watch_experiment() {
         drop(db);
         if let Some(handle) = drain {
             handle.join().expect("drain thread exits when the Db drops");
-            println!("  drain thread saw {} snapshots", seen.load(Ordering::Relaxed));
+            println!(
+                "  drain thread saw {} snapshots",
+                seen.load(Ordering::Relaxed)
+            );
         }
     }
 }
@@ -261,7 +290,7 @@ fn history_experiment() {
         let path = fresh("probe-history.ferro");
         let db = Options::new()
             .durability(Durability::Buffered)
-                .cache_bytes(64 << 20)
+            .cache_bytes(64 << 20)
             .open::<Shop>(&path)
             .expect("open");
         seed(&db, 100);
@@ -269,7 +298,8 @@ fn history_experiment() {
             order_commit(&db, 1 + (index as u64 % 100), 0);
             if index == total / 2 {
                 db.commit("ship", |shop| {
-                    shop.orders.update(&1, |order| order.status = OrderStatus::Shipped);
+                    shop.orders
+                        .update(&1, |order| order.status = OrderStatus::Shipped);
                 })
                 .expect("ship");
             }
@@ -310,7 +340,12 @@ fn step_experiment() {
             order_commit(&db, 1 + (index as u64 % 100), 0);
         }
     }
-    let fresh_handle = || Options::new().read_only().open::<Shop>(&path).expect("open");
+    let fresh_handle = || {
+        Options::new()
+            .read_only()
+            .open::<Shop>(&path)
+            .expect("open")
+    };
     let steps = total as f64 + 1.0;
     let per = |at: Instant| at.elapsed().as_secs_f64() * 1e6 / steps;
     let latest = total as u64;
@@ -412,7 +447,10 @@ fn etag_experiment() {
     for _ in 0..rounds {
         keep += row_hash(&*product).len();
     }
-    println!("row_hash of one product: {:.0} ns", at.elapsed().as_nanos() as f64 / rounds as f64);
+    println!(
+        "row_hash of one product: {:.0} ns",
+        at.elapsed().as_nanos() as f64 / rounds as f64
+    );
     let at = Instant::now();
     for _ in 0..rounds {
         let mut hasher = 0u64;
@@ -421,7 +459,10 @@ fn etag_experiment() {
         }
         keep += hasher as usize & 1;
     }
-    println!("scan 200 products in range: {:.0} ns", at.elapsed().as_nanos() as f64 / rounds as f64);
+    println!(
+        "scan 200 products in range: {:.0} ns",
+        at.elapsed().as_nanos() as f64 / rounds as f64
+    );
     std::hint::black_box(keep);
 }
 
@@ -434,11 +475,16 @@ async fn etag_http() {
     let db = open_db(&path, &config).expect("open");
     seed(&db, 20_000);
     let app = build(db, &config);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(serve(listener, app, std::future::pending()));
     let mut client = Client::connect(addr).await.expect("connect");
-    for (label, route) in [("list 200 items", "/products?limit=200"), ("single product", "/products/777")] {
+    for (label, route) in [
+        ("list 200 items", "/products?limit=200"),
+        ("single product", "/products/777"),
+    ] {
         let first = client.get(route).await.expect("get");
         let tag = first.header("etag").expect("etag").to_string();
         let rounds = 20_000;
@@ -450,7 +496,10 @@ async fn etag_http() {
             full.push(at.elapsed().as_nanos() as u64);
             assert_eq!(response.status, 200);
             let at = Instant::now();
-            let response = client.send("GET", route, &[("if-none-match", &tag)], None).await.expect("get");
+            let response = client
+                .send("GET", route, &[("if-none-match", &tag)], None)
+                .await
+                .expect("get");
             cond.push(at.elapsed().as_nanos() as u64);
             assert_eq!(response.status, 304);
         }

@@ -50,10 +50,19 @@ fn main_and_the_handles_own_branch_cannot_be_dropped() {
     put(&db, 1, 1);
     let side = db.fork("side").unwrap();
     assert!(matches!(db.drop_branch("main"), Err(Error::BranchInUse(_))));
-    assert!(matches!(side.drop_branch("main"), Err(Error::BranchInUse(_))));
-    assert!(matches!(side.drop_branch("side"), Err(Error::BranchInUse(_))));
+    assert!(matches!(
+        side.drop_branch("main"),
+        Err(Error::BranchInUse(_))
+    ));
+    assert!(matches!(
+        side.drop_branch("side"),
+        Err(Error::BranchInUse(_))
+    ));
     assert!(matches!(db.drop_branch("ghost"), Err(Error::NoBranch(_))));
-    let reader = fast().read_only().open::<Root>(dir.path().join("b.ferro")).unwrap();
+    let reader = fast()
+        .read_only()
+        .open::<Root>(dir.path().join("b.ferro"))
+        .unwrap();
     assert!(matches!(reader.drop_branch("side"), Err(Error::ReadOnly)));
     assert!(db.branches().contains(&"side".to_string()));
 }
@@ -121,7 +130,10 @@ fn a_new_branch_of_the_same_name_does_not_inherit_the_old_handles() {
     let old = db.fork("side").unwrap();
     db.drop_branch("side").unwrap();
     let new = db.fork("side").unwrap();
-    assert!(matches!(old.update(|root| root.insert(5, 5)), Err(Error::NoBranch(_))));
+    assert!(matches!(
+        old.update(|root| root.insert(5, 5)),
+        Err(Error::NoBranch(_))
+    ));
     put(&new, 6, 6);
     assert_eq!(new.version(), 2);
     assert_eq!(db.branch("side").unwrap().version(), 2);

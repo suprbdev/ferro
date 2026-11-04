@@ -49,7 +49,11 @@ impl Data for Head {
         Option::<Ptr>::decode(r)?;
         let tip = Option::<Ptr>::decode(r)?.ok_or(Error::Decode("no tip".into()))?;
         Map::<String, (u64, u64)>::decode(r)?;
-        Ok(Head { version, first, tip })
+        Ok(Head {
+            version,
+            first,
+            tip,
+        })
     }
 }
 
@@ -70,12 +74,10 @@ impl Entry {
         w.varint(self.time_ms);
         w.raw(&[0, 0, 0]);
         let wide = self.graph != (0, 0, 0);
-        w.u8(
-            u8::from(self.prev.is_some()) * HAS_PREV
-                + u8::from(self.skip.is_some()) * HAS_SKIP
-                + u8::from(self.merged.is_some()) * MERGED
-                + u8::from(wide) * GRAPH,
-        );
+        w.u8(u8::from(self.prev.is_some()) * HAS_PREV
+            + u8::from(self.skip.is_some()) * HAS_SKIP
+            + u8::from(self.merged.is_some()) * MERGED
+            + u8::from(wide) * GRAPH);
         if let Some((_, floor, after)) = self.merged {
             w.varint(floor);
             w.varint(after + 1);
@@ -85,7 +87,10 @@ impl Entry {
             w.varint(self.graph.1);
             w.varint(self.graph.2);
         }
-        for link in [self.prev, self.skip, self.merged.map(|(ptr, _, _)| ptr)].into_iter().flatten() {
+        for link in [self.prev, self.skip, self.merged.map(|(ptr, _, _)| ptr)]
+            .into_iter()
+            .flatten()
+        {
             w.link(link);
         }
         w.finish().unwrap()
@@ -138,7 +143,11 @@ fn closed(path: &Path) -> bool {
 #[cfg(windows)]
 fn closed(path: &Path) -> bool {
     use std::os::windows::fs::OpenOptionsExt;
-    fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok()
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .is_ok()
 }
 
 fn field(bytes: &[u8], at: usize) -> u64 {
@@ -146,7 +155,11 @@ fn field(bytes: &[u8], at: usize) -> u64 {
 }
 
 fn newest_slot(bytes: &[u8]) -> usize {
-    if field(bytes, SLOT + 8) > field(bytes, 8) { SLOT } else { 0 }
+    if field(bytes, SLOT + 8) > field(bytes, 8) {
+        SLOT
+    } else {
+        0
+    }
 }
 
 fn newest_head(bytes: &[u8]) -> usize {
@@ -179,7 +192,9 @@ fn failure(f: impl FnOnce()) -> Option<String> {
 fn fails_as_corrupt(f: impl FnOnce()) {
     let message = failure(f);
     assert!(
-        message.as_deref().is_some_and(|text| text.starts_with("ferro:")),
+        message
+            .as_deref()
+            .is_some_and(|text| text.starts_with("ferro:")),
         "expected a ferro panic, got {message:?}"
     );
 }
@@ -424,8 +439,22 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
     .write(&mut txn);
     let side = at(1, 200).write(&mut txn);
     let mut refs: Map<String, Head> = Map::new();
-    refs.insert("main".into(), Head { version: 2, first: 1, tip: main });
-    refs.insert("side".into(), Head { version: 1, first: 1, tip: side });
+    refs.insert(
+        "main".into(),
+        Head {
+            version: 2,
+            first: 1,
+            tip: main,
+        },
+    );
+    refs.insert(
+        "side".into(),
+        Head {
+            version: 1,
+            first: 1,
+            tip: side,
+        },
+    );
     let mut encoder = Encoder::new(&mut txn);
     refs.encode(&mut encoder).unwrap();
     let head = encoder.finish().unwrap();
@@ -695,15 +724,25 @@ fn swapping_in_a_compacted_file_reports_a_damaged_branch_table() {
     let temp = dir.path().join("swap.ferro.compacting");
     let hook = move |step: &'static str| {
         if step == "synced" {
-            let file = fs::OpenOptions::new().read(true).write(true).open(&temp).unwrap();
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&temp)
+                .unwrap();
             let mut bytes = Vec::new();
             (&file).read_to_end(&mut bytes).unwrap();
-            let at = bytes.windows(4).position(|window| window == b"main").unwrap();
+            let at = bytes
+                .windows(4)
+                .position(|window| window == b"main")
+                .unwrap();
             (&file).seek(SeekFrom::Start(at as u64)).unwrap();
             (&file).write_all(&[bytes[at] ^ 1]).unwrap();
         }
     };
-    let db = manual().hook(Hook(Arc::new(hook))).open::<Root>(&path).unwrap();
+    let db = manual()
+        .hook(Hook(Arc::new(hook)))
+        .open::<Root>(&path)
+        .unwrap();
     db.commit("one", |root| {
         root.insert(1, "one".into());
     })

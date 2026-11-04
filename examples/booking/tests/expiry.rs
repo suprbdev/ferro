@@ -30,14 +30,23 @@ fn a_hold_blocks_others_until_the_moment_it_expires() {
     let lapsed = h.bookings.get(&first.id).unwrap();
     assert_eq!(lapsed.status, Status::Expired);
     assert_eq!(lapsed.ended_ms, Some(first.expires_ms));
-    assert_eq!(h.holder(2, night), None, "the whole lapsed hold was released, not just the contested night");
+    assert_eq!(
+        h.holder(2, night),
+        None,
+        "the whole lapsed hold was released, not just the contested night"
+    );
     assert_eq!(h.holder(2, night + 1), Some(second.id));
     assert_eq!(h.loads.get(&(1, night)), None);
     drop(h);
     let trail = booking::history::audit(w.svc.db(), first.id).unwrap();
     let last = trail.last().unwrap();
     assert_eq!(last.booking.status, Status::Expired);
-    assert!(last.message.ends_with(&format!("releasing lapsed #{}", first.id)), "{}", last.message);
+    assert!(
+        last.message
+            .ends_with(&format!("releasing lapsed #{}", first.id)),
+        "{}",
+        last.message
+    );
     assert_clean(&w.svc);
 }
 
@@ -51,12 +60,12 @@ fn a_lapsed_hold_cannot_be_confirmed_even_before_the_sweep() {
         w.svc.confirm(held.id, None),
         Err(BookingError::HoldExpired { id, .. }) if id == held.id
     ));
-    assert_eq!(w.svc.read().bookings.get(&held.id).unwrap().status, Status::Held);
+    assert_eq!(
+        w.svc.read().bookings.get(&held.id).unwrap().status,
+        Status::Held
+    );
     assert_eq!(w.svc.read().till.charged, 0);
-    assert!(matches!(
-        w.svc.cancel(held.id),
-        Ok(0)
-    ));
+    assert!(matches!(w.svc.cancel(held.id), Ok(0)));
 }
 
 #[test]
@@ -71,7 +80,11 @@ fn the_sweep_releases_due_holds_and_nothing_else() {
     assert!(w.svc.sweep().unwrap().is_empty());
     let version = w.svc.db().version();
     assert!(w.svc.sweep().unwrap().is_empty());
-    assert_eq!(w.svc.db().version(), version, "an empty sweep writes no version");
+    assert_eq!(
+        w.svc.db().version(),
+        version,
+        "an empty sweep writes no version"
+    );
 
     w.clock.advance(1_000);
     assert_eq!(w.svc.sweep().unwrap(), vec![short.id]);
@@ -81,7 +94,10 @@ fn the_sweep_releases_due_holds_and_nothing_else() {
     assert_eq!(h.bookings.get(&short.id).unwrap().status, Status::Expired);
     assert_eq!(h.bookings.get(&long.id).unwrap().status, Status::Held);
     assert_eq!(h.bookings.get(&paid.id).unwrap().status, Status::Confirmed);
-    assert_eq!(h.loads.get(&(1, night)).map(|l| *l), Some(Load { held: 1, sold: 1 }));
+    assert_eq!(
+        h.loads.get(&(1, night)).map(|l| *l),
+        Some(Load { held: 1, sold: 1 })
+    );
     assert_eq!(h.due(w.clock.now() + 59_000), vec![long.id]);
     drop(h);
 
@@ -158,7 +174,10 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
                 })
             })
             .collect();
-        let taken: Vec<u64> = workers.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let taken: Vec<u64> = workers
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         let tail = |room, ttl_ms| {
             svc.hold(&HoldRequest {
                 customer: 25,
@@ -178,7 +197,10 @@ fn holds_expiring_while_threads_contend_keep_every_version_clean() {
         let mut swept = svc.sweep().unwrap();
         stop.store(true, Ordering::Relaxed);
         swept.extend(sweeper.join().unwrap());
-        assert!(swept.contains(&lapsing.id), "coalesce={coalesce}: swept {swept:?}");
+        assert!(
+            swept.contains(&lapsing.id),
+            "coalesce={coalesce}: swept {swept:?}"
+        );
         let h = svc.read();
         assert_eq!(h.bookings.by_status(&Status::Held).len(), 0);
         assert_eq!(

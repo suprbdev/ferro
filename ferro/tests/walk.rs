@@ -35,7 +35,13 @@ fn reverse_log_walk_reads_only_what_it_yields() {
     drop(seeded(&path, 400));
     smash_older_half(&path);
     let db = Options::new().read_only().open::<Root>(&path).unwrap();
-    let newest: Vec<u64> = db.log().iter().rev().take(5).map(|(version, _)| version).collect();
+    let newest: Vec<u64> = db
+        .log()
+        .iter()
+        .rev()
+        .take(5)
+        .map(|(version, _)| version)
+        .collect();
     assert_eq!(newest, vec![400, 399, 398, 397, 396]);
     assert!(catch_unwind(AssertUnwindSafe(|| db.log().iter().count())).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| db.log().iter().rev().count())).is_err());
@@ -50,7 +56,12 @@ fn log_iterator_is_ordered_from_both_ends() {
     let db = seeded(&dir.path().join("a.ferro"), 10);
     let forward: Vec<u64> = db.log().iter().map(|(version, _)| version).collect();
     assert_eq!(forward, (1..=10).collect::<Vec<_>>());
-    let backward: Vec<u64> = db.log().values().rev().map(|commit| commit.version).collect();
+    let backward: Vec<u64> = db
+        .log()
+        .values()
+        .rev()
+        .map(|commit| commit.version)
+        .collect();
     assert_eq!(backward, (1..=10).rev().collect::<Vec<_>>());
 
     let mut both = db.log().iter();
@@ -68,7 +79,11 @@ fn log_iterator_is_ordered_from_both_ends() {
 fn naive(db: &Db<Root>, key: u64) -> Vec<(u64, Option<u64>)> {
     let log = db.log();
     let first = log.first().map_or(1, |(version, _)| version);
-    let mut previous = if first == 1 { Some(db.at(0).unwrap().get(&key).map(|v| *v)) } else { None };
+    let mut previous = if first == 1 {
+        Some(db.at(0).unwrap().get(&key).map(|v| *v))
+    } else {
+        None
+    };
     let mut changes = Vec::new();
     for version in first..=db.version() {
         let value = db.at(version).unwrap().get(&key).map(|v| *v);
@@ -231,7 +246,10 @@ fn take_while_gives_the_same_items_as_the_plain_adaptor() {
     assert_eq!(compare(&|(_, row)| row.is_some()), 3);
     assert_eq!(compare(&|(commit, _)| commit.message != "two"), 1);
     assert_eq!(compare(&|(commit, _)| commit.version > 3), 3);
-    assert_eq!(compare(&|(commit, row)| row.is_some() && commit.version > 5), 2);
+    assert_eq!(
+        compare(&|(commit, row)| row.is_some() && commit.version > 5),
+        2
+    );
     assert_eq!(compare(&|_| true), 5);
     assert_eq!(compare(&|_| false), 0);
     let every: Vec<_> = db.history_of(project).collect();

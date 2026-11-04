@@ -108,7 +108,8 @@ fn run<S: Summary<u64, i64>>(
         .open(&path)
         .unwrap();
     let started = Instant::now();
-    db.update(|root| root.extend((0..n).map(|i| (mix(i), amount(i))))).unwrap();
+    db.update(|root| root.extend((0..n).map(|i| (mix(i), amount(i)))))
+        .unwrap();
     let bulk_ns = started.elapsed().as_nanos() as f64 / n as f64;
     let bulk = db.size_on_disk() as f64 / n as f64;
     let db = match cache {
@@ -196,7 +197,9 @@ fn argument(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let n: u64 = argument("--n").and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: u64 = argument("--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let dir = PathBuf::from(argument("--dir").unwrap_or_else(|| "target/bench".to_string()));
     std::fs::create_dir_all(&dir).unwrap();
     let cache = argument("--cache").and_then(|v| v.parse().ok());

@@ -66,9 +66,17 @@ fn main() {
         .split(',')
         .map(|n| n.parse().unwrap())
         .collect();
-    let secs: f64 = argument("--secs").and_then(|v| v.parse().ok()).unwrap_or(3.0);
-    let keys: u64 = argument("--keys").and_then(|v| v.parse().ok()).unwrap_or(100_000);
-    let work = Duration::from_micros(argument("--closure-us").and_then(|v| v.parse().ok()).unwrap_or(0));
+    let secs: f64 = argument("--secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3.0);
+    let keys: u64 = argument("--keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let work = Duration::from_micros(
+        argument("--closure-us")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    );
     let coalesce = argument("--coalesce").is_some_and(|v| v == "1");
     let awaited = argument("--async").is_some_and(|v| v == "1");
     let own = argument("--branches").is_some_and(|v| v == "own");

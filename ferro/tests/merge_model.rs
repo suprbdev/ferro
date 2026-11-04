@@ -501,7 +501,8 @@ struct Version {
 }
 
 fn has(bits: &[u64], id: usize) -> bool {
-    bits.get(id / 64).is_some_and(|word| word & (1 << (id % 64)) != 0)
+    bits.get(id / 64)
+        .is_some_and(|word| word & (1 << (id % 64)) != 0)
 }
 
 struct Graph(Vec<Version>);
@@ -561,7 +562,11 @@ fn counts(db: &Db<Events>) -> Counts {
 }
 
 fn id_of(snapshot: &Snapshot<Events>) -> usize {
-    snapshot.commit().message.strip_prefix('n').map_or(0, |id| id.parse().unwrap())
+    snapshot
+        .commit()
+        .message
+        .strip_prefix('n')
+        .map_or(0, |id| id.parse().unwrap())
 }
 
 fn add_deltas(root: &mut Events, base: &Events, theirs: &Events) {
@@ -649,7 +654,9 @@ struct Run {
 
 impl Run {
     fn live(&self) -> Vec<usize> {
-        (0..SLOTS).filter(|slot| self.dbs[*slot].is_some()).collect()
+        (0..SLOTS)
+            .filter(|slot| self.dbs[*slot].is_some())
+            .collect()
     }
 
     fn inc(&mut self, slot: usize) {
@@ -709,7 +716,10 @@ impl Run {
         sorted.sort_unstable();
         prop_assert_eq!(&sorted, &best, "bases {:?}", seen);
         let generation = |id: &usize| self.graph.0[*id].generation;
-        prop_assert!(seen.windows(2).all(|pair| generation(&pair[0]) >= generation(&pair[1])));
+        prop_assert!(
+            seen.windows(2)
+                .all(|pair| generation(&pair[0]) >= generation(&pair[1]))
+        );
         prop_assert_eq!(id_of(&ours.common_ancestor(&theirs).unwrap()), seen[0]);
         let id = self.graph.0.len();
         let before = ours.version();
@@ -924,7 +934,13 @@ impl Devices {
                     continue;
                 };
                 let head = self.heads[device][slot];
-                prop_assert_eq!(counts(db), self.graph.events(head), "d{} {}", device, LOCAL[slot]);
+                prop_assert_eq!(
+                    counts(db),
+                    self.graph.events(head),
+                    "d{} {}",
+                    device,
+                    LOCAL[slot]
+                );
             }
         }
         Ok(())
@@ -942,7 +958,9 @@ fn run_devices(acts: Vec<Act>) -> Result<Crossed, TestCaseError> {
     };
     devices.graph.push(&[], None);
     for device in 0..DEVICES {
-        let db: Db<Events> = fast().open(dir.path().join(format!("d{device}.ferro"))).unwrap();
+        let db: Db<Events> = fast()
+            .open(dir.path().join(format!("d{device}.ferro")))
+            .unwrap();
         devices.dbs.push([Some(db), None]);
     }
     for act in acts {
@@ -1010,13 +1028,23 @@ fn random_histories_cross_often_and_each_delta_is_still_applied_once() {
     let mut runner = TestRunner::deterministic();
     let (mut graphs, mut devices) = (Crossed::default(), Crossed::default());
     for _ in 0..common::cases(100) {
-        let ops = prop::collection::vec(op(), 1..80).new_tree(&mut runner).unwrap().current();
+        let ops = prop::collection::vec(op(), 1..80)
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
         graphs.add(run_graph(ops, fast(), Keep::All, false).unwrap());
-        let acts = prop::collection::vec(act(), 1..80).new_tree(&mut runner).unwrap().current();
+        let acts = prop::collection::vec(act(), 1..80)
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
         devices.add(run_devices(acts).unwrap());
     }
     assert!(graphs.merges >= 50, "{} criss-cross merges", graphs.merges);
-    assert!(devices.merges >= 50, "{} criss-cross merges", devices.merges);
+    assert!(
+        devices.merges >= 50,
+        "{} criss-cross merges",
+        devices.merges
+    );
     assert!(graphs.calls >= 3 && devices.calls >= 3);
 }
 
@@ -1039,7 +1067,9 @@ fn branches_that_keep_syncing_merge_exactly_with_bounded_history() {
             ops.extend([Op::Fork(0), Op::Fork(0)]);
         }
     }
-    let options = fast().history(Keep::Last(40)).reclaim(Reclaim { every_bytes: 0 });
+    let options = fast()
+        .history(Keep::Last(40))
+        .reclaim(Reclaim { every_bytes: 0 });
     run_graph(ops, options, Keep::Last(40), false).unwrap();
 }
 
@@ -1047,80 +1077,307 @@ fn branches_that_keep_syncing_merge_exactly_with_bounded_history() {
 fn pruned_graphs_that_once_found_a_wrong_base_or_changed_after_a_cycle() {
     use Op::*;
     let cases = [
-        (2, vec![Fork(0), Inc(2), Merge(1, 2), Inc(1), Inc(1), Merge(1, 2)]),
+        (
+            2,
+            vec![Fork(0), Inc(2), Merge(1, 2), Inc(1), Inc(1), Merge(1, 2)],
+        ),
         (
             6,
             vec![
-                Merge(1, 0), Merge(2, 2), Fork(2), Inc(4), Inc(4), Inc(3), Drop(3), Fork(2),
-                Merge(1, 2), Drop(2), Merge(3, 3), Inc(0), Inc(2), Fork(1), Merge(3, 1), Inc(3),
-                Merge(0, 2), Inc(1), Merge(0, 2), Inc(3), Compact, Inc(0), Merge(3, 4), Merge(0, 0),
-                Merge(2, 0), Inc(4), Compact, Merge(0, 0), Merge(2, 1), Inc(0), Merge(4, 2), Inc(3),
-                Inc(4), Inc(0), Inc(1), Fork(0), Merge(4, 2), Fork(1), Inc(3), Fork(2), Fork(2),
-                Inc(2), Merge(0, 2), Inc(2), Fork(3), Fork(3), Compact, Inc(2), Merge(0, 2),
+                Merge(1, 0),
+                Merge(2, 2),
+                Fork(2),
+                Inc(4),
+                Inc(4),
+                Inc(3),
+                Drop(3),
+                Fork(2),
+                Merge(1, 2),
+                Drop(2),
+                Merge(3, 3),
+                Inc(0),
+                Inc(2),
+                Fork(1),
+                Merge(3, 1),
+                Inc(3),
+                Merge(0, 2),
+                Inc(1),
+                Merge(0, 2),
+                Inc(3),
+                Compact,
+                Inc(0),
+                Merge(3, 4),
+                Merge(0, 0),
+                Merge(2, 0),
+                Inc(4),
+                Compact,
+                Merge(0, 0),
+                Merge(2, 1),
+                Inc(0),
+                Merge(4, 2),
+                Inc(3),
+                Inc(4),
+                Inc(0),
+                Inc(1),
+                Fork(0),
+                Merge(4, 2),
+                Fork(1),
+                Inc(3),
+                Fork(2),
+                Fork(2),
+                Inc(2),
+                Merge(0, 2),
+                Inc(2),
+                Fork(3),
+                Fork(3),
+                Compact,
+                Inc(2),
+                Merge(0, 2),
             ],
         ),
         (
             6,
             vec![
-                Drop(1), Fork(1), Inc(4), Inc(0), Fork(0), Inc(1), Merge(4, 2), Merge(1, 3),
-                Fork(2), Merge(0, 2), Inc(2), Inc(1), Merge(4, 1), Fork(1), Merge(4, 3), Inc(2),
-                Fork(1), Compact, Merge(3, 2), Inc(2), Fork(0), Merge(2, 3), Merge(2, 2), Fork(2),
-                Merge(3, 2), Inc(3), Inc(4), Inc(2), Drop(4), Merge(4, 2), Inc(1), Inc(1), Inc(4),
-                Merge(1, 0), Inc(3), Merge(4, 3), Inc(0), Fork(1), Inc(0), Merge(3, 2), Inc(4),
-                Merge(0, 4), Merge(0, 1), Compact, Inc(1),
+                Drop(1),
+                Fork(1),
+                Inc(4),
+                Inc(0),
+                Fork(0),
+                Inc(1),
+                Merge(4, 2),
+                Merge(1, 3),
+                Fork(2),
+                Merge(0, 2),
+                Inc(2),
+                Inc(1),
+                Merge(4, 1),
+                Fork(1),
+                Merge(4, 3),
+                Inc(2),
+                Fork(1),
+                Compact,
+                Merge(3, 2),
+                Inc(2),
+                Fork(0),
+                Merge(2, 3),
+                Merge(2, 2),
+                Fork(2),
+                Merge(3, 2),
+                Inc(3),
+                Inc(4),
+                Inc(2),
+                Drop(4),
+                Merge(4, 2),
+                Inc(1),
+                Inc(1),
+                Inc(4),
+                Merge(1, 0),
+                Inc(3),
+                Merge(4, 3),
+                Inc(0),
+                Fork(1),
+                Inc(0),
+                Merge(3, 2),
+                Inc(4),
+                Merge(0, 4),
+                Merge(0, 1),
+                Compact,
+                Inc(1),
             ],
         ),
         (
             7,
             vec![
-                Compact, Inc(2), Fork(2), Merge(1, 4), Inc(1), Inc(1), Fork(1), Fork(4), Drop(4),
-                Merge(3, 2), Merge(2, 2), Inc(3), Merge(2, 0), Compact, Fork(1), Fork(3),
-                Merge(4, 1), Merge(0, 0), Merge(0, 3), Drop(2), Merge(4, 0), Compact, Inc(2),
-                Merge(4, 2), Inc(4), Drop(2), Inc(1), Merge(4, 0), Inc(0), Merge(0, 1), Inc(3),
-                Fork(0), Merge(3, 4), Inc(2), Merge(0, 0), Merge(4, 1), Merge(1, 3), Inc(3),
-                Inc(2), Inc(0), Merge(1, 2), Fork(2), Fork(2), Merge(0, 2), Merge(1, 1), Fork(0),
-                Merge(4, 2), Merge(1, 2), Merge(3, 1), Merge(3, 0), Merge(3, 4), Inc(0),
-                Merge(3, 3), Drop(4), Inc(3), Fork(1), Merge(1, 0), Inc(4), Compact,
+                Compact,
+                Inc(2),
+                Fork(2),
+                Merge(1, 4),
+                Inc(1),
+                Inc(1),
+                Fork(1),
+                Fork(4),
+                Drop(4),
+                Merge(3, 2),
+                Merge(2, 2),
+                Inc(3),
+                Merge(2, 0),
+                Compact,
+                Fork(1),
+                Fork(3),
+                Merge(4, 1),
+                Merge(0, 0),
+                Merge(0, 3),
+                Drop(2),
+                Merge(4, 0),
+                Compact,
+                Inc(2),
+                Merge(4, 2),
+                Inc(4),
+                Drop(2),
+                Inc(1),
+                Merge(4, 0),
+                Inc(0),
+                Merge(0, 1),
+                Inc(3),
+                Fork(0),
+                Merge(3, 4),
+                Inc(2),
+                Merge(0, 0),
+                Merge(4, 1),
+                Merge(1, 3),
+                Inc(3),
+                Inc(2),
+                Inc(0),
+                Merge(1, 2),
+                Fork(2),
+                Fork(2),
+                Merge(0, 2),
+                Merge(1, 1),
+                Fork(0),
+                Merge(4, 2),
+                Merge(1, 2),
+                Merge(3, 1),
+                Merge(3, 0),
+                Merge(3, 4),
+                Inc(0),
+                Merge(3, 3),
+                Drop(4),
+                Inc(3),
+                Fork(1),
+                Merge(1, 0),
+                Inc(4),
+                Compact,
             ],
         ),
         (
             4,
             vec![
-                Merge(3, 0), Fork(2), Merge(4, 4), Inc(2), Fork(0), Merge(3, 3), Fork(3), Fork(3),
-                Merge(3, 0), Fork(3), Merge(4, 1), Merge(1, 3), Inc(0), Fork(1), Fork(4),
-                Merge(1, 0), Inc(0), Compact, Fork(3), Inc(0), Fork(1), Merge(2, 2), Fork(4),
-                Merge(1, 0), Merge(0, 1), Inc(2), Merge(3, 2), Inc(4), Fork(0), Inc(1),
-                Merge(4, 1), Merge(1, 2), Inc(0), Inc(0), Merge(4, 2), Merge(4, 0), Inc(4),
-                Fork(4), Inc(1), Compact, Merge(2, 2), Fork(3), Merge(2, 4), Inc(4), Merge(3, 2),
-                Merge(4, 2), Inc(1), Merge(0, 3), Inc(0), Fork(1), Merge(4, 2), Fork(4),
+                Merge(3, 0),
+                Fork(2),
+                Merge(4, 4),
+                Inc(2),
+                Fork(0),
+                Merge(3, 3),
+                Fork(3),
+                Fork(3),
+                Merge(3, 0),
+                Fork(3),
+                Merge(4, 1),
+                Merge(1, 3),
+                Inc(0),
+                Fork(1),
+                Fork(4),
+                Merge(1, 0),
+                Inc(0),
+                Compact,
+                Fork(3),
+                Inc(0),
+                Fork(1),
+                Merge(2, 2),
+                Fork(4),
+                Merge(1, 0),
+                Merge(0, 1),
+                Inc(2),
+                Merge(3, 2),
+                Inc(4),
+                Fork(0),
+                Inc(1),
+                Merge(4, 1),
+                Merge(1, 2),
+                Inc(0),
+                Inc(0),
+                Merge(4, 2),
+                Merge(4, 0),
+                Inc(4),
+                Fork(4),
+                Inc(1),
+                Compact,
+                Merge(2, 2),
+                Fork(3),
+                Merge(2, 4),
+                Inc(4),
+                Merge(3, 2),
+                Merge(4, 2),
+                Inc(1),
+                Merge(0, 3),
+                Inc(0),
+                Fork(1),
+                Merge(4, 2),
+                Fork(4),
             ],
         ),
         (
             4,
             vec![
-                Fork(0), Inc(1), Fork(1), Fork(0), Inc(1), Inc(1), Fork(0), Drop(3), Cross(2, 4),
-                Fork(1), Merge(4, 0), Inc(2), Inc(1), Inc(4), Merge(1, 2), Merge(4, 1),
+                Fork(0),
+                Inc(1),
+                Fork(1),
+                Fork(0),
+                Inc(1),
+                Inc(1),
+                Fork(0),
+                Drop(3),
+                Cross(2, 4),
+                Fork(1),
+                Merge(4, 0),
+                Inc(2),
+                Inc(1),
+                Inc(4),
+                Merge(1, 2),
+                Merge(4, 1),
             ],
         ),
         (
             4,
             vec![
-                Inc(2), Inc(0), Inc(0), Fork(1), Fork(0), Inc(0), Fork(0), Merge(2, 0), Cross(0, 1),
-                Inc(4), Fork(4), Inc(4), Inc(0), Merge(4, 2), Merge(0, 1), Inc(4), Drop(1), Inc(4),
-                Inc(1), Fork(4), Merge(4, 2),
+                Inc(2),
+                Inc(0),
+                Inc(0),
+                Fork(1),
+                Fork(0),
+                Inc(0),
+                Fork(0),
+                Merge(2, 0),
+                Cross(0, 1),
+                Inc(4),
+                Fork(4),
+                Inc(4),
+                Inc(0),
+                Merge(4, 2),
+                Merge(0, 1),
+                Inc(4),
+                Drop(1),
+                Inc(4),
+                Inc(1),
+                Fork(4),
+                Merge(4, 2),
             ],
         ),
         (
             3,
             vec![
-                Drop(1), Fork(0), Inc(1), Merge(0, 1), Fork(0), Inc(0), Inc(0), Inc(4), Fork(0),
-                Inc(2), Cross(0, 2), Merge(3, 1), Merge(3, 0), Inc(0),
+                Drop(1),
+                Fork(0),
+                Inc(1),
+                Merge(0, 1),
+                Fork(0),
+                Inc(0),
+                Inc(0),
+                Inc(4),
+                Fork(0),
+                Inc(2),
+                Cross(0, 2),
+                Merge(3, 1),
+                Merge(3, 0),
+                Inc(0),
             ],
         ),
     ];
     for _ in 0..50 {
         for (keep, ops) in &cases {
-            let options = fast().history(Keep::Last(*keep)).reclaim(Reclaim { every_bytes: 0 });
+            let options = fast()
+                .history(Keep::Last(*keep))
+                .reclaim(Reclaim { every_bytes: 0 });
             run_graph(ops.clone(), options, Keep::Last(*keep), true).unwrap();
         }
     }
@@ -1183,13 +1440,19 @@ fn a_fork_of_a_merged_branch_does_not_bring_its_changes_back() {
     assert_eq!(counts(&main), ones(&[0, 1, 2, 3]));
     main.compact(Keep::All).unwrap();
     event(&follow, "g2", 4);
-    assert_eq!(merge_named(&main, &follow, "main <- follow again").value, "g1");
+    assert_eq!(
+        merge_named(&main, &follow, "main <- follow again").value,
+        "g1"
+    );
     assert_eq!(counts(&main), ones(&[0, 1, 2, 3, 4]));
     main.verify().unwrap();
 }
 
 fn messages(snapshots: &[Snapshot<Events>]) -> Vec<String> {
-    snapshots.iter().map(|s| s.commit().message.clone()).collect()
+    snapshots
+        .iter()
+        .map(|s| s.commit().message.clone())
+        .collect()
 }
 
 fn sorted_messages(snapshots: &[Snapshot<Events>]) -> Vec<String> {
@@ -1242,21 +1505,37 @@ fn criss_cross_merges_merge_the_best_ancestors_into_a_virtual_base_first() {
     {
         let (main, side) = criss_cross(&path);
         assert_eq!(main.common_ancestor(&side).unwrap().commit().message, "s2");
-        assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
-        assert_eq!(messages(&side.common_ancestors(&main).unwrap()), ["s2", "m1"]);
+        assert_eq!(
+            messages(&main.common_ancestors(&side).unwrap()),
+            ["s2", "m1"]
+        );
+        assert_eq!(
+            messages(&side.common_ancestors(&main).unwrap()),
+            ["s2", "m1"]
+        );
     }
     let main: Db<Events> = fast().open(&path).unwrap();
     let side = main.branch("side").unwrap();
-    assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
+    assert_eq!(
+        messages(&main.common_ancestors(&side).unwrap()),
+        ["s2", "m1"]
+    );
     let before = main.version();
     let (merged, calls) = traced_merge(&main, &side, "main <- side again");
     assert_eq!(
         calls,
-        [call(1, "m0", "m1"), call(0, "main <- side again", "side <- copy")]
+        [
+            call(1, "m0", "m1"),
+            call(0, "main <- side again", "side <- copy")
+        ]
     );
     assert_eq!(counts(&main), ones(&[0, 1, 2, 3]));
     assert_eq!(merged.version, before + 1);
-    let log: Vec<String> = main.log().values().map(|commit| commit.message.clone()).collect();
+    let log: Vec<String> = main
+        .log()
+        .values()
+        .map(|commit| commit.message.clone())
+        .collect();
     assert_eq!(log, ["m0", "m1", "main <- side", "main <- side again"]);
     let (_, calls) = traced_merge(&side, &main, "side <- main");
     assert_eq!(calls, [call(4, "side <- copy", "main <- side again")]);
@@ -1297,7 +1576,10 @@ fn an_error_while_building_the_virtual_base_discards_the_merge() {
     assert!(matches!(failed, Err(ferro::Error::BranchInUse(_))));
     assert_eq!(calls, 1);
     assert_eq!((main.version(), main.head_hash()), (before, head));
-    assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["s2", "m1"]);
+    assert_eq!(
+        messages(&main.common_ancestors(&side).unwrap()),
+        ["s2", "m1"]
+    );
     let (_, calls) = traced_merge(&main, &side, "main <- side again");
     assert_eq!(calls.len(), 2);
     assert_eq!(counts(&main), ones(&[0, 1, 2, 3]));
@@ -1321,12 +1603,18 @@ fn a_criss_cross_of_criss_crosses_builds_its_virtual_base_recursively() {
     merge_named(&main, &side, "a2");
     merge_named(&side, &copy, "b2");
     main.drop_branch("copy").unwrap();
-    assert_eq!(sorted_messages(&main.common_ancestors(&side).unwrap()), ["m2", "s2"]);
+    assert_eq!(
+        sorted_messages(&main.common_ancestors(&side).unwrap()),
+        ["m2", "s2"]
+    );
     let (_, calls) = traced_merge(&main, &side, "a3");
     assert_eq!(calls.len(), 3, "{calls:?}");
     let first = [call(1, "m0", "m1"), call(1, "m0", "s1")];
     assert!(first.contains(&calls[0]), "{calls:?}");
-    assert!([call(0, "a3", "m2"), call(0, "a3", "s2")].contains(&calls[1]), "{calls:?}");
+    assert!(
+        [call(0, "a3", "m2"), call(0, "a3", "s2")].contains(&calls[1]),
+        "{calls:?}"
+    );
     assert_eq!(calls[2], call(0, "a3", "b2"));
     assert_eq!(counts(&main), ones(&[0, 1, 2, 3, 4]));
     let (_, calls) = traced_merge(&side, &main, "b3");
@@ -1362,12 +1650,24 @@ fn a_criss_cross_made_by_syncs_between_three_files_applies_each_change_once() {
     assert_eq!(counts(&b), ones(&[0, 1, 2]));
     event(&a, "a2", 3);
     event(&b, "b2", 4);
-    assert_eq!(pull_named(&a, &b, "b", "a <- b again"), (Outcome::Merged, 2));
+    assert_eq!(
+        pull_named(&a, &b, "b", "a <- b again"),
+        (Outcome::Merged, 2)
+    );
     assert_eq!(counts(&a), ones(&[0, 1, 2, 3, 4]));
-    assert_eq!(pull_named(&b, &a, "a", "b <- a again"), (Outcome::Merged, 1));
+    assert_eq!(
+        pull_named(&b, &a, "a", "b <- a again"),
+        (Outcome::Merged, 1)
+    );
     assert_eq!(counts(&b), ones(&[0, 1, 2, 3, 4]));
-    assert_eq!(pull_named(&a, &b, "b", "a <- b last"), (Outcome::UpToDate, 0));
-    assert_eq!(pull_named(&b, &a, "a", "b <- a last"), (Outcome::UpToDate, 0));
+    assert_eq!(
+        pull_named(&a, &b, "b", "a <- b last"),
+        (Outcome::UpToDate, 0)
+    );
+    assert_eq!(
+        pull_named(&b, &a, "a", "b <- a last"),
+        (Outcome::UpToDate, 0)
+    );
 }
 
 fn pairs(dbs: &[Db<Events>]) -> Vec<String> {
@@ -1388,7 +1688,11 @@ fn pairs(dbs: &[Db<Events>]) -> Vec<String> {
 fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p.ferro");
-    let options = || fast().history(Keep::Last(4)).reclaim(Reclaim { every_bytes: 0 });
+    let options = || {
+        fast()
+            .history(Keep::Last(4))
+            .reclaim(Reclaim { every_bytes: 0 })
+    };
     let main: Db<Events> = options().open(&path).unwrap();
     let mut next = 0;
     let mut bump = |db: &Db<Events>| {
@@ -1424,20 +1728,31 @@ fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
     }
     let dbs = vec![main.clone(), a.clone(), b.clone()];
     let before = pairs(&dbs);
-    assert!(before.iter().any(|line| !line.ends_with("share no retained version")), "{before:?}");
+    assert!(
+        before
+            .iter()
+            .any(|line| !line.ends_with("share no retained version")),
+        "{before:?}"
+    );
     main.compact(Keep::Last(4)).unwrap();
     assert_eq!(pairs(&dbs), before);
     main.verify().unwrap();
     drop((main, a, b, dbs));
     let main: Db<Events> = options().open(&path).unwrap();
-    let dbs = vec![main.clone(), main.branch("a").unwrap(), main.branch("b").unwrap()];
+    let dbs = vec![
+        main.clone(),
+        main.branch("a").unwrap(),
+        main.branch("b").unwrap(),
+    ];
     assert_eq!(pairs(&dbs), before);
 }
 
 fn crossed_under_pruning(path: &std::path::Path, keep: usize, step: u64) -> [Db<Events>; 3] {
     let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
     let clock = Clock(Arc::new(move || ticks.fetch_add(step, Ordering::Relaxed)));
-    let options = fast().history(Keep::Last(keep)).reclaim(Reclaim { every_bytes: 0 });
+    let options = fast()
+        .history(Keep::Last(keep))
+        .reclaim(Reclaim { every_bytes: 0 });
     let main: Db<Events> = options.clock(clock).open(path).unwrap();
     let b1 = main.fork("b1").unwrap();
     event(&b1, "n1", 1);
@@ -1461,8 +1776,16 @@ fn a_pruned_search_does_not_report_a_base_below_another_and_the_merge_goes_throu
     for step in [0, 1] {
         let dir = tempfile::tempdir().unwrap();
         let [main, b1, b4] = crossed_under_pruning(&dir.path().join("b.ferro"), 4, step);
-        assert_eq!(messages(&b4.common_ancestors(&b1).unwrap()), ["n3"], "step {step}");
-        assert_eq!(messages(&b1.common_ancestors(&b4).unwrap()), ["n3"], "step {step}");
+        assert_eq!(
+            messages(&b4.common_ancestors(&b1).unwrap()),
+            ["n3"],
+            "step {step}"
+        );
+        assert_eq!(
+            messages(&b1.common_ancestors(&b4).unwrap()),
+            ["n3"],
+            "step {step}"
+        );
         let (_, calls) = traced_merge(&b4, &b1, "n10");
         assert_eq!(calls, [call(3, "n3", "n9")], "step {step}");
         assert_eq!(counts(&b4), ones(&[1, 2, 3, 6, 7, 8]));
@@ -1473,7 +1796,9 @@ fn a_pruned_search_does_not_report_a_base_below_another_and_the_merge_goes_throu
 #[test]
 fn a_base_pruned_from_our_branch_but_kept_on_theirs_is_found() {
     let dir = tempfile::tempdir().unwrap();
-    let options = fast().history(Keep::Last(3)).reclaim(Reclaim { every_bytes: 0 });
+    let options = fast()
+        .history(Keep::Last(3))
+        .reclaim(Reclaim { every_bytes: 0 });
     let main: Db<Events> = options.open(dir.path().join("k.ferro")).unwrap();
     event(&main, "m1", 1);
     let side = main.fork("side").unwrap();
@@ -1507,7 +1832,10 @@ fn a_pruned_search_refuses_when_a_base_could_lie_under_history_no_branch_keeps()
             add_deltas(root, base, theirs);
             ("n10", ())
         });
-        assert!(matches!(merged, Err(ferro::Error::NoCommonAncestor)), "step {step}");
+        assert!(
+            matches!(merged, Err(ferro::Error::NoCommonAncestor)),
+            "step {step}"
+        );
         assert_eq!((b4.version(), b4.head_hash()), (before, head));
         main.verify().unwrap();
     }
@@ -1535,7 +1863,10 @@ fn a_later_merge_does_not_reach_history_an_earlier_merge_let_go() {
     merge_named(&fresh, &side, "fresh <- side");
     let dbs = vec![main.clone(), side.clone(), fresh.clone()];
     let before = pairs(&dbs);
-    assert!(before.iter().all(|line| !line.contains("corrupt")), "{before:?}");
+    assert!(
+        before.iter().all(|line| !line.contains("corrupt")),
+        "{before:?}"
+    );
     main.compact(Keep::Last(2)).unwrap();
     assert_eq!(pairs(&dbs), before);
     main.verify().unwrap();

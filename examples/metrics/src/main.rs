@@ -125,17 +125,24 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
                 by: by.as_deref(),
             };
             let rows = match rollup {
-                Some(rollup) => tsdb::aggregate_rollups(&snap, &sel, parse_duration(&rollup)?, query)?,
+                Some(rollup) => {
+                    tsdb::aggregate_rollups(&snap, &sel, parse_duration(&rollup)?, query)?
+                }
                 None => tsdb::aggregate(&snap, &sel, query)?,
             };
             for row in rows {
                 match &by {
-                    Some(label) => writeln!(out, "{label}={}\t{}\t{}", row.group, row.bucket, row.value)?,
+                    Some(label) => {
+                        writeln!(out, "{label}={}\t{}\t{}", row.group, row.bucket, row.value)?
+                    }
                     None => writeln!(out, "{}\t{}", row.bucket, row.value)?,
                 }
             }
         }
-        Command::Series { selector: text, count } => {
+        Command::Series {
+            selector: text,
+            count,
+        } => {
             let sel = selector(text.as_deref().unwrap_or(""))?;
             let tsdb = Tsdb::open_read_only(path)?;
             let snap = tsdb.snapshot();
@@ -242,7 +249,11 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             for (step, entries) in &stats.rollup_tables {
                 writeln!(out, "rollups      {step}ms: {entries}")?;
             }
-            writeln!(out, "versions     {} (head v{})", stats.versions, stats.version)?;
+            writeln!(
+                out,
+                "versions     {} (head v{})",
+                stats.versions, stats.version
+            )?;
             writeln!(out, "file bytes   {}", stats.file_bytes)?;
             if stats.points > 0 {
                 writeln!(
@@ -288,9 +299,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Res<()> {
             no_sync,
         } => {
             let scrapes = rate.saturating_mul(seconds) / series.max(1) as u64;
-            let start_ts = start_ts.unwrap_or_else(|| {
-                now_ms().saturating_sub(scrapes.saturating_mul(interval_ms))
-            });
+            let start_ts = start_ts
+                .unwrap_or_else(|| now_ms().saturating_sub(scrapes.saturating_mul(interval_ms)));
             let options = LoadOptions {
                 rate,
                 seconds,

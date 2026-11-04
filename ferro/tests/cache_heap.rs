@@ -57,8 +57,14 @@ fn grown_by(read: impl FnOnce()) -> usize {
 }
 
 fn check(name: &str, setting: usize, heap: usize) {
-    assert!(heap < setting * 3 / 2, "{name}: {heap} heap at a setting of {setting}");
-    assert!(heap > setting / 2, "{name}: {heap} heap at a setting of {setting}");
+    assert!(
+        heap < setting * 3 / 2,
+        "{name}: {heap} heap at a setting of {setting}"
+    );
+    assert!(
+        heap > setting / 2,
+        "{name}: {heap} heap at a setting of {setting}"
+    );
 }
 
 #[test]

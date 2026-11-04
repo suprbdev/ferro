@@ -64,7 +64,8 @@ pub fn seed(svc: &Reservations, plan: &Plan) -> Result<Seeded> {
         }
         for c in 0..plan.customers {
             let n = h.next_customer + 1;
-            let customer = h.add_customer(&format!("guest{n}@example.com"), &format!("Guest {n}"))?;
+            let customer =
+                h.add_customer(&format!("guest{n}@example.com"), &format!("Guest {n}"))?;
             if plan.credit > 0 {
                 h.deposit(customer, plan.credit + Cents::from(c % 4) * 25_000)?;
             }

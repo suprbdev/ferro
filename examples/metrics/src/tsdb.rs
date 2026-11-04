@@ -195,7 +195,11 @@ pub fn select(m: &Metrics, selector: &Selector) -> Vec<Val<SeriesRec>> {
     }
     let mut rows: Vec<Val<SeriesRec>> = match best {
         Some(rows) => rows.filter(|rec| selector.matches(rec)).collect(),
-        None => m.series.iter().filter(|rec| selector.matches(rec)).collect(),
+        None => m
+            .series
+            .iter()
+            .filter(|rec| selector.matches(rec))
+            .collect(),
     };
     rows.sort_by_key(|rec| rec.id);
     rows
@@ -227,7 +231,9 @@ pub fn scan(
 
 pub fn read_series(m: &Metrics, sid: u64, from: u64, to: u64) -> Result<Vec<(u64, f64)>> {
     let mut out = Vec::new();
-    scan(m, &[sid], from, to, |_, points| out.extend_from_slice(points))?;
+    scan(m, &[sid], from, to, |_, points| {
+        out.extend_from_slice(points)
+    })?;
     Ok(out)
 }
 
@@ -358,7 +364,12 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(from: u64, to: u64, step: Option<u64>, groups: Vec<String>) -> std::result::Result<Grid, String> {
+    fn new(
+        from: u64,
+        to: u64,
+        step: Option<u64>,
+        groups: Vec<String>,
+    ) -> std::result::Result<Grid, String> {
         let (step, first_bucket, buckets) = match step {
             Some(step) => {
                 if step == 0 {
@@ -372,7 +383,9 @@ impl Grid {
         };
         let total = buckets as u64 * groups.len().max(1) as u64;
         if total > MAX_CELLS {
-            return Err(format!("{total} result cells; use a larger --step or a narrower range"));
+            return Err(format!(
+                "{total} result cells; use a larger --step or a narrower range"
+            ));
         }
         let cells = (0..total).map(|_| Cell::default()).collect();
         Ok(Grid {
@@ -614,12 +627,17 @@ pub fn aggregate_rollups(
         by,
     } = query;
     if matches!(func, Func::Rate | Func::Pct(_)) {
-        return Err("rollups hold count, sum, min and max only; rate and percentiles need raw points".to_string());
+        return Err(
+            "rollups hold count, sum, min and max only; rate and percentiles need raw points"
+                .to_string(),
+        );
     }
     if let Some(step) = step
         && step % rollup_step != 0
     {
-        return Err(format!("step must be a multiple of the rollup step {rollup_step}"));
+        return Err(format!(
+            "step must be a multiple of the rollup step {rollup_step}"
+        ));
     }
     let Some(table) = m.rollups.get(&rollup_step) else {
         return Ok(Vec::new());
@@ -738,7 +756,9 @@ pub fn downsample(
     let entries: Vec<((u64, u64), Rollup)> = per_series.into_iter().flatten().collect();
     let rollups = entries.len();
     db.commit(format!("downsample {step}ms"), |m| {
-        m.rollups.get_or_insert_with(step, Map::default).extend(entries);
+        m.rollups
+            .get_or_insert_with(step, Map::default)
+            .extend(entries);
     })?;
     Ok(Downsampled {
         series: sids.len(),
@@ -758,7 +778,12 @@ pub fn drop_before(db: &Db<Metrics>, cutoff: u64) -> Result<Retained> {
         let mut report = Retained::default();
         let boundary = bucket_of(cutoff);
         report.partitions_dropped = m.chunks.remove_range(..boundary);
-        report.points_dropped = m.part_points.take_range(..boundary).values().map(|n| *n).sum();
+        report.points_dropped = m
+            .part_points
+            .take_range(..boundary)
+            .values()
+            .map(|n| *n)
+            .sum();
         if cutoff > boundary
             && let Some(part) = m.chunks.get_mut(&boundary)
         {
@@ -814,7 +839,11 @@ pub fn stats(db: &Db<Metrics>) -> Stats {
         partitions: m.chunks.len(),
         chunks: m.chunks.values().map(|part| part.len()).sum(),
         points: m.points,
-        rollup_tables: m.rollups.iter().map(|(step, table)| (step, table.len())).collect(),
+        rollup_tables: m
+            .rollups
+            .iter()
+            .map(|(step, table)| (step, table.len()))
+            .collect(),
         first_bucket: m.chunks.first().map(|(bucket, _)| bucket),
         last_bucket: m.chunks.last().map(|(bucket, _)| bucket + BUCKET_MS),
         raw_floor: m.raw_floor,
@@ -848,7 +877,9 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
         for (sid, chunk) in part.iter() {
             report.chunks += 1;
             if !m.series.contains(&sid) {
-                report.problems.push(format!("chunk for unknown series {sid}"));
+                report
+                    .problems
+                    .push(format!("chunk for unknown series {sid}"));
             }
             match chunk.decode_points() {
                 Err(error) => report
@@ -857,23 +888,23 @@ pub fn verify(db: &Db<Metrics>) -> Result<Verification> {
                 Ok(points) => {
                     report.points += points.len() as u64;
                     if points.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-                        report
-                            .problems
-                            .push(format!("bucket {bucket} series {sid}: timestamps not increasing"));
+                        report.problems.push(format!(
+                            "bucket {bucket} series {sid}: timestamps not increasing"
+                        ));
                     }
                     if points.iter().any(|p| bucket_of(p.0) != bucket) {
-                        report
-                            .problems
-                            .push(format!("bucket {bucket} series {sid}: point outside bucket"));
+                        report.problems.push(format!(
+                            "bucket {bucket} series {sid}: point outside bucket"
+                        ));
                     }
                 }
             }
         }
         let held = report.points - before;
         if m.part_points.get(&bucket).as_deref() != Some(&held) {
-            report
-                .problems
-                .push(format!("bucket {bucket} holds {held} points but its counter disagrees"));
+            report.problems.push(format!(
+                "bucket {bucket} holds {held} points but its counter disagrees"
+            ));
         }
     }
     if m.part_points.len() != m.chunks.len() {
@@ -901,7 +932,9 @@ pub fn label_summary(m: &Metrics, name: Option<&str>) -> Vec<(String, Vec<(Strin
         if let Some((k, v)) = pair.split_once('=')
             && name.is_none_or(|n| n == k)
         {
-            out.entry(k.to_string()).or_default().push((v.to_string(), count));
+            out.entry(k.to_string())
+                .or_default()
+                .push((v.to_string(), count));
         }
     }
     out.into_iter().collect()

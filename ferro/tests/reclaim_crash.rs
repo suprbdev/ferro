@@ -242,8 +242,15 @@ fn check(path: &Path, recording: &Recording, acked: u64, context: &str) {
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: {error}"));
-    assert!(reader.version() >= acked, "{context}: read-only lost {acked}");
-    assert_eq!(dump(&reader.read()), recording.models[&reader.version()], "{context}");
+    assert!(
+        reader.version() >= acked,
+        "{context}: read-only lost {acked}"
+    );
+    assert_eq!(
+        dump(&reader.read()),
+        recording.models[&reader.version()],
+        "{context}"
+    );
     drop(reader);
     let db: Db<Root> = Options::new()
         .durability(Durability::Buffered)
@@ -251,8 +258,16 @@ fn check(path: &Path, recording: &Recording, acked: u64, context: &str) {
         .reclaim(MANUAL)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: {error}"));
-    assert!(db.version() >= acked, "{context}: lost {acked}, at {}", db.version());
-    assert_eq!(dump(&db.read()), recording.models[&db.version()], "{context}");
+    assert!(
+        db.version() >= acked,
+        "{context}: lost {acked}, at {}",
+        db.version()
+    );
+    assert_eq!(
+        dump(&db.read()),
+        recording.models[&db.version()],
+        "{context}"
+    );
     let log: Vec<u64> = db.log().iter().map(|(v, _)| v).collect();
     for version in log {
         assert_eq!(
@@ -261,13 +276,16 @@ fn check(path: &Path, recording: &Recording, acked: u64, context: &str) {
             "{context} v{version}"
         );
     }
-    db.verify().unwrap_or_else(|error| panic!("{context}: {error}"));
+    db.verify()
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
     db.update(|root| {
         root.insert(u64::MAX, "after".into());
     })
     .unwrap();
-    db.compact(Keep::Last(1)).unwrap_or_else(|error| panic!("{context}: {error}"));
-    db.verify().unwrap_or_else(|error| panic!("{context}: {error}"));
+    db.compact(Keep::Last(1))
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+    db.verify()
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
 }
 
 fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
@@ -289,7 +307,10 @@ fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
             }
             let context = format!("cut {cut} of {} {loss:?}", recording.ops.len());
             check(&path, recording, state.acked, &context);
-            assert!(!temp.exists(), "{context}: temp file survived a writer open");
+            assert!(
+                !temp.exists(),
+                "{context}: temp file survived a writer open"
+            );
             images += 1;
         }
         cut += stride.max(1);
@@ -319,14 +340,22 @@ fn the_new_file_is_durable_before_it_is_named_and_named_before_it_is_used() {
     for op in &recording.ops {
         match op {
             Op::Write(inode, ..) | Op::SetLen(inode, _) => {
-                assert_ne!(Some(*inode), unnamed, "written before the rename was durable");
+                assert_ne!(
+                    Some(*inode),
+                    unnamed,
+                    "written before the rename was durable"
+                );
                 *unsynced.entry(*inode).or_default() += 1;
             }
             Op::Sync(inode) => {
                 unsynced.insert(*inode, 0);
             }
             Op::Rename(inode) => {
-                assert_eq!(unsynced.get(inode).copied().unwrap_or(0), 0, "named before it was durable");
+                assert_eq!(
+                    unsynced.get(inode).copied().unwrap_or(0),
+                    0,
+                    "named before it was durable"
+                );
                 unnamed = Some(*inode);
                 renames += 1;
             }
@@ -346,7 +375,10 @@ fn either_superblock_of_a_new_generation_can_be_damaged() {
     let mut rng = Rng::new(21);
     let mut checked = 0;
     for cut in 0..=recording.ops.len() {
-        if !matches!(cut.checked_sub(1).map(|at| &recording.ops[at]), Some(Op::SyncDir)) {
+        if !matches!(
+            cut.checked_sub(1).map(|at| &recording.ops[at]),
+            Some(Op::SyncDir)
+        ) {
             continue;
         }
         let state = crash(&recording, cut, Loss::Nothing, &mut rng);
@@ -354,10 +386,18 @@ fn either_superblock_of_a_new_generation_can_be_damaged() {
             let mut damaged = state.named.clone();
             damaged[slot + 8] ^= 0x40;
             fs::write(&path, &damaged).unwrap();
-            let reader = Options::new().read_only().cache_bytes(1).open::<Root>(&path);
+            let reader = Options::new()
+                .read_only()
+                .cache_bytes(1)
+                .open::<Root>(&path);
             let db = reader.unwrap_or_else(|error| panic!("cut {cut} slot {slot}: {error}"));
-            assert_eq!(dump(&db.read()), recording.models[&db.version()], "cut {cut}");
-            db.verify().unwrap_or_else(|error| panic!("cut {cut} slot {slot}: {error}"));
+            assert_eq!(
+                dump(&db.read()),
+                recording.models[&db.version()],
+                "cut {cut}"
+            );
+            db.verify()
+                .unwrap_or_else(|error| panic!("cut {cut} slot {slot}: {error}"));
             checked += 1;
         }
     }

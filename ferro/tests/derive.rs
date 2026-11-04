@@ -132,9 +132,16 @@ struct GrewBlob {
 fn transparent_newtypes_encode_as_their_field() {
     let raw = Bytes::from(vec![1u8, 2, 3, 4]);
     assert_eq!(bytes(&Blob(raw.clone())), bytes(&raw));
-    assert_eq!(bytes(&Named { inner: raw.to_vec() }), bytes(&raw));
+    assert_eq!(
+        bytes(&Named {
+            inner: raw.to_vec()
+        }),
+        bytes(&raw)
+    );
     roundtrip(Blob(raw.clone()));
-    roundtrip(Named { inner: raw.to_vec() });
+    roundtrip(Named {
+        inner: raw.to_vec(),
+    });
     let mut encoded = Vec::new();
     {
         let mut sink = HashSink;
@@ -368,10 +375,12 @@ fn composite_index_orders_by_each_field_in_turn() {
     table.insert(event(2, "a", 20));
     table.insert(event(3, "a", 10));
     table.insert(event(4, "a", 20));
-    let listed = |rows: ferro::table::IndexIter<Event>| -> Vec<u64> {
-        rows.map(|row| row.id).collect()
-    };
-    assert_eq!(listed(table.by_tenant_created(&("a".to_string(), 20))), [2, 4]);
+    let listed =
+        |rows: ferro::table::IndexIter<Event>| -> Vec<u64> { rows.map(|row| row.id).collect() };
+    assert_eq!(
+        listed(table.by_tenant_created(&("a".to_string(), 20))),
+        [2, 4]
+    );
     assert_eq!(listed(table.by_tenant_created_prefix("a")), [3, 2, 4]);
     assert_eq!(listed(table.by_tenant_created_prefix("b")), [1]);
     assert_eq!(listed(table.by_tenant_created_prefix("c")), [0u64; 0]);

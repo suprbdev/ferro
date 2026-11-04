@@ -19,7 +19,13 @@ pub fn rss_mib() -> u64 {
     status
         .lines()
         .find_map(|line| line.strip_prefix("VmHWM:"))
-        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .and_then(|rest| {
+            rest.trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .map_or(0, |kib| kib / 1024)
 }
 
@@ -146,8 +152,18 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
             }
         })
         .collect();
-    let (ferro_has, h1) = timed(|| probes.iter().filter(|&&(a, b)| g.out.contains(a, b)).count());
-    let (ferro_has2, _) = timed(|| probes.iter().filter(|&&(a, b)| g.out.contains(a, b)).count());
+    let (ferro_has, h1) = timed(|| {
+        probes
+            .iter()
+            .filter(|&&(a, b)| g.out.contains(a, b))
+            .count()
+    });
+    let (ferro_has2, _) = timed(|| {
+        probes
+            .iter()
+            .filter(|&&(a, b)| g.out.contains(a, b))
+            .count()
+    });
     let (vec_has, h2) = timed(|| {
         probes
             .iter()
@@ -167,7 +183,8 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
 
     let (scan_t, scan_n) = timed(|| {
         let mut total = 0;
-        g.out.for_each_user(0, n as UserId, |_, ids| total += ids.len());
+        g.out
+            .for_each_user(0, n as UserId, |_, ids| total += ids.len());
         total
     });
     let (walk_t, walked) = timed(|| {
@@ -176,7 +193,12 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
         total
     });
     assert_eq!(walked, scan_n);
-    let (vec_scan, vs) = timed(|| std::hint::black_box(&csr.out_to).iter().map(|&v| v as u64).sum::<u64>());
+    let (vec_scan, vs) = timed(|| {
+        std::hint::black_box(&csr.out_to)
+            .iter()
+            .map(|&v| v as u64)
+            .sum::<u64>()
+    });
     std::hint::black_box(vs);
     writeln!(
         out,
@@ -196,10 +218,12 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
     )?;
 
     let starts: Vec<UserId> = (0..20)
-        .map(|_| loop {
-            let u = rng.below(n) as UserId;
-            if csr.out(u).len() >= 5 {
-                break u;
+        .map(|_| {
+            loop {
+                let u = rng.below(n) as UserId;
+                if csr.out(u).len() >= 5 {
+                    break u;
+                }
             }
         })
         .collect();
@@ -269,13 +293,22 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
         )?;
     }
     let (t_vec, picks) = timed(|| {
-        starts.iter().map(|&u| csr_recommend(&csr, u, 10, 10_000).len()).sum::<usize>()
+        starts
+            .iter()
+            .map(|&u| csr_recommend(&csr, u, 10, 10_000).len())
+            .sum::<usize>()
     });
     let (t_cold, cold_picks) = timed(|| {
-        starts.iter().map(|&u| query::recommend(g, u, 10, 10_000).len()).sum::<usize>()
+        starts
+            .iter()
+            .map(|&u| query::recommend(g, u, 10, 10_000).len())
+            .sum::<usize>()
     });
     let (t_warm, _) = timed(|| {
-        starts.iter().map(|&u| query::recommend(g, u, 10, 10_000).len()).sum::<usize>()
+        starts
+            .iter()
+            .map(|&u| query::recommend(g, u, 10, 10_000).len())
+            .sum::<usize>()
     });
     assert_eq!(picks, cold_picks);
     writeln!(
@@ -291,7 +324,12 @@ fn overhead(out: &mut dyn Write, db: &Db<Graph>, lookups: usize) -> Res<()> {
     Ok(())
 }
 
-fn pagerank_bench(out: &mut dyn Write, db: &Db<Graph>, iterations: usize, threads: usize) -> Res<()> {
+fn pagerank_bench(
+    out: &mut dyn Write,
+    db: &Db<Graph>,
+    iterations: usize,
+    threads: usize,
+) -> Res<()> {
     let snap = db.read();
     let g: &Graph = &snap;
     let (build, csr) = timed(|| Csr::from_graph(g));
@@ -335,9 +373,10 @@ fn writers_bench(
                         if a == b {
                             continue;
                         }
-                        let done = db.try_commit_with::<_, String, Box<dyn std::error::Error>>(|g| {
-                            ops::follow(g, a, b).map(|v| ("follow".to_string(), v))
-                        });
+                        let done =
+                            db.try_commit_with::<_, String, Box<dyn std::error::Error>>(|g| {
+                                ops::follow(g, a, b).map(|v| ("follow".to_string(), v))
+                            });
                         if done.is_ok_and(|d| d.changed) {
                             count.fetch_add(1, Ordering::Relaxed);
                         }
@@ -405,7 +444,10 @@ fn writers_bench(
         live.edges
     )?;
     let identical = ranks0 == ranks1;
-    writeln!(out, "pagerank results identical idle vs during writes: {identical}")?;
+    writeln!(
+        out,
+        "pagerank results identical idle vs during writes: {identical}"
+    )?;
     Ok(())
 }
 
@@ -424,13 +466,20 @@ fn counts_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
     let n = g.user_count() as u64;
     writeln!(out, "celebrity {celebrity} with {followers} followers")?;
     let mut rng = Rng::new(3);
-    for (label, with_counts) in [("without cached counts", false), ("with cached counts", true)] {
+    for (label, with_counts) in [
+        ("without cached counts", false),
+        ("with cached counts", true),
+    ] {
         for (who, celeb) in [("celebrity followed", true), ("ordinary followed", false)] {
             let before = db.size_on_disk();
             let mut lat = Vec::new();
             for _ in 0..commits {
                 let a = rng.below(n) as UserId;
-                let b = if celeb { celebrity } else { rng.below(n) as UserId };
+                let b = if celeb {
+                    celebrity
+                } else {
+                    rng.below(n) as UserId
+                };
                 if a == b {
                     continue;
                 }
@@ -509,7 +558,11 @@ fn fanout_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
         for fanout in [false, true] {
             let mut lat = Vec::new();
             let before = db.size_on_disk();
-            let reps = if followers > 50_000 { commits.min(3) } else { commits };
+            let reps = if followers > 50_000 {
+                commits.min(3)
+            } else {
+                commits
+            };
             for _ in 0..reps {
                 let t = Instant::now();
                 db.try_commit_with::<_, String, Box<dyn std::error::Error>>(|g| {

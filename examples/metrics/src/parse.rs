@@ -86,7 +86,9 @@ fn parse_value(token: &str) -> Result<f64, String> {
         "NaN" | "nan" => Ok(f64::NAN),
         "+Inf" | "Inf" | "inf" | "+inf" => Ok(f64::INFINITY),
         "-Inf" | "-inf" => Ok(f64::NEG_INFINITY),
-        _ => token.parse::<f64>().map_err(|_| format!("bad value '{token}'")),
+        _ => token
+            .parse::<f64>()
+            .map_err(|_| format!("bad value '{token}'")),
     }
 }
 

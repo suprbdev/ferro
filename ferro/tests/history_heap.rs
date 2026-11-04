@@ -73,7 +73,10 @@ fn row(i: u64) -> Row {
 }
 
 fn build(path: &Path) {
-    let db: Db<Shop> = Options::new().durability(Durability::Buffered).open(path).unwrap();
+    let db: Db<Shop> = Options::new()
+        .durability(Durability::Buffered)
+        .open(path)
+        .unwrap();
     db.update(|shop| {
         for i in 0..60_000u64 {
             shop.rows.insert(row(i));
@@ -139,7 +142,12 @@ fn walking_history_stays_near_cache_bytes() {
         report("at every version", setting, &versions);
         let projected = walk(&path, setting, |db| {
             let changes = db
-                .history_of(|shop| (shop.rows.get(&probe).map(|row| row.name.clone()), shop.counts.len()))
+                .history_of(|shop| {
+                    (
+                        shop.rows.get(&probe).map(|row| row.name.clone()),
+                        shop.counts.len(),
+                    )
+                })
                 .count();
             std::hint::black_box(changes);
         });

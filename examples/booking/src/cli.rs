@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "booking", about = "Hotel reservations with holds, refunds and what-ifs, on ferro")]
+#[command(
+    name = "booking",
+    about = "Hotel reservations with holds, refunds and what-ifs, on ferro"
+)]
 pub struct Cli {
     #[arg(long, global = true, default_value = "booking.ferro")]
     pub db: PathBuf,
@@ -181,7 +184,9 @@ impl Command {
         match self {
             Command::Venue { cmd } => matches!(cmd, VenueCmd::List),
             Command::Room { cmd } => matches!(cmd, RoomCmd::Prices { .. } | RoomCmd::List { .. }),
-            Command::Customer { cmd } => matches!(cmd, CustomerCmd::Show { .. } | CustomerCmd::List),
+            Command::Customer { cmd } => {
+                matches!(cmd, CustomerCmd::Show { .. } | CustomerCmd::List)
+            }
             Command::Whatif { cmd } => matches!(cmd, WhatIfCmd::Show { .. } | WhatIfCmd::List),
             Command::Avail { .. }
             | Command::Show { .. }

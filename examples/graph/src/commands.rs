@@ -91,7 +91,9 @@ pub fn run_write(out: &mut dyn Write, db: &Db<Graph>, cmd: WriteCmd) -> Res<()> 
             let snap = db.read();
             let who = resolve(&snap, &user)?;
             drop(snap);
-            let done = commit(db, format!("like {who} {post}"), |g| ops::like(g, who, post))?;
+            let done = commit(db, format!("like {who} {post}"), |g| {
+                ops::like(g, who, post)
+            })?;
             if done.value {
                 writeln!(out, "liked post {post} by {who} (v{})", done.version)?;
             } else {
@@ -161,7 +163,10 @@ pub fn run_read(out: &mut dyn Write, snap: &Snapshot<Graph>, cmd: ReadCmd) -> Re
             }
             let follows_ab = g.out.contains(x, y);
             let follows_ba = g.out.contains(y, x);
-            writeln!(out, "{x} follows {y}: {follows_ab}, {y} follows {x}: {follows_ba}")?;
+            writeln!(
+                out,
+                "{x} follows {y}: {follows_ab}, {y} follows {x}: {follows_ba}"
+            )?;
         }
         ReadCmd::Path { a, b, max_depth } => {
             let (x, y) = (resolve(g, &a)?, resolve(g, &b)?);
@@ -194,10 +199,7 @@ pub fn run_read(out: &mut dyn Write, snap: &Snapshot<Graph>, cmd: ReadCmd) -> Re
                 writeln!(
                     out,
                     "{}\t{}\t{}\t{}",
-                    post.id,
-                    post.author,
-                    post.at_ms,
-                    post.text
+                    post.id, post.author, post.at_ms, post.text
                 )?;
             }
         }
@@ -260,20 +262,12 @@ fn stats(out: &mut dyn Write, snap: &Snapshot<Graph>) -> Res<()> {
         g.out.block_count(),
         g.inn.block_count()
     )?;
-    let mut top: Vec<(u32, UserId)> = g
-        .degrees
-        .iter()
-        .map(|(id, d)| (d.followers, id))
-        .collect();
+    let mut top: Vec<(u32, UserId)> = g.degrees.iter().map(|(id, d)| (d.followers, id)).collect();
     top.sort_unstable_by(|a, b| b.cmp(a));
     for (followers, id) in top.iter().take(5) {
         writeln!(out, "top {id} followers {followers}")?;
     }
-    let mut busy: Vec<(u32, UserId)> = g
-        .degrees
-        .iter()
-        .map(|(id, d)| (d.following, id))
-        .collect();
+    let mut busy: Vec<(u32, UserId)> = g.degrees.iter().map(|(id, d)| (d.following, id)).collect();
     busy.sort_unstable_by(|a, b| b.cmp(a));
     for (following, id) in busy.iter().take(3) {
         writeln!(out, "busiest {id} following {following}")?;

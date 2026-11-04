@@ -78,7 +78,9 @@ fn field(line: &str, index: usize) -> &str {
 #[test]
 fn ingest_reports_and_rejects_bad_lines() {
     let env = Env::new();
-    let out = env.ingest_text("up{job=\"x\"} 1 1000\n# comment\n\nnot a metric line\nup{job=\"x\"} 2 2000\n");
+    let out = env.ingest_text(
+        "up{job=\"x\"} 1 1000\n# comment\n\nnot a metric line\nup{job=\"x\"} 2 2000\n",
+    );
     assert!(out.contains("ingested 2 points"), "{out}");
     assert!(out.contains("rejected 1 lines"), "{out}");
     assert!(out.contains("1 new series"), "{out}");
@@ -103,7 +105,10 @@ fn ingest_strict_fails_on_bad_line() {
     let path = env.dir.path().join("bad.txt");
     std::fs::write(&path, "up 1 1000\nbroken\n").unwrap();
     let err = env.fail(&["ingest", "--strict", path.to_str().unwrap()]);
-    assert!(err.contains("rejected") || err.contains("lines rejected"), "{err}");
+    assert!(
+        err.contains("rejected") || err.contains("lines rejected"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -161,7 +166,14 @@ fn query_filters_by_labels_and_time() {
     assert_eq!(glob.len(), 7 * 120);
     let from = (T0 + 10 * 60_000).to_string();
     let to = (T0 + 20 * 60_000).to_string();
-    let window = env.lines(&["query", r#"http_requests{host="a",status="200"}"#, "--from", &from, "--to", &to]);
+    let window = env.lines(&[
+        "query",
+        r#"http_requests{host="a",status="200"}"#,
+        "--from",
+        &from,
+        "--to",
+        &to,
+    ]);
     assert_eq!(window.len(), 10);
     assert!(window[0].ends_with(&from));
     let limited = env.lines(&["query", "http_requests", "--limit", "3"]);
@@ -203,7 +215,10 @@ fn rows(env: &Env, args: &[&str]) -> Vec<(String, f64)> {
         .iter()
         .map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            (parts[parts.len() - 2].to_string(), parts[parts.len() - 1].parse().unwrap())
+            (
+                parts[parts.len() - 2].to_string(),
+                parts[parts.len() - 1].parse().unwrap(),
+            )
         })
         .collect()
 }
@@ -211,7 +226,9 @@ fn rows(env: &Env, args: &[&str]) -> Vec<(String, f64)> {
 #[test]
 fn aggregate_functions_over_whole_range() {
     let env = Env::new();
-    env.ingest_text("g{h=\"a\"} 1 1000\ng{h=\"a\"} 3 2000\ng{h=\"b\"} 10 1500\ng{h=\"b\"} 20 2500\n");
+    env.ingest_text(
+        "g{h=\"a\"} 1 1000\ng{h=\"a\"} 3 2000\ng{h=\"b\"} 10 1500\ng{h=\"b\"} 20 2500\n",
+    );
     let agg = |f: &str| rows(&env, &["aggregate", "g", "--fn", f]);
     assert_eq!(agg("sum")[0].1, 34.0);
     assert_eq!(agg("avg")[0].1, 8.5);
@@ -250,9 +267,19 @@ fn aggregate_groups_by_label_and_steps() {
         &step,
     ]);
     assert_eq!(by_host.len(), 3 * 12);
-    assert!(by_host.iter().all(|line| field(line, 2) == "20"), "{by_host:?}");
+    assert!(
+        by_host.iter().all(|line| field(line, 2) == "20"),
+        "{by_host:?}"
+    );
     assert!(by_host[0].starts_with("host=a\t"));
-    let by_status = env.lines(&["aggregate", "http_requests", "--fn", "max", "--by", "status"]);
+    let by_status = env.lines(&[
+        "aggregate",
+        "http_requests",
+        "--fn",
+        "max",
+        "--by",
+        "status",
+    ]);
     assert_eq!(by_status.len(), 2);
     assert_eq!(field(&by_status[0], 2), "238");
     assert_eq!(field(&by_status[1], 2), "119");
@@ -261,10 +288,20 @@ fn aggregate_groups_by_label_and_steps() {
 #[test]
 fn aggregate_rate_handles_counter_resets() {
     let env = Env::new();
-    env.ingest_text(
-        "c 0 0\nc 10 10000\nc 20 20000\nc 5 30000\nc 15 40000\n",
+    env.ingest_text("c 0 0\nc 10 10000\nc 20 20000\nc 5 30000\nc 15 40000\n");
+    let rate = rows(
+        &env,
+        &[
+            "aggregate",
+            "c",
+            "--fn",
+            "rate",
+            "--from",
+            "0",
+            "--to",
+            "50000",
+        ],
     );
-    let rate = rows(&env, &["aggregate", "c", "--fn", "rate", "--from", "0", "--to", "50000"]);
     assert_eq!(rate.len(), 1);
     let expected = (10.0 + 10.0 + 5.0 + 10.0) / 40.0;
     assert!((rate[0].1 - expected).abs() < 1e-9, "{rate:?}");
@@ -296,15 +333,30 @@ fn aggregate_across_many_series_is_exact() {
     }
     env.ingest_text(&text);
     let sum = |args: &[&str]| rows(&env, args);
-    assert_eq!(sum(&["aggregate", "many", "--fn", "sum"])[0].1, (0..300u64).map(|id| 4 * id + 6000).sum::<u64>() as f64);
+    assert_eq!(
+        sum(&["aggregate", "many", "--fn", "sum"])[0].1,
+        (0..300u64).map(|id| 4 * id + 6000).sum::<u64>() as f64
+    );
     assert_eq!(sum(&["aggregate", "many", "--fn", "count"])[0].1, 1200.0);
     assert_eq!(sum(&["aggregate", "many", "--fn", "max"])[0].1, 3299.0);
     assert_eq!(sum(&["aggregate", "many", "--fn", "min"])[0].1, 0.0);
     let p50 = sum(&["aggregate", "many", "--fn", "p50"])[0].1;
     assert!((1000.0..=3000.0).contains(&p50), "{p50}");
-    let by_group = env.lines(&["aggregate", "many", "--fn", "count", "--by", "grp", "--step", "20s"]);
+    let by_group = env.lines(&[
+        "aggregate",
+        "many",
+        "--fn",
+        "count",
+        "--by",
+        "grp",
+        "--step",
+        "20s",
+    ]);
     assert_eq!(by_group.len(), 3 * 2, "{by_group:?}");
-    assert!(by_group.iter().all(|l| field(l, 2) == "200"), "{by_group:?}");
+    assert!(
+        by_group.iter().all(|l| field(l, 2) == "200"),
+        "{by_group:?}"
+    );
     let rate = sum(&["aggregate", "many", "--fn", "rate", "--step", "1h"])[0].1;
     assert!((rate - 300.0 * 1000.0 / 10.0).abs() < 1e-6, "{rate}");
 }
@@ -321,7 +373,10 @@ fn aggregate_rejects_unknown_function() {
 fn aggregate_on_empty_selection_prints_nothing() {
     let env = Env::new();
     env.seed();
-    assert!(env.lines(&["aggregate", "missing", "--fn", "sum"]).is_empty());
+    assert!(
+        env.lines(&["aggregate", "missing", "--fn", "sum"])
+            .is_empty()
+    );
 }
 
 #[test]
@@ -332,10 +387,21 @@ fn series_lists_and_counts() {
     assert_eq!(env.ok(&["series", "--count"]).trim(), "7");
     let a = env.lines(&["series", r#"{host="a"}"#]);
     assert_eq!(a.len(), 3);
-    assert!(a.contains(&r#"http_requests{host="a",status="200"}"#.to_string()), "{a:?}");
+    assert!(
+        a.contains(&r#"http_requests{host="a",status="200"}"#.to_string()),
+        "{a:?}"
+    );
     assert!(a.contains(&r#"temp{host="a"}"#.to_string()), "{a:?}");
-    assert_eq!(env.lines(&["series", r#"http_requests{status="500",host=~"b*"}"#]).len(), 1);
-    assert_eq!(env.lines(&["series", r#"http_requests{status!="500"}"#]).len(), 3);
+    assert_eq!(
+        env.lines(&["series", r#"http_requests{status="500",host=~"b*"}"#])
+            .len(),
+        1
+    );
+    assert_eq!(
+        env.lines(&["series", r#"http_requests{status!="500"}"#])
+            .len(),
+        3
+    );
 }
 
 #[test]
@@ -409,9 +475,27 @@ fn downsample_is_idempotent() {
     let env = Env::new();
     env.seed();
     env.ok(&["downsample", "--step", "10m"]);
-    let first = env.ok(&["aggregate", "http_requests", "--rollup", "10m", "--fn", "sum", "--step", "1h"]);
+    let first = env.ok(&[
+        "aggregate",
+        "http_requests",
+        "--rollup",
+        "10m",
+        "--fn",
+        "sum",
+        "--step",
+        "1h",
+    ]);
     env.ok(&["downsample", "--step", "10m"]);
-    let second = env.ok(&["aggregate", "http_requests", "--rollup", "10m", "--fn", "sum", "--step", "1h"]);
+    let second = env.ok(&[
+        "aggregate",
+        "http_requests",
+        "--rollup",
+        "10m",
+        "--fn",
+        "sum",
+        "--step",
+        "1h",
+    ]);
     assert_eq!(first, second);
 }
 
@@ -445,7 +529,12 @@ fn rollup_aggregates_match_raw_aggregates() {
         ]);
         let parse = |text: &str| -> Vec<(String, f64)> {
             text.lines()
-                .map(|l| (format!("{}{}", field(l, 0), field(l, 1)), field(l, 2).parse().unwrap()))
+                .map(|l| {
+                    (
+                        format!("{}{}", field(l, 0), field(l, 1)),
+                        field(l, 2).parse().unwrap(),
+                    )
+                })
                 .collect()
         };
         let (raw, rolled) = (parse(&raw), parse(&rolled));
@@ -474,7 +563,12 @@ fn rollup_folds_match_raw_aggregates() {
     ];
     let parse = |text: &str| -> Vec<(String, f64)> {
         text.lines()
-            .map(|l| (format!("{}{}", field(l, 0), field(l, 1)), field(l, 2).parse().unwrap()))
+            .map(|l| {
+                (
+                    format!("{}{}", field(l, 0), field(l, 1)),
+                    field(l, 2).parse().unwrap(),
+                )
+            })
             .collect()
     };
     for func in ["sum", "avg", "min", "max", "count"] {
@@ -520,7 +614,16 @@ fn rollup_rejects_rate_and_bad_step() {
     env.ok(&["downsample", "--step", "10m"]);
     let err = env.fail(&["aggregate", "temp", "--rollup", "10m", "--fn", "rate"]);
     assert!(err.contains("raw points"), "{err}");
-    let err = env.fail(&["aggregate", "temp", "--rollup", "10m", "--fn", "sum", "--step", "15m"]);
+    let err = env.fail(&[
+        "aggregate",
+        "temp",
+        "--rollup",
+        "10m",
+        "--fn",
+        "sum",
+        "--step",
+        "15m",
+    ]);
     assert!(err.contains("multiple"), "{err}");
 }
 
@@ -570,10 +673,16 @@ fn retain_drops_old_points_and_shrinks_file() {
     assert!(size_after < size_before, "{size_after} < {size_before}");
     let lines = env.lines(&["query", r#"m{host="b"}"#]);
     assert_eq!(lines.len(), 18);
-    assert!(lines[0].ends_with(&(T0 + 3 * HOUR).to_string()), "{lines:?}");
+    assert!(
+        lines[0].ends_with(&(T0 + 3 * HOUR).to_string()),
+        "{lines:?}"
+    );
     let stats = env.ok(&["stats"]);
     assert!(stats.contains("versions     1 "), "{stats}");
-    assert!(stats.contains(&format!("raw floor    {}", T0 + 3 * HOUR)), "{stats}");
+    assert!(
+        stats.contains(&format!("raw floor    {}", T0 + 3 * HOUR)),
+        "{stats}"
+    );
     env.ok(&["verify"]);
 }
 
@@ -604,7 +713,10 @@ fn retain_inside_a_partition_keeps_its_counter_right() {
     let now = (start + 200_000 + HOUR).to_string();
     let out = env.ok(&["retain", "--older-than", "1h", "--now", &now]);
     assert!(out.contains("dropped 2 points in 0 partitions"), "{out}");
-    assert_eq!(env.lines(&["query", r#"m{host="a"}"#, "--from", "0"]).len(), 1);
+    assert_eq!(
+        env.lines(&["query", r#"m{host="a"}"#, "--from", "0"]).len(),
+        1
+    );
     env.ok(&["verify"]);
     env.ingest_text(&format!("m{{host=\"a\"}} 4 {}\n", start + 400_000));
     env.ok(&["verify"]);
@@ -623,9 +735,25 @@ fn retain_keep_versions_controls_history() {
         env.ingest_text(&format!("m {i} {}\n", T0 + i * 1000));
     }
     let now = T0.to_string();
-    env.ok(&["retain", "--older-than", "1h", "--now", &now, "--keep-versions", "4"]);
+    env.ok(&[
+        "retain",
+        "--older-than",
+        "1h",
+        "--now",
+        &now,
+        "--keep-versions",
+        "4",
+    ]);
     assert!(env.ok(&["stats"]).contains("versions     4 "));
-    env.ok(&["retain", "--older-than", "1h", "--now", &now, "--keep-since", "1h"]);
+    env.ok(&[
+        "retain",
+        "--older-than",
+        "1h",
+        "--now",
+        &now,
+        "--keep-since",
+        "1h",
+    ]);
     assert!(env.ok(&["stats"]).contains("versions     4 "));
     env.ok(&["retain", "--older-than", "1h", "--now", &now]);
     assert!(env.ok(&["stats"]).contains("versions     1 "));
@@ -637,7 +765,14 @@ fn retain_without_compact_leaves_file_size() {
     old_and_new(&env);
     let size_before = std::fs::metadata(&env.db).unwrap().len();
     let now = (T0 + 6 * HOUR).to_string();
-    let out = env.ok(&["retain", "--older-than", "1h", "--now", &now, "--no-compact"]);
+    let out = env.ok(&[
+        "retain",
+        "--older-than",
+        "1h",
+        "--now",
+        &now,
+        "--no-compact",
+    ]);
     assert!(!out.contains("compacted"), "{out}");
     assert!(std::fs::metadata(&env.db).unwrap().len() >= size_before);
     assert!(env.ok(&["stats"]).contains("versions     2 "));
@@ -650,10 +785,28 @@ fn retain_keeps_rollups_after_dropping_raw() {
     env.ok(&["downsample", "--step", "1h"]);
     let now = (T0 + 6 * HOUR).to_string();
     env.ok(&["retain", "--older-than", "3h", "--now", &now]);
-    let rolled = env.lines(&["aggregate", "m", "--rollup", "1h", "--fn", "count", "--step", "1h"]);
+    let rolled = env.lines(&[
+        "aggregate",
+        "m",
+        "--rollup",
+        "1h",
+        "--fn",
+        "count",
+        "--step",
+        "1h",
+    ]);
     assert_eq!(rolled.len(), 6, "{rolled:?}");
     env.ok(&["downsample", "--step", "1h"]);
-    let again = env.lines(&["aggregate", "m", "--rollup", "1h", "--fn", "count", "--step", "1h"]);
+    let again = env.lines(&[
+        "aggregate",
+        "m",
+        "--rollup",
+        "1h",
+        "--fn",
+        "count",
+        "--step",
+        "1h",
+    ]);
     assert_eq!(rolled, again);
 }
 

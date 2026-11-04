@@ -50,7 +50,11 @@ fn check(ledger: &Ledger, rng: &mut Rng) {
         for _ in 0..12 {
             let from = FIRST_DAY - 5 + rng.below(DAYS + 10) as i32;
             let to = FIRST_DAY - 5 + rng.below(DAYS + 10) as i32;
-            let wanted = if from > to { 0 } else { scan(ledger, account.id, from, to) };
+            let wanted = if from > to {
+                0
+            } else {
+                scan(ledger, account.id, from, to)
+            };
             assert_eq!(ledger.sum_postings(account.id, from, to), wanted);
             let closing = scan(ledger, account.id, i32::MIN, to);
             assert_eq!(ledger.balance_at(&account, Some(to)), closing);
@@ -59,7 +63,10 @@ fn check(ledger: &Ledger, rng: &mut Rng) {
             assert_eq!(statement.opening, opening);
             assert_eq!(statement.closing, opening + wanted);
         }
-        assert_eq!(ledger.balance_at(&account, None), i128::from(account.balance));
+        assert_eq!(
+            ledger.balance_at(&account, None),
+            i128::from(account.balance)
+        );
         assert_eq!(
             ledger.sum_postings(account.id, i32::MIN, i32::MAX),
             i128::from(account.balance)
@@ -93,7 +100,9 @@ fn as_of_balances_match_a_scan_with_backdated_entries_and_reversals() {
                 ledger.post(entry(&mut rng, &names), NOW).unwrap();
             }
             let newest = ledger.next_entry;
-            ledger.reverse(newest, FIRST_DAY + rng.below(DAYS) as i32, None, NOW).unwrap();
+            ledger
+                .reverse(newest, FIRST_DAY + rng.below(DAYS) as i32, None, NOW)
+                .unwrap();
             if round % 7 == 0 {
                 check(ledger, &mut rng);
             }
@@ -121,13 +130,25 @@ fn an_as_of_total_past_the_range_of_i64_stays_exact() {
     db.update(|ledger| {
         ledger.add_account(a, Kind::Asset, "USD").unwrap();
         ledger.add_account(b, Kind::Asset, "USD").unwrap();
-        ledger.post(NewEntry::transfer(30, "up", b, a, i64::MAX), NOW).unwrap();
-        ledger.post(NewEntry::transfer(50, "down", a, b, i64::MAX), NOW).unwrap();
-        ledger.post(NewEntry::transfer(20, "up", b, a, i64::MAX), NOW).unwrap();
+        ledger
+            .post(NewEntry::transfer(30, "up", b, a, i64::MAX), NOW)
+            .unwrap();
+        ledger
+            .post(NewEntry::transfer(50, "down", a, b, i64::MAX), NOW)
+            .unwrap();
+        ledger
+            .post(NewEntry::transfer(20, "up", b, a, i64::MAX), NOW)
+            .unwrap();
     })
     .unwrap();
     let snapshot = db.read();
     let account = snapshot.account(a).unwrap();
-    assert_eq!(snapshot.balance_at(&account, Some(40)), 2 * i128::from(i64::MAX));
-    assert_eq!(snapshot.balance_at(&account, Some(60)), i128::from(i64::MAX));
+    assert_eq!(
+        snapshot.balance_at(&account, Some(40)),
+        2 * i128::from(i64::MAX)
+    );
+    assert_eq!(
+        snapshot.balance_at(&account, Some(60)),
+        i128::from(i64::MAX)
+    );
 }

@@ -170,12 +170,18 @@ impl Adj {
 
     pub fn degree(&self, a: UserId) -> usize {
         let mut total = 0;
-        self.0.for_each_range((a, 0)..=(a, UserId::MAX), |_, bytes| total += block_len(bytes));
+        self.0
+            .for_each_range((a, 0)..=(a, UserId::MAX), |_, bytes| {
+                total += block_len(bytes)
+            });
         total
     }
 
     pub fn degrees(&self, low: UserId, high: UserId, mut f: impl FnMut(UserId, usize)) {
-        self.0.for_each_range((low, 0)..(high, 0), |&(user, _), bytes| f(user, block_len(bytes)));
+        self.0
+            .for_each_range((low, 0)..(high, 0), |&(user, _), bytes| {
+                f(user, block_len(bytes))
+            });
     }
 
     pub fn neighbours(&self, a: UserId) -> Vec<UserId> {
@@ -187,7 +193,9 @@ impl Adj {
     }
 
     pub fn iter_after(&self, a: UserId, after: Option<UserId>) -> Neighbours {
-        let start = after.and_then(|b| self.floor(a, b)).map_or(0, |(first, _)| first);
+        let start = after
+            .and_then(|b| self.floor(a, b))
+            .map_or(0, |(first, _)| first);
         let mut cursor = self.0.cursor();
         cursor.seek(&(a, start));
         Neighbours {
@@ -209,15 +217,16 @@ impl Adj {
     pub fn for_each_user(&self, low: UserId, high: UserId, mut f: impl FnMut(UserId, &[u32])) {
         let mut ids = Vec::new();
         let mut owner = None;
-        self.0.for_each_range((low, 0)..(high, 0), |&(user, first), bytes| {
-            if owner != Some(user) {
-                if let Some(done) = owner.replace(user) {
-                    f(done, &ids);
+        self.0
+            .for_each_range((low, 0)..(high, 0), |&(user, first), bytes| {
+                if owner != Some(user) {
+                    if let Some(done) = owner.replace(user) {
+                        f(done, &ids);
+                    }
+                    ids.clear();
                 }
-                ids.clear();
-            }
-            decode_into(first, bytes, &mut ids);
-        });
+                decode_into(first, bytes, &mut ids);
+            });
         if let Some(done) = owner {
             f(done, &ids);
         }
@@ -289,7 +298,9 @@ impl Walker {
 
     pub fn contains(&mut self, a: UserId, b: UserId) -> bool {
         self.cursor.seek_back(&(a, b));
-        let held = self.cursor.read(|&(user, first), bytes| user == a && holds(first, bytes, b));
+        let held = self
+            .cursor
+            .read(|&(user, first), bytes| user == a && holds(first, bytes, b));
         held == Some(true)
     }
 }
@@ -384,7 +395,10 @@ pub fn intersect(
     }
     if small_degree * 16 < large_degree {
         let mut walker = large.walker();
-        return small.iter(small_user).filter(|&id| walker.contains(large_user, id)).collect();
+        return small
+            .iter(small_user)
+            .filter(|&id| walker.contains(large_user, id))
+            .collect();
     }
     let mut out = Vec::new();
     let mut x = small.iter(small_user);

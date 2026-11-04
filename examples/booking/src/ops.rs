@@ -134,10 +134,12 @@ impl Hotels {
             credit: 0,
             deposited: 0,
         };
-        self.customers.try_insert(customer).map_err(|taken| BookingError::EmailTaken {
-            email: email.to_string(),
-            holder: taken.holder,
-        })?;
+        self.customers
+            .try_insert(customer)
+            .map_err(|taken| BookingError::EmailTaken {
+                email: email.to_string(),
+                holder: taken.holder,
+            })?;
         self.next_customer = id;
         Ok(id)
     }
@@ -162,7 +164,10 @@ impl Hotels {
         if rate <= 0 {
             return Err(BookingError::BadAmount(rate));
         }
-        let mut row = self.rooms.get_mut(&room).ok_or(BookingError::NoRoom(room))?;
+        let mut row = self
+            .rooms
+            .get_mut(&room)
+            .ok_or(BookingError::NoRoom(room))?;
         let old = row.rate;
         row.rate = rate;
         Ok(old)
@@ -211,7 +216,11 @@ impl Hotels {
             .ok_or(BookingError::NoRoom(request.room))?
             .into_owned();
         let last = request.first + request.nights - 1;
-        if self.venues.get(&room.venue).is_none_or(|venue| !venue.open_on(last)) {
+        if self
+            .venues
+            .get(&room.venue)
+            .is_none_or(|venue| !venue.open_on(last))
+        {
             return Err(BookingError::VenueClosed(room.venue));
         }
         let id = self.next_booking + 1;
@@ -234,7 +243,9 @@ impl Hotels {
                 self.expire(holder, now);
                 released.push(holder);
             }
-            self.loads.get_or_insert_with((room.venue, night), Load::default).held += 1;
+            self.loads
+                .get_or_insert_with((room.venue, night), Load::default)
+                .held += 1;
         }
         let total = prices.iter().try_fold(0, |sum, price| add(sum, *price))?;
         let expires_ms = now.saturating_add(request.ttl_ms);
@@ -475,7 +486,8 @@ impl Hotels {
             None => self.rooms.rows().keys().collect(),
         };
         for room in &rooms {
-            self.rooms.update(room, |row| row.rate = scaled(row.rate, percent));
+            self.rooms
+                .update(room, |row| row.rate = scaled(row.rate, percent));
             let overrides: Vec<(u32, Night)> = self
                 .rates
                 .range((*room, 0)..=(*room, Night::MAX))

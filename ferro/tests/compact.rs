@@ -38,8 +38,7 @@ fn keep_all_preserves_every_version() {
     assert_eq!(db.version(), latest);
     for (index, rows) in expected.iter().enumerate() {
         let snapshot = db.at(index as u64 + 1).unwrap();
-        let found: Vec<(u64, String)> =
-            snapshot.iter().map(|(k, s)| (k, (*s).clone())).collect();
+        let found: Vec<(u64, String)> = snapshot.iter().map(|(k, s)| (k, (*s).clone())).collect();
         assert_eq!(&found, rows);
     }
     assert!(db.verify().unwrap().objects > 0);
@@ -105,7 +104,10 @@ fn compaction_refuses_a_live_writer_and_empty_is_a_noop() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("d.ferro");
     let db = Db::<Root>::open(&path).unwrap();
-    assert!(matches!(admin::compact(&path, Keep::All), Err(Error::Locked)));
+    assert!(matches!(
+        admin::compact(&path, Keep::All),
+        Err(Error::Locked)
+    ));
     drop(db);
     let report = admin::compact(&path, Keep::All).unwrap();
     assert_eq!(report.objects, 0);
@@ -116,7 +118,10 @@ fn read_only_handle_follows_a_replaced_file_on_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.ferro");
     build(&path, 5);
-    let reader = ferro::Options::new().read_only().open::<Root>(&path).unwrap();
+    let reader = ferro::Options::new()
+        .read_only()
+        .open::<Root>(&path)
+        .unwrap();
     let held = reader.read();
     admin::compact(&path, Keep::Last(1)).unwrap();
     assert_eq!(reader.log().len(), 5);

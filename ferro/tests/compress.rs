@@ -7,7 +7,11 @@ use ferro::{Db, Map};
 type Root = Map<u64, String>;
 
 fn value(key: u64) -> String {
-    format!("customer-{key:08} lives at {} Example Street, Exampleville", key % 97).repeat(1 + (key % 5) as usize)
+    format!(
+        "customer-{key:08} lives at {} Example Street, Exampleville",
+        key % 97
+    )
+    .repeat(1 + (key % 5) as usize)
 }
 
 #[test]
@@ -23,7 +27,11 @@ fn compressible_values_round_trip_and_shrink_the_file() {
             }
         })
         .unwrap();
-        assert!(db.size_on_disk() < raw / 2, "{} vs {raw}", db.size_on_disk());
+        assert!(
+            db.size_on_disk() < raw / 2,
+            "{} vs {raw}",
+            db.size_on_disk()
+        );
     }
     let check = |db: &Db<Root>| {
         let snapshot = db.read();

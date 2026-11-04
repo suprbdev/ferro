@@ -55,7 +55,10 @@ pub(crate) enum Parts {
 impl Parts {
     pub(crate) fn join(messages: Vec<String>) -> (String, Parts) {
         if messages.len() < 2 {
-            return (messages.into_iter().next().unwrap_or_default(), Parts::Whole);
+            return (
+                messages.into_iter().next().unwrap_or_default(),
+                Parts::Whole,
+            );
         }
         let lengths = messages.iter().map(String::len).collect();
         (messages.join("\n"), Parts::Joined(lengths))
@@ -78,7 +81,9 @@ impl Parts {
             start = end + 1;
         }
         if lengths.len() < 2 {
-            return Err(Error::Decode("a joined commit message needs two parts".into()));
+            return Err(Error::Decode(
+                "a joined commit message needs two parts".into(),
+            ));
         }
         Ok(())
     }
@@ -99,7 +104,11 @@ impl PartialEq for Commit {
 impl Commit {
     pub fn messages(&self) -> impl Iterator<Item = &str> {
         let messages: Vec<&str> = match &self.parts {
-            Parts::Lines => self.message.split('\n').filter(|line| !line.is_empty()).collect(),
+            Parts::Lines => self
+                .message
+                .split('\n')
+                .filter(|line| !line.is_empty())
+                .collect(),
             Parts::Whole if self.message.is_empty() => Vec::new(),
             Parts::Whole => vec![self.message.as_str()],
             Parts::Joined(lengths) => {
@@ -156,7 +165,9 @@ impl Stamp<'_> {
     }
 
     pub fn time_ms(&self) -> u64 {
-        *self.time.get_or_init(|| read_clock(self.clock).max(self.floor))
+        *self
+            .time
+            .get_or_init(|| read_clock(self.clock).max(self.floor))
     }
 }
 
@@ -581,7 +592,9 @@ fn nanos(took: Duration) -> u64 {
 }
 
 fn adjust(slot: &AtomicU64, next: impl Fn(u64) -> u64) {
-    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(next(current)));
+    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(next(current))
+    });
 }
 
 fn average(slot: &AtomicU64, took: Duration) {
@@ -611,7 +624,10 @@ impl Costs {
 
     fn worth_waiting(&self) -> bool {
         let handoff = self.handoff.load(Ordering::Relaxed);
-        let saved = self.seal.load(Ordering::Relaxed).saturating_add(self.sync.load(Ordering::Relaxed));
+        let saved = self
+            .seal
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sync.load(Ordering::Relaxed));
         if handoff < saved {
             return true;
         }
@@ -823,7 +839,10 @@ where
             }
         }
         loop {
-            let wait = this.wait.take().expect("ferro: a write was polled after it finished");
+            let wait = this
+                .wait
+                .take()
+                .expect("ferro: a write was polled after it finished");
             match wait {
                 Wait::Ticket(staged) => {
                     match db.shared.poll_settle(staged.ticket, this.id, cx.waker()) {
@@ -847,7 +866,8 @@ where
                         }
                         Poll::Ready(Ok(Grouped::Unframed(ticket, version, time_ms))) => {
                             joined.seal.forget(this.id);
-                            this.wait = Some(Wait::Ticket(joined.unframed(ticket, version, time_ms)));
+                            this.wait =
+                                Some(Wait::Ticket(joined.unframed(ticket, version, time_ms)));
                         }
                     }
                 }
@@ -1233,7 +1253,9 @@ impl<T: Data> Shared<T> {
             let attached = self.branches.lock();
             let same = attached.len() == branches.len()
                 && branches.iter().all(|branch| {
-                    attached.get(&branch.name).is_some_and(|now| Arc::ptr_eq(now, branch))
+                    attached
+                        .get(&branch.name)
+                        .is_some_and(|now| Arc::ptr_eq(now, branch))
                 });
             drop(attached);
             if same {
@@ -1299,7 +1321,11 @@ impl<T: Data> Shared<T> {
         if handed_on && group.members < MAX_GROUP {
             group.handed = arriving.then(Instant::now);
             others.extend(Self::other_groups(&queue, branch));
-            if !queue.open.iter().any(|(open, _)| Arc::ptr_eq(open, &group.seal)) {
+            if !queue
+                .open
+                .iter()
+                .any(|(open, _)| Arc::ptr_eq(open, &group.seal))
+            {
                 queue.open.push((group.seal.clone(), branch.clone()));
             }
             **lane = Some(group);
@@ -1309,7 +1335,10 @@ impl<T: Data> Shared<T> {
     }
 
     fn other_groups(queue: &Queue<T>, branch: &Arc<Branch<T>>) -> Vec<Arc<Branch<T>>> {
-        let others = queue.open.iter().filter(|(_, other)| !Arc::ptr_eq(other, branch));
+        let others = queue
+            .open
+            .iter()
+            .filter(|(_, other)| !Arc::ptr_eq(other, branch));
         others.map(|(_, other)| other.clone()).collect()
     }
 
@@ -1693,10 +1722,18 @@ impl<T: Data> Shared<T> {
             Ok(()) => queue.settled = frame.seq,
             Err(_) => queue.failed = true,
         }
-        let next = queue.waiting.first().and_then(|pending| pending.seal.clone());
+        let next = queue
+            .waiting
+            .first()
+            .and_then(|pending| pending.seal.clone());
         let next = next.or_else(|| queue.open.first().map(|(seal, _)| seal.clone()));
         if queue.failed {
-            seals.extend(queue.waiting.iter().filter_map(|pending| pending.seal.clone()));
+            seals.extend(
+                queue
+                    .waiting
+                    .iter()
+                    .filter_map(|pending| pending.seal.clone()),
+            );
             seals.extend(queue.open.iter().map(|(seal, _)| seal.clone()));
         }
         let settled = !queue.failed;
@@ -1849,7 +1886,14 @@ impl<T: Data> Shared<T> {
             store: store.clone(),
         };
         let seal = seal.map(|seal| (seal, version, time_ms));
-        self.stage(tip, next, txn, Some((branch, state)), seal, Some(&mut settling))?;
+        self.stage(
+            tip,
+            next,
+            txn,
+            Some((branch, state)),
+            seal,
+            Some(&mut settling),
+        )?;
         Ok((version, time_ms, Some((settling, store))))
     }
 
@@ -1936,7 +1980,9 @@ impl<T: Data> Shared<T> {
         drop(log);
         if outcome.is_err() {
             Copier::abandon(&sibling(&self.file));
-            self.signal.base.store(self.store().size(), Ordering::Relaxed);
+            self.signal
+                .base
+                .store(self.store().size(), Ordering::Relaxed);
         }
         outcome
     }
@@ -2163,9 +2209,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
         let message = message.into();
-        let done = self.transact::<R, E>(|root, _| {
-            f(root).map(|value| (message, value))
-        })?;
+        let done = self.transact::<R, E>(|root, _| f(root).map(|value| (message, value)))?;
         Ok(done.value)
     }
 
@@ -2199,7 +2243,9 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R> {
         let message = message.into();
-        let done = self.writing::<R, Error, _>(|root, _| Ok((message, f(root)))).await?;
+        let done = self
+            .writing::<R, Error, _>(|root, _| Ok((message, f(root))))
+            .await?;
         Ok(done.value)
     }
 
@@ -2227,7 +2273,9 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> std::result::Result<R, E> {
         let message = message.into();
-        let done = self.writing(|root, _| f(root).map(|value| (message, value))).await?;
+        let done = self
+            .writing(|root, _| f(root).map(|value| (message, value)))
+            .await?;
         Ok(done.value)
     }
 
@@ -2277,11 +2325,7 @@ impl<T: Data> Db<T> {
     fn alone<R, E: From<Error>>(
         &self,
         from: Option<&Branch<T>>,
-        f: impl FnOnce(
-            &RefState,
-            &State<T>,
-            &mut T,
-        ) -> std::result::Result<(String, R, Intent), E>,
+        f: impl FnOnce(&RefState, &State<T>, &mut T) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let lane = self.shared.lane(&self.branch);
@@ -2305,11 +2349,7 @@ impl<T: Data> Db<T> {
         &self,
         lane: Lane<'_, T>,
         from: Option<&Branch<T>>,
-        f: impl FnOnce(
-            &State<T>,
-            &mut T,
-            &Stamp<'_>,
-        ) -> std::result::Result<(String, R, Intent), E>,
+        f: impl FnOnce(&State<T>, &mut T, &Stamp<'_>) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Staged<R, E>, E> {
         self.branch.check_live()?;
         let state = self.branch.tip.load_full();
@@ -2565,7 +2605,12 @@ impl<T: Data> Db<T> {
             changes_between((from - 1, &before), (to, &high.1), &value_at, &mut changed)?;
         } else {
             changed.push(from);
-            changes_between((from, &value_at(from)?), (to, &high.1), &value_at, &mut changed)?;
+            changes_between(
+                (from, &value_at(from)?),
+                (to, &high.1),
+                &value_at,
+                &mut changed,
+            )?;
         }
         changed
             .into_iter()
@@ -2699,7 +2744,10 @@ impl<T: Data> Db<T> {
         ptr: Ptr,
     ) -> Result<Option<Merged>> {
         let head = tip.refs.try_get(&other.branch.name)?;
-        let floor = head.map_or(1, |head| head.log.first).max(theirs.log.first).max(1);
+        let floor = head
+            .map_or(1, |head| head.log.first)
+            .max(theirs.log.first)
+            .max(1);
         if floor > theirs.log.last {
             return Ok(None);
         }
@@ -2733,8 +2781,16 @@ impl<T: Data> Db<T> {
     fn common_starts(&self, other: &Db<T>) -> Result<Vec<Start>> {
         let (refs, store, ours, theirs) = {
             let published = self.shared.published.lock();
-            let states = (self.branch.state.load_full(), other.branch.state.load_full());
-            (published.refs.clone(), self.shared.store(), states.0, states.1)
+            let states = (
+                self.branch.state.load_full(),
+                other.branch.state.load_full(),
+            );
+            (
+                published.refs.clone(),
+                self.shared.store(),
+                states.0,
+                states.1,
+            )
         };
         Self::merge_base(
             &refs,
@@ -2913,9 +2969,7 @@ impl<T: Data> Db<T> {
         let _whole = reentry::whole(self.shared.id);
         let current = self.shared.store();
         let (store, head) = match current.refresh() {
-            Err(Error::Replaced) => {
-                Store::open(&self.shared.file, self.shared.options.clone())?
-            }
+            Err(Error::Replaced) => Store::open(&self.shared.file, self.shared.options.clone())?,
             other => (current.clone(), other?),
         };
         let replaced = store.id() != current.id();

@@ -76,10 +76,7 @@ impl Reservations {
         self.db.read()
     }
 
-    pub fn write<R>(
-        &self,
-        f: impl FnOnce(&mut Hotels, u64) -> Result<(String, R)>,
-    ) -> Result<R> {
+    pub fn write<R>(&self, f: impl FnOnce(&mut Hotels, u64) -> Result<(String, R)>) -> Result<R> {
         self.write_stamped(|hotels, now, _| f(hotels, now))
     }
 
@@ -88,7 +85,9 @@ impl Reservations {
         f: impl FnOnce(&mut Hotels, u64, &Stamp<'_>) -> Result<(String, R)>,
     ) -> Result<R> {
         let clock = &self.clock;
-        let done = self.db.try_commit_stamped(|hotels, stamp| f(hotels, clock(), stamp))?;
+        let done = self
+            .db
+            .try_commit_stamped(|hotels, stamp| f(hotels, clock(), stamp))?;
         Ok(done.value)
     }
 
@@ -131,7 +130,10 @@ impl Reservations {
         self.write(|h, _| {
             h.set_night_rate(room, night, rate)?;
             let what = rate.map_or("base".to_string(), |rate| rate.to_string());
-            Ok((format!("rate room {room} on {} -> {what}", format_night(night)), ()))
+            Ok((
+                format!("rate room {room} on {} -> {what}", format_night(night)),
+                (),
+            ))
         })
     }
 
@@ -147,7 +149,8 @@ impl Reservations {
                 request.customer
             );
             if !held.released.is_empty() {
-                let released: Vec<String> = held.released.iter().map(|id| format!("#{id}")).collect();
+                let released: Vec<String> =
+                    held.released.iter().map(|id| format!("#{id}")).collect();
                 message.push_str(&format!(", releasing lapsed {}", released.join(" ")));
             }
             Ok((message, held))

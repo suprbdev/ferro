@@ -25,7 +25,11 @@ pub struct Taken<K> {
 
 impl<K: fmt::Debug> fmt::Display for Taken<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unique index {} already holds this value for {:?}", self.index, self.holder)
+        write!(
+            f,
+            "unique index {} already holds this value for {:?}",
+            self.index, self.holder
+        )
     }
 }
 
@@ -41,7 +45,10 @@ pub trait TableData<T: Record>: Data + Default {
 }
 
 fn clash<K>(taken: Taken<K>) -> ! {
-    panic!("ferro: unique index {} already holds this value", taken.index)
+    panic!(
+        "ferro: unique index {} already holds this value",
+        taken.index
+    )
 }
 
 pub struct Table<T: Record>(T::Table);
@@ -247,7 +254,12 @@ impl<T: Record> Table<T> {
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        let drained: Vec<Val<T>> = self.0.rows_mut().take_range::<Q, R>(range).values().collect();
+        let drained: Vec<Val<T>> = self
+            .0
+            .rows_mut()
+            .take_range::<Q, R>(range)
+            .values()
+            .collect();
         for row in &drained {
             self.0.reindex(Some(row), None);
         }
@@ -341,7 +353,10 @@ impl<T: Record> Table<T> {
             let Some((key, row)) = held.next_unasked() else {
                 break;
             };
-            let ours = self.0.conflict(&row, None).and_then(|taken| self.get(&taken.holder));
+            let ours = self
+                .0
+                .conflict(&row, None)
+                .and_then(|taken| self.get(&taken.holder));
             let resolved = resolve(Conflict {
                 key: key.clone(),
                 base: base.get(&key),
@@ -671,7 +686,11 @@ pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
     rows.try_values()
 }
 
-pub fn unique_eq<I, T, Q>(rows: &Map<T::Key, T>, index: &Map<I, T::Key>, value: &Q) -> Option<Val<T>>
+pub fn unique_eq<I, T, Q>(
+    rows: &Map<T::Key, T>,
+    index: &Map<I, T::Key>,
+    value: &Q,
+) -> Option<Val<T>>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,

@@ -114,7 +114,10 @@ fn a_watcher_with_an_unseen_snapshot_does_not_hold_the_file() {
     drop(db);
     let reopened = fast().open::<Root>(&path).unwrap();
     assert_eq!(reopened.version(), 1);
-    assert!(matches!(watcher.try_recv(), Err(TryRecvError::Disconnected)));
+    assert!(matches!(
+        watcher.try_recv(),
+        Err(TryRecvError::Disconnected)
+    ));
     assert!(matches!(
         watcher.recv_timeout(Duration::from_secs(10)),
         Err(RecvTimeoutError::Disconnected)
@@ -155,20 +158,28 @@ fn a_read_only_watcher_coalesces_across_refreshes() {
     assert!(!reader.refresh().unwrap());
     assert!(matches!(watcher.try_recv(), Err(TryRecvError::Empty)));
     drop(reader);
-    assert!(matches!(watcher.try_recv(), Err(TryRecvError::Disconnected)));
+    assert!(matches!(
+        watcher.try_recv(),
+        Err(TryRecvError::Disconnected)
+    ));
 }
 
 fn parked(calls: &AtomicUsize, before: usize) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while calls.load(Ordering::SeqCst) <= before {
-        assert!(Instant::now() < deadline, "the test never ran on the commit path");
+        assert!(
+            Instant::now() < deadline,
+            "the test never ran on the commit path"
+        );
         thread::sleep(Duration::from_millis(1));
     }
 }
 
 fn opened() -> (tempfile::TempDir, Db<Root>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = common::fast().open::<Root>(dir.path().join("watch.ferro")).unwrap();
+    let db = common::fast()
+        .open::<Root>(dir.path().join("watch.ferro"))
+        .unwrap();
     (dir, db)
 }
 
@@ -209,10 +220,19 @@ fn closing_reaches_every_clone_and_no_other_watcher() {
         assert!(handle.join().unwrap());
     }
     put(&db, 1, 1);
-    assert_eq!(other.recv_timeout(Duration::from_secs(5)).unwrap().version(), 1);
+    assert_eq!(
+        other
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .version(),
+        1
+    );
     let late = db.watch();
     put(&db, 1, 2);
-    assert_eq!(late.recv_timeout(Duration::from_secs(5)).unwrap().version(), 2);
+    assert_eq!(
+        late.recv_timeout(Duration::from_secs(5)).unwrap().version(),
+        2
+    );
 }
 
 #[test]
@@ -268,7 +288,12 @@ fn a_filtered_watcher_sleeps_through_commits_that_do_not_concern_it() {
         let (counters, threads) = (counters.clone(), threads.clone());
         db.watch_when(move |snapshot| {
             let here = Some(thread::current().id());
-            let at = threads.lock().unwrap().iter().position(|id| *id == here).unwrap_or(2);
+            let at = threads
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|id| *id == here)
+                .unwrap_or(2);
             counters[at].fetch_add(1, Ordering::SeqCst);
             snapshot.contains_key(&7)
         })
@@ -297,8 +322,16 @@ fn a_filtered_watcher_sleeps_through_commits_that_do_not_concern_it() {
     }
     put(&db, 7, 7);
     assert_eq!(parked_on.join().unwrap(), db.version());
-    assert_eq!(on_waiter.load(Ordering::SeqCst), woken, "woken by a commit it does not want");
-    assert_eq!(on_committer.load(Ordering::SeqCst), 0, "a test ran on the committing thread");
+    assert_eq!(
+        on_waiter.load(Ordering::SeqCst),
+        woken,
+        "woken by a commit it does not want"
+    );
+    assert_eq!(
+        on_committer.load(Ordering::SeqCst),
+        0,
+        "a test ran on the committing thread"
+    );
     assert!(elsewhere.load(Ordering::SeqCst) <= evaluated + 201);
 }
 
@@ -317,7 +350,13 @@ fn a_filtered_watcher_sees_commits_that_landed_before_it_parked() {
         Err(RecvTimeoutError::Timeout)
     ));
     put(&db, 3, 3);
-    assert_eq!(watcher.recv_timeout(Duration::from_secs(5)).unwrap().version(), 4);
+    assert_eq!(
+        watcher
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .version(),
+        4
+    );
 }
 
 #[test]
@@ -445,7 +484,9 @@ fn a_read_only_test_may_open_a_branch_while_refresh_runs_it() {
     let watcher = {
         let reader = reader.clone();
         reader.clone().watch_when(move |snapshot| {
-            reader.branch("side").is_ok_and(|side| side.version() < snapshot.version())
+            reader
+                .branch("side")
+                .is_ok_and(|side| side.version() < snapshot.version())
         })
     };
     let calls = Arc::new(AtomicUsize::new(0));
@@ -462,7 +503,10 @@ fn a_read_only_test_may_open_a_branch_while_refresh_runs_it() {
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     while calls.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "refresh never returned from a test that opens a branch");
+        assert!(
+            Instant::now() < deadline,
+            "refresh never returned from a test that opens a branch"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     assert!(refresher.join().unwrap());
@@ -498,7 +542,10 @@ fn a_test_may_commit_while_its_commit_publishes() {
     thread::sleep(Duration::from_millis(30));
     let writer = db.clone();
     within("a commit whose test commits", move || put(&writer, 1, 1));
-    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()).unwrap(), 2);
+    assert_eq!(
+        within("the watcher", move || parked_thread.join().unwrap()).unwrap(),
+        2
+    );
     assert_eq!(db.version(), 2);
     assert!(fired.load(Ordering::SeqCst) >= 1);
 }
@@ -521,7 +568,9 @@ fn a_slow_test_holds_up_no_commit() {
     thread::sleep(Duration::from_millis(30));
     let before = calls.load(Ordering::SeqCst);
     let writer = db.clone();
-    within("the commit that starts a slow test", move || put(&writer, 1, 1));
+    within("the commit that starts a slow test", move || {
+        put(&writer, 1, 1)
+    });
     parked(&calls, before);
     let writer = db.clone();
     within("commits while a test is held", move || {
@@ -544,16 +593,21 @@ fn a_read_only_test_may_refresh_while_refresh_runs_it() {
     let reader = common::fast().read_only().open::<Root>(&path).unwrap();
     let watcher = {
         let reader = reader.clone();
-        reader.clone().watch_when(move |snapshot| {
-            reader.refresh().is_ok() && snapshot.contains_key(&2)
-        })
+        reader
+            .clone()
+            .watch_when(move |snapshot| reader.refresh().is_ok() && snapshot.contains_key(&2))
     };
     let parked_thread = thread::spawn(move || watcher.recv().map(|snapshot| snapshot.version()));
     thread::sleep(Duration::from_millis(30));
     put(&db, 2, 2);
     let refresher = reader.clone();
-    assert!(within("a refresh whose test refreshes", move || refresher.refresh().unwrap()));
-    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()).unwrap(), 2);
+    assert!(within("a refresh whose test refreshes", move || refresher
+        .refresh()
+        .unwrap()));
+    assert_eq!(
+        within("the watcher", move || parked_thread.join().unwrap()).unwrap(),
+        2
+    );
     assert_eq!(reader.version(), 2);
 }
 
@@ -610,7 +664,13 @@ fn a_changes_test_compares_against_what_the_watcher_returned_last() {
     assert!(matches!(watcher.try_recv(), Err(TryRecvError::Empty)));
     assert_eq!(watcher.seen().unwrap().version(), 3);
     put(&db, 7, 4);
-    assert_eq!(watcher.recv_timeout(Duration::from_secs(5)).unwrap().version(), 6);
+    assert_eq!(
+        watcher
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .version(),
+        6
+    );
     assert_eq!(watcher.seen().unwrap().version(), 6);
 }
 
@@ -629,7 +689,10 @@ fn a_parked_changes_watcher_wakes_only_for_a_difference() {
     }
     put(&db, 7, 1);
     put(&db, 7, 2);
-    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()), (22, 2));
+    assert_eq!(
+        within("the watcher", move || parked_thread.join().unwrap()),
+        (22, 2)
+    );
 }
 
 #[test]
@@ -720,7 +783,10 @@ fn a_test_may_use_the_feed_it_runs_on() {
         put(&writer, 2, 2);
         put(&writer, 1, 1);
     });
-    assert_eq!(within("the watcher", move || parked_thread.join().unwrap()), (2, 2));
+    assert_eq!(
+        within("the watcher", move || parked_thread.join().unwrap()),
+        (2, 2)
+    );
     assert!(used.load(Ordering::SeqCst) >= 1);
     assert!(ended.recv().is_err());
 }
@@ -732,7 +798,9 @@ fn watchers_never_see_versions_out_of_order() {
         .map(|index| {
             let watcher = match index % 2 {
                 0 => db.watch(),
-                _ => db.watch_when(|snapshot| snapshot.get(&0).is_some_and(|value| *value % 2 == 0)),
+                _ => {
+                    db.watch_when(|snapshot| snapshot.get(&0).is_some_and(|value| *value % 2 == 0))
+                }
             };
             thread::spawn(move || {
                 let mut versions = Vec::new();
@@ -756,7 +824,9 @@ fn watchers_never_see_versions_out_of_order() {
             })
         })
         .collect();
-    writers.into_iter().for_each(|writer| writer.join().unwrap());
+    writers
+        .into_iter()
+        .for_each(|writer| writer.join().unwrap());
     db.update(|root| {
         root.insert(0, 0);
         root.insert(99, 99);
@@ -765,7 +835,10 @@ fn watchers_never_see_versions_out_of_order() {
     let last = db.version();
     for consumer in consumers {
         let versions = within("a consumer", move || consumer.join().unwrap());
-        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]), "{versions:?}");
+        assert!(
+            versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{versions:?}"
+        );
         assert_eq!(versions.last(), Some(&last));
     }
 }

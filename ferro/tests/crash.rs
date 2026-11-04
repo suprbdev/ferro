@@ -40,7 +40,11 @@ fn build(commits: u64, keys_per_commit: u64) -> Built {
         let mut edits = Vec::new();
         for _ in 0..keys_per_commit {
             let key = rng.below(keys_per_commit * 3);
-            let len = if rng.chance(25) { 600 } else { rng.below(40) as usize };
+            let len = if rng.chance(25) {
+                600
+            } else {
+                rng.below(40) as usize
+            };
             edits.push((key, text(rng.next(), len)));
         }
         let remove = (commit > 0).then(|| rng.below(keys_per_commit * 3));
@@ -367,7 +371,10 @@ fn recovery_stops_at_the_first_damaged_frame() {
         drop(readonly);
         let db = fast().open::<Root>(&path).unwrap();
         check_at_version(&db, &built, damaged - 1);
-        assert_eq!(fs::metadata(&path).unwrap().len() as usize, built.lens[damaged - 1]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            built.lens[damaged - 1]
+        );
     }
 }
 
@@ -408,7 +415,8 @@ fn recovery_refuses_a_checksummed_frame_with_the_wrong_sequence() {
     let mut check = xxhash_rust::xxh3::Xxh3::new();
     check.update(&image[start..start + FRAME_CHECKED]);
     check.update(&image[start + FRAME_BYTES..end]);
-    image[start + FRAME_CHECKED..start + FRAME_BYTES].copy_from_slice(&check.digest128().to_le_bytes());
+    image[start + FRAME_CHECKED..start + FRAME_BYTES]
+        .copy_from_slice(&check.digest128().to_le_bytes());
     fs::write(&path, &image).unwrap();
     let db = fast().open::<Root>(&path).unwrap();
     check_at_version(&db, &built, commit);
@@ -430,7 +438,10 @@ fn zeroed_space_past_the_last_frame_ends_the_log() {
         assert_eq!(fs::metadata(&path).unwrap().len() as usize, image.len());
         let db = fast().open::<Root>(&path).unwrap();
         check_at_version(&db, &built, last);
-        assert_eq!(fs::metadata(&path).unwrap().len() as usize, built.lens[last]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            built.lens[last]
+        );
     }
 }
 
@@ -589,7 +600,8 @@ fn read_everything(db: &Db<Root>, built: &Built) -> ferro::Result<Reads> {
                 return Ok(Reads::Wrong(format!("get {key} of v{version}")));
             }
         }
-        if snapshot.nth(model.len() / 2).map(|p| p.0) != model.keys().nth(model.len() / 2).copied() {
+        if snapshot.nth(model.len() / 2).map(|p| p.0) != model.keys().nth(model.len() / 2).copied()
+        {
             return Ok(Reads::Wrong(format!("nth of v{version}")));
         }
         let mut edited = (*snapshot).clone();
@@ -802,7 +814,10 @@ fn redirected_link_stays_caught_once_child_memos_are_warm() {
                 Outcome::FerroPanic(_) => failures.push(key),
             }
         }
-        assert!(!failures.is_empty(), "the redirected link was never followed");
+        assert!(
+            !failures.is_empty(),
+            "the redirected link was never followed"
+        );
         assert_eq!(*failed.get_or_insert_with(|| failures.clone()), failures);
     }
 }
@@ -845,7 +860,10 @@ fn oversized_object_is_refused_before_it_reaches_the_log() {
         body: vec![0u8; (1usize << 32) + 1],
         links: Vec::new(),
     };
-    assert!(matches!(txn.put(object, [0; HASH_BYTES]), Err(Error::TooLarge(_))));
+    assert!(matches!(
+        txn.put(object, [0; HASH_BYTES]),
+        Err(Error::TooLarge(_))
+    ));
 }
 
 #[test]

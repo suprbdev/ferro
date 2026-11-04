@@ -205,7 +205,11 @@ fn value_bench<T: Data + AsRef<[u8]>>(
     let cold = start.elapsed().as_secs_f64() * 1e9 / count as f64;
     let start = Instant::now();
     for (_, value) in snapshot.iter() {
-        total += AsRef::<[u8]>::as_ref(&*value).iter().step_by(4096).map(|b| *b as usize).sum::<usize>();
+        total += AsRef::<[u8]>::as_ref(&*value)
+            .iter()
+            .step_by(4096)
+            .map(|b| *b as usize)
+            .sum::<usize>();
     }
     let scan = start.elapsed().as_secs_f64() * 1e9 / count as f64;
     std::hint::black_box(total);
@@ -285,7 +289,9 @@ impl<T: Data + Ord, const N: u64> Seq for Chunked<T, N> {
 
     fn push(&mut self, item: T) {
         let chunk = self.len / N;
-        self.chunks.get_or_insert_with(chunk, Vec::new).push(Arc::new(item));
+        self.chunks
+            .get_or_insert_with(chunk, Vec::new)
+            .push(Arc::new(item));
         self.len += 1;
     }
 
@@ -343,7 +349,11 @@ fn seq_bench<S: Seq>(dir: &Path, label: &str, n: u64, make: impl Fn(u64) -> S::I
 }
 
 fn comment(i: u64) -> String {
-    let word = |x: u64| ["ferro", "commit", "merge", "branch", "index", "table", "scan", "flush"][x as usize % 8];
+    let word = |x: u64| {
+        [
+            "ferro", "commit", "merge", "branch", "index", "table", "scan", "flush",
+        ][x as usize % 8]
+    };
     let seed = mix(i);
     format!(
         "user{} wrote about {} and {} near {} on {} {} {}",
@@ -433,7 +443,10 @@ fn list_bench(dir: &Path) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map_or("all", String::as_str);
-    let n: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: u64 = args
+        .get(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     std::fs::create_dir_all("target/bench").unwrap();
     let dir = tempfile::tempdir_in("target/bench").unwrap();
     match command {

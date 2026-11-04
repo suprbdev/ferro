@@ -53,8 +53,13 @@ fn account(i: u64) -> Account {
     let seed = mix(i);
     Account {
         id: i,
-        tier: if seed.is_multiple_of(3) { Tier::Pro } else { Tier::Free },
-        country: ["nz", "au", "de", "us", "jp", "br", "ca", "fr"][(seed >> 8) as usize % 8].to_string(),
+        tier: if seed.is_multiple_of(3) {
+            Tier::Pro
+        } else {
+            Tier::Free
+        },
+        country: ["nz", "au", "de", "us", "jp", "br", "ca", "fr"][(seed >> 8) as usize % 8]
+            .to_string(),
         email: format!("user{i}@example.com"),
         name: format!("Account Holder {}", seed % 100_000),
         balance: (seed % 1_000_000) as i64,
@@ -62,7 +67,9 @@ fn account(i: u64) -> Account {
 }
 
 fn fast() -> Options {
-    Options::new().durability(Durability::Buffered).cache_bytes(1 << 28)
+    Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(1 << 28)
 }
 
 fn build_metrics(path: &Path, seconds: u64) {
@@ -79,7 +86,10 @@ fn build_metrics(path: &Path, seconds: u64) {
         durability: Durability::Buffered,
     };
     let report = load::run(path, &options).unwrap();
-    println!("metrics {} points {} commits", report.points, report.commits);
+    println!(
+        "metrics {} points {} commits",
+        report.points, report.commits
+    );
 }
 
 fn build_ledger(path: &Path, entries: u64) {
@@ -108,11 +118,14 @@ fn build_wiki(path: &Path, pages: u64, edits: u64) {
     let mut texts = Vec::new();
     for index in 0..pages {
         let text = prose(&mut rng, &vocab, 64 * 1024, &mut |_| None);
-        wiki_edit(&db, Edit {
-            slug: slug(index),
-            text: Some(text.clone()),
-            ..Edit::default()
-        });
+        wiki_edit(
+            &db,
+            Edit {
+                slug: slug(index),
+                text: Some(text.clone()),
+                ..Edit::default()
+            },
+        );
         texts.push(text);
     }
     for _ in 0..edits {
@@ -123,11 +136,14 @@ fn build_wiki(path: &Path, pages: u64, edits: u64) {
         insert.push_str(vocab.word(&mut rng));
         insert.push(' ');
         text.insert_str(at, &insert);
-        wiki_edit(&db, Edit {
-            slug: slug(index),
-            text: Some(text.clone()),
-            ..Edit::default()
-        });
+        wiki_edit(
+            &db,
+            Edit {
+                slug: slug(index),
+                text: Some(text.clone()),
+                ..Edit::default()
+            },
+        );
     }
 }
 
@@ -160,7 +176,11 @@ fn pinned(extents: &[(u64, u32)], unit: u64) -> Pinned {
     for (offset, len) in extents {
         let first = offset / unit;
         let tail = (offset + u64::from(*len) - 1) / unit;
-        let from = if last != u64::MAX && first <= last { last + 1 } else { first };
+        let from = if last != u64::MAX && first <= last {
+            last + 1
+        } else {
+            first
+        };
         if from <= tail {
             if last == u64::MAX || from > last + 1 {
                 runs += 1;
@@ -178,7 +198,11 @@ fn mib(bytes: u64) -> f64 {
 
 fn analyse(layout: &Layout) {
     let file = layout.file_bytes;
-    let live: u64 = layout.extents.iter().map(|extent| u64::from(extent.1)).sum();
+    let live: u64 = layout
+        .extents
+        .iter()
+        .map(|extent| u64::from(extent.1))
+        .sum();
     let garbage = file.saturating_sub(live).max(1);
     println!(
         "file {:.1} MiB, live {:.2} MiB in {} objects, mean {} bytes",
@@ -216,7 +240,8 @@ fn analyse(layout: &Layout) {
                 break;
             }
             live_bytes += u64::from(layout.extents[next].1);
-            last_block = last_block.max((layout.extents[next].0 + u64::from(layout.extents[next].1) - 1) / BLOCK);
+            last_block = last_block
+                .max((layout.extents[next].0 + u64::from(layout.extents[next].1) - 1) / BLOCK);
             next += 1;
         }
         spans.push((live_bytes, (last_block + 1 - first_block) * BLOCK));
@@ -263,7 +288,9 @@ struct Outcome {
 }
 
 fn env_number(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().map_or(default, |text| text.parse().unwrap())
+    std::env::var(name)
+        .ok()
+        .map_or(default, |text| text.parse().unwrap())
 }
 
 fn drive<T: Data>(
@@ -379,7 +406,11 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     outcome.read_latencies.sort_by(|a, b| a.total_cmp(b));
     let lat = &outcome.latencies;
     let reads = &outcome.read_latencies;
-    let pauses: Vec<f64> = outcome.cycles.iter().map(|c| c.pause.as_secs_f64() * 1e3).collect();
+    let pauses: Vec<f64> = outcome
+        .cycles
+        .iter()
+        .map(|c| c.pause.as_secs_f64() * 1e3)
+        .collect();
     let moved: u64 = outcome.cycles.iter().map(|c| c.after_bytes).sum();
     let ratios: Vec<f64> = outcome
         .cycles
@@ -426,7 +457,11 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     );
     if std::env::var("RECLAIM_SAMPLES").is_ok() {
         for (at, allocated, log) in &outcome.samples {
-            println!("sample {name} {at:.2} {:.1} {:.1}", mib(*allocated), mib(*log));
+            println!(
+                "sample {name} {at:.2} {:.1} {:.1}",
+                mib(*allocated),
+                mib(*log)
+            );
         }
     }
 }
@@ -450,31 +485,49 @@ fn run_metrics(path: &Path, run: &Run) {
     let keys = synthetic_series(1000);
     let writers: Vec<_> = (0..4).map(|_| Mutex::new(tsdb.writer())).collect();
     let keys = &keys;
-    let outcome = drive(&db, 4, run, |writer, index| {
-        let mut batch = Batch::default();
-        let group = 250 / 25;
-        let at = (index as usize * group) % 250;
-        for slot in 0..group {
-            let key = &keys[writer + 4 * ((at + slot) % 250)];
-            let ts = 1_700_000_000_000 + (index / 25) * 10_000;
-            batch.push(key, ts, (index % 1000) as f64 + slot as f64);
-        }
-        writers[writer].lock().unwrap().write(batch).unwrap();
-    }, |_| {});
+    let outcome = drive(
+        &db,
+        4,
+        run,
+        |writer, index| {
+            let mut batch = Batch::default();
+            let group = 250 / 25;
+            let at = (index as usize * group) % 250;
+            for slot in 0..group {
+                let key = &keys[writer + 4 * ((at + slot) % 250)];
+                let ts = 1_700_000_000_000 + (index / 25) * 10_000;
+                batch.push(key, ts, (index % 1000) as f64 + slot as f64);
+            }
+            writers[writer].lock().unwrap().write(batch).unwrap();
+        },
+        |_| {},
+    );
     report("metrics", &db, run, outcome);
 }
 
 fn run_ledger(path: &Path, run: &Run) {
     let db: Db<Ledger> = open_options(run).open(path).unwrap();
     ledger::seed::run(&db, 1, 1).unwrap();
-    let outcome = drive(&db, 4, run, |writer, index| {
-        let entry = NewEntry::transfer(19_500, "payment", "assets:bank-1", "assets:bank-2", 100 + index as i64 + writer as i64);
-        db.try_commit_with::<_, _, ledger::LedgerError>(|root| {
-            let id = root.post(entry, 1)?;
-            Ok((format!("entry {id}"), ()))
-        })
-        .unwrap();
-    }, |_| {});
+    let outcome = drive(
+        &db,
+        4,
+        run,
+        |writer, index| {
+            let entry = NewEntry::transfer(
+                19_500,
+                "payment",
+                "assets:bank-1",
+                "assets:bank-2",
+                100 + index as i64 + writer as i64,
+            );
+            db.try_commit_with::<_, _, ledger::LedgerError>(|root| {
+                let id = root.post(entry, 1)?;
+                Ok((format!("entry {id}"), ()))
+            })
+            .unwrap();
+        },
+        |_| {},
+    );
     report("ledger", &db, run, outcome);
 }
 
@@ -486,24 +539,36 @@ fn run_wiki(path: &Path, run: &Run) {
     let mut texts = Vec::new();
     for index in 0..pages {
         let text = prose(&mut rng, &vocab, 64 * 1024, &mut |_| None);
-        wiki_edit(&db, Edit {
-            slug: slug(index),
-            text: Some(text.clone()),
-            ..Edit::default()
-        });
+        wiki_edit(
+            &db,
+            Edit {
+                slug: slug(index),
+                text: Some(text.clone()),
+                ..Edit::default()
+            },
+        );
         texts.push(Mutex::new(text));
     }
-    let outcome = drive(&db, 2, run, |writer, index| {
-        let page = mix(index * 2 + writer as u64) % pages;
-        let mut text = texts[page as usize].lock().unwrap();
-        let at = text.floor_char_boundary((mix(index) % (text.len() as u64 - 1000)) as usize);
-        text.insert_str(at, "edit ");
-        wiki_edit(&db, Edit {
-            slug: slug(page),
-            text: Some(text.clone()),
-            ..Edit::default()
-        });
-    }, |_| {});
+    let outcome = drive(
+        &db,
+        2,
+        run,
+        |writer, index| {
+            let page = mix(index * 2 + writer as u64) % pages;
+            let mut text = texts[page as usize].lock().unwrap();
+            let at = text.floor_char_boundary((mix(index) % (text.len() as u64 - 1000)) as usize);
+            text.insert_str(at, "edit ");
+            wiki_edit(
+                &db,
+                Edit {
+                    slug: slug(page),
+                    text: Some(text.clone()),
+                    ..Edit::default()
+                },
+            );
+        },
+        |_| {},
+    );
     report("wiki", &db, run, outcome);
 }
 
@@ -519,23 +584,30 @@ fn run_table(path: &Path, run: &Run) {
         .unwrap();
     }
     let db: Db<Bank> = open_options(run).open(path).unwrap();
-    let outcome = drive(&db, 4, run, |writer, index| {
-        let id = mix(index * 4 + writer as u64) % rows;
-        db.update(|bank| {
-            bank.accounts.get_mut(&id).unwrap().balance += 1;
-        })
-        .unwrap();
-    }, |index| {
-        let id = mix(index) % rows;
-        assert!(db.read().accounts.get(&id).is_some());
-    });
+    let outcome = drive(
+        &db,
+        4,
+        run,
+        |writer, index| {
+            let id = mix(index * 4 + writer as u64) % rows;
+            db.update(|bank| {
+                bank.accounts.get_mut(&id).unwrap().balance += 1;
+            })
+            .unwrap();
+        },
+        |index| {
+            let id = mix(index) % rows;
+            assert!(db.read().accounts.get(&id).is_some());
+        },
+    );
     report("table", &db, run, outcome);
 }
 
 fn live(args: &[String]) {
     let (workload, path) = (args[2].as_str(), Path::new(&args[3]));
     let number = |index: usize, default: f64| -> f64 {
-        args.get(index).map_or(default, |text| text.parse().unwrap())
+        args.get(index)
+            .map_or(default, |text| text.parse().unwrap())
     };
     let run = Run {
         seconds: number(4, 20.0) as u64,
@@ -565,7 +637,8 @@ fn main() {
     let command = args[1].as_str();
     let path = Path::new(&args[2]);
     let number = |index: usize, default: u64| -> u64 {
-        args.get(index).map_or(default, |text| text.parse().unwrap())
+        args.get(index)
+            .map_or(default, |text| text.parse().unwrap())
     };
     match command {
         "metrics" => build_metrics(path, number(3, 60)),

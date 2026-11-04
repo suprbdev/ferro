@@ -135,7 +135,10 @@ fn dir() -> TempDir {
 }
 
 fn options() -> Options {
-    Options::new().durability(Durability::Buffered).cache_bytes(1).reclaim(MANUAL)
+    Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(1)
+        .reclaim(MANUAL)
 }
 
 fn fill(db: &Db<Root>, start: u64, commits: u64) {
@@ -272,7 +275,11 @@ fn a_commit_with_the_hash_of_a_pruned_entry_during_a_cycle_is_copied() {
         db.compact(Keep::Last(1)).unwrap();
         *slot.lock().unwrap() = None;
         let want = dump(&db.read());
-        assert_eq!(want.iter().find(|row| row.0 == 9).unwrap().1, "same", "{stage}");
+        assert_eq!(
+            want.iter().find(|row| row.0 == 9).unwrap().1,
+            "same",
+            "{stage}"
+        );
         db.update(|root| {
             root.insert(1, "after".into());
         })
@@ -316,7 +323,11 @@ fn a_swap_waits_for_commits_that_are_still_syncing() {
     let _turn = serial();
     let dir = dir();
     let path = dir.path().join("db.ferro");
-    let db: Db<Root> = Options::new().cache_bytes(1).reclaim(MANUAL).open(&path).unwrap();
+    let db: Db<Root> = Options::new()
+        .cache_bytes(1)
+        .reclaim(MANUAL)
+        .open(&path)
+        .unwrap();
     fill(&db, 0, 100);
     SYNC_ENTERED.store(false, Ordering::SeqCst);
     SYNC_RELEASED.store(false, Ordering::SeqCst);
@@ -439,7 +450,11 @@ fn a_failed_sync_at_any_point_in_a_cycle_loses_nothing() {
         }
         drop(db);
         let db: Db<Root> = options().open(&path).unwrap();
-        assert!(db.version() >= last, "sync {failing}: {} below {last}", db.version());
+        assert!(
+            db.version() >= last,
+            "sync {failing}: {} below {last}",
+            db.version()
+        );
         assert_eq!(dump(&db.at(last).unwrap()), model, "sync {failing}");
         db.verify().unwrap();
         db.update(|root| {

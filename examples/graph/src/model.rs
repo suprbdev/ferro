@@ -2,8 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferro::{Data, Map, Record, Set, Table};
 
-pub use crate::adj::UserId;
 use crate::adj::Adj;
+pub use crate::adj::UserId;
 
 pub type PostId = u64;
 

@@ -36,9 +36,15 @@ fn describe<K, V>(
         }
         let id = key(change.key());
         let entry = match &change {
-            Change::Added(_, after) => json!({"table": table, "op": "added", "id": id, "after": show(after)}),
-            Change::Removed(_, before) => json!({"table": table, "op": "removed", "id": id, "before": show(before)}),
-            Change::Changed(_, before, after) => json!({"table": table, "op": "changed", "id": id, "before": show(before), "after": show(after)}),
+            Change::Added(_, after) => {
+                json!({"table": table, "op": "added", "id": id, "after": show(after)})
+            }
+            Change::Removed(_, before) => {
+                json!({"table": table, "op": "removed", "id": id, "before": show(before)})
+            }
+            Change::Changed(_, before, after) => {
+                json!({"table": table, "op": "changed", "id": id, "before": show(before), "after": show(after)})
+            }
         };
         out.push(entry);
     }
@@ -167,18 +173,27 @@ fn stream(feed: Feed) -> impl Stream<Item = Result<Event, std::convert::Infallib
                         match catch_up(&feed.app, feed.last).await {
                             Ok(Some(frame)) => {
                                 feed.last = frame.version;
-                                feed.app.counters.events_sent.fetch_add(1, Ordering::Relaxed);
+                                feed.app
+                                    .counters
+                                    .events_sent
+                                    .fetch_add(1, Ordering::Relaxed);
                                 return Some((Ok(sse_event(&frame)), feed));
                             }
                             _ => continue,
                         }
                     }
                     feed.last = frame.version;
-                    feed.app.counters.events_sent.fetch_add(1, Ordering::Relaxed);
+                    feed.app
+                        .counters
+                        .events_sent
+                        .fetch_add(1, Ordering::Relaxed);
                     return Some((Ok(sse_event(&frame)), feed));
                 }
                 Err(RecvError::Lagged(_)) => {
-                    feed.app.counters.events_lagged.fetch_add(1, Ordering::Relaxed);
+                    feed.app
+                        .counters
+                        .events_lagged
+                        .fetch_add(1, Ordering::Relaxed);
                     match catch_up(&feed.app, feed.last).await {
                         Ok(Some(frame)) => {
                             feed.last = frame.version;

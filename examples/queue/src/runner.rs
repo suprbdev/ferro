@@ -1,6 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -151,7 +151,9 @@ fn work(
             }
             match queue.ack_many(&acks) {
                 Ok(lost) => {
-                    counters.lost.fetch_add(lost.len() as u64, Ordering::Relaxed);
+                    counters
+                        .lost
+                        .fetch_add(lost.len() as u64, Ordering::Relaxed);
                     counters
                         .done
                         .fetch_add((acks.len() - lost.len()) as u64, Ordering::Relaxed);

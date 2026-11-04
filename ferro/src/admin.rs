@@ -9,8 +9,8 @@ use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
 use crate::log::Closures;
 use crate::map::Map;
-use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 pub use crate::reclaim::{Compacted, Reclaim, Space};
+use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::store::{Store, StoreOptions};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,7 +75,10 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     let refs = load_refs(&store, head)?;
     let mut branches = Vec::new();
     for (name, branch) in refs.try_entries()? {
-        let last = branch.log.tip_entry(&store)?.map(|entry| entry.commit.time_ms);
+        let last = branch
+            .log
+            .tip_entry(&store)?
+            .map(|entry| entry.commit.time_ms);
         branches.push(BranchInfo {
             name,
             version: branch.version,
@@ -123,10 +126,14 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
     if let Some(ptr) = head {
         let mut seen = HashSet::new();
         let roots = Roots::of(ptr, &load_refs(store, head)?)?;
-        roots.walk(store, |ptr| seen.insert(ptr), |_, _, len| {
-            report.objects += 1;
-            report.bytes += u64::from(len);
-        })?;
+        roots.walk(
+            store,
+            |ptr| seen.insert(ptr),
+            |_, _, len| {
+                report.objects += 1;
+                report.bytes += u64::from(len);
+            },
+        )?;
     }
     Ok(report)
 }
@@ -168,7 +175,11 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
                         kind.name, ptr.offset
                     ))
                 })?;
-                queue.extend(found.into_iter().map(|(index, child)| (object.links[index], child)));
+                queue.extend(
+                    found
+                        .into_iter()
+                        .map(|(index, child)| (object.links[index], child)),
+                );
                 checked.insert(ptr.hash, &kind, shape);
                 shape
             }
@@ -208,7 +219,10 @@ pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     extents.sort_unstable();
     let file_bytes = store.size();
     store.close();
-    Ok(Layout { file_bytes, extents })
+    Ok(Layout {
+        file_bytes,
+        extents,
+    })
 }
 
 #[derive(Clone, Default)]
@@ -270,7 +284,13 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     result
 }
 
-fn write_copy(store: &Store, refs: &Refs, keep: Keep, temp: &Path, before: u64) -> Result<Compacted> {
+fn write_copy(
+    store: &Store,
+    refs: &Refs,
+    keep: Keep,
+    temp: &Path,
+    before: u64,
+) -> Result<Compacted> {
     let (pruned, commits_dropped) = pruned(store, refs, keep)?;
     let mut copier = Copier::create(store, temp, &StoreOptions::default(), None)?;
     copier.pass(&pruned)?;

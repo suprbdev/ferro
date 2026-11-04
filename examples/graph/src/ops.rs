@@ -86,13 +86,7 @@ pub fn block(g: &mut Graph, a: UserId, b: UserId) -> Res<bool> {
     Ok(g.blocks.insert((a, b)))
 }
 
-pub fn post(
-    g: &mut Graph,
-    author: UserId,
-    text: &str,
-    now: u64,
-    fanout: bool,
-) -> Res<PostId> {
+pub fn post(g: &mut Graph, author: UserId, text: &str, now: u64, fanout: bool) -> Res<PostId> {
     check_user(g, author)?;
     g.next_post += 1;
     let id = g.next_post;

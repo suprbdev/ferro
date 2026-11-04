@@ -26,7 +26,10 @@ fn a_room_night_has_one_holder_and_a_clash_names_it() {
     assert_eq!(h.stays.len(), 3, "the refused hold left no partial stays");
     assert_eq!(h.bookings.len(), 1);
     assert_eq!(h.next_booking, first.id);
-    assert_eq!(h.loads.get(&(1, night + 1)).map(|l| *l), Some(Load { held: 1, sold: 0 }));
+    assert_eq!(
+        h.loads.get(&(1, night + 1)).map(|l| *l),
+        Some(Load { held: 1, sold: 0 })
+    );
     assert_eq!(h.holder(1, night + 2), Some(first.id));
     assert_eq!(h.holder(1, night + 3), None);
     drop(h);
@@ -65,8 +68,17 @@ fn names_emails_and_room_numbers_are_unique() {
         Err(BookingError::EmailTaken { holder, .. }) => assert_eq!(holder, 1),
         other => panic!("expected EmailTaken, got {other:?}"),
     }
-    assert!(matches!(w.svc.add_room(1, 101, 5_000), Err(BookingError::RoomExists { venue: 1, number: 101 })));
-    assert!(matches!(w.svc.add_venue("Harbour House", "Porto"), Err(BookingError::VenueExists(_))));
+    assert!(matches!(
+        w.svc.add_room(1, 101, 5_000),
+        Err(BookingError::RoomExists {
+            venue: 1,
+            number: 101
+        })
+    ));
+    assert!(matches!(
+        w.svc.add_venue("Harbour House", "Porto"),
+        Err(BookingError::VenueExists(_))
+    ));
     let id = w.svc.add_room(2, 201, 5_000).unwrap();
     assert_eq!(w.svc.read().room_at(2, 201).unwrap().id, id);
     assert_eq!(w.svc.read().next_customer, 5);
@@ -80,7 +92,9 @@ fn confirm_needs_funds_and_the_agreed_price_and_charges_the_quote() {
     assert_eq!(held.total, 14 * 17_000);
 
     match w.svc.confirm(held.id, Some(held.total)) {
-        Err(BookingError::InsufficientFunds { needed, available, .. }) => {
+        Err(BookingError::InsufficientFunds {
+            needed, available, ..
+        }) => {
             assert_eq!((needed, available), (238_000, 200_000));
         }
         other => panic!("expected InsufficientFunds, got {other:?}"),
@@ -92,16 +106,25 @@ fn confirm_needs_funds_and_the_agreed_price_and_charges_the_quote() {
     ));
 
     w.svc.set_rate(3, 99_000).unwrap();
-    assert_eq!(w.svc.confirm(held.id, Some(held.total)).unwrap(), held.total);
+    assert_eq!(
+        w.svc.confirm(held.id, Some(held.total)).unwrap(),
+        held.total
+    );
     let h = w.svc.read();
     let customer = h.customers.get(&1).unwrap();
     assert_eq!(customer.credit, 250_000 - held.total);
     assert_eq!(h.till.charged, held.total);
-    assert_eq!(h.loads.get(&(1, night)).map(|l| *l), Some(Load { held: 0, sold: 1 }));
+    assert_eq!(
+        h.loads.get(&(1, night)).map(|l| *l),
+        Some(Load { held: 0, sold: 1 })
+    );
     drop(h);
     assert!(matches!(
         w.svc.confirm(held.id, None),
-        Err(BookingError::WrongStatus { status: Status::Confirmed, .. })
+        Err(BookingError::WrongStatus {
+            status: Status::Confirmed,
+            ..
+        })
     ));
     assert_clean(&w.svc);
 }
@@ -111,14 +134,38 @@ fn bad_requests_are_typed_errors_and_change_nothing() {
     let w = world();
     let today = w.clock.today();
     let version = w.svc.db().version();
-    assert!(matches!(w.hold(1, 1, today, 0, 1), Err(BookingError::BadStay { .. })));
-    assert!(matches!(w.hold(1, 1, today, 15, 1), Err(BookingError::BadStay { .. })));
-    assert!(matches!(w.hold(1, 1, today - 1, 1, 1), Err(BookingError::PastNight { .. })));
-    assert!(matches!(w.hold(77, 1, today, 1, 1), Err(BookingError::NoCustomer(_))));
-    assert!(matches!(w.hold(1, 77, today, 1, 1), Err(BookingError::NoRoom(77))));
-    assert!(matches!(w.svc.confirm(42, None), Err(BookingError::NoBooking(42))));
-    assert!(matches!(w.svc.deposit(1, 0), Err(BookingError::BadAmount(0))));
-    assert!(matches!(w.svc.set_rate(1, -5), Err(BookingError::BadAmount(-5))));
+    assert!(matches!(
+        w.hold(1, 1, today, 0, 1),
+        Err(BookingError::BadStay { .. })
+    ));
+    assert!(matches!(
+        w.hold(1, 1, today, 15, 1),
+        Err(BookingError::BadStay { .. })
+    ));
+    assert!(matches!(
+        w.hold(1, 1, today - 1, 1, 1),
+        Err(BookingError::PastNight { .. })
+    ));
+    assert!(matches!(
+        w.hold(77, 1, today, 1, 1),
+        Err(BookingError::NoCustomer(_))
+    ));
+    assert!(matches!(
+        w.hold(1, 77, today, 1, 1),
+        Err(BookingError::NoRoom(77))
+    ));
+    assert!(matches!(
+        w.svc.confirm(42, None),
+        Err(BookingError::NoBooking(42))
+    ));
+    assert!(matches!(
+        w.svc.deposit(1, 0),
+        Err(BookingError::BadAmount(0))
+    ));
+    assert!(matches!(
+        w.svc.set_rate(1, -5),
+        Err(BookingError::BadAmount(-5))
+    ));
     assert_eq!(w.svc.db().version(), version);
 }
 
@@ -181,7 +228,10 @@ fn the_checker_reports_broken_counters_and_stolen_holds() {
     broken.loads.insert((1, night), Load { held: 2, sold: 0 });
     broken.till.charged += 1;
     let found = check_state(&broken);
-    assert!(found.iter().any(|m| m.contains("load counters")), "{found:?}");
+    assert!(
+        found.iter().any(|m| m.contains("load counters")),
+        "{found:?}"
+    );
     assert!(found.iter().any(|m| m.contains("till says")), "{found:?}");
 
     let before = (*w.svc.read()).clone();
@@ -195,7 +245,10 @@ fn the_checker_reports_broken_counters_and_stolen_holds() {
         sold: false,
     });
     let found = check_pair(&before, &stolen);
-    assert!(found.iter().any(|m| m.contains("while still held")), "{found:?}");
+    assert!(
+        found.iter().any(|m| m.contains("while still held")),
+        "{found:?}"
+    );
 
     w.svc
         .db()
@@ -205,5 +258,10 @@ fn the_checker_reports_broken_counters_and_stolen_holds() {
         .unwrap();
     let walked = booking::walk(w.svc.db(), 1).unwrap();
     assert_eq!(walked.violations.len(), 2, "{:?}", walked.violations);
-    assert!(walked.violations.iter().all(|v| v.version == w.svc.db().version()));
+    assert!(
+        walked
+            .violations
+            .iter()
+            .all(|v| v.version == w.svc.db().version())
+    );
 }

@@ -43,7 +43,14 @@ impl World {
         self.dir.path().join("hotels.ferro")
     }
 
-    pub fn hold(&self, customer: u32, room: u32, first: Night, nights: u32, ttl_ms: u64) -> booking::Result<booking::Held> {
+    pub fn hold(
+        &self,
+        customer: u32,
+        room: u32,
+        first: Night,
+        nights: u32,
+        ttl_ms: u64,
+    ) -> booking::Result<booking::Held> {
         self.svc.hold(&HoldRequest {
             customer,
             room,
@@ -55,7 +62,14 @@ impl World {
 }
 
 pub fn open(path: &Path, coalesce: bool) -> Reservations {
-    Reservations::open(path, Config { coalesce, ..Config::default() }).unwrap()
+    Reservations::open(
+        path,
+        Config {
+            coalesce,
+            ..Config::default()
+        },
+    )
+    .unwrap()
 }
 
 pub fn world_with(plan: Plan, coalesce: bool) -> World {

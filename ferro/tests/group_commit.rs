@@ -268,7 +268,9 @@ fn a_no_op_on_an_unpublished_tip_waits_for_that_tip_to_become_durable() {
             })
         })
     };
-    wait_until("the no-op closure to run", || observed.load(Ordering::SeqCst) != 0);
+    wait_until("the no-op closure to run", || {
+        observed.load(Ordering::SeqCst) != 0
+    });
     assert_eq!(observed.load(Ordering::SeqCst), 2);
     settle_queue();
     assert!(!reader.is_finished());
@@ -296,7 +298,9 @@ fn a_no_op_on_a_lost_tip_reports_the_failure_instead_of_the_value() {
             })
         })
     };
-    wait_until("the no-op closure to run", || observed.load(Ordering::SeqCst) != 0);
+    wait_until("the no-op closure to run", || {
+        observed.load(Ordering::SeqCst) != 0
+    });
     settle_queue();
     release(true);
     assert!(leader.join().unwrap().is_err());
@@ -319,7 +323,9 @@ fn a_closure_error_from_an_unpublished_tip_waits_for_durability() {
             })
         })
     };
-    wait_until("the refusing closure to run", || observed.load(Ordering::SeqCst) != 0);
+    wait_until("the refusing closure to run", || {
+        observed.load(Ordering::SeqCst) != 0
+    });
     settle_queue();
     assert!(!refuser.is_finished());
     release(false);
@@ -374,7 +380,10 @@ fn branches_queue_together_and_publish_on_their_own_heads() {
     settle_queue();
     assert_eq!((db.version(), side.version()), (1, 1));
     release(false);
-    assert_eq!(leader.join().unwrap().unwrap() + 1, on_main.join().unwrap().unwrap());
+    assert_eq!(
+        leader.join().unwrap().unwrap() + 1,
+        on_main.join().unwrap().unwrap()
+    );
     assert_eq!(on_side.join().unwrap().unwrap(), 2);
     assert_eq!((db.version(), side.version()), (3, 2));
     drop((db, side));
@@ -424,7 +433,10 @@ fn power_cut_run(writers: u64, rounds: u64) -> (TempDir, u64, Vec<(u64, Vec<u8>)
 fn check_image(path: &Path, image: &[u8], floor: u64) {
     fs::write(path, image).unwrap();
     let readonly = fast().read_only().open::<Root>(path).unwrap();
-    assert!(readonly.version() >= floor, "read-only lost an acknowledged commit");
+    assert!(
+        readonly.version() >= floor,
+        "read-only lost an acknowledged commit"
+    );
     assert_eq!(counter(&readonly.read()), readonly.version());
     drop(readonly);
     let db = fast().open::<Root>(path).unwrap();
@@ -461,7 +473,10 @@ fn reservation_is_invisible_to_readers_and_released_on_close() {
     })
     .unwrap();
     let size = db.size_on_disk();
-    assert!(fs::metadata(&path).unwrap().len() > size, "no space was reserved");
+    assert!(
+        fs::metadata(&path).unwrap().len() > size,
+        "no space was reserved"
+    );
     let image = fs::read(&path).unwrap();
     let copy = path.with_extension("copy");
     fs::write(&copy, &image).unwrap();

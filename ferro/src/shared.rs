@@ -111,14 +111,19 @@ impl<T> Shared<T> {
     }
 
     pub(crate) fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.unique().then(|| unsafe { &mut (*this.ptr.as_ptr()).data })
+        this.unique()
+            .then(|| unsafe { &mut (*this.ptr.as_ptr()).data })
     }
 
     pub(crate) fn make_mut(this: &mut Self) -> &mut T
     where
         T: Clone,
     {
-        if this.strong().compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if this
+            .strong()
+            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             let fresh = Shared::new((**this).clone());
             *this = fresh;
         } else if this.weak().load(Ordering::Relaxed) != 1 {
@@ -135,7 +140,11 @@ impl<T> Shared<T> {
     where
         T: Clone,
     {
-        if this.strong().compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if this
+            .strong()
+            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return (*this).clone();
         }
         let this = ManuallyDrop::new(this);
@@ -210,7 +219,11 @@ impl<T> Shared<T> {
     }
 
     fn unique(&self) -> bool {
-        if self.weak().compare_exchange(1, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self
+            .weak()
+            .compare_exchange(1, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
         let unique = self.strong().load(Ordering::Acquire) == 1;
@@ -291,7 +304,9 @@ impl Erased {
 
     #[inline]
     pub(crate) fn as_ptr(&self) -> *const () {
-        unsafe { self.ptr.as_ptr().add(self.kind.data) }.cast_const().cast()
+        unsafe { self.ptr.as_ptr().add(self.kind.data) }
+            .cast_const()
+            .cast()
     }
 
     pub(crate) fn hold(&self) {
@@ -350,8 +365,12 @@ impl<T> Weak<T> {
             if count > MAX_STRONG {
                 process::abort();
             }
-            match strong.compare_exchange_weak(count, count + 1, Ordering::Acquire, Ordering::Relaxed)
-            {
+            match strong.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     return Some(Shared {
                         ptr: self.ptr,
@@ -378,7 +397,10 @@ impl<T> Weak<T> {
             if !(*inner).lent.load(Ordering::SeqCst) {
                 (*inner).lent.store(true, Ordering::SeqCst);
             }
-            (*inner).cached.load(Ordering::SeqCst).then(|| &(*inner).data)
+            (*inner)
+                .cached
+                .load(Ordering::SeqCst)
+                .then(|| &(*inner).data)
         }
     }
 }
@@ -480,7 +502,10 @@ mod tests {
         Shared::make_mut(&mut owner).value = 3;
         assert_eq!(clones.load(Ordering::SeqCst), 0);
         assert!(weak.upgrade().is_none());
-        assert_eq!(Shared::get_mut(&mut owner).map(|counted| counted.value), Some(3));
+        assert_eq!(
+            Shared::get_mut(&mut owner).map(|counted| counted.value),
+            Some(3)
+        );
         let other = owner.clone();
         Shared::make_mut(&mut owner).value = 4;
         assert_eq!(clones.load(Ordering::SeqCst), 1);

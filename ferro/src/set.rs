@@ -103,7 +103,11 @@ impl<T: Data + Ord> Set<T> {
     }
 
     pub fn apply(&mut self, edits: impl IntoIterator<Item = (T, bool)>) {
-        self.0.apply(edits.into_iter().map(|(item, keep)| (item, keep.then_some(()))));
+        self.0.apply(
+            edits
+                .into_iter()
+                .map(|(item, keep)| (item, keep.then_some(()))),
+        );
     }
 
     pub fn take_range<Q, R>(&mut self, range: R) -> Set<T>
@@ -155,11 +159,19 @@ impl<T: Data + Ord> Set<T> {
     }
 
     pub fn intersection(&self, other: &Set<T>) -> Set<T> {
-        other.contains_many(self.iter()).filter(|(_, found)| *found).map(|(item, _)| item).collect()
+        other
+            .contains_many(self.iter())
+            .filter(|(_, found)| *found)
+            .map(|(item, _)| item)
+            .collect()
     }
 
     pub fn difference(&self, other: &Set<T>) -> Set<T> {
-        other.contains_many(self.iter()).filter(|(_, found)| !found).map(|(item, _)| item).collect()
+        other
+            .contains_many(self.iter())
+            .filter(|(_, found)| !found)
+            .map(|(item, _)| item)
+            .collect()
     }
 }
 

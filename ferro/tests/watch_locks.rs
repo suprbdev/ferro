@@ -40,7 +40,10 @@ fn arm(gate: &Arc<Gate>) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fdatasync(fd: c_int) -> c_int {
-    let gate = ARMED.try_with(|armed| armed.borrow_mut().take()).ok().flatten();
+    let gate = ARMED
+        .try_with(|armed| armed.borrow_mut().take())
+        .ok()
+        .flatten();
     if let Some(gate) = gate {
         gate.entered.store(true, Ordering::SeqCst);
         while !gate.released.load(Ordering::SeqCst) {
@@ -140,7 +143,9 @@ fn a_test_commits_while(what: &str, armed: Armed, during: fn(&Db<Root>)) -> Opti
             during(&db);
         })
     };
-    eventually("the test's own commit", || committing.load(Ordering::SeqCst));
+    eventually("the test's own commit", || {
+        committing.load(Ordering::SeqCst)
+    });
     held.released.store(true, Ordering::SeqCst);
     joined(runner, what);
     eventually("the watcher's wake", || woken.0.load(Ordering::SeqCst));

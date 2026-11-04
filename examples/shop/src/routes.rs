@@ -52,12 +52,7 @@ struct Reply {
 }
 
 impl Reply {
-    fn new(
-        snap: &Snap,
-        tag: String,
-        inm: &Option<String>,
-        body: impl FnOnce() -> Value,
-    ) -> Reply {
+    fn new(snap: &Snap, tag: String, inm: &Option<String>, body: impl FnOnce() -> Value) -> Reply {
         let fresh = !matches_tag(inm, &tag);
         Reply {
             version: snap.snapshot.version(),
@@ -221,7 +216,9 @@ async fn get_product(
                 .ok_or_else(|| ApiError::NotFound(format!("product {id}")))?;
             let stock = stock_of(shop, id);
             let tag = format!("{}-{stock}", row_hash(&*product));
-            Ok(Reply::new(&snap, tag, &inm, || product_view(&product, stock)))
+            Ok(Reply::new(&snap, tag, &inm, || {
+                product_view(&product, stock)
+            }))
         })
         .await??;
     Ok(reply.finish(&app))
@@ -358,7 +355,9 @@ async fn get_cart(
                 .carts
                 .get(&id)
                 .ok_or_else(|| ApiError::NotFound(format!("cart {id}")))?;
-            Ok(Reply::new(&snap, row_hash(&*cart), &inm, || cart_view(&cart)))
+            Ok(Reply::new(&snap, row_hash(&*cart), &inm, || {
+                cart_view(&cart)
+            }))
         })
         .await??;
     Ok(reply.finish(&app))
@@ -631,7 +630,10 @@ struct NewOrder {
 
 fn place_order(shop: &mut Shop, request: NewOrder) -> Result<(String, Order), ApiError> {
     if !shop.customers.contains(&request.customer_id) {
-        return Err(ApiError::NotFound(format!("customer {}", request.customer_id)));
+        return Err(ApiError::NotFound(format!(
+            "customer {}",
+            request.customer_id
+        )));
     }
     let mut wanted: BTreeMap<u64, u32> = BTreeMap::new();
     match (&request.items, request.cart_id) {
@@ -665,7 +667,9 @@ fn place_order(shop: &mut Shop, request: NewOrder) -> Result<(String, Order), Ap
             .get(&product_id)
             .ok_or_else(|| ApiError::NotFound(format!("product {product_id}")))?;
         if !product.active {
-            return Err(ApiError::Bad(format!("product {product_id} is not for sale")));
+            return Err(ApiError::Bad(format!(
+                "product {product_id} is not for sale"
+            )));
         }
         let available = stock_of(shop, product_id);
         if available < qty {
@@ -808,7 +812,11 @@ async fn seed(State(app): State<Shared>, Json(seed): Json<Seed>) -> Result<Respo
             for _ in 0..seed.customers {
                 shop.next_customer += 1;
                 let id = shop.next_customer;
-                first_customer = if first_customer == 0 { id } else { first_customer };
+                first_customer = if first_customer == 0 {
+                    id
+                } else {
+                    first_customer
+                };
                 shop.customers.insert(Customer {
                     id,
                     name: format!("Customer {id}"),
@@ -847,7 +855,10 @@ async fn pin_version(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(version) = params.get("version").and_then(|text| text.parse::<u64>().ok()) else {
+    let Some(version) = params
+        .get("version")
+        .and_then(|text| text.parse::<u64>().ok())
+    else {
         return ApiError::Bad("bad version".into()).into_response();
     };
     let db = app.db.clone();

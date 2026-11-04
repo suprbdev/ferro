@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,7 +186,9 @@ fn stalled_stream_lets_everything_else_run(keys: u64, value: usize, spilled: boo
     let receiving = thread::spawn(move || receiver.receive_from("a", gate, merge_in));
     reached.recv_timeout(PATIENCE).unwrap();
     let main = b.clone();
-    within("a commit on the pulling branch", move || ours(&main, 1, "main"));
+    within("a commit on the pulling branch", move || {
+        ours(&main, 1, "main")
+    });
     let side = b.branch("side").unwrap();
     within("a commit on another branch", move || ours(&side, 2, "side"));
     let forking = b.clone();
@@ -194,7 +196,9 @@ fn stalled_stream_lets_everything_else_run(keys: u64, value: usize, spilled: boo
     let dropping = b.clone();
     within("a drop", move || dropping.drop_branch("doomed").unwrap());
     let compacting = b.clone();
-    let cycle = within("a reclamation cycle", move || compacting.compact(Keep::All).unwrap());
+    let cycle = within("a reclamation cycle", move || {
+        compacting.compact(Keep::All).unwrap()
+    });
     assert!(cycle.after_bytes > 0);
     let main = b.clone();
     within("a commit after the cycle", move || ours(&main, 3, "main"));
@@ -245,7 +249,9 @@ fn a_stream_that_fast_forwards_lands_after_a_cycle_moved_the_file() {
     within("a commit on another branch", move || ours(&side, 2, "side"));
     for _ in 0..2 {
         let compacting = b.clone();
-        within("a reclamation cycle", move || compacting.compact(Keep::All).unwrap());
+        within("a reclamation cycle", move || {
+            compacting.compact(Keep::All).unwrap()
+        });
     }
     release.send(()).unwrap();
     let pulled = receiving.join().unwrap().unwrap();
@@ -275,7 +281,10 @@ fn a_closure_receiving_into_its_own_file_is_refused_before_the_stream_is_read() 
         side.update(|_| b.receive_from("a", input, refuse)).unwrap()
     });
     assert!(matches!(nested, Err(Error::Reentrant)), "{nested:?}");
-    assert!(!read.load(Ordering::SeqCst), "the refused receive read its stream");
+    assert!(
+        !read.load(Ordering::SeqCst),
+        "the refused receive read its stream"
+    );
     assert_eq!(pair.b.branch("a").unwrap().version(), 4);
 }
 
@@ -289,25 +298,27 @@ fn a_closure_on_the_receiving_file_may_write_back_while_the_stream_is_read() {
     let (gate, reached, release) = gated(bundle.clone(), bundle.len() / 2);
     let receiving = {
         let (other, b) = (other.clone(), b.clone());
-        thread::spawn(move || {
-            other
-                .update(|_| b.receive_from("a", gate, refuse))
-                .unwrap()
-        })
+        thread::spawn(move || other.update(|_| b.receive_from("a", gate, refuse)).unwrap())
     };
     reached.recv_timeout(PATIENCE).unwrap();
     let side = b.branch("side").unwrap();
-    let written = within("a write back into the receiving closure's file", move || {
-        side.update(|_| elsewhere.update(|root| set_ours(root, 9)))
-            .unwrap()
-    });
+    let written = within(
+        "a write back into the receiving closure's file",
+        move || {
+            side.update(|_| elsewhere.update(|root| set_ours(root, 9)))
+                .unwrap()
+        },
+    );
     assert!(written.is_ok(), "{written:?}");
     release.send(()).unwrap();
     let pulled = receiving.join().unwrap().unwrap();
     assert_eq!(pulled.outcome, Outcome::FastForward);
     assert_eq!(b.head_hash(), a.head_hash());
     let x = other.branch("x").unwrap();
-    assert_eq!(x.read().get(&(OURS + 9)).as_deref(), Some(&"back".to_string()));
+    assert_eq!(
+        x.read().get(&(OURS + 9)).as_deref(),
+        Some(&"back".to_string())
+    );
     b.verify_typed().unwrap();
     other.verify().unwrap();
 }
@@ -489,7 +500,10 @@ fn commits_between_placing_and_landing_keep_their_frames() {
     assert_eq!(pulled.outcome, Outcome::FastForward);
     assert_eq!(b.head_hash(), a.head_hash());
     let side = b.branch("side").unwrap();
-    assert_eq!(side.read().get(&(OURS + 7)).as_deref(), Some(&"side".to_string()));
+    assert_eq!(
+        side.read().get(&(OURS + 7)).as_deref(),
+        Some(&"side".to_string())
+    );
     b.verify_typed().unwrap();
     let side_head = side.head_hash();
     drop(side);
@@ -500,9 +514,9 @@ fn commits_between_placing_and_landing_keep_their_frames() {
 
 #[test]
 fn reclamation_due_during_a_large_receive_runs_once_it_lands() {
-    let options = fast()
-        .history(Keep::Last(8))
-        .reclaim(Reclaim { every_bytes: 1 << 20 });
+    let options = fast().history(Keep::Last(8)).reclaim(Reclaim {
+        every_bytes: 1 << 20,
+    });
     let pair = Pair::new(2_000, 1_500, options);
     let Pair { a, b, bundle, .. } = &pair;
     let before = b.space().unwrap().cycles;
@@ -580,7 +594,11 @@ fn open_cut(target: &Path, image: &[u8], cut: usize, loss: usize) -> Db<Root> {
     db.verify()
         .unwrap_or_else(|error| panic!("cut {cut} loss {loss}: {error}"));
     let size = fs::metadata(target).unwrap().len();
-    assert_eq!(size, db.size_on_disk(), "cut {cut} loss {loss} kept a partial frame");
+    assert_eq!(
+        size,
+        db.size_on_disk(),
+        "cut {cut} loss {loss} kept a partial frame"
+    );
     db
 }
 
@@ -638,15 +656,27 @@ fn a_power_cut_at_any_write_of_an_unlocked_receive_keeps_every_acknowledged_comm
         let side = db.branch("side").unwrap().head_hash();
         let main = db.head_hash();
         assert!(remote == old.1 || remote == a_head, "cut {cut} loss {loss}");
-        assert!(side == old_side || side == new_side, "cut {cut} loss {loss}");
+        assert!(
+            side == old_side || side == new_side,
+            "cut {cut} loss {loss}"
+        );
         if cut >= first {
-            assert_ne!(main, old.0, "cut {cut} loss {loss} lost an acknowledged commit");
+            assert_ne!(
+                main, old.0,
+                "cut {cut} loss {loss} lost an acknowledged commit"
+            );
         }
         if cut >= second {
-            assert_eq!(side, new_side, "cut {cut} loss {loss} lost an acknowledged commit");
+            assert_eq!(
+                side, new_side,
+                "cut {cut} loss {loss} lost an acknowledged commit"
+            );
         }
         if cut >= last {
-            assert_eq!(main, merged.0, "cut {cut} loss {loss} lost the acknowledged pull");
+            assert_eq!(
+                main, merged.0,
+                "cut {cut} loss {loss} lost the acknowledged pull"
+            );
         }
         let state = if main == merged.0 {
             assert_eq!(dump(&db.read()), merged.1, "cut {cut} loss {loss}");

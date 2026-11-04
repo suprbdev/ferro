@@ -27,12 +27,26 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> String {
-        let out = self.cmd().args(args).assert().success().get_output().stdout.clone();
+        let out = self
+            .cmd()
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         String::from_utf8(out).unwrap()
     }
 
     fn fails(&self, args: &[&str]) -> String {
-        let out = self.cmd().args(args).assert().failure().get_output().stderr.clone();
+        let out = self
+            .cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
         String::from_utf8(out).unwrap()
     }
 }
@@ -74,26 +88,29 @@ fn enqueue_lease_ack_show() {
         .assert()
         .success()
         .stdout(predicate::str::contains("enqueued job=0"));
-    env.cmd()
-        .args(["show", "0"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("state=ready").and(predicate::str::contains("payload=hello")));
+    env.cmd().args(["show", "0"]).assert().success().stdout(
+        predicate::str::contains("state=ready").and(predicate::str::contains("payload=hello")),
+    );
     let leased = env.run(&["lease", "mail", "--worker", "w1", "--ttl-ms", "60000"]);
     assert!(leased.contains("job=0 attempt=1 queue=mail priority=5 payload=hello"));
+    env.cmd().args(["show", "0"]).assert().success().stdout(
+        predicate::str::contains("state=leased").and(predicate::str::contains("worker=w1")),
+    );
     env.cmd()
-        .args(["show", "0"])
+        .args(["lease", "mail"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("state=leased").and(predicate::str::contains("worker=w1")));
-    env.cmd().args(["lease", "mail"]).assert().success().stdout("empty\n");
+        .stdout("empty\n");
     env.cmd()
         .args(["ack", "0", "1"])
         .assert()
         .success()
         .stdout(predicate::str::contains("acked job=0"));
     assert!(env.fails(&["show", "0"]).contains("no such job: 0"));
-    assert!(env.fails(&["ack", "0", "1"]).contains("lease on job 0 is lost"));
+    assert!(
+        env.fails(&["ack", "0", "1"])
+            .contains("lease on job 0 is lost")
+    );
 }
 
 #[test]
@@ -127,7 +144,10 @@ fn enqueue_batch_from_stdin_and_file() {
         .success()
         .stdout(predicate::str::contains("count=2"));
     assert!(env.run(&["stats", "q"]).contains("ready=5"));
-    assert!(env.fails(&["enqueue-batch", "q", "--key", "k"]).contains("--key applies to a single job"));
+    assert!(
+        env.fails(&["enqueue-batch", "q", "--key", "k"])
+            .contains("--key applies to a single job")
+    );
 }
 
 #[test]
@@ -143,7 +163,15 @@ fn delayed_job_not_ready_until_due() {
 #[test]
 fn nack_backoff_then_dead_letter_and_dlq_commands() {
     let env = Env::new();
-    env.run(&["enqueue", "q", "x", "--max-attempts", "2", "--backoff-ms", "1"]);
+    env.run(&[
+        "enqueue",
+        "q",
+        "x",
+        "--max-attempts",
+        "2",
+        "--backoff-ms",
+        "1",
+    ]);
     env.run(&["lease", "q"]);
     let nacked = env.run(&["nack", "0", "1", "--error", "boom"]);
     assert!(nacked.contains("state=delayed"));
@@ -152,18 +180,19 @@ fn nack_backoff_then_dead_letter_and_dlq_commands() {
     assert!(again.contains("attempt=2"));
     let dead = env.run(&["nack", "0", "2", "--error", "fatal"]);
     assert!(dead.contains("state=dead"));
-    env.cmd()
-        .args(["dlq", "list"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("state=dead").and(predicate::str::contains("error=\"fatal\"")));
+    env.cmd().args(["dlq", "list"]).assert().success().stdout(
+        predicate::str::contains("state=dead").and(predicate::str::contains("error=\"fatal\"")),
+    );
     assert!(env.run(&["stats", "q"]).contains("dead=1"));
     env.cmd()
         .args(["dlq", "retry", "0"])
         .assert()
         .success()
         .stdout("retried count=1\n");
-    env.cmd().args(["dlq", "list"]).assert().stdout("dead letter queue is empty\n");
+    env.cmd()
+        .args(["dlq", "list"])
+        .assert()
+        .stdout("dead letter queue is empty\n");
     assert!(env.run(&["lease", "q"]).contains("attempt=1"));
 }
 
@@ -186,8 +215,14 @@ fn dlq_retry_whole_queue_and_listing_by_queue() {
         .stdout("retried count=2\n");
     assert!(env.run(&["stats", "a"]).contains("ready=2"));
     assert!(env.run(&["stats", "b"]).contains("dead=1"));
-    assert!(env.fails(&["dlq", "retry"]).contains("give a job id or --queue"));
-    assert!(env.fails(&["dlq", "retry", "0"]).contains("not in the dead letter queue"));
+    assert!(
+        env.fails(&["dlq", "retry"])
+            .contains("give a job id or --queue")
+    );
+    assert!(
+        env.fails(&["dlq", "retry", "0"])
+            .contains("not in the dead letter queue")
+    );
 }
 
 #[test]
@@ -213,9 +248,18 @@ fn extend_and_tick_reap_expired_leases() {
 #[test]
 fn idempotency_key_dedupes() {
     let env = Env::new();
-    assert!(env.run(&["enqueue", "q", "x", "--key", "order-9"]).contains("enqueued job=0"));
-    assert!(env.run(&["enqueue", "q", "x", "--key", "order-9"]).contains("duplicate job=0"));
-    assert!(env.run(&["enqueue", "q", "x", "--key", "order-10"]).contains("enqueued job=1"));
+    assert!(
+        env.run(&["enqueue", "q", "x", "--key", "order-9"])
+            .contains("enqueued job=0")
+    );
+    assert!(
+        env.run(&["enqueue", "q", "x", "--key", "order-9"])
+            .contains("duplicate job=0")
+    );
+    assert!(
+        env.run(&["enqueue", "q", "x", "--key", "order-10"])
+            .contains("enqueued job=1")
+    );
     assert!(env.run(&["stats", "q"]).contains("ready=2"));
 }
 
@@ -230,17 +274,28 @@ fn dependencies_block_until_parent_acked() {
     assert_eq!(first.lines().count(), 1);
     env.run(&["ack", "0", "1"]);
     assert!(env.run(&["lease", "q"]).contains("payload=child"));
-    assert!(env.fails(&["enqueue", "q", "x", "--after", "77"]).contains("unknown dependency"));
+    assert!(
+        env.fails(&["enqueue", "q", "x", "--after", "77"])
+            .contains("unknown dependency")
+    );
 }
 
 #[test]
 fn pause_and_resume() {
     let env = Env::new();
     env.run(&["enqueue", "q", "x"]);
-    env.cmd().args(["pause", "q"]).assert().success().stdout("paused queue=q\n");
+    env.cmd()
+        .args(["pause", "q"])
+        .assert()
+        .success()
+        .stdout("paused queue=q\n");
     assert!(env.run(&["stats", "q"]).contains("paused=true"));
     env.cmd().args(["lease", "q"]).assert().stdout("empty\n");
-    env.cmd().args(["resume", "q"]).assert().success().stdout("resumed queue=q\n");
+    env.cmd()
+        .args(["resume", "q"])
+        .assert()
+        .success()
+        .stdout("resumed queue=q\n");
     assert!(env.run(&["lease", "q"]).contains("payload=x"));
 }
 
@@ -248,11 +303,22 @@ fn pause_and_resume() {
 fn recurring_add_list_remove_and_tick_spawns() {
     let env = Env::new();
     env.cmd()
-        .args(["recurring", "add", "nightly", "q", "report", "--every-ms", "100"])
+        .args([
+            "recurring",
+            "add",
+            "nightly",
+            "q",
+            "report",
+            "--every-ms",
+            "100",
+        ])
         .assert()
         .success()
         .stdout("recurring added name=nightly\n");
-    assert!(env.run(&["recurring", "list"]).contains("name=nightly queue=q every_ms=100"));
+    assert!(
+        env.run(&["recurring", "list"])
+            .contains("name=nightly queue=q every_ms=100")
+    );
     std::thread::sleep(Duration::from_millis(150));
     assert!(env.run(&["tick"]).contains("spawned=1"));
     assert!(env.run(&["stats", "q"]).contains("ready=1"));
@@ -310,7 +376,10 @@ fn replay_from_version_reenqueues_in_flight() {
     assert!(leased.contains("payload=alpha") && leased.contains("payload=beta"));
     let again = env.run(&["replay", "--from", &version]);
     assert!(again.contains("duplicate=true"));
-    assert!(env.fails(&["replay", "--from", "9999"]).contains("no such version"));
+    assert!(
+        env.fails(&["replay", "--from", "9999"])
+            .contains("no such version")
+    );
 }
 
 #[test]
@@ -337,9 +406,23 @@ fn work_runs_command_per_job_and_retries_failures() {
         .write_stdin("one\ntwo\nthree\n")
         .assert()
         .success();
-    let exec = format!("cat >> {}; echo \" id=$QUEUE_JOB_ID q=$QUEUE_NAME a=$QUEUE_ATTEMPT\" >> {}", out.display(), out.display());
+    let exec = format!(
+        "cat >> {}; echo \" id=$QUEUE_JOB_ID q=$QUEUE_NAME a=$QUEUE_ATTEMPT\" >> {}",
+        out.display(),
+        out.display()
+    );
     env.cmd()
-        .args(["work", "q", "--workers", "2", "--batch", "2", "--exit-when-idle", "--exec", &exec])
+        .args([
+            "work",
+            "q",
+            "--workers",
+            "2",
+            "--batch",
+            "2",
+            "--exit-when-idle",
+            "--exec",
+            &exec,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("done=3 failed=0 lost=0"));
@@ -348,21 +431,45 @@ fn work_runs_command_per_job_and_retries_failures() {
         assert!(text.contains(word), "{text}");
     }
     assert!(text.contains("q=q a=1"));
-    assert!(env.run(&["stats", "q"]).contains("ready=0 delayed=0 leased=0"));
+    assert!(
+        env.run(&["stats", "q"])
+            .contains("ready=0 delayed=0 leased=0")
+    );
 
-    env.run(&["enqueue", "f", "x", "--max-attempts", "2", "--backoff-ms", "1"]);
+    env.run(&[
+        "enqueue",
+        "f",
+        "x",
+        "--max-attempts",
+        "2",
+        "--backoff-ms",
+        "1",
+    ]);
     env.cmd()
-        .args(["work", "f", "--exit-when-idle", "--exec", "echo nope >&2; exit 3"])
+        .args([
+            "work",
+            "f",
+            "--exit-when-idle",
+            "--exec",
+            "echo nope >&2; exit 3",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("failed=2"));
-    assert!(env.run(&["dlq", "list"]).contains("exit exit status: 3: nope"));
+    assert!(
+        env.run(&["dlq", "list"])
+            .contains("exit exit status: 3: nope")
+    );
 }
 
 #[test]
 fn work_stops_after_max_jobs() {
     let env = Env::new();
-    env.cmd().args(["enqueue-batch", "q"]).write_stdin("1\n2\n3\n4\n").assert().success();
+    env.cmd()
+        .args(["enqueue-batch", "q"])
+        .write_stdin("1\n2\n3\n4\n")
+        .assert()
+        .success();
     env.cmd()
         .args(["work", "q", "--max-jobs", "2", "--exec", "true"])
         .assert()
@@ -387,10 +494,7 @@ fn stats_without_queue_lists_all_and_info_reports_size() {
 fn readers_work_while_a_writer_process_is_alive() {
     let env = Env::new();
     env.run(&["enqueue", "q", "x"]);
-    let mut worker = spawn_queue(
-        &env.db(),
-        &["work", "idle", "--exec", "true"],
-    );
+    let mut worker = spawn_queue(&env.db(), &["work", "idle", "--exec", "true"]);
     std::thread::sleep(Duration::from_millis(500));
     env.cmd()
         .args(["--lock-wait-ms", "0", "stats", "q"])

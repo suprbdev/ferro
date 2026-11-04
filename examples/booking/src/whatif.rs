@@ -46,10 +46,11 @@ pub struct Applied {
 }
 
 fn branch_of(db: &Db<Hotels>, name: &str) -> Result<Db<Hotels>> {
-    db.branch(&format!("{PREFIX}{name}")).map_err(|error| match error {
-        Error::NoBranch(_) => BookingError::NoScenario(name.to_string()),
-        other => other.into(),
-    })
+    db.branch(&format!("{PREFIX}{name}"))
+        .map_err(|error| match error {
+            Error::NoBranch(_) => BookingError::NoScenario(name.to_string()),
+            other => other.into(),
+        })
 }
 
 pub fn list(svc: &Reservations) -> Result<Vec<(String, Option<Scenario>)>> {
@@ -66,7 +67,10 @@ pub fn list(svc: &Reservations) -> Result<Vec<(String, Option<Scenario>)>> {
 pub fn propose(svc: &Reservations, name: &str, scenario: Scenario) -> Result<Preview> {
     let snapshot = svc.read();
     match &scenario {
-        Scenario::Close { venue } | Scenario::Reprice { venue: Some(venue), .. } => {
+        Scenario::Close { venue }
+        | Scenario::Reprice {
+            venue: Some(venue), ..
+        } => {
             if !snapshot.venues.contains(venue) {
                 return Err(BookingError::NoVenue(venue.to_string()));
             }
@@ -132,13 +136,18 @@ pub fn preview(svc: &Reservations, name: &str) -> Result<Preview> {
     let mut exposure = Vec::new();
     for status in [Status::Held, Status::Confirmed] {
         for booking in main.bookings.by_status(&status) {
-            if booking.last_night() < today || !repriced.iter().any(|(id, _, _)| *id == booking.room) {
+            if booking.last_night() < today
+                || !repriced.iter().any(|(id, _, _)| *id == booking.room)
+            {
                 continue;
             }
             let Some(room) = theirs.rooms.get(&booking.room) else {
                 continue;
             };
-            let at_new_rates = booking.nights().map(|night| theirs.price(&room, night)).sum();
+            let at_new_rates = booking
+                .nights()
+                .map(|night| theirs.price(&room, night))
+                .sum();
             if at_new_rates != booking.total {
                 exposure.push(Exposure {
                     booking: booking.into_owned(),
@@ -199,13 +208,24 @@ fn merged(
                 conflicts += 1;
                 conflict.ours.map(|rate| scaled(*rate, *percent))
             });
-            Ok((format!("{scenario}: {rooms} rooms, {rates} night rates"), conflicts, Vec::new()))
+            Ok((
+                format!("{scenario}: {rooms} rooms, {rates} night rates"),
+                conflicts,
+                Vec::new(),
+            ))
         }
         Scenario::Close { venue } => {
             let cancelled = ours.close_venue(now, *venue)?;
             let refunds: Cents = cancelled.iter().map(|(_, refund)| refund).sum();
-            let summary = format!("{scenario}: cancelled {}, refunded {refunds}", cancelled.len());
-            Ok((summary, 0, cancelled.into_iter().map(|(id, _)| id).collect()))
+            let summary = format!(
+                "{scenario}: cancelled {}, refunded {refunds}",
+                cancelled.len()
+            );
+            Ok((
+                summary,
+                0,
+                cancelled.into_iter().map(|(id, _)| id).collect(),
+            ))
         }
     }
 }

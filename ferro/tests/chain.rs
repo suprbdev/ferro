@@ -26,7 +26,10 @@ fn every_version_is_reachable_through_skip_pointers() {
         let snapshot = db.at(version).unwrap();
         assert_eq!(snapshot.version(), version);
         assert_eq!(*snapshot.get(&0).unwrap(), version);
-        assert_eq!(db.log().get(&version).unwrap().message, format!("c{version}"));
+        assert_eq!(
+            db.log().get(&version).unwrap().message,
+            format!("c{version}")
+        );
     }
     assert!(matches!(db.at(1501), Err(Error::NoVersion(1501))));
     let versions: Vec<u64> = db.log().iter().map(|(version, _)| version).collect();

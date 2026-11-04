@@ -7,8 +7,8 @@ use std::io::ErrorKind;
 use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -106,9 +106,18 @@ pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
 struct CacheEntry(Entry);
 
 enum Entry {
-    Value { value: Arc<dyn Cached>, weight: u32 },
-    Node { node: Erased, weight: u32, owned: bool },
-    Taken { weight: u32 },
+    Value {
+        value: Arc<dyn Cached>,
+        weight: u32,
+    },
+    Node {
+        node: Erased,
+        weight: u32,
+        owned: bool,
+    },
+    Taken {
+        weight: u32,
+    },
 }
 
 impl CacheEntry {
@@ -321,9 +330,9 @@ fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
         let mut bytes = [0u8; SUPER_BYTES];
         file.read_exact_at(&mut bytes, start)?;
         if let Some(candidate) = Super::decode(&bytes)
-            && best.as_ref().is_none_or(|b| {
-                (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq)
-            })
+            && best
+                .as_ref()
+                .is_none_or(|b| (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq))
         {
             best = Some((candidate, slot));
         }
@@ -504,7 +513,9 @@ impl RecordReader<'_> {
         if upto <= self.bytes.len() {
             return Ok(());
         }
-        let past = (upto as u64).checked_add(self.start).is_none_or(|end| end > self.tail);
+        let past = (upto as u64)
+            .checked_add(self.start)
+            .is_none_or(|end| end > self.tail);
         let Some(file) = self.file.filter(|_| !past) else {
             return Err(Error::Corrupt(format!(
                 "record at {} runs past end of log",
@@ -573,9 +584,15 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
     let mut retries = 0;
     loop {
         let mut options = OpenOptions::new();
-        options.read(true).write(!read_only).create(!read_only).truncate(false);
+        options
+            .read(true)
+            .write(!read_only)
+            .create(!read_only)
+            .truncate(false);
         let file = platform::open(&options, path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound if read_only => Error::NoDatabase(path.display().to_string()),
+            std::io::ErrorKind::NotFound if read_only => {
+                Error::NoDatabase(path.display().to_string())
+            }
             _ => error.into(),
         })?;
         if read_only {
@@ -591,7 +608,9 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
             }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
-        if platform::path_id(path).is_ok_and(|on_disk| platform::file_id(&file).is_ok_and(|id| id == on_disk)) {
+        if platform::path_id(path)
+            .is_ok_and(|on_disk| platform::file_id(&file).is_ok_and(|id| id == on_disk))
+        {
             return Ok(file);
         }
     }
@@ -683,7 +702,9 @@ pub(crate) struct Retired(Weak<Inner>);
 
 impl Retired {
     pub(crate) fn bytes(&self) -> Option<u64> {
-        self.0.upgrade().map(|inner| inner.tail.load(Ordering::Acquire))
+        self.0
+            .upgrade()
+            .map(|inner| inner.tail.load(Ordering::Acquire))
     }
 }
 
@@ -943,7 +964,8 @@ impl Store {
     pub(crate) fn settle_anchor(&self) -> Result<()> {
         let inner = &self.inner;
         let marks = *inner.marks.lock();
-        if inner.options.read_only || marks.anchor == marks.latest || self.check_healthy().is_err() {
+        if inner.options.read_only || marks.anchor == marks.latest || self.check_healthy().is_err()
+        {
             return Ok(());
         }
         inner.file.sync_data()?;
@@ -1048,7 +1070,11 @@ impl Store {
         let body = if flagged & 1 == 1 {
             let raw_len = usize::try_from(reader.varint()?)
                 .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-            if raw_len > stored_len.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
+            if raw_len
+                > stored_len
+                    .saturating_mul(MAX_RATIO)
+                    .saturating_add(MAX_RATIO)
+            {
                 return Err(Error::Corrupt(format!(
                     "implausible compression at {}",
                     ptr.offset
@@ -1080,7 +1106,8 @@ impl Store {
                 ptr.offset
             )));
         }
-        let len = u32::try_from(reader.pos).map_err(|_| Error::Corrupt("record overflow".into()))?;
+        let len =
+            u32::try_from(reader.pos).map_err(|_| Error::Corrupt("record overflow".into()))?;
         Ok((object, len, packed))
     }
 
@@ -1116,7 +1143,9 @@ impl Store {
         }
         let (node, weight) = self.decode_fresh(ptr, decode, weigh)?;
         let node = Shared::new(node);
-        self.admit(ptr, || CacheEntry::node(Shared::erase(node.clone()), weight));
+        self.admit(ptr, || {
+            CacheEntry::node(Shared::erase(node.clone()), weight)
+        });
         Ok((node, false))
     }
 
@@ -1271,7 +1300,9 @@ struct Dedupe {
 
 impl Dedupe {
     fn new(entries: usize) -> Dedupe {
-        let sets = (entries / DEDUPE_WAYS).next_power_of_two().max(DEDUPE_CHUNK);
+        let sets = (entries / DEDUPE_WAYS)
+            .next_power_of_two()
+            .max(DEDUPE_CHUNK);
         Dedupe {
             chunks: (0..sets / DEDUPE_CHUNK).map(|_| OnceLock::new()).collect(),
             mask: sets - 1,
@@ -1295,10 +1326,13 @@ impl Dedupe {
 
     fn insert(&self, hash: Hash, offset: u64) {
         let (chunk, set) = self.index(&hash);
-        let chunk = self.chunks[chunk]
-            .get_or_init(|| (0..DEDUPE_CHUNK).map(|_| Set::default()).collect());
+        let chunk =
+            self.chunks[chunk].get_or_init(|| (0..DEDUPE_CHUNK).map(|_| Set::default()).collect());
         let mut ways = chunk[set].0.lock();
-        let at = ways.iter().position(|way| way.hash == hash).unwrap_or(DEDUPE_WAYS - 1);
+        let at = ways
+            .iter()
+            .position(|way| way.hash == hash)
+            .unwrap_or(DEDUPE_WAYS - 1);
         ways.copy_within(0..at, 1);
         ways[0] = Way {
             hash,
@@ -1474,7 +1508,8 @@ impl Sink for Txn {
     }
 
     fn remember(&mut self, ptr: Ptr, value: Erased, weight: u32) {
-        self.remembered.push((ptr.hash, CacheEntry::node(value, weight), None));
+        self.remembered
+            .push((ptr.hash, CacheEntry::node(value, weight), None));
     }
 
     fn remember_moving(
@@ -1484,7 +1519,8 @@ impl Sink for Txn {
         weight: u32,
         relocate: (Relocate, usize),
     ) {
-        self.remembered.push((ptr.hash, CacheEntry::node(value, weight), Some(relocate)));
+        self.remembered
+            .push((ptr.hash, CacheEntry::node(value, weight), Some(relocate)));
     }
 
     fn store_id(&self) -> u64 {
@@ -1514,10 +1550,19 @@ impl Txn {
         if u32::try_from(raw).is_err() {
             return Err(Error::TooLarge(raw as u64));
         }
-        let offset = self.seen.get(&hash).copied().or_else(|| match self.unshared {
-            true => None,
-            false => self.store.inner.dedupe.get(&hash).filter(|offset| *offset < self.origin),
-        });
+        let offset = self
+            .seen
+            .get(&hash)
+            .copied()
+            .or_else(|| match self.unshared {
+                true => None,
+                false => self
+                    .store
+                    .inner
+                    .dedupe
+                    .get(&hash)
+                    .filter(|offset| *offset < self.origin),
+            });
         Ok(offset.map(|offset| Ptr { hash, offset }))
     }
 
@@ -1638,7 +1683,10 @@ impl Txn {
         let mut chunk = vec![0u8; SCAN_CHUNK.min((self.start - at) as usize)];
         while at < self.start {
             let take = chunk.len().min((self.start - at) as usize);
-            self.store.inner.file.read_exact_at(&mut chunk[..take], at)?;
+            self.store
+                .inner
+                .file
+                .read_exact_at(&mut chunk[..take], at)?;
             hasher.update(&chunk[..take]);
             at += take as u64;
         }

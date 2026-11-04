@@ -29,7 +29,10 @@ struct Pending {
 
 impl Pending {
     fn take(&mut self, oldest: u64) -> Vec<Retired> {
-        let freed: Vec<Retired> = self.items.extract_if(.., |item| item.epoch < oldest).collect();
+        let freed: Vec<Retired> = self
+            .items
+            .extract_if(.., |item| item.epoch < oldest)
+            .collect();
         self.bytes -= freed.iter().map(|item| item.bytes).sum::<usize>();
         freed
     }
@@ -91,7 +94,10 @@ pub(crate) fn pin() -> Option<Guard> {
         .try_with(|local| {
             let depth = local.depth.get();
             if depth == 0 {
-                local.slot.epoch.swap(EPOCH.load(Ordering::SeqCst), Ordering::SeqCst);
+                local
+                    .slot
+                    .epoch
+                    .swap(EPOCH.load(Ordering::SeqCst), Ordering::SeqCst);
             }
             local.depth.set(depth + 1);
         })
@@ -147,7 +153,9 @@ fn free(slot: &Slot, oldest: u64) {
         freed
     };
     let count = freed.len();
-    let counted = FREEING_HERE.try_with(|here| here.set(here.get() + count)).is_ok();
+    let counted = FREEING_HERE
+        .try_with(|here| here.set(here.get() + count))
+        .is_ok();
     drop(freed);
     if counted {
         let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));

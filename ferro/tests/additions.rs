@@ -165,7 +165,10 @@ fn value_hash_agrees_with_hash_of_for_inline_spilled_and_dirty_values() {
     })
     .unwrap();
     let snapshot = db.read();
-    assert_eq!(snapshot.notes.value_hash(&1), Some(hash_of(&"short".to_string())));
+    assert_eq!(
+        snapshot.notes.value_hash(&1),
+        Some(hash_of(&"short".to_string()))
+    );
     assert_eq!(snapshot.notes.value_hash(&2), Some(hash_of(&spilled)));
     assert_eq!(snapshot.notes.value_hash(&3), None);
     let mut dirty = snapshot.notes.clone();
@@ -191,10 +194,16 @@ fn a_spilled_value_hash_does_not_read_the_value() {
     assert_eq!(hash, offset);
     let needle = &spilled.as_bytes()[..64];
     let mut bytes = std::fs::read(&path).unwrap();
-    let at = bytes.windows(64).position(|window| window == needle).unwrap();
+    let at = bytes
+        .windows(64)
+        .position(|window| window == needle)
+        .unwrap();
     bytes[at + 16] ^= 0xFF;
     std::fs::write(&path, bytes).unwrap();
-    let db = Options::new().read_only().open::<Map<u64, String>>(&path).unwrap();
+    let db = Options::new()
+        .read_only()
+        .open::<Map<u64, String>>(&path)
+        .unwrap();
     let snapshot = db.read();
     assert_eq!(snapshot.value_hash(&1), Some(hash));
     assert!(snapshot.try_get(&1).is_err());
@@ -211,11 +220,23 @@ fn an_index_cursor_continues_after_the_key_it_was_given() {
     assert_eq!(ids(store.items.by_shelf_after(shelf, &0)), whole);
     assert_eq!(ids(store.items.by_shelf_after(shelf, &1)), whole[1..]);
     assert_eq!(ids(store.items.by_shelf_after(shelf, &2)), whole[1..]);
-    assert_eq!(ids(store.items.by_shelf_after(shelf, &whole[41])), whole[42..]);
+    assert_eq!(
+        ids(store.items.by_shelf_after(shelf, &whole[41])),
+        whole[42..]
+    );
     assert_eq!(store.items.by_shelf_after(shelf, &whole[41]).len(), 58);
-    assert_eq!(ids(store.items.by_shelf_after(shelf, &whole[99])), Vec::<u64>::new());
-    assert_eq!(ids(store.items.by_shelf_after(shelf, &u64::MAX)), Vec::<u64>::new());
-    assert_eq!(ids(store.items.by_shelf_after("nowhere", &0)), Vec::<u64>::new());
+    assert_eq!(
+        ids(store.items.by_shelf_after(shelf, &whole[99])),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(store.items.by_shelf_after(shelf, &u64::MAX)),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(store.items.by_shelf_after("nowhere", &0)),
+        Vec::<u64>::new()
+    );
     let reversed = ids(store.items.by_shelf_after(shelf, &whole[97]).rev());
     assert_eq!(reversed, vec![whole[99], whole[98]]);
 }
@@ -226,12 +247,21 @@ fn cursors_exist_for_each_kind_of_index() {
     let db = filled(&dir.path().join("i.ferro"));
     let store = db.read();
     let tagged = ids(store.items.by_tags("t1"));
-    assert_eq!(ids(store.items.by_tags_after("t1", &tagged[9])), tagged[10..]);
+    assert_eq!(
+        ids(store.items.by_tags_after("t1", &tagged[9])),
+        tagged[10..]
+    );
     let owned = ids(store.items.by_owner_some(&1));
-    assert_eq!(ids(store.items.by_owner_some_after(&1, &owned[4])), owned[5..]);
+    assert_eq!(
+        ids(store.items.by_owner_some_after(&1, &owned[4])),
+        owned[5..]
+    );
     assert_eq!(ids(store.items.by_owner_some_after(&1, &0)), owned);
     let unowned = ids(store.items.by_owner(&None));
-    assert_eq!(ids(store.items.by_owner_after(&None, &unowned[0])), unowned[1..]);
+    assert_eq!(
+        ids(store.items.by_owner_after(&None, &unowned[0])),
+        unowned[1..]
+    );
 }
 
 #[test]
@@ -303,7 +333,10 @@ fn db_snapshot_and_watcher_format_without_a_debug_bound() {
     let db = fast().open::<Opaque>(&path).unwrap();
     db.commit("first", |root| root.value = 1).unwrap();
     let held = format!("{db:?}");
-    assert!(held.contains("main") && held.contains("version: 1"), "{held}");
+    assert!(
+        held.contains("main") && held.contains("version: 1"),
+        "{held}"
+    );
     assert!(format!("{:?}", db.read()).contains("first"));
     let error = fast().open::<Opaque>(&path).unwrap_err();
     assert!(matches!(error, Error::Locked));

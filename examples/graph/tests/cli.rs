@@ -62,18 +62,36 @@ fn users_and_follows() {
     assert!(env.ok(&["user", "bob"]).starts_with("user 1 bob"));
     assert!(env.fail(&["user", "alice"]).contains("taken"));
     assert!(env.fail(&["user", "42"]).contains("invalid"));
-    assert!(env.ok(&["follow", "alice", "bob"]).starts_with("followed 0 -> 1"));
+    assert!(
+        env.ok(&["follow", "alice", "bob"])
+            .starts_with("followed 0 -> 1")
+    );
     assert!(env.ok(&["follow", "0", "1"]).contains("already following"));
     assert!(env.fail(&["follow", "0", "0"]).contains("yourself"));
     assert!(env.fail(&["follow", "0", "9"]).contains("no such user"));
     assert_eq!(env.ids(&["following", "alice"]), vec![1]);
     assert_eq!(env.ids(&["followers", "bob"]), vec![0]);
-    assert!(env.ok(&["count", "bob"]).contains("followers 1 following 0"));
-    assert!(env.ok(&["count", "bob", "--scan"]).contains("followers 1 following 0"));
-    assert!(env.ok(&["unfollow", "alice", "bob"]).starts_with("unfollowed"));
-    assert!(env.ok(&["unfollow", "alice", "bob"]).contains("was not following"));
+    assert!(
+        env.ok(&["count", "bob"])
+            .contains("followers 1 following 0")
+    );
+    assert!(
+        env.ok(&["count", "bob", "--scan"])
+            .contains("followers 1 following 0")
+    );
+    assert!(
+        env.ok(&["unfollow", "alice", "bob"])
+            .starts_with("unfollowed")
+    );
+    assert!(
+        env.ok(&["unfollow", "alice", "bob"])
+            .contains("was not following")
+    );
     assert!(env.ids(&["followers", "bob"]).is_empty());
-    assert!(env.ok(&["count", "bob"]).contains("followers 0 following 0"));
+    assert!(
+        env.ok(&["count", "bob"])
+            .contains("followers 0 following 0")
+    );
     env.ok(&["verify"]);
 }
 
@@ -105,7 +123,10 @@ fn pagination_walks_every_follower_once() {
     }
     assert_eq!(pages, 6);
     assert_eq!(seen, (1..40).collect::<Vec<u32>>());
-    assert!(env.ok(&["followers", "0", "--limit", "39"]).ends_with("end\n"));
+    assert!(
+        env.ok(&["followers", "0", "--limit", "39"])
+            .ends_with("end\n")
+    );
 }
 
 #[test]
@@ -117,13 +138,18 @@ fn mutuals_intersects_both_directions() {
     let text = env.ok(&["mutuals", "1", "2", "--followers"]);
     assert!(text.starts_with("count 1\n0\t"), "{text}");
     assert!(env.ok(&["mutuals", "0", "6"]).starts_with("count 0"));
-    assert!(env.ok(&["mutuals", "0", "1"]).contains("0 follows 1: true, 1 follows 0: false"));
+    assert!(
+        env.ok(&["mutuals", "0", "1"])
+            .contains("0 follows 1: true, 1 follows 0: false")
+    );
 }
 
 #[test]
 fn mutuals_matches_brute_force_for_celebrity_and_balanced_pairs() {
     let env = Env::new();
-    env.ok(&["seed", "--users", "3000", "--edges", "40000", "--seed", "11"]);
+    env.ok(&[
+        "seed", "--users", "3000", "--edges", "40000", "--seed", "11",
+    ]);
     let stats = env.ok(&["stats"]);
     let tops: Vec<u32> = stats
         .lines()
@@ -171,13 +197,22 @@ fn mutuals_matches_brute_force_for_celebrity_and_balanced_pairs() {
 fn path_is_shortest_and_respects_depth() {
     let env = Env::new();
     env.small();
-    assert!(env.ok(&["path", "0", "5"]).starts_with("length 4 path 0 -> 1 -> 3 -> 4 -> 5"));
-    assert!(env.ok(&["path", "0", "5", "--max-depth", "3"]).contains("no path within 3"));
+    assert!(
+        env.ok(&["path", "0", "5"])
+            .starts_with("length 4 path 0 -> 1 -> 3 -> 4 -> 5")
+    );
+    assert!(
+        env.ok(&["path", "0", "5", "--max-depth", "3"])
+            .contains("no path within 3")
+    );
     assert!(env.ok(&["path", "0", "6"]).contains("no path"));
     assert!(env.ok(&["path", "5", "0"]).contains("no path"));
     assert!(env.ok(&["path", "2", "2"]).starts_with("length 0"));
     env.ok(&["follow", "0", "4"]);
-    assert!(env.ok(&["path", "0", "5"]).starts_with("length 2 path 0 -> 4 -> 5"));
+    assert!(
+        env.ok(&["path", "0", "5"])
+            .starts_with("length 2 path 0 -> 4 -> 5")
+    );
 }
 
 #[test]
@@ -215,7 +250,13 @@ fn timeline_merges_followed_authors_newest_first() {
     let env = Env::new();
     env.small();
     let mut ids = Vec::new();
-    for (author, text) in [("1", "one"), ("2", "two"), ("3", "three"), ("1", "four"), ("2", "five")] {
+    for (author, text) in [
+        ("1", "one"),
+        ("2", "two"),
+        ("3", "three"),
+        ("1", "four"),
+        ("2", "five"),
+    ] {
         let out = env.ok(&["post", author, text]);
         ids.push(out.split_whitespace().nth(1).unwrap().to_string());
     }
@@ -239,7 +280,12 @@ fn inbox_timeline_matches_computed_timeline_for_fanout_posts() {
     let computed = env.ok(&["timeline", "0", "--limit", "2"]);
     let inbox = env.ok(&["timeline", "0", "--limit", "2", "--inbox"]);
     assert_eq!(computed, inbox);
-    assert!(env.ok(&["timeline", "0", "--limit", "10", "--inbox"]).lines().count() == 2);
+    assert!(
+        env.ok(&["timeline", "0", "--limit", "10", "--inbox"])
+            .lines()
+            .count()
+            == 2
+    );
 }
 
 #[test]
@@ -258,11 +304,26 @@ fn likes_are_counted_once() {
 fn reach_counts_distinct_users_per_hop() {
     let env = Env::new();
     env.small();
-    assert!(env.ok(&["reach", "0", "--hops", "1"]).starts_with("reach 2 levels 2"));
-    assert!(env.ok(&["reach", "0", "--hops", "2"]).starts_with("reach 3 levels 2 1"));
-    assert!(env.ok(&["reach", "0", "--hops", "9"]).starts_with("reach 5 levels 2 1 1 1"));
-    assert!(env.ok(&["reach", "3", "--hops", "2", "--dir", "in"]).starts_with("reach 3 levels 2 1"));
-    assert!(env.ok(&["reach", "3", "--hops", "1", "--dir", "both"]).starts_with("reach 3 levels 3"));
+    assert!(
+        env.ok(&["reach", "0", "--hops", "1"])
+            .starts_with("reach 2 levels 2")
+    );
+    assert!(
+        env.ok(&["reach", "0", "--hops", "2"])
+            .starts_with("reach 3 levels 2 1")
+    );
+    assert!(
+        env.ok(&["reach", "0", "--hops", "9"])
+            .starts_with("reach 5 levels 2 1 1 1")
+    );
+    assert!(
+        env.ok(&["reach", "3", "--hops", "2", "--dir", "in"])
+            .starts_with("reach 3 levels 2 1")
+    );
+    assert!(
+        env.ok(&["reach", "3", "--hops", "1", "--dir", "both"])
+            .starts_with("reach 3 levels 3")
+    );
 }
 
 #[test]
@@ -273,12 +334,30 @@ fn graph_at_and_diff_see_old_versions() {
     let after = env.version(&["unfollow", "0", "1"]);
     let newer = env.version(&["follow", "7", "0"]);
     assert_eq!(env.ids(&["following", "0"]), vec![2]);
-    assert_eq!(env.ids(&["graph-at", &before.to_string(), "following", "0"]), vec![1, 2]);
-    assert_eq!(env.ids(&["--at", &before.to_string(), "following", "0"]), vec![1, 2]);
-    assert_eq!(env.ids(&["graph-at", &after.to_string(), "following", "0"]), vec![2]);
-    assert_eq!(env.ids(&["graph-at", &after.to_string(), "followers", "0"]), Vec::<u32>::new());
-    assert_eq!(env.ids(&["graph-at", &newer.to_string(), "followers", "0"]), vec![7]);
-    assert!(env.ok(&["graph-at", &before.to_string(), "stats"]).contains("follows 8"));
+    assert_eq!(
+        env.ids(&["graph-at", &before.to_string(), "following", "0"]),
+        vec![1, 2]
+    );
+    assert_eq!(
+        env.ids(&["--at", &before.to_string(), "following", "0"]),
+        vec![1, 2]
+    );
+    assert_eq!(
+        env.ids(&["graph-at", &after.to_string(), "following", "0"]),
+        vec![2]
+    );
+    assert_eq!(
+        env.ids(&["graph-at", &after.to_string(), "followers", "0"]),
+        Vec::<u32>::new()
+    );
+    assert_eq!(
+        env.ids(&["graph-at", &newer.to_string(), "followers", "0"]),
+        vec![7]
+    );
+    assert!(
+        env.ok(&["graph-at", &before.to_string(), "stats"])
+            .contains("follows 8")
+    );
     assert!(env.ok(&["stats"]).contains("follows 8"));
     assert!(env.fail(&["graph-at", "9999", "stats"]).contains("version"));
     let text = env.ok(&["diff", &before.to_string(), &newer.to_string()]);
@@ -289,7 +368,10 @@ fn graph_at_and_diff_see_old_versions() {
     assert!(none.starts_with("added 0 removed 0"));
     let back = env.ok(&["diff", &newer.to_string(), &before.to_string()]);
     assert!(back.contains("+ 0 -> 1") && back.contains("- 7 -> 0"));
-    assert!(env.ok(&["log", "--limit", "3"]).starts_with(&format!("v{newer}\t")));
+    assert!(
+        env.ok(&["log", "--limit", "3"])
+            .starts_with(&format!("v{newer}\t"))
+    );
 }
 
 #[test]
@@ -301,7 +383,13 @@ fn diff_across_large_adjacency_with_block_splits() {
         env.ok(&["follow", &i.to_string(), "9"]);
     }
     let end = env.version(&["follow", "1", "3"]);
-    let text = env.ok(&["diff", &start.to_string(), &end.to_string(), "--limit", "1000"]);
+    let text = env.ok(&[
+        "diff",
+        &start.to_string(),
+        &end.to_string(),
+        "--limit",
+        "1000",
+    ]);
     let added = text.lines().filter(|l| l.starts_with("+ ")).count();
     assert!(text.contains(&format!("added {added} removed 0")));
     assert!(added > 600 && added <= 691, "{added}");
@@ -313,7 +401,15 @@ fn diff_across_large_adjacency_with_block_splits() {
 fn pagerank_and_communities() {
     let env = Env::new();
     env.small();
-    let text = env.ok(&["pagerank", "--iterations", "30", "--threads", "3", "--top", "3"]);
+    let text = env.ok(&[
+        "pagerank",
+        "--iterations",
+        "30",
+        "--threads",
+        "3",
+        "--top",
+        "3",
+    ]);
     assert!(text.starts_with("sum 1.0000"), "{text}");
     let top: Vec<&str> = text.lines().nth(1).unwrap().split('\t').collect();
     assert!(top[0] == "5" || top[0] == "7", "{text}");
@@ -327,13 +423,18 @@ fn pagerank_and_communities() {
     let lpa = env.ok(&["communities", "--algo", "lpa", "--iterations", "20"]);
     let count: usize = lpa.split_whitespace().nth(1).unwrap().parse().unwrap();
     assert!((2..=8).contains(&count), "{lpa}");
-    assert!(env.ok(&["graph-at", "1", "communities"]).starts_with("communities 1"));
+    assert!(
+        env.ok(&["graph-at", "1", "communities"])
+            .starts_with("communities 1")
+    );
 }
 
 #[test]
 fn seed_stats_verify() {
     let env = Env::new();
-    let text = env.ok(&["seed", "--users", "800", "--edges", "6000", "--posts", "300", "--likes", "200"]);
+    let text = env.ok(&[
+        "seed", "--users", "800", "--edges", "6000", "--posts", "300", "--likes", "200",
+    ]);
     assert!(text.contains("users 800"));
     assert!(text.contains("posts 300"));
     let stats = env.ok(&["stats"]);
@@ -353,7 +454,9 @@ fn seed_stats_verify() {
     env.ok(&["unfollow", "u1", "u700"]);
     assert_eq!(
         before.lines().find(|l| l.starts_with("follows")),
-        env.ok(&["stats"]).lines().find(|l| l.starts_with("follows"))
+        env.ok(&["stats"])
+            .lines()
+            .find(|l| l.starts_with("follows"))
     );
     env.ok(&["verify"]);
 }
@@ -386,11 +489,28 @@ fn experiment_and_bench_run() {
         assert!(out.contains("bytes/edge"), "{out}");
         assert!(out.contains("celebrity row update"));
     }
-    env.ok(&["seed", "--users", "1500", "--edges", "9000", "--posts", "500"]);
-    assert!(env.ok(&["bench", "counts", "--commits", "20"]).contains("cached"));
-    assert!(env.ok(&["bench", "fanout", "--commits", "3"]).contains("fanout-on-write"));
-    assert!(env.ok(&["bench", "overhead", "--lookups", "2000"]).contains("contains"));
-    assert!(env.ok(&["bench", "pagerank", "--iterations", "2"]).contains("pagerank"));
+    env.ok(&[
+        "seed", "--users", "1500", "--edges", "9000", "--posts", "500",
+    ]);
+    assert!(
+        env.ok(&["bench", "counts", "--commits", "20"])
+            .contains("cached")
+    );
+    assert!(
+        env.ok(&["bench", "fanout", "--commits", "3"])
+            .contains("fanout-on-write")
+    );
+    assert!(
+        env.ok(&["bench", "overhead", "--lookups", "2000"])
+            .contains("contains")
+    );
+    assert!(
+        env.ok(&["bench", "pagerank", "--iterations", "2"])
+            .contains("pagerank")
+    );
     let writers = env.ok(&["bench", "writers", "--seconds", "1", "--iterations", "3"]);
-    assert!(writers.contains("identical idle vs during writes: true"), "{writers}");
+    assert!(
+        writers.contains("identical idle vs during writes: true"),
+        "{writers}"
+    );
 }

@@ -63,7 +63,10 @@ fn assert_lands(db: &Db<Root>, id: u64, (version, time_ms): (u64, u64)) {
     let found = db.as_of(time_ms).unwrap();
     assert_eq!(found.version(), version, "as_of({time_ms}) for mark {id}");
     assert_eq!(found.commit().time_ms, time_ms);
-    assert_eq!(found.marks.get(&id).map(|seen| *seen), Some((version, time_ms)));
+    assert_eq!(
+        found.marks.get(&id).map(|seen| *seen),
+        Some((version, time_ms))
+    );
     assert!(db.at(version - 1).unwrap().marks.get(&id).is_none());
 }
 
@@ -91,7 +94,10 @@ fn a_stamp_names_the_version_and_time_its_commit_gets() {
     });
     let done = failed.unwrap();
     assert_eq!(done.version, 3);
-    assert_eq!(db.read().marks.get(&8).map(|seen| *seen), Some((3, done.time_ms)));
+    assert_eq!(
+        db.read().marks.get(&8).map(|seen| *seen),
+        Some((3, done.time_ms))
+    );
     assert_lands(&db, 8, (3, done.time_ms));
 }
 
@@ -118,7 +124,9 @@ fn committed_carries_the_time_of_every_kind_of_write() {
     plain(&db, 4);
     let merged = db
         .merge_with(&branch, |ours, base, theirs| {
-            ours.plain.merge(&base.plain, &theirs.plain, |conflict| conflict.theirs.map(|v| *v));
+            ours.plain.merge(&base.plain, &theirs.plain, |conflict| {
+                conflict.theirs.map(|v| *v)
+            });
             ("merge side", ())
         })
         .unwrap();
@@ -187,7 +195,12 @@ fn commit_times_hold_their_order_when_the_clock_goes_backwards() {
     wall.set(60_000);
     assert_eq!(plain(&db, 5).time_ms, 90_001);
 
-    for (id, seen) in [(1, behind.value), (2, second.value), (3, (6, 50_002)), (4, ahead.value)] {
+    for (id, seen) in [
+        (1, behind.value),
+        (2, second.value),
+        (3, (6, 50_002)),
+        (4, ahead.value),
+    ] {
         assert_lands(&db, id, seen);
     }
     assert_eq!(db.as_of(49_999).unwrap().version(), 0);
@@ -259,7 +272,11 @@ fn an_error_a_panic_or_a_no_op_claims_no_millisecond() {
 
     let refused = db.try_commit_stamped(|root, stamp| -> Result<(&str, ()), Error> {
         root.marks.insert(1, (stamp.version(), stamp.time_ms()));
-        Err(Error::Decode(format!("refused v{} at {}", stamp.version(), stamp.time_ms())))
+        Err(Error::Decode(format!(
+            "refused v{} at {}",
+            stamp.version(),
+            stamp.time_ms()
+        )))
     });
     match refused {
         Err(Error::Decode(message)) => assert_eq!(message, "refused v2 at 3000"),
@@ -302,7 +319,9 @@ fn forks_merges_and_pulls_keep_a_stamped_millisecond() {
 
     let merged = db
         .merge_with(&side, |ours, base, theirs| {
-            ours.plain.merge(&base.plain, &theirs.plain, |conflict| conflict.theirs.map(|v| *v));
+            ours.plain.merge(&base.plain, &theirs.plain, |conflict| {
+                conflict.theirs.map(|v| *v)
+            });
             ("merge side", ())
         })
         .unwrap();
@@ -354,8 +373,10 @@ fn race(db: &Db<Root>, coalesce: bool) {
             })
         })
         .collect();
-    let seen: Vec<(u64, (u64, u64))> =
-        writers.into_iter().flat_map(|writer| writer.join().unwrap()).collect();
+    let seen: Vec<(u64, (u64, u64))> = writers
+        .into_iter()
+        .flat_map(|writer| writer.join().unwrap())
+        .collect();
     assert_eq!(seen.len() as u64, threads * (each - each.div_ceil(3)));
     let tip = db.read();
     for (id, at) in &seen {
@@ -365,7 +386,10 @@ fn race(db: &Db<Root>, coalesce: bool) {
     }
     let mut versions: Vec<u64> = seen.iter().map(|(_, at)| at.0).collect();
     versions.sort_unstable();
-    let shared = versions.windows(2).filter(|pair| pair[0] == pair[1]).count();
+    let shared = versions
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .count();
     if !coalesce {
         assert_eq!(shared, 0);
     }
@@ -386,7 +410,10 @@ fn concurrent_writers_each_land_on_the_commit_their_stamp_named() {
 #[test]
 fn coalesced_writers_each_land_on_their_groups_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let db: Db<Root> = Options::new().coalesce(true).open(dir.path().join("group.ferro")).unwrap();
+    let db: Db<Root> = Options::new()
+        .coalesce(true)
+        .open(dir.path().join("group.ferro"))
+        .unwrap();
     race(&db, true);
 }
 

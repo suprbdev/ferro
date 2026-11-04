@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use booking::date::DAY_MS;
 use booking::seed::{Plan, Seeded, seed};
-use booking::{Cents, Hotels, HoldRequest, Reservations, Why};
+use booking::{Cents, HoldRequest, Hotels, Reservations, Why};
 use ferro::codec::{HASH_BYTES, Object};
 use ferro::store::{Store, StoreOptions};
 use ferro::{Db, Durability, Map, Options, Ptr, hash_of};
@@ -110,7 +110,8 @@ fn median(mut values: Vec<u64>) -> f64 {
 }
 
 fn summary(samples: &[Sample]) -> String {
-    let mean = samples.iter().map(|s| s.instructions).sum::<u64>() as f64 / samples.len().max(1) as f64;
+    let mean =
+        samples.iter().map(|s| s.instructions).sum::<u64>() as f64 / samples.len().max(1) as f64;
     format!(
         "cpu {:>6.1} us  wall {:>6.1} us  instructions {:>8.0}",
         median(samples.iter().map(|s| s.cpu).collect()),
@@ -127,7 +128,9 @@ fn argument(name: &str) -> Option<String> {
 }
 
 fn number(name: &str, default: u64) -> u64 {
-    argument(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+    argument(name)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn mix(mut x: u64) -> u64 {
@@ -262,8 +265,17 @@ fn frame_of(mut file: &File, start: u64, end: u64) -> Framed {
     assert!(n >= 4, "a commit frame holds at least four records");
     let entry = &recs[n - 3];
     let root = entry.links[0];
-    assert_eq!(root.offset, recs[n - 4].offset, "the record before the entry is the root");
-    assert!(recs[n - 2].links.iter().any(|link| link.offset == entry.offset));
+    assert_eq!(
+        root.offset,
+        recs[n - 4].offset,
+        "the record before the entry is the root"
+    );
+    assert!(
+        recs[n - 2]
+            .links
+            .iter()
+            .any(|link| link.offset == entry.offset)
+    );
     let tree = recs[..n - 4].iter().map(|r| r.len as u64).sum();
     Framed {
         start,
@@ -293,14 +305,18 @@ fn body_diff(old: &[u8], new: &[u8]) -> usize {
         .take_while(|(a, b)| a == b)
         .count();
     let middle = new.len() - prefix - suffix;
-    let ends = varint_len(prefix as u64) + varint_len(suffix as u64) + varint_len(middle as u64) + middle;
+    let ends =
+        varint_len(prefix as u64) + varint_len(suffix as u64) + varint_len(middle as u64) + middle;
     ends.min(copies(old, new))
 }
 
 fn copies(old: &[u8], new: &[u8]) -> usize {
     let mut index: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
     for at in 0..old.len().saturating_sub(3) {
-        index.entry(old[at..at + 4].try_into().unwrap()).or_default().push(at);
+        index
+            .entry(old[at..at + 4].try_into().unwrap())
+            .or_default()
+            .push(at);
     }
     let (mut cost, mut literal, mut at) = (0, 0, 0);
     while at < new.len() {
@@ -309,7 +325,11 @@ fn copies(old: &[u8], new: &[u8]) -> usize {
             && let Some(starts) = index.get(&new[at..at + 4])
         {
             for &from in starts.iter().take(16) {
-                let len = old[from..].iter().zip(&new[at..]).take_while(|(a, b)| a == b).count();
+                let len = old[from..]
+                    .iter()
+                    .zip(&new[at..])
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 if len > best.1 {
                     best = (from, len);
                 }
@@ -367,7 +387,10 @@ impl Walker {
             if (fresh.0..fresh.1).contains(&link.offset) {
                 let child = self.get(*link);
                 let mut best: Option<(usize, Ptr)> = None;
-                for candidate in [index.checked_sub(1), Some(index), Some(index + 1)].into_iter().flatten() {
+                for candidate in [index.checked_sub(1), Some(index), Some(index + 1)]
+                    .into_iter()
+                    .flatten()
+                {
                     let Some(&candidate) = old_links.get(candidate) else {
                         continue;
                     };
@@ -402,7 +425,8 @@ fn deltas(path: &Path, framed: &mut [(usize, Framed)], before: Ptr) {
     };
     let mut previous = before;
     for (_, frame) in framed.iter_mut() {
-        frame.parts.delta = walker.delta(frame.root, Some(previous), (frame.start, frame.end)) as u64;
+        frame.parts.delta =
+            walker.delta(frame.root, Some(previous), (frame.start, frame.end)) as u64;
         previous = frame.root;
     }
 }
@@ -428,7 +452,10 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         })
         .unwrap();
     }
-    println!("map, {n} keys, loaded in {:.1} s", started.elapsed().as_secs_f64());
+    println!(
+        "map, {n} keys, loaded in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
     let mut next = n;
     let mut framed = Vec::new();
     let before_root;
@@ -512,7 +539,10 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         }
     }
     let tiny = dir.join("tiny.ferro");
-    let small = Options::new().durability(Durability::Buffered).open::<Map<u64, u64>>(&tiny).unwrap();
+    let small = Options::new()
+        .durability(Durability::Buffered)
+        .open::<Map<u64, u64>>(&tiny)
+        .unwrap();
     small
         .update(|root| {
             for i in 0..16 {
@@ -553,7 +583,9 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         let (big_start, little_start) = (large.size_on_disk(), small.size_on_disk());
         for i in 0..fsync_rounds {
             let began = Instant::now();
-            large.update(|root| root.insert(mix(next), "x".to_string())).unwrap();
+            large
+                .update(|root| root.insert(mix(next), "x".to_string()))
+                .unwrap();
             next += 1;
             big.push(began.elapsed().as_nanos() as u64);
             let began = Instant::now();
@@ -577,7 +609,11 @@ enum Kind {
     Cancel,
 }
 
-const KINDS: [(Kind, &str); 3] = [(Kind::Hold, "hold"), (Kind::Confirm, "confirm"), (Kind::Cancel, "cancel")];
+const KINDS: [(Kind, &str); 3] = [
+    (Kind::Hold, "hold"),
+    (Kind::Confirm, "confirm"),
+    (Kind::Cancel, "cancel"),
+];
 
 enum Step {
     Hold(HoldRequest, u64),
@@ -624,7 +660,9 @@ impl Script {
                 self.confirmed.push(id);
             }
             if i % 4 == 3 && !self.confirmed.is_empty() {
-                let id = self.confirmed.swap_remove(self.rng.usize(0..self.confirmed.len()));
+                let id = self
+                    .confirmed
+                    .swap_remove(self.rng.usize(0..self.confirmed.len()));
                 run(&Step::Cancel(id, now));
             }
         }
@@ -635,7 +673,9 @@ fn apply(hotels: &mut Hotels, step: &Step, version: u64) -> Option<(u64, Cents)>
     let kept = hotels.clone();
     let done = match step {
         Step::Hold(request, now) => hotels.hold(*now, request).map(|held| (held.id, held.total)),
-        Step::Confirm(id, total, now) => hotels.confirm(*now, version, *id, Some(*total)).map(|_| (*id, 0)),
+        Step::Confirm(id, total, now) => hotels
+            .confirm(*now, version, *id, Some(*total))
+            .map(|_| (*id, 0)),
         Step::Cancel(id, now) => hotels.cancel(*now, *id, Why::Customer).map(|_| (*id, 0)),
     };
     if done.is_err() {
@@ -648,7 +688,8 @@ fn commit(db: &Db<Hotels>, step: &Step, inside: impl FnOnce(&mut Hotels)) -> Opt
     db.try_commit_stamped(|hotels, stamp| {
         let done = apply(hotels, step, stamp.version());
         inside(hotels);
-        done.map(|done| (format!("{:?}", step.kind()), done)).ok_or(ferro::Error::Detached)
+        done.map(|done| (format!("{:?}", step.kind()), done))
+            .ok_or(ferro::Error::Detached)
     })
     .ok()
     .map(|done| done.value)
@@ -685,7 +726,10 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
         let start = db.size_on_disk();
         let done = commit(&db, step, |_| {});
         if done.is_some() {
-            framed.push((step.kind() as usize, frame_of(&file, start, db.size_on_disk())));
+            framed.push((
+                step.kind() as usize,
+                frame_of(&file, start, db.size_on_disk()),
+            ));
         }
         done
     });
@@ -697,7 +741,11 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
         all.add(frame.parts);
     }
     for (kind, name) in KINDS {
-        by_kind.get(&(kind as usize)).copied().unwrap_or_default().report(name);
+        by_kind
+            .get(&(kind as usize))
+            .copied()
+            .unwrap_or_default()
+            .report(name);
     }
     all.report("all");
     let mut rest: HashMap<Kind, Vec<Sample>> = HashMap::new();
@@ -722,7 +770,8 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
                     hashing = Sample::now(counter, began).since(start);
                 }
                 inside = Sample::now(counter, began).since(start);
-                done.map(|done| (format!("{kind:?}"), done)).ok_or(ferro::Error::Detached)
+                done.map(|done| (format!("{kind:?}"), done))
+                    .ok_or(ferro::Error::Detached)
             })
             .ok()
             .map(|done| done.value);
@@ -736,7 +785,10 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
     });
     for (kind, name) in KINDS {
         println!("  {name:<8} outside the closure  {}", summary(&rest[&kind]));
-        println!("  {name:<8} hash_of, no write    {}", summary(&hashed[&kind]));
+        println!(
+            "  {name:<8} hash_of, no write    {}",
+            summary(&hashed[&kind])
+        );
     }
     let mut bumps = Vec::new();
     for i in 0..pairs + 500 {
@@ -795,9 +847,19 @@ fn main() {
     let counter = Counter::instructions();
     let workload = argument("--workload").unwrap_or_else(|| "all".to_string());
     if workload == "all" || workload == "map" {
-        map_workload(dir.path(), number("--n", 1_000_000), number("--commits", 1_000), &counter);
+        map_workload(
+            dir.path(),
+            number("--n", 1_000_000),
+            number("--commits", 1_000),
+            &counter,
+        );
     }
     if workload == "all" || workload == "booking" {
-        booking_workload(dir.path(), number("--pairs", 2_000), number("--warm", 4_000), &counter);
+        booking_workload(
+            dir.path(),
+            number("--pairs", 2_000),
+            number("--warm", 4_000),
+            &counter,
+        );
     }
 }

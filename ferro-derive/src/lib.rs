@@ -198,7 +198,9 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
 
 fn visit_stmts(fields: &[Field]) -> TokenStream2 {
     let stored: Vec<&Field> = fields.iter().filter(|f| f.stored()).collect();
-    let seen: Vec<Ident> = (0..stored.len()).map(|i| format_ident!("__seen{}", i)).collect();
+    let seen: Vec<Ident> = (0..stored.len())
+        .map(|i| format_ident!("__seen{}", i))
+        .collect();
     let arms = stored.iter().zip(&seen).map(|(field, seen)| {
         let tag = field.tag();
         let ty = &field.ty;
@@ -654,7 +656,9 @@ impl Indexed {
         }
         let tys = self.fields.iter().map(|(_, ty)| ty);
         match (&self.kind, self.sole()) {
-            (IndexKind::Each, Some((_, ty))) => quote! { <#ty as ::ferro::table::IndexEach>::Value },
+            (IndexKind::Each, Some((_, ty))) => {
+                quote! { <#ty as ::ferro::table::IndexEach>::Value }
+            }
             (_, Some((_, ty))) => quote! { #ty },
             _ => quote! { (#(#tys),*) },
         }
@@ -696,8 +700,7 @@ fn cover_list(
 ) -> syn::Result<Vec<(Ident, Type)>> {
     let content;
     syn::parenthesized!(content in meta.input);
-    let names =
-        syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated(&content)?;
+    let names = syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated(&content)?;
     if names.is_empty() {
         return Err(meta.error("cover needs at least one field"));
     }
@@ -744,7 +747,9 @@ fn check_cover(ix: &Indexed, key: &Ident, skipped: &[Ident]) -> syn::Result<()> 
             return fail(format!("`{ident}` is covered twice"));
         }
         if ident == key {
-            return fail(format!("`{ident}` is the key, which every index entry already holds"));
+            return fail(format!(
+                "`{ident}` is the key, which every index entry already holds"
+            ));
         }
         if skipped.contains(ident) {
             return fail(format!("`{ident}` is not stored, so it cannot be covered"));
@@ -948,7 +953,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let stored_of = ix.stored_of();
         let same_cover = ix.same_cover();
         let project = ix.project_path();
-        let same = ix.fields.iter().map(|(ident, _)| quote! { __o.#ident == __n.#ident });
+        let same = ix
+            .fields
+            .iter()
+            .map(|(ident, _)| quote! { __o.#ident == __n.#ident });
         let same = quote! { #(#same &&)* __o.#key_ident == __n.#key_ident };
         if !ix.cover.is_empty() {
             let project_fn = ix.project_fn();

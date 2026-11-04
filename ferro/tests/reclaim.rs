@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use common::{Rng, fast, text, uncached};
 use ferro::db::Hook;
-use ferro::{Commit, Data, Db, Durability, Error, Keep, Map, Options, Ptr, Reclaim, Snapshot, admin};
+use ferro::{
+    Commit, Data, Db, Durability, Error, Keep, Map, Options, Ptr, Reclaim, Snapshot, admin,
+};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -54,7 +56,10 @@ fn pruning_reclaims_while_retained_versions_stay_exact() {
     assert!(report.before_bytes <= before);
     assert_eq!(report.after_bytes, db.size_on_disk());
     assert!(report.after_bytes * 10 < report.before_bytes, "{report:?}");
-    assert_eq!(std::fs::metadata(db.path()).unwrap().len(), report.after_bytes);
+    assert_eq!(
+        std::fs::metadata(db.path()).unwrap().len(),
+        report.after_bytes
+    );
     assert_eq!(db.log().len(), 10);
     assert!(matches!(db.at(2990), Err(Error::NoVersion(2990))));
     for (index, want) in keep.iter().enumerate() {
@@ -132,7 +137,10 @@ fn repeated_cycles_stay_bounded_and_exact() {
     let space = db.space().unwrap();
     assert!(space.file_bytes * 10 < peak, "{space:?} peak {peak}");
     assert!(space.live_bytes <= space.file_bytes, "{space:?}");
-    assert!(space.file_bytes < 2 * smallest, "{space:?} smallest {smallest}");
+    assert!(
+        space.file_bytes < 2 * smallest,
+        "{space:?} smallest {smallest}"
+    );
     assert_eq!(space.cycles, 30);
     assert_eq!(space.retired_bytes, 0, "{space:?}");
     assert!(space.longest_pause > Duration::ZERO);
@@ -153,7 +161,10 @@ fn the_live_estimate_tracks_growth_between_cycles_and_survives_reopening() {
     fill(&db, 500, 20);
     let space = db.space().unwrap();
     assert!(space.file_bytes > 4 * base, "{space:?} base {base}");
-    assert!(space.live_bytes * 2 < space.file_bytes, "{space:?} base {base}");
+    assert!(
+        space.live_bytes * 2 < space.file_bytes,
+        "{space:?} base {base}"
+    );
     assert!(space.live_bytes >= base, "{space:?} base {base}");
     drop(db);
     assert_eq!(admin::space(&path).unwrap().live_bytes, space.live_bytes);
@@ -196,7 +207,10 @@ fn a_held_snapshot_keeps_reading_and_its_file_until_it_drops() {
     assert!(db.space().unwrap().retired_bytes > 0);
     db.compact(Keep::Last(1)).unwrap();
     assert_eq!(dump(&held), want);
-    assert_eq!(held.try_get(&3).unwrap().as_deref(), want.iter().find(|e| e.0 == 3).map(|e| &e.1));
+    assert_eq!(
+        held.try_get(&3).unwrap().as_deref(),
+        want.iter().find(|e| e.0 == 3).map(|e| &e.1)
+    );
     drop(held);
     assert_eq!(db.space().unwrap().retired_bytes, 0);
     db.verify().unwrap();
@@ -425,13 +439,21 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
     let reader = {
         let (done, path) = (done.clone(), path.clone());
         thread::spawn(move || {
-            let reader: Db<Root> = Options::new().read_only().cache_bytes(1).open(&path).unwrap();
+            let reader: Db<Root> = Options::new()
+                .read_only()
+                .cache_bytes(1)
+                .open(&path)
+                .unwrap();
             let mut seen = 0;
             while !done.load(Ordering::Relaxed) {
                 reader.refresh().unwrap();
                 assert_eq!(reader.read().iter().count(), 30);
                 seen += 1;
-                let fresh: Db<Root> = Options::new().read_only().cache_bytes(1).open(&path).unwrap();
+                let fresh: Db<Root> = Options::new()
+                    .read_only()
+                    .cache_bytes(1)
+                    .open(&path)
+                    .unwrap();
                 assert!(fresh.version() >= 100);
                 assert_eq!(fresh.read().iter().count(), 30);
             }
@@ -446,7 +468,11 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
     assert!(reader.join().unwrap() > 0);
 }
 
-fn hooked(path: &Path, cache: u64, hook: impl Fn(&'static str) + Send + Sync + 'static) -> Db<Root> {
+fn hooked(
+    path: &Path,
+    cache: u64,
+    hook: impl Fn(&'static str) + Send + Sync + 'static,
+) -> Db<Root> {
     Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(cache)
@@ -461,7 +487,11 @@ fn content_rewritten_after_its_first_copy_died_reads_back() {
     for cache in [1, 1 << 20, 1 << 26] {
         let dir = dir();
         let path = path_in(&dir);
-        let db: Db<Root> = fast().cache_bytes(cache).reclaim(MANUAL).open(&path).unwrap();
+        let db: Db<Root> = fast()
+            .cache_bytes(cache)
+            .reclaim(MANUAL)
+            .open(&path)
+            .unwrap();
         for _ in 0..6 {
             fill(&db, 200, 40);
             db.compact(Keep::Last(3)).unwrap();
@@ -645,7 +675,9 @@ fn dropping_the_last_handle_stops_the_background_thread_and_frees_the_lock() {
     for _ in 0..5 {
         let db: Db<Root> = fast()
             .history(Keep::Last(1))
-            .reclaim(Reclaim { every_bytes: 4 << 10 })
+            .reclaim(Reclaim {
+                every_bytes: 4 << 10,
+            })
             .open(&path)
             .unwrap();
         fill(&db, 300, 20);
@@ -676,7 +708,9 @@ fn shutting_down_during_a_copy_abandons_it_and_leaves_no_temp_file() {
     };
     let db: Db<Root> = fast()
         .history(Keep::Last(2))
-        .reclaim(Reclaim { every_bytes: 32 << 10 })
+        .reclaim(Reclaim {
+            every_bytes: 32 << 10,
+        })
         .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
@@ -705,7 +739,10 @@ fn offline_tools_work_alongside_online_cycles() {
         db.compact(Keep::Last(3)).unwrap();
         fill(&db, 100, 50);
         db.compact(Keep::Last(3)).unwrap();
-        assert!(matches!(admin::compact(&path, Keep::All), Err(Error::Locked)));
+        assert!(matches!(
+            admin::compact(&path, Keep::All),
+            Err(Error::Locked)
+        ));
         dump(&db.read())
     };
     assert_eq!(admin::info(&path).unwrap().branches[0].commits, 3);
@@ -806,12 +843,18 @@ fn a_commit_or_pointer_held_across_a_cycle_cannot_be_written_back() {
         notes.pointer = None;
         notes.commit = Some(commit.clone());
     });
-    assert!(matches!(by_commit, Err(Error::StalePointer(_))), "{by_commit:?}");
+    assert!(
+        matches!(by_commit, Err(Error::StalePointer(_))),
+        "{by_commit:?}"
+    );
     let by_pointer = db.update(|notes| {
         notes.commit = None;
         notes.pointer = pointer;
     });
-    assert!(matches!(by_pointer, Err(Error::StalePointer(_))), "{by_pointer:?}");
+    assert!(
+        matches!(by_pointer, Err(Error::StalePointer(_))),
+        "{by_pointer:?}"
+    );
     assert_eq!(db.version(), version);
     db.verify().unwrap();
     let kept = db.read().commit.clone().unwrap();
@@ -844,7 +887,12 @@ fn a_leftover_temp_file_behind_a_symlink_is_cleared_on_open() {
     drop(db);
     let report = admin::compact(&link, Keep::Last(1)).unwrap();
     assert!(report.objects > 0);
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -870,7 +918,9 @@ fn a_trigger_raised_during_a_cycle_does_not_run_another() {
     let db: Db<Root> = Options::new()
         .durability(Durability::Buffered)
         .history(Keep::Last(1))
-        .reclaim(Reclaim { every_bytes: 64 << 10 })
+        .reclaim(Reclaim {
+            every_bytes: 64 << 10,
+        })
         .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
@@ -899,7 +949,10 @@ fn a_cycle_keeps_the_mode_of_the_file() {
     fill(&db, 50, 5);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     db.compact(Keep::Last(1)).unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[cfg(unix)]
@@ -917,7 +970,12 @@ fn a_cycle_through_a_symlink_replaces_the_file_it_names() {
     fill(&db, 50, 5);
     let want = dump(&db.read());
     db.compact(Keep::Last(1)).unwrap();
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(dump(&db.read()), want);
     drop(db);
     let db: Db<Root> = options().open(&real).unwrap();
@@ -949,7 +1007,9 @@ fn as_of_stops_at_the_oldest_retained_commit_across_a_pruned_skip_link() {
         }
     }
     assert_eq!(db.version(), 100);
-    let times: Vec<u64> = (98..=100).map(|v| db.log().get(&v).unwrap().time_ms).collect();
+    let times: Vec<u64> = (98..=100)
+        .map(|v| db.log().get(&v).unwrap().time_ms)
+        .collect();
     db.compact(Keep::Last(3)).unwrap();
     assert_eq!(db.log().first().unwrap().0, 98);
     assert_eq!(db.as_of(times[2]).unwrap().version(), 100);
@@ -1020,7 +1080,8 @@ fn snapshots_stay_consistent_under_writers_readers_and_cycles() {
                     let value = pair.left.get(&key).map_or(0, |v| *v);
                     pair.left.insert(key, value + bump);
                     pair.total += bump;
-                    pair.right.insert(key, vec![bump as u8; 900 + (key % 16) as usize]);
+                    pair.right
+                        .insert(key, vec![bump as u8; 900 + (key % 16) as usize]);
                 })
                 .unwrap();
                 commits.fetch_add(1, Ordering::Relaxed);
@@ -1124,7 +1185,10 @@ struct BranchModel {
 }
 
 fn body(key: u64, value: u64) -> String {
-    text(key * 31 + value, if key.is_multiple_of(5) { 700 } else { 30 })
+    text(
+        key * 31 + value,
+        if key.is_multiple_of(5) { 700 } else { 30 },
+    )
 }
 
 fn check_all(main: &Db<Root>, models: &[Option<BranchModel>]) {

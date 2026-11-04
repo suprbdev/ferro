@@ -532,7 +532,10 @@ fn draft_publish_merges_disjoint_changes() {
     assert!(env.ok(&["search", "draft"]).contains("fresh"));
     env.cmd(&["verify"]).assert().success();
     assert!(!env.ok(&["draft", "list"]).contains("d1"));
-    assert!(env.fail(&["draft", "publish", "d1"]).contains("no such branch"));
+    assert!(
+        env.fail(&["draft", "publish", "d1"])
+            .contains("no such branch")
+    );
 }
 
 #[test]
@@ -600,7 +603,10 @@ fn draft_publish_reports_delete_edit_conflicts() {
     assert!(env.fail(&["get", "b"]).contains("no such page"));
     assert!(!out.contains("dropped draft"), "{out}");
     assert!(env.ok(&["draft", "list"]).contains("d3"));
-    assert!(env.ok(&["draft", "drop", "d3"]).contains("dropped draft d3"));
+    assert!(
+        env.ok(&["draft", "drop", "d3"])
+            .contains("dropped draft d3")
+    );
     assert!(!env.ok(&["draft", "list"]).contains("d3"));
 }
 

@@ -128,7 +128,10 @@ fn decode_everything(bytes: &[u8], links: &[Ptr]) {
 fn bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         prop::collection::vec(any::<u8>(), 0..64),
-        prop::collection::vec(prop_oneof![Just(0xFFu8), Just(0x80), Just(0x00), Just(0x01), Just(0x7F)], 0..64),
+        prop::collection::vec(
+            prop_oneof![Just(0xFFu8), Just(0x80), Just(0x00), Just(0x01), Just(0x7F)],
+            0..64
+        ),
         prop::collection::vec(any::<u8>(), 0..4096),
     ]
 }
@@ -216,7 +219,15 @@ fn edge_integers_round_trip() {
     roundtrip(i16::MIN);
     roundtrip(i32::MIN);
     roundtrip(u128::MAX);
-    for value in [0i128, 1, -1, i128::from(i64::MIN) - 1, i128::from(u64::MAX) + 1, i128::MAX, i128::MIN] {
+    for value in [
+        0i128,
+        1,
+        -1,
+        i128::from(i64::MIN) - 1,
+        i128::from(u64::MAX) + 1,
+        i128::MAX,
+        i128::MIN,
+    ] {
         roundtrip(value);
     }
     roundtrip(char::MAX);
@@ -230,7 +241,9 @@ fn overlong_varints_are_rejected() {
     let cases: [&[u8]; 5] = [
         &[0xFF; 10],
         &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02],
-        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+        &[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+        ],
         &[0xFF; 3],
         &[],
     ];
@@ -238,7 +251,11 @@ fn overlong_varints_are_rejected() {
         let mut decoder = Decoder::new(bytes, &[], None);
         assert!(decoder.varint().is_err(), "{bytes:?}");
     }
-    let mut decoder = Decoder::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01], &[], None);
+    let mut decoder = Decoder::new(
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+        &[],
+        None,
+    );
     assert_eq!(decoder.varint().unwrap(), u64::MAX);
 }
 
@@ -314,7 +331,10 @@ fn large_declared_lengths_do_not_allocate_ahead_of_input() {
     let result = Vec::<[u64; 512]>::decode(&mut decoder);
     assert!(result.is_err());
     let peak = LARGEST.get();
-    assert!(peak < limit, "single allocation of {peak} bytes for 4 KiB of input");
+    assert!(
+        peak < limit,
+        "single allocation of {peak} bytes for 4 KiB of input"
+    );
 }
 
 #[test]
@@ -391,6 +411,8 @@ fn map_decoded_without_a_store_fails_with_a_ferro_panic() {
 fn field_tag_is_stable_and_spreads() {
     assert_eq!(field_tag("name"), field_tag("name"));
     assert_ne!(field_tag("name"), field_tag("nane"));
-    let names: BTreeSet<u16> = (0..1000).map(|n| field_tag(&format!("field_{n}"))).collect();
+    let names: BTreeSet<u16> = (0..1000)
+        .map(|n| field_tag(&format!("field_{n}")))
+        .collect();
     assert!(names.len() > 980);
 }

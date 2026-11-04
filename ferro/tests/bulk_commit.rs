@@ -27,20 +27,33 @@ fn value(i: u64) -> String {
 
 #[test]
 fn large_flushes_keep_the_hashes_of_the_sequential_build() {
-    let plain: Map<u64, String> = (0..50_000u64).map(|i| (mix(i), format!("value-{i}"))).collect();
-    assert_eq!(hex(plain.root_hash().unwrap()), "89e2a9af3d4f46b37eadc6b97d0180ab10adb2b0");
+    let plain: Map<u64, String> = (0..50_000u64)
+        .map(|i| (mix(i), format!("value-{i}")))
+        .collect();
+    assert_eq!(
+        hex(plain.root_hash().unwrap()),
+        "89e2a9af3d4f46b37eadc6b97d0180ab10adb2b0"
+    );
     let mut spilled = Map::new();
     for i in 0..50_000u64 {
         spilled.insert(mix(i), value(i));
     }
-    assert_eq!(hex(spilled.root_hash().unwrap()), "cd8c5f4b224b31d751409f40923d01c13d1161f1");
+    assert_eq!(
+        hex(spilled.root_hash().unwrap()),
+        "cd8c5f4b224b31d751409f40923d01c13d1161f1"
+    );
     let mut nested: Map<u64, Map<u64, u64>> = Map::new();
     for i in 0..6_000u64 {
         nested.insert(mix(i), (0..i % 5).map(|j| (j, i * j)).collect());
     }
-    assert_eq!(hex(nested.root_hash().unwrap()), "313fb44173ed046971e3fb69e847a45b5dccc9c6");
+    assert_eq!(
+        hex(nested.root_hash().unwrap()),
+        "313fb44173ed046971e3fb69e847a45b5dccc9c6"
+    );
     let dir = tempfile::tempdir().unwrap();
-    let db = roomy().open::<Map<u64, String>>(dir.path().join("pins.ferro")).unwrap();
+    let db = roomy()
+        .open::<Map<u64, String>>(dir.path().join("pins.ferro"))
+        .unwrap();
     db.update(|root| *root = spilled.clone()).unwrap();
     db.update(|root| {
         for i in 0..20_000u64 {
@@ -51,8 +64,14 @@ fn large_flushes_keep_the_hashes_of_the_sequential_build() {
         }
     })
     .unwrap();
-    assert_eq!(hex(hash_of(&*db.read())), "1139214c59d0ddcd434fc84be10c8e1f4ecc18ea");
-    assert_eq!(hex(db.read().root_hash().unwrap()), "8b8911642884ac9a14e77e496581ab49cdc6830f");
+    assert_eq!(
+        hex(hash_of(&*db.read())),
+        "1139214c59d0ddcd434fc84be10c8e1f4ecc18ea"
+    );
+    assert_eq!(
+        hex(db.read().root_hash().unwrap()),
+        "8b8911642884ac9a14e77e496581ab49cdc6830f"
+    );
     let nested_db = roomy()
         .open::<Map<u64, Map<u64, u64>>>(dir.path().join("nested.ferro"))
         .unwrap();
@@ -78,12 +97,22 @@ fn a_large_commit_reads_back_from_memory_and_from_disk() {
         for (key, value) in &model {
             assert_eq!(snapshot.get(key).as_deref(), Some(value));
         }
-        assert!(snapshot.iter().map(|(key, value)| (key, (*value).clone())).eq(model.clone()));
+        assert!(
+            snapshot
+                .iter()
+                .map(|(key, value)| (key, (*value).clone()))
+                .eq(model.clone())
+        );
         db.verify().unwrap();
     }
     let db = roomy().open::<Map<u64, String>>(&path).unwrap();
     let snapshot = db.read();
-    assert!(snapshot.iter().map(|(key, value)| (key, (*value).clone())).eq(model.clone()));
+    assert!(
+        snapshot
+            .iter()
+            .map(|(key, value)| (key, (*value).clone()))
+            .eq(model.clone())
+    );
     assert_eq!(snapshot.get(&mix(97)).as_deref(), model.get(&mix(97)));
 }
 
@@ -107,7 +136,9 @@ impl Data for Picky {
 #[test]
 fn a_large_commit_refuses_a_value_that_does_not_decode() {
     let dir = tempfile::tempdir().unwrap();
-    let db = roomy().open::<Map<u64, Picky>>(dir.path().join("picky.ferro")).unwrap();
+    let db = roomy()
+        .open::<Map<u64, Picky>>(dir.path().join("picky.ferro"))
+        .unwrap();
     db.update(|root| root.insert(1, Picky(1))).unwrap();
     let refused = db.try_update(|root| {
         for i in 0..40_000u64 {

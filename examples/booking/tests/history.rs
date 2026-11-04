@@ -37,10 +37,25 @@ fn the_audit_trail_shows_each_change_to_one_booking_oldest_first() {
         ]
     );
     assert!(events[0].message.starts_with(&format!("hold #{}", held.id)));
-    assert!(events[1].message.starts_with(&format!("confirm #{}", held.id)));
-    assert!(events[2].message.starts_with(&format!("cancel #{}", held.id)));
-    assert!(events.windows(2).all(|pair| pair[0].version < pair[1].version));
-    assert!(matches!(audit(w.svc.db(), 999), Err(booking::BookingError::NoBooking(999))));
+    assert!(
+        events[1]
+            .message
+            .starts_with(&format!("confirm #{}", held.id))
+    );
+    assert!(
+        events[2]
+            .message
+            .starts_with(&format!("cancel #{}", held.id))
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].version < pair[1].version)
+    );
+    assert!(matches!(
+        audit(w.svc.db(), 999),
+        Err(booking::BookingError::NoBooking(999))
+    ));
 }
 
 #[test]
@@ -55,7 +70,16 @@ fn price_history_lists_every_rate_and_override_change() {
 
     let points = price_history(w.svc.db(), 2).unwrap();
     let rates: Vec<(i64, usize)> = points.iter().map(|p| (p.rate, p.overrides.len())).collect();
-    assert_eq!(rates, vec![(14_500, 0), (15_000, 0), (15_000, 1), (16_000, 1), (16_000, 0)]);
+    assert_eq!(
+        rates,
+        vec![
+            (14_500, 0),
+            (15_000, 0),
+            (15_000, 1),
+            (16_000, 1),
+            (16_000, 0)
+        ]
+    );
     assert_eq!(points[2].overrides, vec![(night, 40_000)]);
 }
 
@@ -135,7 +159,10 @@ fn as_of_reads_the_hotels_at_a_wall_clock_time() {
     assert_eq!(then.version(), 1);
     assert_eq!(then.rooms.get(&1).unwrap().rate, 12_000);
     assert!(then.bookings.get(&held.id).is_none());
-    assert_eq!(svc.db().as_of(now_ms()).unwrap().holder(1, night), Some(held.id));
+    assert_eq!(
+        svc.db().as_of(now_ms()).unwrap().holder(1, night),
+        Some(held.id)
+    );
     assert_eq!(svc.db().as_of(before_anything).unwrap().version(), 0);
 }
 
@@ -197,7 +224,10 @@ fn receipts_while_rates_change(coalesce: bool, bookings: u32, buyers: u32) {
             })
         })
         .collect();
-    let paid: Vec<u64> = workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect();
+    let paid: Vec<u64> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect();
     stop.store(true, Ordering::Relaxed);
     assert!(noise.join().unwrap() > 0);
     assert_eq!(paid.len(), bookings as usize);
@@ -205,18 +235,32 @@ fn receipts_while_rates_change(coalesce: bool, bookings: u32, buyers: u32) {
     let db = svc.db();
     for id in paid {
         let receipt = as_paid(db, id).unwrap();
-        assert_eq!(db.bisect(.., |h| paid_in(h, id)).unwrap(), Some(receipt.version));
+        assert_eq!(
+            db.bisect(.., |h| paid_in(h, id)).unwrap(),
+            Some(receipt.version)
+        );
         let past = db.at(receipt.version).unwrap();
         assert!(paid_in(&past, id) && !paid_in(&db.at(receipt.version - 1).unwrap(), id));
         let confirm = format!("confirm #{id} paid");
-        assert!(past.commit().messages().any(|line| line.starts_with(&confirm)));
+        assert!(
+            past.commit()
+                .messages()
+                .any(|line| line.starts_with(&confirm))
+        );
         assert_eq!(receipt.then.status, Status::Confirmed);
         assert_eq!(receipt.then.paid_version, Some(receipt.version));
         let room = past.rooms.get(&receipt.then.room).unwrap();
-        assert_eq!(receipt.rates_then, vec![past.price(&room, receipt.then.first)]);
+        assert_eq!(
+            receipt.rates_then,
+            vec![past.price(&room, receipt.then.first)]
+        );
     }
     let walked = booking::walk(db, 0).unwrap();
-    assert!(walked.ok(), "{:#?}", &walked.violations[..walked.violations.len().min(5)]);
+    assert!(
+        walked.ok(),
+        "{:#?}",
+        &walked.violations[..walked.violations.len().min(5)]
+    );
 }
 
 #[test]

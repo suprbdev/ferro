@@ -26,7 +26,8 @@ fn run(cli: Cli) -> Result<(), BookingError> {
     } else {
         commands::run_write(&mut out, &svc, cli.command)?;
     }
-    out.flush().map_err(|error| BookingError::Db(ferro::Error::Io(error)))?;
+    out.flush()
+        .map_err(|error| BookingError::Db(ferro::Error::Io(error)))?;
     Ok(())
 }
 

@@ -55,7 +55,10 @@ impl Summary<u32, String> for Probe {
             shortest: self.shortest.min(other.shortest),
             first: self.first,
             last: other.last,
-            digest: self.digest.wrapping_mul(other.scale).wrapping_add(other.digest),
+            digest: self
+                .digest
+                .wrapping_mul(other.scale)
+                .wrapping_add(other.digest),
             scale: self.scale.wrapping_mul(other.scale),
         }
     }
@@ -98,7 +101,11 @@ fn folded<S: Summary<u32, String>>(model: &Model, span: &Span) -> Option<S> {
 }
 
 fn check_span(map: &Probed, model: &Model, span: Span) {
-    assert_eq!(map.range_summary::<u32, _>(span), folded(model, &span), "{span:?}");
+    assert_eq!(
+        map.range_summary::<u32, _>(span),
+        folded(model, &span),
+        "{span:?}"
+    );
     let by = map.summary_by(
         |key| !in_span(*key, &(span.0, Bound::Unbounded)),
         |key| in_span(*key, &(Bound::Unbounded, span.1)),
@@ -293,7 +300,10 @@ fn apply(map: &mut Probed, model: &mut Model, op: &Op) {
         Op::Summarize(low, high) => check_span(map, model, (*low, *high)),
         Op::Commit | Op::Reopen => {}
     }
-    assert_eq!(map.summary(), folded(model, &(Bound::Unbounded, Bound::Unbounded)));
+    assert_eq!(
+        map.summary(),
+        folded(model, &(Bound::Unbounded, Bound::Unbounded))
+    );
 }
 
 fn memory_run(ops: &[Op]) {
@@ -413,11 +423,7 @@ fn churned<S: Summary<u32, String>>(model: &Model, seed: u64, keys: u32) -> Map<
     map
 }
 
-fn commit_batches<S: Summary<u32, String>>(
-    db: &Db<Map<u32, String, S>>,
-    model: &Model,
-    seed: u64,
-) {
+fn commit_batches<S: Summary<u32, String>>(db: &Db<Map<u32, String, S>>, model: &Model, seed: u64) {
     let mut rng = Rng::new(seed);
     db.update(|root| root.clear()).unwrap();
     let mut order: Vec<(u32, String)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -472,7 +478,8 @@ where
     commit_batches(&db, model, seed);
     check(&db.read());
     let version = db.version();
-    db.update(|root| *root = churned::<S>(model, seed ^ 99, keys)).unwrap();
+    db.update(|root| *root = churned::<S>(model, seed ^ 99, keys))
+        .unwrap();
     assert_eq!(db.version(), version);
     db.update(|root| {
         root.insert(u32::MAX - 1, "tmp".into());
@@ -545,7 +552,9 @@ impl Summary<u64, i64> for Total {
 #[test]
 fn large_stored_tree_matches_prefix_sums() {
     let mut rng = Rng::new(5);
-    let values: Vec<i64> = (0..150_000).map(|_| rng.below(2001) as i64 - 1000).collect();
+    let values: Vec<i64> = (0..150_000)
+        .map(|_| rng.below(2001) as i64 - 1000)
+        .collect();
     let mut sums = vec![0i64];
     for value in &values {
         sums.push(sums[sums.len() - 1] + value);
@@ -556,13 +565,18 @@ fn large_stored_tree_matches_prefix_sums() {
     db.update(|root| root.extend(values.iter().enumerate().map(|(i, v)| (i as u64, *v))))
         .unwrap();
     drop(db);
-    let db = uncached().read_only().open::<Map<u64, i64, Total>>(&path).unwrap();
+    let db = uncached()
+        .read_only()
+        .open::<Map<u64, i64, Total>>(&path)
+        .unwrap();
     let map = db.read();
     assert_eq!(map.summary(), Some(Total(sums[values.len()])));
     for _ in 0..2_000 {
         let low = rng.below(150_000) as usize;
         let high = low + rng.below(150_001 - low as u64) as usize;
-        let got = map.range_summary((low as u64)..(high as u64)).map_or(0, |total| total.0);
+        let got = map
+            .range_summary((low as u64)..(high as u64))
+            .map_or(0, |total| total.0);
         assert_eq!(got, sums[high] - sums[low]);
     }
 }
@@ -591,7 +605,8 @@ fn a_range_folds_what_the_links_hold_not_its_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.ferro");
     let db = fast().open::<Map<u64, u64, Counted>>(&path).unwrap();
-    db.update(|root| root.extend((0..200_000u64).map(|key| (key, key)))).unwrap();
+    db.update(|root| root.extend((0..200_000u64).map(|key| (key, key))))
+        .unwrap();
     CALLS.set(0);
     let map = db.read();
     assert_eq!(map.range_summary(1_000..199_000u64), Some(Counted(198_000)));
@@ -607,7 +622,8 @@ fn spilled_values_are_summarized_without_being_read() {
     let path = dir.path().join("p.ferro");
     let db = fast().open::<Map<u64, String, Counted>>(&path).unwrap();
     let big = "x".repeat(2_000);
-    db.update(|root| root.extend((0..5_000u64).map(|key| (key, big.clone())))).unwrap();
+    db.update(|root| root.extend((0..5_000u64).map(|key| (key, big.clone()))))
+        .unwrap();
     drop(db);
     let db = uncached().open::<Map<u64, String, Counted>>(&path).unwrap();
     CALLS.set(0);
@@ -617,7 +633,11 @@ fn spilled_values_are_summarized_without_being_read() {
         root.insert(1, "small".to_string());
     })
     .unwrap();
-    assert!(CALLS.get() <= 1, "a commit recomputed {} spilled values", CALLS.get());
+    assert!(
+        CALLS.get() <= 1,
+        "a commit recomputed {} spilled values",
+        CALLS.get()
+    );
     assert_eq!(db.read().summary(), Some(Counted(5_000)));
 }
 
@@ -625,7 +645,9 @@ fn spilled_values_are_summarized_without_being_read() {
 fn summaries_follow_compaction_foreign_stores_and_merges() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.ferro");
-    let model: Model = (0..2_000u32).map(|key| (key * 3, text(u64::from(key), 40))).collect();
+    let model: Model = (0..2_000u32)
+        .map(|key| (key * 3, text(u64::from(key), 40)))
+        .collect();
     let span = (Bound::Included(300), Bound::Excluded(4_200));
     {
         let db = fast().open::<Probed>(&path).unwrap();
@@ -666,8 +688,9 @@ fn summaries_follow_compaction_foreign_stores_and_merges() {
     .unwrap();
     let merged = db
         .merge_with(&theirs, |root, base, incoming| {
-            let written =
-                root.merge(base, incoming, |conflict| conflict.theirs.map(|v| (*v).clone()));
+            let written = root.merge(base, incoming, |conflict| {
+                conflict.theirs.map(|v| (*v).clone())
+            });
             ("merge", written)
         })
         .unwrap();
@@ -694,7 +717,10 @@ fn a_composite_prefix_can_be_summarized_by_predicate() {
         model.insert((group, key), value);
     }
     for group in 0..6u8 {
-        let wanted: i64 = model.range((group, 0)..=(group, u32::MAX)).map(|(_, v)| *v).sum();
+        let wanted: i64 = model
+            .range((group, 0)..=(group, u32::MAX))
+            .map(|(_, v)| *v)
+            .sum();
         let got = map.summary_by(|key| key.0 < group, |key| key.0 <= group);
         assert_eq!(got.map_or(0, |pair| pair.0), wanted);
     }
@@ -735,7 +761,8 @@ fn a_panicking_summary_discards_the_commit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("f.ferro");
     let db = fast().open::<Map<u64, u64, Fragile>>(&path).unwrap();
-    db.update(|root| root.extend((0..1_000u64).map(|key| (key, 1)))).unwrap();
+    db.update(|root| root.extend((0..1_000u64).map(|key| (key, 1))))
+        .unwrap();
     let version = db.version();
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.update(|root| {

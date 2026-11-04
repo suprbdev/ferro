@@ -306,14 +306,24 @@ fn a_batch_of_absent_deletes_changes_nothing() {
 #[test]
 fn a_batch_keeps_the_last_edit_of_each_key() {
     let mut map: Map<u32, u32> = (0..100).map(|key| (key, key)).collect();
-    map.apply([(5, None), (5, Some(50)), (6, Some(60)), (6, None), (200, Some(1)), (200, None)]);
+    map.apply([
+        (5, None),
+        (5, Some(50)),
+        (6, Some(60)),
+        (6, None),
+        (200, Some(1)),
+        (200, None),
+    ]);
     assert_eq!(map.get(&5).as_deref(), Some(&50));
     assert_eq!(map.get(&6), None);
     assert_eq!(map.get(&200), None);
     assert_eq!(map.len(), 99);
     let mut set: Set<u32> = (0..10).collect();
     set.apply([(3, false), (4, false), (4, true), (20, true)]);
-    assert_eq!(set.iter().collect::<Vec<u32>>(), [0, 1, 2, 4, 5, 6, 7, 8, 9, 20]);
+    assert_eq!(
+        set.iter().collect::<Vec<u32>>(),
+        [0, 1, 2, 4, 5, 6, 7, 8, 9, 20]
+    );
 }
 
 static KEY_COMPARES: AtomicU64 = AtomicU64::new(0);
@@ -453,14 +463,21 @@ fn byte_values_survive_the_store_at_every_size() {
     let sample = |size: usize| -> Vec<u8> { text(size as u64, size).into_bytes() };
     let db = uncached().open::<Map<u64, Bytes>>(&path).unwrap();
     db.update(|root| {
-        root.extend(sizes.iter().map(|size| (*size as u64, Bytes::from(sample(*size)))));
+        root.extend(
+            sizes
+                .iter()
+                .map(|size| (*size as u64, Bytes::from(sample(*size)))),
+        );
     })
     .unwrap();
     drop(db);
     let db = uncached().open::<Map<u64, Bytes>>(&path).unwrap();
     let snapshot = db.read();
     for size in sizes {
-        assert_eq!(&**snapshot.get(&(size as u64)).unwrap(), sample(size).as_slice());
+        assert_eq!(
+            &**snapshot.get(&(size as u64)).unwrap(),
+            sample(size).as_slice()
+        );
     }
     db.verify().unwrap();
 }
