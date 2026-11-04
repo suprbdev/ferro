@@ -107,7 +107,7 @@ fn shared_child() {
 
 fn follow(path: &str, until: u64) {
     let db: Db<Root> = loop {
-        match Options::new().read_only().open(path) {
+        match Options::new().read_only(true).open(path) {
             Ok(db) => break db,
             Err(ferro::Error::NoDatabase(_) | ferro::Error::NotFerro(_)) => {
                 std::thread::sleep(Duration::from_millis(2));

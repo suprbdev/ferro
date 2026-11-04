@@ -133,7 +133,7 @@ impl Queue {
     }
 
     pub fn open_read_only(path: impl AsRef<Path>, options: QueueOptions) -> Result<Queue> {
-        let db = Options::new().read_only().open::<State>(path.as_ref())?;
+        let db = Options::new().read_only(true).open::<State>(path.as_ref())?;
         Ok(Queue {
             db,
             clock: options.clock,

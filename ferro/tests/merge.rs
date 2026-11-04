@@ -296,7 +296,7 @@ fn map_merge_matches_table_semantics_and_read_only_error_is_clear() {
     assert_eq!(*ours.get(&1).unwrap(), 9);
     assert_eq!(*ours.get(&3).unwrap(), 3);
     let missing = ferro::Options::new()
-        .read_only()
+        .read_only(true)
         .open::<Map<u64, u64>>(dir.path().join("nope.ferro"));
     assert!(matches!(missing.err(), Some(Error::NoDatabase(_))));
 }

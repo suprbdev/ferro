@@ -91,8 +91,8 @@ branch that sorts before its own while a cycle or `receive` waits for this closu
 
 ## Several processes
 
-Other processes can read while one writes: `Options::new().read_only()` takes no lock, and `refresh`
-picks up new commits.
+Other processes can read while one writes: `Options::new().read_only(true)` takes no lock, and
+`refresh` picks up new commits.
 
 Several processes can also write, if every one of them opens the file with `shared`:
 

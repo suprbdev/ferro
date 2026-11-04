@@ -60,7 +60,7 @@ fn followed(compact: bool) {
     let side = db.fork("side").unwrap();
     let reader = fast()
         .cache_bytes(1)
-        .read_only()
+        .read_only(true)
         .open::<Root>(&path)
         .unwrap();
     let reader_side = reader.branch("side").unwrap();

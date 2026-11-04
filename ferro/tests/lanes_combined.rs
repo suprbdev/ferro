@@ -205,7 +205,7 @@ fn draft_straddling_pieces(stale: bool) {
     }
     b.verify_typed().unwrap();
     let before = every_branch(&b);
-    let cold = reread(&path, fast().read_only().cache_bytes(1));
+    let cold = reread(&path, fast().read_only(true).cache_bytes(1));
     assert_eq!(
         cold, before,
         "stale {stale}: a cold reader sees other branches"
@@ -1186,7 +1186,7 @@ fn combined(config: &Config) -> BTreeMap<&'static str, u64> {
     other.verify_typed().unwrap();
     let before = every_mixed(&local);
     let cold: Db<Mixed> = (config.options)()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(&path)
         .unwrap();

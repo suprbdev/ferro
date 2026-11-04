@@ -1068,7 +1068,7 @@ fn check(
     context: &str,
 ) {
     let reader: Db<Text> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
@@ -1384,7 +1384,7 @@ fn a_power_cut_across_branch_table_steps_keeps_one_set_of_heads() {
                 fs::write(&image, &state.image).unwrap();
                 let context = format!("{kind}: cut {cut} of {} {loss:?}", recording.ops.len());
                 let reader: Db<Text> = Options::new()
-                    .read_only()
+                    .read_only(true)
                     .cache_bytes(1)
                     .open(&image)
                     .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));

@@ -43,7 +43,7 @@ fn version_of(db: &Path) -> u64 {
     if !db.exists() {
         return 0;
     }
-    match Options::new().read_only().open::<Hotels>(db) {
+    match Options::new().read_only(true).open::<Hotels>(db) {
         Ok(reader) => reader.version(),
         Err(_) => 0,
     }
@@ -147,7 +147,7 @@ fn crash_rounds(coalesce: bool) {
         survive(&db, &log, round);
     }
     let svc = Reservations::open(&db, Config::default()).unwrap();
-    let reader: Db<Hotels> = Options::new().read_only().open(&db).unwrap();
+    let reader: Db<Hotels> = Options::new().read_only(true).open(&db).unwrap();
     assert_eq!(reader.version(), svc.db().version());
     assert!(!acks(&log).is_empty());
 }

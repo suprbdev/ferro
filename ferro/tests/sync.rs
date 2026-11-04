@@ -570,7 +570,7 @@ fn remote_names_cannot_be_main_or_the_pulling_branch() {
     assert_eq!(side.version(), 1);
     drop((side, b));
     let reader = fast()
-        .read_only()
+        .read_only(true)
         .open::<Root>(dir.path().join("b.ferro"))
         .unwrap();
     assert!(matches!(reader.pull(&a, "a", refuse), Err(Error::ReadOnly)));
@@ -2411,7 +2411,7 @@ fn a_reader_verifies_a_remote_landed_again_after_a_drop() {
     };
     let (a, b) = (open("a.ferro", Keep::All), open("b.ferro", Keep::Last(2)));
     let reader: Db<Events> = Options::new()
-        .read_only()
+        .read_only(true)
         .open(dir.path().join("a.ferro"))
         .unwrap();
     event(&b, 0);

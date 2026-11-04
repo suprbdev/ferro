@@ -119,7 +119,7 @@ fn read_only_handle_follows_a_replaced_file_on_refresh() {
     let path = dir.path().join("e.ferro");
     build(&path, 5);
     let reader = ferro::Options::new()
-        .read_only()
+        .read_only(true)
         .open::<Root>(&path)
         .unwrap();
     let held = reader.read();

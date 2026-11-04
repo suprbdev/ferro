@@ -102,7 +102,7 @@ struct Walked {
 
 fn walk(path: &Path, setting: usize, step: impl Fn(&Db<Shop>)) -> Walked {
     let db: Db<Shop> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(setting as u64)
         .open(path)
         .unwrap();

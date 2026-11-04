@@ -89,7 +89,7 @@ fn child_entry() {
             println!("done {}", db.version());
         }
         "reader" => {
-            let db: Db<Root> = Options::new().read_only().open(path).unwrap();
+            let db: Db<Root> = Options::new().read_only(true).open(path).unwrap();
             let mut last = 0;
             let mut seen = 0u64;
             let deadline = Instant::now() + Duration::from_secs(20);

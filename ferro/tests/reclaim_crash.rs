@@ -251,7 +251,7 @@ fn crash(recording: &Recording, cut: usize, loss: Loss, rng: &mut Rng) -> Crash 
 
 fn check(path: &Path, recording: &Recording, acked: u64, context: &str) {
     let reader: Db<Root> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: {error}"));
@@ -423,7 +423,7 @@ fn either_superblock_of_a_new_generation_can_be_damaged() {
             damaged[slot + 8] ^= 0x40;
             fs::write(&path, &damaged).unwrap();
             let reader = Options::new()
-                .read_only()
+                .read_only(true)
                 .cache_bytes(1)
                 .open::<Root>(&path);
             let db = reader.unwrap_or_else(|error| panic!("cut {cut} slot {slot}: {error}"));

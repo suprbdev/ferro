@@ -172,7 +172,7 @@ impl Device {
         self.dbs[1] = side.then(|| main.branch(LOCAL[1]).unwrap());
         self.dbs[0] = Some(main);
         if self.reader.is_none() {
-            self.reader = Some(Options::new().read_only().open(&self.path).unwrap());
+            self.reader = Some(Options::new().read_only(true).open(&self.path).unwrap());
         }
     }
 
@@ -563,7 +563,7 @@ impl World {
             reader
                 .verify_typed()
                 .unwrap_or_else(|error| panic!("{when}: d{index} reader: {error}"));
-            let cold: Db<Events> = Options::new().read_only().open(&device.path).unwrap();
+            let cold: Db<Events> = Options::new().read_only(true).open(&device.path).unwrap();
             cold.verify_typed()
                 .unwrap_or_else(|error| panic!("{when}: d{index} cold: {error}"));
             assert_eq!(cold.branches(), main.branches(), "{when}: d{index}");

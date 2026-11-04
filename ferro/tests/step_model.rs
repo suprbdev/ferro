@@ -71,8 +71,8 @@ impl World {
             root.insert(1000, 0);
         })
         .unwrap();
-        let eager = options(keep, cache).read_only().open(&path).unwrap();
-        let lazy = options(keep, cache).read_only().open(&path).unwrap();
+        let eager = options(keep, cache).read_only(true).open(&path).unwrap();
+        let lazy = options(keep, cache).read_only(true).open(&path).unwrap();
         World {
             branches: vec![("main".to_string(), db.clone())],
             db: Some(db),
@@ -222,7 +222,10 @@ impl World {
         }
         self.lazy.refresh().unwrap();
         assert_eq!(heads(&self.lazy), written, "{context}: lazy follower");
-        let fresh: Db<Root> = options(self.keep, 1).read_only().open(self.path()).unwrap();
+        let fresh: Db<Root> = options(self.keep, 1)
+            .read_only(true)
+            .open(self.path())
+            .unwrap();
         assert_eq!(heads(&fresh), written, "{context}: fresh reader");
         fresh
             .verify()

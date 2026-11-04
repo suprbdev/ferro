@@ -315,7 +315,7 @@ fn map_case<V: Data + Default + Weigh>(
 
     COUNTING.store(true, Ordering::Relaxed);
     let reader = Options::new()
-        .read_only()
+        .read_only(true)
         .open::<Map<u64, V>>(&path)
         .unwrap();
     let heap = heap_per_key(&reader, n, |root| {
@@ -327,7 +327,7 @@ fn map_case<V: Data + Default + Weigh>(
     COUNTING.store(false, Ordering::Relaxed);
     report.set(&format!("{tag}_heap_per_key"), heap);
     let snapshot = reader.read();
-    let cold = Options::new().read_only().cache_bytes(COLD_CACHE);
+    let cold = Options::new().read_only(true).cache_bytes(COLD_CACHE);
     let cold = cold.open::<Map<u64, V>>(&path).unwrap();
     let cold_view = cold.read();
     report.timed(&format!("{tag}_cold_scan"), n, || {
@@ -354,7 +354,7 @@ fn table_case(report: &mut Report, dir: &Path, n: u64) {
         .unwrap();
     }
     drop(db);
-    let reader = Options::new().read_only().open::<Bank>(&path).unwrap();
+    let reader = Options::new().read_only(true).open::<Bank>(&path).unwrap();
     let snapshot = reader.read();
     let bank: &Bank = &snapshot;
     black_box(bank.accounts.iter().count());
@@ -417,7 +417,7 @@ fn text_keys_case(report: &mut Report, dir: &Path, n: u64) {
     .unwrap();
     drop(db);
     let reader = Options::new()
-        .read_only()
+        .read_only(true)
         .open::<Map<String, u64>>(&path)
         .unwrap();
     let snapshot = reader.read();

@@ -34,7 +34,7 @@ fn reverse_log_walk_reads_only_what_it_yields() {
     let path = dir.path().join("a.ferro");
     drop(seeded(&path, 400));
     smash_older_half(&path);
-    let db = Options::new().read_only().open::<Root>(&path).unwrap();
+    let db = Options::new().read_only(true).open::<Root>(&path).unwrap();
     let newest: Vec<u64> = db
         .log()
         .iter()
@@ -277,7 +277,7 @@ fn history_try_next_reports_corruption_as_an_error() {
     let path = dir.path().join("a.ferro");
     drop(seeded(&path, 400));
     smash_older_half(&path);
-    let db = Options::new().read_only().open::<Root>(&path).unwrap();
+    let db = Options::new().read_only(true).open::<Root>(&path).unwrap();
     let mut history = db.history_of(|root| root.get(&0).map(|v| *v));
     let mut seen = 0;
     let failure = loop {

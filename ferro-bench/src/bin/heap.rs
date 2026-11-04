@@ -138,7 +138,7 @@ fn main() {
         .unwrap();
     });
     row("short strings", &sizes, |bytes| {
-        let db = Options::new().read_only().cache_bytes(bytes as u64);
+        let db = Options::new().read_only(true).cache_bytes(bytes as u64);
         let db = db.open::<Map<u64, String>>(&short).unwrap();
         settle(&db, |root| {
             for (key, value) in root.iter() {
@@ -156,7 +156,7 @@ fn main() {
         .unwrap();
     });
     row("300 byte strings", &sizes, |bytes| {
-        let db = Options::new().read_only().cache_bytes(bytes as u64);
+        let db = Options::new().read_only(true).cache_bytes(bytes as u64);
         let db = db.open::<Map<u64, String>>(&medium).unwrap();
         settle(&db, |root| {
             for (key, value) in root.iter() {
@@ -174,7 +174,7 @@ fn main() {
         .unwrap();
     });
     row("2 KiB spilled", &sizes, |bytes| {
-        let db = Options::new().read_only().cache_bytes(bytes as u64);
+        let db = Options::new().read_only(true).cache_bytes(bytes as u64);
         let db = db.open::<Map<u64, String>>(&large).unwrap();
         settle(&db, |root| {
             for (key, value) in root.iter() {
@@ -209,7 +209,7 @@ fn main() {
     });
     row("history walk", &sizes, |bytes| {
         let db = Options::new()
-            .read_only()
+            .read_only(true)
             .cache_bytes(bytes as u64)
             .open::<Map<u64, String>>(&churn)
             .unwrap();
@@ -233,7 +233,7 @@ fn main() {
         }
     });
     row("table rows", &sizes, |bytes| {
-        let db = Options::new().read_only().cache_bytes(bytes as u64);
+        let db = Options::new().read_only(true).cache_bytes(bytes as u64);
         let db = db.open::<Bank>(&table).unwrap();
         settle(&db, |bank| {
             for row in bank.accounts.iter() {

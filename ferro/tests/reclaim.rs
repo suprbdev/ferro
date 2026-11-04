@@ -395,7 +395,7 @@ fn a_read_only_handle_keeps_its_view_and_follows_on_refresh() {
     let db: Db<Root> = uncached().reclaim(MANUAL).open(&path).unwrap();
     fill(&db, 500, 100);
     let reader: Db<Root> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(&path)
         .unwrap();
@@ -425,7 +425,7 @@ fn a_read_only_handle_keeps_its_view_and_follows_on_refresh() {
     assert_eq!(reader.version(), version);
     assert!(seen);
     assert!(watcher.try_recv().is_err());
-    let fresh: Db<Root> = Options::new().read_only().open(&path).unwrap();
+    let fresh: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
     assert_eq!(dump(&fresh.read()), dump(&db.read()));
 }
 
@@ -440,7 +440,7 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
         let (done, path) = (done.clone(), path.clone());
         thread::spawn(move || {
             let reader: Db<Root> = Options::new()
-                .read_only()
+                .read_only(true)
                 .cache_bytes(1)
                 .open(&path)
                 .unwrap();
@@ -450,7 +450,7 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
                 assert_eq!(reader.read().iter().count(), 30);
                 seen += 1;
                 let fresh: Db<Root> = Options::new()
-                    .read_only()
+                    .read_only(true)
                     .cache_bytes(1)
                     .open(&path)
                     .unwrap();
@@ -769,7 +769,7 @@ fn a_leftover_temp_file_is_cleared_on_open() {
     let mut temp = path.clone().into_os_string();
     temp.push(".compacting");
     std::fs::write(&temp, vec![0xAB; 4096]).unwrap();
-    let reader: Db<Root> = Options::new().read_only().open(&path).unwrap();
+    let reader: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
     assert!(Path::new(&temp).exists());
     drop(reader);
     let db: Db<Root> = options().open(&path).unwrap();

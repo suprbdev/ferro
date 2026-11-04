@@ -591,7 +591,7 @@ fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
             size,
             "{kind}: a superblock moved past a held frame"
         );
-        let reader: Db<Root> = Options::new().read_only().open(&path).unwrap();
+        let reader: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
         for at in 0..3 {
             let branch = reader.branch(&format!("b{at}")).unwrap();
             assert_eq!(contents(&branch).get(&2), None, "{kind}");

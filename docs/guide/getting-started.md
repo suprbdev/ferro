@@ -126,7 +126,7 @@ concurrency](concurrency.md#awaited-writes).
 | `durability(Durability)` | `Durability::Fsync` | `Buffered` skips the fsync on each commit. See [Durability and crash safety](durability.md). |
 | `checkpoint_bytes(u64)` | 64 MiB | Under `Buffered`, how much unsynced log a checkpoint covers. |
 | `cache_bytes(u64)` | 1 GiB | Approximate bound on the decoded node cache. See [Cache weight](../internals/read-scaling.md#cache-weight). |
-| `read_only()` | off | Opens without the writer lock. See [Writers and concurrency](concurrency.md#several-processes). |
+| `read_only(bool)` | `false` | Opens without the writer lock. See [Writers and concurrency](concurrency.md#several-processes). |
 | `history(Keep)` | `Keep::All` | How much history to retain. See [Retention and reclamation](retention.md). |
 | `reclaim(Reclaim)` | `every_bytes: 64 << 20` | When background reclamation cycles run. |
 | `coalesce(bool)` | `false` | Lets queued closures share one version. See [Sharing a version between writers](concurrency.md#sharing-a-version-between-writers). |

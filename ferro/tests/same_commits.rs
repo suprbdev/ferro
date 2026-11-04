@@ -50,7 +50,7 @@ struct Device {
 impl Device {
     fn reopen(&mut self) {
         let placeholder: Db<Root> = options(self.cache, self.keep)
-            .read_only()
+            .read_only(true)
             .open(&self.path)
             .unwrap();
         drop(std::mem::replace(&mut self.db, placeholder));

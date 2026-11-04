@@ -162,7 +162,7 @@ pub fn options(read_only: bool) -> Options {
         .durability(Durability::Buffered)
         .cache_bytes(1 << 20);
     if read_only {
-        options.read_only()
+        options.read_only(true)
     } else {
         options
     }

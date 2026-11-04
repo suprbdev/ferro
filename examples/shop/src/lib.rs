@@ -47,13 +47,13 @@ impl Default for Config {
 pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
     let options = Options::new()
         .durability(config.durability)
-        .coalesce(config.coalesce);
+        .coalesce(config.coalesce)
+        .read_only(config.replica);
     let options = match config.keep_versions {
-        _ if config.replica => options.read_only(),
-        Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {
+        Some(count) if !config.replica => options.history(Keep::Last(count)).reclaim(Reclaim {
             every_bytes: config.reclaim_bytes,
         }),
-        None => options,
+        _ => options,
     };
     options.open::<Shop>(path)
 }

@@ -405,7 +405,7 @@ fn run<K: TestKey, V: TestValue>(case: &Case, options: fn() -> Options) {
     db.update(|root| *root = mixed.clone()).unwrap();
     drop((snapshot, mixed, memory));
     drop(db);
-    let db = options().read_only().open::<Map<K, V>>(&path).unwrap();
+    let db = options().read_only(true).open::<Map<K, V>>(&path).unwrap();
     check_all(&db.read(), &model, case);
 }
 
@@ -719,7 +719,7 @@ fn damage_is_never_read_as_data() {
         std::fs::write(&damaged, &bytes).unwrap();
         let cache = 1 + rng.below(1 << 16);
         let opened = Options::new()
-            .read_only()
+            .read_only(true)
             .cache_bytes(cache)
             .open::<Map<u32, String>>(&damaged);
         let Ok(db) = opened else {

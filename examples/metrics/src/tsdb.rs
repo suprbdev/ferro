@@ -35,7 +35,7 @@ impl Tsdb {
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Tsdb> {
-        let db = Options::new().read_only().open(path)?;
+        let db = Options::new().read_only(true).open(path)?;
         Ok(Tsdb { db })
     }
 

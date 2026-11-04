@@ -60,7 +60,7 @@ fn main_and_the_handles_own_branch_cannot_be_dropped() {
     ));
     assert!(matches!(db.drop_branch("ghost"), Err(Error::NoBranch(_))));
     let reader = fast()
-        .read_only()
+        .read_only(true)
         .open::<Root>(dir.path().join("b.ferro"))
         .unwrap();
     assert!(matches!(reader.drop_branch("side"), Err(Error::ReadOnly)));
@@ -207,7 +207,7 @@ fn a_read_only_handle_learns_of_the_drop_on_refresh() {
     put(&db, 1, 1);
     let side = db.fork("side").unwrap();
     put(&side, 2, 2);
-    let reader = fast().read_only().open::<Root>(&path).unwrap();
+    let reader = fast().read_only(true).open::<Root>(&path).unwrap();
     let handle = reader.branch("side").unwrap();
     let watcher = handle.watch();
     assert_eq!(handle.version(), 2);

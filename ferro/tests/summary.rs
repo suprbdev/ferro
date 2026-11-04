@@ -566,7 +566,7 @@ fn large_stored_tree_matches_prefix_sums() {
         .unwrap();
     drop(db);
     let db = uncached()
-        .read_only()
+        .read_only(true)
         .open::<Map<u64, i64, Total>>(&path)
         .unwrap();
     let map = db.read();

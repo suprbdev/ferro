@@ -166,7 +166,7 @@ fn writer_options() -> Options {
 }
 
 fn reader_options(cache: u64) -> Options {
-    Options::new().read_only().cache_bytes(cache)
+    Options::new().read_only(true).cache_bytes(cache)
 }
 
 fn populate(db: &Db<Root>, model: &Model) {

@@ -147,7 +147,7 @@ fn a_read_only_watcher_coalesces_across_refreshes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w.ferro");
     let db = fast().open::<Root>(&path).unwrap();
-    let reader = fast().read_only().open::<Root>(&path).unwrap();
+    let reader = fast().read_only(true).open::<Root>(&path).unwrap();
     let watcher = reader.watch();
     for n in 1..=3 {
         bump(&db, n);
@@ -463,7 +463,7 @@ fn a_filtered_watcher_follows_a_read_only_refresh() {
     let path = dir.path().join("watch.ferro");
     let db = common::fast().open::<Root>(&path).unwrap();
     put(&db, 1, 1);
-    let reader = common::fast().read_only().open::<Root>(&path).unwrap();
+    let reader = common::fast().read_only(true).open::<Root>(&path).unwrap();
     let watcher = reader.watch_when(|snapshot| snapshot.contains_key(&7));
     put(&db, 2, 2);
     reader.refresh().unwrap();
@@ -480,7 +480,7 @@ fn a_read_only_test_may_open_a_branch_while_refresh_runs_it() {
     let db = common::fast().open::<Root>(&path).unwrap();
     put(&db, 1, 1);
     db.fork("side").unwrap();
-    let reader = common::fast().read_only().open::<Root>(&path).unwrap();
+    let reader = common::fast().read_only(true).open::<Root>(&path).unwrap();
     let watcher = {
         let reader = reader.clone();
         reader.clone().watch_when(move |snapshot| {
@@ -590,7 +590,7 @@ fn a_read_only_test_may_refresh_while_refresh_runs_it() {
     let path = dir.path().join("watch.ferro");
     let db = common::fast().open::<Root>(&path).unwrap();
     put(&db, 1, 1);
-    let reader = common::fast().read_only().open::<Root>(&path).unwrap();
+    let reader = common::fast().read_only(true).open::<Root>(&path).unwrap();
     let watcher = {
         let reader = reader.clone();
         reader

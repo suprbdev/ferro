@@ -96,7 +96,7 @@ fn cache_bytes_bounds_the_decoded_heap() {
     }
     for setting in [2 * MIB, 8 * MIB] {
         let db = Options::new()
-            .read_only()
+            .read_only(true)
             .cache_bytes(setting as u64)
             .open::<Map<u64, String>>(&path)
             .unwrap();
@@ -108,7 +108,7 @@ fn cache_bytes_bounds_the_decoded_heap() {
         });
         check("map", setting, heap);
         let db = Options::new()
-            .read_only()
+            .read_only(true)
             .cache_bytes(setting as u64)
             .open::<Rows>(&rows_path)
             .unwrap();

@@ -201,7 +201,7 @@ fn a_spilled_value_hash_does_not_read_the_value() {
     bytes[at + 16] ^= 0xFF;
     std::fs::write(&path, bytes).unwrap();
     let db = Options::new()
-        .read_only()
+        .read_only(true)
         .open::<Map<u64, String>>(&path)
         .unwrap();
     let snapshot = db.read();

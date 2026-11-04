@@ -67,7 +67,7 @@ fn every_set_of_heads_reopens_as_it_was_written() {
             db.drop_branch(&doomed).unwrap();
         }
         if round % 17 == 0 || round == rounds {
-            let reader = options().read_only().open::<Root>(&path).unwrap();
+            let reader = options().read_only(true).open::<Root>(&path).unwrap();
             assert_eq!(heads(&reader), heads(&db), "round {round}");
         }
     }
@@ -88,7 +88,7 @@ fn a_follower_refreshes_through_steps_tables_and_cycles() {
     let db: Db<Root> = options().open(&path).unwrap();
     put(&db, 0, 0);
     let branches: Vec<Db<Root>> = (0..4).map(|b| db.fork(&name(b)).unwrap()).collect();
-    let follower = options().read_only().open::<Root>(&path).unwrap();
+    let follower = options().read_only(true).open::<Root>(&path).unwrap();
     let rounds = 200 * u64::from(cases(1));
     for round in 1..=rounds {
         let branch = &branches[(round % 4) as usize];

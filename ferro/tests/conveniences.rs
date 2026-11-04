@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use common::{Rng, fast};
 use ferro::table::Taken;
-use ferro::{Data, Map, Record, Set, Summary, Table, Val};
+use ferro::{Data, Error, Map, Record, Set, Summary, Table, Val};
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Seat {
@@ -371,4 +371,27 @@ fn set_and_table_prefixes_take_a_borrowed_head() {
     wide.insert((8, 0, 0, 0), ());
     let sevens: Vec<_> = wide.prefix(&7).map(|(key, _)| key).collect();
     assert_eq!(sevens, vec![(7, 1, 2, 3)]);
+}
+
+#[test]
+fn read_only_takes_the_mode_as_a_bool() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h.ferro");
+    let writer = fast()
+        .read_only(true)
+        .read_only(false)
+        .open::<Hall>(&path)
+        .unwrap();
+    writer.update(|root| *root = hall()).unwrap();
+    for read_only in [true, false] {
+        let opened = fast().read_only(read_only).open::<Hall>(&path);
+        match read_only {
+            true => {
+                let reader = opened.unwrap();
+                assert_eq!(reader.read().seats.len(), 9);
+                assert!(matches!(reader.update(|_| ()), Err(Error::ReadOnly)));
+            }
+            false => assert!(matches!(opened, Err(Error::Locked))),
+        }
+    }
 }

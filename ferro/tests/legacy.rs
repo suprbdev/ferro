@@ -209,7 +209,7 @@ fn move_on(db: &Db<Tally>, name: &str) {
 #[test]
 fn a_file_whose_heads_all_sit_in_one_table_opens_and_moves_on_to_steps() {
     let (_dir, path) = branch_table();
-    let follower = Options::new().read_only().open::<Tally>(&path).unwrap();
+    let follower = Options::new().read_only(true).open::<Tally>(&path).unwrap();
     check_table_branches(&follower, 0);
     let db: Db<Tally> = Db::open(&path).unwrap();
     check_table_branches(&db, 0);
@@ -227,7 +227,7 @@ fn a_file_whose_heads_all_sit_in_one_table_opens_and_moves_on_to_steps() {
     drop((db, follower));
     let db: Db<Tally> = Db::open(&path).unwrap();
     check_table_branches(&db, 3);
-    let read_only = Options::new().read_only().open::<Tally>(&path).unwrap();
+    let read_only = Options::new().read_only(true).open::<Tally>(&path).unwrap();
     check_table_branches(&read_only, 3);
     db.compact(ferro::Keep::All).unwrap();
     check_table_branches(&db, 3);

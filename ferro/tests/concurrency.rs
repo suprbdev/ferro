@@ -460,7 +460,7 @@ fn read_only_open_never_races_a_writer_into_an_error() {
         openers.push(thread::spawn(move || {
             let mut opens = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let reader = fast().read_only().open::<Ledger>(&path).unwrap();
+                let reader = fast().read_only(true).open::<Ledger>(&path).unwrap();
                 assert_consistent(&reader.read());
                 opens += 1;
             }
@@ -495,7 +495,7 @@ fn read_only_open_never_races_a_durable_writer_closing() {
             thread::spawn(move || {
                 let mut last = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    let reader = fast().read_only().open::<Map<u64, u64>>(&path).unwrap();
+                    let reader = fast().read_only(true).open::<Map<u64, u64>>(&path).unwrap();
                     assert!(reader.version() >= last);
                     last = reader.version();
                 }
@@ -533,7 +533,7 @@ fn refresh_tracks_a_writer_in_the_same_process() {
         let (path, opened) = (path.clone(), opened.clone());
         readers.push(thread::spawn(move || {
             let options = if cache % 2 == 0 { fast() } else { uncached() };
-            let reader = options.read_only().open::<Ledger>(&path).unwrap();
+            let reader = options.read_only(true).open::<Ledger>(&path).unwrap();
             opened.wait();
             let mut last = reader.version();
             let mut changes = 0;
@@ -566,7 +566,7 @@ fn refresh_on_a_new_branch_and_read_only_writes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("b.ferro");
     let db = fast().open::<Map<u64, u64>>(&path).unwrap();
-    let reader = fast().read_only().open::<Map<u64, u64>>(&path).unwrap();
+    let reader = fast().read_only(true).open::<Map<u64, u64>>(&path).unwrap();
     assert!(!reader.refresh().unwrap());
     assert_eq!(reader.version(), 0);
     let fork = db.fork("x").unwrap();
@@ -616,7 +616,7 @@ fn refresh_never_moves_a_reader_backwards() {
     drop(db);
     let copy = dir.path().join("copy.ferro");
     fs::copy(&path, &copy).unwrap();
-    let reader = fast().read_only().open::<Map<u64, u64>>(&copy).unwrap();
+    let reader = fast().read_only(true).open::<Map<u64, u64>>(&copy).unwrap();
     assert_eq!(reader.version(), 4);
     let mut image = fs::read(&copy).unwrap();
     image[20] ^= 0xFF;
@@ -630,7 +630,7 @@ fn watchers_on_a_read_only_handle_fire_on_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w.ferro");
     let db = fast().open::<Map<u64, u64>>(&path).unwrap();
-    let reader = fast().read_only().open::<Map<u64, u64>>(&path).unwrap();
+    let reader = fast().read_only(true).open::<Map<u64, u64>>(&path).unwrap();
     let events = reader.watch();
     db.update(|root| {
         root.insert(1, 1);
@@ -659,7 +659,7 @@ fn second_writer_is_locked_out_and_reader_is_not() {
         fast().open::<Map<u64, u64>>(&path),
         Err(Error::Locked)
     ));
-    assert!(fast().read_only().open::<Map<u64, u64>>(&path).is_ok());
+    assert!(fast().read_only(true).open::<Map<u64, u64>>(&path).is_ok());
     let clone = db.clone();
     drop(db);
     assert!(matches!(

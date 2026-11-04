@@ -1128,8 +1128,8 @@ impl Options {
         self
     }
 
-    pub fn read_only(mut self) -> Self {
-        self.store.read_only = true;
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.store.read_only = read_only;
         self
     }
 

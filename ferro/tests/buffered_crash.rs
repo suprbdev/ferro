@@ -181,7 +181,7 @@ fn crash(recording: &Recording, cut: usize, loss: Loss, rng: &mut Rng) -> Crash 
 
 fn check(path: &Path, recording: &Recording, state: &Crash, context: &str) {
     let reader: Db<Root> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
@@ -219,7 +219,7 @@ fn check(path: &Path, recording: &Recording, state: &Crash, context: &str) {
         "{context}"
     );
     let follower: Db<Root> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: follower open: {error}"));
@@ -341,7 +341,7 @@ fn nothing_before_a_checkpoint_is_rolled_back() {
     image[start] ^= 0x40;
     fs::write(&copy, &image).unwrap();
     let reader: Db<Root> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(&copy)
         .unwrap();

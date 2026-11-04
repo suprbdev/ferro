@@ -160,7 +160,7 @@ fn run<S: Summary<u64, i64>>(
     drop(snapshot);
     drop(db);
     let db: Db<Map<u64, i64, S>> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1 << 20)
         .open(&path)
         .unwrap();

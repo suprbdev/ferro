@@ -128,7 +128,7 @@ fn corrupt<T: Debug>(result: ferro::Result<T>) {
 }
 
 fn read_only() -> Options {
-    Options::new().read_only()
+    Options::new().read_only(true)
 }
 
 #[cfg(target_os = "linux")]

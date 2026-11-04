@@ -26,10 +26,9 @@ pub struct Reservations {
 
 impl Reservations {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let mut options = Options::new().coalesce(config.coalesce);
-        if config.read_only {
-            options = options.read_only();
-        }
+        let mut options = Options::new()
+            .coalesce(config.coalesce)
+            .read_only(config.read_only);
         if config.buffered {
             options = options.durability(Durability::Buffered);
         }

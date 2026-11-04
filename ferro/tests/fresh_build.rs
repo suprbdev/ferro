@@ -754,7 +754,7 @@ fn run(seed: u64, rounds: u64) {
     db.compact(Keep::Last(1)).unwrap();
     same_objects(&db, &model, seed ^ 5);
     drop(db);
-    let db = uncached().read_only().open::<Root>(&path).unwrap();
+    let db = uncached().read_only(true).open::<Root>(&path).unwrap();
     check(&db, &model, seed ^ 7);
     db.verify_typed().unwrap();
 }
@@ -908,7 +908,7 @@ fn coalesced_writers_keep_their_guarantees_and_match_a_fresh_build() {
         assert_eq!(db.read().summary(), built.summary());
         db.verify_typed().unwrap();
         drop(db);
-        let db = uncached().read_only().open::<Counters>(&path).unwrap();
+        let db = uncached().read_only(true).open::<Counters>(&path).unwrap();
         assert_eq!(db.read().root_hash(), built.root_hash());
     }
 }

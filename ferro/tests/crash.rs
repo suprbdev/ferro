@@ -133,7 +133,7 @@ fn truncation_at_every_byte_opens_or_errors() {
         let mut image = built.bytes[..end.min(full)].to_vec();
         image.resize(end, 0xAB);
         fs::write(&path, &image).unwrap();
-        let readonly = fast().read_only().open::<Root>(&path);
+        let readonly = fast().read_only(true).open::<Root>(&path);
         let writable = fast().open::<Root>(&path);
         if end >= full {
             check_at_version(&readonly.unwrap(), &built, last);
@@ -159,7 +159,7 @@ fn crash_images_open_at_the_last_durable_commit() {
         for tail in start..end {
             let image = built.image(commit, tail);
             fs::write(&path, &image).unwrap();
-            let readonly = fast().read_only().open::<Root>(&path).unwrap();
+            let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&readonly, &built, commit);
             drop(readonly);
             let db = fast().open::<Root>(&path).unwrap();
@@ -167,7 +167,7 @@ fn crash_images_open_at_the_last_durable_commit() {
             assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
         }
         fs::write(&path, built.image(commit, end)).unwrap();
-        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
         check_at_version(&readonly, &built, commit + 1);
         drop(readonly);
         let db = fast().open::<Root>(&path).unwrap();
@@ -340,7 +340,7 @@ fn recovery_replays_every_complete_frame_past_a_stale_superblock() {
         for frames in base + 1..=last {
             let full = built.lens[frames];
             fs::write(&path, built.image(base, full)).unwrap();
-            let readonly = fast().read_only().open::<Root>(&path).unwrap();
+            let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&readonly, &built, frames);
             drop(readonly);
             assert_eq!(fs::read(&path).unwrap(), built.image(base, full));
@@ -366,7 +366,7 @@ fn recovery_stops_at_the_first_damaged_frame() {
         let mut image = built.image(base, built.lens[last]);
         image[position] ^= 0x41;
         fs::write(&path, &image).unwrap();
-        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
         check_at_version(&readonly, &built, damaged - 1);
         drop(readonly);
         let db = fast().open::<Root>(&path).unwrap();
@@ -432,7 +432,7 @@ fn zeroed_space_past_the_last_frame_ends_the_log() {
         let mut image = built.image(base, built.lens[last]);
         image.resize(built.lens[last] + (1 << 18), 0);
         fs::write(&path, &image).unwrap();
-        let readonly = fast().read_only().open::<Root>(&path).unwrap();
+        let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
         check_at_version(&readonly, &built, last);
         drop(readonly);
         assert_eq!(fs::metadata(&path).unwrap().len() as usize, image.len());
@@ -457,20 +457,20 @@ fn corrupt_superblocks_fall_back_or_report() {
             let mut image = built.bytes.clone();
             image[newest + byte] ^= bit;
             fs::write(&path, &image).unwrap();
-            let db = fast().read_only().open::<Root>(&path).unwrap();
+            let db = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&db, &built, last);
             drop(db);
 
             image[built.lens[last - 1]] ^= bit;
             fs::write(&path, &image).unwrap();
-            let db = fast().read_only().open::<Root>(&path).unwrap();
+            let db = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&db, &built, last - 1);
             drop(db);
 
             let mut image = built.bytes.clone();
             image[older + byte] ^= bit;
             fs::write(&path, &image).unwrap();
-            let db = fast().read_only().open::<Root>(&path).unwrap();
+            let db = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&db, &built, last);
             drop(db);
 
@@ -536,7 +536,7 @@ fn foreign_files_are_rejected_and_left_alone() {
     ] {
         fs::write(&path, &body).unwrap();
         assert_clear_error(fast().open::<Root>(&path), "foreign file");
-        assert_clear_error(fast().read_only().open::<Root>(&path), "foreign file");
+        assert_clear_error(fast().read_only(true).open::<Root>(&path), "foreign file");
         assert_eq!(fs::read(&path).unwrap(), body);
     }
 }

@@ -230,7 +230,7 @@ fn a_stamped_millisecond_survives_reopening() {
     let db = open_at(&path, &wall);
     assert_eq!(plain(&db, 4).time_ms, 7_001);
     db.verify().unwrap();
-    let reader: Db<Root> = Options::new().read_only().open(&path).unwrap();
+    let reader: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
     assert_eq!(reader.as_of(7_000).unwrap().version(), 2);
     assert_eq!(reader.as_of(7_001).unwrap().version(), 5);
 }

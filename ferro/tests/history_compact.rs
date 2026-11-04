@@ -379,7 +379,7 @@ fn compact_with_a_reader_open_keeps_the_reader_on_its_snapshot_until_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rd.ferro");
     let content = populate(&path, 200);
-    let reader: Db<Root> = Options::new().read_only().open(&path).unwrap();
+    let reader: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
     let old = reader.at(50).unwrap();
     let old_content = dump(&old);
     admin::compact(&path, Keep::Last(5)).unwrap();
@@ -392,7 +392,7 @@ fn compact_with_a_reader_open_keeps_the_reader_on_its_snapshot_until_refresh() {
     assert_eq!(reader.log().len(), 5);
     assert!(matches!(reader.at(50), Err(Error::NoVersion(50))));
     assert_eq!(dump(&reader.read()), content);
-    let fresh: Db<Root> = Options::new().read_only().open(&path).unwrap();
+    let fresh: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
     assert_eq!(fresh.log().len(), 5);
     assert_eq!(dump(&fresh.read()), content);
 }
@@ -446,7 +446,7 @@ fn readers_see_the_old_or_new_file_while_compactions_rename() {
         std::thread::spawn(move || {
             let mut opened = 0;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                let db: Db<Root> = Options::new().read_only().open(&path).unwrap();
+                let db: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
                 assert_eq!(dump(&db.read()), content);
                 db.verify().unwrap();
                 opened += 1;

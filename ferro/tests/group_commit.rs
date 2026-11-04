@@ -180,7 +180,7 @@ fn queued_commits_stay_invisible_until_their_sync_returns() {
     let _turn = serial();
     let (_dir, path, db) = database();
     let events = db.watch();
-    let outside = fast().read_only().open::<Root>(&path).unwrap();
+    let outside = fast().read_only(true).open::<Root>(&path).unwrap();
     let ran = Arc::new(AtomicUsize::new(0));
     let leader = stall_leader(&db, &ran);
     let followers: Vec<_> = (0..4).map(|_| bump(&db, &ran)).collect();
@@ -193,7 +193,7 @@ fn queued_commits_stay_invisible_until_their_sync_returns() {
     assert!(events.try_recv().is_err());
     assert!(!outside.refresh().unwrap());
     assert_eq!(outside.version(), 1);
-    let fresh = fast().read_only().open::<Root>(&path).unwrap();
+    let fresh = fast().read_only(true).open::<Root>(&path).unwrap();
     assert_eq!(fresh.version(), 1);
     assert_eq!(counter(&fresh.read()), 1);
     assert!(!leader.is_finished());
@@ -242,7 +242,7 @@ fn a_failed_sync_fails_everything_queued_behind_it_and_poisons() {
     assert!(matches!(late, Err(Error::Poisoned)));
     assert!(matches!(db.fork("late"), Err(Error::Poisoned)));
     assert!(matches!(db.update(|_| ()), Err(Error::Poisoned)));
-    let fresh = fast().read_only().open::<Root>(&path).unwrap();
+    let fresh = fast().read_only(true).open::<Root>(&path).unwrap();
     assert_eq!(fresh.version(), 1);
     hook().fail = false;
     drop(db);
@@ -432,7 +432,7 @@ fn power_cut_run(writers: u64, rounds: u64) -> (TempDir, u64, Vec<(u64, Vec<u8>)
 
 fn check_image(path: &Path, image: &[u8], floor: u64) {
     fs::write(path, image).unwrap();
-    let readonly = fast().read_only().open::<Root>(path).unwrap();
+    let readonly = fast().read_only(true).open::<Root>(path).unwrap();
     assert!(
         readonly.version() >= floor,
         "read-only lost an acknowledged commit"
@@ -480,7 +480,14 @@ fn reservation_is_invisible_to_readers_and_released_on_close() {
     let image = fs::read(&path).unwrap();
     let copy = path.with_extension("copy");
     fs::write(&copy, &image).unwrap();
-    assert_eq!(fast().read_only().open::<Root>(&copy).unwrap().version(), 2);
+    assert_eq!(
+        fast()
+            .read_only(true)
+            .open::<Root>(&copy)
+            .unwrap()
+            .version(),
+        2
+    );
     assert_eq!(fast().open::<Root>(&copy).unwrap().version(), 2);
     assert_eq!(fs::metadata(&copy).unwrap().len(), size);
     drop(db);

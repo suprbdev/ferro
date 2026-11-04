@@ -16,10 +16,7 @@ use graph::seed::{self, SeedOpts};
 type Res<T> = Result<T, Box<dyn Error>>;
 
 fn options(cli: &Cli, read_only: bool) -> Options {
-    let mut options = Options::new();
-    if read_only {
-        options = options.read_only();
-    }
+    let mut options = Options::new().read_only(read_only);
     if cli.buffered {
         options = options.durability(Durability::Buffered);
     }

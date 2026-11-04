@@ -346,7 +346,7 @@ fn check(
     context: &str,
 ) {
     let reader: Db<Text> = Options::new()
-        .read_only()
+        .read_only(true)
         .cache_bytes(1)
         .open(path)
         .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));

@@ -18,11 +18,7 @@ pub type Res<T> = Result<T, Box<dyn Error>>;
 
 fn run(cli: Cli) -> Res<()> {
     let read_only = cli.command.is_read_only();
-    let mut options = Options::new();
-    if read_only {
-        options = options.read_only();
-    }
-    let main: Db<Tracker> = options.open(&cli.db)?;
+    let main: Db<Tracker> = Options::new().read_only(read_only).open(&cli.db)?;
     let db = match &cli.branch {
         Some(name) if name != "main" => main.branch(name)?,
         _ => main,

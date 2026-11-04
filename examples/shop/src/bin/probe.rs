@@ -342,7 +342,7 @@ fn step_experiment() {
     }
     let fresh_handle = || {
         Options::new()
-            .read_only()
+            .read_only(true)
             .open::<Shop>(&path)
             .expect("open")
     };

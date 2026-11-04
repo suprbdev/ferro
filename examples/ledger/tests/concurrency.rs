@@ -149,7 +149,7 @@ fn sixteen_writers_and_a_checking_reader() {
     drop(last);
     drop(db);
 
-    let reopened: Db<Ledger> = Options::new().read_only().open(&path).unwrap();
+    let reopened: Db<Ledger> = Options::new().read_only(true).open(&path).unwrap();
     assert_eq!(reopened.version(), setup_version + committed);
     nets_to_zero(&reopened.read());
 }

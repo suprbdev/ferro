@@ -219,7 +219,10 @@ impl Data for Raw {
 }
 
 pub fn space(path: impl AsRef<Path>) -> Result<Space> {
-    crate::Options::new().read_only().open::<Raw>(path)?.space()
+    crate::Options::new()
+        .read_only(true)
+        .open::<Raw>(path)?
+        .space()
 }
 
 fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {

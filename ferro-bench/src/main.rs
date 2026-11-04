@@ -157,14 +157,14 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
     cold_gets(
         report,
         "map_get_cold",
-        Options::new().read_only().cache_bytes(COLD_CACHE),
+        Options::new().read_only(true).cache_bytes(COLD_CACHE),
         &path,
         n,
     );
     cold_gets(
         report,
         "map_get_cold_5m",
-        Options::new().read_only().cache_bytes(5 << 20),
+        Options::new().read_only(true).cache_bytes(5 << 20),
         &path,
         n,
     );
