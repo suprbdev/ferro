@@ -1122,6 +1122,7 @@ struct Draft<T> {
     root: Ptr,
     value: T,
     object: Object,
+    entry: Option<(Commit, Chain)>,
 }
 
 fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
@@ -1137,6 +1138,7 @@ fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
         root,
         value,
         object,
+        entry: None,
     })
 }
 
@@ -1357,26 +1359,23 @@ impl<T: Data> Shared<T> {
         let started = Instant::now();
         let framed = branch.framed.load(Ordering::Acquire);
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
-            let drafted = self.draft(branch, &working)?;
+            let mut change = Change {
+                branch,
+                state: &state,
+                working: &working,
+                message,
+                parts,
+                intent: Intent {
+                    time: time.into_inner(),
+                    ..Intent::default()
+                },
+                seal: Some(&seal),
+                from: None,
+            };
+            let drafted = self.draft(&mut change)?;
             let mut tip = self.tip.lock();
             let whole = reentry::whole(self.id);
-            let committed = self.commit_locked(
-                &mut tip,
-                Change {
-                    branch,
-                    state: &state,
-                    working: &working,
-                    message,
-                    parts,
-                    intent: Intent {
-                        time: time.into_inner(),
-                        ..Intent::default()
-                    },
-                    seal: Some(&seal),
-                    from: None,
-                },
-                drafted,
-            );
+            let committed = self.commit_locked(&mut tip, change, drafted);
             drop(whole);
             drop(tip);
             let (version, time_ms, settling) = committed?;
@@ -1816,11 +1815,62 @@ impl<T: Data> Shared<T> {
         Ok(())
     }
 
-    fn draft(&self, branch: &Branch<T>, working: &T) -> Result<Draft<T>> {
-        branch.check_live()?;
-        let drafted = write_draft(working, self.store())?;
+    fn draft(&self, change: &mut Change<'_, T>) -> Result<Draft<T>> {
+        change.branch.check_live()?;
+        let mut drafted = write_draft(change.working, self.store())?;
+        if change.intent.merged.is_none()
+            && change.intent.record.is_none()
+            && drafted.store.id() == change.state.store.id()
+        {
+            drafted.entry = self.draft_entry(change, &mut drafted)?;
+        }
         self.step("drafted");
         Ok(drafted)
+    }
+
+    fn draft_entry(
+        &self,
+        change: &mut Change<'_, T>,
+        drafted: &mut Draft<T>,
+    ) -> Result<Option<(Commit, Chain)>> {
+        let state = change.state;
+        let head = &state.snapshot.commit;
+        if head.root.map_or(self.genesis_hash, |ptr| ptr.hash) == drafted.root.hash {
+            return Ok(None);
+        }
+        let version = head
+            .version
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("the branch has reached the last version".into()))?;
+        let intent = &change.intent;
+        let commit = Commit {
+            version,
+            time_ms: intent.time.unwrap_or_else(|| self.now().max(head.floor())),
+            message: mem::take(&mut change.message),
+            root: Some(drafted.root),
+            restored: intent.restored,
+            parts: mem::replace(&mut change.parts, Parts::Whole),
+            stamped: intent.time.is_some(),
+        };
+        let (store, txn) = (&drafted.store, &mut drafted.txn);
+        let log = self.append_entry(state, store, txn, commit.clone(), None)?;
+        Ok(Some((commit, log)))
+    }
+
+    fn append_entry(
+        &self,
+        state: &State<T>,
+        store: &Store,
+        txn: &mut Txn,
+        commit: Commit,
+        merged: Option<Merged>,
+    ) -> Result<Chain> {
+        txn.unshared();
+        let log = state.log.append(store, txn, commit, merged)?;
+        match self.history {
+            Keep::Last(_) => log.pruned(store, self.history),
+            _ => Ok(log),
+        }
     }
 
     fn commit_locked(
@@ -1843,9 +1893,12 @@ impl<T: Data> Shared<T> {
         if let Some(from) = from {
             from.check_live()?;
         }
-        let drafted = match drafted.store.id() == state.store.id() {
-            true => drafted,
-            false => write_draft(working, self.store())?,
+        let (drafted, template) = match drafted.store.id() == state.store.id() {
+            true => (drafted, None),
+            false => {
+                let template = drafted.entry.map(|(commit, _)| commit);
+                (write_draft(working, self.store())?, template)
+            }
         };
         let Draft {
             mut txn,
@@ -1853,6 +1906,7 @@ impl<T: Data> Shared<T> {
             mut root,
             mut value,
             object,
+            entry,
         } = drafted;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let version = state
@@ -1881,35 +1935,57 @@ impl<T: Data> Shared<T> {
             return Ok((head.version, head.time_ms, None));
         }
         let mut settling = txn.rebase()?;
+        let corrupt = || Error::Corrupt("a drafted root links a record its frame lost".into());
         if let Some(moves) = settling.moves() {
-            let corrupt = || Error::Corrupt("a drafted root links a record its frame lost".into());
             root = moves.ptr(root).ok_or_else(corrupt)?;
             let links = object.links.iter().map(|link| moves.ptr(*link));
             let links = links.collect::<Option<Vec<_>>>().ok_or_else(corrupt)?;
             value = T::decode(&mut Decoder::new(&object.body, &links, Some(&store)))?;
         }
-        let mut time_ms = intent.time.unwrap_or_else(|| self.now().max(head.floor()));
-        if let Some(link) = intent.merged {
-            time_ms = time_ms.max(Entry::load(&store, link.ptr)?.commit.time_ms);
-        }
-        let commit = Commit {
-            version,
-            time_ms,
-            message,
-            root: Some(root),
-            restored: intent.restored,
-            parts,
-            stamped: intent.time.is_some(),
+        let (commit, log) = match entry {
+            Some((commit, log)) => {
+                let tip = match (settling.moves(), log.tip) {
+                    (Some(moves), Some(tip)) => Some(moves.ptr(tip).ok_or_else(corrupt)?),
+                    (_, tip) => tip,
+                };
+                let commit = Commit {
+                    root: Some(root),
+                    ..commit
+                };
+                (commit, Chain { tip, ..log })
+            }
+            None => {
+                let commit = match template {
+                    Some(commit) => Commit {
+                        root: Some(root),
+                        ..commit
+                    },
+                    None => {
+                        let mut time_ms =
+                            intent.time.unwrap_or_else(|| self.now().max(head.floor()));
+                        if let Some(link) = intent.merged {
+                            time_ms = time_ms.max(Entry::load(&store, link.ptr)?.commit.time_ms);
+                        }
+                        Commit {
+                            version,
+                            time_ms,
+                            message,
+                            root: Some(root),
+                            restored: intent.restored,
+                            parts,
+                            stamped: intent.time.is_some(),
+                        }
+                    }
+                };
+                let merged = intent.merged;
+                let log = self.append_entry(state, &store, &mut txn, commit.clone(), merged)?;
+                (commit, log)
+            }
         };
+        let time_ms = commit.time_ms;
         let snapshot = Snapshot {
             value: Arc::new(value),
-            commit: Arc::new(commit.clone()),
-        };
-        txn.unshared();
-        let log = state.log.append(&store, &mut txn, commit, intent.merged)?;
-        let log = match self.history {
-            Keep::Last(_) => log.pruned(&store, self.history)?,
-            _ => log,
+            commit: Arc::new(commit),
         };
         let mut next = tip.refs.clone();
         next.insert(
@@ -2407,7 +2483,7 @@ impl<T: Data> Db<T> {
         let ran = f(&state, &mut working, &stamp);
         let result = ran.and_then(|(message, value, mut intent)| {
             intent.time = time.get().copied();
-            let change = Change {
+            let mut change = Change {
                 branch: &self.branch,
                 state: &state,
                 working: &working,
@@ -2417,7 +2493,7 @@ impl<T: Data> Db<T> {
                 seal: None,
                 from,
             };
-            let drafted = self.shared.draft(&self.branch, &working)?;
+            let drafted = self.shared.draft(&mut change)?;
             let mut tip = self.shared.tip.lock();
             let whole = reentry::whole(self.shared.id);
             let committed = self.shared.commit_locked(&mut tip, change, drafted);

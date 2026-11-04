@@ -1315,6 +1315,7 @@ impl Store {
             seen: HashMap::default(),
             remembered: Vec::new(),
             unshared: false,
+            shared_end: u64::MAX,
             reserve: true,
         })
     }
@@ -1416,6 +1417,7 @@ pub struct Txn {
     seen: Seen,
     remembered: Vec<Remembered>,
     unshared: bool,
+    shared_end: u64,
     reserve: bool,
 }
 
@@ -1484,7 +1486,7 @@ fn relayout(
     from: u64,
     to: u64,
     hashes: &[(u64, Hash)],
-    known: impl Fn(&Hash) -> Option<u64>,
+    known: impl Fn(u64, &Hash) -> Option<u64>,
 ) -> Result<(Vec<u8>, Moves)> {
     let mut out = Vec::with_capacity(old.len() + old.len() / 32);
     out.extend_from_slice(&old[..FRAME_BYTES]);
@@ -1507,7 +1509,7 @@ fn relayout(
             Some((offset, hash)) if *offset == was => hash,
             _ => return Err(Error::Corrupt("a drafted record has no hash".into())),
         };
-        if let Some(found) = known(hash) {
+        if let Some(found) = known(was, hash) {
             for _ in 0..flagged >> 1 {
                 at += HASH_BYTES;
                 take_varint(old, &mut at)?;
@@ -1634,7 +1636,10 @@ impl Txn {
     }
 
     pub(crate) fn unshared(&mut self) {
-        self.unshared = true;
+        if !self.unshared {
+            self.unshared = true;
+            self.shared_end = self.start + self.buf.len() as u64;
+        }
     }
 
     pub(crate) fn unreserved(&mut self) {
@@ -1665,8 +1670,11 @@ impl Txn {
                     .map(|(hash, offset)| (*offset, *hash))
                     .collect();
                 hashes.sort_unstable_by_key(|(offset, _)| *offset);
-                let dedupe = (!self.unshared).then_some(&self.store.inner.dedupe);
-                let known = |hash: &Hash| dedupe?.get(hash).filter(|offset| *offset < now);
+                let (dedupe, shared_end) = (&self.store.inner.dedupe, self.shared_end);
+                let known = |was: u64, hash: &Hash| match was < shared_end {
+                    true => dedupe.get(hash).filter(|offset| *offset < now),
+                    false => None,
+                };
                 let (buf, moves) = relayout(&self.buf, self.origin, now, &hashes, known)?;
                 for offset in self.seen.values_mut() {
                     *offset = moves

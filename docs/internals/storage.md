@@ -55,7 +55,7 @@ read are registered, after their hash check. Offsets are not hashed, so a link i
 nothing about the offset it carries until it is followed, and registering links would let a damaged
 offset spread into new commits. A read-only handle registers nothing. A commit drafted outside
 `tip`, as described under Drafting outside `tip`, takes only offsets below the start of its draft,
-and looks its records up again if its frame has to move.
+and looks its records up again, all but its log entry, if its frame has to move.
 
 So rewriting a value costs nothing if this process read the old one, whichever process wrote it.
 `get_mut` on a spilled value needs no special case: the slot becomes `Fresh`, the value is encoded

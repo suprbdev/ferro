@@ -11,15 +11,15 @@ which orders frames. Writers run their closures and encode what they changed one
 branch under its lane, place their frames one at a time under `tip`, write them to the page cache
 under the lane alone, and sync outside both. Each branch has two states: `state`, the published one
 that readers load through `ArcSwap`, and `tip`, the newest one written. Under its lane a writer
-clones the branch's tip, runs the closure and drafts its records, then under `tip` it places them,
-appends the log entry, writes the refs and queues the frame, and after releasing `tip` it writes the
-frame to the page cache and releases its lane. The next writer on the branch builds on that tip even
-though it is not durable yet, and a writer on another branch runs its closure meanwhile, as
-described under [A lock per branch](#a-lock-per-branch) below. Object reads are bounded by
-`written`, the end of the run of frames already in the page cache, rather than `tail`, the published
-end, so unpublished objects stay readable to writers, and a read inside a frame that is placed but
-not yet written waits for it, as described under [Writing frames after
-`tip`](#writing-frames-after-tip). Published pointers never reach past `tail`.
+clones the branch's tip, runs the closure and drafts its records and log entry, then under `tip` it
+places them, writes the refs and queues the frame, and after releasing `tip` it writes the frame to
+the page cache and releases its lane. The next writer on the branch builds on that tip even though
+it is not durable yet, and a writer on another branch runs its closure meanwhile, as described under
+[A lock per branch](#a-lock-per-branch) below. Object reads are bounded by `written`, the end of the
+run of frames already in the page cache, rather than `tail`, the published end, so unpublished
+objects stay readable to writers, and a read inside a frame that is placed but not yet written waits
+for it, as described under [Writing frames after `tip`](#writing-frames-after-tip). Published
+pointers never reach past `tail`.
 
 Each writer then waits for its frame. The first to find no sync running becomes the leader: it takes
 the whole queue, waits until every frame in it is in the page cache, fdatasyncs, writes one
@@ -83,9 +83,9 @@ Every branch used to share the `tip` mutex for the whole of a write, so a closur
 stalled commits on every other, and closures on different branches never overlapped though they
 touch independent state (#37). Each `Branch` now has a lane, a mutex held while a closure runs on a
 copy of that branch's tip, which also holds the branch's open coalescing group. `tip` is taken after
-the closure and its draft, only to place the drafted records, append the log entry, write the refs
-and queue the frame. Locks are always taken in the order lane, `tip`, `published`, the attached
-branches, the queue, and nothing waits for a lane while it holds `tip`.
+the closure and its draft, only to place the drafted records, write the refs and queue the frame.
+Locks are always taken in the order lane, `tip`, `published`, the attached branches, the queue, and
+nothing waits for a lane while it holds `tip`.
 
 When the lanes were added, a commit had to know where its frame started before it encoded its first
 record. A record names each link by offset, stored as the distance back from the record itself, and
@@ -310,7 +310,8 @@ and 24.0 µs Buffered and 411 and 405 µs with fsync, and its concurrent commits
 Left open:
 
 - The log entry, a fifth of what is left under `tip`, depends only on the branch's own chain except
-  when a merge records what it merged, so it could be drafted too.
+  when a merge records what it merged. It is now drafted too, as described under [Drafting the log
+  entry](#drafting-the-log-entry).
 - The frame's write to the page cache is the largest part left. It is now written after `tip`, as
   described under [Writing frames after `tip`](#writing-frames-after-tip).
 - A frame that moves loses the cached copies of nodes holding nested collections and of a parallel
@@ -397,3 +398,87 @@ section shrank by less: with no closure, `tip` was held for 11.3 µs at the medi
 at 8 branches, and 13.4 and 12.3 µs at 16, where the refs, the relayout and the log entry are most
 of it. Fsync waits on the disk and moved within its runs: an earlier set of three gave 0.71 to 1.35
 of before for the same cells.
+
+## Drafting the log entry
+
+With the frame written after `tip`, the log entry was the largest part of what a booking commit
+still did under `tip`: about 9,000 instructions and 1 to 2 µs (#51). An entry depends only on its
+own branch: its version, time, message and root, the entry before it, the skip pointer found by
+walking back down that chain, and the merge-graph numbers carried from the entry before. All of that
+is fixed under the lane, so the draft now appends the entry after the root, where the commit
+appended it under `tip`, and the commit under `tip` takes it as drafted. A merge that links the
+other branch's entry or records what it merged still appends under `tip`, since it reads the refs,
+and so does a commit whose file a cycle swapped during its draft, with the time and message it
+drafted.
+
+The entry is written without looking in `dedupe`, as before, for the reason given under [Commits
+stored twice](sync-receive.md#commits-stored-twice). So that a moved frame matches one drafted in
+place, the transaction remembers where its records stopped looking in `dedupe`, and the relayout
+looks up again only the records before that point. Moving the entry is moving any other record: its
+links to older entries grow and its link to the root goes through the table, and the commit takes
+the moved root and the moved entry. The time is now read when the draft builds the entry rather than
+under `tip`. It was never ordered across branches, and on one branch the lane orders it as before.
+`a_frame_another_branch_moves_is_the_frame_written_in_its_place` now moves entries as well, and the
+files still match byte for byte.
+
+`tables` as above, median of three interleaved runs of the tree before both changes, the frame
+written after `tip`, and this: `tip` was held for 7.86, 3.70 and 2.04 µs at the median, -74% in all,
+and for 33,461, 22,917 and 14,306 instructions, -57%. Outside the closure a hold ran 566,604,
+567,379 and 567,479 instructions, a confirm 732,782, 733,176 and 733,451, and a cancel 900,867,
+901,360 and 901,670, 0.1% more in all, with thread CPU time of 75.6, 75.7 and 75.8, 96.5, 96.6 and
+96.7, and 124.8, 124.5 and 124.2 µs, and bytes per write stayed at 13,297.
+
+`group` with `--branches own`, the same runs as above, closures a second:
+
+| Durability | Closure | Branches | Before both | Frame after `tip` | And the entry drafted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Buffered | none | 4 | 88,493 | 91,606 | 93,857 (1.06x) |
+| Buffered | none | 8 | 70,154 | 77,003 | 89,180 (1.27x) |
+| Buffered | none | 16 | 58,494 | 60,496 | 68,134 (1.16x) |
+| Buffered | 10 µs | 4 | 79,018 | 80,198 | 81,502 (1.03x) |
+| Buffered | 10 µs | 8 | 70,437 | 74,616 | 90,746 (1.29x) |
+| Buffered | 10 µs | 16 | 58,266 | 62,304 | 64,973 (1.12x) |
+| Fsync | none | 4 | 5,292 | 5,472 | 5,394 |
+| Fsync | none | 8 | 9,934 | 10,144 | 9,666 |
+| Fsync | none | 16 | 18,038 | 17,822 | 18,164 |
+| Fsync | 10 µs | 4 | 5,471 | 5,165 | 5,545 |
+| Fsync | 10 µs | 8 | 10,296 | 9,720 | 9,957 |
+| Fsync | 10 µs | 16 | 17,864 | 18,326 | 17,714 |
+
+Buffered p50 with no closure fell from 114 to 88 µs at 8 branches and from 284 to 243 µs at 16. At 4
+branches a writer waited about 6 µs for `tip` at the median before, against 73 µs at 8 and 269 µs at
+16, so there was less to gain. With no closure, `tip` was held at the median for 3.70, 2.84 and 1.70
+µs on one branch, 11.3, 11.4 and 9.0 µs at 8 branches and 13.4, 12.3 and 11.1 µs at 16. Fsync waits
+on the disk, one fdatasync per round of branches, and stayed within its runs.
+
+One writer on one branch, against the tree before both changes: `group`'s single-key commits ran
+2,576 and 2,549 a second under Fsync over eight runs in ABBA order, p50 382 and 385 µs, and 47,984
+and 48,176 Buffered over five, p50 19 µs both. Bytes per commit of `ferro-bench`'s map and table
+workloads stayed at 3,531.7 and 4,744.4. A 1M-key bulk load took 806 and 799 ms at the median of
+eight ABBA runs, its commit 207 and 205 ms, with the same instructions per key, and the single-key
+commits after it ran about 350 instructions more each, 0.2%, in 848 and 822 ms under Fsync and 55.5
+and 50.7 ms Buffered.
+
+What is left under `tip` at 16 branches, with a counter around each part: writing the refs, 4.7 µs
+and 28,000 instructions, inserting into them, 1.1 µs and 5,800, moving the draft, 1.5 µs and 13,000,
+queueing the frame, 1.0 µs and 3,500, and checking the branch and reading its head from the refs,
+0.8 µs and 1,900. The refs grow with the branches: on one branch writing them takes 7,800
+instructions, and at 16 nearly two nodes of the branch table are written for each commit, so the
+leaf with the new head is encoded again in full, and both are hashed, compressed and copied for the
+cache.
+
+Measured and left out:
+
+- Writing the refs and the entry without LZ4. A refs node of 16 branches is over the 96 bytes where
+  compression starts, and compressing it took about 3,100 instructions a commit, 10% of writing the
+  refs. Leaving it out gave 3 to 6% more commits a second at 8 and 16 branches over three
+  alternating runs, and 1.7 to 2.1% more bytes per commit, a trade rather than a win.
+
+Left open:
+
+- The leaf of the branch table that holds a commit's head is encoded again on every commit, with the
+  nodes above it, and at 16 branches inserting into and writing the refs are more than half of what
+  a commit does under `tip`. A format that kept each head in a record of its own, drafted with the
+  commit, would leave only the nodes that link the heads to write under `tip`.
+- Moving a draft runs 13,000 instructions for a 2.5 KB frame, about a fifth of a commit's
+  instructions under `tip` at 16 branches.
