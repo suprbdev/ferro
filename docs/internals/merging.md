@@ -162,12 +162,40 @@ was made. Without pruning nothing is cut, and the commits of a dropped branch st
 merge brought them in.
 
 The search reads only what that rule keeps, never whatever bytes are still on disk, so its answer
-does not change when a cycle runs, and every path it follows was copied. When a path that is not
-stale runs into pruned history, what is hidden there is older than where it stopped, since a merge
-commit takes the later of its parents' times, and of lower generation. The search then runs on until
-nothing that is not stale is left, and returns `NoCommonAncestor` if the other side reached anything
-that old and that low, or if both sides ran into pruned history, because the base could be hidden
-there. Otherwise its answer is the one the whole history would give.
+does not change when a cycle runs, and every path it follows was copied. Where a path runs into
+pruned history, the entry it stopped at still names its parent by hash. If another path the rule
+keeps reaches that parent, nothing is hidden there: the parent takes the sides of the path that
+stopped, stale included, and the search goes on below it under the limits of the path that reached
+it. That needs every chain through the parent to stop on it. Once the path has stopped, a chain
+moving down treats the parent as a place where something joins it, and before that, the binary
+search that finds where two chains meet looks one version below the higher of their lowest versions,
+comparing the parents the two entries there name. The search runs on while a queued item could
+still reach such a parent, which is any item whose level is at least the parent's version, since a
+generation is never below its version.
+
+What no path the rule keeps reaches is hidden. Below a path that is not stale, it is older than
+where the path stopped, since a merge commit takes the later of its parents' times, and of lower
+generation. The search then runs on until nothing that is not stale is left, and returns
+`NoCommonAncestor` if the other side reached anything that old and that low, or if both sides ran
+into pruned history, because the base could be hidden there. Below a stale path it is below a base
+already found, so a base found elsewhere that could lie in there, no newer than where the path
+stopped and at least two generations lower, could be an ancestor of another, and the search refuses
+too. A merge link the search cannot follow names its parent but not the parent's version, so no
+chain can be made to stop on it: a path that is not stale is cut there as before, and for a stale
+path that parent always counts as hidden. Otherwise the answer is the one the whole history would
+give.
+
+Stale paths used to stop at pruned history without a trace (#45). With `Keep::Last(4)`, a commit n1
+under n3 on one chain, with n2 between them, was retained on a branch forked at n1 and reached
+through merge links on both sides, while the paths from n3 stopped at n2. `common_ancestors` then
+answered n3 and n1, and `merge_with` refused because the step from n3 to n1 ran into pruned history.
+n2 names n1, so the search now finds n1 under n3 and answers n3 alone. When no branch keeps n2, as
+with `Keep::Last(3)`, the search refuses. Following named parents helps paths that are not stale as
+well: in `merge_model`'s pruned graphs, with every commit at the same millisecond, 1,485 of 22,325
+searches refused for one seed where 2,418 had, and with each commit a millisecond after the last,
+1,662 of 22,325 where 2,716 had. Pulls gain the same way: when we have pruned the parent of our
+oldest retained commit and the remote sends that commit again, the landed branch keeps it, and the
+pull merges against it, or finds itself `Ahead`, where it used to refuse.
 
 A merged chain is kept down to where its `prev` links stop, and the search finds that place by
 following them, taking a skip link only to a commit the `prev` links also reach. Two writers broke
