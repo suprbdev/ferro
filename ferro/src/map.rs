@@ -13,8 +13,8 @@ use std::sync::{Arc, OnceLock};
 use std::vec;
 
 use crate::codec::{
-    Data, Decoder, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape, Sink, Staged,
-    try_hash_of,
+    Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape,
+    Sink, Staged, try_hash_of,
 };
 use crate::epoch::{self, Guard};
 use crate::error::{Error, Result};
@@ -3362,6 +3362,13 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
 
     fn missing() -> Option<Self> {
         Some(Map::default())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("map");
+        d.of::<K>();
+        d.of::<V>();
+        d.of::<S>();
     }
 }
 

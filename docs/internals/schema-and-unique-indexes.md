@@ -1,16 +1,17 @@
 # Schema evolution, unique and covering indexes
 
 How the derive macros encode a struct so that it can change, how unique indexes keep their
-constraint through inserts, updates and merges, and how a covering index stores fields beside its
-entries and what that costs. The API is in [Changing your types](../guide/schema-evolution.md) and
-[Tables and indexes](../guide/tables.md).
+constraint through inserts, updates and merges, how a covering index stores fields beside its
+entries and what that costs, and how a table knows which stored indexes it can read. The API is in
+[Changing your types](../guide/schema-evolution.md) and [Tables and indexes](../guide/tables.md).
 
 ## Schema evolution
 
 The derive macro writes structs as `(tag, length, payload)` fields, where the tag is a 16-bit FNV-1a
 hash of the field name. Fields are sorted by tag, so reordering a struct does not change its hash.
 Unknown fields are skipped. Missing fields use `Data::missing`, or `#[ferro(default)]`.
-`#[ferro(rename = "old")]` keeps the old tag.
+`#[ferro(rename = "old")]` keeps the old tag. A table's indexes are not told apart by tag, as
+described under [Index fingerprints](#index-fingerprints).
 
 ## Unique indexes
 
@@ -40,12 +41,13 @@ offered again. If it still clashes when nothing else can move, the key keeps our
 never panics on a clash, the indexes always match the rows, and a row is removed only when theirs
 removed it or `resolve` returned `None` for its key.
 
-The index field is named `unique_x`, not `by_x`, so turning an `#[index]` into a `#[unique]`
+The kind of an index is part of its fingerprint, so turning an `#[index]` into a `#[unique]`
 rebuilds it instead of reading the old map with new types. The rebuild on decode covers unique
-indexes. If two existing rows share a value it fails with `Error::Decode` naming the index, because
-a constraint the data breaks cannot be honoured, so that version does not open until the data or the
-attribute changes. The rebuild reads the rows through `table::stored_rows`, which returns a damaged
-row node as an error, so `Db::open` fails with it instead of panicking.
+indexes, and checks the ones it rebuilds. If two existing rows share a value it fails with
+`Error::Decode` naming the index, because a constraint the data breaks cannot be honoured, so that
+version does not open until the data or the attribute changes. The rebuild reads the rows through
+`table::stored_rows`, which returns a damaged row node as an error, so `Db::open` fails with it
+instead of panicking.
 
 ## Covering indexes
 
@@ -63,14 +65,14 @@ in place in the leaf, clones it and builds the projection with a function the de
 takes no count on the leaf's value column. `uncovered` wraps the cursor so the iterator's type no
 longer names the projection. A plain index passes a projection that is never called.
 
-The index's field tag is a hash of `by_x cover(a,b)`, the stored fields in order under the names
-their rows store them by, instead of `by_x`. A table that adds, drops or reorders a covered field,
-or stores one under another name, finds its index field missing on decode and rebuilds every index
-of that table from the rows, as it does when an index is added, and the next commit writes the
-rebuilt maps. A field renamed in Rust that keeps its stored name with `#[ferro(rename)]` keeps the
-tag. The old field is skipped as unknown and not written again. Naming only the index's own fields
-stores nothing, keeps the plain tag, and is not rebuilt. A covering unique index rebuilds under the
-same check for two rows sharing a value.
+The covered fields an index stores are part of its fingerprint, in list order under the names their
+rows store them by, each with its type. A table that adds, drops or reorders a covered field, or
+stores one under another name or type, finds no stored map with that index's fingerprint on decode
+and rebuilds that index from the rows, as it does when an index is added, and the next commit writes
+the rebuilt map. A field renamed in Rust that keeps its stored name with `#[ferro(rename)]` keeps
+the fingerprint. The old map is skipped and not written again. Naming only the index's own fields
+stores nothing, keeps the plain index's fingerprint, and is not rebuilt. A covering unique index
+rebuilds under the same check for two rows sharing a value.
 
 Keeping the entries costs a comparison. An update that leaves the indexed value and the key alone
 but changes a covered field overwrites the entry in place, where a plain index does nothing, and an
@@ -149,5 +151,148 @@ of a rarely read index, or for wide strings, and the guide says so.
   one type cannot swap them silently, is left to the reader of the list.
 - `by_x_covered`, `by_x_range_covered` and the rest as separate methods: six more per index, where
   `.covered()` on the iterator every lookup already returns gives them all.
-- Rebuilding only the index whose cover list changed. The decode rebuilds every index of the table,
-  as it does when an index is added, and this was not measured.
+
+## Index fingerprints
+
+A covered index once learned that its cover list changed only because the field tag it looked for,
+a 16-bit hash of `by_x cover(a,b)`, was missing from the stored table. Three things slipped through.
+Two lists could hash to the same tag, one change in 65,536, and `cover(total)` read as `cover(price,
+speed)` panicked while `cover(size_id)` read as `cover(length_v2)` returned the old field's values.
+`#[index] tags` and `#[index(each)] tags` used the same tag over maps of different key types. And
+the keyed part of the tag hashed Rust names, so giving an indexed field another stored name kept a
+stale index, while renaming it in Rust rebuilt one that was fine. The tag was standing in for an
+identity it did not capture.
+
+### What the fingerprint covers
+
+Each index is identified by a 64-bit fingerprint of a description of what decides its encoding and
+meaning:
+
+- its kind as the derive generates it: value, option for a value index on a field written
+  `Option<T>`, composite, each, unique, unique option for a unique index that leaves `None` out, or
+  unique composite;
+- the key's type;
+- the stored names of the fields it is keyed on, in order, each with its type;
+- the stored names of the covered fields it stores, in list order, each with its type. Covered
+  fields the index is keyed on come from the entry and are left out, so a list naming only them
+  describes the plain index.
+
+Rust names take no part. The generated field and methods keep them, so `by_amount` on a field
+stored as `total` has the fingerprint `by_total` had, and a Rust-only rename rebuilds nothing.
+
+A type is described by `Data::describe`, which follows the encoding:
+
+- Primitives, `String` and `Bytes` by name. `Option`, `Vec`, arrays, tuples, `BTreeMap`,
+  `BTreeSet`, `Map`, `Set`, `List` and `Table` by their shape and their parameters. `Box<T>` and
+  `Arc<T>` as `T`, since they encode as `T`.
+- A derived struct by its stored fields in tag order, each name with its type, and a derived enum
+  by its variants the same way. The struct's Rust name, the order its fields are declared in and its
+  skipped fields take no part. A transparent struct is described as the field it wraps.
+- A type met again inside its own description, directly or through others, by how many types up the
+  first one is, so `struct Tree { kids: Vec<Tree> }` has a finite description.
+- Anything else by `std::any::type_name`, unless its `Data` impl overrides `describe`.
+
+The derive's code names a field's type, and the compiler resolves it, so `type Amount = i64`
+describes as `i64`, and pointing the alias at another type changes the fingerprint. The description
+is a byte string in which every word carries its length and every count a marker, so two different
+descriptions cannot be the same bytes. The fingerprint is the first eight bytes of its BLAKE3 hash
+in derive-key mode, under a context string of ferro's own.
+
+The fingerprints of a table type are computed the first time it is encoded or decoded and kept in a
+`OnceLock` for the life of the process. Decoding then compares eight bytes per index and hashes
+nothing.
+
+### Where it is stored
+
+A table encodes as a struct of fields, as before: its rows under the tag of `rows`, and every index
+under the one tag of `indexes`, as its fingerprint in eight little-endian bytes followed by the map.
+Index fields are written in fingerprint order, so the order indexes are declared in does not change
+the encoding, and since the tag of `indexes` is below that of `rows` they come first. Decode reads
+each index field's first eight bytes and keeps the map under the declared index with that
+fingerprint. A field shorter than eight bytes, or whose fingerprint no declared index has, is
+skipped. Each declared index left without a map is rebuilt: the rows are read once, every such index
+is filled from them, unique ones are checked for clashes as they fill, and the indexes that were
+found are kept as they are. `visit`, which `verify_typed` and the check on receiving a sync use,
+reads index fields the same way and checks only those it can match.
+
+That is the whole format change. The tag of an index no longer depends on its name, and its field
+holds eight bytes before the map. Nothing global moved: no file format version, and no change to
+rows, maps, nodes, commits, or structs that are not tables. A table without indexes encodes as it
+did, byte for byte.
+
+A file written before fingerprints keeps each index under the tag of its old name. Decode does not
+know those tags, so it skips them, rebuilds every index once, and the next commit writes them with
+fingerprints. If an old name happens to hash to the tag of `indexes`, one in 65,536, its field is a
+map's count and link, shorter than eight bytes or starting with bytes no fingerprint matches, and is
+skipped all the same. `tagged-indexes.db`, written by the version before this change, checks that
+value, option, each, composite, unique and covered indexes all come back equal to a rebuild, in the
+newest version and in the first, and that the commit after stores them. A version written before
+fingerprints, read later through `at`, history or a merge base, rebuilds its indexes on every read,
+as any version written under another layout already did. An older ferro opening a newer file finds
+none of its index tags and rebuilds its indexes, unless one of its index names hashes to the tag of
+`indexes`, when it would read that field's fingerprint as part of a map. Going back is not
+supported.
+
+### What it does not see
+
+- How a value compares. The description follows the encoding, so a change to `Ord` with the same
+  bytes keeps the fingerprint: reordering the fields of a struct that derives `Ord`, a hand-written
+  `Ord`, or a transparent wrapper that orders differently. The entries then sit where the old order
+  put them, and lookups miss rows. The values of an indexed field are keys of its index's map, and
+  [Changing your types](../guide/schema-evolution.md) already says not to change a key type's
+  `Ord` on existing data.
+- A hand-written `Data` impl that changes its encoding and keeps its type name. Its description is
+  the name. Overriding `describe` fixes that. The name `type_name` gives may also change with the
+  compiler, which costs one rebuild.
+- Changes that would have read correctly. The fingerprint changes whenever a description does, so
+  `u32` to `u64`, `Vec<u8>` to `Bytes`, or a defaulted field added to a covered struct rebuilds an
+  index that decoding would have handled. That costs a rebuild, where missing a change costs wrong
+  answers.
+
+### What it costs
+
+Eight bytes per index in the root, which every commit rewrites, and nothing on the read path that
+was not there. Both benches gained a timing of the root decode before the change, and each build ran
+them twice, interleaved with the other build's runs.
+
+In `bench-covered`, on 200,000 rows with two indexes, each commit wrote 16 bytes more: a balance
+update with the plain index went from 7,649 to 7,665 bytes, a name update from 4,168 to 4,184 and an
+insert from 8,363 to 8,379, under 0.4%. CPU per commit stayed within the spread of two runs of one
+build, which reached 7%. The root grew from 27 to 43 bytes, and the variant without indexes kept its
+13 bytes. Decoding that root took 130 and 147 ns before and 133 and 142 ns after, and 143 and 159 ns
+against 138 and 142 ns with the widest cover. Opening the file of the plain variant as the one whose
+`tier` index covers `balance` took 192 and 201 ms before, rebuilding both indexes, and 110 ms after,
+rebuilding `tier` alone. Opening the narrow file as the wide variant went from 206 to 119 and 121
+ms.
+
+In `bench-tables`, whose booking model has nine indexes over six tables, the root grew from 183 to
+255 bytes and each write from 13,297 to 13,367 bytes, 0.5% more. A hold ran 641,000 instructions
+against 638,000, a confirm 823,000 against 822,000 and a cancel 1,023,000 against 1,018,000, at most
+0.5% more, and wall and CPU time stayed within 2.5%. Decoding the root took 1,073 ns before and 995
+and 1,010 ns after.
+
+### Collisions
+
+A stored index is mistaken for a declared one only if their fingerprints are equal while their
+descriptions differ. With BLAKE3 truncated to 64 bits that happens for a given pair with probability
+2^-64. Decode only ever compares the declared indexes with the few the last writer stored, so there
+is no birthday effect across all the layouts a schema has had: an accidental match needs one of a
+handful of pairs to collide, and a deliberate one needs a second preimage, about 2^64 hashes. Two
+indexes of one table cannot have the same description, since their Rust names would clash, so equal
+fingerprints there would be a hash collision too. `Fingerprints::new` checks for one and panics
+naming the table the first time the table is used, so it would show in the first test that touches
+it, not in a file.
+
+### Left out
+
+- Recognising indexes written before fingerprints instead of rebuilding them. Their tag is exactly
+  the identity the bugs above came from, so trusting it on the first open would bring them back for
+  every file that has one.
+- A wider fingerprint. Every commit rewrites the root, which holds every index of every table, so
+  each byte of fingerprint is paid per index per commit, and 64 bits already put a wrong match far
+  below any other failure.
+- Storing the description beside the fingerprint, which would detect a collision outright, at the
+  cost of its length on every commit.
+- A tag per index from its stored names. It would give back 16 bits of discrimination, but two
+  indexes of a table could then share a tag, which the derive can only reject, and a user cannot fix
+  that without renaming stored fields.

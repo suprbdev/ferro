@@ -83,8 +83,8 @@ leave wide strings and fields rewritten on most commits out. A plain `#[index]` 
 costs nothing more. [Covering indexes](../internals/schema-and-unique-indexes.md#covering-indexes)
 has the measurements.
 
-Changing a cover list rebuilds the table's indexes the next time it is read, as [Changing your
-types](schema-evolution.md) describes.
+Changing a cover list rebuilds that index the next time the table is read, as [Changing your
+types](schema-evolution.md#indexes) describes.
 
 ## Lookups
 

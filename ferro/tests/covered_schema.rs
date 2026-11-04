@@ -20,6 +20,22 @@ struct Line {
     note: String,
 }
 
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[ferro(transparent)]
+struct Cents(i64);
+
+impl From<i64> for Cents {
+    fn from(value: i64) -> Self {
+        Cents(value)
+    }
+}
+
+impl From<Cents> for i64 {
+    fn from(cents: Cents) -> Self {
+        cents.0
+    }
+}
+
 trait Version: Record<Key = u32> + Sized {
     type Root: Data + Default;
     const LAYOUT: &'static [&'static str];
@@ -29,7 +45,7 @@ trait Version: Record<Key = u32> + Sized {
     fn table(root: &Self::Root) -> &Table<Self>;
     fn table_mut(root: &mut Self::Root) -> &mut Table<Self>;
     fn hashes(table: &Table<Self>) -> Vec<Option<Hash>>;
-    fn dirty(table: &Table<Self>) -> bool;
+    fn dirty(table: &Table<Self>) -> Vec<bool>;
     fn agree(table: &Table<Self>);
 }
 
@@ -39,12 +55,12 @@ macro_rules! version {
     (
         $record:ident, $root:ident, $layout:expr,
         [$(#[$outer:meta])*],
-        [$(#[$customer:meta])*],
+        $customer:ident: $customer_ty:ty [$(#[$customer_attr:meta])*],
         [$(#[$code:meta])*],
         [$(#[$tags:meta])*],
-        $total:ident [$(#[$total_attr:meta])*],
+        $total:ident: $total_ty:ty [$(#[$total_attr:meta])*],
         $fee:ident [$(#[$fee_attr:meta])*],
-        $cover:expr,
+        $by:ident, $cover:expr,
         |$t:ident| [$($index:ident),*]
     ) => {
         #[derive(Data, Record, Clone, Debug, PartialEq)]
@@ -52,14 +68,14 @@ macro_rules! version {
         struct $record {
             #[key]
             id: u32,
-            $(#[$customer])*
-            customer: u8,
+            $(#[$customer_attr])*
+            $customer: $customer_ty,
             $(#[$code])*
             code: Option<u8>,
             $(#[$tags])*
             tags: Vec<u8>,
             $(#[$total_attr])*
-            $total: i64,
+            $total: $total_ty,
             $(#[$fee_attr])*
             $fee: i64,
             note: String,
@@ -70,6 +86,11 @@ macro_rules! version {
             rows: Table<$record>,
         }
 
+        #[allow(
+            clippy::clone_on_copy,
+            clippy::useless_conversion,
+            clippy::unnecessary_fallible_conversions
+        )]
         impl Version for $record {
             type Root = $root;
             const LAYOUT: &'static [&'static str] = $layout;
@@ -77,10 +98,10 @@ macro_rules! version {
             fn of(line: &Line) -> Self {
                 $record {
                     id: line.id,
-                    customer: line.customer,
+                    $customer: <$customer_ty>::from(line.customer),
                     code: line.code,
                     tags: line.tags.clone(),
-                    $total: line.total,
+                    $total: <$total_ty>::from(line.total),
                     $fee: line.fee,
                     note: line.note.clone(),
                 }
@@ -89,10 +110,10 @@ macro_rules! version {
             fn line(&self) -> Line {
                 Line {
                     id: self.id,
-                    customer: self.customer,
+                    customer: u8::try_from(self.$customer.clone()).unwrap(),
                     code: self.code,
                     tags: self.tags.clone(),
-                    total: self.$total,
+                    total: i64::from(self.$total.clone()),
                     fee: self.$fee,
                     note: self.note.clone(),
                 }
@@ -110,20 +131,21 @@ macro_rules! version {
                 vec![$t.rows().root_hash(), $($t.$index.root_hash()),*]
             }
 
-            fn dirty($t: &Table<Self>) -> bool {
-                false $(|| $t.$index.is_dirty())*
+            fn dirty($t: &Table<Self>) -> Vec<bool> {
+                vec![$($t.$index.is_dirty()),*]
             }
 
             fn agree(table: &Table<Self>) {
                 for customer in 0..CUSTOMERS {
+                    let value = <$customer_ty>::from(customer);
                     let covered: Vec<String> = table
-                        .by_customer(&customer)
+                        .$by(&value)
                         .covered()
                         .map(|entry| format!("{entry:?}"))
                         .collect();
                     let rows: Vec<String> = table
                         .iter()
-                        .filter(|row| row.customer == customer)
+                        .filter(|row| row.$customer == value)
                         .map(|row| format!("{:?}", (row.id, ($cover)(&*row))))
                         .collect();
                     assert_eq!(covered, rows, "{} customer {customer}", stringify!($record));
@@ -133,139 +155,350 @@ macro_rules! version {
     };
 }
 
+const UNIQUE: &str = "unique option code:option<u8>";
+const EACH: &str = "each tags:vec<u8>";
+
 version!(
-    Plain, PlainRoot, &["by_customer", "unique_code", "by_tags"],
+    Plain, PlainRoot, &["value customer:u8", UNIQUE, EACH],
     [],
-    [#[index]],
+    customer: u8 [#[index]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |_: &Plain| (),
+    by_customer, |_: &Plain| (),
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Total, TotalRoot, &["by_customer cover(total)", "unique_code", "by_tags"],
+    Total, TotalRoot, &["value customer:u8 cover total:i64", UNIQUE, EACH],
     [],
-    [#[index(cover(total))]],
+    customer: u8 [#[index(cover(total))]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &Total| row.total,
+    by_customer, |row: &Total| row.total,
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    TotalNote, TotalNoteRoot, &["by_customer cover(total,note)", "unique_code cover(total)", "by_tags"],
+    TotalNote, TotalNoteRoot,
+    &[
+        "value customer:u8 cover total:i64,note:string",
+        "unique option code:option<u8> cover total:i64",
+        EACH,
+    ],
     [],
-    [#[index(cover(total, note))]],
+    customer: u8 [#[index(cover(total, note))]],
     [#[unique(cover(total))]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &TotalNote| (row.total, row.note.clone()),
+    by_customer, |row: &TotalNote| (row.total, row.note.clone()),
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    NoteTotal, NoteTotalRoot, &["by_customer cover(note,total)", "unique_code cover(total)", "by_tags cover(total)"],
+    NoteTotal, NoteTotalRoot,
+    &[
+        "value customer:u8 cover note:string,total:i64",
+        "unique option code:option<u8> cover total:i64",
+        "each tags:vec<u8> cover total:i64",
+    ],
     [],
-    [#[index(cover(note, total))]],
+    customer: u8 [#[index(cover(note, total))]],
     [#[unique(cover(total))]],
     [#[index(each, cover(total))]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &NoteTotal| (row.note.clone(), row.total),
+    by_customer, |row: &NoteTotal| (row.note.clone(), row.total),
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Own, OwnRoot, &["by_customer", "unique_code", "by_tags"],
+    Own, OwnRoot, &["value customer:u8", UNIQUE, EACH],
     [],
-    [#[index(cover(customer))]],
+    customer: u8 [#[index(cover(customer))]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &Own| row.customer,
+    by_customer, |row: &Own| row.customer,
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    OwnTotal, OwnTotalRoot, &["by_customer cover(total)", "unique_code", "by_tags"],
+    OwnTotal, OwnTotalRoot, &["value customer:u8 cover total:i64", UNIQUE, EACH],
     [],
-    [#[index(cover(customer, total))]],
+    customer: u8 [#[index(cover(customer, total))]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &OwnTotal| (row.customer, row.total),
+    by_customer, |row: &OwnTotal| (row.customer, row.total),
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Renamed, RenamedRoot, &["by_customer cover(total)", "unique_code", "by_tags"],
+    Renamed, RenamedRoot, &["value customer:u8 cover total:i64", UNIQUE, EACH],
     [],
-    [#[index(cover(amount))]],
+    customer: u8 [#[index(cover(amount))]],
     [#[unique]],
     [#[index(each)]],
-    amount [#[ferro(rename = "total")]],
+    amount: i64 [#[ferro(rename = "total")]],
     fee [],
-    |row: &Renamed| row.amount,
+    by_customer, |row: &Renamed| row.amount,
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Swapped, SwappedRoot, &["by_customer cover(fee)", "unique_code", "by_tags"],
+    Swapped, SwappedRoot, &["value customer:u8 cover fee:i64", UNIQUE, EACH],
     [],
-    [#[index(cover(total))]],
+    customer: u8 [#[index(cover(total))]],
     [#[unique]],
     [#[index(each)]],
-    fee [#[ferro(rename = "total")]],
+    fee: i64 [#[ferro(rename = "total")]],
     total [#[ferro(rename = "fee")]],
-    |row: &Swapped| row.total,
+    by_customer, |row: &Swapped| row.total,
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Fee, FeeRoot, &["by_customer cover(fee)", "unique_code", "by_tags"],
+    Fee, FeeRoot, &["value customer:u8 cover fee:i64", UNIQUE, EACH],
     [],
-    [#[index(cover(fee))]],
+    customer: u8 [#[index(cover(fee))]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &Fee| row.fee,
+    by_customer, |row: &Fee| row.fee,
     |t| [by_customer, unique_code, by_tags]
 );
 
 version!(
-    Composite, CompositeRoot, &["by_customer", "unique_code", "by_tags", "by_customer_total cover(note)"],
+    Composite, CompositeRoot,
+    &[
+        "value customer:u8",
+        UNIQUE,
+        EACH,
+        "composite customer:u8,total:i64 cover note:string",
+    ],
     [#[index(customer, total, cover(note))]],
-    [#[index]],
+    customer: u8 [#[index]],
     [#[unique]],
     [#[index(each)]],
-    total [],
+    total: i64 [],
     fee [],
-    |_: &Composite| (),
+    by_customer, |_: &Composite| (),
     |t| [by_customer, unique_code, by_tags, by_customer_total]
 );
 
 version!(
-    Wide, WideRoot, &["by_customer cover(total)", "unique_code cover(customer,fee)", "by_tags cover(note,fee)"],
+    Wide, WideRoot,
+    &[
+        "value customer:u8 cover total:i64",
+        "unique option code:option<u8> cover customer:u8,fee:i64",
+        "each tags:vec<u8> cover note:string,fee:i64",
+    ],
     [],
-    [#[index(cover(total))]],
+    customer: u8 [#[index(cover(total))]],
     [#[unique(cover(customer, fee))]],
     [#[index(each, cover(note, fee))]],
-    total [],
+    total: i64 [],
     fee [],
-    |row: &Wide| row.total,
+    by_customer, |row: &Wide| row.total,
     |t| [by_customer, unique_code, by_tags]
 );
 
-const VERSIONS: usize = 11;
+version!(
+    TagsValue, TagsValueRoot, &["value customer:u8", UNIQUE, "value tags:vec<u8>"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &TagsValue| (),
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    TagsValueNote, TagsValueNoteRoot,
+    &["value customer:u8", UNIQUE, "value tags:vec<u8> cover note:string"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(cover(note))]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &TagsValueNote| (),
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    TagsEachNote, TagsEachNoteRoot,
+    &["value customer:u8", UNIQUE, "each tags:vec<u8> cover note:string"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each, cover(note))]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &TagsEachNote| (),
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    CodeValue, CodeValueRoot, &["value customer:u8", "option code:option<u8>", EACH],
+    [],
+    customer: u8 [#[index]],
+    [#[index]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &CodeValue| (),
+    |t| [by_customer, by_code, by_tags]
+);
+
+version!(
+    UniqueNote, UniqueNoteRoot,
+    &[
+        "value customer:u8",
+        "unique option code:option<u8> cover note:string",
+        EACH,
+    ],
+    [],
+    customer: u8 [#[index]],
+    [#[unique(cover(note))]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &UniqueNote| (),
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    KeySwap, KeySwapRoot, &["value customer:u8", UNIQUE, EACH, "value fee:i64"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    fee: i64 [#[ferro(rename = "total")]],
+    total [#[index] #[ferro(rename = "fee")]],
+    by_customer, |_: &KeySwap| (),
+    |t| [by_customer, unique_code, by_tags, by_total]
+);
+
+version!(
+    FeeKeyed, FeeKeyedRoot, &["value customer:u8", UNIQUE, EACH, "value fee:i64"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [#[index]],
+    by_customer, |_: &FeeKeyed| (),
+    |t| [by_customer, unique_code, by_tags, by_fee]
+);
+
+version!(
+    TotalKeyed, TotalKeyedRoot, &["value customer:u8", UNIQUE, EACH, "value total:i64"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    total: i64 [#[index]],
+    fee [],
+    by_customer, |_: &TotalKeyed| (),
+    |t| [by_customer, unique_code, by_tags, by_total]
+);
+
+version!(
+    CentsKeyed, CentsKeyedRoot, &["value customer:u8", UNIQUE, EACH, "value total:i64"],
+    [],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    total: Cents [#[index]],
+    fee [],
+    by_customer, |_: &CentsKeyed| (),
+    |t| [by_customer, unique_code, by_tags, by_total]
+);
+
+version!(
+    CentsTotal, CentsTotalRoot, &["value customer:u8 cover total:i64", UNIQUE, EACH],
+    [],
+    customer: u8 [#[index(cover(total))]],
+    [#[unique]],
+    [#[index(each)]],
+    total: Cents [],
+    fee [],
+    by_customer, |row: &CentsTotal| row.total.clone(),
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    Widened, WidenedRoot, &["value customer:u16 cover total:i64", UNIQUE, EACH],
+    [],
+    customer: u16 [#[index(cover(total))]],
+    [#[unique]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [],
+    by_customer, |row: &Widened| row.total,
+    |t| [by_customer, unique_code, by_tags]
+);
+
+version!(
+    Client, ClientRoot, &["value customer:u8 cover total:i64", UNIQUE, EACH],
+    [],
+    client: u8 [#[index(cover(total))] #[ferro(rename = "customer")]],
+    [#[unique]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [],
+    by_client, |row: &Client| row.total,
+    |t| [by_client, unique_code, by_tags]
+);
+
+version!(
+    CompositeSwap, CompositeSwapRoot,
+    &[
+        "value customer:u8",
+        UNIQUE,
+        EACH,
+        "composite customer:u8,fee:i64 cover note:string",
+    ],
+    [#[index(customer, total, cover(note))]],
+    customer: u8 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    fee: i64 [#[ferro(rename = "total")]],
+    total [#[ferro(rename = "fee")]],
+    by_customer, |_: &CompositeSwap| (),
+    |t| [by_customer, unique_code, by_tags, by_customer_total]
+);
+
+version!(
+    CompositeWide, CompositeWideRoot,
+    &[
+        "value customer:u16",
+        UNIQUE,
+        EACH,
+        "composite customer:u16,total:i64 cover note:string",
+    ],
+    [#[index(customer, total, cover(note))]],
+    customer: u16 [#[index]],
+    [#[unique]],
+    [#[index(each)]],
+    total: i64 [],
+    fee [],
+    by_customer, |_: &CompositeWide| (),
+    |t| [by_customer, unique_code, by_tags, by_customer_total]
+);
+
+const VERSIONS: usize = 25;
 
 #[derive(Clone, Debug)]
 enum Edit {
@@ -383,7 +616,10 @@ fn step<V: Version>(
     {
         let read = db.read();
         let table = V::table(&read);
-        let rebuild = !V::LAYOUT.iter().all(|index| written.contains(index));
+        let rebuild: Vec<bool> = V::LAYOUT
+            .iter()
+            .map(|index| !written.contains(index))
+            .collect();
         assert_eq!(
             V::dirty(table),
             rebuild,
@@ -435,7 +671,21 @@ fn visit(
         7 => step::<Swapped>(path, written, lines, edits, seed),
         8 => step::<Fee>(path, written, lines, edits, seed),
         9 => step::<Composite>(path, written, lines, edits, seed),
-        _ => step::<Wide>(path, written, lines, edits, seed),
+        10 => step::<Wide>(path, written, lines, edits, seed),
+        11 => step::<TagsValue>(path, written, lines, edits, seed),
+        12 => step::<TagsValueNote>(path, written, lines, edits, seed),
+        13 => step::<TagsEachNote>(path, written, lines, edits, seed),
+        14 => step::<CodeValue>(path, written, lines, edits, seed),
+        15 => step::<UniqueNote>(path, written, lines, edits, seed),
+        16 => step::<KeySwap>(path, written, lines, edits, seed),
+        17 => step::<FeeKeyed>(path, written, lines, edits, seed),
+        18 => step::<TotalKeyed>(path, written, lines, edits, seed),
+        19 => step::<CentsKeyed>(path, written, lines, edits, seed),
+        20 => step::<CentsTotal>(path, written, lines, edits, seed),
+        21 => step::<Widened>(path, written, lines, edits, seed),
+        22 => step::<Client>(path, written, lines, edits, seed),
+        23 => step::<CompositeSwap>(path, written, lines, edits, seed),
+        _ => step::<CompositeWide>(path, written, lines, edits, seed),
     }
 }
 
@@ -482,7 +732,7 @@ proptest! {
     fn every_index_equals_a_rebuild_whichever_version_opens_the_file(
         visits in prop::collection::vec(
             (0..VERSIONS, prop::collection::vec(edit_strategy(), 0..5)),
-            1..14,
+            1..24,
         ),
     ) {
         let dir = tempfile::tempdir().unwrap();

@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::RangeBounds;
 
-use crate::codec::{Data, Decoder, Encoder};
+use crate::codec::{Data, Decoder, Description, Encoder};
 use crate::error::Result;
 use crate::map::{Cursor, Diff, Keys, Map};
 
@@ -186,6 +186,11 @@ impl<T: Data + Ord> Data for Set<T> {
 
     fn missing() -> Option<Self> {
         Some(Set::new())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("set");
+        d.of::<T>();
     }
 }
 

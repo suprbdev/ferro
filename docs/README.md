@@ -18,7 +18,7 @@ each part costs, and what was measured and left out on the way. Start with
 | [Durability and crash safety](guide/durability.md) | Fsync and Buffered, recovery, verification and errors on read |
 | [Retention and reclamation](guide/retention.md) | `Keep`, background cycles, `compact` and what pruning means |
 | [Writers and concurrency](guide/concurrency.md) | Branch locks, awaited writes, `coalesce`, reentrancy and several processes |
-| [Changing your types](guide/schema-evolution.md) | Adding, removing, reordering and renaming fields |
+| [Changing your types](guide/schema-evolution.md) | Adding, removing, reordering and renaming fields, and when an index rebuilds |
 | [The `ferro` tool](guide/cli.md) | Inspecting, verifying and compacting a file without your types |
 | [Performance](guide/performance.md) | Headline numbers, the comparison with other stores, and allocators |
 | [Example apps](guide/examples.md) | The ten apps in `examples/` and their load tests |
@@ -47,7 +47,7 @@ each part costs, and what was measured and left out on the way. Start with
 | [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice and type checks |
 | [Reclamation](internals/reclamation.md) | Cycles, generations, crashes, measurements and offline compaction |
 | [Windows](internals/windows.md) | Locks, durability and renaming over an open file |
-| [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints, and covered fields and their cost |
+| [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints, covered fields and their cost, and index fingerprints |
 | [Errors and checks on local reads](internals/errors.md) | Panics, `Result` and bounds on crafted files |
 | [Fuzzing and testing](internals/testing.md) | Fuzz targets, and where the other tests are described |
 | [A delta log between checkpoints](internals/delta-log.md) | A design that was built, measured and left out |

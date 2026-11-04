@@ -175,6 +175,10 @@ pub trait Data: Clone + Send + Sync + 'static {
     fn missing() -> Option<Self> {
         None
     }
+    fn describe(d: &mut Description) {
+        d.word("rust");
+        d.word(type_name::<Self>());
+    }
     fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
         for item in items {
             item.encode(w)?;
@@ -188,6 +192,61 @@ pub trait Data: Clone + Send + Sync + 'static {
             out.push(r.item(Self::decode)?);
         }
         Ok(out)
+    }
+}
+
+#[derive(Default)]
+pub struct Description {
+    bytes: Vec<u8>,
+    open: Vec<TypeId>,
+}
+
+const FINGERPRINT_CONTEXT: &str = "ferro 2026-11-04 index fingerprint";
+
+impl Description {
+    pub fn new() -> Self {
+        Description::default()
+    }
+
+    pub fn word(&mut self, word: &str) {
+        self.bytes.push(0);
+        push_varint(&mut self.bytes, word.len() as u64);
+        self.bytes.extend_from_slice(word.as_bytes());
+    }
+
+    pub fn count(&mut self, count: u64) {
+        self.bytes.push(1);
+        push_varint(&mut self.bytes, count);
+    }
+
+    pub fn of<D: Data>(&mut self) {
+        D::describe(self);
+    }
+
+    pub fn named<D: Data>(&mut self, describe: impl FnOnce(&mut Description)) {
+        let id = TypeId::of::<D>();
+        if let Some(at) = self.open.iter().rposition(|open| *open == id) {
+            let depth = self.open.len() - at;
+            self.word("recurse");
+            self.count(depth as u64);
+            return;
+        }
+        self.open.push(id);
+        describe(self);
+        self.open.pop();
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
+        hasher.update(&self.bytes);
+        let hash = hasher.finalize();
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&hash.as_bytes()[..8]);
+        u64::from_le_bytes(head)
     }
 }
 
@@ -670,6 +729,10 @@ impl Data for Ptr {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         r.link()
     }
+
+    fn describe(d: &mut Description) {
+        d.word("ptr");
+    }
 }
 
 impl Data for () {
@@ -679,6 +742,10 @@ impl Data for () {
 
     fn decode(_r: &mut Decoder<'_>) -> Result<Self> {
         Ok(())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("unit");
     }
 }
 
@@ -695,6 +762,10 @@ impl Data for bool {
             other => Err(Error::Decode(format!("invalid bool {other}"))),
         }
     }
+
+    fn describe(d: &mut Description) {
+        d.word("bool");
+    }
 }
 
 impl Data for u8 {
@@ -705,6 +776,10 @@ impl Data for u8 {
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         r.u8()
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("u8");
     }
 
     fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
@@ -730,6 +805,10 @@ macro_rules! unsigned {
                 <$ty>::try_from(value)
                     .map_err(|_| Error::Decode(format!("{value} out of range for {}", stringify!($ty))))
             }
+
+            fn describe(d: &mut Description) {
+                d.word(stringify!($ty));
+            }
         }
     )*};
 }
@@ -751,6 +830,10 @@ macro_rules! signed {
                 <$ty>::try_from(wide)
                     .map_err(|_| Error::Decode(format!("{wide} out of range for {}", stringify!($ty))))
             }
+
+            fn describe(d: &mut Description) {
+                d.word(stringify!($ty));
+            }
         }
     )*};
 }
@@ -767,6 +850,10 @@ impl Data for u128 {
         let bytes: [u8; 16] = r.take(16)?.try_into().expect("slice length is 16");
         Ok(u128::from_le_bytes(bytes))
     }
+
+    fn describe(d: &mut Description) {
+        d.word("u128");
+    }
 }
 
 impl Data for i128 {
@@ -781,6 +868,10 @@ impl Data for i128 {
         let bits = u128::from(r.varint()?) | (u128::from(r.varint()?) << 64);
         Ok(((bits >> 1) as i128) ^ -((bits & 1) as i128))
     }
+
+    fn describe(d: &mut Description) {
+        d.word("i128");
+    }
 }
 
 impl Data for f32 {
@@ -793,6 +884,10 @@ impl Data for f32 {
         let bytes: [u8; 4] = r.take(4)?.try_into().expect("slice length is 4");
         Ok(f32::from_le_bytes(bytes))
     }
+
+    fn describe(d: &mut Description) {
+        d.word("f32");
+    }
 }
 
 impl Data for f64 {
@@ -804,6 +899,10 @@ impl Data for f64 {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let bytes: [u8; 8] = r.take(8)?.try_into().expect("slice length is 8");
         Ok(f64::from_le_bytes(bytes))
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("f64");
     }
 }
 
@@ -819,6 +918,10 @@ impl Data for char {
             .ok()
             .and_then(char::from_u32)
             .ok_or_else(|| Error::Decode(format!("invalid char {raw}")))
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("char");
     }
 }
 
@@ -841,6 +944,10 @@ impl Data for String {
         let len = r.varint()? as usize;
         std::str::from_utf8(r.take(len)?).map_err(|e| Error::Decode(e.to_string()))?;
         Ok(())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("string");
     }
 }
 
@@ -875,6 +982,11 @@ impl<T: Data> Data for Option<T> {
     fn missing() -> Option<Self> {
         Some(None)
     }
+
+    fn describe(d: &mut Description) {
+        d.word("option");
+        d.of::<T>();
+    }
 }
 
 impl<T: Data> Data for Vec<T> {
@@ -900,6 +1012,11 @@ impl<T: Data> Data for Vec<T> {
 
     fn missing() -> Option<Self> {
         Some(Vec::new())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("vec");
+        d.of::<T>();
     }
 }
 
@@ -966,6 +1083,10 @@ impl Data for Bytes {
     fn missing() -> Option<Self> {
         Some(Bytes::new())
     }
+
+    fn describe(d: &mut Description) {
+        d.word("bytes");
+    }
 }
 
 impl<T: Data, const N: usize> Data for [T; N] {
@@ -984,6 +1105,12 @@ impl<T: Data, const N: usize> Data for [T; N] {
             r.item(T::visit)?;
         }
         Ok(())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("array");
+        d.count(N as u64);
+        d.of::<T>();
     }
 }
 
@@ -1005,6 +1132,10 @@ impl<T: Data> Data for Box<T> {
     fn missing() -> Option<Self> {
         T::missing().map(Box::new)
     }
+
+    fn describe(d: &mut Description) {
+        d.of::<T>();
+    }
 }
 
 impl<T: Data> Data for Arc<T> {
@@ -1024,6 +1155,10 @@ impl<T: Data> Data for Arc<T> {
 
     fn missing() -> Option<Self> {
         T::missing().map(Arc::new)
+    }
+
+    fn describe(d: &mut Description) {
+        d.of::<T>();
     }
 }
 
@@ -1062,6 +1197,12 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     fn missing() -> Option<Self> {
         Some(BTreeMap::new())
     }
+
+    fn describe(d: &mut Description) {
+        d.word("btreemap");
+        d.of::<K>();
+        d.of::<V>();
+    }
 }
 
 impl<T: Data + Ord> Data for BTreeSet<T> {
@@ -1094,6 +1235,11 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     fn missing() -> Option<Self> {
         Some(BTreeSet::new())
     }
+
+    fn describe(d: &mut Description) {
+        d.word("btreeset");
+        d.of::<T>();
+    }
 }
 
 macro_rules! tuple {
@@ -1111,6 +1257,12 @@ macro_rules! tuple {
             fn visit(r: &mut Decoder<'_>) -> Result<()> {
                 $($name::visit(r)?;)+
                 Ok(())
+            }
+
+            fn describe(d: &mut Description) {
+                d.word("tuple");
+                d.count([$($index),+].len() as u64);
+                $(d.of::<$name>();)+
             }
         }
     };

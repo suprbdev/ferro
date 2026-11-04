@@ -7,7 +7,7 @@ use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, HashSink};
+use crate::codec::{Data, Decoder, Description, Encoder, Hash, HashSink};
 use crate::error::Result;
 use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values};
 
@@ -490,6 +490,11 @@ impl<T: Record> Data for Table<T> {
     fn missing() -> Option<Self> {
         Some(Table::default())
     }
+
+    fn describe(d: &mut Description) {
+        d.word("table");
+        d.of::<T>();
+    }
 }
 
 impl<T: Record> PartialEq for Table<T> {
@@ -718,6 +723,57 @@ impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
 }
 
 impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
+
+const FINGERPRINT_BYTES: usize = 8;
+
+pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
+    let mut d = Description::new();
+    d.word("index");
+    describe(&mut d);
+    d.fingerprint()
+}
+
+pub struct Fingerprints<const N: usize> {
+    values: [u64; N],
+    order: [usize; N],
+}
+
+impl<const N: usize> Fingerprints<N> {
+    pub fn new(table: &str, values: [u64; N]) -> Self {
+        let mut order: [usize; N] = std::array::from_fn(|slot| slot);
+        order.sort_unstable_by_key(|slot| values[*slot]);
+        assert!(
+            order
+                .windows(2)
+                .all(|pair| values[pair[0]] != values[pair[1]]),
+            "ferro: two indexes of {table} have the same fingerprint"
+        );
+        Fingerprints { values, order }
+    }
+
+    pub fn get(&self, slot: usize) -> u64 {
+        self.values[slot]
+    }
+
+    pub fn order(&self) -> &[usize; N] {
+        &self.order
+    }
+
+    pub fn slot(&self, r: &mut Decoder<'_>) -> Option<usize> {
+        if r.remaining() < FINGERPRINT_BYTES {
+            return None;
+        }
+        let mut stored = [0u8; FINGERPRINT_BYTES];
+        stored.copy_from_slice(r.take(FINGERPRINT_BYTES).ok()?);
+        let stored = u64::from_le_bytes(stored);
+        self.values.iter().position(|value| *value == stored)
+    }
+}
+
+pub fn encode_index<M: Data>(fingerprint: u64, index: &M, w: &mut Encoder<'_>) -> Result<()> {
+    w.raw(&fingerprint.to_le_bytes());
+    index.encode(w)
+}
 
 pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
     rows.try_values()

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::codec::{Data, Decoder, Encoder};
+use crate::codec::{Data, Decoder, Description, Encoder};
 use crate::error::Result;
 use crate::map::{Map, Val, Values};
 
@@ -90,6 +90,11 @@ impl<T: Data> Data for List<T> {
 
     fn missing() -> Option<Self> {
         Some(List::new())
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("list");
+        d.of::<T>();
     }
 }
 

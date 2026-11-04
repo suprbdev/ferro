@@ -123,3 +123,5 @@ numbers. This index lists them by subsystem.
   reads](errors.md).
 - Last writer wins or an overwritten index on a unique clash: [Unique
   indexes](schema-and-unique-indexes.md#unique-indexes).
+- Trusting indexes written before fingerprints, a wider fingerprint, storing the description, and a
+  tag per index: [Index fingerprints](schema-and-unique-indexes.md#index-fingerprints).

@@ -298,8 +298,9 @@ about 25 µs.
   twice](sync-receive.md#commits-stored-twice), until the copy the receiver had stops being
   retained.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
-  other's trees, not only their roots. A table without one of its index fields passes, because the
-  check visits fields and does not rebuild the index. Reading it rebuilds the index, and if two rows
+  other's trees, not only their roots. A table without one of its indexes, or holding one under
+  another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows
+  and does not rebuild the others. Reading it rebuilds the index, and if two rows
   share a value of a unique index that read fails, so a peer can still send a table that does not
   read. Checking it at receive would mean reading every row.
 - A summary is checked as an `S`, not recomputed, so a peer can send a subtree whose summary is not

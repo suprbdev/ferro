@@ -237,6 +237,24 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
     }
 }
 
+fn describe_stmts(fields: &[Field]) -> TokenStream2 {
+    let mut stored: Vec<&Field> = fields.iter().filter(|f| f.stored()).collect();
+    stored.sort_by(|a, b| (a.tag(), &a.name).cmp(&(b.tag(), &b.name)));
+    let count = stored.len() as u64;
+    let parts = stored.iter().map(|field| {
+        let name = &field.name;
+        let ty = &field.ty;
+        quote! {
+            __d.word(#name);
+            __d.of::<#ty>();
+        }
+    });
+    quote! {
+        __d.count(#count);
+        #(#parts)*
+    }
+}
+
 fn construct(
     path: TokenStream2,
     fields: &[Field],
@@ -324,6 +342,10 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn missing() -> ::std::option::Option<Self> {
                 ::ferro::Data::missing().map(|__v| #build)
             }
+
+            fn describe(__d: &mut ::ferro::codec::Description) {
+                __d.named::<Self>(|__d| __d.of::<#ty>());
+            }
         }
     })
 }
@@ -335,7 +357,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let (encode, decode, visit) = match &input.data {
+    let (encode, decode, visit, describe) = match &input.data {
         Data::Struct(data) => {
             let fields = parse_fields(&data.fields)?;
             check_fields(&fields)?;
@@ -356,10 +378,15 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let (stmts, values) = decode_stmts(&fields, &vs);
             let build = construct(quote! { Self }, &fields, &data.fields, &values);
             let visit = visit_stmts(&fields);
+            let described = describe_stmts(&fields);
             (
                 quote! { #encode ::std::result::Result::Ok(()) },
                 quote! { #stmts ::std::result::Result::Ok(#build) },
                 quote! { #visit ::std::result::Result::Ok(()) },
+                quote! {
+                    __d.word("struct");
+                    #described
+                },
             )
         }
         Data::Enum(data) => {
@@ -378,6 +405,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let mut encode_arms = Vec::new();
             let mut decode_arms = Vec::new();
             let mut visit_arms = Vec::new();
+            let mut described = Vec::new();
             for (variant, vname) in data.variants.iter().zip(&variant_names) {
                 let vident = &variant.ident;
                 let vtag = field_tag(vname);
@@ -431,7 +459,19 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                         ::std::result::Result::Ok(())
                     }
                 });
+                let fields_described = describe_stmts(&fields);
+                described.push((
+                    vtag,
+                    vname.clone(),
+                    quote! {
+                        __d.word(#vname);
+                        #fields_described
+                    },
+                ));
             }
+            described.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            let variant_count = described.len() as u64;
+            let variants_described = described.iter().map(|(_, _, tokens)| tokens);
             let encode_match = if data.variants.is_empty() {
                 quote! { match *self {} }
             } else {
@@ -461,6 +501,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #unknown
                     }
                 },
+                quote! {
+                    __d.word("enum");
+                    __d.count(#variant_count);
+                    #(#variants_described)*
+                },
             )
         }
         Data::Union(_) => {
@@ -482,6 +527,12 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
                 #visit
+            }
+
+            fn describe(__d: &mut ::ferro::codec::Description) {
+                __d.named::<Self>(|__d| {
+                    #describe
+                });
             }
         }
     })
@@ -573,21 +624,47 @@ impl Indexed {
         quote! { true #(&& #same)* }
     }
 
-    fn tag_name(&self, stored_as: &[(Ident, String)]) -> String {
-        let stored: Vec<String> = self
-            .stored()
-            .iter()
-            .map(|(ident, _)| {
-                stored_as
-                    .iter()
-                    .find(|(field, _)| field == ident)
-                    .map_or_else(|| ident.to_string(), |(_, name)| name.clone())
+    fn kind_word(&self) -> &'static str {
+        let composite = self.fields.len() > 1;
+        let option = self
+            .sole()
+            .is_some_and(|(_, ty)| option_inner(ty).is_some());
+        match self.kind {
+            IndexKind::Value if composite => "composite",
+            IndexKind::Value if option => "option",
+            IndexKind::Value => "value",
+            IndexKind::Each => "each",
+            IndexKind::Unique if composite => "unique composite",
+            IndexKind::Unique if option => "unique option",
+            IndexKind::Unique => "unique",
+        }
+    }
+
+    fn fingerprint(&self, key_ty: &Type, stored_name: &dyn Fn(&Ident) -> String) -> TokenStream2 {
+        let kind = self.kind_word();
+        let described = |fields: Vec<&(Ident, Type)>| {
+            let count = fields.len() as u64;
+            let parts = fields.into_iter().map(|(ident, ty)| {
+                let name = stored_name(ident);
+                quote! {
+                    __d.word(#name);
+                    __d.of::<#ty>();
+                }
+            });
+            quote! {
+                __d.count(#count);
+                #(#parts)*
+            }
+        };
+        let keyed = described(self.fields.iter().collect());
+        let covered = described(self.stored());
+        quote! {
+            ::ferro::table::index_fingerprint(|__d| {
+                __d.word(#kind);
+                __d.of::<#key_ty>();
+                #keyed
+                #covered
             })
-            .collect();
-        if stored.is_empty() {
-            self.field().to_string()
-        } else {
-            format!("{} cover({})", self.field(), stored.join(","))
         }
     }
 
@@ -910,55 +987,37 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         check_cover(ix, &key_ident, &skipped)?;
     }
 
-    let mut table_fields: Vec<Field> = vec![Field {
-        ident: Some(format_ident!("rows")),
-        ty: syn::parse_quote!(::ferro::Map<#key_ty, #name>),
-        name: "rows".into(),
-        span: Span::call_site(),
-        fallback: Fallback::Required,
-    }];
-    for ix in &indexes {
-        let field = ix.field();
-        let vt = ix.value_ty();
-        let st = ix.stored_ty();
-        let ty: Type = match ix.kind {
-            IndexKind::Unique if ix.stores_cover() => {
-                syn::parse_quote!(::ferro::Map<#vt, (#key_ty, #st)>)
-            }
-            IndexKind::Unique => syn::parse_quote!(::ferro::Map<#vt, #key_ty>),
-            _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), #st>),
-        };
-        table_fields.push(Field {
-            ty,
-            name: ix.tag_name(&stored_as),
-            ident: Some(field),
-            span: ix.span,
-            fallback: Fallback::Required,
-        });
-    }
-    check_fields(&table_fields)?;
-
-    let field_decls = table_fields.iter().map(|f| {
-        let ident = f.ident.as_ref().unwrap();
-        let ty = &f.ty;
-        quote! { #ident: #ty }
-    });
-    let idents: Vec<&Ident> = table_fields
+    let stored_name = |ident: &Ident| -> String {
+        stored_as
+            .iter()
+            .find(|(field, _)| field == ident)
+            .map_or_else(|| ident.to_string(), |(_, name)| name.clone())
+    };
+    let rows_ty: Type = syn::parse_quote!(::ferro::Map<#key_ty, #name>);
+    let map_tys: Vec<Type> = indexes
         .iter()
-        .map(|f| f.ident.as_ref().unwrap())
+        .map(|ix| {
+            let vt = ix.value_ty();
+            let st = ix.stored_ty();
+            match ix.kind {
+                IndexKind::Unique if ix.stores_cover() => {
+                    syn::parse_quote!(::ferro::Map<#vt, (#key_ty, #st)>)
+                }
+                IndexKind::Unique => syn::parse_quote!(::ferro::Map<#vt, #key_ty>),
+                _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), #st>),
+            }
+        })
         .collect();
-    let access: Vec<TokenStream2> = idents.iter().map(|i| quote! { &self.#i }).collect();
-    let encode = encode_stmts(&table_fields, &access);
-    let vs = vars(table_fields.len());
-    let (decode_ts, values) = decode_stmts(&table_fields, &vs);
-    let visit_ts = visit_stmts(&table_fields);
-    let index_vars: Vec<&Ident> = vs.iter().skip(1).collect();
-    let index_idents: Vec<&Ident> = idents.iter().skip(1).copied().collect();
+    let fingerprints: Vec<TokenStream2> = indexes
+        .iter()
+        .map(|ix| ix.fingerprint(&key_ty, &stored_name))
+        .collect();
+    let index_fields: Vec<Ident> = indexes.iter().map(Indexed::field).collect();
 
     let mut reindex = Vec::new();
-    let mut conflicts = Vec::new();
+    let mut clashes = Vec::new();
     let mut methods = Vec::new();
-    for ix in &indexes {
+    for (slot, ix) in indexes.iter().enumerate() {
         let field = ix.field();
         let vt = ix.value_ty();
         let st = ix.stored_ty();
@@ -1060,7 +1119,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         }
                     }
                 });
-                conflicts.push(quote! {
+                clashes.push((slot, quote! {
                     {
                         let __r = __row;
                         if let ::std::option::Option::Some(__value) = #optional {
@@ -1075,7 +1134,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                             }
                         }
                     }
-                });
+                }));
                 let by = ix.method();
                 let key_by = format_ident!("key_{}", by);
                 methods.push(quote! {
@@ -1269,53 +1328,180 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         });
     }
 
+    let rows_tag = field_tag("rows");
+    let index_tag = field_tag("indexes");
+    let count = indexes.len();
+    let total = count as u64 + 1;
+    let slots: Vec<usize> = (0..count).collect();
+    let vars: Vec<Ident> = (0..count).map(|i| format_ident!("__index{}", i)).collect();
+    let reindex_fns: Vec<Ident> = index_fields
+        .iter()
+        .map(|field| format_ident!("__reindex_{}", field))
+        .collect();
+    let clash_slots: Vec<usize> = clashes.iter().map(|(slot, _)| *slot).collect();
+    let clash_fns: Vec<Ident> = clash_slots
+        .iter()
+        .map(|slot| format_ident!("__clash_{}", index_fields[*slot]))
+        .collect();
+    let clash_blocks = clashes.iter().map(|(_, block)| block);
+
+    let encode_rows = quote! {
+        __w.field(#rows_tag, |__w| ::ferro::Data::encode(&self.rows, __w))?;
+    };
+    let encode_indexes = if count == 0 {
+        quote! {}
+    } else {
+        quote! {
+            let __fingerprints = Self::__fingerprints();
+            for &__slot in __fingerprints.order() {
+                let __fingerprint = __fingerprints.get(__slot);
+                match __slot {
+                    #(#slots => __w.field(#index_tag, |__w| ::ferro::table::encode_index(__fingerprint, &self.#index_fields, __w))?,)*
+                    _ => {}
+                }
+            }
+        }
+    };
+    let (encode_first, encode_last) = if rows_tag < index_tag {
+        (encode_rows, encode_indexes)
+    } else {
+        (encode_indexes, encode_rows)
+    };
+    let fingerprints_of = if count == 0 {
+        quote! {}
+    } else {
+        quote! { let __fingerprints = Self::__fingerprints(); }
+    };
+    let decode_arm = if count == 0 {
+        quote! {}
+    } else {
+        quote! {
+            #index_tag => match __fingerprints.slot(__r) {
+                #(::std::option::Option::Some(#slots) => #vars = ::std::option::Option::Some(::ferro::Data::decode(__r)?),)*
+                _ => {}
+            },
+        }
+    };
+    let visit_arm = if count == 0 {
+        quote! {}
+    } else {
+        quote! {
+            #index_tag => match __fingerprints.slot(__r) {
+                #(::std::option::Option::Some(#slots) => <#map_tys as ::ferro::Data>::visit(__r)?,)*
+                _ => {}
+            },
+        }
+    };
+    let stale = if count == 0 {
+        quote! {}
+    } else {
+        quote! { let __stale = [#(#vars.is_none()),*]; }
+    };
+    let rebuild = if count == 0 {
+        quote! {}
+    } else {
+        quote! {
+            if __stale.contains(&true) {
+                let __rows = ::ferro::table::stored_rows::<#name>(&__table.rows)?;
+                for __row in __rows {
+                    #(
+                        if __stale[#clash_slots] {
+                            if let ::std::option::Option::Some(__taken) = __table.#clash_fns(&*__row, ::std::option::Option::None) {
+                                return ::std::result::Result::Err(::ferro::Error::Decode(::std::format!(
+                                    "two rows of {} share a value of unique index {}",
+                                    ::std::stringify!(#name),
+                                    __taken.index,
+                                )));
+                            }
+                        }
+                    )*
+                    #(
+                        if __stale[#slots] {
+                            __table.#reindex_fns(::std::option::Option::None, ::std::option::Option::Some(&*__row));
+                        }
+                    )*
+                }
+            }
+        }
+    };
+    let fingerprints_fn = if count == 0 {
+        quote! {}
+    } else {
+        quote! {
+            fn __fingerprints() -> &'static ::ferro::table::Fingerprints<#count> {
+                static __FINGERPRINTS: ::std::sync::OnceLock<::ferro::table::Fingerprints<#count>> =
+                    ::std::sync::OnceLock::new();
+                __FINGERPRINTS.get_or_init(|| {
+                    ::ferro::table::Fingerprints::new(::std::stringify!(#name), [#(#fingerprints),*])
+                })
+            }
+        }
+    };
+
     Ok(quote! {
         #vis struct #table {
-            #(#field_decls),*
+            rows: #rows_ty,
+            #(#index_fields: #map_tys),*
         }
 
         impl ::std::clone::Clone for #table {
             fn clone(&self) -> Self {
-                #table { #(#idents: ::std::clone::Clone::clone(&self.#idents)),* }
+                #table {
+                    rows: ::std::clone::Clone::clone(&self.rows),
+                    #(#index_fields: ::std::clone::Clone::clone(&self.#index_fields)),*
+                }
             }
         }
 
         impl ::std::default::Default for #table {
             fn default() -> Self {
-                #table { #(#idents: ::std::default::Default::default()),* }
+                #table {
+                    rows: ::std::default::Default::default(),
+                    #(#index_fields: ::std::default::Default::default()),*
+                }
             }
         }
 
         impl ::ferro::Data for #table {
             fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
-                #encode
+                __w.varint(#total);
+                #encode_first
+                #encode_last
                 ::std::result::Result::Ok(())
             }
 
             fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                #decode_ts
-                let __rebuild = false #(|| #index_vars.is_none())*;
-                #[allow(unused_mut)]
-                let mut __table = #table { #(#idents: #values),* };
-                if __rebuild {
-                    #(__table.#index_idents = ::std::default::Default::default();)*
-                    let __rows = ::ferro::table::stored_rows::<#name>(&__table.rows)?;
-                    for __row in __rows {
-                        if let ::std::option::Option::Some(__taken) = ::ferro::TableData::<#name>::conflict(&__table, &*__row, ::std::option::Option::None) {
-                            return ::std::result::Result::Err(::ferro::Error::Decode(::std::format!(
-                                "two rows of {} share a value of unique index {}",
-                                ::std::stringify!(#name),
-                                __taken.index,
-                            )));
-                        }
-                        ::ferro::TableData::<#name>::reindex(&mut __table, ::std::option::Option::None, ::std::option::Option::Some(&*__row));
+                #fingerprints_of
+                let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
+                #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
+                __r.fields(|__tag, __r| {
+                    match __tag {
+                        #rows_tag => __rows = ::std::option::Option::Some(::ferro::Data::decode(__r)?),
+                        #decode_arm
+                        _ => {}
                     }
-                }
+                    ::std::result::Result::Ok(())
+                })?;
+                #stale
+                #[allow(unused_mut)]
+                let mut __table = #table {
+                    rows: ::ferro::codec::required(__rows, "rows")?,
+                    #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
+                };
+                #rebuild
                 ::std::result::Result::Ok(__table)
             }
 
             fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-                #visit_ts
+                #fingerprints_of
+                __r.fields(|__tag, __r| {
+                    match __tag {
+                        #rows_tag => <#rows_ty as ::ferro::Data>::visit(__r)?,
+                        #visit_arm
+                        _ => {}
+                    }
+                    ::std::result::Result::Ok(())
+                })?;
                 ::std::result::Result::Ok(())
             }
         }
@@ -1339,7 +1525,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             fn reindex(&mut self, __old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>) {
-                #(#reindex)*
+                #(self.#reindex_fns(__old, __new);)*
             }
 
             fn conflict(
@@ -1347,12 +1533,37 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 __row: &#name,
                 __moving: ::std::option::Option<&#key_ty>,
             ) -> ::std::option::Option<::ferro::table::Taken<#key_ty>> {
-                #(#conflicts)*
+                #(
+                    if let ::std::option::Option::Some(__taken) = self.#clash_fns(__row, __moving) {
+                        return ::std::option::Option::Some(__taken);
+                    }
+                )*
                 ::std::option::Option::None
             }
         }
 
         impl #table {
+            #fingerprints_fn
+
+            #(
+                #[inline]
+                fn #reindex_fns(&mut self, __old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>) {
+                    #reindex
+                }
+            )*
+
+            #(
+                #[inline]
+                fn #clash_fns(
+                    &self,
+                    __row: &#name,
+                    __moving: ::std::option::Option<&#key_ty>,
+                ) -> ::std::option::Option<::ferro::table::Taken<#key_ty>> {
+                    #clash_blocks
+                    ::std::option::Option::None
+                }
+            )*
+
             #(#methods)*
         }
     })
