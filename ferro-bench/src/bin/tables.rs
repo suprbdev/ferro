@@ -5,7 +5,8 @@ use std::time::Instant;
 use booking::date::DAY_MS;
 use booking::seed::{Plan, seed};
 use booking::{BookingError, HoldRequest, Hotels, Reservations, Why};
-use ferro::{Db, Durability, Options};
+use ferro::codec::{Decoder, Encoder, HashSink};
+use ferro::{Data, Db, Durability, Options};
 
 #[cfg(target_os = "linux")]
 struct Counter(Option<i32>);
@@ -249,5 +250,26 @@ fn main() {
     println!(
         "  bytes per write {:.0}",
         bytes as f64 / writes.max(1) as f64
+    );
+    let root = db.read();
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    root.encode(&mut encoder).unwrap();
+    let object = encoder.into_object();
+    let decodes = 20_000u32;
+    let mut samples = Vec::new();
+    for _ in 0..9 {
+        let began = Instant::now();
+        for _ in 0..decodes {
+            let mut decoder = Decoder::new(&object.body, &object.links, None);
+            std::hint::black_box(Hotels::decode(&mut decoder).unwrap());
+        }
+        samples.push(began.elapsed().as_nanos() as u64 * 1000 / u64::from(decodes));
+    }
+    println!(
+        "  root {} bytes {} links, decode {:.1} ns",
+        object.body.len(),
+        object.links.len(),
+        median(samples)
     );
 }

@@ -1,6 +1,8 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use ferro::codec::{Decoder, Encoder, HashSink};
 use ferro::{Data, Db, Durability, Keep, Options, Record, Table};
 
 const BALANCES: u64 = 1_000_000;
@@ -123,11 +125,34 @@ struct Cost {
 }
 
 const KINDS: [&str; 3] = ["balance", "name", "insert"];
+const DECODES: u32 = 20_000;
+
+struct Decoded {
+    body: usize,
+    links: usize,
+    ns: f64,
+}
 
 trait Subject {
     fn name(&self) -> &'static str;
     fn size(&self) -> u64;
     fn round(&mut self, commits: u64) -> [Cost; 3];
+    fn decode(&self, rounds: usize) -> Decoded;
+}
+
+fn reopen<B: Bank>(path: &Path, rounds: usize) -> f64 {
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let started = Instant::now();
+        let db = Options::new()
+            .durability(Durability::Buffered)
+            .open::<B>(path)
+            .unwrap();
+        std::hint::black_box(&*db.read());
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        drop(db);
+    }
+    median(samples)
 }
 
 struct Opened<B: Bank> {
@@ -200,6 +225,28 @@ impl<B: Bank> Subject for Opened<B> {
         let insert = self.commits(commits, |bank, _, i| bank.fill(start + i..start + i + 1));
         self.added += commits;
         [balance, name, insert]
+    }
+
+    fn decode(&self, rounds: usize) -> Decoded {
+        let root = self.db.read();
+        let mut sink = HashSink;
+        let mut encoder = Encoder::new(&mut sink);
+        root.encode(&mut encoder).unwrap();
+        let object = encoder.into_object();
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = Instant::now();
+            for _ in 0..DECODES {
+                let mut decoder = Decoder::new(&object.body, &object.links, None);
+                std::hint::black_box(B::decode(&mut decoder).unwrap());
+            }
+            samples.push(started.elapsed().as_nanos() as f64 / f64::from(DECODES));
+        }
+        Decoded {
+            body: object.body.len(),
+            links: object.links.len(),
+            ns: median(samples),
+        }
     }
 }
 
@@ -281,5 +328,47 @@ fn main() {
             pick(2, |cost| cost.bytes),
             pick(2, |cost| cost.cpu_us),
         );
+    }
+    println!(
+        "{:<8} {:>11} {:>7} {:>11}",
+        "variant", "root bytes", "links", "decode ns"
+    );
+    for subject in &subjects {
+        let decoded = subject.decode(rounds.max(5));
+        println!(
+            "{:<8} {:>11} {:>7} {:>11.1}",
+            subject.name(),
+            decoded.body,
+            decoded.links,
+            decoded.ns
+        );
+    }
+    drop(subjects);
+    let file = |name: &str| dir.path().join(format!("{name}.ferro"));
+    let opens = [
+        (
+            "plain",
+            "plain",
+            reopen::<PlainBank>(&file("plain"), rounds.max(5)),
+        ),
+        (
+            "narrow",
+            "narrow",
+            reopen::<NarrowBank>(&file("narrow"), rounds.max(5)),
+        ),
+        (
+            "plain",
+            "narrow",
+            reopen::<NarrowBank>(&file("plain"), rounds.max(5)),
+        ),
+        (
+            "narrow",
+            "wide",
+            reopen::<WideBank>(&file("narrow"), rounds.max(5)),
+        ),
+    ];
+    println!("{:<8} {:<9} {:>9}", "file", "opened as", "open ms");
+    for (written, opened, ms) in opens {
+        println!("{written:<8} {opened:<9} {ms:>9.2}");
     }
 }
