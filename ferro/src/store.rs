@@ -739,6 +739,7 @@ struct Inner {
     dedupe: Dedupe,
     basis: Basis,
     poisoned: AtomicBool,
+    unsynced: AtomicBool,
     closed: AtomicBool,
     options: StoreOptions,
 }
@@ -843,6 +844,7 @@ impl Store {
                 dedupe: Dedupe::new(dedupe),
                 basis: sb.basis,
                 poisoned: AtomicBool::new(false),
+                unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 options,
             }),
@@ -920,6 +922,11 @@ impl Store {
         self.inner.landed.notify_all();
     }
 
+    fn poison_unsynced(&self) {
+        self.inner.unsynced.store(true, Ordering::Release);
+        self.poison();
+    }
+
     fn arrived(&self, start: u64, end: u64) {
         let inner = &self.inner;
         let mut arrivals = inner.arrivals.lock();
@@ -971,7 +978,7 @@ impl Store {
 
     pub(crate) fn sync(&self, frame: Frame) -> Result<()> {
         let inner = &self.inner;
-        if self.landed_to(frame.end) < frame.end {
+        if self.landed_to(frame.end) < frame.end || inner.unsynced.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
         let durable = inner.options.durability == Durability::Fsync;
@@ -995,7 +1002,7 @@ impl Store {
             Ok(())
         })();
         if let Err(error) = attempt {
-            self.poison();
+            self.poison_unsynced();
             return Err(error);
         }
         inner.tail.store(frame.end, Ordering::Release);
@@ -1007,7 +1014,7 @@ impl Store {
             return Ok(());
         }
         if let Err(error) = self.inner.file.sync_data() {
-            self.poison();
+            self.poison_unsynced();
             return Err(error.into());
         }
         Ok(())
@@ -1021,9 +1028,11 @@ impl Store {
         {
             return;
         }
-        match inner.file.sync_data() {
-            Ok(()) => inner.marks.lock().anchor = frame.mark(),
-            Err(_) => self.poison(),
+        if !inner.unsynced.load(Ordering::Acquire) {
+            match inner.file.sync_data() {
+                Ok(()) => inner.marks.lock().anchor = frame.mark(),
+                Err(_) => self.poison_unsynced(),
+            }
         }
         inner.checkpointing.store(false, Ordering::Release);
     }

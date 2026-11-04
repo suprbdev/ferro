@@ -52,6 +52,15 @@ write poisons the same way, but frames queued ahead of it are whole, so they sti
 acknowledge. Frames placed after it fail with `Error::Poisoned` even when their own bytes were
 written, since recovery keeps only a prefix of frames.
 
+An fdatasync that fails outside a leader's sync, at a Buffered checkpoint or under a `receive`
+that placed its records ahead of its refs, poisons the same way, and after it no superblock is
+written and no checkpoint moves the anchor. A later fdatasync can succeed though the pages the
+failed one dropped never reached the disk, so the next leader fails its batch with
+`Error::Poisoned` instead of acknowledging frames written before the failure.
+`a_failed_checkpoint_sync_fails_the_commits_queued_behind_it` and
+`a_failed_sync_under_a_large_receive_fails_the_commits_queued_behind_it` hold a commit on another
+branch between its write and its sync while the fdatasync fails, and saw it acknowledged before.
+
 ## Direct I/O, rejected
 
 Writing frames with `O_DIRECT|O_DSYNC` was also measured. On the test NVMe a forced-unit-access
