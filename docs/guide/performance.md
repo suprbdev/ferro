@@ -1,62 +1,138 @@
 # Performance
 
-Measured in release on one NVMe SSD with ext4, on 1M `u64` keys with short string values, using
-`ferro-bench`. Random `get`, full scan and range read are medians of seven runs, and bulk insert of
-five, on a machine shared with other jobs. The fsync commit is a median of three runs and the
-coalesced writers of eight on a machine shared with other jobs, the commits on 16 branches of four
-from `ferro-bench`'s `group` tool, and the booking commits come from `ferro-bench`'s `tables` tool
-the same way. The rest are single runs on an otherwise idle machine.
+Measured on 2026-11-04 in release, on an AMD Ryzen AI MAX+ 395 with 16 cores in two CCDs of 8, 32
+threads and 124 GB of RAM, on one NVMe SSD with ext4, under Linux 7.2.14 with rustc 1.92.0. Nothing
+else was running: the 1-minute load average was under 2 before each set of runs, and other processes
+kept well under one core busy during them. The workload is 1M `u64` keys with short string values,
+using `ferro-bench`. Its figures are medians of seven runs, and the coalesced writers of nine runs
+alternating with plain ones. The commits on 16 branches are medians of five runs of `ferro-bench`'s
+`group` tool, and the booking commits of seven runs of its `tables` tool, pinned to one CCD.
 
 | Operation | Result |
 | --- | --- |
-| Bulk insert in one commit | 0.69 s |
-| Random `get` | 0.34 µs |
-| Full scan | 22 ns per key |
-| Range read | 33 ns per key |
+| Bulk insert in one commit | 0.71 s |
+| Random `get` | 0.32 µs |
+| Full scan | 19 ns per key |
+| Range read | 28 ns per key |
 | Single-key commit, fsync | 410 µs, about 2,400 per second |
-| Single-key commits, fsync, 8 writers with 8 readers | about 9,600 per second |
-| Reads per second with those writers running | 38M |
-| The same 8 writers with `coalesce` | about 14,600 per second, 12,800 before in the same runs |
-| Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 125,000 per second |
-| Single-key commit, `Durability::Buffered` | 27 µs |
+| Single-key commits, fsync, 8 writers with 8 readers | about 10,100 per second |
+| Reads per second with those writers running | 71M |
+| The same 8 writers with `coalesce` | about 14,900 per second, 9,600 without in the same runs |
+| Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 124,000 per second |
+| Single-key commit, `Durability::Buffered` | 24 µs |
 | Bytes written per single-key commit | 3.5 KB |
-| `diff` | 3.5 µs per changed key |
-| Booking hold commit, `Durability::Buffered` | 82 µs of CPU, 13 µs of it in the closure |
-| Booking confirm commit, `Durability::Buffered` | 93 µs of CPU, 12 µs of it in the closure |
+| `diff` | 3.8 µs per changed key |
+| Booking hold commit, `Durability::Buffered` | 86 µs of CPU, 14 µs of it in the closure |
+| Booking confirm commit, `Durability::Buffered` | 106 µs of CPU, 14 µs of it in the closure |
+
+The booking commits cost 4 and 14% more than the 82 and 93 µs this page gave before, measured on
+2026-11-03. Since then the example's customer index covers six fields of each booking, which
+[Covering indexes](../internals/schema-and-unique-indexes.md#covering-indexes) found adds 5% to the
+instructions of a hold and 10% to those of a confirm, whose status it covers. Outside their closures
+the two ran 72 and 92 µs.
 
 ## Against other embedded stores
 
-Against other embedded stores on the same workload, with 1 GiB of cache each, medians of five runs
-of 3 rounds on a machine shared with other jobs:
+Against other embedded stores on the same workload, with 1 GiB of cache each, medians of seven runs
+of 3 rounds:
 
 | Engine | Get | Scan | Durable commit | 8 writers, commits/s | File size |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ferro | 0.32 µs | 20 ns | 0.41 ms | 9,094 | 23 MiB |
-| redb | 0.27 µs | 49 ns | 0.43 ms | 2,263 | 65 MiB |
-| SQLite, `synchronous=FULL` | 0.87 µs | 50 ns | 0.48 ms | 1,085 | 57 MiB |
-| fjall | 1.21 µs | 79 ns | 0.51 ms | 1,957 | 64 MiB |
+| ferro | 0.32 µs | 19 ns | 0.40 ms | 9,113 | 23 MiB |
+| redb | 0.27 µs | 49 ns | 0.43 ms | 2,241 | 65 MiB |
+| SQLite, `synchronous=FULL` | 0.89 µs | 49 ns | 0.50 ms | 1,083 | 57 MiB |
+| fjall | 1.21 µs | 81 ns | 0.52 ms | 1,942 | 64 MiB |
 
 ferro keeps every version and re-hashes objects as it reads them, and the others do neither. SQLite
-bulk loads about 1.2 times faster, 0.59 s against 0.70 s, while fjall takes 1.4 times as long as
-ferro and redb 1.9 times, and redb's `get` is about 15% faster. These numbers come from a warm
+bulk loads about 1.2 times faster, 0.60 s against 0.71 s, while fjall takes 1.3 times as long as
+ferro and redb 1.8 times, and redb's `get` takes about 16% less time. These numbers come from a warm
 cache, on a workload with few overwrites. Full results, including caveats about sled, are in
 [`benchmarks/compare/RESULTS.md`](../../benchmarks/compare/RESULTS.md).
+
+## Writers and branches
+
+`group` runs single-key commits into a map of 100,000 keys from each writer thread for three
+seconds, either one writer on each of its own branches or all of them on one branch. Commits a
+second, median of five runs:
+
+| Writers | Buffered, own branches | Buffered, one branch | One branch, `coalesce` | Fsync, own branches | Fsync, one branch | One branch, `coalesce` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 49,600 | 49,800 | 49,300 | 2,490 | 2,510 | 2,620 |
+| 4 | 109,100 | 42,800 | 50,200 | 5,400 | 5,300 | 8,600 |
+| 8 | 150,000 | 42,000 | 48,400 | 10,200 | 10,100 | 14,400 |
+| 16 | 123,800 | 39,500 | 53,400 | 18,100 | 18,500 | 23,500 |
+
+With `coalesce` 16 writers on one branch shared a version 13 at a time Buffered and 16 at a time
+with fsync, and wrote 1,515 and 1,427 bytes a closure against 2,464 and 2,385 without it. A writer
+alone on its branch has nothing to share, and `coalesce` there ran within 5% of the plain figures,
+apart from 8 Buffered branches at 139,600 a second, 7% fewer.
+
+## Reads from many threads
+
+`scaling` reads a 1M-key `Map<u64, String>` and a 200,000-row table from 1 to 32 threads pinned a
+core at a time, so 8 fill one CCD, 16 both, and 32 add the second thread of every core. A lookup
+reads about 20 rows by a range of an index, and a page 200 rows in key order, through a plain index
+and through a twin whose index covers the field read. Operations a second, medians of five rounds
+of a pass with no writer:
+
+| Workload | Cache | 1 thread | 8 threads | 16 threads | 32 threads |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `get` | 1 GiB | 3.2M | 24.8M | 45.5M | 68.8M |
+| `get` | 16 MiB | 342k | 1.8M | 2.0M | 2.8M |
+| `for_each` scan, keys | 1 GiB | 91M | 504M | 991M | 1,564M |
+| `for_each` scan, keys | 16 MiB | 7.8M | 39M | 42M | 72M |
+| 100-key range | 1 GiB | 411k | 2.9M | 5.0M | 7.7M |
+| 100-key range | 16 MiB | 54k | 265k | 277k | 379k |
+| Index lookup | 1 GiB | 240k | 1.6M | 1.9M | 2.8M |
+| Index lookup, covered | 1 GiB | 2.3M | 10.4M | 9.4M | 14.9M |
+| Index lookup | 16 MiB | 14k | 68k | 77k | 106k |
+| Index lookup, covered | 16 MiB | 2.0M | 9.9M | 9.2M | 15.3M |
+| Page of 200 rows | 1 GiB | 179k | 803k | 722k | 986k |
+| Page of 200 rows, covered | 1 GiB | 754k | 3.0M | 2.7M | 3.3M |
+
+In a pass of its own beside one thread committing single-key updates as fast as it can, gets at 32
+threads ran 60M a second with the 1 GiB cache and 2.6M with the 16 MiB one, and index lookups 2.5M
+and 93,000. Run in one pass with the writer's cells, as the tool does by default, the cells without
+a writer read up to 12% slower on one thread.
 
 ## Many threads and the allocator
 
 When many threads read through a cache smaller than the data, the allocator decides. Each read then
 decodes nodes and evicts others that other threads allocated, and glibc keeps only seven freed
 blocks of each size per thread, returning the rest to the arena that allocated them, most under its
-lock. With a 16 MiB cache over 1M keys, 32 threads did 3.0M gets a second with the default glibc,
-4.7M with `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024` in the environment, 4.6M with jemalloc and
-4.1M with mimalloc, and index lookups went from 108,000 a second to between 181,000 and 195,000. One
-thread gains 9 to 13%. ferro does not choose an allocator, so an application with that workload
+lock. With a 16 MiB cache over 1M keys, medians of three alternating runs of `scaling`, 32 threads
+did 2.9M gets a second with the default glibc, 4.6M with
+`GLIBC_TUNABLES=glibc.malloc.tcache_count=1024` in the environment, 4.5M with jemalloc preloaded and
+4.0M with mimalloc, and index lookups went from 108,000 a second to between 176,000 and 189,000. One
+thread gains 2 to 7%. ferro does not choose an allocator, so an application with that workload
 should set one, or the tunable, itself.
+
+## Other tools
+
+The other `ferro-bench` tools, on the same machine and day, with how many runs each figure is the
+median of:
+
+| Tool, runs | Workload | Result |
+| --- | --- | --- |
+| `bulk`, 7 | 1M random keys inserted in one commit | 0.73 s: 0.53 s of inserts and 0.20 s to commit and drop the tree, 378 MiB peak RSS |
+| `tables`, 7 | Booking hold, confirm and cancel, Buffered | 86, 106 and 146 µs of CPU, 14, 14 and 26 µs of it in the closure, 13,362 bytes a write |
+| `covered`, 3 of 3 rounds | A balance update on 200,000 rows, a plain `tier` index against one covering `balance` | 7,660 against 10,415 bytes and 52 against 67 µs of CPU, indexes of 3.90 against 4.56 MiB |
+| `merge`, 3 | Merge base of a fork at 10,000 commits followed by 10,000 and 1,000 more, of a branch that took a side branch 1,000 times, and of one with 1,000 features merged since it forked | 62 µs, 51 µs and 7.7 ms |
+| `merge`, 3 | `Map<u64, u64>::merge` of 1M keys, 100,000 changed on each side | 182 ms, 302 ms with struct values and 452 ms for a `Table` with one index |
+| `clone`, 5 | First `pull` of a 330 MB file of 124,937 objects, fsync | 0.91 s, 65 MiB peak RSS, 467 bytes of heap an object |
+| `clone`, 5 | `bundle` of that file into another, then `receive` of it | 0.62 s at 19 MiB peak RSS, then 0.78 s at 63 MiB |
+| `clone`, 5 | `pull` of three one-key commits | 1.33 ms, and 0.57 ms Buffered |
+| `heap`, 3 | Live heap after scans with a 64 MiB cache | 45 MiB for short strings, 58 MiB for 300 byte strings, 65 MiB for 2 KiB values, 69 MiB for table rows |
+| `watchers`, 5 | A Buffered single-key commit with 0, 1,000 and 10,000 parked watchers | 12.3, 12.0 and 12.1 µs, and 23, 57 and 375 µs at p50 to a watcher whose test passes |
+| `reclaim`, 3 | 15 s of fsync commits keeping 100 versions, a cycle every 64 MiB | Longest pause 2.9 ms on `metrics`, 3.8 ms on `ledger`, 4.4 ms on `wiki` and 2.8 ms on table updates, commits a second within 1% of no cycles |
+| `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.5 ms |
+| `ferro compact`, 3 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values | 1.07 and 0.58 s, 180 and 570 MB/s |
 
 ## More measurements
 
-- [Example apps](examples.md) has load-test figures for `chat` and `booking`.
-- Each internals file records what its subsystem costs and what was measured and left out.
-  [Alternatives measured and rejected](../internals/alternatives.md) lists them.
+- [Example apps](examples.md) has load-test figures for `chat` and `booking`, measured on 2026-11-03
+  and 2026-11-04.
+- Each internals file records what its subsystem cost when it changed, and what was measured and
+  left out. [Alternatives measured and rejected](../internals/alternatives.md) lists them.
 - `make bench`, `make bench-reads`, `make bench-scaling`, `make bench-tables` and the other bench
   targets run the tools these figures come from, as described in [Development](development.md).
