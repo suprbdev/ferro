@@ -750,6 +750,22 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
+pub(crate) struct Closing(pub(crate) Store);
+
+impl Deref for Closing {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 impl Store {
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
         Store::open_as(path, path, options)

@@ -174,16 +174,18 @@ pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Durability, StoreOptions};
+    use crate::store::{Closing, Durability, StoreOptions};
 
-    fn open(dir: &tempfile::TempDir) -> Store {
+    fn open(dir: &tempfile::TempDir) -> Closing {
         let options = StoreOptions {
             durability: Durability::Buffered,
             ..StoreOptions::default()
         };
-        Store::open(&dir.path().join("refs.ferro"), options)
-            .unwrap()
-            .0
+        Closing(
+            Store::open(&dir.path().join("refs.ferro"), options)
+                .unwrap()
+                .0,
+        )
     }
 
     fn head(version: u64) -> Head {

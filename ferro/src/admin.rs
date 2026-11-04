@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs;
-use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use crate::map::Map;
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::refs::{self, Root};
-use crate::store::{Store, StoreOptions};
+use crate::store::{Closing, Store, StoreOptions};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Keep {
@@ -35,22 +34,6 @@ pub struct BranchInfo {
 pub struct Info {
     pub file_bytes: u64,
     pub branches: Vec<BranchInfo>,
-}
-
-struct Closing(Store);
-
-impl Deref for Closing {
-    type Target = Store;
-
-    fn deref(&self) -> &Store {
-        &self.0
-    }
-}
-
-impl Drop for Closing {
-    fn drop(&mut self) {
-        self.0.close();
-    }
 }
 
 fn read_only(path: &Path) -> Result<(Closing, Option<Ptr>)> {
