@@ -12,26 +12,58 @@ cargo run --release --example seeds -- corpus/seeds [files or directories of cap
 cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -malloc_limit_mb=1024
 ```
 
-- `open` and `admin` take one mode byte and a file image. For `open` the mode picks the root type
-  (one of six, or a type that decodes nothing so that any file opens), read-only or read-write, and
-  whether to repair the image first, and for `admin` whether to repair and whether to compact.
-  Repairing recomputes every object hash bottom-up, then the frame checks and the superblock
-  checksums, so that a mutation gets past the hash checks to the code behind them. `open` then reads
-  the value, the log, `at`, `as_of`, `history_of`, `bisect`, branches, `common_ancestor`, `verify`,
-  `space` and `refresh`, and scans every map it reaches. `admin` runs `info`, `log`, `verify`,
-  `space`, `layout` and, when its mode says so, `compact`.
+- `open` and `admin` take one mode byte and a file image. For `open` the mode picks the root type,
+  read-only or read-write, whether to repair the image first, and what runs after the reads, and
+  for `admin` whether to repair and whether to compact. The root types are six maps and a shop,
+  three versions of a catalog whose table has covered, unique, each and composite indexes under
+  changed cover lists, kinds, stored names and defaults, so that a file written under one opens
+  under another and rebuilds its indexes, a type with sets, lists, tables and summaries that the
+  `sync` target uses too, and a type that decodes nothing so that any file opens. Repairing
+  recomputes every object hash bottom-up, then the frame checks and the superblock checksums, so
+  that a mutation gets past the hash checks to the code behind them. `open` then reads the value,
+  the log, `at`, `as_of`, `history_of`, `bisect`, branches, `common_ancestor`, `verify`,
+  `verify_typed`, `space` and `refresh`, and scans every map and index it reaches. Read-write, it
+  can commit on main and another branch, write from inside a closure, fork, merge and drop a
+  branch, and run a cycle that keeps two versions. Read-only, it can follow a writer on the same
+  file through 70 more commits, past a full branch table and a cycle, refreshing on the way. Either
+  can bundle the file for an empty one and receive the bundle there, and a read-write handle then
+  pulls a commit back from it. `admin` runs `info`, `log`, `verify`, `space`, `layout` and, when its
+  mode says so, `compact`.
 - `log_entry` writes a log of crafted entries with valid hashes, mostly coherent and with fields
-  perturbed by the input, plus branch heads that point into it, then runs the `open` reads over it
-  and, for half the inputs, the `admin` functions.
+  perturbed by the input, plus a branch table that points into it and up to 75 branch-table steps
+  over it, whose links, names, tags and heads the input perturbs. It then runs the `open` reads
+  over it and, for half the inputs, the `admin` functions. Half the time a follower opens it
+  read-only before more steps are written, and refreshes through them.
 - `map_node` writes crafted map nodes with valid hashes for six key, value and summary types,
   including a value with a `Table`, loads the map and reads, scans and edits it.
+- `sync` receives a bundle into a copy of a database through `receive_from`. Nine honest pairs of a
+  database and a bundle are built once per binary and cached beside the scratch files: hints into
+  held trees, a clone into an empty file, merges on both sides, edited covered indexes, a 1.2 MB
+  bundle that spills to the scratch file and is placed in pieces, and four taken from devices that
+  pull from each other's branches with pruned history and cycles, so that a bundle can carry
+  commits the receiver already holds. The input picks one, then mutates its objects, links, header
+  and count as parsed values and rehashes them up to the head, or edits the encoded bytes, or
+  replaces the bundle outright. It can feed the stream in small reads, interrupt it, break it, or
+  commit, fork or run a cycle while the checked bundle waits to be placed, or commit or fork
+  between placing a spilled bundle's pieces and landing it. A refused bundle must leave both
+  branches where they were. An accepted one must read back whole on both branches, with every map's
+  length equal to its iteration, every key found and every index lookup answered, and pass
+  `verify` and `verify_typed`, before and after a reopen and a commit.
 
 The harness treats a panic whose message starts with `ferro:` as expected inside the infallible
 reads, which panic on corruption by design, and as a failure anywhere else. The `seeds` example
-writes a corpus from databases it builds and from any files passed to it; files captured while
-`cargo test --workspace` and the examples ran make a broader one.
+writes a corpus from databases it builds and from any files passed to it. The databases it builds
+include catalogs written under each schema in turn, branches written by concurrent lanes with and
+without coalescing, devices that relay through pulls and cycles, branch tables of 40, 126 and 127
+branches, step chains just below and past multiples of 64, crash images cut from the recorded
+writes of concurrent commits with every kind of loss, a frame of objects nothing names, and a file
+caught between placing a bundle's pieces and landing it. Files captured from the tests make a
+broader corpus: the one used here kept every database file `cargo test --workspace` deleted, copied
+aside by a small `LD_PRELOAD` wrapper around `unlink`, `unlinkat` and `rename`. Images over 69,000
+bytes go to `open-large`, for a run of `open` with a larger `-max_len`.
 `cargo run --example fixture -- <target> <crash> <out.db>` turns a crashing input into the file it
-opens, which is how the fixtures behind `ferro/tests/fuzzed.rs` were made.
+opens, and for `sync` also writes the bundle beside it, which is how the fixtures behind
+`ferro/tests/fuzzed.rs` were made.
 
 The `Makefile` wraps the last two steps: `make fuzz-seeds` builds `corpus/seeds`, and
 `make fuzz FUZZ=open FUZZ_TIME=600` runs one target for that many seconds with the flags above.
