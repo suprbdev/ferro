@@ -1720,7 +1720,9 @@ impl<T: Data> Shared<T> {
                 if queue.waiting.is_empty() {
                     return Ok(());
                 }
-                return self.lead(queue, notices);
+                self.lead(queue, notices)?;
+                queue = self.queue.lock();
+                continue;
             }
             self.done.wait(&mut queue);
         }

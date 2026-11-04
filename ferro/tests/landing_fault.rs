@@ -354,10 +354,7 @@ fn check_failed_landing(kind: &str, options: fn() -> Options, panics: bool) {
             "{kind}: a frame placed after a failed one was answered {result:?}"
         );
     }
-    assert!(
-        matches!(before, Ok(3) | Err(Error::Poisoned)),
-        "{kind}: {before:?}"
-    );
+    assert!(matches!(before, Ok(3)), "{kind}: {before:?}");
     assert!(matches!(put(&db, 1, 1), Err(Error::Poisoned)), "{kind}");
     let published: Vec<_> = branches.iter().map(contents).collect();
     for (at, seen) in published.iter().enumerate().skip(1) {
@@ -368,11 +365,8 @@ fn check_failed_landing(kind: &str, options: fn() -> Options, panics: bool) {
     for at in 0..4u64 {
         let branch = db.branch(&format!("b{at}")).unwrap();
         let value = contents(&branch).get(&(10 + at)).copied();
-        match at {
-            0 if before.is_ok() => assert_eq!(value, Some(2), "{kind}: b0"),
-            0 => assert!(matches!(value, Some(1 | 2)), "{kind}: b0"),
-            _ => assert_eq!(value, Some(1), "{kind}: b{at}"),
-        }
+        let expected = if at == 0 { 2 } else { 1 };
+        assert_eq!(value, Some(expected), "{kind}: b{at}");
     }
     db.verify().unwrap();
     put(&db, 99, 99).unwrap();
@@ -396,6 +390,88 @@ fn a_writer_that_dies_between_placing_and_writing_strands_no_one() {
     quiet_ferro_panics();
     for (kind, options) in kinds() {
         check_failed_landing(kind, options, true);
+    }
+}
+
+fn check_frame_ahead_of_failure(kind: &str, options: fn() -> Options, in_write: bool) {
+    for flag in [&WRITE_HELD, &WRITE_ENTERED, &WRITE_RELEASED] {
+        flag.store(false, Ordering::SeqCst);
+    }
+    let dir = dir();
+    let path = dir.path().join("ahead.ferro");
+    let stalls = stalls(&["before", "failing", "after"]);
+    stalls.landing["before"].open();
+    stalls.landing["after"].open();
+    stalls.landed["after"].open();
+    stalls.landed["failing"].open();
+    stalls.fail_at_landing.lock().unwrap().push("failing");
+    if in_write {
+        stalls.hold_write.lock().unwrap().push("before");
+        stalls.landed["before"].open();
+    }
+    let held = match in_write {
+        true => &stalls.landing["before"],
+        false => &stalls.landed["before"],
+    };
+    let (db, branches) = seeded(options().hook(hook(&stalls)), &path, &["b0", "b1", "b2"]);
+    for (key, branch) in (10..).zip(&branches) {
+        put(branch, key, 1).unwrap();
+    }
+    let before = writer(&branches[0], "before", 10, 2);
+    wait_until("the first frame to stall", || {
+        held.reached() && (!in_write || WRITE_ENTERED.load(Ordering::SeqCst))
+    });
+    let failing = writer(&branches[1], "failing", 11, 2);
+    wait_until("the failing frame to be placed", || {
+        stalls.landing["failing"].reached()
+    });
+    let after = writer(&branches[2], "after", 12, 2);
+    wait_until("the frame after it to land", || {
+        stalls.landed["after"].reached()
+    });
+    stalls.landing["failing"].open();
+    let failed = joined("the failing writer", failing).unwrap();
+    assert!(matches!(failed, Err(Error::Io(_))), "{kind}: {failed:?}");
+    WRITE_RELEASED.store(true, Ordering::SeqCst);
+    stalls.landed["before"].open();
+    let before = joined("the writer before", before).unwrap();
+    let after = joined("the writer after", after).unwrap();
+    assert!(
+        matches!(before, Ok(3)),
+        "{kind}: a whole frame placed ahead of the failed one was answered {before:?}"
+    );
+    assert!(
+        matches!(after, Err(Error::Poisoned)),
+        "{kind}: a frame placed after the failed one was answered {after:?}"
+    );
+    assert_eq!(contents(&branches[0]).get(&10), Some(&2), "{kind}");
+    assert_eq!(contents(&branches[2]).get(&12), Some(&1), "{kind}");
+    drop((db, branches));
+    let db: Db<Root> = options().open(&path).unwrap();
+    for (at, value) in [(0, 2), (1, 1), (2, 1)] {
+        let branch = db.branch(&format!("b{at}")).unwrap();
+        assert_eq!(
+            contents(&branch).get(&(10 + at)),
+            Some(&value),
+            "{kind}: b{at}"
+        );
+    }
+    db.verify().unwrap();
+}
+
+#[test]
+fn a_frame_still_in_its_write_when_a_later_one_fails_is_acknowledged() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        check_frame_ahead_of_failure(kind, options, true);
+    }
+}
+
+#[test]
+fn a_leader_whose_own_frame_follows_a_failed_one_is_not_acknowledged() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        check_frame_ahead_of_failure(kind, options, false);
     }
 }
 

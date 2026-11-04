@@ -739,6 +739,7 @@ struct Inner {
     dedupe: Dedupe,
     basis: Basis,
     poisoned: AtomicBool,
+    lost_at: AtomicU64,
     unsynced: AtomicBool,
     closed: AtomicBool,
     options: StoreOptions,
@@ -844,6 +845,7 @@ impl Store {
                 dedupe: Dedupe::new(dedupe),
                 basis: sb.basis,
                 poisoned: AtomicBool::new(false),
+                lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 options,
@@ -927,6 +929,11 @@ impl Store {
         self.poison();
     }
 
+    fn poison_at(&self, at: u64) {
+        self.inner.lost_at.fetch_min(at, Ordering::AcqRel);
+        self.poison();
+    }
+
     fn arrived(&self, start: u64, end: u64) {
         let inner = &self.inner;
         let mut arrivals = inner.arrivals.lock();
@@ -955,7 +962,7 @@ impl Store {
             let written = inner.written.load(Ordering::Acquire);
             if offset < written
                 || offset >= inner.placed.load(Ordering::Acquire)
-                || inner.poisoned.load(Ordering::Acquire)
+                || written >= inner.lost_at.load(Ordering::Acquire)
             {
                 return written;
             }
@@ -1898,7 +1905,7 @@ impl Landing {
         header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
         self.buf[..FRAME_BYTES].copy_from_slice(&header);
         if let Err(error) = self.store.inner.file.write_all_at(&self.buf, self.at) {
-            self.store.poison();
+            self.store.poison_at(self.at);
             return Err(error.into());
         }
         self.store.arrived(self.at, self.frame.end);
@@ -1909,7 +1916,7 @@ impl Landing {
 impl Drop for Landing {
     fn drop(&mut self) {
         if self.pending {
-            self.store.poison();
+            self.store.poison_at(self.at);
         }
     }
 }

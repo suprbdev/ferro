@@ -48,9 +48,10 @@ once durable. `branches` and `verify` use the published refs and do not touch th
 If a sync fails, the store poisons, nothing in the batch is published, the leader gets the I/O
 error, and every queued writer gets `Error::Poisoned`. A failed commit's frame may still be on disk
 and reappear after reopen: an error means not acknowledged, not guaranteed absent. A failed frame
-write poisons the same way, but frames queued ahead of it are whole, so they still sync and
-acknowledge. Frames placed after it fail with `Error::Poisoned` even when their own bytes were
-written, since recovery keeps only a prefix of frames.
+write poisons the same way, but frames queued ahead of it are whole, so the leader waits for any of
+them still being written, and they sync and acknowledge. Frames placed after it fail with
+`Error::Poisoned` even when their own bytes were written, the leader's own among them, since
+recovery keeps only a prefix of frames.
 
 An fdatasync that fails outside a leader's sync, at a Buffered checkpoint or under a `receive`
 that placed its records ahead of its refs, poisons the same way, and after it no superblock is
@@ -362,10 +363,20 @@ was. A reclamation cycle and a landing `receive` take every lane before `tip`, s
 written while they copy or swap. The Fsync preallocation zero-fills past the end of the newest
 placed frame, under `tip`, so it never overwrites a frame being written.
 
-If a frame's write fails, the store poisons and every waiter wakes. The leader syncs and
-acknowledges the frames of its batch before the failed one and fails the rest with
+If a frame's write fails, the store notes where that frame starts and poisons, and every waiter
+wakes. The leader waits until `written` reaches that point, so every frame of its batch before the
+failed one is in the page cache, then syncs and acknowledges those frames and fails the rest with
 `Error::Poisoned`, including frames placed after it whose bytes were written, since recovery would
-not keep them. The writer whose write failed puts its branch's tip back to the frame before and
+not keep them. A read before that point waits for its frame as it would on a healthy store, and a
+read past it fails once `written` gets there. The leader used to stop waiting as soon as the store
+poisoned, so a frame placed ahead of the failed one and still being written then failed with
+`Error::Poisoned`, though it was whole and reappeared after reopen
+(`a_frame_still_in_its_write_when_a_later_one_fails_is_acknowledged`). A leader also took the
+outcome of its sync for its own, so one whose frame followed the failed one was acknowledged when
+the frames ahead synced, and a reopen did not keep its commit
+(`a_leader_whose_own_frame_follows_a_failed_one_is_not_acknowledged`). It now checks its own frame
+against what the sync settled.
+The writer whose write failed puts its branch's tip back to the frame before and
 reports the I/O error, as when the write failed under `tip`. A writer that panics between placing
 and writing poisons the store the same way. The other branches keep tips in frames placed after
 the failed one, past `written` for good, so a read there fails with `Error::Poisoned`, and a closure
