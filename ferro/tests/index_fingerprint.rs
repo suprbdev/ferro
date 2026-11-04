@@ -857,3 +857,204 @@ fn a_recursive_or_wrapped_covered_type_keeps_its_index_when_spelled_another_way(
         ]
     );
 }
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Untiered {
+    #[key]
+    id: u32,
+    region: u8,
+}
+
+fn tier_one() -> u8 {
+    1
+}
+
+fn tier_two() -> u8 {
+    2
+}
+
+fn also_two() -> u8 {
+    2
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct TierOne {
+    #[key]
+    id: u32,
+    #[index(cover(tier))]
+    region: u8,
+    #[index]
+    #[ferro(default = "tier_one")]
+    tier: u8,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct TierTwo {
+    #[key]
+    id: u32,
+    #[index(cover(tier))]
+    region: u8,
+    #[index]
+    #[ferro(default = "tier_two")]
+    tier: u8,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct AlsoTwo {
+    #[key]
+    id: u32,
+    #[index(cover(tier))]
+    region: u8,
+    #[index]
+    #[ferro(default = "also_two")]
+    tier: u8,
+}
+
+root!(UntieredRoot, Untiered);
+root!(TierOneRoot, TierOne);
+root!(TierTwoRoot, TierTwo);
+root!(AlsoTwoRoot, AlsoTwo);
+
+fn fill_untiered(path: &Path) -> Option<ferro::Hash> {
+    let db: Db<UntieredRoot> = fast().open(path).unwrap();
+    db.update(|root| {
+        for id in 0..6u32 {
+            root.rows.insert(Untiered {
+                id,
+                region: (id % 2) as u8,
+            });
+        }
+    })
+    .unwrap();
+    db.read().rows.root_hash()
+}
+
+#[test]
+fn changing_the_default_of_an_indexed_or_covered_field_rebuilds_the_index() {
+    let (_dir, path) = scratch("tiers.ferro");
+    let untouched = fill_untiered(&path);
+    {
+        let db: Db<TierOneRoot> = fast().open(&path).unwrap();
+        let read = db.read();
+        let ones: Vec<u32> = read.rows.by_tier(&1).keys().collect();
+        assert_eq!(ones, vec![0, 1, 2, 3, 4, 5]);
+        let covered: Vec<(u32, u8)> = read.rows.by_region(&0).covered().collect();
+        assert_eq!(covered, vec![(0, 1), (2, 1), (4, 1)]);
+        db.update(|_| ()).unwrap();
+    }
+    {
+        let db: Db<TierOneRoot> = fast().open(&path).unwrap();
+        let read = db.read();
+        assert_eq!(read.rows.root_hash(), untouched);
+        assert!(!read.rows.by_tier.is_dirty());
+        assert!(!read.rows.by_region.is_dirty());
+    }
+    {
+        let db: Db<TierTwoRoot> = fast().open(&path).unwrap();
+        let read = db.read();
+        assert_eq!(read.rows.root_hash(), untouched);
+        assert!(read.rows.by_tier.is_dirty());
+        assert!(read.rows.by_region.is_dirty());
+        assert_eq!(read.rows.by_tier(&1).count(), 0);
+        let twos: Vec<u32> = read.rows.by_tier(&2).keys().collect();
+        assert_eq!(twos, vec![0, 1, 2, 3, 4, 5]);
+        let covered: Vec<(u32, u8)> = read.rows.by_region(&0).covered().collect();
+        assert_eq!(covered, vec![(0, 2), (2, 2), (4, 2)]);
+        let fresh = rebuilt(&read.rows);
+        assert_eq!(read.rows.by_tier.root_hash(), fresh.by_tier.root_hash());
+        assert_eq!(read.rows.by_region.root_hash(), fresh.by_region.root_hash());
+        db.update(|root| {
+            root.rows.update(&5, |row| row.region = 0);
+            root.rows.update(&4, |row| row.tier = 7);
+        })
+        .unwrap();
+        let read = db.read();
+        let covered: Vec<(u32, u8)> = read.rows.by_region(&0).covered().collect();
+        assert_eq!(covered, vec![(0, 2), (2, 2), (4, 7), (5, 2)]);
+        let twos: Vec<u32> = read.rows.by_tier(&2).keys().collect();
+        assert_eq!(twos, vec![0, 1, 2, 3, 5]);
+        let fresh = rebuilt(&read.rows);
+        assert_eq!(read.rows.by_tier.root_hash(), fresh.by_tier.root_hash());
+        assert_eq!(read.rows.by_region.root_hash(), fresh.by_region.root_hash());
+    }
+    let db: Db<AlsoTwoRoot> = fast().open(&path).unwrap();
+    let read = db.read();
+    assert!(!read.rows.by_tier.is_dirty());
+    assert!(!read.rows.by_region.is_dirty());
+    let twos: Vec<u32> = read.rows.by_tier(&2).keys().collect();
+    assert_eq!(twos, vec![0, 1, 2, 3, 5]);
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[ferro(transparent)]
+struct GradeA(u8);
+
+impl Default for GradeA {
+    fn default() -> Self {
+        GradeA(1)
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[ferro(transparent)]
+struct GradeB(u8);
+
+impl Default for GradeB {
+    fn default() -> Self {
+        GradeB(2)
+    }
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct GradedA {
+    #[key]
+    id: u32,
+    region: u8,
+    #[index]
+    #[ferro(default)]
+    grade: GradeA,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct GradedB {
+    #[key]
+    id: u32,
+    region: u8,
+    #[index]
+    #[ferro(default)]
+    grade: GradeB,
+}
+
+root!(GradedARoot, GradedA);
+root!(GradedBRoot, GradedB);
+
+#[test]
+fn changing_what_default_returns_for_an_indexed_type_rebuilds_its_index() {
+    let (_dir, path) = scratch("grades.ferro");
+    let untouched = fill_untiered(&path);
+    {
+        let db: Db<GradedARoot> = fast().open(&path).unwrap();
+        let ones: Vec<u32> = db.read().rows.by_grade(&GradeA(1)).keys().collect();
+        assert_eq!(ones, vec![0, 1, 2, 3, 4, 5]);
+        db.update(|_| ()).unwrap();
+    }
+    let db: Db<GradedBRoot> = fast().open(&path).unwrap();
+    let read = db.read();
+    assert_eq!(read.rows.root_hash(), untouched);
+    assert!(read.rows.by_grade.is_dirty());
+    assert_eq!(read.rows.by_grade(&GradeB(1)).count(), 0);
+    let twos: Vec<u32> = read.rows.by_grade(&GradeB(2)).keys().collect();
+    assert_eq!(twos, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn a_default_is_described_by_the_value_it_returns() {
+    let fingerprint = |value: u8| {
+        ferro::table::index_fingerprint(|d| {
+            d.word("value");
+            d.value(&value);
+        })
+    };
+    assert_eq!(fingerprint(2), fingerprint(2));
+    assert_ne!(fingerprint(1), fingerprint(2));
+}

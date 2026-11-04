@@ -176,7 +176,9 @@ meaning:
 - the stored names of the fields it is keyed on, in order, each with its type;
 - the stored names of the covered fields it stores, in list order, each with its type. Covered
   fields the index is keyed on come from the entry and are left out, so a list naming only them
-  describes the plain index.
+  describes the plain index;
+- for each of those fields that has `#[ferro(default)]` or `#[ferro(default = "...")]`, the hash
+  of the value the default returns, as described under [Defaults](#defaults).
 
 Rust names take no part. The generated field and methods keep them, so `by_amount` on a field
 stored as `total` has the fingerprint `by_total` had, and a Rust-only rename rebuilds nothing.
@@ -202,6 +204,55 @@ in derive-key mode, under a context string of ferro's own.
 The fingerprints of a table type are computed the first time it is encoded or decoded and kept in a
 `OnceLock` for the life of the process. Decoding then compares eight bytes per index and hashes
 nothing.
+
+### Defaults
+
+A row written before a field existed reads that field as its default, and an index keyed on the
+field, or covering it, holds what the default returned when the index was built. Pointing
+`#[ferro(default = "...")]` at a function that returns something else changed no fingerprint, so
+the index kept the old value for those rows: a lookup by the new default missed them, a lookup by
+the old one found rows that no longer read as it, and an update of such a row removed an entry
+under the new value that was never there and left the old entry behind for good.
+
+The description of a field with a default now goes on with the word `default` and the BLAKE3 hash
+of the default value's encoding, marked so that it cannot be read as a word or a count. The value
+comes from calling the function, or `Default::default` for `#[ferro(default)]`, once, when the
+fingerprints are computed. Changing what a default returns then rebuilds every index keyed on or
+covering that field, the next time the table is read, as any other change of layout does, and the
+next commit stores the rebuilt map. A field without a default is described as before, so an index
+keeps its fingerprint unless one of its fields has a default, and those indexes are rebuilt once
+after upgrading.
+
+The value is described rather than the path of the function. A path misses a function whose body
+changed, and a `#[ferro(default)]` whose type's `Default` changed, and it rebuilds an index when the
+function is moved or renamed but returns the same thing. The value changes exactly when the index
+would hold something else. It assumes the default returns the same value every time. One that does
+not, such as the current time or a fresh id, gives the index another fingerprint in every process,
+so the index is rebuilt each time the program starts. Such a default was never coherent on an
+indexed field, since every read of a row that lacks the field gives another value.
+
+Which rows still lack the field depends on history, index or no index. A commit that rewrites a leaf
+of the rows map encodes every row in it, so its neighbours store the default they read as, and a
+later change of default reaches only the rows whose leaves were never rewritten. The rebuild makes
+the index agree with the rows as they read now, whichever those are.
+
+Handling the rows that lack the field another way was considered and left out:
+
+- Marking decoded rows whose field was missing. A decoded row does not know which of its fields were
+  read and which defaulted, and recording it would cost every row a flag for the benefit of rows
+  written before one schema change.
+- Writing the default into those rows when an index is built. The index is often built while
+  reading an old version, through `at`, history or a merge base, and rewriting rows there would
+  change the root hash of a version nobody changed, which merges and sync would then see as a
+  change.
+- Storing the default value beside the index. It would detect the same changes as the eight bytes of
+  fingerprint, at the cost of the value's length in every commit.
+
+`index_fingerprint.rs` reads rows written without a field through a type whose default for it
+returns 1, then through one whose default returns 2, and checks that the index keyed on the field
+and the index covering it are rebuilt and agree with a rebuild, and that a third type whose default
+is another function returning 2 keeps them. A pair of transparent types whose `Default` impls differ
+checks `#[ferro(default)]` the same way.
 
 ### Where it is stored
 
@@ -245,6 +296,8 @@ supported.
 - A hand-written `Data` impl that changes its encoding and keeps its type name. Its description is
   the name. Overriding `describe` fixes that. The name `type_name` gives may also change with the
   compiler, which costs one rebuild.
+- A default that returns another value each time it is called, as described under
+  [Defaults](#defaults).
 - Changes that would have read correctly. The fingerprint changes whenever a description does, so
   `u32` to `u64`, `Vec<u8>` to `Bytes`, or a defaulted field added to a covered struct rebuilds an
   index that decoding would have handled. That costs a rebuild, where missing a change costs wrong

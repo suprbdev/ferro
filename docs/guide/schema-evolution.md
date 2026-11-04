@@ -27,13 +27,17 @@ index in every commit. Any of these rebuilds that one index:
 - switching between `#[index]`, `#[index(each)]` and `#[unique]`;
 - adding, removing or reordering the fields in its `cover(...)` list;
 - giving one of its fields another stored name with `#[ferro(rename)]`;
-- changing the type of one of its fields, or of the key.
+- changing the type of one of its fields, or of the key;
+- changing what the `#[ferro(default)]` or `#[ferro(default = "...")]` of one of its fields returns,
+  which is what rows written before that field existed hold in the index.
 
 These rebuild nothing: renaming a field in Rust while `#[ferro(rename)]` keeps its stored name,
 writing a type through an alias, a `Box`, an `Arc` or a `#[ferro(transparent)]` wrapper, renaming a
-struct, and reordering a struct's fields. A cover list naming only the index's own fields stores
-nothing and rebuilds nothing. Turning an `#[index]` into a `#[unique]` fails to open if two rows
-share a value, as described under [Unique
+struct, reordering a struct's fields, and pointing a default at another function that returns the
+same value. A default on a field an index is keyed on or covers must return the same value every
+time it is called, or the index is rebuilt every time the program starts. A cover list naming only
+the index's own fields stores nothing and rebuilds nothing. Turning an `#[index]` into a `#[unique]`
+fails to open if two rows share a value, as described under [Unique
 indexes](../internals/schema-and-unique-indexes.md#unique-indexes).
 
 The fingerprint follows encodings, not ordering. The values of an indexed field are keys of its

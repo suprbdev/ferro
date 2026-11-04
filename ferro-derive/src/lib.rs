@@ -692,15 +692,27 @@ impl Indexed {
         }
     }
 
-    fn fingerprint(&self, key_ty: &Type, stored_name: &dyn Fn(&Ident) -> String) -> TokenStream2 {
+    fn fingerprint(
+        &self,
+        key_ty: &Type,
+        stored_name: &dyn Fn(&Ident) -> String,
+        default_of: &dyn Fn(&Ident) -> Option<TokenStream2>,
+    ) -> TokenStream2 {
         let kind = self.kind_word();
         let described = |fields: Vec<&(Ident, Type)>| {
             let count = fields.len() as u64;
             let parts = fields.into_iter().map(|(ident, ty)| {
                 let name = stored_name(ident);
+                let default = default_of(ident).map(|value| {
+                    quote! {
+                        __d.word("default");
+                        __d.value::<#ty>(&#value);
+                    }
+                });
                 quote! {
                     __d.word(#name);
                     __d.of::<#ty>();
+                    #default
                 }
             });
             quote! {
@@ -1022,13 +1034,21 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
     let mut skipped = Vec::new();
     let mut stored_as = Vec::new();
+    let mut defaults = Vec::new();
     for field in &named.named {
         let attrs = parse_attrs(&field.attrs)?;
         let Some(ident) = &field.ident else {
             continue;
         };
-        if matches!(attrs.fallback, Fallback::Skip) {
-            skipped.push(ident.clone());
+        let ty = &field.ty;
+        match &attrs.fallback {
+            Fallback::Skip => skipped.push(ident.clone()),
+            Fallback::Default => defaults.push((
+                ident.clone(),
+                quote! { <#ty as ::std::default::Default>::default() },
+            )),
+            Fallback::With(path) => defaults.push((ident.clone(), quote! { #path() })),
+            Fallback::Required => {}
         }
         stored_as.push((
             ident.clone(),
@@ -1060,9 +1080,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         })
         .collect();
+    let default_of = |ident: &Ident| -> Option<TokenStream2> {
+        defaults
+            .iter()
+            .find(|(field, _)| field == ident)
+            .map(|(_, value)| value.clone())
+    };
     let fingerprints: Vec<TokenStream2> = indexes
         .iter()
-        .map(|ix| ix.fingerprint(&key_ty, &stored_name))
+        .map(|ix| ix.fingerprint(&key_ty, &stored_name, &default_of))
         .collect();
     let index_fields: Vec<Ident> = indexes.iter().map(Indexed::field).collect();
 

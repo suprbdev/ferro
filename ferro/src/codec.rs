@@ -224,6 +224,11 @@ impl Description {
         push_varint(&mut self.bytes, count);
     }
 
+    pub fn value<D: Data>(&mut self, value: &D) {
+        self.bytes.push(2);
+        self.bytes.extend_from_slice(&hash_of(value));
+    }
+
     pub fn of<D: Data>(&mut self) {
         D::describe(self);
     }
