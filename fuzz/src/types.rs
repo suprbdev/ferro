@@ -2,6 +2,7 @@ use ferro::codec::{Decoder, Encoder};
 use ferro::map::Summary;
 use ferro::{Bytes, Data, Map, Record, Table};
 
+use crate::catalog::word;
 use crate::guarded;
 use crate::input::Input;
 
@@ -79,6 +80,8 @@ pub trait Probe: Data {
     fn measure(&self) -> u64 {
         0
     }
+
+    fn poke(&mut self, _seed: u64) {}
 }
 
 impl Probe for u8 {}
@@ -91,10 +94,33 @@ impl Probe for Order {}
 
 impl<K, V, S> Probe for Map<K, V, S>
 where
-    K: Data + Ord,
-    V: Probe,
+    K: Data + Ord + Clone,
+    V: Probe + Clone,
     S: Summary<K, V>,
 {
+    fn poke(&mut self, seed: u64) {
+        let (Some((first, low)), Some((last, high))) = (self.first(), self.last()) else {
+            return;
+        };
+        let (low, high) = ((*low).clone(), (*high).clone());
+        match seed % 4 {
+            0 => {
+                self.remove(&first);
+            }
+            1 => {
+                self.insert(first, high);
+            }
+            2 => {
+                self.insert(last, low);
+            }
+            _ => {
+                if let Some(value) = self.get_mut(&first) {
+                    value.poke(seed / 4);
+                }
+            }
+        }
+    }
+
     fn probe(&self, budget: &mut usize) {
         let _ = self.len();
         guarded(|| self.summary());
@@ -150,6 +176,32 @@ impl Probe for Shop {
         (self.stock.len() as u64)
             .wrapping_add(self.orders.len() as u64)
             .wrapping_add(self.next_order)
+    }
+
+    fn poke(&mut self, seed: u64) {
+        self.next_order = self.next_order.wrapping_add(1);
+        self.stock.poke(seed);
+        match seed % 3 {
+            0 => {
+                self.orders.insert(Order {
+                    id: self.next_order,
+                    customer: word(seed, 4),
+                    status: Status::Pending,
+                    total_cents: seed,
+                });
+            }
+            1 => {
+                if let Some((id, _)) = self.orders.rows().first() {
+                    self.orders
+                        .update(&id, |order| order.status = Status::Shipped);
+                }
+            }
+            _ => {
+                if let Some((id, _)) = self.orders.rows().last() {
+                    self.orders.remove(&id);
+                }
+            }
+        }
     }
 }
 
@@ -229,7 +281,11 @@ impl Gen for Shop {
             shop.orders.insert(Order {
                 id: input.num(),
                 customer: input.text(),
-                status: if input.byte() % 2 == 0 { Status::Pending } else { Status::Shipped },
+                status: if input.byte() % 2 == 0 {
+                    Status::Pending
+                } else {
+                    Status::Shipped
+                },
                 total_cents: input.num(),
             });
         }

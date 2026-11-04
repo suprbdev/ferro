@@ -121,6 +121,7 @@ dependencies = [
  "parking_lot",
  "quick_cache",
  "thiserror",
+ "windows-sys",
  "xxhash-rust",
 ]
 
@@ -139,8 +140,10 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "ferro",
+ "libc",
  "libfuzzer-sys",
  "lz4_flex",
+ "parking_lot",
  "tempfile",
  "xxhash-rust",
 ]

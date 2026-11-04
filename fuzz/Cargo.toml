@@ -10,8 +10,10 @@ cargo-fuzz = true
 [dependencies]
 blake3 = "1"
 ferro = { path = "../ferro" }
+libc = "0.2"
 libfuzzer-sys = "0.4"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+parking_lot = "0.12"
 tempfile = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
@@ -45,6 +47,13 @@ bench = false
 [[bin]]
 name = "map_node"
 path = "fuzz_targets/map_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync"
+path = "fuzz_targets/sync.rs"
 test = false
 doc = false
 bench = false

@@ -15,6 +15,8 @@ const MERGED: u8 = 16;
 const GRAPH: u8 = 32;
 const BOUNDED: u8 = 64;
 const EXTRA: u8 = 128;
+const STEP: u8 = 0x7f;
+const FOLLOW: u8 = 8;
 
 #[derive(Clone)]
 struct Head {
@@ -94,7 +96,9 @@ fn entry(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> (Object, Buil
     if control == 0xff {
         let len = usize::from(input.byte());
         let body = input.bytes(len).to_vec();
-        let links = (0..input.byte() % 4).map(|_| choose(input, built, roots)).collect();
+        let links = (0..input.byte() % 4)
+            .map(|_| choose(input, built, roots))
+            .collect();
         let object = Object { body, links };
         let made = Built {
             ptr: Ptr {
@@ -115,7 +119,9 @@ fn entry(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> (Object, Buil
         _ => input.num(),
     };
     let time = match control & 2 {
-        0 => below.map_or(1000, |entry| entry.time.wrapping_add(u64::from(input.byte()))),
+        0 => below.map_or(1000, |entry| {
+            entry.time.wrapping_add(u64::from(input.byte()))
+        }),
         _ => input.num(),
     };
     let prev = match control & 4 {
@@ -226,7 +232,11 @@ fn entry(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> (Object, Buil
         w.varint(reach);
         w.varint(last_merge);
     }
-    for (bit, link) in [(HAS_PREV, prev), (HAS_SKIP, skip), (MERGED, merged.map(|m| m.0))] {
+    for (bit, link) in [
+        (HAS_PREV, prev),
+        (HAS_SKIP, skip),
+        (MERGED, merged.map(|m| m.0)),
+    ] {
         if flags & bit != 0 {
             w.link(link.unwrap_or_else(|| choose(input, built, roots)));
         }
@@ -256,7 +266,45 @@ fn value(txn: &mut Txn, value: &impl Data) -> ferro::Result<Ptr> {
     encoder.finish()
 }
 
-fn build(input: &mut Input<'_>, store: &Store) -> ferro::Result<()> {
+struct Made {
+    built: Vec<Built>,
+    roots: Vec<Ptr>,
+    names: Vec<String>,
+    tables: Vec<Ptr>,
+}
+
+fn head(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> Head {
+    let tip = match input.byte() % 4 {
+        0 => built[usize::from(input.byte()) % built.len()],
+        _ => *built.last().unwrap(),
+    };
+    let control = input.byte();
+    let mut merged = Map::new();
+    if control & 1 != 0 {
+        merged.insert(input.text(), (input.num(), input.num()));
+    }
+    Head {
+        version: if control & 2 != 0 {
+            input.num()
+        } else {
+            tip.version
+        },
+        first: if control & 4 != 0 { input.num() } else { 1 },
+        root: if control & 8 != 0 {
+            Some(choose(input, built, roots))
+        } else {
+            tip.root
+        },
+        tip: if control & 16 != 0 {
+            None
+        } else {
+            Some(tip.ptr)
+        },
+        merged,
+    }
+}
+
+fn build(input: &mut Input<'_>, store: &Store) -> ferro::Result<Made> {
     let mut txn = store.begin()?;
     let mut roots = Vec::new();
     for _ in 0..2 {
@@ -271,48 +319,122 @@ fn build(input: &mut Input<'_>, store: &Store) -> ferro::Result<()> {
         built.push(made);
     }
     let mut refs: Map<String, Head> = Map::new();
-    for name in ["main", "side", "other"].iter().take(1 + usize::from(input.byte() % 3)) {
-        let tip = match input.byte() % 4 {
-            0 => built[usize::from(input.byte()) % built.len()],
-            _ => *built.last().unwrap(),
-        };
-        let control = input.byte();
-        let mut merged = Map::new();
-        if control & 1 != 0 {
-            merged.insert(input.text(), (input.num(), input.num()));
-        }
-        let head = Head {
-            version: if control & 2 != 0 { input.num() } else { tip.version },
-            first: if control & 4 != 0 { input.num() } else { 1 },
-            root: if control & 8 != 0 { Some(choose(input, &built, &roots)) } else { tip.root },
-            tip: if control & 16 != 0 { None } else { Some(tip.ptr) },
-            merged,
-        };
-        refs.insert(name.to_string(), head);
+    let mut names = Vec::new();
+    for name in ["main", "side", "other"]
+        .iter()
+        .take(1 + usize::from(input.byte() % 3))
+    {
+        refs.insert(name.to_string(), head(input, &built, &roots));
+        names.push(name.to_string());
     }
-    let head = value(&mut txn, &refs)?;
-    txn.commit(head)
+    let table = value(&mut txn, &refs)?;
+    txn.commit(table)?;
+    Ok(Made {
+        built,
+        roots,
+        names,
+        tables: vec![table],
+    })
 }
 
-pub fn write(data: &[u8], path: &Path) -> Option<u8> {
-    let mut input = Input::new(data);
-    let mode = input.byte();
+fn steps(input: &mut Input<'_>, store: &Store, top: Ptr, made: &mut Made) -> ferro::Result<()> {
+    let count = match input.byte() % 8 {
+        0 => 0,
+        7 => 60 + usize::from(input.byte() % 16),
+        pick => usize::from(pick) * 2,
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    let mut txn = store.begin()?;
+    let mut prev = top;
+    for _ in 0..count {
+        let control = input.byte();
+        let link = match control % 16 {
+            0 => made.tables[usize::from(input.byte()) % made.tables.len()],
+            1 => choose(input, &made.built, &made.roots),
+            _ => prev,
+        };
+        let name = match control / 16 % 8 {
+            0 => input.text(),
+            pick => made.names[usize::from(pick) % made.names.len()].clone(),
+        };
+        let head = head(input, &made.built, &made.roots);
+        let mut w = Encoder::new(&mut txn);
+        let forged = control & 128 != 0 && input.chance(2);
+        w.u8(if forged { input.byte() } else { STEP });
+        w.link(link);
+        w.varint(name.len() as u64);
+        w.raw(name.as_bytes());
+        head.encode(&mut w)?;
+        if control & 128 != 0 && input.chance(2) {
+            w.raw(input.bytes(2));
+        }
+        prev = w.finish()?;
+        made.tables.push(prev);
+        if !made.names.contains(&name) {
+            made.names.push(name);
+        }
+    }
+    txn.commit(prev)
+}
+
+fn open_store(path: &Path) -> Option<(Store, Option<Ptr>)> {
     let options = StoreOptions {
         durability: Durability::Buffered,
         cache_bytes: 1 << 20,
         ..StoreOptions::default()
     };
-    let (store, _) = Store::open(path, options).ok()?;
-    let built = build(&mut input, &store);
+    Store::open(path, options).ok()
+}
+
+fn more_steps(input: &mut Input<'_>, path: &Path, made: &mut Made) -> Option<()> {
+    let (store, top) = open_store(path)?;
+    let stepped = match top {
+        Some(top) => steps(input, &store, top, made),
+        None => Ok(()),
+    };
     store.close();
-    built.ok().map(|()| mode)
+    stepped.ok()
+}
+
+fn first_phase(input: &mut Input<'_>, path: &Path) -> Option<Made> {
+    let (store, _) = open_store(path)?;
+    let built = build(input, &store);
+    store.close();
+    let mut made = built.ok()?;
+    more_steps(input, path, &mut made)?;
+    Some(made)
+}
+
+pub fn write(data: &[u8], path: &Path) -> Option<u8> {
+    let mut input = Input::new(data);
+    let mode = input.byte();
+    let mut made = first_phase(&mut input, path)?;
+    if mode & FOLLOW != 0 {
+        more_steps(&mut input, path, &mut made)?;
+    }
+    Some(mode)
 }
 
 pub fn run(data: &[u8]) {
     let path = crate::fresh("log.ferro");
-    let Some(mode) = write(data, &path) else {
+    let mut input = Input::new(data);
+    let mode = input.byte();
+    let Some(mut made) = first_phase(&mut input, &path) else {
         return;
     };
+    if mode & FOLLOW != 0 {
+        let follower = crate::options(true).open::<Root>(&path);
+        let appended = more_steps(&mut input, &path, &mut made);
+        if let Ok(db) = follower {
+            let _ = db.refresh();
+            crate::exercise(&db, true);
+        }
+        if appended.is_none() {
+            return;
+        }
+    }
     crate::open_as::<Root>(&path, mode & 1 != 0);
     if mode & 2 != 0 {
         crate::run_admin(&path, mode & 4 != 0);
