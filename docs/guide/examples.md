@@ -10,7 +10,7 @@ targets of the same name that pass `ARGS` through, and `shop-load`, `chat-load`,
 | [`tracker`](#tracker) | Command-line issue tracker | Iterator queries, history, undo, branches and merges |
 | [`shop`](#shop) | axum HTTP shop with products, carts and orders, and a load tester | Tables, awaited writes, `coalesce`, read replicas |
 | [`chat`](#chat) | axum multi-room chat with Server-Sent Events | Watchers, summaries, awaited writes |
-| [`booking`](#booking) | Hotel reservations with holds, refunds and what-ifs | Unique indexes, stamped commits, forks, fallible merges |
+| [`booking`](#booking) | Hotel reservations with holds, refunds and what-ifs | Unique and covering indexes, stamped commits, forks, fallible merges |
 | [`notes`](sync.md#converging-devices) | Offline-first notes kept per device | Sync |
 | `queue` | Durable job queue | `coalesce`, filtered watchers, `bisect_changes` |
 | `ledger` | Double-entry ledger | Summaries for balances |
@@ -81,6 +81,15 @@ second at 0.35 ms per post and 2.1 ms to delivery. These ran on a machine shared
 hold blocks everyone until it is paid or lapses, and a sweeper or the next buyer releases it once it
 lapses. Every write is a `try_commit_stamped` closure that returns a typed error. The till, each
 customer's credit and the per-night counters move in the same commit as the rows they sum.
+
+A customer's bookings page, `customer show` and `Hotels::lines_of`, reads its lines from
+`#[index(cover(status, venue, room, first, nights, total))]` on the customer index, so it touches no
+booking row. `booking-stress --browsers 4` runs four threads paging the newest 20 bookings of
+random customers beside the writers. With 16 writer threads and the fsync on, medians of three
+interleaved 5 second rounds, pages went from 2.14 million a second to 5.26 million, page p50 from
+1.7 to 0.7 us and p99 from 4.0 to between 1.1 and 2.1 us. Bytes per write rose from 10,900 to
+12,400, and writes a second stayed within the spread of the runs, 4,000 to 5,700 either way. The
+full check confirms at every 50th version that the covered lines match the rows.
 
 A confirm records its own version from the `Stamp`, so a receipt is `at` that version. Audit trails
 and price history come from `history_of`. A what-if reprice or venue closure runs on a fork, which

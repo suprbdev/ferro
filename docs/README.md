@@ -10,7 +10,7 @@ each part costs, and what was measured and left out on the way. Start with
 | --- | --- |
 | [Getting started](guide/getting-started.md) | A first database, reading, writing and `Options` |
 | [Collections](guide/collections.md) | `Map`, `Set`, `List`, `Bytes`, bulk reads, cursors, range edits and summaries |
-| [Tables and indexes](guide/tables.md) | `Table`, `#[derive(Record)]`, secondary, composite and unique indexes |
+| [Tables and indexes](guide/tables.md) | `Table`, `#[derive(Record)]`, secondary, composite, unique and covering indexes |
 | [History, versions and branches](guide/history.md) | `at`, `as_of`, `diff`, `history_of`, `bisect`, stamps, forks, dropping branches, `head_hash` |
 | [Merging](guide/merging.md) | Three-way merges, criss-crosses and merges that can fail |
 | [Watchers](guide/watchers.md) | `watch`, `watch_when`, `watch_changes`, closers and async waits |
@@ -47,7 +47,7 @@ each part costs, and what was measured and left out on the way. Start with
 | [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice and type checks |
 | [Reclamation](internals/reclamation.md) | Cycles, generations, crashes, measurements and offline compaction |
 | [Windows](internals/windows.md) | Locks, durability and renaming over an open file |
-| [Schema evolution and unique indexes](internals/schema-and-unique-indexes.md) | Field tags and unique constraints |
+| [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints, and covered fields and their cost |
 | [Errors and checks on local reads](internals/errors.md) | Panics, `Result` and bounds on crafted files |
 | [Fuzzing and testing](internals/testing.md) | Fuzz targets, and where the other tests are described |
 | [A delta log between checkpoints](internals/delta-log.md) | A design that was built, measured and left out |

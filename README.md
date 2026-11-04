@@ -15,7 +15,8 @@ ferro is an experiment, not a production database. Its file format is not stable
 - **Persistent collections.** `Map`, `Set`, `List` and `Table` nest inside your type. Cloning is
   O(1), `==` compares root hashes in O(1), and `diff` costs O(changes).
 - **Indexes without a query planner.** `#[derive(Record)]` keeps secondary, composite and unique
-  indexes on a `Table` up to date and generates their lookups.
+  indexes on a `Table` up to date and generates their lookups. A covering index stores chosen
+  fields beside its entries, so a page of results reads no rows.
 - **Range totals in O(log n).** A `Summary` keeps a fold of every subtree of a map.
 - **History.** `at`, `as_of`, `history_of`, `bisect` and `diff` read old versions, and `restore`
   commits one again as a new version.
@@ -60,7 +61,7 @@ explained or undone from the history, and corruption surfaces as an error rather
 - **Several writing processes.** One process holds the writer lock. Others open read-only and call
   `refresh`.
 - **Ad hoc queries.** There is no query language or planner. You choose the index, and an index
-  lookup reads each row separately.
+  lookup reads each row separately unless the index covers the fields it needs.
 - **Very large files.** A reclamation cycle copies everything retained at about 50 MB/s and needs
   that much free disk, and a first sync keeps under 500 bytes per object in memory.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never

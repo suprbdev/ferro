@@ -10,8 +10,9 @@ path](read-path.md).
 and a 200,000-row table with two indexes. Its workloads are a random `get`, a full scan through
 `iter().fold`, a full scan through `for_each`, ranges of about 100 keys through `range(..).fold`,
 index lookups of about 20 scattered rows through `by_balance_range`, and pages of 200 rows that sit
-in key order through `by_tier(..).take(200)`. Each runs with a 1 GiB cache that holds everything and
-a 16 MiB one that holds about a seventh of the decoded map, with no writer and with one thread
+in key order through `by_tier(..).take(200)`, and the same two read through `.covered()` from a twin
+table whose indexes cover `balance`. Each runs with a 1 GiB cache that holds everything and a 16 MiB
+one that holds about a seventh of the decoded map, with no writer and with one thread
 committing single-key updates as fast as it can. The test machine has 16 cores in two CCDs of 8,
 each CCD with its own L3, and two threads per core. Threads are pinned a core at a time, so 8 fill
 one CCD, 16 both, and 32 add the second thread of every core. The tool reads cycles, instructions
@@ -436,9 +437,10 @@ default and was used only for the last column.
 A `Val` for a value with a destructor still costs a shared count per item from `iter()`, and any
 iterator, cursor or finder holds a count on each node below the pinned levels, a shared count per
 leaf it passes. That is what pages of the same 200 rows meet: each page passes about 25 index leaves
-and 50 row leaves that every thread also passes. Each iterator still clones the store and the root.
-With a cache smaller than the data the allocator decides, and the library leaves that to the
-application.
+and 50 row leaves that every thread also passes. A covering index skips the row leaves, as described
+under [Covering indexes](schema-and-unique-indexes.md#covering-indexes). Each iterator still clones
+the store and the root. With a cache smaller than the data the allocator decides, and the library
+leaves that to the application.
 
 ## Cache weight
 
