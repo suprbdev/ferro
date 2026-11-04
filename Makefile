@@ -17,7 +17,7 @@ FUZZ_TIME ?= 600
 .PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt fmt-check doc ci act \
 	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-combine bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
-	info log verify space compact fuzz fuzz-seeds clean clean-tmp
+	info log verify space compact fuzz fuzz-seeds fuzz-lint clean clean-tmp
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -60,7 +60,7 @@ fmt-check: ## Fail if any file is not formatted with rustfmt
 doc: ## Build the library's API docs and open them
 	$(CARGO) doc --no-deps -p ferro --open
 
-ci: fmt-check lint lint-windows test ## Run the local equivalent of CI
+ci: fmt-check lint lint-windows fuzz-lint test ## Run the local equivalent of CI
 
 act: ## Run the GitHub workflow's Linux job locally with act
 	act push -j test
@@ -148,6 +148,10 @@ compact: ## Rewrite DB, keeping KEEP newest commits per branch if set
 
 fuzz-seeds: ## Build a starting corpus for the fuzz targets
 	cd fuzz && $(RUN) run --release --example seeds -- corpus/seeds
+
+fuzz-lint: ## Check the fuzz crate's formatting and run clippy on it with warnings as errors
+	cd fuzz && $(CARGO) fmt -- --check
+	cd fuzz && $(RUN) clippy --all-targets --release -- -D warnings
 
 fuzz: ## Fuzz target FUZZ for FUZZ_TIME seconds with nightly
 	cd fuzz && $(CAP) cargo +nightly fuzz run $(FUZZ) corpus/seeds/$(FUZZ) -- -max_len=70000 -timeout=10 -malloc_limit_mb=1024 -max_total_time=$(FUZZ_TIME)
