@@ -67,7 +67,7 @@ fn bases_in(dir: &Path) -> Vec<Base> {
             put(db, 0);
             let side = db.fork("side").unwrap();
             db.compact(Keep::All).unwrap();
-            for at in 0..64u64 {
+            for at in 0..65u64 {
                 put(if at % 2 == 0 { db } else { &side }, at);
             }
         }),
