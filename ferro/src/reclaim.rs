@@ -1,19 +1,28 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::hash::BuildHasherDefault;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
 use crate::db::Refs;
 use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry, skip_version};
 use crate::platform::copy_owner;
 pub(crate) use crate::platform::{rename, sync_parent};
 use crate::refs;
-use crate::store::{Basis, LOG_START, Store, StoreOptions, Traced, append_record, seal};
+use crate::store::{
+    Basis, LOG_START, Prehashed, Store, StoreOptions, Traced, Unpacked, append_staged, body_of,
+    compressed, seal, staged, verify_stored,
+};
 
 const FLUSH_BYTES: usize = 1 << 20;
+const SPARE: usize = 256;
+const SPARE_BYTES: usize = 256 << 10;
+
+type ByHash = BuildHasherDefault<Prehashed>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reclaim {
@@ -138,13 +147,17 @@ struct CopySink<'a> {
     file: Traced,
     buf: Vec<u8>,
     end: u64,
-    copied: HashMap<Hash, Copied>,
-    entries: HashSet<Hash>,
+    scratch: Unpacked,
+    bytes: Vec<u8>,
+    body: Vec<u8>,
+    spare: Vec<Buffers>,
+    copied: HashMap<Hash, Copied, ByHash>,
+    entries: HashSet<Hash, ByHash>,
     records: HashMap<u64, u64>,
     kept: Needs,
     needs: Needs,
     below: HashMap<u64, Below>,
-    pruned: HashSet<Hash>,
+    pruned: HashSet<Hash, ByHash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
 }
@@ -235,12 +248,25 @@ impl Needs {
     }
 }
 
+#[derive(Default)]
+struct Buffers {
+    payload: Vec<u8>,
+    old: Vec<Ptr>,
+    links: Vec<Ptr>,
+}
+
 struct Pending {
     from: Ptr,
-    object: Object,
+    raw: usize,
+    packed: bool,
     next: usize,
-    links: Vec<Ptr>,
+    held: Buffers,
     entry: Option<Rungs>,
+}
+
+enum Step {
+    Done(Ptr),
+    Descend(Pending),
 }
 
 #[derive(Clone, Copy)]
@@ -251,8 +277,8 @@ struct Rungs {
 }
 
 impl Rungs {
-    fn of(object: &Object) -> Result<Rungs> {
-        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+    fn of(body: &[u8], links: &[Ptr]) -> Result<Rungs> {
+        let entry = Entry::decode(&mut Decoder::new(body, links, None))?;
         let prev = usize::from(entry.commit.root.is_some());
         let skip = prev + usize::from(entry.prev.is_some());
         Ok(Rungs {
@@ -271,16 +297,10 @@ impl CopySink<'_> {
         Ok(())
     }
 
-    fn emit(
-        &mut self,
-        from: Ptr,
-        object: &Object,
-        links: &[Ptr],
-        below: Option<Below>,
-    ) -> Result<Ptr> {
+    fn emit(&mut self, from: Ptr, staged: Staged<'_>, below: Option<Below>) -> Result<Ptr> {
         let (hash, offset) = (from.hash, self.end);
         let before = self.buf.len();
-        append_record(&mut self.buf, offset, &object.body, links);
+        append_staged(&mut self.buf, offset, staged);
         self.end += (self.buf.len() - before) as u64;
         match below {
             Some(below) => {
@@ -385,60 +405,117 @@ impl CopySink<'_> {
         }
     }
 
-    fn read(&self, ptr: Ptr) -> Result<Pending> {
+    fn read(&mut self, ptr: Ptr) -> Result<Step> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
         }
-        let object = self.source.read_object(ptr)?;
+        let mut bytes = mem::take(&mut self.bytes);
+        let step = self.step(ptr, &mut bytes);
+        if bytes.capacity() <= SPARE_BYTES {
+            self.bytes = bytes;
+        }
+        step
+    }
+
+    fn step(&mut self, ptr: Ptr, bytes: &mut Vec<u8>) -> Result<Step> {
+        let mut held = self.spare.pop().unwrap_or_default();
+        let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old)?;
+        verify_stored(record, ptr, &mut self.scratch)?;
         let entry = if self.entries.contains(&ptr.hash) {
-            Some(Rungs::of(&object)?)
+            let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
+            Some(Rungs::of(body, &held.old)?)
         } else {
             None
         };
-        Ok(Pending {
+        let payload = &record[stored.payload.clone()];
+        if entry.is_none() {
+            while let Some(link) = held.old.get(held.links.len()) {
+                let Some(done) = self.settled(*link) else {
+                    break;
+                };
+                held.links.push(done);
+            }
+            if held.links.len() == held.old.len() {
+                let staged = Staged {
+                    raw: stored.raw,
+                    payload,
+                    packed: stored.packed,
+                    links: &held.links,
+                };
+                let done = self.emit(ptr, staged, None)?;
+                self.recycle(held);
+                return Ok(Step::Done(done));
+            }
+        }
+        held.payload.clear();
+        held.payload.extend_from_slice(payload);
+        Ok(Step::Descend(Pending {
             from: ptr,
-            object,
-            next: 0,
-            links: Vec::new(),
+            raw: stored.raw,
+            packed: stored.packed,
+            next: held.links.len(),
+            held,
             entry,
-        })
+        }))
     }
 
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
         if let Some(done) = self.settled(root) {
             return Ok(done);
         }
-        let mut stack = vec![self.read(root)?];
+        let mut stack = match self.read(root)? {
+            Step::Done(done) => return Ok(done),
+            Step::Descend(pending) => vec![pending],
+        };
         loop {
             let top = stack.last_mut().expect("stack is not empty");
-            if top.next < top.object.links.len() {
-                let link = top.object.links[top.next];
+            if top.next < top.held.old.len() {
+                let link = top.held.old[top.next];
                 let settled = match top.entry.filter(|rungs| rungs.skip == Some(top.next)) {
-                    Some(rungs) => self.skipped(&top.links, rungs, link),
+                    Some(rungs) => self.skipped(&top.held.links, rungs, link),
                     None => self.settled(link),
                 };
-                if let Some(done) = settled {
-                    let top = stack.last_mut().expect("stack is not empty");
-                    top.links.push(done);
-                    top.next += 1;
-                } else {
-                    let pending = self.read(link)?;
-                    stack.push(pending);
-                }
+                let done = match settled {
+                    Some(done) => done,
+                    None => match self.read(link)? {
+                        Step::Done(done) => done,
+                        Step::Descend(pending) => {
+                            stack.push(pending);
+                            continue;
+                        }
+                    },
+                };
+                let top = stack.last_mut().expect("stack is not empty");
+                top.held.links.push(done);
+                top.next += 1;
                 continue;
             }
             let done = stack.pop().expect("stack is not empty");
             let below = done
                 .entry
-                .map(|rungs| Self::below(done.from, &done.links, rungs));
-            let ptr = self.emit(done.from, &done.object, &done.links, below)?;
+                .map(|rungs| Self::below(done.from, &done.held.links, rungs));
+            let staged = Staged {
+                raw: done.raw,
+                payload: &done.held.payload,
+                packed: done.packed,
+                links: &done.held.links,
+            };
+            let ptr = self.emit(done.from, staged, below)?;
+            self.recycle(done.held);
             match stack.last_mut() {
                 Some(parent) => {
-                    parent.links.push(ptr);
+                    parent.held.links.push(ptr);
                     parent.next += 1;
                 }
                 None => return Ok(ptr),
             }
+        }
+    }
+
+    fn recycle(&mut self, mut held: Buffers) {
+        if self.spare.len() < SPARE && held.payload.capacity() <= SPARE_BYTES {
+            held.links.clear();
+            self.spare.push(held);
         }
     }
 }
@@ -452,7 +529,9 @@ impl Sink for CopySink<'_> {
         for link in &object.links {
             links.push(self.copy(*link)?);
         }
-        self.emit(Ptr { hash, offset: 0 }, &object, &links, None)
+        let packed = compressed(&object.body);
+        let staged = staged(&object.body, packed.as_deref(), &links);
+        self.emit(Ptr { hash, offset: 0 }, staged, None)
     }
 
     fn store_id(&self) -> u64 {
@@ -489,13 +568,17 @@ impl<'a> Copier<'a> {
                 file,
                 buf: Vec::new(),
                 end: LOG_START,
-                copied: HashMap::new(),
-                entries: HashSet::new(),
+                scratch: Unpacked::default(),
+                bytes: Vec::new(),
+                body: Vec::new(),
+                spare: Vec::new(),
+                copied: HashMap::default(),
+                entries: HashSet::default(),
                 records: HashMap::new(),
                 kept: Needs::default(),
                 needs: Needs::default(),
                 below: HashMap::new(),
-                pruned: HashSet::new(),
+                pruned: HashSet::default(),
                 objects: 0,
                 stop,
             },

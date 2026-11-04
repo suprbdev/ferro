@@ -19,7 +19,7 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
-    Staged, push_varint,
+    Staged, hash_parts, push_varint,
 };
 use crate::dense::{Column, Hashes};
 use crate::error::{Error, Result};
@@ -54,6 +54,7 @@ const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 pub(crate) const MAX_RATIO: usize = 255;
 const REPLAY_CHUNK: usize = 256 << 10;
+const SCRATCH_KEEP: usize = 1 << 20;
 const LOCKS_AT: u64 = 1 << 62;
 const MULTI_AT: u64 = LOCKS_AT + 1;
 const COMMIT_AT: u64 = LOCKS_AT + 2;
@@ -521,7 +522,7 @@ pub(crate) fn staged<'a>(body: &'a [u8], packed: Option<&'a [u8]>, links: &'a [P
     }
 }
 
-fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) {
+pub(crate) fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) {
     push_varint(buf, staged.payload.len() as u64);
     if staged.packed {
         push_varint(buf, (staged.links.len() as u64) << 1 | 1);
@@ -606,6 +607,178 @@ impl RecordReader<'_> {
         self.pos = end;
         Ok(out)
     }
+
+    fn header(&mut self) -> Result<Header> {
+        let stored = usize::try_from(self.varint()?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        let flagged = self.varint()?;
+        let links = usize::try_from(flagged >> 1)
+            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
+        if flagged & 1 == 0 {
+            return Ok(Header {
+                stored,
+                links,
+                raw: None,
+            });
+        }
+        let raw = usize::try_from(self.varint()?)
+            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
+        if raw > stored.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
+            return Err(Error::Corrupt(format!(
+                "implausible compression at {}",
+                self.start
+            )));
+        }
+        Ok(Header {
+            stored,
+            links,
+            raw: Some(raw),
+        })
+    }
+
+    fn link(&mut self) -> Result<Ptr> {
+        let hash: Hash = self
+            .take(HASH_BYTES)?
+            .try_into()
+            .expect("slice length is HASH_BYTES");
+        let delta = unzigzag(self.varint()?);
+        Ok(Ptr {
+            hash,
+            offset: self.start.wrapping_sub(delta as u64),
+        })
+    }
+}
+
+struct Header {
+    stored: usize,
+    links: usize,
+    raw: Option<usize>,
+}
+
+pub(crate) struct Stored {
+    pub(crate) raw: usize,
+    pub(crate) packed: bool,
+    pub(crate) payload: std::ops::Range<usize>,
+    pub(crate) len: usize,
+}
+
+fn unpack_into(payload: &[u8], raw: usize, at: u64, out: &mut Vec<u8>) -> Result<()> {
+    let from = out.len();
+    out.resize(from + raw, 0);
+    let len = lz4_flex::block::decompress_into(payload, &mut out[from..])
+        .map_err(|error| Error::Corrupt(format!("bad compressed body at {at}: {error}")))?;
+    out.truncate(from + len);
+    Ok(())
+}
+
+pub(crate) fn body_of<'a>(
+    bytes: &'a [u8],
+    stored: &Stored,
+    at: u64,
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
+    let payload = &bytes[stored.payload.clone()];
+    if !stored.packed {
+        return Ok(payload);
+    }
+    out.clear();
+    unpack_into(payload, stored.raw, at, out)?;
+    Ok(out)
+}
+
+fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for index in 0..MAX_VARINT - 1 {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Stored> {
+    let mut pos = 0;
+    let stored = usize::try_from(varint_within(bytes, &mut pos)?).ok()?;
+    let flagged = varint_within(bytes, &mut pos)?;
+    let count = usize::try_from(flagged >> 1).ok()?;
+    let raw = match flagged & 1 {
+        0 => stored,
+        _ => {
+            let raw = usize::try_from(varint_within(bytes, &mut pos)?).ok()?;
+            if raw > stored.saturating_mul(MAX_RATIO).saturating_add(MAX_RATIO) {
+                return None;
+            }
+            raw
+        }
+    };
+    let payload = pos..pos.checked_add(stored)?;
+    if payload.end > bytes.len() || count > (bytes.len() - payload.end) / (HASH_BYTES + 1) {
+        return None;
+    }
+    pos = payload.end;
+    links.clear();
+    for _ in 0..count {
+        let hash: Hash = bytes.get(pos..pos + HASH_BYTES)?.try_into().ok()?;
+        pos += HASH_BYTES;
+        let delta = unzigzag(varint_within(bytes, &mut pos)?);
+        links.push(Ptr {
+            hash,
+            offset: start.wrapping_sub(delta as u64),
+        });
+    }
+    Some(Stored {
+        raw,
+        packed: flagged & 1 == 1,
+        payload,
+        len: pos,
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct Unpacked {
+    body: Vec<u8>,
+    hashes: Vec<Hash>,
+}
+
+pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
+    let mut reader = RecordReader {
+        file: None,
+        start: ptr.offset,
+        tail: ptr.offset.saturating_add(record.len() as u64),
+        bytes: Cow::Borrowed(record),
+        pos: 0,
+    };
+    let header = reader.header()?;
+    let start = reader.pos;
+    reader.take(header.stored)?;
+    let payload = start..reader.pos;
+    scratch.hashes.clear();
+    for _ in 0..header.links {
+        let link = reader.link()?;
+        scratch.hashes.push(link.hash);
+    }
+    let payload = &record[payload];
+    let body = match header.raw {
+        Some(raw) => {
+            scratch.body.clear();
+            unpack_into(payload, raw, ptr.offset, &mut scratch.body)?;
+            &scratch.body
+        }
+        None => payload,
+    };
+    let hash = hash_parts(body, scratch.hashes.iter());
+    scratch.body.clear();
+    scratch.body.shrink_to(SCRATCH_KEEP);
+    if hash != ptr.hash {
+        return Err(Error::Corrupt(format!(
+            "hash mismatch for object at {}",
+            ptr.offset
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basis) -> Result<()> {
@@ -1535,6 +1708,59 @@ impl Store {
         Ok((object, packed))
     }
 
+    pub(crate) fn read_stored<'a>(
+        &self,
+        ptr: Ptr,
+        bytes: &'a mut Vec<u8>,
+        links: &mut Vec<Ptr>,
+    ) -> Result<(&'a [u8], Stored)> {
+        let tail = self.readable_past(ptr.offset)?;
+        if ptr.offset < LOG_START || ptr.offset >= tail {
+            return Err(Error::Corrupt(format!(
+                "pointer {} outside log of {tail} bytes",
+                ptr.offset
+            )));
+        }
+        let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
+        if bytes.len() < want {
+            bytes.resize(want, 0);
+        }
+        bytes.truncate(want);
+        self.inner.file.read_exact_at(bytes, ptr.offset)?;
+        if let Some(stored) = stored_within(bytes, ptr.offset, links) {
+            return Ok((&bytes[..stored.len], stored));
+        }
+        let mut reader = RecordReader {
+            file: Some(&*self.inner.file),
+            start: ptr.offset,
+            tail,
+            bytes: Cow::Owned(mem::take(bytes)),
+            pos: 0,
+        };
+        let stored = Self::stored_in(&mut reader, links);
+        *bytes = reader.bytes.into_owned();
+        let stored = stored?;
+        Ok((&bytes[..stored.len], stored))
+    }
+
+    fn stored_in(reader: &mut RecordReader<'_>, links: &mut Vec<Ptr>) -> Result<Stored> {
+        let header = reader.header()?;
+        let start = reader.pos;
+        reader.take(header.stored)?;
+        let payload = start..reader.pos;
+        links.clear();
+        links.reserve(header.links.min(1024));
+        for _ in 0..header.links {
+            links.push(reader.link()?);
+        }
+        Ok(Stored {
+            raw: header.raw.unwrap_or(header.stored),
+            packed: header.raw.is_some(),
+            payload,
+            len: reader.pos,
+        })
+    }
+
     pub(crate) fn read_links(&self, ptr: Ptr) -> Result<Vec<Ptr>> {
         let tail = self.readable_past(ptr.offset)?;
         if ptr.offset < LOG_START || ptr.offset >= tail {
@@ -1602,43 +1828,22 @@ impl Store {
             bytes,
             pos: 0,
         };
-        let stored_len = usize::try_from(reader.varint()?)
-            .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-        let flagged = reader.varint()?;
-        let link_count = usize::try_from(flagged >> 1)
-            .map_err(|_| Error::Corrupt("link count overflow".into()))?;
+        let header = reader.header()?;
         let mut packed = None;
-        let body = if flagged & 1 == 1 {
-            let raw_len = usize::try_from(reader.varint()?)
-                .map_err(|_| Error::Corrupt("body length overflow".into()))?;
-            if raw_len
-                > stored_len
-                    .saturating_mul(MAX_RATIO)
-                    .saturating_add(MAX_RATIO)
-            {
-                return Err(Error::Corrupt(format!(
-                    "implausible compression at {}",
-                    ptr.offset
-                )));
+        let body = match header.raw {
+            Some(raw_len) => {
+                let stored = reader.take(header.stored)?;
+                let body = lz4_flex::block::decompress(stored, raw_len).map_err(|error| {
+                    Error::Corrupt(format!("bad compressed body at {}: {error}", ptr.offset))
+                })?;
+                packed = keep.then(|| stored.to_vec());
+                body
             }
-            let stored = reader.take(stored_len)?;
-            let body = lz4_flex::block::decompress(stored, raw_len).map_err(|error| {
-                Error::Corrupt(format!("bad compressed body at {}: {error}", ptr.offset))
-            })?;
-            packed = keep.then(|| stored.to_vec());
-            body
-        } else {
-            reader.take(stored_len)?.to_vec()
+            None => reader.take(header.stored)?.to_vec(),
         };
-        let mut links = Vec::with_capacity(link_count.min(1024));
-        for _ in 0..link_count {
-            let hash: Hash = reader
-                .take(HASH_BYTES)?
-                .try_into()
-                .expect("slice length is HASH_BYTES");
-            let delta = unzigzag(reader.varint()?);
-            let offset = ptr.offset.wrapping_sub(delta as u64);
-            links.push(Ptr { hash, offset });
+        let mut links = Vec::with_capacity(header.links.min(1024));
+        for _ in 0..header.links {
+            links.push(reader.link()?);
         }
         let object = Object { body, links };
         if verify && object.hash() != ptr.hash {
@@ -1815,7 +2020,7 @@ impl Store {
 }
 
 #[derive(Default)]
-struct Prehashed(u64);
+pub(crate) struct Prehashed(u64);
 
 impl Hasher for Prehashed {
     fn finish(&self) -> u64 {
