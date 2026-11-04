@@ -911,6 +911,7 @@ impl Store {
         if sb.seq < cursor.seq || self.inner.ignored == Some(sb.mark()) {
             return Ok(None);
         }
+        let len = self.inner.file.metadata()?.len();
         if len < sb.log_end {
             return Err(Error::Corrupt(format!(
                 "file is {len} bytes but superblock expects {}",
