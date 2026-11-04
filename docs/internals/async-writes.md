@@ -5,10 +5,11 @@ API is in [Writers and concurrency](../guide/concurrency.md#awaited-writes).
 
 A blocking write holds its thread through the closure, the encode and the sync, so the async
 examples wrapped every write in `spawn_blocking` or a pool of writer threads and paid a thread for
-each commit in flight (#31). `update_async`, `commit_async`, `commit_with_async` and their `try_`
-forms return a future that resolves when the commit is published, which under Fsync is when it is
-durable, and that holds no thread while it waits for the lock or the sync. It uses
-`std::task::Waker` alone, as `Watcher::changed` does, so the library depends on no runtime.
+each commit in flight (#31). `update_async`, `commit_async`, `commit_with_async`,
+`commit_stamped_async` and their `try_` forms return a future that resolves when the commit is
+published, which under Fsync is when it is durable, and that holds no thread while it waits for the
+lock or the sync. It uses `std::task::Waker` alone, as `Watcher::changed` does, so the library
+depends on no runtime.
 
 ## Where the closure runs
 

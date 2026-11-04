@@ -2928,6 +2928,28 @@ impl<T: Data> Db<T> {
         .await
     }
 
+    pub async fn commit_stamped_async<R, S: Into<String>>(
+        &self,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> (S, R),
+    ) -> Result<Committed<R>> {
+        self.writing::<R, Error, _>(|root, stamp| {
+            let (message, value) = f(root, stamp);
+            Ok((message.into(), value))
+        })
+        .await
+    }
+
+    pub async fn try_commit_stamped_async<R, S: Into<String>, E: From<Error>>(
+        &self,
+        f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Committed<R>, E> {
+        self.writing(|root, stamp| {
+            let (message, value) = f(root, stamp)?;
+            Ok((message.into(), value))
+        })
+        .await
+    }
+
     fn transact<R, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,

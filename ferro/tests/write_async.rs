@@ -644,11 +644,51 @@ fn closures_and_results_need_not_be_send() {
     assert_eq!(borrowed, vec![1]);
 }
 
+fn sendable<F: Future + Send>(future: F) -> F {
+    future
+}
+
+#[test]
+fn stamped_async_writes_record_the_version_and_time_they_commit_at() {
+    for (kind, options) in every_kind() {
+        let dir = dir();
+        let db: Db<Root> = options.open(dir.path().join("db.ferro")).unwrap();
+        let done = block_on(db.commit_stamped_async(|root, stamp| {
+            root.insert(stamp.version(), stamp.time_ms());
+            ("first", stamp.version())
+        }))
+        .unwrap();
+        assert_eq!((done.value, done.version), (1, 1), "{kind}");
+        assert_eq!(
+            db.read().get(&1).map(|at| *at),
+            Some(done.time_ms),
+            "{kind}"
+        );
+        let done = block_on(db.try_commit_stamped_async(|root, stamp| {
+            root.insert(stamp.version(), stamp.time_ms());
+            Ok::<_, Refused>(("second", stamp.time_ms()))
+        }))
+        .unwrap();
+        assert_eq!((done.version, done.value), (2, done.time_ms), "{kind}");
+        assert_eq!(db.as_of(done.time_ms).unwrap().version(), 2, "{kind}");
+        let refused = block_on(db.try_commit_stamped_async(|root, stamp| {
+            root.insert(stamp.version(), stamp.time_ms());
+            Err::<(&str, ()), _>(Refused(stamp.version()))
+        }));
+        assert_eq!(refused, Err(Refused(3)), "{kind}");
+        assert_eq!(db.version(), 2, "{kind}");
+        assert_eq!(db.read().get(&3), None, "{kind}");
+        let future = sendable(db.try_commit_stamped_async(|root, stamp| {
+            root.insert(stamp.version(), 0);
+            Ok::<_, Error>(("sent", stamp.version()))
+        }));
+        let sent = thread::scope(|scope| scope.spawn(|| block_on(future)).join().unwrap()).unwrap();
+        assert_eq!((sent.value, sent.version), (3, 3), "{kind}");
+    }
+}
+
 #[test]
 fn the_future_is_send_when_its_closure_is() {
-    fn sendable<F: Future + Send>(future: F) -> F {
-        future
-    }
     let dir = dir();
     let db: Db<Root> = fsync()
         .coalesce(true)

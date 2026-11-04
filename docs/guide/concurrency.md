@@ -19,12 +19,12 @@ branch before they hold up all of them.
 
 ## Awaited writes
 
-`update_async`, `commit_async`, `commit_with_async`, `try_update_async`, `try_commit_async` and
-`try_commit_with_async` return a future that resolves once the commit is published, which under
-`Durability::Fsync` means durable. It holds no thread while it waits for the writer lock or the
-sync: one `ferro-sync` thread per open database, started by the first awaited write, syncs each
-batch and wakes the futures in it through `std::task::Waker`, so any executor works and ferro
-depends on no runtime.
+`update_async`, `commit_async`, `commit_with_async`, `commit_stamped_async`, `try_update_async`,
+`try_commit_async`, `try_commit_with_async` and `try_commit_stamped_async` return a future that
+resolves once the commit is published, which under `Durability::Fsync` means durable. It holds no
+thread while it waits for the writer lock or the sync: one `ferro-sync` thread per open database,
+started by the first awaited write, syncs each batch and wakes the futures in it through
+`std::task::Waker`, so any executor works and ferro depends on no runtime.
 
 ```rust
 let order = db
@@ -45,8 +45,7 @@ writer can get in ahead of them. A write dropped before its closure ran, polled 
 nothing. Once the closure has run its outcome is decided: dropping the future gives up only the
 answer, the commit lands as if awaited, and closing the database first writes and syncs it. So
 whether a dropped write landed is exactly whether its closure ran. With `coalesce`, awaited closures
-join the same groups as blocking ones. The stamped forms, `restore` and the merges have no awaited
-form.
+join the same groups as blocking ones. `restore` and the merges have no awaited form.
 
 ## Sharing a version between writers
 

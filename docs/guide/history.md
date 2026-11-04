@@ -69,8 +69,9 @@ back when the row goes, which is why `alive` stops short of `ended`. It returns 
 
 ## Stamping a commit
 
-`commit_stamped` and `try_commit_stamped` also hand the closure a `Stamp`, so a row can record the
-commit that writes it:
+`commit_stamped` and `try_commit_stamped`, and their awaited forms `commit_stamped_async` and
+`try_commit_stamped_async`, also hand the closure a `Stamp`, so a row can record the commit that
+writes it:
 
 ```rust
 db.try_commit_stamped(|shop, stamp| {
