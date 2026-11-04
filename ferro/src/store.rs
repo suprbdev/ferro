@@ -1138,6 +1138,9 @@ impl Store {
         }
         let durable = inner.options.durability == Durability::Fsync;
         let attempt = (|| -> Result<()> {
+            if inner.options.shared {
+                return self.sync_shared(frame, durable);
+            }
             if durable {
                 inner.file.sync_data()?;
             }
@@ -1157,6 +1160,48 @@ impl Store {
             return Err(error);
         }
         inner.tail.store(frame.end, Ordering::Release);
+        Ok(())
+    }
+
+    fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
+        let inner = &self.inner;
+        let _held = Range::hold(&inner.file, SUPER_AT, true)?;
+        let newest = read_supers(&inner.file, LOG_START)?;
+        let mark = frame.mark();
+        if durable && newest.is_some_and(|(found, _)| found.anchor.seq >= frame.seq) {
+            let mut marks = inner.marks.lock();
+            marks.latest = mark;
+            marks.anchor = mark;
+            return Ok(());
+        }
+        let last = match durable {
+            true => {
+                let len = inner.file.metadata()?.len();
+                scan(&inner.file, Super::new(mark, mark, inner.basis), len)?.mark()
+            }
+            false => mark,
+        };
+        if durable {
+            inner.file.sync_data()?;
+        }
+        let anchor = {
+            let mut marks = inner.marks.lock();
+            marks.latest = mark;
+            if durable {
+                marks.anchor = mark;
+            }
+            if durable { last } else { marks.anchor }
+        };
+        let sb = Super::new(last, anchor, inner.basis);
+        let slot = match newest {
+            Some((found, _)) if (found.seq, found.anchor.seq) >= (sb.seq, sb.anchor.seq) => {
+                return Ok(());
+            }
+            Some((_, slot)) => 1 - slot,
+            None => 1 - inner.slot.load(Ordering::Relaxed),
+        };
+        inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+        inner.slot.store(slot, Ordering::Relaxed);
         Ok(())
     }
 
