@@ -429,16 +429,11 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
     Ok(tip)
 }
 
-fn retired_at(file: &File, at: u64) -> Result<bool> {
-    let mut magic = [0u8; 8];
-    Ok(read_or_end(file, &mut magic, at)? && &magic == RETIRED_MAGIC)
-}
-
-fn recover(file: &File, sb: Super, slot: u64, len: u64, shared: bool) -> Result<(Super, u64)> {
+fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
     let mut tip = scan(file, sb.at_anchor(), len)?;
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
-    let shrink = len > tip.log_end && !(shared && retired_at(file, tip.log_end)?);
+    let shrink = len > tip.log_end;
     tip.anchor = tip.mark();
     if moved {
         file.sync_data()?;
@@ -965,7 +960,7 @@ impl Store {
                 if options.read_only {
                     (observe(&file, actual, sb, len)?, slot)
                 } else {
-                    recover(&file, sb, slot, len, shared)?
+                    recover(&file, sb, slot, len)?
                 }
             }
             None => {

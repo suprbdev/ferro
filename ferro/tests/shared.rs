@@ -622,3 +622,49 @@ fn a_closure_on_a_branch_another_handle_dropped_never_runs() {
         bump(&a, 0, 2);
     }
 }
+
+#[test]
+fn a_marker_left_by_a_dead_cycle_never_keeps_a_stranded_frame_after_a_power_cut() {
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kept.ferro");
+    let len = || std::fs::metadata(&path).unwrap().len();
+    let manual = Reclaim { every_bytes: 0 };
+    let commit = |db: &Db<Padded>, fill: u64| {
+        db.update(|root| {
+            root.n += 1;
+            root.pad = vec![fill; 20];
+        })
+        .unwrap()
+    };
+    {
+        let db: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+        for _ in 0..5 {
+            commit(&db, 7);
+        }
+    }
+    let end = len();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut marker = [0u8; 68];
+    marker[..8].copy_from_slice(b"FERROGEN");
+    file.write_all_at(&marker, end).unwrap();
+    let db: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    let mut slots = vec![0u8; 8192];
+    file.read_exact_at(&mut slots, 0).unwrap();
+    commit(&db, 7);
+    commit(&db, 7);
+    drop(db);
+    file.write_all_at(&marker, end).unwrap();
+    file.write_all_at(&slots, 0).unwrap();
+    let db: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    assert_eq!(db.read().n, 5);
+    commit(&db, 8);
+    drop(db);
+    let db: Db<Padded> = Options::new().reclaim(manual).open(&path).unwrap();
+    assert_eq!(db.read().n, 6, "a stranded frame lined up with the log");
+    db.verify().unwrap();
+}
