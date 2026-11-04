@@ -159,23 +159,26 @@ work, but not this order, as described under [Windows](windows.md#renaming-over-
 ## Measurements
 
 Four workloads ran for 15 seconds each on the test NVMe with ext4, with fsync, keeping the last 100
-versions and starting a cycle every 64 MiB. These are medians of three runs, alternated on a machine
-other work was sharing:
+versions and starting a cycle every 64 MiB. These are medians of three runs of `ferro-bench --bin
+reclaim live`, on 2026-11-04 with nothing else running:
 
 | Workload | Commits/s without cycles | With cycles | Longest pause | File after a cycle | Live | Grows to without cycles |
 | --- | --- | --- | --- | --- | --- | --- |
-| `metrics`, one commit per scrape | 5,240 | 5,190 | 2.8 ms | 1.3 MiB | 1.4 MiB | 248 MiB |
-| `ledger`, single entries | 4,810 | 4,820 | 3.5 ms | 4.6 MiB | 4.5 MiB | 443 MiB |
-| `wiki`, edits of 64 KiB pages | 670 | 680 | 4.8 ms | 7.2 MiB | 7.1 MiB | 100 MiB |
-| Table updates, 200,000 rows | 5,090 | 5,090 | 3.2 ms | 13.2 MiB | 12.2 MiB | 332 MiB |
+| `metrics`, one commit per scrape | 5,242 | 5,282 | 2.9 ms | 1.5 MiB | 1.5 MiB | 254 MiB |
+| `ledger`, single entries | 4,945 | 4,935 | 3.8 ms | 5.2 MiB | 4.6 MiB | 460 MiB |
+| `wiki`, edits of 64 KiB pages | 565 | 566 | 4.4 ms | 7.2 MiB | 7.2 MiB | 90 MiB |
+| Table updates, 200,000 rows | 5,151 | 5,184 | 2.8 ms | 13.2 MiB | 12.4 MiB | 338 MiB |
 
-p99 commit latency moved from 0.93 to 0.94 ms, 1.21 to 1.33 ms, 4.51 to 4.59 ms and 0.95 to 1.01 ms.
+p99 commit latency moved from 0.92 to 0.93 ms, 1.14 to 1.33 ms, 5.17 to 5.20 ms and 0.93 to 0.98 ms.
 The file saws between what is live and 64 MiB above it. While both files exist the peak is higher by
-what has been copied, which came to 77 MiB on `ledger` and 95 MiB on table updates.
+what has been copied, which came to 77 MiB on `ledger` and 94 MiB on table updates. The same table
+measured on 2026-11-03, on a machine other work was sharing, had `wiki` at 670 and 680 commits a
+second.
 
-`metrics load` at 20,000 points a second with one commit per scrape grew to 190 MB without cycles.
-With them the file sawed between 3 and 62 MB with two cycles in 30 seconds, and the longest pause
-was 1.8 ms. It used to stall writers for 0.34 to 0.74 s, dropping the database each time.
+The rest of this section was measured on 2026-11-03. `metrics load` at 20,000 points a second with
+one commit per scrape grew to 190 MB without cycles. With them the file sawed between 3 and 62 MB
+with two cycles in 30 seconds, and the longest pause was 1.8 ms. It used to stall writers for 0.34
+to 0.74 s, dropping the database each time.
 
 With 8 readers on a 1M row table and 60 MiB live, at 4,200 commits a second with or without cycles,
 reads went from 1.67M a second to 1.54M, because every swap empties the node cache. p99 read latency
@@ -217,11 +220,14 @@ comparison was made on one base, before value columns landed:
 
 ## Limits
 
-A cycle reads, verifies, recompresses and writes everything retained, in one thread, at about 50
-MB/s, so a 10 GB database takes minutes and needs 10 GB free. The trigger keeps that to one extra
-byte copied per byte written, at worst. `Keep::All` copies all of history, so `history` is what
-makes background cycles worthwhile. The copy holds a map from hash to offset, about 50 bytes per
-object, and about 70 bytes per commit for where each entry was copied and what its copy keeps.
+A cycle reads, verifies, recompresses and writes everything retained, in one thread. `ferro
+compact` of a file in the page cache, keeping everything, ran at 180 MB/s on 189 MB of table rows,
+200,000 rows and 40,000 updates in 383,364 objects, and at 570 MB/s on 331 MB of a million 320 byte
+values in 124,939 objects, on 2026-11-04. So a 10 GB database takes up to a minute and needs 10 GB
+free. The trigger keeps that to one extra byte copied per byte written, at worst. `Keep::All` copies
+all of history, so `history` is what makes background cycles worthwhile. The copy holds a map from
+hash to offset, about 50 bytes per object, and about 70 bytes per commit for where each entry was
+copied and what its copy keeps.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the

@@ -1,8 +1,10 @@
 # ferro documentation
 
 The guides describe what ferro does and how to use it. The internals describe how it works, what
-each part costs, and what was measured and left out on the way. Start with
-[Getting started](guide/getting-started.md).
+each part costs, and what was measured and left out on the way. Their figures were measured when
+each change landed, often on a machine shared with other work, and record the decisions they
+informed. [Performance](guide/performance.md) has the current figures, all measured on 2026-11-04
+on one idle machine. Start with [Getting started](guide/getting-started.md).
 
 ## Guides
 

@@ -62,7 +62,7 @@ explained or undone from the history, and corruption surfaces as an error rather
   `refresh`.
 - **Ad hoc queries.** There is no query language or planner. You choose the index, and an index
   lookup reads each row separately unless the index covers the fields it needs.
-- **Very large files.** A reclamation cycle copies everything retained at about 50 MB/s and needs
+- **Very large files.** A reclamation cycle copies everything retained at 180 to 570 MB/s and needs
   that much free disk, and a first sync keeps under 500 bytes per object in memory.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
   measured, and failed syncs and process death are tested on Unix only.

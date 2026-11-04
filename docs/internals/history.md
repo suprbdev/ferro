@@ -158,7 +158,7 @@ and claims nothing.
 The cost is drift. A branch that stamps more than 1,000 commits a second takes times ahead of the
 clock by a millisecond for each one past that rate, and the clock catches up once the rate falls.
 Stamping every commit would make `as_of` exact for any commit's time without asking, but a plain
-commit takes 27 µs with buffered durability, so a busy writer would run seconds ahead within a
+commit takes about 24 µs with buffered durability, so a busy writer would run seconds ahead within a
 minute and `as_of(now)` would stop returning the head.
 
 The flag byte of an entry had one bit left. Bit 128 now says a varint of further flags follows the

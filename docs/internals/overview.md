@@ -49,7 +49,8 @@ Around it:
 
 - `ferro-derive`: the `Data` and `Record` derive macros, which `ferro` re-exports.
 - `ferro-cli`: the [`ferro` tool](../guide/cli.md).
-- `ferro-bench`: the benchmark tools the measurements in these files come from.
+- `ferro-bench`: the benchmark tools the measurements in these files come from. Those date from
+  when each change landed; [Performance](../guide/performance.md) has the current figures.
 - `benchmarks/compare`: the comparison with other embedded stores, excluded from the workspace.
 - `fuzz`: the `cargo-fuzz` targets, described under [Fuzzing](testing.md#fuzzing).
 - `examples`: the [example apps](../guide/examples.md).

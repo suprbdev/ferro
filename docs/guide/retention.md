@@ -54,8 +54,9 @@ to its size.
 ## Limits
 
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
-  miss the node cache are slower for a moment after each swap. It runs at about 50 MB/s, so a 10 GB
-  database takes minutes.
+  miss the node cache are slower for a moment after each swap. It ran at 180 MB/s on a file of small
+  table rows and 570 MB/s on one of 320 byte values, measured on 2026-11-04, so a 10 GB database
+  takes up to a minute.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.
