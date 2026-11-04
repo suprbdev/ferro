@@ -126,7 +126,7 @@ median of:
 | `watchers`, 5 | A Buffered single-key commit with 0, 1,000 and 10,000 parked watchers | 12.3, 12.0 and 12.1 µs, and 23, 57 and 375 µs at p50 to a watcher whose test passes |
 | `reclaim`, 3 | 15 s of fsync commits keeping 100 versions, a cycle every 64 MiB | Longest pause 2.9 ms on `metrics`, 3.8 ms on `ledger`, 4.4 ms on `wiki` and 2.8 ms on table updates, commits a second within 1% of no cycles |
 | `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.5 ms |
-| `ferro compact`, 3 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values | 1.07 and 0.58 s, 180 and 570 MB/s |
+| `reclaim copy`, 5 and 15 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on four threads since #63, measured with other work sharing the machine | 0.39 and 0.16 s, 489 and 2,067 MB/s, against 1.05 and 0.56 s before |
 
 ## Slower than before
 

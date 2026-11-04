@@ -15,12 +15,13 @@ copying stays proportional to what was written.
 1. Prune. One frame raises `first` on every branch. Branch state changes before anything else, so
    `at` stops serving a version before its objects are left behind.
 2. Copy, with no lock. Walk the published refs and write each reachable object to
-   `<file>.compacting`, re-emitting links with new offsets, verifying each object's hash and
-   compressing again. Chain entries are copied like anything else, but a link to an entry that is
-   past `first` and was not brought in by a retained merge, as described under [Merges and
-   pruning](merging.md#merges-and-pruning), is written with offset 0 instead of being followed, and
-   so is a skip link below where the entry's `prev` links reach. Copies are keyed by hash, and
-   entries by the offset they were read from, as described under [Commits stored
+   `<file>.compacting`, re-emitting links with new offsets behind each body as it is stored, while
+   up to three other threads verify each object's hash, as described under [The copy on several
+   threads](#the-copy-on-several-threads). Chain entries are copied like anything else, but a link
+   to an entry that is past `first` and was not brought in by a retained merge, as described under
+   [Merges and pruning](merging.md#merges-and-pruning), is written with offset 0 instead of being
+   followed, and so is a skip link below where the entry's `prev` links reach. Copies are keyed by
+   hash, and entries by the offset they were read from, as described under [Commits stored
    twice](sync-receive.md#commits-stored-twice), so a later pass from newer refs visits only what is
    new. An entry's copy also records how much history it was made for, and a walk that needs more
    copies the record again, as described under [Copies made for less
@@ -103,6 +104,162 @@ pause varied by up to 1.8 times between runs: from 7.2 to 5.9 ms over four alter
 64 branches, and from 12.2 to 12.9 ms over ten at 256. A run at 256 branches that counted them
 copied no entry twice, so only the bookkeeping differs.
 
+## The copy on several threads
+
+Until #63 the copy did everything for an object on the thread that walked to it: it read the
+record, decompressed the body, checked the hash, encoded the links with their new offsets,
+compressed the body again and appended the record. Timers around each step of `ferro compact`,
+keeping everything, of the two files under [Limits](#limits), on 2026-11-04 on a machine other work
+was sharing:
+
+| Step | 189 MB of table rows | 331 MB of 320 byte values |
+| --- | ---: | ---: |
+| Walking the chains before the copy | 36 ms | 0 ms |
+| Reading records, in 467,728 and 218,384 `pread`s | 113 ms | 48 ms |
+| Decompressing, 241 MB and none | 63 ms | 0 ms |
+| Checking hashes, over 241 and 327 MB | 318 ms | 278 ms |
+| Compressing again | 179 ms | 46 ms |
+| Relinking and the rest of the walk | 279 ms | 56 ms |
+| Writing | 18 ms | 32 ms |
+| Syncing the new file | 40 ms | 61 ms |
+| All of it | 1.07 s | 0.53 s |
+
+None of the 320 byte values compresses, so their 46 ms went on attempts that failed. Four changes
+take most of the rest away.
+
+- A body is copied as it is stored. A record keeps its links after the body and compresses only the
+  body, and the hash covers the body before compression, so a new offset in a link never changes
+  the body's bytes. The copy writes the stored bytes, compressed or not, behind the new links. LZ4
+  is deterministic, so a file written by this version copies to the same bytes as before: `cmp`
+  found the copies of both files identical to those the old copy made. A body stored raw that would
+  compress, which no writer in this version produces, stays raw.
+- Hashes are checked on other threads. The walk reads a record without decompressing it, takes its
+  links and appends its bytes to a batch. A batch of 256 KiB or 4,096 records goes to one of up to
+  three threads, which decompress each record in it into a buffer of their own, hash it and compare
+  the hash with the pointer the walk reached it by. The walking thread still writes every record,
+  in the order it finishes them, so it assigns offsets as before, each parent after its children,
+  and the file is the same byte for byte at any number of threads. A pass returns only once every
+  batch is checked, and the pause checks what it copied before it seals, so no record reaches a
+  named file unchecked. The first failure fails the pass with the error the check found, and a
+  panic on a checking thread is raised again on the walking thread.
+- The new file is written back as it grows. After each 1 MiB it writes, the copy asks Linux to start
+  writing that range to disk with `sync_file_range`, which waits only for room in the device's
+  queue and makes nothing durable. The `fdatasync` before the rename is left with the last part,
+  and fell from 40 and 61 ms to about 1 ms. Other targets have no such call and sync as before.
+- The walk does less for each object. It parses a record in its read buffer when the record fits
+  there, writes an object whose links are all copied without holding it on its stack, reuses the
+  buffers of the objects it does hold, and keys copies by the first 8 bytes of the hash, which
+  BLAKE3 has already mixed, instead of SipHash.
+
+Checking later means the walk follows the links of objects it has not checked yet. A damaged link
+can only send it to a wrong offset, which it reads with the usual bounds and record checks, and it
+looks for a failed batch before every read. It runs ahead of the checks by at most the batches
+queued, two for each checking thread, and one being checked on each, ten batches with three
+threads, so it follows damage no further than that, and a loop in damaged links ends there too.
+Chain entries are the exception: the walk decodes an entry to find its `prev` and skip links, so it
+checks each entry on its own thread before decoding it, as it did before, which took 11 ms for
+40,000 entries.
+
+`Options::copy_threads` sets how many threads a cycle copies with, the caller's included, and 0, the
+default, takes the number of cores, at most 4. With 1 the copy checks each record as it reads it
+and starts no thread. The checking threads start when the first batch fills, so a cycle that copies
+less than 256 KiB starts none, and they stop when the cycle ends. `admin::compact` uses the same
+copy with the default.
+
+`ferro-bench --bin reclaim copy` copies a file aside and times `Db::compact` keeping everything on
+it, one thread count after another, against the same tool built on the tree before. On 2026-11-04,
+medians of five rounds for the table rows, of fifteen in three sets for the values and of three for
+the large files:
+
+| File | Before | 1 thread | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 189 MB of table rows, 383,364 objects | 1.05 s | 0.80 s | 0.48 s | 0.39 s | 0.38 s |
+| 331 MB of 320 byte values, 124,939 objects | 0.56 s | 0.44 s | 0.33 s | 0.16 s | 0.15 s |
+| 1.14 GB of table rows, 2,130,227 objects | 6.81 s | 5.29 s | 3.17 s | 2.55 s | 2.58 s |
+| 1.32 GB of 320 byte values, 500,168 objects | 2.42 s | 1.67 s | 1.25 s | 0.91 s | 0.58 s |
+
+That is 180 against 489 MB/s on the first file at 4 threads, 596 against 2,067 MB/s on the
+second, 167 against 446 on the third and 548 against 1,457 on the fourth. The 1-minute load average
+was 1.1 for the table rows and 1 to 11 for the others, from other work, and runs spread as other
+work used the disk: the values from 0.13 to 1.05 s at 4 threads and the last file from 0.56 to
+1.30 s, whose fastest runs took 2.13 s before and 0.56 s at 4 threads. The large files are a
+million rows with 200,000 updates and four million values, built under `target/` with `ferro-bench
+--bin reclaim table` and `--bin clone build`.
+
+At 4 threads the copy of the table rows spent its time like this, the walking thread's share in
+order:
+
+| Step | Time |
+| --- | ---: |
+| Walking the chains before the copy | 36 ms |
+| Reading records, in 383,362 `pread`s | 139 ms |
+| Looking up 2,852,005 links | 48 ms |
+| Writing records and recording where they went | 66 ms |
+| Checking 40,001 chain entries before decoding them | 11 ms |
+| Copying bodies of objects it holds, and filling batches | 18 ms |
+| The rest of the walk | 92 ms |
+| Syncing the new file | 1 ms |
+| All of it | 0.42 s |
+| Checking batches, on the other threads | 0.43 s of CPU |
+
+So the walking thread is now the limit, and more than four threads change nothing measurable. A
+record it reads takes 360 ns of the walk, where the same `pread`s in a loop of nothing else take
+215 ns: most of history is a path of nine or so objects for each version, each found from the one
+above it and scattered across the file, and a lookup or a read that misses the cache waits for
+memory.
+
+The map of copies is as big as before, about 50 bytes an object and 70 a commit. The threads add up
+to twenty batches with three checking threads, ten in flight and as many spare, each of 256 to 512
+KiB unless one record is larger, and a buffer of up to 1 MiB on each thread for decompressing. The
+walk keeps up to 64 sets of buffers for the objects it holds, at most 4 MiB.
+
+The pause is unchanged and a cycle is shorter. Alternating runs of `ferro-bench --bin reclaim
+live` as under [Measurements](#measurements), on 2026-11-04 with the load average at 1 to 2,
+medians of six runs each on table updates and three on `ledger`: the longest pause in a run was
+2.96 ms before and 2.98 ms after on table updates, and 3.14 and 2.95 ms on `ledger`. A cycle took
+0.19 s before and 0.12 s after on table updates, and 0.16 and 0.15 s on `ledger`, which retains far
+less. Commits a second were 4,437 and 4,831 on table updates and 4,929 and 4,937 on `ledger`, and
+p99 on `ledger` 1.22 and 1.24 ms. Other work's syncs on the disk halved the commits of four of the
+twelve table runs, two of each build.
+
+`reclaim_threads.rs` compares the files copied at 1, 2 and 4 threads byte for byte, checks that
+every record follows its children and that the records tile the copy, damages a record only old
+history reaches and expects the cycle and `admin::compact` to fail at its offset with no temp file
+left and the database still working, and counts the checking threads at a small and a large cycle.
+`reclaim_crash.rs` cuts the power at every third operation of two cycles whose copies span several
+batches, `reclaim_fault.rs` shuts a writer down while three threads check a copy slowed in its
+writes, and the unit tests damage one record in 30,000 at each batch boundary and drop a verifier
+with batches queued. `epoch_stress.rs`, the unit tests and `reclaim_threads.rs` pass under
+AddressSanitizer and ThreadSanitizer.
+
+### Measured and left out
+
+- Reading a node's children in one read. When the children still to copy lay within 256 KiB and
+  averaged at most 16 KiB apart, the walk read the whole span once and parsed them from it, which
+  meant looking up an object's links when it was read rather than when the walk reached them. On
+  the values 110,105 of 124,937 records came from such a read, and reading fell from 59 to 40 ms,
+  but copying each record out of the span cost as much again, and alternating runs took 0.21 to
+  0.27 s either way. On the table rows only 6,100 spans formed, the early lookups took 55 to 61 ms
+  against 51 to 53, and the copy took 0.48 to 0.51 s against 0.45 to 0.46.
+- Reading the file from memory. With the whole file read into memory first, which a mapping would
+  approach, reading the table rows' records took 141 to 146 ms against 169 to 172 with `pread`s,
+  loading the file included, because a record far from the last one misses the cache either way.
+  That is under a tenth of the walk, for unsafe code and a mapping that a file truncated under it
+  turns into `SIGBUS`.
+- Fetching ahead on the checking threads. Not built. The walk needs an object's links before it can
+  go on, and most objects in the table rows' history lie on the path of one version from its root,
+  each found only from the one above, so a thread fetching ahead would have nothing to fetch until
+  the walk got there, and the walk would wait for it instead of for a read. Where a node's children
+  could be fetched together, the walk would still copy each record out of the other thread's
+  buffer, at a cost close to the `pread`'s.
+- Copying independent subtrees in parallel. Not built. A link is a delta from its record to its
+  target, so a subtree written by another thread before its place in the file is known needs its
+  links out of the subtree rewritten when it is placed, and a varint that changes length moves
+  every record after it. Copies are also shared by hash across subtrees, so two threads would copy
+  one object twice or wait for each other, and most of history is shared that way. Reading is what
+  such a copy would take off the walking thread, 139 of its 380 ms on the table rows; writing,
+  relinking and the map of copies stay on one thread.
+
 ## Generations
 
 A `Store` is one generation: a file, a node cache, a dedupe cache and an id. Offsets mean nothing
@@ -151,7 +308,9 @@ found after a crash. Both slots are written so that one damaged sector cannot lo
 with no commits yet.
 
 A failed copy, a full disk or a failed rename removes the temp file and reports the error from
-`Db::compact` or in `Space::last_error`, and commits never notice. A store poisoned while a cycle
+`Db::compact` or in `Space::last_error`, and commits never notice. So does an object that fails its
+hash check on any of the copy's threads, since a pass waits for every check before it returns. The
+writeback the copy starts as it goes makes nothing durable, so the order above is unchanged. A store poisoned while a cycle
 copied stays poisoned, because the swap checks first. On Unix the new file takes the old one's mode
 and owner, and a path through a symlink stays a symlink. Windows changes how the rename and its sync
 work, but not this order, as described under [Windows](windows.md#renaming-over-an-open-file).
@@ -160,7 +319,9 @@ work, but not this order, as described under [Windows](windows.md#renaming-over-
 
 Four workloads ran for 15 seconds each on the test NVMe with ext4, with fsync, keeping the last 100
 versions and starting a cycle every 64 MiB. These are medians of three runs of `ferro-bench --bin
-reclaim live`, on 2026-11-04 with nothing else running:
+reclaim live`, on 2026-11-04 with nothing else running, before the copy ran on several threads; how
+that changed pauses and commits is under [The copy on several
+threads](#the-copy-on-several-threads):
 
 | Workload | Commits/s without cycles | With cycles | Longest pause | File after a cycle | Live | Grows to without cycles |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -223,14 +384,18 @@ comparison was made on one base, before value columns landed:
 
 ## Limits
 
-A cycle reads, verifies, recompresses and writes everything retained, in one thread. `ferro
-compact` of a file in the page cache, keeping everything, ran at 180 MB/s on 189 MB of table rows,
-200,000 rows and 40,000 updates in 383,364 objects, and at 570 MB/s on 331 MB of a million 320 byte
-values in 124,939 objects, on 2026-11-04. So a 10 GB database takes up to a minute and needs 10 GB
-free. The trigger keeps that to one extra byte copied per byte written, at worst. `Keep::All` copies
-all of history, so `history` is what makes background cycles worthwhile. The copy holds a map from
-hash to offset, about 50 bytes per object, and about 70 bytes per commit for where each entry was
-copied and what its copy keeps.
+A cycle reads and writes everything retained on one thread and checks it on up to three others,
+as described under [The copy on several threads](#the-copy-on-several-threads). On 2026-11-04 the
+copy of a file in the page cache, keeping everything, ran at 489 MB/s on 189 MB of table rows,
+200,000 rows and 40,000 updates in 383,364 objects, and at 2,067 MB/s on 331 MB of a million 320
+byte values in 124,939 objects, with 4 threads, where it ran at 180 and 596 MB/s on one thread
+before. On one thread it now runs at 236 and 755 MB/s. So a 10 GB database of table rows takes
+about 20 seconds and needs 10 GB free. The trigger keeps that to one extra byte copied per byte
+written, at worst. The walking thread is the limit, at 450 to 500 MB/s on table rows however many
+threads check. `Keep::All` copies all of history, so `history` is what makes background cycles
+worthwhile. The copy holds a map from hash to offset, about 50 bytes per object, about 70 bytes per
+commit for where each entry was copied and what its copy keeps, and about 20 MiB of buffers at
+most.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the
@@ -243,7 +408,7 @@ then scaled by the share that survived the last cycle. Before the first cycle it
 
 ## Offline compaction
 
-`admin::compact` is the same copy in one pass, with no writer running. It prunes by raising `first`
-in a private copy of the refs and needs no user types. The copy is iterative, because a chain is as
-deep as the number of commits. A read-only handle follows it on `refresh` the same way it follows a
-cycle.
+`admin::compact` is the same copy in one pass, on the same threads, with no writer running. It
+prunes by raising `first` in a private copy of the refs and needs no user types. The copy is
+iterative, because a chain is as deep as the number of commits. A read-only handle follows it on
+`refresh` the same way it follows a cycle.

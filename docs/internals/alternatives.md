@@ -125,6 +125,9 @@ numbers. This index lists them by subsystem.
 
 - Hole punching, copying sparse runs to the tail, and a segmented log:
   [Measurements](reclamation.md#measurements).
+- Reading a node's children in one read, reading the file from memory, fetching ahead on the
+  checking threads, and copying subtrees in parallel: [Measured and left
+  out](reclamation.md#measured-and-left-out).
 - `File::lock`, `ReOpenFile`, generation-numbered files, and deleting before renaming:
   [Windows](windows.md).
 
