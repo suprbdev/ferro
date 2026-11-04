@@ -406,12 +406,26 @@ fn a_dropped_coalesced_write_does_not_strand_its_group() {
             let mut futures: Vec<_> = (0..8u64)
                 .map(|key| Box::pin(marked(&db, &ran, round * 8 + key, round)))
                 .collect();
-            for future in &mut futures {
-                let _ = poll_once(future);
-            }
+            let mut early: Vec<_> = futures
+                .iter_mut()
+                .map(|future| match poll_once(future) {
+                    Poll::Ready(out) => Some(out),
+                    Poll::Pending => None,
+                })
+                .collect();
             let kept = futures.split_off(4);
+            let kept_early = early.split_off(4);
             drop(futures);
-            for done in join_all(kept) {
+            let mut pending = Vec::new();
+            for (future, out) in kept.into_iter().zip(kept_early) {
+                match out {
+                    Some(out) => {
+                        out.unwrap();
+                    }
+                    None => pending.push(future),
+                }
+            }
+            for done in join_all(pending) {
                 done.unwrap();
             }
             let blocking = db.update(|root| root.len()).unwrap();
@@ -591,7 +605,7 @@ fn a_panic_in_an_async_closure_unwinds_to_its_poller() {
         let mut good = Box::pin(db.update_async(|root| {
             root.insert(2, 2);
         }));
-        let _ = poll_once(&mut good);
+        let early = poll_once(&mut good);
         let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
             block_on(db.update_async(|root| {
                 root.insert(3, 3);
@@ -599,7 +613,10 @@ fn a_panic_in_an_async_closure_unwinds_to_its_poller() {
             }))
         }));
         assert!(unwound.is_err(), "{kind}");
-        block_on(good).unwrap();
+        match early {
+            Poll::Ready(out) => out.unwrap(),
+            Poll::Pending => block_on(good).unwrap(),
+        }
         block_on(db.update_async(|root| {
             root.insert(4, 4);
         }))
@@ -729,10 +746,21 @@ fn record(path: &Path, options: fn() -> Options, durable: bool, seed: u64) -> Re
                 })
                 .collect();
             if rng.chance(30) {
-                for future in &mut futures {
-                    let _ = poll_once(future);
+                let mut early: Vec<_> = futures.iter_mut().map(poll_once).collect();
+                let keep = futures.len() / 2;
+                futures.truncate(keep);
+                early.truncate(keep);
+                let mut pending = Vec::new();
+                for (future, out) in futures.into_iter().zip(early) {
+                    match out {
+                        Poll::Ready(out) => {
+                            out.unwrap();
+                            db.trace_op(Op::Acked(db.version()));
+                        }
+                        Poll::Pending => pending.push(future),
+                    }
                 }
-                futures.truncate(futures.len() / 2);
+                futures = pending;
             }
             let acked: Vec<_> = futures
                 .into_iter()
