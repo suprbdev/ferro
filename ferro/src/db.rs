@@ -247,9 +247,14 @@ struct RefState {
     depth: usize,
 }
 
+pub(crate) struct Cycles<'a> {
+    _across: Option<Held>,
+    _local: MutexGuard<'a, ()>,
+}
+
 struct Tip<'a> {
-    guard: MutexGuard<'a, RefState>,
     commit: Option<Held>,
+    guard: MutexGuard<'a, RefState>,
 }
 
 impl Deref for Tip<'_> {
@@ -1368,6 +1373,16 @@ impl<T: Data> Shared<T> {
         lane
     }
 
+    fn attached_since(&self, branches: &[Arc<Branch<T>>]) -> bool {
+        let attached = self.branches.lock();
+        attached.len() != branches.len()
+            || !branches.iter().all(|branch| {
+                attached
+                    .get(&branch.name)
+                    .is_some_and(|now| Arc::ptr_eq(now, branch))
+            })
+    }
+
     fn exclusively<R>(&self, f: impl FnOnce(&mut RefState) -> Result<R>) -> Result<R> {
         let mut notices = Vec::new();
         loop {
@@ -1376,21 +1391,19 @@ impl<T: Data> Shared<T> {
             let mut lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
             lanes.iter_mut().for_each(Lane::uncross);
             let store = self.store();
-            let range = store.is_shared().then(|| store.lock_lanes()).transpose()?;
+            let stale = || self.attached_since(&branches);
+            let range = match store.is_shared() {
+                true => match store.lock_lanes(stale)? {
+                    Some(range) => Some(range),
+                    None => continue,
+                },
+                false => None,
+            };
             let mut tip = self.tip.lock();
             let commit = store.is_shared().then(|| store.lock_commit()).transpose()?;
             let current = self.store().id() == store.id()
                 && self.follow(&mut tip, &mut notices)? != Caught::Swapped;
-            let attached = self.branches.lock();
-            let same = current
-                && attached.len() == branches.len()
-                && branches.iter().all(|branch| {
-                    attached
-                        .get(&branch.name)
-                        .is_some_and(|now| Arc::ptr_eq(now, branch))
-                });
-            drop(attached);
-            if same {
+            if current && !self.attached_since(&branches) {
                 let whole = reentry::whole(self.id);
                 let out = f(&mut tip);
                 drop(whole);
@@ -3644,10 +3657,13 @@ impl<T: Data> Db<T> {
         store.check_healthy()
     }
 
-    pub(crate) fn hold_cycles(&self) -> Result<(MutexGuard<'_, ()>, Option<Held>)> {
+    pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_>> {
         let local = self.shared.cycle.lock();
         let across = self.shared.hold_cycle(true)?;
-        Ok((local, across))
+        Ok(Cycles {
+            _across: across,
+            _local: local,
+        })
     }
 
     pub(crate) fn append_frame<X>(

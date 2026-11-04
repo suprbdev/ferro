@@ -708,8 +708,18 @@ pub(crate) struct Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let _ = platform::unlock_range(&self.store.inner.file, self.at, self.len);
+        let inner = &self.store.inner;
+        let mut taken = inner.taken.lock();
+        let _ = platform::unlock_range(&inner.file, self.at, self.len);
+        taken.retain(|at| *at != self.at);
+        inner.freed.notify_all();
     }
+}
+
+#[derive(Default)]
+struct Lanes {
+    held: HashMap<u64, Option<usize>>,
+    whole: bool,
 }
 
 pub(crate) struct AllLanes {
@@ -719,22 +729,10 @@ pub(crate) struct AllLanes {
 impl Drop for AllLanes {
     fn drop(&mut self) {
         let inner = &self.store.inner;
-        let lanes = inner.lanes.lock();
-        let mut held: Vec<u64> = lanes.keys().copied().collect();
-        if cfg!(windows) {
-            held.clear();
-        }
-        held.sort_unstable();
-        let mut at = LANES_AT;
-        for byte in held {
-            if byte > at {
-                let _ = platform::unlock_range(&inner.file, at, byte - at);
-            }
-            at = byte + 1;
-        }
-        if at < LANES_AT + LANES {
-            let _ = platform::unlock_range(&inner.file, at, LANES_AT + LANES - at);
-        }
+        let mut lanes = inner.lanes.lock();
+        let _ = platform::unlock_range(&inner.file, LANES_AT, LANES);
+        lanes.whole = false;
+        inner.lanes_moved.notify_all();
     }
 }
 
@@ -870,8 +868,10 @@ struct Inner {
     lost_at: AtomicU64,
     unsynced: AtomicBool,
     closed: AtomicBool,
-    lanes: Mutex<HashMap<u64, Option<usize>>>,
+    lanes: Mutex<Lanes>,
     lanes_moved: Condvar,
+    taken: Mutex<Vec<u64>>,
+    freed: Condvar,
     options: StoreOptions,
 }
 
@@ -1002,8 +1002,10 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                lanes: Mutex::new(HashMap::new()),
+                lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
+                taken: Mutex::new(Vec::new()),
+                freed: Condvar::new(),
                 options,
             }),
         };
@@ -1192,7 +1194,7 @@ impl Store {
 
     fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
         let inner = &self.inner;
-        let _held = Range::hold(&inner.file, SUPER_AT, true)?;
+        let _held = self.hold(SUPER_AT, 1, true)?;
         let newest = newest_super(&inner.file)?;
         let mark = frame.mark();
         if durable && newest.is_some_and(|(found, _)| found.anchor.seq >= frame.seq) {
@@ -1281,7 +1283,10 @@ impl Store {
 
     fn write_super(&self, sb: &Super) -> Result<()> {
         let inner = &self.inner;
-        let _held = Range::hold(&inner.file, SUPER_AT, inner.options.shared)?;
+        let _held = match inner.options.shared {
+            true => self.hold(SUPER_AT, 1, true)?,
+            false => None,
+        };
         let slot = match inner.options.shared {
             false => 1 - inner.slot.load(Ordering::Relaxed),
             true => match newest_super(&inner.file)? {
@@ -1302,14 +1307,30 @@ impl Store {
     }
 
     fn hold(&self, at: u64, len: u64, wait: bool) -> Result<Option<Held>> {
-        match platform::lock_range(&self.inner.file, at, len, true, wait) {
-            Ok(()) => Ok(Some(Held {
+        let inner = &self.inner;
+        let mut taken = inner.taken.lock();
+        while taken.contains(&at) {
+            if !wait {
+                return Ok(None);
+            }
+            inner.freed.wait(&mut taken);
+        }
+        taken.push(at);
+        drop(taken);
+        let locked = platform::lock_range(&inner.file, at, len, true, wait);
+        if locked.is_ok() {
+            return Ok(Some(Held {
                 store: self.clone(),
                 at,
                 len,
-            })),
-            Err(TryLockError::WouldBlock) => Ok(None),
+            }));
+        }
+        let mut taken = inner.taken.lock();
+        taken.retain(|held| *held != at);
+        inner.freed.notify_all();
+        match locked {
             Err(TryLockError::Error(error)) => Err(error.into()),
+            _ => Ok(None),
         }
     }
 
@@ -1317,16 +1338,37 @@ impl Store {
         self.hold(COMMIT_AT, 1, true)?.ok_or(Error::Locked)
     }
 
-    pub(crate) fn lock_lanes(&self) -> Result<AllLanes> {
-        platform::lock_range(&self.inner.file, LANES_AT, LANES, true, true).map_err(|error| {
-            match error {
+    pub(crate) fn lock_lanes(&self, stale: impl Fn() -> bool) -> Result<Option<AllLanes>> {
+        let inner = &self.inner;
+        let mut lanes = inner.lanes.lock();
+        while lanes.whole {
+            inner.lanes_moved.wait(&mut lanes);
+        }
+        lanes.whole = true;
+        while !lanes.held.is_empty() {
+            inner
+                .lanes_moved
+                .wait_for(&mut lanes, Duration::from_millis(1));
+            drop(lanes);
+            let stale = stale();
+            lanes = inner.lanes.lock();
+            if stale {
+                lanes.whole = false;
+                inner.lanes_moved.notify_all();
+                return Ok(None);
+            }
+        }
+        drop(lanes);
+        let all = AllLanes {
+            store: self.clone(),
+        };
+        platform::lock_range(&inner.file, LANES_AT, LANES, true, true).map_err(
+            |error| match error {
                 TryLockError::Error(error) => Error::Io(error),
                 TryLockError::WouldBlock => Error::Locked,
-            }
-        })?;
-        Ok(AllLanes {
-            store: self.clone(),
-        })
+            },
+        )?;
+        Ok(Some(all))
     }
 
     pub(crate) fn lock_cycle(&self, wait: bool) -> Result<Option<Held>> {
@@ -1345,7 +1387,14 @@ impl Store {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
         loop {
-            match lanes.get_mut(&at) {
+            if lanes.whole {
+                match wait {
+                    true => inner.lanes_moved.wait(&mut lanes),
+                    false => return Ok(false),
+                }
+                continue;
+            }
+            match lanes.held.get_mut(&at) {
                 Some(Some(count)) => {
                     *count += 1;
                     return Ok(true);
@@ -1355,13 +1404,13 @@ impl Store {
                 None => break,
             }
         }
-        lanes.insert(at, None);
+        lanes.held.insert(at, None);
         drop(lanes);
         let locked = platform::lock_range(&inner.file, at, 1, true, wait);
         let mut lanes = inner.lanes.lock();
         match locked {
-            Ok(()) => lanes.insert(at, Some(1)),
-            Err(_) => lanes.remove(&at),
+            Ok(()) => lanes.held.insert(at, Some(1)),
+            Err(_) => lanes.held.remove(&at),
         };
         inner.lanes_moved.notify_all();
         match locked {
@@ -1374,11 +1423,12 @@ impl Store {
     pub(crate) fn unlock_lane(&self, at: u64) {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
-        match lanes.get_mut(&at) {
+        match lanes.held.get_mut(&at) {
             Some(Some(count)) if *count > 1 => *count -= 1,
             _ => {
-                lanes.remove(&at);
+                lanes.held.remove(&at);
                 let _ = platform::unlock_range(&inner.file, at, 1);
+                inner.lanes_moved.notify_all();
             }
         }
     }

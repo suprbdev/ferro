@@ -1,9 +1,13 @@
 mod common;
 
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
+use std::task::{Context, Waker};
 use std::thread;
+use std::time::Duration;
 
 use common::fast;
+use ferro::db::Hook;
 use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim};
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
@@ -338,4 +342,131 @@ fn background_cycles_in_several_handles_run_one_at_a_time() {
     let db: Db<Root> = Options::new().open(&path).unwrap();
     check_chain(&db.read(), 3, each);
     db.verify().unwrap();
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Padded {
+    n: u64,
+    pad: Vec<u64>,
+}
+
+#[test]
+fn threads_of_two_handles_on_branches_of_their_own_place_in_turn() {
+    for _ in 0..common::cases(3) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tip.ferro");
+        let p: Db<Padded> = shared().open(&path).unwrap();
+        let q: Db<Padded> = shared().open(&path).unwrap();
+        let mut branches = Vec::new();
+        for (h, db) in [&p, &q].into_iter().enumerate() {
+            for t in 0..4 {
+                let name = format!("b{h}{t}");
+                branches.push(db.fork(&name).unwrap());
+            }
+        }
+        let each = 300u64;
+        let barrier = Arc::new(Barrier::new(branches.len()));
+        let threads: Vec<_> = branches
+            .into_iter()
+            .map(|db| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 1..=each {
+                        db.update(|root| {
+                            root.n += 1;
+                            root.pad = vec![i; (i % 7) as usize * 50];
+                        })
+                        .unwrap();
+                    }
+                    db.branch_name().to_string()
+                })
+            })
+            .collect();
+        let names: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        drop((p, q));
+        let db: Db<Padded> = Options::new().open(&path).unwrap();
+        for name in &names {
+            assert_eq!(db.branch(name).unwrap().read().n, each, "{name}");
+        }
+        db.verify().unwrap();
+    }
+}
+
+fn hooked(steps: &[&'static str]) -> (Hook, mpsc::Receiver<&'static str>, Arc<Barrier>) {
+    let (sender, receiver) = mpsc::channel();
+    let sender = parking_lot::Mutex::new(sender);
+    let resume = Arc::new(Barrier::new(2));
+    let steps: Vec<&'static str> = steps.to_vec();
+    let paused = resume.clone();
+    let hook = Hook(Arc::new(move |step| {
+        if steps.contains(&step) {
+            let _ = sender.lock().send(step);
+        }
+        if step == "paused" {
+            paused.wait();
+        }
+    }));
+    (hook, receiver, resume)
+}
+
+#[test]
+fn an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause() {
+    for _ in 0..common::cases(4) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hole.ferro");
+        let manual = Reclaim { every_bytes: 0 };
+        let (hook, steps, resume) = hooked(&["synced", "paused"]);
+        let a: Db<Root> = shared().reclaim(manual).hook(hook).open(&path).unwrap();
+        let b: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+        for i in 1..=3 {
+            bump(&a, 0, i);
+        }
+        let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let holder = {
+            let (b, entered, release) = (b.clone(), entered.clone(), release.clone());
+            thread::spawn(move || {
+                b.update(|root| {
+                    entered.wait();
+                    release.wait();
+                    root.n += 1;
+                })
+                .unwrap();
+            })
+        };
+        entered.wait();
+        let mut future = Box::pin(a.update_async(|root| root.n += 1));
+        let waker = Waker::from(Arc::new(Unpark(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        let cycler = {
+            let a = a.clone();
+            thread::spawn(move || a.compact(Keep::All))
+        };
+        assert_eq!(steps.recv().unwrap(), "synced");
+        thread::sleep(Duration::from_millis(50));
+        release.wait();
+        holder.join().unwrap();
+        assert_eq!(steps.recv().unwrap(), "paused");
+        let ran = Arc::new(AtomicBool::new(false));
+        let intruder = {
+            let (b, ran) = (b.clone(), ran.clone());
+            thread::spawn(move || {
+                b.update(|root| {
+                    ran.store(true, Ordering::Release);
+                    root.n += 1;
+                })
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        let inside = ran.load(Ordering::Acquire);
+        resume.wait();
+        cycler.join().unwrap().unwrap();
+        let intruded = intruder.join().unwrap();
+        while future.as_mut().poll(&mut cx).is_pending() {
+            thread::park_timeout(Duration::from_millis(20));
+        }
+        assert!(!inside, "a closure ran inside the pause: {intruded:?}");
+        intruded.unwrap();
+    }
 }
