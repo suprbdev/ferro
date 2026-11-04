@@ -221,9 +221,9 @@ in the model below.
 model bursts of 60 to 150 commits on one branch, which carry it past the 64-step bound, remotes
 dropped and landed again, and cycles that drop and land a remote again from a hook at their
 `created`, `copied` or `synced` step, with a commit after it half the time.
-`pruned_devices_committing_across_cycles_and_step_tables_count_each_event_once` does the same with
-pruned devices, but only commits from the hook. Every step checks `verify` and `verify_typed` on
-each device, a refreshed and a cold reader, and that each device counts every event once.
+`pruned_devices_relanding_remotes_across_cycles_and_step_tables_count_each_event_once` does the same
+with pruned devices. Every step checks `verify` and `verify_typed` on each device, a refreshed and a
+cold reader, and that each device counts every event once.
 
 Measured and left out:
 
@@ -234,14 +234,17 @@ Measured and left out:
   damaged table could no longer be planted between the copy and the pause, as
   `swapping_in_a_compacted_file_reports_a_damaged_branch_table` does.
 
-Left open:
+Left open until #55:
 
-- A head that lands while a cycle copies can run through entries a pass copied for a head that kept
-  less history, with the links below that head's `first` cut, and the pause takes those copies as
-  they are. With remotes landed again from the hook, seed 73 of the pruned sweep at a scale of 30
-  dropped a remote kept from v2, landed it again kept from v1 through the same records, and the
+- A head that lands while a cycle copies could run through entries a pass copied for a head that
+  kept less history, with the links below that head's `first` cut, and the pause took those copies
+  as they were. With remotes landed again from the hook, seed 73 of the pruned sweep at a scale of
+  30 dropped a remote kept from v2, landed it again kept from v1 through the same records, and the
   cycle's file failed `verify` with `commit log keeps versions from 1 but v2 links pruned history`.
-  The pruned sweep commits from the hook until a pass records what each copy cut.
+  Each entry's copy now records how much history it was made for, and a walk that needs more copies
+  the record again, as described under [Copies made for less
+  history](reclamation.md#copies-made-for-less-history). The pruned sweep lands remotes again from
+  the hook as the other does.
 
 ## Checking trees
 

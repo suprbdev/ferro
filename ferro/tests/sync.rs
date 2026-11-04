@@ -2564,3 +2564,230 @@ fn a_remote_landed_again_during_every_stage_of_a_cycle_verifies_and_reopens() {
         ferro::admin::verify(dir.path().join("c.ferro")).unwrap();
     }
 }
+
+type Armed = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+fn clocked(
+    dir: &TempDir,
+    name: &str,
+    now: &Arc<AtomicU64>,
+    keep: Keep,
+    hook: Option<(&str, Armed)>,
+) -> Db<Events> {
+    let now = now.clone();
+    let mut options = fast()
+        .history(keep)
+        .reclaim(Reclaim { every_bytes: 0 })
+        .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))));
+    if let Some((stage, armed)) = hook {
+        let stage = stage.to_string();
+        options = options.hook(Hook(Arc::new(move |name: &'static str| {
+            if name == stage
+                && let Some(job) = armed.lock().take()
+            {
+                job();
+            }
+        })));
+    }
+    options.open(dir.path().join(name)).unwrap()
+}
+
+fn land_aside(db: &Db<Events>, from: &Db<Events>, remote: &str) {
+    let aside = db.fork("aside").unwrap();
+    let pulled = aside.pull(from, remote, add_deltas).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    drop(aside);
+    db.drop_branch("aside").unwrap();
+}
+
+fn reland(db: &Db<Events>, from: &Db<Events>, remote: &str) -> Box<dyn FnOnce() + Send> {
+    let (db, from, remote) = (db.clone(), from.clone(), remote.to_string());
+    Box::new(move || {
+        if db.branches().contains(&remote) {
+            db.drop_branch(&remote).unwrap();
+        }
+        db.pull(&from, &remote, add_deltas).unwrap();
+    })
+}
+
+fn whole(db: &Db<Events>, name: &str, versions: u64, when: &str) {
+    db.verify()
+        .unwrap_or_else(|error| panic!("{when}: {error}"));
+    db.verify_typed()
+        .unwrap_or_else(|error| panic!("{when}: {error}"));
+    let log = db.branch(name).unwrap().log();
+    assert_eq!(log.len() as u64, versions, "{when}");
+    assert_eq!(log.iter().count(), log.len(), "{when}");
+    for version in 1..=versions {
+        assert!(log.get(&version).is_some(), "{when}: v{version}");
+    }
+}
+
+#[test]
+fn a_remote_landed_again_with_more_history_than_a_pass_copied_keeps_its_links() {
+    for stage in ["created", "copied", "synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let armed = Armed::default();
+        let a = clocked(&dir, "a.ferro", &now, Keep::All, None);
+        let c = clocked(
+            &dir,
+            "c.ferro",
+            &now,
+            Keep::All,
+            Some((stage, armed.clone())),
+        );
+        for at in 1..=7 {
+            event(&a, at);
+        }
+        land_aside(&c, &a, "a");
+        *armed.lock() = Some(reland(&c, &a, "a"));
+        c.compact(Keep::Last(3)).unwrap();
+        assert!(armed.lock().is_none(), "{stage}");
+        whole(&c, "a", 7, stage);
+        whole(&c, "main", 7, stage);
+        drop(c);
+        let c = clocked(&dir, "c.ferro", &now, Keep::All, None);
+        whole(&c, "a", 7, &format!("{stage} reopened"));
+        c.compact(Keep::All).unwrap();
+        whole(&c, "a", 7, &format!("{stage} after another cycle"));
+        drop(c);
+        ferro::admin::verify(dir.path().join("c.ferro")).unwrap();
+    }
+}
+
+#[test]
+fn a_skip_link_copied_after_its_target_was_copied_again_names_the_copy_on_its_chain() {
+    for stage in ["created", "copied", "synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let armed = Armed::default();
+        let a = clocked(&dir, "a.ferro", &now, Keep::All, None);
+        let b = clocked(&dir, "b.ferro", &now, Keep::All, None);
+        let c = clocked(
+            &dir,
+            "c.ferro",
+            &now,
+            Keep::Last(4),
+            Some((stage, armed.clone())),
+        );
+        for at in 1..=4 {
+            event(&a, at);
+        }
+        assert_eq!(
+            b.pull(&a, "a", add_deltas).unwrap().outcome,
+            Outcome::FastForward
+        );
+        event(&a, 5);
+        let side = c.fork("side").unwrap();
+        land_aside(&c, &a, "a");
+        *armed.lock() = Some(Box::new({
+            let (a, b, c, side) = (a.clone(), b.clone(), c.clone(), side.clone());
+            move || {
+                event(&a, 6);
+                c.pull(&a, "a", add_deltas).unwrap();
+                let pulled = side.pull(&b, "b", add_deltas).unwrap();
+                assert_eq!(pulled.outcome, Outcome::FastForward);
+                event(&side, 50);
+                c.drop_branch("b").unwrap();
+            }
+        }));
+        c.compact(Keep::Last(2)).unwrap();
+        assert!(armed.lock().is_none(), "{stage}");
+        assert_eq!(side.log().first().map(|(version, _)| version), Some(2));
+        drop(side);
+        c.drop_branch("side").unwrap();
+        c.verify()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        c.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        let log = c.branch("a").unwrap().log();
+        assert_eq!(log.len(), 3, "{stage}");
+        for version in 4..=6 {
+            assert!(log.get(&version).is_some(), "{stage}: v{version}");
+        }
+        drop(c);
+        ferro::admin::verify(dir.path().join("c.ferro")).unwrap();
+    }
+}
+
+#[test]
+fn a_remote_landed_again_past_a_merge_a_pass_cut_by_time_keeps_its_links() {
+    for stage in ["created", "copied", "synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let armed = Armed::default();
+        let a = clocked(&dir, "a.ferro", &now, Keep::All, None);
+        let c = clocked(
+            &dir,
+            "c.ferro",
+            &now,
+            Keep::All,
+            Some((stage, armed.clone())),
+        );
+        for at in 1..=5 {
+            event(&a, at);
+        }
+        event(&c, 10);
+        assert_eq!(
+            c.pull(&a, "a", add_deltas).unwrap().outcome,
+            Outcome::Merged
+        );
+        event(&c, 11);
+        c.drop_branch("a").unwrap();
+        *armed.lock() = Some(reland(&c, &a, "a"));
+        c.compact(Keep::Last(2)).unwrap();
+        assert!(armed.lock().is_none(), "{stage}");
+        whole(&c, "a", 5, stage);
+        drop(c);
+        let c = clocked(&dir, "c.ferro", &now, Keep::All, None);
+        whole(&c, "a", 5, &format!("{stage} reopened"));
+    }
+}
+
+#[test]
+fn a_remote_landed_again_through_a_merge_keeps_the_merged_history_a_pass_cut_by_time() {
+    for stage in ["created", "copied", "synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let armed = Armed::default();
+        let a = clocked(&dir, "a.ferro", &now, Keep::All, None);
+        let b = clocked(&dir, "b.ferro", &now, Keep::All, None);
+        let c = clocked(
+            &dir,
+            "c.ferro",
+            &now,
+            Keep::All,
+            Some((stage, armed.clone())),
+        );
+        let d = clocked(&dir, "d.ferro", &now, Keep::All, None);
+        event(&a, 1);
+        assert_eq!(
+            d.pull(&a, "a", add_deltas).unwrap().outcome,
+            Outcome::FastForward
+        );
+        event(&d, 20);
+        event(&a, 2);
+        event(&a, 3);
+        event(&b, 30);
+        assert_eq!(
+            b.pull(&a, "a", add_deltas).unwrap().outcome,
+            Outcome::Merged
+        );
+        event(&b, 31);
+        event(&b, 32);
+        land_aside(&c, &b, "b");
+        *armed.lock() = Some(reland(&c, &b, "b"));
+        c.compact(Keep::Last(3)).unwrap();
+        assert!(armed.lock().is_none(), "{stage}");
+        whole(&c, "b", 4, stage);
+        let pulled = c.pull(&d, "d", add_deltas).map(|pulled| pulled.outcome);
+        assert!(matches!(pulled, Ok(Outcome::Merged)), "{stage}: {pulled:?}");
+        let counts: BTreeMap<u32, i64> =
+            c.read().iter().map(|(key, value)| (key, *value)).collect();
+        let expected: BTreeMap<u32, i64> = [1, 2, 3, 20, 30, 31, 32].map(|key| (key, 1)).into();
+        assert_eq!(counts, expected, "{stage}");
+        c.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage} merged: {error}"));
+    }
+}

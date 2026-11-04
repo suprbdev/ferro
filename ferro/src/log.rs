@@ -306,31 +306,48 @@ impl Node {
 }
 
 type Seed = (u64, Option<u64>, Hash, u64);
+type Walks = Vec<(u64, Option<u64>)>;
 
 #[derive(Default)]
 pub(crate) struct Closures {
     queue: BinaryHeap<Reverse<Seed>>,
-    walked: HashMap<Hash, Vec<(u64, Option<u64>)>>,
+    walked: HashMap<(Hash, u64), Walks>,
+    exact: bool,
 }
 
 impl Closures {
-    pub(crate) fn seed(&mut self, entry: &Entry, after: Option<u64>) {
-        if let Some(merged) = entry.merged {
-            let Ptr { hash, offset } = merged.ptr;
-            self.queue
-                .push(Reverse((merged.floor, merged.after(after), hash, offset)));
+    pub(crate) fn exact() -> Closures {
+        Closures {
+            exact: true,
+            ..Closures::default()
         }
     }
 
-    pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
-        self.walked
-            .entry(ptr.hash)
-            .or_default()
-            .push((floor, after));
+    fn key(&self, ptr: Ptr) -> (Hash, u64) {
+        (ptr.hash, if self.exact { ptr.offset } else { 0 })
     }
 
-    fn covered(&self, hash: &Hash, floor: u64, after: Option<u64>) -> bool {
-        let walks = self.walked.get(hash).map_or(&[][..], Vec::as_slice);
+    pub(crate) fn seed(&mut self, entry: &Entry, after: Option<u64>) {
+        if let Some(merged) = entry.merged {
+            self.push(merged.ptr, merged.floor, merged.after(after));
+        }
+    }
+
+    pub(crate) fn push(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
+        self.queue
+            .push(Reverse((floor, after, ptr.hash, ptr.offset)));
+    }
+
+    pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
+        let key = self.key(ptr);
+        self.walked.entry(key).or_default().push((floor, after));
+    }
+
+    fn covered(&self, ptr: Ptr, floor: u64, after: Option<u64>) -> bool {
+        let walks = self
+            .walked
+            .get(&self.key(ptr))
+            .map_or(&[][..], Vec::as_slice);
         walks.iter().any(|(walked, bound)| {
             *walked <= floor
                 && match (bound, after) {
@@ -346,11 +363,21 @@ impl Closures {
         store: &Store,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
     ) -> Result<()> {
+        self.walk_bounded(store, |ptr, entry, object, len, _| {
+            each(ptr, entry, object, len)
+        })
+    }
+
+    pub(crate) fn walk_bounded(
+        &mut self,
+        store: &Store,
+        mut each: impl FnMut(Ptr, &Entry, &Object, u32, (u64, Option<u64>)) -> Result<bool>,
+    ) -> Result<()> {
         while let Some(Reverse((floor, after, hash, offset))) = self.queue.pop() {
             let mut next = Some(Ptr { hash, offset });
             let mut above = u64::MAX;
             while let Some(ptr) = next.take() {
-                if ptr.offset == 0 || self.covered(&ptr.hash, floor, after) {
+                if ptr.offset == 0 || self.covered(ptr, floor, after) {
                     break;
                 }
                 let (object, len) = store.read_record(ptr)?;
@@ -366,15 +393,12 @@ impl Closures {
                 }
                 if after.is_some_and(|after| entry.commit.time_ms < after) {
                     if first {
-                        each(ptr, &entry, &object, len)?;
+                        each(ptr, &entry, &object, len, (floor, after))?;
                     }
                     break;
                 }
-                self.walked
-                    .entry(ptr.hash)
-                    .or_default()
-                    .push((floor, after));
-                if !each(ptr, &entry, &object, len)? {
+                self.mark(ptr, floor, after);
+                if !each(ptr, &entry, &object, len, (floor, after))? {
                     break;
                 }
                 self.seed(&entry, after);

@@ -141,7 +141,9 @@ struct CopySink<'a> {
     copied: HashMap<Hash, Copied>,
     entries: HashSet<Hash>,
     records: HashMap<u64, u64>,
-    reach: HashMap<u64, u64>,
+    kept: Needs,
+    needs: Needs,
+    below: HashMap<u64, Below>,
     pruned: HashSet<Hash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
@@ -151,6 +153,86 @@ struct CopySink<'a> {
 enum Copied {
     Object(u64),
     Entry,
+}
+
+#[derive(Clone, Copy)]
+struct Below {
+    from: u64,
+    prev: u64,
+    skip: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Need {
+    floor: u64,
+    after: u64,
+}
+
+impl Need {
+    fn new(floor: u64, after: Option<u64>) -> Need {
+        Need {
+            floor,
+            after: after.map_or(0, |after| after.saturating_add(1)),
+        }
+    }
+
+    fn after(self) -> Option<u64> {
+        self.after.checked_sub(1)
+    }
+
+    fn covers(self, other: Need) -> bool {
+        self.floor <= other.floor && self.after <= other.after
+    }
+}
+
+#[derive(Default)]
+struct Needs {
+    one: HashMap<u64, Need>,
+    more: HashMap<u64, Vec<Need>>,
+}
+
+impl Needs {
+    fn covers(&self, at: u64, need: Need) -> bool {
+        let more = self.more.get(&at).into_iter().flatten();
+        self.one
+            .get(&at)
+            .into_iter()
+            .chain(more)
+            .any(|kept| kept.covers(need))
+    }
+
+    fn take(&mut self, at: u64) -> impl Iterator<Item = Need> + use<> {
+        let more = self.more.remove(&at).into_iter().flatten();
+        self.one.remove(&at).into_iter().chain(more)
+    }
+
+    fn add(&mut self, at: u64, need: Need) {
+        let Some(one) = self.one.get(&at).copied() else {
+            self.one.insert(at, need);
+            return;
+        };
+        let mut kept = vec![one];
+        kept.extend(self.more.remove(&at).into_iter().flatten());
+        kept.retain(|kept| !need.covers(*kept));
+        self.one.insert(at, need);
+        if !kept.is_empty() {
+            self.more.insert(at, kept);
+        }
+    }
+
+    fn hand(&mut self, at: u64, to: &mut Needs) {
+        if let Some(one) = self.one.remove(&at) {
+            to.one.insert(at, one);
+        }
+        if let Some(more) = self.more.remove(&at) {
+            to.more.insert(at, more);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.one.clear();
+        self.more.clear();
+    }
 }
 
 struct Pending {
@@ -194,17 +276,18 @@ impl CopySink<'_> {
         from: Ptr,
         object: &Object,
         links: &[Ptr],
-        reach: Option<u64>,
+        below: Option<Below>,
     ) -> Result<Ptr> {
         let (hash, offset) = (from.hash, self.end);
         let before = self.buf.len();
         append_record(&mut self.buf, offset, &object.body, links);
         self.end += (self.buf.len() - before) as u64;
-        match reach {
-            Some(reach) => {
+        match below {
+            Some(below) => {
                 self.copied.insert(hash, Copied::Entry);
                 self.records.insert(from.offset, offset);
-                self.reach.insert(offset, reach);
+                self.below.insert(offset, below);
+                self.needs.hand(from.offset, &mut self.kept);
             }
             None => {
                 self.copied.insert(hash, Copied::Object(offset));
@@ -215,6 +298,23 @@ impl CopySink<'_> {
             self.drain()?;
         }
         Ok(Ptr { hash, offset })
+    }
+
+    fn wanted(&mut self, ptr: Ptr, need: Need, again: &mut Vec<(Ptr, Need)>) -> bool {
+        let at = ptr.offset;
+        if self.needs.covers(at, need) {
+            return false;
+        }
+        if self.records.contains_key(&at) {
+            if self.kept.covers(at, need) {
+                return false;
+            }
+            self.records.remove(&at);
+            let kept = self.kept.take(at).filter(|kept| !need.covers(*kept));
+            again.extend(kept.map(|kept| (ptr, kept)));
+        }
+        self.needs.add(at, need);
+        true
     }
 
     fn remap(&self, ptr: Ptr) -> Option<Ptr> {
@@ -240,13 +340,49 @@ impl CopySink<'_> {
             .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
     }
 
-    fn reached(&self, links: &[Ptr], rungs: Rungs) -> u64 {
+    fn below(from: Ptr, links: &[Ptr], rungs: Rungs) -> Below {
+        let offset = |index: Option<usize>| index.map_or(0, |index| links[index].offset);
+        Below {
+            from: from.offset,
+            prev: offset(rungs.prev),
+            skip: offset(rungs.skip),
+        }
+    }
+
+    fn on_path(&self, mut at: u64, mut version: u64, target: u64) -> Option<u64> {
+        while version > target {
+            let below = self.below.get(&at)?;
+            let skip = skip_version(version);
+            (at, version) = if below.skip != 0 && skip >= target {
+                (below.skip, skip)
+            } else {
+                (below.prev, version - 1)
+            };
+            if at == 0 {
+                return None;
+            }
+        }
+        (version == target).then_some(at)
+    }
+
+    fn skipped(&self, links: &[Ptr], rungs: Rungs, link: Ptr) -> Option<Ptr> {
+        let target = skip_version(rungs.version);
         let prev = rungs
             .prev
             .map(|index| links[index])
             .filter(|prev| prev.offset != 0);
-        prev.and_then(|prev| self.reach.get(&prev.offset).copied())
-            .unwrap_or(rungs.version)
+        let found = prev.and_then(|prev| self.on_path(prev.offset, rungs.version - 1, target));
+        match found.map(|offset| (offset, self.below.get(&offset))) {
+            None => Some(Ptr {
+                hash: link.hash,
+                offset: 0,
+            }),
+            Some((offset, Some(below))) if below.from == link.offset => Some(Ptr {
+                hash: link.hash,
+                offset,
+            }),
+            Some(_) => self.settled(link),
+        }
     }
 
     fn read(&self, ptr: Ptr) -> Result<Pending> {
@@ -277,19 +413,9 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.object.links.len() {
                 let link = top.object.links[top.next];
-                let jumps = top
-                    .entry
-                    .filter(|rungs| rungs.skip == Some(top.next))
-                    .is_some_and(|rungs| {
-                        self.reached(&top.links, rungs) > skip_version(rungs.version)
-                    });
-                let settled = if jumps {
-                    Some(Ptr {
-                        hash: link.hash,
-                        offset: 0,
-                    })
-                } else {
-                    self.settled(link)
+                let settled = match top.entry.filter(|rungs| rungs.skip == Some(top.next)) {
+                    Some(rungs) => self.skipped(&top.links, rungs, link),
+                    None => self.settled(link),
                 };
                 if let Some(done) = settled {
                     let top = stack.last_mut().expect("stack is not empty");
@@ -302,8 +428,10 @@ impl CopySink<'_> {
                 continue;
             }
             let done = stack.pop().expect("stack is not empty");
-            let reach = done.entry.map(|rungs| self.reached(&done.links, rungs));
-            let ptr = self.emit(done.from, &done.object, &done.links, reach)?;
+            let below = done
+                .entry
+                .map(|rungs| Self::below(done.from, &done.links, rungs));
+            let ptr = self.emit(done.from, &done.object, &done.links, below)?;
             match stack.last_mut() {
                 Some(parent) => {
                     parent.links.push(ptr);
@@ -364,7 +492,9 @@ impl<'a> Copier<'a> {
                 copied: HashMap::new(),
                 entries: HashSet::new(),
                 records: HashMap::new(),
-                reach: HashMap::new(),
+                kept: Needs::default(),
+                needs: Needs::default(),
+                below: HashMap::new(),
                 pruned: HashSet::new(),
                 objects: 0,
                 stop,
@@ -374,30 +504,40 @@ impl<'a> Copier<'a> {
 
     fn encode(&mut self, refs: &Refs) -> Result<Ptr> {
         let sink = &mut self.sink;
+        let source = sink.source.clone();
         let mut retained = HashSet::new();
         let mut edge = Vec::new();
-        let mut closures = Closures::default();
+        let mut again = Vec::new();
+        let mut closures = Closures::exact();
         for (_, branch) in refs.try_entries()? {
-            let after = branch.log.after(&sink.source)?;
-            branch.log.visit(&sink.source, |ptr, entry, _, _| {
-                if sink.records.contains_key(&ptr.offset) {
+            let (first, after) = (branch.log.first, branch.log.after(&source)?);
+            branch.log.visit(&source, |ptr, entry, _, _| {
+                if !sink.wanted(ptr, Need::new(first, after), &mut again) {
                     return Ok(false);
                 }
                 retained.insert(ptr.hash);
                 edge.extend(links_of(entry));
-                closures.mark(ptr, branch.log.first, after);
+                closures.mark(ptr, first, after);
                 closures.seed(entry, after);
                 Ok(true)
             })?;
         }
-        closures.walk(&sink.source, |ptr, entry, _, _| {
-            if sink.records.contains_key(&ptr.offset) {
-                return Ok(false);
+        loop {
+            for (ptr, need) in again.drain(..) {
+                closures.push(ptr, need.floor, need.after());
             }
-            retained.insert(ptr.hash);
-            edge.extend(links_of(entry));
-            Ok(true)
-        })?;
+            closures.walk_bounded(&source, |ptr, entry, _, _, (floor, after)| {
+                if !sink.wanted(ptr, Need::new(floor, after), &mut again) {
+                    return Ok(false);
+                }
+                retained.insert(ptr.hash);
+                edge.extend(links_of(entry));
+                Ok(true)
+            })?;
+            if again.is_empty() {
+                break;
+            }
+        }
         for hash in &retained {
             sink.pruned.remove(hash);
             sink.entries.insert(*hash);
@@ -410,7 +550,9 @@ impl<'a> Copier<'a> {
         }
         let mut encoder = Encoder::new(&mut *sink);
         refs.encode(&mut encoder)?;
-        encoder.finish()
+        let head = encoder.finish();
+        sink.needs.clear();
+        head
     }
 
     pub(crate) fn pass(&mut self, refs: &Refs) -> Result<u64> {

@@ -20,7 +20,7 @@ type Counts = BTreeMap<u32, i64>;
 type Seen = (Option<Hash>, Counts);
 type Job = Box<dyn FnOnce() + Send>;
 type Armed = Arc<Mutex<Option<(&'static str, Job)>>>;
-type Crossed = Arc<Mutex<Option<Option<(ferro::Result<Outcome>, Seen)>>>>;
+type Crossed = Arc<Mutex<Option<(ferro::Result<Outcome>, Seen)>>>;
 
 const LOCAL: [&str; 2] = ["main", "side"];
 const CACHES: [u64; 3] = [1 << 20, 16 << 10, 2 << 10];
@@ -453,7 +453,7 @@ impl World {
         self.pull(a, 0, b, 0, &remote);
     }
 
-    fn cross_cycle(&mut self, a: usize, b: usize, stage: &'static str, reland: bool, commit: bool) {
+    fn cross_cycle(&mut self, a: usize, b: usize, stage: &'static str, commit: bool) {
         let remote = self.remote(b, 0);
         let ours = self.devices[a].main().clone();
         let theirs = self.devices[b].main().clone();
@@ -465,34 +465,30 @@ impl World {
         let job = {
             let (ours, remote, crossed) = (ours.clone(), remote.clone(), crossed.clone());
             move || {
-                let pulled = reland.then(|| {
-                    if ours.branches().contains(&remote) {
-                        ours.drop_branch(&remote).unwrap();
-                    }
-                    let pulled = pull_counting(&ours, &theirs, &remote, id);
-                    (pulled, (ours.head_hash(), counted(&ours)))
-                });
+                if ours.branches().contains(&remote) {
+                    ours.drop_branch(&remote).unwrap();
+                }
+                let pulled = pull_counting(&ours, &theirs, &remote, id);
+                let after = (ours.head_hash(), counted(&ours));
                 if commit {
                     ours.commit(format!("e{event}"), |root| {
                         root.insert(event, 1);
                     })
                     .unwrap();
                 }
-                *crossed.lock().unwrap() = Some(pulled);
+                *crossed.lock().unwrap() = Some((pulled, after));
             }
         };
         *self.devices[a].armed.lock().unwrap() = Some((stage, Box::new(job)));
         let keep = self.devices[a].keep;
         ours.compact(keep).unwrap();
         self.devices[a].armed.lock().unwrap().take();
-        let Some(pulled) = crossed.lock().unwrap().take() else {
+        let Some((pulled, after)) = crossed.lock().unwrap().take() else {
             return;
         };
-        if let Some((pulled, after)) = pulled {
-            let what = format!("d{a} <- d{b} as {remote} while a cycle was {stage}");
-            self.account(a, 0, (ha, hb), (before, after), pulled, &what);
-            self.count("cycle relanded");
-        }
+        let what = format!("d{a} <- d{b} as {remote} while a cycle was {stage}");
+        self.account(a, 0, (ha, hb), (before, after), pulled, &what);
+        self.count("cycle relanded");
         if commit {
             self.events += 1;
             let head = self.devices[a].heads[0];
@@ -618,7 +614,7 @@ enum Act {
     DropTracking(usize, u64),
     Burst(usize, usize, usize),
     Reland(usize, usize),
-    CrossCycle(usize, usize, &'static str, bool, bool),
+    CrossCycle(usize, usize, &'static str, bool),
 }
 
 struct Setup {
@@ -626,13 +622,7 @@ struct Setup {
     coalesce: Vec<bool>,
 }
 
-fn around_tables(
-    rng: &mut Rng,
-    roll: u64,
-    pruned: bool,
-    (a, b): (usize, usize),
-    (s, t): (usize, usize),
-) -> Act {
+fn around_tables(rng: &mut Rng, roll: u64, (a, b): (usize, usize), (s, t): (usize, usize)) -> Act {
     match roll {
         0..16 => Act::Commit(a, s),
         16..22 => Act::Burst(a, s, 60 + rng.below(90) as usize),
@@ -643,7 +633,7 @@ fn around_tables(
         58..62 => Act::Compact(a),
         62..72 => {
             let stage = STAGES[rng.below(STAGES.len() as u64) as usize];
-            Act::CrossCycle(a, b, stage, !pruned, pruned || rng.chance(50))
+            Act::CrossCycle(a, b, stage, rng.chance(50))
         }
         72..78 => Act::Reland(a, b),
         78..83 => Act::Reopen(a, rng.chance(40)),
@@ -675,7 +665,7 @@ fn plan(seed: u64, steps: usize, pruned: bool, tables: bool) -> (Setup, Vec<Act>
         let (s, t) = (rng.below(2) as usize, rng.below(2) as usize);
         let roll = rng.below(100);
         if tables {
-            acts.push(around_tables(&mut rng, roll, pruned, (a, b), (s, t)));
+            acts.push(around_tables(&mut rng, roll, (a, b), (s, t)));
             continue;
         }
         acts.push(match roll {
@@ -745,9 +735,7 @@ fn execute(seed: u64, setup: &Setup, acts: &[Act]) -> BTreeMap<&'static str, usi
             Act::DropTracking(a, pick) => world.drop_tracking(a, pick),
             Act::Burst(a, s, commits) => world.burst(a, s, commits),
             Act::Reland(a, b) => world.reland(a, b),
-            Act::CrossCycle(a, b, stage, reland, commit) => {
-                world.cross_cycle(a, b, stage, reland, commit)
-            }
+            Act::CrossCycle(a, b, stage, commit) => world.cross_cycle(a, b, stage, commit),
         }
         world.check();
     }
@@ -794,9 +782,10 @@ fn devices_relanding_remotes_across_cycles_and_step_tables_count_each_event_once
 }
 
 #[test]
-fn pruned_devices_committing_across_cycles_and_step_tables_count_each_event_once() {
+fn pruned_devices_relanding_remotes_across_cycles_and_step_tables_count_each_event_once() {
     let tally = sweep(cases(30) as u64, true, true);
     assert!(tally["burst"] > 20, "{tally:?}");
-    assert!(tally["cycle crossed"] > 20, "{tally:?}");
+    assert!(tally["cycle relanded"] > 20, "{tally:?}");
+    assert!(tally["dropped to reland"] > 20, "{tally:?}");
     assert!(tally["pull refused"] > 10, "{tally:?}");
 }
