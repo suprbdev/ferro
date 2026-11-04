@@ -80,6 +80,7 @@ fn main() {
     let coalesce = argument("--coalesce").is_some_and(|v| v == "1");
     let awaited = argument("--async").is_some_and(|v| v == "1");
     let own = argument("--branches").is_some_and(|v| v == "own");
+    let shared = argument("--shared").is_some_and(|v| v == "1");
     let durability = match argument("--durability").as_deref() {
         Some("buffered") => Durability::Buffered,
         _ => Durability::Fsync,
@@ -93,6 +94,7 @@ fn main() {
         let db = Options::new()
             .durability(durability)
             .coalesce(coalesce)
+            .shared(shared)
             .open::<Root>(&path)
             .unwrap();
         db.update(|root| {

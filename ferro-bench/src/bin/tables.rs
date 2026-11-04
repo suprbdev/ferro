@@ -177,8 +177,10 @@ fn main() {
     let parent = PathBuf::from(argument("--dir").unwrap_or_else(|| "target/bench".to_string()));
     std::fs::create_dir_all(&parent).unwrap();
     let dir = tempfile::tempdir_in(&parent).unwrap();
+    let shared = argument("--shared").is_some_and(|v| v == "1");
     let db = Options::new()
         .durability(durability)
+        .shared(shared)
         .open::<Hotels>(dir.path().join("tables.ferro"))
         .unwrap();
     let start_ms = 20_000 * DAY_MS;
