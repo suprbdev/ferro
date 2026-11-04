@@ -1417,7 +1417,7 @@ impl<T: Data> Shared<T> {
         wait: bool,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Option<Store>> {
-        if lane.crossed() {
+        if !self.options.shared || lane.crossed() {
             return Ok(None);
         }
         loop {
@@ -1454,13 +1454,13 @@ impl<T: Data> Shared<T> {
     fn lock_tip(&self, notices: &mut Vec<Notice<T>>) -> Result<Tip<'_>> {
         loop {
             let mut guard = self.tip.lock();
-            let store = self.store();
-            if !store.is_shared() {
+            if !self.options.shared {
                 return Ok(Tip {
                     guard,
                     commit: None,
                 });
             }
+            let store = self.store();
             let commit = store.lock_commit()?;
             if self.follow(&mut guard, notices)? != Caught::Swapped {
                 return Ok(Tip {
@@ -1472,10 +1472,10 @@ impl<T: Data> Shared<T> {
     }
 
     fn follow(&self, tip: &mut RefState, notices: &mut Vec<Notice<T>>) -> Result<Caught> {
-        let store = self.store();
-        if !store.is_shared() {
+        if !self.options.shared {
             return Ok(Caught::Still);
         }
+        let store = self.store();
         match store.follow()? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
