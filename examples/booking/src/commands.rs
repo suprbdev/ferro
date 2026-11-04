@@ -5,7 +5,8 @@ use booking::history::{as_paid, audit, price_history};
 use booking::seed::{Plan, seed};
 use booking::whatif::{self, Preview};
 use booking::{
-    Booking, BookingError, Flow, Hotels, HoldRequest, Reservations, Result, Scenario, Status, walk,
+    Booking, BookingError, Flow, Hotels, HoldRequest, Line, Reservations, Result, Scenario, Status,
+    walk,
 };
 
 use crate::cli::{Command, CustomerCmd, RoomCmd, VenueCmd, WhatIfCmd};
@@ -44,6 +45,10 @@ fn room_id(h: &Hotels, text: &str) -> Result<u32> {
 }
 
 fn line(out: Out<'_>, h: &Hotels, b: &Booking) -> Result<()> {
+    listed(out, h, b.customer, &Line::from(b))
+}
+
+fn listed(out: Out<'_>, h: &Hotels, customer: u32, b: &Line) -> Result<()> {
     let room = h.rooms.get(&b.room).map_or(0, |room| room.number);
     let venue = h.venues.get(&b.venue).map(|v| v.name.clone()).unwrap_or_default();
     say!(
@@ -51,7 +56,7 @@ fn line(out: Out<'_>, h: &Hotels, b: &Booking) -> Result<()> {
         "#{:<5} {:<9} customer {:<4} {} room {} {} x{} total {}",
         b.id,
         b.status,
-        b.customer,
+        customer,
         venue,
         room,
         format_night(b.first),
@@ -181,8 +186,8 @@ pub fn run_read(out: Out<'_>, svc: &Reservations, command: Command) -> Result<()
             let c = h.customer_named(&customer)?;
             say!(out, "{} {} <{}>", c.id, c.name, c.email);
             say!(out, "  deposited {}, credit {}", format_money(c.deposited), format_money(c.credit));
-            for b in h.bookings.by_customer(&c.id) {
-                line(out, &h, &b)?;
+            for b in h.lines_of(c.id) {
+                listed(out, &h, c.id, &b)?;
             }
         }
         Command::Avail { venue, from, nights } => {

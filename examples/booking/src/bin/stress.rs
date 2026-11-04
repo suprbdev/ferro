@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::hint::black_box;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use booking::date::{format_money, night_of};
 use booking::seed::{Plan, seed};
-use booking::{BookingError, Config, Hotels, HoldRequest, Night, Reservations, Status, walk};
+use booking::{BookingError, Config, Hotels, HoldRequest, Line, Night, Reservations, Status, walk};
 use clap::Parser;
 
 #[derive(Parser, Clone, Debug)]
@@ -61,6 +62,10 @@ struct Args {
     ack_log: Option<PathBuf>,
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    #[arg(long, default_value_t = 0)]
+    browsers: usize,
+    #[arg(long, default_value_t = 20)]
+    page: usize,
 }
 
 #[derive(Default)]
@@ -80,10 +85,13 @@ struct Tally {
     reprices: u64,
     sweeps: u64,
     swept: u64,
+    pages: u64,
+    lines: u64,
     errors: BTreeMap<String, u64>,
     hold_ns: Vec<u64>,
     confirm_ns: Vec<u64>,
     sweep_ns: Vec<u64>,
+    page_ns: Vec<u64>,
 }
 
 impl Tally {
@@ -103,12 +111,15 @@ impl Tally {
         self.reprices += other.reprices;
         self.sweeps += other.sweeps;
         self.swept += other.swept;
+        self.pages += other.pages;
+        self.lines += other.lines;
         for (kind, count) in other.errors {
             *self.errors.entry(kind).or_default() += count;
         }
         self.hold_ns.extend(other.hold_ns);
         self.confirm_ns.extend(other.confirm_ns);
         self.sweep_ns.extend(other.sweep_ns);
+        self.page_ns.extend(other.page_ns);
     }
 
     fn error(&mut self, error: &BookingError) {
@@ -341,6 +352,26 @@ fn sweeper(svc: Reservations, stop: Arc<AtomicBool>) -> Tally {
     tally
 }
 
+fn browser(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool>, index: usize) -> Tally {
+    let mut rng = fastrand::Rng::with_seed(args.seed ^ 0xb0b ^ (index as u64).wrapping_mul(0x9e37_79b9));
+    let mut tally = Tally::default();
+    while !stop.load(Ordering::Relaxed) {
+        let customer = world.customers[rng.usize(0..world.customers.len())];
+        let timed = tally.pages % 16 == 0;
+        let began = Instant::now();
+        let h = svc.read();
+        let page: Vec<Line> = h.lines_of(customer).rev().take(args.page).collect();
+        drop(h);
+        if timed {
+            tally.page_ns.push(began.elapsed().as_nanos() as u64);
+        }
+        tally.pages += 1;
+        tally.lines += page.len() as u64;
+        black_box(page);
+    }
+    tally
+}
+
 fn pricer(svc: Reservations, world: Arc<World>, args: Args, stop: Arc<AtomicBool>) -> Tally {
     let mut rng = fastrand::Rng::with_seed(args.seed ^ 0x5eed);
     let mut tally = Tally::default();
@@ -406,6 +437,10 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
         let (svc, world, args, stop) = (svc.clone(), world.clone(), args.clone(), stop.clone());
         handles.push(thread::spawn(move || pricer(svc, world, args, stop)));
     }
+    for index in 0..args.browsers {
+        let (svc, world, args, stop) = (svc.clone(), world.clone(), args.clone(), stop.clone());
+        handles.push(thread::spawn(move || browser(svc, world, args, stop, index)));
+    }
     let deadline = Duration::from_secs_f64(args.secs);
     while started.elapsed() < deadline {
         thread::sleep(Duration::from_millis(200).min(deadline.saturating_sub(started.elapsed())));
@@ -460,6 +495,7 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
     t.hold_ns.sort_unstable();
     t.confirm_ns.sort_unstable();
     t.sweep_ns.sort_unstable();
+    t.page_ns.sort_unstable();
     let s = outcome.secs;
     println!("== {} ({:.1}s)", outcome.label, s);
     println!(
@@ -491,6 +527,16 @@ fn print(outcome: &mut Outcome, svc: &Reservations) {
         pct(&t.sweep_ns, 0.99),
         pct(&t.sweep_ns, 1.0)
     );
+    if t.pages > 0 {
+        println!(
+            "  customer pages {} ({:.0}/s, {:.1} lines each)   page p50 {:.1} us p99 {:.1} us",
+            t.pages,
+            t.pages as f64 / s,
+            t.lines as f64 / t.pages as f64,
+            pct(&t.page_ns, 0.5) * 1000.0,
+            pct(&t.page_ns, 0.99) * 1000.0
+        );
+    }
     if let Some(space) = &outcome.space {
         println!(
             "  file {:.1} MiB, about {:.1} MiB live, {} reclamation cycles, longest pause {:?}, last error {:?}",

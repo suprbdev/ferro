@@ -108,6 +108,31 @@ impl Booking {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub id: u64,
+    pub status: Status,
+    pub venue: u32,
+    pub room: u32,
+    pub first: Night,
+    pub nights: u32,
+    pub total: Cents,
+}
+
+impl From<&Booking> for Line {
+    fn from(booking: &Booking) -> Self {
+        Line {
+            id: booking.id,
+            status: booking.status,
+            venue: booking.venue,
+            room: booking.room,
+            first: booking.first,
+            nights: booking.nights,
+            total: booking.total,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 #[unique(room, night)]
 pub struct Stay {
@@ -201,5 +226,9 @@ impl Hotels {
 
     pub fn holder(&self, room: u32, night: Night) -> Option<u64> {
         self.stays.key_by_room_night(&(room, night)).map(|slot| slot.0)
+    }
+
+    pub fn lines_of(&self, customer: u32) -> impl DoubleEndedIterator<Item = Line> + ExactSizeIterator + use<> {
+        self.bookings.by_customer(&customer).map(|booking| Line::from(&*booking))
     }
 }
