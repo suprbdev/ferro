@@ -19,6 +19,15 @@ back and forth, through a third branch or through a fork of a branch that was al
 Finding the base costs about two binary searches over the log, plus a step for each merge made since
 the base.
 
+## What counts as a change
+
+Merges and `diff` compare values as they are stored, not with `==`: two values are the same when
+they encode to the same bytes. A row holding NaN that neither side touched is unchanged, though NaN
+is not equal to itself, and a change from `0.0` to `-0.0`, or to a field your `PartialEq` leaves
+out, is a change, though `==` holds. So `diff`, `merge` and `try_merge` no longer need `PartialEq`
+on values or rows. `Data::same_encoding(&a, &b)` makes the same comparison for a `resolve` closure
+that compares what it is handed. Keys are still told apart by `Ord`.
+
 ## Criss-crosses
 
 When two branches have each merged an older state of the other, they have several best common

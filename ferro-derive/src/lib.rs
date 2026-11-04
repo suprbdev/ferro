@@ -318,9 +318,9 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             "transparent needs a struct with one field",
         ));
     };
-    let access = match &field.ident {
-        Some(ident) => quote! { &self.#ident },
-        None => quote! { &self.0 },
+    let (access, other) = match &field.ident {
+        Some(ident) => (quote! { &self.#ident }, quote! { &__other.#ident }),
+        None => (quote! { &self.0 }, quote! { &__other.0 }),
     };
     let build = construct(quote! { Self }, &fields, &data.fields, &[quote! { __v }]);
     let ty = &field.ty;
@@ -346,6 +346,10 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn describe(__d: &mut ::ferro::codec::Description) {
                 __d.named::<Self>(|__d| __d.of::<#ty>());
             }
+
+            fn same_encoding(&self, __other: &Self) -> bool {
+                ::ferro::Data::same_encoding(#access, #other)
+            }
         }
     })
 }
@@ -357,7 +361,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let (encode, decode, visit, describe) = match &input.data {
+    let (encode, decode, visit, describe, same) = match &input.data {
         Data::Struct(data) => {
             let fields = parse_fields(&data.fields)?;
             check_fields(&fields)?;
@@ -373,6 +377,23 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     }
                 })
                 .collect();
+            let same = data
+                .fields
+                .iter()
+                .zip(&fields)
+                .enumerate()
+                .filter(|(_, (_, field))| field.stored())
+                .map(|(i, (f, _))| {
+                    let member = match &f.ident {
+                        Some(ident) => quote! { #ident },
+                        None => {
+                            let index = syn::Index::from(i);
+                            quote! { #index }
+                        }
+                    };
+                    quote! { && ::ferro::Data::same_encoding(&self.#member, &__other.#member) }
+                });
+            let same = quote! { true #(#same)* };
             let encode = encode_stmts(&fields, &members);
             let vs = vars(fields.len());
             let (stmts, values) = decode_stmts(&fields, &vs);
@@ -387,6 +408,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     __d.word("struct");
                     #described
                 },
+                same,
             )
         }
         Data::Enum(data) => {
@@ -405,6 +427,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let mut encode_arms = Vec::new();
             let mut decode_arms = Vec::new();
             let mut visit_arms = Vec::new();
+            let mut same_arms = Vec::new();
             let mut described = Vec::new();
             for (variant, vname) in data.variants.iter().zip(&variant_names) {
                 let vident = &variant.ident;
@@ -412,9 +435,12 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let fields = parse_fields(&variant.fields)?;
                 check_fields(&fields)?;
                 let vs = vars(fields.len());
-                let pattern = match &variant.fields {
+                let others: Vec<Ident> = (0..fields.len())
+                    .map(|i| format_ident!("__g{}", i))
+                    .collect();
+                let bind = |vs: &[Ident]| match &variant.fields {
                     Fields::Named(_) => {
-                        let binds = fields.iter().zip(&vs).map(|(f, v)| {
+                        let binds = fields.iter().zip(vs).map(|(f, v)| {
                             let ident = f.ident.as_ref().unwrap();
                             if f.stored() {
                                 quote! { #ident: #v }
@@ -425,7 +451,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                         quote! { Self::#vident { #(#binds),* } }
                     }
                     Fields::Unnamed(_) => {
-                        let binds = fields.iter().zip(&vs).map(|(f, v)| {
+                        let binds = fields.iter().zip(vs).map(|(f, v)| {
                             if f.stored() {
                                 quote! { #v }
                             } else {
@@ -436,6 +462,16 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     }
                     Fields::Unit => quote! { Self::#vident },
                 };
+                let pattern = bind(&vs);
+                let other_pattern = bind(&others);
+                let same = fields
+                    .iter()
+                    .zip(vs.iter().zip(&others))
+                    .filter(|(field, _)| field.stored())
+                    .map(|(_, (v, o))| quote! { && ::ferro::Data::same_encoding(#v, #o) });
+                same_arms.push(quote! {
+                    (#pattern, #other_pattern) => true #(#same)*,
+                });
                 let access: Vec<TokenStream2> = vs.iter().map(|v| quote! { #v }).collect();
                 let body = encode_stmts(&fields, &access);
                 encode_arms.push(quote! {
@@ -480,6 +516,16 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::std::result::Result::Ok(())
                 }
             };
+            let same_match = if data.variants.is_empty() {
+                quote! { match *self {} }
+            } else {
+                quote! {
+                    match (self, __other) {
+                        #(#same_arms)*
+                        _ => false,
+                    }
+                }
+            };
             let unknown = quote! {
                 __other => ::std::result::Result::Err(::ferro::Error::Decode(
                     ::std::format!("unknown variant tag {} for {}", __other, ::std::stringify!(#name))
@@ -506,6 +552,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     __d.count(#variant_count);
                     #(#variants_described)*
                 },
+                same_match,
             )
         }
         Data::Union(_) => {
@@ -533,6 +580,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                 __d.named::<Self>(|__d| {
                     #describe
                 });
+            }
+
+            #[allow(unreachable_patterns)]
+            fn same_encoding(&self, __other: &Self) -> bool {
+                #same
             }
         }
     })
@@ -1503,6 +1555,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::std::result::Result::Ok(())
                 })?;
                 ::std::result::Result::Ok(())
+            }
+
+            fn same_encoding(&self, __other: &Self) -> bool {
+                ::ferro::Data::same_encoding(&self.rows, &__other.rows)
+                    #(&& ::ferro::Data::same_encoding(&self.#index_fields, &__other.#index_fields))*
             }
         }
 

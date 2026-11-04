@@ -142,6 +142,24 @@ impl<V: Clone> Val<V> {
     }
 }
 
+impl<V> Val<V> {
+    fn shares(&self, other: &Val<V>) -> bool {
+        match (&self.0, &other.0) {
+            (Held::Single(a), Held::Single(b)) => Arc::ptr_eq(a, b),
+            (Held::Column(a, i), Held::Column(b, j)) => i == j && Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn same_value<V: Data>(a: Option<&Val<V>>, b: Option<&Val<V>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.shares(b) || V::same_encoding(a, b),
+        _ => false,
+    }
+}
+
 impl<V> Deref for Val<V> {
     type Target = V;
 
@@ -235,6 +253,15 @@ impl<V, S> Slot<V, S> {
             Slot::Packed(column, index) => Some(&column[*index as usize]),
             Slot::Fresh(value) => Some(value),
             Slot::Spilled(..) => None,
+        }
+    }
+
+    fn shares(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Slot::Packed(a, i), Slot::Packed(b, j)) => i == j && Arc::ptr_eq(a, b),
+            (Slot::Fresh(a), Slot::Fresh(b)) => Arc::ptr_eq(a, b),
+            (Slot::Spilled(a, _), Slot::Spilled(b, _)) => a.hash == b.hash,
+            _ => false,
         }
     }
 
@@ -3227,10 +3254,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(absorb(store, &mut self.root, &mut edits, count));
     }
 
-    pub fn diff(&self, newer: &Map<K, V, S>) -> Diff<K, V, S>
-    where
-        V: PartialEq,
-    {
+    pub fn diff(&self, newer: &Map<K, V, S>) -> Diff<K, V, S> {
         Diff {
             old_store: self.store.clone(),
             new_store: newer.store.clone(),
@@ -3244,10 +3268,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         base: &Map<K, V, S>,
         theirs: &Map<K, V, S>,
         mut resolve: impl FnMut(Conflict<K, V>) -> Option<V>,
-    ) -> usize
-    where
-        V: PartialEq,
-    {
+    ) -> usize {
         let Ok(written) = self.try_merge(base, theirs, |conflict| {
             Ok::<_, Infallible>(resolve(conflict))
         });
@@ -3259,10 +3280,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         base: &Map<K, V, S>,
         theirs: &Map<K, V, S>,
         resolve: impl FnMut(Conflict<K, V>) -> std::result::Result<Option<V>, E>,
-    ) -> std::result::Result<usize, E>
-    where
-        V: PartialEq,
-    {
+    ) -> std::result::Result<usize, E> {
         let kept = self.clone();
         let merged = three_way(
             self,
@@ -3369,6 +3387,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
         d.of::<K>();
         d.of::<V>();
         d.of::<S>();
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && (self.root.same_as(&other.root) || self.root_hash() == other.root_hash())
     }
 }
 
@@ -4252,7 +4275,7 @@ pub(crate) fn three_way<T, K, V, S, E>(
 ) -> std::result::Result<usize, E>
 where
     K: Data + Ord,
-    V: Data + PartialEq,
+    V: Data,
     S: Summary<K, V>,
 {
     let mut written = 0;
@@ -4261,10 +4284,10 @@ where
         let before = change.before().cloned();
         let after = change.after().cloned();
         let ours = read(target, &key);
-        if ours == after {
+        if same_value(ours.as_ref(), after.as_ref()) {
             continue;
         }
-        let value = if ours == before {
+        let value = if same_value(ours.as_ref(), before.as_ref()) {
             after.map(|value| (*value).clone())
         } else {
             resolve(Conflict {
@@ -4320,7 +4343,7 @@ fn expand<K: Data + Ord, V: Data, S: Data>(store: Option<&Store>, steps: &mut Ve
     }
 }
 
-impl<K: Data + Ord, V: Data + PartialEq, S: Data> Diff<K, V, S> {
+impl<K: Data + Ord, V: Data, S: Data> Diff<K, V, S> {
     fn action(&self) -> Action {
         match (self.old.last(), self.new.last()) {
             (None, None) => Action::Done,
@@ -4348,7 +4371,7 @@ impl<K: Data + Ord, V: Data + PartialEq, S: Data> Diff<K, V, S> {
     }
 }
 
-impl<K: Data + Ord, V: Data + PartialEq, S: Data> Iterator for Diff<K, V, S> {
+impl<K: Data + Ord, V: Data, S: Data> Iterator for Diff<K, V, S> {
     type Item = Change<K, V>;
 
     fn next(&mut self) -> Option<Change<K, V>> {
@@ -4377,14 +4400,12 @@ impl<K: Data + Ord, V: Data + PartialEq, S: Data> Iterator for Diff<K, V, S> {
                     let old = self.old.pop();
                     let new = self.new.pop();
                     if let (Some(Step::Entry(key, a)), Some(Step::Entry(_, b))) = (old, new) {
-                        if let (Slot::Spilled(x, _), Slot::Spilled(y, _)) = (&a, &b)
-                            && x.hash == y.hash
-                        {
+                        if a.shares(&b) {
                             continue;
                         }
                         let before = fatal(read_slot(self.old_store.as_ref(), &a));
                         let after = fatal(read_slot(self.new_store.as_ref(), &b));
-                        if before != after {
+                        if !V::same_encoding(&before, &after) {
                             return Some(Change::Changed(key, before, after));
                         }
                     }

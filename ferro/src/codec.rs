@@ -25,9 +25,11 @@ pub struct Object {
 }
 
 const JOINED_BYTES: usize = 4096;
+const SCRATCH_BYTES: usize = 4096;
 
 thread_local! {
     static JOINED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH: RefCell<[Vec<u8>; 2]> = const { RefCell::new([Vec::new(), Vec::new()]) };
 }
 
 impl Object {
@@ -179,6 +181,9 @@ pub trait Data: Clone + Send + Sync + 'static {
         d.word("rust");
         d.word(type_name::<Self>());
     }
+    fn same_encoding(&self, other: &Self) -> bool {
+        encodings_match(self, other)
+    }
     fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
         for item in items {
             item.encode(w)?;
@@ -259,6 +264,32 @@ pub fn try_hash_of<D: Data>(value: &D) -> Result<Hash> {
 
 pub fn hash_of<D: Data>(value: &D) -> Hash {
     crate::map::fatal(try_hash_of(value))
+}
+
+fn scratch(buf: Vec<u8>) -> Vec<u8> {
+    if buf.capacity() > SCRATCH_BYTES {
+        Vec::new()
+    } else {
+        buf
+    }
+}
+
+fn encodings_match<D: Data>(a: &D, b: &D) -> bool {
+    let [left, right] = SCRATCH.take();
+    let (mut left_sink, mut right_sink) = (HashSink, HashSink);
+    let mut left = Encoder::reusing(&mut left_sink, left);
+    let mut right = Encoder::reusing(&mut right_sink, right);
+    let same = a.encode(&mut left).is_ok()
+        && b.encode(&mut right).is_ok()
+        && left.bytes() == right.bytes()
+        && left.links().len() == right.links().len()
+        && left
+            .links()
+            .iter()
+            .zip(right.links())
+            .all(|(a, b)| a.hash == b.hash);
+    SCRATCH.set([scratch(left.into_buf()), scratch(right.into_buf())]);
+    same
 }
 
 pub const fn field_tag(name: &str) -> u16 {
@@ -733,6 +764,10 @@ impl Data for Ptr {
     fn describe(d: &mut Description) {
         d.word("ptr");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
 }
 
 impl Data for () {
@@ -746,6 +781,10 @@ impl Data for () {
 
     fn describe(d: &mut Description) {
         d.word("unit");
+    }
+
+    fn same_encoding(&self, _other: &Self) -> bool {
+        true
     }
 }
 
@@ -766,6 +805,10 @@ impl Data for bool {
     fn describe(d: &mut Description) {
         d.word("bool");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 impl Data for u8 {
@@ -780,6 +823,10 @@ impl Data for u8 {
 
     fn describe(d: &mut Description) {
         d.word("u8");
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
     }
 
     fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
@@ -809,6 +856,10 @@ macro_rules! unsigned {
             fn describe(d: &mut Description) {
                 d.word(stringify!($ty));
             }
+
+            fn same_encoding(&self, other: &Self) -> bool {
+                self == other
+            }
         }
     )*};
 }
@@ -834,6 +885,10 @@ macro_rules! signed {
             fn describe(d: &mut Description) {
                 d.word(stringify!($ty));
             }
+
+            fn same_encoding(&self, other: &Self) -> bool {
+                self == other
+            }
         }
     )*};
 }
@@ -854,6 +909,10 @@ impl Data for u128 {
     fn describe(d: &mut Description) {
         d.word("u128");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 impl Data for i128 {
@@ -872,6 +931,10 @@ impl Data for i128 {
     fn describe(d: &mut Description) {
         d.word("i128");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 impl Data for f32 {
@@ -888,6 +951,10 @@ impl Data for f32 {
     fn describe(d: &mut Description) {
         d.word("f32");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
 }
 
 impl Data for f64 {
@@ -903,6 +970,10 @@ impl Data for f64 {
 
     fn describe(d: &mut Description) {
         d.word("f64");
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
     }
 }
 
@@ -922,6 +993,10 @@ impl Data for char {
 
     fn describe(d: &mut Description) {
         d.word("char");
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -948,6 +1023,10 @@ impl Data for String {
 
     fn describe(d: &mut Description) {
         d.word("string");
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -987,6 +1066,14 @@ impl<T: Data> Data for Option<T> {
         d.word("option");
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        match (self, other) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_encoding(b),
+            _ => false,
+        }
+    }
 }
 
 impl<T: Data> Data for Vec<T> {
@@ -1017,6 +1104,10 @@ impl<T: Data> Data for Vec<T> {
     fn describe(d: &mut Description) {
         d.word("vec");
         d.of::<T>();
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
     }
 }
 
@@ -1087,6 +1178,10 @@ impl Data for Bytes {
     fn describe(d: &mut Description) {
         d.word("bytes");
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 impl<T: Data, const N: usize> Data for [T; N] {
@@ -1112,6 +1207,10 @@ impl<T: Data, const N: usize> Data for [T; N] {
         d.count(N as u64);
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
+    }
 }
 
 impl<T: Data> Data for Box<T> {
@@ -1136,6 +1235,10 @@ impl<T: Data> Data for Box<T> {
     fn describe(d: &mut Description) {
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        (**self).same_encoding(other)
+    }
 }
 
 impl<T: Data> Data for Arc<T> {
@@ -1159,6 +1262,10 @@ impl<T: Data> Data for Arc<T> {
 
     fn describe(d: &mut Description) {
         d.of::<T>();
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self, other) || (**self).same_encoding(other)
     }
 }
 
@@ -1203,6 +1310,14 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
         d.of::<K>();
         d.of::<V>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other)
+                .all(|(a, b)| a.0.same_encoding(b.0) && a.1.same_encoding(b.1))
+    }
 }
 
 impl<T: Data + Ord> Data for BTreeSet<T> {
@@ -1240,6 +1355,10 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
         d.word("btreeset");
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
+    }
 }
 
 macro_rules! tuple {
@@ -1263,6 +1382,10 @@ macro_rules! tuple {
                 d.word("tuple");
                 d.count([$($index),+].len() as u64);
                 $(d.of::<$name>();)+
+            }
+
+            fn same_encoding(&self, other: &Self) -> bool {
+                $(self.$index.same_encoding(&other.$index))&&+
             }
         }
     };

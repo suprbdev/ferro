@@ -192,6 +192,10 @@ impl<T: Data + Ord> Data for Set<T> {
         d.word("set");
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.0.same_encoding(&other.0)
+    }
 }
 
 impl<T: Data + Ord> PartialEq for Set<T> {

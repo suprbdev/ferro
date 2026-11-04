@@ -96,6 +96,10 @@ impl<T: Data> Data for List<T> {
         d.word("list");
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.0.same_encoding(&other.0)
+    }
 }
 
 impl<T: Data> PartialEq for List<T> {

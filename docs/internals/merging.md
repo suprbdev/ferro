@@ -21,6 +21,78 @@ merged, so a closure that adds counter deltas applies each delta once. The base 
 our branch's lane against the tip the closure runs on. A merge that keeps only our side still
 commits, so the link is not lost, and merging a branch whose tip we already contain writes nothing.
 
+## Comparing values
+
+A three-way merge asks three questions of values: whether a value changed between the base and
+theirs, which `diff` decides; whether ours already holds their value; and whether ours still holds
+the base's. All three used to be `PartialEq`, and `==` is not what a file stores (#52). NaN is not
+equal to itself, so a row holding NaN that neither side touched came out of `diff` whenever its leaf
+held a change, then counted as changed on both sides and went to `resolve`. A resolver that blends
+two rows into a new one wrote a new row each time, and two files syncing such rows never settled.
+`==` can also hold between values that are stored differently: `0.0 == -0.0`, and a hand-written
+`PartialEq` may leave a field out. A change from one to the other was then no change: `diff` left it
+out, the file that pulled it kept its own value, and the other fast-forwarded to that and lost it.
+
+Merges now compare values as stored. Two values are the same when they encode to the same bytes and
+links, which is what root hashes, the commit no-op skip and sync's `Equal` already went by, and
+`Data::same_encoding` answers it. Its default encodes both values into two reused buffers and
+compares them. The impls ferro provides answer without encoding: integers, `bool`, `char`, `String`
+and `Bytes` with `==`, which agrees with their encodings; floats by their bits; `Option`, `Vec`,
+arrays, tuples, `Box`, `BTreeMap` and `BTreeSet` part by part; `Arc` by pointer, then by value;
+`Map`, `Set`, `List` and `Table` by length and root hash, as their `==` already did; and `Ptr` by
+hash. The derive compares a struct's stored fields, an enum's variant and then its stored fields,
+and a transparent struct's one field. Skipped fields are not stored and take no part. A hand-written
+`Data` impl gets the default unless it overrides the method, as it can `describe`.
+
+`diff` skips an entry whose slot both sides share without reading it: the same column of a node
+that was copied on write, the same `Arc`, or a spilled value with the same hash. It compares the
+rest with `same_encoding`. `Map::merge` and `Table::merge` compare ours with theirs and with the
+base the same way, after checking whether the two `Val`s point at one value. Nothing in `diff`,
+`merge` or `try_merge` calls `==` any more, so their `PartialEq` bounds are gone. Covered index
+entries already counted a covered field as unchanged only when `==` held and it encoded to the same
+bytes, which `same_stored` now decides with `same_encoding`.
+
+Keys are told apart by `Ord`, as before. A map holds one entry for keys that compare equal and keeps
+the key it was first given, and the values an index is keyed on are keys of its map. `history_of`
+and `bisect_changes` compare the projections a caller gives them, which need not be `Data`, so they
+still use `PartialEq`. The commit no-op skip, sync's choice between up to date, fast-forward and
+merge, and `==` on collections compared hashes already and are unchanged.
+
+`stored_equality.rs` merges maps of floats and of a type whose `PartialEq` ignores a field, both in
+memory and read back from a file: an untouched NaN, NaN with another payload, a zero changing sign
+on one side or both, and the ignored field changing on one side or both. It does the same for
+`Table::merge` and `Table::try_merge`, and has two and three devices sync tables holding NaN rows
+under a resolver that blends two rows into a new one and counts the blends. Exchanges stop moving
+anything within the six rounds the test allows, no row that neither side changed is blended, with
+two devices only the row both changed is, and every device ends with the same rows bit for bit.
+Before the change they were still merging after six rounds. A further test draws pairs of values of
+a struct that uses every impl above, a derived enum and a transparent struct, and checks
+`same_encoding` against comparing `hash_of`.
+
+### What it costs
+
+`cargo run --release -p ferro-bench --bin merge` gained three shapes: a map of 1,000,000 keys read
+back from a file, with 100,000 keys changed on each side, 10,000 of them on both, merged by
+`Map::merge` with `u64` values and with a struct of a string, a float and an integer, and by
+`Table::merge` over rows with one index. Theirs changes a key in nearly every leaf, so `diff`
+compares nearly all million entries. Each figure is the mean of five merges after a first, averaged
+over three runs of each build taken in turns on a quiet machine, pinned to sixteen cores. The first
+version of the change compared every pair by encoding both values. The middle column is two runs of
+it:
+
+| Shape | Before | Encoding both | After |
+| --- | --- | --- | --- |
+| `Map<u64, u64>::merge`, 110,000 keys written | 180.0 ms | 210.3 ms | 178.5 ms |
+| `Map<u64, Reading>::merge`, the same | 293.5 ms | 352.1 ms | 296.3 ms |
+| `Table<Visit>::merge`, the same, with one index | 443.8 ms | 518.4 ms | 448.0 ms |
+
+Encoding cost 17 to 20%, which is why `same_encoding` is a method the built-in and derived impls
+answer without encoding. With it the merges are within 1% of comparing with `==`, inside the spread
+between runs of one build. The base-search shapes of the tables above compare no values and moved
+by no more than their runs spread: 62 against 63 µs for the fork at 10,000, 51 against 52 µs for
+both shapes of a side branch taken 1,000 times, 7.70 against 7.75 ms for the 1,000 features, 2.31
+against 2.34 ms after syncing, and 211 against 213 µs for the whole criss-cross merge.
+
 ## Merges that fail
 
 `merge_with` had no error channel, so a merge closure that found it could not go ahead had to panic,

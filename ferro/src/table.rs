@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -7,9 +6,9 @@ use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Description, Encoder, Hash, HashSink};
+use crate::codec::{Data, Decoder, Description, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values};
+use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values, same_value};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -267,10 +266,7 @@ impl<T: Record> Table<T> {
         drained
     }
 
-    pub fn diff(&self, newer: &Table<T>) -> Diff<T::Key, T>
-    where
-        T: PartialEq,
-    {
+    pub fn diff(&self, newer: &Table<T>) -> Diff<T::Key, T> {
         self.0.rows().diff(newer.0.rows())
     }
 
@@ -279,10 +275,7 @@ impl<T: Record> Table<T> {
         base: &Table<T>,
         theirs: &Table<T>,
         mut resolve: impl FnMut(Conflict<T::Key, T>) -> Option<T>,
-    ) -> usize
-    where
-        T: PartialEq,
-    {
+    ) -> usize {
         let Ok(written) = self.try_merge(base, theirs, |conflict| {
             Ok::<_, Infallible>(resolve(conflict))
         });
@@ -294,10 +287,7 @@ impl<T: Record> Table<T> {
         base: &Table<T>,
         theirs: &Table<T>,
         resolve: impl FnMut(Conflict<T::Key, T>) -> std::result::Result<Option<T>, E>,
-    ) -> std::result::Result<usize, E>
-    where
-        T: PartialEq,
-    {
+    ) -> std::result::Result<usize, E> {
         let kept = self.clone();
         let merged = self.merge_rows(base, theirs, resolve);
         if merged.is_err() {
@@ -311,10 +301,7 @@ impl<T: Record> Table<T> {
         base: &Table<T>,
         theirs: &Table<T>,
         mut resolve: impl FnMut(Conflict<T::Key, T>) -> std::result::Result<Option<T>, E>,
-    ) -> std::result::Result<usize, E>
-    where
-        T: PartialEq,
-    {
+    ) -> std::result::Result<usize, E> {
         let mut held = Pending::default();
         let mut written = 0;
         for change in base.0.rows().diff(theirs.0.rows()) {
@@ -322,11 +309,11 @@ impl<T: Record> Table<T> {
             let before = change.before().cloned();
             let after = change.after().cloned();
             let ours = self.get(&key);
-            if ours == after {
+            if same_value(ours.as_ref(), after.as_ref()) {
                 continue;
             }
             written += 1;
-            let (row, asked) = if ours == before {
+            let (row, asked) = if same_value(ours.as_ref(), before.as_ref()) {
                 (after.map(|row| (*row).clone()), false)
             } else {
                 let conflict = Conflict {
@@ -495,6 +482,10 @@ impl<T: Record> Data for Table<T> {
         d.word("table");
         d.of::<T>();
     }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self.0.same_encoding(&other.0)
+    }
 }
 
 impl<T: Record> PartialEq for Table<T> {
@@ -527,40 +518,8 @@ pub type Project<I, S, C> = fn(&I, S) -> C;
 
 pub fn plain<I>(_value: &I, _stored: ()) {}
 
-const STORED_BYTES: usize = 4096;
-
-thread_local! {
-    static STORED: RefCell<[Vec<u8>; 2]> = const { RefCell::new([Vec::new(), Vec::new()]) };
-}
-
-fn kept(buf: Vec<u8>) -> Vec<u8> {
-    if buf.capacity() > STORED_BYTES {
-        Vec::new()
-    } else {
-        buf
-    }
-}
-
-fn encoding<D: Data>(value: &D, buf: Vec<u8>) -> (Vec<u8>, Option<Vec<Hash>>) {
-    let mut sink = HashSink;
-    let mut encoder = Encoder::reusing(&mut sink, buf);
-    let encoded = value.encode(&mut encoder);
-    let links = encoded
-        .ok()
-        .map(|()| encoder.links().iter().map(|ptr| ptr.hash).collect());
-    (encoder.into_buf(), links)
-}
-
 pub fn same_stored<D: Data + PartialEq>(old: &D, new: &D) -> bool {
-    if old != new {
-        return false;
-    }
-    let [left, right] = STORED.take();
-    let (left, old_links) = encoding(old, left);
-    let (right, new_links) = encoding(new, right);
-    let same = old_links.is_some() && old_links == new_links && left == right;
-    STORED.set([kept(left), kept(right)]);
-    same
+    old == new && old.same_encoding(new)
 }
 
 struct Entries<I, K, S, C> {
