@@ -771,6 +771,16 @@ impl Indexed {
         }
     }
 
+    fn found_path(&self, table: &Ident) -> TokenStream2 {
+        if self.cover.is_empty() {
+            let vt = self.value_ty();
+            quote! { ::ferro::table::plain::<#vt> }
+        } else {
+            let project = self.project_fn();
+            quote! { #table::#project }
+        }
+    }
+
     fn field(&self) -> Ident {
         match self.kind {
             IndexKind::Unique => format_ident!("unique_{}", self.name),
@@ -1095,6 +1105,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut reindex = Vec::new();
     let mut clashes = Vec::new();
     let mut methods = Vec::new();
+    let mut finds = Vec::new();
     for (slot, ix) in indexes.iter().enumerate() {
         let field = ix.field();
         let vt = ix.value_ty();
@@ -1374,7 +1385,51 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::ferro::table::index_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
                 }
             });
+            let found = ix.found_path(&table);
+            finds.push(quote! {
+                #[inline]
+                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
+                where
+                    #inner: ::std::borrow::Borrow<__Q>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::match_eq_some::<#inner, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
+                }
+
+                #[inline]
+                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
+                where
+                    #inner: ::std::borrow::Borrow<__Q>,
+                    #key_ty: ::std::borrow::Borrow<__A>,
+                    __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                    __A: ::std::cmp::Ord + ?::std::marker::Sized,
+                {
+                    ::ferro::table::match_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
+                }
+            });
         }
+        let found = ix.found_path(&table);
+        finds.push(quote! {
+            #[inline]
+            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
+            where
+                #vt: ::std::borrow::Borrow<__Q>,
+                __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+            {
+                ::ferro::table::match_eq::<#vt, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
+            }
+
+            #[inline]
+            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
+            where
+                #vt: ::std::borrow::Borrow<__Q>,
+                #key_ty: ::std::borrow::Borrow<__A>,
+                __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                __A: ::std::cmp::Ord + ?::std::marker::Sized,
+            {
+                ::ferro::table::match_after::<#vt, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
+            }
+        });
         methods.push(quote! {
             pub fn #counts(&self) -> ::std::vec::Vec<(#vt, usize)> {
                 ::ferro::table::index_counts(&self.#field)
@@ -1411,6 +1466,35 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         });
     }
+
+    let find = format_ident!("{}Find", name);
+    let find_items = if finds.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #vis struct #find<'a> {
+                table: &'a #table,
+            }
+
+            impl ::std::clone::Clone for #find<'_> {
+                fn clone(&self) -> Self {
+                    *self
+                }
+            }
+
+            impl ::std::marker::Copy for #find<'_> {}
+
+            impl #table {
+                pub fn find(&self) -> #find<'_> {
+                    #find { table: self }
+                }
+            }
+
+            impl #find<'_> {
+                #(#finds)*
+            }
+        }
+    };
 
     let rows_tag = field_tag("rows");
     let index_tag = field_tag("indexes");
@@ -1655,6 +1739,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             #(#methods)*
         }
+
+        #find_items
     })
 }
 

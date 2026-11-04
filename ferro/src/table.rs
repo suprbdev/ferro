@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Description, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values, same_value};
+use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Map, Val, Values, same_value};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -697,6 +697,848 @@ impl<T: Record> DoubleEndedIterator for IndexKeys<T> {
 
 impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 
+pub trait IntoMatches<T: Record> {
+    type Covered: Send + 'static;
+
+    fn into_matches(self) -> Matches<T, Self::Covered>;
+}
+
+impl<T: Record, C: Send + 'static> IntoMatches<T> for IndexIter<T, C> {
+    type Covered = C;
+
+    fn into_matches(self) -> Matches<T, C> {
+        let mut entries = self.entries;
+        let left = entries.left();
+        let collect: Collect<T::Key, C> = Box::new(move || {
+            let mut items = Vec::with_capacity(left);
+            while let Some((key, covered)) = entries.forward_covered() {
+                items.push((key, Some(covered)));
+            }
+            items
+        });
+        Matches {
+            rows: self.rows,
+            stream: Box::new(Listed::pending(left, collect)),
+            started: false,
+        }
+    }
+}
+
+impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
+    type Covered = C;
+
+    fn into_matches(self) -> Matches<T, C> {
+        self
+    }
+}
+
+pub struct Matches<T: Record, C = ()> {
+    rows: Finder<T::Key, T>,
+    stream: Box<dyn Stream<T::Key, C>>,
+    started: bool,
+}
+
+impl<T: Record, C: Send + 'static> Matches<T, C> {
+    pub fn and<M: IntoMatches<T>>(self, other: M) -> Matches<T, C> {
+        let left = self.unstarted();
+        let right = other.into_matches().unstarted();
+        Matches {
+            rows: left.rows,
+            stream: Box::new(All::new(left.stream, Box::new(Blind(right.stream)))),
+            started: false,
+        }
+    }
+
+    pub fn or<M: IntoMatches<T, Covered = C>>(self, other: M) -> Matches<T, C> {
+        let left = self.unstarted();
+        let right = other.into_matches().unstarted();
+        Matches {
+            rows: left.rows,
+            stream: Box::new(Any {
+                sides: vec![left.stream, right.stream],
+                landed: None,
+            }),
+            started: false,
+        }
+    }
+
+    pub fn keys(self) -> MatchKeys<T> {
+        MatchKeys(Box::new(Blind(self.stream)))
+    }
+
+    pub fn covered(mut self) -> MatchCovered<T, C> {
+        self.stream.cover();
+        MatchCovered(self.stream)
+    }
+
+    pub fn uncovered(self) -> Matches<T> {
+        Matches {
+            rows: self.rows,
+            stream: Box::new(Blind(self.stream)),
+            started: self.started,
+        }
+    }
+
+    fn unstarted(mut self) -> Self {
+        if !self.started {
+            return self;
+        }
+        self.stream.cover();
+        let mut items = VecDeque::new();
+        while let Some(item) = self.stream.take(End::Front) {
+            items.push_back(item);
+        }
+        Matches {
+            rows: self.rows,
+            stream: Box::new(Listed::ready(items)),
+            started: false,
+        }
+    }
+}
+
+impl<T: Record, C> Iterator for Matches<T, C> {
+    type Item = Val<T>;
+
+    fn next(&mut self) -> Option<Val<T>> {
+        self.started = true;
+        let (key, _) = self.stream.take(End::Front)?;
+        self.rows.get(&key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.stream.len()))
+    }
+}
+
+impl<T: Record, C> DoubleEndedIterator for Matches<T, C> {
+    fn next_back(&mut self) -> Option<Val<T>> {
+        self.started = true;
+        let (key, _) = self.stream.take(End::Back)?;
+        self.rows.get(&key)
+    }
+}
+
+pub struct MatchKeys<T: Record>(Box<dyn Stream<T::Key, ()>>);
+
+impl<T: Record> Iterator for MatchKeys<T> {
+    type Item = T::Key;
+
+    fn next(&mut self) -> Option<T::Key> {
+        self.0.take(End::Front).map(|(key, _)| key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.0.len()))
+    }
+}
+
+impl<T: Record> DoubleEndedIterator for MatchKeys<T> {
+    fn next_back(&mut self) -> Option<T::Key> {
+        self.0.take(End::Back).map(|(key, _)| key)
+    }
+}
+
+pub struct MatchCovered<T: Record, C = ()>(Box<dyn Stream<T::Key, C>>);
+
+impl<T: Record, C> Iterator for MatchCovered<T, C> {
+    type Item = (T::Key, C);
+
+    fn next(&mut self) -> Option<(T::Key, C)> {
+        let (key, covered) = self.0.take(End::Front)?;
+        Some((key, covered.expect("covered fields kept once covered")))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.0.len()))
+    }
+}
+
+impl<T: Record, C> DoubleEndedIterator for MatchCovered<T, C> {
+    fn next_back(&mut self) -> Option<(T::Key, C)> {
+        let (key, covered) = self.0.take(End::Back)?;
+        Some((key, covered.expect("covered fields kept once covered")))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    Front,
+    Back,
+}
+
+impl End {
+    fn slot(self) -> usize {
+        match self {
+            End::Front => 0,
+            End::Back => 1,
+        }
+    }
+
+    fn other(self) -> End {
+        match self {
+            End::Front => End::Back,
+            End::Back => End::Front,
+        }
+    }
+
+    fn before<K: Ord>(self, key: &K, target: &K) -> bool {
+        match self {
+            End::Front => key < target,
+            End::Back => key > target,
+        }
+    }
+}
+
+trait Stream<K, C>: Send {
+    fn len(&self) -> usize;
+    fn cover(&mut self);
+    fn peek(&self, end: End) -> Option<&K>;
+    fn fill(&mut self, end: End) -> Option<&K>;
+    fn seek(&mut self, end: End, target: &K) -> Option<&K>;
+    fn take(&mut self, end: End) -> Option<(K, Option<C>)>;
+    fn probe(&mut self, end: End, target: &K) -> Option<&K>;
+    fn found(&mut self) -> Option<C>;
+}
+
+const STEPS: usize = 16;
+
+struct EqualStream<I, K, S, C> {
+    index: Map<(I, K), S>,
+    iter: Iter<(I, K), S>,
+    project: Project<I, S, C>,
+    covering: bool,
+    started: bool,
+    value: Option<I>,
+    first: Option<K>,
+    last: Option<K>,
+    held: [Option<(K, Option<C>)>; 2],
+    edge: [Bound<K>; 2],
+    cursor: Option<Cursor<(I, K), S>>,
+    probe: Option<(I, K)>,
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> EqualStream<I, K, S, C> {
+    fn new(index: Map<(I, K), S>, iter: Iter<(I, K), S>, project: Project<I, S, C>) -> Self {
+        EqualStream {
+            index,
+            iter,
+            project,
+            covering: false,
+            started: false,
+            value: None,
+            first: None,
+            last: None,
+            held: [None, None],
+            edge: [Bound::Unbounded, Bound::Unbounded],
+            cursor: None,
+            probe: None,
+        }
+    }
+
+    #[inline]
+    fn read(&mut self, end: End) -> Option<(K, Option<C>)> {
+        let project = self.project;
+        if self.covering {
+            let read = |entry: &(I, K), stored: &S| {
+                (entry.1.clone(), Some(project(&entry.0, stored.clone())))
+            };
+            match end {
+                End::Front => self.iter.next_with(read),
+                End::Back => self.iter.next_back_with(read),
+            }
+        } else {
+            let read = |entry: &(I, K)| (entry.1.clone(), None);
+            match end {
+                End::Front => self.iter.next_key_with(read),
+                End::Back => self.iter.next_back_key_with(read),
+            }
+        }
+    }
+
+    #[inline]
+    fn start(&mut self) {
+        if !self.started {
+            self.begin();
+        }
+    }
+
+    fn begin(&mut self) {
+        self.started = true;
+        let project = self.project;
+        let covering = self.covering;
+        let mut value = None;
+        let first = self.iter.next_with(|entry, stored| {
+            value = Some(entry.0.clone());
+            (
+                entry.1.clone(),
+                covering.then(|| project(&entry.0, stored.clone())),
+            )
+        });
+        self.value = value;
+        let last = self.read(End::Back);
+        self.first = first.as_ref().map(|(key, _)| key.clone());
+        self.last = last.as_ref().or(first.as_ref()).map(|(key, _)| key.clone());
+        if let (Some(first), Some(last)) = (&self.first, &self.last) {
+            self.edge = [
+                Bound::Included(first.clone()),
+                Bound::Included(last.clone()),
+            ];
+        }
+        self.held = [first, last];
+    }
+
+    #[inline]
+    fn pull(&mut self, end: End) {
+        let next = self.read(end);
+        self.held[end.slot()] = match next {
+            Some(entry) => Some(entry),
+            None => self.held[end.other().slot()].take(),
+        };
+    }
+
+    fn rebuild(&mut self, end: End, target: &K) {
+        let Some(value) = self.value.as_ref() else {
+            return;
+        };
+        let other = end.other();
+        let far = match &self.held[other.slot()] {
+            Some((key, _)) => Bound::Excluded(key.clone()),
+            None => self.edge[other.slot()].clone(),
+        };
+        let near = Bound::Included(target.clone());
+        let (low, high) = match end {
+            End::Front => (near, far),
+            End::Back => (far, near),
+        };
+        self.iter = self.index.range_by(
+            |entry| match entry.0.cmp(value) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => match &low {
+                    Bound::Included(bound) => entry.1 < *bound,
+                    Bound::Excluded(bound) => entry.1 <= *bound,
+                    Bound::Unbounded => false,
+                },
+            },
+            |entry| match entry.0.cmp(value) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => match &high {
+                    Bound::Included(bound) => entry.1 <= *bound,
+                    Bound::Excluded(bound) => entry.1 < *bound,
+                    Bound::Unbounded => true,
+                },
+            },
+        );
+        self.edge[end.slot()] = Bound::Included(target.clone());
+    }
+
+    fn lookup(&self, key: &K) -> Option<C> {
+        let value = self.value.as_ref()?;
+        let stored = self.index.get(&(value.clone(), key.clone()))?;
+        Some((self.project)(value, (*stored).clone()))
+    }
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStream<I, K, S, C> {
+    fn len(&self) -> usize {
+        self.iter.len() + self.held.iter().filter(|held| held.is_some()).count()
+    }
+
+    fn cover(&mut self) {
+        self.covering = true;
+    }
+
+    fn peek(&self, end: End) -> Option<&K> {
+        self.held[end.slot()].as_ref().map(|(key, _)| key)
+    }
+
+    fn fill(&mut self, end: End) -> Option<&K> {
+        self.start();
+        if self.held[end.slot()].is_none() {
+            self.pull(end);
+        }
+        self.peek(end)
+    }
+
+    fn seek(&mut self, end: End, target: &K) -> Option<&K> {
+        self.start();
+        let slot = end.slot();
+        if let Some((key, _)) = &self.held[slot]
+            && !end.before(key, target)
+        {
+            return self.peek(end);
+        }
+        self.held[slot] = None;
+        let mut steps = 0;
+        loop {
+            if steps == STEPS && self.iter.len() > 0 {
+                self.rebuild(end, target);
+            }
+            steps += 1;
+            let next = match self.read(end) {
+                Some(next) => next,
+                None => self.held[end.other().slot()].take()?,
+            };
+            if !end.before(&next.0, target) {
+                self.held[slot] = Some(next);
+                return self.peek(end);
+            }
+        }
+    }
+
+    fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
+        self.fill(end)?;
+        let (key, covered) = self.held[end.slot()].take()?;
+        self.edge[end.slot()] = Bound::Excluded(key.clone());
+        let covered = match covered {
+            None if self.covering => self.lookup(&key),
+            covered => covered,
+        };
+        Some((key, covered))
+    }
+
+    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+        self.start();
+        let (Some(first), Some(last), Some(value)) = (&self.first, &self.last, &self.value) else {
+            return None;
+        };
+        let target = match end {
+            End::Front if target > last => return None,
+            End::Back if target < first => return None,
+            End::Front if target < first => first,
+            End::Back if target > last => last,
+            _ => target,
+        };
+        let probe = match &mut self.probe {
+            Some(probe) => {
+                probe.1 = target.clone();
+                probe
+            }
+            None => self.probe.insert((value.clone(), target.clone())),
+        };
+        let cursor = self.cursor.get_or_insert_with(|| self.index.cursor());
+        match end {
+            End::Front => cursor.seek(probe),
+            End::Back => cursor.seek_back(probe),
+        };
+        let entry = cursor.key()?;
+        let inside = entry.0 == *value
+            && match end {
+                End::Front => entry.1 <= *last,
+                End::Back => entry.1 >= *first,
+            };
+        inside.then_some(&entry.1)
+    }
+
+    fn found(&mut self) -> Option<C> {
+        let project = self.project;
+        self.cursor
+            .as_ref()?
+            .read(|entry, stored| project(&entry.0, stored.clone()))
+    }
+}
+
+type Collect<K, C> = Box<dyn FnOnce() -> Vec<(K, Option<C>)> + Send>;
+
+struct Listed<K, C> {
+    pending: Option<(usize, Collect<K, C>)>,
+    items: VecDeque<(K, Option<C>)>,
+    landed: usize,
+}
+
+impl<K: Ord, C> Listed<K, C> {
+    fn pending(left: usize, collect: Collect<K, C>) -> Self {
+        Listed {
+            pending: Some((left, collect)),
+            items: VecDeque::new(),
+            landed: 0,
+        }
+    }
+
+    fn ready(items: VecDeque<(K, Option<C>)>) -> Self {
+        Listed {
+            pending: None,
+            items,
+            landed: 0,
+        }
+    }
+
+    fn items(&mut self) -> &mut VecDeque<(K, Option<C>)> {
+        if let Some((_, collect)) = self.pending.take() {
+            let mut items = collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            items.dedup_by(|a, b| a.0 == b.0);
+            self.items = items.into();
+        }
+        &mut self.items
+    }
+}
+
+impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
+    fn len(&self) -> usize {
+        match &self.pending {
+            Some((left, _)) => *left,
+            None => self.items.len(),
+        }
+    }
+
+    fn cover(&mut self) {}
+
+    fn peek(&self, end: End) -> Option<&K> {
+        match end {
+            End::Front => self.items.front(),
+            End::Back => self.items.back(),
+        }
+        .map(|(key, _)| key)
+    }
+
+    fn fill(&mut self, end: End) -> Option<&K> {
+        self.items();
+        self.peek(end)
+    }
+
+    fn seek(&mut self, end: End, target: &K) -> Option<&K> {
+        let items = self.items();
+        match end {
+            End::Front => {
+                let behind = items.partition_point(|(key, _)| key < target);
+                items.drain(..behind);
+            }
+            End::Back => {
+                let kept = items.partition_point(|(key, _)| key <= target);
+                items.truncate(kept);
+            }
+        }
+        self.peek(end)
+    }
+
+    fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
+        let items = self.items();
+        match end {
+            End::Front => items.pop_front(),
+            End::Back => items.pop_back(),
+        }
+    }
+
+    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+        let items = self.items();
+        let landed = match end {
+            End::Front => items.partition_point(|(key, _)| key < target),
+            End::Back => items
+                .partition_point(|(key, _)| key <= target)
+                .checked_sub(1)?,
+        };
+        self.landed = landed;
+        self.items.get(landed).map(|(key, _)| key)
+    }
+
+    fn found(&mut self) -> Option<C> {
+        self.items.get_mut(self.landed)?.1.take()
+    }
+}
+
+struct Blind<K, X>(Box<dyn Stream<K, X>>);
+
+impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn cover(&mut self) {}
+
+    fn peek(&self, end: End) -> Option<&K> {
+        self.0.peek(end)
+    }
+
+    fn fill(&mut self, end: End) -> Option<&K> {
+        self.0.fill(end)
+    }
+
+    fn seek(&mut self, end: End, target: &K) -> Option<&K> {
+        self.0.seek(end, target)
+    }
+
+    fn take(&mut self, end: End) -> Option<(K, Option<()>)> {
+        self.0.take(end).map(|(key, _)| (key, Some(())))
+    }
+
+    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+        self.0.probe(end, target)
+    }
+
+    fn found(&mut self) -> Option<()> {
+        Some(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Plan {
+    Merge,
+    Left,
+    Right,
+}
+
+const RATIO: usize = 4;
+
+struct All<K, C> {
+    left: Box<dyn Stream<K, C>>,
+    right: Box<dyn Stream<K, ()>>,
+    plan: Option<Plan>,
+    settled: [bool; 2],
+    covering: bool,
+    landed: Option<K>,
+}
+
+fn merged<K: Ord + Clone, X, Y>(
+    a: &mut dyn Stream<K, X>,
+    b: &mut dyn Stream<K, Y>,
+    end: End,
+) -> bool {
+    let Some(key) = a.fill(end) else {
+        return false;
+    };
+    let mut key = key.clone();
+    loop {
+        let Some(found) = b.seek(end, &key) else {
+            return false;
+        };
+        if *found == key {
+            return true;
+        }
+        key = found.clone();
+        let Some(found) = a.seek(end, &key) else {
+            return false;
+        };
+        if *found == key {
+            return true;
+        }
+        key = found.clone();
+    }
+}
+
+fn led<K: Ord + Clone, X, Y>(
+    lead: &mut dyn Stream<K, X>,
+    follow: &mut dyn Stream<K, Y>,
+    end: End,
+) -> bool {
+    let Some(key) = lead.fill(end) else {
+        return false;
+    };
+    let mut key = key.clone();
+    loop {
+        let Some(found) = follow.probe(end, &key) else {
+            return false;
+        };
+        if *found == key {
+            return true;
+        }
+        let found = found.clone();
+        let Some(next) = lead.seek(end, &found) else {
+            return false;
+        };
+        key = next.clone();
+    }
+}
+
+impl<K: Data + Ord, C> All<K, C> {
+    fn new(left: Box<dyn Stream<K, C>>, right: Box<dyn Stream<K, ()>>) -> Self {
+        All {
+            left,
+            right,
+            plan: None,
+            settled: [false, false],
+            covering: false,
+            landed: None,
+        }
+    }
+
+    fn plan(&mut self) -> Plan {
+        if let Some(plan) = self.plan {
+            return plan;
+        }
+        let (left, right) = (self.left.len(), self.right.len());
+        let plan = if left.max(right) < left.min(right).saturating_mul(RATIO) {
+            Plan::Merge
+        } else if left <= right {
+            Plan::Left
+        } else {
+            Plan::Right
+        };
+        self.plan = Some(plan);
+        plan
+    }
+
+    fn settle(&mut self, end: End) -> bool {
+        let settled = match self.plan() {
+            Plan::Merge => merged(&mut *self.left, &mut *self.right, end),
+            Plan::Left => led(&mut *self.left, &mut *self.right, end),
+            Plan::Right => led(&mut *self.right, &mut *self.left, end),
+        };
+        self.settled[end.slot()] = settled;
+        settled
+    }
+}
+
+impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
+    fn len(&self) -> usize {
+        self.left.len().min(self.right.len())
+    }
+
+    fn cover(&mut self) {
+        self.covering = true;
+        self.left.cover();
+    }
+
+    fn peek(&self, end: End) -> Option<&K> {
+        if !self.settled[end.slot()] {
+            return None;
+        }
+        match self.plan? {
+            Plan::Merge | Plan::Left => self.left.peek(end),
+            Plan::Right => self.right.peek(end),
+        }
+    }
+
+    fn fill(&mut self, end: End) -> Option<&K> {
+        if !self.settle(end) {
+            return None;
+        }
+        self.peek(end)
+    }
+
+    fn seek(&mut self, end: End, target: &K) -> Option<&K> {
+        match self.plan() {
+            Plan::Merge | Plan::Left => self.left.seek(end, target)?,
+            Plan::Right => self.right.seek(end, target)?,
+        };
+        self.fill(end)
+    }
+
+    fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
+        if !self.settle(end) {
+            return None;
+        }
+        self.settled[end.slot()] = false;
+        match self.plan() {
+            Plan::Merge => {
+                self.right.take(end)?;
+                self.left.take(end)
+            }
+            Plan::Left => self.left.take(end),
+            Plan::Right => {
+                let (key, _) = self.right.take(end)?;
+                let covered = if self.covering {
+                    self.left.found()
+                } else {
+                    None
+                };
+                Some((key, covered))
+            }
+        }
+    }
+
+    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+        let mut key = target.clone();
+        loop {
+            let found = self.left.probe(end, &key)?.clone();
+            let again = self.right.probe(end, &found)?;
+            if *again == found {
+                self.landed = Some(found);
+                return self.landed.as_ref();
+            }
+            key = again.clone();
+        }
+    }
+
+    fn found(&mut self) -> Option<C> {
+        self.left.found()
+    }
+}
+
+struct Any<K, C> {
+    sides: Vec<Box<dyn Stream<K, C>>>,
+    landed: Option<(usize, K)>,
+}
+
+impl<K: Data + Ord, C> Any<K, C> {
+    fn best(&self, end: End) -> Option<usize> {
+        let mut best: Option<(usize, &K)> = None;
+        for (side, stream) in self.sides.iter().enumerate() {
+            if let Some(key) = stream.peek(end)
+                && best.is_none_or(|(_, held)| end.before(key, held))
+            {
+                best = Some((side, key));
+            }
+        }
+        best.map(|(side, _)| side)
+    }
+}
+
+impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
+    fn len(&self) -> usize {
+        self.sides
+            .iter()
+            .fold(0usize, |total, side| total.saturating_add(side.len()))
+    }
+
+    fn cover(&mut self) {
+        for side in &mut self.sides {
+            side.cover();
+        }
+    }
+
+    fn peek(&self, end: End) -> Option<&K> {
+        self.sides[self.best(end)?].peek(end)
+    }
+
+    fn fill(&mut self, end: End) -> Option<&K> {
+        for side in &mut self.sides {
+            side.fill(end);
+        }
+        self.peek(end)
+    }
+
+    fn seek(&mut self, end: End, target: &K) -> Option<&K> {
+        for side in &mut self.sides {
+            side.seek(end, target);
+        }
+        self.peek(end)
+    }
+
+    fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
+        let key = self.fill(end)?.clone();
+        let mut taken = None;
+        for side in &mut self.sides {
+            if side.peek(end) == Some(&key) {
+                let item = side.take(end);
+                if taken.is_none() {
+                    taken = item;
+                }
+            }
+        }
+        taken
+    }
+
+    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+        let mut best: Option<(usize, K)> = None;
+        for (side, stream) in self.sides.iter_mut().enumerate() {
+            if let Some(key) = stream.probe(end, target)
+                && best.as_ref().is_none_or(|(_, held)| end.before(key, held))
+            {
+                best = Some((side, key.clone()));
+            }
+        }
+        self.landed = best;
+        self.landed.as_ref().map(|(_, key)| key)
+    }
+
+    fn found(&mut self) -> Option<C> {
+        let side = self.landed.as_ref()?.0;
+        self.sides[side].found()
+    }
+}
+
 const FINGERPRINT_BYTES: usize = 8;
 
 pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
@@ -937,6 +1779,119 @@ where
         ),
         project,
     )
+}
+
+fn seeking<I, T, S, C>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), S>,
+    entries: Iter<(I, T::Key), S>,
+    project: Project<I, S, C>,
+) -> Matches<T, C>
+where
+    I: Data + Ord,
+    T: Record,
+    S: Data,
+    C: Send + 'static,
+{
+    Matches {
+        rows: rows.finder(),
+        stream: Box::new(EqualStream::new(index.clone(), entries, project)),
+        started: false,
+    }
+}
+
+pub fn match_eq<I, T, S, C, Q>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
+    value: &Q,
+) -> Matches<T, C>
+where
+    I: Data + Ord + Borrow<Q>,
+    T: Record,
+    S: Data,
+    C: Send + 'static,
+    Q: Ord + ?Sized,
+{
+    let entries = index.range_by(
+        |entry| entry.0.borrow() < value,
+        |entry| entry.0.borrow() <= value,
+    );
+    seeking(rows, index, entries, project)
+}
+
+pub fn match_eq_some<X, T, S, C, Q>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(Option<X>, T::Key), S>,
+    project: Project<Option<X>, S, C>,
+    value: &Q,
+) -> Matches<T, C>
+where
+    X: Data + Ord + Borrow<Q>,
+    T: Record,
+    S: Data,
+    C: Send + 'static,
+    Q: Ord + ?Sized,
+{
+    let entries = index.range_by(
+        |entry| entry.0.as_ref().is_none_or(|x| x.borrow() < value),
+        |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
+    );
+    seeking(rows, index, entries, project)
+}
+
+pub fn match_after<I, T, S, C, Q, A>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
+    value: &Q,
+    after: &A,
+) -> Matches<T, C>
+where
+    I: Data + Ord + Borrow<Q>,
+    T: Record,
+    T::Key: Borrow<A>,
+    S: Data,
+    C: Send + 'static,
+    Q: Ord + ?Sized,
+    A: Ord + ?Sized,
+{
+    let entries = index.range_by(
+        |entry| match entry.0.borrow().cmp(value) {
+            Ordering::Less => true,
+            Ordering::Equal => past_cursor(&entry.1, after),
+            Ordering::Greater => false,
+        },
+        |entry| entry.0.borrow() <= value,
+    );
+    seeking(rows, index, entries, project)
+}
+
+pub fn match_after_some<X, T, S, C, Q, A>(
+    rows: &Map<T::Key, T>,
+    index: &Map<(Option<X>, T::Key), S>,
+    project: Project<Option<X>, S, C>,
+    value: &Q,
+    after: &A,
+) -> Matches<T, C>
+where
+    X: Data + Ord + Borrow<Q>,
+    T: Record,
+    T::Key: Borrow<A>,
+    S: Data,
+    C: Send + 'static,
+    Q: Ord + ?Sized,
+    A: Ord + ?Sized,
+{
+    let entries = index.range_by(
+        |entry| match entry.0.as_ref().map(|x| x.borrow().cmp(value)) {
+            None | Some(Ordering::Less) => true,
+            Some(Ordering::Equal) => past_cursor(&entry.1, after),
+            Some(Ordering::Greater) => false,
+        },
+        |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
+    );
+    seeking(rows, index, entries, project)
 }
 
 pub fn index_counts<I: Data + Ord, K: Data + Ord, S: Data>(
