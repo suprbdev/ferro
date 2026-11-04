@@ -758,7 +758,7 @@ pub fn prepare(data: &[u8]) -> Option<Prepared> {
         _ => 1 + (input.num() % 8192) as usize,
     };
     let interrupt = match mode & (CHUNKED | FAILING) {
-        flags if flags == CHUNKED | FAILING => 1 + usize::from(input.byte() % 7),
+        flags if flags == CHUNKED | FAILING => 2 + usize::from(input.byte() % 6),
         _ => 0,
     };
     let fail_at = match mode & (CHUNKED | FAILING) {
