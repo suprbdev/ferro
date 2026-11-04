@@ -34,7 +34,9 @@ pub fn for_each_token(text: &str, mut emit: impl FnMut(&str)) {
         token.clear();
     };
     for c in text.chars() {
-        if c.is_alphanumeric() {
+        if c.is_ascii_alphanumeric() {
+            token.push(c.to_ascii_lowercase());
+        } else if c.is_alphanumeric() {
             token.extend(c.to_lowercase());
         } else if !token.is_empty() {
             flush(&mut token);
