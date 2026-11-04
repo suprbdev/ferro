@@ -1174,6 +1174,10 @@ trait Objects {
     fn read_object(&self, ptr: Ptr) -> Result<Object>;
     fn relink(&self, object: Object, hash: Hash) -> Result<()>;
     fn hashes(&self) -> &Hashes;
+
+    fn staging(&self) -> Option<&Staging> {
+        None
+    }
 }
 
 impl Objects for Staging {
@@ -1191,6 +1195,10 @@ impl Objects for Staging {
 
     fn hashes(&self) -> &Hashes {
         Staging::hashes(self)
+    }
+
+    fn staging(&self) -> Option<&Staging> {
+        Some(self)
     }
 }
 
@@ -1398,21 +1406,25 @@ impl Landing<'_> {
 
 type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
 
-type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
+struct Kept {
+    left: u8,
+    checks: Vec<(Shape, Vec<Kind>)>,
+}
 
-struct Vetting<'a, O> {
+struct Vetting<'a> {
     store: &'a Store,
-    objects: &'a O,
+    staging: &'a Staging,
+    links: &'a Column<u8>,
     held_at: &'a HashMap<Hash, usize>,
     roots: &'a [Ptr],
     hinted: &'a [Ptr],
     hint_kinds: &'a [Option<Kind>],
     root_kind: &'a Kind,
-    sent: Checked,
+    kept: HashMap<u32, Kept>,
     held: Checked,
     spent: usize,
     budget: usize,
-    queue: Vec<(Ptr, Kind)>,
+    queue: Vec<(Ptr, Kind, Vec<Kind>)>,
 }
 
 fn rejected(error: Error) -> Error {
@@ -1422,17 +1434,11 @@ fn rejected(error: Error) -> Error {
     }
 }
 
-impl<O: Objects> Vetting<'_, O> {
+impl Vetting<'_> {
     fn run(&mut self) -> Result<()> {
-        while let Some((ptr, kind)) = self.queue.pop() {
-            let shape = match self.objects.offset_of(&ptr.hash) {
-                Some(offset) => self.sent(
-                    Ptr {
-                        hash: ptr.hash,
-                        offset,
-                    },
-                    &kind,
-                )?,
+        while let Some((ptr, kind, before)) = self.queue.pop() {
+            let shape = match self.staging.id_of(&ptr.hash) {
+                Some(id) => self.sent(id, ptr.hash, &kind, before)?,
                 None => {
                     let reference = *self.held_at.get(&ptr.hash).ok_or_else(|| {
                         bad("an object links to one that was neither sent nor known")
@@ -1453,40 +1459,116 @@ impl<O: Objects> Vetting<'_, O> {
         Ok(())
     }
 
-    fn sent(&mut self, ptr: Ptr, kind: &Kind) -> Result<Shape> {
-        if let Some(shape) = self.sent.get(&ptr.hash, kind) {
-            return Ok(shape);
+    fn sent(&mut self, id: u32, hash: Hash, kind: &Kind, mut before: Vec<Kind>) -> Result<Shape> {
+        let links = self.links.get(id);
+        let pinned = links == u8::MAX || self.held_at.contains_key(&hash);
+        let shared = links >= 2 || pinned;
+        let counted = before.is_empty();
+        if shared && let Some(kept) = self.kept.get_mut(&id) {
+            let same = kept
+                .checks
+                .iter()
+                .position(|(_, kinds)| kinds[0].id == kind.id);
+            let hit = same.and_then(|at| {
+                let (shape, kinds) = &kept.checks[at];
+                kinds
+                    .iter()
+                    .any(|seen| (seen.within)(seen, kind))
+                    .then_some(*shape)
+            });
+            if counted && kept.left != u8::MAX {
+                kept.left = kept.left.saturating_sub(1);
+            }
+            if let Some(shape) = hit {
+                if kept.left == 0 {
+                    self.kept.remove(&id);
+                }
+                return Ok(shape);
+            }
+            if let Some(at) = same {
+                before.extend(kept.checks[at].1.iter().cloned());
+            }
         }
-        let object = self.objects.read_object(ptr)?;
-        self.spent = self.spent.saturating_add(object.body.len());
+        let ptr = Ptr {
+            hash,
+            offset: self.staging.offset(id),
+        };
+        let object = self.staging.read_object(ptr)?;
+        let checks = 1 + before.len();
+        self.spent = self
+            .spent
+            .saturating_add(object.body.len().saturating_mul(checks));
         if self.spent > self.budget {
             return Err(bad("it reuses its objects under too many key ranges"));
         }
-        let (shape, found) = kind.check(&object.body, &object.links).map_err(|error| {
+        let undecodable = |kind: &Kind, error: Error| {
             bad(format!(
                 "a {} it carries does not decode: {error}",
                 kind.name
             ))
-        })?;
-        for (index, child) in found {
-            self.queue.push((object.links[index], child));
+        };
+        let (shape, found) = kind
+            .check(&object.body, &object.links)
+            .map_err(|error| undecodable(kind, error))?;
+        let mut earlier = Vec::with_capacity(before.len());
+        for old in &before {
+            let (_, found) = old
+                .check(&object.body, &object.links)
+                .map_err(|error| undecodable(old, error))?;
+            earlier.push(found);
         }
-        self.sent.insert(ptr.hash, kind, shape);
+        for (index, child) in found {
+            let covered: Vec<Kind> = earlier
+                .iter()
+                .filter_map(|found| {
+                    found
+                        .iter()
+                        .find(|(at, _)| *at == index)
+                        .map(|(_, kind)| kind.clone())
+                })
+                .collect();
+            if covered.iter().any(|old| old.implies(&child)) {
+                continue;
+            }
+            self.queue.push((object.links[index], child, covered));
+        }
+        if shared {
+            let left = if pinned {
+                u8::MAX
+            } else {
+                links - u8::from(counted)
+            };
+            let kept = self.kept.entry(id).or_insert_with(|| Kept {
+                left,
+                checks: Vec::new(),
+            });
+            match kept
+                .checks
+                .iter_mut()
+                .find(|(_, kinds)| kinds[0].id == kind.id)
+            {
+                Some((_, kinds)) => kinds.push(kind.clone()),
+                None => kept.checks.push((shape, vec![kind.clone()])),
+            }
+            if kept.left == 0 {
+                self.kept.remove(&id);
+            }
+        }
         Ok(shape)
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
         let roots = self.roots.len();
-        let hint_kinds = self.hint_kinds;
         let (ptr, known) = if reference <= roots {
-            (self.roots[reference - 1], Some(self.root_kind))
+            (self.roots[reference - 1], Some(self.root_kind.clone()))
         } else {
             let id = reference - 1 - roots;
-            (self.hinted[id], hint_kinds[id].as_ref())
+            (self.hinted[id], self.hint_kinds[id].clone())
         };
         if ptr.hash != hash {
             return Err(bad("a link does not match the object it names"));
         }
+        let known = known.as_ref();
         if known.is_some_and(|known| known.implies(kind)) {
             return Ok(None);
         }
@@ -1855,6 +1937,9 @@ fn resolve<O: Objects>(
         root_kind,
     }) = vetted
     {
+        let staging = objects
+            .staging()
+            .expect("a bundle is checked where it is staged");
         let now = now_ms();
         let horizon = now.saturating_add(MAX_AHEAD_MS);
         if let Some(sent) = landing
@@ -1887,13 +1972,14 @@ fn resolve<O: Objects>(
         }
         let mut vetting = Vetting {
             store,
-            objects,
+            staging,
+            links: &streamed.links,
             held_at: &held_at,
             roots: &anchors.roots,
             hinted: &anchors.hinted,
             hint_kinds: &anchors.hint_kinds,
             root_kind,
-            sent: Checked::default(),
+            kept: HashMap::new(),
             held: Checked::default(),
             spent: 0,
             budget: streamed
@@ -1902,12 +1988,16 @@ fn resolve<O: Objects>(
                 .saturating_add(RECHECK_SLACK),
             queue: Vec::new(),
         };
-        for sent in landing.commits.iter() {
+        for (_, _, id) in &order {
+            let sent = landing
+                .commits
+                .get(*id)
+                .expect("an ordered commit was walked");
             if let Some(root) = sent.root {
-                vetting.queue.push((root, root_kind.clone()));
+                vetting.queue.push((root, root_kind.clone(), Vec::new()));
+                vetting.run()?;
             }
         }
-        vetting.run()?;
         drop(vetting);
         linked = Some(streamed.links);
     }
