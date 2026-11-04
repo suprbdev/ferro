@@ -74,3 +74,16 @@ fn nested_maps_are_clean_after_commit() {
         }
     }
 }
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+#[test]
+fn shared_writers_are_refused_where_they_were_never_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let opened = ferro::Options::new()
+        .shared(true)
+        .open::<Root>(dir.path().join("shared.ferro"));
+    match opened {
+        Err(ferro::Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::Unsupported),
+        other => panic!("{other:?}"),
+    }
+}

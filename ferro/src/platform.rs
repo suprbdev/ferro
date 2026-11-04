@@ -35,96 +35,6 @@ mod imp {
         file.unlock()
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) const RANGES: bool = true;
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) const RANGES: bool = false;
-
-    #[cfg(target_os = "linux")]
-    fn ofd(
-        file: &File,
-        command: libc::c_int,
-        kind: libc::c_int,
-        at: u64,
-        len: u64,
-    ) -> io::Result<libc::flock> {
-        use std::os::fd::AsRawFd;
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = kind as libc::c_short;
-        lock.l_whence = libc::SEEK_SET as libc::c_short;
-        lock.l_start = at as libc::off_t;
-        lock.l_len = len as libc::off_t;
-        loop {
-            if unsafe { libc::fcntl(file.as_raw_fd(), command, &mut lock) } != -1 {
-                return Ok(lock);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn lock_range(
-        file: &File,
-        at: u64,
-        len: u64,
-        exclusive: bool,
-        wait: bool,
-    ) -> Result<(), TryLockError> {
-        let kind = if exclusive {
-            libc::F_WRLCK
-        } else {
-            libc::F_RDLCK
-        };
-        let command = if wait {
-            libc::F_OFD_SETLKW
-        } else {
-            libc::F_OFD_SETLK
-        };
-        match ofd(file, command, kind, at, len) {
-            Ok(_) => Ok(()),
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) => {
-                Err(TryLockError::WouldBlock)
-            }
-            Err(error) => Err(TryLockError::Error(error)),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn unlock_range(file: &File, at: u64, len: u64) -> io::Result<()> {
-        ofd(file, libc::F_OFD_SETLK, libc::F_UNLCK, at, len).map(|_| ())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn range_held(file: &File, at: u64, len: u64) -> io::Result<bool> {
-        let lock = ofd(file, libc::F_OFD_GETLK, libc::F_WRLCK, at, len)?;
-        Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn lock_range(
-        _file: &File,
-        _at: u64,
-        _len: u64,
-        _exclusive: bool,
-        _wait: bool,
-    ) -> Result<(), TryLockError> {
-        Err(TryLockError::Error(io::ErrorKind::Unsupported.into()))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn unlock_range(_file: &File, _at: u64, _len: u64) -> io::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn range_held(_file: &File, _at: u64, _len: u64) -> io::Result<bool> {
-        Ok(false)
-    }
-
     pub(crate) fn sync_reader(file: &File, _path: &Path) -> io::Result<()> {
         file.sync_data()
     }
@@ -280,22 +190,22 @@ mod imp {
         )
     }
 
-    fn region(at: u64) -> OVERLAPPED {
+    fn lock_range() -> OVERLAPPED {
         OVERLAPPED {
             Anonymous: OVERLAPPED_0 {
                 Anonymous: OVERLAPPED_0_0 {
-                    Offset: at as u32,
-                    OffsetHigh: (at >> 32) as u32,
+                    Offset: LOCK_AT as u32,
+                    OffsetHigh: (LOCK_AT >> 32) as u32,
                 },
             },
             ..OVERLAPPED::default()
         }
     }
 
-    fn lock(file: &File, at: u64, len: u64, flags: LOCK_FILE_FLAGS) -> Result<(), TryLockError> {
-        let mut range = region(at);
-        let (low, high) = (len as u32, (len >> 32) as u32);
-        if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, low, high, &mut range) } != 0 {
+    fn lock(file: &File, flags: LOCK_FILE_FLAGS) -> Result<(), TryLockError> {
+        let mut range = lock_range();
+        let flags = flags | LOCKFILE_FAIL_IMMEDIATELY;
+        if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut range) } != 0 {
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -307,44 +217,16 @@ mod imp {
     }
 
     pub(crate) fn try_lock(file: &File) -> Result<(), TryLockError> {
-        lock(
-            file,
-            LOCK_AT,
-            1,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-        )
+        lock(file, LOCKFILE_EXCLUSIVE_LOCK)
     }
 
     pub(crate) fn try_lock_shared(file: &File) -> Result<(), TryLockError> {
-        lock(file, LOCK_AT, 1, LOCKFILE_FAIL_IMMEDIATELY)
+        lock(file, 0)
     }
 
     pub(crate) fn unlock(file: &File) -> io::Result<()> {
-        unlock_range(file, LOCK_AT, 1)
-    }
-
-    pub(crate) const RANGES: bool = true;
-
-    pub(crate) fn lock_range(
-        file: &File,
-        at: u64,
-        len: u64,
-        exclusive: bool,
-        wait: bool,
-    ) -> Result<(), TryLockError> {
-        let kind = if exclusive {
-            LOCKFILE_EXCLUSIVE_LOCK
-        } else {
-            0
-        };
-        let wait = if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
-        lock(file, at, len, kind | wait)
-    }
-
-    pub(crate) fn unlock_range(file: &File, at: u64, len: u64) -> io::Result<()> {
-        let mut range = region(at);
-        let (low, high) = (len as u32, (len >> 32) as u32);
-        if unsafe { UnlockFileEx(file.as_raw_handle(), 0, low, high, &mut range) } != 0 {
+        let mut range = lock_range();
+        if unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut range) } != 0 {
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -352,14 +234,6 @@ mod imp {
             Ok(())
         } else {
             Err(error)
-        }
-    }
-
-    pub(crate) fn range_held(file: &File, at: u64, len: u64) -> io::Result<bool> {
-        match lock_range(file, at, len, true, false) {
-            Ok(()) => unlock_range(file, at, len).map(|()| false),
-            Err(TryLockError::WouldBlock) => Ok(true),
-            Err(TryLockError::Error(error)) => Err(error),
         }
     }
 
@@ -440,3 +314,98 @@ mod imp {
 }
 
 pub(crate) use imp::*;
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod ranges {
+    use std::fs::{File, TryLockError};
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    pub(crate) const RANGES: bool = true;
+
+    fn ofd(
+        file: &File,
+        command: libc::c_int,
+        kind: libc::c_int,
+        at: u64,
+        len: u64,
+    ) -> io::Result<libc::flock> {
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = kind as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        lock.l_start = at as libc::off_t;
+        lock.l_len = len as libc::off_t;
+        loop {
+            if unsafe { libc::fcntl(file.as_raw_fd(), command, &mut lock) } != -1 {
+                return Ok(lock);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    pub(crate) fn lock_range(
+        file: &File,
+        at: u64,
+        len: u64,
+        exclusive: bool,
+        wait: bool,
+    ) -> Result<(), TryLockError> {
+        let kind = if exclusive {
+            libc::F_WRLCK
+        } else {
+            libc::F_RDLCK
+        };
+        let command = if wait {
+            libc::F_OFD_SETLKW
+        } else {
+            libc::F_OFD_SETLK
+        };
+        match ofd(file, command, kind, at, len) {
+            Ok(_) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) => {
+                Err(TryLockError::WouldBlock)
+            }
+            Err(error) => Err(TryLockError::Error(error)),
+        }
+    }
+
+    pub(crate) fn unlock_range(file: &File, at: u64, len: u64) -> io::Result<()> {
+        ofd(file, libc::F_OFD_SETLK, libc::F_UNLCK, at, len).map(|_| ())
+    }
+
+    pub(crate) fn range_held(file: &File, at: u64, len: u64) -> io::Result<bool> {
+        let lock = ofd(file, libc::F_OFD_GETLK, libc::F_WRLCK, at, len)?;
+        Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+mod ranges {
+    use std::fs::{File, TryLockError};
+    use std::io;
+
+    pub(crate) const RANGES: bool = false;
+
+    pub(crate) fn lock_range(
+        _file: &File,
+        _at: u64,
+        _len: u64,
+        _exclusive: bool,
+        _wait: bool,
+    ) -> Result<(), TryLockError> {
+        Err(TryLockError::Error(io::ErrorKind::Unsupported.into()))
+    }
+
+    pub(crate) fn unlock_range(_file: &File, _at: u64, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn range_held(_file: &File, _at: u64, _len: u64) -> io::Result<bool> {
+        Ok(false)
+    }
+}
+
+pub(crate) use ranges::*;

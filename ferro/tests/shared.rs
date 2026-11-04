@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "linux", target_pointer_width = "64"))]
+
 mod common;
 
 use std::sync::atomic::{AtomicBool, Ordering};

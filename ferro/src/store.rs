@@ -460,7 +460,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     if settled || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
     }
-    if platform::range_held(file, MULTI_AT, 1).unwrap_or(true) {
+    if platform::range_held(file, MULTI_AT, 1).unwrap_or(false) {
         platform::unlock(file)?;
         return Ok(sb);
     }
