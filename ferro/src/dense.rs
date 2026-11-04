@@ -105,4 +105,8 @@ impl Hashes {
     pub(crate) fn hash(&self, id: u32) -> Hash {
         self.hashes.get(id)
     }
+
+    pub(crate) fn into_column(self) -> Column<Hash> {
+        self.hashes
+    }
 }

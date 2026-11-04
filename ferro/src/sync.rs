@@ -427,7 +427,9 @@ impl Header {
 struct Emitter {
     store: Store,
     header: Vec<u8>,
-    order: Vec<Ptr>,
+    hashes: Column<Hash>,
+    offsets: Column<u64>,
+    order: Vec<u32>,
     next: usize,
     references: HashMap<Hash, usize>,
     bodies: usize,
@@ -440,12 +442,15 @@ impl Emitter {
     fn new(
         store: &Store,
         header: &Header,
-        order: Vec<Ptr>,
+        sending: Sendable,
+        order: Vec<u32>,
         references: HashMap<Hash, usize>,
     ) -> Emitter {
         Emitter {
             store: store.clone(),
             header: header.encode(),
+            hashes: sending.hashes.into_column(),
+            offsets: sending.offsets,
             order,
             next: 0,
             references,
@@ -465,7 +470,12 @@ impl Emitter {
             return Ok(true);
         }
         while self.out.len() < WRITE_CHUNK && self.next < self.order.len() {
-            let (object, packed) = self.store.read_packed(self.order[self.next])?;
+            let id = self.order[self.next];
+            let ptr = Ptr {
+                hash: self.hashes.get(id),
+                offset: self.offsets.get(id),
+            };
+            let (object, packed) = self.store.read_packed(ptr)?;
             self.next += 1;
             let before = self.sent;
             put_body(
@@ -630,26 +640,92 @@ fn read_entry(object: &Object) -> Result<Entry> {
 
 #[derive(Clone, Copy)]
 enum Origin {
-    Root(usize),
-    Child(Hash, usize),
+    Root(u32),
+    Child(u32, u32),
+}
+
+fn too_many() -> Error {
+    bad("it would carry more objects than one receive can hold")
+}
+
+struct Sendable {
+    hashes: Hashes,
+    offsets: Column<u64>,
+    bare: Column<bool>,
+}
+
+impl Sendable {
+    fn new() -> Sendable {
+        Sendable {
+            hashes: Hashes::new(),
+            offsets: Column::new(),
+            bare: Column::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    fn find(&self, hash: &Hash) -> Option<u32> {
+        self.hashes.find(hash)
+    }
+
+    fn insert(&mut self, ptr: Ptr, bare: bool) -> Result<u32> {
+        let id = self.hashes.insert(ptr.hash).ok_or_else(too_many)?;
+        self.offsets.push(ptr.offset);
+        self.bare.push(bare);
+        Ok(id)
+    }
+}
+
+struct Known {
+    hashes: Hashes,
+    origins: Column<Origin>,
+}
+
+impl Known {
+    fn find(&self, hash: &Hash) -> Option<u32> {
+        self.hashes.find(hash)
+    }
+
+    fn insert(&mut self, hash: Hash, origin: Origin) -> Result<u32> {
+        let id = self.hashes.insert(hash).ok_or_else(too_many)?;
+        self.origins.push(origin);
+        Ok(id)
+    }
+
+    fn child(&self, hash: &Hash) -> Option<u32> {
+        self.find(hash)
+            .filter(|id| matches!(self.origins.get(*id), Origin::Child(..)))
+    }
 }
 
 struct Difference {
-    known: HashMap<Hash, Origin>,
-    send: HashSet<Hash>,
+    known: Known,
+    send: Sendable,
     links: HashMap<Hash, Vec<Ptr>>,
     cached: usize,
 }
 
-fn difference(store: &Store, old_roots: &[Ptr], new_roots: Vec<Ptr>) -> Result<Difference> {
+fn difference(
+    store: &Store,
+    old_roots: &[Ptr],
+    new_roots: impl IntoIterator<Item = Ptr>,
+) -> Result<Difference> {
     let mut found = Difference {
-        known: HashMap::new(),
-        send: HashSet::new(),
+        known: Known {
+            hashes: Hashes::new(),
+            origins: Column::new(),
+        },
+        send: Sendable::new(),
         links: HashMap::new(),
         cached: 0,
     };
     for (slot, root) in old_roots.iter().enumerate() {
-        found.known.entry(root.hash).or_insert(Origin::Root(slot));
+        if found.known.find(&root.hash).is_none() {
+            found.known.insert(root.hash, Origin::Root(slot as u32))?;
+        }
     }
     let mut previous = old_roots.to_vec();
     for root in new_roots {
@@ -661,7 +737,7 @@ fn difference(store: &Store, old_roots: &[Ptr], new_roots: Vec<Ptr>) -> Result<D
 
 impl Difference {
     fn classified(&self, hash: &Hash) -> bool {
-        self.known.contains_key(hash) || self.send.contains(hash)
+        self.known.find(hash).is_some() || self.send.find(hash).is_some()
     }
 
     fn step(&mut self, store: &Store, mut old: Vec<Ptr>, root: Ptr) -> Result<()> {
@@ -682,12 +758,24 @@ impl Difference {
                     Some(links) => links.clone(),
                     None => store.read_links(ptr)?,
                 };
+                let mut parent = None;
                 for (index, link) in links.into_iter().enumerate() {
                     if link.offset == 0 {
                         continue;
                     }
                     if !self.classified(&link.hash) {
-                        self.known.insert(link.hash, Origin::Child(ptr.hash, index));
+                        let parent = match parent {
+                            Some(parent) => parent,
+                            None => {
+                                *parent.insert(self.known.find(&ptr.hash).ok_or_else(|| {
+                                    Error::Corrupt(
+                                        "sync expanded an object it had not classified".into(),
+                                    )
+                                })?)
+                            }
+                        };
+                        self.known
+                            .insert(link.hash, Origin::Child(parent, index as u32))?;
                     }
                     deeper.push(link);
                 }
@@ -698,25 +786,33 @@ impl Difference {
                 if self.classified(&ptr.hash) {
                     continue;
                 }
-                if ptr.offset == 0 {
-                    return Err(bad(
-                        "the branch links to pruned history outside its commit log",
-                    ));
-                }
-                let links = store.read_links(ptr)?;
-                for link in &links {
+                let links = match ptr.offset {
+                    0 => Vec::new(),
+                    _ => store.read_links(ptr)?,
+                };
+                self.send_object(ptr, &links)?;
+                for link in links {
                     if seen.insert(link.hash) {
-                        next.push(*link);
+                        next.push(link);
                     }
-                }
-                self.send.insert(ptr.hash);
-                if self.cached + 1 + links.len() <= CACHED_LINKS {
-                    self.cached += 1 + links.len();
-                    self.links.insert(ptr.hash, links);
                 }
             }
             fresh = next;
         }
+    }
+
+    fn send_object(&mut self, ptr: Ptr, links: &[Ptr]) -> Result<()> {
+        if ptr.offset == 0 {
+            return Err(bad(
+                "the branch links to pruned history outside its commit log",
+            ));
+        }
+        self.send.insert(ptr, links.is_empty())?;
+        if !links.is_empty() && self.cached + 1 + links.len() <= CACHED_LINKS {
+            self.cached += 1 + links.len();
+            self.links.insert(ptr.hash, links.to_vec());
+        }
+        Ok(())
     }
 }
 
@@ -728,59 +824,74 @@ enum Visit {
 }
 
 struct Ordered {
-    order: Vec<Ptr>,
-    ids: HashMap<Hash, usize>,
+    order: Vec<u32>,
+    ids: HashMap<u32, usize>,
     hints: Vec<(usize, usize)>,
 }
 
 fn post_order(
     store: &Store,
-    starts: &[Ptr],
-    state: &mut HashMap<Hash, Visit>,
+    starts: impl IntoIterator<Item = Ptr>,
+    send: &Sendable,
     mut cached: HashMap<Hash, Vec<Ptr>>,
-    old: &HashMap<Hash, Origin>,
+    old: &Known,
     anchors: usize,
 ) -> Result<Ordered> {
-    let mut links_of = |ptr: Ptr| match cached.remove(&ptr.hash) {
-        Some(links) => Ok(links),
-        None => store.read_links(ptr),
+    let mut links_of = |id: u32, ptr: Ptr| {
+        if send.bare.get(id) {
+            return Ok(Vec::new());
+        }
+        match cached.remove(&ptr.hash) {
+            Some(links) => Ok(links),
+            None => store.read_links(ptr),
+        }
     };
+    let mut state = Column::new();
+    for _ in 0..send.len() {
+        state.push(Visit::Waiting);
+    }
     let mut found = Ordered {
-        order: Vec::with_capacity(state.len()),
+        order: Vec::with_capacity(send.len()),
         ids: HashMap::new(),
         hints: Vec::new(),
     };
     for start in starts {
-        if state.get(&start.hash) != Some(&Visit::Waiting) {
+        let Some(id) = send.find(&start.hash) else {
+            continue;
+        };
+        if state.get(id) != Visit::Waiting {
             continue;
         }
-        state.insert(start.hash, Visit::Open);
-        let mut stack = vec![(*start, links_of(*start)?, 0usize)];
+        state.set(id, Visit::Open);
+        let mut stack = vec![(id, links_of(id, start)?, 0usize)];
         while let Some((_, links, next)) = stack.last_mut() {
             if let Some(link) = links.get(*next).copied() {
                 *next += 1;
-                if link.offset != 0 && state.get(&link.hash) == Some(&Visit::Waiting) {
-                    state.insert(link.hash, Visit::Open);
-                    stack.push((link, links_of(link)?, 0));
+                if link.offset != 0
+                    && let Some(id) = send.find(&link.hash)
+                    && state.get(id) == Visit::Waiting
+                {
+                    state.set(id, Visit::Open);
+                    stack.push((id, links_of(id, link)?, 0));
                 }
                 continue;
             }
-            let (ptr, links, _) = stack.pop().expect("the stack has a top");
+            let (id, links, _) = stack.pop().expect("the stack has a top");
             for link in &links {
-                if !state.contains_key(&link.hash)
-                    && matches!(old.get(&link.hash), Some(Origin::Child(..)))
+                if send.find(&link.hash).is_none()
+                    && let Some(child) = old.child(&link.hash)
                 {
-                    hint_for(link.hash, old, &mut found.ids, &mut found.hints, anchors);
+                    hint_for(child, old, &mut found.ids, &mut found.hints, anchors);
                 }
             }
-            state.insert(ptr.hash, Visit::Done);
-            found.order.push(ptr);
+            state.set(id, Visit::Done);
+            found.order.push(id);
         }
     }
     Ok(found)
 }
 
-struct Known {
+struct Recognised {
     mark: Mark,
     ptr: Ptr,
     chain: Chain,
@@ -790,7 +901,6 @@ struct Known {
 struct Sending {
     ptr: Ptr,
     root: Option<Ptr>,
-    merged: Option<Merged>,
     generation: u64,
 }
 
@@ -799,7 +909,6 @@ impl Sending {
         Sending {
             ptr,
             root: entry.commit.root,
-            merged: entry.merged,
             generation: entry.generation(),
         }
     }
@@ -809,13 +918,19 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
     let mut header = Header::default();
     let chain = refs.try_get(name)?.map(|head| head.log);
     let Some(chain) = chain.filter(|chain| chain.tip.is_some()) else {
-        return Ok(Emitter::new(store, &header, Vec::new(), HashMap::new()));
+        return Ok(Emitter::new(
+            store,
+            &header,
+            Sendable::new(),
+            Vec::new(),
+            HashMap::new(),
+        ));
     };
     let tip = chain.tip.expect("chain has a tip");
     let mut known = Vec::new();
     for (index, mark) in have.marks.iter().enumerate() {
         if let Some((ptr, base)) = locate(store, refs, *mark)? {
-            known.push(Known {
+            known.push(Recognised {
                 mark: *mark,
                 ptr,
                 chain: base,
@@ -836,7 +951,8 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         .map_or(0, |(version, _)| version)
         .max(chain.first.saturating_sub(1))
         .min(if named { chain.last } else { chain.last - 1 });
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity((chain.last - floor) as usize);
+    let mut merges = Vec::new();
     let mut next = Some(tip);
     while let Some(ptr) = next {
         let entry = read_entry(&store.read_object(ptr)?)?;
@@ -845,6 +961,7 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
             break;
         }
         next = entry.prev.filter(|_| at > chain.first);
+        merges.extend(entry.merged);
         entries.push(Sending::of(ptr, &entry));
     }
     header.tip = Some(Mark {
@@ -873,64 +990,63 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         header.roots.push(base_slot(slot, &mut header.bases));
         old_roots.push(root);
     }
-    let extra = closures(store, &chain, &entries, &known, &mut header.bases)?;
-    let mut new_roots = Vec::new();
-    for sending in entries.iter().rev().chain(&extra) {
-        new_roots.extend(sending.root);
-    }
+    let extra = closures(store, &chain, &entries, merges, &known, &mut header.bases)?;
+    let new_roots = entries
+        .iter()
+        .rev()
+        .chain(&extra)
+        .filter_map(|sending| sending.root);
     let Difference {
         known: old,
-        send,
+        mut send,
         links,
         ..
     } = difference(store, &old_roots, new_roots)?;
-    let mut state: HashMap<Hash, Visit> = send
-        .into_iter()
-        .map(|hash| (hash, Visit::Waiting))
-        .collect();
-    let mut starts: Vec<(u64, Ptr)> = Vec::with_capacity(entries.len() + extra.len());
-    for sending in entries.iter().chain(&extra) {
-        state.insert(sending.ptr.hash, Visit::Waiting);
-        starts.push((sending.generation, sending.ptr));
+    entries.extend(extra);
+    for sending in &entries {
+        if send.find(&sending.ptr.hash).is_none() {
+            send.insert(sending.ptr, false)?;
+        }
     }
-    starts.sort_by_key(|(generation, ptr)| (*generation, ptr.offset));
-    let starts: Vec<Ptr> = starts.into_iter().map(|(_, ptr)| ptr).collect();
+    entries.sort_by_key(|sending| (sending.generation, sending.ptr.offset));
+    let starts = entries.iter().map(|sending| sending.ptr);
     let Ordered { order, ids, hints } =
-        post_order(store, &starts, &mut state, links, &old, old_roots.len())?;
-    if order.len() != state.len() {
+        post_order(store, starts, &send, links, &old, old_roots.len())?;
+    drop(entries);
+    if order.len() != send.len() {
         return Err(Error::Corrupt(
             "sync found objects its head does not reach".into(),
         ));
     }
-    drop(state);
     header.hints = hints;
     header.count = order.len() as u64;
     let mut references = HashMap::with_capacity(old_roots.len() + ids.len());
     for (slot, root) in old_roots.iter().enumerate() {
         references.entry(root.hash).or_insert(1 + slot);
     }
-    for (hash, id) in ids {
-        if let Some(Origin::Child(..)) = old.get(&hash) {
-            references.insert(hash, 1 + old_roots.len() + id);
-        }
+    for (id, hint) in ids {
+        references.insert(old.hashes.hash(id), 1 + old_roots.len() + hint);
     }
-    Ok(Emitter::new(store, &header, order, references))
+    drop(old);
+    Ok(Emitter::new(store, &header, send, order, references))
 }
 
 fn closures(
     store: &Store,
     chain: &Chain,
     entries: &[Sending],
-    known: &[Known],
+    merges: Vec<Merged>,
+    known: &[Recognised],
     bases: &mut Vec<Mark>,
 ) -> Result<Vec<Sending>> {
     let after = chain.after(store)?;
-    let mut sending: HashSet<Hash> = entries.iter().map(|sending| sending.ptr.hash).collect();
-    let mut seeds: Vec<(Merged, Option<u64>)> = entries
-        .iter()
-        .filter_map(|sending| sending.merged.map(|merged| (merged, after)))
-        .collect();
     let mut extra = Vec::new();
+    if merges.is_empty() {
+        return Ok(extra);
+    }
+    let mut sending: HashSet<Hash> = entries.iter().map(|sending| sending.ptr.hash).collect();
+    let mut seeds: Vec<(Merged, Option<u64>)> =
+        merges.into_iter().map(|merged| (merged, after)).collect();
     while let Some((merged, path)) = seeds.pop() {
         let (ptr, after) = (merged.ptr, merged.after(path));
         let marked = |hash: &Hash| bases.iter().any(|mark| mark.hash == *hash);
@@ -986,22 +1102,22 @@ fn closures(
 }
 
 fn hint_for(
-    hash: Hash,
-    old: &HashMap<Hash, Origin>,
-    ids: &mut HashMap<Hash, usize>,
+    child: u32,
+    old: &Known,
+    ids: &mut HashMap<u32, usize>,
     hints: &mut Vec<(usize, usize)>,
     roots: usize,
-) -> usize {
+) {
     let mut path = Vec::new();
-    let mut at = hash;
+    let mut at = child;
     let parent = loop {
         if let Some(id) = ids.get(&at) {
             break roots + id;
         }
-        match old[&at] {
-            Origin::Root(slot) => break slot,
+        match old.origins.get(at) {
+            Origin::Root(slot) => break slot as usize,
             Origin::Child(parent, index) => {
-                path.push((at, index));
+                path.push((at, index as usize));
                 at = parent;
             }
         }
@@ -1013,7 +1129,6 @@ fn hint_for(
         ids.insert(child, id);
         parent = roots + id;
     }
-    ids[&hash]
 }
 
 #[derive(Clone, Copy)]
