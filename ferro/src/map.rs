@@ -3911,6 +3911,30 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         }
     }
 
+    pub(crate) fn next_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
+        let index = self.advance()?;
+        self.front.last().map(|frame| f(&frame.node.keys[index]))
+    }
+
+    pub(crate) fn next_back_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
+        let index = self.retreat()?;
+        self.back.last().map(|frame| f(&frame.node.keys[index]))
+    }
+
+    pub(crate) fn next_with<R>(&mut self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
+        let index = self.advance()?;
+        let frame = self.front.last()?;
+        let key = &frame.node.keys[index];
+        Some(fatal(frame.node.read(self.store.as_ref(), index, |value| f(key, value))))
+    }
+
+    pub(crate) fn next_back_with<R>(&mut self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
+        let index = self.retreat()?;
+        let frame = self.back.last()?;
+        let key = &frame.node.keys[index];
+        Some(fatal(frame.node.read(self.store.as_ref(), index, |value| f(key, value))))
+    }
+
     fn value_of(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<Val<V>> {
         frame.map(|frame| fatal(frame.node.value(self.store.as_ref(), index)))
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Diff, Finder, Iter, Keys, Map, Val, Values};
+use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -497,65 +497,153 @@ trait KeyCursor<K>: Send {
     fn left(&self) -> usize;
 }
 
-struct Entries<I, K>(Keys<(I, K), ()>);
+trait EntryCursor<K, C>: KeyCursor<K> {
+    fn forward_covered(&mut self) -> Option<(K, C)>;
+    fn backward_covered(&mut self) -> Option<(K, C)>;
+}
 
-impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Entries<I, K> {
+pub type Project<I, S, C> = fn(&I, S) -> C;
+
+pub fn plain<I>(_value: &I, _stored: ()) {}
+
+struct Entries<I, K, S, C> {
+    iter: Iter<(I, K), S>,
+    project: Project<I, S, C>,
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> KeyCursor<K> for Entries<I, K, S, C> {
     fn forward(&mut self) -> Option<K> {
-        self.0.next().map(|(_, key)| key)
+        self.iter.next_key_with(|entry| entry.1.clone())
     }
 
     fn backward(&mut self) -> Option<K> {
-        self.0.next_back().map(|(_, key)| key)
+        self.iter.next_back_key_with(|entry| entry.1.clone())
     }
 
     fn left(&self) -> usize {
-        self.0.len()
+        self.iter.len()
     }
 }
 
-pub struct IndexIter<T: Record> {
-    rows: Finder<T::Key, T>,
-    keys: Box<dyn KeyCursor<T::Key>>,
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for Entries<I, K, S, C> {
+    fn forward_covered(&mut self) -> Option<(K, C)> {
+        let project = self.project;
+        self.iter
+            .next_with(|entry, stored| (entry.1.clone(), project(&entry.0, stored.clone())))
+    }
+
+    fn backward_covered(&mut self) -> Option<(K, C)> {
+        let project = self.project;
+        self.iter
+            .next_back_with(|entry, stored| (entry.1.clone(), project(&entry.0, stored.clone())))
+    }
 }
 
-impl<T: Record> IndexIter<T> {
-    fn over<I: Data + Ord>(rows: &Map<T::Key, T>, entries: Iter<(I, T::Key), ()>) -> Self {
+struct Uncovered<K, C>(Box<dyn EntryCursor<K, C>>);
+
+impl<K, C> KeyCursor<K> for Uncovered<K, C> {
+    fn forward(&mut self) -> Option<K> {
+        self.0.forward()
+    }
+
+    fn backward(&mut self) -> Option<K> {
+        self.0.backward()
+    }
+
+    fn left(&self) -> usize {
+        self.0.left()
+    }
+}
+
+impl<K, C> EntryCursor<K, ()> for Uncovered<K, C> {
+    fn forward_covered(&mut self) -> Option<(K, ())> {
+        self.0.forward().map(|key| (key, ()))
+    }
+
+    fn backward_covered(&mut self) -> Option<(K, ())> {
+        self.0.backward().map(|key| (key, ()))
+    }
+}
+
+pub struct IndexIter<T: Record, C = ()> {
+    rows: Finder<T::Key, T>,
+    entries: Box<dyn EntryCursor<T::Key, C>>,
+}
+
+impl<T: Record, C: 'static> IndexIter<T, C> {
+    fn over<I: Data + Ord, S: Data>(
+        rows: &Map<T::Key, T>,
+        entries: Iter<(I, T::Key), S>,
+        project: Project<I, S, C>,
+    ) -> Self {
         IndexIter {
             rows: rows.finder(),
-            keys: Box::new(Entries(entries.into_keys())),
+            entries: Box::new(Entries {
+                iter: entries,
+                project,
+            }),
         }
     }
 
     pub fn keys(self) -> IndexKeys<T> {
-        IndexKeys(self.keys)
+        IndexKeys(self.entries)
     }
 
-    fn row(&mut self, key: &T::Key) -> Option<Val<T>> {
-        self.rows.get(key)
+    pub fn covered(self) -> IndexCovered<T, C> {
+        IndexCovered(self.entries)
+    }
+
+    pub fn uncovered(self) -> IndexIter<T> {
+        IndexIter {
+            rows: self.rows,
+            entries: Box::new(Uncovered(self.entries)),
+        }
     }
 }
 
-impl<T: Record> Iterator for IndexIter<T> {
+impl<T: Record, C> Iterator for IndexIter<T, C> {
     type Item = Val<T>;
 
     fn next(&mut self) -> Option<Val<T>> {
-        let key = self.keys.forward()?;
-        self.row(&key)
+        let key = self.entries.forward()?;
+        self.rows.get(&key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.keys.left(), Some(self.keys.left()))
+        (self.entries.left(), Some(self.entries.left()))
     }
 }
 
-impl<T: Record> DoubleEndedIterator for IndexIter<T> {
+impl<T: Record, C> DoubleEndedIterator for IndexIter<T, C> {
     fn next_back(&mut self) -> Option<Val<T>> {
-        let key = self.keys.backward()?;
-        self.row(&key)
+        let key = self.entries.backward()?;
+        self.rows.get(&key)
     }
 }
 
-impl<T: Record> ExactSizeIterator for IndexIter<T> {}
+impl<T: Record, C> ExactSizeIterator for IndexIter<T, C> {}
+
+pub struct IndexCovered<T: Record, C = ()>(Box<dyn EntryCursor<T::Key, C>>);
+
+impl<T: Record, C> Iterator for IndexCovered<T, C> {
+    type Item = (T::Key, C);
+
+    fn next(&mut self) -> Option<(T::Key, C)> {
+        self.0.forward_covered()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.left(), Some(self.0.left()))
+    }
+}
+
+impl<T: Record, C> DoubleEndedIterator for IndexCovered<T, C> {
+    fn next_back(&mut self) -> Option<(T::Key, C)> {
+        self.0.backward_covered()
+    }
+}
+
+impl<T: Record, C> ExactSizeIterator for IndexCovered<T, C> {}
 
 pub struct IndexKeys<T: Record>(Box<dyn KeyCursor<T::Key>>);
 
@@ -592,30 +680,37 @@ where
     rows.get(&*index.get(value)?)
 }
 
-pub fn index_where<I, T>(
+pub fn index_where<I, T, S, C>(
     rows: &Map<T::Key, T>,
-    index: &Map<(I, T::Key), ()>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
     below: impl Fn(&I) -> bool,
     within: impl Fn(&I) -> bool,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     I: Data + Ord,
     T: Record,
+    S: Data,
+    C: 'static,
 {
     IndexIter::over(
         rows,
         index.range_by(|entry| below(&entry.0), |entry| within(&entry.0)),
+        project,
     )
 }
 
-pub fn index_eq<I, T, Q>(
+pub fn index_eq<I, T, S, C, Q>(
     rows: &Map<T::Key, T>,
-    index: &Map<(I, T::Key), ()>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
     value: &Q,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,
+    S: Data,
+    C: 'static,
     Q: Ord + ?Sized,
 {
     IndexIter::over(
@@ -624,17 +719,21 @@ where
             |entry| entry.0.borrow() < value,
             |entry| entry.0.borrow() <= value,
         ),
+        project,
     )
 }
 
-pub fn index_eq_some<X, T, Q>(
+pub fn index_eq_some<X, T, S, C, Q>(
     rows: &Map<T::Key, T>,
-    index: &Map<(Option<X>, T::Key), ()>,
+    index: &Map<(Option<X>, T::Key), S>,
+    project: Project<Option<X>, S, C>,
     value: &Q,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     X: Data + Ord + Borrow<Q>,
     T: Record,
+    S: Data,
+    C: 'static,
     Q: Ord + ?Sized,
 {
     IndexIter::over(
@@ -643,17 +742,21 @@ where
             |entry| entry.0.as_ref().is_none_or(|x| x.borrow() < value),
             |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
         ),
+        project,
     )
 }
 
-pub fn index_range<I, T, Q, R>(
+pub fn index_range<I, T, S, C, Q, R>(
     rows: &Map<T::Key, T>,
-    index: &Map<(I, T::Key), ()>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
     range: R,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,
+    S: Data,
+    C: 'static,
     Q: Ord + ?Sized,
     R: RangeBounds<Q>,
 {
@@ -673,6 +776,7 @@ where
                 Bound::Unbounded => true,
             },
         ),
+        project,
     )
 }
 
@@ -684,16 +788,19 @@ where
     key.borrow() <= after
 }
 
-pub fn index_after<I, T, Q, A>(
+pub fn index_after<I, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
-    index: &Map<(I, T::Key), ()>,
+    index: &Map<(I, T::Key), S>,
+    project: Project<I, S, C>,
     value: &Q,
     after: &A,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     I: Data + Ord + Borrow<Q>,
     T: Record,
     T::Key: Borrow<A>,
+    S: Data,
+    C: 'static,
     Q: Ord + ?Sized,
     A: Ord + ?Sized,
 {
@@ -707,19 +814,23 @@ where
             },
             |entry| entry.0.borrow() <= value,
         ),
+        project,
     )
 }
 
-pub fn index_after_some<X, T, Q, A>(
+pub fn index_after_some<X, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
-    index: &Map<(Option<X>, T::Key), ()>,
+    index: &Map<(Option<X>, T::Key), S>,
+    project: Project<Option<X>, S, C>,
     value: &Q,
     after: &A,
-) -> IndexIter<T>
+) -> IndexIter<T, C>
 where
     X: Data + Ord + Borrow<Q>,
     T: Record,
     T::Key: Borrow<A>,
+    S: Data,
+    C: 'static,
     Q: Ord + ?Sized,
     A: Ord + ?Sized,
 {
@@ -733,10 +844,13 @@ where
             },
             |entry| entry.0.as_ref().is_none_or(|x| x.borrow() <= value),
         ),
+        project,
     )
 }
 
-pub fn index_counts<I: Data + Ord, K: Data + Ord>(index: &Map<(I, K), ()>) -> Vec<(I, usize)> {
+pub fn index_counts<I: Data + Ord, K: Data + Ord, S: Data>(
+    index: &Map<(I, K), S>,
+) -> Vec<(I, usize)> {
     let mut counts = Vec::new();
     let mut next = index.first();
     while let Some(((value, _), _)) = next {

@@ -521,9 +521,108 @@ struct Indexed {
     span: Span,
     fields: Vec<(Ident, Type)>,
     kind: IndexKind,
+    cover: Vec<(Ident, Type)>,
 }
 
+const MAX_STORED: usize = 12;
+
 impl Indexed {
+    fn indexes(&self, ident: &Ident) -> Option<usize> {
+        self.fields.iter().position(|(field, _)| field == ident)
+    }
+
+    fn stored(&self) -> Vec<&(Ident, Type)> {
+        self.cover
+            .iter()
+            .filter(|(ident, _)| self.indexes(ident).is_none())
+            .collect()
+    }
+
+    fn stores_cover(&self) -> bool {
+        !self.stored().is_empty()
+    }
+
+    fn stored_ty(&self) -> TokenStream2 {
+        let tys = self.stored().into_iter().map(|(_, ty)| ty);
+        quote! { (#(#tys,)*) }
+    }
+
+    fn cover_ty(&self) -> TokenStream2 {
+        let tys: Vec<&Type> = self.cover.iter().map(|(_, ty)| ty).collect();
+        match tys.as_slice() {
+            [only] => quote! { #only },
+            _ => quote! { (#(#tys),*) },
+        }
+    }
+
+    fn stored_of(&self) -> TokenStream2 {
+        let clones = self
+            .stored()
+            .into_iter()
+            .map(|(ident, _)| quote! { ::std::clone::Clone::clone(&__r.#ident) });
+        quote! { (#(#clones,)*) }
+    }
+
+    fn same_cover(&self) -> TokenStream2 {
+        let same = self
+            .stored()
+            .into_iter()
+            .map(|(ident, _)| quote! { __o.#ident == __n.#ident });
+        quote! { true #(&& #same)* }
+    }
+
+    fn tag_name(&self) -> String {
+        let stored: Vec<String> = self
+            .stored()
+            .iter()
+            .map(|(ident, _)| ident.to_string())
+            .collect();
+        if stored.is_empty() {
+            self.field().to_string()
+        } else {
+            format!("{} cover({})", self.field(), stored.join(","))
+        }
+    }
+
+    fn projected(&self) -> TokenStream2 {
+        let mut parts = Vec::new();
+        let mut slot = 0;
+        for (ident, _) in &self.cover {
+            parts.push(match self.indexes(ident) {
+                Some(_) if self.fields.len() == 1 => {
+                    quote! { ::std::clone::Clone::clone(__value) }
+                }
+                Some(position) => {
+                    let position = syn::Index::from(position);
+                    quote! { ::std::clone::Clone::clone(&__value.#position) }
+                }
+                None => {
+                    let position = syn::Index::from(slot);
+                    slot += 1;
+                    quote! { __stored.#position }
+                }
+            });
+        }
+        match parts.as_slice() {
+            [only] => quote! { #only },
+            _ => quote! { (#(#parts),*) },
+        }
+    }
+
+    fn project_fn(&self) -> Ident {
+        format_ident!("__{}_cover", self.field())
+    }
+
+    fn project_path(&self) -> TokenStream2 {
+        if self.cover.is_empty() {
+            let vt = self.value_ty();
+            quote! { ::ferro::table::plain::<#vt> }
+        } else {
+            let project = self.project_fn();
+            quote! { Self::#project }
+        }
+    }
+
     fn field(&self) -> Ident {
         match self.kind {
             IndexKind::Unique => format_ident!("unique_{}", self.name),
@@ -591,17 +690,88 @@ fn field_named(fields: &syn::FieldsNamed, name: &Ident) -> syn::Result<(Ident, T
         .ok_or_else(|| syn::Error::new(name.span(), format!("no field named `{name}`")))
 }
 
-fn composite(attr: &Attribute, fields: &syn::FieldsNamed) -> syn::Result<Vec<(Ident, Type)>> {
-    let names = attr.parse_args_with(
-        syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated,
-    )?;
+fn cover_list(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    fields: &syn::FieldsNamed,
+) -> syn::Result<Vec<(Ident, Type)>> {
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let names =
+        syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated(&content)?;
+    if names.is_empty() {
+        return Err(meta.error("cover needs at least one field"));
+    }
+    names.iter().map(|name| field_named(fields, name)).collect()
+}
+
+fn is_cover(meta: &syn::meta::ParseNestedMeta<'_>) -> bool {
+    meta.path.is_ident("cover") && meta.input.peek(syn::token::Paren)
+}
+
+type Composite = (Vec<(Ident, Type)>, Vec<(Ident, Type)>);
+
+fn composite(attr: &Attribute, fields: &syn::FieldsNamed) -> syn::Result<Composite> {
+    let mut names = Vec::new();
+    let mut cover = None;
+    attr.parse_nested_meta(|meta| {
+        if is_cover(&meta) {
+            if cover.is_some() {
+                return Err(meta.error("an index takes one cover list"));
+            }
+            cover = Some(cover_list(&meta, fields)?);
+            return Ok(());
+        }
+        names.push(meta.path.require_ident()?.clone());
+        Ok(())
+    })?;
     if names.len() < 2 {
         return Err(syn::Error::new(
             attr.span(),
             "a struct level index needs at least two fields",
         ));
     }
-    names.iter().map(|name| field_named(fields, name)).collect()
+    let indexed = names
+        .iter()
+        .map(|name| field_named(fields, name))
+        .collect::<syn::Result<_>>()?;
+    Ok((indexed, cover.unwrap_or_default()))
+}
+
+fn check_cover(ix: &Indexed, key: &Ident, skipped: &[Ident]) -> syn::Result<()> {
+    for (at, (ident, _)) in ix.cover.iter().enumerate() {
+        let fail = |message: String| Err(syn::Error::new(ident.span(), message));
+        if ix.cover[..at].iter().any(|(other, _)| other == ident) {
+            return fail(format!("`{ident}` is covered twice"));
+        }
+        if ident == key {
+            return fail(format!("`{ident}` is the key, which every index entry already holds"));
+        }
+        if skipped.contains(ident) {
+            return fail(format!("`{ident}` is not stored, so it cannot be covered"));
+        }
+        if ix.indexes(ident).is_some() {
+            match ix.kind {
+                IndexKind::Value => {}
+                IndexKind::Each => {
+                    return fail(format!(
+                        "an each index holds one element of `{ident}`, so it cannot cover `{ident}`"
+                    ));
+                }
+                IndexKind::Unique => {
+                    return fail(format!(
+                        "a unique index is looked up by `{ident}`, so it cannot cover `{ident}`"
+                    ));
+                }
+            }
+        }
+    }
+    if ix.stored().len() > MAX_STORED {
+        return Err(syn::Error::new(
+            ix.span,
+            format!("a cover list stores at most {MAX_STORED} fields"),
+        ));
+    }
+    Ok(())
 }
 
 fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
@@ -642,13 +812,17 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 key = Some((ident.clone(), field.ty.clone()));
             } else if attr.path().is_ident("index") {
                 let mut kind = IndexKind::Value;
+                let mut cover = Vec::new();
                 if matches!(attr.meta, syn::Meta::List(_)) {
                     attr.parse_nested_meta(|meta| {
                         if meta.path.is_ident("each") {
                             kind = IndexKind::Each;
                             Ok(())
+                        } else if is_cover(&meta) {
+                            cover = cover_list(&meta, named)?;
+                            Ok(())
                         } else {
-                            Err(meta.error("expected `each`"))
+                            Err(meta.error("expected `each` or `cover(...)`"))
                         }
                     })?;
                 }
@@ -657,14 +831,28 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     span: ident.span(),
                     fields: vec![(ident.clone(), field.ty.clone())],
                     kind,
+                    cover,
                 });
             } else if attr.path().is_ident("unique") {
-                attr.meta.require_path_only()?;
+                let mut cover = Vec::new();
+                if matches!(attr.meta, syn::Meta::List(_)) {
+                    attr.parse_nested_meta(|meta| {
+                        if is_cover(&meta) {
+                            cover = cover_list(&meta, named)?;
+                            Ok(())
+                        } else {
+                            Err(meta.error("expected `cover(...)`"))
+                        }
+                    })?;
+                } else {
+                    attr.meta.require_path_only()?;
+                }
                 indexes.push(Indexed {
                     name: ident.to_string(),
                     span: ident.span(),
                     fields: vec![(ident.clone(), field.ty.clone())],
                     kind: IndexKind::Unique,
+                    cover,
                 });
             }
         }
@@ -677,13 +865,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         } else {
             continue;
         };
-        let fields = composite(attr, named)?;
+        let (fields, cover) = composite(attr, named)?;
         let names: Vec<String> = fields.iter().map(|(ident, _)| ident.to_string()).collect();
         indexes.push(Indexed {
             name: names.join("_"),
             span: attr.span(),
             fields,
             kind,
+            cover,
         });
     }
     let Some((key_ident, key_ty)) = key else {
@@ -692,6 +881,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             "Record requires exactly one #[key] field",
         ));
     };
+    let mut skipped = Vec::new();
+    for field in &named.named {
+        if matches!(parse_attrs(&field.attrs)?.fallback, Fallback::Skip) {
+            skipped.extend(field.ident.clone());
+        }
+    }
+    for ix in &indexes {
+        check_cover(ix, &key_ident, &skipped)?;
+    }
 
     let mut table_fields: Vec<Field> = vec![Field {
         ident: Some(format_ident!("rows")),
@@ -703,13 +901,17 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     for ix in &indexes {
         let field = ix.field();
         let vt = ix.value_ty();
+        let st = ix.stored_ty();
         let ty: Type = match ix.kind {
+            IndexKind::Unique if ix.stores_cover() => {
+                syn::parse_quote!(::ferro::Map<#vt, (#key_ty, #st)>)
+            }
             IndexKind::Unique => syn::parse_quote!(::ferro::Map<#vt, #key_ty>),
-            _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), ()>),
+            _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), #st>),
         };
         table_fields.push(Field {
             ty,
-            name: field.to_string(),
+            name: ix.tag_name(),
             ident: Some(field),
             span: ix.span,
             fallback: Fallback::Required,
@@ -740,10 +942,48 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     for ix in &indexes {
         let field = ix.field();
         let vt = ix.value_ty();
+        let st = ix.stored_ty();
+        let ct = ix.cover_ty();
         let owned = ix.owned();
+        let stored_of = ix.stored_of();
+        let same_cover = ix.same_cover();
+        let project = ix.project_path();
         let same = ix.fields.iter().map(|(ident, _)| quote! { __o.#ident == __n.#ident });
         let same = quote! { #(#same &&)* __o.#key_ident == __n.#key_ident };
+        if !ix.cover.is_empty() {
+            let project_fn = ix.project_fn();
+            let projected = ix.projected();
+            let signature = match ix.kind {
+                IndexKind::Unique => quote! { __stored: #st },
+                _ => quote! { __value: &#vt, __stored: #st },
+            };
+            methods.push(quote! {
+                fn #project_fn(#signature) -> #ct {
+                    #projected
+                }
+            });
+        }
         match ix.kind {
+            IndexKind::Value if ix.stores_cover() => {
+                reindex.push(quote! {
+                    {
+                        let (__same, __same_cover) = match (__old, __new) {
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => (#same, #same_cover),
+                            _ => (false, false),
+                        };
+                        if !__same {
+                            if let ::std::option::Option::Some(__r) = __old {
+                                self.#field.remove(&(#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
+                            }
+                        }
+                        if !__same || !__same_cover {
+                            if let ::std::option::Option::Some(__r) = __new {
+                                self.#field.insert((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of);
+                            }
+                        }
+                    }
+                });
+            }
             IndexKind::Value => {
                 reindex.push(quote! {
                     {
@@ -765,19 +1005,34 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             IndexKind::Unique => {
                 let optional = ix.optional();
                 let index_name = &ix.name;
+                let (entry, held, entry_ty) = if ix.stores_cover() {
+                    (
+                        quote! { (::std::clone::Clone::clone(&__r.#key_ident), #stored_of) },
+                        quote! { &__holder.0 },
+                        quote! { (#key_ty, #st) },
+                    )
+                } else {
+                    (
+                        quote! { ::std::clone::Clone::clone(&__r.#key_ident) },
+                        quote! { &*__holder },
+                        quote! { #key_ty },
+                    )
+                };
                 reindex.push(quote! {
                     {
-                        let __same = match (__old, __new) {
-                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => #same,
-                            _ => false,
+                        let (__same, __same_cover) = match (__old, __new) {
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => (#same, #same_cover),
+                            _ => (false, false),
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__value) = __old.and_then(|__r| #optional) {
                                 self.#field.remove(&__value);
                             }
+                        }
+                        if !__same || !__same_cover {
                             if let ::std::option::Option::Some(__r) = __new {
                                 if let ::std::option::Option::Some(__value) = #optional {
-                                    self.#field.insert(__value, ::std::clone::Clone::clone(&__r.#key_ident));
+                                    self.#field.insert(__value, #entry);
                                 }
                             }
                         }
@@ -788,10 +1043,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         let __r = __row;
                         if let ::std::option::Option::Some(__value) = #optional {
                             if let ::std::option::Option::Some(__holder) = self.#field.get(&__value) {
-                                if *__holder != __r.#key_ident && ::std::option::Option::Some(&*__holder) != __moving {
+                                let __held: &#key_ty = #held;
+                                if *__held != __r.#key_ident && ::std::option::Option::Some(__held) != __moving {
                                     return ::std::option::Option::Some(::ferro::table::Taken {
                                         index: #index_name,
-                                        holder: ::std::clone::Clone::clone(&*__holder),
+                                        holder: ::std::clone::Clone::clone(__held),
                                     });
                                 }
                             }
@@ -801,16 +1057,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let by = ix.method();
                 let key_by = format_ident!("key_{}", by);
                 methods.push(quote! {
-                    pub fn #field(&self) -> &::ferro::Map<#vt, #key_ty> {
+                    pub fn #field(&self) -> &::ferro::Map<#vt, #entry_ty> {
                         &self.#field
-                    }
-
-                    pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
-                    where
-                        #vt: ::std::borrow::Borrow<__Q>,
-                        __Q: ::std::cmp::Ord + ?::std::marker::Sized,
-                    {
-                        ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
                     }
 
                     pub fn #key_by<__Q>(&self, value: &__Q) -> ::std::option::Option<#key_ty>
@@ -818,10 +1066,81 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #vt: ::std::borrow::Borrow<__Q>,
                         __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                     {
-                        self.#field.get(value).map(|__key| ::std::clone::Clone::clone(&*__key))
+                        self.#field.get(value).map(|__holder| {
+                            let __held: &#key_ty = #held;
+                            ::std::clone::Clone::clone(__held)
+                        })
                     }
                 });
+                if ix.stores_cover() {
+                    let covered_by = format_ident!("covered_{}", by);
+                    let project_fn = ix.project_fn();
+                    methods.push(quote! {
+                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
+                        where
+                            #vt: ::std::borrow::Borrow<__Q>,
+                            __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                        {
+                            let __holder = self.#field.get(value)?;
+                            self.rows.get::<#key_ty>(&__holder.0)
+                        }
+
+                        pub fn #covered_by<__Q>(&self, value: &__Q) -> ::std::option::Option<(#key_ty, #ct)>
+                        where
+                            #vt: ::std::borrow::Borrow<__Q>,
+                            __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                        {
+                            self.#field.get(value).map(|__holder| {
+                                let (__key, __stored) = ::ferro::Val::into_owned(__holder);
+                                (__key, Self::#project_fn(__stored))
+                            })
+                        }
+                    });
+                } else {
+                    methods.push(quote! {
+                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
+                        where
+                            #vt: ::std::borrow::Borrow<__Q>,
+                            __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                        {
+                            ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                        }
+                    });
+                }
                 continue;
+            }
+            IndexKind::Each if ix.stores_cover() => {
+                let ident = &ix.fields[0].0;
+                reindex.push(quote! {
+                    {
+                        let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
+                            match __r {
+                                ::std::option::Option::Some(__r) => ::ferro::table::IndexEach::values(&__r.#ident)
+                                    .into_iter()
+                                    .map(|__v| (__v, ::std::clone::Clone::clone(&__r.#key_ident)))
+                                    .collect(),
+                                ::std::option::Option::None => ::std::collections::BTreeSet::new(),
+                            }
+                        };
+                        let __same_cover = match (__old, __new) {
+                            (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) => #same_cover,
+                            _ => false,
+                        };
+                        let __before = __collect(__old);
+                        let __after = __collect(__new);
+                        for __entry in __before.difference(&__after) {
+                            self.#field.remove(__entry);
+                        }
+                        if let ::std::option::Option::Some(__r) = __new {
+                            let __stored = #stored_of;
+                            for __entry in &__after {
+                                if !__same_cover || !__before.contains(__entry) {
+                                    self.#field.insert(::std::clone::Clone::clone(__entry), ::std::clone::Clone::clone(&__stored));
+                                }
+                            }
+                        }
+                    }
+                });
             }
             IndexKind::Each => {
                 let ident = &ix.fields[0].0;
@@ -855,14 +1174,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             let prefix = format_ident!("{}_prefix", field);
             let first = &ix.fields[0].1;
             methods.push(quote! {
-                pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+                pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #first: ::std::borrow::Borrow<__Q>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_where::<#vt, #name>(
+                    ::ferro::table::index_where::<#vt, #name, #st, #ct>(
                         &self.rows,
                         &self.#field,
+                        #project,
                         |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) < value,
                         |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) <= value,
                     )
@@ -874,22 +1194,22 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             let some = format_ident!("{}_some", field);
             let some_after = format_ident!("{}_some_after", field);
             methods.push(quote! {
-                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_eq_some::<#inner, #name, __Q>(&self.rows, &self.#field, value)
+                    ::ferro::table::index_eq_some::<#inner, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
                 }
 
-                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name>
+                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     #key_ty: ::std::borrow::Borrow<__A>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                     __A: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_after_some::<#inner, #name, __Q, __A>(&self.rows, &self.#field, value, after)
+                    ::ferro::table::index_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
                 }
             });
         }
@@ -898,31 +1218,31 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_counts(&self.#field)
             }
 
-            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name>
+            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::index_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                ::ferro::table::index_eq::<#vt, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
             }
 
-            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name>
+            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 #key_ty: ::std::borrow::Borrow<__A>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __A: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::index_after::<#vt, #name, __Q, __A>(&self.rows, &self.#field, value, after)
+                ::ferro::table::index_after::<#vt, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
             }
 
-            pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name>
+            pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __R: ::std::ops::RangeBounds<__Q>,
             {
-                ::ferro::table::index_range::<#vt, #name, __Q, __R>(&self.rows, &self.#field, range)
+                ::ferro::table::index_range::<#vt, #name, #st, #ct, __Q, __R>(&self.rows, &self.#field, #project, range)
             }
         });
     }
