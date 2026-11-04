@@ -511,9 +511,9 @@ impl Probe for World {
         guarded(|| self.people.by_email("user1@0.example"));
         guarded(|| self.items.by_shelf(&1).covered().take(8).count());
         guarded(|| self.items.unique_shelf_label().len());
-        if *budget > 1000 {
-            guarded(|| world_whole(self));
-        }
+        guarded(|| self.items.by_tags_counts().len());
+        guarded(|| self.items.by_shelf_rank_prefix(&2).covered().count());
+        guarded(|| self.items.by_price_range(..0).covered().next_back());
     }
 
     fn measure(&self) -> u64 {
