@@ -470,3 +470,40 @@ fn an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause() {
         intruded.unwrap();
     }
 }
+
+#[test]
+fn a_branch_attached_while_a_followed_frame_waits_for_its_sync_reads_the_newest_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.ferro");
+    let armed = Arc::new(AtomicBool::new(false));
+    let (at_hook, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let hook = {
+        let (armed, at_hook, release) = (armed.clone(), at_hook.clone(), release.clone());
+        Hook(Arc::new(move |step| {
+            if step == "drafted" && armed.swap(false, Ordering::AcqRel) {
+                at_hook.wait();
+                release.wait();
+            }
+        }))
+    };
+    let a: Db<Root> = shared().hook(hook).open(&path).unwrap();
+    let b: Db<Root> = shared().open(&path).unwrap();
+    a.update(|root| root.n += 1).unwrap();
+    let side_b = b.fork("side").unwrap();
+    side_b.update(|root| root.n = 10).unwrap();
+    a.refresh().unwrap();
+    side_b.update(|root| root.n = 20).unwrap();
+    armed.store(true, Ordering::Release);
+    let writer = {
+        let a = a.clone();
+        thread::spawn(move || a.update(|root| root.n += 1).unwrap())
+    };
+    at_hook.wait();
+    let side_a = a.branch("side").unwrap();
+    release.wait();
+    writer.join().unwrap();
+    assert_eq!(side_a.read().n, 20);
+    side_a.update(|root| root.n += 1).unwrap();
+    side_a.update(|root| root.n += 1).unwrap();
+    assert_eq!(side_a.read().n, 22);
+}

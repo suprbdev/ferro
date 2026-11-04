@@ -1376,13 +1376,22 @@ impl<T: Data> Shared<T> {
         if let Some(branch) = self.branches.lock().get(name) {
             return Ok(branch.clone());
         }
-        if self.options.shared && self.published.lock().refs.try_get(name)?.is_none() {
-            self.catch_up()?;
+        loop {
+            if self.options.shared {
+                self.catch_up()?;
+            }
+            let tip = self.tip.lock();
+            let _whole = reentry::whole(self.id);
+            let published = self.published.lock();
+            if self.options.shared {
+                let newest = tip.refs.try_get(name)?;
+                let seen = published.refs.try_get(name)?;
+                if moved(seen.as_deref(), newest.as_deref()) {
+                    continue;
+                }
+            }
+            return self.attach(name, &published.refs);
         }
-        let _tip = self.tip.lock();
-        let _whole = reentry::whole(self.id);
-        let published = self.published.lock();
-        self.attach(name, &published.refs)
     }
 
     fn lane<'a>(&self, branch: &'a Arc<Branch<T>>) -> Lane<'a, T> {
