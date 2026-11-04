@@ -1,11 +1,30 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ferro::{Db, Durability, Map, Options, Snapshot};
+use ferro::{Data, Db, Durability, Map, Options, Record, Snapshot, Table, Val};
 
 type Root = Map<u64, u64>;
 
 const ROUNDS: u32 = 100;
+const LARGE_ROWS: u64 = 1_000_000;
+const LARGE_ROUNDS: u32 = 5;
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct Reading {
+    name: String,
+    score: f64,
+    visits: u64,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Visit {
+    #[key]
+    id: u64,
+    #[index]
+    bucket: u64,
+    name: String,
+    score: f64,
+}
 
 fn open(path: &Path) -> Db<Root> {
     Options::new()
@@ -177,6 +196,141 @@ fn criss_cross(dir: &Path) {
     );
 }
 
+fn sides<V: Data>(
+    path: &Path,
+    build: impl Fn() -> V,
+    change: impl Fn(&mut V, u64, u64),
+) -> Db<Map<u8, V>> {
+    let db = Options::new()
+        .durability(Durability::Buffered)
+        .cache_bytes(1 << 30)
+        .open::<Map<u8, V>>(path)
+        .unwrap();
+    db.update(|root| {
+        let base = build();
+        let (mut ours, mut theirs) = (base.clone(), base.clone());
+        for key in (0..LARGE_ROWS).filter(|key| key % 10 == 3) {
+            change(&mut ours, key, 1);
+        }
+        for key in (0..LARGE_ROWS).filter(|key| key % 10 == 7 || key % 100 == 3) {
+            change(&mut theirs, key, 2);
+        }
+        root.insert(0, base);
+        root.insert(1, ours);
+        root.insert(2, theirs);
+    })
+    .unwrap();
+    db
+}
+
+fn timed<V: Data>(name: &str, db: &Db<Map<u8, V>>, merge: impl Fn(&mut V, &V, &V) -> usize) {
+    let read = db.read();
+    let (base, ours, theirs) = (
+        read.get(&0).unwrap(),
+        read.get(&1).unwrap(),
+        read.get(&2).unwrap(),
+    );
+    let mut took = Vec::new();
+    let mut written = 0;
+    for _ in 0..=LARGE_ROUNDS {
+        let mut merged = (*ours).clone();
+        let start = Instant::now();
+        written = merge(&mut merged, &base, &theirs);
+        took.push(start.elapsed());
+        drop(merged);
+    }
+    let then = took[1..].iter().sum::<Duration>() / LARGE_ROUNDS;
+    println!(
+        "| {name}, {written} written | {} | {} |",
+        micros(took[0]),
+        micros(then)
+    );
+}
+
+fn reading(key: u64, side: u64) -> Reading {
+    Reading {
+        name: format!("reading {key:>12} side {side}"),
+        score: key as f64 / 7.0 + side as f64,
+        visits: key * 3 + side,
+    }
+}
+
+fn visit(key: u64, side: u64) -> Visit {
+    Visit {
+        id: key,
+        bucket: (key + side) % 64,
+        name: format!("visit {key:>12} side {side}"),
+        score: key as f64 / 7.0 + side as f64,
+    }
+}
+
+fn large(dir: &Path) {
+    let numbers = sides(
+        &dir.join("large-u64.ferro"),
+        || {
+            (0..LARGE_ROWS)
+                .map(|key| (key, key))
+                .collect::<Map<u64, u64>>()
+        },
+        |map, key, side| {
+            map.insert(key, key + side);
+        },
+    );
+    timed(
+        "`Map<u64, u64>::merge` of 1,000,000 keys, 100,000 changed on each side",
+        &numbers,
+        |ours, base, theirs| {
+            ours.merge(base, theirs, |conflict| {
+                conflict.theirs.map(Val::into_owned)
+            })
+        },
+    );
+    drop(numbers);
+    let readings = sides(
+        &dir.join("large-struct.ferro"),
+        || {
+            (0..LARGE_ROWS)
+                .map(|key| (key, reading(key, 0)))
+                .collect::<Map<u64, Reading>>()
+        },
+        |map, key, side| {
+            map.insert(key, reading(key, side));
+        },
+    );
+    timed(
+        "`Map<u64, Reading>::merge` of the same shape",
+        &readings,
+        |ours, base, theirs| {
+            ours.merge(base, theirs, |conflict| {
+                conflict.theirs.map(Val::into_owned)
+            })
+        },
+    );
+    drop(readings);
+    let visits = sides(
+        &dir.join("large-table.ferro"),
+        || {
+            let mut table: Table<Visit> = Table::new();
+            for key in 0..LARGE_ROWS {
+                table.insert(visit(key, 0));
+            }
+            table
+        },
+        |table: &mut Table<Visit>, key, side| {
+            table.insert(visit(key, side));
+        },
+    );
+    timed(
+        "`Table<Visit>::merge` of the same shape, with one index",
+        &visits,
+        |ours, base, theirs| {
+            ours.merge(base, theirs, |conflict| {
+                conflict.theirs.map(Val::into_owned)
+            })
+        },
+    );
+}
+
 fn main() {
     let parent = PathBuf::from(
         std::env::args()
@@ -192,4 +346,5 @@ fn main() {
     took_side(dir.path(), false);
     features(dir.path());
     criss_cross(dir.path());
+    large(dir.path());
 }
