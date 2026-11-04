@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -6,7 +7,7 @@ use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder, Hash};
+use crate::codec::{Data, Decoder, Encoder, Hash, HashSink};
 use crate::error::Result;
 use crate::map::{Conflict, Diff, Finder, Iter, Map, Val, Values};
 
@@ -520,6 +521,42 @@ trait EntryCursor<K, C>: KeyCursor<K> {
 pub type Project<I, S, C> = fn(&I, S) -> C;
 
 pub fn plain<I>(_value: &I, _stored: ()) {}
+
+const STORED_BYTES: usize = 4096;
+
+thread_local! {
+    static STORED: RefCell<[Vec<u8>; 2]> = const { RefCell::new([Vec::new(), Vec::new()]) };
+}
+
+fn kept(buf: Vec<u8>) -> Vec<u8> {
+    if buf.capacity() > STORED_BYTES {
+        Vec::new()
+    } else {
+        buf
+    }
+}
+
+fn encoding<D: Data>(value: &D, buf: Vec<u8>) -> (Vec<u8>, Option<Vec<Hash>>) {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::reusing(&mut sink, buf);
+    let encoded = value.encode(&mut encoder);
+    let links = encoded
+        .ok()
+        .map(|()| encoder.links().iter().map(|ptr| ptr.hash).collect());
+    (encoder.into_buf(), links)
+}
+
+pub fn same_stored<D: Data + PartialEq>(old: &D, new: &D) -> bool {
+    if old != new {
+        return false;
+    }
+    let [left, right] = STORED.take();
+    let (left, old_links) = encoding(old, left);
+    let (right, new_links) = encoding(new, right);
+    let same = old_links.is_some() && old_links == new_links && left == right;
+    STORED.set([kept(left), kept(right)]);
+    same
+}
 
 struct Entries<I, K, S, C> {
     iter: Iter<(I, K), S>,

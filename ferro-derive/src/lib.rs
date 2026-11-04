@@ -569,7 +569,7 @@ impl Indexed {
         let same = self
             .stored()
             .into_iter()
-            .map(|(ident, _)| quote! { __o.#ident == __n.#ident });
+            .map(|(ident, _)| quote! { ::ferro::table::same_stored(&__o.#ident, &__n.#ident) });
         quote! { true #(&& #same)* }
     }
 

@@ -72,9 +72,12 @@ covering unique index rebuilds under the same check for two rows sharing a value
 
 Keeping the entries costs a comparison. An update that leaves the indexed value and the key alone
 but changes a covered field overwrites the entry in place, where a plain index does nothing, and an
-update that changes neither touches nothing. An `#[index(each)]` entry is rewritten for every
-element when a covered field changes. `Table::merge` and sync move rows and let the indexes follow,
-so they need nothing more, which `covered_merge.rs` checks against a plain-indexed twin.
+update that changes neither touches nothing. A covered field counts as unchanged only when `==`
+holds and it encodes to the same bytes, so a float that turns from `0.0` to `-0.0` is rewritten,
+and the equal-looking case costs encoding the field twice. An `#[index(each)]` entry is rewritten
+for every element when a covered field changes. `Table::merge` and sync move rows and let the
+indexes follow, so they need nothing more, which `covered_merge.rs` checks against a plain-indexed
+twin.
 
 ### What it measured
 
