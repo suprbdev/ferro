@@ -182,9 +182,21 @@ in the middle. `a_writer_that_opens_during_another_handles_cycle_pause_writes_th
 cycle at its pause while another handle opens, and lost the commit that handle acknowledged. Once
 two processes were on different files, both could run a cycle, each into the same `.compacting`
 and each renaming over the other's file, which is the likeliest way a stress run ended in `varint
-overflow in record`. Recovery by a shared writer also stops truncating at a marker, so one left by a
-cycle that failed before its rename is written over by the next frame instead, and one on a
-retired file can never be removed.
+overflow in record`.
+
+Recovery truncates everything past the last frame, a marker included, as it always has. A marker is
+only ever on a retired file or, left by a cycle that died or failed before its rename, at the end of
+a live one, and the check under the placement lock keeps recovery off retired files, so the marker
+it truncates is always a stale one. For a while recovery by a shared writer kept a marker as a
+second guard, and that broke the promise under [File format and
+durability](storage.md#file-format-and-durability) that a frame stranded past a torn one can never
+line up with the log later. Frames written over a stale marker, then a power cut that kept the
+second frame but not the page with the first one's header, left the marker in front of a whole
+frame, and recovery stopped at the marker and kept the frame. The next frame of the same length
+then lined it up again, linking into what had been rewritten, and the file failed to open with a
+hash mismatch. `a_marker_left_by_a_dead_cycle_never_keeps_a_stranded_frame_after_a_power_cut` writes
+a marker, writes two frames over it, puts the marker and the superblocks back as such a power cut
+would, and failed that way while the marker was kept.
 
 A shared writer does not truncate the Fsync reservation when it closes, since other writers may be
 placing frames into it. The next writer to open truncates it, so the file can stay up to 4 MiB
@@ -280,8 +292,9 @@ handle's closure, a pull landing beside the other handle's commits, background c
 handles at once, four threads on branches of their own in each of two handles, an awaited write
 waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
 a drop and fork that must wait for a closure, a writer opening during the other handle's cycle
-pause, and a closure on a branch the other handle dropped. Each test added for a finding of the
-review failed before its fix, as described above. Both files build on 64-bit Linux only, and
+pause, a closure on a branch the other handle dropped, and a stale marker that a power cut leaves in
+front of a whole frame. Each test added for a finding of the review failed before its fix, as
+described above. Both files build on 64-bit Linux only, and
 `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
