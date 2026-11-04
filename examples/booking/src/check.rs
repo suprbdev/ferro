@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use ferro::{Change, Db, Snapshot};
 
 use crate::error::Result;
-use crate::model::{Booking, Cents, Flow, Hotels, Load, Night, Status};
+use crate::model::{Booking, Cents, Flow, Hotels, Line, Load, Night, Status};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
@@ -154,10 +154,22 @@ pub fn check_state(h: &Hotels) -> Vec<String> {
     let out = &mut Report { out: &mut messages };
 
     let mut statuses: BTreeMap<Status, usize> = BTreeMap::new();
+    let mut lines: BTreeMap<u32, Vec<Line>> = BTreeMap::new();
     for booking in h.bookings.iter() {
         *statuses.entry(booking.status).or_default() += 1;
+        lines.entry(booking.customer).or_default().push(Line::from(&*booking));
         booking_in(h, &booking, out);
     }
+    for (customer, rows) in &lines {
+        let listed: Vec<Line> = h.lines_of(*customer).collect();
+        out.check(&listed == rows, || {
+            format!("customer {customer}'s covered bookings disagree with the rows")
+        });
+    }
+    let covered: usize = h.bookings.by_customer_counts().iter().map(|(_, count)| count).sum();
+    out.check(covered == h.bookings.len(), || {
+        format!("customer index has {covered} entries for {} bookings", h.bookings.len())
+    });
     let indexed: BTreeMap<Status, usize> = h.bookings.by_status_counts().into_iter().collect();
     out.check(indexed == statuses, || {
         format!("status index {indexed:?} disagrees with rows {statuses:?}")

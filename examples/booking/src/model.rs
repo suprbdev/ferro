@@ -76,7 +76,7 @@ pub struct Customer {
 pub struct Booking {
     #[key]
     pub id: u64,
-    #[index]
+    #[index(cover(status, venue, room, first, nights, total))]
     pub customer: u32,
     #[index]
     pub status: Status,
@@ -229,6 +229,16 @@ impl Hotels {
     }
 
     pub fn lines_of(&self, customer: u32) -> impl DoubleEndedIterator<Item = Line> + ExactSizeIterator + use<> {
-        self.bookings.by_customer(&customer).map(|booking| Line::from(&*booking))
+        self.bookings.by_customer(&customer).covered().map(
+            |(id, (status, venue, room, first, nights, total))| Line {
+                id,
+                status,
+                venue,
+                room,
+                first,
+                nights,
+                total,
+            },
+        )
     }
 }
