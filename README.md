@@ -58,8 +58,10 @@ explained or undone from the history, and corruption surfaces as an error rather
   migration. Power loss was modelled, never tested on real hardware.
 - **Many tiny independent writes.** A single-key commit writes about 3.5 KB at 1M keys, and each
   branch runs one closure at a time. Batch related changes, or use `coalesce`.
-- **Several writing processes.** One process holds the writer lock. Others open read-only and call
-  `refresh`.
+- **Many processes on one branch without fsync.** With `Options::shared` several processes commit to
+  one file, as fast as threads under fsync, but under `Buffered` each reads back what the others
+  wrote, so on one branch they commit more slowly than threads. It needs Linux or Windows and one
+  machine.
 - **Ad hoc queries.** There is no query language or planner. You choose the indexes, `and` and
   `or` combine equality lookups by key, a range joins them only after its keys are read and sorted,
   and each matching row is read separately unless the index covers the fields it needs.

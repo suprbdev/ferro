@@ -130,6 +130,7 @@ concurrency](concurrency.md#awaited-writes).
 | `history(Keep)` | `Keep::All` | How much history to retain. See [Retention and reclamation](retention.md). |
 | `reclaim(Reclaim)` | `every_bytes: 64 << 20` | When background reclamation cycles run. |
 | `coalesce(bool)` | `false` | Lets queued closures share one version. See [Sharing a version between writers](concurrency.md#sharing-a-version-between-writers). |
+| `shared(bool)` | `false` | Lets other processes that open the file with it write too. See [Several processes](concurrency.md#several-processes). |
 
 `open` needs `T: Default`, since version 0, the value before the first commit, is `T::default()`.
 `Db::open_with(path, init)` and `Options::open_with` take that value from `init` instead.

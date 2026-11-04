@@ -73,6 +73,9 @@ numbers. This index lists them by subsystem.
   branch](commit-path.md#a-lock-per-branch).
 - Keeping moved-node records in a vector of their own: [Drafting outside
   `tip`](commit-path.md#drafting-outside-tip).
+- Shared writers by default, one cross-process lock for every closure, closures run again on a
+  conflict, each process syncing alone, a placement mark in the header, frames written after the
+  placement lock, and shared memory: [Measured and left out](processes.md#measured-and-left-out).
 - Head records linked from a table of links, the branch table without LZ4, merge records outside
   the head, and a table every 16, 32 or 128 steps: [Branch-table
   steps](commit-path.md#branch-table-steps).

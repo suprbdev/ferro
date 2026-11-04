@@ -95,8 +95,38 @@ branch that sorts before its own while a cycle or `receive` waits for this closu
 Other processes can read while one writes: `Options::new().read_only()` takes no lock, and `refresh`
 picks up new commits.
 
-Only one process may hold the writer lock. A held `Snapshot` or `Map` keeps the file it was read
-from open, though not the writer lock, so a new writer can open once the last `Db` handle is gone.
+Several processes can also write, if every one of them opens the file with `shared`:
+
+```rust
+let db = Options::new().shared(true).open::<Jobs>("jobs.ferro")?;
+```
+
+Each commit then lands on top of the newest one from any process. A closure runs under a lock on its
+branch that holds across processes, so it starts from the newest commit on its branch and never runs
+again, and closures on different branches run at the same time in different processes as they do in
+one. A process sees the others' commits when it next commits to the file, attaches a branch or calls
+`refresh`, which also fires its watchers. Until then `read` shows what it last saw, as on a
+read-only follower. Under `Durability::Fsync` one fdatasync covers the commits every process has
+queued, as group commit does within a process.
+
+The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
+file open, and they get it while it does. On one process it costs a few microseconds a commit for
+its locks: one writer made 42,700 single-key Buffered commits a second with it and 47,500 without,
+on 2026-11-04. With fsync, 8 processes made 9,963 commits a second on one branch where 8 threads
+of one process made 10,292. Under `Durability::Buffered` processes on one branch take turns, and
+each reads back the nodes the last one rewrote, where threads share one cache: 2 processes made
+29,231 and 8 made 19,805, against about 39,000 for threads. On branches of their own 4 processes
+made 77,106 and 4 threads 88,848.
+
+A reclamation cycle runs in one process at a time, and the others move to the new file at their next
+commit or `refresh`. A process killed in the middle of a commit holds up the others only until the
+operating system releases its locks, and nothing it acknowledged is lost. It needs open file
+description locks, so it runs on Linux and Windows, and the processes must share one machine and a
+local file system. On other Unix systems the open fails with an `Unsupported` I/O error.
+
+A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
+new writer can open once the last `Db` handle is gone. How it works is in [Writers in several
+processes](../internals/processes.md).
 
 ## How it works
 
@@ -105,3 +135,5 @@ from open, though not the writer lock, so a new writer can open once the last `D
 - [Coalescing](../internals/coalescing.md), [Awaited writes](../internals/async-writes.md) and
   [Writes from inside a closure](../internals/reentrancy.md).
 - [Commits of a few rows](../internals/commit-cost.md): where a small commit's CPU time goes.
+- [Writers in several processes](../internals/processes.md): the locks, catching up, superblocks
+  and cycles across processes.

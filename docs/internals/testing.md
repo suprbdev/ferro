@@ -121,5 +121,6 @@ Tests are described next to what they test:
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).
+- Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
 - What runs on Windows: [Tests](windows.md#tests).
 - Crash safety in general: [Durability and crash safety](../guide/durability.md#what-was-tested).

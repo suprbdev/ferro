@@ -83,7 +83,9 @@ unlocks, in that order, so a new writer can open while they live. They read what
 The new writer's open truncates only past the last valid frame, and every published object lies
 before it. It appends after that, and a cycle writes a new file and renames it over the path, so the
 old inode stays whole for whoever holds it. A closed store writes nothing more, and a second close
-does nothing, so it never truncates under the new writer. A `Map` from the old writer is foreign to
+does nothing, so it never truncates under the new writer. A writer that opened with
+`Options::shared` holds the lock shared and truncates nothing when it closes, as described under
+[Writers in several processes](processes.md). A `Map` from the old writer is foreign to
 the new one, since store ids differ, and is rebuilt if committed there. A closure works on a clone
 of the tip, or of its group's working copy, so a panic or an `Err` discards its changes.
 
