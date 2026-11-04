@@ -920,12 +920,30 @@ where
         }
         if let Some(f) = this.start.take() {
             db.shared.start_syncer(&db.keeper);
-            let Some(lane) = db.branch.enter(this.id, cx.waker(), this.gated) else {
+            let Some(mut lane) = db.branch.enter(this.id, cx.waker(), this.gated) else {
                 this.start = Some(f);
                 this.gated = true;
                 return Poll::Pending;
             };
             this.gated = false;
+            let mut notices = Vec::new();
+            match db.shared.crossing(&mut lane, false, &mut notices) {
+                Err(error) => return Poll::Ready(Err(error.into())),
+                Ok(Some(busy)) => {
+                    let at = lane.branch.lane_at;
+                    drop(lane);
+                    let waker = cx.waker().clone();
+                    thread::spawn(move || {
+                        if busy.lock_lane(at).is_ok() {
+                            busy.unlock_lane(at);
+                        }
+                        waker.wake();
+                    });
+                    this.start = Some(f);
+                    return Poll::Pending;
+                }
+                Ok(None) => {}
+            }
             match db.begin(lane, f) {
                 Ok(wait) => this.wait = Some(wait),
                 Err(error) => return Poll::Ready(Err(error)),
@@ -1390,16 +1408,29 @@ impl<T: Data> Shared<T> {
     }
 
     fn cross(&self, lane: &mut Lane<'_, T>, notices: &mut Vec<Notice<T>>) -> Result<()> {
+        self.crossing(lane, true, notices).map(|_| ())
+    }
+
+    fn crossing(
+        &self,
+        lane: &mut Lane<'_, T>,
+        wait: bool,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<Option<Store>> {
         if lane.crossed() {
-            return Ok(());
+            return Ok(None);
         }
         loop {
             let store = self.store();
             if !store.is_shared() {
-                return Ok(());
+                return Ok(None);
             }
             let at = lane.branch.lane_at;
-            store.lock_lane(at)?;
+            match wait {
+                true => store.lock_lane(at)?,
+                false if store.try_lock_lane(at)? => {}
+                false => return Ok(Some(store)),
+            }
             let mut tip = self.tip.lock();
             let caught = match self.store().id() == store.id() {
                 true => self.follow(&mut tip, notices),
@@ -1410,7 +1441,7 @@ impl<T: Data> Shared<T> {
                 Ok(Caught::Swapped) => store.unlock_lane(at),
                 Ok(_) => {
                     lane.cross(store);
-                    return Ok(());
+                    return Ok(None);
                 }
                 Err(error) => {
                     store.unlock_lane(at);

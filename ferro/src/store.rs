@@ -1307,31 +1307,41 @@ impl Store {
     }
 
     pub(crate) fn lock_lane(&self, at: u64) -> Result<()> {
+        self.take_lane(at, true).map(|_| ())
+    }
+
+    pub(crate) fn try_lock_lane(&self, at: u64) -> Result<bool> {
+        self.take_lane(at, false)
+    }
+
+    fn take_lane(&self, at: u64, wait: bool) -> Result<bool> {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
         loop {
             match lanes.get_mut(&at) {
                 Some(Some(count)) => {
                     *count += 1;
-                    return Ok(());
+                    return Ok(true);
                 }
-                Some(None) => inner.lanes_moved.wait(&mut lanes),
+                Some(None) if wait => inner.lanes_moved.wait(&mut lanes),
+                Some(None) => return Ok(false),
                 None => break,
             }
         }
         lanes.insert(at, None);
         drop(lanes);
-        let locked = platform::lock_range(&inner.file, at, 1, true, true);
+        let locked = platform::lock_range(&inner.file, at, 1, true, wait);
         let mut lanes = inner.lanes.lock();
         match locked {
             Ok(()) => lanes.insert(at, Some(1)),
             Err(_) => lanes.remove(&at),
         };
         inner.lanes_moved.notify_all();
-        locked.map_err(|error| match error {
-            TryLockError::Error(error) => Error::Io(error),
-            TryLockError::WouldBlock => Error::Locked,
-        })
+        match locked {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
     }
 
     pub(crate) fn unlock_lane(&self, at: u64) {

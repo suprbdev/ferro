@@ -253,6 +253,40 @@ fn coalesced_and_awaited_writes_from_several_handles_lose_nothing() {
 }
 
 #[test]
+fn an_awaited_write_waits_off_thread_while_another_handle_holds_its_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("await.ferro");
+    let a: Db<Root> = shared().open(&path).unwrap();
+    let b: Db<Root> = shared().open(&path).unwrap();
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let holder = {
+        let (entered, release) = (entered.clone(), release.clone());
+        thread::spawn(move || {
+            b.update(|root| {
+                entered.wait();
+                release.wait();
+                root.n += 1;
+            })
+            .unwrap();
+        })
+    };
+    entered.wait();
+    let mut future = std::pin::pin!(a.update_async(|root| root.n += 1));
+    let waker = std::task::Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    release.wait();
+    holder.join().unwrap();
+    loop {
+        if future.as_mut().poll(&mut cx).is_ready() {
+            break;
+        }
+        thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(a.read().n, 2);
+}
+
+#[test]
 fn a_pull_into_a_shared_file_lands_beside_another_handles_commits() {
     let dir = tempfile::tempdir().unwrap();
     let source: Db<Root> = fast().open(dir.path().join("source.ferro")).unwrap();
