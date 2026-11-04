@@ -40,7 +40,8 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   merged each other, dropped a third and ran a cycle. The input picks one and appends steps whose
   tag, name, link, head and trailing bytes it perturbs, runs of 62 to 1,025 honest steps, tables of
   0, 126, 127, 128 or 300 branches, raw objects, and steps over an older link of the chain, in one
-  frame or several. A follower opened before the forgery refreshes across it. A handle then opens
+  frame or several. A follower opened before the forgery refreshes after each frame and once it is
+  whole, so that loading the table starts from forged steps it already knows. A handle then opens
   the file, reads it as `open` does and can commit on its branches, past a full table when the
   input asks for 70 commits, fork, merge, drop a branch and run a cycle, before the follower
   refreshes again and, for some inputs, the `admin` functions run.
@@ -83,6 +84,19 @@ beside it, which is how the fixtures behind
 
 The `Makefile` wraps the last two steps: `make fuzz-seeds` builds `corpus/seeds`, and
 `make fuzz FUZZ=open FUZZ_TIME=600` runs one target for that many seconds with the flags above.
+`make fuzz-lint` checks the fuzz crate with rustfmt and clippy on stable, and `make ci` runs it.
+
+The round that added `refs`, with the seeds for covered steps, 200 branches and frames that land
+out of order, ran each target on one core under the flags above and `-rss_limit_mb=2048`, starting
+from the corpus the round before saved: `open` for two hours, 370,000 executions reaching 95,000
+edges, and an hour more with `-use_value_profile=1`; `open-large` with `-max_len=400000` for 45
+minutes, 76,000 executions; `admin`, `log_entry` and `map_node` for an hour each, 1.6 to 1.7
+million executions reaching 6,200, 10,300 and 17,800 edges, with an hour more of `log_entry` under
+value profiles; `sync` for two hours and 40 minutes, 99,000 executions reaching 31,800 edges;
+and `refs` for three hours and 40 minutes over five runs, 280,000 executions reaching 12,800 edges.
+No input crashed, hung, leaked or passed a memory limit, so the library needed no fix. The round's
+one fault was in the harness: the `refs` base meant to sit a whole step table deep was a step
+short, which walking the chain of a file written by `fixture` showed.
 
 ## Where the other tests are described
 
