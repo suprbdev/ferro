@@ -647,6 +647,7 @@ struct Config {
     coalesce: bool,
     per_branch: u64,
     seconds: u64,
+    cache: u64,
 }
 
 #[derive(Default)]
@@ -978,7 +979,7 @@ fn combined(config: &Config) -> BTreeMap<&'static str, u64> {
     let options = || {
         (config.options)()
             .coalesce(config.coalesce)
-            .cache_bytes(1 << 26)
+            .cache_bytes(config.cache)
             .reclaim(MANUAL)
     };
     let local: Db<Mixed> = options().open(&path).unwrap();
@@ -1097,6 +1098,7 @@ fn branches_closures_files_receives_and_cycles_match_a_model() {
             coalesce: false,
             per_branch: 1,
             seconds: u64::from(cases(4)),
+            cache: 1 << 26,
         },
         Config {
             name: "buffered coalesced",
@@ -1104,6 +1106,7 @@ fn branches_closures_files_receives_and_cycles_match_a_model() {
             coalesce: true,
             per_branch: 2,
             seconds: u64::from(cases(4)),
+            cache: 1 << 16,
         },
         Config {
             name: "fsync",
@@ -1111,6 +1114,7 @@ fn branches_closures_files_receives_and_cycles_match_a_model() {
             coalesce: false,
             per_branch: 1,
             seconds: u64::from(cases(3)),
+            cache: 1 << 20,
         },
     ];
     for config in &configs {
