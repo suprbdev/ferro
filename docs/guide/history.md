@@ -74,7 +74,7 @@ back when the row goes, which is why `alive` stops short of `ended`. It returns 
 writes it:
 
 ```rust
-db.try_commit_stamped(|shop, stamp| {
+db.try_commit_stamped(|shop, stamp| -> Result<_, ShopError> {
     let mut order = shop.orders.get_mut(&id).ok_or(ShopError::NoOrder(id))?;
     order.paid = Some((stamp.version(), stamp.time_ms()));
     Ok(("pay", ()))

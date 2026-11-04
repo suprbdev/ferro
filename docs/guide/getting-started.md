@@ -113,6 +113,17 @@ so a transaction is serializable by construction. `commit_with` and its `try_` f
 `Committed` with your value and the `version` and `time_ms` of the commit that holds the change, or
 of the head it ran on if it changed nothing.
 
+A `try_` closure can return any error type that converts from `ferro::Error`. When its errors all
+come through `?` and the caller uses `?` on the result too, Rust cannot tell which type is meant, so
+name it on the closure:
+
+```rust
+let done = db.try_commit_with(|shop| -> Result<_, ShopError> {
+    let order = shop.orders.get(&id).ok_or(ShopError::NoOrder(id))?;
+    Ok((format!("look at #{id}"), order.total_cents))
+})?;
+```
+
 A write can also be awaited from async code, as described in [Writers and
 concurrency](concurrency.md#awaited-writes).
 

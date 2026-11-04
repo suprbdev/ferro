@@ -28,7 +28,7 @@ started by the first awaited write, syncs each batch and wakes the futures in it
 
 ```rust
 let order = db
-    .try_commit_with_async(|shop| {
+    .try_commit_with_async(|shop| -> Result<_, ShopError> {
         let left = shop.stock.get_mut(&id).ok_or(ShopError::NoProduct(id))?;
         *left = left.checked_sub(qty).ok_or(ShopError::SoldOut(id))?;
         Ok((format!("order {id}"), *left))
