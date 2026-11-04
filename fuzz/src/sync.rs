@@ -812,7 +812,7 @@ struct Feed<'a> {
 impl Read for Feed<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.calls += 1;
-        if self.interrupt > 0 && self.calls % self.interrupt == 0 {
+        if self.interrupt > 0 && self.calls.is_multiple_of(self.interrupt) {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if self.pos >= self.fail_at && self.pos < self.data.len() {

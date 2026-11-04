@@ -528,7 +528,7 @@ impl Probe for World {
         self.people.insert(person(seed % 40, seed));
         let _ = self.items.try_insert(item((seed % 70) as u32, seed));
         self.nested.poke(seed);
-        if seed % 5 == 0 {
+        if seed.is_multiple_of(5) {
             self.blobs.remove(&(seed % 12));
         }
     }

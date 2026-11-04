@@ -371,6 +371,12 @@ fn sync_out<T: Probe + Default>(db: &Db<T>) {
     if let Ok(have) = db.have() {
         let _ = to.bundle(&have);
     }
+    guarded(|| to.update(|value| value.poke(3)));
+    let pulled = db.pull(&to, "back", |_, _, _| ("merge back", ()));
+    if pulled.is_ok() {
+        let _ = db.verify();
+        let _ = db.verify_typed();
+    }
 }
 
 pub fn run_admin(path: &Path, compact: bool) {
