@@ -358,6 +358,23 @@ fn read_or_end(file: &File, out: &mut [u8], at: u64) -> Result<bool> {
     }
 }
 
+fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
+    let mut bytes = vec![0u8; SLOT_BYTES as usize + SUPER_BYTES];
+    file.read_exact_at(&mut bytes, 0)?;
+    let mut best: Option<(Super, u64)> = None;
+    for slot in 0..2u64 {
+        let at = (slot * SLOT_BYTES) as usize;
+        if let Some(candidate) = Super::decode(&bytes[at..at + SUPER_BYTES])
+            && best
+                .as_ref()
+                .is_none_or(|b| (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq))
+        {
+            best = Some((candidate, slot));
+        }
+    }
+    Ok(best)
+}
+
 fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
     let start = tip.log_end;
     let body_start = start.saturating_add(FRAME_BYTES as u64);
@@ -368,7 +385,17 @@ fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
     if !read_or_end(file, &mut header, start)? || &header[0..8] != FRAME_MAGIC {
         return Ok(None);
     }
-    let Some(mut frame) = Super::fields(&header) else {
+    frame_after(file, tip, &header, len)
+}
+
+fn frame_after(
+    file: &File,
+    tip: &Super,
+    header: &[u8; FRAME_BYTES],
+    len: u64,
+) -> Result<Option<Super>> {
+    let body_start = tip.log_end.saturating_add(FRAME_BYTES as u64);
+    let Some(mut frame) = Super::fields(header) else {
         return Ok(None);
     };
     frame.basis = tip.basis;
@@ -1166,7 +1193,7 @@ impl Store {
     fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
         let inner = &self.inner;
         let _held = Range::hold(&inner.file, SUPER_AT, true)?;
-        let newest = read_supers(&inner.file, LOG_START)?;
+        let newest = newest_super(&inner.file)?;
         let mark = frame.mark();
         if durable && newest.is_some_and(|(found, _)| found.anchor.seq >= frame.seq) {
             let mut marks = inner.marks.lock();
@@ -1257,7 +1284,7 @@ impl Store {
         let _held = Range::hold(&inner.file, SUPER_AT, inner.options.shared)?;
         let slot = match inner.options.shared {
             false => 1 - inner.slot.load(Ordering::Relaxed),
-            true => match read_supers(&inner.file, LOG_START)? {
+            true => match newest_super(&inner.file)? {
                 Some((found, _)) if (found.seq, found.anchor.seq) >= (sb.seq, sb.anchor.seq) => {
                     return Ok(());
                 }
@@ -1366,7 +1393,6 @@ impl Store {
         };
         let mut at = Super::new(start, start, Basis::default());
         let mut last = None;
-        let mut len = None;
         loop {
             let mut header = [0u8; FRAME_BYTES];
             if !read_or_end(&inner.file, &mut header, at.log_end)? {
@@ -1381,11 +1407,7 @@ impl Store {
             if &header[0..8] != FRAME_MAGIC {
                 break;
             }
-            let len = match len {
-                Some(len) => len,
-                None => *len.insert(inner.file.metadata()?.len()),
-            };
-            match read_frame(&inner.file, &at, len)? {
+            match frame_after(&inner.file, &at, &header, u64::MAX)? {
                 Some(next) if next.head.is_some() => {
                     at = next;
                     last = Some(next);
