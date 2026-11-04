@@ -9,7 +9,7 @@ use ferro::{Db, Durability, Keep, Map};
 
 use crate::input::Input;
 use crate::log_entry::Head;
-use crate::types::Root;
+use crate::types::{Probe, Root};
 use crate::{guarded, options};
 
 pub const STEP: u8 = 0x7f;
@@ -357,7 +357,13 @@ fn raw(txn: &mut Txn, input: &mut Input<'_>, known: &Known) -> Option<Ptr> {
     w.finish().ok()
 }
 
-fn forge_in(input: &mut Input<'_>, store: &Store, top: Ptr, frames: bool) -> Option<()> {
+fn forge_in(
+    input: &mut Input<'_>,
+    store: &Store,
+    top: Ptr,
+    frames: bool,
+    follower: Option<&Db<Root>>,
+) -> Option<()> {
     let mut known = survey(store, top);
     let mut txn = store.begin().ok()?;
     let mut top = top;
@@ -379,20 +385,31 @@ fn forge_in(input: &mut Input<'_>, store: &Store, top: Ptr, frames: bool) -> Opt
         known.chain.insert(0, top);
         if frames && input.chance(6) {
             txn.commit(top).ok()?;
+            if let Some(db) = follower {
+                let _ = db.refresh();
+                let mut budget = 200;
+                guarded(|| db.read().probe(&mut budget));
+                let _ = guarded(|| db.branches());
+            }
             txn = store.begin().ok()?;
         }
     }
     txn.commit(top).ok()
 }
 
-fn forge(input: &mut Input<'_>, path: &Path, frames: bool) -> Option<()> {
+fn forge(
+    input: &mut Input<'_>,
+    path: &Path,
+    frames: bool,
+    follower: Option<&Db<Root>>,
+) -> Option<()> {
     let options = StoreOptions {
         durability: Durability::Buffered,
         cache_bytes: 1 << 20,
         ..StoreOptions::default()
     };
     let (store, top) = Store::open(path, options).ok()?;
-    let forged = top.and_then(|top| forge_in(input, &store, top, frames));
+    let forged = top.and_then(|top| forge_in(input, &store, top, frames, follower));
     store.close();
     forged
 }
@@ -452,7 +469,7 @@ pub fn write(data: &[u8], path: &Path) -> Option<(u8, &'static str)> {
     let mut input = Input::new(data);
     let (control, base) = start(&mut input);
     fs::write(path, &base.image).ok()?;
-    forge(&mut input, path, control & FRAMES != 0)?;
+    forge(&mut input, path, control & FRAMES != 0, None)?;
     Some((control, base.name))
 }
 
@@ -464,7 +481,7 @@ pub fn run(data: &[u8]) {
         0 => None,
         _ => options(true).open::<Root>(&path).ok(),
     };
-    let forged = forge(&mut input, &path, control & FRAMES != 0);
+    let forged = forge(&mut input, &path, control & FRAMES != 0, follower.as_ref());
     if let Some(db) = &follower {
         let _ = db.refresh();
         crate::exercise(db, true);
