@@ -2079,9 +2079,9 @@ impl<T: Data> Shared<T> {
             for (name, mut head) in tip.refs.try_entries()? {
                 let log = head.log.pruned(&store, keep)?;
                 if log != head.log {
-                    dropped += (head.log.len() - log.len()) as u64;
+                    dropped = u64::saturating_add(dropped, (head.log.len() - log.len()) as u64);
                     head.log = log;
-                    next.insert(name, head);
+                    next.try_insert(name, head)?;
                 }
             }
             if dropped == 0 {

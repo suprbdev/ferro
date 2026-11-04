@@ -843,3 +843,21 @@ fn a_commit_after_the_last_sequence_number_is_corrupt() {
     let db = read_only().open::<Root>(&path).unwrap();
     assert_eq!(db.read().len(), 1);
 }
+
+#[test]
+fn a_cycle_reports_a_branch_table_it_cannot_edit() {
+    let (_dir, path) = fixture("prune-insert");
+    let db = manual().open::<Opaque>(&path).unwrap();
+    corrupt(db.compact(Keep::Last(2)));
+}
+
+#[test]
+fn a_cycle_counts_the_commits_it_prunes_without_overflow() {
+    let (_dir, path) = fixture("prune-dropped");
+    let db = manual().open::<Opaque>(&path).unwrap();
+    let compacted = db.compact(Keep::Last(2));
+    assert!(
+        matches!(compacted, Ok(_) | Err(Error::Corrupt(_))),
+        "{compacted:?}"
+    );
+}
