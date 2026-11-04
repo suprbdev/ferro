@@ -645,3 +645,102 @@ fn a_closure_after_a_failed_landing_is_told_of_the_poison() {
         drop((db, branches));
     }
 }
+
+type Work = Box<dyn FnOnce() -> ferro::Result<()> + Send>;
+
+fn heads(db: &Db<Root>) -> BTreeMap<String, BTreeMap<u64, u64>> {
+    db.branches()
+        .into_iter()
+        .map(|name| (name.clone(), contents(&db.branch(&name).unwrap())))
+        .collect()
+}
+
+#[test]
+fn tables_cycles_and_receives_wait_out_a_frame_held_before_its_write() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let path = dir.path().join("tables.ferro");
+        let stalls = stalls(&["held"]);
+        stalls.landed["held"].open();
+        let (db, branches) = seeded(
+            options().hook(hook(&stalls)),
+            &path,
+            &["b0", "b1", "b2", "b3"],
+        );
+        let peer: Db<Root> = options().open(dir.path().join("peer.ferro")).unwrap();
+        let merge =
+            |root: &mut Root, base: &ferro::Snapshot<Root>, theirs: &ferro::Snapshot<Root>| {
+                root.merge(base, theirs, |conflict| conflict.theirs.map(|value| *value));
+                ("merge", ())
+            };
+        peer.pull(&db, "origin", merge).unwrap();
+        put(&peer, 50, 50).unwrap();
+        let held = writer(&branches[0], "held", 1, 1);
+        wait_until("the held frame to be placed", || {
+            stalls.landing["held"].reached()
+        });
+        let main = db.clone();
+        let (b1, b2) = (branches[1].clone(), branches[2].clone());
+        let work: Vec<(&str, Work)> = vec![
+            (
+                "drop",
+                Box::new({
+                    let main = main.clone();
+                    move || main.drop_branch("b3")
+                }),
+            ),
+            (
+                "fork",
+                Box::new({
+                    let main = main.clone();
+                    move || main.fork("x").map(|_| ())
+                }),
+            ),
+            (
+                "cycle",
+                Box::new({
+                    let main = main.clone();
+                    move || main.compact(ferro::Keep::All).map(|_| ())
+                }),
+            ),
+            (
+                "pull",
+                Box::new({
+                    let peer = peer.clone();
+                    move || b1.pull(&peer, "peer", merge).map(|_| ())
+                }),
+            ),
+            ("commit", Box::new(move || put(&b2, 2, 2).map(|_| ()))),
+        ];
+        let waiting: Vec<_> = work
+            .into_iter()
+            .map(|(what, work)| (what, thread::spawn(work)))
+            .collect();
+        thread::sleep(Duration::from_millis(50));
+        for (what, handle) in &waiting {
+            assert!(
+                !handle.is_finished(),
+                "{kind}: {what} finished past a frame not yet written"
+            );
+        }
+        stalls.landing["held"].open();
+        joined("the held writer", held).unwrap().unwrap();
+        for (what, handle) in waiting {
+            joined(what, handle)
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{kind}: {what}: {error}"));
+        }
+        let written = heads(&db);
+        assert!(!written.contains_key("b3"), "{kind}");
+        assert!(written.contains_key("x"), "{kind}");
+        assert_eq!(written["b0"].get(&1), Some(&1), "{kind}");
+        assert_eq!(written["b1"].get(&50), Some(&50), "{kind}");
+        assert_eq!(written["b2"].get(&2), Some(&2), "{kind}");
+        db.verify().unwrap();
+        drop((db, main, branches));
+        let db: Db<Root> = options().open(&path).unwrap();
+        assert_eq!(heads(&db), written, "{kind}");
+        db.verify().unwrap();
+    }
+}
