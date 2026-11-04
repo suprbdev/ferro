@@ -406,11 +406,12 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     outcome.read_latencies.sort_by(|a, b| a.total_cmp(b));
     let lat = &outcome.latencies;
     let reads = &outcome.read_latencies;
-    let pauses: Vec<f64> = outcome
+    let mut pauses: Vec<f64> = outcome
         .cycles
         .iter()
         .map(|c| c.pause.as_secs_f64() * 1e3)
         .collect();
+    pauses.sort_by(|a, b| a.total_cmp(b));
     let moved: u64 = outcome.cycles.iter().map(|c| c.after_bytes).sum();
     let ratios: Vec<f64> = outcome
         .cycles
@@ -429,7 +430,7 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
     let garbage = written.saturating_sub(verified.bytes).max(1);
     let reclaimed = written.saturating_sub(space.file_bytes);
     println!(
-        "{name} fill={} keep={} commits/s={:.0} p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms cycles={} cycle_secs={:.2} pause_max={:.2}ms pause_sum={:.1}ms moved={:.1}MiB log={:.1}MiB peak={:.1}MiB alloc={:.1}MiB live={:.1}MiB reclaim={:.1}% cycle_ratio={:.1}% after_cycle={:.1}MiB reads/s={:.0} read_p50={:.2}us read_p99={:.2}us read_p999={:.1}us read_max={:.0}us",
+        "{name} fill={} keep={} commits/s={:.0} p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms cycles={} cycle_secs={:.2} pause_p50={:.3}ms pause_max={:.2}ms pause_sum={:.1}ms moved={:.1}MiB log={:.1}MiB peak={:.1}MiB alloc={:.1}MiB live={:.1}MiB reclaim={:.1}% cycle_ratio={:.1}% after_cycle={:.1}MiB reads/s={:.0} read_p50={:.2}us read_p99={:.2}us read_p999={:.1}us read_max={:.0}us",
         run.fill,
         run.keep,
         outcome.commits as f64 / run.seconds as f64,
@@ -439,6 +440,7 @@ fn report<T: Data>(name: &str, db: &Db<T>, run: &Run, mut outcome: Outcome) {
         lat.last().copied().unwrap_or(0.0),
         outcome.cycles.len(),
         outcome.cycle_secs,
+        percentile(&pauses, 50.0),
         pauses.iter().copied().fold(0.0, f64::max),
         pauses.iter().sum::<f64>(),
         mib(moved),
@@ -584,12 +586,20 @@ fn run_table(path: &Path, run: &Run) {
         .unwrap();
     }
     let db: Db<Bank> = open_options(run).open(path).unwrap();
+    let branches: Vec<Db<Bank>> = (0..env_number("RECLAIM_BRANCHES", 1).max(1))
+        .map(|at| match at {
+            0 => db.clone(),
+            _ => db.fork(&format!("b{at}")).unwrap(),
+        })
+        .collect();
     let outcome = drive(
         &db,
         4,
         run,
         |writer, index| {
-            let id = mix(index * 4 + writer as u64) % rows;
+            let pick = mix(index * 4 + writer as u64);
+            let id = pick % rows;
+            let db = &branches[(pick >> 32) as usize % branches.len()];
             db.update(|bank| {
                 bank.accounts.get_mut(&id).unwrap().balance += 1;
             })
