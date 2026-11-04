@@ -1,8 +1,9 @@
-use std::any::TypeId;
+use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, hash_map};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::mem;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
@@ -10,7 +11,7 @@ use crate::codec::{
     Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
-use crate::dense::{Column, Hashes};
+use crate::dense::{Column, Hashes, Index};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
@@ -37,6 +38,10 @@ const PLACE_AT: usize = 256 << 10;
 const PIPE_CHUNKS: usize = 8;
 const PIPE_OBJECTS: usize = 256;
 const CACHED_LINKS: usize = 1 << 16;
+const UNRESOLVED: Ptr = Ptr {
+    hash: [0; HASH_BYTES],
+    offset: 0,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Have(Vec<u8>);
@@ -399,6 +404,9 @@ impl Header {
         }
         let mut hints = Vec::new();
         for _ in 0..input.varint()? {
+            if roots.len() + hints.len() >= u32::MAX as usize {
+                return Err(bad("it names more hints than one receive can hold"));
+            }
             let parent = input.below(roots.len() + hints.len())?;
             hints.push((parent, input.size()?));
         }
@@ -1404,8 +1412,6 @@ impl Landing<'_> {
     }
 }
 
-type Parent = (Vec<Ptr>, HashMap<usize, Kind>);
-
 struct Kept {
     left: u8,
     checks: Vec<(Shape, Vec<Kind>)>,
@@ -1415,10 +1421,8 @@ struct Vetting<'a> {
     store: &'a Store,
     staging: &'a Staging,
     links: &'a Column<u8>,
-    held_at: &'a HashMap<Hash, usize>,
-    roots: &'a [Ptr],
-    hinted: &'a [Ptr],
-    hint_kinds: &'a [Option<Kind>],
+    anchors: &'a Anchors,
+    held_at: &'a Index,
     root_kind: &'a Kind,
     kept: HashMap<u32, Kept>,
     held: Checked,
@@ -1440,9 +1444,10 @@ impl Vetting<'_> {
             let shape = match self.staging.id_of(&ptr.hash) {
                 Some(id) => self.sent(id, ptr.hash, &kind, before)?,
                 None => {
-                    let reference = *self.held_at.get(&ptr.hash).ok_or_else(|| {
+                    let reference = self.anchors.find(self.held_at, &ptr.hash).ok_or_else(|| {
                         bad("an object links to one that was neither sent nor known")
-                    })?;
+                    })? as usize
+                        + 1;
                     match self.held(ptr.hash, reference, &kind)? {
                         Some(shape) => shape,
                         None => continue,
@@ -1461,7 +1466,7 @@ impl Vetting<'_> {
 
     fn sent(&mut self, id: u32, hash: Hash, kind: &Kind, mut before: Vec<Kind>) -> Result<Shape> {
         let links = self.links.get(id);
-        let pinned = links == u8::MAX || self.held_at.contains_key(&hash);
+        let pinned = links == u8::MAX || self.anchors.find(self.held_at, &hash).is_some();
         let shared = links >= 2 || pinned;
         let counted = before.is_empty();
         if shared && let Some(kept) = self.kept.get_mut(&id) {
@@ -1558,12 +1563,15 @@ impl Vetting<'_> {
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
-        let roots = self.roots.len();
+        let roots = self.anchors.roots.len();
         let (ptr, known) = if reference <= roots {
-            (self.roots[reference - 1], Some(self.root_kind.clone()))
+            (
+                self.anchors.roots[reference - 1],
+                Some(self.root_kind.clone()),
+            )
         } else {
             let id = reference - 1 - roots;
-            (self.hinted[id], self.hint_kinds[id].clone())
+            (self.anchors.hinted[id], self.anchors.hint_kinds.get(id))
         };
         if ptr.hash != hash {
             return Err(bad("a link does not match the object it names"));
@@ -1595,22 +1603,99 @@ impl Vetting<'_> {
     }
 }
 
+#[derive(Clone)]
+struct Held {
+    template: u16,
+    count: Option<u64>,
+    below: Option<u8>,
+    range: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct Kinds {
+    templates: Vec<Kind>,
+    held: Vec<Held>,
+}
+
+impl Kinds {
+    fn new(len: usize) -> Kinds {
+        let none = Held {
+            template: u16::MAX,
+            count: None,
+            below: None,
+            range: None,
+        };
+        Kinds {
+            templates: Vec::new(),
+            held: vec![none; len],
+        }
+    }
+
+    fn set(&mut self, id: usize, kind: Kind) {
+        let template = match self.templates.iter().position(|seen| seen.id == kind.id) {
+            Some(at) => at,
+            None => {
+                let mut template = kind.clone();
+                (template.count, template.below, template.range) = (None, None, None);
+                self.templates.push(template);
+                self.templates.len() - 1
+            }
+        };
+        self.held[id] = Held {
+            template: u16::try_from(template).unwrap_or(u16::MAX),
+            count: kind.count,
+            below: kind.below,
+            range: kind.range,
+        };
+    }
+
+    fn get(&self, id: usize) -> Option<Kind> {
+        let held = &self.held[id];
+        let mut kind = self.templates.get(usize::from(held.template))?.clone();
+        kind.count = held.count;
+        kind.below = held.below;
+        kind.range = held.range.clone();
+        Some(kind)
+    }
+}
+
 struct Anchors {
     generation: u64,
     bases: Vec<(Ptr, Chain)>,
     roots: Vec<Ptr>,
     hinted: Vec<Ptr>,
-    hint_kinds: Vec<Option<Kind>>,
+    hint_kinds: Kinds,
 }
 
 impl Anchors {
-    fn held(&self) -> HashMap<Hash, Ptr> {
-        let mut held = HashMap::with_capacity(self.roots.len() + self.hinted.len());
-        for ptr in self.roots.iter().chain(&self.hinted) {
-            held.entry(ptr.hash).or_insert(*ptr);
+    fn ptr(&self, at: u32) -> Ptr {
+        let at = at as usize;
+        match at.checked_sub(self.roots.len()) {
+            None => self.roots[at],
+            Some(id) => self.hinted[id],
         }
-        held
     }
+
+    fn held(&self) -> Index {
+        let mut index = Index::default();
+        for at in 0..(self.roots.len() + self.hinted.len()) as u32 {
+            let hash = self.ptr(at).hash;
+            if index.find(&hash, |at| self.ptr(at).hash).is_none() {
+                index.insert(&hash, at, |at| self.ptr(at).hash);
+            }
+        }
+        index
+    }
+
+    fn find(&self, held: &Index, hash: &Hash) -> Option<u32> {
+        held.find(hash, |at| self.ptr(at).hash)
+    }
+}
+
+fn by_parent(hints: &[(usize, usize)]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..hints.len() as u32).collect();
+    order.sort_by_key(|id| hints[*id as usize].0);
+    order
 }
 
 fn located_bases(store: &Store, refs: &Refs, header: &Header) -> Result<Vec<(Ptr, Chain)>> {
@@ -1640,35 +1725,34 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                 .ok_or_else(|| bad("a base it names has no root"))?,
         );
     }
-    let mut hinted: Vec<Ptr> = Vec::with_capacity(header.hints.len());
-    let mut hint_kinds: Vec<Option<Kind>> = Vec::with_capacity(header.hints.len());
-    let mut parents: HashMap<(Ptr, Option<TypeId>), Parent> = HashMap::new();
-    for (parent, slot) in &header.hints {
-        let (from, kind) = if *parent < roots.len() {
-            (roots[*parent], Some(root_kind))
-        } else {
-            let id = *parent - roots.len();
-            (hinted[id], hint_kinds[id].as_ref())
+    let mut hinted = vec![UNRESOLVED; header.hints.len()];
+    let mut hint_kinds = Kinds::new(header.hints.len());
+    let order = by_parent(&header.hints);
+    for group in order.chunk_by(|a, b| header.hints[*a as usize].0 == header.hints[*b as usize].0) {
+        let parent = header.hints[group[0] as usize].0;
+        let (from, kind) = match parent.checked_sub(roots.len()) {
+            None => (roots[parent], Some(root_kind.clone())),
+            Some(id) => (hinted[id], hint_kinds.get(id)),
         };
-        let (links, kinds) = match parents.entry((from, kind.map(|kind| kind.id))) {
-            hash_map::Entry::Occupied(found) => found.into_mut(),
-            hash_map::Entry::Vacant(empty) => {
-                let object = store.read_object(from)?;
-                let kinds = kind
-                    .and_then(|kind| kind.check(&object.body, &object.links).ok())
-                    .map(|(_, found)| found.into_iter().collect())
-                    .unwrap_or_default();
-                empty.insert((object.links, kinds))
+        let object = store.read_object(from)?;
+        let kinds: Vec<(usize, Kind)> = kind
+            .and_then(|kind| kind.check(&object.body, &object.links).ok())
+            .map(|(_, found)| found)
+            .unwrap_or_default();
+        for id in group {
+            let slot = header.hints[*id as usize].1;
+            let link = *object
+                .links
+                .get(slot)
+                .ok_or_else(|| bad("a hint names a link that does not exist"))?;
+            if link.offset == 0 {
+                return Err(bad("a hint leads into pruned history"));
             }
-        };
-        let link = *links
-            .get(*slot)
-            .ok_or_else(|| bad("a hint names a link that does not exist"))?;
-        if link.offset == 0 {
-            return Err(bad("a hint leads into pruned history"));
+            hinted[*id as usize] = link;
+            if let Some((_, kind)) = kinds.iter().find(|(at, _)| *at == slot) {
+                hint_kinds.set(*id as usize, kind.clone());
+            }
         }
-        hinted.push(link);
-        hint_kinds.push(kinds.get(slot).cloned());
     }
     Ok(Anchors {
         generation: store.id(),
@@ -1694,25 +1778,30 @@ fn reanchor(store: &Store, refs: &Refs, header: &Header, before: &Anchors) -> Re
     let hinted = if store.id() == before.generation {
         before.hinted.clone()
     } else {
-        let mut hinted: Vec<Ptr> = Vec::with_capacity(before.hinted.len());
-        let mut parents: HashMap<Ptr, Vec<Ptr>> = HashMap::new();
-        for ((parent, slot), was) in header.hints.iter().zip(&before.hinted) {
+        let mut hinted = vec![UNRESOLVED; before.hinted.len()];
+        let order = by_parent(&header.hints);
+        for group in
+            order.chunk_by(|a, b| header.hints[*a as usize].0 == header.hints[*b as usize].0)
+        {
+            let parent = header.hints[group[0] as usize].0;
             let from = match parent.checked_sub(roots.len()) {
-                None => roots[*parent],
+                None => roots[parent],
                 Some(id) => hinted[id],
             };
-            let links = match parents.entry(from) {
-                hash_map::Entry::Occupied(found) => found.into_mut(),
-                hash_map::Entry::Vacant(empty) => empty.insert(store.read_links(from)?),
-            };
-            let link = links
-                .get(*slot)
-                .copied()
-                .filter(|link| link.hash == was.hash && link.offset != 0)
-                .ok_or_else(|| {
-                    Error::StaleHave("an object it builds on is no longer in this database".into())
-                })?;
-            hinted.push(link);
+            let links = store.read_links(from)?;
+            for id in group {
+                let (slot, was) = (header.hints[*id as usize].1, before.hinted[*id as usize]);
+                let link = links
+                    .get(slot)
+                    .copied()
+                    .filter(|link| link.hash == was.hash && link.offset != 0)
+                    .ok_or_else(|| {
+                        Error::StaleHave(
+                            "an object it builds on is no longer in this database".into(),
+                        )
+                    })?;
+                hinted[*id as usize] = link;
+            }
         }
         hinted
     };
@@ -1721,7 +1810,7 @@ fn reanchor(store: &Store, refs: &Refs, header: &Header, before: &Anchors) -> Re
         bases,
         roots,
         hinted,
-        hint_kinds: Vec::new(),
+        hint_kinds: Kinds::default(),
     })
 }
 
@@ -1793,7 +1882,8 @@ fn place(
     record: &Record,
     hashes: &Hashes,
     placed: &mut Column<u64>,
-    held: &HashMap<Hash, Ptr>,
+    anchors: &Anchors,
+    held: &Index,
     unlisted: bool,
 ) -> Result<()> {
     let earlier = Earlier {
@@ -1808,9 +1898,12 @@ fn place(
                 hash: link.hash,
                 offset,
             },
-            None => *held.get(&link.hash).ok_or_else(|| {
-                Error::Corrupt("a received object links to one that was not placed".into())
-            })?,
+            None => anchors
+                .find(held, &link.hash)
+                .map(|at| anchors.ptr(at))
+                .ok_or_else(|| {
+                    Error::Corrupt("a received object links to one that was not placed".into())
+                })?,
         });
     }
     let staged = record.staged(&links);
@@ -1966,18 +2059,13 @@ fn resolve<O: Objects>(
                 "an object links to one that was neither sent nor known",
             ));
         }
-        let mut held_at: HashMap<Hash, usize> = HashMap::new();
-        for (index, ptr) in anchors.roots.iter().chain(&anchors.hinted).enumerate() {
-            held_at.entry(ptr.hash).or_insert(1 + index);
-        }
+        let held_at = anchors.held();
         let mut vetting = Vetting {
             store,
             staging,
             links: &streamed.links,
+            anchors,
             held_at: &held_at,
-            roots: &anchors.roots,
-            hinted: &anchors.hinted,
-            hint_kinds: &anchors.hint_kinds,
             root_kind,
             kept: HashMap::new(),
             held: Checked::default(),
@@ -2366,7 +2454,7 @@ impl<T: Data> Db<T> {
         self.check_writable()?;
         let (store, refs) = self.published_refs();
         let root_kind = Kind::value::<T>();
-        let anchors = anchors(&store, &refs, header, &root_kind)?;
+        let mut anchors = anchors(&store, &refs, header, &root_kind)?;
         let mut staging = Staging::new(store.path(), SPILL_AT);
         let streamed = stream(&mut staging, header, &anchors, input)?;
         let vetted = Vetted {
@@ -2382,6 +2470,7 @@ impl<T: Data> Db<T> {
             &anchors,
             Some(vetted),
         )?;
+        anchors.hint_kinds = Kinds::default();
         staging.seal()?;
         self.step("received");
         Ok(Received {
@@ -2414,7 +2503,15 @@ impl<T: Data> Db<T> {
                 let held = anchors.held();
                 let mut replay = staging.replay();
                 while let Some(record) = replay.next_record()? {
-                    place(txn, &record, staging.hashes(), &mut placed, &held, false)?;
+                    place(
+                        txn,
+                        &record,
+                        staging.hashes(),
+                        &mut placed,
+                        &anchors,
+                        &held,
+                        false,
+                    )?;
                 }
             }
             let objects = Placed {
@@ -2459,7 +2556,15 @@ impl<T: Data> Db<T> {
                 }
                 for record in &batch {
                     let unlisted = commits.binary_search(&(placed.len() as u32)).is_ok();
-                    place(txn, record, staging.hashes(), &mut placed, &held, unlisted)?;
+                    place(
+                        txn,
+                        record,
+                        staging.hashes(),
+                        &mut placed,
+                        anchors,
+                        &held,
+                        unlisted,
+                    )?;
                 }
                 Ok(())
             })?;
