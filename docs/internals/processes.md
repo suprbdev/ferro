@@ -66,6 +66,18 @@ branch byte as a no-op inside its own process's cycle, then unlocked it, and ano
 closure ran during the pause and failed with `the file was replaced while a closure held its
 branch`. `an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause` reproduces it.
 
+So the cycle's lanes must cover every branch byte the process can hold for long, and attached
+branches are not all of them: a coalesced group keeps its branch's byte between closures, and a
+branch can stop being attached under it. A closure that took the byte on a branch another process
+had dropped, and caught up, retired the branch and then joined a group on it anyway, and the group
+stayed open while a sync ran. The cycle took every attached lane, which no longer included that
+branch, and waited for its byte; the group's member was parked until the sync thread sealed it,
+and the sync thread was waiting for a lane the cycle held. A stress run hung about once in 25 to 50
+runs of 20 rounds on two CPUs. Now a closure checks its branch is live again after taking the byte
+and catching up, and lets the byte go and fails with `Error::NoBranch` if it is not, before it
+runs (`a_closure_on_a_branch_another_handle_dropped_never_runs`), and a cycle also takes the lane
+of every branch with a group open, attached or not, which seals the group.
+
 ## A commit
 
 1. Under its lane the writer takes its branch's lock, waiting while another process runs a closure
@@ -121,7 +133,8 @@ never moved: every commit on it failed with `another process moved branch`.
 on `main` between catching up and syncing while it attaches the branch.
 
 The marker a cycle leaves, described under [Reclamation](#reclamation), is checked against the path,
-which a store now keeps canonical. The first version kept the path it was opened by, so a handle
+which a shared writer's store keeps canonical; other stores keep the path they were given, as
+before. The first version kept the path it was opened by, so a handle
 opened by a relative path, after the working directory changed, could not find the file, read the
 marker as a cycle that failed, and went on committing to the retired file: an acknowledged commit
 was lost (`a_handle_opened_by_a_relative_path_follows_a_cycle_after_the_directory_changes`). It also
@@ -156,6 +169,22 @@ but none can be placing a frame, and every frame they placed is whole, so the sc
 log. A Buffered file with live writers may have up to `checkpoint_bytes` past its anchor to scan. It
 removes a stale `.compacting` file only if it can take the cycle lock, since another process's cycle
 may be writing it.
+
+Once it holds the placement lock it checks again that the path names the file it opened, and opens
+the path again if not. A cycle renames the new file over the path under the old file's placement
+lock, so a file still named by the path once that lock is held is one no cycle has retired. The
+first version checked the path only before taking the lock. A writer that opened the path during
+another process's cycle pause got the old file's placement lock once the cycle had renamed and let
+go, recovered the retired file, and truncated the marker the cycle had left at its end as anything
+past the last frame, so it never learned of the new file and acknowledged commits into one that no
+longer had a name. A process that ran two cycles before another followed did the same to the file
+in the middle. `a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file` holds a
+cycle at its pause while another handle opens, and lost the commit that handle acknowledged. Once
+two processes were on different files, both could run a cycle, each into the same `.compacting`
+and each renaming over the other's file, which is the likeliest way a stress run ended in `varint
+overflow in record`. Recovery by a shared writer also stops truncating at a marker, so one left by a
+cycle that failed before its rename is written over by the next frame instead, and one on a
+retired file can never be removed.
 
 A shared writer does not truncate the Fsync reservation when it closes, since other writers may be
 placing frames into it. The next writer to open truncates it, so the file can stay up to 4 MiB
@@ -231,6 +260,18 @@ and that the file verifies:
 - A child opens the file by a relative path beside a second handle, changes directory, and commits
   after the other handle's cycle, and that commit must survive a reopen.
 - A child counts its threads while 32 awaited writes wait for another handle's closure.
+- A child runs a stress mix, adapted from the review's: two handles of one file, one coalesced, each
+  with three branches of its own written by a thread that awaits every third commit and checks that
+  each commit acknowledged the version after the last, writers on `main` in both, background cycles
+  every 128 KiB with `Keep::Last(3)`, one handle forking and dropping four names in a loop and the
+  other attaching and committing on them. After each round the file is reopened and every branch
+  and every acknowledged `main` commit must be there, and the file must verify. It runs 40 rounds of
+  400 commits a branch in about two seconds, `FERRO_TEST_SCALE` multiplies the rounds and
+  `FERRO_SHARED_EACH` sets the commits, and the parent kills it and fails if it does not finish.
+  Run on two CPUs, `taskset -c 0,1`, 20 rounds a run, the build before the fixes for opening
+  during a pause and for groups on dropped branches went bad in 12 of 200 runs: 6 hung and 6
+  failed, three of those with acknowledged commits missing after the reopen. With the fixes, 600
+  runs, 12,000 rounds, ran clean, and so did 150 runs of 20 rounds of the review's own mix.
 
 `ferro/tests/shared.rs` opens one file twice in one process, which locks as two processes do, for
 what is easier to arrange there: forks and drops seen by the other handle, watchers fired by a
@@ -238,8 +279,9 @@ commit and by `refresh`, coalesced and awaited writes, an awaited write held up 
 handle's closure, a pull landing beside the other handle's commits, background cycles in three
 handles at once, four threads on branches of their own in each of two handles, an awaited write
 waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
-and a drop and fork that must wait for a closure. Each test added for a finding of the review
-failed before its fix, as described above. Both files build on 64-bit Linux only, and
+a drop and fork that must wait for a closure, a writer opening during the other handle's cycle
+pause, and a closure on a branch the other handle dropped. Each test added for a finding of the
+review failed before its fix, as described above. Both files build on 64-bit Linux only, and
 `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
@@ -261,7 +303,10 @@ single-key Buffered commits into 100,000 keys, median of seven alternating three
 commits a second before, 47,488 after and 42,718 with the option, p50 19, 19 and 21 µs. With fsync,
 median of five: 2,604, 2,554 and 2,453, p50 377, 377 and 402 µs, where single runs of each ranged
 over 20%. These ran before a later change read both superblock slots in one read, which takes one
-read off each sync with the option.
+read off each sync with the option. The fixes from review left a writer without the option where it
+was: against the commit before the second set of them, median of five interleaved runs, a hold ran
+564,131 instructions outside the closure before and 564,739 after, a confirm 730,014 and 729,972,
+and a cancel 897,147 and 896,960, with CPU time within its runs' spread.
 
 `ferro-bench`, median of three alternating runs against the tree before: no figure that does not
 wait on fsync was more than 1.4% slower, and several were faster, but `map_diff_per_change`, a read
