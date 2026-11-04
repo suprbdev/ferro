@@ -367,7 +367,11 @@ acknowledges the frames of its batch before the failed one and fails the rest wi
 `Error::Poisoned`, including frames placed after it whose bytes were written, since recovery would
 not keep them. The writer whose write failed puts its branch's tip back to the frame before and
 reports the I/O error, as when the write failed under `tip`. A writer that panics between placing
-and writing poisons the store the same way.
+and writing poisons the store the same way. The other branches keep tips in frames placed after
+the failed one, past `written` for good, so a read there fails with `Error::Poisoned`, and a closure
+on a poisoned store does not run. A closure on such a branch used to read its tip and panic on
+`pointer ... outside log`, and an awaited commit that waited on such a read failed with
+`Error::StalePointer` (`a_closure_after_a_failed_landing_is_told_of_the_poison`).
 `a_power_cut_between_frames_that_landed_out_of_order_keeps_a_prefix` holds one branch's writer
 between placing and writing while two other branches place and write the frames after it, so every
 round writes three frames out of order, and replays prefixes of the recorded writes under both

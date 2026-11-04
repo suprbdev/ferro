@@ -2500,6 +2500,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&State<T>, &mut T, &Stamp<'_>) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Staged<R, E>, E> {
         self.branch.check_live()?;
+        self.shared.store().check_healthy()?;
         let state = self.branch.tip.load_full();
         let framed = self.branch.framed.load(Ordering::Acquire);
         let mut working = (*state.snapshot.value).clone();
@@ -2556,7 +2557,8 @@ impl<T: Data> Db<T> {
     ) -> std::result::Result<Joined<R, E>, E> {
         let shared = &self.shared;
         let branch = &self.branch;
-        if let Err(error) = branch.check_live() {
+        let live = branch.check_live();
+        if let Err(error) = live.and_then(|()| shared.store().check_healthy()) {
             if let Some(group) = lane.take() {
                 shared.seal_for_others(branch, group);
             }

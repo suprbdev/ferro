@@ -5,10 +5,13 @@ mod common;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
+use std::future::Future;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use common::quiet_ferro_panics;
@@ -374,6 +377,89 @@ fn a_writer_that_dies_between_placing_and_writing_strands_no_one() {
     }
 }
 
+struct Flag {
+    thread: Thread,
+    woken: AtomicBool,
+}
+
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let flag = Arc::new(Flag {
+        thread: thread::current(),
+        woken: AtomicBool::new(false),
+    });
+    let waker = Waker::from(flag.clone());
+    let mut cx = Context::from_waker(&waker);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        while !flag.woken.swap(false, Ordering::SeqCst) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "an awaited write was never woken");
+            thread::park_timeout(left);
+        }
+    }
+}
+
+#[test]
+fn awaited_writes_behind_a_failed_frame_are_woken_with_the_failure() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let path = dir.path().join("awaited.ferro");
+        let stalls = stalls(&["failing"]);
+        stalls.landed["failing"].open();
+        stalls.fail_at_landing.lock().unwrap().push("failing");
+        let (db, branches) = seeded(options().hook(hook(&stalls)), &path, &["b0", "b1", "b2"]);
+        let failing = writer(&branches[0], "failing", 1, 1);
+        wait_until("the failing frame to be placed", || {
+            stalls.landing["failing"].reached()
+        });
+        let awaited: Vec<_> = branches[1..]
+            .iter()
+            .map(|branch| {
+                let branch = branch.clone();
+                thread::spawn(move || {
+                    block_on(branch.update_async(|root| {
+                        root.insert(2, 2);
+                    }))
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(30));
+        stalls.landing["failing"].open();
+        assert!(
+            matches!(joined("the failing writer", failing), Ok(Err(Error::Io(_)))),
+            "{kind}"
+        );
+        for handle in awaited {
+            let result = joined("an awaited writer", handle).unwrap();
+            assert!(matches!(result, Err(Error::Poisoned)), "{kind}: {result:?}");
+        }
+        drop((db, branches));
+        let db: Db<Root> = options().open(&path).unwrap();
+        for at in 0..3 {
+            let branch = db.branch(&format!("b{at}")).unwrap();
+            assert_eq!(contents(&branch).get(&1), None, "{kind}");
+            assert_eq!(contents(&branch).get(&2), None, "{kind}");
+        }
+        db.verify().unwrap();
+    }
+}
+
 #[test]
 fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
     let _turn = serial();
@@ -510,4 +596,52 @@ fn a_failed_sync_under_a_large_receive_fails_the_commits_queued_behind_it() {
     drop((db, side));
     let db: Db<Text> = fsync().open(&path).unwrap();
     db.verify().unwrap();
+}
+
+#[test]
+fn a_closure_after_a_failed_landing_is_told_of_the_poison() {
+    let _turn = serial();
+    quiet_ferro_panics();
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let path = dir.path().join("after.ferro");
+        let stalls = stalls(&["failing", "ahead"]);
+        stalls.landed["failing"].open();
+        stalls.landing["ahead"].open();
+        stalls.landed["ahead"].open();
+        stalls.fail_at_landing.lock().unwrap().push("failing");
+        let (db, branches) = seeded(
+            options().cache_bytes(1).hook(hook(&stalls)),
+            &path,
+            &["b0", "b1"],
+        );
+        let failing = writer(&branches[0], "failing", 1, 1);
+        wait_until("the failing frame to be placed", || {
+            stalls.landing["failing"].reached()
+        });
+        let ahead = writer(&branches[1], "ahead", 2, 2);
+        wait_until("the frame ahead to land", || {
+            stalls.landed["ahead"].reached()
+        });
+        stalls.landing["failing"].open();
+        assert!(
+            matches!(joined("the failing writer", failing), Ok(Err(Error::Io(_)))),
+            "{kind}"
+        );
+        let ahead = joined("the writer ahead", ahead).unwrap();
+        assert!(matches!(ahead, Err(Error::Poisoned)), "{kind}: {ahead:?}");
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            branches[1].update(|root| root.get(&2).map(|value| *value))
+        }));
+        match read {
+            Ok(Err(Error::Poisoned)) => {}
+            Ok(other) => panic!("{kind}: a closure after the failure returned {other:?}"),
+            Err(payload) => panic!(
+                "{kind}: a closure after the failure panicked: {}",
+                common::panic_text(&*payload)
+            ),
+        }
+        assert_eq!(contents(&branches[1]).get(&2), None, "{kind}");
+        drop((db, branches));
+    }
 }

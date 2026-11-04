@@ -969,6 +969,18 @@ impl Store {
         self.landed_past(end.saturating_sub(1))
     }
 
+    fn readable_past(&self, offset: u64) -> Result<u64> {
+        let inner = &self.inner;
+        let written = self.landed_past(offset);
+        if offset >= written
+            && inner.poisoned.load(Ordering::Acquire)
+            && offset < inner.placed.load(Ordering::Acquire)
+        {
+            return Err(Error::Poisoned);
+        }
+        Ok(written)
+    }
+
     pub(crate) fn check_healthy(&self) -> Result<()> {
         if self.inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -1057,21 +1069,21 @@ impl Store {
     }
 
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
-        let tail = self.landed_past(ptr.offset);
+        let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
         let (object, len, _) = Store::read_within(file, ptr, tail, &[], true, false)?;
         Ok((object, len))
     }
 
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
-        let tail = self.landed_past(ptr.offset);
+        let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
         let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true)?;
         Ok((object, packed))
     }
 
     pub(crate) fn read_links(&self, ptr: Ptr) -> Result<Vec<Ptr>> {
-        let tail = self.landed_past(ptr.offset);
+        let tail = self.readable_past(ptr.offset)?;
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
                 "pointer {} outside log of {tail} bytes",
@@ -1754,9 +1766,10 @@ impl Txn {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
-            _ if ptr.offset < self.origin => {
-                (&[][..], self.store.landed_past(ptr.offset).min(self.start))
-            }
+            _ if ptr.offset < self.origin => (
+                &[][..],
+                self.store.readable_past(ptr.offset)?.min(self.start),
+            ),
             _ => (&[][..], self.start),
         };
         let verify = ptr.offset < self.origin;
