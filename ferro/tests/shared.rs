@@ -507,3 +507,49 @@ fn a_branch_attached_while_a_followed_frame_waits_for_its_sync_reads_the_newest_
     side_a.update(|root| root.n += 1).unwrap();
     assert_eq!(side_a.read().n, 22);
 }
+
+#[test]
+fn a_drop_and_fork_in_another_handle_wait_for_a_closure_on_that_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refork.ferro");
+    let a: Db<Root> = shared().open(&path).unwrap();
+    let b: Db<Root> = shared().open(&path).unwrap();
+    bump(&a, 0, 1);
+    let side = a.fork("side").unwrap();
+    bump(&side, 1, 1);
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let closure = {
+        let (entered, release) = (entered.clone(), release.clone());
+        thread::spawn(move || {
+            side.update(|root| {
+                entered.wait();
+                release.wait();
+                root.n += 1;
+            })
+        })
+    };
+    entered.wait();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropper = {
+        let (b, dropped) = (b.clone(), dropped.clone());
+        thread::spawn(move || {
+            b.drop_branch("side").unwrap();
+            dropped.store(true, Ordering::Release);
+            b.fork("side").unwrap();
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    let early = dropped.load(Ordering::Acquire);
+    release.wait();
+    let committed = closure.join().unwrap();
+    dropper.join().unwrap();
+    assert!(
+        !early,
+        "the drop did not wait for the closure: {committed:?}"
+    );
+    assert!(
+        matches!(committed, Ok(()) | Err(Error::NoBranch(_))),
+        "{committed:?}"
+    );
+    assert_eq!(b.branch("side").unwrap().read().n, 1);
+}

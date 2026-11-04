@@ -247,6 +247,17 @@ struct RefState {
     depth: usize,
 }
 
+struct Byte {
+    store: Store,
+    at: u64,
+}
+
+impl Drop for Byte {
+    fn drop(&mut self) {
+        self.store.unlock_lane(self.at);
+    }
+}
+
 pub(crate) struct Cycles<'a> {
     _across: Option<Held>,
     _local: MutexGuard<'a, ()>,
@@ -1403,6 +1414,16 @@ impl<T: Data> Shared<T> {
             self.seal_for_others(branch, group);
         }
         lane
+    }
+
+    fn byte_of(&self, name: &str) -> Result<Option<Byte>> {
+        if !self.options.shared {
+            return Ok(None);
+        }
+        let store = self.store();
+        let at = lane_of(name);
+        store.lock_lane(at)?;
+        Ok(Some(Byte { store, at }))
     }
 
     fn attached_since(&self, branches: &[Arc<Branch<T>>]) -> bool {
@@ -3499,10 +3520,15 @@ impl<T: Data> Db<T> {
         loop {
             let doomed = self.shared.branches.lock().get(name).cloned();
             let lane = doomed.as_ref().map(|branch| self.shared.lane(branch));
+            let byte = self.shared.byte_of(name)?;
             let mut tip = self.shared.lock_tip(&mut notices)?;
             let _whole = reentry::whole(self.shared.id);
             let attached = self.shared.branches.lock().get(name).cloned();
-            if attached.as_ref().map(Arc::as_ptr) != doomed.as_ref().map(Arc::as_ptr) {
+            let moved_file = byte
+                .as_ref()
+                .is_some_and(|byte| byte.store.id() != self.shared.store().id());
+            if moved_file || attached.as_ref().map(Arc::as_ptr) != doomed.as_ref().map(Arc::as_ptr)
+            {
                 continue;
             }
             if tip.refs.try_get(name)?.is_none() {
@@ -3531,6 +3557,7 @@ impl<T: Data> Db<T> {
                 branch.retire();
             }
             drop(tip);
+            drop(byte);
             drop(lane);
             return Ok(());
         }
