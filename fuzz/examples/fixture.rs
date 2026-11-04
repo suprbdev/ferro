@@ -5,7 +5,7 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let [target, input, out] = &args[..] else {
-        panic!("usage: fixture <open|admin|log_entry|sync> <fuzz input> <output .db>");
+        panic!("usage: fixture <open|admin|log_entry|refs|sync> <fuzz input> <output .db>");
     };
     let data = fs::read(input).unwrap();
     let out = PathBuf::from(out);
@@ -26,6 +26,17 @@ fn main() {
                 "mode {mode:#04x}: read_only {}, admin {}",
                 mode & 1 != 0,
                 mode & 2 != 0
+            );
+        }
+        "refs" => {
+            let (control, base) =
+                ferro_fuzz::refs::write(&data, &out).expect("input forges no branch table");
+            println!(
+                "control {control:#04x} over the {base} base: follow {}, read_only {}, writes {}, admin {}",
+                control & ferro_fuzz::refs::FOLLOW != 0,
+                control & ferro_fuzz::refs::READ_ONLY != 0,
+                control & ferro_fuzz::refs::WRITES != 0,
+                control & ferro_fuzz::refs::ADMIN != 0
             );
         }
         "sync" => {

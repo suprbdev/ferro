@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use ferro::codec::{Encoder, Object, Sink};
 use ferro::db::Hook;
@@ -507,6 +509,222 @@ fn steps(corpus: &mut Corpus, dir: &Path) {
     }
 }
 
+fn wide_steps(corpus: &mut Corpus, dir: &Path) {
+    let path = dir.join("covered-steps.ferro");
+    {
+        let db = options().open::<Catalog>(&path).unwrap();
+        db.commit("seed", |catalog| {
+            for id in 0..12 {
+                let _ = catalog.items.try_insert(item(id, 0));
+            }
+        })
+        .unwrap();
+        let forks: Vec<Db<Catalog>> = (0..20)
+            .map(|at| db.fork(&format!("c{at:02}")).unwrap())
+            .collect();
+        for count in 1..=140u64 {
+            let branch = &forks[(count * 7 % 20) as usize];
+            branch
+                .commit(format!("covered {count}"), |catalog| {
+                    let id = (count % 12) as u32;
+                    let _ = catalog.items.try_update(&id, |row| {
+                        row.price += count as i64;
+                        row.tier = item(id, count).tier;
+                        row.label = word(count, 3);
+                    });
+                })
+                .unwrap();
+            if matches!(count, 43 | 44 | 45 | 107 | 108 | 109 | 140) {
+                corpus.emit(CATALOG, &fs::read(&path).unwrap());
+            }
+        }
+        db.drop_branch("c05").unwrap();
+    }
+    corpus.emit_file(CATALOG, &path);
+    let path = dir.join("branches200.ferro");
+    {
+        let db = options().open::<Root>(&path).unwrap();
+        small(&db, 0, 0);
+        let forks: Vec<Db<Root>> = (0..200u64)
+            .map(|at| db.fork(&format!("wide-{at:03}")).unwrap())
+            .collect();
+        for count in 0..70u64 {
+            small(&forks[(count * 13 % 200) as usize], count % 5, count);
+        }
+    }
+    let bytes = fs::read(&path).unwrap();
+    corpus.emit(ROOT, &bytes);
+    corpus.emit(OPAQUE, &bytes);
+}
+
+const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+
+fn wait_until(ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready() {
+        assert!(Instant::now() < deadline, "a held frame never moved");
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+#[derive(Default)]
+struct Held {
+    placed: AtomicBool,
+    released: AtomicBool,
+    landed: AtomicUsize,
+}
+
+fn out_of_order(corpus: &mut Corpus, dir: &Path) {
+    let path = dir.join("out-of-order.ferro");
+    let writers = 4u64;
+    {
+        let db = options().open::<Catalog>(&path).unwrap();
+        db.commit("seed", |catalog| catalog.poke(4)).unwrap();
+        for at in 0..writers {
+            db.fork(&format!("o{at}")).unwrap();
+        }
+    }
+    let base = fs::read(&path).unwrap();
+    let trace: Trace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let held = Arc::new(Held::default());
+    let seen = held.clone();
+    let hook = Hook(Arc::new(move |step| {
+        match (thread::current().name(), step) {
+            (Some("held"), "landing") => {
+                seen.placed.store(true, Ordering::SeqCst);
+                wait_until(|| seen.released.load(Ordering::SeqCst));
+            }
+            (Some("ahead"), "landed") => {
+                seen.landed.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }));
+    {
+        let db = options()
+            .checkpoint_bytes(4096)
+            .trace(trace.clone())
+            .hook(hook)
+            .open::<Catalog>(&path)
+            .unwrap();
+        let commit = |at: u64, round: u64, name: &str| {
+            let handle = db.branch(&format!("o{at}")).unwrap();
+            thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    handle
+                        .commit(format!("o{at} {round}"), |catalog| {
+                            catalog.poke(round * 4 + at)
+                        })
+                        .unwrap();
+                })
+                .unwrap()
+        };
+        for round in 0..24u64 {
+            held.placed.store(false, Ordering::SeqCst);
+            held.released.store(false, Ordering::SeqCst);
+            held.landed.store(0, Ordering::SeqCst);
+            let first = commit(round % writers, round, "held");
+            wait_until(|| held.placed.load(Ordering::SeqCst));
+            let later: Vec<_> = (1..writers)
+                .map(|step| commit((round + step) % writers, round, "ahead"))
+                .collect();
+            wait_until(|| held.landed.load(Ordering::SeqCst) == later.len());
+            held.released.store(true, Ordering::SeqCst);
+            first.join().unwrap();
+            for handle in later {
+                handle.join().unwrap();
+            }
+        }
+    }
+    let ops = trace.lock().clone();
+    let frames: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op, Op::Write(_, _, bytes) if bytes.starts_with(FRAME_MAGIC)))
+        .map(|(at, _)| at)
+        .collect();
+    let offset = |at: usize| match &ops[at] {
+        Op::Write(_, offset, _) => *offset,
+        _ => 0,
+    };
+    let early: Vec<usize> = frames
+        .windows(2)
+        .filter(|pair| offset(pair[1]) < offset(pair[0]))
+        .map(|pair| pair[0])
+        .collect();
+    println!(
+        "out of order: {} frames, {} landed before a frame below them",
+        frames.len(),
+        early.len()
+    );
+    let image = |skip: &[usize], upto: usize| {
+        let mut image = base.clone();
+        for (at, op) in ops[..upto].iter().enumerate() {
+            if !skip.contains(&at) {
+                replay(&mut image, op, &mut || true, false);
+            }
+        }
+        image
+    };
+    let mut by_offset = frames.clone();
+    by_offset.sort_by_key(|at| offset(*at));
+    for hole in by_offset
+        .iter()
+        .step_by(by_offset.len().div_ceil(10).max(1))
+    {
+        corpus.emit(CATALOG, &image(&[*hole], ops.len()));
+        corpus.emit(CATALOG, &image(&[*hole], hole + 3));
+    }
+    for late in early.iter().take(8) {
+        let below = frames
+            .iter()
+            .copied()
+            .filter(|at| at > late && offset(*at) < offset(*late))
+            .collect::<Vec<_>>();
+        corpus.emit(CATALOG, &image(&[], late + 1));
+        corpus.emit(CATALOG, &image(&below, ops.len()));
+    }
+}
+
+fn refs_seeds(corpus: &mut Corpus) {
+    use ferro_fuzz::refs::{ADMIN, COMPACT, FOLLOW, FRAMES, LONG, READ_ONLY, WRITES};
+    let controls = [
+        0,
+        FOLLOW,
+        WRITES,
+        WRITES | LONG,
+        FOLLOW | WRITES | FRAMES,
+        READ_ONLY | ADMIN,
+        WRITES | COMPACT | ADMIN,
+        FOLLOW | WRITES | LONG | COMPACT,
+    ];
+    let forges: [&[u8]; 10] = [
+        &[0, 0, 1],
+        &[0, 0, 4, 0],
+        &[0, 3, 2],
+        &[0, 3, 6],
+        &[0, 4, 2],
+        &[1, 4, 4, 1, 1],
+        &[2, 6, 1, 0, 7, 3, 0, 0],
+        &[0, 7, 1, 4, 4, 8, 2],
+        &[3, 0, 0, 2, 3, 0, 0, 5, 9, 1, 1, 0, 1],
+        &[
+            0, 5, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 2, 1, 0,
+        ],
+    ];
+    for base in 0..ferro_fuzz::refs::bases().len() as u8 {
+        for (at, control) in controls.iter().enumerate() {
+            for forge in forges.iter().skip(at % 2).step_by(2) {
+                let mut data = vec![*control, base];
+                data.extend_from_slice(forge);
+                data.extend_from_slice(&[3, 1, 4, 1, 5, 9, 2, 6]);
+                corpus.put("refs", &data);
+            }
+        }
+    }
+}
+
 struct Lcg(u64);
 
 impl Lcg {
@@ -813,9 +1031,12 @@ fn main() {
     relayed(&mut corpus, dir.path());
     pieces(&mut corpus, dir.path());
     steps(&mut corpus, dir.path());
+    wide_steps(&mut corpus, dir.path());
     crashes(&mut corpus, dir.path());
+    out_of_order(&mut corpus, dir.path());
     mid_receive(&mut corpus, dir.path());
     sync_seeds(&mut corpus, dir.path());
+    refs_seeds(&mut corpus);
     let generated = corpus.seen.len();
     for extra in args {
         collect(&mut corpus, Path::new(&extra));

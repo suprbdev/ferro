@@ -34,6 +34,16 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   over it, whose links, names, tags and heads the input perturbs. It then runs the `open` reads
   over it and, for half the inputs, the `admin` functions. Half the time a follower opens it
   read-only before more steps are written, and refreshes through them.
+- `refs` forges branch tables. Four honest files are built once per binary: three branches whose
+  140 commits cross the 64-step table twice, 130 branches whose table spans several map nodes, a
+  chain exactly 64 steps deep so that the next commit writes a full table, and two branches that
+  merged each other, dropped a third and ran a cycle. The input picks one and appends steps whose
+  tag, name, link, head and trailing bytes it perturbs, runs of 62 to 1,025 honest steps, tables of
+  0, 126, 127, 128 or 300 branches, raw objects, and steps over an older link of the chain, in one
+  frame or several. A follower opened before the forgery refreshes across it. A handle then opens
+  the file, reads it as `open` does and can commit on its branches, past a full table when the
+  input asks for 70 commits, fork, merge, drop a branch and run a cycle, before the follower
+  refreshes again and, for some inputs, the `admin` functions run.
 - `map_node` writes crafted map nodes with valid hashes for six key, value and summary types,
   including a value with a `Table`, loads the map and reads, scans and edits it.
 - `sync` receives a bundle into a copy of a database through `receive_from`. Nine honest pairs of a
@@ -54,15 +64,21 @@ The harness treats a panic whose message starts with `ferro:` as expected inside
 reads, which panic on corruption by design, and as a failure anywhere else. The `seeds` example
 writes a corpus from databases it builds and from any files passed to it. The databases it builds
 include catalogs written under each schema in turn, branches written by concurrent lanes with and
-without coalescing, devices that relay through pulls and cycles, branch tables of 40, 126 and 127
-branches, step chains just below and past multiples of 64, crash images cut from the recorded
-writes of concurrent commits with every kind of loss, a frame of objects nothing names, and a file
-caught between placing a bundle's pieces and landing it. Files captured from the tests make a
+without coalescing, devices that relay through pulls and cycles, branch tables of 40, 126, 127 and
+200 branches, step chains just below and past multiples of 64, twenty branches whose commits
+rewrite covered index entries across two full tables, crash images cut from the recorded writes of
+concurrent commits with every kind of loss, a frame of objects nothing names, and a file caught
+between placing a bundle's pieces and landing it. Frames that land out of order come from a hook
+that holds one commit's frame before its write until three later frames have landed: the images
+leave a hole where a held frame belongs with every later frame written, or stop just after a later
+frame landed ahead of the held one. Each `refs` seed pairs one of its bases with a forgery and a
+mode. Files captured from the tests make a
 broader corpus: the one used here kept every database file `cargo test --workspace` deleted, copied
 aside by a small `LD_PRELOAD` wrapper around `unlink`, `unlinkat` and `rename`. Images over 69,000
 bytes go to `open-large`, for a run of `open` with a larger `-max_len`.
 `cargo run --example fixture -- <target> <crash> <out.db>` turns a crashing input into the file it
-opens, and for `sync` also writes the bundle beside it, which is how the fixtures behind
+opens, for `refs` the forged file before any handle opens it, and for `sync` also writes the bundle
+beside it, which is how the fixtures behind
 `ferro/tests/fuzzed.rs` were made.
 
 The `Makefile` wraps the last two steps: `make fuzz-seeds` builds `corpus/seeds`, and

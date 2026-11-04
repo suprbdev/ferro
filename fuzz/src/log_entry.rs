@@ -19,12 +19,12 @@ const STEP: u8 = 0x7f;
 const FOLLOW: u8 = 8;
 
 #[derive(Clone)]
-struct Head {
-    version: u64,
-    first: u64,
-    root: Option<Ptr>,
-    tip: Option<Ptr>,
-    merged: Map<String, (u64, u64)>,
+pub struct Head {
+    pub version: u64,
+    pub first: u64,
+    pub root: Option<Ptr>,
+    pub tip: Option<Ptr>,
+    pub merged: Map<String, (u64, u64)>,
 }
 
 fn put_link(w: &mut Encoder<'_>, link: Option<Ptr>) {
