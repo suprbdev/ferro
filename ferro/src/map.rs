@@ -9,17 +9,17 @@ use std::marker::PhantomData;
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::mem::needs_drop;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering as Atomic};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::vec;
 
 use crate::codec::{
-    Cached, Data, Decoder, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape, Sink,
+    Data, Decoder, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape, Sink,
     Staged,
     try_hash_of,
 };
 use crate::epoch::{self, Guard};
 use crate::error::{Error, Result};
+use crate::shared::{Erased, Shared, Weak};
 use crate::store::{MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -342,7 +342,7 @@ impl<V, S> Cells<V, S> {
 }
 
 enum Memo<K, V, S> {
-    Pinned(Arc<Node<K, V, S>>),
+    Pinned(Shared<Node<K, V, S>>),
     Weak(Weak<Node<K, V, S>>, Hint),
 }
 
@@ -364,7 +364,7 @@ struct Hint {
 impl Hint {
     const NONE: Hint = Hint { keys: 0, rest: 0 };
 
-    fn of<K, V, S>(node: &Arc<Node<K, V, S>>) -> Hint {
+    fn of<K, V, S>(node: &Shared<Node<K, V, S>>) -> Hint {
         Hint::spans(node, false)
     }
 
@@ -456,7 +456,7 @@ enum Link<K, V, S> {
         summary: S,
         memo: OnceLock<Memo<K, V, S>>,
     },
-    Mem(Arc<Node<K, V, S>>, Hint),
+    Mem(Shared<Node<K, V, S>>, Hint),
 }
 
 impl<K, V, S: Clone> Clone for Link<K, V, S> {
@@ -476,7 +476,7 @@ impl<K, V, S: Clone> Clone for Link<K, V, S> {
 }
 
 impl<K, V, S> Link<K, V, S> {
-    fn mem(node: Arc<Node<K, V, S>>) -> Self {
+    fn mem(node: Shared<Node<K, V, S>>) -> Self {
         let hint = Hint::dirty(&node);
         Link::Mem(node, hint)
     }
@@ -544,7 +544,7 @@ impl<K, V, S> Link<K, V, S> {
         match (self, other) {
             (Link::Empty, Link::Empty) => true,
             (Link::Stored { ptr: a, .. }, Link::Stored { ptr: b, .. }) => a.hash == b.hash,
-            (Link::Mem(a, _), Link::Mem(b, _)) => Arc::ptr_eq(a, b),
+            (Link::Mem(a, _), Link::Mem(b, _)) => Shared::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -575,8 +575,6 @@ struct Node<K, V, S> {
     cells: Cells<V, S>,
     count: u64,
     level: u8,
-    cached: AtomicBool,
-    lent: AtomicBool,
     origin: Option<Ptr>,
     prefix: Option<Arc<Prefix>>,
 }
@@ -589,22 +587,9 @@ impl<K: Clone, V, S: Clone> Clone for Node<K, V, S> {
             cells: self.cells.clone(),
             children: self.children.clone(),
             count: self.count,
-            cached: AtomicBool::new(false),
-            lent: AtomicBool::new(false),
             origin: self.origin,
             prefix: self.prefix.clone(),
         }
-    }
-}
-
-impl<K: Data, V: Data, S: Data> Cached for Node<K, V, S> {
-    fn hold(&self) {
-        self.cached.store(true, Atomic::SeqCst);
-    }
-
-    fn release(&self) -> bool {
-        self.cached.store(false, Atomic::SeqCst);
-        self.lent.load(Atomic::SeqCst)
     }
 }
 
@@ -790,15 +775,13 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
             cells,
             children,
             count: total,
-            cached: AtomicBool::new(false),
-            lent: AtomicBool::new(false),
             origin: Some(origin),
             prefix: None,
         })
     }
 }
 
-type Fetched<K, V, S> = (Arc<Node<K, V, S>>, bool);
+type Fetched<K, V, S> = (Shared<Node<K, V, S>>, bool);
 
 fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetched<K, V, S>> {
     let decode = |decoder: &mut Decoder<'_>| {
@@ -812,9 +795,9 @@ fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetc
         }
         Ok(node)
     };
-    let (node, cached) = store.fetch(ptr, decode, Node::weight)?;
+    let (node, cached) = store.fetch_node(ptr, decode, Node::weight)?;
     if (K::LOCATED || V::LOCATED) && node.origin != Some(ptr) {
-        return Ok((Arc::new(store.decode_at(ptr, decode)?), false));
+        return Ok((Shared::new(store.decode_at(ptr, decode)?), false));
     }
     Ok((node, cached))
 }
@@ -948,7 +931,7 @@ fn check_node<K: Data + Ord, V: Data, S: Data>(
 
 fn extreme<K: Data, V: Data, S: Data>(
     store: &Store,
-    top: &Arc<Node<K, V, S>>,
+    top: &Shared<Node<K, V, S>>,
     last: bool,
 ) -> Result<K> {
     let mut node = top.clone();
@@ -987,23 +970,9 @@ fn held_node<K: Data + Ord, V: Data, S: Data>(
 
 enum Reach<'a, 'g, K, V, S> {
     Absent,
-    Borrowed(&'a Arc<Node<K, V, S>>),
-    Owned(Arc<Node<K, V, S>>),
+    Borrowed(&'a Shared<Node<K, V, S>>),
+    Owned(Shared<Node<K, V, S>>),
     Held(&'g Node<K, V, S>),
-}
-
-#[inline]
-fn held<'g, K, V, S>(weak: &Weak<Node<K, V, S>>, _guard: &'g Guard) -> Option<&'g Node<K, V, S>> {
-    let node = weak.as_ptr();
-    unsafe {
-        if !(*node).cached.load(Atomic::SeqCst) {
-            return None;
-        }
-        if !(*node).lent.load(Atomic::SeqCst) {
-            (*node).lent.store(true, Atomic::SeqCst);
-        }
-        (*node).cached.load(Atomic::SeqCst).then(|| &*node)
-    }
 }
 
 #[inline]
@@ -1022,7 +991,7 @@ fn reach<'a, 'g, K: Data, V: Data, S: Data>(
         Some(Memo::Pinned(node)) => return Ok(Reach::Borrowed(node)),
         Some(Memo::Weak(weak, hint)) => {
             hint.prefetch(weak);
-            if let Some(node) = guard.and_then(|guard| held(weak, guard)) {
+            if let Some(node) = guard.and_then(|guard| weak.lend(guard)) {
                 return Ok(Reach::Held(node));
             }
             if let Some(node) = weak.upgrade() {
@@ -1036,7 +1005,7 @@ fn reach<'a, 'g, K: Data, V: Data, S: Data>(
 
 enum At<'g, K, V, S> {
     Ref(&'g Node<K, V, S>),
-    Arc(Arc<Node<K, V, S>>),
+    Shared(Shared<Node<K, V, S>>),
 }
 
 impl<'g, K, V, S> At<'g, K, V, S> {
@@ -1046,7 +1015,7 @@ impl<'g, K, V, S> At<'g, K, V, S> {
             Reach::Absent => None,
             Reach::Borrowed(node) => Some(At::Ref(node)),
             Reach::Held(node) => Some(At::Ref(node)),
-            Reach::Owned(node) => Some(At::Arc(node)),
+            Reach::Owned(node) => Some(At::Shared(node)),
         }
     }
 
@@ -1054,9 +1023,9 @@ impl<'g, K, V, S> At<'g, K, V, S> {
     fn owned(reached: Reach<'_, 'g, K, V, S>) -> Option<Self> {
         match reached {
             Reach::Absent => None,
-            Reach::Borrowed(node) => Some(At::Arc(node.clone())),
+            Reach::Borrowed(node) => Some(At::Shared(node.clone())),
             Reach::Held(node) => Some(At::Ref(node)),
-            Reach::Owned(node) => Some(At::Arc(node)),
+            Reach::Owned(node) => Some(At::Shared(node)),
         }
     }
 
@@ -1064,7 +1033,7 @@ impl<'g, K, V, S> At<'g, K, V, S> {
     fn node(&self) -> &Node<K, V, S> {
         match self {
             At::Ref(node) => node,
-            At::Arc(node) => node,
+            At::Shared(node) => node,
         }
     }
 }
@@ -1094,7 +1063,7 @@ fn fetch_link<'a, 'g, K: Data, V: Data, S: Data>(
             return Ok(Reach::Borrowed(node));
         }
     } else if cached {
-        memo.get_or_init(|| Memo::Weak(Arc::downgrade(&node), Hint::of(&node)));
+        memo.get_or_init(|| Memo::Weak(Shared::downgrade(&node), Hint::of(&node)));
     }
     Ok(Reach::Owned(node))
 }
@@ -1103,7 +1072,7 @@ fn resident<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &Link<K, V, S>,
     depth: usize,
-) -> Result<Option<Arc<Node<K, V, S>>>> {
+) -> Result<Option<Shared<Node<K, V, S>>>> {
     Ok(match reach(store, link, depth, None)? {
         Reach::Absent => None,
         Reach::Borrowed(node) => Some(node.clone()),
@@ -1115,7 +1084,7 @@ fn resident<K: Data, V: Data, S: Data>(
 fn load<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
     link: &Link<K, V, S>,
-) -> Result<Option<Arc<Node<K, V, S>>>> {
+) -> Result<Option<Shared<Node<K, V, S>>>> {
     match link {
         Link::Empty => Ok(None),
         Link::Mem(node, _) => Ok(Some(node.clone())),
@@ -1154,8 +1123,8 @@ fn dirty_mut<'a, K: Data, V: Data, S: Data>(
     }
     match link {
         Link::Mem(node, hint) => {
-            let shared = Arc::as_ptr(node);
-            let node = Arc::make_mut(node);
+            let shared = Shared::as_ptr(node);
+            let node = Shared::make_mut(node);
             if !std::ptr::eq(shared, node) {
                 *hint = Hint::NONE;
             }
@@ -1184,13 +1153,11 @@ fn link_from<K, V, S>(
         cells: Cells::Slots(slots),
         children,
         count: 0,
-        cached: AtomicBool::new(false),
-        lent: AtomicBool::new(false),
         origin,
         prefix: None,
     };
     node.recount();
-    Link::mem(Arc::new(node))
+    Link::mem(Shared::new(node))
 }
 
 type Parts<K, V, S> = (Link<K, V, S>, Link<K, V, S>);
@@ -1220,7 +1187,7 @@ fn split<K: Data + Ord, V: Data, S: Data>(
         mut children,
         origin,
         ..
-    } = Arc::unwrap_or_clone(node);
+    } = Shared::unwrap_or_clone(node);
     let mut slots = cells.into_slots();
     let position = keys
         .binary_search_by(side)
@@ -1256,25 +1223,25 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
     match x.level.cmp(&y.level) {
         Ordering::Greater => {
             drop(a);
-            let mut node = Arc::unwrap_or_clone(x);
+            let mut node = Shared::unwrap_or_clone(x);
             let last = node.children_mut().pop().ok_or(Error::Detached)?;
             node.children.push(merge(store, last, b)?);
             node.recount();
-            Ok(Link::mem(Arc::new(node)))
+            Ok(Link::mem(Shared::new(node)))
         }
         Ordering::Less => {
             drop(b);
-            let mut node = Arc::unwrap_or_clone(y);
+            let mut node = Shared::unwrap_or_clone(y);
             let first = node.children_mut()[0].take();
             node.children[0] = merge(store, a, first)?;
             node.recount();
-            Ok(Link::mem(Arc::new(node)))
+            Ok(Link::mem(Shared::new(node)))
         }
         Ordering::Equal => {
             drop(a);
             drop(b);
-            let mut left = Arc::unwrap_or_clone(x);
-            let mut right = Arc::unwrap_or_clone(y);
+            let mut left = Shared::unwrap_or_clone(x);
+            let mut right = Shared::unwrap_or_clone(y);
             let inner_left = left.children_mut().pop().ok_or(Error::Detached)?;
             let inner_right = right.children_mut()[0].take();
             left.children.push(merge(store, inner_left, inner_right)?);
@@ -1283,7 +1250,7 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
             left.cells.slots().append(right.cells.slots());
             left.origin = None;
             left.recount();
-            Ok(Link::mem(Arc::new(left)))
+            Ok(Link::mem(Shared::new(left)))
         }
     }
 }
@@ -1348,7 +1315,7 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             if node.level <= HINTED_LEVEL
                 && let Link::Mem(child, hint) = &node.children[position]
             {
-                hint.prefetch_at(Arc::as_ptr(child).addr());
+                hint.prefetch_at(Shared::as_ptr(child).addr());
             }
             let replaced = insert_at(store, &mut node.children[position], key, level, value)?;
             if replaced.is_none() {
@@ -1512,19 +1479,19 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
     emit(flushed, sink, depth, dense)
 }
 
-fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Arc<Node<K, V, S>>) {
+fn memoize<K, V, S>(link: &Link<K, V, S>, node: &Shared<Node<K, V, S>>) {
     if let Link::Stored { memo, .. } = link {
-        memo.get_or_init(|| Memo::Weak(Arc::downgrade(node), Hint::of(node)));
+        memo.get_or_init(|| Memo::Weak(Shared::downgrade(node), Hint::of(node)));
     }
 }
 
 fn relocate<K: Data, V: Data, S: Data>(
-    old: &Arc<dyn Cached>,
+    old: &Erased,
     links: usize,
     moves: &Moves,
     moved: &Moved,
-) -> Option<Arc<dyn Cached>> {
-    let old = (&**old as &dyn Any).downcast_ref::<Node<K, V, S>>()?;
+) -> Option<Erased> {
+    let old = old.downcast_ref::<Node<K, V, S>>()?;
     let children = old.children.iter().filter(|child| matches!(child, Link::Stored { .. }));
     let slots = match &old.cells {
         Cells::Slots(slots) => slots.as_slice(),
@@ -1548,17 +1515,17 @@ fn relocate<K: Data, V: Data, S: Data>(
             }
         }
     }
-    let node = Arc::new(node);
+    let node = Shared::new(node);
     for (link, was) in node.children.iter().zip(&old.children) {
         if let Link::Stored { memo, .. } = was
             && let Some(Memo::Weak(child, _)) = memo.get()
             && let Some(child) = moved.get(&child.as_ptr().addr())
-            && let Ok(child) = (child.clone() as Arc<dyn Any + Send + Sync>).downcast()
+            && let Ok(child) = child.clone().downcast()
         {
             memoize(link, &child);
         }
     }
-    Some(node)
+    Some(Shared::erase(node))
 }
 
 fn fans_out<K, V, S>(node: &Node<K, V, S>) -> bool {
@@ -1659,8 +1626,6 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
             cells: node.cells.settled(spilled, checked),
             children: stored,
             count: node.count,
-            cached: AtomicBool::new(false),
-            lent: AtomicBool::new(false),
             origin: None,
             prefix: None,
         }),
@@ -1765,11 +1730,11 @@ fn emit<K: Data, V: Data, S: Data>(
     if let Some(mut decoded) = cached {
         decoded.origin = Some(ptr);
         let weight = heap_weight(decoded.fixed_bytes(), body_bytes);
-        let decoded = Arc::new(decoded);
+        let decoded = Shared::new(decoded);
         if dense && depth >= PIN_DEPTH {
             memoize(&written, &decoded);
         }
-        sink.remember_moving(ptr, decoded, weight, (relocate::<K, V, S>, links));
+        sink.remember_moving(ptr, Shared::erase(decoded), weight, (relocate::<K, V, S>, links));
     }
     Ok(written)
 }
@@ -1825,8 +1790,8 @@ impl Arena {
     }
 }
 
-type Settled<K, V, S> = (Ptr, Arc<Node<K, V, S>>, u32);
-type Written<K, V, S> = (usize, Arc<Node<K, V, S>>);
+type Settled<K, V, S> = (Ptr, Shared<Node<K, V, S>>, u32);
+type Written<K, V, S> = (usize, Shared<Node<K, V, S>>);
 
 struct Deferred<'a, K, V, S> {
     node: &'a Node<K, V, S>,
@@ -2039,7 +2004,7 @@ fn settle_tree<K: Data, V: Data, S: Data>(
     root: &mut Deferred<'_, K, V, S>,
     depth: usize,
     store: &Store,
-) -> Result<Arc<Node<K, V, S>>> {
+) -> Result<Shared<Node<K, V, S>>> {
     let mut tasks = Vec::new();
     for (_, _, child) in &mut root.children {
         owned(child, depth + 1, &mut tasks);
@@ -2086,7 +2051,7 @@ fn settle<K: Data, V: Data, S: Data>(
     store: &Store,
     scratch: &mut Vec<u8>,
     settled: &mut Vec<Settled<K, V, S>>,
-) -> Result<Arc<Node<K, V, S>>> {
+) -> Result<Shared<Node<K, V, S>>> {
     let mut below = Vec::with_capacity(deferred.children.len());
     for (_, position, child) in &deferred.children {
         below.push((*position, settle(child, depth + 1, arena, store, scratch, settled)?));
@@ -2103,7 +2068,7 @@ fn settle_spine<K: Data, V: Data, S: Data>(
     arena: &Arena,
     store: &Store,
     scratch: &mut Vec<u8>,
-) -> Result<Arc<Node<K, V, S>>> {
+) -> Result<Shared<Node<K, V, S>>> {
     let mut below = Vec::with_capacity(deferred.children.len());
     for (_, position, child) in &mut deferred.children {
         let node = if child.arena.is_none() {
@@ -2146,7 +2111,7 @@ fn decoded<K: Data, V: Data, S: Data>(
         }
     }
     let weight = heap_weight(node.fixed_bytes(), placed.raw);
-    Ok((deferred.ptr, Arc::new(node), weight))
+    Ok((deferred.ptr, Shared::new(node), weight))
 }
 
 fn remember<K: Data, V: Data, S: Data>(deferred: Deferred<'_, K, V, S>, sink: &mut dyn Sink) {
@@ -2154,7 +2119,7 @@ fn remember<K: Data, V: Data, S: Data>(deferred: Deferred<'_, K, V, S>, sink: &m
         remember(child, sink);
     }
     for (ptr, node, weight) in deferred.settled {
-        sink.remember(ptr, node, weight);
+        sink.remember(ptr, Shared::erase(node), weight);
     }
 }
 
@@ -2620,7 +2585,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             };
             let next = match &at {
                 At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
-                At::Arc(node) => At::owned(reach(store, node.child(position), depth, guard)?),
+                At::Shared(node) => At::owned(reach(store, node.child(position), depth, guard)?),
             };
             match next {
                 Some(next) => at = next,
@@ -2888,7 +2853,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             };
             current = match &at {
                 At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
-                At::Arc(node) => At::owned(reach(store, node.child(position), depth, guard)?),
+                At::Shared(node) => At::owned(reach(store, node.child(position), depth, guard)?),
             };
             if position > 0 {
                 best = Some((at, position - 1));
@@ -3366,7 +3331,7 @@ fn scattered<K, V, S>(root: &Node<K, V, S>) -> bool {
     falling * 4 > rising
 }
 
-fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
+fn teardown<K, V, S>(root: Shared<Node<K, V, S>>) {
     let mut nodes = vec![root];
     let mut values = Vec::new();
     let mut keys = Vec::new();
@@ -3375,7 +3340,7 @@ fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
     let mut index = 0;
     while index < nodes.len() {
         if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD) {
-            let base = Arc::as_ptr(ahead).addr();
+            let base = Shared::as_ptr(ahead).addr();
             prefetch(base);
             prefetch(base + LINE_BYTES);
         }
@@ -3385,7 +3350,7 @@ fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
                 prefetch_items(held);
             }
         }
-        let Some(node) = Arc::get_mut(&mut nodes[index]) else {
+        let Some(node) = Shared::get_mut(&mut nodes[index]) else {
             index += 1;
             continue;
         };
@@ -3413,7 +3378,7 @@ fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
     keys.sort_unstable_by_key(|keys| keys.as_ptr().addr());
     slots.sort_unstable_by_key(|slots| slots.as_ptr().addr());
     children.sort_unstable_by_key(|children| children.as_ptr().addr());
-    nodes.sort_unstable_by_key(|node| Arc::as_ptr(node).addr());
+    nodes.sort_unstable_by_key(|node| Shared::as_ptr(node).addr());
     let mut values = values.into_iter().peekable();
     let mut keys = keys.into_iter().peekable();
     let mut slots = slots.into_iter().peekable();
@@ -3425,7 +3390,7 @@ fn teardown<K, V, S>(root: Arc<Node<K, V, S>>) {
             keys.peek().map_or(usize::MAX, |keys| keys.as_ptr().addr()),
             slots.peek().map_or(usize::MAX, |slots| slots.as_ptr().addr()),
             children.peek().map_or(usize::MAX, |children| children.as_ptr().addr()),
-            nodes.peek().map_or(usize::MAX, |node| Arc::as_ptr(node).addr()),
+            nodes.peek().map_or(usize::MAX, |node| Shared::as_ptr(node).addr()),
         ];
         let lowest = heads.iter().copied().min().unwrap_or(usize::MAX);
         if lowest == usize::MAX {
@@ -3476,12 +3441,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> IntoIterator for &Map<K, V, S> {
 
 struct Hold<K, V, S> {
     tagged: NonNull<Node<K, V, S>>,
-    _owns: PhantomData<Arc<Node<K, V, S>>>,
+    _owns: PhantomData<Shared<Node<K, V, S>>>,
 }
 
-unsafe impl<K, V, S> Send for Hold<K, V, S> where Arc<Node<K, V, S>>: Send {}
+unsafe impl<K, V, S> Send for Hold<K, V, S> where Shared<Node<K, V, S>>: Send {}
 
-unsafe impl<K, V, S> Sync for Hold<K, V, S> where Arc<Node<K, V, S>>: Sync {}
+unsafe impl<K, V, S> Sync for Hold<K, V, S> where Shared<Node<K, V, S>>: Sync {}
 
 impl<K, V, S> Deref for Hold<K, V, S> {
     type Target = Node<K, V, S>;
@@ -3496,16 +3461,16 @@ impl<K, V, S> Drop for Hold<K, V, S> {
     #[inline]
     fn drop(&mut self) {
         if !self.anchored() {
-            drop(unsafe { Arc::from_raw(self.node()) });
+            drop(unsafe { Shared::from_raw(self.node()) });
         }
     }
 }
 
 impl<K, V, S> Hold<K, V, S> {
     #[inline]
-    fn owned(node: Arc<Node<K, V, S>>) -> Self {
+    fn owned(node: Shared<Node<K, V, S>>) -> Self {
         Hold {
-            tagged: unsafe { NonNull::new_unchecked(Arc::into_raw(node).cast_mut()) },
+            tagged: unsafe { NonNull::new_unchecked(Shared::into_raw(node).cast_mut()) },
             _owns: PhantomData,
         }
     }
@@ -3531,7 +3496,7 @@ impl<K, V, S> Hold<K, V, S> {
     #[inline]
     fn share(&self) -> Self {
         if !self.anchored() {
-            unsafe { Arc::increment_strong_count(self.node()) };
+            unsafe { Shared::increment_strong_count(self.node()) };
         }
         Hold {
             tagged: self.tagged,
@@ -3750,15 +3715,15 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
 pub(crate) struct Finder<K, V, S = ()> {
     store: Option<Store>,
     root: Link<K, V, S>,
-    leaf: Option<Arc<Node<K, V, S>>>,
+    leaf: Option<Shared<Node<K, V, S>>>,
     parent: Parent<K, V, S>,
 }
 
-type Parent<K, V, S> = Option<(Arc<Node<K, V, S>>, usize)>;
+type Parent<K, V, S> = Option<(Shared<Node<K, V, S>>, usize)>;
 
-type Found<K, V, S> = (Option<Val<V>>, Option<Arc<Node<K, V, S>>>, Parent<K, V, S>);
+type Found<K, V, S> = (Option<Val<V>>, Option<Shared<Node<K, V, S>>>, Parent<K, V, S>);
 
-fn strong<K, V, S>(link: &Link<K, V, S>) -> Option<Arc<Node<K, V, S>>> {
+fn strong<K, V, S>(link: &Link<K, V, S>) -> Option<Shared<Node<K, V, S>>> {
     match link {
         Link::Empty => None,
         Link::Mem(node, _) => Some(node.clone()),
@@ -3832,7 +3797,7 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             let link = node.child(position);
             let next = match &at {
                 At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
-                At::Arc(_) => At::owned(reach(store, link, depth, guard)?),
+                At::Shared(_) => At::owned(reach(store, link, depth, guard)?),
             };
             let Some(next) = next else {
                 return Ok((None, leaf, parent));
@@ -3840,12 +3805,12 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             let child = next.node();
             if child.children.is_empty() {
                 leaf = match &next {
-                    At::Arc(node) => Some(node.clone()),
+                    At::Shared(node) => Some(node.clone()),
                     At::Ref(_) => strong(link),
                 };
             } else if child.level <= 1 {
                 parent = match &next {
-                    At::Arc(node) => Some(node.clone()),
+                    At::Shared(node) => Some(node.clone()),
                     At::Ref(_) => strong(link),
                 }
                 .map(|node| (node, depth));
@@ -3859,7 +3824,7 @@ pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
     front: Vec<Frame<K, V, S>>,
     back: Vec<Frame<K, V, S>>,
-    _root: Option<Arc<Node<K, V, S>>>,
+    _root: Option<Shared<Node<K, V, S>>>,
     remaining: u64,
 }
 
@@ -4272,7 +4237,7 @@ mod tests {
 
     const ROUNDS: usize = 40;
 
-    fn leaf(first: u64) -> Arc<Node<u64, u64, ()>> {
+    fn leaf(first: u64) -> Shared<Node<u64, u64, ()>> {
         let keys: Vec<u64> = (first..first + 8).collect();
         let column: Arc<[u64]> = keys.iter().map(|key| key * 3).collect();
         let node = Node {
@@ -4281,19 +4246,17 @@ mod tests {
             children: Vec::new(),
             cells: Cells::Column(column),
             level: 0,
-            cached: AtomicBool::new(false),
-            lent: AtomicBool::new(false),
             origin: None,
             prefix: None,
         };
-        Arc::new(node)
+        Shared::new(node)
     }
 
     fn read(weak: &Weak<Node<u64, u64, ()>>, first: u64) -> bool {
         let Some(guard) = epoch::pin() else {
             return false;
         };
-        let Some(node) = held(weak, &guard) else {
+        let Some(node) = weak.lend(&guard) else {
             return false;
         };
         assert_eq!(node.keys.iter().sum::<u64>(), 8 * first + 28);
@@ -4304,9 +4267,9 @@ mod tests {
         true
     }
 
-    fn evict(node: Arc<Node<u64, u64, ()>>) {
+    fn evict(node: Shared<Node<u64, u64, ()>>) {
         if node.release() {
-            epoch::retire(node, 64);
+            epoch::retire(Shared::erase(node), 64);
         }
     }
 
@@ -4316,7 +4279,7 @@ mod tests {
             let first = round * 100;
             let node = leaf(first);
             node.hold();
-            let weak = Arc::downgrade(&node);
+            let weak = Shared::downgrade(&node);
             let readers: Vec<_> = (0..3)
                 .map(|_| {
                     let weak = weak.clone();
@@ -4335,18 +4298,38 @@ mod tests {
     }
 
     #[test]
+    fn epoch_readers_after_an_eviction_race_the_free_of_what_it_retired() {
+        let node = leaf(500);
+        node.hold();
+        let weak = Shared::downgrade(&node);
+        assert!(read(&weak, 500));
+        evict(node);
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let weak = weak.clone();
+                thread::spawn(move || (0..ROUNDS).filter(|_| read(&weak, 500)).count())
+            })
+            .collect();
+        epoch::flush();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), 0);
+        }
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[test]
     fn epoch_a_node_never_lent_is_freed_at_eviction() {
         let node = leaf(7);
         node.hold();
-        let weak = Arc::downgrade(&node);
+        let weak = Shared::downgrade(&node);
         evict(node);
         assert_eq!(weak.strong_count(), 0);
         assert!(!read(&weak, 7));
     }
 
-    type Tree = (Arc<Node<u64, u64, ()>>, Vec<u64>);
+    type Tree = (Shared<Node<u64, u64, ()>>, Vec<u64>);
 
-    fn tree(depth: usize, next: &mut u64, keep: &mut Vec<Arc<Node<u64, u64, ()>>>) -> Tree {
+    fn tree(depth: usize, next: &mut u64, keep: &mut Vec<Shared<Node<u64, u64, ()>>>) -> Tree {
         if depth == PIN_DEPTH + 1 {
             let node = leaf(*next);
             *next += 10;
@@ -4357,7 +4340,7 @@ mod tests {
         let key = *next;
         *next += 1;
         let (right, right_keys) = tree(depth + 1, next, keep);
-        let mut link = |node: Arc<Node<u64, u64, ()>>, count: usize| {
+        let mut link = |node: Shared<Node<u64, u64, ()>>, count: usize| {
             if depth + 1 < PIN_DEPTH {
                 return Link::Mem(node, Hint::NONE);
             }
@@ -4367,7 +4350,7 @@ mod tests {
             };
             let link = Link::under(ptr, count as u64, LEVELS, ());
             if let Link::Stored { memo, .. } = &link {
-                let _ = memo.set(Memo::Weak(Arc::downgrade(&node), Hint::NONE));
+                let _ = memo.set(Memo::Weak(Shared::downgrade(&node), Hint::NONE));
             }
             keep.push(node);
             link
@@ -4381,12 +4364,10 @@ mod tests {
             children,
             cells: Cells::Column(Arc::from([key * 3])),
             level: (PIN_DEPTH + 1 - depth) as u8,
-            cached: AtomicBool::new(false),
-            lent: AtomicBool::new(false),
             origin: None,
             prefix: None,
         };
-        (Arc::new(node), keys)
+        (Shared::new(node), keys)
     }
 
     #[test]
@@ -4424,16 +4405,16 @@ mod tests {
         drop(edited);
         let rest: Vec<(u64, u64)> = walk.map(|(key, value)| (key, *value)).collect();
         assert_eq!(rest, pairs[1..]);
-        assert!(keep.iter().all(|node| Arc::strong_count(node) == 1));
+        assert!(keep.iter().all(|node| Shared::strong_count(node) == 1));
     }
 
     #[test]
     fn epoch_a_lent_node_waits_for_the_reader_that_borrowed_it() {
         let node = leaf(30);
         node.hold();
-        let weak = Arc::downgrade(&node);
+        let weak = Shared::downgrade(&node);
         let guard = epoch::pin().unwrap();
-        let borrowed = held(&weak, &guard).unwrap();
+        let borrowed = weak.lend(&guard).unwrap();
         evict(node);
         let flusher = thread::spawn(epoch::flush);
         assert_eq!(borrowed.keys[0], 30);

@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
+use crate::shared::{Erased, Shared};
 
 const MAGIC: &[u8; 8] = b"FERRODB3";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
@@ -102,40 +103,69 @@ pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
     u32::try_from(weight).unwrap_or(u32::MAX)
 }
 
-struct CacheEntry {
-    value: Option<Arc<dyn Cached>>,
-    weight: u32,
-    owned: bool,
+struct CacheEntry(Entry);
+
+enum Entry {
+    Value { value: Arc<dyn Cached>, weight: u32 },
+    Node { node: Erased, weight: u32, owned: bool },
+    Taken { weight: u32 },
 }
 
 impl CacheEntry {
-    fn new(value: Arc<dyn Cached>, weight: u32) -> CacheEntry {
-        value.hold();
-        CacheEntry {
-            value: Some(value),
+    fn value(value: Arc<dyn Cached>, weight: u32) -> CacheEntry {
+        CacheEntry(Entry::Value { value, weight })
+    }
+
+    fn node(node: Erased, weight: u32) -> CacheEntry {
+        node.hold();
+        CacheEntry(Entry::Node {
+            node,
             weight,
             owned: true,
+        })
+    }
+
+    fn weight(&self) -> u32 {
+        match self.0 {
+            Entry::Value { weight, .. } | Entry::Node { weight, .. } | Entry::Taken { weight } => {
+                weight
+            }
         }
+    }
+
+    fn take(&mut self) -> Entry {
+        let weight = self.weight();
+        mem::replace(&mut self.0, Entry::Taken { weight })
     }
 }
 
 impl Clone for CacheEntry {
     fn clone(&self) -> Self {
-        CacheEntry {
-            value: self.value.clone(),
-            weight: self.weight,
-            owned: false,
-        }
+        CacheEntry(match &self.0 {
+            Entry::Value { value, weight } => Entry::Value {
+                value: value.clone(),
+                weight: *weight,
+            },
+            Entry::Node { node, weight, .. } => Entry::Node {
+                node: node.clone(),
+                weight: *weight,
+                owned: false,
+            },
+            Entry::Taken { weight } => Entry::Taken { weight: *weight },
+        })
     }
 }
 
 impl Drop for CacheEntry {
     fn drop(&mut self) {
-        if self.owned
-            && let Some(value) = self.value.take()
-            && value.release()
+        if let Entry::Node {
+            node,
+            weight,
+            owned: true,
+        } = self.take()
+            && node.release()
         {
-            crate::epoch::retire(value, self.weight as usize);
+            crate::epoch::retire(node, weight as usize);
         }
     }
 }
@@ -152,7 +182,7 @@ struct EntryWeight;
 
 impl Weighter<Hash, CacheEntry> for EntryWeight {
     fn weight(&self, _key: &Hash, entry: &CacheEntry) -> u64 {
-        u64::from(entry.weight)
+        u64::from(entry.weight())
     }
 }
 
@@ -1061,25 +1091,58 @@ impl Store {
         weigh: impl FnOnce(&T, usize, usize) -> u32,
     ) -> Result<(Arc<T>, bool)> {
         if let Some(mut entry) = self.inner.cache.get(&ptr.hash)
-            && let Some(value) = entry.value.take()
+            && let Entry::Value { value, .. } = entry.take()
             && let Ok(value) = (value as Arc<dyn Any + Send + Sync>).downcast::<T>()
         {
             return Ok((value, true));
         }
+        let (value, weight) = self.decode_fresh(ptr, decode, weigh)?;
+        let value = Arc::new(value);
+        self.admit(ptr, || CacheEntry::value(value.clone(), weight));
+        Ok((value, false))
+    }
+
+    pub(crate) fn fetch_node<T: Any + Send + Sync>(
+        &self,
+        ptr: Ptr,
+        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+        weigh: impl FnOnce(&T, usize, usize) -> u32,
+    ) -> Result<(Shared<T>, bool)> {
+        if let Some(mut entry) = self.inner.cache.get(&ptr.hash)
+            && let Entry::Node { node, .. } = entry.take()
+            && let Ok(node) = node.downcast::<T>()
+        {
+            return Ok((node, true));
+        }
+        let (node, weight) = self.decode_fresh(ptr, decode, weigh)?;
+        let node = Shared::new(node);
+        self.admit(ptr, || CacheEntry::node(Shared::erase(node.clone()), weight));
+        Ok((node, false))
+    }
+
+    fn decode_fresh<T>(
+        &self,
+        ptr: Ptr,
+        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+        weigh: impl FnOnce(&T, usize, usize) -> u32,
+    ) -> Result<(T, u32)> {
         let object = self.read_object(ptr)?;
         if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
             self.inner.dedupe.insert(ptr.hash, ptr.offset);
         }
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
-        let value = Arc::new(decode(&mut decoder)?);
+        let value = decode(&mut decoder)?;
         let weight = weigh(&value, object.body.len(), decoder.heap());
+        Ok((value, weight))
+    }
+
+    fn admit(&self, ptr: Ptr, entry: impl FnOnce() -> CacheEntry) {
         if !self.inner.closed.load(Ordering::SeqCst) {
-            self.inner.cache.insert(ptr.hash, CacheEntry::new(value.clone(), weight));
+            self.inner.cache.insert(ptr.hash, entry());
             if self.inner.closed.load(Ordering::SeqCst) {
                 self.inner.cache.clear();
             }
         }
-        Ok((value, false))
     }
 
     pub fn close(&self) {
@@ -1287,14 +1350,15 @@ impl Settling {
         };
         let mut moved = Moved::new();
         for (hash, entry, relocate) in self.remembered {
-            let (Some((relocate, links)), Some(old)) = (relocate, &entry.value) else {
+            let (Some((relocate, links)), Entry::Node { node: old, .. }) = (relocate, &entry.0)
+            else {
                 continue;
             };
             let Some(value) = relocate(old, links, moves, &moved) else {
                 continue;
             };
-            moved.insert(Arc::as_ptr(old).cast::<()>().addr(), value.clone());
-            cache.insert(hash, CacheEntry::new(value, entry.weight));
+            moved.insert(old.as_ptr().addr(), value.clone());
+            cache.insert(hash, CacheEntry::node(value, entry.weight()));
         }
     }
 }
@@ -1409,18 +1473,18 @@ impl Sink for Txn {
         Ok(self.record(hash, staged))
     }
 
-    fn remember(&mut self, ptr: Ptr, value: Arc<dyn Cached>, weight: u32) {
-        self.remembered.push((ptr.hash, CacheEntry::new(value, weight), None));
+    fn remember(&mut self, ptr: Ptr, value: Erased, weight: u32) {
+        self.remembered.push((ptr.hash, CacheEntry::node(value, weight), None));
     }
 
     fn remember_moving(
         &mut self,
         ptr: Ptr,
-        value: Arc<dyn Cached>,
+        value: Erased,
         weight: u32,
         relocate: (Relocate, usize),
     ) {
-        self.remembered.push((ptr.hash, CacheEntry::new(value, weight), Some(relocate)));
+        self.remembered.push((ptr.hash, CacheEntry::node(value, weight), Some(relocate)));
     }
 
     fn store_id(&self) -> u64 {
@@ -1894,47 +1958,30 @@ impl Replay<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
-
     use super::*;
-
-    #[derive(Default)]
-    struct Probe {
-        held: AtomicBool,
-        lent: AtomicBool,
-        releases: AtomicUsize,
-    }
-
-    impl Cached for Probe {
-        fn hold(&self) {
-            self.held.store(true, Ordering::SeqCst);
-        }
-
-        fn release(&self) -> bool {
-            self.held.store(false, Ordering::SeqCst);
-            self.releases.fetch_add(1, Ordering::SeqCst);
-            self.lent.load(Ordering::SeqCst)
-        }
-    }
 
     #[test]
     fn epoch_only_the_cached_entry_releases_its_value() {
         for lent in [false, true] {
-            let value = Arc::new(Probe::default());
-            value.lent.store(lent, Ordering::SeqCst);
-            let entry = CacheEntry::new(value.clone(), 64);
-            assert!(value.held.load(Ordering::SeqCst));
+            let value = Shared::new(7u64);
+            let weak = Shared::downgrade(&value);
+            let entry = CacheEntry::node(Shared::erase(value.clone()), 64);
+            assert!(value.held());
+            if lent {
+                let guard = crate::epoch::pin().unwrap();
+                assert_eq!(weak.lend(&guard), Some(&7));
+            }
             let mut copy = entry.clone();
-            assert!(copy.value.take().is_some());
+            assert!(matches!(copy.take(), Entry::Node { owned: false, .. }));
             drop(copy);
             drop(entry.clone());
-            assert!(value.held.load(Ordering::SeqCst));
-            assert_eq!(value.releases.load(Ordering::SeqCst), 0);
+            assert!(value.held());
+            assert_eq!(Shared::strong_count(&value), 2);
             drop(entry);
-            assert!(!value.held.load(Ordering::SeqCst));
-            assert_eq!(value.releases.load(Ordering::SeqCst), 1);
+            assert!(!value.held());
+            assert_eq!(Shared::strong_count(&value), if lent { 2 } else { 1 });
             crate::epoch::flush();
-            assert_eq!(Arc::strong_count(&value), 1);
+            assert_eq!(Shared::strong_count(&value), 1);
         }
     }
 }

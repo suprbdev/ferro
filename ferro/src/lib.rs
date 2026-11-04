@@ -13,6 +13,7 @@ pub mod map;
 mod platform;
 mod reclaim;
 mod reentry;
+mod shared;
 pub mod set;
 pub mod store;
 pub mod sync;

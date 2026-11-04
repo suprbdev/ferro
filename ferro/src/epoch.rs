@@ -1,11 +1,11 @@
-use std::any::Any;
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+
+use crate::shared::Erased;
 
 const BATCH: usize = 128;
 const BATCH_BYTES: usize = 64 << 10;
@@ -18,7 +18,7 @@ static FREEING: AtomicUsize = AtomicUsize::new(0);
 struct Retired {
     epoch: u64,
     bytes: usize,
-    _value: Arc<dyn Any + Send + Sync>,
+    _value: Erased,
 }
 
 #[derive(Default)]
@@ -113,7 +113,7 @@ impl Drop for Guard {
     }
 }
 
-pub(crate) fn retire(value: Arc<dyn Any + Send + Sync>, bytes: usize) {
+pub(crate) fn retire(value: Erased, bytes: usize) {
     let item = Retired {
         epoch: EPOCH.load(Ordering::SeqCst),
         bytes,
@@ -194,10 +194,12 @@ pub(crate) fn flush() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     use super::*;
+    use crate::shared::Shared;
 
     struct Counted(Arc<AtomicUsize>);
 
@@ -218,7 +220,7 @@ mod tests {
             thread::yield_now();
             drop(guard);
         });
-        retire(Arc::new(Counted(dropped.clone())), 1);
+        retire(Shared::erase(Shared::new(Counted(dropped.clone()))), 1);
         let flusher = thread::spawn(flush);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(outer);
@@ -237,7 +239,7 @@ mod tests {
                 thread::spawn(move || {
                     for _ in 0..BATCH + 1 {
                         let guard = pin().unwrap();
-                        retire(Arc::new(Counted(dropped.clone())), 1);
+                        retire(Shared::erase(Shared::new(Counted(dropped.clone()))), 1);
                         drop(guard);
                     }
                 })

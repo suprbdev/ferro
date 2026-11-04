@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::shared::Erased;
 use crate::store::Store;
 
 pub const HASH_BYTES: usize = 20;
@@ -78,12 +79,7 @@ impl Staged<'_> {
     }
 }
 
-pub trait Cached: Any + Send + Sync {
-    fn hold(&self) {}
-    fn release(&self) -> bool {
-        false
-    }
-}
+pub trait Cached: Any + Send + Sync {}
 
 impl<T: Data> Cached for T {}
 
@@ -115,11 +111,10 @@ impl Moves {
 }
 
 #[doc(hidden)]
-pub type Moved = HashMap<usize, Arc<dyn Cached>>;
+pub type Moved = HashMap<usize, Erased>;
 
 #[doc(hidden)]
-pub type Relocate =
-    fn(&Arc<dyn Cached>, usize, &Moves, &Moved) -> Option<Arc<dyn Cached>>;
+pub type Relocate = fn(&Erased, usize, &Moves, &Moved) -> Option<Erased>;
 
 pub trait Sink {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
@@ -136,12 +131,12 @@ pub trait Sink {
     fn check_link(&self, _ptr: Ptr) -> Result<()> {
         Ok(())
     }
-    fn remember(&mut self, _ptr: Ptr, _value: Arc<dyn Cached>, _weight: u32) {}
+    fn remember(&mut self, _ptr: Ptr, _value: Erased, _weight: u32) {}
     #[doc(hidden)]
     fn remember_moving(
         &mut self,
         ptr: Ptr,
-        value: Arc<dyn Cached>,
+        value: Erased,
         weight: u32,
         _relocate: (Relocate, usize),
     ) {
