@@ -1426,25 +1426,44 @@ impl<T: Data> Shared<T> {
         Ok(Some(Byte { store, at }))
     }
 
-    fn attached_since(&self, branches: &[Arc<Branch<T>>]) -> bool {
+    fn every_lane(&self) -> Vec<Arc<Branch<T>>> {
+        let mut branches: Vec<_> = self.branches.lock().values().cloned().collect();
+        if self.options.shared {
+            for (_, branch) in &self.queue.lock().open {
+                if !branches.iter().any(|held| Arc::ptr_eq(held, branch)) {
+                    branches.push(branch.clone());
+                }
+            }
+        }
+        branches.sort_by(|a, b| a.name.cmp(&b.name));
+        branches
+    }
+
+    fn covers(&self, branches: &[Arc<Branch<T>>]) -> bool {
+        let held = |branch: &Arc<Branch<T>>| branches.iter().any(|lane| Arc::ptr_eq(lane, branch));
         let attached = self.branches.lock();
-        attached.len() != branches.len()
-            || !branches.iter().all(|branch| {
-                attached
-                    .get(&branch.name)
-                    .is_some_and(|now| Arc::ptr_eq(now, branch))
-            })
+        if !self.options.shared {
+            return attached.len() == branches.len() && attached.values().all(held);
+        }
+        if !attached.values().all(held) {
+            return false;
+        }
+        drop(attached);
+        self.queue
+            .lock()
+            .open
+            .iter()
+            .all(|(_, branch)| held(branch))
     }
 
     fn exclusively<R>(&self, f: impl FnOnce(&mut RefState) -> Result<R>) -> Result<R> {
         let mut notices = Vec::new();
         loop {
-            let mut branches: Vec<_> = self.branches.lock().values().cloned().collect();
-            branches.sort_by(|a, b| a.name.cmp(&b.name));
+            let branches = self.every_lane();
             let mut lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
             lanes.iter_mut().for_each(Lane::uncross);
             let store = self.store();
-            let stale = || self.attached_since(&branches);
+            let stale = || !self.covers(&branches);
             let range = match store.is_shared() {
                 true => match store.lock_lanes(stale)? {
                     Some(range) => Some(range),
@@ -1456,7 +1475,7 @@ impl<T: Data> Shared<T> {
             let commit = store.is_shared().then(|| store.lock_commit()).transpose()?;
             let current = self.store().id() == store.id()
                 && self.follow(&mut tip, &mut notices)? != Caught::Swapped;
-            if current && !self.attached_since(&branches) {
+            if current && self.covers(&branches) {
                 let whole = reentry::whole(self.id);
                 let out = f(&mut tip);
                 drop(whole);
@@ -2969,6 +2988,7 @@ impl<T: Data> Db<T> {
         self.shared.store().check_healthy()?;
         let mut notices = Vec::new();
         self.shared.cross(&mut lane, &mut notices)?;
+        self.branch.check_live()?;
         let state = self.branch.tip.load_full();
         let framed = self.branch.framed.load(Ordering::Acquire);
         let mut working = (*state.snapshot.value).clone();
@@ -3023,7 +3043,8 @@ impl<T: Data> Db<T> {
         let live = branch.check_live();
         let mut notices = Vec::new();
         let ready = live.and_then(|()| shared.store().check_healthy());
-        if let Err(error) = ready.and_then(|()| shared.cross(&mut lane, &mut notices)) {
+        let crossed = ready.and_then(|()| shared.cross(&mut lane, &mut notices));
+        if let Err(error) = crossed.and_then(|()| branch.check_live()) {
             if let Some(group) = lane.take() {
                 shared.seal_for_others(branch, group);
             }

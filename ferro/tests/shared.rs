@@ -600,3 +600,25 @@ fn a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file() 
     assert_eq!(db.read().n, acked, "an acknowledged commit was lost");
     db.verify().unwrap();
 }
+
+#[test]
+fn a_closure_on_a_branch_another_handle_dropped_never_runs() {
+    for coalesce in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dropped.ferro");
+        let a: Db<Root> = shared().coalesce(coalesce).open(&path).unwrap();
+        let b: Db<Root> = shared().open(&path).unwrap();
+        bump(&a, 0, 1);
+        let side = a.fork("side").unwrap();
+        b.drop_branch("side").unwrap();
+        let ran = AtomicBool::new(false);
+        let out = side.update(|root| {
+            ran.store(true, Ordering::Release);
+            root.n += 1;
+        });
+        assert!(matches!(out, Err(Error::NoBranch(_))), "{out:?}");
+        assert!(!ran.load(Ordering::Acquire), "coalesce {coalesce}");
+        a.compact(Keep::All).unwrap();
+        bump(&a, 0, 2);
+    }
+}
