@@ -488,11 +488,8 @@ impl Hotels {
         for room in &rooms {
             self.rooms
                 .update(room, |row| row.rate = scaled(row.rate, percent));
-            let overrides: Vec<(u32, Night)> = self
-                .rates
-                .range((*room, 0)..=(*room, Night::MAX))
-                .map(|(key, _)| key)
-                .collect();
+            let overrides: Vec<(u32, Night)> =
+                self.rates.prefix(room).map(|(key, _)| key).collect();
             for key in overrides {
                 if let Some(rate) = self.rates.get_mut(&key) {
                     *rate = scaled(*rate, percent);

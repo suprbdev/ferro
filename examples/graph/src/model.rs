@@ -60,13 +60,9 @@ impl Graph {
     pub fn blocked_either_way(&self, user: UserId) -> Vec<UserId> {
         let mut out: Vec<UserId> = self
             .blocks
-            .range((user, 0)..=(user, UserId::MAX))
+            .prefix(&user)
             .map(|(_, other)| other)
-            .chain(
-                self.blocked_by
-                    .range((user, 0)..=(user, UserId::MAX))
-                    .map(|(_, other)| other),
-            )
+            .chain(self.blocked_by.prefix(&user).map(|(_, other)| other))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -74,7 +70,7 @@ impl Graph {
     }
 
     pub fn like_count(&self, post: PostId) -> usize {
-        self.likes.range((post, 0)..=(post, UserId::MAX)).len()
+        self.likes.prefix(&post).len()
     }
 }
 

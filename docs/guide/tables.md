@@ -8,9 +8,11 @@ row in [Getting started](getting-started.md#a-first-database) is an example.
 
 `get`, `first`, `last`, `iter` and `range` read rows by key, and `insert` and `remove` write them.
 `range` yields rows in key order as `iter` and the index lookups do, `keys` gives the keys alone,
-and `rows()` gives the underlying `Map` for `(key, row)` pairs. `get_mut` hands out a `RowMut` that
-updates the indexes when it drops. `update(&key, f)` runs `f` on the row and returns what `f`
-returns, or `None` when no row has that key, so a missing row becomes your own error in one line:
+and `rows()` gives the underlying `Map` for `(key, row)` pairs. For a tuple key, `prefix(&head)`
+gives the rows whose key starts with `head`, as described under [Tuple
+keys](collections.md#tuple-keys). `get_mut` hands out a `RowMut` that updates the indexes when it
+drops. `update(&key, f)` runs `f` on the row and returns what `f` returns, or `None` when no row has
+that key, so a missing row becomes your own error in one line:
 
 ```rust
 let total = shop

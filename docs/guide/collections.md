@@ -39,6 +39,22 @@ let mut other = right.cursor();
 left.for_each(|key, _| shared += usize::from(other.seek(key)));
 ```
 
+## Tuple keys
+
+A map, set or table keyed by a tuple of two to four fields often groups its entries by the first.
+`prefix(&head)` reads every entry whose first field is `head`, in key order and from either end,
+and `Map::prefix_summary(&head)` folds them, so no call has to name the smallest and largest value
+of every other field:
+
+```rust
+let follows = graph.follows.prefix(&user).len();
+let next = state.ready.prefix("mail").next();
+```
+
+The head can be borrowed, as `&str` for a `String` field, and each call costs what the same
+`range` does. A key type of your own gets these by implementing `Prefix` for its leading field. A
+range within a group, such as one account's postings between two dates, still takes bounds.
+
 ## Cutting, joining and batching
 
 `Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and join

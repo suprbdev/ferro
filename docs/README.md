@@ -11,7 +11,7 @@ on one idle machine. Start with [Getting started](guide/getting-started.md).
 | File | Covers |
 | --- | --- |
 | [Getting started](guide/getting-started.md) | A first database, reading, writing and `Options` |
-| [Collections](guide/collections.md) | `Map`, `Set`, `List`, `Bytes`, bulk reads, cursors, range edits and summaries |
+| [Collections](guide/collections.md) | `Map`, `Set`, `List`, `Bytes`, bulk reads, cursors, prefixes, range edits and summaries |
 | [Tables and indexes](guide/tables.md) | `Table`, `#[derive(Record)]`, secondary, composite, unique and covering indexes, combined lookups |
 | [History, versions and branches](guide/history.md) | `at`, `as_of`, `diff`, `history_of`, `bisect`, stamps, forks, dropping branches, `head_hash` |
 | [Merging](guide/merging.md) | Three-way merges, criss-crosses and merges that can fail |

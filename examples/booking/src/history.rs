@@ -57,7 +57,7 @@ pub fn price_history(db: &Db<Hotels>, room: u32) -> Result<Vec<PricePoint>> {
         h.rooms.get(&room).map(|row| {
             let overrides: Vec<(Night, Cents)> = h
                 .rates
-                .range((room, 0)..=(room, Night::MAX))
+                .prefix(&room)
                 .map(|((_, night), rate)| (night, *rate))
                 .collect();
             (row.rate, overrides)

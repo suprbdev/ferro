@@ -1,8 +1,10 @@
 mod common;
 
-use common::fast;
+use std::collections::BTreeMap;
+
+use common::{Rng, fast};
 use ferro::table::Taken;
-use ferro::{Data, Map, Record, Table, Val};
+use ferro::{Data, Map, Record, Set, Summary, Table, Val};
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Seat {
@@ -19,6 +21,27 @@ struct Seat {
 struct Hall {
     seats: Table<Seat>,
     prices: Map<u32, u64>,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Stay {
+    #[key]
+    slot: (u64, u32, u8),
+    guest: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Data)]
+#[ferro(transparent)]
+struct Total(u64);
+
+impl Summary<(u8, u16), u32> for Total {
+    fn of(_key: &(u8, u16), value: &u32) -> Self {
+        Total(u64::from(*value))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Total(self.0 + other.0)
+    }
 }
 
 fn seat(id: u32) -> Seat {
@@ -164,4 +187,77 @@ fn table_keys_lists_the_keys_in_order() {
     assert_eq!(hall.seats.keys().rev().next(), Some(9));
     assert_eq!(hall.seats.keys().len(), hall.seats.len());
     assert_eq!(Table::<Seat>::new().keys().next(), None);
+}
+
+#[test]
+fn map_prefix_matches_a_range_over_the_other_fields() {
+    let mut rng = Rng::new(66);
+    let mut model: BTreeMap<(u8, u16), u32> = BTreeMap::new();
+    let mut map: Map<(u8, u16), u32, Total> = Map::default();
+    for _ in 0..3_000 {
+        let key = (
+            rng.below(12) as u8 * 2,
+            rng.below(u64::from(u16::MAX) + 1) as u16,
+        );
+        let value = rng.below(1_000) as u32;
+        model.insert(key, value);
+        map.insert(key, value);
+    }
+    for head in 0..=24u8 {
+        let want: Vec<((u8, u16), u32)> = model
+            .range((head, 0)..=(head, u16::MAX))
+            .map(|(key, value)| (*key, *value))
+            .collect();
+        let got: Vec<((u8, u16), u32)> = map
+            .prefix(&head)
+            .map(|(key, value)| (key, *value))
+            .collect();
+        assert_eq!(got, want, "head {head}");
+        let back: Vec<(u8, u16)> = map.prefix(&head).rev().map(|(key, _)| key).collect();
+        assert!(back.iter().rev().eq(want.iter().map(|(key, _)| key)));
+        assert_eq!(map.prefix(&head).len(), want.len());
+        let total: u64 = want.iter().map(|(_, value)| u64::from(*value)).sum();
+        assert_eq!(
+            map.prefix_summary(&head).map(|sum| sum.0),
+            (!want.is_empty()).then_some(total)
+        );
+    }
+}
+
+#[test]
+fn set_and_table_prefixes_take_a_borrowed_head() {
+    let mut queues: Set<(String, u8, u64)> = Set::new();
+    for (queue, priority, id) in [
+        ("mail", 1, 4),
+        ("mail", 0, 9),
+        ("mailbox", 0, 1),
+        ("ma", 3, 2),
+    ] {
+        queues.insert((queue.to_string(), priority, id));
+    }
+    let mail: Vec<u64> = queues.prefix("mail").map(|key| key.2).collect();
+    assert_eq!(mail, vec![9, 4]);
+    assert_eq!(queues.prefix("mailbox").len(), 1);
+    assert_eq!(queues.prefix("m").next(), None);
+    assert_eq!(queues.prefix("ma").next_back().map(|key| key.2), Some(2));
+
+    let mut stays: Table<Stay> = Table::new();
+    for booking in [3u64, 1, 2] {
+        for night in [20, 10, 30] {
+            stays.insert(Stay {
+                slot: (booking, night, 0),
+                guest: format!("g{booking}"),
+            });
+        }
+    }
+    let nights: Vec<u32> = stays.prefix(&2).map(|stay| stay.slot.1).collect();
+    assert_eq!(nights, vec![10, 20, 30]);
+    assert!(stays.prefix(&2).all(|stay| stay.guest == "g2"));
+    assert_eq!(stays.prefix(&9).len(), 0);
+
+    let mut wide: Map<(u32, u8, u8, u8), ()> = Map::new();
+    wide.insert((7, 1, 2, 3), ());
+    wide.insert((8, 0, 0, 0), ());
+    let sevens: Vec<_> = wide.prefix(&7).map(|(key, _)| key).collect();
+    assert_eq!(sevens, vec![(7, 1, 2, 3)]);
 }

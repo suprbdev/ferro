@@ -646,10 +646,11 @@ pub fn aggregate_rollups(
     let mut low = u64::MAX;
     let mut high = 0;
     for rec in &rows {
-        if let Some(((_, start), _)) = table.range((rec.id, 0)..=(rec.id, u64::MAX)).next() {
+        let mut chunks = table.prefix(&rec.id);
+        if let Some(((_, start), _)) = chunks.next() {
             low = low.min(start);
         }
-        if let Some(((_, start), _)) = table.range((rec.id, 0)..=(rec.id, u64::MAX)).next_back() {
+        if let Some(((_, start), _)) = chunks.next_back() {
             high = high.max(start + rollup_step);
         }
     }

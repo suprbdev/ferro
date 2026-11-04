@@ -71,7 +71,7 @@ impl Rep for Flat {
     }
 
     fn visit(&self, user: u32, f: &mut dyn FnMut(u32)) {
-        for ((_, other), _) in self.edges.range((user, 0)..=(user, u32::MAX)) {
+        for ((_, other), _) in self.edges.prefix(&user) {
             f(other);
         }
     }
@@ -85,7 +85,7 @@ impl Rep for Flat {
     }
 
     fn degree(&self, user: u32) -> usize {
-        self.edges.range((user, 0)..=(user, u32::MAX)).len()
+        self.edges.prefix(&user).len()
     }
 }
 
@@ -106,7 +106,7 @@ impl Rep for Both {
     }
 
     fn visit(&self, user: u32, f: &mut dyn FnMut(u32)) {
-        for ((_, other), _) in self.out.range((user, 0)..=(user, u32::MAX)) {
+        for ((_, other), _) in self.out.prefix(&user) {
             f(other);
         }
     }
@@ -121,7 +121,7 @@ impl Rep for Both {
     }
 
     fn degree(&self, user: u32) -> usize {
-        self.out.range((user, 0)..=(user, u32::MAX)).len()
+        self.out.prefix(&user).len()
     }
 }
 
@@ -199,7 +199,7 @@ impl Rep for Bucketed {
     }
 
     fn visit(&self, user: u32, f: &mut dyn FnMut(u32)) {
-        for ((_, first), bytes) in self.blocks.range((user, 0)..=(user, u32::MAX)) {
+        for ((_, first), bytes) in self.blocks.prefix(&user) {
             for id in decode_block(first, &bytes) {
                 f(id);
             }
@@ -214,7 +214,7 @@ impl Rep for Bucketed {
     fn add(&mut self, a: u32, b: u32) {
         match self.find(a, b) {
             None => {
-                let next = self.blocks.range((a, 0)..=(a, u32::MAX)).next();
+                let next = self.blocks.prefix(&a).next();
                 match next {
                     Some(((_, first), bytes)) => {
                         let mut ids = decode_block(first, &bytes);

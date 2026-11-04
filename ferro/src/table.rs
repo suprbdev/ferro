@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::codec::{Data, Decoder, Description, Encoder, Hash};
 use crate::error::Result;
 use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, same_value};
+use crate::prefix::Prefix;
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -138,6 +139,14 @@ impl<T: Record> Table<T> {
         R: RangeBounds<Q>,
     {
         self.0.rows().range::<Q, R>(range).into_values()
+    }
+
+    pub fn prefix<Q>(&self, head: &Q) -> Values<T::Key, T>
+    where
+        T::Key: Prefix<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.rows().prefix(head).into_values()
     }
 
     pub fn first(&self) -> Option<Val<T>> {

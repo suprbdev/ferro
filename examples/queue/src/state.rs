@@ -68,27 +68,19 @@ impl State {
         if self.paused.contains(queue) {
             return false;
         }
-        let low = (queue.to_string(), 0u8, 0u64);
-        let high = (queue.to_string(), u8::MAX, u64::MAX);
-        self.ready.range::<ReadyKey, _>(low..=high).next().is_some()
+        self.ready.prefix(queue).next().is_some()
     }
 
     pub fn count_ready(&self, queue: &str) -> usize {
-        let low = (queue.to_string(), 0u8, 0u64);
-        let high = (queue.to_string(), u8::MAX, u64::MAX);
-        self.ready.range::<ReadyKey, _>(low..=high).len()
+        self.ready.prefix(queue).len()
     }
 
     pub fn count_dead(&self, queue: &str) -> usize {
-        let low = (queue.to_string(), 0u64);
-        let high = (queue.to_string(), u64::MAX);
-        self.dead.range::<(String, u64), _>(low..=high).len()
+        self.dead.prefix(queue).len()
     }
 
     pub fn count_blocked(&self, queue: &str) -> usize {
-        let low = (queue.to_string(), 0u64);
-        let high = (queue.to_string(), u64::MAX);
-        self.blocked.range::<(String, u64), _>(low..=high).len()
+        self.blocked.prefix(queue).len()
     }
 
     fn place(&mut self, job: &mut Job, now: u64) {
@@ -188,13 +180,7 @@ impl State {
         if self.paused.contains(queue) {
             return Vec::new();
         }
-        let low = (queue.to_string(), 0u8, 0u64);
-        let high = (queue.to_string(), u8::MAX, u64::MAX);
-        let keys: Vec<ReadyKey> = self
-            .ready
-            .range::<ReadyKey, _>(low..=high)
-            .take(n)
-            .collect();
+        let keys: Vec<ReadyKey> = self.ready.prefix(queue).take(n).collect();
         let expires = now + ttl_ms;
         let mut leased = Vec::with_capacity(keys.len());
         let mut lease_edits = Vec::with_capacity(keys.len());
@@ -275,17 +261,12 @@ impl State {
     }
 
     fn release_children(&mut self, parent: u64, now: u64) {
-        let low = (parent, 0u64);
-        let high = (parent, u64::MAX);
-        let kids: Vec<u64> = self
-            .children
-            .range::<(u64, u64), _>(low..=high)
-            .map(|key| key.1)
-            .collect();
+        let kids: Vec<u64> = self.children.prefix(&parent).map(|key| key.1).collect();
         if kids.is_empty() {
             return;
         }
-        self.children.remove_range::<(u64, u64), _>(low..=high);
+        self.children
+            .remove_range::<(u64, u64), _>((parent, 0)..=(parent, u64::MAX));
         for kid in kids {
             let Some(found) = self.jobs.get(&kid) else {
                 continue;

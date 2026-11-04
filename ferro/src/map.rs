@@ -18,6 +18,7 @@ use crate::codec::{
 };
 use crate::epoch::{self, Guard};
 use crate::error::{Error, Result};
+use crate::prefix::Prefix as KeyPrefix;
 use crate::shared::{Erased, Shared, Weak};
 use crate::store::{MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
@@ -3135,6 +3136,22 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         let start = range.start_bound();
         let end = range.end_bound();
         self.summary_by(|key| below(key, start), |key| within(key, end))
+    }
+
+    pub fn prefix<Q>(&self, head: &Q) -> Iter<K, V, S>
+    where
+        K: KeyPrefix<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.range_by(|key| key.head() < head, |key| key.head() <= head)
+    }
+
+    pub fn prefix_summary<Q>(&self, head: &Q) -> Option<S>
+    where
+        K: KeyPrefix<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.summary_by(|key| key.head() < head, |key| key.head() <= head)
     }
 
     pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V, S>

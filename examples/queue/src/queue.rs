@@ -9,7 +9,7 @@ use ferro::{Compacted, Db, Durability, Keep, Options, Reclaim, Space, Watcher};
 
 use crate::error::{QueueError, Result};
 use crate::model::{Job, JobState, NewJob, Recurring};
-use crate::state::{State, Tick, ready_key};
+use crate::state::{State, Tick};
 
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -372,13 +372,7 @@ impl Queue {
     pub fn dlq_retry_queue(&self, queue: &str) -> Result<usize> {
         let committed = self.db.try_commit_with::<_, _, QueueError>(|state| {
             let now = self.now();
-            let ids: Vec<u64> = state
-                .dead
-                .range::<(String, u64), _>(
-                    (queue.to_string(), 0u64)..=(queue.to_string(), u64::MAX),
-                )
-                .map(|key| key.1)
-                .collect();
+            let ids: Vec<u64> = state.dead.prefix(queue).map(|key| key.1).collect();
             for id in &ids {
                 state.retry_dead(*id, now)?;
             }
@@ -500,12 +494,6 @@ impl Queue {
 
     pub fn ready_head(&self, queue: &str) -> Option<u64> {
         let snapshot = self.db.read();
-        let low = ready_key(queue, u8::MAX, 0);
-        let high = ready_key(queue, 0, u64::MAX);
-        snapshot
-            .ready
-            .range::<(String, u8, u64), _>(low..=high)
-            .next()
-            .map(|key| key.2)
+        snapshot.ready.prefix(queue).next().map(|key| key.2)
     }
 }

@@ -5,6 +5,7 @@ use std::ops::RangeBounds;
 use crate::codec::{Data, Decoder, Description, Encoder};
 use crate::error::Result;
 use crate::map::{Cursor, Diff, Keys, Map};
+use crate::prefix::Prefix;
 
 pub struct Set<T>(Map<T, ()>);
 
@@ -84,6 +85,14 @@ impl<T: Data + Ord> Set<T> {
         R: RangeBounds<Q>,
     {
         self.0.range::<Q, R>(range).into_keys()
+    }
+
+    pub fn prefix<Q>(&self, head: &Q) -> Keys<T, ()>
+    where
+        T: Prefix<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.prefix(head).into_keys()
     }
 
     pub fn first(&self) -> Option<T> {

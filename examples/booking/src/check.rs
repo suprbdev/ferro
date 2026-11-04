@@ -164,7 +164,7 @@ fn booking_in(h: &Hotels, b: &Booking, out: &mut Report<'_>) {
             format!("booking #{id} names missing room {}", b.room)
         }),
     }
-    let stays: Vec<_> = h.stays.range((id, 0)..=(id, Night::MAX)).collect();
+    let stays: Vec<_> = h.stays.prefix(&id).collect();
     if b.status.active() {
         out.check(stays.len() == b.nights as usize, || {
             format!(

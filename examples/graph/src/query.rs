@@ -212,7 +212,7 @@ pub fn timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Val<Post>> {
 
 pub fn inbox_timeline(g: &Graph, user: UserId, limit: usize) -> Vec<Val<Post>> {
     g.inbox
-        .range((user, 0)..=(user, u64::MAX))
+        .prefix(&user)
         .rev()
         .filter_map(|(_, id)| g.posts.get(&id))
         .take(limit)

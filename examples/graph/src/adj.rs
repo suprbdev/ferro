@@ -126,7 +126,7 @@ impl Adj {
     pub fn insert(&mut self, a: UserId, b: UserId) -> bool {
         let held = self.floor(a, b).or_else(|| {
             self.0
-                .range((a, 0)..=(a, UserId::MAX))
+                .prefix(&a)
                 .next()
                 .map(|((_, first), bytes)| (first, (*bytes).clone()))
         });
