@@ -189,12 +189,18 @@ fn entry(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> (Object, Buil
     }
     let stamped = input.chance(4);
     let wide = (lift, reach, last_merge) != (0, 0, 0);
-    flags |= u8::from(prev.is_some()) * HAS_PREV
-        | u8::from(skip.is_some()) * HAS_SKIP
-        | u8::from(merged.is_some()) * MERGED
-        | u8::from(wide) * GRAPH
-        | u8::from(control & 64 != 0) * BOUNDED
-        | u8::from(stamped) * EXTRA;
+    for (set, bit) in [
+        (prev.is_some(), HAS_PREV),
+        (skip.is_some(), HAS_SKIP),
+        (merged.is_some(), MERGED),
+        (wide, GRAPH),
+        (control & 64 != 0, BOUNDED),
+        (stamped, EXTRA),
+    ] {
+        if set {
+            flags |= bit;
+        }
+    }
     if control & 128 != 0 {
         flags ^= input.byte();
     }

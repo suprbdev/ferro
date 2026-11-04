@@ -55,7 +55,9 @@ fn record(bytes: &[u8], start: usize, end: usize) -> Option<(Record, usize)> {
         1 => Some(usize::try_from(varint(bytes, &mut pos, end)?).ok()?),
         _ => None,
     };
-    let body_end = pos.checked_add(stored).filter(|body_end| *body_end <= end)?;
+    let body_end = pos
+        .checked_add(stored)
+        .filter(|body_end| *body_end <= end)?;
     let stored_body = &bytes[pos..body_end];
     let body = match raw {
         Some(raw) if raw <= MAX_BODY && raw <= stored.saturating_mul(255).saturating_add(255) => {
@@ -88,7 +90,8 @@ fn record(bytes: &[u8], start: usize, end: usize) -> Option<(Record, usize)> {
 fn run(bytes: &[u8], start: usize, end: usize, bare: bool, out: &mut Vec<Record>) -> usize {
     let mut pos = start;
     while pos < end && out.len() < MAX_RECORDS {
-        if bare && (bytes[pos..].starts_with(FRAME_MAGIC) || bytes[pos..end.min(pos + 4)] == [0; 4]) {
+        if bare && (bytes[pos..].starts_with(FRAME_MAGIC) || bytes[pos..end.min(pos + 4)] == [0; 4])
+        {
             break;
         }
         match record(bytes, pos, end) {

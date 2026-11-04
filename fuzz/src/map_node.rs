@@ -29,7 +29,7 @@ where
         let control = input.byte();
         let mut w = Encoder::new(&mut *txn);
         let mut count = 0u64;
-        if control % 8 == 0 {
+        if control.is_multiple_of(8) {
             let len = usize::from(input.byte());
             w.raw(input.bytes(len));
             for _ in 0..input.byte() % 4 {
@@ -81,7 +81,11 @@ where
                     continue;
                 }
                 let (child, below) = nodes[usize::from(input.byte()) % nodes.len()];
-                let below = if control & 32 != 0 { input.num() } else { below };
+                let below = if control & 32 != 0 {
+                    input.num()
+                } else {
+                    below
+                };
                 count = count.wrapping_add(below);
                 w.varint(below);
                 S::generate(input).encode(&mut w)?;
@@ -95,7 +99,11 @@ where
     }
     let (root, count) = *nodes.last().unwrap();
     let mut w = Encoder::new(txn);
-    w.varint(if input.chance(2) { input.num() } else { count.max(1) });
+    w.varint(if input.chance(2) {
+        input.num()
+    } else {
+        count.max(1)
+    });
     S::generate(input).encode(&mut w)?;
     w.link(root);
     w.finish()

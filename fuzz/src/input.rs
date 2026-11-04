@@ -53,7 +53,11 @@ impl<'a> Input<'a> {
     }
 
     pub fn pick(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { usize::from(self.byte()) % n }
+        if n == 0 {
+            0
+        } else {
+            usize::from(self.byte()) % n
+        }
     }
 
     pub fn text(&mut self) -> String {

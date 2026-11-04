@@ -281,7 +281,7 @@ impl Gen for Shop {
             shop.orders.insert(Order {
                 id: input.num(),
                 customer: input.text(),
-                status: if input.byte() % 2 == 0 {
+                status: if input.byte().is_multiple_of(2) {
                     Status::Pending
                 } else {
                     Status::Shipped
