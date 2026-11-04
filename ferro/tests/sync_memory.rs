@@ -292,3 +292,72 @@ fn a_stream_of_commits_with_long_messages_costs_a_buffer_not_its_messages() {
     );
     b.verify_typed().unwrap();
 }
+
+fn clone_heap(a: &Db<Root>, dir: &std::path::Path) -> (usize, usize, usize) {
+    let b: Db<Root> = fast().open(dir.join("b.ferro")).unwrap();
+    let have = b.have().unwrap();
+    let path = dir.join("bundle");
+    let (written, sent) = heap_of(|| {
+        a.bundle_to(&have, BufWriter::new(File::create(&path).unwrap()))
+            .unwrap()
+    });
+    let (pulled, received) = heap_of(|| {
+        let input = BufReader::new(File::open(&path).unwrap());
+        b.receive_from("a", input, refuse).unwrap()
+    });
+    let objects = pulled.objects as usize;
+    println!(
+        "{written} bytes in {objects} objects, sent with {sent} bytes of heap, received with {received}"
+    );
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.head_hash(), a.head_hash());
+    (objects, sent, received)
+}
+
+#[test]
+fn a_clone_of_a_large_tree_holds_a_few_dozen_bytes_for_each_object() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for round in 0..8u64 {
+        a.commit(format!("round {round}"), |root| {
+            for key in round * 500_000..(round + 1) * 500_000 {
+                root.insert(key, text(key, 8));
+            }
+        })
+        .unwrap();
+    }
+    let (objects, sent, received) = clone_heap(&a, dir.path());
+    assert!(objects > 480_000, "{objects}");
+    assert!(
+        sent < 8 * MIB + 44 * objects,
+        "sending {objects} objects took {sent} bytes of heap"
+    );
+    assert!(
+        received < 4 * MIB + 48 * objects,
+        "receiving {objects} objects took {received} bytes of heap"
+    );
+}
+
+#[test]
+fn a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for round in 0..50_000u64 {
+        a.commit(format!("round {round}"), |root| {
+            for key in round * 8..(round + 1) * 8 {
+                root.insert(key, text(key, 8));
+            }
+        })
+        .unwrap();
+    }
+    let (objects, sent, received) = clone_heap(&a, dir.path());
+    assert!(objects > 380_000, "{objects}");
+    assert!(
+        sent < 8 * MIB + 64 * objects,
+        "sending {objects} objects in 50,000 commits took {sent} bytes of heap"
+    );
+    assert!(
+        received < 4 * MIB + 64 * objects,
+        "receiving {objects} objects in 50,000 commits took {received} bytes of heap"
+    );
+}
