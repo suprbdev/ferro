@@ -60,7 +60,7 @@ explained or undone from the history, and corruption surfaces as an error rather
   branch runs one closure at a time. Batch related changes, or use `coalesce`.
 - **Many processes on one branch without fsync.** With `Options::shared` several processes commit to
   one file, as fast as threads under fsync, but under `Buffered` each reads back what the others
-  wrote, so on one branch they commit more slowly than threads. It needs Linux or Windows and one
+  wrote, so on one branch they commit more slowly than threads. It needs 64-bit Linux and one
   machine.
 - **Ad hoc queries.** There is no query language or planner. You choose the indexes, `and` and
   `or` combine equality lookups by key, a range joins them only after its keys are read and sorted,

@@ -112,17 +112,17 @@ queued, as group commit does within a process.
 The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
 file open, and they get it while it does. On one process it costs a few microseconds a commit for
 its locks: one writer made 42,700 single-key Buffered commits a second with it and 47,500 without,
-on 2026-11-04. With fsync, 8 processes made 9,963 commits a second on one branch where 8 threads
-of one process made 10,292. Under `Durability::Buffered` processes on one branch take turns, and
+on 2026-11-04. With fsync, 8 processes made 9,727 commits a second on one branch where 8 threads
+of one process made 10,406. Under `Durability::Buffered` processes on one branch take turns, and
 each reads back the nodes the last one rewrote, where threads share one cache: 2 processes made
-29,231 and 8 made 19,805, against about 39,000 for threads. On branches of their own 4 processes
-made 77,106 and 4 threads 88,848.
+29,134 and 8 made 17,888, against about 41,000 for threads. On branches of their own 4 processes
+made 82,583 and 4 threads 92,915.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`. A process killed in the middle of a commit holds up the others only until the
 operating system releases its locks, and nothing it acknowledged is lost. It needs open file
-description locks, so it runs on Linux and Windows, and the processes must share one machine and a
-local file system. On other Unix systems the open fails with an `Unsupported` I/O error.
+description locks, so it runs on 64-bit Linux only, and the processes must share one machine and a
+local file system. Elsewhere, Windows included, the open fails with an `Unsupported` I/O error.
 
 A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
 new writer can open once the last `Db` handle is gone. How it works is in [Writers in several

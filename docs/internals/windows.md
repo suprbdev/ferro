@@ -23,11 +23,11 @@ because Windows documents that it releases the locks of a process that dies afte
 "depends upon available system resources", so a writer that opens right after another was killed can
 get `Error::Locked`.
 
-Writers that open with `Options::shared` take that byte shared, and lock other single bytes past it,
-and on Linux the same offsets with open file description locks, as described under [Writers in
-several processes](processes.md#the-locks). Where a shared writer has to wait, for another process's
-frame or branch, it calls `LockFileEx` without `LOCKFILE_FAIL_IMMEDIATELY`, which on a handle
-opened without `FILE_FLAG_OVERLAPPED` returns once the lock is granted.
+`Options::shared` fails with `Unsupported` on Windows. Writers in several processes wait for each
+other's locks, and a `LockFileEx` that waits on a handle opened without `FILE_FLAG_OVERLAPPED`
+holds up every other I/O call on that file object until it returns, so it would stall readers and
+could deadlock two processes. That and the rest of the option have never run on Windows, as
+described under [Limits](processes.md#limits).
 
 The identity that `open_locked` checks after locking, and that `refresh` compares to notice a cycle,
 is the 64-bit file index from `GetFileInformationByHandle`, read through a handle opened with no
@@ -123,7 +123,7 @@ copied.
 CI runs the library's tests on `windows-latest`. Tests that interpose libc symbols through `dlsym`
 (`fdatasync`, `fsync`, `pread64`, `pwrite64`, `rename`, `clock_gettime`), run a child under `sh`
 with `ulimit -f`, kill or abort a child process, or make symlinks or check mode bits are
-`#[cfg(unix)]`, and `reentry_sync.rs` runs on Linux only. The shared-writer tests that only spawn
-processes, or open one file twice in one process, run on both. The traced crash simulations replay
+`#[cfg(unix)]`, and `reentry_sync.rs` runs on Linux only, as do `shared.rs` and `shared_process.rs`,
+since `Options::shared` is refused elsewhere. The traced crash simulations replay
 ferro's own writes and run on both. So on Windows failed syncs, failed renames and process death go
 unexercised, and as on Unix, power loss was never tested on hardware.

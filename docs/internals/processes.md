@@ -14,7 +14,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 
 | Lock | Held | For |
 | --- | --- | --- |
-| The writer lock, a `flock` on Unix and the byte at 2^62 on Windows | Shared, for the writer's life | Keeping out writers without the option |
+| The writer lock, a `flock` | Shared, for the writer's life | Keeping out writers without the option |
 | 2^62 + 1 | Shared, for the writer's life | Telling a read-only open that a writer is alive |
 | 2^62 + 2, placement | Exclusive, per frame | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
@@ -24,25 +24,47 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 A cycle's prune and pause, the landing of a `receive` and anything else that replaces every
 branch's head lock the whole range of branch bytes at once, as they take every lane within a
 process. Locks are taken in the order lane, branch lock, `tip`, placement lock, and the leader of a
-sync takes the superblock lock holding none of them. The cycle lock comes before all of them. A
-process that locks the whole range first lets go of the branch bytes it holds itself, since on
-Windows its own locks conflict with a range over them, and on Linux it unlocks the range around any
-byte another of its threads took meanwhile, since unlocking a range there unlocks every byte in it.
+sync takes the superblock lock holding none of them. The cycle lock comes before all of them.
 
-On Linux the byte-range locks are open file description locks, `fcntl` with `F_OFD_SETLK` and
-`F_OFD_SETLKW`. Classic POSIX record locks would not do: they belong to the process, so threads of
-one process never conflict on them, and closing any descriptor of the file drops all of them, which
-a read-only handle or a retired generation does. An open file description lock belongs to the open
-file, so two shared `Db`s of one file in one process exclude each other as two processes do, and the
-tests use that. macOS and the BSDs have no such locks, and an open with the option fails there with
-an `Unsupported` I/O error. On Windows they are `LockFileEx` ranges, as the writer lock already was,
-taken without `LOCKFILE_FAIL_IMMEDIATELY` where a writer waits. Both kinds are released by the
-kernel when a process dies, which is what lets the others go on.
+The byte-range locks are open file description locks, `fcntl` with `F_OFD_SETLK` and
+`F_OFD_SETLKW`, which only Linux has, on 64-bit targets where `off_t` holds the offsets. Classic
+POSIX record locks would not do: they belong to the process, so threads of one process never
+conflict on them, and closing any descriptor of the file drops all of them, which a read-only handle
+or a retired generation does. An open file description lock belongs to the open file, so two shared
+`Db`s of one file in one process exclude each other as two processes do, and the tests use that.
+The kernel releases them when a process dies, which is what lets the others go on. On every other
+target, Windows included, an open with the option fails with an `Unsupported` I/O error, as
+described under [Limits](#limits).
 
-Two branch names can hash to one byte. That costs only parallelism, since a process counts how many
-of its lanes hold each byte and unlocks it when the last one lets go, except that with nested writes
-across branches two such names could deadlock two processes. With 60 bits, a thousand branch names
-share a byte with odds of about 4 in 10^13.
+### One owner per lock in a process
+
+Every thread of a process locks through the same open file description, and a lock it already holds
+is granted again at once, as a no-op, and released by whichever thread unlocks it first. So each
+lock has an owner within the process as well. The placement, superblock and cycle locks are taken
+through a table of the ranges a thread of this process holds: a thread waits on a condition
+variable until no other thread holds the range, takes it from the kernel, and on release unlocks it
+in the kernel before it frees the entry. The first version had none. `Tip`, the guard that holds
+`tip` and the placement lock, released `tip` first, so a second thread took `tip` and was granted
+the placement lock as a no-op, and the first thread's release then unlocked it while the second was
+placing. Another process placed a frame at the same offset, which ended in `StalePointer`, hash
+mismatches and a file that no longer opened.
+`threads_of_two_handles_on_branches_of_their_own_place_in_turn` runs four threads on branches of
+their own in each of two handles of one file and failed on its first round. The guard now drops the
+placement lock first as well, and the receive's hold on the cycle lock likewise, but neither order
+matters any more.
+
+Branch bytes are shared within a process on purpose: two branch names can hash to one byte, and a
+process counts how many of its lanes hold each byte and unlocks it when the last one lets go. That
+costs only parallelism, except that with nested writes across branches two such names could
+deadlock two processes. With 60 bits, a thousand branch names share a byte with odds of about 4 in
+10^13. Taking the whole range is exclusive with them: a thread that wants it marks it wanted, so no
+thread of the process takes a branch byte, and waits until none holds one before it locks the
+range. A thread that holds a byte for a branch attached after the cycle listed its lanes could be
+waiting for one of those lanes, so the wait gives up when the set of attached branches changes and
+the cycle lists them again. In the first version an awaited write's waiting thread was granted a
+branch byte as a no-op inside its own process's cycle, then unlocked it, and another process's
+closure ran during the pause and failed with `the file was replaced while a closure held its
+branch`. `an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause` reproduces it.
 
 ## A commit
 
@@ -61,8 +83,11 @@ share a byte with odds of about 4 in 10^13.
 A closure never runs against a head another process has since moved, so it never runs again. The
 other way round, optimistic closures checked at placement and run again on a conflict, would need
 them to be `FnMut`, and `update` and every other write take an `FnOnce`, which is what lets a
-closure move its captures into the root. A closure whose branch another process dropped while it
-ran gets `Error::NoBranch`, as it does when the drop is in its own process.
+closure move its captures into the root. `drop_branch` takes the dropped branch's lock too, so a
+drop waits for a closure another process is running on that branch, and a closure that starts after
+it gets `Error::NoBranch`, as it does when the drop is in its own process. Without that lock a drop
+and a fork of the same name in another process, while a closure ran, left the closure's commit
+failing with `Corrupt` (`a_drop_and_fork_in_another_handle_wait_for_a_closure_on_that_branch`).
 
 ## Catching up
 
@@ -86,6 +111,22 @@ Catching up happens when a process takes a branch lock, before it places a frame
 branch it has not seen, before each pass of a cycle and on `refresh`. A process that does none of
 these sees nothing new, as a read-only handle that never refreshes sees nothing new.
 
+Catching up only rebuilds branches that are attached. A branch attached later takes its state from
+the published refs, so attaching first catches up and syncs what is queued, and then attaches only
+if the newest head for that name is the published one, and otherwise goes round again. The first
+version attached from the published refs alone, so a branch whose newer head another process had
+written, and this one had caught up with but not yet synced, attached with the older state and
+never moved: every commit on it failed with `another process moved branch`.
+`a_branch_attached_while_a_followed_frame_waits_for_its_sync_reads_the_newest_head` holds a commit
+on `main` between catching up and syncing while it attaches the branch.
+
+The marker a cycle leaves, described under [Reclamation](#reclamation), is checked against the path,
+which a store now keeps canonical. The first version kept the path it was opened by, so a handle
+opened by a relative path, after the working directory changed, could not find the file, read the
+marker as a cycle that failed, and went on committing to the retired file: an acknowledged commit
+was lost (`a_handle_opened_by_a_relative_path_follows_a_cycle_after_the_directory_changes`). It also
+treated any error checking the path as no change, and now fails the commit instead.
+
 ## Superblocks and group commit
 
 Within a process one leader syncs every frame queued behind it. Across processes each leader used
@@ -103,10 +144,9 @@ Under `Durability::Buffered` nothing is synced and the lock only orders superblo
 process checkpoints for itself, and a superblock carries the anchor of the process that wrote it,
 which is never past what an fdatasync covered.
 
-A sync that fails in one process is reported to the others on Linux, which reports a writeback error
+A sync that fails in one process is reported to the others, since Linux reports a writeback error
 once to every open file of the inode at its next fsync, so a process whose frame followed the failed
-one fails its own sync rather than acknowledging over a hole. Windows documents no such thing for
-`FlushFileBuffers`.
+one fails its own sync rather than acknowledging over a hole.
 
 ## Opening and closing
 
@@ -123,7 +163,8 @@ longer than `size_on_disk` while no shared writer has it open.
 
 A read-only open that can take the writer lock shared tests the lock that shared writers hold for
 their lives, and treats a held one as a live writer, trusting the superblock instead of scanning and
-syncing. Read-only handles otherwise behave as before.
+syncing. If the test itself fails, it scans, as it would with no writer alive, since scanning beside
+a live writer only costs time. Read-only handles otherwise behave as before.
 
 ## Reclamation
 
@@ -152,9 +193,13 @@ it was.
 - With `coalesce`, a group holds its branch's lock from its first closure until it is sealed, so
   another process's closures on that branch wait until the group is written. Groups are per process:
   closures in two processes never share a version.
-- An awaited write takes its branch's lock without waiting. If another process holds it, the future
-  returns `Pending` and a thread waits for the lock, lets it go and wakes the future, so no executor
-  thread waits on another process's closure.
+- An awaited write takes its branch's lock without waiting. If another process holds it, the
+  future returns `Pending` and a thread waits for the lock, lets it go and wakes every future
+  waiting on that branch, so no executor thread waits on another process's closure. There is one
+  such thread per branch at a time. The first version started one for every future: 32 futures
+  queued behind another process's closure took the process from 3 threads to 36, and now take it
+  to 5, the waiting thread and the sync thread
+  (`awaited_writes_waiting_on_another_process_share_one_waiting_thread`).
 - `receive` places a large bundle's pieces under the cycle lock and lands it under every branch
   lock, so its checks run against the newest heads of every process.
 
@@ -183,13 +228,19 @@ and that the file verifies:
 - One process runs a cycle every 25 commits beside three writers and a read-only follower that must
   see every commit, and in another test aborts at each stage of its second cycle while two writers
   go on.
+- A child opens the file by a relative path beside a second handle, changes directory, and commits
+  after the other handle's cycle, and that commit must survive a reopen.
+- A child counts its threads while 32 awaited writes wait for another handle's closure.
 
 `ferro/tests/shared.rs` opens one file twice in one process, which locks as two processes do, for
 what is easier to arrange there: forks and drops seen by the other handle, watchers fired by a
 commit and by `refresh`, coalesced and awaited writes, an awaited write held up by the other
-handle's closure, a pull landing beside the other handle's commits, and background cycles in three
-handles at once. The tests that only spawn processes or open a file twice run on Windows too, and
-those that kill or abort a process on Unix only, as elsewhere.
+handle's closure, a pull landing beside the other handle's commits, background cycles in three
+handles at once, four threads on branches of their own in each of two handles, an awaited write
+waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
+and a drop and fork that must wait for a closure. Each test added for a finding of the review
+failed before its fix, as described above. Both files build on 64-bit Linux only, and
+`ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
 
@@ -226,37 +277,40 @@ the NVMe drive of the 32-core machine, shared with other work, commits a second:
 
 | Durability | Branches | Closure | Writers | Processes | Threads of one process |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Fsync | one | none | 1 | 2,418 | 2,381 |
-| Fsync | one | none | 2 | 2,669 | 2,741 |
-| Fsync | one | none | 4 | 5,359 | 5,268 |
-| Fsync | one | none | 8 | 9,963 | 10,292 |
-| Fsync | own | none | 2 | 2,618 | 2,628 |
-| Fsync | own | none | 4 | 5,165 | 5,053 |
-| Fsync | own | none | 8 | 9,752 | 10,455 |
-| Buffered | one | none | 1 | 41,383 | 39,719 |
-| Buffered | one | none | 2 | 29,231 | 39,639 |
-| Buffered | one | none | 4 | 23,386 | 34,154 |
-| Buffered | one | none | 8 | 19,805 | 38,232 |
-| Buffered | own | none | 2 | 63,780 | 58,643 |
-| Buffered | own | none | 4 | 77,106 | 88,848 |
-| Buffered | own | none | 8 | 50,086 | 103,432 |
-| Buffered | own | 50 µs | 2 | 24,769 | 26,941 |
-| Buffered | own | 50 µs | 4 | 46,423 | 45,892 |
-| Buffered | own | 50 µs | 8 | 51,352 | 70,118 |
+| Fsync | one | none | 1 | 2,382 | 2,536 |
+| Fsync | one | none | 2 | 2,690 | 2,575 |
+| Fsync | one | none | 4 | 5,347 | 5,288 |
+| Fsync | one | none | 8 | 9,727 | 10,406 |
+| Fsync | own | none | 2 | 2,770 | 2,705 |
+| Fsync | own | none | 4 | 4,921 | 5,278 |
+| Fsync | own | none | 8 | 9,827 | 10,284 |
+| Buffered | one | none | 1 | 38,280 | 43,684 |
+| Buffered | one | none | 2 | 29,134 | 40,614 |
+| Buffered | one | none | 4 | 24,895 | 42,027 |
+| Buffered | one | none | 8 | 17,888 | 41,249 |
+| Buffered | own | none | 2 | 57,459 | 62,842 |
+| Buffered | own | none | 4 | 82,583 | 92,915 |
+| Buffered | own | none | 8 | 54,202 | 107,160 |
+| Buffered | own | 50 µs | 2 | 23,996 | 25,806 |
+| Buffered | own | 50 µs | 4 | 45,038 | 48,941 |
+| Buffered | own | 50 µs | 8 | 55,232 | 69,399 |
 
-p99 under Fsync was 1.6 ms at 8 processes against 1.0 ms for 8 threads, and p50 within 3%.
+These ran with the fixes described under [One owner per lock in a
+process](#one-owner-per-lock-in-a-process) and after it, and came within the spread of three rounds
+run before them. p99 under Fsync was 1.5 ms at 8 processes on one branch against 1.0 ms for 8
+threads, and p50 813 against 765 µs.
 
 Under Fsync the disk is the limit, one fdatasync a round, and processes keep up with threads. Under
 Buffered, writers on one branch take turns, and each turn in a process other than the last one's
 starts cold: it reads the frame and steps the last writer placed, loads the branch's new root and
 entry, and reads back the nodes of its path that the other process rewrote, where a thread finds
-all of them in the cache the last writer filled. So two processes commit 0.74 times as fast as two
-threads on one branch, and eight 0.52 times. On branches of their own the closures overlap, but
+all of them in the cache the last writer filled. So two processes commit 0.72 times as fast as two
+threads on one branch, and eight 0.43 times. On branches of their own the closures overlap, but
 every placement reads, under the placement lock, every frame placed since this process last looked,
 and the steps they wrote, and rebuilds the state of every branch it has attached that moved, here
 `main` of the first process. That work grows with the processes, and at eight it is the limit,
-about half of what eight threads make. With 50 µs of work in each closure four processes keep up
-with four threads.
+about half of what eight threads make. With 50 µs of work in each closure four processes come within
+8% of four threads.
 
 ## Measured and left out
 
@@ -329,3 +383,11 @@ with four threads.
 - Two shared `Db`s of one file in one process behave as two processes. A closure that writes through
   the other one to the same branch waits for itself, and `Error::Reentrant` cannot see it.
 - An open of a Buffered file with live writers scans up to `checkpoint_bytes`.
+- Only 64-bit Linux. Windows has byte-range locks, `LockFileEx`, but a blocking one on a handle
+  opened without `FILE_FLAG_OVERLAPPED`, as `std` opens every file, holds up every other I/O call on
+  that file object while it waits, so a writer waiting for another process's branch would stall this
+  process's readers, and two processes could deadlock on each other's reads. Doing it right means
+  a second handle for the locks, or overlapped waits, and none of it can be run here: CI only checks
+  that the Windows build compiles, so the option fails with `Unsupported` there until a Windows run
+  tests it. macOS and the BSDs have no open file description locks, and 32-bit Linux has an `off_t`
+  too narrow for the offsets.

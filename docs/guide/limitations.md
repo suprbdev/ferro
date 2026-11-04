@@ -23,9 +23,10 @@ This is an experiment, not a production database.
   closure that waits for another thread's commit in a way ferro cannot see can still deadlock, as
   described under [Writing from inside a closure](concurrency.md#writing-from-inside-a-closure).
 - Several processes can write one file only if each opens it with `Options::shared`, which needs
-  Linux or Windows and one machine. A process sees the others' commits only when it commits or
-  refreshes, and on one branch processes commit more slowly than threads, since each reads back
-  what the others wrote, as described under [Several processes](concurrency.md#several-processes).
+  64-bit Linux and one machine. It was never run on Windows, where it is refused until it can be
+  tested. A process sees the others' commits only when it commits or refreshes, and on one branch
+  processes commit more slowly than threads, since each reads back what the others wrote, as
+  described under [Several processes](concurrency.md#several-processes).
 - A held `Snapshot` or `Map` keeps its file open, and the disk space of a file a cycle replaced
   comes back only when the last such handle is dropped, as described under [Several
   processes](concurrency.md#several-processes) and [Limits](retention.md#limits).
