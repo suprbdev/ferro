@@ -95,6 +95,10 @@ is `Fn` because it can run twice per item. The run at the tip has no commit to p
 that is absent at the tip costs the age of that absence; find where it ended with `bisect` and start
 `history_of_range` there.
 
+`History::while_some` is this `take_while` with the predicate `Option::is_some` on the value, for a
+projection that returns an `Option`. Its items drop the `Option`, which the predicate has already
+ruled out, so it stops where the `take_while` form stops and walks the same commits.
+
 ## The cost of a step
 
 A step loads one `Entry`, loads and decodes the root `T`, and runs the projection. Measured on a

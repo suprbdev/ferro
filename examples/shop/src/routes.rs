@@ -375,13 +375,13 @@ async fn order_history(
     }
     let mut versions: Vec<Value> = blocking(move || {
         db.history_of_range(..=horizon, |shop| shop.orders.get(&id))
-            .take_while(|(_, order)| order.is_some())
+            .while_some()
             .map(|(commit, order)| {
                 json!({
                     "version": commit.version,
                     "time_ms": commit.time_ms,
                     "message": commit.message,
-                    "order": order.as_deref(),
+                    "order": &*order,
                 })
             })
             .collect()

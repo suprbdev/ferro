@@ -15,11 +15,9 @@ pub fn audit(db: &Db<Hotels>, id: u64) -> Result<Vec<Event>> {
     let mut events = Vec::new();
     let mut history = db
         .history_of(|h| h.bookings.get(&id).map(Val::into_owned))
-        .take_while(|(_, row)| row.is_some());
-    while let Some((commit, row)) = history.try_next()? {
-        if let Some(booking) = row {
-            events.push(event(commit, booking));
-        }
+        .while_some();
+    while let Some((commit, booking)) = history.try_next()? {
+        events.push(event(commit, booking));
     }
     if events.is_empty() {
         return Err(BookingError::NoBooking(id));
@@ -64,16 +62,14 @@ pub fn price_history(db: &Db<Hotels>, room: u32) -> Result<Vec<PricePoint>> {
         })
     };
     let mut points = Vec::new();
-    let mut history = db.history_of(project).take_while(|(_, row)| row.is_some());
-    while let Some((commit, row)) = history.try_next()? {
-        if let Some((rate, overrides)) = row {
-            points.push(PricePoint {
-                version: commit.version,
-                time_ms: commit.time_ms,
-                rate,
-                overrides,
-            });
-        }
+    let mut history = db.history_of(project).while_some();
+    while let Some((commit, (rate, overrides))) = history.try_next()? {
+        points.push(PricePoint {
+            version: commit.version,
+            time_ms: commit.time_ms,
+            rate,
+            overrides,
+        });
     }
     if points.is_empty() {
         return Err(BookingError::NoRoom(room));

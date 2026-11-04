@@ -308,7 +308,7 @@ fn history_experiment() {
             let at = Instant::now();
             let count = db
                 .history_of(|shop| shop.orders.get(&id))
-                .take_while(|(_, order)| order.is_some())
+                .while_some()
                 .count();
             (count, at.elapsed().as_secs_f64() * 1e3)
         };

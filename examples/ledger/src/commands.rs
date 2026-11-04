@@ -518,23 +518,21 @@ fn audit_trail(w: &mut dyn Write, db: &Db<Ledger>, name: &str, limit: usize) -> 
     writeln!(w, "commits that changed {name}")?;
     let mut changes: Vec<_> = db
         .history_of(|l| l.accounts.get(&id).map(|row| (row.balance, row.closed)))
-        .take_while(|(_, state)| state.is_some())
+        .while_some()
         .collect();
     changes.reverse();
     let skip = changes.len().saturating_sub(limit);
-    for (commit, state) in changes.iter().skip(skip) {
-        if let Some((balance, closed)) = state {
-            writeln!(
-                w,
-                "  v{} {} {:>16} {}{} {}",
-                commit.version,
-                format_ms(commit.time_ms),
-                format_amount(natural(&account, i128::from(*balance)), cur),
-                cur,
-                if *closed { " closed" } else { "" },
-                commit.message
-            )?;
-        }
+    for (commit, (balance, closed)) in changes.iter().skip(skip) {
+        writeln!(
+            w,
+            "  v{} {} {:>16} {}{} {}",
+            commit.version,
+            format_ms(commit.time_ms),
+            format_amount(natural(&account, i128::from(*balance)), cur),
+            cur,
+            if *closed { " closed" } else { "" },
+            commit.message
+        )?;
     }
     if skip > 0 {
         writeln!(w, "  ... {skip} earlier commits not shown")?;

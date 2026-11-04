@@ -90,8 +90,37 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
     }
 }
 
+impl<T: Data, X: PartialEq, F: Fn(&T) -> Option<X>> History<T, Option<X>, F> {
+    pub fn while_some(self) -> WhileSome<T, X, F> {
+        WhileSome(self.take_while(present))
+    }
+}
+
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V> Iterator for History<T, V, F> {
     type Item = (Commit, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        fatal(self.try_next())
+    }
+}
+
+type Present<X> = fn(&(Commit, Option<X>)) -> bool;
+
+fn present<X>(item: &(Commit, Option<X>)) -> bool {
+    item.1.is_some()
+}
+
+pub struct WhileSome<T, X, F>(TakeWhile<T, Option<X>, F, Present<X>>);
+
+impl<T: Data, X: PartialEq, F: Fn(&T) -> Option<X>> WhileSome<T, X, F> {
+    pub fn try_next(&mut self) -> Result<Option<(Commit, X)>> {
+        let next = self.0.try_next()?;
+        Ok(next.and_then(|(commit, value)| value.map(|value| (commit, value))))
+    }
+}
+
+impl<T: Data, X: PartialEq, F: Fn(&T) -> Option<X>> Iterator for WhileSome<T, X, F> {
+    type Item = (Commit, X);
 
     fn next(&mut self) -> Option<Self::Item> {
         fatal(self.try_next())

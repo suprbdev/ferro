@@ -319,12 +319,11 @@ fn history(w: &mut dyn Write, db: &Db<Wiki>, slug: &str) -> Res<()> {
     drop(head);
     let mut changes: Vec<_> = db
         .history_of(|wiki| (wiki.next_id >= id).then(|| wiki.pages.get(&id)))
-        .take_while(|(_, page)| page.is_some())
+        .while_some()
         .collect();
     changes.reverse();
     let mut previous: Option<Val<Page>> = None;
     for (commit, page) in changes {
-        let page = page.flatten();
         let summary = match (&previous, &page) {
             (_, None) => "deleted".to_string(),
             (None, Some(new)) => format!("created, {} bytes", chunk::bytes(&new.body)),

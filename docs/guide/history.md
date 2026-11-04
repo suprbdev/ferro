@@ -18,7 +18,7 @@ for change in old.orders.diff(&db.read().orders) {
 
 let life: Vec<_> = db
     .history_of(|shop| shop.orders.get(&order_id))
-    .take_while(|(_, row)| row.is_some())
+    .while_some()
     .collect();
 
 db.restore(&old)?;
@@ -40,10 +40,14 @@ can fall before, on or after its commit's time.
 
 `history_of` walks the log newest first and yields `(commit, value)` for each commit that changed
 the projection, including a change back to an earlier value. It reads nothing until you ask and
-stops when you stop, so `take`, `find` and the `take_while` above cost the commits actually walked:
-for that `take_while`, the age of the row, not the length of the log. To show changes oldest first,
-collect and reverse. `log().iter()` runs in version order like any collection, and `.rev()` walks
-newest first the same lazy way.
+stops when you stop, so `take`, `find` and the `while_some` above cost the commits actually walked:
+for that `while_some`, the age of the row, not the length of the log. `while_some` is for a
+projection that returns an `Option`, such as a row by key. It yields each value without its
+`Option` and stops at the version before the row existed, where
+`take_while(|(_, row)| row.is_some())` would, so it does not walk past the row's creation into the
+rest of the log. Its `try_next` returns a read error where the iterator would panic. To show
+changes oldest first, collect and reverse. `log().iter()` runs in version order like any
+collection, and `.rev()` walks newest first the same lazy way.
 
 Three forms take a range of versions, for when you know where to look or can find out:
 

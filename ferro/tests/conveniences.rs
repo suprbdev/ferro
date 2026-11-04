@@ -189,6 +189,63 @@ fn table_keys_lists_the_keys_in_order() {
     assert_eq!(Table::<Seat>::new().keys().next(), None);
 }
 
+#[test]
+fn while_some_yields_a_row_back_to_its_creation_without_the_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast().open::<Hall>(dir.path().join("h.ferro")).unwrap();
+    let steps: [(&str, fn(&mut Hall)); 6] = [
+        ("add", |hall| {
+            hall.seats.insert(seat(1));
+        }),
+        ("move", |hall| {
+            hall.seats.update(&1, |seat| seat.row = 2);
+        }),
+        ("price", |hall| {
+            hall.prices.insert(1, 5);
+        }),
+        ("remove", |hall| {
+            hall.seats.remove(&1);
+        }),
+        ("add again", |hall| {
+            hall.seats.insert(seat(1));
+        }),
+        ("sell", |hall| {
+            hall.seats.update(&1, |seat| seat.sold = true);
+        }),
+    ];
+    for (message, step) in steps {
+        db.commit(message, step).unwrap();
+    }
+    let project = |hall: &Hall| hall.seats.get(&1).map(Val::into_owned);
+    let life: Vec<(u64, bool)> = db
+        .history_of(project)
+        .while_some()
+        .map(|(commit, seat)| (commit.version, seat.sold))
+        .collect();
+    assert_eq!(life, vec![(6, true), (5, false)]);
+    let taken: Vec<u64> = db
+        .history_of(project)
+        .take_while(|(_, seat)| seat.is_some())
+        .map(|(commit, _)| commit.version)
+        .collect();
+    assert_eq!(taken, vec![6, 5]);
+    let mut first = db.history_of_range(..=3, project).while_some();
+    assert_eq!(
+        first.try_next().unwrap().map(|(commit, _)| commit.version),
+        Some(2)
+    );
+    assert_eq!(
+        first
+            .try_next()
+            .unwrap()
+            .map(|(commit, seat)| (commit.version, seat.row)),
+        Some((1, 1))
+    );
+    assert!(first.try_next().unwrap().is_none());
+    let gone = db.history_of(|hall: &Hall| hall.seats.get(&7)).while_some();
+    assert_eq!(gone.count(), 0);
+}
+
 fn sides() -> (Hall, Hall, Hall) {
     let base = hall();
     let mut ours = base.clone();
