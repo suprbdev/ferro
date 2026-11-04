@@ -1,10 +1,12 @@
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ferro::admin::{self, Layout};
+use ferro::codec::{Decoder, Encoder};
 use ferro::{Compacted, Data, Db, Durability, Keep, Options, Reclaim, Record, Table};
 use ledger::Ledger;
 use ledger::ops::NewEntry;
@@ -637,6 +639,49 @@ fn live(args: &[String]) {
     let _ = std::fs::remove_file(path);
 }
 
+#[derive(Clone, Default)]
+struct Opaque;
+
+impl Data for Opaque {
+    fn encode(&self, _w: &mut Encoder<'_>) -> ferro::Result<()> {
+        Ok(())
+    }
+
+    fn decode(_r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Opaque)
+    }
+}
+
+fn copy(path: &Path, rounds: u64, threads: &[usize]) {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".copy");
+    let work = PathBuf::from(name);
+    let bytes = fs::metadata(path).unwrap().len();
+    for _ in 0..rounds {
+        for &count in threads {
+            fs::copy(path, &work).unwrap();
+            File::open(&work).unwrap().sync_all().unwrap();
+            let db: Db<Opaque> = Options::new()
+                .reclaim(Reclaim { every_bytes: 0 })
+                .copy_threads(count)
+                .open(&work)
+                .unwrap();
+            let began = Instant::now();
+            let done = db.compact(Keep::All).unwrap();
+            let secs = began.elapsed().as_secs_f64();
+            println!(
+                "copy threads={count} secs={secs:.3} mb_per_s={:.0} objects={} after={:.1}MiB pause={:.2}ms",
+                bytes as f64 / secs / 1e6,
+                done.objects,
+                mib(done.after_bytes),
+                done.pause.as_secs_f64() * 1e3
+            );
+            drop(db);
+            let _ = fs::remove_file(&work);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args[1] == "live" {
@@ -655,6 +700,10 @@ fn main() {
         "ledger" => build_ledger(path, number(3, 200_000)),
         "wiki" => build_wiki(path, number(3, 100), number(4, 20_000)),
         "table" => build_table(path, number(3, 200_000), number(4, 200_000)),
+        "copy" => {
+            let threads: Vec<usize> = args[4..].iter().map(|text| text.parse().unwrap()).collect();
+            copy(path, number(3, 3), &threads);
+        }
         "layout" => {
             for keep in args[3..].iter().map(|text| text.parse::<usize>().unwrap()) {
                 println!("--- keep last {keep}");
