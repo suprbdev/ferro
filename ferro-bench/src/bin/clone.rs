@@ -49,6 +49,47 @@ unsafe impl GlobalAlloc for Counted {
 #[global_allocator]
 static ALLOCATOR: Counted = Counted;
 
+#[cfg(target_os = "linux")]
+struct Counter(Option<i32>);
+
+#[cfg(not(target_os = "linux"))]
+struct Counter;
+
+#[cfg(not(target_os = "linux"))]
+impl Counter {
+    fn instructions() -> Counter {
+        Counter
+    }
+
+    fn read(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Counter {
+    fn instructions() -> Counter {
+        let mut attr = [0u64; 16];
+        attr[0] = 128 << 32;
+        attr[1] = 1;
+        attr[5] = 1 << 5 | 1 << 6;
+        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
+        if fd < 0 {
+            return Counter(None);
+        }
+        Counter(Some(fd as i32))
+    }
+
+    fn read(&self) -> u64 {
+        let Some(fd) = self.0 else {
+            return 0;
+        };
+        let mut value = 0u64;
+        unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+        value
+    }
+}
+
 fn heap_mib() -> f64 {
     HIGH.load(Ordering::Relaxed) as f64 / (1 << 20) as f64
 }
@@ -184,6 +225,55 @@ fn send(dir: &Path) {
     );
 }
 
+fn edit(dir: &Path, args: &[String]) {
+    let edits = arg(args, "--edits", 100_000);
+    let value = arg(args, "--value", 320) as usize;
+    let path = fresh(dir, "edit-source.ferro");
+    fs::copy(dir.join("source.ferro"), &path).unwrap();
+    let source: Db<Root> = options().open(&path).unwrap();
+    let keys = source.read().len() as u64;
+    let mut rng = Rng(11);
+    let values: Vec<(u64, String)> = (0..edits)
+        .map(|_| (rng.next() % keys, rng.text(value)))
+        .collect();
+    source
+        .commit("edit", |root| {
+            for (key, text) in values {
+                root.insert(key, text);
+            }
+        })
+        .unwrap();
+    println!("edited {edits} keys of {value} bytes");
+}
+
+fn send_edit(dir: &Path) {
+    let source: Db<Root> = options().open(dir.join("edit-source.ferro")).unwrap();
+    let clone: Db<Root> = options().open(dir.join("clone.ferro")).unwrap();
+    let have: Have = clone.have().unwrap();
+    drop(clone);
+    let started = Instant::now();
+    let bytes = write_bundle(&source, &have, &dir.join("edit-bundle.bin"));
+    println!(
+        "edit bundle: {bytes} bytes, {:.3} s, peak RSS {:.1} MiB, peak heap {:.1} MiB",
+        started.elapsed().as_secs_f64(),
+        peak_rss_mib(),
+        heap_mib()
+    );
+}
+
+fn receive_edit(dir: &Path) {
+    let path = fresh(dir, "edit-clone.ferro");
+    fs::copy(dir.join("clone.ferro"), &path).unwrap();
+    let clone: Db<Root> = options().open(&path).unwrap();
+    let started = Instant::now();
+    let pulled = read_bundle(&clone, &dir.join("edit-bundle.bin"));
+    report(
+        "receive an edit into the clone",
+        &pulled,
+        started.elapsed().as_secs_f64(),
+    );
+}
+
 fn receive(dir: &Path) {
     let clone: Db<Root> = options().open(fresh(dir, "received.ferro")).unwrap();
     let started = Instant::now();
@@ -253,6 +343,8 @@ fn incremental(dir: &Path, args: &[String]) {
     let mut rng = Rng(7);
     let keys = source.read().len() as u64;
     let mut times = Vec::new();
+    let mut counts = Vec::new();
+    let counter = Counter::instructions();
     let mut last = None;
     for _ in 0..rounds {
         for _ in 0..3 {
@@ -265,20 +357,24 @@ fn incremental(dir: &Path, args: &[String]) {
                 .unwrap();
         }
         let started = Instant::now();
+        let before = counter.read();
         let pulled = clone.pull(&source, "source", refuse).unwrap();
+        counts.push(counter.read() - before);
         times.push(started.elapsed().as_secs_f64() * 1000.0);
         last = Some(pulled);
     }
     times.sort_by(f64::total_cmp);
+    counts.sort_unstable();
     let pulled = last.unwrap();
     println!(
-        "incremental pull of 3 commits: {:?}, {} bytes in {} objects, median {:.2} ms, min {:.2} ms, max {:.2} ms, peak RSS {:.1} MiB",
+        "incremental pull of 3 commits: {:?}, {} bytes in {} objects, median {:.2} ms, min {:.2} ms, max {:.2} ms, median {} instructions, peak RSS {:.1} MiB",
         pulled.outcome,
         pulled.received_bytes,
         pulled.objects,
         times[times.len() / 2],
         times[0],
         times[times.len() - 1],
+        counts[counts.len() / 2],
         peak_rss_mib()
     );
     assert_eq!(clone.head_hash(), source.head_hash());
@@ -288,7 +384,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(command), Some(dir)) = (args.get(1), args.get(2)) else {
         eprintln!(
-            "usage: clone build|pull|send|receive|receive-busy|incremental <dir> [--keys N] [--value BYTES] [--commits N] [--rounds N]"
+            "usage: clone build|pull|send|receive|receive-busy|incremental|edit|send-edit|receive-edit <dir> [--keys N] [--value BYTES] [--commits N] [--rounds N] [--edits N]"
         );
         std::process::exit(2);
     };
@@ -300,6 +396,9 @@ fn main() {
         "receive" => receive(&dir),
         "receive-busy" => receive_busy(&dir),
         "incremental" => incremental(&dir, &args[3..]),
+        "edit" => edit(&dir, &args[3..]),
+        "send-edit" => send_edit(&dir),
+        "receive-edit" => receive_edit(&dir),
         other => panic!("unknown command {other}"),
     }
 }
