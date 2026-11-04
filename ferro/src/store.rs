@@ -21,6 +21,7 @@ use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
     Staged, push_varint,
 };
+use crate::dense::{Column, Hashes};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
@@ -2398,8 +2399,8 @@ pub(crate) struct Staging {
     file: Option<File>,
     start: u64,
     buf: Vec<u8>,
-    seen: Seen,
-    count: usize,
+    hashes: Hashes,
+    offsets: Column<u64>,
 }
 
 pub(crate) struct Record {
@@ -2503,35 +2504,45 @@ impl Staging {
             file: None,
             start: LOG_START,
             buf: Vec::new(),
-            seen: HashMap::default(),
-            count: 0,
+            hashes: Hashes::new(),
+            offsets: Column::new(),
         }
     }
 
-    pub(crate) fn put(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+    pub(crate) fn put(&mut self, hash: Hash, staged: Staged<'_>) -> Result<u32> {
         let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
         let most = HASH_BYTES + staged.payload.len() + 3 * MAX_VARINT + links;
         if !self.buf.is_empty() && self.buf.len() + most > self.limit {
             self.spill()?;
         }
+        let id = self.hashes.insert(hash).ok_or_else(|| {
+            Error::Bundle("it carries more objects than one receive can hold".into())
+        })?;
         self.buf.extend_from_slice(&hash);
         let offset = self.start + self.buf.len() as u64;
         append_staged(&mut self.buf, offset, staged);
-        self.seen.insert(hash, offset);
-        self.count += 1;
-        Ok(Ptr { hash, offset })
+        self.offsets.push(offset);
+        Ok(id)
+    }
+
+    pub(crate) fn id_of(&self, hash: &Hash) -> Option<u32> {
+        self.hashes.find(hash)
+    }
+
+    pub(crate) fn offset(&self, id: u32) -> u64 {
+        self.offsets.get(id)
     }
 
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
-        self.seen.get(hash).copied()
+        self.id_of(hash).map(|id| self.offset(id))
+    }
+
+    pub(crate) fn hashes(&self) -> &Hashes {
+        &self.hashes
     }
 
     pub(crate) fn spilled(&self) -> bool {
         self.file.is_some()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.count
     }
 
     pub(crate) fn spill(&mut self) -> Result<()> {
@@ -2559,7 +2570,7 @@ impl Staging {
     }
 
     pub(crate) fn seal(&mut self) -> Result<()> {
-        self.seen = HashMap::default();
+        self.offsets = Column::new();
         if self.spilled() {
             self.spill()?;
             self.buf = Vec::new();
