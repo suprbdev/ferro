@@ -2266,7 +2266,8 @@ impl<T: Data> Db<T> {
             file_bytes
         } else {
             let grown = file_bytes.saturating_sub(basis.bytes) as f64;
-            basis.bytes + (grown * basis.survival()) as u64
+            let survived = (grown * basis.survival()) as u64;
+            basis.bytes.saturating_add(survived).min(file_bytes)
         };
         let retired = self.shared.retired.lock();
         let retired_bytes = retired.iter().filter_map(Retired::bytes).sum();

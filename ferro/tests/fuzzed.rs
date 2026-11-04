@@ -845,6 +845,59 @@ fn a_commit_after_the_last_sequence_number_is_corrupt() {
 }
 
 #[test]
+fn space_estimates_no_more_live_bytes_than_the_file_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("basis.ferro");
+    let db = Db::<Root>::open(&path).unwrap();
+    db.commit("one", |root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    drop(db);
+    let honest = fs::read(&path).unwrap();
+    let slot = newest_slot(&honest);
+    for basis in [LOG_START, u64::MAX] {
+        let mut bytes = honest.clone();
+        reseal(&mut bytes, slot, |sb| {
+            sb[ANCHOR - 16..ANCHOR - 8].copy_from_slice(&basis.to_le_bytes());
+            sb[ANCHOR - 8..ANCHOR].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        fs::write(&path, &bytes).unwrap();
+        let space = read_only().open::<Root>(&path).unwrap().space().unwrap();
+        assert!(space.live_bytes <= space.file_bytes, "{space:?}");
+    }
+}
+
+#[test]
+fn refresh_refuses_a_superblock_whose_log_ends_past_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("follow.ferro");
+    let db = Db::<Root>::open(&path).unwrap();
+    db.commit("one", |root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    drop(db);
+    let mut bytes = fs::read(&path).unwrap();
+    let slot = newest_slot(&bytes);
+    reseal(&mut bytes, slot, |sb| {
+        sb[ANCHOR - 16..ANCHOR - 8].copy_from_slice(&LOG_START.to_le_bytes());
+        sb[ANCHOR - 8..ANCHOR].copy_from_slice(&u64::MAX.to_le_bytes());
+    });
+    fs::write(&path, &bytes).unwrap();
+    let follower = read_only().open::<Root>(&path).unwrap();
+    reseal(&mut bytes, slot, |sb| {
+        sb[16..24].copy_from_slice(&(u64::MAX >> 4).to_le_bytes());
+    });
+    fs::write(&path, &bytes).unwrap();
+    corrupt(follower.refresh());
+    assert!(follower.size_on_disk() <= bytes.len() as u64);
+    let space = follower.space().unwrap();
+    assert!(space.live_bytes <= space.file_bytes, "{space:?}");
+    assert!(follower.read().contains_key(&1));
+}
+
+#[test]
 fn a_cycle_reports_a_branch_table_it_cannot_edit() {
     let (_dir, path) = fixture("prune-insert");
     let db = manual().open::<Opaque>(&path).unwrap();

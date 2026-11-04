@@ -911,6 +911,12 @@ impl Store {
         if sb.seq < cursor.seq || self.inner.ignored == Some(sb.mark()) {
             return Ok(None);
         }
+        if len < sb.log_end {
+            return Err(Error::Corrupt(format!(
+                "file is {len} bytes but superblock expects {}",
+                sb.log_end
+            )));
+        }
         cursor.seq = sb.seq;
         self.inner.tail.fetch_max(sb.log_end, Ordering::AcqRel);
         self.inner.placed.fetch_max(sb.log_end, Ordering::AcqRel);
