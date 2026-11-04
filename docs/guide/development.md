@@ -27,7 +27,7 @@ take the machine down. Set `CAP=` to run without the cap.
 | `make fmt`, `make fmt-check` | Format the workspace with rustfmt, or fail if any file is not formatted. |
 | `make doc` | The library's API docs. |
 | `make bench` | The main benchmark, appending to `target/bench/results.jsonl`. |
-| `make bench-reads`, `bench-scaling`, `bench-heap`, `bench-tables`, `bench-bulk`, `bench-merge`, `bench-covered` | The `ferro-bench` tools of those names. |
+| `make bench-reads`, `bench-scaling`, `bench-heap`, `bench-tables`, `bench-bulk`, `bench-merge`, `bench-covered`, `bench-combine` | The `ferro-bench` tools of those names. |
 | `make bench-compare` | ferro against SQLite, redb and fjall. |
 | `make fuzz-seeds`, `make fuzz FUZZ=open` | Fuzzing, as described in [Fuzzing and testing](../internals/testing.md). |
 | `make clean`, `make clean-tmp` | Remove build output, or ferro test directories in `/tmp` untouched for an hour. |
