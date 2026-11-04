@@ -93,6 +93,7 @@ pub struct StoreOptions {
     pub read_only: bool,
     pub checkpoint_bytes: u64,
     pub shared: bool,
+    pub copy_threads: usize,
     #[doc(hidden)]
     pub trace: Option<Trace>,
 }
@@ -105,6 +106,7 @@ impl Default for StoreOptions {
             read_only: false,
             checkpoint_bytes: 64 << 20,
             shared: false,
+            copy_threads: 0,
             trace: None,
         }
     }

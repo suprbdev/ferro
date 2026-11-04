@@ -37,6 +37,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
+    static WRITES_SLOW: Cell<bool> = const { Cell::new(false) };
     static SYNC_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -101,6 +102,9 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
     if count > SPLIT && WRITES_FAIL.with(Cell::get) {
         unsafe { *__errno_location() = ENOSPC };
         return -1;
+    }
+    if count > SPLIT && WRITES_SLOW.with(Cell::get) {
+        std::thread::sleep(Duration::from_millis(2));
     }
     let symbol = unsafe { dlsym(RTLD_NEXT, c"pwrite64".as_ptr()) };
     let real: extern "C" fn(c_int, *const c_void, usize, i64) -> isize =
@@ -465,4 +469,71 @@ fn a_failed_sync_at_any_point_in_a_cycle_loses_nothing() {
         db.verify().unwrap();
     }
     assert!(failed >= 4, "only {failed} failed");
+}
+
+#[cfg(target_os = "linux")]
+fn verifying_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+        .filter(|name| name.trim() == "ferro-verify")
+        .count()
+}
+
+#[test]
+fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_file() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".compacting");
+    let temp = std::path::PathBuf::from(temp);
+    let created = Arc::new(AtomicI64::new(0));
+    let hook = {
+        let created = created.clone();
+        move |name: &'static str| {
+            if name == "created" {
+                created.fetch_add(1, Ordering::SeqCst);
+                WRITES_SLOW.with(|slow| slow.set(true));
+            }
+        }
+    };
+    let db: Db<Root> = options()
+        .copy_threads(4)
+        .history(Keep::Last(1 << 20))
+        .reclaim(Reclaim {
+            every_bytes: 8 << 20,
+        })
+        .hook(Hook(Arc::new(hook)))
+        .open(&path)
+        .unwrap();
+    let mut next = 0;
+    while created.load(Ordering::SeqCst) == 0 {
+        db.update(|root| {
+            for _ in 0..4 {
+                root.insert(next % 3000, text(next, 1500));
+                next += 1;
+            }
+        })
+        .unwrap();
+    }
+    let want = dump(&db.read());
+    let began = std::time::Instant::now();
+    while std::fs::metadata(&temp).map_or(0, |meta| meta.len()) < 2 << 20 {
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "the copy never grew"
+        );
+        std::thread::yield_now();
+    }
+    #[cfg(target_os = "linux")]
+    assert_eq!(verifying_threads(), 3);
+    drop(db);
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert!(no_temp(&path));
+    #[cfg(target_os = "linux")]
+    assert_eq!(verifying_threads(), 0);
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(dump(&db.read()), want);
+    db.verify().unwrap();
 }

@@ -53,6 +53,18 @@ fn acknowledged(db: &Db<Root>, shared: &Shared, keys: u64) {
 }
 
 fn record(cycles: u64, commits: u64, keys: u64, keep: usize) -> Recording {
+    record_on(commits, cycles, commits, keys, keep, 40, 0)
+}
+
+fn record_on(
+    filled: u64,
+    cycles: u64,
+    commits: u64,
+    keys: u64,
+    keep: usize,
+    len: usize,
+    threads: usize,
+) -> Recording {
     let dir = dir();
     let path = dir.path().join("trace.ferro");
     let rng = Rng::new(cycles * 977 + commits + keep as u64);
@@ -64,9 +76,9 @@ fn record(cycles: u64, commits: u64, keys: u64, keep: usize) -> Recording {
             .reclaim(MANUAL)
             .open(&path)
             .unwrap();
-        for i in 0..commits {
+        for i in 0..filled {
             db.update(|root| {
-                root.insert(i % keys, text(i, 40));
+                root.insert(i % keys, text(i, len));
             })
             .unwrap();
             models.insert(db.version(), dump(&db.read()));
@@ -88,6 +100,7 @@ fn record(cycles: u64, commits: u64, keys: u64, keep: usize) -> Recording {
     };
     let db: Db<Root> = Options::new()
         .reclaim(MANUAL)
+        .copy_threads(threads)
         .trace(trace.clone())
         .hook(Hook(Arc::new(hook)))
         .open(&path)
@@ -329,6 +342,29 @@ fn power_loss_at_any_operation_keeps_every_acknowledged_commit() {
 fn power_loss_keeping_a_single_version_keeps_every_acknowledged_commit() {
     let recording = record(3, 10, 24, 1);
     assert!(replay(&recording, 2, 12) > 100);
+}
+
+#[test]
+fn power_loss_while_threads_verify_a_copy_of_many_batches_keeps_every_acknowledged_commit() {
+    let recording = record_on(400, 2, 8, 400, 2, 2000, 4);
+    let temp = recording
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Create(inode) => Some(*inode),
+            _ => None,
+        })
+        .unwrap();
+    let copied: usize = recording
+        .ops
+        .iter()
+        .map(|op| match op {
+            Op::Write(inode, _, bytes) if *inode == temp => bytes.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(copied > 512 << 10, "{copied}");
+    assert!(replay(&recording, 3, 13) > 150);
 }
 
 #[test]

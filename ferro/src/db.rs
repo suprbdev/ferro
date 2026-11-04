@@ -1143,6 +1143,11 @@ impl Options {
         self
     }
 
+    pub fn copy_threads(mut self, threads: usize) -> Self {
+        self.store.copy_threads = threads;
+        self
+    }
+
     pub fn coalesce(mut self, coalesce: bool) -> Self {
         self.coalesce = coalesce;
         self

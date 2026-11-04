@@ -1,10 +1,17 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::BuildHasherDefault;
 use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use parking_lot::{Condvar, Mutex};
 
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
 use crate::db::Refs;
@@ -19,8 +26,11 @@ use crate::store::{
 };
 
 const FLUSH_BYTES: usize = 1 << 20;
+const BATCH_BYTES: usize = 256 << 10;
+const BATCH_RECORDS: usize = 4096;
 const SPARE: usize = 256;
 const SPARE_BYTES: usize = 256 << 10;
+const COPY_THREADS: usize = 4;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 
@@ -66,6 +76,13 @@ fn links_of(entry: &Entry) -> Vec<Hash> {
         .chain(&merged)
         .map(|link| link.hash)
         .collect()
+}
+
+fn copy_threads(options: &StoreOptions) -> usize {
+    match options.copy_threads {
+        0 => thread::available_parallelism().map_or(1, |cores| cores.get().min(COPY_THREADS)),
+        threads => threads,
+    }
 }
 
 pub(crate) fn sibling(path: &Path) -> PathBuf {
@@ -142,12 +159,232 @@ impl Roots {
     }
 }
 
+#[derive(Default)]
+struct Batch {
+    bytes: Vec<u8>,
+    records: Vec<(Ptr, usize)>,
+}
+
+impl Batch {
+    fn full(&self) -> bool {
+        self.bytes.len() >= BATCH_BYTES || self.records.len() >= BATCH_RECORDS
+    }
+
+    fn verify(&self, scratch: &mut Unpacked) -> Result<()> {
+        let mut start = 0;
+        for &(ptr, end) in &self.records {
+            verify_stored(&self.bytes[start..end], ptr, scratch)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.bytes.shrink_to(2 * BATCH_BYTES);
+        self.records.clear();
+    }
+}
+
+enum Failure {
+    Failed(Error),
+    Panicked(Box<dyn Any + Send>),
+}
+
+#[derive(Default)]
+struct Progress {
+    queued: usize,
+    failure: Option<Failure>,
+}
+
+#[derive(Default)]
+struct Board {
+    progress: Mutex<Progress>,
+    idle: Condvar,
+    failed: AtomicBool,
+    spare: Mutex<Vec<Batch>>,
+}
+
+impl Board {
+    fn fail(&self, progress: &mut Progress, failure: Failure) {
+        self.failed.store(true, Ordering::Release);
+        progress.failure.get_or_insert(failure);
+    }
+
+    fn take(&self) -> Result<()> {
+        let failure = self.progress.lock().failure.take();
+        match failure {
+            None => Ok(()),
+            Some(Failure::Failed(error)) => Err(error),
+            Some(Failure::Panicked(payload)) => panic::resume_unwind(payload),
+        }
+    }
+}
+
+fn verify_batches(work: &Mutex<Receiver<Batch>>, board: &Board) {
+    let mut scratch = Unpacked::default();
+    loop {
+        let next = work.lock().recv();
+        let Ok(mut batch) = next else {
+            return;
+        };
+        let outcome = if board.failed.load(Ordering::Acquire) {
+            Ok(Ok(()))
+        } else {
+            panic::catch_unwind(AssertUnwindSafe(|| batch.verify(&mut scratch)))
+        };
+        batch.clear();
+        board.spare.lock().push(batch);
+        let mut progress = board.progress.lock();
+        progress.queued -= 1;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => board.fail(&mut progress, Failure::Failed(error)),
+            Err(payload) => board.fail(&mut progress, Failure::Panicked(payload)),
+        }
+        if progress.queued == 0 {
+            board.idle.notify_all();
+        }
+    }
+}
+
+struct Pool {
+    queue: Option<SyncSender<Batch>>,
+    board: Arc<Board>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Pool {
+    fn start(threads: usize) -> Option<Pool> {
+        let (queue, work) = mpsc::sync_channel(threads * 2);
+        let work = Arc::new(Mutex::new(work));
+        let board = Arc::new(Board::default());
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (work, board) = (work.clone(), board.clone());
+            let spawned = thread::Builder::new()
+                .name("ferro-verify".to_string())
+                .spawn(move || verify_batches(&work, &board));
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        if handles.is_empty() {
+            return None;
+        }
+        Some(Pool {
+            queue: Some(queue),
+            board,
+            threads: handles,
+        })
+    }
+
+    fn send(&self, batch: Batch) -> Result<()> {
+        self.board.progress.lock().queued += 1;
+        let queue = self
+            .queue
+            .as_ref()
+            .expect("the queue lives as long as the pool");
+        if queue.send(batch).is_err() {
+            let mut progress = self.board.progress.lock();
+            progress.queued -= 1;
+            let gone = Error::Io(std::io::Error::other("the copy's verifying threads exited"));
+            self.board.fail(&mut progress, Failure::Failed(gone));
+        }
+        self.check()
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.board.failed.load(Ordering::Acquire) {
+            return self.board.take();
+        }
+        Ok(())
+    }
+
+    fn settle(&self) -> Result<()> {
+        let mut progress = self.board.progress.lock();
+        while progress.queued > 0 {
+            self.board.idle.wait(&mut progress);
+        }
+        drop(progress);
+        self.board.take()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.board.failed.store(true, Ordering::Release);
+        self.queue = None;
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct Verifier {
+    threads: usize,
+    batch: Batch,
+    scratch: Unpacked,
+    pool: Option<Pool>,
+}
+
+impl Verifier {
+    fn new(threads: usize) -> Verifier {
+        Verifier {
+            threads,
+            batch: Batch::default(),
+            scratch: Unpacked::default(),
+            pool: None,
+        }
+    }
+
+    fn inline(&mut self, record: &[u8], ptr: Ptr) -> Result<()> {
+        verify_stored(record, ptr, &mut self.scratch)
+    }
+
+    fn add(&mut self, ptr: Ptr, record: &[u8]) -> Result<()> {
+        if self.threads <= 1 {
+            return self.inline(record, ptr);
+        }
+        self.batch.bytes.extend_from_slice(record);
+        self.batch.records.push((ptr, self.batch.bytes.len()));
+        if !self.batch.full() {
+            return Ok(());
+        }
+        if self.pool.is_none() {
+            self.pool = Pool::start(self.threads - 1);
+            if self.pool.is_none() {
+                self.threads = 1;
+            }
+        }
+        let Some(pool) = &self.pool else {
+            let verified = self.batch.verify(&mut self.scratch);
+            self.batch.clear();
+            return verified;
+        };
+        let spare = pool.board.spare.lock().pop().unwrap_or_default();
+        pool.send(mem::replace(&mut self.batch, spare))
+    }
+
+    fn check(&self) -> Result<()> {
+        self.pool.as_ref().map_or(Ok(()), Pool::check)
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        let verified = self.batch.verify(&mut self.scratch);
+        self.batch.clear();
+        let settled = self.pool.as_ref().map_or(Ok(()), Pool::settle);
+        settled.and(verified)
+    }
+}
+
 struct CopySink<'a> {
     source: Store,
     file: Traced,
     buf: Vec<u8>,
     end: u64,
-    scratch: Unpacked,
+    verifier: Verifier,
     bytes: Vec<u8>,
     body: Vec<u8>,
     spare: Vec<Buffers>,
@@ -409,6 +646,7 @@ impl CopySink<'_> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
         }
+        self.verifier.check()?;
         let mut bytes = mem::take(&mut self.bytes);
         let step = self.step(ptr, &mut bytes);
         if bytes.capacity() <= SPARE_BYTES {
@@ -420,11 +658,12 @@ impl CopySink<'_> {
     fn step(&mut self, ptr: Ptr, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
         let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old)?;
-        verify_stored(record, ptr, &mut self.scratch)?;
         let entry = if self.entries.contains(&ptr.hash) {
+            self.verifier.inline(record, ptr)?;
             let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
             Some(Rungs::of(body, &held.old)?)
         } else {
+            self.verifier.add(ptr, record)?;
             None
         };
         let payload = &record[stored.payload.clone()];
@@ -568,7 +807,7 @@ impl<'a> Copier<'a> {
                 file,
                 buf: Vec::new(),
                 end: LOG_START,
-                scratch: Unpacked::default(),
+                verifier: Verifier::new(copy_threads(options)),
                 bytes: Vec::new(),
                 body: Vec::new(),
                 spare: Vec::new(),
@@ -641,6 +880,7 @@ impl<'a> Copier<'a> {
     pub(crate) fn pass(&mut self, refs: &Refs) -> Result<u64> {
         let before = self.sink.end;
         self.encode(refs)?;
+        self.sink.verifier.settle()?;
         self.sink.drain()?;
         Ok(self.sink.end - before)
     }
@@ -656,6 +896,7 @@ impl<'a> Copier<'a> {
 
     pub(crate) fn finish(&mut self, refs: &Refs, seq: u64, survival: f64) -> Result<(Ptr, u64)> {
         let head = self.encode(refs)?;
+        self.sink.verifier.settle()?;
         self.sink.drain()?;
         let basis = Basis::new(self.sink.end, survival);
         seal(&self.sink.file, self.sink.end, head, seq, basis)?;
@@ -664,5 +905,71 @@ impl<'a> Copier<'a> {
 
     pub(crate) fn abandon(temp: &Path) {
         let _ = fs::remove_file(temp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::append_record;
+
+    fn records(count: u64, bad: Option<u64>) -> Vec<(Ptr, Vec<u8>)> {
+        (0..count)
+            .map(|index| {
+                let body = format!("record {index} ").repeat(1 + index as usize % 40);
+                let object = Object {
+                    body: body.into_bytes(),
+                    links: Vec::new(),
+                };
+                let mut hash = object.hash();
+                if bad == Some(index) {
+                    hash[0] ^= 1;
+                }
+                let offset = LOG_START + index * 4096;
+                let mut record = Vec::new();
+                append_record(&mut record, offset, &object.body, &object.links);
+                (Ptr { hash, offset }, record)
+            })
+            .collect()
+    }
+
+    fn verified(threads: usize, records: &[(Ptr, Vec<u8>)]) -> Result<()> {
+        let mut verifier = Verifier::new(threads);
+        for (ptr, record) in records {
+            verifier.check()?;
+            verifier.add(*ptr, record)?;
+        }
+        verifier.settle()
+    }
+
+    #[test]
+    fn every_thread_count_verifies_every_record_and_reports_the_damaged_one() {
+        let good = records(30_000, None);
+        for threads in [1, 2, 4] {
+            verified(threads, &good).unwrap();
+            for bad in [0, 4095, 4096, 17_000, 29_999] {
+                let damaged = records(30_000, Some(bad));
+                let at = format!(
+                    "hash mismatch for object at {}",
+                    damaged[bad as usize].0.offset
+                );
+                match verified(threads, &damaged) {
+                    Err(Error::Corrupt(message)) => assert_eq!(message, at, "{threads}"),
+                    other => panic!("{threads} threads, record {bad}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_verifier_dropped_with_batches_queued_joins_its_threads() {
+        let good = records(40_000, None);
+        let mut verifier = Verifier::new(4);
+        for (ptr, record) in &good {
+            verifier.add(*ptr, record).unwrap();
+        }
+        let board = verifier.pool.as_ref().unwrap().board.clone();
+        drop(verifier);
+        assert_eq!(Arc::strong_count(&board), 1);
     }
 }
