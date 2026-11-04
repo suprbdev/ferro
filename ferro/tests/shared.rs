@@ -555,3 +555,48 @@ fn a_drop_and_fork_in_another_handle_wait_for_a_closure_on_that_branch() {
     );
     assert_eq!(b.branch("side").unwrap().read().n, 1);
 }
+
+#[test]
+fn a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pause.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let armed = Arc::new(AtomicBool::new(false));
+    let (paused, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let hook = {
+        let (armed, paused, resume) = (armed.clone(), paused.clone(), resume.clone());
+        Hook(Arc::new(move |step| {
+            if step == "paused" && armed.swap(false, Ordering::AcqRel) {
+                paused.wait();
+                resume.wait();
+            }
+        }))
+    };
+    let durable = shared().durability(Durability::Fsync).reclaim(manual);
+    let a: Db<Root> = durable.clone().hook(hook).open(&path).unwrap();
+    for i in 1..=10 {
+        bump(&a, 0, i);
+    }
+    armed.store(true, Ordering::Release);
+    let cycler = {
+        let a = a.clone();
+        thread::spawn(move || a.compact(Keep::All))
+    };
+    paused.wait();
+    let opener = {
+        let (path, durable) = (path.clone(), durable.clone());
+        thread::spawn(move || durable.open::<Root>(&path).unwrap())
+    };
+    thread::sleep(Duration::from_millis(100));
+    resume.wait();
+    cycler.join().unwrap().unwrap();
+    let b = opener.join().unwrap();
+    let acked = bump(&b, 1, 1);
+    assert_eq!(acked, 11);
+    a.refresh().unwrap();
+    assert_eq!(a.read().n, 11);
+    drop((a, b));
+    let db: Db<Root> = Options::new().reclaim(manual).open(&path).unwrap();
+    assert_eq!(db.read().n, acked, "an acknowledged commit was lost");
+    db.verify().unwrap();
+}

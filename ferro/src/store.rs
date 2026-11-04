@@ -429,11 +429,16 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
     Ok(tip)
 }
 
-fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
+fn retired_at(file: &File, at: u64) -> Result<bool> {
+    let mut magic = [0u8; 8];
+    Ok(read_or_end(file, &mut magic, at)? && &magic == RETIRED_MAGIC)
+}
+
+fn recover(file: &File, sb: Super, slot: u64, len: u64, shared: bool) -> Result<(Super, u64)> {
     let mut tip = scan(file, sb.at_anchor(), len)?;
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
-    let shrink = len > tip.log_end;
+    let shrink = len > tip.log_end && !(shared && retired_at(file, tip.log_end)?);
     tip.anchor = tip.mark();
     if moved {
         file.sync_data()?;
@@ -677,15 +682,19 @@ struct Range<'a> {
     at: u64,
 }
 
+fn locked(error: TryLockError) -> Error {
+    match error {
+        TryLockError::Error(error) => Error::Io(error),
+        TryLockError::WouldBlock => Error::Locked,
+    }
+}
+
 impl<'a> Range<'a> {
     fn hold(file: &'a File, at: u64, shared: bool) -> Result<Option<Range<'a>>> {
         if !shared {
             return Ok(None);
         }
-        platform::lock_range(file, at, 1, true, true).map_err(|error| match error {
-            TryLockError::Error(error) => Error::Io(error),
-            TryLockError::WouldBlock => Error::Locked,
-        })?;
+        platform::lock_range(file, at, 1, true, true).map_err(locked)?;
         Ok(Some(Range { file, at }))
     }
 }
@@ -907,14 +916,30 @@ impl Store {
         options: StoreOptions,
     ) -> Result<(Store, Option<Ptr>)> {
         let shared = options.shared && !options.read_only;
-        let file = open_locked(actual, options.read_only, shared)?;
         let renamed = actual != path;
-        let path = &platform::canonicalize(path)?;
-        let commit = Range::hold(&file, COMMIT_AT, shared)?;
+        let file = loop {
+            let file = open_locked(actual, options.read_only, shared)?;
+            if !shared {
+                break file;
+            }
+            platform::lock_range(&file, COMMIT_AT, 1, true, true).map_err(locked)?;
+            if renamed || platform::path_id(actual)? == platform::file_id(&file)? {
+                break file;
+            }
+        };
+        let kept = match shared {
+            true => platform::canonicalize(path)?,
+            false => path.to_path_buf(),
+        };
+        let commit = shared.then_some(Range {
+            file: &file,
+            at: COMMIT_AT,
+        });
         let tops = Range::hold(&file, SUPER_AT, shared)?;
         let idle = !shared || platform::lock_range(&file, CYCLE_AT, 1, true, false).is_ok();
         if !options.read_only && !renamed && idle {
-            let _ = std::fs::remove_file(sibling(path));
+            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let _ = std::fs::remove_file(sibling(&real));
         }
         if shared && idle {
             platform::unlock_range(&file, CYCLE_AT, 1)?;
@@ -940,7 +965,7 @@ impl Store {
                 if options.read_only {
                     (observe(&file, actual, sb, len)?, slot)
                 } else {
-                    recover(&file, sb, slot, len)?
+                    recover(&file, sb, slot, len, shared)?
                 }
             }
             None => {
@@ -977,7 +1002,7 @@ impl Store {
         let store = Store {
             inner: Arc::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
-                path: path.to_path_buf(),
+                path: kept,
                 file,
                 tail: AtomicU64::new(sb.log_end),
                 written: AtomicU64::new(sb.log_end),
