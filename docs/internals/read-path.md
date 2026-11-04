@@ -315,3 +315,7 @@ from 6.1 to 1.5 ns an item and cold scans down about 7%.
   leaves hot-set latency unchanged. Not admitting scanned nodes saved 7 to 17% on scans larger than
   the cache, but made repeated short range pages 3 to 4 times slower, and a budget per iterator that
   avoided that saved only 6 to 8%.
+- Other shapes for the loop a fold runs over a run, described under [Scans](#scans). Calling the
+  slot path out of line, to keep the loop small, left a call in the column's loop, and `iter()` over
+  `u64` values took 61 instructions a key against 44. A `for` loop over the run took 48 and a zip of
+  the keys with their offsets 46, and both made `iter().count()` dearer, 44 to 46 against 41.

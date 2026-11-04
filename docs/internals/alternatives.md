@@ -44,8 +44,9 @@ numbers. This index lists them by subsystem.
   cursors](read-path.md#sorted-lookups-and-cursors).
 - A wider varint decoder: [What is left, on
   `examples/graph`](read-path.md#what-is-left-on-examplesgraph).
-- Bulk decode hooks, lazy value decoding, `mmap`, cheaper cache keys, a chunked or trie `List`, and
-  scan admission control: [Measured and left out](read-path.md#measured-and-left-out).
+- Bulk decode hooks, lazy value decoding, `mmap`, cheaper cache keys, a chunked or trie `List`,
+  scan admission control, and other loop shapes for folds: [Measured and left
+  out](read-path.md#measured-and-left-out).
 - Pinning every level, index-based iterator frames, more prefetching, a plain store on pin, moved
   flags, a per-thread read buffer, more cache shards and aligned shared state: [Measured and left
   out](read-scaling.md#measured-and-left-out).

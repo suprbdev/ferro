@@ -136,8 +136,8 @@ run alternately with this one on the same machine confirmed each: a filtered sca
 200 rows on one thread, 798,000 a second against 896,000 (#58), and bulk inserts, 3,092
 instructions a key against 2,978 (#59).
 
-Two of them, #57 and #59, have been fixed since, as [Where the flags
-live](../internals/read-scaling.md#where-the-flags-live) describes. The bulk inserts ran more
+All four have been fixed since. For #57 and #59, as [Where the flags
+live](../internals/read-scaling.md#where-the-flags-live) describes, the bulk inserts ran more
 instructions because `Shared::make_mut` was not inlined, and now run 2,941 a key. The store did no
 more work for a `wiki` commit than before: the example's tokenizer had compiled to slower code, and
 with it rewritten `wiki` commits 1,004 times a second against 548 before the fix and 638 before
