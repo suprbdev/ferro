@@ -4,21 +4,27 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use common::{Rng, cases, fast};
-use ferro::{Db, Error, Keep, Map, Options, Outcome, Reclaim, Snapshot};
+use ferro::db::Hook;
+use ferro::{Db, Error, Hash, Keep, Map, Options, Outcome, Reclaim, Snapshot};
 use tempfile::TempDir;
 
 type Events = Map<u32, i64>;
 type Counts = BTreeMap<u32, i64>;
+type Seen = (Option<Hash>, Counts);
+type Job = Box<dyn FnOnce() + Send>;
+type Armed = Arc<Mutex<Option<(&'static str, Job)>>>;
+type Crossed = Arc<Mutex<Option<Option<(ferro::Result<Outcome>, Seen)>>>>;
 
 const LOCAL: [&str; 2] = ["main", "side"];
 const CACHES: [u64; 3] = [1 << 20, 16 << 10, 2 << 10];
+const STAGES: [&str; 3] = ["created", "copied", "synced"];
 
 struct Flag {
     thread: Thread,
@@ -139,15 +145,25 @@ struct Device {
     heads: [usize; 2],
     forks: usize,
     reader: Option<Db<Events>>,
+    armed: Armed,
 }
 
 impl Device {
     fn options(&self) -> Options {
+        let armed = self.armed.clone();
         fast()
             .cache_bytes(self.cache)
             .history(self.keep)
             .reclaim(Reclaim { every_bytes: 0 })
             .coalesce(self.coalesce)
+            .hook(Hook(Arc::new(move |step| {
+                let mut slot = armed.lock().unwrap();
+                if slot.as_ref().is_some_and(|(stage, _)| *stage == step) {
+                    let (_, job) = slot.take().unwrap();
+                    drop(slot);
+                    job();
+                }
+            })))
     }
 
     fn open(&mut self) {
@@ -282,7 +298,6 @@ impl World {
     }
 
     fn pull(&mut self, a: usize, s: usize, b: usize, t: usize, remote: &str) -> Option<Outcome> {
-        let when = self.when();
         let (Some(ours), Some(theirs)) = (
             self.devices[a].dbs[s].clone(),
             self.devices[b].dbs[t].clone(),
@@ -291,26 +306,30 @@ impl World {
         };
         let (ha, hb) = (self.devices[a].heads[s], self.devices[b].heads[t]);
         let before = (ours.head_hash(), counted(&ours));
-        let id = self.graph.0.len();
-        let pulled = ours.pull(&theirs, remote, |root, base, other| {
-            add_deltas(root, base, other);
-            (format!("n{id}"), ())
-        });
+        let pulled = pull_counting(&ours, &theirs, remote, self.graph.0.len());
+        let after = (ours.head_hash(), counted(&ours));
+        let what = format!("d{a} {} <- d{b} {} as {remote}", LOCAL[s], LOCAL[t]);
+        self.account(a, s, (ha, hb), (before, after), pulled, &what)
+    }
+
+    fn account(
+        &mut self,
+        a: usize,
+        s: usize,
+        (ha, hb): (usize, usize),
+        (before, after): (Seen, Seen),
+        pulled: ferro::Result<Outcome>,
+        what: &str,
+    ) -> Option<Outcome> {
+        let when = self.when();
         let outcome = match pulled {
-            Ok(pulled) => pulled.outcome,
+            Ok(outcome) => outcome,
             Err(Error::NoCommonAncestor) if self.pruned => {
-                assert_eq!(
-                    (ours.head_hash(), counted(&ours)),
-                    before,
-                    "{when}: refused pull"
-                );
+                assert_eq!(after, before, "{when}: refused pull");
                 self.count("pull refused");
                 return None;
             }
-            Err(error) => panic!(
-                "{when}: d{a} {} <- d{b} {} as {remote}: {error}",
-                LOCAL[s], LOCAL[t]
-            ),
+            Err(error) => panic!("{when}: {what}: {error}"),
         };
         match outcome {
             Outcome::Merged => {
@@ -417,6 +436,71 @@ impl World {
         self.count("compact");
     }
 
+    fn burst(&mut self, device: usize, slot: usize, commits: usize) {
+        for _ in 0..commits {
+            self.commit(device, slot);
+        }
+        self.count("burst");
+    }
+
+    fn reland(&mut self, a: usize, b: usize) {
+        let remote = self.remote(b, 0);
+        let main = self.devices[a].main().clone();
+        if main.branches().contains(&remote) {
+            main.drop_branch(&remote).unwrap();
+            self.count("dropped to reland");
+        }
+        self.pull(a, 0, b, 0, &remote);
+    }
+
+    fn cross_cycle(&mut self, a: usize, b: usize, stage: &'static str, reland: bool, commit: bool) {
+        let remote = self.remote(b, 0);
+        let ours = self.devices[a].main().clone();
+        let theirs = self.devices[b].main().clone();
+        let (ha, hb) = (self.devices[a].heads[0], self.devices[b].heads[0]);
+        let before = (ours.head_hash(), counted(&ours));
+        let id = self.graph.0.len();
+        let event = self.events;
+        let crossed: Crossed = Arc::new(Mutex::new(None));
+        let job = {
+            let (ours, remote, crossed) = (ours.clone(), remote.clone(), crossed.clone());
+            move || {
+                let pulled = reland.then(|| {
+                    if ours.branches().contains(&remote) {
+                        ours.drop_branch(&remote).unwrap();
+                    }
+                    let pulled = pull_counting(&ours, &theirs, &remote, id);
+                    (pulled, (ours.head_hash(), counted(&ours)))
+                });
+                if commit {
+                    ours.commit(format!("e{event}"), |root| {
+                        root.insert(event, 1);
+                    })
+                    .unwrap();
+                }
+                *crossed.lock().unwrap() = Some(pulled);
+            }
+        };
+        *self.devices[a].armed.lock().unwrap() = Some((stage, Box::new(job)));
+        let keep = self.devices[a].keep;
+        ours.compact(keep).unwrap();
+        self.devices[a].armed.lock().unwrap().take();
+        let Some(pulled) = crossed.lock().unwrap().take() else {
+            return;
+        };
+        if let Some((pulled, after)) = pulled {
+            let what = format!("d{a} <- d{b} as {remote} while a cycle was {stage}");
+            self.account(a, 0, (ha, hb), (before, after), pulled, &what);
+            self.count("cycle relanded");
+        }
+        if commit {
+            self.events += 1;
+            let head = self.devices[a].heads[0];
+            self.devices[a].heads[0] = self.graph.push(&[head], Some(event));
+        }
+        self.count("cycle crossed");
+    }
+
     fn reopen(&mut self, device: usize, offline: bool) {
         self.devices[device].close();
         if offline {
@@ -507,6 +591,19 @@ impl World {
     }
 }
 
+fn pull_counting(
+    ours: &Db<Events>,
+    theirs: &Db<Events>,
+    remote: &str,
+    id: usize,
+) -> ferro::Result<Outcome> {
+    let pulled = ours.pull(theirs, remote, |root, base, other| {
+        add_deltas(root, base, other);
+        (format!("n{id}"), ())
+    });
+    pulled.map(|pulled| pulled.outcome)
+}
+
 #[derive(Clone, Debug)]
 enum Act {
     Commit(usize, usize),
@@ -519,6 +616,9 @@ enum Act {
     Reopen(usize, bool),
     Side(usize),
     DropTracking(usize, u64),
+    Burst(usize, usize, usize),
+    Reland(usize, usize),
+    CrossCycle(usize, usize, &'static str, bool, bool),
 }
 
 struct Setup {
@@ -526,7 +626,33 @@ struct Setup {
     coalesce: Vec<bool>,
 }
 
-fn plan(seed: u64, steps: usize, pruned: bool) -> (Setup, Vec<Act>) {
+fn around_tables(
+    rng: &mut Rng,
+    roll: u64,
+    pruned: bool,
+    (a, b): (usize, usize),
+    (s, t): (usize, usize),
+) -> Act {
+    match roll {
+        0..16 => Act::Commit(a, s),
+        16..22 => Act::Burst(a, s, 60 + rng.below(90) as usize),
+        22..30 => Act::Merge(a, rng.chance(50)),
+        30..44 => Act::Pull(a, s, b, t),
+        44..50 => Act::Sync(a, b),
+        50..58 => Act::Relay(a, b, rng.chance(30), rng.chance(30)),
+        58..62 => Act::Compact(a),
+        62..72 => {
+            let stage = STAGES[rng.below(STAGES.len() as u64) as usize];
+            Act::CrossCycle(a, b, stage, !pruned, pruned || rng.chance(50))
+        }
+        72..78 => Act::Reland(a, b),
+        78..83 => Act::Reopen(a, rng.chance(40)),
+        83..90 => Act::Side(a),
+        _ => Act::DropTracking(a, rng.next()),
+    }
+}
+
+fn plan(seed: u64, steps: usize, pruned: bool, tables: bool) -> (Setup, Vec<Act>) {
     let mut rng = Rng::new(seed.wrapping_mul(7919).wrapping_add(17));
     let count = 3;
     let mut setup = Setup {
@@ -547,7 +673,12 @@ fn plan(seed: u64, steps: usize, pruned: bool) -> (Setup, Vec<Act>) {
         let a = rng.below(count as u64) as usize;
         let b = (a + 1 + rng.below(count as u64 - 1) as usize) % count;
         let (s, t) = (rng.below(2) as usize, rng.below(2) as usize);
-        acts.push(match rng.below(100) {
+        let roll = rng.below(100);
+        if tables {
+            acts.push(around_tables(&mut rng, roll, pruned, (a, b), (s, t)));
+            continue;
+        }
+        acts.push(match roll {
             0..22 => Act::Commit(a, s),
             22..28 => {
                 let count = 1 + rng.below(5) as usize;
@@ -581,6 +712,7 @@ fn execute(seed: u64, setup: &Setup, acts: &[Act]) -> BTreeMap<&'static str, usi
             heads: [0, 0],
             forks: 0,
             reader: None,
+            armed: Armed::default(),
         };
         device.open();
         devices.push(device);
@@ -611,21 +743,26 @@ fn execute(seed: u64, setup: &Setup, acts: &[Act]) -> BTreeMap<&'static str, usi
             Act::Reopen(a, offline) => world.reopen(a, offline),
             Act::Side(a) => world.fork_or_drop_side(a),
             Act::DropTracking(a, pick) => world.drop_tracking(a, pick),
+            Act::Burst(a, s, commits) => world.burst(a, s, commits),
+            Act::Reland(a, b) => world.reland(a, b),
+            Act::CrossCycle(a, b, stage, reland, commit) => {
+                world.cross_cycle(a, b, stage, reland, commit)
+            }
         }
         world.check();
     }
     world.tally
 }
 
-fn run(seed: u64, steps: usize, pruned: bool) -> BTreeMap<&'static str, usize> {
-    let (setup, acts) = plan(seed, steps, pruned);
+fn run(seed: u64, steps: usize, pruned: bool, tables: bool) -> BTreeMap<&'static str, usize> {
+    let (setup, acts) = plan(seed, steps, pruned, tables);
     execute(seed, &setup, &acts)
 }
 
-fn sweep(seeds: u64, pruned: bool) -> BTreeMap<&'static str, usize> {
+fn sweep(seeds: u64, pruned: bool, tables: bool) -> BTreeMap<&'static str, usize> {
     let mut tally = BTreeMap::new();
     for seed in 0..seeds {
-        for (name, seen) in run(seed, 70, pruned) {
+        for (name, seen) in run(seed, 70, pruned, tables) {
             *tally.entry(name).or_default() += seen;
         }
     }
@@ -634,7 +771,7 @@ fn sweep(seeds: u64, pruned: bool) -> BTreeMap<&'static str, usize> {
 
 #[test]
 fn devices_with_branches_merges_syncs_and_reclamation_count_each_event_once() {
-    let tally = sweep(cases(100) as u64, false);
+    let tally = sweep(cases(100) as u64, false, false);
     assert!(tally["merged"] > 50, "{tally:?}");
     assert!(tally["pull merged"] > 50, "{tally:?}");
     assert!(tally["synced"] > 20, "{tally:?}");
@@ -642,8 +779,24 @@ fn devices_with_branches_merges_syncs_and_reclamation_count_each_event_once() {
 
 #[test]
 fn pruned_devices_with_branches_count_each_event_once_or_refuse() {
-    let tally = sweep(cases(100) as u64, true);
+    let tally = sweep(cases(100) as u64, true, false);
     assert!(tally["merged"] > 30, "{tally:?}");
     assert!(tally["pull merged"] > 30, "{tally:?}");
+    assert!(tally["pull refused"] > 10, "{tally:?}");
+}
+
+#[test]
+fn devices_relanding_remotes_across_cycles_and_step_tables_count_each_event_once() {
+    let tally = sweep(cases(30) as u64, false, true);
+    assert!(tally["burst"] > 20, "{tally:?}");
+    assert!(tally["cycle relanded"] > 20, "{tally:?}");
+    assert!(tally["dropped to reland"] > 20, "{tally:?}");
+}
+
+#[test]
+fn pruned_devices_committing_across_cycles_and_step_tables_count_each_event_once() {
+    let tally = sweep(cases(30) as u64, true, true);
+    assert!(tally["burst"] > 20, "{tally:?}");
+    assert!(tally["cycle crossed"] > 20, "{tally:?}");
     assert!(tally["pull refused"] > 10, "{tally:?}");
 }

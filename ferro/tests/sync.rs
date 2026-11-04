@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::{Rng, cases, fast, text};
 use ferro::codec::{Encoder, HashSink, Object};
-use ferro::db::Clock;
+use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Trace};
 use ferro::{
     Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Snapshot,
@@ -2477,5 +2477,90 @@ fn a_writer_with_a_small_cache_verifies_a_remote_landed_again_after_a_drop() {
             .unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
         a.verify_typed()
             .unwrap_or_else(|error| panic!("cache_bytes {cache}: {error}"));
+    }
+}
+
+#[test]
+fn a_remote_landed_again_during_every_stage_of_a_cycle_verifies_and_reopens() {
+    for stage in ["created", "copied", "synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let slot: Arc<Mutex<Option<[Db<Events>; 2]>>> = Arc::new(Mutex::new(None));
+        let open = |name: &str, keep: Keep, hooked: bool| -> Db<Events> {
+            let now = now.clone();
+            let mut options = fast()
+                .history(keep)
+                .reclaim(Reclaim { every_bytes: 0 })
+                .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))));
+            if hooked {
+                let slot = slot.clone();
+                options = options.hook(Hook(Arc::new(move |name: &'static str| {
+                    if name != stage {
+                        return;
+                    }
+                    let Some([a, c]) = slot.lock().take() else {
+                        return;
+                    };
+                    c.drop_branch("a").unwrap();
+                    assert_eq!(
+                        a.pull(&c, "c", add_deltas)
+                            .map(|pulled| pulled.outcome)
+                            .ok(),
+                        Some(Outcome::Ahead)
+                    );
+                    assert!(matches!(
+                        c.pull(&a, "a", add_deltas),
+                        Err(Error::NoCommonAncestor)
+                    ));
+                })));
+            }
+            options.open(dir.path().join(name)).unwrap()
+        };
+        let (a, b, c) = (
+            open("a.ferro", Keep::Last(2), false),
+            open("b.ferro", Keep::All, false),
+            open("c.ferro", Keep::All, true),
+        );
+        let pull = |to: &Db<Events>, from: &Db<Events>, remote: &str| match to
+            .pull(from, remote, add_deltas)
+        {
+            Ok(pulled) => Some(pulled.outcome),
+            Err(Error::NoCommonAncestor) => None,
+            Err(error) => panic!("{error}"),
+        };
+        event(&b, 1);
+        assert_eq!(pull(&a, &b, "b"), Some(Outcome::FastForward));
+        event(&a, 2);
+        event(&a, 3);
+        event(&c, 4);
+        assert_eq!(pull(&c, &b, "b"), Some(Outcome::Merged));
+        assert_eq!(pull(&b, &c, "c"), Some(Outcome::Merged));
+        assert_eq!(pull(&a, &b, "b"), Some(Outcome::Merged));
+        event(&a, 5);
+        assert_eq!(pull(&c, &a, "a"), None);
+        *slot.lock() = Some([a.clone(), c.clone()]);
+        c.compact(Keep::All).unwrap();
+        assert!(slot.lock().is_none(), "{stage}");
+        c.verify()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        c.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        let landed = c.branch("a").unwrap().head_hash();
+        drop(c);
+        let c = open("c.ferro", Keep::All, false);
+        c.verify()
+            .unwrap_or_else(|error| panic!("{stage} reopened: {error}"));
+        c.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage} reopened: {error}"));
+        assert_eq!(c.branch("a").unwrap().head_hash(), landed, "{stage}");
+        let log = c.branch("a").unwrap().log();
+        assert_eq!(log.iter().count(), log.len(), "{stage}");
+        event(&a, 6);
+        assert_eq!(pull(&c, &a, "a"), None);
+        c.compact(Keep::All).unwrap();
+        c.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage} after another cycle: {error}"));
+        drop(c);
+        ferro::admin::verify(dir.path().join("c.ferro")).unwrap();
     }
 }

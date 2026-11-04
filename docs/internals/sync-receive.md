@@ -181,6 +181,68 @@ The combined model now verifies each device's refreshed reader after every step,
 devices run with caches of 1 MiB, 16 KiB and 2 KiB. Before the fix the reader check failed at seed
 212 of the pruned sweep at a scale of 20.
 
+### Table records found by hash
+
+Dedupe was not the only way a table write could take a record an earlier write had made (#54). Like
+any map, the table keeps the offset a changed node was read from, its origin, when the node's new
+encoding hashes the same: `map::emit` hands back the origin instead of appending, so a change undone
+before the next write costs nothing. A table node that did that while a head under it had moved to
+another copy of its commit would name the old copy, as dedupe did. That cannot happen in a write the
+handle makes. Every node of the table in memory was read from the newest table written or loaded: a
+table write reads its table back from the records it wrote, and open, `refresh` and the swap of a
+cycle load the table they end with. Until the next table write the table changes only by steps, and
+a step puts a head whose version is one past the head it replaces. The version is hashed, so a head
+a step changed never hashes like the one the origin holds. The write that ends the stretch makes its
+own change, and each changes a hashed field of every head it touches: a fork adds a name,
+`drop_branch` removes one and the merge records naming it, pruning raises `first`, a fast-forward
+raises the version, a pull's merge records change `merged`, and the commit that would put a 65th
+step raises the version as a step does. A landing is the one write that could put a head of the
+same hash with another copy, and it writes nothing when the remote already holds the commit it
+carries. So a node hashes like its origin only when each head under it is the one the origin's
+record holds, decoded from that record, and the offset it keeps names the copies the table in memory
+names.
+
+A reclamation cycle does take table records by hash. Its passes copy the table and what it reaches
+while commits go on, and the copy finds every object but an entry by its hash, so the table it
+writes in the pause takes a node, or the whole table, from a pass whenever one hashes the same. A
+remote dropped and landed again from the same head after a pass read the refs has a table equal by
+hash to the one the pass copied, and the new file names the copy of the tip the first landing made,
+while the handle held the second's. A copier that printed each record the pause took from a pass
+showed it in `a_remote_landed_again_during_every_stage_of_a_cycle_verifies_and_reopens`. Nothing
+reads the two copies differently. Nodes that hash alike hold heads that hash alike, which keep the
+same versions from the same `first` over the same commits, and the pass that copied the node copied,
+for each of those heads, its chain down to `first` and its merges newer than its first entry. That
+is as far as the logs, `verify` and a merge's search for its base go, since the search marks a
+merged commit older than the first entry bare. After the swap the handle reads its table from the
+new file, so it names what the file names, and `verify`, a reopen and the logs pass in that test and
+in the model below.
+
+`devices_relanding_remotes_across_cycles_and_step_tables_count_each_event_once` gives the combined
+model bursts of 60 to 150 commits on one branch, which carry it past the 64-step bound, remotes
+dropped and landed again, and cycles that drop and land a remote again from a hook at their
+`created`, `copied` or `synced` step, with a commit after it half the time.
+`pruned_devices_committing_across_cycles_and_step_tables_count_each_event_once` does the same with
+pruned devices, but only commits from the hook. Every step checks `verify` and `verify_typed` on
+each device, a refreshed and a cold reader, and that each device counts every event once.
+
+Measured and left out:
+
+- Leaving the table to the pause, with the passes copying only what each head links, its root, its
+  tip and its merge records, so that no pass has copied a table record for the pause to find. The
+  pause grew, at the median of 41 cycles in each of two alternating runs, from 323 to 369 µs at 64
+  branches and from 1.37 to 1.48 ms at 256, to change a copy that nothing reads differently, and a
+  damaged table could no longer be planted between the copy and the pause, as
+  `swapping_in_a_compacted_file_reports_a_damaged_branch_table` does.
+
+Left open:
+
+- A head that lands while a cycle copies can run through entries a pass copied for a head that kept
+  less history, with the links below that head's `first` cut, and the pause takes those copies as
+  they are. With remotes landed again from the hook, seed 73 of the pruned sweep at a scale of 30
+  dropped a remote kept from v2, landed it again kept from v1 through the same records, and the
+  cycle's file failed `verify` with `commit log keeps versions from 1 but v2 links pruned history`.
+  The pruned sweep commits from the hook until a pass records what each copy cut.
+
 ## Checking trees
 
 A `Map` decodes lazily, so decoding a root as `T` says nothing about the nodes under it. A bundle
