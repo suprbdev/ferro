@@ -1,8 +1,11 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::fast;
+use ferro::db::Clock;
 use ferro::{Conflict, Data, Db, Keep, Map, Options, Outcome, Reclaim, Record, Snapshot, Table};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -1092,6 +1095,28 @@ fn pruned_graphs_that_once_found_a_wrong_base_or_changed_after_a_cycle() {
                 Merge(4, 2), Inc(1), Merge(0, 3), Inc(0), Fork(1), Merge(4, 2), Fork(4),
             ],
         ),
+        (
+            4,
+            vec![
+                Fork(0), Inc(1), Fork(1), Fork(0), Inc(1), Inc(1), Fork(0), Drop(3), Cross(2, 4),
+                Fork(1), Merge(4, 0), Inc(2), Inc(1), Inc(4), Merge(1, 2), Merge(4, 1),
+            ],
+        ),
+        (
+            4,
+            vec![
+                Inc(2), Inc(0), Inc(0), Fork(1), Fork(0), Inc(0), Fork(0), Merge(2, 0), Cross(0, 1),
+                Inc(4), Fork(4), Inc(4), Inc(0), Merge(4, 2), Merge(0, 1), Inc(4), Drop(1), Inc(4),
+                Inc(1), Fork(4), Merge(4, 2),
+            ],
+        ),
+        (
+            3,
+            vec![
+                Drop(1), Fork(0), Inc(1), Merge(0, 1), Fork(0), Inc(0), Inc(0), Inc(4), Fork(0),
+                Inc(2), Cross(0, 2), Merge(3, 1), Merge(3, 0), Inc(0),
+            ],
+        ),
     ];
     for _ in 0..50 {
         for (keep, ops) in &cases {
@@ -1407,6 +1432,85 @@ fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
     let main: Db<Events> = options().open(&path).unwrap();
     let dbs = vec![main.clone(), main.branch("a").unwrap(), main.branch("b").unwrap()];
     assert_eq!(pairs(&dbs), before);
+}
+
+fn crossed_under_pruning(path: &std::path::Path, keep: usize, step: u64) -> [Db<Events>; 3] {
+    let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let clock = Clock(Arc::new(move || ticks.fetch_add(step, Ordering::Relaxed)));
+    let options = fast().history(Keep::Last(keep)).reclaim(Reclaim { every_bytes: 0 });
+    let main: Db<Events> = options.clock(clock).open(path).unwrap();
+    let b1 = main.fork("b1").unwrap();
+    event(&b1, "n1", 1);
+    let b2 = b1.fork("b2").unwrap();
+    event(&b1, "n2", 2);
+    event(&b1, "n3", 3);
+    let copy = b2.fork("copy").unwrap();
+    merge_named(&main, &copy, "n4");
+    main.drop_branch("copy").unwrap();
+    let b4 = b1.fork("b4").unwrap();
+    assert_eq!(merge_named(&b4, &main, "n5").value, "n1");
+    event(&b2, "n6", 6);
+    event(&b1, "n7", 7);
+    event(&b4, "n8", 8);
+    assert_eq!(merge_named(&b1, &b2, "n9").value, "n1");
+    [main, b1, b4]
+}
+
+#[test]
+fn a_pruned_search_does_not_report_a_base_below_another_and_the_merge_goes_through() {
+    for step in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let [main, b1, b4] = crossed_under_pruning(&dir.path().join("b.ferro"), 4, step);
+        assert_eq!(messages(&b4.common_ancestors(&b1).unwrap()), ["n3"], "step {step}");
+        assert_eq!(messages(&b1.common_ancestors(&b4).unwrap()), ["n3"], "step {step}");
+        let (_, calls) = traced_merge(&b4, &b1, "n10");
+        assert_eq!(calls, [call(3, "n3", "n9")], "step {step}");
+        assert_eq!(counts(&b4), ones(&[1, 2, 3, 6, 7, 8]));
+        main.verify().unwrap();
+    }
+}
+
+#[test]
+fn a_base_pruned_from_our_branch_but_kept_on_theirs_is_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = fast().history(Keep::Last(3)).reclaim(Reclaim { every_bytes: 0 });
+    let main: Db<Events> = options.open(dir.path().join("k.ferro")).unwrap();
+    event(&main, "m1", 1);
+    let side = main.fork("side").unwrap();
+    for (name, key) in [("m2", 2), ("m3", 3), ("m4", 4)] {
+        event(&main, name, key);
+    }
+    event(&side, "s1", 5);
+    assert_eq!(main.log().first().unwrap().0, 2);
+    assert_eq!(messages(&main.common_ancestors(&side).unwrap()), ["m1"]);
+    assert_eq!(messages(&side.common_ancestors(&main).unwrap()), ["m1"]);
+    assert_eq!(merge_named(&main, &side, "main <- side").value, "m1");
+    assert_eq!(counts(&main), ones(&[1, 2, 3, 4, 5]));
+    main.compact(Keep::Last(3)).unwrap();
+    assert_eq!(merge_named(&side, &main, "side <- main").value, "s1");
+    assert_eq!(counts(&side), ones(&[1, 2, 3, 4, 5]));
+    main.verify().unwrap();
+}
+
+#[test]
+fn a_pruned_search_refuses_when_a_base_could_lie_under_history_no_branch_keeps() {
+    for step in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let [main, b1, b4] = crossed_under_pruning(&dir.path().join("h.ferro"), 3, step);
+        let refused = |found: ferro::Result<Vec<Snapshot<Events>>>| {
+            matches!(found, Err(ferro::Error::NoCommonAncestor))
+        };
+        assert!(refused(b4.common_ancestors(&b1)), "step {step}");
+        assert!(refused(b1.common_ancestors(&b4)), "step {step}");
+        let (before, head) = (b4.version(), b4.head_hash());
+        let merged = b4.merge_with(&b1, |root, base, theirs| {
+            add_deltas(root, base, theirs);
+            ("n10", ())
+        });
+        assert!(matches!(merged, Err(ferro::Error::NoCommonAncestor)), "step {step}");
+        assert_eq!((b4.version(), b4.head_hash()), (before, head));
+        main.verify().unwrap();
+    }
 }
 
 #[test]

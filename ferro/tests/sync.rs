@@ -1934,11 +1934,17 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     assert_eq!((b.head_hash(), b.size_on_disk()), before);
     let fresh = a.bundle(&b.have().unwrap()).unwrap();
     match b.receive("a", &fresh, theirs_win) {
-        Err(Error::NoCommonAncestor) => {}
+        Ok(received) => assert_eq!(received.outcome, Outcome::Merged),
         other => panic!("a bundle from a fresh have did not land: {other:?}"),
     }
-    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
-    assert_eq!(b.head_hash(), before.0);
+    let landed = b.branch("a").unwrap();
+    assert_eq!(landed.head_hash(), a.head_hash());
+    assert_eq!(landed.log().first().unwrap().0, 1);
+    assert_eq!(b.common_ancestor(&landed).unwrap().commit().message, "put 3");
+    let merged = [(1, "one"), (2, "two"), (3, "three")];
+    let merged: BTreeMap<u64, String> = merged.map(|(k, v)| (k, v.to_string())).into();
+    assert_eq!(dump(&b.read()), merged);
+    b.verify_typed().unwrap();
 }
 
 fn pruned_events(path: &Path, keep: usize) -> Db<Events> {
@@ -2040,11 +2046,12 @@ fn a_remote_whose_head_we_pruned_below_a_commit_it_knows_still_lands() {
     let before = (a.head_hash(), dump(&a.read()));
     for _ in 0..2 {
         match a.pull(&s, "s", theirs_win) {
-            Err(Error::NoCommonAncestor) => {}
+            Ok(pulled) => assert_eq!(pulled.outcome, Outcome::Ahead),
             other => panic!("a pull that a fresh have cannot fix: {other:?}"),
         }
     }
     assert_eq!(a.branch("s").unwrap().head_hash(), s.head_hash());
+    assert_eq!(a.branch("s").unwrap().log().first().unwrap().0, 3);
     assert_eq!((a.head_hash(), dump(&a.read())), before);
     a.verify_typed().unwrap();
 }

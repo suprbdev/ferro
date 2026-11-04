@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 
+use crate::codec::Hash;
 use crate::error::{Error, Result};
 use crate::log::{Entry, Merged, Node};
 use crate::store::Store;
@@ -42,6 +43,18 @@ impl Mark {
             generation: node.entry.generation(),
         }
     }
+
+    fn under(&self, other: &Mark) -> bool {
+        self.time <= other.time && self.generation < other.generation
+    }
+}
+
+struct Hidden {
+    parent: Hash,
+    version: Option<u64>,
+    colors: u8,
+    at: Mark,
+    reached: bool,
 }
 
 impl Item {
@@ -78,6 +91,7 @@ struct Search {
     found: Vec<Start>,
     cut: [Vec<Mark>; 2],
     painted: [Vec<Mark>; 2],
+    hidden: Vec<Hidden>,
 }
 
 pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
@@ -86,6 +100,7 @@ pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
         found: Vec::new(),
         cut: [Vec::new(), Vec::new()],
         painted: [Vec::new(), Vec::new()],
+        hidden: Vec::new(),
     };
     for (colors, starts) in [(ONE, ours), (TWO, theirs)] {
         for start in starts {
@@ -118,38 +133,53 @@ fn index(colors: u8) -> Option<usize> {
 impl Search {
     fn run(mut self) -> Result<Vec<Start>> {
         loop {
+            let Some(top) = (0..self.items.len()).max_by_key(|at| self.items[*at].level()) else {
+                break;
+            };
+            let (level, _) = self.items[top].level();
+            let mut unreached = self.hidden.iter().filter(|hidden| !hidden.reached);
+            let open = unreached.clone().any(|hidden| hidden.version.is_some_and(|v| v <= level));
             let live = |color: u8| {
                 self.items.iter().any(|item| item.live() && item.colors & color != 0)
             };
             let (one, two) = (live(ONE), live(TWO));
-            if !one && !two {
+            if !one && !two && !open {
                 break;
             }
             let inexact = self.items.iter().any(|item| item.live() && !item.exact());
-            let cut = self.cut.iter().any(|cuts| !cuts.is_empty());
-            if (!one || !two) && !inexact && !cut {
+            let cut = self.cut.iter().any(|cuts| !cuts.is_empty())
+                || unreached.any(|hidden| index(hidden.colors).is_some());
+            if (!one || !two) && !inexact && !cut && !open {
                 break;
             }
-            let top = (0..self.items.len())
-                .max_by_key(|at| self.items[*at].level())
-                .expect("a live item is queued");
             let item = self.items.swap_remove(top);
             match item.merges {
                 None => self.advance(item)?,
                 Some(above) => self.expand(item, above)?,
             }
         }
+        let mut stale = Vec::new();
+        for hidden in std::mem::take(&mut self.hidden) {
+            match index(hidden.colors) {
+                Some(side) if !hidden.reached => self.cut[side].push(hidden.at),
+                None if !hidden.reached || hidden.version.is_none() => stale.push(Mark {
+                    generation: hidden.at.generation.saturating_sub(1),
+                    ..hidden.at
+                }),
+                _ => {}
+            }
+        }
         for (side, other) in [(0, 1), (1, 0)] {
-            let hidden = |cut: &Mark| {
-                self.painted[other]
-                    .iter()
-                    .any(|seen| seen.time <= cut.time && seen.generation < cut.generation)
-            };
+            let hidden = |cut: &Mark| self.painted[other].iter().any(|seen| seen.under(cut));
             if self.cut[side].iter().any(hidden) {
                 return Err(Error::NoCommonAncestor);
             }
         }
         if !self.cut[0].is_empty() && !self.cut[1].is_empty() {
+            return Err(Error::NoCommonAncestor);
+        }
+        let found = self.found.iter().map(|start| Mark::of(&start.node));
+        if stale.iter().any(|bound| found.clone().any(|base| base.under(bound))) {
             return Err(Error::NoCommonAncestor);
         }
         let key = |start: &Start| {
@@ -183,9 +213,17 @@ impl Search {
         }
     }
 
-    fn cut(&mut self, colors: u8, at: &Node) {
-        if let Some(side) = index(colors) {
-            self.cut[side].push(Mark::of(at));
+    fn cut(&mut self, colors: u8, at: &Node, parent: Hash, version: Option<u64>) {
+        let mark = Mark::of(at);
+        match (index(colors), version) {
+            (Some(side), None) => self.cut[side].push(mark),
+            _ => self.hidden.push(Hidden {
+                parent,
+                version,
+                colors,
+                at: mark,
+                reached: false,
+            }),
         }
     }
 
@@ -196,6 +234,12 @@ impl Search {
     }
 
     fn advance(&mut self, mut item: Item) -> Result<()> {
+        for hidden in &mut self.hidden {
+            if hidden.parent == item.node.ptr.hash {
+                hidden.reached = true;
+                item.colors |= hidden.colors;
+            }
+        }
         if item.colors & BOTH == BOTH && item.live() {
             self.found.push(Start {
                 store: item.store.clone(),
@@ -217,6 +261,16 @@ impl Search {
                 target = target.max(Some(meet));
             }
             reach = reach.max(other.reach());
+        }
+        for hidden in &self.hidden {
+            if let Some(version) = hidden.version
+                && !hidden.reached
+                && item.low <= version
+                && version < at
+                && item.node.down_to(&item.store, version)?.ptr.hash == hidden.parent
+            {
+                target = target.max(Some(version));
+            }
         }
         if reach > 0 {
             let above = |entry: &Entry| entry.generation() > reach;
@@ -251,8 +305,8 @@ impl Search {
                 if item.live() {
                     self.painted(item.colors, &item.node);
                 }
-                if item.node.entry.prev.is_some() {
-                    self.cut(item.colors, &item.node);
+                if let Some(prev) = item.node.entry.prev {
+                    self.cut(item.colors, &item.node, prev.hash, Some(at - 1));
                 }
             }
         }
@@ -271,7 +325,7 @@ impl Search {
             .ok_or_else(|| Error::Corrupt(format!("commit log entry {last} is not a merge")))?;
         match self.closure(&item, merged)? {
             Some(child) if !item.bare => self.push(child),
-            _ => self.cut(item.colors, &merge),
+            _ => self.cut(item.colors, &merge, merged.ptr.hash, None),
         }
         if last > item.low && last - 1 > above {
             let node = Node::load(&item.store, merge.entry.prev.ok_or_else(ends_early)?)?;
@@ -322,8 +376,11 @@ fn meet(a: &Item, b: &Item) -> Result<Option<u64>> {
         return Ok(Some(top));
     }
     let same = |x: &Node, y: &Node| x.ptr.hash == y.ptr.hash;
-    if !same(&high_a.down_to(&a.store, floor)?, &high_b.down_to(&b.store, floor)?) {
-        return Ok(None);
+    let (low_a, low_b) = (high_a.down_to(&a.store, floor)?, high_b.down_to(&b.store, floor)?);
+    if !same(&low_a, &low_b) {
+        let parent = |node: &Node| node.entry.prev.map(|prev| prev.hash);
+        let joined = a.low < floor && parent(&low_a).is_some() && parent(&low_a) == parent(&low_b);
+        return Ok(joined.then(|| floor - 1));
     }
     let (mut low, mut high) = (floor, top);
     while high - low > 1 {
