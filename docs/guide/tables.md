@@ -86,11 +86,42 @@ indexes](../internals/schema-and-unique-indexes.md#covering-indexes) has the mea
 Changing a cover list rebuilds that index the next time the table is read, as [Changing your
 types](schema-evolution.md#indexes) describes.
 
+## Combining lookups
+
+`find()` on a table returns a view with the same equality lookups, `by_x(&value)`, `by_x_after`,
+`by_x_some`, `by_x_some_after` and a composite's `by_a_b(&(a, b))`, which return `Matches` instead
+of an `IndexIter`. `and` and `or` combine them by primary key and read a row only for a key that
+matches:
+
+```rust
+let find = shop.orders.find();
+let pending: Vec<_> = find
+    .by_customer("wile")
+    .and(find.by_status(&Status::Pending))
+    .rev()
+    .take(20)
+    .collect();
+```
+
+`Matches` yields rows in key order from either end and takes further `and` and `or` calls. `.keys()`
+gives the keys alone, and `.covered()` the covered fields of the leftmost lookup, so a combination
+whose first index covers what you show reads no rows at all. An index entry is `(value, key)`, so
+the keys of one value come in key order, and two lookups of similar size are walked side by side.
+When one has at least four times the keys of the other, only the smaller is walked and each of its
+keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where walking both took
+600 µs.
+
+A lookup made on the table itself, such as `by_x_range` or `by_x_prefix`, can be passed to `and`
+or `or` too, but it is not in key order, so its keys are read in full and sorted first. A
+combination reads the indexes as they were when you built it, like any lookup. [Combining
+lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
+
 ## Lookups
 
 A `Table` lookup through an index reads each row separately unless you read it through `.covered()`,
-and no query planning happens. You choose the index. `IndexIter::keys` gives the primary keys
-without reading any row.
+and no query planning happens. You choose the indexes, and combine them as described under
+[Combining lookups](#combining-lookups). `IndexIter::keys` gives the primary keys without reading
+any row.
 
 ## How it works
 

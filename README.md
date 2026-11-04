@@ -60,8 +60,9 @@ explained or undone from the history, and corruption surfaces as an error rather
   branch runs one closure at a time. Batch related changes, or use `coalesce`.
 - **Several writing processes.** One process holds the writer lock. Others open read-only and call
   `refresh`.
-- **Ad hoc queries.** There is no query language or planner. You choose the index, and an index
-  lookup reads each row separately unless the index covers the fields it needs.
+- **Ad hoc queries.** There is no query language or planner. You choose the indexes, `and` and
+  `or` combine equality lookups by key, a range joins them only after its keys are read and sorted,
+  and each matching row is read separately unless the index covers the fields it needs.
 - **Very large files.** A reclamation cycle copies everything retained at 180 to 570 MB/s and needs
   that much free disk, and a first sync keeps under 500 bytes per object in memory.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
