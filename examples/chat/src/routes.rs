@@ -160,7 +160,7 @@ async fn list_rooms(State(app): State<Shared>, Query(page): Query<Page>) -> Json
     let rooms: Vec<Value> = rows
         .by_ref()
         .take(limit)
-        .map(|(_, room)| room_view(&room))
+        .map(|room| room_view(&room))
         .collect();
     let next = more
         .then(|| rooms.last().and_then(|room| room["id"].as_u64()))

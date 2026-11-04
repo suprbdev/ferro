@@ -4016,6 +4016,10 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         Keys(self)
     }
 
+    pub(crate) fn into_values(self) -> Values<K, V, S> {
+        Values(self)
+    }
+
     #[inline]
     fn advance(&mut self) -> Option<usize> {
         if self.remaining == 0 {

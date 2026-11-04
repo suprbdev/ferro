@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::codec::{Data, Decoder, Description, Encoder, Hash};
 use crate::error::Result;
-use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Map, Val, Values, same_value};
+use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, same_value};
 
 pub trait Record: Data {
     type Key: Data + Ord;
@@ -114,6 +114,10 @@ impl<T: Record> Table<T> {
         self.0.rows().values()
     }
 
+    pub fn keys(&self) -> Keys<T::Key, T> {
+        self.0.rows().keys()
+    }
+
     pub fn for_each(&self, mut f: impl FnMut(&T)) {
         self.0.rows().for_each(|_, row| f(row));
     }
@@ -127,13 +131,13 @@ impl<T: Record> Table<T> {
         self.0.rows().for_each_range::<Q, R>(range, |_, row| f(row));
     }
 
-    pub fn range<Q, R>(&self, range: R) -> Iter<T::Key, T>
+    pub fn range<Q, R>(&self, range: R) -> Values<T::Key, T>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        self.0.rows().range::<Q, R>(range)
+        self.0.rows().range::<Q, R>(range).into_values()
     }
 
     pub fn first(&self) -> Option<Val<T>> {

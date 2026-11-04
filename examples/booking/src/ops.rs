@@ -483,7 +483,7 @@ impl Hotels {
         }
         let rooms: Vec<u32> = match venue {
             Some(venue) => self.rooms.by_venue(&venue).keys().collect(),
-            None => self.rooms.rows().keys().collect(),
+            None => self.rooms.keys().collect(),
         };
         for room in &rooms {
             self.rooms

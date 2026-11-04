@@ -163,8 +163,7 @@ fn products_page(shop: &Shop, query: &ListQuery) -> Value {
         Some(category) => Box::new(shop.products.by_category_after(category.as_str(), &after)),
         None => Box::new(
             shop.products
-                .range((Bound::Excluded(after), Bound::Unbounded))
-                .map(|(_, product)| product),
+                .range((Bound::Excluded(after), Bound::Unbounded)),
         ),
     };
     let needle = query.q.as_ref().map(|text| text.to_lowercase());

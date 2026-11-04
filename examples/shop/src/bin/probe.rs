@@ -454,8 +454,8 @@ fn etag_experiment() {
     let at = Instant::now();
     for _ in 0..rounds {
         let mut hasher = 0u64;
-        for (id, item) in snap.products.range(1000u64..1200).take(200) {
-            hasher += id + item.price_cents;
+        for item in snap.products.range(1000u64..1200).take(200) {
+            hasher += item.id + item.price_cents;
         }
         keep += hasher as usize & 1;
     }

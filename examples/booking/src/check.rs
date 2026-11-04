@@ -174,16 +174,16 @@ fn booking_in(h: &Hotels, b: &Booking, out: &mut Report<'_>) {
                 b.nights
             )
         });
-        for (slot, stay) in &stays {
+        for stay in &stays {
             let sold = b.status == Status::Confirmed;
             let fits = stay.room == b.room
                 && stay.venue == b.venue
-                && stay.night == slot.1
+                && stay.night == stay.slot.1
                 && stay.night >= b.first
                 && stay.night <= b.last_night()
                 && stay.sold == sold;
             out.check(fits, || {
-                format!("stay {slot:?} does not match booking #{id}")
+                format!("stay {:?} does not match booking #{id}", stay.slot)
             });
         }
     } else {

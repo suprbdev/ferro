@@ -178,7 +178,7 @@ fn world(svc: &Reservations, args: &Args) -> Result<World, BookingError> {
         .iter()
         .map(|venue| h.rooms.by_venue(&venue.id).keys().collect())
         .collect();
-    let customers = h.customers.rows().keys().collect();
+    let customers = h.customers.keys().collect();
     let acks = match &args.ack_log {
         Some(path) => Some(Mutex::new(
             fs::OpenOptions::new()

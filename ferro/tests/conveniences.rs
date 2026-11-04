@@ -138,3 +138,30 @@ fn a_closure_that_fails_inside_update_discards_the_commit() {
     assert!(now.seats.get(&6).unwrap().sold);
     assert_eq!(now.prices.get(&60), None);
 }
+
+#[test]
+fn table_range_yields_rows_as_iter_does() {
+    let hall = hall();
+    assert_eq!(ids(hall.seats.range(3..6)), vec![3, 4, 5]);
+    assert_eq!(ids(hall.seats.range(..=2).rev()), vec![2, 1]);
+    assert_eq!(hall.seats.range(4..).len(), 6);
+    let mut tail = hall.seats.range(7..);
+    assert_eq!(tail.next_back().map(|seat| seat.id), Some(9));
+    assert_eq!(tail.len(), 2);
+    assert_eq!(
+        ids(hall.seats.range(..)),
+        ids(hall.seats.iter()),
+        "a full range is the table"
+    );
+}
+
+#[test]
+fn table_keys_lists_the_keys_in_order() {
+    let mut hall = hall();
+    hall.seats.remove(&4);
+    let keys: Vec<u32> = hall.seats.keys().collect();
+    assert_eq!(keys, vec![1, 2, 3, 5, 6, 7, 8, 9]);
+    assert_eq!(hall.seats.keys().rev().next(), Some(9));
+    assert_eq!(hall.seats.keys().len(), hall.seats.len());
+    assert_eq!(Table::<Seat>::new().keys().next(), None);
+}
