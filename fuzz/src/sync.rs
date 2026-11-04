@@ -833,12 +833,19 @@ impl Read for Feed<'_> {
 static ACTION: Mutex<Option<(Db<World>, u8)>> = Mutex::new(None);
 
 fn interfere(step: &'static str) {
-    if step != "received" {
+    let mut action = ACTION.lock().unwrap();
+    let wanted = match action.as_ref() {
+        Some((_, what)) if what & 8 != 0 => "placed",
+        Some(_) => "received",
+        None => return,
+    };
+    if step != wanted {
         return;
     }
-    let Some((db, what)) = ACTION.lock().unwrap().take() else {
+    let Some((db, what)) = action.take() else {
         return;
     };
+    drop(action);
     match what % 8 {
         4 => {
             let _ = db.update(|world| world.poke(31));
@@ -848,8 +855,13 @@ fn interfere(step: &'static str) {
                 let _ = other.update(|world| world.poke(32));
             }
         }
-        6 => {
+        6 if step == "received" => {
             let _ = db.compact(Keep::Last(1));
+        }
+        6 => {
+            if let Ok(other) = db.branch(&db.branches()[0]) {
+                let _ = other.update(|world| world.poke(34));
+            }
         }
         7 => {
             if let Ok(side) = db.fork("fuzz-side") {

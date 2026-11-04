@@ -278,6 +278,10 @@ fn follow<T: Probe + Default>(follower: &Db<T>, path: &Path) {
             {
                 break;
             }
+            if step == 40 {
+                let _ = follower.refresh();
+                let _ = writer.compact(Keep::Last(3));
+            }
         }
     }
     let _ = follower.refresh();
@@ -339,6 +343,10 @@ fn writes<T: Probe>(db: &Db<T>) {
         let _ = db.drop_branch("fuzz-side");
     }
     let _ = db.verify();
+    if db.compact(Keep::Last(2)).is_ok() {
+        guarded(|| db.update(|value| value.poke(10)));
+        let _ = db.verify();
+    }
 }
 
 fn sync_out<T: Probe + Default>(db: &Db<T>) {
