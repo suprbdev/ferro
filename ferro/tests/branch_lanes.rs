@@ -1102,6 +1102,14 @@ fn check(
         .unwrap_or_else(|error| panic!("{context}: verify again: {error}"));
 }
 
+fn syncs(recording: &Recording) -> usize {
+    recording
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Sync(_)))
+        .count()
+}
+
 fn replay(recording: &Recording, options: fn() -> Options, durable: bool, seed: u64) -> usize {
     let dir = dir();
     let path = dir.path().join("image.ferro");
@@ -1138,11 +1146,7 @@ fn a_power_cut_keeps_every_acknowledged_commit_on_every_branch() {
     for (seed, (kind, options)) in durable.into_iter().enumerate() {
         let dir = dir();
         let recording = record(&dir.path().join("trace.ferro"), options, 4, 10);
-        let syncs = recording
-            .ops
-            .iter()
-            .filter(|op| matches!(op, Op::Sync(_)))
-            .count();
+        let syncs = syncs(&recording);
         assert!(syncs > 4, "{kind}: only {syncs} syncs");
         assert!(
             replay(&recording, options, true, seed as u64) > 100,
@@ -1158,13 +1162,14 @@ fn a_power_cut_leaves_buffered_branches_whole() {
     let lossy: [Kind; 2] = [("buffered", small), ("buffered coalesced", coalesced)];
     for (seed, (kind, options)) in lossy.into_iter().enumerate() {
         let dir = dir();
-        let recording = record(&dir.path().join("trace.ferro"), options, 4, 12);
-        let syncs = recording
-            .ops
-            .iter()
-            .filter(|op| matches!(op, Op::Sync(_)))
-            .count();
-        assert!(syncs >= 3, "{kind}: only {syncs} syncs");
+        let recording = [12, 24, 48]
+            .into_iter()
+            .map(|commits| {
+                let path = dir.path().join(format!("trace-{commits}.ferro"));
+                record(&path, options, 4, commits)
+            })
+            .find(|recording| syncs(recording) >= 3)
+            .unwrap_or_else(|| panic!("{kind}: under 3 syncs in every recording"));
         assert!(
             replay(&recording, options, false, 10 + seed as u64) > 100,
             "{kind}"
