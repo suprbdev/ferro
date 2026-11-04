@@ -408,6 +408,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "ferro-derive",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "proptest",

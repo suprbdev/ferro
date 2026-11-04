@@ -15,7 +15,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
@@ -29,6 +29,7 @@ use crate::shared::{Erased, Shared};
 
 const MAGIC: &[u8; 8] = b"FERRODB3";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+const RETIRED_MAGIC: &[u8; 8] = b"FERROGEN";
 const SLOT_BYTES: u64 = 4096;
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
 const MARK_BYTES: usize = 24 + HASH_BYTES;
@@ -52,6 +53,13 @@ const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 pub(crate) const MAX_RATIO: usize = 255;
 const REPLAY_CHUNK: usize = 256 << 10;
+const LOCKS_AT: u64 = 1 << 62;
+const MULTI_AT: u64 = LOCKS_AT + 1;
+const COMMIT_AT: u64 = LOCKS_AT + 2;
+const SUPER_AT: u64 = LOCKS_AT + 3;
+const CYCLE_AT: u64 = LOCKS_AT + 4;
+const LANES_AT: u64 = LOCKS_AT + (1 << 20);
+const LANES: u64 = 1 << 60;
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -82,6 +90,7 @@ pub struct StoreOptions {
     pub cache_bytes: u64,
     pub read_only: bool,
     pub checkpoint_bytes: u64,
+    pub shared: bool,
     #[doc(hidden)]
     pub trace: Option<Trace>,
 }
@@ -93,6 +102,7 @@ impl Default for StoreOptions {
             cache_bytes: 1 << 30,
             read_only: false,
             checkpoint_bytes: 64 << 20,
+            shared: false,
             trace: None,
         }
     }
@@ -423,6 +433,10 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     if settled || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
     }
+    if platform::range_held(file, MULTI_AT, 1).unwrap_or(true) {
+        platform::unlock(file)?;
+        return Ok(sb);
+    }
     let before = sb.anchor.seq;
     let scanned = file
         .metadata()
@@ -580,7 +594,18 @@ pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basi
     Ok(())
 }
 
-fn open_locked(path: &Path, read_only: bool) -> Result<File> {
+fn try_lock_shared_writer(file: &File) -> std::result::Result<(), TryLockError> {
+    platform::lock_range(file, MULTI_AT, 1, false, false)?;
+    platform::try_lock_shared(file)
+}
+
+fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
+    if shared && !read_only && !platform::RANGES {
+        return Err(Error::Io(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "writers in several processes need open file description locks",
+        )));
+    }
     let mut retries = 0;
     loop {
         let mut options = OpenOptions::new();
@@ -598,7 +623,11 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
         if read_only {
             return Ok(file);
         }
-        match platform::try_lock(&file) {
+        let locked = match shared {
+            true => try_lock_shared_writer(&file),
+            false => platform::try_lock(&file),
+        };
+        match locked {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) if retries == LOCK_RETRIES => return Err(Error::Locked),
             Err(TryLockError::WouldBlock) => {
@@ -616,11 +645,83 @@ fn open_locked(path: &Path, read_only: bool) -> Result<File> {
     }
 }
 
+struct Range<'a> {
+    file: &'a File,
+    at: u64,
+}
+
+impl<'a> Range<'a> {
+    fn hold(file: &'a File, at: u64, shared: bool) -> Result<Option<Range<'a>>> {
+        if !shared {
+            return Ok(None);
+        }
+        platform::lock_range(file, at, 1, true, true).map_err(|error| match error {
+            TryLockError::Error(error) => Error::Io(error),
+            TryLockError::WouldBlock => Error::Locked,
+        })?;
+        Ok(Some(Range { file, at }))
+    }
+}
+
+impl Drop for Range<'_> {
+    fn drop(&mut self) {
+        let _ = platform::unlock_range(self.file, self.at, 1);
+    }
+}
+
+pub(crate) fn lane_of(name: &str) -> u64 {
+    LANES_AT + (xxh3_64(name.as_bytes()) & (LANES - 1))
+}
+
+pub(crate) struct Held {
+    store: Store,
+    at: u64,
+    len: u64,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = platform::unlock_range(&self.store.inner.file, self.at, self.len);
+    }
+}
+
+pub(crate) struct AllLanes {
+    store: Store,
+}
+
+impl Drop for AllLanes {
+    fn drop(&mut self) {
+        let inner = &self.store.inner;
+        let lanes = inner.lanes.lock();
+        let mut held: Vec<u64> = lanes.keys().copied().collect();
+        if cfg!(windows) {
+            held.clear();
+        }
+        held.sort_unstable();
+        let mut at = LANES_AT;
+        for byte in held {
+            if byte > at {
+                let _ = platform::unlock_range(&inner.file, at, byte - at);
+            }
+            at = byte + 1;
+        }
+        if at < LANES_AT + LANES {
+            let _ = platform::unlock_range(&inner.file, at, LANES_AT + LANES - at);
+        }
+    }
+}
+
+pub(crate) enum Followed {
+    Still,
+    Moved(Frame),
+    Retired,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
     pub(crate) seq: u64,
     pub(crate) end: u64,
-    head: Ptr,
+    pub(crate) head: Ptr,
 }
 
 impl Frame {
@@ -742,6 +843,8 @@ struct Inner {
     lost_at: AtomicU64,
     unsynced: AtomicBool,
     closed: AtomicBool,
+    lanes: Mutex<HashMap<u64, Option<usize>>>,
+    lanes_moved: Condvar,
     options: StoreOptions,
 }
 
@@ -776,10 +879,17 @@ impl Store {
         path: &Path,
         options: StoreOptions,
     ) -> Result<(Store, Option<Ptr>)> {
-        let file = open_locked(actual, options.read_only)?;
-        if !options.read_only && actual == path {
+        let shared = options.shared && !options.read_only;
+        let file = open_locked(actual, options.read_only, shared)?;
+        let commit = Range::hold(&file, COMMIT_AT, shared)?;
+        let tops = Range::hold(&file, SUPER_AT, shared)?;
+        let idle = !shared || platform::lock_range(&file, CYCLE_AT, 1, true, false).is_ok();
+        if !options.read_only && actual == path && idle {
             let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let _ = std::fs::remove_file(sibling(&real));
+        }
+        if shared && idle {
+            platform::unlock_range(&file, CYCLE_AT, 1)?;
         }
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
@@ -830,6 +940,7 @@ impl Store {
                 (sb, 0)
             }
         };
+        drop((tops, commit));
         let cache_bytes = options.cache_bytes.max(1);
         let items = ((cache_bytes / 4096).max(64)) as usize;
         let dedupe = (cache_bytes / 4096).clamp(MIN_DEDUPE, MAX_DEDUPE) as usize;
@@ -864,6 +975,8 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                lanes: Mutex::new(HashMap::new()),
+                lanes_moved: Condvar::new(),
                 options,
             }),
         };
@@ -1037,11 +1150,7 @@ impl Store {
                 }
                 marks.anchor
             };
-            let sb = Super::new(mark, anchor, inner.basis);
-            let slot = 1 - inner.slot.load(Ordering::Relaxed);
-            inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
-            inner.slot.store(slot, Ordering::Relaxed);
-            Ok(())
+            self.write_super(&Super::new(mark, anchor, inner.basis))
         })();
         if let Err(error) = attempt {
             self.poison_unsynced();
@@ -1088,9 +1197,174 @@ impl Store {
         }
         inner.file.sync_data()?;
         let sb = Super::new(marks.latest, marks.latest, inner.basis);
-        let slot = inner.slot.load(Ordering::Relaxed);
-        inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+        if inner.options.shared {
+            self.write_super(&sb)?;
+        } else {
+            let slot = inner.slot.load(Ordering::Relaxed);
+            inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+        }
         inner.marks.lock().anchor = marks.latest;
+        Ok(())
+    }
+
+    fn write_super(&self, sb: &Super) -> Result<()> {
+        let inner = &self.inner;
+        let _held = Range::hold(&inner.file, SUPER_AT, inner.options.shared)?;
+        let slot = match inner.options.shared {
+            false => 1 - inner.slot.load(Ordering::Relaxed),
+            true => match read_supers(&inner.file, LOG_START)? {
+                Some((found, _)) if (found.seq, found.anchor.seq) >= (sb.seq, sb.anchor.seq) => {
+                    return Ok(());
+                }
+                Some((_, slot)) => 1 - slot,
+                None => 1 - inner.slot.load(Ordering::Relaxed),
+            },
+        };
+        inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
+        inner.slot.store(slot, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.inner.options.shared
+    }
+
+    fn hold(&self, at: u64, len: u64, wait: bool) -> Result<Option<Held>> {
+        match platform::lock_range(&self.inner.file, at, len, true, wait) {
+            Ok(()) => Ok(Some(Held {
+                store: self.clone(),
+                at,
+                len,
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn lock_commit(&self) -> Result<Held> {
+        self.hold(COMMIT_AT, 1, true)?.ok_or(Error::Locked)
+    }
+
+    pub(crate) fn lock_lanes(&self) -> Result<AllLanes> {
+        platform::lock_range(&self.inner.file, LANES_AT, LANES, true, true).map_err(|error| {
+            match error {
+                TryLockError::Error(error) => Error::Io(error),
+                TryLockError::WouldBlock => Error::Locked,
+            }
+        })?;
+        Ok(AllLanes {
+            store: self.clone(),
+        })
+    }
+
+    pub(crate) fn lock_cycle(&self, wait: bool) -> Result<Option<Held>> {
+        self.hold(CYCLE_AT, 1, wait)
+    }
+
+    pub(crate) fn lock_lane(&self, at: u64) -> Result<()> {
+        let inner = &self.inner;
+        let mut lanes = inner.lanes.lock();
+        loop {
+            match lanes.get_mut(&at) {
+                Some(Some(count)) => {
+                    *count += 1;
+                    return Ok(());
+                }
+                Some(None) => inner.lanes_moved.wait(&mut lanes),
+                None => break,
+            }
+        }
+        lanes.insert(at, None);
+        drop(lanes);
+        let locked = platform::lock_range(&inner.file, at, 1, true, true);
+        let mut lanes = inner.lanes.lock();
+        match locked {
+            Ok(()) => lanes.insert(at, Some(1)),
+            Err(_) => lanes.remove(&at),
+        };
+        inner.lanes_moved.notify_all();
+        locked.map_err(|error| match error {
+            TryLockError::Error(error) => Error::Io(error),
+            TryLockError::WouldBlock => Error::Locked,
+        })
+    }
+
+    pub(crate) fn unlock_lane(&self, at: u64) {
+        let inner = &self.inner;
+        let mut lanes = inner.lanes.lock();
+        match lanes.get_mut(&at) {
+            Some(Some(count)) if *count > 1 => *count -= 1,
+            _ => {
+                lanes.remove(&at);
+                let _ = platform::unlock_range(&inner.file, at, 1);
+            }
+        }
+    }
+
+    pub(crate) fn follow(&self) -> Result<Followed> {
+        let inner = &self.inner;
+        let cursor = inner.cursor.lock();
+        let start = Mark {
+            seq: cursor.seq,
+            log_end: inner.placed.load(Ordering::Acquire),
+            head: None,
+        };
+        let mut at = Super::new(start, start, Basis::default());
+        let mut last = None;
+        let mut len = None;
+        loop {
+            let mut header = [0u8; FRAME_BYTES];
+            if !read_or_end(&inner.file, &mut header, at.log_end)? {
+                break;
+            }
+            if &header[0..8] == RETIRED_MAGIC {
+                if platform::path_id(&inner.path).is_ok_and(|id| id != inner.file.inode) {
+                    return Ok(Followed::Retired);
+                }
+                break;
+            }
+            if &header[0..8] != FRAME_MAGIC {
+                break;
+            }
+            let len = match len {
+                Some(len) => len,
+                None => *len.insert(inner.file.metadata()?.len()),
+            };
+            match read_frame(&inner.file, &at, len)? {
+                Some(next) if next.head.is_some() => {
+                    at = next;
+                    last = Some(next);
+                }
+                _ => break,
+            }
+        }
+        let Some(last) = last else {
+            return Ok(Followed::Still);
+        };
+        inner.written.fetch_max(last.log_end, Ordering::AcqRel);
+        Ok(Followed::Moved(Frame {
+            seq: last.seq,
+            end: last.log_end,
+            head: last.head.expect("a followed frame names its head"),
+        }))
+    }
+
+    pub(crate) fn advance(&self, frame: Frame) {
+        let inner = &self.inner;
+        let mut cursor = inner.cursor.lock();
+        if frame.seq <= cursor.seq {
+            return;
+        }
+        cursor.seq = frame.seq;
+        inner.placed.fetch_max(frame.end, Ordering::AcqRel);
+        inner.written.fetch_max(frame.end, Ordering::AcqRel);
+    }
+
+    pub(crate) fn mark_retired(&self) -> Result<()> {
+        let mut header = [0u8; FRAME_BYTES];
+        header[0..8].copy_from_slice(RETIRED_MAGIC);
+        let at = self.inner.placed.load(Ordering::Acquire);
+        self.inner.file.write_all_at(&header, at)?;
         Ok(())
     }
 
@@ -1298,6 +1572,11 @@ impl Store {
         inner.cache.clear();
         crate::epoch::flush();
         if closed || inner.options.read_only {
+            return;
+        }
+        if inner.options.shared {
+            let _ = platform::unlock_range(&inner.file, MULTI_AT, 1);
+            let _ = platform::unlock(&inner.file);
             return;
         }
         let end = inner.written.load(Ordering::Acquire);
@@ -1654,6 +1933,13 @@ impl Sink for Txn {
 
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
     if inner.options.durability != Durability::Fsync || end <= cursor.reserved {
+        return;
+    }
+    if inner.options.shared
+        && let Ok(meta) = inner.file.metadata()
+        && meta.len() > end
+    {
+        cursor.reserved = meta.len();
         return;
     }
     let zeros = vec![0u8; cursor.reserve as usize];

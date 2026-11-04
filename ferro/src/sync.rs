@@ -2197,7 +2197,7 @@ impl<T: Data> Db<T> {
             commits,
         } = received;
         let spilled = staging.spilled();
-        let _cycles = spilled.then(|| self.hold_cycles());
+        let _cycles = spilled.then(|| self.hold_cycles()).transpose()?;
         let mut placed = HashMap::new();
         if spilled {
             let (store, refs) = self.published_refs();
