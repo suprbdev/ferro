@@ -14,7 +14,7 @@ FUZZ ?= open
 FUZZ_TIME ?= 600
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt doc ci act \
+.PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt fmt-check doc ci act \
 	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds clean clean-tmp
@@ -54,10 +54,13 @@ lint-windows: ## Run clippy for the Windows target
 fmt: ## Format the workspace with rustfmt
 	$(CARGO) fmt --all
 
+fmt-check: ## Fail if any file is not formatted with rustfmt
+	$(CARGO) fmt --all -- --check
+
 doc: ## Build the library's API docs and open them
 	$(CARGO) doc --no-deps -p ferro --open
 
-ci: lint lint-windows test ## Run the local equivalent of CI
+ci: fmt-check lint lint-windows test ## Run the local equivalent of CI
 
 act: ## Run the GitHub workflow's Linux job locally with act
 	act push -j test

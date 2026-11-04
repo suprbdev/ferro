@@ -149,7 +149,7 @@ The `Makefile` wraps the common commands, and `make help` lists every target.
 | `make build` | Builds the workspace in release. |
 | `make test` | Runs every test in the workspace, in release. |
 | `make test-one T=sync` | Runs the library tests whose names match `T`. |
-| `make ci` | Runs clippy for Linux and Windows, then every test. |
+| `make ci` | Checks formatting, runs clippy for Linux and Windows, then every test. |
 | `make bench` | Runs the main benchmark and appends to `target/bench/results.jsonl`. |
 | `make bench-compare` | Compares ferro with SQLite, redb and fjall. |
 | `make fuzz FUZZ=open` | Fuzzes one target with nightly, after `make fuzz-seeds`. |
