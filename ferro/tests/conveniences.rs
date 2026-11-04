@@ -46,6 +46,8 @@ impl Summary<(u8, u16), u32> for Total {
     }
 }
 
+type Step = (&'static str, fn(&mut Hall));
+
 fn seat(id: u32) -> Seat {
     Seat {
         id,
@@ -186,7 +188,7 @@ fn table_keys_lists_the_keys_in_order() {
     hall.seats.remove(&4);
     let keys: Vec<u32> = hall.seats.keys().collect();
     assert_eq!(keys, vec![1, 2, 3, 5, 6, 7, 8, 9]);
-    assert_eq!(hall.seats.keys().rev().next(), Some(9));
+    assert_eq!(hall.seats.keys().next_back(), Some(9));
     assert_eq!(hall.seats.keys().len(), hall.seats.len());
     assert_eq!(Table::<Seat>::new().keys().next(), None);
 }
@@ -195,7 +197,7 @@ fn table_keys_lists_the_keys_in_order() {
 fn while_some_yields_a_row_back_to_its_creation_without_the_option() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast().open::<Hall>(dir.path().join("h.ferro")).unwrap();
-    let steps: [(&str, fn(&mut Hall)); 6] = [
+    let steps: [Step; 6] = [
         ("add", |hall| {
             hall.seats.insert(seat(1));
         }),
