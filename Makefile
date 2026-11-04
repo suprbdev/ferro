@@ -15,7 +15,7 @@ FUZZ_TIME ?= 600
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt doc ci act \
-	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-compare \
+	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds clean clean-tmp
 
@@ -82,6 +82,9 @@ bench-bulk: ## Benchmark a bulk load phase by phase
 
 bench-merge: ## Benchmark merge-base searches
 	$(RUN) run --release -p ferro-bench --bin merge -- $(ARGS)
+
+bench-covered: ## Measure index size and commit cost with and without covered fields
+	$(RUN) run --release -p ferro-bench --bin covered -- $(ARGS)
 
 bench-compare: ## Compare ferro with SQLite, redb and fjall
 	cd benchmarks/compare && $(RUN) run --release -- $(ARGS)

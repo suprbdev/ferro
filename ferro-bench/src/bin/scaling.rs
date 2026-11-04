@@ -42,6 +42,25 @@ struct Bank {
     accounts: Table<Account>,
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct CoveredAccount {
+    #[key]
+    id: u64,
+    #[index(cover(balance))]
+    tier: Tier,
+    email: String,
+    name: String,
+    #[index(cover(balance))]
+    balance: i64,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct CoveredBank {
+    accounts: Table<CoveredAccount>,
+}
+
+const FILES: [&str; 3] = ["map.ferro", "bank.ferro", "covered.ferro"];
+
 fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e3779b97f4a7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -61,6 +80,23 @@ fn account(i: u64) -> Account {
         email: format!("user{i}@example.com"),
         name: format!("Account Holder {}", seed % 100_000),
         balance: (seed % BALANCES) as i64,
+    }
+}
+
+fn covered_account(i: u64) -> CoveredAccount {
+    let Account {
+        id,
+        tier,
+        email,
+        name,
+        balance,
+    } = account(i);
+    CoveredAccount {
+        id,
+        tier,
+        email,
+        name,
+        balance,
     }
 }
 
@@ -215,6 +251,8 @@ enum Work {
     Range,
     Index,
     Tier,
+    IndexCovered,
+    TierCovered,
 }
 
 impl Work {
@@ -226,6 +264,8 @@ impl Work {
             Work::Range => "range",
             Work::Index => "index",
             Work::Tier => "tier",
+            Work::IndexCovered => "index-covered",
+            Work::TierCovered => "tier-covered",
         }
     }
 
@@ -237,6 +277,8 @@ impl Work {
             "range" => Work::Range,
             "index" => Work::Index,
             "tier" => Work::Tier,
+            "index-covered" => Work::IndexCovered,
+            "tier-covered" => Work::TierCovered,
             other => panic!("unknown workload {other}"),
         }
     }
@@ -245,7 +287,7 @@ impl Work {
         match self {
             Work::Get => 256,
             Work::Scan | Work::Each => 1,
-            Work::Range | Work::Index | Work::Tier => 16,
+            Work::Range | Work::Index | Work::Tier | Work::IndexCovered | Work::TierCovered => 16,
         }
     }
 
@@ -254,8 +296,8 @@ impl Work {
             Work::Get => "gets",
             Work::Scan | Work::Each => "keys",
             Work::Range => "ranges",
-            Work::Index => "lookups",
-            Work::Tier => "pages",
+            Work::Index | Work::IndexCovered => "lookups",
+            Work::Tier | Work::TierCovered => "pages",
         }
     }
 }
@@ -263,6 +305,7 @@ impl Work {
 struct Dbs {
     map: Db<Map<u64, String>>,
     bank: Db<Bank>,
+    covered: Db<CoveredBank>,
 }
 
 struct Outcome {
@@ -353,6 +396,39 @@ fn read_batch(work: Work, dbs: &Dbs, n: u64, rng: &mut u64) -> u64 {
             }
             work.batch()
         }
+        Work::IndexCovered => {
+            let snapshot = dbs.covered.read();
+            for _ in 0..work.batch() {
+                let low = (next(rng) % BALANCES) as i64;
+                let total = snapshot
+                    .accounts
+                    .by_balance_range(low..low + INDEX_SPAN)
+                    .covered()
+                    .map(|(_, balance)| balance)
+                    .fold(0i64, i64::wrapping_add);
+                black_box(total);
+            }
+            work.batch()
+        }
+        Work::TierCovered => {
+            let snapshot = dbs.covered.read();
+            for _ in 0..work.batch() {
+                let tier = if next(rng).is_multiple_of(2) {
+                    Tier::Pro
+                } else {
+                    Tier::Free
+                };
+                let total = snapshot
+                    .accounts
+                    .by_tier(&tier)
+                    .covered()
+                    .take(TIER_PAGE)
+                    .map(|(_, balance)| balance)
+                    .fold(0i64, i64::wrapping_add);
+                black_box(total);
+            }
+            work.batch()
+        }
     }
 }
 
@@ -362,6 +438,15 @@ fn write_one(work: Work, dbs: &Dbs, n: u64, rows: u64, rng: &mut u64) {
             let id = next(rng) % rows;
             let balance = (next(rng) % BALANCES) as i64;
             dbs.bank
+                .update(|bank| {
+                    bank.accounts.update(&id, |row| row.balance = balance);
+                })
+                .unwrap();
+        }
+        Work::IndexCovered | Work::TierCovered => {
+            let id = next(rng) % rows;
+            let balance = (next(rng) % BALANCES) as i64;
+            dbs.covered
                 .update(|bank| {
                     bank.accounts.update(&id, |row| row.balance = balance);
                 })
@@ -493,6 +578,20 @@ fn build(dir: &Path, n: u64, rows: u64) {
         })
         .unwrap();
     }
+    drop(bank);
+    let covered = Options::new()
+        .durability(Durability::Buffered)
+        .open::<CoveredBank>(dir.join("covered.ferro"))
+        .unwrap();
+    for chunk in 0..rows.div_ceil(100_000) {
+        covered
+            .update(|bank| {
+                for i in chunk * 100_000..((chunk + 1) * 100_000).min(rows) {
+                    bank.accounts.insert(covered_account(i));
+                }
+            })
+            .unwrap();
+    }
 }
 
 fn open(dir: &Path, cache: u64) -> Dbs {
@@ -504,6 +603,7 @@ fn open(dir: &Path, cache: u64) -> Dbs {
     Dbs {
         map: options().open(dir.join("map.ferro")).unwrap(),
         bank: options().open(dir.join("bank.ferro")).unwrap(),
+        covered: options().open(dir.join("covered.ferro")).unwrap(),
     }
 }
 
@@ -529,6 +629,22 @@ fn warm(dbs: &Dbs) {
                 .count(),
         );
         black_box(bank.accounts.by_tier(&Tier::Pro).keys().count());
+        let covered = dbs.covered.read();
+        black_box(
+            covered
+                .accounts
+                .iter()
+                .map(|row| row.balance)
+                .fold(0i64, i64::wrapping_add),
+        );
+        black_box(
+            covered
+                .accounts
+                .by_balance_range(0..BALANCES as i64)
+                .covered()
+                .count(),
+        );
+        black_box(covered.accounts.by_tier(&Tier::Pro).covered().count());
     }
 }
 
@@ -576,7 +692,7 @@ fn main() {
     let threads = list("--threads", "1,2,4,8,16,32", |item| {
         item.parse::<usize>().unwrap()
     });
-    let works = list("--work", "get,scan,each,range,index,tier", Work::parse);
+    let works = list("--work", "get,scan,each,range,index,tier,index-covered,tier-covered", Work::parse);
     let writers = list("--writers", "0,1", |item| item.parse::<usize>().unwrap());
     let caches = list("--cache", "warm,small", |item| match item {
         "warm" => WARM_CACHE,
@@ -589,7 +705,7 @@ fn main() {
     let dir = tempfile::tempdir_in(&parent).unwrap();
     match argument("--from") {
         Some(golden) => {
-            for name in ["map.ferro", "bank.ferro"] {
+            for name in FILES {
                 std::fs::copy(Path::new(&golden).join(name), dir.path().join(name)).unwrap();
             }
         }
@@ -597,7 +713,7 @@ fn main() {
     }
     if let Some(golden) = argument("--save") {
         std::fs::create_dir_all(&golden).unwrap();
-        for name in ["map.ferro", "bank.ferro"] {
+        for name in FILES {
             std::fs::copy(dir.path().join(name), Path::new(&golden).join(name)).unwrap();
         }
         return;
