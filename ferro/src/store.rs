@@ -908,12 +908,13 @@ impl Store {
     ) -> Result<(Store, Option<Ptr>)> {
         let shared = options.shared && !options.read_only;
         let file = open_locked(actual, options.read_only, shared)?;
+        let renamed = actual != path;
+        let path = &platform::canonicalize(path)?;
         let commit = Range::hold(&file, COMMIT_AT, shared)?;
         let tops = Range::hold(&file, SUPER_AT, shared)?;
         let idle = !shared || platform::lock_range(&file, CYCLE_AT, 1, true, false).is_ok();
-        if !options.read_only && actual == path && idle {
-            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            let _ = std::fs::remove_file(sibling(&real));
+        if !options.read_only && !renamed && idle {
+            let _ = std::fs::remove_file(sibling(path));
         }
         if shared && idle {
             platform::unlock_range(&file, CYCLE_AT, 1)?;
@@ -1449,7 +1450,7 @@ impl Store {
                 break;
             }
             if &header[0..8] == RETIRED_MAGIC {
-                if platform::path_id(&inner.path).is_ok_and(|id| id != inner.file.inode) {
+                if platform::path_id(&inner.path)? != inner.file.inode {
                     return Ok(Followed::Retired);
                 }
                 break;

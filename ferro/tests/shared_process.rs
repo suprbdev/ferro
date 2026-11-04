@@ -71,6 +71,10 @@ fn shared_child() {
         follow(&path, count);
         return;
     }
+    if role == "relative" {
+        relative(Path::new(&path));
+        return;
+    }
     if role == "waiters" {
         waiters(Path::new(&path), count);
         return;
@@ -118,6 +122,33 @@ fn follow(path: &str, until: u64) {
         assert!(Instant::now() < deadline, "the reader stopped at {seen}");
     }
     println!("FOLLOWED {seen} {refreshes}");
+}
+
+fn relative(dir: &Path) {
+    let home = dir.join("home");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::env::set_current_dir(&home).unwrap();
+    let a: Db<Root> = options().open("rel.ferro").unwrap();
+    let b: Db<Root> = options().open(home.join("rel.ferro")).unwrap();
+    for i in 1..=5 {
+        commit(&a, 0, i);
+        commit(&b, 1, i);
+    }
+    std::env::set_current_dir(&elsewhere).unwrap();
+    b.compact(Keep::All).unwrap();
+    let acked = commit(&a, 0, 6);
+    b.refresh().unwrap();
+    commit(&b, 1, 6);
+    drop((a, b));
+    let db: Db<Root> = Options::new()
+        .reclaim(MANUAL)
+        .open(home.join("rel.ferro"))
+        .unwrap();
+    assert_eq!(db.read().n, acked + 1, "an acknowledged commit was lost");
+    assert_eq!(*db.read().order.get(&acked).unwrap(), (0, 6));
+    println!("RELATIVE {}", db.read().n);
 }
 
 #[cfg(target_os = "linux")]
@@ -318,6 +349,13 @@ fn child_output(path: &Path, role: &str, count: u64) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{role}: {stdout}{stderr}");
     stdout
+}
+
+#[test]
+fn a_handle_opened_by_a_relative_path_follows_a_cycle_after_the_directory_changes() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let out = child_output(dir.path(), "relative", 0);
+    assert!(out.contains("RELATIVE 12"), "{out}");
 }
 
 #[cfg(target_os = "linux")]
