@@ -66,7 +66,8 @@ explained or undone from the history, and corruption surfaces as an error rather
   `or` combine equality lookups by key, a range joins them only after its keys are read and sorted,
   and each matching row is read separately unless the index covers the fields it needs.
 - **Very large files.** A reclamation cycle copies everything retained at 180 to 570 MB/s and needs
-  that much free disk, and a first sync keeps under 500 bytes per object in memory.
+  that much free disk, and a first sync keeps about 40 bytes per object in memory on each side,
+  about 2 GB for 50 million objects.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
   measured, and failed syncs and process death are tested on Unix only.
 - **Adversaries.** Hashes are 160-bit and unkeyed, so collision resistance is 2^80, and `head_hash`

@@ -74,7 +74,7 @@ the file, beside those commits, where nothing can find them until one frame poin
 at them, so a crash leaves the previous head. Only that frame takes the writer locks, and it checks
 again that the commits the bundle builds on are still here. A damaged or forged bundle is rejected
 with `Error::Bundle` and never reaches the file. `receive` uses a fixed buffer, the object it is
-reading and under 500 bytes for each object the bundle carries, not memory for its bytes or for what
+reading and about 40 bytes for each object the bundle carries, not memory for its bytes or for what
 it claims, and refuses commits dated more than a day past this machine's clock.
 
 ## When the other side has moved
@@ -111,9 +111,11 @@ cargo run --release -p notes --bin notes-scale
 
 ## Limits
 
-Sync streams, but keeps under 500 bytes per object received and 110 per object sent, and holds each
-object whole, so a clone of tens of millions of objects or of one huge value still needs memory to
-match. A bundle over 1 MiB is written twice, to a scratch file beside the database while it arrives
+Sync streams, but keeps about 40 bytes per object received and 45 per object sent, so a clone of 50
+million objects needs about 2 GB on each side. A pull that changes many scattered keys costs about
+140 bytes more on the receiver for each unchanged node next to a changed one, which the bundle names
+so that the new tree can link it. Each object is held whole, so one huge value needs a few times its
+size. A bundle over 1 MiB is written twice, to a scratch file beside the database while it arrives
 and then into the file, so it needs disk for both until it lands. A crash while it is copied in, or
 a bundle refused because this file pruned what it builds on while it arrived, leaves the copy in the
 file until the next reclamation cycle. Files that share no commit send everything on their first

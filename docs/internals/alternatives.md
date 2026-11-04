@@ -116,6 +116,10 @@ numbers. This index lists them by subsystem.
   wait](sync-receive.md#where-checked-objects-wait).
 - Landing onto the existing record, keying the cache by hash and offset, and resolving links by
   hash: [Commits stored twice](sync-receive.md#commits-stored-twice).
+- A map from hash to position, one table, keeping every check, interned types with a slot an object,
+  keeping checks past their last link, five-byte offsets, hashes read back from the scratch file, a
+  sorted array to plan from, and streaming the plan: [Memory for each
+  object](sync.md#memory-for-each-object).
 
 ## Reclamation and Windows
 

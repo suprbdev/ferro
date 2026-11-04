@@ -119,8 +119,8 @@ median of:
 | `covered`, 3 of 3 rounds | A balance update on 200,000 rows, a plain `tier` index against one covering `balance` | 7,660 against 10,415 bytes and 52 against 67 µs of CPU, indexes of 3.90 against 4.56 MiB |
 | `merge`, 3 | Merge base of a fork at 10,000 commits followed by 10,000 and 1,000 more, of a branch that took a side branch 1,000 times, and of one with 1,000 features merged since it forked | 62 µs, 51 µs and 7.7 ms |
 | `merge`, 3 | `Map<u64, u64>::merge` of 1M keys, 100,000 changed on each side | 182 ms, 302 ms with struct values and 452 ms for a `Table` with one index |
-| `clone`, 5 | First `pull` of a 330 MB file of 124,937 objects, fsync | 0.91 s, 65 MiB peak RSS, 467 bytes of heap an object |
-| `clone`, 5 | `bundle` of that file into another, then `receive` of it | 0.62 s at 19 MiB peak RSS, then 0.78 s at 63 MiB |
+| `clone`, 5 | First `pull` of a 330 MB file of 124,937 objects, fsync | 0.91 s, 17 MiB peak RSS, 90 bytes of heap an object |
+| `clone`, 5 | `bundle` of that file into another, then `receive` of it | 0.62 s at 13 MiB peak RSS, then 0.78 s at 13 MiB |
 | `clone`, 5 | `pull` of three one-key commits | 1.33 ms, and 0.57 ms Buffered |
 | `heap`, 3 | Live heap after scans with a 64 MiB cache | 45 MiB for short strings, 58 MiB for 300 byte strings, 65 MiB for 2 KiB values, 69 MiB for table rows |
 | `watchers`, 5 | A Buffered single-key commit with 0, 1,000 and 10,000 parked watchers | 12.3, 12.0 and 12.1 µs, and 23, 57 and 375 µs at p50 to a watcher whose test passes |

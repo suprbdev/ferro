@@ -78,13 +78,14 @@ head, that first commit, the landed remote or the merge, never lost a commit ack
 cut, and had nothing past the end of the log.
 
 The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written, the object being
-read, and for each object its offset in the staging and the types it was checked as, under 500 bytes
-an object. Placing drops the staging's index and the types first, and holds each object's offset in
-the log, one piece and a window on the scratch file. An object is held whole, about three times over
+read, and for each object its hash, its offset in the staging and a count of the links to it, about
+38 bytes an object, as described under [Memory for each object](sync.md#memory-for-each-object).
+Placing drops the offsets in the staging first and holds each object's offset in the log in their
+place, one piece and a window on the scratch file. An object is held whole, about three times over
 while it is read, hashed and copied, so the largest value sent bounds memory too. A hostile stream
 gets no more: 48 distinct objects of 1 MiB took 2.1 MiB of heap and never reached the database. A 33
-MB stream of 4,549 objects took 2.79 MB, where the frame it used to fill took 2.80 MB, and 256
-commits with 64 KiB messages, 17 MB, took 2.3 MB.
+MB stream of 4,549 objects took 1.66 MB, where the frame it used to fill took 2.80 MB, and 256
+commits with 64 KiB messages, 17 MB, took 2.2 MB.
 
 Three other places were weighed. Writing the staged objects into the log as frames of their own
 while the bundle streams writes each byte once, but a cycle that swaps the file meanwhile copies
@@ -264,13 +265,23 @@ range the parent gives the node, visits the inline values and summaries, and rep
 value as a `V` and each child as a node one level down at most, with the separators around it as its
 range. It returns the node's count and level, which must match what the link claimed.
 
-The receive check is a worklist that starts at each new commit's root as `T`. A link to a sent
-object checks that object as the kind the link names, at most once for each type, and pushes its own
-links. A link that resolves to an object the receiver holds is not walked into: what the receiver
-holds is trusted. Its type comes from the hint path. The anchor root is a `T`, and each hint step
-checks the held parent as its kind to learn the kind of the link the step follows, one read per
-parent on a changed path, which the hint resolution already paid. A held child agrees with a sent
-parent when it has the same type and count, its trusted range lies inside the new one and its
+The receive check is a worklist that starts at each new commit's root as `T`, oldest commit first,
+and runs each root's tree to the end before the next. A link to a sent object checks that object as
+the kind the link names and pushes its own links. Most objects are linked once, so their checks are
+not kept. While the bundle streams, the receiver counts the links each object gets from other sent
+objects, and only an object linked more than once, or also named by a hint, keeps the kinds it was
+checked as, until its last link has reached it. A later link of the same type whose range contains
+one it was checked under is not checked again. A link under a range no earlier check covers checks
+the object again, and decodes it again under each earlier kind to learn what those gave its
+children. A child is pushed again only if the new check gives it a kind that one of those does not
+imply, which in a narrower range only the edge children get, and it carries the earlier kinds with
+it, so a recheck goes down the edge of the subtree as it did when every check was kept. The counts
+only decide what is kept: an object reached more often than it was counted is checked again, never
+let through. A link that resolves to an object the receiver holds is not walked into: what the
+receiver holds is trusted. Its type comes from the hint path. The anchor root is a `T`, and each
+hint step checks the held parent as its kind to learn the kind of the link the step follows, one
+read per parent on a changed path, which the hint resolution already paid. A held child agrees with
+a sent parent when it has the same type and count, its trusted range lies inside the new one and its
 trusted parent's level is no higher. Otherwise the held node is loaded and its leftmost and
 rightmost keys are found down its edges, O(depth). A link that names held data of another type is
 accepted only if that one object checks as the new type and holds no typed links of its own: a
@@ -279,10 +290,14 @@ rejects the bundle.
 
 The check costs the bundle, not the database: every sent object is decoded once, plus one read per
 parent on a hint path and the edges of a reused subtree whose range narrowed. A node reached again
-under a range its first check does not cover is checked again, and those rechecks may not exceed
-twice the bundle's body bytes plus 16 MiB. Cloning a `Map<u64, String>` of 400,000 keys, 36 MB in
-50,143 objects, took 164 ms against 102 ms without the check, and a bundle editing 1,008 keys spread
-over it, 3.2 MB in 2,480 objects, took 18.8 ms against 15.5 ms.
+under a range its first check does not cover is checked again, and those rechecks, with the earlier
+kinds each decodes it under, may not exceed twice the bundle's body bytes plus 16 MiB. Cloning a
+`Map<u64, String>` of 400,000 keys, 36 MB in 50,143 objects, took 164 ms against 102 ms without the
+check, and a bundle editing 1,008 keys spread over it, 3.2 MB in 2,480 objects, took 18.8 ms against
+15.5 ms. That was when every check was kept, keyed by hash and type with the kind it was made under.
+Keeping only the checks of objects linked twice took the receive of a clone of a million objects
+from 2.35 to 1.59 s and from 436 to 41 MiB of heap, with the other changes described under [Memory
+for each object](sync.md#memory-for-each-object).
 
 Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
 Nothing reads them as a type. Summaries are checked as `S` but not recomputed, because a summary is

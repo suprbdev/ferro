@@ -120,6 +120,8 @@ Tests are described next to what they test:
 - The three-device sync model with small caches: [Commits stored
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
+- The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
+  [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).
 - Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
 - What runs on Windows: [Tests](windows.md#tests).
