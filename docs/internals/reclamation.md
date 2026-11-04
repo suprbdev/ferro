@@ -310,10 +310,11 @@ with no commits yet.
 A failed copy, a full disk or a failed rename removes the temp file and reports the error from
 `Db::compact` or in `Space::last_error`, and commits never notice. So does an object that fails its
 hash check on any of the copy's threads, since a pass waits for every check before it returns. The
-writeback the copy starts as it goes makes nothing durable, so the order above is unchanged. A store poisoned while a cycle
-copied stays poisoned, because the swap checks first. On Unix the new file takes the old one's mode
-and owner, and a path through a symlink stays a symlink. Windows changes how the rename and its sync
-work, but not this order, as described under [Windows](windows.md#renaming-over-an-open-file).
+writeback the copy starts as it goes makes nothing durable, so the order above is unchanged. A
+store poisoned while a cycle copied stays poisoned, because the swap checks first. On Unix the new
+file takes the old one's mode and owner, and a path through a symlink stays a symlink. Windows
+changes how the rename and its sync work, but not this order, as described under
+[Windows](windows.md#renaming-over-an-open-file).
 
 ## Measurements
 
