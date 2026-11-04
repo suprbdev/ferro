@@ -622,7 +622,7 @@ fn run(ops: Vec<Op>) {
                 );
             }
             Op::Update(id, _) | Op::Edit(id, _) if !model.contains_key(&id) => {
-                assert_eq!(table.try_update(&id, |_| {}), Ok(false));
+                assert_eq!(table.try_update(&id, |_| {}), Ok(None));
                 assert!(table.get_mut(&id).is_none());
             }
             Op::Update(id, changes) => {

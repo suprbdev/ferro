@@ -2736,18 +2736,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.get_mut(&key).expect("key was just inserted")
     }
 
-    pub fn update<Q>(&mut self, key: &Q, f: impl FnOnce(&mut V)) -> bool
+    pub fn update<Q, R>(&mut self, key: &Q, f: impl FnOnce(&mut V) -> R) -> Option<R>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        match self.get_mut(key) {
-            Some(value) => {
-                f(value);
-                true
-            }
-            None => false,
-        }
+        self.get_mut(key).map(f)
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<Val<V>> {

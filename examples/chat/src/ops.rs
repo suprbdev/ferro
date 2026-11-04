@@ -79,11 +79,7 @@ fn live_message(room: &Room, seq: u64) -> Result<Message, ApiError> {
 }
 
 fn edit_room(chat: &mut Chat, room: u64, f: impl FnOnce(&mut Room)) -> Result<(), ApiError> {
-    if chat.rooms.update(&room, f) {
-        Ok(())
-    } else {
-        Err(no_room())
-    }
+    chat.rooms.update(&room, f).ok_or_else(no_room)
 }
 
 pub fn create_user(chat: &mut Chat, name: &str, now: u64) -> Result<u64, ApiError> {

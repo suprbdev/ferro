@@ -188,7 +188,10 @@ fn edit_map<S: Summary<u32, String>>(
                     slot.push('q');
                 }
             };
-            assert_eq!(map.update(&key, change), entries.contains_key(&key));
+            assert_eq!(
+                map.update(&key, change).is_some(),
+                entries.contains_key(&key)
+            );
             if let Some(slot) = entries.get_mut(&key) {
                 change(slot);
             }
@@ -473,7 +476,10 @@ fn edit_rows(root: &mut Root, model: &mut Model, rng: &mut Rng) {
                 row.group = group;
                 row.tags.push(tag);
             };
-            assert_eq!(root.rows.update(&id, change), model.rows.contains_key(&id));
+            assert_eq!(
+                root.rows.update(&id, change).is_some(),
+                model.rows.contains_key(&id)
+            );
             if let Some(row) = model.rows.get_mut(&id) {
                 change(row);
             }

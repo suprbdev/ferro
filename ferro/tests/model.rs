@@ -269,7 +269,7 @@ fn apply<K: TestKey>(
                     }
                 }
             };
-            let touched = map.update(&key, change);
+            let touched = map.update(&key, change).is_some();
             assert_eq!(touched, model.contains_key(&key));
             if let Some(value) = model.get_mut(&key) {
                 change(value);

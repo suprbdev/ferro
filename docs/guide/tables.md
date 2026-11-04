@@ -4,6 +4,26 @@ A `Table<T>` holds rows keyed by the field marked `#[key]`, and keeps a secondar
 field marked `#[index]`. `#[derive(Record)]` generates the indexes and their lookups. The `Order`
 row in [Getting started](getting-started.md#a-first-database) is an example.
 
+## Rows
+
+`get_mut` hands out a `RowMut` that updates the indexes when it drops. `update(&key, f)` runs `f`
+on the row and returns what `f` returns, or `None` when no row has that key, so a missing row
+becomes your own error in one line:
+
+```rust
+let total = shop
+    .orders
+    .update(&id, |order| {
+        order.status = Status::Shipped;
+        order.total_cents
+    })
+    .ok_or(ShopError::NoOrder(id))?;
+```
+
+A closure that can fail returns a `Result`, and `update(..).ok_or(..)??` passes either error on.
+Inside a commit, returning that error discards the half-changed row with the rest of the
+transaction. `Map::update` works the same way on a value.
+
 ## Secondary indexes
 
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
@@ -22,7 +42,8 @@ that `a`, ordered by `b`. Any of these can store fields beside the entries, as d
 
 `#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
 `by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
-index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash. `insert`,
+index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash, and
+`try_update` otherwise returns `Ok` with what `update` would. `insert`,
 `update` and `get_mut` have no error channel, so they panic, which discards the transaction.
 `Table::merge` passes a clash to your `resolve` closure with `ours` set to the row holding the
 value, and asks about each key once at most. A row that still clashes after that keeps our row for

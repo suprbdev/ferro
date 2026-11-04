@@ -533,7 +533,7 @@ fn run(ops: Vec<Op>) {
             }
             Op::Update(id, changes) => {
                 let Some(mut row) = model.get(&id).cloned() else {
-                    assert_eq!(table.try_update(&id, |_| {}), Ok(false));
+                    assert_eq!(table.try_update(&id, |_| {}), Ok(None));
                     continue;
                 };
                 for change in &changes {
@@ -731,7 +731,7 @@ fn covered_unique_indexes_still_refuse_a_clash() {
     second.number = 1;
     let taken = table.try_insert(second).unwrap_err();
     assert_eq!((taken.index, taken.holder), ("shop_number", 1));
-    assert_eq!(table.try_update(&1, |row| row.number = 9), Ok(true));
+    assert_eq!(table.try_update(&1, |row| row.number = 9), Ok(Some(())));
     assert_eq!(table.covered_by_shop_number(&(0, 9)), Some((1, 10)));
     assert_eq!(table.covered_by_shop_number(&(0, 1)), None);
 }

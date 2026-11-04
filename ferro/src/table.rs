@@ -200,39 +200,34 @@ impl<T: Record> Table<T> {
         })
     }
 
-    pub fn update<Q>(&mut self, key: &Q, f: impl FnOnce(&mut T)) -> bool
+    pub fn update<Q, R>(&mut self, key: &Q, f: impl FnOnce(&mut T) -> R) -> Option<R>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        match self.get_mut(key) {
-            Some(mut row) => {
-                f(&mut row);
-                true
-            }
-            None => false,
-        }
+        let mut row = self.get_mut(key)?;
+        Some(f(&mut row))
     }
 
-    pub fn try_update<Q>(
+    pub fn try_update<Q, R>(
         &mut self,
         key: &Q,
-        f: impl FnOnce(&mut T),
-    ) -> std::result::Result<bool, Taken<T::Key>>
+        f: impl FnOnce(&mut T) -> R,
+    ) -> std::result::Result<Option<R>, Taken<T::Key>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
         let Some(old) = self.0.rows().get(key) else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut row = (*old).clone();
-        f(&mut row);
+        let value = f(&mut row);
         if let Some(taken) = self.0.conflict(&row, Some(&old.key())) {
             return Err(taken);
         }
         self.replace(&old, row);
-        Ok(true)
+        Ok(Some(value))
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {

@@ -328,7 +328,7 @@ fn run(ops: Vec<Op>) {
             }
             Op::Update(id, f) => {
                 let hit = table.update(&id, |row| set_fields(row, &f));
-                assert_eq!(hit, model.contains_key(&id));
+                assert_eq!(hit.is_some(), model.contains_key(&id));
                 if let Some(row) = model.get_mut(&id) {
                     set_fields(row, &f);
                 }

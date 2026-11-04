@@ -206,8 +206,8 @@ fn run(ops: Vec<Op>) {
                 match result {
                     Err(_) => assert!(clash),
                     Ok(hit) => {
-                        assert_eq!(hit, model.contains_key(&id));
-                        if hit {
+                        assert_eq!(hit.is_some(), model.contains_key(&id));
+                        if hit.is_some() {
                             assert!(!clash);
                             model.insert(id, row);
                         }

@@ -46,6 +46,12 @@ fn find(t: &Tracker, id: u64) -> Res<Val<Issue>> {
         .ok_or_else(|| format!("no such issue #{id}").into())
 }
 
+fn change<R>(t: &mut Tracker, id: u64, f: impl FnOnce(&mut Issue) -> R) -> Res<R> {
+    t.issues
+        .update(&id, f)
+        .ok_or_else(|| format!("no such issue #{id}").into())
+}
+
 fn ensure_user(t: &mut Tracker, name: &str) {
     if !t.users.contains_key(name) {
         t.users.insert(
@@ -60,14 +66,12 @@ fn ensure_user(t: &mut Tracker, name: &str) {
 
 fn set_status(w: &mut dyn Write, db: &Db<Tracker>, id: u64, verb: &str, status: Status) -> Res<()> {
     let done = mutate(db, format!("{verb} #{id}"), |t| {
-        if find(t, id)?.status == status {
-            return Ok(());
-        }
-        t.issues.update(&id, |issue| {
-            issue.status = status;
-            issue.updated_ms = now_ms();
-        });
-        Ok(())
+        change(t, id, |issue| {
+            if issue.status != status {
+                issue.status = status;
+                issue.updated_ms = now_ms();
+            }
+        })
     })?;
     report(w, &done, &format!("{verb} #{id}"))
 }
@@ -120,8 +124,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                 return Err("nothing to edit: pass --title, --body or --priority".into());
             }
             let done = mutate(db, format!("edit #{id}"), |t| {
-                find(t, id)?;
-                t.issues.update(&id, |issue| {
+                change(t, id, |issue| {
                     if let Some(title) = title {
                         issue.title = title;
                     }
@@ -132,68 +135,62 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                         issue.priority = priority;
                     }
                     issue.updated_ms = now_ms();
-                });
-                Ok(())
+                })
             })?;
             report(w, &done, &format!("edited #{id}"))
         }
         Command::Assign { id, user } => {
             let done = mutate(db, format!("assign #{id} to {user}"), |t| {
-                if find(t, id)?.assignee.as_deref() == Some(user.as_str()) {
-                    return Ok(());
+                let moved = change(t, id, |issue| {
+                    let moved = issue.assignee.as_deref() != Some(user.as_str());
+                    if moved {
+                        issue.assignee = Some(user.clone());
+                        issue.updated_ms = now_ms();
+                    }
+                    moved
+                })?;
+                if moved {
+                    ensure_user(t, &user);
                 }
-                ensure_user(t, &user);
-                t.issues.update(&id, |issue| {
-                    issue.assignee = Some(user.clone());
-                    issue.updated_ms = now_ms();
-                });
                 Ok(())
             })?;
             report(w, &done, &format!("assigned #{id}"))
         }
         Command::Unassign { id } => {
             let done = mutate(db, format!("unassign #{id}"), |t| {
-                if find(t, id)?.assignee.is_none() {
-                    return Ok(());
-                }
-                t.issues.update(&id, |issue| {
-                    issue.assignee = None;
-                    issue.updated_ms = now_ms();
-                });
-                Ok(())
+                change(t, id, |issue| {
+                    if issue.assignee.take().is_some() {
+                        issue.updated_ms = now_ms();
+                    }
+                })
             })?;
             report(w, &done, &format!("unassigned #{id}"))
         }
         Command::Label { id, label } => {
             let done = mutate(db, format!("label #{id} {label}"), |t| {
-                if find(t, id)?.labels.contains(&label) {
-                    return Ok(());
-                }
-                t.issues.update(&id, |issue| {
-                    issue.labels.push(label.clone());
-                    issue.updated_ms = now_ms();
-                });
-                Ok(())
+                change(t, id, |issue| {
+                    if !issue.labels.contains(&label) {
+                        issue.labels.push(label.clone());
+                        issue.updated_ms = now_ms();
+                    }
+                })
             })?;
             report(w, &done, &format!("labelled #{id}"))
         }
         Command::Unlabel { id, label } => {
             let done = mutate(db, format!("unlabel #{id} {label}"), |t| {
-                if !find(t, id)?.labels.contains(&label) {
-                    return Ok(());
-                }
-                t.issues.update(&id, |issue| {
-                    issue.labels.retain(|existing| existing != &label);
-                    issue.updated_ms = now_ms();
-                });
-                Ok(())
+                change(t, id, |issue| {
+                    if issue.labels.contains(&label) {
+                        issue.labels.retain(|existing| existing != &label);
+                        issue.updated_ms = now_ms();
+                    }
+                })
             })?;
             report(w, &done, &format!("unlabelled #{id}"))
         }
         Command::Comment { id, text, author } => {
             let done = mutate(db, format!("comment on #{id}"), |t| {
-                find(t, id)?;
-                t.issues.update(&id, |issue| {
+                change(t, id, |issue| {
                     let now = now_ms();
                     issue.comments.push(Comment {
                         author,
@@ -201,8 +198,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
                         at_ms: now,
                     });
                     issue.updated_ms = now;
-                });
-                Ok(())
+                })
             })?;
             report(w, &done, &format!("commented on #{id}"))
         }

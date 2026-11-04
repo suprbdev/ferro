@@ -513,9 +513,24 @@ async fn patch_product(
     let id = id_of(&params)?;
     let done = app
         .commit(move |shop| -> Result<_, ApiError> {
-            if !shop.products.contains(&id) {
-                return Err(ApiError::NotFound(format!("product {id}")));
-            }
+            let product = shop
+                .products
+                .update(&id, |product| {
+                    if let Some(name) = patch.name {
+                        product.name = name;
+                    }
+                    if let Some(category) = patch.category {
+                        product.category = category;
+                    }
+                    if let Some(price) = patch.price_cents {
+                        product.price_cents = price;
+                    }
+                    if let Some(active) = patch.active {
+                        product.active = active;
+                    }
+                    product.clone()
+                })
+                .ok_or_else(|| ApiError::NotFound(format!("product {id}")))?;
             if let Some(stock) = patch.stock {
                 shop.stock.insert(id, stock);
             }
@@ -529,21 +544,7 @@ async fn patch_product(
                 }
                 shop.stock.insert(id, next as u32);
             }
-            shop.products.update(&id, |product| {
-                if let Some(name) = patch.name {
-                    product.name = name;
-                }
-                if let Some(category) = patch.category {
-                    product.category = category;
-                }
-                if let Some(price) = patch.price_cents {
-                    product.price_cents = price;
-                }
-                if let Some(active) = patch.active {
-                    product.active = active;
-                }
-            });
-            let view = product_view(&shop.products.get(&id).expect("exists"), stock_of(shop, id));
+            let view = product_view(&product, stock_of(shop, id));
             Ok((format!("patch product {id}"), view))
         })
         .await?;
