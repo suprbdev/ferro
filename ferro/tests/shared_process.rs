@@ -71,6 +71,10 @@ fn shared_child() {
         follow(&path, count);
         return;
     }
+    if role == "waiters" {
+        waiters(Path::new(&path), count);
+        return;
+    }
     let mut options = options();
     if let Ok(step) = std::env::var("FERRO_SHARED_ABORT") {
         options = options.hook(abort_at(step, number("FERRO_SHARED_NTH")));
@@ -114,6 +118,68 @@ fn follow(path: &str, until: u64) {
         assert!(Instant::now() < deadline, "the reader stopped at {seen}");
     }
     println!("FOLLOWED {seen} {refreshes}");
+}
+
+#[cfg(target_os = "linux")]
+fn threads() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Threads:"))
+        .unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn threads() -> u64 {
+    0
+}
+
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn waiters(path: &Path, count: u64) {
+    let a: Db<Root> = options().open(path).unwrap();
+    let b: Db<Root> = options().open(path).unwrap();
+    let (entered, release) = (
+        Arc::new(std::sync::Barrier::new(2)),
+        Arc::new(std::sync::Barrier::new(2)),
+    );
+    let holder = {
+        let (b, entered, release) = (b.clone(), entered.clone(), release.clone());
+        std::thread::spawn(move || {
+            b.update(|root| {
+                entered.wait();
+                release.wait();
+                root.n += 1;
+            })
+            .unwrap();
+        })
+    };
+    entered.wait();
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let before = threads();
+    let mut futures: Vec<_> = (0..count)
+        .map(|_| Box::pin(a.update_async(|root| root.n += 1)))
+        .collect();
+    for future in &mut futures {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    let during = threads();
+    release.wait();
+    holder.join().unwrap();
+    while !futures.is_empty() {
+        futures.retain_mut(|future| future.as_mut().poll(&mut cx).is_pending());
+        std::thread::park_timeout(Duration::from_millis(5));
+    }
+    assert_eq!(a.read().n, count + 1);
+    println!("WAITERS {before} {during}");
 }
 
 struct Spawned {
@@ -236,6 +302,41 @@ fn rounds(durability: &str, writers: u64, each: u64) {
     let complete: Vec<_> = (0..writers).map(|writer| (writer, each)).collect();
     let root = check(&path, &acks, &complete);
     assert_eq!(root.n, writers * each);
+}
+
+fn child_output(path: &Path, role: &str, count: u64) -> String {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "shared_child", "--nocapture", "--test-threads=1"])
+        .env("FERRO_SHARED_ROLE", role)
+        .env("FERRO_SHARED_PATH", path)
+        .env("FERRO_SHARED_WRITER", "0")
+        .env("FERRO_SHARED_FIRST", "1")
+        .env("FERRO_SHARED_COUNT", count.to_string())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{role}: {stdout}{stderr}");
+    stdout
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn awaited_writes_waiting_on_another_process_share_one_waiting_thread() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let out = child_output(&dir.path().join("waiters.ferro"), "waiters", 32);
+    let line = out
+        .lines()
+        .find_map(|line| line.split_once("WAITERS "))
+        .unwrap()
+        .1;
+    let counts: Vec<u64> = line.split(' ').map(|n| n.trim().parse().unwrap()).collect();
+    assert!(
+        counts[1] <= counts[0] + 2,
+        "{} threads became {}",
+        counts[0],
+        counts[1]
+    );
 }
 
 #[test]

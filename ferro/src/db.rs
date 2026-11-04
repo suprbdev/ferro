@@ -814,6 +814,7 @@ struct Shared<T> {
     signal: Arc<Signal>,
     syncer: OnceLock<Arc<Signal>>,
     ids: AtomicU64,
+    lane_waits: Arc<Mutex<HashMap<u64, Vec<Waker>>>>,
     flush: fn(&Shared<T>),
 }
 
@@ -843,6 +844,33 @@ impl<T> Shared<T> {
 
     fn forget(&self, id: u64) {
         self.queue.lock().tasks.retain(|task| task.id != id);
+    }
+
+    fn await_lane(&self, store: Store, at: u64, waker: &Waker) {
+        let mut waits = self.lane_waits.lock();
+        if let Some(wakers) = waits.get_mut(&at) {
+            if !wakers.iter().any(|held| held.will_wake(waker)) {
+                wakers.push(waker.clone());
+            }
+            return;
+        }
+        waits.insert(at, vec![waker.clone()]);
+        drop(waits);
+        let waits = self.lane_waits.clone();
+        let waiting = waits.clone();
+        let spawned = thread::Builder::new()
+            .name("ferro-lane".to_string())
+            .spawn(move || {
+                if store.lock_lane(at).is_ok() {
+                    store.unlock_lane(at);
+                }
+                let woken = waiting.lock().remove(&at).unwrap_or_default();
+                woken.into_iter().for_each(Waker::wake);
+            });
+        if spawned.is_err() {
+            let woken = waits.lock().remove(&at).unwrap_or_default();
+            woken.into_iter().for_each(Waker::wake);
+        }
     }
 }
 
@@ -937,13 +965,7 @@ where
                 Ok(Some(busy)) => {
                     let at = lane.branch.lane_at;
                     drop(lane);
-                    let waker = cx.waker().clone();
-                    thread::spawn(move || {
-                        if busy.lock_lane(at).is_ok() {
-                            busy.unlock_lane(at);
-                        }
-                        waker.wake();
-                    });
+                    db.shared.await_lane(busy, at, cx.waker());
                     this.start = Some(f);
                     return Poll::Pending;
                 }
@@ -1206,6 +1228,7 @@ impl Options {
             signal: signal.clone(),
             syncer: OnceLock::new(),
             ids: AtomicU64::new(0),
+            lane_waits: Arc::default(),
             flush: Shared::<T>::flush,
         });
         let branch = {
