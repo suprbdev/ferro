@@ -128,6 +128,14 @@ median of:
 | `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.5 ms |
 | `ferro compact`, 3 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values | 1.07 and 0.58 s, 180 and 570 MB/s |
 
+## Slower than before
+
+Four figures came out slower than before, beyond the spread of the runs, and builds of older trees
+run alternately with this one on the same machine confirmed each: a filtered scan of table rows,
+31.6 ns a row against 17.8 (#56), `wiki` commits, 564 a second against 691 (#57), a covered page of
+200 rows on one thread, 798,000 a second against 896,000 (#58), and bulk inserts, 3,092
+instructions a key against 2,978 (#59).
+
 ## More measurements
 
 - [Example apps](examples.md) has load-test figures for `chat` and `booking`, measured on 2026-11-03
