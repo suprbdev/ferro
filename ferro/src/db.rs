@@ -37,6 +37,7 @@ const MAIN: &str = "main";
 const MAX_PASSES: u32 = 6;
 const QUIET_BYTES: u64 = 256 << 10;
 const MAX_GROUP: usize = 256;
+const LOCK_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
 pub struct Commit {
@@ -1104,6 +1105,7 @@ pub struct Options {
     history: Keep,
     reclaim: Reclaim,
     coalesce: bool,
+    lock_wait: Duration,
     hook: Option<Hook>,
     clock: Option<Clock>,
 }
@@ -1158,6 +1160,11 @@ impl Options {
         self
     }
 
+    pub fn lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
+    }
+
     #[doc(hidden)]
     pub fn hook(mut self, hook: Hook) -> Self {
         self.hook = Some(hook);
@@ -1188,7 +1195,17 @@ impl Options {
         let read_only = self.store.read_only;
         self.store.shared &= !read_only;
         let options = self.store.clone();
-        let (store, head) = Store::open(path.as_ref(), self.store)?;
+        let deadline = Instant::now().checked_add(self.lock_wait);
+        let (store, head) = loop {
+            match Store::open(path.as_ref(), self.store.clone()) {
+                Err(Error::Locked) if deadline.is_none_or(|at| Instant::now() < at) => {
+                    let left = deadline
+                        .map_or(LOCK_POLL, |at| at.saturating_duration_since(Instant::now()));
+                    thread::sleep(left.min(LOCK_POLL));
+                }
+                opened => break opened?,
+            }
+        };
         let genesis = Arc::new(init());
         let genesis_hash = try_hash_of(&*genesis)?;
         let (refs, depth) = refs::load(&store, head, None).inspect_err(|_| store.close())?;

@@ -1,6 +1,8 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{Rng, fast};
 use ferro::table::Taken;
@@ -394,4 +396,31 @@ fn read_only_takes_the_mode_as_a_bool() {
             false => assert!(matches!(opened, Err(Error::Locked))),
         }
     }
+}
+
+#[test]
+fn lock_wait_opens_once_the_writer_lets_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h.ferro");
+    let first = fast().open::<Hall>(&path).unwrap();
+    first.update(|root| *root = hall()).unwrap();
+    assert!(matches!(fast().open::<Hall>(&path), Err(Error::Locked)));
+    let started = Instant::now();
+    let refused = fast()
+        .lock_wait(Duration::from_millis(60))
+        .open::<Hall>(&path);
+    assert!(matches!(refused, Err(Error::Locked)));
+    assert!(started.elapsed() >= Duration::from_millis(60));
+    let waiting = thread::spawn({
+        let path = path.clone();
+        move || {
+            fast()
+                .lock_wait(Duration::from_secs(30))
+                .open::<Hall>(&path)
+                .map(|db| (db.version(), db.read().seats.len()))
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+    drop(first);
+    assert_eq!(waiting.join().unwrap().unwrap(), (1, 9));
 }

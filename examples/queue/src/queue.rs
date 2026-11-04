@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ferro::{Compacted, Db, Durability, Keep, Options, Reclaim, Space, Watcher};
 
@@ -107,29 +106,19 @@ pub struct Queue {
 
 impl Queue {
     pub fn open(path: impl AsRef<Path>, options: QueueOptions) -> Result<Queue> {
-        let deadline = Instant::now() + options.lock_wait;
-        loop {
-            let mut opened = Options::new()
-                .durability(options.durability)
-                .history(options.history)
-                .reclaim(options.reclaim)
-                .coalesce(options.coalesce);
-            if let Some(bytes) = options.cache_bytes {
-                opened = opened.cache_bytes(bytes);
-            }
-            match opened.open::<State>(path.as_ref()) {
-                Ok(db) => {
-                    return Ok(Queue {
-                        db,
-                        clock: options.clock,
-                    });
-                }
-                Err(ferro::Error::Locked) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error.into()),
-            }
+        let mut opened = Options::new()
+            .durability(options.durability)
+            .history(options.history)
+            .reclaim(options.reclaim)
+            .coalesce(options.coalesce)
+            .lock_wait(options.lock_wait);
+        if let Some(bytes) = options.cache_bytes {
+            opened = opened.cache_bytes(bytes);
         }
+        Ok(Queue {
+            db: opened.open::<State>(path.as_ref())?,
+            clock: options.clock,
+        })
     }
 
     pub fn open_read_only(path: impl AsRef<Path>, options: QueueOptions) -> Result<Queue> {
