@@ -42,6 +42,9 @@ static SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static WRITE_HELD: AtomicBool = AtomicBool::new(false);
 static WRITE_ENTERED: AtomicBool = AtomicBool::new(false);
 static WRITE_RELEASED: AtomicBool = AtomicBool::new(false);
+static SUPERS_FAIL: AtomicBool = AtomicBool::new(false);
+static ZEROS_FAIL: AtomicBool = AtomicBool::new(false);
+static ZEROS_FAILED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static FRAMES_FAIL: Cell<bool> = const { Cell::new(false) };
@@ -69,8 +72,24 @@ fn is_frame(buf: *const c_void, count: usize) -> bool {
     count >= 8 && unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), 8) } == b"FERROFRM"
 }
 
+fn is_zeros(buf: *const c_void, count: usize) -> bool {
+    count >= 4096
+        && unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), count) }
+            .iter()
+            .all(|byte| *byte == 0)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: i64) -> isize {
+    if offset < 8192 && count > 0 && SUPERS_FAIL.swap(false, Ordering::SeqCst) {
+        unsafe { *__errno_location() = EIO };
+        return -1;
+    }
+    if offset >= 8192 && ZEROS_FAIL.load(Ordering::SeqCst) && is_zeros(buf, count) {
+        ZEROS_FAILED.fetch_add(1, Ordering::SeqCst);
+        unsafe { *__errno_location() = ENOSPC };
+        return -1;
+    }
     if is_frame(buf, count) {
         if FRAMES_FAIL.with(Cell::get) {
             unsafe { *__errno_location() = ENOSPC };
@@ -99,9 +118,12 @@ fn serial() -> MutexGuard<'static, ()> {
         &WRITE_HELD,
         &WRITE_ENTERED,
         &WRITE_RELEASED,
+        &SUPERS_FAIL,
+        &ZEROS_FAIL,
     ] {
         flag.store(false, Ordering::SeqCst);
     }
+    ZEROS_FAILED.store(0, Ordering::SeqCst);
     turn
 }
 
@@ -743,4 +765,55 @@ fn tables_cycles_and_receives_wait_out_a_frame_held_before_its_write() {
         assert_eq!(heads(&db), written, "{kind}");
         db.verify().unwrap();
     }
+}
+
+#[test]
+fn a_superblock_that_fails_to_write_fails_its_batch_and_the_frames_reopen() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let path = dir.path().join("super.ferro");
+        let (db, branches) = seeded(options(), &path, &["b0"]);
+        put(&branches[0], 1, 1).unwrap();
+        SUPERS_FAIL.store(true, Ordering::SeqCst);
+        let failed = put(&branches[0], 2, 2);
+        assert!(matches!(failed, Err(Error::Io(_))), "{kind}: {failed:?}");
+        assert!(matches!(put(&db, 3, 3), Err(Error::Poisoned)), "{kind}");
+        assert!(matches!(db.fork("x"), Err(Error::Poisoned)), "{kind}");
+        assert_eq!(contents(&branches[0]).get(&2), None, "{kind}");
+        drop((db, branches));
+        let db: Db<Root> = options().open(&path).unwrap();
+        let b0 = db.branch("b0").unwrap();
+        assert_eq!(contents(&b0).get(&1), Some(&1), "{kind}");
+        assert!(matches!(contents(&b0).get(&2), None | Some(&2)), "{kind}");
+        db.verify().unwrap();
+        put(&db, 4, 4).unwrap();
+    }
+}
+
+#[test]
+fn a_reservation_that_fails_to_write_leaves_commits_running() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("reserve.ferro");
+    let (db, branches) = seeded(fsync(), &path, &["b0", "b1"]);
+    ZEROS_FAIL.store(true, Ordering::SeqCst);
+    let mut round = 0;
+    while ZEROS_FAILED.load(Ordering::SeqCst) == 0 {
+        assert!(round < 5_000, "no reservation was written");
+        put(&branches[(round % 2) as usize], round % 64, round).unwrap();
+        round += 1;
+    }
+    for round in round..round + 40 {
+        put(&branches[(round % 2) as usize], round % 64, round).unwrap();
+    }
+    ZEROS_FAIL.store(false, Ordering::SeqCst);
+    for round in 0..20 {
+        put(&branches[(round % 2) as usize], round, round).unwrap();
+    }
+    let written = heads(&db);
+    drop((db, branches));
+    let db: Db<Root> = fsync().open(&path).unwrap();
+    assert_eq!(heads(&db), written);
+    db.verify().unwrap();
 }
