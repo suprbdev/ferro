@@ -1,3 +1,24 @@
+//! A stress test of reads that borrow nodes without counts: under epoch guards, through hazard
+//! slots, and through iterators that outlive what they came from, checked against a model of every
+//! version while the caches evict and the file is reclaimed.
+//!
+//! Eight readers do gets, `floor`, `summary_by`, row gets, index lookups, ranges both ways and
+//! cursor seeks on the writer's handle and on read-only handles with caches of 12 KiB to 1 MiB,
+//! which they refresh and reopen. They keep ranges, cursors and index walks from one round to the
+//! next, and read nested maps through iterators whose snapshot and handle are gone, so that what
+//! they hold outlives the snapshot, the handle and the store it came from. Three writers on a
+//! 12 KiB cache edit values, rows and the nested maps, with a reclamation cycle every 96 KiB and
+//! compactions, and the writer's `Db` is dropped between four phases and opened again. At the end
+//! a fresh handle checks the last version.
+//! [How the protocol is checked](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
+//! describes the runs under AddressSanitizer and ThreadSanitizer. `FERRO_STRESS_SEED` sets the
+//! seed, 40 by default, and `FERRO_STRESS_MS` how many milliseconds it runs, 4,000 by default.
+//!
+//! ```sh
+//! make test-pkg P=ferro T=guarded_reads_match_the_model
+//! FERRO_STRESS_SEED=7 FERRO_STRESS_MS=20000 cargo test --release -p ferro --test epoch_stress
+//! ```
+
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
