@@ -4230,6 +4230,7 @@ fn teardown<K, V, S>(root: Shared<Node<K, V, S>>) {
             let base = Shared::as_ptr(ahead).addr();
             prefetch(base);
             prefetch(base + LINE_BYTES);
+            prefetch(base + size_of::<Node<K, V, S>>());
         }
         if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD / 2) {
             prefetch_items(&ahead.children);
@@ -4271,34 +4272,51 @@ fn teardown<K, V, S>(root: Shared<Node<K, V, S>>) {
     let mut slots = slots.into_iter().peekable();
     let mut children = children.into_iter().peekable();
     let mut nodes = nodes.into_iter().peekable();
+    let mut heads = [
+        address(values.peek().map(Arc::as_ptr)),
+        address(keys.peek().map(|keys| keys.as_ptr())),
+        address(slots.peek().map(|slots| slots.as_ptr())),
+        address(children.peek().map(|children| children.as_ptr())),
+        address(nodes.peek().map(Shared::as_ptr)),
+    ];
     loop {
-        let heads = [
-            values
-                .peek()
-                .map_or(usize::MAX, |value| Arc::as_ptr(value).addr()),
-            keys.peek().map_or(usize::MAX, |keys| keys.as_ptr().addr()),
-            slots
-                .peek()
-                .map_or(usize::MAX, |slots| slots.as_ptr().addr()),
-            children
-                .peek()
-                .map_or(usize::MAX, |children| children.as_ptr().addr()),
-            nodes
-                .peek()
-                .map_or(usize::MAX, |node| Shared::as_ptr(node).addr()),
-        ];
-        let lowest = heads.iter().copied().min().unwrap_or(usize::MAX);
-        if lowest == usize::MAX {
+        let mut which = 0;
+        for (index, &head) in heads.iter().enumerate().skip(1) {
+            if head < heads[which] {
+                which = index;
+            }
+        }
+        if heads[which] == usize::MAX {
             break;
         }
-        match heads.iter().position(|&head| head == lowest) {
-            Some(0) => drop(values.next()),
-            Some(1) => drop(keys.next()),
-            Some(2) => drop(slots.next()),
-            Some(3) => drop(children.next()),
-            _ => drop(nodes.next()),
-        }
+        heads[which] = match which {
+            0 => {
+                drop(values.next());
+                address(values.peek().map(Arc::as_ptr))
+            }
+            1 => {
+                drop(keys.next());
+                address(keys.peek().map(|keys| keys.as_ptr()))
+            }
+            2 => {
+                drop(slots.next());
+                address(slots.peek().map(|slots| slots.as_ptr()))
+            }
+            3 => {
+                drop(children.next());
+                address(children.peek().map(|children| children.as_ptr()))
+            }
+            _ => {
+                drop(nodes.next());
+                address(nodes.peek().map(Shared::as_ptr))
+            }
+        };
     }
+}
+
+#[inline]
+fn address<T>(at: Option<*const T>) -> usize {
+    at.map_or(usize::MAX, <*const T>::addr)
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Extend<(K, V)> for Map<K, V, S> {
