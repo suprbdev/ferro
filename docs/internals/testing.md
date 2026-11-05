@@ -22,13 +22,20 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   recomputes every object hash bottom-up, then the frame checks and the superblock checksums, so
   that a mutation gets past the hash checks to the code behind them. `open` then reads the value,
   the log, `at`, `as_of`, `history_of`, `bisect`, branches, `common_ancestor`, `verify`,
-  `verify_typed`, `space` and `refresh`, and scans every map and index it reaches. Read-write, it
+  `verify_typed`, `space` and `refresh`, and scans every map and index it reaches, unique indexes
+  through their ranges and a composite one's prefixes too, from both ends. Read-write, it
   can commit on main and another branch, write from inside a closure, fork, merge and drop a
   branch, and run a cycle that keeps two versions. Read-only, it can follow a writer on the same
   file through 70 more commits, past a full branch table and a cycle, refreshing on the way. Either
   can bundle the file for an empty one and receive the bundle there, and a read-write handle then
   pulls a commit back from it. `admin` runs `info`, `log`, `verify`, `space`, `layout` and, when its
   mode says so, `compact`.
+- `reclaim` takes the input `admin` takes, opens the file as the type that decodes nothing and
+  compacts it with `copy_threads(1)` and again, from the same image, with `copy_threads(4)`, keeping
+  every version, the newest one or three, or those since time 0, and for some modes compacts the
+  result again with the thread counts the other way round. Both copies must fail with the same
+  error, the file's name aside, or succeed with the same report and the same bytes, and when
+  `Db::verify` passed on the file as opened, the compacted file must pass `admin::verify`.
 - `log_entry` writes a log of crafted entries with valid hashes, mostly coherent and with fields
   perturbed by the input, plus a branch table that points into it and up to 75 branch-table steps
   over it, whose links, names, tags and heads the input perturbs. It then runs the `open` reads
@@ -58,8 +65,9 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   commit, fork or run a cycle while the checked bundle waits to be placed, or commit or fork
   between placing a spilled bundle's pieces and landing it. A refused bundle must leave both
   branches where they were. An accepted one must read back whole on both branches, with every map's
-  length equal to its iteration, every key found and every index lookup answered, and pass
-  `verify` and `verify_typed`, before and after a reopen and a commit.
+  length equal to its iteration, every key found, every index lookup answered and each unique
+  index's range over the whole index as long as its map from either end, and pass `verify` and
+  `verify_typed`, before and after a reopen and a commit.
 
 The harness treats a panic whose message starts with `ferro:` as expected inside the infallible
 reads, which panic on corruption by design, and as a failure anywhere else. The `seeds` example
@@ -73,12 +81,12 @@ between placing a bundle's pieces and landing it. Frames that land out of order 
 that holds one commit's frame before its write until three later frames have landed: the images
 leave a hole where a held frame belongs with every later frame written, or stop just after a later
 frame landed ahead of the held one. Each `refs` seed pairs one of its bases with a forgery and a
-mode. Files captured from the tests make a
-broader corpus: the one used here kept every database file `cargo test --workspace` deleted, copied
+mode. Every image small enough for `admin` goes to `reclaim` too, under three modes. Files captured
+from the tests make a broader corpus: the one used here kept every database file `cargo test --workspace` deleted, copied
 aside by a small `LD_PRELOAD` wrapper around `unlink`, `unlinkat` and `rename`. Images over 69,000
 bytes go to `open-large`, for a run of `open` with a larger `-max_len`.
 `cargo run --example fixture -- <target> <crash> <out.db>` turns a crashing input into the file it
-opens, for `refs` the forged file before any handle opens it, and for `sync` also writes the bundle
+opens, for `reclaim` the one it compacts, for `refs` the forged file before any handle opens it, and for `sync` also writes the bundle
 beside it, which is how the fixtures behind
 `ferro/tests/fuzzed.rs` were made.
 
@@ -97,6 +105,38 @@ and `refs` for three hours and 40 minutes over five runs, 280,000 executions rea
 No input crashed, hung, leaked or passed a memory limit, so the library needed no fix. The round's
 one fault was in the harness: the `refs` base meant to sit a whole step table deep was a step
 short, which walking the chain of a file written by `fixture` showed.
+
+The round after it covered what had changed since: receives staged in dense columns with type
+checks kept for objects linked more than once and hints resolved a parent at a time, the copy that
+writes each body as stored and checks it on other threads with a bounded read-ahead, the stored
+length checked on every read, unique index ranges and prefixes, and iterators that borrow nodes
+under hazards. It added `reclaim` and the unique range probes, rebuilt the seeds, and ran each
+target on one core of six under the flags above and `-rss_limit_mb=2048`, starting from the corpus
+the round before saved. `admin`, `log_entry`, `map_node` and `refs` ran for 50 minutes each: 1.54
+million, 1.27 million, 1.16 million and 50,000 executions reaching 6,700, 11,300, 20,200 and 13,600
+edges. `open` replayed its 15,000 inputs in 15 minutes, 16,000 executions reaching 109,000 edges,
+until libFuzzer passed the RSS limit holding that corpus and reading it back, and then ran 25 and
+15 minutes from random samples of 1,000 inputs, 84,000 executions more reaching 93,000 and 96,000
+edges. `sync` ran 25 minutes over its whole corpus, 14,400 executions reaching 37,500 edges, and 25
+from a sample, 13,300 more. `reclaim` ran 50 minutes on each of two cores, one from the `admin`
+corpus and the seeds and one from 1,000 `open` inputs, 1.27 million and 970,000 executions reaching
+8,500 and 8,300 edges. Merging added 303 inputs to the saved `open` corpus, 93 to `sync`, 221 to
+`log_entry`, 579 to `map_node`, 83 to `admin`, 110 to `refs`, and started `reclaim` with 2,381.
+
+Only `reclaim` failed, twice in the library and three times in its own checks. The copy took every
+link at offset 0 for a tombstone and wrote it back unread, so a file whose branch table named log
+entries as plain trees, one with null parent links, compacted into a file `verify` refused as it
+had refused the source. And it wrote a link whose hash was a pruned entry's as a tombstone wherever
+it sat, so a tree that linked a log entry by hash came out of `Keep::Last(1)` with a null link. Both
+are now tombstones only among an entry's `prev`, skip and merge links, and elsewhere fail the cycle,
+as [the copy's tombstones](reclamation.md#a-cycle) describe, with fixtures in
+`ferro/tests/fuzzed.rs`. The harness at first compared errors that named the two copies' files, and
+asked every compacted file to verify. A chain whose skip link pointed outside the log, which the
+copy places by following `prev` and cut, and a table node with keys out of order that linked a
+second record of an entry no head named, which the copy wrote as an entry and `verify` read as a
+tree, each compacted into a file `verify` refused from a source that failed `verify` or
+`verify_typed`. Reads never follow either link, so the target now asks for a verifying result only
+from a file that passes both. No other input crashed, hung or passed a memory limit.
 
 ## Where the other tests are described
 
