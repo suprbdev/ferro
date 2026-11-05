@@ -41,7 +41,10 @@ yet, only records and a superblock naming them, the same shape offline compactio
 An entry's hash covers its version, time, message, root and links, so a branch can make a commit
 identical to one pruned from another branch, in the same millisecond or when the clock has stepped
 back. Pruned hashes are therefore kept apart from copied ones and drop out of the set when a chain
-retains that hash again, and a link already at offset 0 is never followed.
+retains that hash again, and an entry's `prev`, skip or merge link already at offset 0 is never
+followed. Anywhere else, including an entry's root, a link at offset 0 names nothing in the file, so
+the copy fails on it with the error `verify` gives, rather than writing a file whose trees cannot
+be read.
 
 ## Copies made for less history
 

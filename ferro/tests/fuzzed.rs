@@ -474,6 +474,28 @@ fn compact_counts_the_commits_it_drops_without_overflow() {
 }
 
 #[test]
+fn compacting_a_null_link_outside_a_log_entry_fails_as_verify_does() {
+    let (_dir, path) = fixture("compact-null-link");
+    let before = fs::read(&path).unwrap();
+    let wrong = admin::verify(&path).unwrap_err().to_string();
+    assert!(wrong.contains("pointer 0 outside log"), "{wrong}");
+    for threads in [1, 4] {
+        for keep in [Keep::All, Keep::Last(1)] {
+            let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+            let outcome = db.compact(keep);
+            assert!(
+                matches!(&outcome, Err(error) if error.to_string() == wrong),
+                "{threads} threads, {keep:?}: {outcome:?}"
+            );
+            drop(db);
+            assert!(fs::read(&path).unwrap() == before, "{threads} threads, {keep:?}");
+        }
+    }
+    admin::compact(&path, Keep::All).unwrap();
+    admin::verify(&path).unwrap();
+}
+
+#[test]
 fn a_node_whose_child_counts_overflow_is_rejected() {
     let (_dir, _store, map) = crafted(|txn| {
         let low = node(txn, 0, &[1], &[]);

@@ -600,6 +600,7 @@ enum Step {
 #[derive(Clone, Copy)]
 struct Rungs {
     version: u64,
+    parents: usize,
     prev: Option<usize>,
     skip: Option<usize>,
 }
@@ -611,6 +612,7 @@ impl Rungs {
         let skip = prev + usize::from(entry.prev.is_some());
         Ok(Rungs {
             version: entry.commit.version,
+            parents: prev,
             prev: entry.prev.map(|_| prev),
             skip: entry.skip.map(|_| skip),
         })
@@ -682,9 +684,6 @@ impl CopySink<'_> {
             hash: link.hash,
             offset: 0,
         };
-        if link.offset == 0 {
-            return Some(tombstone);
-        }
         self.remap(link)
             .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
     }
@@ -810,9 +809,12 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.held.old.len() {
                 let link = top.held.old[top.next];
-                let settled = match top.entry.filter(|rungs| rungs.skip == Some(top.next)) {
-                    Some(rungs) => self.skipped(&top.held.links, rungs, link),
-                    None => self.settled(link),
+                let settled = match top.entry {
+                    Some(rungs) if link.offset == 0 && top.next >= rungs.parents => Some(link),
+                    Some(rungs) if rungs.skip == Some(top.next) => {
+                        self.skipped(&top.held.links, rungs, link)
+                    }
+                    _ => self.settled(link),
                 };
                 let done = match settled {
                     Some(done) => done,
