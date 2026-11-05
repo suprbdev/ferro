@@ -1186,11 +1186,12 @@ impl<T: Record, C> IndexIter<T, C> {
     /// Steps to the next row and lends it, where `next` hands out a [`Val`].
     ///
     /// The row is borrowed from the node the lookup holds, so it lasts until the lookup moves
-    /// again. Each [`Val`] takes a reference count on its node's column, and many threads reading
-    /// the same rows all write those counts' cache lines, where a lent row writes nothing shared.
-    /// So this is the form for hot pages of rows that the caller reads in place: a `while let`
-    /// loop over it can stop after a page, return or use `?` as it likes, and the lookup goes on
-    /// from there. [`visit`](IndexIter::visit) lends every row left to a closure.
+    /// again. A [`Val`] of a row with a destructor takes a reference count on its node's column,
+    /// and many threads reading the same rows all write those counts' cache lines, where a lent
+    /// row writes nothing shared. So this is the form for hot pages of rows that the caller reads
+    /// in place: a `while let` loop over it can stop after a page, return or use `?` as it likes,
+    /// and the lookup goes on from there. [`visit`](IndexIter::visit) lends every row left to a
+    /// closure.
     ///
     /// # Examples
     ///
