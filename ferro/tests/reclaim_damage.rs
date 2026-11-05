@@ -252,7 +252,7 @@ fn layout(path: &Path) -> Hosts {
 enum Damage {
     MidRecord,
     LargeClaims,
-    LargeClaimsUnderDamage,
+    ParentDamagedToo,
 }
 
 fn damaged(source: &[u8], layout: &Hosts, damage: &Damage) -> (Vec<u8>, String) {
@@ -273,7 +273,7 @@ fn damaged(source: &[u8], layout: &Hosts, damage: &Damage) -> (Vec<u8>, String) 
     let fake = find(source, &marker(kind, key));
     retarget(&mut bytes, parent, link, fake);
     let wrong = match damage {
-        Damage::LargeClaimsUnderDamage => {
+        Damage::ParentDamagedToo => {
             bytes[link.hash_at] ^= 1;
             parent
         }
@@ -299,7 +299,7 @@ fn a_link_damaged_to_land_mid_record_fails_alike_at_every_thread_count() {
     for damage in [
         Damage::MidRecord,
         Damage::LargeClaims,
-        Damage::LargeClaimsUnderDamage,
+        Damage::ParentDamagedToo,
     ] {
         let (damaged, wrong) = damaged(&bytes, &layout, &damage);
         let mut peaks = Vec::new();
