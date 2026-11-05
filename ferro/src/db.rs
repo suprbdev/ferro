@@ -2197,8 +2197,12 @@ impl<T: Data> Shared<T> {
                 None if !queue.syncing && branch.arriving.load(Ordering::Acquire) == 0 => {
                     drop(queue);
                     let mut lane = self.arrive(branch);
-                    if let Some(group) = lane.take() {
-                        self.seal_group(branch, group);
+                    match lane.take() {
+                        Some(group) if Arc::ptr_eq(&group.seal, seal) => {
+                            self.seal_group(branch, group);
+                        }
+                        Some(group) => self.seal_for_others(branch, group),
+                        None => {}
                     }
                     continue;
                 }

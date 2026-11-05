@@ -735,6 +735,76 @@ fn a_closure_stops_waiting_for_followers_that_are_slow_to_reach_the_lock() {
 }
 
 #[test]
+fn a_member_that_seals_a_newer_group_on_its_way_wakes_that_group() {
+    let _turn = serial();
+    let dir = on_disk();
+    let armed = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (armed, stalled, gate) = (armed.clone(), stalled.clone(), gate.clone());
+        move |step: &'static str| {
+            if step == "arriving"
+                && thread::current().name() == Some("member")
+                && armed.swap(false, Ordering::SeqCst)
+            {
+                stalled.store(true, Ordering::SeqCst);
+                while !gate.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    };
+    let db = coalesced()
+        .hook(ferro::db::Hook(Arc::new(hook)))
+        .open::<Root>(dir.path().join("newer.ferro"))
+        .unwrap();
+    db.update(|root| {
+        root.insert(0, 1);
+    })
+    .unwrap();
+    let ran = Ran::new();
+    let leader = stall_leader(&db, &ran);
+    let member = {
+        let (db, ran) = (db.clone(), ran.0.clone());
+        thread::Builder::new()
+            .name("member".to_string())
+            .spawn(move || {
+                db.commit_with(|root| {
+                    let next = increment(root);
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    ("member", next)
+                })
+            })
+            .unwrap()
+    };
+    ran.reach(2);
+    settle_queue();
+    armed.store(true, Ordering::SeqCst);
+    release(false);
+    assert_eq!(leader.join().unwrap().unwrap().version, 2);
+    wait_until("the member to set out to seal its group", || {
+        stalled.load(Ordering::SeqCst)
+    });
+    let side = db.fork("side").unwrap();
+    assert_eq!(side.version(), 3);
+    let late = bump(&db, &ran, "late".to_string());
+    ran.reach(3);
+    settle_queue();
+    gate.store(true, Ordering::SeqCst);
+    assert_eq!(member.join().unwrap().unwrap().version, 3);
+    wait_until("the newer group to be written", || late.is_finished());
+    let late = late.join().unwrap().unwrap();
+    assert_eq!((late.version, late.value), (4, 4));
+    assert_eq!(counter(&db.read()), 4);
+    let log = db.log();
+    assert_eq!(
+        log.get(&4).unwrap().messages().collect::<Vec<_>>(),
+        vec!["late"]
+    );
+}
+
+#[test]
 fn a_failed_sync_fails_the_group_waiting_on_it_and_the_one_behind_it() {
     let _turn = serial();
     let (_dir, path, db) = database();
