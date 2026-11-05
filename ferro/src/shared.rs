@@ -543,7 +543,8 @@ impl<T> Shared<T> {
     ///
     /// If `cached` is still set, the cache clears it only after the new slot was written, so any
     /// free of the value, which comes after that, reads the new slot. If it was cleared, this
-    /// clears `hazard` and returns `false`, and the caller takes a count instead, through
+    /// clears `hazard` through [`epoch::retract`](crate::epoch::retract), as [`Weak::lend_to`]
+    /// does, and returns `false`, and the caller takes a count instead, through
     /// [`Shared::share`], since the count may be passing through zero.
     ///
     /// # Safety
@@ -556,12 +557,14 @@ impl<T> Shared<T> {
         // value's offset before it, in the same allocation.
         let inner = unsafe { data.byte_sub(offset_of!(Inner<T>, data)) }.cast::<Inner<T>>();
         hazard.store(inner.cast_mut().cast(), Ordering::SeqCst);
+        #[cfg(test)]
+        between();
         // SAFETY: the caller keeps the allocation live across the call, and `cached` is only ever
         // accessed atomically.
         if unsafe { (*inner).cached.load(Ordering::SeqCst) } {
             return true;
         }
-        hazard.store(ptr::null_mut(), Ordering::Release);
+        crate::epoch::retract(hazard);
         false
     }
 
@@ -1064,8 +1067,10 @@ impl<T: Send + Sync + 'static> Weak<T> {
     /// set and reads `cached` again, all sequentially consistent. If `cached` is still set, the
     /// cache had not cleared it when the slot was written, so its release sees `lent` and retires
     /// the value, and the epoch frees a retired value only once no slot holds it. Otherwise it
-    /// clears `hazard` and returns `None`, and the caller takes a count instead. `hazard` must be
-    /// an entry of a [`Hazards`](crate::epoch::Hazards) record, whose slots every free reads.
+    /// clears `hazard` through [`epoch::retract`](crate::epoch::retract), so that a free that
+    /// marked the record meanwhile either finds the slot cleared or has the record's drop flush,
+    /// and returns `None`, and the caller takes a count instead. `hazard` must be an entry of a
+    /// [`Hazards`](crate::epoch::Hazards) record, whose slots every free reads.
     #[inline]
     pub(crate) fn lend_to(&self, hazard: &AtomicPtr<()>) -> Option<NonNull<T>> {
         let inner = self.ptr.as_ptr();
@@ -1084,11 +1089,13 @@ impl<T: Send + Sync + 'static> Weak<T> {
             if !(*inner).lent.load(Ordering::SeqCst) {
                 (*inner).lent.store(true, Ordering::SeqCst);
             }
+            #[cfg(test)]
+            between();
             if (*inner).cached.load(Ordering::SeqCst) {
                 return Some(NonNull::new_unchecked(&raw mut (*inner).data));
             }
         }
-        hazard.store(ptr::null_mut(), Ordering::Release);
+        crate::epoch::retract(hazard);
         None
     }
 
@@ -1131,6 +1138,30 @@ impl<T> Drop for Weak<T> {
         // SAFETY: this handle holds a weak count, which it gives up once, here, and it never
         // touches the allocation again.
         unsafe { Inner::release_weak(self.ptr.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the next [`Weak::lend_to`] or [`Shared::lend_again`] on this thread runs between
+    /// writing its slot and reading `cached` again, set by [`lend_between`].
+    static BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Has the next [`Weak::lend_to`] or [`Shared::lend_again`] on this thread run `between` once it
+/// has written its slot and before it reads `cached` again, so that tests can let the cache go of
+/// the value and run a free inside the borrow.
+#[cfg(test)]
+pub(crate) fn lend_between(between: impl FnOnce() + 'static) {
+    BETWEEN.with(|hook| *hook.borrow_mut() = Some(Box::new(between)));
+}
+
+/// Runs what [`lend_between`] set, if anything.
+#[cfg(test)]
+fn between() {
+    if let Some(between) = BETWEEN.with(|hook| hook.borrow_mut().take()) {
+        between();
     }
 }
 
@@ -1353,6 +1384,41 @@ mod tests {
         epoch::flush();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_a_borrow_that_clears_its_slot_after_a_free_marked_it_flushes_at_drop() {
+        for again in [false, true] {
+            let (counted, _, drops) = Counted::new(17);
+            let owner = Shared::new(counted);
+            let weak = Shared::downgrade(&owner);
+            let cache = Shared::erase(owner.clone());
+            cache.hold();
+            let first = Hazards::new().unwrap();
+            Shared::lend_to(&owner, first.entry(ROOT));
+            drop(first);
+            let hazards = Hazards::new().unwrap();
+            let kept = weak.clone();
+            lend_between(move || {
+                assert!(cache.release());
+                epoch::retire(cache, 1);
+                epoch::flush();
+                assert_eq!(kept.strong_count(), 2);
+            });
+            let entry = hazards.entry(HAZARDS - 1);
+            let lent = if again {
+                // SAFETY: `owner` holds a count on the value across the call.
+                unsafe { Shared::lend_again(Shared::as_ptr(&owner), entry) }
+            } else {
+                weak.lend_to(entry).is_some()
+            };
+            assert!(!lent, "again {again}");
+            assert!(entry.load(Ordering::SeqCst).is_null(), "again {again}");
+            drop(hazards);
+            assert_eq!(weak.strong_count(), 1, "again {again}");
+            drop(owner);
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "again {again}");
+        }
     }
 
     #[test]

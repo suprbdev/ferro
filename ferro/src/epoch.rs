@@ -19,7 +19,9 @@
 //! - **Marks.** Whoever parks a value, or skips an item because a slot holds it, marks each record
 //!   that holds it and then reads that slot again. A record's owner clears its slots and then reads
 //!   its mark, so either the owner sees the mark and flushes when it drops the record, or the
-//!   marker finds the slot cleared and lets the item go itself.
+//!   marker finds the slot cleared and lets the item go itself. A borrow that writes a slot and
+//!   then finds it cannot lend clears the slot through [`retract`], and the owner reads the mark
+//!   at its drop whether or not a slot is still set.
 //! - **Flushing.** [`flush`] waits for the threads pinned before it, then frees everything the pins
 //!   and slots allow and waits for other threads still dropping what they took from a list, so that
 //!   [`Store::close`](crate::store::Store::close) and a marked record's drop let go of what they
@@ -369,7 +371,9 @@ impl Drop for Hazards {
     ///
     /// The slots are cleared and the mark read behind a sequentially consistent fence, and a
     /// marker sets the mark and then reads the slot again, so either this sees the mark or the
-    /// marker sees the slot cleared and lets the item go itself.
+    /// marker sees the slot cleared and lets the item go itself. A slot cleared before the drop,
+    /// by a borrow that found it could not lend, went through [`retract`], which has a fence of
+    /// its own, so the mark is read even when no slot is set, and then without a fence.
     fn drop(&mut self) {
         let record = self.record;
         let held = record
@@ -379,10 +383,10 @@ impl Drop for Hazards {
         for entry in &record.entries {
             entry.store(ptr::null_mut(), Ordering::Release);
         }
-        let hinted = held && {
+        if held {
             atomic::fence(Ordering::SeqCst);
-            record.hint.load(Ordering::Relaxed)
-        };
+        }
+        let hinted = record.hint.load(Ordering::Relaxed);
         if hinted {
             record.hint.store(false, Ordering::Relaxed);
         }
@@ -403,6 +407,20 @@ impl Drop for Hazards {
             flush();
         }
     }
+}
+
+/// Clears `hazard`, a slot that a borrow wrote and then found it could not lend through, with a
+/// release store and then a sequentially consistent fence.
+///
+/// A free that marks the record while the slot holds the value reads the slot again after the
+/// mark. Either that reading comes after the fence in the single order of sequentially consistent
+/// operations and finds the slot cleared, so the free lets the item go itself, or the mark comes
+/// before the fence, and the drop of the record, which reads the mark after this whether or not a
+/// slot is still set, sees it and flushes. `hazard` must be an entry of a [`Hazards`] record.
+#[inline]
+pub(crate) fn retract(hazard: &AtomicPtr<()>) {
+    hazard.store(ptr::null_mut(), Ordering::Release);
+    atomic::fence(Ordering::SeqCst);
 }
 
 /// Whether any slot of any record holds `addr`, read sequentially consistent.
@@ -462,10 +480,10 @@ pub(crate) fn park(value: Parked, bytes: usize) {
 /// Marks each record with a slot that holds `addr`, then reads that slot again, both sequentially
 /// consistent, and returns whether any still holds it.
 ///
-/// A record's owner clears its slots and then reads its mark behind a sequentially consistent
-/// fence. So if this returns `false`, no slot holds the value and the caller lets it go, and if it
-/// returns `true`, the owner of a record still holding it sees the mark once it clears the slot,
-/// and flushes.
+/// A record's owner clears its slots, when it drops the record or earlier through [`retract`], and
+/// then reads its mark behind a sequentially consistent fence. So if this returns `false`, no slot
+/// holds the value and the caller lets it go, and if it returns `true`, the owner of a record still
+/// holding it sees the mark once it clears the slot, and flushes.
 fn waits(addr: usize) -> bool {
     let records = RECORDS.lock();
     let mut held = false;
