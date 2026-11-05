@@ -12,10 +12,13 @@ SECS ?= 10
 KEEP ?=
 FUZZ ?= open
 FUZZ_TIME ?= 600
+STRESS_ROUNDS ?= 25
+STRESS_COPIES ?= 12
+STRESS_THREADS ?= 16
 LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt fmt-check doc doc-check ci act \
+.PHONY: help build build-debug check test test-lib test-one test-pkg test-stress lint lint-windows fmt fmt-check doc doc-check ci act \
 	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-combine bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds fuzz-lint clean clean-tmp
@@ -23,6 +26,7 @@ LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf '\nVariables: MEM=%s T=test-filter P=package DB=path ADDR=%s ARGS="..." FUZZ=%s\n' "$(MEM)" "$(ADDR)" "$(FUZZ)"
+	@printf 'STRESS_ROUNDS=%s STRESS_COPIES=%s STRESS_THREADS=%s size test-stress.\n' "$(STRESS_ROUNDS)" "$(STRESS_COPIES)" "$(STRESS_THREADS)"
 	@printf 'Set CAP= (empty) to run cargo without the systemd memory cap.\n'
 
 build: ## Build the whole workspace in release
@@ -46,6 +50,26 @@ test-one: ## Run tests matching T in the library, e.g. make test-one T=sync
 test-pkg: ## Run one package's tests, e.g. make test-pkg P=booking
 	$(RUN) test --release -p $(P) -- $(T)
 
+test-stress: ## Run the library's unit tests in STRESS_COPIES processes at once, STRESS_ROUNDS times over
+	$(RUN) test --release -p ferro --lib --no-run
+	@bin=$$($(CARGO) test --release -p ferro --lib --no-run 2>&1 | sed -n 's|.*Executable unittests src/lib.rs (\(.*\))$$|\1|p'); \
+	test -n "$$bin" || { echo "test-stress: found no unit test binary for the library"; exit 1; }; \
+	rm -rf target/stress && mkdir -p target/stress && \
+	$(CAP) sh -c 'for round in $$(seq "$$1"); do \
+		for copy in $$(seq "$$2"); do \
+			"$$3" --test-threads "$$4" -q > "target/stress/$$round.$$copy" 2>&1 || echo "$$round.$$copy" >> target/stress/failed & \
+		done; \
+		wait; \
+	done' sh $(STRESS_ROUNDS) $(STRESS_COPIES) "$$bin" $(STRESS_THREADS); \
+	runs=$$(($(STRESS_ROUNDS) * $(STRESS_COPIES))); \
+	if [ -s target/stress/failed ]; then \
+		for run in $$(cat target/stress/failed); do \
+			echo "--- run $$run"; grep -E "panicked at|^test .* \.\.\. FAILED|^ *(left|right):|ERROR|WARNING" "target/stress/$$run"; \
+		done; \
+		echo "test-stress: $$(wc -l < target/stress/failed) of $$runs runs failed, logs in target/stress"; exit 1; \
+	fi; \
+	echo "test-stress: $$runs runs of the library's unit tests, $(STRESS_COPIES) at a time, all passed"
+
 lint: ## Run clippy on every target with warnings as errors
 	$(RUN) clippy --workspace --all-targets --release -- -D warnings $(LINTS)
 
@@ -64,7 +88,7 @@ doc: ## Build the library's API docs and open them
 doc-check: ## Build the API docs with warnings as errors, so broken links fail
 	RUSTDOCFLAGS="-D warnings" $(RUN) doc --no-deps -p ferro -p ferro-derive
 
-ci: fmt-check lint lint-windows fuzz-lint doc-check test ## Run the local equivalent of CI
+ci: fmt-check lint lint-windows fuzz-lint doc-check test test-stress ## Run the local equivalent of CI
 
 act: ## Run the GitHub workflow's Linux job locally with act
 	act push -j test
