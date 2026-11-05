@@ -644,6 +644,68 @@ fn a_nested_map_dropped_before_its_iterators_leaves_the_file_readable() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn open_files(path: &std::path::Path) -> usize {
+    let target = std::fs::canonicalize(path).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|link| *link == target)
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_closes_when_the_last_iterator_over_it_goes() {
+    for blob in [8, 700] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.ferro");
+        drop(nested_db(&path, blob));
+        let db = fast().open::<Map<u64, Nested>>(&path).unwrap();
+        let snapshot = db.read();
+        let mut walk = snapshot.iter();
+        let mut cursor = snapshot.cursor();
+        assert_eq!(walk.next().map(|(key, _)| key), Some(0));
+        assert!(cursor.seek(&20));
+        drop(snapshot);
+        drop(db);
+        assert_eq!(
+            open_files(&path),
+            1,
+            "blob {blob}: open while iterators read"
+        );
+        drop(walk);
+        assert_eq!(cursor.advance(), Some(&21));
+        drop(cursor);
+        assert_eq!(
+            open_files(&path),
+            0,
+            "blob {blob}: open after the last iterator"
+        );
+        let db = fast().open::<Map<u64, Nested>>(&path).unwrap();
+        let snapshot = db.read();
+        let mut walk = snapshot.iter();
+        drop(snapshot);
+        drop(db);
+        let (_, value) = walk.next().unwrap();
+        let mut inner = value.inner.iter();
+        assert_eq!(inner.next().map(|(key, _)| key), Some(0));
+        drop(value);
+        drop(walk);
+        assert_eq!(
+            open_files(&path),
+            1,
+            "blob {blob}: open while a nested iterator reads"
+        );
+        drop(inner);
+        assert_eq!(
+            open_files(&path),
+            0,
+            "blob {blob}: open after the nested iterator"
+        );
+    }
+}
+
 #[test]
 fn a_map_edited_beside_its_iterators_leaves_what_they_read() {
     let dir = tempfile::tempdir().unwrap();

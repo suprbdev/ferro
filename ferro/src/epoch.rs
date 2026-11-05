@@ -17,6 +17,7 @@ pub(crate) const STORE: usize = 0;
 pub(crate) const ROOT: usize = 1;
 const SPARE_RECORDS: usize = 8;
 const MAX_RECORDS: usize = 4096;
+const HELD: u64 = 0;
 
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static SLOTS: Mutex<Vec<&'static Slot>> = Mutex::new(Vec::new());
@@ -41,6 +42,10 @@ impl Retired {
             Value::Counted(value) => value.addr(),
             Value::Parked(value) => value.addr(),
         }
+    }
+
+    fn held_at(&self, addr: usize) -> bool {
+        self.epoch == HELD && self.addr() == addr
     }
 
     fn release(self) -> Option<(Dead, usize)> {
@@ -204,7 +209,8 @@ impl Hazards {
 impl Drop for Hazards {
     fn drop(&mut self) {
         let record = self.record;
-        let held = record.entries[..=ROOT]
+        let held = record
+            .entries
             .iter()
             .any(|entry| !entry.load(Ordering::Relaxed).is_null());
         for entry in &record.entries {
@@ -258,14 +264,15 @@ fn hazarded() -> Vec<usize> {
 }
 
 pub(crate) fn retire(value: Erased, bytes: usize) {
-    push(Value::Counted(ManuallyDrop::new(value)), bytes);
+    let epoch = EPOCH.load(Ordering::SeqCst);
+    push(Value::Counted(ManuallyDrop::new(value)), bytes, epoch);
 }
 
 pub(crate) fn park(value: Parked, bytes: usize) {
     let addr = value.addr();
-    let slot = push(Value::Parked(value), bytes);
+    let slot = push(Value::Parked(value), bytes, HELD);
     if !waits(addr) {
-        release(slot, &mut |item| item.addr() == addr);
+        release(slot, &mut |item| item.held_at(addr));
     }
 }
 
@@ -273,25 +280,20 @@ fn waits(addr: usize) -> bool {
     let records = RECORDS.lock();
     let mut held = false;
     for record in records.iter() {
-        for (index, entry) in record.entries.iter().enumerate() {
+        for entry in &record.entries {
             if entry.load(Ordering::SeqCst).addr() != addr {
                 continue;
             }
-            if index <= ROOT {
-                record.hint.store(true, Ordering::SeqCst);
-                if entry.load(Ordering::SeqCst).addr() != addr {
-                    continue;
-                }
-            }
-            held = true;
+            record.hint.store(true, Ordering::SeqCst);
+            held |= entry.load(Ordering::SeqCst).addr() == addr;
         }
     }
     held
 }
 
-fn push(value: Value, bytes: usize) -> &'static Slot {
+fn push(value: Value, bytes: usize, epoch: u64) -> &'static Slot {
     let item = Retired {
-        epoch: EPOCH.load(Ordering::SeqCst),
+        epoch,
         bytes,
         value,
     };
@@ -318,9 +320,23 @@ fn push(value: Value, bytes: usize) -> &'static Slot {
 }
 
 fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
+    let mut held = Vec::new();
     release(slot, &mut |item| {
-        item.epoch < oldest && hazards.binary_search(&item.addr()).is_err()
+        if item.epoch >= oldest {
+            return false;
+        }
+        if hazards.binary_search(&item.addr()).is_err() {
+            return true;
+        }
+        item.epoch = HELD;
+        held.push(item.addr());
+        false
     });
+    for addr in held {
+        if !waits(addr) {
+            release(slot, &mut |item| item.held_at(addr));
+        }
+    }
 }
 
 fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
@@ -341,23 +357,24 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
         let (kept, gone): (Vec<_>, Vec<_>) = dying
             .into_iter()
             .partition(|(dead, _)| held.binary_search(&dead.addr()).is_ok());
-        drop(gone);
         if !kept.is_empty() {
             let addrs: Vec<usize> = kept.iter().map(|(dead, _)| dead.addr()).collect();
-            let epoch = EPOCH.load(Ordering::SeqCst);
             let mut pending = slot.pending.lock();
             for (value, bytes) in kept {
                 pending.bytes += bytes;
                 pending.kept_bytes += bytes;
                 pending.kept += 1;
                 pending.items.push(Retired {
-                    epoch,
+                    epoch: HELD,
                     bytes,
                     value: Value::Parked(value.revive()),
                 });
             }
             drop(pending);
+            drop(gone);
             loose = addrs.into_iter().filter(|addr| !waits(*addr)).collect();
+        } else {
+            drop(gone);
         }
     }
     if counted {
@@ -365,7 +382,7 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
     }
     FREEING.fetch_sub(count, Ordering::SeqCst);
     for addr in loose {
-        release(slot, &mut |item| item.addr() == addr);
+        release(slot, &mut |item| item.held_at(addr));
     }
 }
 
