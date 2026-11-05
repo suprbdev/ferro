@@ -488,7 +488,10 @@ fn compacting_a_null_link_outside_a_log_entry_fails_as_verify_does() {
                 "{threads} threads, {keep:?}: {outcome:?}"
             );
             drop(db);
-            assert!(fs::read(&path).unwrap() == before, "{threads} threads, {keep:?}");
+            assert!(
+                fs::read(&path).unwrap() == before,
+                "{threads} threads, {keep:?}"
+            );
         }
     }
     admin::compact(&path, Keep::All).unwrap();
