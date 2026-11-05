@@ -348,6 +348,7 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 ///
 /// # Errors
 ///
+/// [`Error::Io`] with [`NotFound`](std::io::ErrorKind::NotFound) if there is no file at `path`,
 /// [`Error::Locked`] while a writer has the file open, and [`Error::NotFerro`], [`Error::Corrupt`]
 /// or [`Error::Io`] if the file cannot be read or the copy written. A copy that fails is removed,
 /// and the file is left as it was.
@@ -373,8 +374,7 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 /// # }
 /// ```
 pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
-    let path = path.as_ref();
-    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = fs::canonicalize(path.as_ref())?;
     let path = real.as_path();
     let (store, head) = Store::open(path, StoreOptions::default())?;
     let before_bytes = store.size();

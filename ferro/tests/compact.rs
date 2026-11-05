@@ -114,6 +114,17 @@ fn compaction_refuses_a_live_writer_and_empty_is_a_noop() {
 }
 
 #[test]
+fn compacting_a_missing_path_fails_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.ferro");
+    assert!(matches!(
+        admin::compact(&path, Keep::All),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
 fn read_only_handle_follows_a_replaced_file_on_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.ferro");
