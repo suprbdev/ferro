@@ -312,18 +312,25 @@ dropped, keep a leaf the finder holds once the borrowed node that pinned it is f
 through its map after a free has scanned the records, and move records between threads. They also
 check that `make_mut`, `get_mut` and `unwrap_or_clone` copy a value a slot holds, that each end of a
 narrow range holds its nodes in its own slots and that a finder whose descent panicked holds only
-what its slots hold, and race a lent value's last owner with the release of its slot and with a
-clone through it, and `Shared`'s and `Erased`'s clones assert in debug builds that the count they
-add to is not zero. They pass under Miri with stacked borrows and with tree borrows over 32
-schedules each. Under Miri the epoch's lists lock with `std::sync::Mutex` rather than `parking_lot`,
-whose futex call Miri's shim rejects when two threads contend for a lock, which stopped one schedule
-in 32 under tree borrows. Under Miri their assertions fail for the sabotages of the loan, the
-records and the retired list's second reading, and Miri reports a data race on the freed value when
-a last drop is not parked. The uniqueness check made to ignore slots and the finder made to keep its
-fields through a descent fail their unit tests on every run. The decoder's clone made to take a
-count from zero is reported as a dangling reference in 3 of 64 schedules, the owner made to read its
-mark before clearing its slots fails the race in 2 of 64, and the parker made to trust its first
-reading of the slots in 1 of 256.
+what its slots hold, race a lent value's last owner with the release of its slot and with a clone
+through it, and run a free inside a borrow through a memo and inside the copy of a slot, between the
+slot's write and the second read of `cached`, and check that the record's drop lets go of what the
+free kept once the borrow has cleared its slot. `Shared`'s and `Erased`'s clones assert in debug
+builds that the count they add to is not zero. They pass under Miri with stacked borrows and with
+tree borrows over 32 schedules each. Under Miri the epoch's lists lock with `std::sync::Mutex`
+rather than `parking_lot`, whose futex call Miri's shim rejects when two threads contend for a lock,
+which stopped one schedule in 32 under tree borrows. Under Miri their assertions fail for the
+sabotages of the loan, the records and the retired list's second reading, and Miri reports a data
+race on the freed value when a last drop is not parked. The uniqueness check made to ignore slots
+and the finder made to keep its fields through a descent fail their unit tests on every run. The
+decoder's clone made to take a count from zero is reported as a dangling reference in 3 of 64
+schedules, the owner made to read its mark before clearing its slots fails the race in 2 of 64, and
+the parker made to trust its first reading of the slots in 1 of 256. The drop made to read its mark
+only when a slot is set fails the free run inside a borrow on every run. Leaving the fence out of
+`epoch::retract` passes that test, which runs on one thread, and also passed a race of the same
+borrows beside a free on another thread over 64 schedules, in which Miri never let the free read the
+slot's old address once the clear had run; the fence rests on the argument under [The root and the
+store](#the-root-and-the-store).
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
@@ -334,9 +341,9 @@ MIRIFLAGS="-Zmiri-many-seeds=0..32" cargo +nightly miri test -p ferro --lib -- e
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-many-seeds=0..32" \
     cargo +nightly miri test -p ferro --lib -- epoch_ shared_
 RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR=target/asan cargo +nightly test -Zbuild-std \
-    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress
+    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress --test reads
 RUSTFLAGS="-Zsanitizer=thread" CARGO_TARGET_DIR=target/tsan cargo +nightly test -Zbuild-std \
-    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress
+    --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress --test reads
 ```
 
 ## Index rows
@@ -632,6 +639,23 @@ descriptors on a file as its last iterator, cursor and nested map's iterator dro
 slot cost the cells with the 16 MiB cache 0.3 to 0.7% more instructions and 1 to 4% of their rate
 across two alternating runs, and moved nothing with the 1 GiB cache.
 
+Two borrows write a slot and then clear it again: a borrow through a `Weak` memo whose second read
+of `cached` finds it cleared, and the back path's copy of a shared frame when the copy's read of
+`cached` does (#75). The clear was a release store, and the owner read its mark only if some slot
+was set when it dropped the record. A free could mark the record between the borrow's write and its
+clear, read the slot again before the clear reached it and keep the item, and an owner whose other
+slots were all clear when it dropped the record never read the mark, so the item, a store's file
+with it, waited for an unrelated free. The map's iterators, cursors and row finder hold their store
+in a slot until they drop whenever a node slot can be written, so their drops read the mark, but the
+protocol did not promise it. The clear now goes through `epoch::retract`, a release store and then a
+sequentially consistent fence, the handshake of the clear at drop, and the drop reads the mark
+whether or not a slot is set, behind its own fence only when one is. Either the free's second
+reading comes after the borrow's fence and finds the slot clear, so the free lets the item go
+itself, or the mark comes before that fence, and the drop sees it and flushes. The clear is rare:
+over a round of every workload of `scaling` at 1, 8 and 32 threads with both caches, the back path
+copied a frame more than 67M times and cleared one copy, and borrows through a memo cleared 8 to 15
+slots.
+
 The first version freed a lent value from a retired list as soon as the list's own count was the
 last, trusting the scan of the records that the free began with. A root the cache had retired could
 then be borrowed through its map after that scan, and the map dropped before the list let go, so the
@@ -754,6 +778,17 @@ covered pages, 4% and 5% slower. In `reads` and the main tool the heap per key, 
 a commit writes and the instructions of a bulk load or a commit did not move, and only row reads
 through the finder ran 2 to 3% more instructions.
 
+The fenced clear of a slot, described under [The root and the store](#the-root-and-the-store), was
+measured against the build before it with no writer at 1, 8 and 32 threads. Over two alternating
+runs of every workload, five rounds each, every cell ran the instructions it ran before, within the
+spread that evictions give with the 16 MiB cache. Over six alternating runs of three rounds of
+lookups and pages, leaving out cells during which other work kept more than two cores busy, every
+cell with either cache ran within 2% of its rate before, except index lookups at 32 threads and
+covered pages at 8 with the 16 MiB cache, 4% and 3% slower. With the 1 GiB cache covered lookups
+ran 2.48M a second on one thread against 2.52M, 15.7M at 8 threads against 15.5M and 37.4M at 32
+against 37.7M, at 5,307 instructions against 5,309, and covered pages 844,000 against 847,000, 4.81M
+against 4.88M and 8.99M against 8.79M, at 30,376 instructions against 30,380.
+
 ### Measured and left out
 
 - A counted store in iterators, cursors and the row finder, in place of the store's slot, as the
@@ -795,6 +830,16 @@ through the finder ran 2 to 3% more instructions.
   for its thread would delay. The probe without these counts bounds what striping could gain, and
   the hazards come within a sixth of it for covered lookups, 37.9M a second at 32 threads against
   44.7M in another session.
+- A fence in every drop of a record, whatever its slots hold, in place of the fence in
+  `epoch::retract`, as the fix for a slot cleared early. Where a slot holds the store it changes
+  nothing, but the iterators, cursors and row finders of a map without a store set no slot and pay
+  it on every drop. In a 1,000-key in-memory map, medians of six alternating runs of the best of
+  five, a cursor's seek took 36.7 ns against 36.0 before and 36.2 with the fence in `retract`, and a
+  two-key range 68.5 ns against 68.9 and 69.5, differences the size of what moving the code around
+  gives. The fence stayed in `retract`, which runs only when a borrow clears its slot.
+- `epoch::retract` out of line and marked cold. The code around each inlined borrow changed: a
+  100-key range ran 8,972 instructions against 8,928, a covered lookup 5,328 against 5,309 and a
+  two-key range of an in-memory map 1,383 against 1,371. Inlined, they run what they ran before.
 
 ### What is left
 
