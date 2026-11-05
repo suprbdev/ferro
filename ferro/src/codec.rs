@@ -726,7 +726,7 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn store(&self) -> Option<Store> {
-        self.store.cloned()
+        self.store.map(Store::share)
     }
 
     pub fn fields(&mut self, mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>) -> Result<()> {

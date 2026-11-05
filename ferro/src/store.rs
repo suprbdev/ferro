@@ -1069,17 +1069,9 @@ struct Inner {
     options: StoreOptions,
 }
 
+#[derive(Clone)]
 pub struct Store {
     inner: Shared<Inner>,
-}
-
-impl Clone for Store {
-    #[inline]
-    fn clone(&self) -> Store {
-        Store {
-            inner: Shared::share(&self.inner),
-        }
-    }
 }
 
 pub(crate) struct Lent {
@@ -1285,6 +1277,12 @@ impl Store {
 
     pub(crate) fn metadata(&self) -> Result<std::fs::Metadata> {
         Ok(self.inner.file.metadata()?)
+    }
+
+    pub(crate) fn share(&self) -> Store {
+        Store {
+            inner: Shared::share(&self.inner),
+        }
     }
 
     pub(crate) fn retired(&self) -> Retired {
