@@ -6,7 +6,7 @@ use std::mem::{self, ManuallyDrop, offset_of};
 use std::ops::Deref;
 use std::process;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use crate::epoch::Guard;
 
@@ -194,6 +194,13 @@ impl<T> Shared<T> {
     }
 
     #[inline]
+    pub(crate) fn inner_of(data: *const T) -> *mut () {
+        unsafe { data.byte_sub(offset_of!(Inner<T>, data)) }
+            .cast_mut()
+            .cast()
+    }
+
+    #[inline]
     pub(crate) unsafe fn increment_strong_count(data: *const T) {
         let this = ManuallyDrop::new(unsafe { Shared::from_raw(data) });
         mem::forget(Shared::clone(&this));
@@ -340,6 +347,10 @@ impl Erased {
     fn strong(&self) -> &AtomicUsize {
         unsafe { &*self.ptr.as_ptr().cast::<AtomicUsize>() }
     }
+
+    pub(crate) fn addr(&self) -> usize {
+        self.ptr.addr().get()
+    }
 }
 
 impl Clone for Erased {
@@ -368,6 +379,11 @@ impl<T> Weak<T> {
     #[inline]
     pub(crate) fn as_ptr(&self) -> *const T {
         unsafe { &raw const (*self.ptr.as_ptr()).data }
+    }
+
+    #[inline]
+    pub(crate) fn flags_addr(&self) -> usize {
+        self.ptr.addr().get() + offset_of!(Inner<T>, cached)
     }
 
     pub(crate) fn upgrade(&self) -> Option<Shared<T>> {
@@ -401,7 +417,9 @@ impl<T> Weak<T> {
     pub(crate) fn strong_count(&self) -> usize {
         unsafe { (*self.ptr.as_ptr()).strong.load(Ordering::Relaxed) }
     }
+}
 
+impl<T: Send + Sync + 'static> Weak<T> {
     #[inline]
     pub(crate) fn lend<'g>(&self, _guard: &'g Guard) -> Option<&'g T> {
         let inner = self.ptr.as_ptr();
@@ -417,6 +435,25 @@ impl<T> Weak<T> {
                 .load(Ordering::SeqCst)
                 .then(|| &(*inner).data)
         }
+    }
+
+    #[inline]
+    pub(crate) fn lend_to(&self, hazard: &AtomicPtr<()>) -> Option<NonNull<T>> {
+        let inner = self.ptr.as_ptr();
+        unsafe {
+            if !(*inner).cached.load(Ordering::SeqCst) {
+                return None;
+            }
+            hazard.store(inner.cast(), Ordering::SeqCst);
+            if !(*inner).lent.load(Ordering::SeqCst) {
+                (*inner).lent.store(true, Ordering::SeqCst);
+            }
+            if (*inner).cached.load(Ordering::SeqCst) {
+                return Some(NonNull::new_unchecked(&raw mut (*inner).data));
+            }
+        }
+        hazard.store(ptr::null_mut(), Ordering::Release);
+        None
     }
 }
 
@@ -444,7 +481,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::epoch;
+    use crate::epoch::{self, HAZARDS, Hazards};
 
     #[derive(Debug)]
     struct Counted {
@@ -594,5 +631,38 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let guard = epoch::pin().unwrap();
         assert!(weak.lend(&guard).is_none());
+    }
+
+    #[test]
+    fn shared_a_weak_lends_to_a_hazard_only_what_is_cached() {
+        let (counted, _, drops) = Counted::new(11);
+        let owner = Shared::new(counted);
+        let weak = Shared::downgrade(&owner);
+        let hazards = Hazards::new().unwrap();
+        let entry = hazards.entry(HAZARDS - 1);
+        assert!(weak.lend_to(entry).is_none());
+        assert!(entry.load(Ordering::SeqCst).is_null());
+        let cache = Shared::erase(owner.clone());
+        cache.hold();
+        let lent = weak.lend_to(entry).unwrap();
+        assert_eq!(entry.load(Ordering::SeqCst).addr(), cache.addr());
+        drop(owner);
+        assert!(cache.release());
+        epoch::retire(cache, 1);
+        let reader = {
+            let weak = weak.clone();
+            thread::spawn(move || {
+                let hazards = Hazards::new().unwrap();
+                weak.lend_to(hazards.entry(HAZARDS - 1)).is_none()
+            })
+        };
+        epoch::flush();
+        assert!(reader.join().unwrap());
+        assert_eq!(unsafe { lent.as_ref() }.value, 11);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(hazards);
+        epoch::flush();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(weak.upgrade().is_none());
     }
 }

@@ -1,6 +1,7 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -10,31 +11,46 @@ use crate::shared::Erased;
 const BATCH: usize = 128;
 const BATCH_BYTES: usize = 64 << 10;
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const HAZARDS: usize = 8;
+const SPARE_RECORDS: usize = 8;
+const MAX_RECORDS: usize = 4096;
 
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static SLOTS: Mutex<Vec<&'static Slot>> = Mutex::new(Vec::new());
 static FREEING: AtomicUsize = AtomicUsize::new(0);
+static RECORDS: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
+static SPARE: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
 
 struct Retired {
     epoch: u64,
     bytes: usize,
-    _value: Erased,
+    value: Erased,
 }
 
 #[derive(Default)]
 struct Pending {
     items: Vec<Retired>,
     bytes: usize,
+    kept: usize,
+    kept_bytes: usize,
 }
 
 impl Pending {
-    fn take(&mut self, oldest: u64) -> Vec<Retired> {
+    fn take(&mut self, oldest: u64, hazards: &[usize]) -> Vec<Retired> {
         let freed: Vec<Retired> = self
             .items
-            .extract_if(.., |item| item.epoch < oldest)
+            .extract_if(.., |item| {
+                item.epoch < oldest && hazards.binary_search(&item.value.addr()).is_err()
+            })
             .collect();
         self.bytes -= freed.iter().map(|item| item.bytes).sum::<usize>();
+        self.kept = self.items.len();
+        self.kept_bytes = self.bytes;
         freed
+    }
+
+    fn due(&self) -> bool {
+        self.items.len() >= self.kept + BATCH || self.bytes >= self.kept_bytes + BATCH_BYTES
     }
 }
 
@@ -57,12 +73,26 @@ impl Drop for Local {
     }
 }
 
+#[repr(align(128))]
+struct Record {
+    entries: [AtomicPtr<()>; HAZARDS],
+}
+
+struct Spares(RefCell<Vec<&'static Record>>);
+
+impl Drop for Spares {
+    fn drop(&mut self) {
+        SPARE.lock().append(self.0.get_mut());
+    }
+}
+
 thread_local! {
     static LOCAL: Local = Local {
         slot: claim(),
         depth: Cell::new(0),
     };
     static FREEING_HERE: Cell<usize> = const { Cell::new(0) };
+    static SPARES: Spares = const { Spares(RefCell::new(Vec::new())) };
 }
 
 fn claim() -> &'static Slot {
@@ -119,11 +149,76 @@ impl Drop for Guard {
     }
 }
 
+pub(crate) struct Hazards {
+    record: &'static Record,
+}
+
+impl Hazards {
+    pub(crate) fn new() -> Option<Hazards> {
+        let spare = SPARES.try_with(|spares| spares.0.borrow_mut().pop()).ok()?;
+        let record = match spare.or_else(|| SPARE.lock().pop()) {
+            Some(record) => record,
+            None => {
+                let mut records = RECORDS.lock();
+                if records.len() >= MAX_RECORDS {
+                    return None;
+                }
+                let record: &'static Record = Box::leak(Box::new(Record {
+                    entries: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS],
+                }));
+                records.push(record);
+                record
+            }
+        };
+        Some(Hazards { record })
+    }
+
+    #[inline]
+    pub(crate) fn entry(&self, index: usize) -> &AtomicPtr<()> {
+        &self.record.entries[index]
+    }
+}
+
+impl Drop for Hazards {
+    fn drop(&mut self) {
+        for entry in &self.record.entries {
+            entry.store(ptr::null_mut(), Ordering::Release);
+        }
+        let record = self.record;
+        let kept = SPARES
+            .try_with(|spares| {
+                let mut spares = spares.0.borrow_mut();
+                let room = spares.len() < SPARE_RECORDS;
+                if room {
+                    spares.push(record);
+                }
+                room
+            })
+            .unwrap_or(false);
+        if !kept {
+            SPARE.lock().push(record);
+        }
+    }
+}
+
+fn hazarded() -> Vec<usize> {
+    let records = RECORDS.lock();
+    let mut held: Vec<usize> = records
+        .iter()
+        .flat_map(|record| &record.entries)
+        .map(|entry| entry.load(Ordering::SeqCst).addr())
+        .filter(|addr| *addr != 0)
+        .collect();
+    drop(records);
+    held.sort_unstable();
+    held
+}
+
 pub(crate) fn retire(value: Erased, bytes: usize) {
     let item = Retired {
         epoch: EPOCH.load(Ordering::SeqCst),
         bytes,
-        _value: value,
+        value,
     };
     let Ok(slot) = LOCAL.try_with(|local| local.slot) else {
         let slot = claim();
@@ -138,17 +233,18 @@ pub(crate) fn retire(value: Erased, bytes: usize) {
         let mut pending = slot.pending.lock();
         pending.bytes += item.bytes;
         pending.items.push(item);
-        pending.items.len() >= BATCH || pending.bytes >= BATCH_BYTES
+        pending.due()
     };
     if due {
-        free(slot, oldest(None));
+        let oldest = oldest(None);
+        free(slot, oldest, &hazarded());
     }
 }
 
-fn free(slot: &Slot, oldest: u64) {
+fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
     let freed = {
         let mut pending = slot.pending.lock();
-        let freed = pending.take(oldest);
+        let freed = pending.take(oldest, hazards);
         FREEING.fetch_add(freed.len(), Ordering::SeqCst);
         freed
     };
@@ -164,15 +260,14 @@ fn free(slot: &Slot, oldest: u64) {
 }
 
 fn oldest(skip: Option<&'static Slot>) -> u64 {
-    EPOCH.fetch_add(1, Ordering::SeqCst);
+    let bumped = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     SLOTS
         .lock()
         .iter()
         .filter(|slot| skip.is_none_or(|skip| !std::ptr::eq(**slot, skip)))
         .map(|slot| slot.epoch.load(Ordering::SeqCst))
         .filter(|epoch| *epoch != 0)
-        .min()
-        .unwrap_or(u64::MAX)
+        .fold(bumped, u64::min)
 }
 
 pub(crate) fn flush() {
@@ -190,9 +285,10 @@ pub(crate) fn flush() {
         }
         std::thread::yield_now();
     };
+    let hazards = hazarded();
     let slots: Vec<&'static Slot> = SLOTS.lock().clone();
     for slot in slots {
-        free(slot, oldest);
+        free(slot, oldest, &hazards);
     }
     let here = FREEING_HERE.try_with(Cell::get).unwrap_or(0);
     while FREEING.load(Ordering::SeqCst) > here && start.elapsed() <= FLUSH_WAIT {
@@ -258,5 +354,54 @@ mod tests {
         }
         flush();
         assert_eq!(dropped.load(Ordering::SeqCst), 2 * (BATCH + 1));
+    }
+
+    #[test]
+    fn epoch_hazards_keep_what_they_hold_through_a_flush() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let hazards = Hazards::new().unwrap();
+        let record = std::ptr::from_ref(hazards.record);
+        let value = Shared::erase(Shared::new(Counted(dropped.clone())));
+        let held = std::ptr::without_provenance_mut(value.addr());
+        hazards.entry(HAZARDS - 1).store(held, Ordering::SeqCst);
+        retire(value, 1);
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let other = thread::spawn(flush);
+        other.join().unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(hazards);
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let again = Hazards::new().unwrap();
+        assert!(std::ptr::eq(again.record, record));
+        assert!(
+            again
+                .record
+                .entries
+                .iter()
+                .all(|entry| entry.load(Ordering::SeqCst).is_null())
+        );
+    }
+
+    #[test]
+    fn epoch_hazards_move_between_threads() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let value = Shared::erase(Shared::new(Counted(dropped.clone())));
+        let held = value.addr();
+        let hazards = thread::spawn(move || {
+            let hazards = Hazards::new().unwrap();
+            let held = std::ptr::without_provenance_mut(held);
+            hazards.entry(HAZARDS - 1).store(held, Ordering::SeqCst);
+            hazards
+        })
+        .join()
+        .unwrap();
+        retire(value, 1);
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        thread::spawn(move || drop(hazards)).join().unwrap();
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }

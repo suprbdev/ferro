@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, needs_drop};
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::ptr::NonNull;
+use std::sync::atomic::{self, AtomicPtr};
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
@@ -16,7 +17,7 @@ use crate::codec::{
     Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape,
     Sink, Staged, try_hash_of,
 };
-use crate::epoch::{self, Guard};
+use crate::epoch::{self, Guard, HAZARDS, Hazards};
 use crate::error::{Error, Result};
 use crate::prefix::Prefix as KeyPrefix;
 use crate::shared::{Erased, Shared, Weak};
@@ -44,6 +45,9 @@ const TEARDOWN_AHEAD: usize = 16;
 const TEARDOWN_PATHS: usize = 4;
 const HINTED_LEVEL: u8 = 3;
 const LEAF_CAPACITY: usize = 8;
+const FRONT: usize = 0;
+const SPAN: usize = HAZARDS / 2;
+const BACK: usize = FRONT + SPAN;
 
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
@@ -2832,6 +2836,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ) -> Iter<K, V, S> {
         let build = || -> Result<Iter<K, V, S>> {
             let store = self.store();
+            let hazards = Hazards::new();
+            let ahead = Slots::of(&hazards, FRONT);
+            let behind = Slots::of(&hazards, BACK);
             let mut front = Vec::with_capacity(PATH_FRAMES);
             let mut back = Vec::with_capacity(PATH_FRAMES);
             let mut remaining = 0;
@@ -2849,10 +2856,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 let anchored = node.anchored();
                 depth += 1;
                 if low == high {
-                    current = hold(store, node.child(low), depth, anchored)?;
+                    let hazard = ahead.below(node.level);
+                    current = hold(store, node.child(low), depth, anchored, hazard)?;
                 }
                 back.push(Frame {
-                    node: node.share(),
+                    node: node.share_to(behind.at(node.level)),
                     position: 2 * high as isize - 1,
                 });
                 if low >= high {
@@ -2869,21 +2877,23 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 let inner = (low + 1..high).map(|position| node.child(position).count());
                 let skipped = edge(
                     store,
-                    node.child(low),
+                    (node.child(low), node.level),
                     anchored,
                     depth,
                     &below,
                     1,
                     &mut front,
+                    ahead,
                 )?;
                 let kept = edge(
                     store,
-                    node.child(high),
+                    (node.child(high), node.level),
                     anchored,
                     depth,
                     &within,
                     -1,
                     &mut back,
+                    behind,
                 )?;
                 remaining = (high - low) as u64
                     + inner.sum::<u64>()
@@ -2894,6 +2904,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 store: self.store.clone(),
                 front,
                 back,
+                hazards,
                 _root: root,
                 remaining,
             })
@@ -2918,6 +2929,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Cursor {
             store: self.store.clone(),
             path: Vec::with_capacity(PATH_FRAMES),
+            hazards: Hazards::new(),
             root: self.root.with_memo(),
             index: None,
         }
@@ -3636,8 +3648,13 @@ impl<K, V, S> Hold<K, V, S> {
 
     #[inline]
     fn anchored_at(node: &Node<K, V, S>) -> Self {
+        Hold::lent(NonNull::from(node))
+    }
+
+    #[inline]
+    fn lent(node: NonNull<Node<K, V, S>>) -> Self {
         Hold {
-            tagged: NonNull::from(node).map_addr(|addr| addr | 1),
+            tagged: node.map_addr(|addr| addr | 1),
             _owns: PhantomData,
         }
     }
@@ -3654,13 +3671,45 @@ impl<K, V, S> Hold<K, V, S> {
 
     #[inline]
     fn share(&self) -> Self {
+        self.share_to(None)
+    }
+
+    #[inline]
+    fn share_to(&self, hazard: Option<&AtomicPtr<()>>) -> Self {
         if !self.anchored() {
             unsafe { Shared::increment_strong_count(self.node()) };
+        } else if let Some(hazard) = hazard {
+            hazard.store(Shared::inner_of(self.node()), atomic::Ordering::SeqCst);
         }
         Hold {
             tagged: self.tagged,
             _owns: PhantomData,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Slots<'a> {
+    hazards: &'a Option<Hazards>,
+    base: usize,
+}
+
+impl<'a> Slots<'a> {
+    #[inline]
+    fn of(hazards: &'a Option<Hazards>, base: usize) -> Self {
+        Slots { hazards, base }
+    }
+
+    #[inline]
+    fn at(self, level: u8) -> Option<&'a AtomicPtr<()>> {
+        let index = usize::from(level);
+        let hazards = self.hazards.as_ref()?;
+        (index < SPAN).then(|| hazards.entry(self.base + index))
+    }
+
+    #[inline]
+    fn below(self, parent: u8) -> Option<&'a AtomicPtr<()>> {
+        self.at(parent.wrapping_sub(1))
     }
 }
 
@@ -3670,7 +3719,18 @@ fn hold<K: Data, V: Data, S: Data>(
     link: &Link<K, V, S>,
     depth: usize,
     anchored: bool,
+    hazard: Option<&AtomicPtr<()>>,
 ) -> Result<Option<Hold<K, V, S>>> {
+    if let Some(hazard) = hazard
+        && let Link::Stored { memo, .. } = link
+        && let Some(Memo::Weak(weak, hint)) = memo.get()
+    {
+        hint.prefetch(weak);
+        prefetch(weak.flags_addr());
+        if let Some(node) = weak.lend_to(hazard) {
+            return Ok(Some(Hold::lent(node)));
+        }
+    }
     Ok(match reach(store, link, depth, None)? {
         Reach::Absent => None,
         Reach::Borrowed(node) if anchored => Some(Hold::anchored_at(node)),
@@ -3687,8 +3747,9 @@ struct Frame<K, V, S> {
 
 #[inline]
 fn step<K: Data, V: Data, S: Data>(
-    store: Option<&Store>,
+    store: &Option<Store>,
     path: &mut Vec<Frame<K, V, S>>,
+    slots: Slots<'_>,
 ) -> Option<usize> {
     loop {
         let depth = path.len();
@@ -3703,37 +3764,42 @@ fn step<K: Data, V: Data, S: Data>(
             return Some((position / 2) as usize);
         }
         frame.position += 1;
-        enter(store, path, (position / 2) as usize, depth);
+        enter(store, path, (position / 2) as usize, depth, slots);
     }
 }
 
 #[inline(never)]
 fn enter<K: Data, V: Data, S: Data>(
-    store: Option<&Store>,
+    store: &Option<Store>,
     path: &mut Vec<Frame<K, V, S>>,
     position: usize,
     depth: usize,
+    slots: Slots<'_>,
 ) {
     let Some(frame) = path.last() else {
         return;
     };
     let child = frame.node.child(position);
-    if let Some(node) = fatal(hold(store, child, depth, frame.node.anchored())) {
+    let anchored = frame.node.anchored();
+    let hazard = slots.below(frame.node.level);
+    if let Some(node) = fatal(hold(store.as_ref(), child, depth, anchored, hazard)) {
         path.push(Frame { node, position: 0 });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn edge<K: Data, V: Data, S: Data>(
     store: Option<&Store>,
-    link: &Link<K, V, S>,
+    (link, above): (&Link<K, V, S>, u8),
     anchored: bool,
     mut depth: usize,
     before: &impl Fn(&K) -> bool,
     offset: isize,
     path: &mut Vec<Frame<K, V, S>>,
+    slots: Slots<'_>,
 ) -> Result<u64> {
     let mut rank = 0u64;
-    let mut current = hold(store, link, depth, anchored)?;
+    let mut current = hold(store, link, depth, anchored, slots.below(above))?;
     while let Some(node) = current {
         let position = node.keys.partition_point(|key| before(key));
         rank += position as u64;
@@ -3744,7 +3810,13 @@ fn edge<K: Data, V: Data, S: Data>(
             .map(Link::count)
             .sum::<u64>();
         depth += 1;
-        current = hold(store, node.child(position), depth, node.anchored())?;
+        current = hold(
+            store,
+            node.child(position),
+            depth,
+            node.anchored(),
+            slots.below(node.level),
+        )?;
         path.push(Frame {
             node,
             position: 2 * position as isize + offset,
@@ -3756,6 +3828,7 @@ fn edge<K: Data, V: Data, S: Data>(
 pub struct Cursor<K, V, S = ()> {
     store: Option<Store>,
     path: Vec<Frame<K, V, S>>,
+    hazards: Option<Hazards>,
     root: Link<K, V, S>,
     index: Option<usize>,
 }
@@ -3763,10 +3836,11 @@ pub struct Cursor<K, V, S = ()> {
 impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     pub fn rewind(&mut self) {
         self.path.clear();
-        if let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true)) {
+        if let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true, None)) {
             self.path.push(Frame { node, position: 0 });
         }
-        self.index = step(self.store.as_ref(), &mut self.path);
+        let slots = Slots::of(&self.hazards, FRONT);
+        self.index = step(&self.store, &mut self.path, slots);
     }
 
     fn climb<Q>(&mut self, key: &Q)
@@ -3784,7 +3858,7 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
             self.path.pop();
         }
         if self.path.is_empty()
-            && let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true))
+            && let Some(node) = fatal(hold(self.store.as_ref(), &self.root, 0, true, None))
         {
             self.path.push(Frame { node, position: 0 });
         }
@@ -3797,6 +3871,7 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     {
         self.climb(key);
         let store = self.store.as_ref();
+        let slots = Slots::of(&self.hazards, FRONT);
         loop {
             let depth = self.path.len();
             let Some(frame) = self.path.last_mut() else {
@@ -3811,7 +3886,9 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
                 Err(position) => {
                     frame.position = 2 * position as isize + 1;
                     let anchored = frame.node.anchored();
-                    match fatal(hold(store, frame.node.child(position), depth, anchored)) {
+                    let child = frame.node.child(position);
+                    let hazard = slots.below(frame.node.level);
+                    match fatal(hold(store, child, depth, anchored, hazard)) {
                         Some(node) => self.path.push(Frame { node, position: 0 }),
                         None => return false,
                     }
@@ -3828,7 +3905,8 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         if self.descend(key) {
             return true;
         }
-        self.index = step(self.store.as_ref(), &mut self.path);
+        let slots = Slots::of(&self.hazards, FRONT);
+        self.index = step(&self.store, &mut self.path, slots);
         false
     }
 
@@ -3855,7 +3933,8 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
 
     pub fn advance(&mut self) -> Option<&K> {
         self.index?;
-        self.index = step(self.store.as_ref(), &mut self.path);
+        let slots = Slots::of(&self.hazards, FRONT);
+        self.index = step(&self.store, &mut self.path, slots);
         self.key()
     }
 
@@ -4024,6 +4103,7 @@ pub struct Iter<K, V, S = ()> {
     store: Option<Store>,
     front: Vec<Frame<K, V, S>>,
     back: Vec<Frame<K, V, S>>,
+    hazards: Option<Hazards>,
     _root: Option<Shared<Node<K, V, S>>>,
     remaining: u64,
 }
@@ -4042,7 +4122,8 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         if self.remaining == 0 {
             return None;
         }
-        let index = step(self.store.as_ref(), &mut self.front)?;
+        let slots = Slots::of(&self.hazards, FRONT);
+        let index = step(&self.store, &mut self.front, slots)?;
         self.remaining -= 1;
         Some(index)
     }
@@ -4050,9 +4131,11 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
     fn drain<B>(
         &mut self,
         init: B,
-        mut visit: impl FnMut(B, &Node<K, V, S>, Range<usize>) -> B,
+        mut visit: impl FnMut(B, Option<&Store>, &Node<K, V, S>, Range<usize>) -> B,
     ) -> B {
         let mut total = init;
+        let store = self.store.as_ref();
+        let slots = Slots::of(&self.hazards, FRONT);
         while self.remaining > 0 {
             let depth = self.front.len();
             let Some(frame) = self.front.last_mut() else {
@@ -4066,7 +4149,7 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
             if frame.node.children.is_empty() {
                 let start = (frame.position / 2) as usize;
                 let stop = width.min(start.saturating_add(self.remaining as usize));
-                total = visit(total, &frame.node, start..stop);
+                total = visit(total, store, &frame.node, start..stop);
                 self.remaining -= (stop - start) as u64;
                 frame.position = 2 * stop as isize + 1;
                 continue;
@@ -4076,12 +4159,13 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
             if position % 2 == 1 {
                 self.remaining -= 1;
                 let index = (position / 2) as usize;
-                total = visit(total, &frame.node, index..index + 1);
+                total = visit(total, store, &frame.node, index..index + 1);
                 continue;
             }
             let child = frame.node.child((position / 2) as usize);
             let anchored = frame.node.anchored();
-            if let Some(node) = fatal(hold(self.store.as_ref(), child, depth, anchored)) {
+            let hazard = slots.below(frame.node.level);
+            if let Some(node) = fatal(hold(store, child, depth, anchored, hazard)) {
                 self.front.push(Frame { node, position: 0 });
             }
         }
@@ -4108,7 +4192,8 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
             frame.position -= 1;
             let child = frame.node.child((position / 2) as usize);
             let anchored = frame.node.anchored();
-            if let Some(node) = fatal(hold(self.store.as_ref(), child, depth, anchored)) {
+            let hazard = Slots::of(&self.hazards, BACK).below(frame.node.level);
+            if let Some(node) = fatal(hold(self.store.as_ref(), child, depth, anchored, hazard)) {
                 let position = 2 * node.keys.len() as isize;
                 self.back.push(Frame { node, position });
             }
@@ -4170,15 +4255,11 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Iter<K, V, S> {
     }
 
     fn fold<B, F: FnMut(B, Self::Item) -> B>(mut self, init: B, mut f: F) -> B {
-        let store = self.store.clone();
-        self.drain(init, |total, node, run| {
+        self.drain(init, |total, store, node, run| {
             let keys = &node.keys[run.clone()];
             let values = Run::of(&node.cells, run);
             (0..keys.len()).fold(total, |total, offset| {
-                f(
-                    total,
-                    (keys[offset].clone(), values.value(store.as_ref(), offset)),
-                )
+                f(total, (keys[offset].clone(), values.value(store, offset)))
             })
         })
     }
@@ -4211,7 +4292,7 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Keys<K, V, S> {
     }
 
     fn fold<B, F: FnMut(B, K) -> B>(mut self, init: B, mut f: F) -> B {
-        self.0.drain(init, |total, node, run| {
+        self.0.drain(init, |total, _, node, run| {
             node.keys[run].iter().cloned().fold(total, &mut f)
         })
     }
@@ -4244,12 +4325,9 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
     }
 
     fn fold<B, F: FnMut(B, Val<V>) -> B>(mut self, init: B, mut f: F) -> B {
-        let store = self.0.store.clone();
-        self.0.drain(init, |total, node, run| {
+        self.0.drain(init, |total, store, node, run| {
             let values = Run::of(&node.cells, run.clone());
-            (0..run.len()).fold(total, |total, offset| {
-                f(total, values.value(store.as_ref(), offset))
-            })
+            (0..run.len()).fold(total, |total, offset| f(total, values.value(store, offset)))
         })
     }
 }
@@ -4670,5 +4748,109 @@ mod tests {
         flusher.join().unwrap();
         epoch::flush();
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    fn cache(keep: &[Shared<Node<u64, u64, ()>>]) -> Vec<Erased> {
+        keep.iter()
+            .map(|node| {
+                let entry = Shared::erase(node.clone());
+                entry.hold();
+                entry
+            })
+            .collect()
+    }
+
+    fn evict_all(entries: Vec<Erased>) {
+        for entry in entries {
+            if entry.release() {
+                epoch::retire(entry, 64);
+            }
+        }
+    }
+
+    fn uncounted(path: &[Frame<u64, u64, ()>]) -> impl Iterator<Item = *const Node<u64, u64, ()>> {
+        path.iter()
+            .filter(|frame| frame.node.anchored())
+            .map(|frame| frame.node.node())
+    }
+
+    fn values(walk: impl Iterator<Item = (u64, Val<u64>)>) -> Vec<(u64, u64)> {
+        walk.map(|(key, value)| (key, *value)).collect()
+    }
+
+    #[test]
+    fn epoch_iterators_keep_borrowed_nodes_past_their_eviction() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let entries = cache(&keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let pairs: Vec<(u64, u64)> = keys.iter().map(|key| (*key, key * 3)).collect();
+        let mut walk = map.iter();
+        let mut seen = values(walk.by_ref().take(3));
+        let (low, high) = (keys[1], keys[keys.len() - 2]);
+        let mut back = map.range(low..high);
+        let last = back.next_back().map(|(key, value)| (key, *value));
+        let middle = keys[keys.len() / 2];
+        let mut cursor = map.cursor();
+        assert!(cursor.seek(&middle));
+        let held: Vec<*const Node<u64, u64, ()>> = uncounted(&walk.front)
+            .chain(uncounted(&back.front))
+            .chain(uncounted(&back.back))
+            .chain(uncounted(&cursor.path))
+            .collect();
+        let watched: Vec<Weak<Node<u64, u64, ()>>> = keep
+            .iter()
+            .filter(|node| held.contains(&Shared::as_ptr(node)))
+            .map(Shared::downgrade)
+            .collect();
+        assert!(watched.len() >= 2);
+        evict_all(entries);
+        keep.retain(|node| !held.contains(&Shared::as_ptr(node)));
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 1));
+        assert_eq!(cursor.value().map(|value| *value), Some(middle * 3));
+        seen.extend(values(walk));
+        assert_eq!(seen, pairs);
+        let mut inner = values(back);
+        inner.extend(last);
+        let want: Vec<(u64, u64)> = pairs
+            .iter()
+            .copied()
+            .filter(|(key, _)| (low..high).contains(key))
+            .collect();
+        assert_eq!(inner, want);
+        assert!(watched.iter().any(|weak| weak.strong_count() == 1));
+        drop(cursor);
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 0));
+    }
+
+    #[test]
+    fn epoch_iterators_dropped_mid_walk_let_their_nodes_go() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let entries = cache(&keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let walks: Vec<Iter<u64, u64>> = (0..3)
+            .map(|skip| {
+                let mut walk = map.range(keys[skip]..);
+                walk.by_ref().take(5 + skip).for_each(drop);
+                walk
+            })
+            .collect();
+        let watched: Vec<Weak<Node<u64, u64, ()>>> = keep.iter().map(Shared::downgrade).collect();
+        evict_all(entries);
+        drop(keep);
+        epoch::flush();
+        assert!(watched.iter().any(|weak| weak.strong_count() == 1));
+        drop(walks);
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 0));
     }
 }
