@@ -28,6 +28,7 @@ fn compact(path: &Path, threads: usize, keep: Keep) -> Outcome {
         .copy_threads(threads)
         .open::<Opaque>(path)
         .map_err(|error| format!("open: {}", text(error)))?;
+    let sound = db.verify().is_ok();
     let report = db.compact(keep).map_err(text)?;
     drop(db);
     let bytes = fs::read(path).unwrap();
@@ -36,8 +37,8 @@ fn compact(path: &Path, threads: usize, keep: Keep) -> Outcome {
         bytes.len() as u64,
         "a compacted file's size differs from its report"
     );
-    if let Err(error) = admin::verify(path) {
-        panic!("a compacted file on {threads} threads fails verify: {error}");
+    if sound && let Err(error) = admin::verify(path) {
+        panic!("a file that verified fails verify once compacted on {threads} threads: {error}");
     }
     Ok((
         report.objects,
