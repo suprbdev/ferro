@@ -275,7 +275,7 @@ Measured and left out:
 
 ### How the protocol is checked
 
-The protocol is checked four ways. `tests/epoch_stress.rs` runs eight readers doing gets, `floor`,
+The protocol is checked five ways. `tests/epoch_stress.rs` runs eight readers doing gets, `floor`,
 `summary_by`, row gets, index lookups through the `Finder`, and ranges both ways and cursor seeks
 through the frames described under [Iterator frames](#iterator-frames), against a model of every
 version, on handles with caches of 12 KiB to 1 MiB that read-only readers refresh and reopen, beside
@@ -309,34 +309,51 @@ drive `Shared`'s counts, moves, erasure, layout and flags, including flags read 
 dropped. For the hazards they hold iterators, a cursor and the row finder across an eviction and a
 flush, drop iterators mid-walk, keep a stored root for the iterators that borrow it after its map is
 dropped, keep a leaf the finder holds once the borrowed node that pinned it is freed, borrow a root
-through its map after a free has scanned the records, and move records between threads. They also
-check that `make_mut`, `get_mut` and `unwrap_or_clone` copy a value a slot holds, that each end of a
-narrow range holds its nodes in its own slots and that a finder whose descent panicked holds only
-what its slots hold, race a lent value's last owner with the release of its slot and with a clone
-through it, and run a free inside a borrow through a memo and inside the copy of a slot, between the
-slot's write and the second read of `cached`, and check that the record's drop lets go of what the
-free kept once the borrow has cleared its slot. `Shared`'s and `Erased`'s clones assert in debug
-builds that the count they add to is not zero. They pass under Miri with stacked borrows and with
-tree borrows over 32 schedules each. Under Miri the epoch's lists lock with `std::sync::Mutex`
-rather than `parking_lot`, whose futex call Miri's shim rejects when two threads contend for a lock,
-which stopped one schedule in 32 under tree borrows. Under Miri their assertions fail for the
-sabotages of the loan, the records and the retired list's second reading, and Miri reports a data
-race on the freed value when a last drop is not parked. The uniqueness check made to ignore slots
-and the finder made to keep its fields through a descent fail their unit tests on every run. The
-decoder's clone made to take a count from zero is reported as a dangling reference in 3 of 64
-schedules, the owner made to read its mark before clearing its slots fails the race in 2 of 64, and
-the parker made to trust its first reading of the slots in 1 of 256. The drop made to read its mark
-only when a slot is set fails the free run inside a borrow on every run. Leaving the fence out of
-`epoch::retract` passes that test, which runs on one thread, and also passed a race of the same
-borrows beside a free on another thread over 64 schedules, in which Miri never let the free read the
-slot's old address once the clear had run; the fence rests on the argument under [The root and the
-store](#the-root-and-the-store).
+through its map after a free has scanned the records, run a flush between a free's scan and its
+pass over the lists, so that the free meets an item another found held through a slot written
+after its scan, and move records between threads. They also check that `make_mut`, `get_mut` and
+`unwrap_or_clone` copy a value a slot holds, that each end of a narrow range holds its nodes in its
+own slots and that a finder whose descent panicked holds only what its slots hold, race a lent
+value's last owner with the release of its slot, which must leave the value on no retired list,
+and with a clone through it, and run a free inside a borrow through a memo and inside the copy of
+a slot, between the slot's write and the second read of `cached`, and check that the record's drop
+lets go of what the free kept once the borrow has cleared its slot. `Shared`'s and `Erased`'s
+clones assert in debug builds that the count they add to is not zero. They pass under Miri with
+stacked borrows and with tree borrows over 32 schedules each. Under Miri the epoch's lists lock with
+`std::sync::Mutex` rather than `parking_lot`, whose futex call Miri's shim rejects when two threads
+contend for a lock, which stopped one schedule in 32 under tree borrows. Under Miri their assertions
+fail for the sabotages of the loan, the records and the retired list's second reading, and Miri
+reports a data race on the freed value when a last drop is not parked. The uniqueness check made to
+ignore slots and the finder made to keep its fields through a descent fail their unit tests on
+every run. The decoder's clone made to take a count from zero is reported as a dangling reference in
+3 of 64 schedules, the owner made to read its mark before clearing its slots fails the race in 2 of
+64, and the parker made to trust its first reading of the slots in 1 of 256. The drop made to read
+its mark only when a slot is set fails the free run inside a borrow on every run. Leaving the fence
+out of `epoch::retract` passes that test, which runs on one thread, and also passed a race of the
+same borrows beside a free on another thread over 64 schedules, in which Miri never let the free
+read the slot's old address once the clear had run; the fence rests on the argument under [The root
+and the store](#the-root-and-the-store).
+
+The unit tests share the process's epoch and records, so a free that one test makes acts on every
+other test's items, and `make test-stress` runs them that way: twelve copies of the library's test
+binary at once, 16 test threads each, 25 times over, which keeps every core busy and preempts
+threads between a free's scan and its pass over the lists. `make ci` runs it after the tests, in
+about 30 seconds. Before the fixes described under [The root and the
+store](#the-root-and-the-store) 16 of 1,500 runs failed, and 21 of 600 built with each sanitizer,
+neither of which reported anything. With the first fix alone none of 1,200 runs failed, and with
+both none of 3,000, nor of 600 under AddressSanitizer, while under ThreadSanitizer 4 of 600 failed,
+all in the race the same section describes, the tests' own doing; once that test was fixed none of
+900 failed under ThreadSanitizer, 600 under AddressSanitizer or 1,500 in a release build. The unit
+test that runs a flush between a free's scan and its pass failed every run before the first fix.
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
-seed and its four seconds:
+seed and its four seconds. `STRESS_ROUNDS` and `STRESS_COPIES` size `make test-stress`, and the
+unit test binary that a sanitizer build leaves under its target directory runs the same way, a dozen
+copies at a time with `--test-threads 16`:
 
 ```
+make test-stress STRESS_ROUNDS=250
 MIRIFLAGS="-Zmiri-many-seeds=0..32" cargo +nightly miri test -p ferro --lib -- epoch_ shared_
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-many-seeds=0..32" \
     cargo +nightly miri test -p ferro --lib -- epoch_ shared_
@@ -559,9 +576,12 @@ and reads `cached` again, all sequentially consistent. If `cached` is still set,
 cleared it when the slot was written, so the cache's release sees `lent` and retires the node, and
 `free` frees a retired node only once no slot holds it. It reads the slots after the epoch it bumps
 and frees only what was retired before that bump, so a slot written before a release is always
-seen. If `cached` was cleared, the iterator clears the slot and takes a count as before. A frame
-holding a borrowed node is a tagged pointer with no count, like one anchored to the root, and so are
-frames below it reached through pinned memos or in-memory links, which live as long as it does.
+seen. A node it finds a slot holding waits only for slots from then on, and any free lets such a
+node go only once it has read the slots again, as described under [The root and the
+store](#the-root-and-the-store). If `cached` was cleared, the iterator clears the slot and takes a
+count as before. A frame holding a borrowed node is a tagged pointer with no count, like one
+anchored to the root, and so are frames below it reached through pinned memos or in-memory links,
+which live as long as it does.
 
 A borrowed node is not changed in place. The cache or the retired list usually holds a count on it
 while a slot can hold it, and an iterator over a dirty map counts its root, which keeps every node
@@ -664,6 +684,57 @@ once, and AddressSanitizer reported the use after free. When the list's count is
 value, `free` now reads the records again, after the decrement that orders it behind the owner that
 let go, and parks whatever a slot holds. That costs one more scan a batch, and only for batches that
 free lent values.
+
+A free still trusted the scan it began with for items that already waited only for slots (#77).
+That scan shows every slot an item retired before the free's bump can be held by, but an item can
+come to wait only for slots after the bump: a later free finds it held by a slot written after the
+first free's scan, or the value's last owner parks it for such a slot. A free that was slow between
+its scan and its pass over a list, preempted or busy with other lists, then let such an item go on a
+scan that showed no slot. For a lent value the release read the records again and parked what a
+slot held, so nothing was freed under a reader, but the count went to zero and back while a slot
+held the value, and an iterator that upgraded the node's memo in between found it gone and read the
+node from the file again. A free now reads the slots again for every item that waits only for
+slots, marking the records that hold one as before, and lets go of only those that none holds; the
+scan it began with decides only for items still waiting on their epoch. That second reading is one
+scan of the records for all such items on the list, where the old code made one for each item its
+first scan found held.
+
+A release that revives a value takes it out of the list, counted in `FREEING`, which a flush waits
+for once its own pass over the lists is done, and puts it back, reads its slots again and releases
+it a second time if none still holds it. It gave up its count in `FREEING` before that second
+release. A flush that passed the list while the value was out, such as the flush of the record
+whose drop had just cleared the slot, then found nothing left to wait for and returned with the
+value back on a list and no slot holding it, until the releasing thread got to it: a store's file
+could stay open past the drop of the last iterator that read it. The release now keeps its count
+until the second release is done.
+
+The library's unit tests share the process's epoch and records, and it was they that showed both,
+with twelve copies of their binary running at once at 16 test threads each: 16 of 1,500 runs
+failed. A value that a test retired without lending it, so that only the free's own decision kept
+it, was dropped under its slot; a retired count went while the test still held the slot; a parked
+root's count read zero; and an iterator over a test map with no store panicked when its upgrade
+failed in that window, where a map with a store would have read the node from the file. A build
+that logged every release of an item that a slot still held, and every failed upgrade that a retry
+then won, found 279 such releases in 1,200 runs, made by other tests' flushes, by stores' closes
+and by the test hook that frees every list with a scan made before its callback runs, and each of
+the 7 iterator panics in those runs came after an upgrade that won again within 81 yields, at an
+address a release had just revived. Built with AddressSanitizer, 21 of 600 runs failed the same
+ways, and with ThreadSanitizer 21 of 600, 6 of them in the race of a lent owner's last drop with its
+record's drop, which asserted that one of the two had dropped the value by the time both returned.
+Neither sanitizer reported a use after free or a data race.
+
+That race still failed under ThreadSanitizer with both fixes, in 4 of 600 runs, and was the tests'
+own doing. Logged in a failing run, the owner's drop parked the count, the record's drop returned in
+2 µs without a flush, no slot held the value, and the value was dropped 6 ms later: another test's
+flush had found the parked item with no slot holding it and taken it between the owner's park and
+its own release, which then found nothing left to take. No mark had been set, since every reading
+after the park found the slot clear, so neither drop had anything to wait for, and nothing need
+wait: the item is off the lists, and the thread that took it drops it. The test now holds a `Weak`
+so that the allocation's address stays its own, checks that once both drops have returned no
+retired list still holds the value, and then that the value is dropped once. With the record's drop
+made to skip its flush, it fails in 7 of 10 runs on its own, where the item stays on the owner's
+list. The release that revives a value, two paragraphs up, was found while reading the protocol for
+this race, not from a failure.
 
 ### Measurements
 
@@ -788,6 +859,15 @@ covered pages at 8 with the 16 MiB cache, 4% and 3% slower. With the 1 GiB cache
 ran 2.48M a second on one thread against 2.52M, 15.7M at 8 threads against 15.5M and 37.4M at 32
 against 37.7M, at 5,307 instructions against 5,309, and covered pages 844,000 against 847,000, 4.81M
 against 4.88M and 8.99M against 8.79M, at 30,376 instructions against 30,380.
+
+The free that reads the slots again for items waiting only for slots, and the release that keeps
+its count in `FREEING` until its second release, described under [The root and the
+store](#the-root-and-the-store), were measured against the build before them with the 16 MiB cache
+and no writer, where evictions retire lent nodes and frees run, at 1, 8 and 32 threads, medians of
+three alternating runs of three rounds. Scans, 100-key ranges, index lookups and covered pages ran
+the instructions they ran before, within 0.5%, at rates within 2% either way: at 32 threads scans
+ran 74.0M keys a second against 74.7M, ranges 372,000 against 370,000, index lookups 107,900
+against 106,900 and covered pages 9.40M against 9.22M.
 
 ### Measured and left out
 

@@ -142,7 +142,8 @@ from a file that passes both. No other input crashed, hung or passed a memory li
 
 Tests are described next to what they test:
 
-- The epoch protocol's stress test, sanitizers and Miri, with the commands: [How the protocol is
+- The epoch protocol's stress test, the unit tests run in parallel copies by `make test-stress`,
+  sanitizers and Miri, with the commands: [How the protocol is
   checked](read-scaling.md#how-the-protocol-is-checked).
 - `history_heap`: [Cache weight](read-scaling.md#cache-weight).
 - Modelled power cuts on Buffered checkpoints: [Buffered durability and
