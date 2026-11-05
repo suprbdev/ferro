@@ -75,7 +75,8 @@ in by the hints' prefetches, 15 from L2, 30 from L3 and 7 from DRAM; 13 to 16 li
 all, the rest of them by the hardware prefetcher; 8.5 L1 TLB misses, of which 3.9 walk the page
 table; and about 9 misses in flight on average. The lines of one node are asked for together, so
 whatever their number a get waits on one miss a level: the leaf's, nearly always from DRAM, and its
-parent's, often, each behind a page walk.
+parent's, often, each behind a page walk. Two layouts that read fewer lines were built, measured
+and left out for that reason, as described under [Measured and left out](#measured-and-left-out).
 
 ## Prefetching the next level
 
@@ -171,9 +172,12 @@ MB of L3 on one CCD, and most leaf reads go to DRAM, about 140 ns on this machin
 L3.
 Each of those misses also walks the page table: the process gets no transparent huge pages from
 glibc's heap by default, and with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` gets ran 8 to 12% faster,
-as [Performance](../guide/performance.md#huge-pages) describes. Getting closer to
-redb's 0.27 µs would take fewer lines a leaf or fewer levels, which means a node laid out in one
-allocation or a wider fanout, and the second changes the file format.
+as [Performance](../guide/performance.md#huge-pages) describes. Fewer lines a node do not shorten
+that wait: a node in one allocation, with its keys inline beside its headers and flags, read a
+fifth fewer lines and ran gets of short strings 2 to 7% faster, for slower loads, ranges and scans
+and more heap, as [Node layout](#node-layout) describes. Getting closer to redb's 0.27 µs would
+take fewer levels, which means a wider fanout and a change of the file format, or fewer page walks,
+which huge pages give.
 
 Measured and left out:
 
@@ -416,3 +420,49 @@ from 6.1 to 1.5 ns an item and cold scans down about 7%.
   slot path out of line, to keep the loop small, left a call in the column's loop, and `iter()` over
   `u64` values took 61 instructions a key against 44. A `for` loop over the run took 48 and a zip of
   the keys with their offsets 46, and both made `iter().count()` dearer, 44 to 46 against 41.
+- The headers beside the flags. With `origin`, `prefix`, `count` and `level` first in `Node` and
+  the three vector headers last, the headers a get reads share the line of the flags, and a get on
+  the map of [Node layout](#node-layout) read 36.7 lines rather than 38.3. L1 misses served from L3
+  fell from 4.5 to 3.7 a get and from DRAM from 1.5 to 1.2, but lines from DRAM in all stayed at
+  about 13.5, and over five alternating runs a get took 323 ns against 321 on the first pass after
+  the load and 316 against 317 on the second.
+- A node in one allocation, with its keys inline. `Node` held a 128-byte buffer for its keys,
+  right-aligned against their count, which sat before the child and cell headers, so that a node
+  whose keys fit, sixteen `u64`s or five `String`s, read its keys, headers and flags as one run of
+  lines in one allocation. A node read from the file or cached by `flush` kept its keys there, and
+  its first edit moved them to a vector, as the first edit of a value moves a column to slots. The
+  file and its hashes did not change. A get read 30.5 lines on 10.7 pages rather than 38.3 on 13.4,
+  with 1.0 L1 miss from DRAM against 1.5, but lines from DRAM in all stayed at 13.5, and it ran 39
+  instructions more, for the branch between the buffer and the vector. A 256-byte buffer, which
+  holds the keys of nine in ten of the nodes a get reads, gained 4.8% where 128 bytes gained 3.2%.
+  Every node grew by 112 bytes and only those of 16 keys or fewer lost their key vector, so the
+  heap grew, and scans and folds, which read every node whole, slowed down. Alternating runs of the
+  build before and the one with keys inline, pinned to the first CCD apart from `scaling`, which
+  places its own threads:
+
+| Workload | Before | Keys inline |
+| --- | ---: | ---: |
+| Compare harness, `get`, seven runs | 0.327 µs | 0.320 µs |
+| Compare harness, bulk load | 0.667 s | 0.705 s |
+| Compare harness, 1000-key range | 29.6 µs | 31.2 µs |
+| Compare harness, scan, per key | 19.1 ns | 19.4 ns |
+| `ferro-bench`, warm `get`, three runs | 322 ns, 1,025 instructions | 301 ns, 1,064 instructions |
+| `ferro-bench`, a table's row `get` | 161 ns | 154 ns |
+| `ferro-bench`, bulk load, per key | 683 ns | 726 ns |
+| `ferro-bench`, 1000-key range, per key | 31.3 ns | 33.0 ns |
+| `ferro-bench`, `diff`, per change | 4.61 µs | 3.32 µs |
+| `ferro-bench`, peak RSS | 343 MiB | 364 MiB |
+| `reads`, random `get`, strings, `u64` and `()` values, three runs | 330, 260 and 215 ns | 313, 264 and 219 ns |
+| `reads`, sorted `get`, `u64` values | 61 ns | 70 ns |
+| `reads`, `sum` over `u64` values, per key | 7.0 ns | 8.4 ns |
+| `reads`, heap per key, `u64` values and strings | 60.5 and 108.1 bytes | 67.5 and 115.4 bytes |
+| `scaling`, `get` with the 1 GiB cache at 1, 8 and 32 threads, two runs | 3.00M, 22.6M and 61.9M a second | 3.06M, 23.4M and 64.4M a second |
+| `scaling`, `iter()` scan with the 1 GiB cache at 1, 8 and 32 threads | 57.4M, 267M and 807M keys a second | 54.8M, 262M and 766M keys a second |
+| `scaling`, covered pages of 200 rows with the 1 GiB cache at 1 and 8 threads | 769k and 4.10M a second | 695k and 3.76M a second |
+
+With the 16 MiB cache gets moved by under 2% at every thread count. Other work kept six hardware
+threads of the second CCD busy throughout, which `scaling` shared at 32 threads. Gets of short
+strings gained 2 to 7%, short of the 8% that the layout would have had to show, and gets of `u64`,
+`u32` and `()` values lost 1 to 2%, while bulk loads lost 6%, ranges 5 to 6%, scans 2 to 5%, folds
+over small values up to 38% and the heap 6 to 14%, so a node keeps its keys in a vector of their
+own.

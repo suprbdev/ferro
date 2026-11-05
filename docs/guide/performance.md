@@ -151,7 +151,13 @@ inserts and then gets, measured on 2026-11-05 with the build before the changes 
 | `contains_key` | 313 ns | 276 ns |
 | Resident memory in huge pages | 0 of 347 MiB | 362 of 368 MiB |
 
-As with the allocator, ferro leaves this to the application.
+As with the allocator, ferro leaves this to the application. A node laid out to take fewer lines
+does not do the same. A get reads about 38 lines on 13 pages, and one with each node in one
+allocation, its keys inline beside its headers, read 31 on 11 and ran gets of short strings 2 to
+7% faster, for slower loads, ranges and scans and 6 to 14% more heap, so it was left out. The
+lines of a node arrive together, and what a get waits for is one miss a level, the leaf's from
+DRAM, behind a page walk that huge pages take away and a smaller node does not. [Node
+layout](../internals/read-path.md#node-layout) gives the figures.
 
 ## Other tools
 
