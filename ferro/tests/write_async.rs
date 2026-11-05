@@ -15,6 +15,7 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use common::{Rng, quiet_ferro_panics};
+use ferro::db::Hook;
 use ferro::store::{Op, Trace};
 use ferro::{Committed, Db, Durability, Error, Map, Options, Reclaim};
 use parking_lot::Mutex;
@@ -552,26 +553,64 @@ fn async_and_blocking_writers_share_the_writer() {
 #[test]
 fn coalesced_async_writes_share_versions() {
     let dir = dir();
+    let leading = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (leading, released) = (leading.clone(), released.clone());
+        move |step: &'static str| {
+            if step == "leading" && thread::current().name() == Some("leader") {
+                leading.store(true, Ordering::SeqCst);
+                while !released.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    };
     let db: Db<Root> = fsync()
         .coalesce(true)
+        .hook(Hook(Arc::new(hook)))
         .open(dir.path().join("db.ferro"))
         .unwrap();
-    let futures: Vec<_> = (0..200u64)
+    let leader = {
+        let db = db.clone();
+        thread::Builder::new()
+            .name("leader".to_string())
+            .spawn(move || {
+                db.update(|root| {
+                    root.insert(1_000, 1_000);
+                })
+            })
+            .unwrap()
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while !leading.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the leader never reached its sync"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let mut futures: Vec<_> = (0..200u64)
         .map(|key| {
-            db.commit_with_async(move |root| {
+            Box::pin(db.commit_with_async(move |root| {
                 root.insert(key, key);
                 (format!("k{key}"), key)
-            })
+            }))
         })
         .collect();
+    for future in &mut futures {
+        assert!(poll_once(future).is_pending());
+    }
+    released.store(true, Ordering::SeqCst);
+    leader.join().unwrap().unwrap();
     let done: Vec<_> = join_all(futures).into_iter().map(Result::unwrap).collect();
     let versions: BTreeSet<u64> = done.iter().map(|done| done.version).collect();
-    assert!(
-        versions.len() < 200,
-        "{} versions for 200 writes",
-        versions.len()
+    assert_eq!(
+        versions.into_iter().collect::<Vec<_>>(),
+        vec![2],
+        "200 writes queued behind one sync took more than one version"
     );
-    assert_eq!(db.version(), *versions.last().unwrap());
+    assert_eq!(db.version(), 2);
     let mut messages = 0;
     for version in 1..=db.version() {
         let snapshot = db.at(version).unwrap();

@@ -2481,6 +2481,7 @@ impl<T: Data> Shared<T> {
         queue.syncing = true;
         let mut batch = mem::take(&mut queue.waiting);
         drop(queue);
+        self.step("leading");
         let store = self.store();
         let end = batch.last().expect("a leader has queued commits").frame.end;
         let landed = store.landed_to(end);
