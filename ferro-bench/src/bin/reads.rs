@@ -1,3 +1,31 @@
+//! Measures reads on one thread: gets, scans, batches and walks over maps and a table, and the heap
+//! a fresh read-only handle holds once it has read a map through.
+//!
+//! In a temporary directory under `--dir` (default `target/bench`) it loads a `Map<u64, V>` of
+//! `--n` scrambled keys (default 1,000,000) with one `extend` under `Durability::Buffered`, for `V`
+//! a short `String`, a `u64`, a `u32` and `()`, timing the load and 2,000 single-key commits after
+//! it. A counting global allocator, which counts live bytes as `malloc` chunks, gives the heap per
+//! key that a new read-only handle holds after two passes over the keys and entries, and a handle
+//! with a 1 MiB cache times a cold scan. On a warm snapshot it then times scans through `for`
+//! loops, folds, `count`, `filter`, `keys`, `values` and `for_each`; 500,000 random and sorted
+//! `get`s, and random `contains_key`s, `floor`s, seeks and a `get_many`; and gets, `get_many` and
+//! `contains_many` over every 2nd, 16th, 256th and 4096th key in key order. It also times a table
+//! of `n / 5` accounts indexed on `tier` and `balance`, scanned whole, through an index in key
+//! order, through scattered index rows, with `for_each` and over index keys; a `Map<String, u64>`
+//! scanned three ways; and decoding vectors of a million small, medium and large `u64`s, `f64`s and
+//! pairs of `u32`s. `--only` takes a comma-separated list of `string`, `u64`, `u32`, `unit`,
+//! `rows`, `text` and `decode` to run some of them.
+//!
+//! Each timed read runs three times and reports its fastest nanoseconds per item, and its fewest
+//! user-space instructions per item as `_ins`, counted through `perf_event_open` on Linux and 0
+//! elsewhere. The results are appended under `--label` (default `run`) as a JSON line to
+//! `reads.jsonl` in `--dir`, and printed one to a line.
+//!
+//! ```sh
+//! make bench-reads ARGS='--only u64,rows --label base'
+//! cargo run --release -p ferro-bench --bin reads -- --n 200000 --only string,decode
+//! ```
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -19,11 +47,18 @@ fn chunk(size: usize) -> usize {
     (size + 8).next_multiple_of(16).max(32)
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// reads the atomic flag `COUNTING` and adjusts the atomic counter `LIVE`, neither of which
+// allocates or panics: a layout's size is at most `isize::MAX`, so `chunk` cannot overflow, and
+// the counter wraps rather than panic when a block allocated before counting began is freed.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) {
             LIVE.fetch_add(chunk(layout.size()), Ordering::Relaxed);
         }
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed
+        // on to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
@@ -31,6 +66,8 @@ unsafe impl GlobalAlloc for Counting {
         if COUNTING.load(Ordering::Relaxed) {
             LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
         }
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout`, and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 
@@ -39,6 +76,9 @@ unsafe impl GlobalAlloc for Counting {
             LIVE.fetch_add(chunk(size), Ordering::Relaxed);
             LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
         }
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout` and that `size` is a valid new size for it. The block came from `System` with
+        // that layout, and all three are passed on unchanged.
         unsafe { System.realloc(pointer, layout, size) }
     }
 }
@@ -119,10 +159,16 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
         }
+        // SAFETY: `fd` is the descriptor `perf_event_open` just returned, checked non-negative
+        // above, and `0x2400` is `PERF_EVENT_IOC_ENABLE`, whose argument is an integer the kernel
+        // does not dereference.
         unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
         Counter(Some(fd as i32))
     }
@@ -132,6 +178,9 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` is a descriptor `perf_event_open` returned, which this
+        // `Counter` keeps open until it drops.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }
@@ -141,6 +190,8 @@ impl Counter {
 impl Drop for Counter {
     fn drop(&mut self) {
         if let Some(fd) = self.0 {
+            // SAFETY: `fd` is a descriptor `perf_event_open` returned for this `Counter`, which
+            // owns it, and nothing uses it after this one close.
             unsafe { libc::close(fd) };
         }
     }

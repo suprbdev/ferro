@@ -1,3 +1,30 @@
+//! The main benchmark: bulk loads, reads and commits on a map and a table, and readers beside
+//! writers, with each run's results appended as one line.
+//!
+//! In a temporary directory under `--dir` (default `target/bench`) it loads a `Map<u64, String>`
+//! of `--n` scrambled keys (default 1,000,000) in one `Durability::Fsync` commit, then times
+//! 500,000 warm `get`s, keeping the second of two runs, a full scan, 1,000 ranges of 1,000 keys,
+//! 1,000 single-key Fsync commits and a `diff` of the first version against the last. It reopens
+//! the file with `Durability::Buffered`, timing the open, and times 20,000 single-key commits,
+//! then 100,000 cold `get`s with a 1 MiB and a 5 MiB cache on a read-only handle and with a 1 MiB
+//! cache on a writer. A table of `n / 5` accounts indexed on `tier` and `country` is loaded 10,000
+//! rows a commit and timed on 500,000 row gets, a filtered scan, 2,000 pages of 20 rows through an
+//! index, 1,000 group counts and 1,000 Fsync updates of a row's balance. Last, eight readers get
+//! keys from fresh snapshots of a `Map<u64, u64>` of `n / 10` keys while eight writers each make
+//! 200 single-key commits; `--coalesce` lets those commits share versions, and `--concurrent-only`
+//! runs this part alone.
+//!
+//! Each timed step reports nanoseconds and user-space instructions per item, the instructions
+//! counted through `perf_event_open` on Linux and 0 elsewhere. The file's bytes per key, row,
+//! commit and update, the commits and reads a second of the concurrent part and the peak RSS
+//! follow. The results print under `--label` (default `run`) and are appended as a JSON line to
+//! `results.jsonl` in `--dir`.
+//!
+//! ```sh
+//! make bench ARGS='--n 200000 --label base'
+//! cargo run --release -p ferro-bench -- --concurrent-only --coalesce
+//! ```
+
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -93,10 +120,16 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
         }
+        // SAFETY: `fd` is the descriptor `perf_event_open` just returned, checked non-negative
+        // above, and `0x2400` is `PERF_EVENT_IOC_ENABLE`, whose argument is an integer the kernel
+        // does not dereference.
         unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
         Counter(Some(fd as i32))
     }
@@ -106,6 +139,9 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` is a descriptor `perf_event_open` returned, which this
+        // `Counter` keeps open until it drops.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }
@@ -115,6 +151,8 @@ impl Counter {
 impl Drop for Counter {
     fn drop(&mut self) {
         if let Some(fd) = self.0 {
+            // SAFETY: `fd` is a descriptor `perf_event_open` returned for this `Counter`, which
+            // owns it, and nothing uses it after this one close.
             unsafe { libc::close(fd) };
         }
     }
