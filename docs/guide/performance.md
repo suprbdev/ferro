@@ -111,10 +111,12 @@ rounds, from 65.9M to 70.3M a second:
 | 100-key range | 1 GiB | 422k | 3.1M | 5.8M | 8.6M |
 | 100-key range | 16 MiB | 53k | 262k | 270k | 377k |
 | Index lookup | 1 GiB | 232k | 1.7M | 2.9M | 4.4M |
+| Index lookup, rows lent by `visit` | 1 GiB | 240k | 1.8M | 3.5M | 5.1M |
 | Index lookup, covered | 1 GiB | 2.5M | 15.3M | 27.6M | 37.7M |
 | Index lookup | 16 MiB | 14k | 67k | 76k | 108k |
 | Index lookup, covered | 16 MiB | 2.2M | 14.0M | 26.0M | 35.9M |
 | Page of 200 rows | 1 GiB | 183k | 914k | 1.1M | 1.5M |
+| Page of 200 rows, lent by `next_ref` | 1 GiB | 305k | 1.9M | 3.4M | 4.1M |
 | Page of 200 rows, covered | 1 GiB | 855k | 4.9M | 8.4M | 9.3M |
 
 Against the figures this page gave on 2026-11-04, covered lookups at 32 threads read 37.7M a second
@@ -130,6 +132,18 @@ same tree built in another directory 93,000 at 751,000, and the tree of the firs
 writer read up to 12% slower on one thread. The fixes that followed a review of the hazards,
 described in the same section, moved these cells by 2% or less in alternating runs, apart from
 covered pages, 2 to 6% slower on one thread and within the swing they show between rounds on many.
+
+The two rows read lent were measured later that day, in a pass of five rounds of every workload
+with nothing else running, once lookups and iterators could lend their rows rather than hand out a
+`Val`, as [Rows lent in place](../internals/read-scaling.md#rows-lent-in-place) describes. A `Val`
+of a row with a destructor takes a reference count on its node's column, which every thread
+reading the same rows writes, so pages of the same 200 rows read through `next_ref` ran 13 times
+one thread at 32 threads where those read through `next` ran 8 times, and 65% faster on one thread.
+That is about what 16 cores give a page that touches nothing shared, since the clock falls from
+4.9 GHz with one core busy to 4.0 with 16 and the second thread of each core adds a tenth. In
+alternating runs against the build before, the other cells ran within 2% of their rates, and the
+covered ones within the swing of their rounds. [Reading rows in
+place](tables.md#reading-rows-in-place) says when to use which.
 
 ## Many threads and the allocator
 

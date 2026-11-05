@@ -195,8 +195,8 @@ next step and a clone of the row costs more than a `Val`. The loop around `next_
 
 On 200,000 rows, measured on 2026-11-05, 32 threads reading pages of the same 200 rows through
 `next_ref` read 4.1 million pages a second where `next` read 1.5 million, and one thread 305,000
-where it read 185,000. A lookup of about 20 scattered rows through `visit` went from 4.6 million to
-5.1 million a second on 32 threads, and stayed at 236,000 on one. [Rows lent in
+where it read 182,000. A lookup of about 20 scattered rows through `visit` went from 4.5 million to
+5.1 million a second on 32 threads, and from 236,000 to 240,000 on one. [Rows lent in
 place](../internals/read-scaling.md#rows-lent-in-place) has the measurements.
 
 ## Lookups
