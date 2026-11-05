@@ -1,3 +1,39 @@
+//! The epoch scheme and the hazard records, which let readers borrow nodes without a count.
+//!
+//! A guarded get pins its thread for the length of one descent with [`pin`], which stores the
+//! global epoch in the thread's [`Slot`], and borrows nodes through their memos with
+//! [`Weak::lend`](crate::shared::Weak::lend). An iterator, cursor or row finder lives across the
+//! caller's code, so it borrows into the slots of a [`Hazards`] record instead. Either way the
+//! reader sets the node's `lent` flag and then still sees `cached`, so the cache, which clears
+//! `cached` before it reads `lent`, finds the loan when it lets the node go.
+//!
+//! - **Retiring.** The cache hands its count on a lent node to [`retire`], which puts it on the
+//!   thread's retired list with the current epoch. Once the list has grown by a batch since its
+//!   last check, a free bumps the epoch, reads every pinned slot and then every record, and lets
+//!   go of each item that was retired before the oldest pin and that no record's slot holds. An
+//!   item a slot holds has passed its epoch, so from then on it waits only for slots.
+//! - **Parking.** The last owner of a lent value that a slot holds takes its count back and hands
+//!   it to [`park`], which keeps it on the retired list until no slot holds the value, so a clone
+//!   through a handle without a count always finds one. When the retired list's own count is the
+//!   last on a lent value, it reads the records again and parks what a slot holds.
+//! - **Marks.** Whoever parks a value, or skips an item because a slot holds it, marks each record
+//!   that holds it and then reads that slot again. A record's owner clears its slots and then reads
+//!   its mark, so either the owner sees the mark and flushes when it drops the record, or the
+//!   marker finds the slot cleared and lets the item go itself.
+//! - **Flushing.** [`flush`] waits for the threads pinned before it, then frees everything the pins
+//!   and slots allow and waits for other threads still dropping what they took from a list, so that
+//!   [`Store::close`](crate::store::Store::close) and a marked record's drop let go of what they
+//!   kept.
+//!
+//! So a value retired while a thread is pinned is not let go until that thread unpins, a value
+//! lent into a slot is not let go while the slot holds it, and every value is let go once, by
+//! whichever thread finds both done. Slots and records live as long as the process and are reused.
+//! [Guarded gets and the epoch scheme](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#guarded-gets-and-the-epoch-scheme)
+//! and [Iterators under hazards](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
+//! describe the protocol, and
+//! [How the protocol is checked](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
+//! how it is tested.
+
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -8,15 +44,19 @@ use std::time::{Duration, Instant};
 #[cfg(not(miri))]
 use parking_lot::Mutex;
 
+/// `std`'s mutex behind the `lock` of `parking_lot`'s, for Miri, which cannot run the futex call
+/// `parking_lot` makes when two threads contend for a lock.
 #[cfg(miri)]
 struct Mutex<T>(std::sync::Mutex<T>);
 
 #[cfg(miri)]
 impl<T> Mutex<T> {
+    /// A mutex holding `value`.
     const fn new(value: T) -> Self {
         Mutex(std::sync::Mutex::new(value))
     }
 
+    /// Locks the mutex, ignoring poison, as `parking_lot`'s does.
     fn lock(&self) -> std::sync::MutexGuard<'_, T> {
         self.0
             .lock()
@@ -26,34 +66,66 @@ impl<T> Mutex<T> {
 
 use crate::shared::{Dead, Erased, Parked};
 
+/// How many items a retired list gains past what it kept at its last check before it frees a
+/// batch.
 const BATCH: usize = 128;
+/// How many bytes a retired list gains past what it kept at its last check before it frees a
+/// batch.
 const BATCH_BYTES: usize = 64 << 10;
+/// How long [`flush`] waits for the threads pinned before it, and for other threads to finish
+/// dropping what they took from a list.
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
+/// The number of slots in a hazard record.
 pub(crate) const HAZARDS: usize = 8;
+/// The slot of a record that holds the store an iterator, cursor or row finder borrows.
 pub(crate) const STORE: usize = 0;
+/// The slot of a record that holds the root an iterator, cursor or row finder borrows.
 pub(crate) const ROOT: usize = 1;
+/// How many spare records each thread keeps for itself.
 const SPARE_RECORDS: usize = 8;
+/// The most records there can be. With every one in use, [`Hazards::new`] returns `None`.
 const MAX_RECORDS: usize = 4096;
+/// The epoch of a retired item that waits only for slots: one that has passed its epoch, or a
+/// parked count, which never had one. The epoch starts at 1, so such an item is older than every
+/// pin.
 const HELD: u64 = 0;
 
+/// The global epoch. A pin records it in its slot, and every free bumps it before it reads the
+/// slots.
 static EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Every slot ever claimed. Slots are never freed: a thread that exits gives its slot up, retired
+/// list and all, for the next thread to claim.
 static SLOTS: Mutex<Vec<&'static Slot>> = Mutex::new(Vec::new());
+/// How many retired items threads have taken out of a list and not yet finished letting go, which
+/// [`flush`] waits for.
 static FREEING: AtomicUsize = AtomicUsize::new(0);
+/// Every hazard record ever made, which frees and last owners read. Records are never freed.
 static RECORDS: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
+/// The records that no [`Hazards`] holds and no thread keeps as a spare.
 static SPARE: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
 
+/// The count a retired item holds.
 enum Value {
+    /// The cache's count on a lent value it let go of, kept until every thread pinned before the
+    /// retire has unpinned and no slot holds the value.
     Counted(ManuallyDrop<Erased>),
+    /// A count taken back by the thread that let go of a lent value's last count while a slot held
+    /// it, kept until no slot does.
     Parked(Parked),
 }
 
+/// An item on a thread's retired list.
 struct Retired {
+    /// The epoch it was retired at, or [`HELD`] once it waits only for slots.
     epoch: u64,
+    /// What it weighs, counted against its list's batch.
     bytes: usize,
+    /// The count it holds.
     value: Value,
 }
 
 impl Retired {
+    /// The address of the value's allocation, as the slots hold it.
     fn addr(&self) -> usize {
         match &self.value {
             Value::Counted(value) => value.addr(),
@@ -61,10 +133,14 @@ impl Retired {
         }
     }
 
+    /// Whether the item waits only for slots and holds the value at `addr`.
     fn held_at(&self, addr: usize) -> bool {
         self.epoch == HELD && self.addr() == addr
     }
 
+    /// Lets go of the item's count. If it was the last on a lent value, it returns the value and
+    /// its weight, for the caller to drop or park once it has read the records again; the last
+    /// count on a value never lent drops it at once.
     fn release(self) -> Option<(Dead, usize)> {
         let dead = match self.value {
             Value::Counted(value) => ManuallyDrop::into_inner(value).release_count(),
@@ -74,15 +150,22 @@ impl Retired {
     }
 }
 
+/// A thread's retired list.
 #[derive(Default)]
 struct Pending {
+    /// The items.
     items: Vec<Retired>,
+    /// What the items weigh in all.
     bytes: usize,
+    /// How many items the list kept at its last check.
     kept: usize,
+    /// What the items it kept at its last check weighed.
     kept_bytes: usize,
 }
 
 impl Pending {
+    /// Takes out every item that `pick` returns `true` for, letting it change the others, and
+    /// counts what is left as what the list kept at this check.
     fn take(&mut self, pick: impl FnMut(&mut Retired) -> bool) -> Vec<Retired> {
         let freed: Vec<Retired> = self.items.extract_if(.., pick).collect();
         self.bytes -= freed.iter().map(|item| item.bytes).sum::<usize>();
@@ -91,18 +174,30 @@ impl Pending {
         freed
     }
 
+    /// Whether the list has gained [`BATCH`] items or [`BATCH_BYTES`] bytes since its last check.
     fn due(&self) -> bool {
         self.items.len() >= self.kept + BATCH || self.bytes >= self.kept_bytes + BATCH_BYTES
     }
 }
 
+/// A thread's epoch slot and retired list.
+///
+/// It is aligned to 128 bytes, so that no two slots share the pair of cache lines that the
+/// adjacent-line prefetcher fetches together. A thread claims one for its life and gives it up,
+/// retired list and all, when it exits.
 #[repr(align(128))]
 struct Slot {
+    /// The epoch the thread saw when it pinned, or zero while it is not pinned.
     epoch: AtomicU64,
+    /// Whether a live thread has claimed the slot.
     taken: AtomicBool,
+    /// The thread's retired list.
     pending: Mutex<Pending>,
 }
 
+/// This thread's claim on its [`Slot`], and how deeply its pins are nested.
+///
+/// Its drop, as the thread exits, unpins the slot and gives it up for another thread to claim.
 struct Local {
     slot: &'static Slot,
     depth: Cell<usize>,
@@ -115,12 +210,18 @@ impl Drop for Local {
     }
 }
 
+/// A hazard record: [`HAZARDS`] pointer slots and a mark, aligned to 128 bytes as the epoch slots
+/// are.
 #[repr(align(128))]
 struct Record {
+    /// The slots, each null or the address of the allocation of a value the owner borrows.
     entries: [AtomicPtr<()>; HAZARDS],
+    /// Set by a thread that parks a value or skips an item because a slot here holds it, so that
+    /// the owner flushes when it gives the record up.
     hint: AtomicBool,
 }
 
+/// This thread's spare records, which go to [`SPARE`] when the thread exits.
 struct Spares(RefCell<Vec<&'static Record>>);
 
 impl Drop for Spares {
@@ -130,14 +231,19 @@ impl Drop for Spares {
 }
 
 thread_local! {
+    /// This thread's slot, claimed on first use.
     static LOCAL: Local = Local {
         slot: claim(),
         depth: Cell::new(0),
     };
+    /// How many of the items counted in [`FREEING`] this thread is letting go, which a flush on
+    /// this thread does not wait for.
     static FREEING_HERE: Cell<usize> = const { Cell::new(0) };
+    /// This thread's spare records.
     static SPARES: Spares = const { Spares(RefCell::new(Vec::new())) };
 }
 
+/// Claims a slot that no live thread holds, or makes a new one.
 fn claim() -> &'static Slot {
     let mut slots = SLOTS.lock();
     for slot in slots.iter() {
@@ -158,10 +264,22 @@ fn claim() -> &'static Slot {
     slot
 }
 
+/// A pin of this thread's epoch slot, from [`pin`].
+///
+/// While it lives, the epoch lets go of nothing retired since it was taken, and the cache retires
+/// a lent node only after it has cleared `cached`, so every node borrowed under the guard through
+/// [`Weak::lend`](crate::shared::Weak::lend) stays alive for as long as the reference, which the
+/// guard's lifetime bounds. Pins nest, and the slot is cleared when the outermost guard is
+/// dropped. A guard stands for this thread's slot, so it is neither `Send` nor `Sync`.
 pub(crate) struct Guard {
     _thread: PhantomData<*const ()>,
 }
 
+/// Pins this thread's slot at the current epoch, or nests in a pin the thread already holds.
+///
+/// The outermost pin exchanges the epoch into the slot, sequentially consistent, so a free that
+/// reads the slot later in that order sees the pin. It returns `None` once the thread's slot is
+/// gone because the thread is exiting, and the caller then reads with counts.
 pub(crate) fn pin() -> Option<Guard> {
     LOCAL
         .try_with(|local| {
@@ -181,6 +299,8 @@ pub(crate) fn pin() -> Option<Guard> {
 }
 
 impl Drop for Guard {
+    /// Leaves the pin, and clears the slot with a release store once the outermost pin is gone,
+    /// so a free that reads the cleared slot comes after every borrow made under it.
     fn drop(&mut self) {
         let _ = LOCAL.try_with(|local| {
             let depth = local.depth.get() - 1;
@@ -192,11 +312,25 @@ impl Drop for Guard {
     }
 }
 
+/// A hazard record held by an iterator, cursor or row finder, whose slots keep what they hold from
+/// being let go.
+///
+/// [`Hazards::new`] takes one, and dropping it clears its slots and hands it back, on whichever
+/// thread drops it. Only the owner writes the slots, through the lending functions of
+/// [`Shared`](crate::shared::Shared) and [`Weak`](crate::shared::Weak). A value lent into a slot
+/// is not let go by the epoch, and its last owner parks its count rather than drop it, until the
+/// slot is written again or the record dropped, so the owner may read the value through the
+/// address until then.
 pub(crate) struct Hazards {
     record: &'static Record,
 }
 
 impl Hazards {
+    /// Takes a record with every slot clear, from this thread's spares, the shared spares or a new
+    /// allocation.
+    ///
+    /// It returns `None` once this thread's spares are gone because the thread is exiting, or
+    /// when [`MAX_RECORDS`] records are in use, and the caller then reads with counts.
     pub(crate) fn new() -> Option<Hazards> {
         let spare = SPARES.try_with(|spares| spares.0.borrow_mut().pop()).ok()?;
         let record = match spare.or_else(|| SPARE.lock().pop()) {
@@ -217,6 +351,11 @@ impl Hazards {
         Some(Hazards { record })
     }
 
+    /// The slot at `index`: [`STORE`], [`ROOT`], or one the iterator chooses by level.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is [`HAZARDS`] or more.
     #[inline]
     pub(crate) fn entry(&self, index: usize) -> &AtomicPtr<()> {
         &self.record.entries[index]
@@ -224,6 +363,13 @@ impl Hazards {
 }
 
 impl Drop for Hazards {
+    /// Clears the slots, hands the record back, and flushes the epoch if a thread marked the
+    /// record while a slot held something, so that what the slots kept goes now, a store's file
+    /// included.
+    ///
+    /// The slots are cleared and the mark read behind a sequentially consistent fence, and a
+    /// marker sets the mark and then reads the slot again, so either this sees the mark or the
+    /// marker sees the slot cleared and lets the item go itself.
     fn drop(&mut self) {
         let record = self.record;
         let held = record
@@ -259,6 +405,11 @@ impl Drop for Hazards {
     }
 }
 
+/// Whether any slot of any record holds `addr`, read sequentially consistent.
+///
+/// The last owner of a lent value calls it after the acquire that follows its decrement, so it
+/// sees every slot written before an earlier owner let go, and parks the value if one holds it.
+/// An owner holding the only count calls it before it changes a lent value in place.
 pub(crate) fn hazarded_at(addr: usize) -> bool {
     RECORDS
         .lock()
@@ -267,6 +418,7 @@ pub(crate) fn hazarded_at(addr: usize) -> bool {
         .any(|entry| entry.load(Ordering::SeqCst).addr() == addr)
 }
 
+/// The addresses that every slot of every record holds, sorted, read sequentially consistent.
 fn hazarded() -> Vec<usize> {
     let records = RECORDS.lock();
     let mut held: Vec<usize> = records
@@ -280,11 +432,25 @@ fn hazarded() -> Vec<usize> {
     held
 }
 
+/// Retires `value`, the cache's count on a lent node, weighing `bytes`, at the current epoch, and
+/// frees a batch from this thread's list if one is due.
+///
+/// The caller must have cleared the node's `cached` flag and then found `lent` set, both
+/// sequentially consistent, so a reader that borrowed the node pinned at an epoch no later than the
+/// one read here, or lent it into a slot before the flag was cleared. The count is kept until every
+/// thread pinned at that epoch or an earlier one has unpinned and no slot holds the node, and let
+/// go by the first free after that.
 pub(crate) fn retire(value: Erased, bytes: usize) {
     let epoch = EPOCH.load(Ordering::SeqCst);
     push(Value::Counted(ManuallyDrop::new(value)), bytes, epoch);
 }
 
+/// Parks `value`, weighing `bytes`: a count that a lent value's last owner took back because a
+/// slot held the value, kept on this thread's retired list until no slot does.
+///
+/// It marks each record that holds the value and reads the slot again. If none still holds it,
+/// it lets the count go at once, and otherwise the owner of each record that does sees the mark
+/// and flushes once it drops the record.
 pub(crate) fn park(value: Parked, bytes: usize) {
     let addr = value.addr();
     let slot = push(Value::Parked(value), bytes, HELD);
@@ -293,6 +459,13 @@ pub(crate) fn park(value: Parked, bytes: usize) {
     }
 }
 
+/// Marks each record with a slot that holds `addr`, then reads that slot again, both sequentially
+/// consistent, and returns whether any still holds it.
+///
+/// A record's owner clears its slots and then reads its mark behind a sequentially consistent
+/// fence. So if this returns `false`, no slot holds the value and the caller lets it go, and if it
+/// returns `true`, the owner of a record still holding it sees the mark once it clears the slot,
+/// and flushes.
 fn waits(addr: usize) -> bool {
     let records = RECORDS.lock();
     let mut held = false;
@@ -308,6 +481,11 @@ fn waits(addr: usize) -> bool {
     held
 }
 
+/// Puts `value`, weighing `bytes`, on this thread's retired list at `epoch`, frees a batch if one
+/// is due, and returns the slot whose list holds the item.
+///
+/// A thread whose slot is gone because it is exiting claims a free slot for the item and gives it
+/// straight back, so the next thread to claim that slot, or a flush, lets the item go.
 fn push(value: Value, bytes: usize, epoch: u64) -> &'static Slot {
     let item = Retired {
         epoch,
@@ -336,6 +514,14 @@ fn push(value: Value, bytes: usize, epoch: u64) -> &'static Slot {
     slot
 }
 
+/// Lets go of every item on `slot`'s list retired before `oldest` whose address is not in
+/// `hazards`, and marks the others retired before then as waiting only for slots.
+///
+/// `hazards` must have been read after the bump of the epoch that returned `oldest`. An item
+/// retired before that bump was retired after the cache cleared `cached`, which came after every
+/// slot a reader wrote to borrow the value, so `hazards` shows each such slot. For an item it
+/// skips, it marks the records that hold it and reads them again, as [`park`] does, and lets go of
+/// any that no slot still holds.
 fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
     let mut held = Vec::new();
     release(slot, &mut |item| {
@@ -356,6 +542,14 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
     }
 }
 
+/// Takes the items `pick` chooses out of `slot`'s list and lets go of their counts.
+///
+/// When an item's count was the last on a lent value, it reads the records again. That reading
+/// comes after the decrement, which orders it behind every owner that let go before and any slot
+/// such an owner wrote, so a value lent through a count that has since gone is seen. What a slot
+/// holds is revived, put back on the list as waiting only for slots and marked as [`park`] does,
+/// and what none holds is dropped. Items count in [`FREEING`] while they are out of the list, so
+/// that a flush waits for them.
 fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
     let freed = {
         let mut pending = slot.pending.lock();
@@ -403,6 +597,10 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
     }
 }
 
+/// Bumps the epoch, then returns the oldest epoch that a pinned slot other than `skip` holds, or
+/// the bumped epoch if none holds an older one.
+///
+/// No thread pinned in a slot it reads borrows anything retired before the epoch it returns.
 fn oldest(skip: Option<&'static Slot>) -> u64 {
     let bumped = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     SLOTS
@@ -414,6 +612,8 @@ fn oldest(skip: Option<&'static Slot>) -> u64 {
         .fold(bumped, u64::min)
 }
 
+/// Reads the epochs and the records as a free does, runs `between`, then frees every list with
+/// what it read, so that tests can change slots between a free's reading and its release.
 #[cfg(test)]
 pub(crate) fn free_after(between: impl FnOnce()) {
     let oldest = oldest(None);
@@ -425,6 +625,16 @@ pub(crate) fn free_after(between: impl FnOnce()) {
     }
 }
 
+/// Lets go of everything that the pins and slots allow, after waiting for the threads pinned when
+/// it began.
+///
+/// It waits up to [`FLUSH_WAIT`] for every other thread pinned when it began to unpin or pin again
+/// later, then frees, from every thread's list, what was retired before then and no slot holds,
+/// though nothing this thread's own pin still protects. Within the same time it then waits for
+/// other threads to finish letting go of items they took from a list. A thread pinned for longer
+/// than that only delays what it protects to a later free.
+/// [`Store::close`](crate::store::Store::close) calls it so that retired nodes holding nested maps
+/// do not keep a file open, and the drop of a marked record so that what its slots kept goes.
 pub(crate) fn flush() {
     let target = EPOCH.load(Ordering::SeqCst);
     let pinned = LOCAL
