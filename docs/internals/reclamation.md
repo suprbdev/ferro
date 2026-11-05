@@ -161,11 +161,33 @@ take most of the rest away.
 Checking later means the walk follows the links of objects it has not checked yet. A damaged link
 can only send it to a wrong offset, which it reads with the usual bounds and record checks, and it
 looks for a failed batch before every read. It runs ahead of the checks by at most the batches
-queued, two for each checking thread, and one being checked on each, ten batches with three
-threads, so it follows damage no further than that, and a loop in damaged links ends there too.
-Chain entries are the exception: the walk decodes an entry to find its `prev` and skip links, so it
-checks each entry on its own thread before decoding it, as it did before, which took 11 ms for
-40,000 entries.
+queued, two for each checking thread, one being checked on each and the one it fills, ten batches
+with three threads. A record that claims more than 256 KiB goes in no batch: the walk waits for
+every check in flight before it reads the record, and checks it on its own thread before it
+follows its links, as one thread does. So no batch holds more than 512 KiB, the walk follows damage
+no further than 5 MiB, and a loop in damaged links ends there too. Chain entries are checked on the
+walking thread as well: the walk decodes an entry to find its `prev` and skip links, so it checks
+each entry before decoding it, as it did before, which took 11 ms for 40,000 entries.
+
+That bound used to count batches only, and a batch took a record of any size. A link damaged to
+point into the middle of a value can parse as a record claiming most of the log. In a 21 MB file
+whose link was pointed at bytes claiming 16 MiB, one thread read those 16 MiB and failed their hash
+check at 19 MB of heap; four read them, batched them and wrote them before the check came back, at
+58 MB. With the link's parent damaged too, one thread failed the parent's check at 3 MB and never
+followed the link, and four still read the 16 MiB, at 58 MB. Both now peak within 5 MB of one
+thread. In `ferro-bench --bin reclaim copy`, medians of five runs alternating with the build before
+on 2026-11-05, the table rows took 0.82 s at 1 thread against 0.83 and 0.40 s at 4 against 0.40,
+and the 320 byte values 0.42 and 0.14 s, as before. A 600 MB file of 600 KB values, whose records
+are now each checked on the walking thread, took 0.19 s at 1 thread as before and 0.19 at 4 against
+0.17.
+
+A failure is reported in walk order, as on one thread. Each batch carries its place in the walk, a
+failed check skips only the batches after it, and an error the walk meets itself, such as a record
+that does not parse, waits for the checks of everything read before it, and gives way to the first
+of those that failed. A link pointed at bytes that parse as a small record with a link of its own
+failed on one thread with `hash mismatch for object at 16475`, the record it landed on, and on four
+with `varint overflow in record`, from the garbage the walk followed out of that record before its
+check came back. Both now report the hash mismatch.
 
 `Options::copy_threads` sets how many threads a cycle copies with, the caller's included, and 0, the
 default, takes the number of cores, at most 4. With 1 the copy checks each record as it reads it
@@ -217,7 +239,7 @@ memory.
 
 The map of copies is as big as before, about 50 bytes an object and 70 a commit. The threads add up
 to twenty batches with three checking threads, ten in flight and as many spare, each of 256 to 512
-KiB unless one record is larger, and a buffer of up to 1 MiB on each thread for decompressing. The
+KiB, and a buffer of up to 1 MiB on each thread for decompressing. The
 walk keeps up to 64 sets of buffers for the objects it holds, at most 4 MiB.
 
 The pause is unchanged and a cycle is shorter. Alternating runs of `ferro-bench --bin reclaim
@@ -235,8 +257,12 @@ history reaches and expects the cycle and `admin::compact` to fail at its offset
 left and the database still working, and counts the checking threads at a small and a large cycle.
 `reclaim_crash.rs` cuts the power at every third operation of two cycles whose copies span several
 batches, `reclaim_fault.rs` shuts a writer down while three threads check a copy slowed in its
-writes, and the unit tests damage one record in 30,000 at each batch boundary and drop a verifier
-with batches queued. `a_damaged_raw_length_fails_verify_a_read_and_a_cycle` in `compress.rs`
+writes, and the unit tests damage one record in 30,000 at each batch boundary, damage two and
+expect the first at every thread count, and drop a verifier with batches queued.
+`reclaim_damage.rs` points a link of a node into a value three ways, at bytes that parse as a small
+record linking garbage, at bytes claiming 16 MiB, and at those bytes with the node damaged too, and
+expects a cycle at 1 and 4 threads to fail with the same hash mismatch and four to peak within 12
+MiB of one. `a_damaged_raw_length_fails_verify_a_read_and_a_cycle` in `compress.rs`
 gives a compressed body a length 100,000 bytes too long and expects `verify`, a read, a cycle at 1
 and 4 threads and `admin::compact` to name its offset and leave the file as it was.
 `epoch_stress.rs`, the unit tests and `reclaim_threads.rs` pass under AddressSanitizer and

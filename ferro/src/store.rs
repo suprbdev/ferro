@@ -1728,6 +1728,7 @@ impl Store {
         ptr: Ptr,
         bytes: &'a mut Vec<u8>,
         links: &mut Vec<Ptr>,
+        claims: impl FnOnce(usize) -> Result<()>,
     ) -> Result<(&'a [u8], Stored)> {
         let tail = self.readable_past(ptr.offset)?;
         if ptr.offset < LOG_START || ptr.offset >= tail {
@@ -1752,14 +1753,25 @@ impl Store {
             bytes: Cow::Owned(mem::take(bytes)),
             pos: 0,
         };
-        let stored = Self::stored_in(&mut reader, links);
+        let stored = Self::stored_in(&mut reader, links, claims);
         *bytes = reader.bytes.into_owned();
         let stored = stored?;
         Ok((&bytes[..stored.len], stored))
     }
 
-    fn stored_in(reader: &mut RecordReader<'_>, links: &mut Vec<Ptr>) -> Result<Stored> {
+    fn stored_in(
+        reader: &mut RecordReader<'_>,
+        links: &mut Vec<Ptr>,
+        claims: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<Stored> {
         let header = reader.header()?;
+        let least = header.links.saturating_mul(HASH_BYTES + 1);
+        claims(
+            reader
+                .pos
+                .saturating_add(header.stored)
+                .saturating_add(least),
+        )?;
         let start = reader.pos;
         reader.take(header.stored)?;
         let payload = start..reader.pos;

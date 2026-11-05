@@ -6,7 +6,7 @@ use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -161,6 +161,7 @@ impl Roots {
 
 #[derive(Default)]
 struct Batch {
+    seq: u64,
     bytes: Vec<u8>,
     records: Vec<(Ptr, usize)>,
 }
@@ -194,29 +195,46 @@ enum Failure {
 #[derive(Default)]
 struct Progress {
     queued: usize,
-    failure: Option<Failure>,
+    failure: Option<(u64, Failure)>,
 }
 
-#[derive(Default)]
 struct Board {
     progress: Mutex<Progress>,
     idle: Condvar,
     failed: AtomicBool,
+    first: AtomicU64,
     spare: Mutex<Vec<Batch>>,
 }
 
 impl Board {
-    fn fail(&self, progress: &mut Progress, failure: Failure) {
+    fn new() -> Board {
+        Board {
+            progress: Mutex::default(),
+            idle: Condvar::new(),
+            failed: AtomicBool::new(false),
+            first: AtomicU64::new(u64::MAX),
+            spare: Mutex::default(),
+        }
+    }
+
+    fn fail(&self, progress: &mut Progress, seq: u64, failure: Failure) {
         self.failed.store(true, Ordering::Release);
-        progress.failure.get_or_insert(failure);
+        self.first.fetch_min(seq, Ordering::AcqRel);
+        if progress
+            .failure
+            .as_ref()
+            .is_none_or(|(first, _)| seq < *first)
+        {
+            progress.failure = Some((seq, failure));
+        }
     }
 
     fn take(&self) -> Result<()> {
         let failure = self.progress.lock().failure.take();
         match failure {
             None => Ok(()),
-            Some(Failure::Failed(error)) => Err(error),
-            Some(Failure::Panicked(payload)) => panic::resume_unwind(payload),
+            Some((_, Failure::Failed(error))) => Err(error),
+            Some((_, Failure::Panicked(payload))) => panic::resume_unwind(payload),
         }
     }
 }
@@ -228,7 +246,8 @@ fn verify_batches(work: &Mutex<Receiver<Batch>>, board: &Board) {
         let Ok(mut batch) = next else {
             return;
         };
-        let outcome = if board.failed.load(Ordering::Acquire) {
+        let seq = batch.seq;
+        let outcome = if seq > board.first.load(Ordering::Acquire) {
             Ok(Ok(()))
         } else {
             panic::catch_unwind(AssertUnwindSafe(|| batch.verify(&mut scratch)))
@@ -239,8 +258,8 @@ fn verify_batches(work: &Mutex<Receiver<Batch>>, board: &Board) {
         progress.queued -= 1;
         match outcome {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => board.fail(&mut progress, Failure::Failed(error)),
-            Err(payload) => board.fail(&mut progress, Failure::Panicked(payload)),
+            Ok(Err(error)) => board.fail(&mut progress, seq, Failure::Failed(error)),
+            Err(payload) => board.fail(&mut progress, seq, Failure::Panicked(payload)),
         }
         if progress.queued == 0 {
             board.idle.notify_all();
@@ -258,7 +277,7 @@ impl Pool {
     fn start(threads: usize) -> Option<Pool> {
         let (queue, work) = mpsc::sync_channel(threads * 2);
         let work = Arc::new(Mutex::new(work));
-        let board = Arc::new(Board::default());
+        let board = Arc::new(Board::new());
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let (work, board) = (work.clone(), board.clone());
@@ -286,18 +305,19 @@ impl Pool {
             .queue
             .as_ref()
             .expect("the queue lives as long as the pool");
+        let seq = batch.seq;
         if queue.send(batch).is_err() {
             let mut progress = self.board.progress.lock();
             progress.queued -= 1;
             let gone = Error::Io(std::io::Error::other("the copy's verifying threads exited"));
-            self.board.fail(&mut progress, Failure::Failed(gone));
+            self.board.fail(&mut progress, seq, Failure::Failed(gone));
         }
         self.check()
     }
 
     fn check(&self) -> Result<()> {
         if self.board.failed.load(Ordering::Acquire) {
-            return self.board.take();
+            return self.settle();
         }
         Ok(())
     }
@@ -315,6 +335,7 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.board.failed.store(true, Ordering::Release);
+        self.board.first.store(0, Ordering::Release);
         self.queue = None;
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -325,6 +346,7 @@ impl Drop for Pool {
 struct Verifier {
     threads: usize,
     batch: Batch,
+    sent: u64,
     scratch: Unpacked,
     pool: Option<Pool>,
 }
@@ -334,6 +356,7 @@ impl Verifier {
         Verifier {
             threads,
             batch: Batch::default(),
+            sent: 0,
             scratch: Unpacked::default(),
             pool: None,
         }
@@ -364,7 +387,10 @@ impl Verifier {
             return verified;
         };
         let spare = pool.board.spare.lock().pop().unwrap_or_default();
-        pool.send(mem::replace(&mut self.batch, spare))
+        self.sent += 1;
+        let mut batch = mem::replace(&mut self.batch, spare);
+        batch.seq = self.sent;
+        pool.send(batch)
     }
 
     fn check(&self) -> Result<()> {
@@ -376,6 +402,13 @@ impl Verifier {
         self.batch.clear();
         let settled = self.pool.as_ref().map_or(Ok(()), Pool::settle);
         settled.and(verified)
+    }
+
+    fn first(&mut self, error: Error) -> Error {
+        match self.settle() {
+            Err(earlier) => earlier,
+            Ok(()) => error,
+        }
     }
 }
 
@@ -653,16 +686,24 @@ impl CopySink<'_> {
         if bytes.capacity() <= SPARE_BYTES {
             self.bytes = bytes;
         }
-        step
+        step.map_err(|error| self.verifier.first(error))
     }
 
     fn step(&mut self, ptr: Ptr, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
-        let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old)?;
+        let verifier = &mut self.verifier;
+        let large = |claim: usize| match claim > BATCH_BYTES {
+            true => verifier.settle(),
+            false => Ok(()),
+        };
+        let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old, large)?;
         let entry = if self.entries.contains(&ptr.hash) {
             self.verifier.inline(record, ptr)?;
             let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
             Some(Rungs::of(body, &held.old)?)
+        } else if record.len() > BATCH_BYTES {
+            self.verifier.inline(record, ptr)?;
+            None
         } else {
             self.verifier.add(ptr, record)?;
             None
@@ -914,7 +955,7 @@ mod tests {
     use super::*;
     use crate::store::append_record;
 
-    fn records(count: u64, bad: Option<u64>) -> Vec<(Ptr, Vec<u8>)> {
+    fn records(count: u64, bad: &[u64]) -> Vec<(Ptr, Vec<u8>)> {
         (0..count)
             .map(|index| {
                 let body = format!("record {index} ").repeat(1 + index as usize % 40);
@@ -923,7 +964,7 @@ mod tests {
                     links: Vec::new(),
                 };
                 let mut hash = object.hash();
-                if bad == Some(index) {
+                if bad.contains(&index) {
                     hash[0] ^= 1;
                 }
                 let offset = LOG_START + index * 4096;
@@ -945,11 +986,11 @@ mod tests {
 
     #[test]
     fn every_thread_count_verifies_every_record_and_reports_the_damaged_one() {
-        let good = records(30_000, None);
+        let good = records(30_000, &[]);
         for threads in [1, 2, 4] {
             verified(threads, &good).unwrap();
             for bad in [0, 4095, 4096, 17_000, 29_999] {
-                let damaged = records(30_000, Some(bad));
+                let damaged = records(30_000, &[bad]);
                 let at = format!(
                     "hash mismatch for object at {}",
                     damaged[bad as usize].0.offset
@@ -963,8 +1004,27 @@ mod tests {
     }
 
     #[test]
+    fn the_first_damaged_record_in_walk_order_is_reported_at_every_thread_count() {
+        for threads in [1, 2, 4] {
+            for bad in [[4095, 4096], [1000, 29_999], [17_000, 17_001], [2000, 9000]] {
+                let damaged = records(30_000, &bad);
+                let at = format!(
+                    "hash mismatch for object at {}",
+                    damaged[bad[0] as usize].0.offset
+                );
+                for _ in 0..20 {
+                    match verified(threads, &damaged) {
+                        Err(Error::Corrupt(message)) => assert_eq!(message, at, "{threads}"),
+                        other => panic!("{threads} threads, records {bad:?}: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_verifier_dropped_with_batches_queued_joins_its_threads() {
-        let good = records(40_000, None);
+        let good = records(40_000, &[]);
         let mut verifier = Verifier::new(4);
         for (ptr, record) in &good {
             verifier.add(*ptr, record).unwrap();
