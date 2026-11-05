@@ -11,19 +11,24 @@ lists them with what each covers.
 
 The library is `ferro/src`:
 
-- `lib.rs`: the crate root. It declares the modules and re-exports the public API; `epoch`, `graph`,
-  `platform`, `reclaim`, `reentry` and `shared` are private.
+- `lib.rs`: the crate root and its documentation. It declares the modules and re-exports the public
+  API; `dense`, `epoch`, `graph`, `platform`, `prefix`, `reclaim`, `reentry`, `refs` and `shared`
+  are private, with `Prefix` re-exported from `prefix`.
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls, and `Object`, `Ptr`,
   `hash_of` and `Bytes`.
 - `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
   recovery, object reads with hash verification, node cache, and the `dedupe` table.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree, its optional summaries, `Cursor`, and `Val`,
   the handle reads return.
+- `prefix.rs`: the `Prefix` trait, which lets `Map::prefix` read the entries whose tuple key starts
+  with a given first field.
 - `set.rs` and `list.rs`: `Set<T>`, a wrapper over `Map<T, ()>`, and `List<T>`, a wrapper over
   `Map<u64, T>`.
 - `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, `Options`, commits, branches, coalescing, merges and reclamation
   cycles.
+- `refs.rs`: the branch table a file's head points at, and the steps that change it one branch at a
+  time, described under [Branch-table steps](commit-path.md#branch-table-steps).
 - `log.rs`: the commit chain and `Log`. `history.rs`: `History`, the lazy walk behind `history_of`
   and `history_of_range`.
 - `graph.rs`: the search of the commit graph for best common ancestors, described under [Finding the
@@ -43,6 +48,8 @@ The library is `ferro/src`:
   [Windows](windows.md).
 - `sync.rs`: `Have`, `Bundle`, and `Db::pull`, `push` and `receive`, which copy a branch between
   files.
+- `dense.rs`: `Column` and `Hashes`, the chunked columns and hash index that sync and the store's
+  staging use to track the objects of a bundle compactly.
 - `error.rs`: `Error` and `Result`.
 
 Around it:
