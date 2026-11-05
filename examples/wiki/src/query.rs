@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use ferro::{Map, Val};
 
@@ -92,14 +93,14 @@ pub fn list(w: &Wiki, tag: Option<&str>, prefix: Option<&str>, limit: usize) -> 
             pages.truncate(limit);
             pages
         }
-        None => w
-            .pages
-            .unique_slug()
-            .iter()
-            .filter(|(slug, _)| prefix.is_none_or(|prefix| slug.starts_with(prefix)))
-            .filter_map(|(_, id)| w.pages.get(&id))
-            .take(limit)
-            .collect(),
+        None => {
+            let from = prefix.map_or(Bound::Unbounded, Bound::Included);
+            w.pages
+                .by_slug_range::<str, _>((from, Bound::Unbounded))
+                .take_while(|page| wanted(page))
+                .take(limit)
+                .collect()
+        }
     }
 }
 

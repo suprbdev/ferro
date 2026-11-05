@@ -455,10 +455,10 @@ impl Hotels {
     pub fn active_at(&self, venue: u32, from: Night) -> Vec<u64> {
         let mut ids: Vec<u64> = Vec::new();
         for room in self.rooms.by_venue(&venue).keys() {
-            let index = self.stays.unique_room_night();
-            for (_, slot) in index.range((room, from)..=(room, Night::MAX)) {
-                ids.push(slot.0);
-            }
+            let stays = self
+                .stays
+                .by_room_night_range((room, from)..=(room, Night::MAX));
+            ids.extend(stays.keys().map(|(booking, _)| booking));
         }
         ids.sort_unstable();
         ids.dedup();
