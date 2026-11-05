@@ -132,11 +132,21 @@ are now tombstones only among an entry's `prev`, skip and merge links, and elsew
 as [the copy's tombstones](reclamation.md#a-cycle) describe, with fixtures in
 `ferro/tests/fuzzed.rs`. The harness at first compared errors that named the two copies' files, and
 asked every compacted file to verify. A chain whose skip link pointed outside the log, which the
-copy places by following `prev` and cut, and a table node with keys out of order that linked a
-second record of an entry no head named, which the copy wrote as an entry and `verify` read as a
-tree, each compacted into a file `verify` refused from a source that failed `verify` or
-`verify_typed`. Reads never follow either link, so the target now asks for a verifying result only
-from a file that passes both. No other input crashed, hung or passed a memory limit.
+copy places by following `prev` and cut, compacted into a file `verify` refused as it had refused
+the source, so the target asks for a verifying result only from a file that passes `verify`. A table
+node with keys out of order, which failed only `verify_typed`, linked a second record of an entry no
+head named, which the copy wrote as an entry with its `prev` link cut and `verify` read as a tree.
+That was the copy's fault, since it took any record with an entry's hash for an entry. It now copies
+a record as an entry only when it reached it as one, as [Records reached as
+entries](reclamation.md#records-reached-as-entries) describes, with tests in
+`ferro/tests/fuzzed.rs`, so the target asks every file that passes `verify` to compact into one that
+does, whatever `verify_typed` says. No other input crashed, hung or passed a memory limit.
+
+With that change and that check, `reclaim` ran for 30 minutes as four jobs on four cores, from the
+2,381 inputs the round saved, on a machine other work kept at a load average of about 100 on 32
+cores: 390,000 executions, 53 a second on each core, reaching 7,980 to 7,995 edges and adding 511
+inputs. No compaction of a file that passed `verify` failed it, and no input crashed, hung or passed
+a memory limit.
 
 ## Where the other tests are described
 
@@ -171,6 +181,8 @@ Tests are described next to what they test:
   object](sync.md#memory-for-each-object).
 - A damaged raw length, links pointed into a value, and damaged records at every thread count: [The
   copy on several threads](reclamation.md#the-copy-on-several-threads).
+- A tree that links a second record of a log entry, or the record a chain reads: [Records reached as
+  entries](reclamation.md#records-reached-as-entries).
 - Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
 - What runs on Windows: [Tests](windows.md#tests).
 - Crash safety in general: [Durability and crash safety](../guide/durability.md#what-was-tested).

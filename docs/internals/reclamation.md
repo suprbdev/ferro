@@ -44,8 +44,10 @@ back. Pruned hashes are therefore kept apart from copied ones and drop out of th
 retains that hash again, and an entry's `prev`, skip or merge link already at offset 0 is never
 followed. Only those links are ever written as offset 0. Anywhere else, including an entry's root,
 a link at offset 0 names nothing in the file, so the copy fails on it with the error `verify` gives,
-and a link to a pruned entry fails it with "link to the pruned log entry at <offset>", rather than
-writing a file whose trees cannot be read.
+even where an object with its hash was copied, and a link to a pruned entry fails it with "link to
+the pruned log entry at <offset>", rather than writing a file whose trees cannot be read. Which
+records are entries at all is decided by how the copy reached them, as described under [Records
+reached as entries](#records-reached-as-entries).
 
 ## Copies made for less history
 
@@ -107,6 +109,55 @@ from 9.12 to 8.92 ms at 256. On tmpfs the writers commit three times as fast and
 pause varied by up to 1.8 times between runs: from 7.2 to 5.9 ms over four alternating runs each at
 64 branches, and from 12.2 to 12.9 ms over ten at 256. A run at 256 branches that counted them
 copied no entry twice, so only the bookkeeping differs.
+
+## Records reached as entries
+
+The copy treats a log entry unlike any other object. It checks the record on the walking thread,
+decodes it to find its `prev` and skip links, and may write those and its merge link with offset 0.
+It used to tell an entry by its hash, so a record with an entry's hash was copied as one wherever it
+was linked from (#76). But another record can hold the same bytes: a commit can be stored twice, as
+described under [Commits stored twice](sync-receive.md#commits-stored-twice), and a damaged tree or
+branch-table node can link a second record of an entry that no chain reaches. `verify` reads such a
+record as a tree and follows every link it has, while the copy cut its links and wrote it where
+`verify` would read it as a tree. The reclaim fuzz target found this through a branch-table node
+whose keys were out of order, which linked a second record of an entry no head named. A test builds
+the shape directly: a commit at v3 whose root links a second record of v2. With `Keep::Last(2)` the
+cycle wrote that record with its `prev` link cut to offset 0, and `verify` refused the new file with
+`pointer 0 outside log`.
+
+A record is now an entry only when the copy reaches it as one: a record that the walk down a
+branch's chain or a merge's closure read, in this pass or an earlier one, or the record that the
+`prev`, skip or merge link of an entry being copied names. Reached any other way, it is an object,
+copied with every link in full as `verify` reads it, so the copy fails where one of those links
+names pruned history or offset 0. A tree that links the very record a chain read gets that record's
+copy, which keeps the branch table's links to each branch's tip one record each. On the test's file
+a cycle that keeps everything now writes the second record beside the entry's own copy, as a tree,
+into a file that verifies, the same at 1 and 4 threads. `Keep::Last(2)` fails with "link to the
+pruned log entry at <offset>", as for a tree that links pruned history itself, and with the second
+record's `prev` already at offset 0 every cycle fails with the error `verify` gives on the source,
+where one used to write a file that `verify` refused the same way.
+
+The map of copies marks each hash a chain retains before the copy starts, so a link from a tree
+takes the one lookup by hash it took before, and only a link whose hash is an entry's also looks up
+the records the chains read, kept by offset with their hashes in 32 bytes a slot, where the set of
+entry hashes it replaced took 20. From a file whose trees link no entry, which is every file ferro
+writes, the copy makes the same choices as before: `cmp` found the copies of the two files under
+[Limits](#limits) identical to those the build before made, keeping everything, the last 100
+versions and the last one. On 2026-11-05, on a machine other work kept at load averages of 78 to 136
+on 32 cores, 23 rounds of `ferro-bench --bin reclaim copy` alternating the two builds took medians
+of 2.19 s against 2.09 before at 1 thread and 1.61 against 1.60 s at 4 on the table rows, and 0.94
+against 1.16 and 0.89 against 0.86 s on the 320 byte values, with runs spread over a factor of
+three. The fastest runs took 1.38 against 1.37 s, 0.73 against 0.73, 0.65 against 0.66 and 0.27
+against 0.26. The calling thread's user-space instructions, which load does not move, fell from 6.04
+to 6.00 billion at 1 thread and from 2.11 to 2.07 at 4 on the table rows, and by 0.4% and 2.1% on
+the values, since a record read no longer looks its hash up in a set of entry hashes.
+
+Three tests in `ferro/tests/fuzzed.rs` build the shape. A tree that links a second record of v2
+under v3 must compact with `Keep::All` into the same bytes at 1 and 4 threads and a file that
+verifies, and fail with `Keep::Last(2)` naming v1's offset. With that record's `prev` at offset 0,
+both must fail with the error `verify` then gives. Both failed before the change, which wrote files
+that `verify` refused. A tree that links v2's own record must compact into as many objects as the
+source holds less the versions pruned, so that the record is written once.
 
 ## The copy on several threads
 
@@ -434,9 +485,9 @@ before. On one thread it now runs at 236 and 755 MB/s. So a 10 GB database of ta
 about 20 seconds and needs 10 GB free. The trigger keeps that to one extra byte copied per byte
 written, at worst. The walking thread is the limit, at 450 to 500 MB/s on table rows however many
 threads check. `Keep::All` copies all of history, so `history` is what makes background cycles
-worthwhile. The copy holds a map from hash to offset, about 50 bytes per object, about 70 bytes per
-commit for where each entry was copied and what its copy keeps, and about 20 MiB of buffers at
-most.
+worthwhile. The copy holds a map from hash to offset, about 50 bytes per object, about 80 bytes per
+commit for where each entry was read and copied and what its copy keeps, and about 20 MiB of buffers
+at most.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the
