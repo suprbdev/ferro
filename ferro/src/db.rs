@@ -64,7 +64,8 @@ pub struct Commit {
     /// When the commit was made, in milliseconds since the Unix epoch.
     ///
     /// Times never go back along a branch: a commit's time is the later of the clock and a floor
-    /// set by the commit before it, as [History](docs/guide/history.md#reading-old-versions)
+    /// set by the commit before it, as
+    /// [History](https://github.com/archlemon/ferro/blob/main/docs/guide/history.md#reading-old-versions)
     /// describes.
     pub time_ms: u64,
     /// The message given to the commit.
@@ -1257,8 +1258,9 @@ fn read_clock(clock: Option<&Clock>) -> u64 {
 /// Settings for opening a database, set by chaining.
 ///
 /// [`Options::new`] starts from the defaults that [`Db::open`] uses, each method changes one
-/// setting, and [`Options::open`] or [`Options::open_with`] opens the file. [Getting
-/// started](docs/guide/getting-started.md#options) lists the defaults in a table.
+/// setting, and [`Options::open`] or [`Options::open_with`] opens the file.
+/// [Getting started](https://github.com/archlemon/ferro/blob/main/docs/guide/getting-started.md#options)
+/// lists the defaults in a table.
 ///
 /// # Examples
 ///
@@ -1306,7 +1308,8 @@ impl Options {
     /// The default, [`Durability::Fsync`], syncs each commit before acknowledging it, with one
     /// fsync covering every commit queued meanwhile. [`Durability::Buffered`] skips that sync, so a
     /// power cut can lose recent commits, back to the last checkpoint at worst, but never the whole
-    /// file. See [Durability and crash safety](docs/guide/durability.md).
+    /// file. See
+    /// [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md).
     pub fn durability(mut self, durability: Durability) -> Self {
         self.store.durability = durability;
         self
@@ -1314,8 +1317,9 @@ impl Options {
 
     /// An approximate bound, in bytes, on the decoded nodes and values the cache holds.
     ///
-    /// The default is 1 GiB. [Cache weight](docs/internals/read-scaling.md#cache-weight) describes
-    /// what counts against it.
+    /// The default is 1 GiB.
+    /// [Cache weight](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#cache-weight)
+    /// describes what counts against it.
     pub fn cache_bytes(mut self, bytes: u64) -> Self {
         self.store.cache_bytes = bytes;
         self
@@ -1347,8 +1351,8 @@ impl Options {
     /// [`Keep::Last`] prunes as part of each commit, while [`Keep::Since`] and [`Keep::Within`]
     /// take effect at each reclamation cycle. A writer that keeps less than everything also runs
     /// cycles on a background thread, as [`Options::reclaim`] sets, to give the space back. A
-    /// pruned version is gone, whether or not a cycle has reclaimed its bytes yet. See [Retention
-    /// and reclamation](docs/guide/retention.md).
+    /// pruned version is gone, whether or not a cycle has reclaimed its bytes yet. See
+    /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
     ///
     /// # Examples
     ///
@@ -1399,8 +1403,8 @@ impl Options {
     /// of every tree path they touched and one commit, so [`Committed::version`] and
     /// [`Stamp::version`] are the group's, [`Db::at`] cannot show the state between two of them,
     /// and if the group cannot be written every closure in it gets [`Error::GroupFailed`].
-    /// [`Db::restore`] and the merges always commit alone. Off by default. See [Sharing a version
-    /// between writers](docs/guide/concurrency.md#sharing-a-version-between-writers).
+    /// [`Db::restore`] and the merges always commit alone. Off by default. See
+    /// [Sharing a version between writers](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#sharing-a-version-between-writers).
     pub fn coalesce(mut self, coalesce: bool) -> Self {
         self.coalesce = coalesce;
         self
@@ -1414,10 +1418,10 @@ impl Options {
     /// [`Db::branch`] or calls [`Db::refresh`]. A writer without the option and shared writers
     /// lock each other out with [`Error::Locked`].
     ///
-    /// It needs open file description locks, so it works on 64-bit Linux only, on one machine and
-    /// a local file system. Elsewhere the open fails with an
-    /// [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) error. See [Several
-    /// processes](docs/guide/concurrency.md#several-processes).
+    /// It needs open file description locks, so it works on 64-bit Linux only, on one machine and a
+    /// local file system. Elsewhere the open fails with an
+    /// [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) error. See
+    /// [Several processes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#several-processes).
     pub fn shared(mut self, shared: bool) -> Self {
         self.store.shared = shared;
         self
@@ -3111,11 +3115,11 @@ impl<T: Data> Db<T> {
     /// Runs one reclamation cycle now, pruning every branch to `keep` first.
     ///
     /// The cycle copies what is retained into a new file beside this one, in passes while writers
-    /// keep running, then holds up writers for a few milliseconds to copy what they wrote
-    /// meanwhile and swap the new file in. Readers do not wait at all, and snapshots held from
-    /// before keep reading the old file. `keep` takes the place of [`Options::history`] for this
-    /// cycle, and nothing already pruned comes back. A cycle needs free disk for everything
-    /// retained. See [Retention and reclamation](docs/guide/retention.md).
+    /// keep running, then holds up writers for a few milliseconds to copy what they wrote meanwhile
+    /// and swap the new file in. Readers do not wait at all, and snapshots held from before keep
+    /// reading the old file. `keep` takes the place of [`Options::history`] for this cycle, and
+    /// nothing already pruned comes back. A cycle needs free disk for everything retained. See
+    /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
     ///
     /// # Errors
     ///
@@ -3181,10 +3185,10 @@ impl<T: Data> Db<T> {
     /// It is the hash of the newest commit's log entry, which links the entry before it, and so on
     /// back, so pruning does not change it. Published somewhere an attacker cannot edit, it is a
     /// tamper-evidence anchor: check it later with [`Log::hash_at`] of the same version and
-    /// [`Db::verify`], and a match shows that version and everything before it are unchanged. It
-    /// is not a signature and says nothing about later commits, other branches or whether the
-    /// times were true. See [`head_hash` and tamper
-    /// evidence](docs/internals/history.md#head_hash-and-tamper-evidence).
+    /// [`Db::verify`], and a match shows that version and everything before it are unchanged. It is
+    /// not a signature and says nothing about later commits, other branches or whether the times
+    /// were true. See
+    /// [`head_hash` and tamper evidence](https://github.com/archlemon/ferro/blob/main/docs/internals/history.md#head_hash-and-tamper-evidence).
     ///
     /// # Examples
     ///
@@ -3250,8 +3254,9 @@ impl<T: Data> Db<T> {
     /// - [`Error::ReadOnly`] on a read-only handle, and [`Error::NoBranch`] if the branch was
     ///   dropped.
     /// - [`Error::Reentrant`] from inside a closure on this file, where waiting for this branch's
-    ///   writer lock could deadlock, as [Writing from inside a
-    ///   closure](docs/guide/concurrency.md#writing-from-inside-a-closure) lists.
+    ///   writer lock could deadlock, as
+    ///   [Writing from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#writing-from-inside-a-closure)
+    ///   lists.
     /// - [`Error::Poisoned`] after an earlier write or sync failed, and [`Error::GroupFailed`] if
     ///   the coalesced group this closure joined could not be written.
     /// - [`Error::Io`] if this commit's write or sync fails, and the errors of encoding the value,
@@ -3509,8 +3514,8 @@ impl<T: Data> Db<T> {
     ///
     /// Dropping the future before the closure ran writes nothing. Once the closure has run, the
     /// commit lands as if awaited, and dropping the future gives up only the answer, so whether a
-    /// dropped write landed is exactly whether its closure ran. See [Awaited
-    /// writes](docs/guide/concurrency.md#awaited-writes).
+    /// dropped write landed is exactly whether its closure ran. See
+    /// [Awaited writes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#awaited-writes).
     ///
     /// # Errors
     ///
@@ -4185,7 +4190,8 @@ impl<T: Data> Db<T> {
     /// is merged once however it arrived. After a criss-cross, where there are several, `f` first
     /// merges them into a virtual base, once for each after the first, and what it returns from
     /// those runs is dropped; that is why it is [`FnMut`]. Branches that share no commit merge
-    /// against version 0. See [Merging](docs/guide/merging.md).
+    /// against version 0. See
+    /// [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
     ///
     /// # Errors
     ///
@@ -4712,11 +4718,11 @@ impl<T: Data> Db<T> {
     /// A watcher like [`Db::watch`] that hands out only snapshots that pass `test`.
     ///
     /// It sleeps through commits whose snapshot fails. While a watcher waits, its test runs on a
-    /// `ferro-watch` thread for the branch, started when a filtered or async watcher first waits;
-    /// a receive that finds a new snapshot already there runs it on the receiving thread. Tests run
+    /// `ferro-watch` thread for the branch, started when a filtered or async watcher first waits; a
+    /// receive that finds a new snapshot already there runs it on the receiving thread. Tests run
     /// under no lock, so a test may read, commit or refresh, but it must not wait for a watcher,
-    /// and a slow one delays the branch's other watchers. See [Where tests
-    /// run](docs/guide/watchers.md#where-tests-run).
+    /// and a slow one delays the branch's other watchers. See
+    /// [Where tests run](https://github.com/archlemon/ferro/blob/main/docs/guide/watchers.md#where-tests-run).
     ///
     /// # Examples
     ///

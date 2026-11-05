@@ -1,13 +1,14 @@
 //! Reclamation: copying what a database retains into a new file and swapping it in.
 //!
-//! A cycle prunes each branch, then copies every object that a retained version reaches into a
-//! file beside the database, checking each object's hash as it goes. The copy runs in passes
-//! while writers go on, and a last pass under every writer lock copies what they wrote meanwhile
-//! before the new file is renamed over the old one. [`Db::compact`](crate::Db::compact), the
-//! background cycles that [`Options::history`](crate::Options::history) starts, and
+//! A cycle prunes each branch, then copies every object that a retained version reaches into a file
+//! beside the database, checking each object's hash as it goes. The copy runs in passes while
+//! writers go on, and a last pass under every writer lock copies what they wrote meanwhile before
+//! the new file is renamed over the old one. [`Db::compact`](crate::Db::compact), the background
+//! cycles that [`Options::history`](crate::Options::history) starts, and
 //! [`admin::compact`](crate::admin::compact) share the copy. [`Reclaim`] says when background
 //! cycles run, [`Space`] reports how they have gone, and [`Compacted`] reports one cycle.
-//! [Reclamation](docs/internals/reclamation.md) describes cycles, generations and crashes.
+//! [Reclamation](https://github.com/archlemon/ferro/blob/main/docs/internals/reclamation.md)
+//! describes cycles, generations and crashes.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};

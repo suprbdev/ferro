@@ -1,6 +1,7 @@
 //! Working on a database file by its path, without its types.
 //!
-//! These functions serve tools such as the [`ferro` tool](docs/guide/cli.md) and scripts that
+//! These functions serve tools such as the
+//! [`ferro` tool](https://github.com/archlemon/ferro/blob/main/docs/guide/cli.md) and scripts that
 //! inspect a file another program owns. All but [`compact`] open the file read-only, so they run
 //! beside a writer. [`Keep`], which says how much history to retain, is here too.
 
@@ -24,8 +25,8 @@ use crate::store::{Closing, Store, StoreOptions};
 /// [`Options::history`](crate::Options::history) sets it for a database, and
 /// [`Db::compact`](crate::Db::compact) and [`compact`] apply one for a single cycle. Every form
 /// keeps at least each branch's newest commit. A pruned version is gone, whether or not a cycle has
-/// reclaimed its bytes yet, and version 0 goes when version 1 does. See [Retention and
-/// reclamation](docs/guide/retention.md).
+/// reclaimed its bytes yet, and version 0 goes when version 1 does. See
+/// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Keep {
     /// Every version, the default.

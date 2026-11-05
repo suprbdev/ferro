@@ -1,11 +1,12 @@
 //! The record of the writer locks each thread holds, behind [`Error::Reentrant`].
 //!
-//! A thread notes each branch lock and whole-file lock it takes, and every call that could wait
-//! on a lock checks the list first. A call that could deadlock on a lock this thread holds, or on
-//! a write waiting for this thread, fails with [`Error::Reentrant`] instead of hanging. A thread
-//! that writes into one file while it holds locks in another records the crossing, so that two
-//! threads crossing between the same files in opposite directions are refused as well. [Writes
-//! from inside a closure](docs/internals/reentrancy.md) describes the rules.
+//! A thread notes each branch lock and whole-file lock it takes, and every call that could wait on
+//! a lock checks the list first. A call that could deadlock on a lock this thread holds, or on a
+//! write waiting for this thread, fails with [`Error::Reentrant`] instead of hanging. A thread that
+//! writes into one file while it holds locks in another records the crossing, so that two threads
+//! crossing between the same files in opposite directions are refused as well.
+//! [Writes from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/internals/reentrancy.md)
+//! describes the rules.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};

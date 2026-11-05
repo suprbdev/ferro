@@ -84,8 +84,10 @@
 //! As with every collection, a read that cannot load a node from the file, or finds one damaged,
 //! panics. [`Map::try_get`] on [`Table::rows`] returns that failure as an error instead.
 //!
-//! `docs/guide/tables.md` describes tables and indexes at more length, and
-//! `docs/internals/schema-and-unique-indexes.md` how they are stored.
+//! [The tables guide](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md) describes
+//! tables and indexes at more length, and
+//! [the schema and unique index internals](https://github.com/archlemon/ferro/blob/main/docs/internals/schema-and-unique-indexes.md)
+//! how they are stored.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -2106,7 +2108,9 @@ const FINGERPRINT_BYTES: usize = 8;
 /// The [`Record`](derive@crate::Record) derive describes each index by its kind, the key's type,
 /// the stored names and types of the fields it is keyed on and of the fields it stores, and the
 /// defaults of those fields. A stored index whose fingerprint differs from the struct's is rebuilt
-/// from the rows when the table is read, as `docs/guide/schema-evolution.md` describes.
+/// from the rows when the table is read, as
+/// [the schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// describes.
 pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
     let mut d = Description::new();
     d.word("index");

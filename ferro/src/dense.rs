@@ -2,7 +2,9 @@
 //!
 //! A sync or a staged receive keeps a few facts for every object it moves. [`Hashes`] gives each
 //! object's hash a `u32` id, and [`Column`]s indexed by that id hold the rest, so each object costs
-//! a few dozen bytes rather than a map entry per fact. `docs/internals/sync.md` has the sizes.
+//! a few dozen bytes rather than a map entry per fact.
+//! [The sync internals](https://github.com/archlemon/ferro/blob/main/docs/internals/sync.md) have
+//! the sizes.
 
 use hashbrown::HashTable;
 

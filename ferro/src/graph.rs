@@ -1,11 +1,12 @@
 //! The search for the best common ancestors of two sets of commits over the merge graph.
 //!
 //! [`best`] paints down from both sides as git's merge-base does, but in jumps: a chain moves
-//! straight to the highest place another chain could join it, found by a binary search on
-//! versions, and merge entries are opened only while what they merged could still matter. A
-//! commit reached from both sides is a candidate, and everything below it is stale. The search
-//! refuses to answer where pruned history could change the answer. [Finding the
-//! base](docs/internals/merging.md#finding-the-base) describes it.
+//! straight to the highest place another chain could join it, found by a binary search on versions,
+//! and merge entries are opened only while what they merged could still matter. A commit reached
+//! from both sides is a candidate, and everything below it is stale. The search refuses to answer
+//! where pruned history could change the answer.
+//! [Finding the base](https://github.com/archlemon/ferro/blob/main/docs/internals/merging.md#finding-the-base)
+//! describes it.
 
 use std::cmp::Reverse;
 

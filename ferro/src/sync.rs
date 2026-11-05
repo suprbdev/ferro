@@ -8,7 +8,8 @@
 //! the other side's branch lands in this file as a remote branch, and this branch is brought up to
 //! it by a fast-forward or a merge, as the [`Outcome`] in the returned [`Pulled`] says. Every
 //! object received is checked by hash, and as the type that will read it, before any of it can be
-//! reached from the file. See [Sync between files](docs/guide/sync.md).
+//! reached from the file. See
+//! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
 
 use std::any::Any;
 use std::cell::RefCell;

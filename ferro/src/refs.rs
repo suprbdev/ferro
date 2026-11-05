@@ -3,8 +3,9 @@
 //! A commit does not rewrite the whole table of branches. It writes a step: one branch's name and
 //! new [`Head`], linking the table or step the head named before. Following the steps back to the
 //! table they start from, the newest step for each name winning, gives every branch's head. After
-//! [`STEPS`] steps the next change writes a whole table again. [Branch-table
-//! steps](docs/internals/commit-path.md#branch-table-steps) describes them.
+//! [`STEPS`] steps the next change writes a whole table again.
+//! [Branch-table steps](https://github.com/archlemon/ferro/blob/main/docs/internals/commit-path.md#branch-table-steps)
+//! describes them.
 
 use std::collections::HashSet;
 

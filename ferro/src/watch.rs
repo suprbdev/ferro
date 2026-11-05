@@ -4,9 +4,10 @@
 //! [`Db::watch_changes`](crate::Db::watch_changes) return a [`Watcher`]. Each branch has one feed
 //! that holds its newest snapshot. A commit stores its snapshot there and wakes the branch's watch
 //! thread, so it costs the same with no watchers or ten thousand and never waits for a filter. A
-//! watcher receives by blocking, with a timeout, without waiting, or by awaiting [`Changed`], and
-//! a [`Closer`] ends it from any thread. [Watchers](docs/internals/watchers.md) in the internals
-//! describes the feed and the watch thread.
+//! watcher receives by blocking, with a timeout, without waiting, or by awaiting [`Changed`], and a
+//! [`Closer`] ends it from any thread.
+//! [Watchers](https://github.com/archlemon/ferro/blob/main/docs/internals/watchers.md) in the
+//! internals describes the feed and the watch thread.
 
 use std::fmt;
 use std::future::Future;

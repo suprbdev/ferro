@@ -3,8 +3,9 @@
 //! Reads from collections do not return [`Result`], so that they read like the standard library's:
 //! an I/O failure or a damaged file makes them panic, and their `try_` forms, such as
 //! [`Map::try_get`](crate::Map::try_get), return the [`Error`] instead. Writes, history, branches,
-//! sync and the [`admin`](crate::admin) functions return it directly. [Errors and checks on local
-//! reads](docs/internals/errors.md) describes where each kind comes from.
+//! sync and the [`admin`](crate::admin) functions return it directly.
+//! [Errors and checks on local reads](https://github.com/archlemon/ferro/blob/main/docs/internals/errors.md)
+//! describes where each kind comes from.
 
 use std::io;
 
@@ -51,7 +52,8 @@ pub enum Error {
     ///
     /// The checks on each map node read from the file, of its counts and levels, fail with this
     /// too. In a file that ferro wrote it means damage, or a change to a type that broke its stored
-    /// form, as described in [Changing your types](docs/guide/schema-evolution.md).
+    /// form, as described in
+    /// [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md).
     #[error("decode error: {0}")]
     Decode(String),
     /// A stored struct lacks the named field, and the field has no default.
@@ -143,8 +145,9 @@ pub enum Error {
     /// waiting on this thread.
     ///
     /// A write from inside a commit closure, a merge closure, a watcher test run there, or a `Drop`
-    /// that runs under a writer lock returns this instead of deadlocking. [Writes from inside a
-    /// closure](docs/guide/concurrency.md#writing-from-inside-a-closure) lists what is allowed.
+    /// that runs under a writer lock returns this instead of deadlocking.
+    /// [Writes from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#writing-from-inside-a-closure)
+    /// lists what is allowed.
     #[error(
         "this write would deadlock on a writer lock held by this thread or by a write waiting on it"
     )]

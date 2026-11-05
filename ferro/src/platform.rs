@@ -4,8 +4,10 @@
 //! the directory sync after a create or rename, renaming over an open file, the owner of a new
 //! generation and self-deleting scratch files each have one function here, with the same contract
 //! on every target. The byte-range locks behind `Options::shared` and the early writeback of a copy
-//! exist only on 64-bit Linux, and [`RANGES`] says whether they do. `docs/internals/windows.md`
-//! and `docs/internals/processes.md` describe both sides.
+//! exist only on 64-bit Linux, and [`RANGES`] says whether they do.
+//! [Windows](https://github.com/archlemon/ferro/blob/main/docs/internals/windows.md) and
+//! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
+//! describe both sides.
 
 #[cfg(unix)]
 mod imp {

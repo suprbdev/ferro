@@ -53,21 +53,25 @@
 //!
 //! The guides in the repository's `docs` directory are the long form:
 //!
-//! - [Getting started](docs/guide/getting-started.md): a first database, reading, writing and
-//!   [`Options`].
-//! - [Collections](docs/guide/collections.md) and [Tables and indexes](docs/guide/tables.md): what
+//! - [Getting started](https://github.com/archlemon/ferro/blob/main/docs/guide/getting-started.md):
+//!   a first database, reading, writing and [`Options`].
+//! - [Collections](https://github.com/archlemon/ferro/blob/main/docs/guide/collections.md) and
+//!   [Tables and indexes](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md): what
 //!   goes inside your type.
-//! - [History, versions and branches](docs/guide/history.md) and [Merging](docs/guide/merging.md).
-//! - [Watchers](docs/guide/watchers.md) and [Sync between files](docs/guide/sync.md).
-//! - [Durability and crash safety](docs/guide/durability.md) and [Retention and
-//!   reclamation](docs/guide/retention.md).
-//! - [Writers and concurrency](docs/guide/concurrency.md): branch locks, awaited writes,
-//!   coalescing and several processes.
-//! - [Changing your types](docs/guide/schema-evolution.md) and
-//!   [Limitations](docs/guide/limitations.md).
+//! - [History, versions and branches](https://github.com/archlemon/ferro/blob/main/docs/guide/history.md)
+//!   and [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
+//! - [Watchers](https://github.com/archlemon/ferro/blob/main/docs/guide/watchers.md) and
+//!   [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
+//! - [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md)
+//!   and
+//!   [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
+//! - [Writers and concurrency](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md):
+//!   branch locks, awaited writes, coalescing and several processes.
+//! - [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+//!   and [Limitations](https://github.com/archlemon/ferro/blob/main/docs/guide/limitations.md).
 //!
-//! [The documentation index](docs/README.md) lists the internals, which describe how each part
-//! works and what it costs.
+//! [The documentation index](https://github.com/archlemon/ferro/blob/main/docs/README.md) lists the
+//! internals, which describe how each part works and what it costs.
 
 extern crate self as ferro;
 
