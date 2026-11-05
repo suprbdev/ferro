@@ -174,7 +174,8 @@ fn run(seed: u64, steps: usize, tally: &mut BTreeMap<&'static str, usize>) {
                 else {
                     continue;
                 };
-                let outcome = if rng.chance(50) {
+                let pulling = rng.chance(50);
+                let outcome = if pulling {
                     into.pull(&out, &remote, take_theirs)
                 } else {
                     let have = into.have().unwrap();
@@ -183,7 +184,8 @@ fn run(seed: u64, steps: usize, tally: &mut BTreeMap<&'static str, usize>) {
                 };
                 match outcome {
                     Ok(_) => *tally.entry("pulled").or_default() += 1,
-                    Err(Error::NoCommonAncestor | Error::StaleHave(_)) => {
+                    Err(Error::NoCommonAncestor) => *tally.entry("refused").or_default() += 1,
+                    Err(Error::StaleHave(_)) if !pulling => {
                         *tally.entry("refused").or_default() += 1;
                     }
                     Err(error) => panic!("{when}: d{to} {name} <- d{from} {source}: {error}"),

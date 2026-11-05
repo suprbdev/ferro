@@ -2155,6 +2155,167 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     b.verify_typed().unwrap();
 }
 
+type Pruning = Arc<Mutex<Option<Db<Root>>>>;
+
+fn prunes_once(at: &'static str, pruning: &Pruning, steps: &Arc<AtomicUsize>) -> Hook {
+    let (pruning, steps) = (pruning.clone(), steps.clone());
+    Hook(Arc::new(move |name| {
+        if name != at {
+            return;
+        }
+        steps.fetch_add(1, Ordering::SeqCst);
+        let db = pruning.lock().take();
+        if let Some(db) = db {
+            db.compact(Keep::Last(3)).unwrap();
+        }
+    }))
+}
+
+fn diverged_over_a_prunable_base(dir: &TempDir, hook: Hook) -> (Db<Root>, Db<Root>) {
+    let a = open(dir, "a.ferro");
+    let b: Db<Root> = fast().hook(hook).open(dir.path().join("b.ferro")).unwrap();
+    for (key, value) in [(1, "one"), (2, "two"), (3, "three")] {
+        put(&a, key, value);
+    }
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    b.drop_branch("a").unwrap();
+    put(&b, 4, "four");
+    put(&b, 5, "five");
+    put(&a, 6, "six");
+    (a, b)
+}
+
+fn keys(root: &Root) -> Vec<u64> {
+    root.iter().map(|(key, _)| key).collect()
+}
+
+#[derive(Debug)]
+enum Refused {
+    Ferro(Error),
+    Merge(usize),
+}
+
+impl From<Error> for Refused {
+    fn from(error: Error) -> Self {
+        Refused::Ferro(error)
+    }
+}
+
+#[test]
+fn a_try_pull_retries_a_stale_have_before_its_error_type_and_returns_its_merge_error_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pruning, bundled) = (Pruning::default(), Arc::new(AtomicUsize::new(0)));
+    let (a, b) = diverged_over_a_prunable_base(&dir, prunes_once("bundled", &pruning, &bundled));
+    let (head, before) = (b.head_hash(), bundled.load(Ordering::SeqCst));
+    *pruning.lock() = Some(b.clone());
+    let mut merges = Vec::new();
+    let refused = b.try_pull(&a, "a", |root, base, theirs| {
+        merges.push(base.version());
+        Err::<(String, ()), _>(Refused::Merge(theirs_win(root, base, theirs).1))
+    });
+    assert!(pruning.lock().is_none(), "the hook never pruned");
+    assert!(matches!(refused, Err(Refused::Merge(1))), "{refused:?}");
+    assert_eq!(merges, [3]);
+    assert_eq!(bundled.load(Ordering::SeqCst) - before, 2);
+    assert_eq!(b.head_hash(), head);
+    assert_eq!(b.log().first().map(|(version, _)| version), Some(3));
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    let pulled = b
+        .try_pull(&a, "a", |root, base, theirs| -> Result<_, Refused> {
+            Ok(theirs_win(root, base, theirs))
+        })
+        .unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    assert_eq!(pulled.objects, 0);
+    assert_eq!(bundled.load(Ordering::SeqCst) - before, 3);
+    assert_eq!(keys(&b.read()), [1, 2, 3, 4, 5, 6]);
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_push_whose_base_goes_before_it_lands_tries_again_and_merges_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pruning, received) = (Pruning::default(), Arc::new(AtomicUsize::new(0)));
+    let (a, b) = diverged_over_a_prunable_base(&dir, prunes_once("received", &pruning, &received));
+    let before = received.load(Ordering::SeqCst);
+    *pruning.lock() = Some(b.clone());
+    let mut merges = Vec::new();
+    let pushed = a
+        .push(&b, "a", |root, base, theirs| {
+            merges.push((keys(base), keys(theirs)));
+            theirs_win(root, base, theirs)
+        })
+        .unwrap();
+    assert!(pruning.lock().is_none(), "the hook never pruned");
+    assert_eq!(received.load(Ordering::SeqCst) - before, 2);
+    assert_eq!(merges, [(vec![1, 2, 3], vec![1, 2, 3, 6])]);
+    assert_eq!(pushed.outcome, Outcome::Merged);
+    assert_eq!(pushed.value, Some(1));
+    assert_eq!(pushed.version, 6);
+    assert_eq!(b.log().first().map(|(version, _)| version), Some(3));
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    assert_eq!(keys(&b.read()), [1, 2, 3, 4, 5, 6]);
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_pull_whose_have_goes_stale_on_every_attempt_gives_up_after_three() {
+    let dir = tempfile::tempdir().unwrap();
+    let moving: Arc<Mutex<Option<[Db<Root>; 2]>>> = Arc::default();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let (moving, attempts) = (moving.clone(), attempts.clone());
+        Hook(Arc::new(move |name| {
+            if name != "bundled" {
+                return;
+            }
+            let pair = moving.lock().clone();
+            let Some([a, b]) = pair else {
+                return;
+            };
+            let at = attempts.fetch_add(1, Ordering::SeqCst) as u64;
+            put(&b, 100 + at, "moved on");
+            let pulled = a.pull(&b, "b", refuse).unwrap();
+            assert_eq!(pulled.outcome, Outcome::FastForward);
+        }))
+    };
+    let a = open(&dir, "a.ferro");
+    let b: Db<Root> = fast()
+        .history(Keep::Last(1))
+        .reclaim(Reclaim { every_bytes: 0 })
+        .hook(hook)
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    put(&b, 1, "one");
+    a.pull(&b, "b", refuse).unwrap();
+    *moving.lock() = Some([a.clone(), b.clone()]);
+    let mut merges = 0;
+    let pulled = b.try_pull(&a, "a", |root, base, theirs| -> Result<_, Refused> {
+        merges += 1;
+        Ok(theirs_win(root, base, theirs))
+    });
+    moving.lock().take();
+    match pulled {
+        Err(Refused::Ferro(Error::StaleHave(message))) => {
+            assert!(message.contains("does not have"), "{message}");
+        }
+        other => panic!("a pull whose have went stale on every attempt: {other:?}"),
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(merges, 0);
+    assert_eq!(b.branches(), vec!["main".to_string()]);
+    assert_eq!(b.version(), 4);
+    assert_eq!(a.head_hash(), b.head_hash());
+    b.verify_typed().unwrap();
+    let pulled = b.pull(&a, "a", refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::UpToDate);
+    assert_eq!(b.branch("a").unwrap().head_hash(), b.head_hash());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
 fn pruned_events(path: &Path, keep: usize) -> Db<Events> {
     fast()
         .history(Keep::Last(keep))

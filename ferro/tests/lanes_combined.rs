@@ -869,7 +869,8 @@ impl Read for Paced {
 }
 
 fn receive_once(run: &Run, main: &Db<Mixed>, peer: &Db<Mixed>, round: u64) -> bool {
-    let outcome = if round.is_multiple_of(2) {
+    let pulling = round.is_multiple_of(2);
+    let outcome = if pulling {
         main.pull(peer, "peer", merge_mixed)
     } else {
         let bundle = peer.bundle(&main.have().unwrap()).unwrap();
@@ -890,7 +891,7 @@ fn receive_once(run: &Run, main: &Db<Mixed>, peer: &Db<Mixed>, round: u64) -> bo
             Outcome::UpToDate => "up to date",
             Outcome::Ahead => "ahead",
         }),
-        Err(Error::StaleHave(_)) => {
+        Err(Error::StaleHave(_)) if !pulling => {
             run.count("stale have");
             return false;
         }

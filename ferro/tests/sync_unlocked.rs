@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -481,6 +481,44 @@ fn a_base_pruned_between_placing_and_landing_fails_and_leaves_a_file_that_reclai
         Err(error) => panic!("a fresh pull failed: {error}"),
     }
     assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_pull_whose_base_is_pruned_between_placing_and_landing_tries_again_and_lands() {
+    let cell: Cell = Arc::default();
+    let placed = Arc::new(AtomicUsize::new(0));
+    let pruning = hooked(cell.clone(), "placed", prune_away_base);
+    let hook = {
+        let placed = placed.clone();
+        Hook(Arc::new(move |name| {
+            if name == "placed" {
+                placed.fetch_add(1, Ordering::SeqCst);
+            }
+            (pruning.0)(name);
+        }))
+    };
+    let options = fast()
+        .history(Keep::Last(1))
+        .reclaim(Reclaim { every_bytes: 0 })
+        .hook(hook);
+    let pair = Pair::new(2_000, 1_500, options);
+    let Pair { a, b, bundle, .. } = &pair;
+    let before = placed.load(Ordering::SeqCst);
+    *cell.lock() = Some(b.clone());
+    match b.pull(a, "a", merge_in) {
+        Ok(_) | Err(Error::NoCommonAncestor) => {}
+        Err(error) => panic!("a pull whose base went before it landed: {error}"),
+    }
+    assert!(cell.lock().is_none());
+    assert_eq!(placed.load(Ordering::SeqCst) - before, 2);
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    b.verify_typed().unwrap();
+    let reclaimed = b.compact(Keep::Last(1)).unwrap();
+    assert!(
+        reclaimed.after_bytes + bundle.len() as u64 / 2 < reclaimed.before_bytes,
+        "{reclaimed:?}"
+    );
     b.verify_typed().unwrap();
 }
 
