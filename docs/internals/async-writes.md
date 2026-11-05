@@ -85,9 +85,14 @@ recorded trace of awaited writes, some dropped after their closures ran, is cut 
 the unsynced writes kept, lost, half kept or torn, and every image must open at a version no older
 than the newest one acknowledged under Fsync. Another trace closes the database right after dropping
 polled futures and loses everything unsynced, and every write whose closure ran must still be there.
-`examples/chat` tests the same under tokio: hundreds of tasks on a current-thread runtime,
-`timeout(Duration::ZERO, ..)` and `abort` landing exactly the writes whose closures ran, and awaited
-tasks beside `spawn_blocking` writers.
+Polled from one thread, no write is on its way to the lane while another's closure runs, so awaited
+writes share a group only while a sync is running. `coalesced_async_writes_share_versions` used to
+leave that to the sync thread, and under heavy load, when that thread got no CPU while the writes
+were first polled, it saw a version for each of its 200 writes. It now holds a blocking writer at
+the hook's `leading` step, so a sync is running while every write is polled, and all 200 must share
+one version. `examples/chat` tests the same under tokio: hundreds of tasks on a current-thread
+runtime, `timeout(Duration::ZERO, ..)` and `abort` landing exactly the writes whose closures ran,
+and awaited tasks beside `spawn_blocking` writers.
 
 ## Measurements
 
