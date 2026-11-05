@@ -43,6 +43,12 @@ struct Kind {
     cached: usize,
     lent: usize,
     drop: unsafe fn(NonNull<u8>),
+    last: unsafe fn(NonNull<u8>),
+}
+
+pub struct Dead {
+    ptr: NonNull<u8>,
+    drop: unsafe fn(NonNull<u8>),
 }
 
 unsafe impl<T: Send + Sync> Send for Shared<T> {}
@@ -57,6 +63,8 @@ unsafe impl Send for Erased {}
 
 unsafe impl Sync for Erased {}
 
+unsafe impl Send for Dead {}
+
 impl<T> Inner<T> {
     #[inline]
     unsafe fn release_weak(inner: *mut Inner<T>) {
@@ -66,12 +74,51 @@ impl<T> Inner<T> {
         }
     }
 
+    #[inline]
+    unsafe fn lend_to(inner: *mut Inner<T>, hazard: &AtomicPtr<()>) -> NonNull<T> {
+        hazard.store(inner.cast(), Ordering::SeqCst);
+        let lent = unsafe { &(*inner).lent };
+        if !lent.load(Ordering::Relaxed) {
+            lent.store(true, Ordering::SeqCst);
+        }
+        unsafe { NonNull::new_unchecked(&raw mut (*inner).data) }
+    }
+
     #[inline(never)]
     unsafe fn drop_slow(inner: *mut Inner<T>) {
         unsafe { (*inner).strong.load(Ordering::Acquire) };
+        if unsafe { (*inner).lent.load(Ordering::Relaxed) }
+            && crate::epoch::hazarded_at(inner.addr())
+        {
+            unsafe { Inner::defer(inner) };
+        } else {
+            unsafe { Inner::drop_final(inner) };
+        }
+    }
+
+    unsafe fn drop_final(inner: *mut Inner<T>) {
         unsafe { ptr::drop_in_place(&raw mut (*inner).data) };
         unsafe { Inner::release_weak(inner) };
     }
+
+    #[cold]
+    unsafe fn defer(inner: *mut Inner<T>) {
+        let dead = Dead {
+            ptr: unsafe { NonNull::new_unchecked(inner.cast()) },
+            drop: Inner::<T>::drop_last,
+        };
+        crate::epoch::defer(dead, size_of::<Inner<T>>());
+    }
+
+    unsafe fn drop_last(ptr: NonNull<u8>) {
+        let inner = ptr.cast::<Inner<T>>().as_ptr();
+        unsafe { (*inner).strong.load(Ordering::Acquire) };
+        unsafe { Inner::drop_final(inner) };
+    }
+}
+
+pub(crate) unsafe fn is_dead(inner: *const ()) -> bool {
+    unsafe { (*inner.cast::<AtomicUsize>()).load(Ordering::Acquire) == 0 }
 }
 
 impl<T> Shared<T> {
@@ -261,7 +308,13 @@ impl<T: Any + Send + Sync> Shared<T> {
         cached: offset_of!(Inner<T>, cached),
         lent: offset_of!(Inner<T>, lent),
         drop: Shared::<T>::drop_erased,
+        last: Inner::<T>::drop_last,
     };
+
+    #[inline]
+    pub(crate) fn lend_to(this: &Self, hazard: &AtomicPtr<()>) -> NonNull<T> {
+        unsafe { Inner::lend_to(this.ptr.as_ptr(), hazard) }
+    }
 
     pub(crate) fn erase(this: Self) -> Erased {
         let this = ManuallyDrop::new(this);
@@ -350,6 +403,35 @@ impl Erased {
 
     pub(crate) fn addr(&self) -> usize {
         self.ptr.addr().get()
+    }
+
+    pub(crate) fn release_count(self) -> Option<Dead> {
+        let this = ManuallyDrop::new(self);
+        if this.strong().fetch_sub(1, Ordering::Release) != 1 {
+            return None;
+        }
+        this.strong().load(Ordering::Acquire);
+        let dead = Dead {
+            ptr: this.ptr,
+            drop: this.kind.last,
+        };
+        if this.flag(this.kind.lent).load(Ordering::Relaxed) {
+            return Some(dead);
+        }
+        drop(dead);
+        None
+    }
+}
+
+impl Dead {
+    pub(crate) fn addr(&self) -> usize {
+        self.ptr.addr().get()
+    }
+}
+
+impl Drop for Dead {
+    fn drop(&mut self) {
+        unsafe { (self.drop)(self.ptr) };
     }
 }
 
@@ -455,6 +537,11 @@ impl<T: Send + Sync + 'static> Weak<T> {
         hazard.store(ptr::null_mut(), Ordering::Release);
         None
     }
+
+    #[inline]
+    pub(crate) unsafe fn lend_held(&self, hazard: &AtomicPtr<()>) -> NonNull<T> {
+        unsafe { Inner::lend_to(self.ptr.as_ptr(), hazard) }
+    }
 }
 
 impl<T> Clone for Weak<T> {
@@ -481,7 +568,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::epoch::{self, HAZARDS, Hazards};
+    use crate::epoch::{self, HAZARDS, Hazards, ROOT};
 
     #[derive(Debug)]
     struct Counted {
@@ -631,6 +718,28 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let guard = epoch::pin().unwrap();
         assert!(weak.lend(&guard).is_none());
+    }
+
+    #[test]
+    fn shared_a_lent_owner_waits_for_the_hazard_on_it() {
+        let (counted, _, drops) = Counted::new(9);
+        let owner = Shared::new(counted);
+        let hazards = Hazards::new().unwrap();
+        let lent = Shared::lend_to(&owner, hazards.entry(ROOT));
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        epoch::flush();
+        assert_eq!(unsafe { lent.as_ref() }.value, 9);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(hazards);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let (counted, _, drops) = Counted::new(10);
+        let owner = Shared::new(counted);
+        let hazards = Hazards::new().unwrap();
+        Shared::lend_to(&owner, hazards.entry(ROOT));
+        drop(hazards);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

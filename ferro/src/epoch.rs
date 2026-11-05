@@ -1,17 +1,20 @@
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::shared::Erased;
+use crate::shared::{self, Dead, Erased};
 
 const BATCH: usize = 128;
 const BATCH_BYTES: usize = 64 << 10;
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
 pub(crate) const HAZARDS: usize = 8;
+pub(crate) const STORE: usize = 0;
+pub(crate) const ROOT: usize = 1;
 const SPARE_RECORDS: usize = 8;
 const MAX_RECORDS: usize = 4096;
 
@@ -21,10 +24,36 @@ static FREEING: AtomicUsize = AtomicUsize::new(0);
 static RECORDS: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
 static SPARE: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
 
+enum Value {
+    Counted(ManuallyDrop<Erased>),
+    Dead(Dead),
+}
+
 struct Retired {
     epoch: u64,
     bytes: usize,
-    value: Erased,
+    value: Value,
+}
+
+impl Retired {
+    fn addr(&self) -> usize {
+        match &self.value {
+            Value::Counted(value) => value.addr(),
+            Value::Dead(value) => value.addr(),
+        }
+    }
+
+    fn release(self) -> Option<(Dead, usize)> {
+        match self.value {
+            Value::Counted(value) => ManuallyDrop::into_inner(value)
+                .release_count()
+                .map(|dead| (dead, self.bytes)),
+            Value::Dead(value) => {
+                drop(value);
+                None
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -40,7 +69,7 @@ impl Pending {
         let freed: Vec<Retired> = self
             .items
             .extract_if(.., |item| {
-                item.epoch < oldest && hazards.binary_search(&item.value.addr()).is_err()
+                item.epoch < oldest && hazards.binary_search(&item.addr()).is_err()
             })
             .collect();
         self.bytes -= freed.iter().map(|item| item.bytes).sum::<usize>();
@@ -181,6 +210,10 @@ impl Hazards {
 
 impl Drop for Hazards {
     fn drop(&mut self) {
+        let dead = [STORE, ROOT].into_iter().any(|index| {
+            let held = self.record.entries[index].load(Ordering::Relaxed);
+            !held.is_null() && unsafe { shared::is_dead(held) }
+        });
         for entry in &self.record.entries {
             entry.store(ptr::null_mut(), Ordering::Release);
         }
@@ -198,7 +231,18 @@ impl Drop for Hazards {
         if !kept {
             SPARE.lock().push(record);
         }
+        if dead {
+            flush();
+        }
     }
+}
+
+pub(crate) fn hazarded_at(addr: usize) -> bool {
+    RECORDS
+        .lock()
+        .iter()
+        .flat_map(|record| &record.entries)
+        .any(|entry| entry.load(Ordering::SeqCst).addr() == addr)
 }
 
 fn hazarded() -> Vec<usize> {
@@ -215,6 +259,14 @@ fn hazarded() -> Vec<usize> {
 }
 
 pub(crate) fn retire(value: Erased, bytes: usize) {
+    push(Value::Counted(ManuallyDrop::new(value)), bytes);
+}
+
+pub(crate) fn defer(value: Dead, bytes: usize) {
+    push(Value::Dead(value), bytes);
+}
+
+fn push(value: Value, bytes: usize) {
     let item = Retired {
         epoch: EPOCH.load(Ordering::SeqCst),
         bytes,
@@ -252,7 +304,28 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
     let counted = FREEING_HERE
         .try_with(|here| here.set(here.get() + count))
         .is_ok();
-    drop(freed);
+    let dying: Vec<(Dead, usize)> = freed.into_iter().filter_map(Retired::release).collect();
+    if !dying.is_empty() {
+        let held = hazarded();
+        let (kept, gone): (Vec<_>, Vec<_>) = dying
+            .into_iter()
+            .partition(|(dead, _)| held.binary_search(&dead.addr()).is_ok());
+        drop(gone);
+        if !kept.is_empty() {
+            let epoch = EPOCH.load(Ordering::SeqCst);
+            let mut pending = slot.pending.lock();
+            for (value, bytes) in kept {
+                pending.bytes += bytes;
+                pending.kept_bytes += bytes;
+                pending.kept += 1;
+                pending.items.push(Retired {
+                    epoch,
+                    bytes,
+                    value: Value::Dead(value),
+                });
+            }
+        }
+    }
     if counted {
         let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));
     }
@@ -268,6 +341,17 @@ fn oldest(skip: Option<&'static Slot>) -> u64 {
         .map(|slot| slot.epoch.load(Ordering::SeqCst))
         .filter(|epoch| *epoch != 0)
         .fold(bumped, u64::min)
+}
+
+#[cfg(test)]
+pub(crate) fn free_after(between: impl FnOnce()) {
+    let oldest = oldest(None);
+    let hazards = hazarded();
+    between();
+    let slots: Vec<&'static Slot> = SLOTS.lock().clone();
+    for slot in slots {
+        free(slot, oldest, &hazards);
+    }
 }
 
 pub(crate) fn flush() {

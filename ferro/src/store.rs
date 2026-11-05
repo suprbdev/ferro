@@ -5,10 +5,11 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::ErrorKind;
 use std::mem;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
-use crate::shared::{Erased, Shared};
+use crate::shared::{Erased, Shared, Weak};
 
 const MAGIC: &[u8; 8] = b"FERRODB3";
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
@@ -1070,7 +1071,30 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct Store {
-    inner: Arc<Inner>,
+    inner: Shared<Inner>,
+}
+
+pub(crate) struct Lent {
+    store: ManuallyDrop<Store>,
+    owned: bool,
+}
+
+impl Deref for Lent {
+    type Target = Store;
+
+    #[inline]
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl Drop for Lent {
+    #[inline]
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe { ManuallyDrop::drop(&mut self.store) };
+        }
+    }
 }
 
 pub(crate) struct Closing(pub(crate) Store);
@@ -1184,7 +1208,7 @@ impl Store {
         let head = sb.head;
         let file = Traced::new(file, options.trace.clone())?;
         let store = Store {
-            inner: Arc::new(Inner {
+            inner: Shared::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
                 path: kept,
                 file,
@@ -1255,7 +1279,24 @@ impl Store {
     }
 
     pub(crate) fn retired(&self) -> Retired {
-        Retired(Arc::downgrade(&self.inner))
+        Retired(Shared::downgrade(&self.inner))
+    }
+
+    #[inline]
+    pub(crate) fn lend(&self, hazard: Option<&AtomicPtr<()>>) -> Lent {
+        let Some(hazard) = hazard else {
+            return Lent {
+                store: ManuallyDrop::new(self.clone()),
+                owned: true,
+            };
+        };
+        Shared::lend_to(&self.inner, hazard);
+        Lent {
+            store: ManuallyDrop::new(Store {
+                inner: unsafe { Shared::from_raw(Shared::as_ptr(&self.inner)) },
+            }),
+            owned: false,
+        }
     }
 
     #[doc(hidden)]
