@@ -1,10 +1,10 @@
 # Schema evolution, unique and covering indexes
 
 How the derive macros encode a struct so that it can change, how unique indexes keep their
-constraint through inserts, updates and merges, how a covering index stores fields beside its
-entries and what that costs, how a table knows which stored indexes it can read, and how lookups on
-several indexes combine. The API is in [Changing your types](../guide/schema-evolution.md) and
-[Tables and indexes](../guide/tables.md).
+constraint through inserts, updates and merges and list their rows by range, how a covering index
+stores fields beside its entries and what that costs, how a table knows which stored indexes it can
+read, and how lookups on several indexes combine. The API is in [Changing your
+types](../guide/schema-evolution.md) and [Tables and indexes](../guide/tables.md).
 
 ## Schema evolution
 
@@ -18,8 +18,9 @@ described under [Index fingerprints](#index-fingerprints).
 
 `#[unique]` on a field, or `#[unique(a, b)]` on the struct for a combination of fields, adds a
 `Map<value, key>` to the generated table, with `by_x(&value)` for the row, `key_by_x(&value)` for
-the key alone, and `unique_x()` for the whole map. On an `Option<T>` field `None` is not indexed, so
-any number of rows can leave it empty.
+the key alone, `by_x_range(range)` and a composite's `by_a_b_prefix(&a)` for rows in value order,
+as described under [Ranges and prefixes](#ranges-and-prefixes), and `unique_x()` for the whole map.
+On an `Option<T>` field `None` is not indexed, so any number of rows can leave it empty.
 
 A clash cannot be repaired where it is found. `Table::insert` returns the old row and has no error
 channel, and the two ways of carrying on are both wrong: last writer wins deletes a row nobody
@@ -50,6 +51,68 @@ version does not open until the data or the attribute changes. The rebuild reads
 `table::stored_rows`, which returns a damaged row node as an error, so `Db::open` fails with it
 instead of panicking.
 
+### Ranges and prefixes
+
+`by_x_range(range)` and, on a composite, `by_a_b_prefix(&a)` return an `IndexIter`, so the rows of
+a unique index come with `keys`, `covered`, `uncovered`, both ends, a length known at once and a
+place in `and` and `or`, as a non-unique index's do. The derive builds the walk itself, with
+`Map::range` on the index for a range and `Map::range_by` on the value's first field for a prefix,
+and hands the `Iter` to `table::unique_rows`, or `unique_rows_covered` with the projection
+`covered_by_x` uses. Rows come in value order, and a composite's prefix by the fields after the
+first. The bounds borrow as the value type does, so a `String` index takes `&str` bounds, and on an
+`Option<X>` field they are bounds of `X`, since `None` has no entry.
+
+The cursor behind every other lookup reads the primary key out of a `(value, key)` entry's own key
+and reads the leaf's values only for `covered`. A unique index keeps the key in the value, so its
+lookups put a cursor of their own in the `IndexIter`'s box. `Holders` steps an `Iter<V, Key>` and
+clones the key it reads in place from the leaf's values. `CoveredHolders` steps an `Iter<V, (Key,
+S)>` and clones the key alone for `keys` and for rows, or the key and the stored fields for
+`covered`. A value whose encoding passes 512 bytes is stored apart from the leaf, as [Spilled
+values](tree.md#spilled-values) describes, so a cover list whose fields pass that loads the value
+for every key it yields, `keys` included. The rows are read through the finder every other lookup
+uses, which keeps the last leaf it found.
+
+A range of a unique index is not in key order, so it joins a combination as a range of a
+non-unique one does: its keys and covered fields are read in full and sorted. The `find()` view has
+no unique lookups. `key_by_x` gives the one key of a value, and a range in the view would be
+collected and sorted all the same, which passing the `IndexIter` to `and` or `or` already does.
+There is no `by_x_after` or `by_x_counts`, since a value has one row: the page after a value is a
+range that excludes it.
+
+`unique_range.rs` checks every range over a few bounds, inverted and empty ones among them, and
+every prefix of six unique indexes, plain and covering, on `String`, integer and `Option` fields and
+on composites, against a `BTreeMap` of random rows, read as rows, keys and covered fields from
+either end and from both at once, in memory and from the file, and in `and` and `or` with a `find()`
+lookup.
+
+### What ranges and prefixes cost
+
+The lookups that existed are the code they were. `IndexIter::over` and the entry cursor did not
+change, and the new lookups are generic methods, which produce no code in a crate that does not
+call them. Built before and after, the `bench-tables` and `bench-combine` binaries disassemble to
+the same instructions in every function, apart from addresses, padding, the `TypeId` constants that
+change with the crate's hash and the names of anonymous constants. Over six alternating runs of
+each build, `bench-tables`, whose booking model has unique indexes that now get the new lookups
+unused, ran a hold in 639,954 instructions against 640,190 before, a confirm in 823,700 against
+823,692 and a cancel in 1,019,316 against 1,018,913, medians, and wrote the same 13,362 bytes a
+commit. Its wall times came within 1% of the build before, run by run. The 156 cases and strategies
+of `bench-combine` ran within 0.22% of the instructions they ran before. Their times moved with the
+load of a machine shared with other work, by more than twice between runs of one build, and the
+median ratio of each run to the run of the other build beside it was 0.984 over those six runs and
+1.031 over four earlier ones.
+
+The new lookups cost less than the walk they replace. A program written for the measurement built
+200,000 rows, whose 10,000 rooms hold about 20 nights each under keys scattered across the table,
+and read them after a compaction with the 1 GiB cache. `by_room_night_prefix(&room)` read a room's
+rows in 3.0 to 3.3 µs over two runs, where walking `unique_room_night().range((room, 0)..=(room,
+u32::MAX))` and calling `get` with each key took 3.7 to 3.9 µs. It ran 30,600 instructions against
+26,700, in less time, as the finder does for rows scattered across a table, described under [Sorted
+lookups and cursors](read-path.md#sorted-lookups-and-cursors). Its keys alone took 333 to 355 ns and
+5,265 instructions, against 477 to 519 ns and 6,531 for the map's `(value, key)` pairs, which clone
+each value and a `Val` of each key. On a covering `u64` index, 20 entries by `by_reference_range`
+took 3.3 to 3.6 µs as rows where the map and `get` took 3.8 to 4.6 µs, and 367 to 419 ns through
+`covered` where mapping the map's pairs to the same fields took 446 to 452 ns.
+
 ## Covering indexes
 
 A plain index is a `Map<(value, key), ()>`. `#[index(cover(a, b))]` makes it a `Map<(value, key),
@@ -64,7 +127,9 @@ lookup of an index, whether by value, range, cursor, prefix or `Some`, shares on
 Rows come through the `Finder` as before, `keys` reads only the keys, and `covered` reads each value
 in place in the leaf, clones it and builds the projection with a function the derive generates. It
 takes no count on the leaf's value column. `uncovered` wraps the cursor so the iterator's type no
-longer names the projection. A plain index passes a projection that is never called.
+longer names the projection. A plain index passes a projection that is never called. A unique
+index's range and prefix put a cursor over its map in the same box, as described under [Ranges and
+prefixes](#ranges-and-prefixes).
 
 The trait object costs a call through its vtable for every entry unless the compiler can see which
 cursor the box holds, which it can when the lookup is built in the function that reads it. So the
@@ -496,8 +561,8 @@ between processes. A page of 200 rows, `len` and `keys` ran the same, and every 
 - Even sizes run 1.3 times as long as a merge written for them. A seek inside the range iterator,
   climbing its frames as a cursor does, would let a walked side skip without building its range
   again, and both that and a cursor that steps backwards would live in `map.rs`.
-- A range or prefix lookup is read in full and sorted before it combines. A unique index has no
-  lookup in the view, since `key_by_x` gives its one key.
+- A range or prefix lookup, of a unique index as of a non-unique one, is read in full and sorted
+  before it combines. A unique index has no lookup in the view, since `key_by_x` gives its one key.
 - `Matches` knows only an upper bound on its length, through `size_hint`.
 - Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
   against 0.5 for the merge.

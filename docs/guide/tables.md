@@ -46,12 +46,30 @@ that `a`, ordered by `b`. Any of these can store fields beside the entries, as d
 
 `#[unique]` on a field, or `#[unique(a, b)]` on the struct, keeps a value held by one row at most.
 `by_slug(&value)` returns the row, `key_by_slug(&value)` only its key, and `unique_slug()` the whole
-index. `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash, and
-`try_update` otherwise returns `Ok` with what `update` would. `insert`,
-`update` and `get_mut` have no error channel, so they panic, which discards the transaction.
-`Table::merge` passes a clash to your `resolve` closure with `ours` set to the row holding the
-value, and asks about each key once at most. A row that still clashes after that keeps our row for
-its key, so a merge never panics on a clash.
+index. `by_slug_range(range)` returns the rows whose value lies in `range`, in value order, and a
+composite `#[unique(room, night)]` also has `by_room_night_prefix(&room)`, a room's rows ordered by
+night. A range of the composite reads one room's stays from a night on:
+
+```rust
+let from_tonight: Vec<_> = snapshot
+    .stays
+    .by_room_night_range((room, tonight)..=(room, Night::MAX))
+    .keys()
+    .collect();
+```
+
+Both return the same `IndexIter` as the lookups of a non-unique index, so they run from either end,
+and `.keys()` and `.covered()` read the index alone. On an `Option` field the range is over the
+inner type, and a row holding `None` is in none of them. There is no `by_slug_after` or
+`by_slug_counts`, since each value has one row: the page after a slug is
+`by_slug_range((Bound::Excluded(slug), Bound::Unbounded))`.
+
+`try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash, and `try_update`
+otherwise returns `Ok` with what `update` would. `insert`, `update` and `get_mut` have no error
+channel, so they panic, which discards the transaction. `Table::merge` passes a clash to your
+`resolve` closure with `ours` set to the row holding the value, and asks about each key once at
+most. A row that still clashes after that keeps our row for its key, so a merge never panics on a
+clash.
 
 ## Covering indexes
 
@@ -90,11 +108,11 @@ stored twice, so `#[index(cover(balance))] balance` stores exactly what `#[index
 lets `by_balance_range(..).covered()` return the balances without the rows. On a composite index,
 `#[index(customer, first, cover(first, total))]` lists a customer's rows by `first` with their
 totals through `by_customer_first_prefix(&customer).covered()`. `#[index(each, cover(...))]` stores
-the fields beside each element's entry. `#[unique(cover(...))]` stores them beside the key, and
-`covered_by_x(&value)` returns `Some((key, fields))`. An each index cannot cover the field it
-indexes, a unique index cannot cover its own fields, and no index covers the key, which every entry
-already holds, or a `#[ferro(skip)]` field. A cover list stores at most 12 fields besides the ones
-the index is keyed on.
+the fields beside each element's entry. `#[unique(cover(...))]` stores them beside the key,
+`covered_by_x(&value)` returns `Some((key, fields))`, and `by_x_range(..).covered()` the pairs in
+value order. An each index cannot cover the field it indexes, a unique index cannot cover its own
+fields, and no index covers the key, which every entry already holds, or a `#[ferro(skip)]` field. A
+cover list stores at most 12 fields besides the ones the index is keyed on.
 
 The tuple follows the list, so reordering two covered fields of one type swaps them in code that
 destructures the tuple, and the compiler cannot tell.
@@ -137,10 +155,11 @@ When one has at least four times the keys of the other, only the smaller is walk
 keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where walking both took
 600 µs.
 
-A lookup made on the table itself, such as `by_x_range` or `by_x_prefix`, can be passed to `and`
-or `or` too, but it is not in key order, so its keys are read in full and sorted first. A
-combination reads the indexes as they were when you built it, like any lookup. [Combining
-lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
+A lookup made on the table itself, such as `by_x_range` or `by_x_prefix` of a unique or a non-unique
+index, can be passed to `and` or `or` too, but it is not in key order, so its keys are read in full
+and sorted first. A combination reads the indexes as they were when you built it, like any lookup.
+[Combining lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the
+measurements.
 
 ## Lookups
 

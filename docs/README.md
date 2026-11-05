@@ -50,7 +50,7 @@ on one idle machine. Start with [Getting started](guide/getting-started.md).
 | [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice and type checks |
 | [Reclamation](internals/reclamation.md) | Cycles, generations, crashes, measurements and offline compaction |
 | [Windows](internals/windows.md) | Locks, durability and renaming over an open file |
-| [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints, covered fields and their cost, index fingerprints and combined lookups |
+| [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints and ranges, covered fields and their cost, index fingerprints and combined lookups |
 | [Errors and checks on local reads](internals/errors.md) | Panics, `Result` and bounds on crafted files |
 | [Fuzzing and testing](internals/testing.md) | Fuzz targets, and where the other tests are described |
 | [A delta log between checkpoints](internals/delta-log.md) | A design that was built, measured and left out |
