@@ -1,3 +1,13 @@
+//! Watchers: subscriptions to a branch's new snapshots.
+//!
+//! [`Db::watch`](crate::Db::watch), [`Db::watch_when`](crate::Db::watch_when) and
+//! [`Db::watch_changes`](crate::Db::watch_changes) return a [`Watcher`]. Each branch has one feed
+//! that holds its newest snapshot. A commit stores its snapshot there and wakes the branch's watch
+//! thread, so it costs the same with no watchers or ten thousand and never waits for a filter. A
+//! watcher receives by blocking, with a timeout, without waiting, or by awaiting [`Changed`], and
+//! a [`Closer`] ends it from any thread. [Watchers](docs/internals/watchers.md) in the internals
+//! describes the feed and the watch thread.
+
 use std::fmt;
 use std::future::Future;
 use std::mem;
@@ -17,9 +27,13 @@ use crate::db::Snapshot;
 type Each<T> = Box<dyn Fn(&Snapshot<T>) -> bool + Send + Sync>;
 type Pair<T> = Box<dyn Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync>;
 
+/// Which snapshots a watcher hands out.
 pub(crate) enum Filter<T> {
+    /// Every one.
     All,
+    /// Those that pass the test.
     When(Each<T>),
+    /// Those that pass the test against the snapshot the watcher handed out last.
     Changes(Pair<T>),
 }
 
@@ -107,6 +121,10 @@ struct Plan<T> {
     closed: bool,
 }
 
+/// What publishing a snapshot leaves to do: wake the branch's watch thread and free the snapshot
+/// the feed replaced.
+///
+/// Both happen when it is dropped, so a publisher keeps it until it has released its locks.
 #[must_use]
 pub(crate) struct Notice<T> {
     feed: Option<Arc<Feed<T>>>,
@@ -122,6 +140,7 @@ impl<T> Drop for Notice<T> {
     }
 }
 
+/// A branch's newest snapshot and the watchers waiting on it.
 pub(crate) struct Feed<T> {
     slot: Mutex<Slot<T>>,
     fresh: Condvar,
@@ -132,6 +151,7 @@ pub(crate) struct Feed<T> {
 }
 
 impl<T> Feed<T> {
+    /// A feed holding `current`, which the watchers made from it start at.
     pub(crate) fn new(current: Snapshot<T>) -> Self {
         Feed {
             slot: Mutex::new(Slot {
@@ -151,6 +171,10 @@ impl<T> Feed<T> {
         }
     }
 
+    /// Makes `snapshot` the newest and wakes the watchers that take every snapshot.
+    ///
+    /// Filtered and async watchers wake when the returned [`Notice`] is dropped. A closed feed
+    /// keeps nothing.
     pub(crate) fn publish(self: &Arc<Self>, snapshot: Snapshot<T>) -> Notice<T> {
         let mut slot = self.slot.lock();
         if slot.closed {
@@ -178,6 +202,8 @@ impl<T> Feed<T> {
         }
     }
 
+    /// Replaces the newest snapshot with `snapshot` of the same version, read from another file,
+    /// without waking any watcher.
     pub(crate) fn rebind(&self, snapshot: Snapshot<T>) {
         let mut slot = self.slot.lock();
         let replaced = match slot.closed {
@@ -188,6 +214,7 @@ impl<T> Feed<T> {
         drop(replaced);
     }
 
+    /// Ends every watcher of the feed and stops its watch thread.
     pub(crate) fn close(&self) {
         let mut slot = self.slot.lock();
         slot.closed = true;
@@ -436,6 +463,33 @@ impl<T: Send + Sync + 'static> Feed<T> {
     }
 }
 
+/// A handle that ends a [`Watcher`] and its clones from any thread, without a commit.
+///
+/// [`Watcher::closer`] makes one, and clones of it end the same watcher. Closing wakes every
+/// receive and every [`Changed`] waiting on that watcher, and they return an error. Other watchers
+/// of the branch are not affected.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpsc::TryRecvError;
+///
+/// use ferro::Db;
+///
+/// # fn main() -> ferro::Result<()> {
+/// # let dir = tempfile::tempdir()?;
+/// # let path = dir.path().join("count.ferro");
+/// let db = Db::<u64>::open(&path)?;
+/// let watcher = db.watch();
+/// let other = db.watch();
+///
+/// watcher.closer().close();
+/// db.update(|count| *count = 1)?;
+/// assert!(matches!(watcher.try_recv(), Err(TryRecvError::Disconnected)));
+/// assert_eq!(*other.try_recv().expect("a new version"), 1);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Closer<T> {
     feed: Arc<Feed<T>>,
     gate: Arc<Gate<T>>,
@@ -459,6 +513,9 @@ impl<T> fmt::Debug for Closer<T> {
 }
 
 impl<T> Closer<T> {
+    /// Ends the watcher and its clones, waking any that wait.
+    ///
+    /// Closing twice does nothing more.
     pub fn close(&self) {
         let slot = self.feed.slot.lock();
         self.gate.closed.store(true, Ordering::Release);
@@ -485,6 +542,21 @@ enum Look<T> {
     Nothing,
 }
 
+/// A subscription to the new snapshots of one branch.
+///
+/// A watcher starts at the version current when it was made, so its first receive waits for the
+/// next commit. It does not queue: each receive returns the newest snapshot it has not returned
+/// yet, so a slow consumer skips versions, costs the writers nothing and holds no backlog. As an
+/// [`Iterator`] it blocks on [`Watcher::recv`] and ends when the watcher does.
+///
+/// A watcher ends when its branch is dropped, when its [`Closer`] closes it, or when the last
+/// [`Db`](crate::Db) handle on the file is dropped; it does not keep the file open, and a snapshot
+/// it had not taken by then is lost. Clones share the closer, the filter and, for
+/// [`Db::watch_changes`](crate::Db::watch_changes), what was seen, and each keeps its own place.
+///
+/// # Panics
+///
+/// A receive that runs a filter on its own thread panics if the filter panics.
 pub struct Watcher<T> {
     feed: Arc<Feed<T>>,
     gate: Arc<Gate<T>>,
@@ -510,6 +582,7 @@ impl<T> fmt::Debug for Watcher<T> {
 }
 
 impl<T> Watcher<T> {
+    /// A watcher of `feed` that starts at its current snapshot.
     pub(crate) fn new(feed: Arc<Feed<T>>, filter: Filter<T>) -> Self {
         let slot = feed.slot.lock();
         let place = slot.published;
@@ -525,6 +598,7 @@ impl<T> Watcher<T> {
         }
     }
 
+    /// A [`Closer`] that ends this watcher and its clones.
     pub fn closer(&self) -> Closer<T> {
         Closer {
             feed: self.feed.clone(),
@@ -532,6 +606,11 @@ impl<T> Watcher<T> {
         }
     }
 
+    /// For a watcher from [`Db::watch_changes`](crate::Db::watch_changes), the snapshot its test
+    /// compares new ones with, and `None` for any other watcher.
+    ///
+    /// That is the snapshot it handed out last, or the one current when it was made, so a
+    /// consumer that starts from it misses nothing that lands meanwhile.
     pub fn seen(&self) -> Option<Snapshot<T>> {
         self.gate.seen.lock().as_ref().map(|(_, seen)| seen.clone())
     }
@@ -604,10 +683,22 @@ impl<T: Send + Sync + 'static> Watcher<T> {
         }
     }
 
+    /// Blocks until the branch's newest snapshot is newer than the last one this watcher returned
+    /// and passes its filter, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvError`] once the watcher has ended.
     pub fn recv(&self) -> Result<Snapshot<T>, RecvError> {
         self.take(Wait::Forever).map_err(|_| RecvError)
     }
 
+    /// Like [`Watcher::recv`], waiting at most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvTimeoutError::Timeout`] if nothing arrived in time, and
+    /// [`RecvTimeoutError::Disconnected`] once the watcher has ended.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Snapshot<T>, RecvTimeoutError> {
         let wait = match Instant::now().checked_add(timeout) {
             Some(deadline) => Wait::Until(deadline),
@@ -619,6 +710,14 @@ impl<T: Send + Sync + 'static> Watcher<T> {
         })
     }
 
+    /// Like [`Watcher::recv`], without waiting.
+    ///
+    /// A filtered watcher runs its test on the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// [`TryRecvError::Empty`] if there is nothing new that passes the filter, and
+    /// [`TryRecvError::Disconnected`] once the watcher has ended.
     pub fn try_recv(&self) -> Result<Snapshot<T>, TryRecvError> {
         self.take(Wait::Never).map_err(|stopped| match stopped {
             Stopped::Closed => TryRecvError::Disconnected,
@@ -626,6 +725,27 @@ impl<T: Send + Sync + 'static> Watcher<T> {
         })
     }
 
+    /// [`Watcher::recv`] as a future, for async code.
+    ///
+    /// It waits through a [`Waker`], so it runs on any executor and needs no thread of its own.
+    /// Dropping the future stops the wait.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// async fn follow(db: &Db<Map<String, u32>>) {
+    ///     let watcher = db.watch_changes(|seen, now| seen.get("anvil") != now.get("anvil"));
+    ///     let mut seen = watcher.seen().expect("a watch_changes watcher has seen a snapshot");
+    ///     while let Ok(now) = watcher.changed().await {
+    ///         for change in seen.diff(&now) {
+    ///             println!("{:?} changed", change.key());
+    ///         }
+    ///         seen = now;
+    ///     }
+    /// }
+    /// ```
     pub fn changed(&self) -> Changed<'_, T> {
         Changed {
             watcher: self,
@@ -642,6 +762,15 @@ impl<T: Send + Sync + 'static> Iterator for Watcher<T> {
     }
 }
 
+/// The future [`Watcher::changed`] returns.
+///
+/// It resolves as [`Watcher::recv`] returns: to the branch's newest snapshot once that is new to
+/// the watcher and passes its filter, or to [`RecvError`] once the watcher has ended. Dropping it
+/// stops the wait.
+///
+/// # Panics
+///
+/// A poll that runs the watcher's filter panics if the filter panics.
 #[must_use = "futures do nothing unless polled"]
 pub struct Changed<'a, T> {
     watcher: &'a Watcher<T>,
