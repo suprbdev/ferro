@@ -163,6 +163,8 @@ Tests are described next to what they test:
 - Power cuts across branch-table steps, a reader from before steps, and a file written before them:
   [Branch-table steps](commit-path.md#branch-table-steps).
 - Awaited writes, dropped futures and crash images: [Tests](async-writes.md#tests).
+- A coalesced group left for a member on its way, and the copies of the booking test, pinned and
+  beside busy loops, that hung on it: [Waking members](coalescing.md#waking-members).
 - Writes from inside a closure, `ferro/tests/reentry.rs` and `reentry_sync.rs`: [Writes from inside
   a closure](reentrancy.md#the-cases).
 - Model tests of best common ancestors: [Criss-crosses](merging.md#criss-crosses).
