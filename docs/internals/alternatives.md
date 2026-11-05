@@ -108,7 +108,8 @@ numbers. This index lists them by subsystem.
 
 ## Sync
 
-- Comparing every new root with the anchors at once: [What is sent](sync.md#what-is-sent).
+- Comparing every new root with the anchors at once, and expanding every node the next level names
+  or none of them: [What is sent](sync.md#what-is-sent).
 - Finding the merge base by content: [The merge base](sync.md#the-merge-base).
 - Undoing the landing after an `Err`: [Bringing the branch up](sync.md#bringing-the-branch-up).
 - Writing staged objects as frames while the bundle streams, copying in the landing frame, and

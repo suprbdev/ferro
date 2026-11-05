@@ -38,6 +38,7 @@ const PLACE_AT: usize = 256 << 10;
 const PIPE_CHUNKS: usize = 8;
 const PIPE_OBJECTS: usize = 256;
 const CACHED_LINKS: usize = 1 << 16;
+const MOVED_BUDGET: usize = 1 << 16;
 const UNRESOLVED: Ptr = Ptr {
     hash: [0; HASH_BYTES],
     offset: 0,
@@ -706,6 +707,7 @@ struct Difference {
     send: Sendable,
     links: HashMap<Hash, Vec<Ptr>>,
     cached: usize,
+    moved: usize,
 }
 
 fn difference(
@@ -721,6 +723,7 @@ fn difference(
         send: Sendable::new(),
         links: HashMap::new(),
         cached: 0,
+        moved: MOVED_BUDGET,
     };
     for (slot, root) in old_roots.iter().enumerate() {
         if found.known.find(&root.hash).is_none() {
@@ -744,12 +747,21 @@ impl Difference {
         let mut seen = HashSet::from([root.hash]);
         let mut expanded = HashSet::new();
         let mut fresh = vec![root];
+        let mut moved: Vec<Ptr> = Vec::new();
         loop {
             fresh.retain(|ptr| !self.classified(&ptr.hash));
             if fresh.is_empty() {
                 return Ok(());
             }
             if old.is_empty() {
+                moved.reverse();
+                while self.moved > 0
+                    && let Some(ptr) = moved.pop()
+                {
+                    if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
+                        self.expand(store, ptr, &mut moved, true)?;
+                    }
+                }
                 return self.reach(store, fresh);
             }
             old.sort_unstable_by_key(|ptr| ptr.hash);
@@ -772,35 +784,22 @@ impl Difference {
             starts.push(next.len());
             let mut deeper = Vec::new();
             for (at, ptr) in old.drain(..).enumerate() {
-                if linked[at] || seen.contains(&ptr.hash) || !expanded.insert(ptr.hash) {
-                    continue;
-                }
-                let links = match self.links.get(&ptr.hash) {
-                    Some(links) => links.clone(),
-                    None => store.read_links(ptr)?,
-                };
-                let mut parent = None;
-                for (index, link) in links.into_iter().enumerate() {
-                    if link.offset == 0 {
-                        continue;
-                    }
-                    if !self.classified(&link.hash) {
-                        let parent = match parent {
-                            Some(parent) => parent,
-                            None => {
-                                *parent.insert(self.known.find(&ptr.hash).ok_or_else(|| {
-                                    Error::Corrupt(
-                                        "sync expanded an object it had not classified".into(),
-                                    )
-                                })?)
-                            }
-                        };
-                        self.known
-                            .insert(link.hash, Origin::Child(parent, index as u32))?;
-                    }
-                    deeper.push(link);
+                if linked[at] {
+                    moved.push(ptr);
+                } else if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
+                    self.expand(store, ptr, &mut deeper, false)?;
                 }
             }
+            let mut below = Vec::new();
+            for ptr in mem::take(&mut moved) {
+                if self.moved == 0 {
+                    break;
+                }
+                if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
+                    self.expand(store, ptr, &mut below, true)?;
+                }
+            }
+            moved = below;
             old = deeper;
             let tracking = !old.is_empty();
             let mut kept = 0;
@@ -821,6 +820,37 @@ impl Difference {
             next.truncate(kept);
             fresh = next;
         }
+    }
+
+    fn expand(&mut self, store: &Store, ptr: Ptr, out: &mut Vec<Ptr>, moved: bool) -> Result<()> {
+        let links = match self.links.get(&ptr.hash) {
+            Some(links) => links.clone(),
+            None => store.read_links(ptr)?,
+        };
+        let mut parent = None;
+        for (index, link) in links.into_iter().enumerate() {
+            if link.offset == 0 {
+                continue;
+            }
+            if moved {
+                if self.moved == 0 {
+                    break;
+                }
+                self.moved -= 1;
+            }
+            if !self.classified(&link.hash) {
+                let parent = match parent {
+                    Some(parent) => parent,
+                    None => *parent.insert(self.known.find(&ptr.hash).ok_or_else(|| {
+                        Error::Corrupt("sync expanded an object it had not classified".into())
+                    })?),
+                };
+                self.known
+                    .insert(link.hash, Origin::Child(parent, index as u32))?;
+            }
+            out.push(link);
+        }
+        Ok(())
     }
 
     fn reach(&mut self, store: &Store, mut stack: Vec<Ptr>) -> Result<()> {

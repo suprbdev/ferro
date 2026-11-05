@@ -52,13 +52,35 @@ copy went whole. Root by root it sends 12 objects and 7 KB.
 A `Map`'s shape depends only on its contents, so consecutive roots line up level by level. A change
 that adds or removes a level moves the unchanged subtrees one level up or down. The old side expands
 before the new side looks, so a subtree that sits one level deeper in the old tree is still found,
-and only one moved further is sent again. Before the old side expands a level, the new side reads
-the links of the level it is on, and the old side skips what they name. Where a change added a
-level, the new side is a level behind, and nothing the old side reached had been linked yet, so it
-used to expand the whole old tree. In a bulk load of five million objects in ten commits, the commit
-that added a level held 95 MiB besides its tables while it planned, and holds 26 now. Once the old
-side has nothing left to expand, the rest of the new tree is walked depth first, so a clone holds a
-path through it rather than its widest level.
+and one that sits two or more levels deeper is sent again. What the new side links at the level the
+old tree had it is found whole and not expanded, so an object under it that a new node links as
+well, such as a value the commit copied from a key it left alone, is sent again too.
+
+Before the old side expands a level, the new side reads the links of the level it is on. A node they
+name sits one level deeper in the new tree, which is where a change that added a level puts every
+unchanged node, and the new side will find it there whole. Where nothing the old side reached had
+been linked yet, it used to expand the whole old tree. In a bulk load of five million objects in ten
+commits, the commit that added a level held 95 MiB besides its tables while it planned, and held 26
+once the old side skipped the nodes the next level names. But the build before had found an object
+under such a node that a new node links too, and the skip sent it again: a commit of three new
+values and two copied ones into a map of 105 values of 200 KB sent 1,002,222 bytes in 14 objects,
+where the build before sent 602,212 in 12.
+
+The old side now keeps those nodes apart from the levels it compares and expands them a level at a
+time beside them, and depth first once the levels run out, recording what it reaches as known, until
+it has reached 65,536 objects in the bundle. It skips the rest as before, and an object under them
+is sent again. Pulling each commit of that bulk load on its own, the one that added a level planned
+with 45.5 MiB of heap in 0.53 s, against 42.4 MiB in 0.52 s with the skip and 170.6 MiB in 1.33 s
+expanding everything, and the three others the skip had helped with 25.6 to 27.5 MiB, against 23.5
+to 25.8 and 39.8 to 45.3.
+
+`a_commit_that_pushes_held_nodes_deeper_sends_only_what_the_receiver_lacks` in `ferro/tests/sync.rs`
+adds keys to the right of a map of 600 byte values, with a copy of one of its old values each time,
+until a commit adds a level, and expects that commit to send exactly the objects its tree reaches
+that the previous one did not, 48, where the skip sent 49.
+
+Once the old side has nothing left to expand, the rest of the new tree is walked depth first, so a
+clone holds a path through it rather than its widest level.
 
 A sent merge commit links the commit it merged, and the receiver needs that commit to find later
 merge bases. If the receiver named it in its have, its mark goes into the bundle's list of commits
@@ -313,8 +335,10 @@ The sender keeps, for each object it will send, its hash and offset, whether it 
 its state in the post-order walk, 30 bytes in columns, a slot in the same kind of table, and its
 place in the order, 4 bytes. A commit adds 80 bytes, and each object the old side reaches in an
 incremental pull its hash, its origin as a position and link index, and a slot, about 40. The
-comparison holds the level it is on while the old side has anything left to expand, and walks the
-rest of the new tree depth first.
+objects it reaches under nodes the next level names count toward 65,536 a bundle, so they add at
+most 2.5 MiB that stay until the plan is done, and about 4 MiB while a step expands them. The
+comparison holds the level it is on
+while the old side has anything left to expand, and walks the rest of the new tree depth first.
 
 Before, the receiver kept a map from hash to staging offset, 33 bytes a slot, and every check it
 made, by hash and type: an 81-byte slot, the 96-byte kind it was made under and, for a node, a
@@ -413,7 +437,10 @@ Measured and left out:
   happen to hold.
 - Each commit in a have is looked up in every branch of the sender, so recognising them costs the
   receiver's branches plus log n, times the sender's branches, times log n.
-- A subtree that moved more than one level deeper than where the receiver holds it is sent again.
+- A subtree that sits two or more levels deeper in the receiver's tree than in the new one is sent
+  again. So is an object a new node links that the receiver holds only under a node the new tree
+  links where the old one did, or under a node it moved one level deeper once the old side has
+  reached 65,536 objects there in the bundle.
 - A value that holds a `Ptr` into pruned history cannot be sent.
 - Each pull that brings a head `remote` does not hold replaces `remote`, including commits made on
   it here. If the remote branch's history no longer contains what was landed before, records under

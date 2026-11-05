@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use common::{Rng, cases, fast, text};
 use ferro::codec::{Encoder, HashSink, Object};
 use ferro::db::{Clock, Hook};
-use ferro::store::{Op, Trace};
+use ferro::store::{Op, Store, StoreOptions, Trace};
 use ferro::{
-    Bundle, Data, Db, Error, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Snapshot,
+    Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim,
+    Snapshot,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -117,6 +118,90 @@ fn a_branch_that_has_not_moved_fast_forwards_and_sends_only_new_objects() {
         "{second:?} against {first:?}"
     );
     assert!(second.objects < 30, "{second:?}");
+    b.verify().unwrap();
+}
+
+fn object_graph(path: &Path, scratch: &Path) -> HashMap<Hash, Vec<Hash>> {
+    fs::copy(path, scratch).unwrap();
+    let options = StoreOptions {
+        read_only: true,
+        ..StoreOptions::default()
+    };
+    let (store, head) = Store::open(scratch, options).unwrap();
+    let mut graph = HashMap::new();
+    store
+        .walk(head.unwrap(), |ptr, object| {
+            let links = object.links.iter().map(|link| link.hash).collect();
+            graph.insert(ptr.hash, links);
+        })
+        .unwrap();
+    store.close();
+    graph
+}
+
+fn reached(graph: &HashMap<Hash, Vec<Hash>>, from: Hash) -> HashSet<Hash> {
+    let mut seen = HashSet::from([from]);
+    let mut stack = vec![from];
+    while let Some(hash) = stack.pop() {
+        for link in &graph[&hash] {
+            if seen.insert(*link) {
+                stack.push(*link);
+            }
+        }
+    }
+    seen
+}
+
+fn depth(graph: &HashMap<Hash, Vec<Hash>>, hash: Hash) -> usize {
+    let below = graph[&hash].iter().map(|link| depth(graph, *link));
+    1 + below.max().unwrap_or(0)
+}
+
+#[test]
+fn a_commit_that_pushes_held_nodes_deeper_sends_only_what_the_receiver_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
+    let scratch = dir.path().join("graph.ferro");
+    let value = |key: u64| text(key, 600);
+    a.commit("seed", |root| {
+        for key in 0..64 {
+            root.insert(key, value(key));
+        }
+    })
+    .unwrap();
+    b.pull(&a, "a", refuse).unwrap();
+    let mut deeper = 0;
+    for round in 0..64u64 {
+        let (held_tip, held_root) = (a.head_hash().unwrap(), a.read().root_hash().unwrap());
+        let copied = value(round);
+        a.commit(format!("grow {round}"), |root| {
+            for key in 0..32 {
+                let key = (1 << 20) + round * 32 + key;
+                root.insert(key, value(key));
+            }
+            root.insert(1 << 40 | round, copied.clone());
+        })
+        .unwrap();
+        let pulled = b.pull(&a, "a", refuse).unwrap();
+        let root = a.read().root_hash().unwrap();
+        let graph = object_graph(&dir.path().join("a.ferro"), &scratch);
+        if depth(&graph, root) <= depth(&graph, held_root) {
+            continue;
+        }
+        deeper += 1;
+        let held = reached(&graph, graph[&held_tip][0]);
+        let tree = reached(&graph, graph[&a.head_hash().unwrap()][0]);
+        let shared = ferro::hash_of(&copied);
+        assert!(held.contains(&shared), "round {round}");
+        let fresh = tree.iter().filter(|hash| !held.contains(*hash));
+        let linked = fresh.clone().any(|hash| graph[hash].contains(&shared));
+        assert!(linked, "round {round}");
+        let lacked = 1 + fresh.count();
+        println!("round {round} added a level: {pulled:?}, {lacked} objects lacked");
+        assert_eq!(pulled.objects as usize, lacked, "round {round}");
+    }
+    assert!(deeper >= 1, "{deeper} rounds added a level");
+    assert_eq!(dump(&b.read()), dump(&a.read()));
     b.verify().unwrap();
 }
 
