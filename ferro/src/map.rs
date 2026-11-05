@@ -1232,6 +1232,36 @@ fn reach<'a, 'g, K: Data, V: Data, S: Data>(
     fetch_link(store, link, depth)
 }
 
+#[inline(always)]
+fn owned_by<K, V, S>(link: &Link<K, V, S>) -> Option<&Node<K, V, S>> {
+    match link {
+        Link::Mem(node, _) => Some(node),
+        Link::Stored { memo, .. } => match memo.get()? {
+            Memo::Pinned(node) => Some(node),
+            Memo::Weak(..) => None,
+        },
+        Link::Empty => None,
+    }
+}
+
+#[inline(always)]
+fn held<'g, K: Data, V: Data, S: Data>(
+    link: &'g Link<K, V, S>,
+    guard: Option<&'g Guard>,
+) -> Option<&'g Node<K, V, S>> {
+    match link {
+        Link::Mem(node, _) => Some(node),
+        Link::Stored { memo, .. } => match memo.get()? {
+            Memo::Pinned(node) => Some(node),
+            Memo::Weak(weak, hint) => {
+                hint.prefetch(weak);
+                weak.lend(guard?)
+            }
+        },
+        Link::Empty => None,
+    }
+}
+
 enum At<'g, K, V, S> {
     Ref(&'g Node<K, V, S>),
     Shared(Shared<Node<K, V, S>>),
@@ -2957,10 +2987,28 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V, S>) -> Visit<R>) -> Result<Option<R>> {
         let store = self.store();
+        let mut depth = 0;
+        let mut link = &self.root;
+        while let Some(node) = owned_by(link) {
+            depth += 1;
+            match visit(node) {
+                Visit::Done(result) => return Ok(Some(result)),
+                Visit::Descend(position) => link = node.child(position),
+            }
+        }
+        if let Link::Empty = link {
+            return Ok(None);
+        }
         let guard = epoch::pin();
         let guard = guard.as_ref();
-        let mut depth = 0;
-        let Some(mut at) = At::of(reach(store, &self.root, depth, guard)?) else {
+        while let Some(node) = held(link, guard) {
+            depth += 1;
+            match visit(node) {
+                Visit::Done(result) => return Ok(Some(result)),
+                Visit::Descend(position) => link = node.child(position),
+            }
+        }
+        let Some(mut at) = At::of(reach(store, link, depth, guard)?) else {
             return Ok(None);
         };
         loop {
