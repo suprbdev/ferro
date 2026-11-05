@@ -15,8 +15,9 @@ const WRITERS: u64 = 8;
 const WRITER_COMMITS: u64 = 200;
 const READERS: u64 = 8;
 const ROUNDS: usize = 3;
-const ENGINES: [&str; 6] = [
+const ENGINES: [&str; 7] = [
     "ferro",
+    "ferro-extend",
     "redb",
     "sqlite-full",
     "sqlite-normal",
@@ -69,14 +70,15 @@ mod ferro_engine {
     use super::*;
     use ferro::{Db, Map, Options};
 
-    pub struct Ferro(Db<Map<u64, String>>);
+    pub struct Ferro(Db<Map<u64, String>>, bool);
 
-    pub fn open(dir: &Path) -> Ferro {
+    pub fn open(dir: &Path, extend: bool) -> Ferro {
         Ferro(
             Options::new()
                 .cache_bytes(CACHE)
                 .open::<Map<u64, String>>(dir.join("db.ferro"))
                 .unwrap(),
+            extend,
         )
     }
 
@@ -84,8 +86,12 @@ mod ferro_engine {
         fn bulk(&self, n: u64) {
             self.0
                 .update(|root| {
-                    for i in 0..n {
-                        root.insert(key(i), value(i));
+                    if self.1 {
+                        root.extend((0..n).map(|i| (key(i), value(i))));
+                    } else {
+                        for i in 0..n {
+                            root.insert(key(i), value(i));
+                        }
                     }
                 })
                 .unwrap();
@@ -496,7 +502,8 @@ mod fjall_engine {
 
 fn open(name: &str, dir: &Path) -> Box<dyn Engine> {
     match name {
-        "ferro" => Box::new(ferro_engine::open(dir)),
+        "ferro" => Box::new(ferro_engine::open(dir, false)),
+        "ferro-extend" => Box::new(ferro_engine::open(dir, true)),
         "redb" => Box::new(redb_engine::open(dir)),
         "sqlite-full" => Box::new(sqlite_engine::open(dir, "FULL")),
         "sqlite-normal" => Box::new(sqlite_engine::open(dir, "NORMAL")),
@@ -633,6 +640,7 @@ fn parent(n: u64) {
     for name in ENGINES {
         let dur = match name {
             "ferro" => "fdatasync per commit, group commit",
+            "ferro-extend" => "as ferro, bulk load through `extend`",
             "redb" => "Durability::Immediate (fsync per commit)",
             "sqlite-full" => "WAL, synchronous=FULL",
             "sqlite-normal" => "WAL, synchronous=NORMAL (commit not fsynced)",
