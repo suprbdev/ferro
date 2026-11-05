@@ -4088,7 +4088,9 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             let index = leaf.search(key).ok()?;
             return Some(fatal(leaf.value(self.store.as_deref(), index)));
         }
-        let start = match &self.parent {
+        let held_leaf = self.leaf.take();
+        let held_parent = self.parent.take();
+        let start = match &held_parent {
             Some((parent, depth)) if spans(parent, key) => Some((&**parent, *depth)),
             _ => None,
         };
@@ -4097,12 +4099,8 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             .as_ref()
             .map(|hazards| (hazards.entry(LEAF), hazards.entry(PARENT)));
         let (found, leaf, parent) = fatal(self.descend(start, key, slots));
-        if leaf.is_some() {
-            self.leaf = leaf;
-        }
-        if parent.is_some() {
-            self.parent = parent;
-        }
+        self.leaf = leaf.or(held_leaf);
+        self.parent = parent.or(held_parent);
         found
     }
 
@@ -5131,5 +5129,52 @@ mod tests {
         assert!(rest.iter().rev().eq(pairs[3..6].iter()));
         epoch::flush();
         assert!(watched.iter().all(|weak| weak.strong_count() == 0));
+    }
+
+    #[test]
+    fn epoch_a_finder_that_panics_keeps_only_what_its_slots_hold() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let mut entries = cache(&keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let (first, last) = (keys[0], keys[keys.len() - 1]);
+        let mut finder = map.finder();
+        assert_eq!(finder.get(&first).map(|value| *value), Some(first * 3));
+        assert!(finder.parent.is_some());
+        let doomed = keep
+            .iter()
+            .position(|node| node.children.is_empty() && node.keys.contains(&last))
+            .unwrap();
+        evict_all(vec![entries.remove(doomed)]);
+        drop(keep.remove(doomed));
+        epoch::flush();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finder.get(&last)));
+        assert!(caught.is_err());
+        let slot = |index: usize| {
+            let hazards = finder.hazards.as_ref().unwrap();
+            hazards
+                .entry(index)
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .addr()
+        };
+        let held = |node: &Hold<u64, u64, ()>, index: usize| {
+            !node.anchored()
+                || entries.iter().any(|entry| {
+                    entry.as_ptr() == node.node().cast() && entry.addr() == slot(index)
+                })
+        };
+        assert!(finder.leaf.as_ref().is_none_or(|leaf| held(leaf, LEAF)));
+        assert!(
+            finder
+                .parent
+                .as_ref()
+                .is_none_or(|(parent, _)| held(parent, PARENT))
+        );
+        assert_eq!(finder.get(&first).map(|value| *value), Some(first * 3));
+        assert_eq!(finder.get(&keys[1]).map(|value| *value), Some(keys[1] * 3));
+        evict_all(entries);
     }
 }
