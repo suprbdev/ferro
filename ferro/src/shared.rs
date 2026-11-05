@@ -427,7 +427,9 @@ impl<T: Any + Send + Sync> Shared<T> {
 impl<T> Clone for Shared<T> {
     #[inline]
     fn clone(&self) -> Self {
-        if self.strong().fetch_add(1, Ordering::Relaxed) > MAX_STRONG {
+        let old = self.strong().fetch_add(1, Ordering::Relaxed);
+        debug_assert_ne!(old, 0);
+        if old > MAX_STRONG {
             process::abort();
         }
         Shared {
@@ -566,7 +568,9 @@ impl Parked {
 impl Clone for Erased {
     #[inline]
     fn clone(&self) -> Self {
-        if self.strong().fetch_add(1, Ordering::Relaxed) > MAX_STRONG {
+        let old = self.strong().fetch_add(1, Ordering::Relaxed);
+        debug_assert_ne!(old, 0);
+        if old > MAX_STRONG {
             process::abort();
         }
         Erased {
