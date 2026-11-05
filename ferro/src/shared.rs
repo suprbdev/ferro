@@ -1456,11 +1456,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_a_lent_owner_let_go_beside_its_slot_is_dropped_by_one_of_them() {
+    fn shared_a_lent_owner_let_go_beside_its_slot_is_never_left_waiting() {
         let rounds = if cfg!(miri) { 4 } else { 400 };
         for round in 0..rounds {
             let (counted, _, drops) = Counted::new(round);
             let owner = Shared::new(counted);
+            let kept = Shared::downgrade(&owner);
             let hazards = Hazards::new().unwrap();
             Shared::lend_to(&owner, hazards.entry(ROOT));
             let start = Arc::new(std::sync::Barrier::new(2));
@@ -1474,6 +1475,11 @@ mod tests {
             start.wait();
             drop(owner);
             other.join().unwrap();
+            assert!(!epoch::waiting(kept.ptr.addr().get()), "round {round}");
+            let begun = std::time::Instant::now();
+            while drops.load(Ordering::SeqCst) == 0 && begun.elapsed().as_secs() < 10 {
+                thread::yield_now();
+            }
             assert_eq!(drops.load(Ordering::SeqCst), 1, "round {round}");
         }
     }

@@ -656,6 +656,21 @@ fn oldest(skip: Option<&'static Slot>) -> u64 {
         .fold(bumped, u64::min)
 }
 
+/// Whether an item on any thread's retired list holds the value at `addr`, for tests.
+///
+/// An item that a thread has taken out of its list to let go of is on none.
+#[cfg(test)]
+pub(crate) fn waiting(addr: usize) -> bool {
+    let slots: Vec<&'static Slot> = SLOTS.lock().clone();
+    slots.iter().any(|slot| {
+        slot.pending
+            .lock()
+            .items
+            .iter()
+            .any(|item| item.addr() == addr)
+    })
+}
+
 /// Reads the epochs and the records as a free does, runs `between`, then frees every list with
 /// what it read, so that tests can change slots between a free's reading and its release.
 #[cfg(test)]
