@@ -53,7 +53,8 @@
 //! [`Iter`] of `(key, value)` pairs, and [`keys`](Map::keys) and [`values`](Map::values) return
 //! [`Keys`] and [`Values`]. Each walks in key order from either end and knows its length from the
 //! start. [`for_each`](Map::for_each) and its relatives lend `&K` and `&V` instead of handing out
-//! clones, and a [`Cursor`] keeps its path through the tree, so a seek costs the distance it moves.
+//! clones, as do an iterator's [`next_ref`](Iter::next_ref) and [`visit`](Iter::visit), and a
+//! [`Cursor`] keeps its path through the tree, so a seek costs the distance it moves.
 //!
 //! # Versions
 //!
@@ -85,7 +86,7 @@ use std::hash;
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, needs_drop};
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, OnceLock};
 use std::vec;
@@ -247,7 +248,11 @@ const fn by_copy<V>() -> bool {
 /// A `Val` keeps the value it was read with: an edit of the map afterwards does not change it.
 /// Cloning one is cheap, and comparing, hashing and formatting one do what they do for `V`. Call
 /// [`into_owned`](Val::into_owned) for a `V`, or [`into_arc`](Val::into_arc) for an `Arc<V>`, to
-/// keep a value without keeping its column.
+/// keep a value without keeping its column. A share of a column is a reference count, which every
+/// thread reading values of the same node writes, so a value read in place and not kept is
+/// cheaper lent: the `next_ref` and `visit` of [`Iter`], [`Values`],
+/// [`IndexIter`](crate::table::IndexIter) and [`Matches`](crate::table::Matches) lend `&V`
+/// instead.
 ///
 /// # Examples
 ///
@@ -846,6 +851,14 @@ impl<K, V, S> Node<K, V, S> {
         self.children.get(position).unwrap_or(&Link::Empty)
     }
 
+    #[inline]
+    fn lend(&self, index: usize) -> Option<&V> {
+        match &self.cells {
+            Cells::Column(column) => Some(&column[index]),
+            Cells::Slots(slots) => slots[index].held(),
+        }
+    }
+
     fn children_mut(&mut self) -> &mut Vec<Link<K, V, S>> {
         if self.children.is_empty() {
             self.children
@@ -942,12 +955,7 @@ impl<K, V: Data, S> Node<K, V, S> {
     fn read<R>(&self, store: Option<&Store>, index: usize, f: impl FnOnce(&V) -> R) -> Result<R> {
         match &self.cells {
             Cells::Column(column) => Ok(f(&column[index])),
-            Cells::Slots(slots) => match &slots[index] {
-                Slot::Spilled(spill) => {
-                    Ok(f(&*store.ok_or(Error::Detached)?.load::<V>(spill.0)?))
-                }
-                held => held.held().map(f).ok_or(Error::Detached),
-            },
+            Cells::Slots(slots) => lend_slot(store, &slots[index], f),
         }
     }
 }
@@ -1702,6 +1710,18 @@ where
             }
         }
         Err(position) => find_mut(store, &mut node.children_mut()[position], key),
+    }
+}
+
+#[inline]
+fn lend_slot<V: Data, S, R>(
+    store: Option<&Store>,
+    slot: &Slot<V, S>,
+    f: impl FnOnce(&V) -> R,
+) -> Result<R> {
+    match slot {
+        Slot::Spilled(spill) => Ok(f(&*store.ok_or(Error::Detached)?.load::<V>(spill.0)?)),
+        held => held.held().map(f).ok_or(Error::Detached),
     }
 }
 
@@ -3324,6 +3344,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 hazards,
                 _root: root,
                 remaining,
+                spare: None,
             })
         };
         fatal(build())
@@ -3353,6 +3374,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             parent: None,
             root: self.top(hazards.as_ref()),
             hazards,
+            spare: None,
         }
     }
 
@@ -4813,11 +4835,28 @@ pub(crate) struct Finder<K, V, S = ()> {
     parent: Parent<K, V, S>,
     hazards: Option<Hazards>,
     root: Top<K, V, S>,
+    spare: Option<Val<V>>,
 }
 
 type Parent<K, V, S> = Option<(Hold<K, V, S>, usize)>;
 
-type Found<K, V, S> = (Option<Val<V>>, Option<Hold<K, V, S>>, Parent<K, V, S>);
+/// Which of the nodes a [`Finder`] keeps holds the key a lookup found.
+#[derive(Clone, Copy)]
+enum Kept {
+    Leaf,
+    Parent,
+}
+
+/// Where [`Finder::lend`] found a key: at an index of the leaf or the parent the finder keeps once
+/// the lookup is done, or in another node, whose value it read before letting the node go.
+enum Hit<V> {
+    At(Kept, usize),
+    Value(Val<V>),
+}
+
+type Found<K, V, S, R> = (Option<R>, Option<Hold<K, V, S>>, Parent<K, V, S>);
+
+type Seen<'a, K, V, S> = (Option<&'a Store>, &'a Node<K, V, S>, usize, Option<Kept>);
 
 fn strong<K, V, S>(link: &Link<K, V, S>) -> Option<Shared<Node<K, V, S>>> {
     match link {
@@ -4879,6 +4918,65 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             let index = leaf.search(key).ok()?;
             return Some(fatal(leaf.value(self.store.as_deref(), index)));
         }
+        self.find(key, |(store, node, index, _)| node.value(store, index))
+    }
+
+    /// The value stored under `key`, lent from the node that holds it rather than made into a
+    /// [`Val`], until the next lookup.
+    ///
+    /// A value in the kept leaf or parent is lent from there. One found higher up, or stored on
+    /// its own, is read as [`get`](Finder::get) reads it and kept until the next lookup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value on the way cannot be read, as [`Map::get`] does.
+    #[inline]
+    pub(crate) fn lend<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let (kept, index) = if let Some(leaf) = &self.leaf
+            && spans(leaf, key)
+        {
+            (Kept::Leaf, leaf.search(key).ok()?)
+        } else {
+            match self.hit(key)? {
+                Hit::At(kept, index) => (kept, index),
+                Hit::Value(value) => return Some(self.spare.insert(value)),
+            }
+        };
+        let node = match kept {
+            Kept::Leaf => &**self.leaf.as_ref()?,
+            Kept::Parent => &*self.parent.as_ref()?.0,
+        };
+        match node.lend(index) {
+            Some(value) => Some(value),
+            None => {
+                let value = fatal(node.value(self.store.as_deref(), index));
+                Some(self.spare.insert(value))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn hit<Q>(&mut self, key: &Q) -> Option<Hit<V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.find(key, |(store, node, index, kept)| match kept {
+            Some(kept) => Ok(Hit::At(kept, index)),
+            None => node.value(store, index).map(Hit::Value),
+        })
+    }
+
+    #[inline(always)]
+    fn find<Q, R>(&mut self, key: &Q, hit: impl FnOnce(Seen<'_, K, V, S>) -> Result<R>) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         let held_leaf = self.leaf.take();
         let held_parent = self.parent.take();
         let start = match &held_parent {
@@ -4889,18 +4987,19 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
             .hazards
             .as_ref()
             .map(|hazards| (hazards.entry(LEAF), hazards.entry(PARENT)));
-        let (found, leaf, parent) = fatal(self.descend(start, key, slots));
+        let (found, leaf, parent) = fatal(self.descend(start, key, slots, hit));
         self.leaf = leaf.or(held_leaf);
         self.parent = parent.or(held_parent);
         found
     }
 
-    fn descend<Q>(
+    fn descend<Q, R>(
         &self,
         start: Option<(&Node<K, V, S>, usize)>,
         key: &Q,
         slots: Option<(&AtomicPtr<()>, &AtomicPtr<()>)>,
-    ) -> Result<Found<K, V, S>>
+        hit: impl FnOnce(Seen<'_, K, V, S>) -> Result<R>,
+    ) -> Result<Found<K, V, S, R>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -4916,13 +5015,27 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
         let Some((mut at, mut depth)) = top else {
             return Ok((None, None, None));
         };
-        let mut leaf = None;
-        let mut parent = None;
+        let mut leaf: Option<Hold<K, V, S>> = None;
+        let mut parent: Parent<K, V, S> = None;
         loop {
             depth += 1;
             let node = at.node();
             let position = match node.search(key) {
-                Ok(index) => return Ok((Some(node.value(store, index)?), leaf, parent)),
+                Ok(index) => {
+                    let here = ptr::from_ref(node);
+                    let kept = if leaf.as_ref().is_some_and(|leaf| leaf.node() == here) {
+                        Some(Kept::Leaf)
+                    } else if parent
+                        .as_ref()
+                        .is_some_and(|(parent, _)| parent.node() == here)
+                        || start.is_some_and(|(start, _)| ptr::eq(start, here))
+                    {
+                        Some(Kept::Parent)
+                    } else {
+                        None
+                    };
+                    return Ok((Some(hit((store, node, index, kept))?), leaf, parent));
+                }
                 Err(_) if node.children.is_empty() => return Ok((None, leaf, parent)),
                 Err(position) => position,
             };
@@ -4957,6 +5070,14 @@ impl<'a, V: Data, S> Run<'a, V, S> {
         match cells {
             Cells::Column(column) => Run::Column(column, &column[run.clone()], run.start),
             Cells::Slots(slots) => Run::Slots(&slots[run]),
+        }
+    }
+
+    #[inline(always)]
+    fn read<R>(&self, store: Option<&Store>, offset: usize, f: impl FnOnce(&V) -> R) -> R {
+        match self {
+            Run::Column(_, values, _) => f(&values[offset]),
+            Run::Slots(slots) => fatal(lend_slot(store, &slots[offset], f)),
         }
     }
 
@@ -5012,6 +5133,7 @@ pub struct Iter<K, V, S = ()> {
     hazards: Option<Hazards>,
     _root: Option<Hold<K, V, S>>,
     remaining: u64,
+    spare: Option<Arc<V>>,
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
@@ -5078,6 +5200,82 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
             }
         }
         total
+    }
+
+    /// Steps to the next entry from the front and lends its key and value, where `next` hands out
+    /// a clone of the key and a [`Val`].
+    ///
+    /// The entry is borrowed from the node the iterator holds, so it lasts until the iterator
+    /// moves again, and lending it takes no reference count on the value's column, which every
+    /// thread that makes a [`Val`] of the same entries writes. A value stored on its own is read
+    /// first and kept until the next step. A `while let` loop over it can stop, return or use `?`
+    /// wherever it likes, and [`visit`](Iter::visit) lends every entry left to a closure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let names: Map<u32, String> = (0..10).map(|id| (id, format!("user {id}"))).collect();
+    ///
+    /// let mut rest = names.range(3..);
+    /// let mut letters = 0;
+    /// while let Some((id, name)) = rest.next_ref() {
+    ///     if *id == 6 {
+    ///         break;
+    ///     }
+    ///     letters += name.len();
+    /// }
+    /// assert_eq!(letters, 18);
+    /// assert_eq!(rest.next().map(|(id, _)| id), Some(7));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn next_ref(&mut self) -> Option<(&K, &V)> {
+        let index = self.advance()?;
+        let store = self.store.as_deref();
+        let node = &self.front.last()?.node;
+        let value = match node.lend(index) {
+            Some(value) => value,
+            None => {
+                let value = fatal(node.value(store, index)).into_arc();
+                self.spare.insert(value)
+            }
+        };
+        Some((&node.keys[index], value))
+    }
+
+    /// Calls `f` on each entry the iterator has left, in key order from the front, lending the
+    /// key and value as [`next_ref`](Iter::next_ref) does.
+    ///
+    /// It takes a run of a node's entries in one loop, as [`fold`](Iterator::fold) does, and
+    /// clones no key and takes no reference count on a value's column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let names: Map<u32, String> = (0..10).map(|id| (id, format!("user {id}"))).collect();
+    ///
+    /// let mut letters = 0;
+    /// names.range(3..6).visit(|_, name| letters += name.len());
+    /// assert_eq!(letters, 18);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn visit(mut self, mut f: impl FnMut(&K, &V)) {
+        self.drain((), |(), store, node, run| {
+            let keys = &node.keys[run.clone()];
+            let values = Run::of(&node.cells, run);
+            for (offset, key) in keys.iter().enumerate() {
+                values.read(store, offset, |value| f(key, value));
+            }
+        });
     }
 
     fn retreat(&mut self) -> Option<usize> {
@@ -5245,6 +5443,88 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 ///
 /// It walks as [`Iter`] does and clones no key. [`Table`](crate::Table) hands it out for its rows.
 pub struct Values<K, V, S = ()>(Iter<K, V, S>);
+
+impl<K: Data + Ord, V: Data, S: Data> Values<K, V, S> {
+    /// Steps to the next value from the front and lends it, where `next` hands out a [`Val`], as
+    /// [`Iter::next_ref`] does.
+    ///
+    /// For a table's rows from [`Table::iter`](crate::Table::iter),
+    /// [`Table::range`](crate::Table::range) or [`Table::prefix`](crate::Table::prefix), this
+    /// reads each row in place, without the reference count a [`Val`] takes on its node's column,
+    /// until the iterator moves again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=10 {
+    ///     orders.insert(Order { id, total: id * 100 });
+    /// }
+    ///
+    /// let mut rows = orders.range(3..);
+    /// let mut page = Vec::new();
+    /// while page.len() < 3
+    ///     && let Some(order) = rows.next_ref()
+    /// {
+    ///     page.push(order.total);
+    /// }
+    /// assert_eq!(page, [300, 400, 500]);
+    /// assert_eq!(rows.len(), 5);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn next_ref(&mut self) -> Option<&V> {
+        self.0.next_ref().map(|(_, value)| value)
+    }
+
+    /// Calls `f` on each value the iterator has left, in key order from the front, lending it as
+    /// [`Iter::visit`] does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=10 {
+    ///     orders.insert(Order { id, total: id * 100 });
+    /// }
+    ///
+    /// let mut total = 0;
+    /// orders.range(3..=5).visit(|order| total += order.total);
+    /// assert_eq!(total, 1200);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn visit(mut self, mut f: impl FnMut(&V)) {
+        self.0.drain((), |(), store, node, run| {
+            let values = Run::of(&node.cells, run.clone());
+            for offset in 0..run.len() {
+                values.read(store, offset, &mut f);
+            }
+        });
+    }
+}
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
     type Item = Val<V>;
@@ -6090,6 +6370,41 @@ mod tests {
         assert_eq!(finder.get(&first).map(|value| *value), Some(first * 3));
         assert_eq!(finder.get(&keys[1]).map(|value| *value), Some(keys[1] * 3));
         evict_all(entries);
+    }
+
+    #[test]
+    fn epoch_lent_entries_outlive_the_eviction_of_their_nodes() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let entries = cache(&keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let watched: Vec<Weak<Node<u64, u64, ()>>> = keep.iter().map(Shared::downgrade).collect();
+        let mut walk = map.range(keys[9]..);
+        let mut values = map.range(..keys[4]).into_values();
+        let (mut in_leaf, mut in_parent, mut higher) = (map.finder(), map.finder(), map.finder());
+        let (found, value) = walk.next_ref().unwrap();
+        let first = values.next_ref().unwrap();
+        let row = in_leaf.lend(&keys[2]).unwrap();
+        let above = in_parent.lend(&keys[8]).unwrap();
+        let top = higher.lend(&keys[17]).unwrap();
+        evict_all(entries);
+        drop(keep);
+        epoch::flush();
+        assert_eq!((*found, *value), (keys[9], keys[9] * 3));
+        assert_eq!(*first, keys[0] * 3);
+        assert_eq!(*row, keys[2] * 3);
+        assert_eq!(*above, keys[8] * 3);
+        assert_eq!(*top, keys[17] * 3);
+        assert!(in_parent.parent.is_some() && higher.spare.is_some());
+        assert!(watched.iter().any(|weak| weak.strong_count() == 1));
+        assert_eq!(walk.next_ref(), Some((&keys[10], &(keys[10] * 3))));
+        assert_eq!(in_leaf.lend(&keys[3]), Some(&(keys[3] * 3)));
+        drop((walk, values, in_leaf, in_parent, higher));
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 0));
     }
 
     #[test]

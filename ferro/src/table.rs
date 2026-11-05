@@ -58,7 +58,9 @@
 //!
 //! A lookup such as `by_status(&value)`, `by_status_range(range)` or
 //! `by_status_after(&value, &key)` returns an [`IndexIter`]. It finds its first entry in O(log n),
-//! knows its length at once, and reads each row from the rows map as it yields it.
+//! knows its length at once, and reads each row from the rows map as it yields it, as a [`Val`]
+//! from `next` or lent from the node that holds it by [`IndexIter::next_ref`] and
+//! [`IndexIter::visit`], which is cheaper when many threads read the same rows.
 //! [`IndexIter::keys`] reads no rows at all, and on an index with `cover(...)`
 //! [`IndexIter::covered`] returns the fields the index stores beside each entry, also without
 //! reading a row. `by_x_counts()` counts the rows of each value with one seek per distinct value.
@@ -1180,6 +1182,92 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
     }
 }
 
+impl<T: Record, C> IndexIter<T, C> {
+    /// Steps to the next row and lends it, where `next` hands out a [`Val`].
+    ///
+    /// The row is borrowed from the node the lookup holds, so it lasts until the lookup moves
+    /// again. Each [`Val`] takes a reference count on its node's column, and many threads reading
+    /// the same rows all write those counts' cache lines, where a lent row writes nothing shared.
+    /// So this is the form for hot pages of rows that the caller reads in place: a `while let`
+    /// loop over it can stop after a page, return or use `?` as it likes, and the lookup goes on
+    /// from there. [`visit`](IndexIter::visit) lends every row left to a closure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=5 {
+    ///     orders.insert(Order { id, customer: "wile".into(), total: id * 100 });
+    /// }
+    ///
+    /// let mut rows = orders.by_customer("wile");
+    /// let mut page = Vec::new();
+    /// while page.len() < 2
+    ///     && let Some(order) = rows.next_ref()
+    /// {
+    ///     page.push(order.total);
+    /// }
+    /// assert_eq!(page, [100, 200]);
+    /// assert_eq!(rows.keys().collect::<Vec<_>>(), [3, 4, 5]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a row cannot be read, as `next` does.
+    #[inline]
+    pub fn next_ref(&mut self) -> Option<&T> {
+        let key = self.entries.forward()?;
+        self.rows.lend(&key)
+    }
+
+    /// Calls `f` on each row the lookup has left, in the order `next` yields them, lending each
+    /// as [`next_ref`](IndexIter::next_ref) does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// orders.insert(Order { id: 1, customer: "wile".into(), total: 4999 });
+    /// orders.insert(Order { id: 2, customer: "road".into(), total: 150 });
+    /// orders.insert(Order { id: 3, customer: "wile".into(), total: 900 });
+    ///
+    /// let mut spent = 0;
+    /// orders.by_customer("wile").visit(|order| spent += order.total);
+    /// assert_eq!(spent, 5899);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a row cannot be read, as `next` does.
+    pub fn visit(mut self, mut f: impl FnMut(&T)) {
+        while let Some(row) = self.next_ref() {
+            f(row);
+        }
+    }
+}
+
 impl<T: Record, C> Iterator for IndexIter<T, C> {
     type Item = Val<T>;
 
@@ -1464,6 +1552,85 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
             rows: self.rows,
             stream: Box::new(Listed::ready(items)),
             started: false,
+        }
+    }
+}
+
+impl<T: Record, C> Matches<T, C> {
+    /// Steps to the next matching row and lends it, where `next` hands out a [`Val`], as
+    /// [`IndexIter::next_ref`] does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     #[index]
+    ///     shipped: bool,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=6 {
+    ///     orders.insert(Order { id, customer: "wile".into(), shipped: id % 3 == 0 });
+    /// }
+    ///
+    /// let find = orders.find();
+    /// let mut pending = find.by_customer("wile").and(find.by_shipped(&false));
+    /// assert_eq!(pending.next_ref().map(|order| order.id), Some(1));
+    /// assert_eq!(pending.keys().collect::<Vec<_>>(), [2, 4, 5]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a row cannot be read, as `next` does.
+    pub fn next_ref(&mut self) -> Option<&T> {
+        self.started = true;
+        let (key, _) = self.stream.take(End::Front)?;
+        self.rows.lend(&key)
+    }
+
+    /// Calls `f` on each matching row left, in key order, lending each as
+    /// [`next_ref`](Matches::next_ref) does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     #[index]
+    ///     shipped: bool,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// orders.insert(Order { id: 1, customer: "wile".into(), shipped: false, total: 4999 });
+    /// orders.insert(Order { id: 2, customer: "wile".into(), shipped: true, total: 150 });
+    /// orders.insert(Order { id: 3, customer: "wile".into(), shipped: false, total: 900 });
+    ///
+    /// let find = orders.find();
+    /// let mut owed = 0;
+    /// find.by_customer("wile").and(find.by_shipped(&false)).visit(|order| owed += order.total);
+    /// assert_eq!(owed, 5899);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a row cannot be read, as `next` does.
+    pub fn visit(mut self, mut f: impl FnMut(&T)) {
+        while let Some(row) = self.next_ref() {
+            f(row);
         }
     }
 }

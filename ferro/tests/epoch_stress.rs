@@ -4,7 +4,8 @@
 //!
 //! Eight readers do gets, `floor`, `summary_by`, row gets, index lookups, ranges both ways and
 //! cursor seeks on the writer's handle and on read-only handles with caches of 12 KiB to 1 MiB,
-//! which they refresh and reopen. They keep ranges, cursors and index walks from one round to the
+//! which they refresh and reopen, and read rows, values and nested maps lent by `next_ref` and
+//! `visit` as well as through a `Val`. They keep ranges, cursors and index walks from one round to the
 //! next, and read nested maps through iterators whose snapshot and handle are gone, so that what
 //! they hold outlives the snapshot, the handle and the store it came from. Three writers on a
 //! 12 KiB cache edit values, rows and the nested maps, with a reclamation cycle every 96 KiB and
@@ -352,6 +353,14 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
                 if let Some(got) = got {
                     check_nest(model.seed, key, &got, Some(root.nest_edits), context);
                 }
+                let mut lent = root.nests.range(key..);
+                for _ in 0..rng.below(4) {
+                    let Some((found, nest)) = lent.next_ref() else {
+                        break;
+                    };
+                    let context = format!("{context}: lent nest {found}");
+                    check_nest(model.seed, *found, nest, Some(root.nest_edits), &context);
+                }
             }
             5 => {
                 let low = pick(rng, hot).min(KEYS - 1);
@@ -376,6 +385,17 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
                     .collect();
                 back.reverse();
                 assert_eq!(back, want, "{context}: reversed range {low}..{high}");
+                let mut lent = Vec::new();
+                root.values
+                    .range(low..high)
+                    .visit(|key, value| lent.push((*key, *value)));
+                assert_eq!(lent, want, "{context}: visited range {low}..{high}");
+                let mut range = root.values.range(low..high);
+                let mut lent = Vec::new();
+                while let Some((key, value)) = range.next_ref() {
+                    lent.push((*key, *value));
+                }
+                assert_eq!(lent, want, "{context}: lent range {low}..{high}");
                 let mut cursor = root.values.cursor();
                 for (key, value) in &want {
                     assert!(cursor.seek(key), "{context}: cursor seek {key}");
@@ -384,16 +404,46 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
             }
             _ => {
                 let group = rng.below(GROUPS);
-                let got: Vec<Row> = root
-                    .rows
-                    .by_group(&group)
-                    .map(|row| (*row).clone())
-                    .collect();
+                let mut got = Vec::new();
+                let form = match rng.below(5) {
+                    0 => {
+                        root.rows
+                            .by_group(&group)
+                            .visit(|row| got.push(row.clone()));
+                        "visited group"
+                    }
+                    1 => {
+                        let mut lookup = root.rows.by_group(&group);
+                        while let Some(row) = lookup.next_ref() {
+                            got.push(row.clone());
+                        }
+                        "lent group"
+                    }
+                    2 => {
+                        let mut matches = root.rows.find().by_group(&group);
+                        while let Some(row) = matches.next_ref() {
+                            got.push(row.clone());
+                        }
+                        "lent matches of group"
+                    }
+                    3 => {
+                        root.rows.iter().visit(|row| {
+                            if row.group == group {
+                                got.push(row.clone());
+                            }
+                        });
+                        "visited rows of group"
+                    }
+                    _ => {
+                        got.extend(root.rows.by_group(&group).map(|row| (*row).clone()));
+                        "group"
+                    }
+                };
                 let want: Vec<Row> = (0..ROWS)
                     .filter_map(|id| model.row_at(id, rows))
                     .filter(|row| row.group == group)
                     .collect();
-                assert_eq!(got, want, "{context}: group {group} after {rows} edits");
+                assert_eq!(got, want, "{context}: {form} {group} after {rows} edits");
             }
         }
         checked += 1;
@@ -406,6 +456,7 @@ type Shared = Arc<RwLock<Option<Db<Root>>>>;
 struct Walk {
     values: Iter<u64, u64, Total>,
     backwards: bool,
+    lent: bool,
     want: std::vec::IntoIter<(u64, u64)>,
     context: String,
 }
@@ -418,6 +469,7 @@ struct Seeks {
 
 struct Rows {
     rows: IndexIter<Row>,
+    lent: bool,
     want: std::vec::IntoIter<Row>,
     context: String,
 }
@@ -425,6 +477,7 @@ struct Rows {
 struct Nests {
     nests: Iter<u64, Nest>,
     backwards: bool,
+    lent: bool,
     edits: u64,
     context: String,
 }
@@ -457,6 +510,7 @@ impl Walks {
             self.values = Some(Walk {
                 values: root.values.range(low..high),
                 backwards,
+                lent: !backwards && rng.chance(50),
                 want: want.into_iter(),
                 context: format!("{context}: held range {low}..{high}"),
             });
@@ -476,6 +530,7 @@ impl Walks {
                 .collect();
             self.rows = Some(Rows {
                 rows: root.rows.by_group(&group),
+                lent: rng.chance(50),
                 want: want.into_iter(),
                 context: format!("{context}: held group {group}"),
             });
@@ -489,6 +544,7 @@ impl Walks {
                     false => root.nests.range(from..),
                 },
                 backwards,
+                lent: !backwards && rng.chance(50),
                 edits: root.nest_edits,
                 context: format!("{context}: held nests from {from}"),
             });
@@ -500,12 +556,13 @@ impl Walks {
         if let Some(walk) = &mut self.values {
             let mut done = rng.chance(4);
             for _ in 0..rng.below(48) {
-                let got = if walk.backwards {
-                    walk.values.next_back()
+                let got = if walk.lent {
+                    walk.values.next_ref().map(|(key, value)| (*key, *value))
+                } else if walk.backwards {
+                    walk.values.next_back().map(|(key, value)| (key, *value))
                 } else {
-                    walk.values.next()
+                    walk.values.next().map(|(key, value)| (key, *value))
                 };
-                let got = got.map(|(key, value)| (key, *value));
                 let want = walk.want.next();
                 assert_eq!(got, want, "{}", walk.context);
                 checked += 1;
@@ -537,7 +594,11 @@ impl Walks {
         if let Some(rows) = &mut self.rows {
             let mut done = rng.chance(4);
             for _ in 0..rng.below(24) {
-                let got = rows.rows.next().map(|row| (*row).clone());
+                let got = if rows.lent {
+                    rows.rows.next_ref().cloned()
+                } else {
+                    rows.rows.next().map(|row| (*row).clone())
+                };
                 let want = rows.want.next();
                 assert_eq!(got, want, "{}", rows.context);
                 checked += 1;
@@ -553,6 +614,15 @@ impl Walks {
         if let Some(walk) = &mut self.nests {
             let mut done = rng.chance(4);
             for _ in 0..rng.below(12) {
+                if walk.lent {
+                    let Some((key, value)) = walk.nests.next_ref() else {
+                        done = true;
+                        break;
+                    };
+                    check_nest(seed, *key, value, Some(walk.edits), &walk.context);
+                    checked += 1;
+                    continue;
+                }
                 let got = if walk.backwards {
                     walk.nests.next_back()
                 } else {

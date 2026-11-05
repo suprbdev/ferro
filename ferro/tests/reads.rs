@@ -254,6 +254,39 @@ fn check_folds<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>
 
     assert_eq!(map.iter().count(), all.len());
     assert_eq!(map.keys().filter(|_| true).count(), all.len());
+
+    let mut visited = Vec::new();
+    map.iter()
+        .visit(|key, value| visited.push((key.clone(), value.clone())));
+    assert_eq!(visited, all);
+    let mut visited = Vec::new();
+    map.values().visit(|value| visited.push(value.clone()));
+    assert!(visited.iter().eq(all.iter().map(|(_, value)| value)));
+
+    let mut iter = map.iter();
+    for (key, value) in all[all.len() - back..].iter().rev() {
+        let (found, held) = iter.next_back().unwrap();
+        assert_eq!((&found, &*held), (key, value));
+    }
+    for (key, value) in &all[..front] {
+        assert_eq!(iter.next_ref(), Some((key, value)));
+    }
+    assert_eq!(iter.len(), middle.len());
+    let mut visited = Vec::new();
+    iter.visit(|key, value| visited.push((key.clone(), value.clone())));
+    assert_eq!(visited, middle);
+
+    let mut values = map.values();
+    for _ in 0..front {
+        values.next();
+    }
+    let mut lent = Vec::new();
+    while let Some(value) = values.next_ref() {
+        lent.push(value.clone());
+    }
+    assert!(lent.iter().eq(all[front..].iter().map(|(_, value)| value)));
+    assert_eq!(values.next_ref(), None);
+    assert!(values.next().is_none());
 }
 
 fn check_ranges<K: TestKey, V: TestValue>(map: &Map<K, V>, model: &BTreeMap<K, V>, case: &Case) {
@@ -808,6 +841,45 @@ fn index_keys_match_the_rows_without_reading_them() {
         for id in &wanted {
             assert_eq!(rows.get(id).unwrap().group, group);
         }
+        let mut visited = Vec::new();
+        rows.by_group(&group).visit(|row| visited.push(row.clone()));
+        assert!(visited.iter().map(|row| row.id).eq(wanted.iter().copied()));
+        for row in &visited {
+            assert_eq!(*row, *rows.get(&row.id).unwrap());
+        }
+        let mut lookup = rows.by_group(&group);
+        let mut lent = Vec::new();
+        while lent.len() < wanted.len() / 2
+            && let Some(row) = lookup.next_ref()
+        {
+            lent.push(row.clone());
+        }
+        lent.extend(lookup.map(|row| (*row).clone()));
+        assert_eq!(lent, visited);
+        let mut matches = rows.find().by_group(&group);
+        let mut lent = Vec::new();
+        while let Some(row) = matches.next_ref() {
+            lent.push(row.clone());
+        }
+        assert_eq!(lent, visited);
+        let mut visited = Vec::new();
+        rows.find()
+            .by_group(&group)
+            .visit(|row| visited.push(row.id));
+        assert_eq!(visited, wanted);
+    }
+    let mut visited = Vec::new();
+    rows.range(100..1_200)
+        .visit(|row| visited.push(row.clone()));
+    assert!(visited.iter().map(|row| row.id).eq(100..1_200));
+    let mut range = rows.range(100..1_200);
+    let mut lent = Vec::new();
+    while let Some(row) = range.next_ref() {
+        lent.push(row.clone());
+    }
+    assert_eq!(lent, visited);
+    for row in &visited {
+        assert_eq!(*row, *rows.get(&row.id).unwrap());
     }
     let mut seen = Vec::new();
     rows.for_each(|row| seen.push(row.id));
@@ -835,6 +907,15 @@ fn an_index_entry_without_its_row_ends_the_walk_there() {
     torn.rows_mut().remove(&100);
     let seen: Vec<u32> = torn.by_group(&0).map(|row| row.id).collect();
     assert_eq!(seen, (0..100).step_by(2).collect::<Vec<u32>>());
+    let mut visited = Vec::new();
+    torn.by_group(&0).visit(|row| visited.push(row.id));
+    assert_eq!(visited, seen);
+    let mut lookup = torn.by_group(&0);
+    let mut lent = Vec::new();
+    while let Some(row) = lookup.next_ref() {
+        lent.push(row.id);
+    }
+    assert_eq!(lent, seen);
     assert_eq!(torn.by_group(&0).keys().count(), 100);
 }
 
