@@ -49,10 +49,19 @@ struct Timespec {
 
 #[unsafe(no_mangle)]
 extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"clock_gettime"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"clock_gettime".as_ptr()) };
+    // SAFETY: glibc defines `clock_gettime`, so `symbol` is the non-null address of that function,
+    // and its C prototype `int clock_gettime(clockid_t, struct timespec *)` matches this function
+    // pointer type. `Timespec` is `repr(C)` with the two 64-bit fields of 64-bit Linux's
+    // `timespec`.
     let real: extern "C" fn(c_int, *mut Timespec) -> c_int = unsafe { std::mem::transmute(symbol) };
     let code = real(clock, out);
     if clock == 0 {
+        // SAFETY: a caller of `clock_gettime` passes in `out` a pointer valid for writes to a
+        // `timespec`, which `Timespec` matches in layout. Clock 0 is `CLOCK_REALTIME`, which
+        // always exists, so the real call has just filled it in.
         unsafe { (*out).seconds -= CLOCK_BACK_SECONDS.load(Ordering::SeqCst) };
     }
     code
@@ -64,6 +73,8 @@ fn fails_now() -> bool {
         SYNCS_UNTIL_FAILURE.store(left - 1, Ordering::SeqCst);
         if left == 0 {
             FAILED_SYNC.store(true, Ordering::SeqCst);
+            // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's
+            // `errno`, valid for writes for as long as the thread runs.
             unsafe { *__errno_location() = EIO };
             return true;
         }
@@ -82,7 +93,11 @@ pub extern "C" fn fdatasync(fd: c_int) -> c_int {
     if fails_now() {
         return -1;
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"fdatasync"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"fdatasync".as_ptr()) };
+    // SAFETY: glibc defines `fdatasync`, so `symbol` is the non-null address of that function, and
+    // its C prototype `int fdatasync(int)` matches this function pointer type.
     let real: extern "C" fn(c_int) -> c_int = unsafe { std::mem::transmute(symbol) };
     real(fd)
 }
@@ -92,7 +107,11 @@ pub extern "C" fn fsync(fd: c_int) -> c_int {
     if fails_now() {
         return -1;
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"fsync"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"fsync".as_ptr()) };
+    // SAFETY: glibc defines `fsync`, so `symbol` is the non-null address of that function, and its
+    // C prototype `int fsync(int)` matches this function pointer type.
     let real: extern "C" fn(c_int) -> c_int = unsafe { std::mem::transmute(symbol) };
     real(fd)
 }
@@ -100,13 +119,20 @@ pub extern "C" fn fsync(fd: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: i64) -> isize {
     if count > SPLIT && WRITES_FAIL.with(Cell::get) {
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = ENOSPC };
         return -1;
     }
     if count > SPLIT && WRITES_SLOW.with(Cell::get) {
         std::thread::sleep(Duration::from_millis(2));
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"pwrite64"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"pwrite64".as_ptr()) };
+    // SAFETY: glibc defines `pwrite64`, so `symbol` is the non-null address of that function, and
+    // its C prototype `ssize_t pwrite64(int, const void *, size_t, off64_t)` matches this function
+    // pointer type.
     let real: extern "C" fn(c_int, *const c_void, usize, i64) -> isize =
         unsafe { std::mem::transmute(symbol) };
     real(fd, buf, count, offset)
@@ -116,10 +142,16 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
 pub extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
     let error = RENAME_ERROR.load(Ordering::SeqCst);
     if error != 0 {
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = error };
         return -1;
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"rename"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"rename".as_ptr()) };
+    // SAFETY: glibc defines `rename`, so `symbol` is the non-null address of that function, and its
+    // C prototype `int rename(const char *, const char *)` matches this function pointer type.
     let real: extern "C" fn(*const c_char, *const c_char) -> c_int =
         unsafe { std::mem::transmute(symbol) };
     real(from, to)

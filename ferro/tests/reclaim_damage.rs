@@ -19,25 +19,37 @@ fn grew(size: usize) {
     HIGH.fetch_max(now, Ordering::Relaxed);
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// updates the atomic counters `LIVE` and `HIGH`, which neither allocates nor panics.
 unsafe impl GlobalAlloc for Peak {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         grew(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed on
+        // to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout`, and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         grew(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc_zeroed`'s contract for `layout`, which is
+        // passed on to `System` unchanged.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         grew(size);
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout` and that `size` is a valid new size for it. The block came from `System` with
+        // that layout, and all three are passed on unchanged.
         unsafe { System.realloc(pointer, layout, size) }
     }
 }

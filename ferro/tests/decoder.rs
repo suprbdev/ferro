@@ -24,23 +24,36 @@ fn note(size: usize) {
     let _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// updates the const-initialized thread-local cell `LARGEST`, through `try_with`, which neither
+// allocates nor panics, even while the thread's locals are being destroyed.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed on
+        // to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller guarantees that `ptr` was allocated by this allocator with `layout`,
+        // and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         note(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc_zeroed`'s contract for `layout`, which is
+        // passed on to `System` unchanged.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note(new_size);
+        // SAFETY: the caller guarantees that `ptr` was allocated by this allocator with `layout`
+        // and that `new_size` is a valid new size for it. The block came from `System` with that
+        // layout, and all three are passed on unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }

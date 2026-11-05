@@ -25,10 +25,17 @@ thread_local! {
 #[unsafe(no_mangle)]
 pub extern "C" fn pread64(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize {
     if FAIL_READ_AT.with(Cell::get) == offset {
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = EIO };
         return -1;
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"pread64"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"pread64".as_ptr()) };
+    // SAFETY: glibc defines `pread64`, so `symbol` is the non-null address of that function, and
+    // its C prototype `ssize_t pread64(int, void *, size_t, off64_t)` matches this function pointer
+    // type.
     let real: extern "C" fn(c_int, *mut c_void, usize, i64) -> isize =
         unsafe { std::mem::transmute(symbol) };
     real(fd, buf, count, offset)

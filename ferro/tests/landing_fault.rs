@@ -60,20 +60,32 @@ pub extern "C" fn fdatasync(fd: c_int) -> c_int {
             thread::sleep(Duration::from_millis(1));
         }
         SYNC_FAILED.store(true, Ordering::SeqCst);
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = EIO };
         return -1;
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"fdatasync"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"fdatasync".as_ptr()) };
+    // SAFETY: glibc defines `fdatasync`, so `symbol` is the non-null address of that function, and
+    // its C prototype `int fdatasync(int)` matches this function pointer type.
     let real: extern "C" fn(c_int) -> c_int = unsafe { std::mem::transmute(symbol) };
     real(fd)
 }
 
 fn is_frame(buf: *const c_void, count: usize) -> bool {
+    // SAFETY: `is_frame` is only called from `pwrite64` with its own `buf` and `count`, and a
+    // caller of `pwrite64` guarantees that `buf` is readable for `count` bytes, and `count` is at
+    // least 8 here.
     count >= 8 && unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), 8) } == b"FERROFRM"
 }
 
 fn is_zeros(buf: *const c_void, count: usize) -> bool {
     count >= 4096
+        // SAFETY: `is_zeros` is only called from `pwrite64` with its own `buf` and `count`, and a
+        // caller of `pwrite64` guarantees that `buf` is readable for `count` bytes, which is the
+        // length read here.
         && unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), count) }
             .iter()
             .all(|byte| *byte == 0)
@@ -82,16 +94,22 @@ fn is_zeros(buf: *const c_void, count: usize) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: i64) -> isize {
     if offset < 8192 && count > 0 && SUPERS_FAIL.swap(false, Ordering::SeqCst) {
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = EIO };
         return -1;
     }
     if offset >= 8192 && ZEROS_FAIL.load(Ordering::SeqCst) && is_zeros(buf, count) {
         ZEROS_FAILED.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+        // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = ENOSPC };
         return -1;
     }
     if is_frame(buf, count) {
         if FRAMES_FAIL.with(Cell::get) {
+            // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's
+            // `errno`, valid for writes for as long as the thread runs.
             unsafe { *__errno_location() = ENOSPC };
             return -1;
         }
@@ -102,7 +120,12 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
             });
         }
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"pwrite64"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"pwrite64".as_ptr()) };
+    // SAFETY: glibc defines `pwrite64`, so `symbol` is the non-null address of that function, and
+    // its C prototype `ssize_t pwrite64(int, const void *, size_t, off64_t)` matches this function
+    // pointer type.
     let real: extern "C" fn(c_int, *const c_void, usize, i64) -> isize =
         unsafe { std::mem::transmute(symbol) };
     real(fd, buf, count, offset)

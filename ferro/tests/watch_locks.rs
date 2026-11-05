@@ -50,7 +50,11 @@ pub extern "C" fn fdatasync(fd: c_int) -> c_int {
             thread::yield_now();
         }
     }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"fdatasync"` is a NUL-terminated string that outlives the call.
     let symbol = unsafe { dlsym(RTLD_NEXT, c"fdatasync".as_ptr()) };
+    // SAFETY: glibc defines `fdatasync`, so `symbol` is the non-null address of that function, and
+    // its C prototype `int fdatasync(int)` matches this function pointer type.
     let real: extern "C" fn(c_int) -> c_int = unsafe { std::mem::transmute(symbol) };
     real(fd)
 }

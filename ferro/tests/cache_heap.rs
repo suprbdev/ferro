@@ -12,20 +12,30 @@ fn chunk(size: usize) -> usize {
     (size + 8).next_multiple_of(16).max(32)
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// updates the atomic counters `LIVE`, which neither allocates nor panics.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE.fetch_add(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed on
+        // to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout`, and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         LIVE.fetch_add(chunk(size), Ordering::Relaxed);
         LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout` and that `size` is a valid new size for it. The block came from `System` with
+        // that layout, and all three are passed on unchanged.
         unsafe { System.realloc(pointer, layout, size) }
     }
 }
