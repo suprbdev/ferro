@@ -1,3 +1,17 @@
+//! `shop-probe`: experiments that measure how ferro behaves under the shop's workload.
+//!
+//! The first argument picks the experiment, each run on a fresh file under `target/bench` with
+//! order-like commits. `lock` measures commit throughput as threads and the time spent inside a
+//! commit closure grow, `snapshot` the cost of holding old snapshots while committing, `watch` the
+//! cost of a watcher that drains or never reads, `history` and `step` the cost of `history_of` and
+//! of each step back through the log, `open` the open time as history grows, and `etag` the cost of
+//! computing `ETag`s directly and over HTTP.
+//!
+//! ```sh
+//! cargo run --release -p shop --bin shop-probe -- lock quick
+//! cargo run --release -p shop --bin shop-probe -- etag
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

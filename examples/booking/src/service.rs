@@ -8,8 +8,11 @@ use crate::error::Result;
 use crate::model::{Cents, Hotels, Night};
 use crate::ops::{Held, HoldRequest, Why};
 
+/// The source of the current time in Unix milliseconds, replaceable so tests can move time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// How [`Reservations::open`] opens the database: commit coalescing, read-only, buffered
+/// durability, and how many versions of history to keep.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub coalesce: bool,
@@ -18,6 +21,10 @@ pub struct Config {
     pub keep_last: Option<usize>,
 }
 
+/// The reservations service: a [`Db<Hotels>`](Db) and the [`Clock`] its writes read.
+///
+/// Every write runs as one `try_commit_stamped` closure that returns a commit message or a
+/// [`BookingError`](crate::BookingError), so it either commits whole or writes nothing.
 #[derive(Clone)]
 pub struct Reservations {
     db: Db<Hotels>,

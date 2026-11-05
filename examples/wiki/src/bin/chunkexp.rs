@@ -1,3 +1,17 @@
+//! `chunkexp`: compares ways to store a large page body by the cost of small edits.
+//!
+//! It generates a base text of `base_kib` KiB of prose and `count` small random edits, then for
+//! each layout commits the base and every edit to a fresh database in `dir`: the body as one
+//! `String`, as a [`ferro::List`] of fixed 4 KiB pieces, and as a list of content-defined chunks
+//! either rebuilt or updated in place with [`wiki::chunk::update`] at several chunk sizes. It runs
+//! each layout warm, on one open database, and cold, reopening it for every edit, and prints the
+//! file growth per edit and the time per edit.
+//!
+//! ```sh
+//! cargo run --release -p wiki --bin chunkexp
+//! cargo run --release -p wiki --bin chunkexp -- target/scratch/chunkexp 1000 100
+//! ```
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

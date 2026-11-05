@@ -1,3 +1,18 @@
+//! The `notes` command line: offline-first notes kept per device and synced with ferro.
+//!
+//! `--device`, or `NOTES_DEVICE`, names the device's directory, whose name is the device's name.
+//! Notes can be added with tags, edited, tagged and untagged, deleted, listed by tag and shown with
+//! the stamps of their last changes. `sync` converges this device with another device's directory
+//! through [`notes::Device::sync`], merging edits made on both since they last met, and prints what
+//! each pull sent.
+//!
+//! ```sh
+//! make notes ARGS='--device phone add "buy milk" --tag shopping'
+//! cargo run --release -p notes --bin notes -- --device laptop add "call the bank"
+//! cargo run --release -p notes --bin notes -- --device laptop sync phone
+//! cargo run --release -p notes --bin notes -- --device phone list --tag shopping
+//! ```
+
 use std::error::Error;
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;

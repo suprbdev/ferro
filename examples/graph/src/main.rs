@@ -1,3 +1,25 @@
+//! The `graph` command line: a social graph service on ferro.
+//!
+//! Each run opens the database at `--db`, read-only for commands that only read, and runs one
+//! subcommand from [`graph::commands`]: adding users, following, unfollowing and blocking, posting
+//! with optional fan-out to followers' inboxes, and liking; paging followers and following,
+//! counting, mutuals, shortest paths, reach within a number of hops, recommendations, timelines,
+//! pagerank and communities. Reads run on the current snapshot, or on an older one with `--at` or
+//! `graph-at`, and `diff` lists the follows added and removed between two versions. `seed` fills an
+//! empty database with a power-law graph, `verify` re-hashes the file and checks both edge
+//! directions against each other, the degree counts and the blocks, `bench` runs benchmarks on it,
+//! and `experiment` builds a synthetic graph in other adjacency layouts to compare them.
+//! `--buffered` selects buffered durability, `--cache-mib` the cache size and `--timing` prints the
+//! elapsed time and peak memory.
+//!
+//! ```sh
+//! cargo run --release -p graph -- seed --users 10000 --edges 100000
+//! cargo run --release -p graph -- followers u1 --limit 10
+//! cargo run --release -p graph -- reach u1 --hops 2
+//! cargo run --release -p graph -- pagerank --top 10
+//! cargo run --release -p graph -- graph-at 1 stats
+//! ```
+
 use std::error::Error;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;

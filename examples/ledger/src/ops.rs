@@ -3,6 +3,7 @@ use crate::model::{Account, Entry, Kind, Ledger, Line, PostingKey};
 use crate::money::{format_amount, format_date};
 use ferro::Val;
 
+/// A line of an entry to post, naming its account and optionally the currency it expects.
 #[derive(Clone, Debug)]
 pub struct NewLine {
     pub account: String,
@@ -20,6 +21,8 @@ impl NewLine {
     }
 }
 
+/// An entry to post with [`Ledger::post`]: its date, memo and lines, and what it adjusts or
+/// reverses.
 #[derive(Clone, Debug)]
 pub struct NewEntry {
     pub date: i32,

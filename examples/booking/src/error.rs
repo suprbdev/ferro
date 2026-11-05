@@ -1,5 +1,9 @@
 use crate::model::{Cents, Night, Status};
 
+/// Every way a reservations command can fail, from a missing row or a taken night to a database
+/// error.
+///
+/// Write closures return it to abort their commit, so a failed hold or confirm writes nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum BookingError {
     #[error("no such venue: {0}")]
@@ -64,6 +68,7 @@ pub enum BookingError {
     Db(#[from] ferro::Error),
 }
 
+/// A result whose error is a [`BookingError`].
 pub type Result<T> = std::result::Result<T, BookingError>;
 
 impl BookingError {

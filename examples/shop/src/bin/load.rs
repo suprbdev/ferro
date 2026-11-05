@@ -1,3 +1,22 @@
+//! `shop-load`: load tests and checks against a running `shop` server.
+//!
+//! The first argument picks the mode. `run` drives the server at `--addr` from `--conns`
+//! connections for `--secs` seconds with a `--mix` of reads, cart writes and orders, sending
+//! `If-None-Match` on some reads and reading from a replica at `--read-addr` if given; `--seed`
+//! first fills it with `--products` products, some with scarce stock, and `--customers` customers.
+//! It reports throughput and latency per kind of request, then checks that the stock taken matches
+//! the orders that succeeded. `replica-lag` measures how long a write takes to show on a replica,
+//! `slow-sse` how writes fare with slow change-feed readers attached, and `crash-writer` and
+//! `crash-verify` record acknowledged orders before a crash and check after a restart that none
+//! were lost.
+//!
+//! ```sh
+//! make shop-load SECS=10
+//! cargo run --release -p shop --bin shop-load -- run --addr 127.0.0.1:3000 --secs 10 --seed
+//! cargo run --release -p shop --bin shop-load -- replica-lag --addr 127.0.0.1:3000 \
+//!     --read-addr 127.0.0.1:3001
+//! ```
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

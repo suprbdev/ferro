@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::error::ApiError;
 use crate::model::{Chat, Room, message_view, reactions_view, room_view};
 
+/// What a feed follows: one room, or every room a user belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Room(u64),
@@ -183,6 +184,8 @@ pub fn changes(scope: Scope, old: &Chat, new: &Chat, limit: usize) -> (Vec<Value
     (out, false)
 }
 
+/// One Server-Sent Event: its event name, its id, which is a version when it has one, and its JSON
+/// data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub event: &'static str,
@@ -223,6 +226,7 @@ enum Start {
     Reset(String),
 }
 
+/// Every open feed, so the service can count them and close them all when it shuts down.
 pub struct Feeds {
     next: AtomicU64,
     live: Mutex<HashMap<u64, Closer<Chat>>>,
@@ -253,6 +257,11 @@ impl Feeds {
     }
 }
 
+/// One client's feed: a watcher on the database that wakes when its [`Scope`] changes.
+///
+/// [`Subscription::next`] yields the opening frames, then a frame of changes each time a newer
+/// version changes the scope, and `None` once the feed is closed. Dropping it removes it from
+/// [`Feeds`].
 pub struct Subscription {
     id: u64,
     scope: Scope,

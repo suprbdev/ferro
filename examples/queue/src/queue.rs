@@ -10,8 +10,10 @@ use crate::error::{QueueError, Result};
 use crate::model::{Job, JobState, NewJob, Recurring};
 use crate::state::{State, Tick};
 
+/// The source of the current time in Unix milliseconds, replaceable so tests can move time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// A [`Clock`] that reads the system time.
 pub fn system_clock() -> Clock {
     Arc::new(|| {
         SystemTime::now()
@@ -21,6 +23,9 @@ pub fn system_clock() -> Clock {
     })
 }
 
+/// How [`Queue::open`] opens the database: the clock, durability, how long to wait for another
+/// process's writer lock, the cache size, how much history to keep and reclaim, and whether to
+/// coalesce commits.
 #[derive(Clone)]
 pub struct QueueOptions {
     pub clock: Clock,
@@ -46,12 +51,17 @@ impl Default for QueueOptions {
     }
 }
 
+/// Proof of one lease on a job: its id and the attempt number the lease started.
+///
+/// Acking, nacking or extending with a lease that has since expired or been taken over fails with
+/// [`QueueError::LeaseLost`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub id: u64,
     pub attempt: u32,
 }
 
+/// A job a worker has just leased.
 #[derive(Clone, Debug)]
 pub struct Leased {
     pub job: Job,
@@ -66,12 +76,14 @@ impl Leased {
     }
 }
 
+/// The id of an enqueued job, and whether its key matched a job already enqueued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Enqueued {
     pub id: u64,
     pub duplicate: bool,
 }
 
+/// How many jobs of one queue are in each state, and whether the queue is paused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub queue: String,
@@ -83,6 +95,8 @@ pub struct Stats {
     pub paused: bool,
 }
 
+/// One step in a job's [`Queue::history`]: the commit that changed it, and the job as that commit
+/// left it, or `None` once it was gone.
 #[derive(Clone, Debug)]
 pub struct Event {
     pub version: u64,
@@ -91,6 +105,8 @@ pub struct Event {
     pub job: Option<Job>,
 }
 
+/// A job [`Queue::replay`] re-enqueued: the original id, the new id, and whether the replay key
+/// matched one already enqueued.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replayed {
     pub from_job: u64,
@@ -98,6 +114,10 @@ pub struct Replayed {
     pub duplicate: bool,
 }
 
+/// A handle on the queue database, cheap to clone and share between threads.
+///
+/// Each operation is one commit, so a job is enqueued, leased, acked or retried whole or not at
+/// all.
 #[derive(Clone)]
 pub struct Queue {
     db: Db<State>,

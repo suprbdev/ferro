@@ -1,3 +1,21 @@
+//! `booking-stress`: threads race for the same rooms and nights, then every version is checked.
+//!
+//! It seeds venues, rooms and customers, then runs `--threads` writers that hold, confirm and
+//! cancel stays on a few hot nights while short holds lapse, a sweeper that expires them, a pricer
+//! that changes rates, and `--browsers` readers that page customers' newest bookings from the
+//! covering index. Writes go through [`booking::Reservations`], so each one is a
+//! `try_commit_stamped` closure. By default it runs once without ferro's commit coalescing and once
+//! with it and compares the write rates. Afterwards it walks the commit log with [`booking::walk`],
+//! checking every transition between versions and every `--every`th version in full, and exits with
+//! status 1 if any invariant is broken. `--buffered` and `--keep-last` select buffered durability
+//! and bounded history.
+//!
+//! ```sh
+//! make booking-stress ARGS='--threads 64'
+//! cargo run --release -p booking --bin booking-stress -- --threads 16 --browsers 4
+//! cargo run --release -p booking --bin booking-stress -- --coalesce on --secs 10 --rounds 3
+//! ```
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::hint::black_box;

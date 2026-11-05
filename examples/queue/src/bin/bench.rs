@@ -1,3 +1,21 @@
+//! `queue-bench`: benchmarks for the durable job queue.
+//!
+//! The first argument picks the benchmark and the rest are `key=value` settings. `throughput` runs
+//! workers against a queue prefilled to `depth`, `growth` measures the bytes and time each enqueue,
+//! lease and ack costs, `wake` the time from enqueue to a sleeping worker picking the job up,
+//! `idle` the context switches idle workers cost while other commits land, `batching` draining a
+//! queue with leases of several batch sizes, `day` a steady enqueue `rate` for `secs` with workers
+//! keeping up, `cycle` the same with bounded history and space reclaimed every `reclaim_mb`, `hist`
+//! the cost of a job's history in an existing `file`, and `split` the commit cost of changing each
+//! part of the state alone on a deep queue. All but `hist` write fresh files under `target/qbench`,
+//! and `COALESCE=0` turns off commit coalescing.
+//!
+//! ```sh
+//! make queue-bench ARGS='throughput depth=100000 workers=1,8,32 secs=5'
+//! cargo run --release -p queue --bin queue-bench -- wake samples=100
+//! COALESCE=0 cargo run --release -p queue --bin queue-bench -- day rate=2000 secs=30
+//! ```
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

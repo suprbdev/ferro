@@ -1,3 +1,19 @@
+//! The `shop` server: an HTTP API for products, stock, customers, carts and orders.
+//!
+//! It opens the database at `--db`, builds the server with [`shop::build`] and serves it on
+//! `--addr` until Ctrl-C. Writes are awaited with `try_commit_with_async` unless `--writes` picks
+//! `inline`, `blocking` or `pool:N`, and `--reads` picks where reads run. `--replica` serves a
+//! read-only copy of a file another `shop` process writes, refreshing it every `--refresh-ms`.
+//! `--coalesce` turns on commit coalescing, `--durability` picks `fsync` or `buffered`,
+//! `--keep-versions` and `--reclaim-mb` bound the history kept, and `--workers` sets the number of
+//! Tokio worker threads.
+//!
+//! ```sh
+//! make shop DB=target/demo/shop.ferro ADDR=127.0.0.1:3000
+//! cargo run --release -p shop --bin shop -- --db shop.ferro --coalesce
+//! cargo run --release -p shop --bin shop -- --db shop.ferro --addr 127.0.0.1:3001 --replica
+//! ```
+
 use std::path::PathBuf;
 use std::time::Instant;
 

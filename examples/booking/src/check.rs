@@ -6,12 +6,15 @@ use ferro::{Change, Db, Snapshot};
 use crate::error::Result;
 use crate::model::{Booking, Cents, Flow, Hotels, Line, Load, Night, Status};
 
+/// A broken invariant found by [`walk`], with the version it was found at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
     pub version: u64,
     pub message: String,
 }
 
+/// What [`walk`] checked: the versions it covered, how many it checked in full, the expiry lag it
+/// saw, and every [`Violation`].
 #[derive(Clone, Debug, Default)]
 pub struct Walked {
     pub first: u64,
@@ -197,6 +200,9 @@ fn booking_in(h: &Hotels, b: &Booking, out: &mut Report<'_>) {
     }
 }
 
+/// Checks the invariants of one state, returning a message for each that does not hold.
+///
+/// Rows, indexes, covered fields, counters and the till must all agree.
 pub fn check_state(h: &Hotels) -> Vec<String> {
     let mut messages = Vec::new();
     let out = &mut Report { out: &mut messages };
@@ -569,6 +575,7 @@ fn check_step(
     }
 }
 
+/// Checks that `cur` is an allowed successor of `prev`, returning a message for each broken rule.
 pub fn check_pair(prev: &Hotels, cur: &Hotels) -> Vec<String> {
     let mut messages = Vec::new();
     check_step(
@@ -581,6 +588,14 @@ pub fn check_pair(prev: &Hotels, cur: &Hotels) -> Vec<String> {
     messages
 }
 
+/// Walks every version in the log, checking each step by the rules of [`check_pair`].
+///
+/// The first version is checked in full with [`check_state`], and so are the last and every
+/// `full_every`th version unless `full_every` is 0.
+///
+/// # Errors
+///
+/// Returns an error if a version in the log cannot be read.
 pub fn walk(db: &Db<Hotels>, full_every: u64) -> Result<Walked> {
     let started = Instant::now();
     let log = db.log();

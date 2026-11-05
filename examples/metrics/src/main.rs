@@ -1,3 +1,24 @@
+//! The `metrics` command line: a time-series metrics store on ferro.
+//!
+//! `ingest` reads `metric{label="value"} value [ts]` lines from a file or stdin and commits them in
+//! batches. `query` prints the raw points of the series a selector matches, `series` and `labels`
+//! list what is stored, and `aggregate` computes `avg`, `sum`, `min`, `max`, `count`, `rate` or a
+//! percentile over a time range, per `--step` and grouped `--by` a label, from raw points or from
+//! the `--rollup` built by `downsample`. `retain` drops the points older than a duration, then
+//! compacts the file keeping `--keep-versions` or `--keep-since`. `stats` and `verify` describe and
+//! check the database, and `load` runs a synthetic write load at a given rate with bounded history
+//! and space reclaimed as it goes.
+//!
+//! ```sh
+//! cargo run --release -p metrics -- ingest samples.txt
+//! cargo run --release -p metrics -- query 'http_requests{job="api"}' --from now-1h
+//! cargo run --release -p metrics -- aggregate http_requests --fn rate --step 1m --by job
+//! cargo run --release -p metrics -- downsample --step 10m
+//! cargo run --release -p metrics -- aggregate http_requests --fn max --step 1h --rollup 10m
+//! cargo run --release -p metrics -- retain --older-than 30d
+//! cargo run --release -p metrics -- load 100000 30 --series 5000
+//! ```
+
 mod cli;
 
 use std::error::Error;

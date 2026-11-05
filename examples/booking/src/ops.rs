@@ -10,6 +10,8 @@ use crate::model::{
 pub const MAX_NIGHTS: u32 = 14;
 pub const FREE_CANCEL_NIGHTS: u32 = 2;
 
+/// What a customer asks to hold: a room for a number of nights from a first night, for `ttl_ms`
+/// before the hold lapses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldRequest {
     pub customer: u32,
@@ -19,6 +21,8 @@ pub struct HoldRequest {
     pub ttl_ms: u64,
 }
 
+/// A hold that succeeded: the new booking's id, its total and expiry, and the lapsed holds it
+/// released to take the nights.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held {
     pub id: u64,
@@ -27,6 +31,7 @@ pub struct Held {
     pub released: Vec<u64>,
 }
 
+/// Why a booking was cancelled, which decides its refund.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
     Customer,

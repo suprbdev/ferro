@@ -2,12 +2,21 @@ use std::collections::BTreeMap;
 
 use ferro::{Data, Record, Snapshot, Table, Val};
 
+/// When and where a change was made: a Lamport clock and the device that made it.
+///
+/// Stamps order by clock, then device name, so every device picks the same winner between two
+/// concurrent changes.
 #[derive(Data, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Stamp {
     pub clock: u64,
     pub device: String,
 }
 
+/// A note, indexed by each of its tags, whose text, tags and deletion each carry the [`Stamp`] of
+/// their last change.
+///
+/// `tag_marks` keeps a stamped mark for every tag ever set or removed, and `tags` lists the marks
+/// that are present.
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 pub struct Note {
     #[key]
@@ -22,6 +31,7 @@ pub struct Note {
     pub created: Stamp,
 }
 
+/// The database root: every note, deleted ones included, and the device's Lamport clock.
 #[derive(Data, Clone, Debug, Default, PartialEq)]
 pub struct Notes {
     pub notes: Table<Note>,
@@ -90,6 +100,10 @@ impl Note {
     }
 }
 
+/// Merges `theirs` into `notes` from their common `base`, joining a note both sides changed with
+/// [`Note::join`] and keeping the higher of the two clocks.
+///
+/// It returns the commit message and the number of notes applied, as [`ferro::Db::pull`] expects.
 pub fn merge(
     notes: &mut Notes,
     base: &Snapshot<Notes>,

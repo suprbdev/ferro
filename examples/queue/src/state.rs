@@ -7,6 +7,8 @@ pub type ReadyKey = (String, u8, u64);
 
 const MAINTAIN_LIMIT: usize = 4096;
 
+/// What one maintenance pass did: the leases it expired, the delayed jobs it made ready, the
+/// recurring jobs it spawned, and the idempotency keys it pruned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tick {
     pub expired: Vec<u64>,
@@ -21,6 +23,8 @@ impl Tick {
     }
 }
 
+/// The database root: the live jobs, the sets that order them by state, idempotency keys,
+/// dependencies, paused queues and recurring jobs.
 #[derive(Clone, Debug, Default, Data)]
 pub struct State {
     pub next_id: u64,

@@ -12,6 +12,8 @@ use crate::state::State;
 
 pub type Handler = Arc<dyn Fn(&Job) -> Result<(), String> + Send + Sync>;
 
+/// What a [`Runner`] works on: its queues, how many worker threads, how many jobs each leases at
+/// once and for how long, the worker name, and how long an idle worker waits for a wake-up.
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
     pub queues: Vec<String>,
@@ -42,6 +44,11 @@ struct Counters {
     lost: AtomicU64,
 }
 
+/// Worker threads that lease jobs and run a handler on each, and a reaper thread that runs
+/// [`Queue::tick`] when maintenance falls due.
+///
+/// Workers sleep on a watcher that wakes when one of their queues has ready jobs. A job whose
+/// handler returns an error or panics is nacked, and the rest of a batch are acked together.
 pub struct Runner {
     stop: Arc<AtomicBool>,
     closers: Vec<Closer<State>>,

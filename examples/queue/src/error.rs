@@ -1,3 +1,4 @@
+/// Every way a queue operation can fail, from a lost lease to a database error.
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
     #[error(transparent)]

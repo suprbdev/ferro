@@ -34,6 +34,8 @@ impl fmt::Display for Kind {
     }
 }
 
+/// An account, unique by name, with its [`Kind`], its currency, whether it is closed, and its
+/// current balance in minor units.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Account {
     #[key]
@@ -46,12 +48,16 @@ pub struct Account {
     pub balance: i64,
 }
 
+/// One line of an [`Entry`]: an amount in the account's minor units, positive for a debit and
+/// negative for a credit.
 #[derive(Clone, Debug, PartialEq, Data)]
 pub struct Line {
     pub account: u32,
     pub amount: i64,
 }
 
+/// A posted journal entry: its date in days since 1970-01-01, its memo and lines, and the entry it
+/// reverses or the closed date it adjusts, if any.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Entry {
     #[key]
@@ -80,6 +86,8 @@ impl Summary<PostingKey, i64> for Net {
     }
 }
 
+/// The database root: accounts, entries, the summarized postings, which entries have been reversed,
+/// the date the books are closed through, and the id counters.
 #[derive(Clone, Default, Data)]
 pub struct Ledger {
     pub accounts: Table<Account>,

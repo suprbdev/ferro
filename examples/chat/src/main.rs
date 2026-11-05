@@ -1,3 +1,18 @@
+//! The `chat` server: multi-room chat over HTTP, with live feeds as Server-Sent Events.
+//!
+//! It opens the database at `--db`, builds the service with [`chat::build`] and serves it on
+//! `--addr` until Ctrl-C. Requests made as a user carry its id in an `x-user` header. Clients can
+//! create users and rooms, join and leave, post, edit and delete their own messages, react, mark
+//! messages read, page through history, search a room's words, and follow a room or all of a user's
+//! rooms at `/rooms/{room}/events` or `/users/{user}/events`. `--durability`, `--coalesce`,
+//! `--keep-versions`, `--reclaim-mb` and `--max-changes` set the [`chat::Config`].
+//!
+//! ```sh
+//! make chat DB=target/demo/chat.ferro ADDR=127.0.0.1:3000
+//! cargo run --release -p chat --bin chat -- --db chat.ferro
+//! cargo run --release -p chat --bin chat -- --db chat.ferro --addr 127.0.0.1:3000 --coalesce
+//! ```
+
 use std::path::PathBuf;
 
 use chat::{Config, build, open_db, serve};

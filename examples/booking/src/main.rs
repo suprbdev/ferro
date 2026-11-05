@@ -1,3 +1,23 @@
+//! The `booking` command line: hotel reservations with holds, refunds and what-ifs.
+//!
+//! Each run opens the database named by `--db`, read-only for commands that only read, and runs one
+//! subcommand through [`booking::Reservations`]: adding venues, rooms and customers, holding rooms
+//! for a stay, confirming, cancelling and sweeping lapsed holds, showing a booking `--at` a version
+//! or `--as-of` a time, receipts and audit trails from history, reports, a full invariant `check`,
+//! and what-if scenarios that run on a fork and are previewed, applied by a fallible merge or
+//! dropped. `--coalesce` turns on ferro's commit coalescing.
+//!
+//! ```sh
+//! make booking ARGS='seed'
+//! cargo run --release -p booking --bin booking -- seed
+//! cargo run --release -p booking --bin booking -- hold guest1@example.com "Harbour House/101" \
+//!     --from 2030-01-10 --nights 2
+//! cargo run --release -p booking --bin booking -- confirm 1
+//! cargo run --release -p booking --bin booking -- receipt 1
+//! cargo run --release -p booking --bin booking -- whatif close storm --venue "Harbour House"
+//! cargo run --release -p booking --bin booking -- check
+//! ```
+
 mod cli;
 mod commands;
 

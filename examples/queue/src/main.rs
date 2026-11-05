@@ -1,3 +1,23 @@
+//! The `queue` command line: a durable job queue on ferro.
+//!
+//! Each run opens the queue at `--db`, waiting up to `--lock-wait-ms` for another process that
+//! holds the writer lock, and runs one subcommand through [`queue::Queue`]: enqueueing one job or a
+//! batch with a priority, delay, retry policy, idempotency key and parents to run after; leasing,
+//! acking, nacking and extending jobs by id and attempt; `work`, which runs a shell command per job
+//! on [`queue::Runner`] threads with the payload on stdin; `tick` for maintenance; pausing and
+//! resuming queues; the dead letter queue and recurring jobs; and `history`, which lists every
+//! state a job passed through, and `replay`, which re-enqueues the jobs that were in flight at a
+//! past version.
+//!
+//! ```sh
+//! cargo run --release -p queue --bin queue -- enqueue emails '{"to":"ann"}' --priority 10
+//! cargo run --release -p queue --bin queue -- lease emails --ttl-ms 60000
+//! cargo run --release -p queue --bin queue -- ack 1 1
+//! cargo run --release -p queue --bin queue -- work emails --workers 4 --exec cat --exit-when-idle
+//! cargo run --release -p queue --bin queue -- history 1
+//! cargo run --release -p queue --bin queue -- replay --from 5
+//! ```
+
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;

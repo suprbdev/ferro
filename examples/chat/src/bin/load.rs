@@ -1,3 +1,20 @@
+//! `chat-load`: a load test for the chat service that times posts and their delivery to feeds.
+//!
+//! With `--db` it deletes any file at that path and serves a fresh database in process; with
+//! `--addr` it drives a server that is already running. It seeds `--rooms` rooms and `--users`
+//! users in `--per-user` rooms each through `/admin/seed`, opens a feed for each of `--clients`
+//! users, and posts from `--posters` connections, flat out or at `--rate` posts a second. A
+//! `--receipts` fraction of deliveries send a read receipt back. It reports the post rate and
+//! latency, the time from a post to each member's feed, missing or duplicate deliveries, and how
+//! much the file grew. `--durability`, `--coalesce`, `--keep-versions` and `--reclaim-mb` configure
+//! the in-process server.
+//!
+//! ```sh
+//! make chat-load SECS=10
+//! cargo run --release -p chat --bin chat-load -- --db load.ferro --rate 1000
+//! cargo run --release -p chat --bin chat-load -- --addr 127.0.0.1:8080 --clients 1000
+//! ```
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;

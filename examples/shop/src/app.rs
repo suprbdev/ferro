@@ -49,12 +49,16 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Where a read handler runs: on the async worker that took the request, or on Tokio's blocking
+/// pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadMode {
     Inline,
     Blocking,
 }
 
+/// How a write is committed: awaited with `try_commit_with_async`, inline on the async worker, on
+/// Tokio's blocking pool, or on a pool of the given number of writer threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteMode {
     Async,
@@ -96,6 +100,7 @@ impl FromStr for WriteMode {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Runs reads and writes from async handlers in the configured [`ReadMode`] and [`WriteMode`].
 pub struct Bridge {
     pub reads: ReadMode,
     pub writes: WriteMode,
@@ -193,6 +198,8 @@ pub struct Counters {
     pub events_lagged: AtomicU64,
 }
 
+/// The running server: the database, the [`Bridge`], whether it is a replica, the change feed,
+/// counters, and the signal that it is shutting down.
 pub struct App {
     pub db: Db<Shop>,
     pub bridge: Bridge,

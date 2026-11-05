@@ -1,3 +1,7 @@
+/// Every way a ledger command can fail, from an unbalanced entry or a closed period to a database
+/// error.
+///
+/// Write closures return it to abort their commit, so a rejected entry writes nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
     #[error("unbalanced entry in {currency}: debits {debits} != credits {credits}")]

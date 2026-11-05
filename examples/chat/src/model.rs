@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferro::{Data, Map, Record, Set, Summary, Table};
 use serde_json::{Value, json};
 
+/// A user, unique by name, with the rooms they belong to.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct User {
     #[key]
@@ -14,12 +15,14 @@ pub struct User {
     pub rooms: BTreeSet<u64>,
 }
 
+/// A user's membership of a room: when they joined and the last message they have read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Data)]
 pub struct Member {
     pub joined_ms: u64,
     pub read: u64,
 }
 
+/// A message in a room, with its edit time, its reactions, and whether its author deleted it.
 #[derive(Clone, Debug, Default, PartialEq, Data)]
 pub struct Message {
     pub author: u64,
@@ -30,6 +33,7 @@ pub struct Message {
     pub reactions: BTreeMap<String, BTreeSet<u64>>,
 }
 
+/// The summary of a room's messages: how many of them are not deleted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Data)]
 #[ferro(transparent)]
 pub struct Live(pub u64);
@@ -44,6 +48,8 @@ impl Summary<u64, Message> for Live {
     }
 }
 
+/// A room, unique by name, holding its members, its messages by sequence number, and the
+/// `(term, seq)` pairs that index its messages for search.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Room {
     #[key]
@@ -58,6 +64,7 @@ pub struct Room {
     pub terms: Set<(String, u64)>,
 }
 
+/// The database root: every user and room, and the next id of each.
 #[derive(Clone, Default, Data)]
 pub struct Chat {
     pub users: Table<User>,
@@ -84,6 +91,7 @@ impl Room {
     }
 }
 
+/// The current time in Unix milliseconds, or 0 if the clock is before 1970.
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -91,6 +99,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The lowercased words of 2 to 32 characters in `text`, as the search index keeps them.
 pub fn terms(text: &str) -> BTreeSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| (2..=32).contains(&word.chars().count()))
@@ -98,6 +107,7 @@ pub fn terms(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// The JSON for a message's reactions: each emoji with the users who chose it.
 pub fn reactions_view(reactions: &BTreeMap<String, BTreeSet<u64>>) -> Value {
     Value::Object(
         reactions
@@ -107,6 +117,7 @@ pub fn reactions_view(reactions: &BTreeMap<String, BTreeSet<u64>>) -> Value {
     )
 }
 
+/// The JSON for one message; a deleted message keeps only its place, author and time.
 pub fn message_view(room: u64, seq: u64, message: &Message) -> Value {
     if message.deleted {
         return json!({
@@ -129,6 +140,7 @@ pub fn message_view(room: u64, seq: u64, message: &Message) -> Value {
     })
 }
 
+/// The JSON for a room, with its member count and the number of messages not deleted.
 pub fn room_view(room: &Room) -> Value {
     json!({
         "id": room.id,
@@ -141,6 +153,7 @@ pub fn room_view(room: &Room) -> Value {
     })
 }
 
+/// The JSON for a user and the rooms they belong to.
 pub fn user_view(user: &User) -> Value {
     json!({
         "id": user.id,

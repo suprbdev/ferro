@@ -8,6 +8,8 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_BACKOFF_MS: u64 = 1_000;
 pub const BACKOFF_CAP_MS: u64 = 3_600_000;
 
+/// Where a [`Job`] is: ready to lease, delayed until its run time, leased to a worker, blocked on
+/// the jobs it runs after, or dead after its last attempt failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Data)]
 pub enum JobState {
     Ready,
@@ -35,6 +37,8 @@ impl fmt::Display for JobState {
     }
 }
 
+/// A job that has not finished: its queue, priority and payload, its [`JobState`], its attempts and
+/// retry policy, and the worker and expiry of its lease while it is leased.
 #[derive(Clone, Debug, PartialEq, Data)]
 pub struct Job {
     pub id: u64,
@@ -77,6 +81,7 @@ impl fmt::Display for Job {
     }
 }
 
+/// A named job template that is enqueued again every `every_ms`.
 #[derive(Clone, Debug, PartialEq, Data)]
 pub struct Recurring {
     pub name: String,
@@ -88,6 +93,10 @@ pub struct Recurring {
     pub max_attempts: u32,
 }
 
+/// A job to enqueue, built with [`NewJob::new`] and the builder methods.
+///
+/// A job with a `key` is enqueued once per queue while the key lives, and a job with parents in
+/// `after`, or earlier jobs of the same batch in `after_batch`, waits until they are acked.
 #[derive(Clone, Debug)]
 pub struct NewJob {
     pub queue: String,

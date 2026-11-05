@@ -2,9 +2,13 @@ use std::fmt;
 
 use ferro::{Data, Map, Record, Table};
 
+/// An amount of money in cents.
 pub type Cents = i64;
+/// A night, counted in days since 1970-01-01.
 pub type Night = u32;
 
+/// Where a [`Booking`] is in its life: held until paid or lapsed, then confirmed, cancelled or
+/// expired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Data)]
 pub enum Status {
     Held,
@@ -34,6 +38,7 @@ impl fmt::Display for Status {
     }
 }
 
+/// A hotel, unique by name, which can be closed from a given night on.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Venue {
     #[key]
@@ -50,6 +55,7 @@ impl Venue {
     }
 }
 
+/// A room in a [`Venue`], unique by venue and number, with its base nightly rate.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 #[unique(venue, number)]
 pub struct Room {
@@ -61,6 +67,7 @@ pub struct Room {
     pub rate: Cents,
 }
 
+/// A customer, unique by email, with the credit left to spend and the total deposited.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Customer {
     #[key]
@@ -72,6 +79,11 @@ pub struct Customer {
     pub deposited: Cents,
 }
 
+/// One stay in one room: its nights and their prices, its [`Status`], and what was paid and
+/// refunded.
+///
+/// The customer index covers the fields a [`Line`] needs, so [`Hotels::lines_of`] lists a
+/// customer's bookings without reading the rows.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Booking {
     #[key]
@@ -108,6 +120,7 @@ impl Booking {
     }
 }
 
+/// The summary of a [`Booking`] shown on a customer's bookings page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Line {
     pub id: u64,
@@ -133,6 +146,10 @@ impl From<&Booking> for Line {
     }
 }
 
+/// One night of a room claimed by a booking, keyed by booking and night.
+///
+/// The unique index on room and night is what stops two bookings taking the same room on the same
+/// night: the second insert fails inside the commit and names the holder.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 #[unique(room, night)]
 pub struct Stay {
@@ -144,12 +161,14 @@ pub struct Stay {
     pub sold: bool,
 }
 
+/// Which way a [`Payment`] moved money.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Data)]
 pub enum Flow {
     Charge,
     Refund,
 }
 
+/// A charge or refund against a booking, indexed by booking.
 #[derive(Clone, Debug, PartialEq, Data, Record)]
 pub struct Payment {
     #[key]
@@ -162,12 +181,14 @@ pub struct Payment {
     pub at_ms: u64,
 }
 
+/// How many rooms of a venue are held and sold on one night.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Data)]
 pub struct Load {
     pub held: u32,
     pub sold: u32,
 }
 
+/// Running totals of every deposit, charge and refund, moved in the same commit as the rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Data)]
 pub struct Till {
     pub deposits: Cents,
@@ -175,6 +196,7 @@ pub struct Till {
     pub refunded: Cents,
 }
 
+/// The change a what-if branch makes: reprice one or every venue by a percentage, or close a venue.
 #[derive(Clone, Debug, PartialEq, Eq, Data)]
 pub enum Scenario {
     Reprice { venue: Option<u32>, percent: i32 },
@@ -199,6 +221,10 @@ impl fmt::Display for Scenario {
     }
 }
 
+/// The database root: every table and map the reservations system keeps, and its id counters.
+///
+/// `rates` holds per-night rates that override a room's base rate, `loads` the per-venue, per-night
+/// [`Load`], and `scenario` the [`Scenario`] of a what-if branch.
 #[derive(Clone, Default, Data)]
 pub struct Hotels {
     pub venues: Table<Venue>,

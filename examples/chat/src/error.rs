@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+/// An API failure, sent to the client as an HTTP status and a JSON `error` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     NotFound(String),

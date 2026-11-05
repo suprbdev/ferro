@@ -1,3 +1,15 @@
+//! `gencorpus`: writes a synthetic corpus of Markdown pages for `wiki import`.
+//!
+//! It writes `pages` pages of generated prose under `<dir>`, one Markdown file each in a directory
+//! per category, with a long-tailed spread of sizes, a few very large pages, and links skewed
+//! towards a small set of popular pages, then prints the page count, the total bytes and the
+//! largest page. The same arguments always produce the same corpus.
+//!
+//! ```sh
+//! cargo run --release -p wiki --bin gencorpus -- target/corpus 50000
+//! cargo run --release -p wiki --bin wiki -- --db target/corpus.ferro import target/corpus
+//! ```
+
 use std::fs;
 use std::path::PathBuf;
 

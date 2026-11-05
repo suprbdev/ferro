@@ -10,6 +10,7 @@ use crate::model::{Note, Notes, Stamp, merge};
 
 pub const FILE: &str = "notes.ferro";
 
+/// Every way a notes command can fail.
 #[derive(Debug)]
 pub enum NotesError {
     Ferro(ferro::Error),
@@ -45,8 +46,10 @@ impl From<io::Error> for NotesError {
     }
 }
 
+/// A result whose error is a [`NotesError`].
 pub type Result<T> = std::result::Result<T, NotesError>;
 
+/// One pull in a sync: which device pulled from which, and what the pull did and sent.
 #[derive(Clone, Debug)]
 pub struct Step {
     pub from: String,
@@ -54,6 +57,7 @@ pub struct Step {
     pub pulled: Pulled<usize>,
 }
 
+/// The pulls a [`Device::sync`] made, in order.
 #[derive(Clone, Debug, Default)]
 pub struct Synced {
     pub steps: Vec<Step>,
@@ -72,6 +76,10 @@ impl Synced {
     }
 }
 
+/// One device's notes: a directory, named for the device, holding its database.
+///
+/// Each write makes one commit and stamps what it changes with the device's next clock ticks, and
+/// [`Device::sync`] converges it with another device.
 pub struct Device {
     name: String,
     dir: PathBuf,

@@ -1,3 +1,16 @@
+//! `notes-scale`: measures what a sync sends for a small change on a large notes database.
+//!
+//! It fills a laptop device with `--notes` notes in batches of `--batch`, syncs them to an empty
+//! phone, makes `--edits` edits on each side plus a conflicting edit and a tag on one shared note,
+//! and syncs again, reporting the bytes and objects each pull sent and received and how long it
+//! took. It fails if the two devices do not end with the same notes. The devices live in `--dir`,
+//! or in a temporary directory that is removed afterwards.
+//!
+//! ```sh
+//! make notes-scale
+//! cargo run --release -p notes --bin notes-scale -- --notes 1000000 --edits 20
+//! ```
+
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
