@@ -69,6 +69,57 @@ fn account(i: u64) -> Account {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct Counter(Option<i32>);
+
+#[cfg(not(target_os = "linux"))]
+struct Counter;
+
+#[cfg(not(target_os = "linux"))]
+impl Counter {
+    fn instructions() -> Counter {
+        Counter
+    }
+
+    fn read(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Counter {
+    fn instructions() -> Counter {
+        let mut attr = [0u64; 16];
+        attr[0] = 128 << 32;
+        attr[1] = 1;
+        attr[5] = 1 | 1 << 5 | 1 << 6;
+        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
+        if fd < 0 {
+            return Counter(None);
+        }
+        unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
+        Counter(Some(fd as i32))
+    }
+
+    fn read(&self) -> u64 {
+        let Some(fd) = self.0 else {
+            return 0;
+        };
+        let mut value = 0u64;
+        unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+        value
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Counter {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 struct Report(BTreeMap<String, f64>);
 
 impl Report {
@@ -77,10 +128,14 @@ impl Report {
     }
 
     fn timed<R>(&mut self, name: &str, count: u64, f: impl FnOnce() -> R) -> R {
+        let counter = Counter::instructions();
+        let before = counter.read();
         let start = Instant::now();
         let out = f();
         let nanos = start.elapsed().as_nanos() as f64 / count as f64;
+        let instructions = counter.read() - before;
         self.set(&format!("{name}_ns"), nanos);
+        self.set(&format!("{name}_ins"), instructions as f64 / count as f64);
         out
     }
 }
