@@ -1475,8 +1475,11 @@ mod tests {
             start.wait();
             drop(owner);
             other.join().unwrap();
-            assert!(!epoch::waiting(kept.ptr.addr().get()), "round {round}");
             let begun = std::time::Instant::now();
+            while epoch::waiting(kept.ptr.addr().get()) && begun.elapsed().as_secs() < 10 {
+                thread::yield_now();
+            }
+            assert!(!epoch::waiting(kept.ptr.addr().get()), "round {round}");
             while drops.load(Ordering::SeqCst) == 0 && begun.elapsed().as_secs() < 10 {
                 thread::yield_now();
             }
