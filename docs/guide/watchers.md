@@ -65,9 +65,11 @@ Tests run on a `ferro-watch` thread per branch, started when a filtered or async
 waits, and only for watchers that are waiting. A commit stores its snapshot and wakes that thread,
 so it costs the same with no watchers or ten thousand and never waits for a test. The thread tests
 the newest snapshot for every waiting watcher and wakes those that pass; commits that land while it
-works are folded into its next pass, and a woken watcher looks at the newest snapshot itself. A test
-runs under no lock, so it may read, commit or refresh. It must not wait for a watcher, and a slow
-test delays the other watchers of its branch, so keep tests quick. When a pass takes over a
+works are folded into its next pass, and a woken watcher looks at the newest snapshot itself. A
+receive that finds a new snapshot already there, `try_recv` included, runs the test on its own
+thread, and so does a `watch_changes` watcher once woken, since what it last saw may have moved. A
+test runs under no lock, so it may read, commit or refresh. It must not wait for a watcher, and a
+slow test delays the other watchers of its branch, so keep tests quick. When a pass takes over a
 millisecond, the thread tries splitting the next ones among a few helpers and keeps doing so while
 that is faster.
 
