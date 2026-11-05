@@ -1,3 +1,14 @@
+//! Reclamation: copying what a database retains into a new file and swapping it in.
+//!
+//! A cycle prunes each branch, then copies every object that a retained version reaches into a
+//! file beside the database, checking each object's hash as it goes. The copy runs in passes
+//! while writers go on, and a last pass under every writer lock copies what they wrote meanwhile
+//! before the new file is renamed over the old one. [`Db::compact`](crate::Db::compact), the
+//! background cycles that [`Options::history`](crate::Options::history) starts, and
+//! [`admin::compact`](crate::admin::compact) share the copy. [`Reclaim`] says when background
+//! cycles run, [`Space`] reports how they have gone, and [`Compacted`] reports one cycle.
+//! [Reclamation](docs/internals/reclamation.md) describes cycles, generations and crashes.
+
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -34,8 +45,15 @@ const COPY_THREADS: usize = 4;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 
+/// When background reclamation cycles run, set with [`Options::reclaim`](crate::Options::reclaim).
+///
+/// Background cycles run only on a writer whose [`Options::history`](crate::Options::history) is
+/// not [`Keep::All`](crate::Keep::All).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reclaim {
+    /// A cycle runs once the file has grown by this many bytes since the last one, or by its size
+    /// after the last one if that is larger. Zero turns background cycles off. The default is 64
+    /// MiB.
     pub every_bytes: u64,
 }
 
@@ -47,23 +65,44 @@ impl Default for Reclaim {
     }
 }
 
+/// What one reclamation cycle did, from [`Db::compact`](crate::Db::compact) or
+/// [`admin::compact`](crate::admin::compact).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Compacted {
+    /// The size of the file before the cycle, in bytes.
     pub before_bytes: u64,
+    /// The size of the new file, in bytes.
     pub after_bytes: u64,
+    /// The number of objects copied into the new file.
     pub objects: u64,
+    /// The number of commits the cycle pruned, across every branch.
     pub commits_dropped: u64,
+    /// The number of copy passes made before the last, which runs while writers wait.
     pub passes: u32,
+    /// How long writers waited for the last pass and the swap.
     pub pause: Duration,
 }
 
+/// How a database file's size compares with what it holds, from [`Db::space`](crate::Db::space)
+/// or [`admin::space`](crate::admin::space).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Space {
+    /// The size of the file, in bytes.
     pub file_bytes: u64,
+    /// An estimate of the bytes that retained versions take: the size after the last cycle, plus
+    /// the share of the growth since then that the last cycle found survives, or the whole file if
+    /// no cycle has run on it.
     pub live_bytes: u64,
+    /// The bytes of files that cycles replaced but that held snapshots, maps, logs or histories
+    /// keep open.
     pub retired_bytes: u64,
+    /// The number of cycles started since the database was opened, background ones and
+    /// [`Db::compact`](crate::Db::compact) alike, whether they succeeded or not.
     pub cycles: u64,
+    /// The longest time a cycle since the database was opened made writers wait.
     pub longest_pause: Duration,
+    /// The error the last failed cycle returned, as text, until a cycle succeeds. A cycle stopped
+    /// because the database was closing is not recorded.
     pub last_error: Option<String>,
 }
 
@@ -85,20 +124,28 @@ fn copy_threads(options: &StoreOptions) -> usize {
     }
 }
 
+/// The path a cycle writes its copy of the file at `path` to: the same name with `.compacting`
+/// added.
 pub(crate) fn sibling(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".compacting");
     PathBuf::from(name)
 }
 
+/// Where a walk over everything a branch table reaches starts.
 #[derive(Default)]
 pub(crate) struct Roots {
+    /// Objects walked as trees, such as the branch table itself.
     pub(crate) trees: Vec<Ptr>,
+    /// The retained commit log of each branch.
     pub(crate) chains: Vec<Chain>,
+    /// The logs that older steps of the branch table record for the same branches, which the
+    /// table still links.
     pub(crate) superseded: Vec<Chain>,
 }
 
 impl Roots {
+    /// The roots of the branch table at `head`.
     pub(crate) fn of(store: &Store, head: Ptr) -> Result<Roots> {
         let heads = refs::heads(store, head)?;
         Ok(Roots {
@@ -108,6 +155,16 @@ impl Roots {
         })
     }
 
+    /// Visits each object reachable from these roots through retained versions: log entries, the
+    /// commits that merges brought in, the trees they hold and the branch table.
+    ///
+    /// `fresh` is asked whether each object is new, and only a new one is visited and descended
+    /// into. `visit` gets each new object with its length in the file.
+    ///
+    /// # Errors
+    ///
+    /// The first read error, such as [`Error::Corrupt`] for an object whose bytes do not match its
+    /// hash.
     pub(crate) fn walk(
         &self,
         store: &Store,
@@ -820,11 +877,19 @@ impl Sink for CopySink<'_> {
     }
 }
 
+/// A copy of what a branch table retains into a new file, made in passes.
+///
+/// Each pass copies what the earlier ones did not, and [`Copier::finish`] copies the rest, writes
+/// the branch table and seals the file, which can then be renamed over the old one.
 pub(crate) struct Copier<'a> {
     sink: CopySink<'a>,
 }
 
 impl<'a> Copier<'a> {
+    /// Creates `temp`, empty, with the permissions and owner of the file `store` reads, to copy
+    /// `store` into.
+    ///
+    /// Setting `stop` makes the copy fail with [`Error::Interrupted`] at its next read.
     pub(crate) fn create(
         store: &Store,
         temp: &Path,
@@ -919,6 +984,8 @@ impl<'a> Copier<'a> {
         head
     }
 
+    /// Copies everything `refs` retains that earlier passes did not, checking every object's
+    /// hash, and returns the bytes written.
     pub(crate) fn pass(&mut self, refs: &Refs) -> Result<u64> {
         let before = self.sink.end;
         self.encode(refs)?;
@@ -927,15 +994,21 @@ impl<'a> Copier<'a> {
         Ok(self.sink.end - before)
     }
 
+    /// The size the copy has reached, in bytes.
     pub(crate) fn end(&self) -> u64 {
         self.sink.end
     }
 
+    /// Syncs what the copy has written to disk.
     pub(crate) fn sync(&self) -> Result<()> {
         self.sink.file.sync_data()?;
         Ok(())
     }
 
+    /// Copies what is left for `refs`, writes the branch table, and seals the copy with a
+    /// superblock at sequence `seq` that records `survival`, the share of new bytes that survived.
+    ///
+    /// It returns the branch table's pointer in the copy and the number of objects copied in all.
     pub(crate) fn finish(&mut self, refs: &Refs, seq: u64, survival: f64) -> Result<(Ptr, u64)> {
         let head = self.encode(refs)?;
         self.sink.verifier.settle()?;
@@ -945,6 +1018,7 @@ impl<'a> Copier<'a> {
         Ok((head, self.sink.objects))
     }
 
+    /// Removes a copy that will not be used, ignoring a failure to.
     pub(crate) fn abandon(temp: &Path) {
         let _ = fs::remove_file(temp);
     }
