@@ -469,6 +469,8 @@ impl Hint {
 #[inline(always)]
 fn prefetch(address: usize) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint that never faults, whatever the address, and changes nothing the
+    // program can observe, and the SSE it needs is part of every x86_64 target.
     unsafe {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
         _mm_prefetch::<_MM_HINT_T0>(std::ptr::without_provenance(address));
@@ -3645,8 +3647,16 @@ struct Hold<K, V, S> {
     _owns: PhantomData<Shared<Node<K, V, S>>>,
 }
 
+// SAFETY: a `Hold` stands in for a `Shared<Node>`. It owns one count of its node, or borrows a
+// node that the root, an earlier frame or a hazard slot of the same iterator, cursor or finder
+// keeps alive, and moves with them. It hands out only `&Node` and releases a count the way a
+// `Shared` would, and a hazard record may be cleared from any thread, so it may be sent wherever a
+// `Shared<Node>` may.
 unsafe impl<K, V, S> Send for Hold<K, V, S> where Shared<Node<K, V, S>>: Send {}
 
+// SAFETY: through a `&Hold` the node can only be read, lent to another slot or given another
+// count, all atomically and all of which a `&Shared<Node>` allows, so it may be shared wherever a
+// `Shared<Node>` may.
 unsafe impl<K, V, S> Sync for Hold<K, V, S> where Shared<Node<K, V, S>>: Sync {}
 
 impl<K, V, S> Deref for Hold<K, V, S> {
@@ -3654,6 +3664,16 @@ impl<K, V, S> Deref for Hold<K, V, S> {
 
     #[inline]
     fn deref(&self) -> &Node<K, V, S> {
+        // SAFETY: the node outlives this `Hold`. An owned one keeps it with the count it owns. An
+        // anchored one is the root that its iterator or cursor keeps, or a node owned by a pinned
+        // memo or an in-memory link of the anchored or slotted node of an earlier frame; frames
+        // are popped child first, and drop before that root and the hazards. A slotted one is
+        // read only while the hazard slot it was lent through still holds it: the frames of a
+        // path each have a slot of their own, and the finder rewrites its two only for the leaf
+        // and parent that replace the ones it holds. Neither `free` nor a last owner drops a value
+        // a slot holds. Nothing changes the node in place: a node that more than one handle counts
+        // or that a slot holds is shared, so `make_mut`, `get_mut` and `unwrap_or_clone` copy it
+        // first, and a memo, once set, is never replaced.
         unsafe { &*self.node() }
     }
 }
@@ -3662,6 +3682,8 @@ impl<K, V, S> Drop for Hold<K, V, S> {
     #[inline]
     fn drop(&mut self) {
         if !self.anchored() {
+            // SAFETY: a `Hold` that is not anchored owns one count, the one `owned` took over from
+            // a `Shared` through `into_raw` or the one `share` added, and gives it back here, once.
             drop(unsafe { Shared::from_raw(self.node()) });
         }
     }
@@ -3671,6 +3693,8 @@ impl<K, V, S> Hold<K, V, S> {
     #[inline]
     fn owned(node: Shared<Node<K, V, S>>) -> Self {
         Hold {
+            // SAFETY: `into_raw` returns the address of the value inside a live allocation, which
+            // is not null.
             tagged: unsafe { NonNull::new_unchecked(Shared::into_raw(node).cast_mut()) },
             _owns: PhantomData,
         }
@@ -3710,6 +3734,8 @@ impl<K, V, S> Hold<K, V, S> {
     #[inline]
     fn share(&self) -> Self {
         if !self.anchored() {
+            // SAFETY: this `Hold` owns a count, so the pointer came from `Shared::into_raw` and the
+            // count is above zero. The `Hold` returned owns the count added.
             unsafe { Shared::increment_strong_count(self.node()) };
         }
         Hold {
