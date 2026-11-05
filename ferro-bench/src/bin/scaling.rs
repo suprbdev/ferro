@@ -7,18 +7,20 @@
 //! there instead of building them. Each of `--rounds` rounds (default 5) opens the files with
 //! each cache in `--cache` (default `warm,small`: 1 GiB and 16 MiB, or a size in bytes), reads
 //! them through twice to warm it, and runs every combination of `--work` (default all of `get`,
-//! `scan`, `each`, `range`, `index`, `tier`, `index-covered` and `tier-covered`), `--writers`
-//! (default `0,1`) and `--threads` (default `1,2,4,8,16,32`) for `--secs` seconds each (default
-//! 1), in an order that changes from round to round. A writer commits single-key updates to the
-//! file its workload reads. Reader threads are pinned to one thread of every core before the
-//! second thread of any, unless `--no-pin` is given. Each run prints a progress line on stderr.
-//! The summary on stdout, headed by `--label` (default `run`), has a table for each cache, writer
-//! count and workload, giving for each thread count the median rate across rounds, the speedup
-//! over the first thread count, the rate per thread and, per operation, the cycles, instructions
-//! and AMD's counts of cache fills from the thread's own CCX and from another, read through
-//! `perf_event_open`. Its last two columns are each reader's share of a CPU and how many CPUs'
-//! worth of time other processes used. Building with `--features mimalloc` makes mimalloc the
-//! global allocator.
+//! `scan`, `each`, `range`, `index`, `index-visit`, `tier`, `tier-ref`, `index-covered` and
+//! `tier-covered`), `--writers` (default `0,1`) and `--threads` (default `1,2,4,8,16,32`) for
+//! `--secs` seconds each (default 1), in an order that changes from round to round. `index` and
+//! `tier` read each row as a `Val`, `index-visit` reads the same lookups' rows lent through
+//! `IndexIter::visit`, and `tier-ref` the same pages' rows lent through `IndexIter::next_ref`.
+//! A writer commits single-key updates to the file its workload reads. Reader threads are pinned to
+//! one thread of every core before the second thread of any, unless `--no-pin` is given. Each run
+//! prints a progress line on stderr. The summary on stdout, headed by `--label` (default `run`),
+//! has a table for each cache, writer count and workload, giving for each thread count the median
+//! rate across rounds, the speedup over the first thread count, the rate per thread and, per
+//! operation, the cycles, instructions and AMD's counts of cache fills from the thread's own CCX
+//! and from another, read through `perf_event_open`. Its last two columns are each reader's share
+//! of a CPU and how many CPUs' worth of time other processes used. Building with `--features
+//! mimalloc` makes mimalloc the global allocator.
 //!
 //! ```sh
 //! make bench-scaling ARGS='--work get,index --cache warm'
@@ -292,7 +294,9 @@ enum Work {
     Each,
     Range,
     Index,
+    IndexVisit,
     Tier,
+    TierRef,
     IndexCovered,
     TierCovered,
 }
@@ -305,7 +309,9 @@ impl Work {
             Work::Each => "each",
             Work::Range => "range",
             Work::Index => "index",
+            Work::IndexVisit => "index-visit",
             Work::Tier => "tier",
+            Work::TierRef => "tier-ref",
             Work::IndexCovered => "index-covered",
             Work::TierCovered => "tier-covered",
         }
@@ -318,7 +324,9 @@ impl Work {
             "each" => Work::Each,
             "range" => Work::Range,
             "index" => Work::Index,
+            "index-visit" => Work::IndexVisit,
             "tier" => Work::Tier,
+            "tier-ref" => Work::TierRef,
             "index-covered" => Work::IndexCovered,
             "tier-covered" => Work::TierCovered,
             other => panic!("unknown workload {other}"),
@@ -329,7 +337,13 @@ impl Work {
         match self {
             Work::Get => 256,
             Work::Scan | Work::Each => 1,
-            Work::Range | Work::Index | Work::Tier | Work::IndexCovered | Work::TierCovered => 16,
+            Work::Range
+            | Work::Index
+            | Work::IndexVisit
+            | Work::Tier
+            | Work::TierRef
+            | Work::IndexCovered
+            | Work::TierCovered => 16,
         }
     }
 
@@ -338,8 +352,8 @@ impl Work {
             Work::Get => "gets",
             Work::Scan | Work::Each => "keys",
             Work::Range => "ranges",
-            Work::Index | Work::IndexCovered => "lookups",
-            Work::Tier | Work::TierCovered => "pages",
+            Work::Index | Work::IndexVisit | Work::IndexCovered => "lookups",
+            Work::Tier | Work::TierRef | Work::TierCovered => "pages",
         }
     }
 }
@@ -420,6 +434,19 @@ fn read_batch(work: Work, dbs: &Dbs, n: u64, rng: &mut u64) -> u64 {
             }
             work.batch()
         }
+        Work::IndexVisit => {
+            let snapshot = dbs.bank.read();
+            for _ in 0..work.batch() {
+                let low = (next(rng) % BALANCES) as i64;
+                let mut total = 0i64;
+                snapshot
+                    .accounts
+                    .by_balance_range(low..low + INDEX_SPAN)
+                    .visit(|row| total = total.wrapping_add(row.balance));
+                black_box(total);
+            }
+            work.batch()
+        }
         Work::Tier => {
             let snapshot = dbs.bank.read();
             for _ in 0..work.batch() {
@@ -434,6 +461,26 @@ fn read_batch(work: Work, dbs: &Dbs, n: u64, rng: &mut u64) -> u64 {
                     .take(TIER_PAGE)
                     .map(|row| row.balance)
                     .fold(0i64, i64::wrapping_add);
+                black_box(total);
+            }
+            work.batch()
+        }
+        Work::TierRef => {
+            let snapshot = dbs.bank.read();
+            for _ in 0..work.batch() {
+                let tier = if next(rng).is_multiple_of(2) {
+                    Tier::Pro
+                } else {
+                    Tier::Free
+                };
+                let mut rows = snapshot.accounts.by_tier(&tier);
+                let mut total = 0i64;
+                for _ in 0..TIER_PAGE {
+                    let Some(row) = rows.next_ref() else {
+                        break;
+                    };
+                    total = total.wrapping_add(row.balance);
+                }
                 black_box(total);
             }
             work.batch()
@@ -476,7 +523,7 @@ fn read_batch(work: Work, dbs: &Dbs, n: u64, rng: &mut u64) -> u64 {
 
 fn write_one(work: Work, dbs: &Dbs, n: u64, rows: u64, rng: &mut u64) {
     match work {
-        Work::Index | Work::Tier => {
+        Work::Index | Work::IndexVisit | Work::Tier | Work::TierRef => {
             let id = next(rng) % rows;
             let balance = (next(rng) % BALANCES) as i64;
             dbs.bank
@@ -736,7 +783,7 @@ fn main() {
     });
     let works = list(
         "--work",
-        "get,scan,each,range,index,tier,index-covered,tier-covered",
+        "get,scan,each,range,index,index-visit,tier,tier-ref,index-covered,tier-covered",
         Work::parse,
     );
     let writers = list("--writers", "0,1", |item| item.parse::<usize>().unwrap());
