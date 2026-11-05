@@ -5,7 +5,24 @@ use std::ptr;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(not(miri))]
 use parking_lot::Mutex;
+
+#[cfg(miri)]
+struct Mutex<T>(std::sync::Mutex<T>);
+
+#[cfg(miri)]
+impl<T> Mutex<T> {
+    const fn new(value: T) -> Self {
+        Mutex(std::sync::Mutex::new(value))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 use crate::shared::{Dead, Erased, Parked};
 
