@@ -1,3 +1,38 @@
+//! Measures reclamation cycles: their pauses beside running writers, what they leave, and copying.
+//!
+//! The first argument picks a command:
+//!
+//! - `live <workload> <path> [seconds] [keep] [fill] [every-mib]` runs writers on a fresh file at
+//!   `path` for `seconds` (default 20), keeping the last `keep` versions (default 100), while
+//!   another thread runs `compact` each time the file grows by `every-mib` MiB (default 64), or by
+//!   as much as the last cycle left if that is more. A negative `fill` (default 0.5) turns the
+//!   cycles off, and otherwise it is only printed. `workload` is `metrics`, `ledger` or `wiki`,
+//!   from the example apps, or `table`, single-row updates of a table of accounts. It prints one
+//!   line of commit rate and latency, cycle pauses, bytes moved, file sizes, the share of the
+//!   garbage reclaimed, and the read rate and latency of any reader threads.
+//! - `metrics <path> [seconds]` (default 60), `ledger <path> [entries]` (default 200,000),
+//!   `wiki <path> [pages] [edits]` (defaults 100 and 20,000) and `table <path> [rows] [updates]`
+//!   (defaults 200,000 and 200,000) build a `Durability::Buffered` file that keeps every version,
+//!   for `layout` and `copy` to read.
+//! - `layout <path> <keep>...` reports, for each `keep`, the live bytes of the last `keep`
+//!   versions, how much of the file reclaiming in units of 4 KiB to 64 MiB would leave, and what
+//!   moving the spans of live data sparser than a range of densities would move and leave.
+//! - `copy <path> <rounds> <threads>...` copies the file aside and times a `compact` that keeps
+//!   everything, with each `copy_threads` count in turn, `rounds` times.
+//!
+//! `live` commits with `Durability::Fsync` unless `RECLAIM_BUFFERED=1` is set. `RECLAIM_READERS`
+//! starts that many reader threads, of which only `table`'s read anything, `RECLAIM_ROWS` and
+//! `RECLAIM_BRANCHES` set the `table` workload's rows (default 200,000) and the branches its
+//! writers spread over (default 1), and `RECLAIM_SAMPLES` prints the file's size, alone and with
+//! retired space and any copy in progress, sampled every 50 ms.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin reclaim -- live table target/live.ferro 15 100
+//! cargo run --release -p ferro-bench --bin reclaim -- table target/table.ferro
+//! cargo run --release -p ferro-bench --bin reclaim -- layout target/table.ferro 1 100
+//! cargo run --release -p ferro-bench --bin reclaim -- copy target/table.ferro 5 1 4
+//! ```
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

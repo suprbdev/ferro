@@ -1,3 +1,24 @@
+//! Compares ways to combine two index lookups into the keys both return.
+//!
+//! Builds a `Table` of `--rows` rows (default 200,000) with two `#[index(each)]` fields, in a
+//! `Durability::Buffered` file with a 1 GiB cache in a temporary directory under `--dir` (default
+//! `target/bench`), and compacts it to its last version. Each of twelve cases gives its value to
+//! one field of one set of rows and to the other field of another, with sets of different sizes
+//! and overlaps. The strategies range from a merge of the two sorted key lists, leapfrog searches
+//! through the `_after` lookups or through cursors, with or without a few steps before each seek,
+//! and a hash set, to the `and` of the table's find view, read forwards, backwards, as rows, or as
+//! keys followed by `get`s. Each strategy named in `--strategies`, by default all of `merge`,
+//! `after`, `cursor`, `cursor2`, `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`,
+//! `and-back`, `rows` and `gets`, is checked against the merge and then run over and over for
+//! `--ms` milliseconds (default 40) in each of `--rounds` rounds (default 5). For each case it
+//! prints the two sets' sizes and how many keys they share, then each strategy's median
+//! microseconds and user-space instructions per run, counted through `perf_event_open` on Linux.
+//!
+//! ```sh
+//! make bench-combine ARGS='--strategies merge,and,set'
+//! cargo run --release -p ferro-bench --bin combine -- --rows 200000 --rounds 5 --ms 40
+//! ```
+
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -54,6 +75,9 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
@@ -66,6 +90,8 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }

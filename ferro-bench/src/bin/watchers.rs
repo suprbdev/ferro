@@ -1,3 +1,20 @@
+//! Measures what parked watchers cost a commit, and how soon a commit reaches a watcher it wakes.
+//!
+//! For each count in `--watchers` (default `0,1000,10000`) it fills a fresh `Durability::Buffered`
+//! `Map<u64, u64>` with 100,000 keys, in a temporary directory under `--dir` (default
+//! `target/bench`), and parks that many `watch_when` watchers, each on a thread of its own, whose
+//! test never passes: it looks up a key that is never written, or with `--test false` returns
+//! `false` without reading. It times `--commits` single-key commits (default 5,000) and counts the
+//! voluntary context switches of all the process's threads during them, then adds one watcher
+//! waiting for a target key and commits that key `--rounds` times (default 300), timing each
+//! commit and how long after it began its snapshot reached the watcher. It prints a Markdown table
+//! with a row for each count: the mean commit, switches per commit, the mean commit of the target
+//! key, and the p50 and p99 delivery, all in microseconds but the switches.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin watchers -- --watchers 0,1000,10000 --test false
+//! ```
+
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::thread;

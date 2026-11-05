@@ -1,3 +1,21 @@
+//! Measures a bulk load into a `Map<u64, String>` phase by phase, and the reads and commits after.
+//!
+//! Opens a fresh file with a 1 GiB cache in a temporary directory under `--dir` (default
+//! `target/bench`) and inserts `--n` keys (default 1,000,000) with short string values in one
+//! `Durability::Fsync` commit. The keys are scrambled unless `--sorted` makes them sequential, and
+//! `--extend` inserts them with one `extend` instead of a loop of `insert`. `--split` keeps a clone
+//! of the new root past the commit, so the commit and the drop of the working tree are timed apart
+//! instead of together. It then times 500,000 random `get`s, a full scan, 1,000 ranges of 1,000
+//! keys, 2,000 single-key commits with `Durability::Fsync` and 2,000 with `Durability::Buffered`.
+//! Each phase prints a line named after it with wall and process CPU milliseconds and user-space
+//! instructions per key or operation, counted through `perf_event_open` on Linux and 0 elsewhere.
+//! The file's bytes per key after the load and the peak RSS follow.
+//!
+//! ```sh
+//! make bench-bulk ARGS='--n 1000000 --extend'
+//! cargo run --release -p ferro-bench --bin bulk -- --n 1000000 --sorted --split
+//! ```
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -27,10 +45,16 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 | 1 << 1 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
         }
+        // SAFETY: `fd` is the descriptor `perf_event_open` just returned, checked non-negative
+        // above, and `0x2400` is `PERF_EVENT_IOC_ENABLE`, whose argument is an integer the kernel
+        // does not dereference.
         unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
         Counter(Some(fd as i32))
     }
@@ -40,6 +64,8 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }
@@ -56,6 +82,8 @@ fn cpu_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `now` is a live, writable `timespec`, the only memory `clock_gettime` writes, and a
+    // clock the system lacks only makes the call return an error.
     unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut now) };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }

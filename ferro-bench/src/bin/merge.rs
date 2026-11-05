@@ -1,3 +1,21 @@
+//! Times merge-base searches over histories of different shapes, and large three-way merges.
+//!
+//! In a temporary directory under the directory given as the first argument (default
+//! `target/bench`) it builds `Durability::Buffered` files of `Map<u64, u64>` whose branches forked
+//! far back, merged one into the other many times, criss-crossed, or saw many feature branches
+//! merged after they forked, and times `common_ancestor` between two of their branches: its first
+//! call and the mean of the 100 after it. For the criss-cross it also times a whole
+//! `try_merge_with` whose closure refuses to commit. Then it times the `merge` of a
+//! `Map<u64, u64>`, a map of struct values and a `Table` with one index, each of 1,000,000 keys
+//! with 100,000 changed on one side and 110,000 on the other, 10,000 of them on both: the first
+//! call and the mean of the five after it. It prints a Markdown table of each shape with those two
+//! times.
+//!
+//! ```sh
+//! make bench-merge
+//! cargo run --release -p ferro-bench --bin merge -- target/bench
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

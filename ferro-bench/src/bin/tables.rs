@@ -1,3 +1,20 @@
+//! Measures the `booking` example's hold, confirm and cancel commits, inside the closure and out.
+//!
+//! Seeds the example with 6 venues of 20 rooms and 400 customers in a fresh file in a temporary
+//! directory under `--dir` (default `target/bench`), with `Durability::Buffered` unless
+//! `--durability fsync` is given and `Options::shared` if `--shared 1` is. It runs `--warm`
+//! hold-and-confirm pairs (default 4,000) and then `--pairs` measured ones (default 4,000),
+//! cancelling a random confirmed booking on every fourth. Under `--label` (default `run`) it prints
+//! for each kind of commit the median wall and thread CPU microseconds of the whole commit, of its
+//! closure and of the rest, and the mean user-space instructions of each, counted through
+//! `perf_event_open` on Linux. The bytes written per commit and the root object's size, links and
+//! median decode time follow.
+//!
+//! ```sh
+//! make bench-tables ARGS='--pairs 4000 --durability fsync'
+//! cargo run --release -p ferro-bench --bin tables -- --label buffered --pairs 4000 --warm 4000
+//! ```
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,10 +49,16 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
         }
+        // SAFETY: `fd` is the descriptor `perf_event_open` just returned, checked non-negative
+        // above, and `0x2400` is `PERF_EVENT_IOC_ENABLE`, whose argument is an integer the kernel
+        // does not dereference.
         unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
         Counter(Some(fd as i32))
     }
@@ -45,6 +68,8 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }
@@ -61,6 +86,8 @@ fn cpu_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `now` is a live, writable `timespec`, the only memory `clock_gettime` writes, and a
+    // clock the system lacks only makes the call return an error.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }

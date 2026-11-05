@@ -1,3 +1,26 @@
+//! Splits commits' frames into their records and bounds what a delta log would write instead.
+//!
+//! Works in a temporary directory under `--dir` (default `target/bench`), and `--workload` picks
+//! `map`, `booking` or `all` (the default). Every commit is `Durability::Buffered` but the
+//! `--fsync` ones. `map` loads `--n` scrambled keys (default 1,000,000) into a `Map<u64, String>`
+//! and makes `--commits` single-key inserts (default 1,000). It reads each commit's frame back
+//! from the file, splits its bytes into header, tree, root, log entry and refs, and walks each new
+//! root against the one before to size the record a delta commit would write. It goes on to time
+//! the commit outside the closure against `hash_of` of the dirty root inside it, to size a
+//! checkpoint of 1 to 65,536 inserts, to time commits to a 16-key map, and to time `--fsync`
+//! commits with `Durability::Fsync` (default 300, 0 to skip) to the large map and the small one
+//! in turn. `booking` splits and walks the frames of `--pairs` (default 2,000) of the `booking`
+//! example's hold and confirm pairs, with a cancel on every fourth, after `--warm` warm-up pairs
+//! (default 4,000). It then times their commits against `hash_of` the same way, and a commit that
+//! changes one root field alone, and sizes checkpoints of 1 to 4,096 writes. It prints bytes per
+//! commit by part, and medians of wall and thread CPU microseconds with mean user-space
+//! instructions, counted through `perf_event_open` on Linux.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin delta -- --workload map --n 1000000 --commits 1000
+//! cargo run --release -p ferro-bench --bin delta -- --workload booking --pairs 2000 --fsync 0
+//! ```
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -38,10 +61,16 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
         }
+        // SAFETY: `fd` is the descriptor `perf_event_open` just returned, checked non-negative
+        // above, and `0x2400` is `PERF_EVENT_IOC_ENABLE`, whose argument is an integer the kernel
+        // does not dereference.
         unsafe { libc::ioctl(fd as i32, 0x2400, 0) };
         Counter(Some(fd as i32))
     }
@@ -51,6 +80,8 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }
@@ -67,6 +98,8 @@ fn cpu_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `now` is a live, writable `timespec`, the only memory `clock_gettime` writes, and a
+    // clock the system lacks only makes the call return an error.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }

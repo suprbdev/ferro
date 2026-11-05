@@ -1,3 +1,21 @@
+//! Measures single-key commits a second from many writer threads, on one branch or their own.
+//!
+//! For each count in `--writers` (default `1,8,32`) it opens a fresh file in a temporary directory
+//! under `--dir` (default `target/bench`), loads `--keys` keys (default 100,000), and runs that
+//! many threads, each committing one random key at a time, for `--secs` seconds (default 3). The
+//! writers share the main branch unless `--branches own` gives each after the first a branch of
+//! its own. `--durability buffered` switches from `Durability::Fsync` to `Durability::Buffered`,
+//! `--coalesce 1` and `--shared 1` turn on those `Options`, `--async 1` commits through
+//! `update_async`, awaited on each writer's thread, and `--closure-us` spins for that many
+//! microseconds inside every closure (default 0). It prints a line for each count, starting with
+//! `--label` (default `run`): closures and versions a second, closures per version, bytes written
+//! per closure, and the p50, p99 and slowest commit in microseconds.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin group -- --writers 1,4,8,16 --durability buffered
+//! cargo run --release -p ferro-bench --bin group -- --writers 16 --coalesce 1 --label coalesce
+//! ```
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::pin;

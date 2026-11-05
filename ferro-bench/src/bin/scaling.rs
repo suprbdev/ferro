@@ -1,3 +1,31 @@
+//! Measures reads from 1 to 32 threads on shared snapshots, with and without a writer.
+//!
+//! Builds a `Map<u64, String>` of `--n` scrambled keys (default 1,000,000) and two tables of
+//! `--rows` accounts (default `n / 5`) indexed on `tier` and `balance`, the second with both
+//! indexes covering `balance`, in a temporary directory under `--dir` (default `target/bench`).
+//! `--save <dir>` copies the three files there and exits, and `--from <dir>` copies them from
+//! there instead of building them. Each of `--rounds` rounds (default 5) opens the files with
+//! each cache in `--cache` (default `warm,small`: 1 GiB and 16 MiB, or a size in bytes), reads
+//! them through twice to warm it, and runs every combination of `--work` (default all of `get`,
+//! `scan`, `each`, `range`, `index`, `tier`, `index-covered` and `tier-covered`), `--writers`
+//! (default `0,1`) and `--threads` (default `1,2,4,8,16,32`) for `--secs` seconds each (default
+//! 1), in an order that changes from round to round. A writer commits single-key updates to the
+//! file its workload reads. Reader threads are pinned to one thread of every core before the
+//! second thread of any, unless `--no-pin` is given. Each run prints a progress line on stderr.
+//! The summary on stdout, headed by `--label` (default `run`), has a table for each cache, writer
+//! count and workload, giving for each thread count the median rate across rounds, the speedup
+//! over the first thread count, the rate per thread and, per operation, the cycles, instructions
+//! and AMD's counts of cache fills from the thread's own CCX and from another, read through
+//! `perf_event_open`. Its last two columns are each reader's share of a CPU and how many CPUs'
+//! worth of time other processes used. Building with `--features mimalloc` makes mimalloc the
+//! global allocator.
+//!
+//! ```sh
+//! make bench-scaling ARGS='--work get,index --cache warm'
+//! cargo run --release -p ferro-bench --bin scaling -- --threads 1,8,16 --rounds 3 --no-pin
+//! cargo run --release -p ferro-bench --features mimalloc --bin scaling -- --cache small
+//! ```
+
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -112,6 +140,9 @@ impl Counters {
             attr[0] = u64::from(kind) | 128 << 32;
             attr[1] = config;
             attr[5] = 1 << 5 | 1 << 6;
+            // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says
+            // 128, with every byte past the fields set here zero, and it outlives the call, which
+            // only reads it. Any argument the kernel rejects makes the call return -1.
             let fd =
                 unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
             fds.push(if fd < 0 { -1 } else { fd as i32 });
@@ -127,6 +158,9 @@ impl Counters {
                     return 0;
                 }
                 let mut value = 0u64;
+                // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read`
+                // may write land in it, and `fd` is non-negative, so it is a descriptor
+                // `perf_event_open` returned, which this `Counters` keeps open until it drops.
                 unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
                 value
             })
@@ -139,6 +173,8 @@ impl Drop for Counters {
     fn drop(&mut self) {
         for &fd in &self.0 {
             if fd >= 0 {
+                // SAFETY: `fd` is non-negative, so it is a descriptor `perf_event_open` returned
+                // for this `Counters`, which owns it, and nothing uses it after this one close.
                 unsafe { libc::close(fd) };
             }
         }
@@ -172,6 +208,8 @@ fn thread_cpu_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `now` is a live, writable `timespec`, the only memory `clock_gettime` writes, and a
+    // clock the system lacks only makes the call return an error.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
@@ -207,6 +245,10 @@ fn busy_ticks() -> (u64, u64) {
 
 #[cfg(target_os = "linux")]
 fn pin(cpu: usize) {
+    // SAFETY: `cpu_set_t` is a plain array of integers, for which all zero bytes are a valid,
+    // empty set. `CPU_SET` only sets one bit of `set`, through a bounds-checked index that panics
+    // rather than write past it. `sched_setaffinity` reads `size_of::<cpu_set_t>()` bytes from
+    // `set`, exactly the live set it is given, and pid 0 names the calling thread.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu, &mut set);

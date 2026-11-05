@@ -1,3 +1,21 @@
+//! Compares commits from several processes sharing one file with the same writers as threads.
+//!
+//! For each count in `--processes` (default `1,2,4,8`) it loads `--keys` keys (default 100,000)
+//! into a fresh file opened with `Options::shared`, in a temporary directory under `--dir`
+//! (default `target/bench`), and starts that many copies of itself, each running `--threads`
+//! writer threads (default 1) that commit one random key at a time for `--secs` seconds (default
+//! 3). It then runs the same writers as threads of this one process on a second file opened the
+//! same way. The writers share the main branch unless `--branches own` gives each process after
+//! the first a branch of its own, `--durability buffered` switches from `Durability::Fsync` to
+//! `Durability::Buffered`, and `--closure-us` spins for that many microseconds inside every
+//! closure (default 0). For each count it prints a `processes` and a `threads` line, starting
+//! with `--label` (default `run`), of commits a second and p50 and p99 commit microseconds. The
+//! `--child`, `--process` and `--branch` flags are for the copies it starts.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin processes -- --processes 1,2,4 --threads 2
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;

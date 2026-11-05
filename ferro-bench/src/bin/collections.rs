@@ -1,3 +1,23 @@
+//! Compares ways to change and read ferro's collections in bulk.
+//!
+//! Takes two optional positional arguments: a command, `range`, `merge`, `bytes` or `list`, with
+//! anything else or nothing running all four, and a key count `n` (default 1,000,000), which
+//! `range` and `merge` use. Every case starts from a fresh `Durability::Buffered` file in a
+//! temporary directory under `target/bench`. `range` times `remove_range`, `split_off`, `append`
+//! and `extend` on a `Map<u64, String>` of `n` sequential keys against removing or inserting the
+//! same keys one at a time. `merge` times `extend` against a loop of `insert` for batches of 1 to
+//! 1,000,000 updated or new keys in a map of `n` scrambled keys. `bytes` compares `Vec<u8>` and
+//! `Bytes` values of 1 KiB, 64 KiB and 1 MiB on commit, cold `get` and scan. `list` compares
+//! `List` with maps of chunks of 16, 64 or 256 items, of 100,000 and 1,000,000 numbers or short
+//! strings, on single-item pushes, file size, warm and cold `get`s and scans, and estimates the
+//! bytes a push would write into a trie of fanout 8 or 32. Each case prints one line of its times,
+//! per key or value where it handles many, and of the bytes it wrote or the file holds.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin collections -- range 1000000
+//! cargo run --release -p ferro-bench --bin collections -- list
+//! ```
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;

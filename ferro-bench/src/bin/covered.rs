@@ -1,3 +1,22 @@
+//! Measures what covered index fields cost in index size, commits, root decodes and opens.
+//!
+//! Builds four tables of `--rows` accounts (default 200,000), each in a `Durability::Buffered` file
+//! of its own in a temporary directory under `--dir` (default `target/bench`), compacted to its
+//! last version: `bare` with no index, `plain` with plain indexes on `tier` and `balance`,
+//! `narrow` with both indexes covering `balance`, and `wide`, whose `tier` index also covers
+//! `name` and `email`. Each of `--rounds` rounds (default 3) runs `--commits` (default 2,000)
+//! balance updates, renames and inserts on each table, starting from a different table each round,
+//! and prints each table's bytes per commit and median thread CPU microseconds on stderr. The
+//! summary on stdout, headed by `--label` (default `run`), gives each table's file size, its index
+//! size over `bare` and the medians of those per-round figures, then the size, links and decode
+//! time of its root object, and last the time to open the `plain` and `narrow` files with the
+//! schema they were written with and with the next wider one.
+//!
+//! ```sh
+//! make bench-covered ARGS='--rows 200000 --commits 2000 --rounds 3'
+//! cargo run --release -p ferro-bench --bin covered -- --label covered --dir target/bench
+//! ```
+
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -97,6 +116,8 @@ fn cpu_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `now` is a live, writable `timespec`, the only memory `clock_gettime` writes, and a
+    // clock the system lacks only makes the call return an error.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }

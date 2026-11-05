@@ -1,3 +1,33 @@
+//! Measures a first sync of a large file and later syncs of small changes, one step at a time.
+//!
+//! Each step is a command of its own on the files in `<dir>`, so it runs in a process of its own
+//! and reports its own peak RSS and peak heap. `build` writes `source.ferro`, a `Map<u64, String>`
+//! of `--keys` keys (default 1,000,000) with random values of `--value` bytes (default 320), in
+//! `--commits` commits (default 10). `pull` pulls it into an empty `clone.ferro`. `send` writes a
+//! bundle of all of it to `bundle.bin`, `receive` receives that bundle into an empty file, and
+//! `receive-busy` does the same while another thread commits on a second branch of the receiving
+//! file, reporting the median, p99 and slowest of those commits. `edit` writes new `--value`-byte
+//! values to `--edits` random keys (default 100,000) of a copy of the source in one commit,
+//! `send-edit` bundles that commit against what `clone.ferro` has, and `receive-edit` receives it
+//! into a copy of the clone. `incremental` makes three one-key commits to a copy of the source
+//! `--rounds` times (default 20) and times pulling each three into a copy of the clone, with the
+//! user-space instructions each pull ran. Steps read what earlier ones wrote: `build` comes first,
+//! `send` before `receive` and `receive-busy`, `pull` before `incremental`, and `pull` and `edit`
+//! before `send-edit`, which comes before `receive-edit`. A pull or receive prints its outcome,
+//! the bytes and objects it took in and its seconds, and a bundle its bytes and seconds, each with
+//! the peak RSS and the peak live heap counted by the global allocator. `incremental` prints the
+//! median, fastest and slowest of its pulls and the peak RSS. Steps open files with
+//! `Durability::Fsync`, or `Durability::Buffered` when `CLONE_BUFFERED` is set, and `build` always
+//! writes Buffered.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin clone -- build target/clone --keys 1000000 --value 320
+//! cargo run --release -p ferro-bench --bin clone -- pull target/clone
+//! cargo run --release -p ferro-bench --bin clone -- send target/clone
+//! cargo run --release -p ferro-bench --bin clone -- receive target/clone
+//! CLONE_BUFFERED=1 cargo run --release -p ferro-bench --bin clone -- incremental target/clone
+//! ```
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
@@ -23,25 +53,37 @@ fn grew(size: usize) {
     HIGH.fetch_max(now, Ordering::Relaxed);
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// adjusts the atomic counters `LIVE` and `HIGH`, which neither allocates nor panics.
 unsafe impl GlobalAlloc for Counted {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         grew(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed
+        // on to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout`, and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         grew(layout.size());
+        // SAFETY: the caller meets `GlobalAlloc::alloc_zeroed`'s contract for `layout`, which is
+        // passed on to `System` unchanged.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         grew(size);
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout` and that `size` is a valid new size for it. The block came from `System` with
+        // that layout, and all three are passed on unchanged.
         unsafe { System.realloc(pointer, layout, size) }
     }
 }
@@ -73,6 +115,9 @@ impl Counter {
         attr[0] = 128 << 32;
         attr[1] = 1;
         attr[5] = 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is an initialized 128-byte `perf_event_attr` whose `size` field says 128,
+        // with every byte past the fields set here zero, and it outlives the call, which only
+        // reads it. Any argument the kernel rejects makes the call return -1.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
         if fd < 0 {
             return Counter(None);
@@ -85,6 +130,8 @@ impl Counter {
             return 0;
         };
         let mut value = 0u64;
+        // SAFETY: the pointer is to `value`, a live, writable `u64`, so all 8 bytes `read` may
+        // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
     }

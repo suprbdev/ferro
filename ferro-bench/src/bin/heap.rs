@@ -1,3 +1,21 @@
+//! Measures the live heap that reads and commits hold at each cache size.
+//!
+//! A counting global allocator tracks live bytes as `malloc` chunks: each request plus 8 bytes,
+//! rounded up to a multiple of 16 and at least 32. In a temporary directory under the directory
+//! given as the first argument (default `target/bench`) it builds maps of 8,000,000 short strings,
+//! of 1,200,000 strings of 300 bytes and of 200,000 strings of 2,000 bytes, and a table of
+//! 1,500,000 accounts with two indexes. With caches of 1, 4, 16, 64 and 256 MiB it opens each file
+//! read-only and reports how much the heap grew over two full scans of one snapshot, each followed
+//! on the table by a count of one country's rows through its index. Two more rows measure a fresh
+//! `Durability::Buffered` map of 500,000 keys taking 30,000 single-key commits with two `get`s
+//! after each, and a `history_of` walk over that file. It prints a table of MiB with a row for
+//! each workload and a column for each cache size.
+//!
+//! ```sh
+//! make bench-heap
+//! cargo run --release -p ferro-bench --bin heap -- target/bench
+//! ```
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,20 +30,31 @@ fn chunk(size: usize) -> usize {
     (size + 8).next_multiple_of(16).max(32)
 }
 
+// SAFETY: every method forwards to `System` with the caller's layout, pointer and size unchanged
+// and returns what `System` returns, so `System`'s guarantees carry over. Besides that it only
+// adjusts the atomic counter `LIVE`, which neither allocates nor panics: a layout's size is at
+// most `isize::MAX`, so `chunk` cannot overflow.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE.fetch_add(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller meets `GlobalAlloc::alloc`'s contract for `layout`, which is passed
+        // on to `System` unchanged.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout`, and every block this allocator hands out came from `System` with that layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         LIVE.fetch_add(chunk(size), Ordering::Relaxed);
         LIVE.fetch_sub(chunk(layout.size()), Ordering::Relaxed);
+        // SAFETY: the caller guarantees that `pointer` was allocated by this allocator with
+        // `layout` and that `size` is a valid new size for it. The block came from `System` with
+        // that layout, and all three are passed on unchanged.
         unsafe { System.realloc(pointer, layout, size) }
     }
 }

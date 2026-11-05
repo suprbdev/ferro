@@ -1,3 +1,20 @@
+//! Measures what each kind of `Summary` costs a `Map<u64, i64>` in bytes and time.
+//!
+//! For no summary and then `Sum64`, `Sum128`, a tuple of four fields and a struct of four, it
+//! loads `--n` scrambled keys (default 1,000,000) in one commit into a fresh
+//! `Durability::Buffered` file in `--dir` (default `target/bench`), reopened with a cache of
+//! `--cache` bytes if one is given. It then makes 4,000 single-key inserts and 4,000 updates,
+//! folds 20,000 random ranges with `range_summary`, times a full scan and 20,000 `get`s, and folds
+//! the same ranges again on the file reopened read-only with a 1 MiB cache. For each summary it
+//! prints a line of bytes and nanoseconds per key for the load, bytes per insert with the change
+//! over no summary and microseconds per insert, bytes per update, the warm and cold folds in
+//! microseconds, and the scan and `get` in nanoseconds. Each file is deleted once its line is
+//! printed.
+//!
+//! ```sh
+//! cargo run --release -p ferro-bench --bin summary -- --n 1000000 --cache 16777216
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
