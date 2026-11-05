@@ -982,6 +982,45 @@ impl Indexed {
             quote! { ::std::option::Option::Some(#owned) }
         }
     }
+
+    fn subject(&self) -> String {
+        let names: Vec<String> = self
+            .fields
+            .iter()
+            .map(|(ident, _)| ident.to_string())
+            .collect();
+        match names.as_slice() {
+            [only] => format!("`{only}`"),
+            _ => format!("`({})`", names.join(", ")),
+        }
+    }
+
+    fn matching(&self) -> String {
+        let subject = self.subject();
+        match self.kind {
+            IndexKind::Each => format!("whose {subject} holds `value`"),
+            IndexKind::Unique if self.sparse().is_some() => {
+                format!("whose {subject} is `Some(value)`")
+            }
+            _ => format!("whose {subject} is `value`"),
+        }
+    }
+
+    fn covers(&self) -> String {
+        let names: Vec<String> = self
+            .cover
+            .iter()
+            .map(|(ident, _)| format!("`{ident}`"))
+            .collect();
+        let list = match names.split_last() {
+            None => return String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        };
+        format!(
+            "\n\nThe index covers {list}, which `.covered()` yields with each key without reading the rows."
+        )
+    }
 }
 
 fn field_named(fields: &syn::FieldsNamed, name: &Ident) -> syn::Result<(Ident, Type)> {
@@ -1369,11 +1408,26 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }));
                 let by = ix.method();
                 let key_by = format_ident!("key_{}", by);
+                let subject = ix.subject();
+                let matching = ix.matching();
+                let held_doc = if ix.stores_cover() {
+                    "the key and stored covered fields"
+                } else {
+                    "the key"
+                };
+                let index_doc = format!(
+                    "The unique index on {subject}, from each value to {held_doc} of the row that holds it."
+                );
+                let key_by_doc =
+                    format!("The key of the row {matching}, read from the index alone.");
+                let by_doc = format!("The row {matching}.");
                 methods.push(quote! {
+                    #[doc = #index_doc]
                     pub fn #field(&self) -> &::ferro::Map<#vt, #entry_ty> {
                         &self.#field
                     }
 
+                    #[doc = #key_by_doc]
                     pub fn #key_by<__Q>(&self, value: &__Q) -> ::std::option::Option<#key_ty>
                     where
                         #vt: ::std::borrow::Borrow<__Q>,
@@ -1388,7 +1442,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 if ix.stores_cover() {
                     let covered_by = format_ident!("covered_{}", by);
                     let project_fn = ix.project_fn();
+                    let covered_doc = format!(
+                        "The key and covered fields of the row {matching}, read from the index alone."
+                    );
                     methods.push(quote! {
+                        #[doc = #by_doc]
                         pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
                         where
                             #vt: ::std::borrow::Borrow<__Q>,
@@ -1398,6 +1456,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                             self.rows.get::<#key_ty>(&__holder.0)
                         }
 
+                        #[doc = #covered_doc]
                         pub fn #covered_by<__Q>(&self, value: &__Q) -> ::std::option::Option<(#key_ty, #ct)>
                         where
                             #vt: ::std::borrow::Borrow<__Q>,
@@ -1411,6 +1470,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     });
                 } else {
                     methods.push(quote! {
+                        #[doc = #by_doc]
                         pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
                         where
                             #vt: ::std::borrow::Borrow<__Q>,
@@ -1483,10 +1543,54 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let range = format_ident!("{}_range", field);
         let counts = format_ident!("{}_counts", field);
         let after = format_ident!("{}_after", field);
+        let subject = ix.subject();
+        let matching = ix.matching();
+        let covers = ix.covers();
+        let combined = |method: &Ident| {
+            format!(
+                "[`{table}::{method}`] as [`Matches`](ferro::table::Matches), to combine with `and` and `or`."
+            )
+        };
+        let (range_doc, counts_doc) = match ix.kind {
+            IndexKind::Each => (
+                format!(
+                    "The rows with an element of {subject} in `range`, once for each such element, ordered by element and then by key.{covers}"
+                ),
+                format!(
+                    "Each distinct element of {subject} with the number of rows that hold it, in order, read from the index alone."
+                ),
+            ),
+            _ => (
+                format!(
+                    "The rows whose {subject} lies in `range`, ordered by {subject} and then by key.{covers}"
+                ),
+                format!(
+                    "Each distinct {subject} with the number of rows that hold it, in order, read from the index alone."
+                ),
+            ),
+        };
+        let by_doc = format!("The rows {matching}, in key order.{covers}");
+        let after_doc = format!(
+            "The rows {matching} and whose key is greater than `after`, in key order: the page after the row with key `after`.{covers}"
+        );
         if let (IndexKind::Value, None) = (&ix.kind, ix.sole()) {
             let prefix = format_ident!("{}_prefix", field);
             let first = &ix.fields[0].1;
+            let names: Vec<String> = ix
+                .fields
+                .iter()
+                .map(|(ident, _)| ident.to_string())
+                .collect();
+            let rest = match &names[1..] {
+                [only] => format!("`{only}`"),
+                more => format!("`({})`", more.join(", ")),
+            };
+            let prefix_doc = format!(
+                "The rows whose `{}` is `value`, ordered by {rest} and then by key.{covers}",
+                names[0]
+            );
             methods.push(quote! {
+                #[doc = #prefix_doc]
                 #[inline]
                 pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
@@ -1507,7 +1611,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         if let (IndexKind::Value, Some(inner)) = (&ix.kind, wrapped) {
             let some = format_ident!("{}_some", field);
             let some_after = format_ident!("{}_some_after", field);
+            let some_doc =
+                format!("The rows whose {subject} is `Some(value)`, in key order.{covers}");
+            let some_after_doc = format!(
+                "The rows whose {subject} is `Some(value)` and whose key is greater than `after`, in key order.{covers}"
+            );
+            let some_find_doc = combined(&some);
+            let some_after_find_doc = combined(&some_after);
             methods.push(quote! {
+                #[doc = #some_doc]
                 #[inline]
                 pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
                 where
@@ -1517,6 +1629,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::ferro::table::index_eq_some::<#inner, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
                 }
 
+                #[doc = #some_after_doc]
                 #[inline]
                 pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
                 where
@@ -1530,6 +1643,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             });
             let found = ix.found_path(&table);
             finds.push(quote! {
+                #[doc = #some_find_doc]
                 #[inline]
                 pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
                 where
@@ -1539,6 +1653,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::ferro::table::match_eq_some::<#inner, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
                 }
 
+                #[doc = #some_after_find_doc]
                 #[inline]
                 pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
                 where
@@ -1552,7 +1667,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             });
         }
         let found = ix.found_path(&table);
+        let by_find_doc = combined(&field);
+        let after_find_doc = combined(&after);
         finds.push(quote! {
+            #[doc = #by_find_doc]
             #[inline]
             pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
             where
@@ -1562,6 +1680,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::match_eq::<#vt, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
             }
 
+            #[doc = #after_find_doc]
             #[inline]
             pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
             where
@@ -1574,10 +1693,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         });
         methods.push(quote! {
+            #[doc = #counts_doc]
             pub fn #counts(&self) -> ::std::vec::Vec<(#vt, usize)> {
                 ::ferro::table::index_counts(&self.#field)
             }
 
+            #[doc = #by_doc]
             #[inline]
             pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
             where
@@ -1587,6 +1708,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_eq::<#vt, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
             }
 
+            #[doc = #after_doc]
             #[inline]
             pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
             where
@@ -1598,6 +1720,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::ferro::table::index_after::<#vt, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
             }
 
+            #[doc = #range_doc]
             #[inline]
             pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
             where
@@ -1611,10 +1734,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     }
 
     let find = format_ident!("{}Find", name);
+    let find_doc = format!(
+        "The equality lookups of [`{table}`], returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key. [`{table}::find`] makes one."
+    );
+    let find_fn_doc = "A view of the equality lookups of every non-unique index, returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key, reading a row only for a key that matches.";
     let find_items = if finds.is_empty() {
         quote! {}
     } else {
         quote! {
+            #[doc = #find_doc]
             #vis struct #find<'a> {
                 table: &'a #table,
             }
@@ -1628,6 +1756,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             impl ::std::marker::Copy for #find<'_> {}
 
             impl #table {
+                #[doc = #find_fn_doc]
                 pub fn find(&self) -> #find<'_> {
                     #find { table: self }
                 }
@@ -1748,8 +1877,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     };
+    let table_doc = format!(
+        "The rows of [`{name}`] and the indexes its `Record` derive declares. [`ferro::Table<{name}>`](ferro::Table) derefs to it, so its lookups are called on the table."
+    );
 
     Ok(quote! {
+        #[doc = #table_doc]
         #vis struct #table {
             rows: #rows_ty,
             #(#index_fields: #map_tys),*
@@ -1887,13 +2020,6 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-#[proc_macro_derive(Record, attributes(key, index, unique, ferro))]
-pub fn derive_record(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    expand_record(input)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
-}
 /// Derives `ferro::Record` for a struct with named fields, making it a row of `ferro::Table` with
 /// the secondary indexes its attributes declare.
 ///
@@ -2110,3 +2236,10 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
 ///
 /// assert_eq!(bookings.covered_by_reference("R3"), Some((3, 400)));
 /// ```
+#[proc_macro_derive(Record, attributes(key, index, unique, ferro))]
+pub fn derive_record(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_record(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
