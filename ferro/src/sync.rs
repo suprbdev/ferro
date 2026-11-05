@@ -28,7 +28,7 @@ use crate::dense::{Column, Hashes, Index};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
-use crate::reentry::Needs;
+use crate::reentry::{Crossing, Needs};
 use crate::store::{Record, Staging, Store, Txn, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -50,6 +50,7 @@ const SPILL_AT: usize = 1 << 20;
 const PLACE_AT: usize = 256 << 10;
 const PIPE_CHUNKS: usize = 8;
 const PIPE_OBJECTS: usize = 256;
+const PULL_ATTEMPTS: usize = 3;
 const CACHED_LINKS: usize = 1 << 16;
 const MOVED_BUDGET: usize = 1 << 16;
 const UNRESOLVED: Ptr = Ptr {
@@ -2221,6 +2222,12 @@ struct Received {
     commits: Vec<u32>,
 }
 
+struct Arrival {
+    landed: Option<Option<Crossing>>,
+    objects: u64,
+    received_bytes: u64,
+}
+
 fn resolve<O: Objects>(
     store: &Store,
     objects: &O,
@@ -2674,11 +2681,16 @@ impl<T: Data> Db<T> {
     /// commits at this branch's next version, so compare commits across files by hash. A pull that
     /// brings new commits replaces the branch `remote`, so do not commit to it.
     ///
+    /// If this file prunes or drops what the bundle builds on while it is sent, nothing lands, and
+    /// the pull sends a fresh have and tries again, up to three attempts in all. That is found
+    /// before `merge` can run, so `merge` runs at most once, for the attempt that landed, and the
+    /// [`Pulled`] describes that attempt.
+    ///
     /// # Errors
     ///
     /// - [`Error::BranchInUse`] if `remote` is `main` or this handle's branch.
     /// - [`Error::StaleHave`] if this file pruned or dropped what the bundle builds on while it was
-    ///   sent. Nothing landed, and calling again sends a fresh have.
+    ///   sent, on each of the three attempts. Nothing landed and `merge` did not run.
     /// - [`Error::NoCommonAncestor`] when the merge base could lie in pruned history. The remote
     ///   branch has landed, and this branch is as it was.
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
@@ -2748,7 +2760,10 @@ impl<T: Data> Db<T> {
     ///
     /// An `Err` from `merge` leaves this branch and its merge records as they were and comes back
     /// as it was, while the remote branch stays landed, so the next pull sends nothing new and
-    /// merges it again. The errors of [`Db::pull`] come back through `E::from`.
+    /// merges it again. The errors of [`Db::pull`] come back through `E::from`. A stale have is
+    /// retried as [`Db::pull`] retries it, before anything reaches `E::from`, so a pull that
+    /// succeeds on a later attempt returns `Ok`, and [`Error::StaleHave`] comes back only after
+    /// the third attempt.
     ///
     /// # Panics
     ///
@@ -2760,28 +2775,15 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         check_remote(remote, self.branch_name())?;
-        drop(self.entering(Needs::Every)?);
-        let have = self.have()?;
-        let emitter = {
-            let _theirs = from.entering(Needs::Tip)?;
-            from.emitter(&have)?
+        let mut attempts = 1;
+        let (arrival, sent_bytes) = loop {
+            match self.fetch(from, remote) {
+                Err(Error::StaleHave(_)) if attempts < PULL_ATTEMPTS => attempts += 1,
+                fetched => break fetched?,
+            }
         };
-        self.step("bundled");
-        let mut pulled = if emitter.order.len() < PIPE_OBJECTS {
-            self.try_receive_from(remote, emitter, merge)?
-        } else {
-            let (sender, pipe) = mpsc::sync_channel(PIPE_CHUNKS);
-            thread::scope(|scope| {
-                scope.spawn(move || emitter.send(sender));
-                let piped = Piped {
-                    pipe,
-                    chunk: Vec::new(),
-                    pos: 0,
-                };
-                self.try_receive_from(remote, piped, merge)
-            })?
-        };
-        pulled.sent_bytes = have.as_bytes().len() as u64;
+        let mut pulled = self.bring_up(remote, arrival, merge)?;
+        pulled.sent_bytes = sent_bytes;
         Ok(pulled)
     }
 
@@ -2793,7 +2795,8 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// As for [`Db::pull`], for the branch of `to`.
+    /// As for [`Db::pull`], for the branch of `to`: [`Error::StaleHave`] comes back only once the
+    /// file of `to` has pruned or dropped what the bundle builds on in each of three attempts.
     ///
     /// # Panics
     ///
@@ -2811,7 +2814,8 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// As for [`Db::try_pull`], for the branch of `to`.
+    /// As for [`Db::try_pull`], for the branch of `to`, so a stale have is retried before
+    /// anything reaches `E::from`.
     ///
     /// # Panics
     ///
@@ -2841,7 +2845,8 @@ impl<T: Data> Db<T> {
     /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
-    ///   its have. Nothing lands; build a new bundle from a fresh have.
+    ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.
+    ///   Only the caller can fetch one, so this is not retried as [`Db::pull`] retries it.
     /// - The other errors of [`Db::pull`].
     ///
     /// # Panics
@@ -2860,7 +2865,8 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// As for [`Db::try_pull`].
+    /// An `Err` from `merge` comes back as for [`Db::try_pull`], and the errors of
+    /// [`Db::receive`] through `E::from`, [`Error::StaleHave`] among them without a retry.
     ///
     /// # Panics
     ///
@@ -2924,7 +2930,7 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// As for [`Db::try_pull`], and [`Error::Io`] if reading `input` fails.
+    /// As for [`Db::try_receive`], and [`Error::Io`] if reading `input` fails.
     ///
     /// # Panics
     ///
@@ -2935,6 +2941,36 @@ impl<T: Data> Db<T> {
         input: impl Read,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
+        let arrival = self.land_from(remote, input)?;
+        self.bring_up(remote, arrival, merge)
+    }
+
+    fn fetch(&self, from: &Db<T>, remote: &str) -> Result<(Arrival, u64)> {
+        drop(self.entering(Needs::Every)?);
+        let have = self.have()?;
+        let emitter = {
+            let _theirs = from.entering(Needs::Tip)?;
+            from.emitter(&have)?
+        };
+        self.step("bundled");
+        let arrival = if emitter.order.len() < PIPE_OBJECTS {
+            self.land_from(remote, emitter)?
+        } else {
+            let (sender, pipe) = mpsc::sync_channel(PIPE_CHUNKS);
+            thread::scope(|scope| {
+                scope.spawn(move || emitter.send(sender));
+                let piped = Piped {
+                    pipe,
+                    chunk: Vec::new(),
+                    pos: 0,
+                };
+                self.land_from(remote, piped)
+            })?
+        };
+        Ok((arrival, have.as_bytes().len() as u64))
+    }
+
+    fn land_from(&self, remote: &str, input: impl Read) -> Result<Arrival> {
         check_remote(remote, self.branch_name())?;
         drop(self.entering(Needs::Every)?);
         let mut input = Input::open(input, BUNDLE_MAGIC)?;
@@ -2948,21 +2984,38 @@ impl<T: Data> Db<T> {
         };
         let received_bytes = input.read;
         drop(input);
-        let (outcome, value) = match received {
+        let landed = match received {
             Some(received) => {
-                let _ours = self.entering(Needs::Every)?;
+                let ours = self.entering(Needs::Every)?;
                 self.land_staged(remote, &header, received)?;
-                self.integrate(remote, merge)?
+                Some(ours)
             }
+            None => None,
+        };
+        Ok(Arrival {
+            landed,
+            objects: header.count,
+            received_bytes,
+        })
+    }
+
+    fn bring_up<R, S: Into<String>, E: From<Error>>(
+        &self,
+        remote: &str,
+        arrival: Arrival,
+        merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+    ) -> std::result::Result<Pulled<R>, E> {
+        let (outcome, value) = match arrival.landed {
+            Some(_ours) => self.integrate(remote, merge)?,
             None => (Outcome::UpToDate, None),
         };
         Ok(Pulled {
             outcome,
             value,
             version: self.version(),
-            objects: header.count,
+            objects: arrival.objects,
             sent_bytes: 0,
-            received_bytes,
+            received_bytes: arrival.received_bytes,
         })
     }
 

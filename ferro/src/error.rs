@@ -162,6 +162,8 @@ pub enum Error {
     ///
     /// The bundle was built for another file, or this file pruned or dropped that commit after it
     /// sent its [`Have`](crate::Have). Nothing lands; build a new bundle from a fresh have.
+    /// [`Db::pull`](crate::Db::pull) and [`Db::push`](crate::Db::push) do that themselves, and
+    /// return this only after three attempts.
     #[error("sync bundle is stale: {0}; build a new one from a fresh have")]
     StaleHave(String),
 }
