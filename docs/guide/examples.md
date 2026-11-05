@@ -1,9 +1,11 @@
 # Example apps
 
 Each app in `examples/` is a workspace package with its own tests, run with
-`cargo run --release -p <name>`. `tracker`, `shop`, `chat`, `notes` and `booking` also have `make`
-targets of the same name that pass `ARGS` through, and `shop-load`, `chat-load`, `notes-scale`,
-`booking-stress` and `queue-bench` have targets of their own, listed in `make help`.
+`cargo run --release -p <name> --bin <name>`. The `--bin` is needed wherever a package has more
+than one binary, as `booking`, `chat`, `notes`, `queue`, `shop` and `wiki` do, and `graph`,
+`ledger`, `metrics` and `tracker` run without it. `tracker`, `shop`, `chat`, `notes` and `booking`
+also have `make` targets of the same name that pass `ARGS` through, and `shop-load`, `chat-load`,
+`notes-scale`, `booking-stress` and `queue-bench` have targets of their own, listed in `make help`.
 
 | App | What it is | Features it leans on |
 | --- | --- | --- |
@@ -61,7 +63,7 @@ version, so a client reconnecting with `Last-Event-ID` gets one diff from that v
 if that version is no longer retained.
 
 ```sh
-cargo run --release -p chat -- --db chat.ferro
+cargo run --release -p chat --bin chat -- --db chat.ferro
 cargo run --release -p chat --bin chat-load -- --db load.ferro --rate 1000
 ```
 
@@ -98,12 +100,12 @@ you preview, then merge with `try_merge_with` or drop. If the merge cannot cance
 main took since the fork, it returns that `BookingError` and writes nothing.
 
 ```sh
-cargo run --release -p booking -- seed
-cargo run --release -p booking -- hold guest1@example.com "Harbour House/101" --from 2030-01-10 --nights 2
-cargo run --release -p booking -- confirm 1
-cargo run --release -p booking -- receipt 1
-cargo run --release -p booking -- whatif close storm --venue "Harbour House"
-cargo run --release -p booking -- check
+cargo run --release -p booking --bin booking -- seed
+cargo run --release -p booking --bin booking -- hold guest1@example.com "Harbour House/101" --from 2030-01-10 --nights 2
+cargo run --release -p booking --bin booking -- confirm 1
+cargo run --release -p booking --bin booking -- receipt 1
+cargo run --release -p booking --bin booking -- whatif close storm --venue "Harbour House"
+cargo run --release -p booking --bin booking -- check
 cargo run --release -p booking --bin booking-stress -- --threads 64
 ```
 

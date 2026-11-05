@@ -104,8 +104,8 @@ last-writer-wins on a clock does. `examples/notes` is an offline-first notes app
 each device directory holds its own file, and `sync` exchanges changes both ways.
 
 ```sh
-cargo run --release -p notes -- --device laptop add "buy milk" --tag home
-cargo run --release -p notes -- --device phone sync laptop
+cargo run --release -p notes --bin notes -- --device laptop add "buy milk" --tag home
+cargo run --release -p notes --bin notes -- --device phone sync laptop
 cargo run --release -p notes --bin notes-scale
 ```
 
