@@ -5177,7 +5177,10 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
     }
 
     fn value_of(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<Val<V>> {
-        frame.map(|frame| fatal(frame.node.value(self.store.as_deref(), index)))
+        frame.map(|frame| match &frame.node.cells {
+            Cells::Column(column) => Val::of_column(column, index),
+            Cells::Slots(_) => fatal(frame.node.value(self.store.as_deref(), index)),
+        })
     }
 
     fn pair(&self, frame: Option<&Frame<K, V, S>>, index: usize) -> Option<(K, Val<V>)> {
