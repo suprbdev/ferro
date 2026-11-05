@@ -79,6 +79,41 @@
 //! error channel, so they panic instead, which inside a commit discards the transaction.
 //! [`merge`](Table::merge) passes a clash to its `resolve` closure and never panics on one.
 //!
+//! `by_x(&value)` returns the one row that holds a value. `by_x_range(range)` and, on a composite
+//! `#[unique(a, b)]`, `by_a_b_prefix(&a)` return an [`IndexIter`] over the rows in value order, as
+//! the lookups of a non-unique index do:
+//!
+//! ```
+//! use ferro::{Data, Record, Table};
+//!
+//! #[derive(Data, Record, Clone)]
+//! #[unique(room, night, cover(guest))]
+//! struct Stay {
+//!     #[key]
+//!     id: u64,
+//!     #[unique]
+//!     reference: String,
+//!     room: u16,
+//!     night: u32,
+//!     guest: String,
+//! }
+//!
+//! let mut stays: Table<Stay> = Table::new();
+//! for (id, room, night) in [(1, 101, 3), (2, 102, 1), (3, 101, 1), (4, 101, 2)] {
+//!     let guest = format!("guest {id}");
+//!     stays.insert(Stay { id, reference: format!("S{id}"), room, night, guest });
+//! }
+//!
+//! let room: Vec<u64> = stays.by_room_night_prefix(&101).map(|stay| stay.id).collect();
+//! assert_eq!(room, [3, 4, 1]);
+//!
+//! let guests: Vec<(u64, String)> = stays.by_room_night_range((101, 2)..).covered().collect();
+//! assert_eq!(guests, [(4, "guest 4".into()), (1, "guest 1".into()), (2, "guest 2".into())]);
+//!
+//! let newest = stays.by_reference_range(String::from("S2")..).next_back();
+//! assert_eq!(newest.map(|stay| stay.id), Some(4));
+//! ```
+//!
 //! # Panics
 //!
 //! As with every collection, a read that cannot load a node from the file, or finds one damaged,
@@ -1046,7 +1081,8 @@ impl<K, C> EntryCursor<K, ()> for Uncovered<K, C> {
 /// The rows of one index lookup, in index order: by indexed value, then by primary key.
 ///
 /// Every lookup the [`Record`](derive@crate::Record) derive generates on a non-unique index, such
-/// as `by_x`, `by_x_after`, `by_x_range`, `by_x_some` or `by_x_prefix`, returns one. The rows of
+/// as `by_x`, `by_x_after`, `by_x_range`, `by_x_some` or `by_x_prefix`, returns one, and so do
+/// `by_x_range` and `by_x_prefix` on a unique index, which holds one row per value. The rows of
 /// one value come in key order, and the iterator runs from either end and knows its length as
 /// soon as it is built. Each row is read from the rows map when it is yielded, through a finder
 /// that keeps the last leaf it found, so rows close together in key order cost less.

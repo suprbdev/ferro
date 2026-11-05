@@ -999,6 +999,17 @@ impl Indexed {
         }
     }
 
+    fn rest(&self) -> String {
+        let names: Vec<String> = self.fields[1..]
+            .iter()
+            .map(|(ident, _)| ident.to_string())
+            .collect();
+        match names.as_slice() {
+            [only] => format!("`{only}`"),
+            more => format!("`({})`", more.join(", ")),
+        }
+    }
+
     fn matching(&self) -> String {
         let subject = self.subject();
         match self.kind {
@@ -1484,6 +1495,66 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         }
                     });
                 }
+                let rows_of = |entries: TokenStream2| {
+                    if ix.stores_cover() {
+                        let project_fn = ix.project_fn();
+                        quote! {
+                            ::ferro::table::unique_rows_covered::<#vt, #name, #st, #ct>(&self.rows, #entries, Self::#project_fn)
+                        }
+                    } else {
+                        quote! {
+                            ::ferro::table::unique_rows::<#vt, #name>(&self.rows, #entries)
+                        }
+                    }
+                };
+                let covers = ix.covers();
+                let range = format_ident!("{}_range", by);
+                let range_doc = if ix.sparse().is_some() {
+                    format!(
+                        "The rows whose {subject} is `Some(value)` for a `value` in `range`, ordered by that value. A row whose {subject} is `None` is not indexed.{covers}"
+                    )
+                } else {
+                    format!(
+                        "The rows whose {subject} lies in `range`, ordered by {subject}.{covers}"
+                    )
+                };
+                let range_rows = rows_of(quote! { self.#field.range::<__Q, __R>(range) });
+                methods.push(quote! {
+                    #[doc = #range_doc]
+                    #[inline]
+                    pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
+                    where
+                        #vt: ::std::borrow::Borrow<__Q>,
+                        __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                        __R: ::std::ops::RangeBounds<__Q>,
+                    {
+                        #range_rows
+                    }
+                });
+                if ix.sole().is_none() {
+                    let prefix = format_ident!("{}_prefix", by);
+                    let (head, first) = &ix.fields[0];
+                    let rest = ix.rest();
+                    let prefix_doc =
+                        format!("The rows whose `{head}` is `value`, ordered by {rest}.{covers}");
+                    let prefix_rows = rows_of(quote! {
+                        self.#field.range_by(
+                            |__value| ::std::borrow::Borrow::<__Q>::borrow(&__value.0) < value,
+                            |__value| ::std::borrow::Borrow::<__Q>::borrow(&__value.0) <= value,
+                        )
+                    });
+                    methods.push(quote! {
+                        #[doc = #prefix_doc]
+                        #[inline]
+                        pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
+                        where
+                            #first: ::std::borrow::Borrow<__Q>,
+                            __Q: ::std::cmp::Ord + ?::std::marker::Sized,
+                        {
+                            #prefix_rows
+                        }
+                    });
+                }
                 continue;
             }
             IndexKind::Each if ix.stores_cover() => {
@@ -1579,19 +1650,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         );
         if let (IndexKind::Value, None) = (&ix.kind, ix.sole()) {
             let prefix = format_ident!("{}_prefix", field);
-            let first = &ix.fields[0].1;
-            let names: Vec<String> = ix
-                .fields
-                .iter()
-                .map(|(ident, _)| ident.to_string())
-                .collect();
-            let rest = match &names[1..] {
-                [only] => format!("`{only}`"),
-                more => format!("`({})`", more.join(", ")),
-            };
+            let (head, first) = &ix.fields[0];
+            let rest = ix.rest();
             let prefix_doc = format!(
-                "The rows whose `{}` is `value`, ordered by {rest} and then by key.{covers}",
-                names[0]
+                "The rows whose `{head}` is `value`, ordered by {rest} and then by key.{covers}"
             );
             methods.push(quote! {
                 #[doc = #prefix_doc]
@@ -2103,11 +2165,18 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// | --- | --- |
 /// | `by_x(&value)` | `Option<Val<Name>>`, the row that holds `value`. |
 /// | `key_by_x(&value)` | `Option<Key>`, that row's key, from the index alone. |
+/// | `by_x_range(range)` | `IndexIter<Name, C>` of the rows whose `x` lies in `range`, in value order. |
 /// | `unique_x()` | The whole index: `&Map<V, Key>`, or `&Map<V, (Key, S)>` with a cover list, where `S` is the tuple of the stored fields. |
 /// | `covered_by_x(&value)` | `Option<(Key, C)>`, the key and covered fields, from the index alone. Only with a cover list. |
 ///
-/// On an `Option<X>` field a unique index is keyed by `X`, so `by_x` takes `&X`. A clash on
-/// insert or update is reported as `Taken { index, holder }`, where `index` is the index's name.
+/// A composite `#[unique(a, b, ...)]` also has `by_a_b_prefix(&a)`, the rows whose first field is
+/// `a`, ordered by the fields after it. `by_x_range` and `by_a_b_prefix` return the same
+/// `IndexIter` as the lookups of a non-unique index, so `.keys()` and `.covered()` read the index
+/// alone, and the iterator runs from either end.
+///
+/// On an `Option<X>` field a unique index is keyed by `X`, so `by_x` takes `&X` and `by_x_range` a
+/// range of `X`, and a row whose `x` is `None` is in no lookup. A clash on insert or update is
+/// reported as `Taken { index, holder }`, where `index` is the index's name.
 ///
 /// # Combining lookups
 ///
@@ -2115,8 +2184,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// every non-unique index: `by_x(&value)`, `by_x_after(&value, &key)` and, for an `Option` field,
 /// `by_x_some` and `by_x_some_after`. They return `Matches<Name, C>`, which `and` and `or` combine
 /// by primary key, reading a row only for a key that matches. `and` and `or` also take any
-/// `IndexIter`, such as a range or prefix lookup. `.keys()` reads no rows, and `.covered()` gives
-/// the covered fields of the leftmost lookup.
+/// `IndexIter`, such as a range or prefix lookup of a unique or non-unique index, whose keys are
+/// read in full and sorted first. `.keys()` reads no rows, and `.covered()` gives the covered
+/// fields of the leftmost lookup.
 ///
 /// # Covering indexes
 ///
@@ -2241,6 +2311,55 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// assert_eq!(by_date, [(2, (10, 100)), (3, (20, 400)), (1, (30, 200))]);
 ///
 /// assert_eq!(bookings.covered_by_reference("R3"), Some((3, 400)));
+/// ```
+///
+/// A unique index lists its rows by range, and a composite one by prefix:
+///
+/// ```
+/// use std::ops::Bound;
+///
+/// use ferro::{Data, Record, Table};
+///
+/// #[derive(Data, Record, Clone)]
+/// #[unique(room, night, cover(guest))]
+/// struct Stay {
+///     #[key]
+///     id: u64,
+///     #[unique]
+///     reference: String,
+///     #[unique]
+///     voucher: Option<u32>,
+///     room: u16,
+///     night: u32,
+///     guest: String,
+/// }
+///
+/// let mut stays: Table<Stay> = Table::new();
+/// let plan = [(1, 101, 3, None), (2, 102, 1, Some(9)), (3, 101, 1, None), (4, 101, 2, Some(4))];
+/// for (id, room, night, voucher) in plan {
+///     let reference = format!("S{id}");
+///     let guest = format!("guest {id}");
+///     stays.insert(Stay { id, reference, voucher, room, night, guest });
+/// }
+///
+/// let ids = |rows: ferro::table::IndexIter<Stay, String>| {
+///     rows.map(|row| row.id).collect::<Vec<_>>()
+/// };
+/// assert_eq!(ids(stays.by_room_night_prefix(&101)), [3, 4, 1]);
+///
+/// let from_two: Vec<(u64, String)> =
+///     stays.by_room_night_range((101, 2)..=(101, u32::MAX)).covered().collect();
+/// assert_eq!(from_two, [(4, "guest 4".to_string()), (1, "guest 1".to_string())]);
+///
+/// let latest: Vec<u64> = stays
+///     .by_reference_range::<str, _>((Bound::Included("S2"), Bound::Unbounded))
+///     .rev()
+///     .map(|stay| stay.id)
+///     .collect();
+/// assert_eq!(latest, [4, 3, 2]);
+///
+/// let vouchers: Vec<u64> = stays.by_voucher_range(..10).keys().collect();
+/// assert_eq!(vouchers, [4, 2]);
 /// ```
 #[proc_macro_derive(Record, attributes(key, index, unique, ferro))]
 pub fn derive_record(input: TokenStream) -> TokenStream {
