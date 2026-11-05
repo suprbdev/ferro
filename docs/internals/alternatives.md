@@ -66,6 +66,10 @@ numbers. This index lists them by subsystem.
   counts while one thread reads: [Measured and left out](read-scaling.md#measured-and-left-out-2).
   The headers moved beside the flags behind the value, in place of the flags moved to the front:
   [The flags' line](read-scaling.md#the-flags-line).
+- Closures that stop on a `ControlFlow` beside `next_ref`, a guard type for a lent `Val`, a third
+  slot in the row finder, ten or twelve slots a hazard record, a fourth pinned level, a snapshot
+  every 256 pages, and striped, deferred or biased counts for columns: [Measured and left
+  out](read-scaling.md#measured-and-left-out-3).
 - Choosing an allocator in the library: [The allocator](read-scaling.md#the-allocator).
 - Weighing entries by disk size, and a size hook on `Data`: [Cache
   weight](read-scaling.md#cache-weight).

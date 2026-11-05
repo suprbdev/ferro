@@ -1,8 +1,8 @@
 # Reading from many threads
 
 How reads scale across threads: guarded gets and the epoch scheme, iterator frames, the allocator,
-iterators under hazards, and how the node cache weighs what it holds. The single-thread read path
-is in [The read path](read-path.md).
+iterators under hazards, rows lent in place, and how the node cache weighs what it holds. The
+single-thread read path is in [The read path](read-path.md).
 
 ## The benchmark
 
@@ -337,7 +337,8 @@ its mark only when a slot is set fails the free run inside a borrow on every run
 out of `epoch::retract` passes that test, which runs on one thread, and also passed a race of the
 same borrows beside a free on another thread over 64 schedules, in which Miri never let the free
 read the slot's old address once the clear had run; the fence rests on the argument under [The root
-and the store](#the-root-and-the-store).
+and the store](#the-root-and-the-store). The forms that lend rows and entries in place are checked
+as [How it is checked](#how-it-is-checked) describes.
 
 The unit tests share the process's epoch and records, so a free that one test makes acts on every
 other test's items, and `make test-stress` runs them that way: twelve copies of the library's test
@@ -1041,7 +1042,168 @@ which the third probe puts at more than half of what pages of rows could gain. `
 counts, and so do nodes below the pinned levels that sit above a leaf's grandparent.
 `Space::retired_bytes` counts an old file only while a handle counts its store, so a file that only
 an iterator still reads is left out of it. With a cache smaller than the data the allocator decides,
-as before.
+as before. [Rows lent in place](#rows-lent-in-place) takes up the `Val`.
+
+## Rows lent in place
+
+Each row an index lookup yields is a `Val`, and for a row with a destructor that is a share of the
+column of the node that holds it: an `Arc` increment when the row finder hands the row out and a
+decrement when the caller drops it, on the column's first line, which every thread reading the same
+rows writes. A page of the same 200 rows passes about 50 row leaves, four rows to a leaf, and with
+the 1 GiB cache it pulled about 160 lines a page from the local CCX and 15 from the other at 16
+threads, where one thread pulled none, and ran 8 times one thread at 32. The third probe under
+[Iterators under hazards](#iterators-under-hazards), which leaked that count, took pages from 1.6M
+to 3.6M a second at 32 threads.
+
+### Lending
+
+`IndexIter::next_ref` steps to the next row and lends `&T`, and `IndexIter::visit` lends every row
+left to a closure; `Matches` has the same pair. The row finder's `lend` finds the row as `get` does,
+but where `get` makes a `Val` of it, `lend` notes whether the node it found the row in is the leaf
+or the parent it keeps, which its hazard slots hold, or a count when it got no record, and lends the
+row from there. The reference borrows the lookup mutably, so neither the lookup nor its finder can
+move while it lives, and the finder lets go of a leaf only at a later lookup. A row found in a node
+above the parent, about one row in 64, is read as a `Val` and kept in the finder until its next
+lookup, and so is a row stored on its own. `get` takes the same descent, made generic over what it
+makes of the row it finds, so a lookup through `next` builds its `Val` where it did and runs the
+instructions it ran before, within 0.4%.
+
+`Iter` and `Values` have the same pair, so `Table::iter`, `range` and `prefix` and a map's iterators
+lend too. `next_ref` lends the entry from the frame that holds it and keeps a value stored on its
+own in the iterator, an `Arc` of 8 bytes, until the next step. `visit` takes a run of a node's
+entries at a time, as `fold` does.
+
+A lent row is a borrow of a node that the lookup or iterator already holds, by a slot, an anchor or
+a count, for as long as the reference can live, so no step of the protocol changed and nothing new
+is unsafe. The borrow checker ends the reference at the iterator's next step, which is the first
+point at which the iterator may let the node go.
+
+### How it is checked
+
+The unit test `epoch_lent_entries_outlive_the_eviction_of_their_nodes` lends an entry of a range, a
+value of another and rows that a finder found in its leaf, in its parent and in a node above them,
+evicts and flushes every node they came from, reads the lent references afterwards, and checks that
+the nodes go once the iterators and finders do. `tests/reads.rs` compares `next_ref` and `visit`
+with the `Val` forms, mixed with `next` and `next_back`, over maps with spilled values in memory,
+stored, edited and reopened read-only, and over a table whose notes spill, through its lookups, its
+`find()` lookups and its ranges, and past an index entry whose row is gone. In `epoch_stress` the
+readers read rows, value ranges and nested maps, most of whose values spill, lent both ways, and
+keep lent walks of values, rows and nested maps from one round to the next, against the model while
+the caches evict and the handles reopen.
+
+The unit tests passed under Miri with stacked borrows and with tree borrows over 32 schedules each,
+the library's tests, `tests/reads.rs` and `epoch_stress` with its default seed and three others
+under AddressSanitizer and ThreadSanitizer, 600 runs of the library's tests built with each
+sanitizer, twelve at a time, and 1,200 runs of `make test-stress`. With `Shared` and `Weak` made to
+write nothing to the slot they lend through, Miri reports the new unit test's read of a lent value
+as a dangling reference on each of four schedules, and `epoch_stress` crashes in a release build.
+With the finder made to keep its old leaf when a lookup finds a new one, whose slot the new leaf
+then holds, `epoch_stress` and two tests of `tests/reads.rs` fail on an index past the end of the
+leaf a row is lent from. With `Shared::release` made to report no loan, the new unit test still
+passes, since a lent node's last owner parks it while a slot holds it.
+
+### Measurements
+
+Measured on the machine and data of the tables above, with nothing else running, in one pass of five
+rounds of every workload with no writer; the `next` rows are the same workloads as `index` and
+`tier` above. Operations a second with the 1 GiB cache, and in brackets the speedup over one thread
+of the same form:
+
+| Workload | Read by | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Index lookup | `next` | 236k | 475k (2.0) | 904k (3.8) | 1.7M (7.3) | 2.9M (12.3) | 4.5M (19.2) |
+| Index lookup | `visit` | 240k | 489k (2.0) | 923k (3.9) | 1.8M (7.4) | 3.5M (14.4) | 5.1M (21.4) |
+| Page of 200 rows | `next` | 182k | 348k (1.9) | 581k (3.2) | 947k (5.2) | 1.1M (5.9) | 1.5M (8.3) |
+| Page of 200 rows | `next_ref` | 305k | 605k (2.0) | 1.0M (3.4) | 1.9M (6.3) | 3.4M (11.1) | 4.1M (13.3) |
+
+With the 16 MiB cache:
+
+| Workload | Read by | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Index lookup | `next` | 14k | 24k (1.7) | 40k (2.9) | 70k (5.0) | 76k (5.5) | 109k (7.8) |
+| Index lookup | `visit` | 14k | 24k (1.7) | 40k (2.9) | 70k (5.0) | 76k (5.5) | 109k (7.8) |
+| Page of 200 rows | `next` | 130k | 229k (1.8) | 386k (3.0) | 619k (4.7) | 529k (4.1) | 791k (6.1) |
+| Page of 200 rows | `next_ref` | 181k | 311k (1.7) | 506k (2.8) | 792k (4.4) | 685k (3.8) | 921k (5.1) |
+
+On one thread with the 1 GiB cache a lent page runs 77,080 instructions and 16,150 cycles, against
+83,740 and 27,190 through `next`, which pays for each row the column's locked increment and
+decrement and the 120-byte `Val` the caller moves and drops. At 16 threads a lent page pulls 7.6
+lines from the local CCX and 3.5 from the other, against 157 and 15, and takes 18,940 cycles, 17%
+more than on one thread, where a page through `next` takes 68,140, two and a half times as many. At
+32 threads, two to a core, it takes 29,350 a thread, so the second thread of a core adds a tenth to
+a page that runs 4.8 instructions a cycle alone.
+
+What a thread does a second falls further than its cycles rise, because the clock falls with the
+cores kept busy: rate times cycles gives 4.93 GHz for a lent page on one thread, 3.97 GHz at 8
+threads, 4.01 at 16 and 3.72 at 32, where pages through `next`, which spend their cycles waiting on
+lines, kept the clock at 4.3 to 4.6 GHz. So 13.3 times one thread at 32 is 16 cores at three
+quarters of the clock and a tenth more for the second threads, and what contention still costs a
+lent page is the 17% more cycles it takes at 16 threads than on one. Index lookups, whose 20
+scattered rows each take a descent of their own, read 1 to 2% faster on one thread, 18% faster at 16
+and 13% at 32, where lines from the other CCX fell from 1.9 a lookup to 0.5. With the 16 MiB cache
+pages read 39% faster on one thread and 16% at 32, and index lookups, which the allocator decides as
+[The allocator](#the-allocator) describes, did not move.
+
+Run alternately with the build before the change, three runs of two rounds of the existing workloads
+at 1, 8, 16 and 32 threads with both caches, every cell of `get`, scans, `for_each`, ranges and
+plain index lookups ran within 2% of its rate before, at the instructions it ran before within 0.5%.
+Pages of rows through `next` ran within 1% on one thread, at 0.8% more instructions in those runs
+and the same in the pass above, and within the 4% their runs spread by on more threads. Covered
+lookups at 16 and 32 threads with the 1 GiB cache fall into the two modes described under [Iterator
+frames](#iterator-frames), about 28M and 31M a second at 16 threads with 3.8 and 3.0 lines a lookup
+from the local CCX, and in four more alternating runs of them and of covered pages the new build ran
+4 to 5% faster at 16 and 32 threads and covered pages 2 to 3%, all within the spread of their runs.
+In `reads`, three alternating runs, no item ran more than 0.5% more instructions, and times moved by
+up to 5% either way, apart from the batches over every 256th key, which vary by a factor of two
+between runs of one build. In the main tool, eight alternating runs, every step ran the instructions
+it ran before, within 0.3%, and no time ran more than 2% slower except a warm get, 315 ns against
+308 at the same 1,038.5 instructions. A copy of the new tree built in another directory took 315 ns
+too, but the get's code did not change, `reads` ran random gets within 1% and `scaling` ran gets on
+one thread within 0.3%, so it is where the get's code landed in that binary, as under [Where the
+flags live](#where-the-flags-live).
+
+### Measured and left out
+
+- Closures alone, with `try_visit` taking a `ControlFlow` to stop, on `IndexIter`, `Matches`, `Iter`
+  and `Values`. In one session, built side by side, pages through `try_visit` ran 79,700
+  instructions and 291,000 a second on one thread and 3.87M at 32, against 76,860, 305,000 and 4.09M
+  through a loop over `next_ref`. `next_ref` lets a page stop, return or use `?` as plain control
+  flow, and `try_visit` added nothing a loop over it does not do, so it was dropped; `visit` stays
+  for a closure over every row, and for an iterator's runs.
+- A guard type, a `Val` borrowed for one step that takes the count only when `to_val` keeps it. Not
+  built: it lends what `next_ref` lends, and `next` already hands out the `Val` of a row that is
+  kept.
+- A third slot in the row finder for the node above its parent in which one row in 64 sits. A probe
+  that cloned those rows instead of counting them ran pages 2% faster at 16 threads and no faster at
+  32, pulling three fewer lines a page from the local CCX and one fewer from the other, and 3%
+  slower on one thread for the clones. Not built.
+- Ten or twelve slots a record, so that an index iterator borrows the level below the pinned ones,
+  which it counts with eight. Across two sessions, alternating builds, 100-key ranges ran 2 to 5%
+  faster at 16 and 32 threads, and lines a range from the other CCX fell from 2.2 to 1.2. Covered
+  pages ran up to 12% faster, within what their rounds swing by as [What is left](#what-is-left-1)
+  describes, pages through `next_ref` within the swing of their rounds, and covered lookups 7%
+  slower in one session and the same in the other. Left out until a run can tell them apart.
+- A fourth pinned level, as a probe of the same counted nodes: pages through `next_ref` 3 to 4%
+  faster at 16 threads and covered pages 8 to 11%, at eight times the nodes a map pins outside the
+  cache's budget. Not built.
+- A snapshot every 256 pages rather than every 16: no faster, so the two counts a snapshot's clone
+  and drop write are not what the pages wait on.
+- Striped, deferred or biased counts for columns. Not built. The rows are read by every thread, so a
+  count striped per thread still has to follow a `Val` to the thread that drops it and be summed to
+  know when the column can go, deferring the decrements leaves the increments on the shared line,
+  and biased counting makes only the decoding thread's counts cheap, which is not a reader. The
+  lease per iterator measured under [Measured and left out](#measured-and-left-out-1) cost one
+  thread 10 to 14%. Lending takes the count away instead.
+
+### What is left
+
+A lent row is gone at the next step, so a row that is kept, sent or returned still comes through
+`next` as a `Val` and pays the count, and so does a lent row found above the row finder's parent. An
+index iterator still counts the level of the index below the pinned ones, and the extra slots that
+would borrow it are left out above. A lent page now runs at what the clock and the second threads of
+the cores allow, so taking more from it on this machine means fewer instructions a page, which helps
+one thread as much as 32. Covered pages read no `Val` and moved by no more than their rounds swing
+by, which they still do.
 
 ## Cache weight
 
