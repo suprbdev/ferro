@@ -1,3 +1,80 @@
+//! The ordered map that nests in your database type and that every collection is built on.
+//!
+//! A [`Map<K, V>`](Map) keeps its entries in key order in a Merkle search tree, whose shape depends
+//! only on the keys it holds, never on the order they went in. [`Set`](crate::Set) and
+//! [`List`](crate::List) wrap a map, and a [`Table`](crate::Table) is a map of rows beside one map
+//! per index. A map works in memory without a file. Inside a database it reads the nodes it needs
+//! from the file as it goes, and a commit writes only the nodes that changed.
+//!
+//! - [`get`](Map::get), [`insert`](Map::insert), [`remove`](Map::remove) and the other single-key
+//!   calls cost O(log n), and [`len`](Map::len) is O(1).
+//! - Cloning a map is O(1), and `==` compares two maps by length and root hash, in O(1) for maps
+//!   read from a file.
+//! - [`diff`](Map::diff) skips the subtrees two versions share, so it costs O(changes), and
+//!   [`merge`](Map::merge) runs a three-way merge on top of it.
+//! - [`take_range`](Map::take_range), [`split_off`](Map::split_off) and [`append`](Map::append)
+//!   cut and join trees in O(log n) nodes however many entries move.
+//! - With a [`Summary`] as its third parameter, `Map<K, V, S>` keeps a fold of every subtree, so
+//!   [`range_summary`](Map::range_summary) totals any key range in O(log n).
+//!
+//! ```
+//! use ferro::{Data, Map};
+//!
+//! #[derive(Data, Clone, Default)]
+//! struct Shop {
+//!     stock: Map<String, u32>,
+//!     prices: Map<String, u64>,
+//! }
+//!
+//! let mut shop = Shop::default();
+//! shop.stock.insert("anvil".to_string(), 5);
+//! shop.stock.insert("rope".to_string(), 12);
+//! shop.prices.insert("anvil".to_string(), 4999);
+//!
+//! shop.stock.update("anvil", |count| *count -= 1);
+//! assert_eq!(shop.stock.get("anvil").as_deref(), Some(&4));
+//!
+//! let before = shop.clone();
+//! shop.stock.remove("rope");
+//! assert_ne!(before.stock, shop.stock);
+//!
+//! let changed: Vec<String> = before
+//!     .stock
+//!     .diff(&shop.stock)
+//!     .map(|change| change.key().clone())
+//!     .collect();
+//! assert_eq!(changed, ["rope"]);
+//! ```
+//!
+//! # Reading
+//!
+//! Reads hand out a [`Val<V>`], which derefs to `V` and shares the value with the map rather than
+//! copying it. [`iter`](Map::iter), [`range`](Map::range) and [`prefix`](Map::prefix) return an
+//! [`Iter`] of `(key, value)` pairs, and [`keys`](Map::keys) and [`values`](Map::values) return
+//! [`Keys`] and [`Values`]. Each walks in key order from either end and knows its length from the
+//! start. [`for_each`](Map::for_each) and its relatives lend `&K` and `&V` instead of handing out
+//! clones, and a [`Cursor`] keeps its path through the tree, so a seek costs the distance it moves.
+//!
+//! # Versions
+//!
+//! A map is a persistent value. An edit copies each node on its path that another handle still
+//! shares, so every other handle keeps the nodes it had. A clone, a [`Val`], an iterator, a
+//! [`Cursor`] and a [`Diff`] each go on reading the version they were made from, however the map is
+//! edited afterwards, and none of them borrows the map: they can outlive it, the
+//! [`Snapshot`](crate::Snapshot) it was read from and the [`Db`](crate::Db) that opened its file.
+//!
+//! # Panics
+//!
+//! A read that cannot load a node from the file, or finds one damaged, panics, and so does a write
+//! that has to load one. [`try_get`](Map::try_get) returns that failure as an [`Error`] instead.
+//!
+//! [The collections guide](https://github.com/archlemon/ferro/blob/main/docs/guide/collections.md)
+//! describes maps and summaries at more length,
+//! [the tree internals](https://github.com/archlemon/ferro/blob/main/docs/internals/tree.md) how
+//! the tree is shaped, edited and written, and
+//! [the read path](https://github.com/archlemon/ferro/blob/main/docs/internals/read-path.md) how
+//! it is read.
+
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::RefCell;
@@ -24,6 +101,8 @@ use crate::shared::{Erased, Shared, Weak};
 use crate::store::{Lent, MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
+/// The most encoded bytes a value can take and still be stored inside its node; a larger value is
+/// written as an object of its own, which its node links to.
 pub(crate) const SPILL_BYTES: usize = 512;
 const LEVEL_BITS: u32 = 3;
 const LEVELS: u8 = (u64::BITS / LEVEL_BITS) as u8 + 1;
@@ -51,6 +130,11 @@ const BACK: usize = FRONT + SPAN;
 const LEAF: usize = 2;
 const PARENT: usize = 3;
 
+/// Unwraps the result of a read that has no error channel of its own.
+///
+/// # Panics
+///
+/// Panics with the error, prefixed by `ferro: `, if `result` is an error.
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
         Ok(value) => value,
@@ -62,8 +146,57 @@ thread_local! {
     static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// A fold of a map's entries that [`Map<K, V, S>`](Map) keeps for every subtree.
+///
+/// [`of`](Summary::of) summarizes one entry and [`combine`](Summary::combine) joins the summaries
+/// of two neighbouring runs of entries, the earlier one first. The map stores each subtree's fold
+/// on the link to it, so [`Map::summary`] costs O(1) once the map is committed, and
+/// [`range_summary`](Map::range_summary), [`prefix_summary`](Map::prefix_summary) and
+/// [`summary_by`](Map::summary_by) fold any run of keys in O(log n), where a scan would cost
+/// O(entries). An empty run has no summary, so they return `None` for it and `S` needs no identity
+/// element.
+///
+/// `combine` must be associative, so that the fold of a run does not depend on how the tree
+/// groups it, but it need not be commutative: first, last, minimum and maximum work as well as
+/// sums. `of` must depend only on what the key and value encode, so a `#[ferro(skip)]` field must
+/// not feed it. The summary is stored on every link, so keep it small, and make a wide one a tuple
+/// rather than a derived struct, whose field tags would be stored on every link too. `()`, the
+/// default, keeps nothing and costs nothing.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Data, Map, Summary};
+///
+/// #[derive(Data, Clone, Copy, Debug, PartialEq)]
+/// #[ferro(transparent)]
+/// struct Total(i64);
+///
+/// impl Summary<u32, i64> for Total {
+///     fn of(_day: &u32, amount: &i64) -> Self {
+///         Total(*amount)
+///     }
+///
+///     fn combine(&self, other: &Self) -> Self {
+///         Total(self.0 + other.0)
+///     }
+/// }
+///
+/// let mut ledger: Map<u32, i64, Total> = Map::default();
+/// ledger.extend([(1, 50), (2, -20), (3, 5), (9, 100)]);
+///
+/// assert_eq!(ledger.summary(), Some(Total(135)));
+/// assert_eq!(ledger.range_summary(2..=3), Some(Total(-15)));
+/// assert_eq!(ledger.range_summary(4..9), None);
+/// ```
+///
+/// [The summaries internals](https://github.com/archlemon/ferro/blob/main/docs/internals/summaries.md)
+/// describe how the fold is kept and what it costs.
 pub trait Summary<K, V>: Data {
+    /// The summary of the one entry `key` and `value`.
     fn of(key: &K, value: &V) -> Self;
+    /// The summary of a run of entries made of the run `self` summarizes followed by the run
+    /// `other` summarizes.
     fn combine(&self, other: &Self) -> Self;
 }
 
@@ -98,6 +231,41 @@ const fn by_copy<V>() -> bool {
     !needs_drop::<V>() && size_of::<V>() <= 2 * size_of::<usize>()
 }
 
+/// A value read from a [`Map`], which derefs to `V`.
+///
+/// [`Map::get`], the iterators, [`Cursor::value`], [`Change`] and [`Conflict`] hand out a `Val`
+/// rather than a `V` or an `&V`, so that a read copies nothing and borrows nothing. A `Val` is one
+/// of three things:
+///
+/// - The value itself, when `V` has no destructor and takes at most two `usize`s, 16 bytes on a
+///   64-bit target, such as an integer. It costs no atomic operation to make, clone or drop.
+/// - A share of the column that holds every value of its node, and its index there, for any other
+///   value of a node read from or written to a file. It keeps the whole column alive, outside the
+///   cache's budget, for as long as it is held.
+/// - An [`Arc<V>`], for a value too large to sit in its node or one changed since it was read.
+///
+/// A `Val` keeps the value it was read with: an edit of the map afterwards does not change it.
+/// Cloning one is cheap, and comparing, hashing and formatting one do what they do for `V`. Call
+/// [`into_owned`](Val::into_owned) for a `V`, or [`into_arc`](Val::into_arc) for an `Arc<V>`, to
+/// keep a value without keeping its column.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Map, Val};
+///
+/// let mut names: Map<u32, String> = Map::new();
+/// names.insert(1, "ana".to_string());
+///
+/// let read: Val<String> = names.get(&1).unwrap();
+/// assert_eq!(read.len(), 3);
+///
+/// names.insert(1, "ben".to_string());
+/// assert_eq!(*read, "ana");
+///
+/// let owned: String = read.into_owned();
+/// assert_eq!(owned, "ana");
+/// ```
 pub struct Val<V>(Held<V>);
 
 enum Held<V> {
@@ -125,6 +293,7 @@ impl<V: Clone> Val<V> {
         }
     }
 
+    /// Wraps `value`, for code that hands out values the way a map does.
     pub fn new(value: V) -> Self {
         if by_copy::<V>() {
             Val(Held::Copied(ManuallyDrop::new(value)))
@@ -133,6 +302,10 @@ impl<V: Clone> Val<V> {
         }
     }
 
+    /// The value, as a `V` of its own.
+    ///
+    /// A value held by copy is moved out, one shared with a column is cloned, and one in an
+    /// [`Arc`] is moved out when this was its last handle and cloned otherwise.
     pub fn into_owned(self) -> V {
         match self.0 {
             Held::Copied(value) => ManuallyDrop::into_inner(value),
@@ -141,6 +314,7 @@ impl<V: Clone> Val<V> {
         }
     }
 
+    /// The value in an [`Arc`], without a copy when it is already held in one.
     pub fn into_arc(self) -> Arc<V> {
         match self.0 {
             Held::Single(value) => value,
@@ -159,6 +333,9 @@ impl<V> Val<V> {
     }
 }
 
+/// Whether two values read from maps, `None` for an absent one, are the same as stored: both
+/// absent, or both present and either one value shared by the two handles or two values that
+/// [`Data::same_encoding`] calls equal.
 pub(crate) fn same_value<V: Data>(a: Option<&Val<V>>, b: Option<&Val<V>>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -2602,6 +2779,50 @@ fn left_if(left: bool) -> Ordering {
     }
 }
 
+/// An ordered map from keys to values, stored as a Merkle search tree.
+///
+/// Keys are kept in the order of their [`Ord`], and each key's place in the tree also depends on a
+/// hash of its encoding, so a key type's `Ord` and its encoding must not change on existing data,
+/// and keys that compare equal must encode the same. Reads return a [`Val<V>`] that shares the
+/// value with the map. A map with a [`Summary`] `S` keeps a fold of every subtree; [`Map::new`]
+/// makes a plain `Map<K, V>`, and [`Map::default`] or `collect` makes one with a summary.
+///
+/// A map works in memory without a file, and inside a database it reads the nodes it needs as it
+/// goes. Clones are O(1) and share every node until one side changes it, and `==` compares length
+/// and root hash. A map nests in other values: a field of type `Map` in a struct that derives
+/// [`Data`] is written as a link to the map's root, and a commit writes only the nodes that
+/// changed.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::Map;
+///
+/// let mut scores: Map<u32, String> = Map::new();
+/// scores.insert(20, "ana".to_string());
+/// scores.insert(5, "ben".to_string());
+/// scores.insert(12, "cy".to_string());
+///
+/// assert_eq!(scores.len(), 3);
+/// assert_eq!(scores.get(&5).as_deref().map(String::as_str), Some("ben"));
+/// assert_eq!(scores.insert(5, "bo".to_string()).unwrap().as_str(), "ben");
+/// assert_eq!(scores.first().map(|(key, _)| key), Some(5));
+///
+/// let middle: Vec<(u32, String)> = scores
+///     .range(5..=12)
+///     .map(|(key, name)| (key, name.into_owned()))
+///     .collect();
+/// assert_eq!(middle, [(5, "bo".to_string()), (12, "cy".to_string())]);
+///
+/// let newest_first: Vec<u32> = scores.keys().rev().collect();
+/// assert_eq!(newest_first, [20, 12, 5]);
+/// ```
+///
+/// # Panics
+///
+/// A read that cannot load a node from the file, or finds one damaged, panics, as with every
+/// collection, and so does a write that has to load one. [`Map::try_get`] returns that failure as
+/// an error instead.
 pub struct Map<K, V, S = ()> {
     root: Link<K, V, S>,
     store: Option<Store>,
@@ -2626,24 +2847,37 @@ impl<K, V, S> Default for Map<K, V, S> {
 }
 
 impl<K, V> Map<K, V> {
+    /// Creates an empty map without a summary.
+    ///
+    /// A map with a [`Summary`] starts from [`Map::default`] instead, since a default type
+    /// parameter takes no part in inference.
     pub fn new() -> Self {
         Map::default()
     }
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
+    /// The number of entries, in O(1).
     pub fn len(&self) -> usize {
         self.root.count() as usize
     }
 
+    /// Whether the map has no entries.
     pub fn is_empty(&self) -> bool {
         self.root.count() == 0
     }
 
+    /// Whether the map holds changes that no store has yet.
+    ///
+    /// A map read from a database is clean, and so is an empty one. An insert, a removal or a
+    /// [`get_mut`](Map::get_mut) makes it dirty, while one that finds nothing to change, such as
+    /// removing an absent key, leaves it clean. A commit writes the nodes a dirty map changed, and
+    /// the version it commits reads back clean.
     pub fn is_dirty(&self) -> bool {
         matches!(self.root, Link::Mem(..))
     }
 
+    /// Removes every entry, in O(1).
     pub fn clear(&mut self) {
         self.root = Link::Empty;
     }
@@ -2693,6 +2927,13 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// The value stored under `key`, in O(log n), or the error that stopped the read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a node or value that cannot be read: [`Error::Io`] if the file cannot
+    /// be read, [`Error::Corrupt`] or [`Error::Decode`] if what it holds is damaged, and
+    /// [`Error::Detached`] for a map decoded without the store its nodes are in.
     pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val<V>>>
     where
         K: Borrow<Q>,
@@ -2705,6 +2946,14 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         .transpose()
     }
 
+    /// The value stored under `key`, in O(log n).
+    ///
+    /// `key` may be any borrowed form of the key type, as `&str` for a `String` key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value on the way cannot be read, where [`try_get`](Map::try_get)
+    /// returns the error.
     pub fn get<Q>(&self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
@@ -2713,6 +2962,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(self.try_get(key))
     }
 
+    /// The hash of the value stored under `key`, as [`hash_of`](crate::hash_of) gives it, in
+    /// O(log n).
+    ///
+    /// A value stored as an object of its own is not read: its hash is the one its node links to
+    /// it by. A value inside its node is encoded to hash it. The hash suits an HTTP `ETag` for one
+    /// entry.
     pub fn value_hash<Q>(&self, key: &Q) -> Option<Hash>
     where
         K: Borrow<Q>,
@@ -2731,6 +2986,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(fatal(found).transpose())
     }
 
+    /// Whether the map holds `key`, in O(log n). No value is read.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -2743,6 +2999,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(found).is_some()
     }
 
+    /// A mutable reference to the value stored under `key`, in O(log n).
+    ///
+    /// The reference is to a real `V`: a node on the path that another handle shares is copied
+    /// first, and the value is copied out of its node's column, or read if it is stored on its
+    /// own, so a [`Val`], clone or iterator made before keeps the value it had. An absent key
+    /// leaves the map as it was.
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -2754,6 +3016,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(find_mut(self.store.as_ref(), &mut self.root, key))
     }
 
+    /// A mutable reference to the value stored under `key`, inserting `make()` first if the key is
+    /// absent.
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
         if !self.contains_key(&key) {
             self.insert(key.clone(), make());
@@ -2761,6 +3025,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.get_mut(&key).expect("key was just inserted")
     }
 
+    /// Runs `f` on the value stored under `key` and returns what it returns, or `None` without
+    /// calling it if the key is absent.
+    ///
+    /// The value is reached as [`get_mut`](Map::get_mut) reaches it.
     pub fn update<Q, R>(&mut self, key: &Q, f: impl FnOnce(&mut V) -> R) -> Option<R>
     where
         K: Borrow<Q>,
@@ -2769,10 +3037,15 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.get_mut(key).map(f)
     }
 
+    /// Stores `value` under `key`, in O(log n), returning the value it replaced.
+    ///
+    /// The key passed in is kept only when the map did not hold one equal to it.
     pub fn insert(&mut self, key: K, value: V) -> Option<Val<V>> {
         self.insert_shared(key, Arc::new(value))
     }
 
+    /// [`insert`](Map::insert) for a value already in an [`Arc`], which the map keeps without a
+    /// copy until it is committed.
     pub(crate) fn insert_shared(&mut self, key: K, value: Arc<V>) -> Option<Val<V>> {
         let level = fatal(level_of(&key));
         let store = self.store.as_ref();
@@ -2780,6 +3053,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         replaced.map(|slot| fatal(read_slot(store, &slot)))
     }
 
+    /// [`insert`](Map::insert) that returns a failure to encode the key or to load a node instead
+    /// of panicking, and drops the value it replaced unread.
     pub(crate) fn try_insert(&mut self, key: K, value: V) -> Result<()> {
         let level = level_of(&key)?;
         insert_at(
@@ -2792,6 +3067,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(())
     }
 
+    /// Removes `key`, in O(log n), returning the value it held.
+    ///
+    /// An absent key leaves the map as it was.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
@@ -2805,26 +3083,34 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         removed.map(|slot| fatal(read_slot(store, &slot)))
     }
 
+    /// The entry with the smallest key, in O(log n).
     pub fn first(&self) -> Option<(K, Val<V>)> {
         self.iter().next()
     }
 
+    /// The entry with the largest key, in O(log n).
     pub fn last(&self) -> Option<(K, Val<V>)> {
         self.iter().next_back()
     }
 
+    /// Removes and returns the entry with the smallest key, in O(log n).
     pub fn pop_first(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.first()?;
         self.remove(&key);
         Some((key, value))
     }
 
+    /// Removes and returns the entry with the largest key, in O(log n).
     pub fn pop_last(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.last()?;
         self.remove(&key);
         Some((key, value))
     }
 
+    /// The entry at position `index` in key order, counting from 0, in O(log n).
+    ///
+    /// Every link records how many entries lie below it, so the walk skips whole subtrees rather
+    /// than counting through them. `None` if `index` is not below [`len`](Map::len).
     pub fn nth(&self, index: usize) -> Option<(K, Val<V>)> {
         let mut remaining = index as u64;
         let found = self.walk(|node| {
@@ -2849,6 +3135,34 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             .map(|(key, value)| (key, fatal(value)))
     }
 
+    /// The entries whose key is not `below` the range but is `within` it, in key order, from
+    /// either end.
+    ///
+    /// Both predicates must split the keys in order: `below` holds for every key before the range
+    /// and for none after, and `within` holds for every key up to the end of the range and for
+    /// none after. That lets a range be given by something other than two keys of type `K`, such as
+    /// a prefix of a string or the leading fields of a tuple. A range that no key falls in gives
+    /// an empty iterator. Finding both ends costs O(log n), and the iterator knows its length at
+    /// once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let words: Map<String, usize> = ["apple", "apricot", "banana", "avocado", "apex"]
+    ///     .into_iter()
+    ///     .map(|word| (word.to_string(), word.len()))
+    ///     .collect();
+    ///
+    /// let starts = words.range_by(
+    ///     |word| word.as_str() < "ap",
+    ///     |word| word.as_str() < "ap" || word.starts_with("ap"),
+    /// );
+    /// assert_eq!(starts.len(), 3);
+    /// let found: Vec<String> = starts.map(|(word, _)| word).collect();
+    /// assert_eq!(found, ["apex", "apple", "apricot"]);
+    /// ```
     pub fn range_by(
         &self,
         below: impl Fn(&K) -> bool,
@@ -2934,6 +3248,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(build())
     }
 
+    /// Every entry, in key order, from either end.
+    ///
+    /// The iterator reads the map as it is now, whatever happens to the map later, as [`Iter`]
+    /// describes.
     pub fn iter(&self) -> Iter<K, V, S> {
         self.range_by(|_| false, |_| true)
     }
@@ -2945,6 +3263,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// A [`Finder`] for looking up many keys of this map, as a table's index lookups fetch rows.
     pub(crate) fn finder(&self) -> Finder<K, V, S> {
         let hazards = Hazards::new();
         Finder {
@@ -2956,6 +3275,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// A [`Cursor`] over the map as it is now, whose seeks cost the distance they move.
+    ///
+    /// The cursor starts with no position: [`Cursor::seek`] or [`Cursor::rewind`] gives it one.
     pub fn cursor(&self) -> Cursor<K, V, S> {
         let hazards = Hazards::new();
         Cursor {
@@ -2967,6 +3289,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// The entry with the largest key at or before `key`, in one walk of O(log n).
     pub fn floor<Q>(&self, key: &Q) -> Option<(K, Val<V>)>
     where
         K: Borrow<Q>,
@@ -3009,6 +3332,26 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// Pairs each of `keys` with the value stored under it, looking them all up through one
+    /// [`Cursor`].
+    ///
+    /// Keys in ascending order cost the distance between them rather than a search from the root
+    /// each. Keys out of order still get the right answer, at the cost of a fresh search. The keys
+    /// may be owned or borrowed, and the result is lazy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let doubled: Map<u32, u32> = (0..1000).map(|key| (key, key * 2)).collect();
+    ///
+    /// let found: Vec<(u32, Option<u32>)> = doubled
+    ///     .get_many([3, 500, 2000])
+    ///     .map(|(key, value)| (key, value.as_deref().copied()))
+    ///     .collect();
+    /// assert_eq!(found, [(3, Some(6)), (500, Some(1000)), (2000, None)]);
+    /// ```
     pub fn get_many<I>(
         &self,
         keys: I,
@@ -3024,6 +3367,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         })
     }
 
+    /// Pairs each of `keys` with whether the map holds it, looking them all up through one
+    /// [`Cursor`], as [`get_many`](Map::get_many) does, without reading any value.
     pub fn contains_many<I>(
         &self,
         keys: I,
@@ -3039,6 +3384,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         })
     }
 
+    /// Calls `f` on every entry in key order, lending the key and value instead of cloning them.
+    ///
+    /// It walks a node's entries in one loop and takes one reference count per node rather than
+    /// one per entry, which makes it the cheapest full scan, most of all for values with a
+    /// destructor. A value stored on its own is read before `f` sees it.
     pub fn for_each(&self, mut f: impl FnMut(&K, &V)) {
         let _ = self.try_for_each(|key, value| -> ControlFlow<()> {
             f(key, value);
@@ -3046,6 +3396,27 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         });
     }
 
+    /// Calls `f` on every entry in key order, as [`for_each`](Map::for_each) does, until it
+    /// returns [`ControlFlow::Break`], which this returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ops::ControlFlow;
+    ///
+    /// use ferro::Map;
+    ///
+    /// let squares: Map<u32, u32> = (1..=100).map(|key| (key, key * key)).collect();
+    ///
+    /// let first_big = squares.try_for_each(|key, square| {
+    ///     if *square > 500 {
+    ///         ControlFlow::Break(*key)
+    ///     } else {
+    ///         ControlFlow::Continue(())
+    ///     }
+    /// });
+    /// assert_eq!(first_big, ControlFlow::Break(23));
+    /// ```
     pub fn try_for_each<B>(&self, mut f: impl FnMut(&K, &V) -> ControlFlow<B>) -> ControlFlow<B> {
         fatal(scan(self.store(), &self.root, 0, None, None, &mut f))
     }
@@ -3078,6 +3449,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(())
     }
 
+    /// Every entry, cloned, in key order, or the error that stopped the walk where the public
+    /// reads would panic.
     pub(crate) fn try_entries(&self) -> Result<Vec<(K, V)>> {
         let store = self.store();
         let mut entries = Vec::new();
@@ -3088,6 +3461,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(entries)
     }
 
+    /// Every value in key order, or the error that stopped the walk where the public reads would
+    /// panic.
     pub(crate) fn try_values(&self) -> Result<Vec<Val<V>>> {
         let store = self.store();
         let mut values = Vec::new();
@@ -3098,6 +3473,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(values)
     }
 
+    /// Calls `f` on every entry whose key lies in `range`, in key order, lending each entry as
+    /// [`for_each`](Map::for_each) does.
     pub fn for_each_range<Q, R>(&self, range: R, mut f: impl FnMut(&K, &V))
     where
         K: Borrow<Q>,
@@ -3110,6 +3487,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         });
     }
 
+    /// Calls `f` on every entry whose key lies in `range`, in key order, until it returns
+    /// [`ControlFlow::Break`], which this returns.
     pub fn try_for_each_range<Q, R, B>(
         &self,
         range: R,
@@ -3134,14 +3513,20 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         ))
     }
 
+    /// Every key, in order, from either end. No value is read.
     pub fn keys(&self) -> Keys<K, V, S> {
         self.iter().into_keys()
     }
 
+    /// Every value, in key order, from either end.
     pub fn values(&self) -> Values<K, V, S> {
         Values(self.iter())
     }
 
+    /// The entries whose key lies in `range`, in key order, from either end.
+    ///
+    /// The bounds may be any borrowed form of the key type. Finding both ends costs O(log n), and
+    /// the iterator knows its length at once, from the entry counts on the links between them.
     pub fn range<Q, R>(&self, range: R) -> Iter<K, V, S>
     where
         K: Borrow<Q>,
@@ -3153,10 +3538,20 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.range_by(|key| below(key, start), |key| within(key, end))
     }
 
+    /// The [`Summary`] of every entry, or `None` for an empty map.
+    ///
+    /// A committed map keeps it on its root link, so it costs O(1). Nodes changed since the last
+    /// commit are folded again on each call.
     pub fn summary(&self) -> Option<S> {
         self.root.summary()
     }
 
+    /// The [`Summary`] of the entries whose key is not `below` the range but is `within` it, in
+    /// O(log n), or `None` if there are none.
+    ///
+    /// The predicates are those of [`range_by`](Map::range_by). The fold combines the stored
+    /// summaries of the subtrees between the two ends with the entries along the two paths, so it
+    /// reads no node inside the range. Nodes changed since the last commit are folded on demand.
     pub fn summary_by(&self, below: impl Fn(&K) -> bool, within: impl Fn(&K) -> bool) -> Option<S> {
         let guard = epoch::pin();
         let store = self.store();
@@ -3171,6 +3566,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         ))
     }
 
+    /// The [`Summary`] of the entries whose key lies in `range`, in O(log n), or `None` if there
+    /// are none.
+    ///
+    /// See [`Summary`] for an example.
     pub fn range_summary<Q, R>(&self, range: R) -> Option<S>
     where
         K: Borrow<Q>,
@@ -3182,6 +3581,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.summary_by(|key| below(key, start), |key| within(key, end))
     }
 
+    /// The entries whose key starts with `head`, in key order, from either end.
+    ///
+    /// The key must be a tuple of two to four fields, or a type of your own that implements
+    /// [`Prefix`](crate::Prefix). `head` can be borrowed, as `&str` for a `String` field. It costs
+    /// what the same [`range`](Map::range) does.
     pub fn prefix<Q>(&self, head: &Q) -> Iter<K, V, S>
     where
         K: KeyPrefix<Q>,
@@ -3190,6 +3594,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.range_by(|key| key.head() < head, |key| key.head() <= head)
     }
 
+    /// The [`Summary`] of the entries whose key starts with `head`, in O(log n), or `None` if there
+    /// are none.
     pub fn prefix_summary<Q>(&self, head: &Q) -> Option<S>
     where
         K: KeyPrefix<Q>,
@@ -3198,6 +3604,29 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.summary_by(|key| key.head() < head, |key| key.head() <= head)
     }
 
+    /// Removes the entries whose key lies in `range` and returns them as a map of their own.
+    ///
+    /// The tree is cut along the two ends of the range, so the cut touches O(log n) nodes however
+    /// many entries move. A range that holds no key leaves the map as it was.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let mut map: Map<u32, u32> = (0..10).map(|key| (key, key * 10)).collect();
+    ///
+    /// let mut middle = map.take_range(3..6);
+    /// assert_eq!(middle.keys().collect::<Vec<_>>(), [3, 4, 5]);
+    ///
+    /// let tail = map.split_off(&8);
+    /// assert_eq!(tail.keys().collect::<Vec<_>>(), [8, 9]);
+    /// assert_eq!(map.keys().collect::<Vec<_>>(), [0, 1, 2, 6, 7]);
+    ///
+    /// map.append(&mut middle);
+    /// assert!(middle.is_empty());
+    /// assert_eq!(map.keys().collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    /// ```
     pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V, S>
     where
         K: Borrow<Q>,
@@ -3227,6 +3656,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         taken
     }
 
+    /// Removes the entries whose key lies in `range` and returns how many there were.
+    ///
+    /// The cut touches O(log n) nodes and reads none of the removed subtrees, whose sizes are on
+    /// the links to them.
     pub fn remove_range<Q, R>(&mut self, range: R) -> usize
     where
         K: Borrow<Q>,
@@ -3236,6 +3669,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.take_range::<Q, R>(range).len()
     }
 
+    /// Splits the map at `key`: returns the entries from `key` up and keeps the rest.
+    ///
+    /// Touches O(log n) nodes however many entries move.
     pub fn split_off<Q>(&mut self, key: &Q) -> Map<K, V, S>
     where
         K: Borrow<Q>,
@@ -3253,6 +3689,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// Moves every entry of `other` into this map, leaving `other` empty.
+    ///
+    /// When every key of one map sorts before every key of the other, and the two do not belong
+    /// to different databases, the trees are joined in O(log n) nodes. Otherwise the entries of
+    /// `other` are copied in as one batch, as [`apply`](Map::apply) takes it, and a key both maps
+    /// hold takes the value from `other`.
     pub fn append(&mut self, other: &mut Map<K, V, S>) {
         if other.is_empty() {
             return;
@@ -3289,6 +3731,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         other.clear();
     }
 
+    /// Removes every entry for which `keep` returns `false`.
+    ///
+    /// `keep` sees every entry in key order, and the removals are then applied as one batch.
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         let doomed: Vec<(K, Option<Arc<V>>)> = self
             .iter()
@@ -3298,6 +3743,29 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.batch(doomed);
     }
 
+    /// Applies a batch of edits in one descent of the tree: `(key, Some(value))` stores a value
+    /// and `(key, None)` removes the key.
+    ///
+    /// The edits need not be sorted, and when a key appears more than once its last edit wins. A
+    /// node is walked once however many edits fall in it, and a subtree that none falls in is left
+    /// shared, which makes a large batch cheaper than the same edits one at a time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let mut stock: Map<String, u32> = Map::new();
+    /// stock.insert("anvil".to_string(), 5);
+    ///
+    /// stock.apply([
+    ///     ("rope".to_string(), Some(12)),
+    ///     ("anvil".to_string(), None),
+    ///     ("rope".to_string(), Some(10)),
+    /// ]);
+    /// assert_eq!(stock.len(), 1);
+    /// assert_eq!(stock.get("rope").as_deref(), Some(&10));
+    /// ```
     pub fn apply(&mut self, edits: impl IntoIterator<Item = (K, Option<V>)>) {
         self.batch(
             edits
@@ -3321,6 +3789,37 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         fatal(absorb(store, &mut self.root, &mut edits, count));
     }
 
+    /// The changes that turn this map into `newer`, in key order, as a lazy iterator of
+    /// [`Change`]s.
+    ///
+    /// A subtree the two maps share, in memory or by hash in the file, is skipped without being
+    /// read, so the diff between two versions of one map costs O(changes) rather than O(n). A
+    /// value counts as changed when its encoding changed, as [`Data::same_encoding`] decides, not
+    /// by `==`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Change, Map};
+    ///
+    /// let mut old: Map<u32, String> = Map::new();
+    /// old.extend([(1, "a".to_string()), (2, "b".to_string()), (3, "c".to_string())]);
+    ///
+    /// let mut new = old.clone();
+    /// new.remove(&1);
+    /// new.insert(2, "B".to_string());
+    /// new.insert(4, "d".to_string());
+    ///
+    /// let changes: Vec<String> = old
+    ///     .diff(&new)
+    ///     .map(|change| match change {
+    ///         Change::Added(key, value) => format!("+{key} {}", *value),
+    ///         Change::Removed(key, value) => format!("-{key} {}", *value),
+    ///         Change::Changed(key, before, after) => format!("~{key} {} {}", *before, *after),
+    ///     })
+    ///     .collect();
+    /// assert_eq!(changes, ["-1 a", "~2 b B", "+4 d"]);
+    /// ```
     pub fn diff(&self, newer: &Map<K, V, S>) -> Diff<K, V, S> {
         Diff {
             old_store: self.store.clone(),
@@ -3330,6 +3829,50 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         }
     }
 
+    /// Merges into this map, ours, what changed from `base` to `theirs`, and returns how many keys
+    /// it wrote.
+    ///
+    /// It walks `base.diff(theirs)`, so it costs O(changes on their side), with one lookup in this
+    /// map for each. For each key their side changed:
+    ///
+    /// - if ours already holds their value, nothing is written;
+    /// - if ours still holds the base's value, theirs is applied;
+    /// - otherwise both sides changed it differently, and `resolve` gets a [`Conflict`] and
+    ///   returns the value to store, or `None` to remove the key. [`Conflict::keep_ours`] and
+    ///   [`Conflict::keep_theirs`] are ready-made resolutions.
+    ///
+    /// Values are compared as stored, by [`Data::same_encoding`]. A key only our side changed is
+    /// left as it is. [`Db::merge_with`](crate::Db::merge_with) finds the base of two branches and
+    /// commits the merge.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let base: Map<String, u32> = [("a", 1), ("b", 2), ("c", 3)]
+    ///     .into_iter()
+    ///     .map(|(key, value)| (key.to_string(), value))
+    ///     .collect();
+    ///
+    /// let mut ours = base.clone();
+    /// ours.insert("a".to_string(), 10);
+    /// ours.insert("c".to_string(), 30);
+    ///
+    /// let mut theirs = base.clone();
+    /// theirs.insert("b".to_string(), 20);
+    /// theirs.insert("c".to_string(), 300);
+    ///
+    /// let written = ours.merge(&base, &theirs, |conflict| {
+    ///     let mine = conflict.ours.as_deref().copied().unwrap_or(0);
+    ///     let other = conflict.theirs.as_deref().copied().unwrap_or(0);
+    ///     Some(mine.max(other))
+    /// });
+    /// assert_eq!(written, 2);
+    /// assert_eq!(ours.get("a").as_deref(), Some(&10));
+    /// assert_eq!(ours.get("b").as_deref(), Some(&20));
+    /// assert_eq!(ours.get("c").as_deref(), Some(&300));
+    /// ```
     pub fn merge(
         &mut self,
         base: &Map<K, V, S>,
@@ -3342,6 +3885,31 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         written
     }
 
+    /// [`merge`](Map::merge) with a `resolve` that can refuse a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `resolve` returns, and leaves this map as it was before the merge,
+    /// with none of the keys written before the error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Map;
+    ///
+    /// let base: Map<u32, u32> = [(1, 10), (2, 20)].into_iter().collect();
+    /// let mut ours = base.clone();
+    /// ours.insert(2, 21);
+    /// let mut theirs = base.clone();
+    /// theirs.insert(1, 11);
+    /// theirs.insert(2, 22);
+    ///
+    /// let refused = ours.try_merge(&base, &theirs, |conflict| {
+    ///     Err(format!("key {} changed on both sides", conflict.key))
+    /// });
+    /// assert_eq!(refused, Err("key 2 changed on both sides".to_string()));
+    /// assert_eq!(ours.get(&1).as_deref(), Some(&10));
+    /// ```
     pub fn try_merge<E>(
         &mut self,
         base: &Map<K, V, S>,
@@ -3370,6 +3938,34 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         merged
     }
 
+    /// The hash of the map's tree, or `None` for an empty map.
+    ///
+    /// The tree's shape depends only on its keys, so two maps with the same entries have the same
+    /// root hash whatever order the entries went in, and it can serve as an HTTP `ETag` for the
+    /// whole map. A committed map reads it from its root link in O(1). Nodes changed since the
+    /// last commit are encoded and hashed on each call, though nothing is written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Map, hash_of};
+    ///
+    /// let built: Map<u32, String> = [(1, "x".to_string()), (2, "y".to_string())]
+    ///     .into_iter()
+    ///     .collect();
+    /// let mut inserted: Map<u32, String> = Map::new();
+    /// inserted.insert(2, "y".to_string());
+    /// inserted.insert(1, "x".to_string());
+    ///
+    /// assert_eq!(built.root_hash(), inserted.root_hash());
+    /// assert!(built == inserted);
+    /// assert_eq!(built.value_hash(&1), Some(hash_of(&"x".to_string())));
+    /// assert_eq!(Map::<u32, u32>::new().root_hash(), None);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node changed since the last commit fails to encode.
     pub fn root_hash(&self) -> Option<Hash> {
         match &self.root {
             Link::Empty => None,
@@ -3912,6 +4508,48 @@ impl<K: Data, V: Data, S: Data> Top<K, V, S> {
     }
 }
 
+/// A position in a [`Map`] that keeps its path through the tree, made by [`Map::cursor`].
+///
+/// [`seek`](Cursor::seek) climbs only until a node's key span holds the target and searches down
+/// from there, so a seek costs the distance it moves rather than a search from the root, in
+/// either direction. That suits lookups in sorted order and merge joins of two maps.
+/// [`get_many`](Map::get_many) and [`contains_many`](Map::contains_many) run one over a list of
+/// keys.
+///
+/// A new cursor has no position until [`seek`](Cursor::seek), [`seek_back`](Cursor::seek_back) or
+/// [`rewind`](Cursor::rewind) gives it one, and it loses its position when a move goes past
+/// either end. Like an iterator, a cursor reads the map as it was when the cursor was made, and
+/// can outlive the map.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::Map;
+///
+/// let tens: Map<u32, u32> = (0..10).map(|n| (n * 10, n)).collect();
+/// let mut cursor = tens.cursor();
+/// assert_eq!(cursor.key(), None);
+///
+/// assert!(cursor.seek(&30));
+/// assert_eq!(cursor.value().as_deref(), Some(&3));
+///
+/// assert!(!cursor.seek(&35));
+/// assert_eq!(cursor.key(), Some(&40));
+/// assert_eq!(cursor.advance(), Some(&50));
+///
+/// assert!(!cursor.seek_back(&35));
+/// assert_eq!(cursor.read(|key, value| key + value), Some(33));
+///
+/// assert!(!cursor.seek(&95));
+/// assert_eq!(cursor.key(), None);
+///
+/// cursor.rewind();
+/// assert_eq!(cursor.key(), Some(&0));
+/// ```
+///
+/// # Panics
+///
+/// A move or read that cannot load a node or value from the file, or finds one damaged, panics.
 pub struct Cursor<K, V, S = ()> {
     store: Option<Lent>,
     path: Vec<Frame<K, V, S>>,
@@ -3921,6 +4559,7 @@ pub struct Cursor<K, V, S = ()> {
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
+    /// Moves to the first key, or to no position if the map is empty.
     pub fn rewind(&mut self) {
         self.path.clear();
         if let Some(node) = self.root.hold(self.store.as_deref()) {
@@ -3984,6 +4623,10 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         }
     }
 
+    /// Moves to `key` if the map holds it, and otherwise to the first key after it, returning
+    /// whether it found `key`.
+    ///
+    /// With no key after it, the cursor is left with no position.
     pub fn seek<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -3997,6 +4640,10 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         false
     }
 
+    /// Moves to `key` if the map holds it, and otherwise to the last key before it, returning
+    /// whether it found `key`.
+    ///
+    /// With no key before it, the cursor is left with no position.
     pub fn seek_back<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -4018,6 +4665,10 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         false
     }
 
+    /// Moves to the next key in order and returns it.
+    ///
+    /// Past the last key it returns `None` and leaves the cursor with no position, and a cursor
+    /// with no position stays where it is and returns `None`.
     pub fn advance(&mut self) -> Option<&K> {
         self.index?;
         let slots = Slots::of(&self.hazards, FRONT);
@@ -4025,11 +4676,13 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
         self.key()
     }
 
+    /// The key at the cursor, or `None` if it has no position.
     pub fn key(&self) -> Option<&K> {
         let index = self.index?;
         self.path.last().map(|frame| &frame.node.keys[index])
     }
 
+    /// The value at the cursor, or `None` if it has no position.
     pub fn value(&self) -> Option<Val<V>> {
         let index = self.index?;
         self.path
@@ -4037,6 +4690,10 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
             .map(|frame| fatal(frame.node.value(self.store.as_deref(), index)))
     }
 
+    /// Calls `f` on the entry at the cursor, lending its key and value, and returns what it
+    /// returns, or `None` without calling it if the cursor has no position.
+    ///
+    /// A value stored on its own is read first.
     pub fn read<R>(&self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
         let index = self.index?;
         let node = &self.path.last()?.node;
@@ -4046,6 +4703,11 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     }
 }
 
+/// Looks up many keys of a map, keeping the last leaf it found and that leaf's parent.
+///
+/// A key within the kept leaf's first and last keys is in that leaf or nowhere, and one within the
+/// parent's is below it, so keys that arrive near each other, such as the rows an index lists,
+/// skip most of the descent. Like a cursor, a finder reads the map as it was when it was made.
 pub(crate) struct Finder<K, V, S = ()> {
     store: Option<Lent>,
     leaf: Option<Hold<K, V, S>>,
@@ -4102,6 +4764,11 @@ where
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
+    /// The value stored under `key`, starting from the kept leaf or parent when either spans it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value on the way cannot be read, as [`Map::get`] does.
     pub(crate) fn get<Q>(&mut self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
@@ -4208,6 +4875,37 @@ impl<'a, V: Data, S> Run<'a, V, S> {
     }
 }
 
+/// An iterator over entries of a [`Map`] as `(key, value)` pairs, in key order, from either end.
+///
+/// [`Map::iter`], [`Map::range`], [`Map::range_by`] and [`Map::prefix`] make one. It knows how many
+/// entries are left from the start, so `len` costs nothing, and it walks from both ends at once, so
+/// `next` and `next_back` can be mixed and meet without overlap. `fold` and the adapters built on
+/// it, such as `sum`, `count` and `for_each`, take a run of a node's entries in one loop, while
+/// `for` loops, `collect` and `find` go through `next`.
+///
+/// The iterator holds what it reads and borrows nothing from the map, so it reads the map as it
+/// was when the iterator was made, whatever is done to the map afterwards, and can outlive it.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::Map;
+///
+/// let mut map: Map<u32, u32> = (0..5).map(|key| (key, key * key)).collect();
+/// let before = map.iter();
+///
+/// map.remove(&0);
+/// map.insert(7, 49);
+/// drop(map);
+///
+/// assert_eq!(before.len(), 5);
+/// let keys: Vec<u32> = before.map(|(key, _)| key).collect();
+/// assert_eq!(keys, [0, 1, 2, 3, 4]);
+/// ```
+///
+/// # Panics
+///
+/// A step that cannot load a node or value from the file, or finds one damaged, panics.
 pub struct Iter<K, V, S = ()> {
     store: Option<Lent>,
     front: Vec<Frame<K, V, S>>,
@@ -4218,10 +4916,12 @@ pub struct Iter<K, V, S = ()> {
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
+    /// The same walk, yielding keys only.
     pub(crate) fn into_keys(self) -> Keys<K, V, S> {
         Keys(self)
     }
 
+    /// The same walk, yielding values only.
     pub(crate) fn into_values(self) -> Values<K, V, S> {
         Values(self)
     }
@@ -4309,16 +5009,26 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         }
     }
 
+    /// Steps to the next entry from the front and returns what `f` makes of its key, lent rather
+    /// than cloned, without reading its value.
     pub(crate) fn next_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
         let index = self.advance()?;
         self.front.last().map(|frame| f(&frame.node.keys[index]))
     }
 
+    /// Steps to the next entry from the back and returns what `f` makes of its key, lent rather
+    /// than cloned, without reading its value.
     pub(crate) fn next_back_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
         let index = self.retreat()?;
         self.back.last().map(|frame| f(&frame.node.keys[index]))
     }
 
+    /// Steps to the next entry from the front and returns what `f` makes of its key and value,
+    /// lent rather than cloned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is stored on its own and cannot be read.
     pub(crate) fn next_with<R>(&mut self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
         let index = self.advance()?;
         let frame = self.front.last()?;
@@ -4330,6 +5040,12 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
         )))
     }
 
+    /// Steps to the next entry from the back and returns what `f` makes of its key and value,
+    /// lent rather than cloned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is stored on its own and cannot be read.
     pub(crate) fn next_back_with<R>(&mut self, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
         let index = self.retreat()?;
         let frame = self.back.last()?;
@@ -4383,6 +5099,10 @@ impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Iter<K, V, S> {
 
 impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Iter<K, V, S> {}
 
+/// An iterator over keys of a [`Map`], in order, from either end, made by [`Map::keys`].
+///
+/// It walks as [`Iter`] does and reads no value, so it costs no more than the keys themselves.
+/// [`Set`](crate::Set) hands it out for its values.
 pub struct Keys<K, V, S = ()>(Iter<K, V, S>);
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Keys<K, V, S> {
@@ -4419,6 +5139,9 @@ impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Keys<K, V, S> {
 
 impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 
+/// An iterator over values of a [`Map`], in key order, from either end, made by [`Map::values`].
+///
+/// It walks as [`Iter`] does and clones no key. [`Table`](crate::Table) hands it out for its rows.
 pub struct Values<K, V, S = ()>(Iter<K, V, S>);
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Values<K, V, S> {
@@ -4450,20 +5173,29 @@ impl<K: Data + Ord, V: Data, S: Data> DoubleEndedIterator for Values<K, V, S> {
 
 impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Values<K, V, S> {}
 
+/// One difference between two versions of a [`Map`], from the older to the newer, as [`Diff`]
+/// yields them.
+///
+/// See [`Map::diff`] for an example.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Change<K, V> {
+    /// The newer map holds the key with this value, and the older one does not hold it.
     Added(K, Val<V>),
+    /// The older map held the key with this value, and the newer one does not hold it.
     Removed(K, Val<V>),
+    /// Both hold the key, with values that encode differently: the older value, then the newer.
     Changed(K, Val<V>, Val<V>),
 }
 
 impl<K, V> Change<K, V> {
+    /// The key that changed.
     pub fn key(&self) -> &K {
         match self {
             Change::Added(key, _) | Change::Removed(key, _) | Change::Changed(key, _, _) => key,
         }
     }
 
+    /// The value in the older map, or `None` for a key it lacked.
     pub fn before(&self) -> Option<&Val<V>> {
         match self {
             Change::Added(..) => None,
@@ -4471,6 +5203,7 @@ impl<K, V> Change<K, V> {
         }
     }
 
+    /// The value in the newer map, or `None` for a key it lacks.
     pub fn after(&self) -> Option<&Val<V>> {
         match self {
             Change::Removed(..) => None,
@@ -4479,24 +5212,68 @@ impl<K, V> Change<K, V> {
     }
 }
 
+/// A key that both sides of a three-way merge changed, each in its own way, handed to the
+/// `resolve` closure of [`Map::merge`] and [`Map::try_merge`].
+///
+/// Each side is `None` where that side lacks the key, so a removal on one side and an edit on the
+/// other comes here as well. The closure returns the value the merge stores, or `None` to remove
+/// the key: [`keep_ours`](Conflict::keep_ours) and [`keep_theirs`](Conflict::keep_theirs) take one
+/// side whole, and anything else, such as a value built from both, works too.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Conflict, Map};
+///
+/// let base: Map<u32, String> = [(1, "draft".to_string())].into_iter().collect();
+/// let mut ours = base.clone();
+/// ours.insert(1, "ours".to_string());
+/// let mut theirs = base.clone();
+/// theirs.remove(&1);
+///
+/// let mut seen = Vec::new();
+/// ours.merge(&base, &theirs, |conflict| {
+///     seen.push((conflict.key, conflict.theirs.is_none()));
+///     conflict.keep_theirs()
+/// });
+/// assert_eq!(seen, [(1, true)]);
+/// assert!(ours.is_empty());
+///
+/// let mut again = base.clone();
+/// again.insert(1, "ours".to_string());
+/// again.merge(&base, &theirs, Conflict::keep_ours);
+/// assert_eq!(again.get(&1).as_deref().map(String::as_str), Some("ours"));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conflict<K, V> {
+    /// The key both sides changed.
     pub key: K,
+    /// The value in the merge base, or `None` if the base lacked the key.
     pub base: Option<Val<V>>,
+    /// The value on our side, the map being merged into, or `None` if ours lacks the key.
     pub ours: Option<Val<V>>,
+    /// The value on their side, or `None` if theirs lacks the key.
     pub theirs: Option<Val<V>>,
 }
 
 impl<K, V: Clone> Conflict<K, V> {
+    /// Resolves the conflict by keeping our side, removing the key if ours lacks it.
     pub fn keep_ours(self) -> Option<V> {
         self.ours.map(Val::into_owned)
     }
 
+    /// Resolves the conflict by taking their side, removing the key if theirs lacks it.
     pub fn keep_theirs(self) -> Option<V> {
         self.theirs.map(Val::into_owned)
     }
 }
 
+/// Merges into `target` what changed from `base` to `theirs`, as [`Map::merge`] describes, and
+/// returns how many keys it wrote.
+///
+/// `read` gets ours for a key and `write` stores a value, or removes the key for `None`, so that
+/// a table can merge its rows and keep its indexes in step. The first error `resolve` returns
+/// stops the merge and is returned, with the keys written before it left in `target`.
 pub(crate) fn three_way<T, K, V, S, E>(
     target: &mut T,
     base: &Map<K, V, S>,
@@ -4540,6 +5317,16 @@ enum Step<K, V, S> {
     Entry(K, Slot<V, S>),
 }
 
+/// An iterator over the [`Change`]s between two versions of a [`Map`], in key order, made by
+/// [`Map::diff`].
+///
+/// It is lazy: each step expands only the subtrees the two versions do not share, until it finds
+/// the next change, so stopping early costs only what was read. It holds both versions, and
+/// changes to either map afterwards do not reach it.
+///
+/// # Panics
+///
+/// A step that cannot load a node or value from the file, or finds one damaged, panics.
 pub struct Diff<K, V, S = ()> {
     old_store: Option<Store>,
     new_store: Option<Store>,
