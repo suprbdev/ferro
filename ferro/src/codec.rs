@@ -530,8 +530,9 @@ impl Description {
         &self.bytes
     }
 
-    /// A 64-bit fingerprint of the description: the first eight bytes of a BLAKE3 hash keyed for
-    /// index fingerprints, read as a little-endian integer.
+    /// A 64-bit fingerprint of the description: the first eight bytes of a BLAKE3 hash in key
+    /// derivation mode, under a context string kept for index fingerprints, read as a
+    /// little-endian integer.
     pub fn fingerprint(&self) -> u64 {
         let mut hasher = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
         hasher.update(&self.bytes);
