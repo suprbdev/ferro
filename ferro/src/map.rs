@@ -4208,9 +4208,9 @@ fn teardown<K, V, S>(root: Shared<Node<K, V, S>>) {
     while index < nodes.len() {
         if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD) {
             let base = Shared::as_ptr(ahead).addr();
+            prefetch(Shared::counts_addr(ahead));
             prefetch(base);
             prefetch(base + LINE_BYTES);
-            prefetch(base + size_of::<Node<K, V, S>>());
         }
         if let Some(ahead) = nodes.get(index + TEARDOWN_AHEAD / 2) {
             prefetch_items(&ahead.children);

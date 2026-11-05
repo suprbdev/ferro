@@ -2,8 +2,8 @@
 //! that let readers borrow a value without a count of their own.
 //!
 //! A `Shared` is an `Arc` of the crate's own. Its allocation, an [`Inner<T>`], holds the strong
-//! count at its front, the value right after it, and behind the value a 32-bit weak count and two
-//! flags. Owners hold strong counts and, between them, one weak count, which goes with the value. A
+//! count, a 32-bit weak count and two flags at its front and the value right after them. Owners
+//! hold strong counts and, between them, one weak count, which goes with the value. A
 //! [`Weak`] holds a weak count of its own, and the allocation is freed with the last weak count, so
 //! a `Weak` can read the flags after the value is gone. The flags are only ever accessed
 //! atomically, and no reference to them is ever exclusive: the last owner drops the value through a
@@ -27,7 +27,7 @@
 //! after its last count.
 //! [Where the flags live](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#where-the-flags-live)
 //! and [Iterators under hazards](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
-//! describe the protocol and why the flags sit behind the value.
+//! describe the protocol and why the flags sit outside the value.
 
 use std::alloc::{Layout, dealloc};
 use std::any::{Any, TypeId};
@@ -50,20 +50,18 @@ const LOCKED: u32 = u32::MAX;
 /// The highest weak count. A downgrade or a clone of a [`Weak`] past it aborts the process.
 const MAX_WEAK: u32 = LOCKED - 1;
 
-/// The allocation behind a [`Shared`]: the strong count at the front, the value right after it,
-/// and behind the value the weak count and the flags.
+/// The allocation behind a [`Shared`]: the strong count, the weak count and the flags at the
+/// front, and the value right after them.
 ///
 /// It is `repr(C)`, so every `Inner` starts with its strong count whatever `T` is, which is how an
 /// [`Erased`], a [`Dead`] and a [`Parked`] reach the count without the type. A reader reaches the
-/// flags from a [`Weak`] without making a reference to the value, and they sit apart from the
-/// strong count, which clones and upgrades write.
+/// flags from a [`Weak`] without making a reference to the value, and they share a line with the
+/// start of the value, which a reader goes on to read.
 #[repr(C)]
 struct Inner<T> {
     /// The owners' count. The value is alive while it is above zero, and while it passes through
     /// zero on the way to being parked.
     strong: AtomicUsize,
-    /// The value.
-    data: T,
     /// One count for each [`Weak`], and one that the owners hold between them and let go with the
     /// value. [`Shared::unique`] holds it at [`LOCKED`] while it reads the strong count.
     weak: AtomicU32,
@@ -72,6 +70,8 @@ struct Inner<T> {
     /// Set once a reader has borrowed the value without a count, and cleared only by an owner
     /// holding the only count once no slot holds the value.
     lent: AtomicBool,
+    /// The value.
+    data: T,
 }
 
 /// A strong count on a value, like `Arc<T>`, whose allocation also carries the flags of the
@@ -497,6 +497,12 @@ impl<T> Shared<T> {
         // SAFETY: `this` reaches a live allocation, as every `Shared` does, and the projection
         // makes no reference.
         unsafe { &raw const (*this.ptr.as_ptr()).data }
+    }
+
+    /// The address of the counts and flags, for a prefetch before [`Shared::get_mut`].
+    #[inline]
+    pub(crate) fn counts_addr(this: &Self) -> usize {
+        this.ptr.addr().get()
     }
 
     /// Whether `a` and `b` are counts on one allocation.
@@ -1212,10 +1218,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_keeps_the_flags_after_the_value_in_an_allocation_of_the_same_size() {
+    fn shared_keeps_the_counts_and_flags_ahead_of_the_value_in_an_allocation_of_the_same_size() {
         assert_eq!(size_of::<Inner<[u64; 17]>>(), 152);
-        assert_eq!(offset_of!(Inner<[u64; 17]>, data), 8);
-        assert_eq!(offset_of!(Inner<[u64; 17]>, cached), 148);
+        assert_eq!(offset_of!(Inner<[u64; 17]>, weak), 8);
+        assert_eq!(offset_of!(Inner<[u64; 17]>, cached), 12);
+        assert_eq!(offset_of!(Inner<[u64; 17]>, data), 16);
     }
 
     #[test]
