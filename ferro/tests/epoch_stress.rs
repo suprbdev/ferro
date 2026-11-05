@@ -6,7 +6,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::Rng;
-use ferro::{Data, Db, Durability, Keep, Map, Options, Reclaim, Record, Snapshot, Summary, Table};
+use ferro::map::Iter;
+use ferro::table::IndexIter;
+use ferro::{
+    Cursor, Data, Db, Durability, Keep, Map, Options, Reclaim, Record, Snapshot, Summary, Table,
+};
 
 const KEYS: u64 = 20_000;
 const HOT: u64 = 256;
@@ -295,6 +299,135 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
 
 type Shared = Arc<RwLock<Option<Db<Root>>>>;
 
+struct Walk {
+    values: Iter<u64, u64, Total>,
+    backwards: bool,
+    want: std::vec::IntoIter<(u64, u64)>,
+    context: String,
+}
+
+struct Seeks {
+    cursor: Cursor<u64, u64, Total>,
+    want: std::vec::IntoIter<(u64, u64)>,
+    context: String,
+}
+
+struct Rows {
+    rows: IndexIter<Row>,
+    want: std::vec::IntoIter<Row>,
+    context: String,
+}
+
+#[derive(Default)]
+struct Walks {
+    values: Option<Walk>,
+    seeks: Option<Seeks>,
+    rows: Option<Rows>,
+}
+
+fn values_in(model: &Model, low: u64, high: u64, applied: u64) -> Vec<(u64, u64)> {
+    (low..high.min(KEYS))
+        .filter_map(|key| model.value_at(key, applied).map(|value| (key, value)))
+        .collect()
+}
+
+impl Walks {
+    fn start(&mut self, model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) {
+        let low = pick(rng, hot).min(KEYS - 1);
+        let high = low + 50 + rng.below(800);
+        if self.values.is_none() && rng.chance(30) {
+            let backwards = rng.chance(30);
+            let mut want = values_in(model, low, high, root.value_edits);
+            if backwards {
+                want.reverse();
+            }
+            self.values = Some(Walk {
+                values: root.values.range(low..high),
+                backwards,
+                want: want.into_iter(),
+                context: format!("{context}: held range {low}..{high}"),
+            });
+        }
+        if self.seeks.is_none() && rng.chance(20) {
+            self.seeks = Some(Seeks {
+                cursor: root.values.cursor(),
+                want: values_in(model, low, high, root.value_edits).into_iter(),
+                context: format!("{context}: held cursor over {low}..{high}"),
+            });
+        }
+        if self.rows.is_none() && rng.chance(20) {
+            let group = rng.below(GROUPS);
+            let want: Vec<Row> = (0..ROWS)
+                .filter_map(|id| model.row_at(id, root.row_edits))
+                .filter(|row| row.group == group)
+                .collect();
+            self.rows = Some(Rows {
+                rows: root.rows.by_group(&group),
+                want: want.into_iter(),
+                context: format!("{context}: held group {group}"),
+            });
+        }
+    }
+
+    fn advance(&mut self, rng: &mut Rng) -> u64 {
+        let mut checked = 0;
+        if let Some(walk) = &mut self.values {
+            let mut done = rng.chance(4);
+            for _ in 0..rng.below(48) {
+                let got = if walk.backwards {
+                    walk.values.next_back()
+                } else {
+                    walk.values.next()
+                };
+                let got = got.map(|(key, value)| (key, *value));
+                let want = walk.want.next();
+                assert_eq!(got, want, "{}", walk.context);
+                checked += 1;
+                if want.is_none() {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
+                self.values = None;
+            }
+        }
+        if let Some(seeks) = &mut self.seeks {
+            let mut done = rng.chance(4);
+            for _ in 0..rng.below(32) {
+                let Some((key, value)) = seeks.want.next() else {
+                    done = true;
+                    break;
+                };
+                assert!(seeks.cursor.seek(&key), "{}: seek {key}", seeks.context);
+                let got = seeks.cursor.value().map(|found| *found);
+                assert_eq!(got, Some(value), "{}: value at {key}", seeks.context);
+                checked += 1;
+            }
+            if done {
+                self.seeks = None;
+            }
+        }
+        if let Some(rows) = &mut self.rows {
+            let mut done = rng.chance(4);
+            for _ in 0..rng.below(24) {
+                let got = rows.rows.next().map(|row| (*row).clone());
+                let want = rows.want.next();
+                assert_eq!(got, want, "{}", rows.context);
+                checked += 1;
+                if want.is_none() {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
+                self.rows = None;
+            }
+        }
+        checked
+    }
+}
+
 fn reader(
     model: Arc<Model>,
     path: std::path::PathBuf,
@@ -307,6 +440,7 @@ fn reader(
     let cache = [TINY, 96 << 10, 1 << 20][rng.below(3) as usize];
     let mut own: Option<Db<Root>> = None;
     let mut kept: Option<Snapshot<Root>> = None;
+    let mut walks = Walks::default();
     let mut checked = 0;
     let mut rounds = 0u64;
     while !stop.load(Ordering::Relaxed) {
@@ -319,6 +453,7 @@ fn reader(
         {
             db.refresh().unwrap();
         }
+        checked += walks.advance(&mut rng);
         let snapshot = match rng.below(3) {
             0 => shared.read().unwrap().as_ref().map(Db::read),
             1 => kept.clone(),
@@ -328,13 +463,9 @@ fn reader(
             continue;
         };
         let hot = (start.elapsed().as_millis() as u64 / 50).wrapping_mul(7_919) % KEYS;
-        checked += check(
-            &model,
-            &snapshot,
-            &mut rng,
-            hot,
-            &format!("reader {seed} round {rounds}"),
-        );
+        let context = format!("reader {seed} round {rounds}");
+        checked += check(&model, &snapshot, &mut rng, hot, &context);
+        walks.start(&model, &snapshot, &mut rng, hot, &context);
         if rng.chance(10) {
             kept = Some(snapshot);
         }
