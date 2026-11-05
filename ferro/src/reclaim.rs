@@ -480,7 +480,7 @@ struct CopySink<'a> {
     body: Vec<u8>,
     spare: Vec<Buffers>,
     copied: HashMap<Hash, Copied, ByHash>,
-    entries: HashSet<Hash, ByHash>,
+    walked: HashMap<u64, Hash>,
     records: HashMap<u64, u64>,
     kept: Needs,
     needs: Needs,
@@ -494,6 +494,31 @@ struct CopySink<'a> {
 enum Copied {
     Object(u64),
     Entry,
+    Both(u64),
+}
+
+impl Copied {
+    fn entry(&mut self) {
+        if let Copied::Object(offset) = *self {
+            *self = Copied::Both(offset);
+        }
+    }
+
+    fn is_entry(self) -> bool {
+        !matches!(self, Copied::Object(_))
+    }
+}
+
+enum Link {
+    Copied(Ptr),
+    Entry,
+    Object,
+}
+
+impl Link {
+    fn parent(found: Option<Ptr>) -> Link {
+        found.map_or(Link::Entry, Link::Copied)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -635,13 +660,19 @@ impl CopySink<'_> {
         self.end += (self.buf.len() - before) as u64;
         match below {
             Some(below) => {
-                self.copied.insert(hash, Copied::Entry);
+                self.copied
+                    .entry(hash)
+                    .and_modify(Copied::entry)
+                    .or_insert(Copied::Entry);
                 self.records.insert(from.offset, offset);
                 self.below.insert(offset, below);
                 self.needs.hand(from.offset, &mut self.kept);
             }
             None => {
-                self.copied.insert(hash, Copied::Object(offset));
+                let copied = self.copied.entry(hash).or_insert(Copied::Object(offset));
+                if let Copied::Entry = copied {
+                    *copied = Copied::Both(offset);
+                }
             }
         }
         self.objects += 1;
@@ -668,25 +699,53 @@ impl CopySink<'_> {
         true
     }
 
-    fn remap(&self, ptr: Ptr) -> Option<Ptr> {
-        let offset = match self.copied.get(&ptr.hash)? {
-            Copied::Object(offset) => *offset,
-            Copied::Entry => *self.records.get(&ptr.offset)?,
-        };
-        Some(Ptr {
-            hash: ptr.hash,
-            offset,
-        })
+    fn object(&self, hash: Hash) -> Option<Ptr> {
+        match self.copied.get(&hash)? {
+            Copied::Object(offset) | Copied::Both(offset) => Some(Ptr {
+                hash,
+                offset: *offset,
+            }),
+            Copied::Entry => None,
+        }
     }
 
-    fn settled(&self, link: Ptr) -> Result<Option<Ptr>> {
-        match self.remap(link) {
-            None if self.pruned.contains(&link.hash) => Err(Error::Corrupt(format!(
-                "link to the pruned log entry at {}",
-                link.offset
-            ))),
-            done => Ok(done),
+    fn entry(&self, ptr: Ptr) -> Option<Ptr> {
+        match self.copied.get(&ptr.hash)? {
+            Copied::Object(_) => None,
+            Copied::Entry | Copied::Both(_) => self.records.get(&ptr.offset).map(|offset| Ptr {
+                hash: ptr.hash,
+                offset: *offset,
+            }),
         }
+    }
+
+    fn linked(&self, link: Ptr) -> Result<Link> {
+        if link.offset == 0 {
+            return Ok(Link::Object);
+        }
+        let copied = match self.copied.get(&link.hash) {
+            None if self.pruned.contains(&link.hash) => {
+                return Err(Error::Corrupt(format!(
+                    "link to the pruned log entry at {}",
+                    link.offset
+                )));
+            }
+            None => return Ok(Link::Object),
+            Some(copied) => *copied,
+        };
+        let walked = || self.walked.get(&link.offset) == Some(&link.hash);
+        Ok(match copied {
+            Copied::Object(offset) => Link::Copied(Ptr {
+                hash: link.hash,
+                offset,
+            }),
+            Copied::Entry | Copied::Both(_) if walked() => Link::parent(self.entry(link)),
+            Copied::Both(offset) => Link::Copied(Ptr {
+                hash: link.hash,
+                offset,
+            }),
+            Copied::Entry => Link::Object,
+        })
     }
 
     fn parent(&self, link: Ptr) -> Option<Ptr> {
@@ -697,7 +756,7 @@ impl CopySink<'_> {
         if link.offset == 0 {
             return Some(tombstone);
         }
-        self.remap(link)
+        self.entry(link)
             .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
     }
 
@@ -746,20 +805,20 @@ impl CopySink<'_> {
         }
     }
 
-    fn read(&mut self, ptr: Ptr) -> Result<Step> {
+    fn read(&mut self, ptr: Ptr, entry: bool) -> Result<Step> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
         }
         self.verifier.check()?;
         let mut bytes = mem::take(&mut self.bytes);
-        let step = self.step(ptr, &mut bytes);
+        let step = self.step(ptr, entry, &mut bytes);
         if bytes.capacity() <= SPARE_BYTES {
             self.bytes = bytes;
         }
         step.map_err(|error| self.verifier.first(error))
     }
 
-    fn step(&mut self, ptr: Ptr, bytes: &mut Vec<u8>) -> Result<Step> {
+    fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
         let verifier = &mut self.verifier;
         let large = |claim: usize| match claim > BATCH_BYTES {
@@ -767,7 +826,7 @@ impl CopySink<'_> {
             false => Ok(()),
         };
         let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old, large)?;
-        let entry = if self.entries.contains(&ptr.hash) {
+        let entry = if entry {
             self.verifier.inline(record, ptr)?;
             let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
             Some(Rungs::of(body, &held.old)?)
@@ -781,7 +840,7 @@ impl CopySink<'_> {
         let payload = &record[stored.payload.clone()];
         if entry.is_none() {
             while let Some(link) = held.old.get(held.links.len()) {
-                let Some(done) = self.settled(*link)? else {
+                let Link::Copied(done) = self.linked(*link)? else {
                     break;
                 };
                 held.links.push(done);
@@ -811,11 +870,13 @@ impl CopySink<'_> {
     }
 
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
-        let settled = self.settled(root);
-        if let Some(done) = settled.map_err(|error| self.verifier.first(error))? {
-            return Ok(done);
-        }
-        let mut stack = match self.read(root)? {
+        let linked = self.linked(root);
+        let entry = match linked.map_err(|error| self.verifier.first(error))? {
+            Link::Copied(done) => return Ok(done),
+            Link::Entry => true,
+            Link::Object => false,
+        };
+        let mut stack = match self.read(root, entry)? {
             Step::Done(done) => return Ok(done),
             Step::Descend(pending) => vec![pending],
         };
@@ -823,19 +884,19 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.held.old.len() {
                 let link = top.held.old[top.next];
-                let settled = match top.entry {
+                let linked = match top.entry {
                     Some(rungs) if rungs.skip == Some(top.next) => {
-                        self.skipped(&top.held.links, rungs, link)
+                        Link::parent(self.skipped(&top.held.links, rungs, link))
                     }
-                    Some(rungs) if top.next >= rungs.parents => self.parent(link),
+                    Some(rungs) if top.next >= rungs.parents => Link::parent(self.parent(link)),
                     _ => {
-                        let settled = self.settled(link);
-                        settled.map_err(|error| self.verifier.first(error))?
+                        let linked = self.linked(link);
+                        linked.map_err(|error| self.verifier.first(error))?
                     }
                 };
-                let done = match settled {
-                    Some(done) => done,
-                    None => match self.read(link)? {
+                let done = match linked {
+                    Link::Copied(done) => done,
+                    reached => match self.read(link, matches!(reached, Link::Entry))? {
                         Step::Done(done) => done,
                         Step::Descend(pending) => {
                             stack.push(pending);
@@ -880,7 +941,7 @@ impl CopySink<'_> {
 
 impl Sink for CopySink<'_> {
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
-        if let Some(done) = self.remap(Ptr { hash, offset: 0 }) {
+        if let Some(done) = self.object(hash) {
             return Ok(done);
         }
         let mut links = Vec::with_capacity(object.links.len());
@@ -939,7 +1000,7 @@ impl<'a> Copier<'a> {
                 body: Vec::new(),
                 spare: Vec::new(),
                 copied: HashMap::default(),
-                entries: HashSet::default(),
+                walked: HashMap::new(),
                 records: HashMap::new(),
                 kept: Needs::default(),
                 needs: Needs::default(),
@@ -965,6 +1026,7 @@ impl<'a> Copier<'a> {
                     return Ok(false);
                 }
                 retained.insert(ptr.hash);
+                sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
                 closures.mark(ptr, first, after);
                 closures.seed(entry, after);
@@ -980,6 +1042,7 @@ impl<'a> Copier<'a> {
                     return Ok(false);
                 }
                 retained.insert(ptr.hash);
+                sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
                 Ok(true)
             })?;
@@ -989,11 +1052,14 @@ impl<'a> Copier<'a> {
         }
         for hash in &retained {
             sink.pruned.remove(hash);
-            sink.entries.insert(*hash);
+            sink.copied
+                .entry(*hash)
+                .and_modify(Copied::entry)
+                .or_insert(Copied::Entry);
         }
         for hash in edge {
-            sink.entries.insert(hash);
-            if !retained.contains(&hash) && !sink.copied.contains_key(&hash) {
+            let copied = sink.copied.get(&hash).copied();
+            if !retained.contains(&hash) && !copied.is_some_and(Copied::is_entry) {
                 sink.pruned.insert(hash);
             }
         }

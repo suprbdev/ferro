@@ -61,6 +61,7 @@ impl Data for Head {
 struct Entry {
     version: u64,
     time_ms: u64,
+    root: Option<Ptr>,
     prev: Option<Ptr>,
     skip: Option<Ptr>,
     merged: Option<(Ptr, u64, u64)>,
@@ -72,7 +73,15 @@ impl Entry {
         let mut w = Encoder::new(txn);
         w.varint(self.version);
         w.varint(self.time_ms);
-        w.raw(&[0, 0, 0]);
+        w.u8(0);
+        match self.root {
+            Some(root) => {
+                w.u8(1);
+                w.link(root);
+            }
+            None => w.u8(0),
+        }
+        w.u8(0);
         let wide = self.graph != (0, 0, 0);
         w.u8(u8::from(self.prev.is_some()) * HAS_PREV
             + u8::from(self.skip.is_some()) * HAS_SKIP
@@ -512,6 +521,149 @@ fn compacting_a_tree_that_links_a_pruned_log_entry_fails() {
         db.verify().unwrap();
         drop(db);
         admin::verify(&path).unwrap();
+    }
+}
+
+fn write_refs(txn: &mut Txn, version: u64, tip: Ptr) -> Ptr {
+    let mut refs: Map<String, Head> = Map::new();
+    refs.insert(
+        "main".into(),
+        Head {
+            version,
+            first: 1,
+            tip,
+        },
+    );
+    let mut encoder = Encoder::new(txn);
+    refs.encode(&mut encoder).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Linked {
+    Itself,
+    Again,
+    Cut,
+}
+
+fn entry_linked_from_a_tree(path: &Path, linked: Linked) -> Ptr {
+    let at = |version, time_ms| Entry {
+        version,
+        time_ms,
+        ..Entry::default()
+    };
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let one = at(1, 100).write(&mut txn);
+    let two = Entry {
+        prev: Some(one),
+        ..at(2, 200)
+    }
+    .write(&mut txn);
+    let head = write_refs(&mut txn, 2, two);
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let below = match linked {
+        Linked::Cut => Ptr { offset: 0, ..one },
+        _ => one,
+    };
+    let again = match linked {
+        Linked::Itself => two,
+        _ => Entry {
+            prev: Some(below),
+            ..at(2, 200)
+        }
+        .write(&mut txn),
+    };
+    assert_eq!(again.hash, two.hash);
+    assert_eq!(again.offset == two.offset, linked == Linked::Itself);
+    let mut w = Encoder::new(&mut txn);
+    w.raw(b"tree");
+    w.link(again);
+    let tree = w.finish().unwrap();
+    let three = Entry {
+        root: Some(tree),
+        prev: Some(two),
+        ..at(3, 300)
+    }
+    .write(&mut txn);
+    let head = write_refs(&mut txn, 3, three);
+    txn.commit(head).unwrap();
+    store.close();
+    drop(store);
+    one
+}
+
+#[test]
+fn a_tree_that_links_another_record_of_a_log_entry_is_copied_as_a_tree() {
+    let mut copies = Vec::new();
+    for threads in [1, 4] {
+        for keep in [Keep::All, Keep::Last(2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("again.ferro");
+            let one = entry_linked_from_a_tree(&path, Linked::Again);
+            let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+            db.verify().unwrap();
+            db.verify_typed().unwrap();
+            let outcome = db.compact(keep);
+            drop(db);
+            if keep == Keep::All {
+                assert!(outcome.is_ok(), "{threads} threads: {outcome:?}");
+                copies.push(fs::read(&path).unwrap());
+            } else {
+                let pruned = format!("link to the pruned log entry at {}", one.offset);
+                assert!(
+                    matches!(&outcome, Err(Error::Corrupt(message)) if *message == pruned),
+                    "{threads} threads, {keep:?}: {outcome:?}"
+                );
+            }
+            admin::verify(&path).unwrap();
+        }
+    }
+    assert!(copies[0] == copies[1]);
+}
+
+#[test]
+fn a_tree_that_links_another_record_of_a_log_entry_with_a_null_link_fails_as_verify_does() {
+    for threads in [1, 4] {
+        for keep in [Keep::All, Keep::Last(2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cut.ferro");
+            entry_linked_from_a_tree(&path, Linked::Cut);
+            let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+            let outcome = db.compact(keep);
+            drop(db);
+            let wrong = admin::verify(&path).unwrap_err().to_string();
+            assert!(wrong.contains("pointer 0 outside log"), "{wrong}");
+            assert!(
+                matches!(&outcome, Err(error) if error.to_string() == wrong),
+                "{threads} threads, {keep:?}: {outcome:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_tree_that_links_the_record_a_chain_reads_shares_its_copy() {
+    for threads in [1, 4] {
+        for keep in [Keep::All, Keep::Last(2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("itself.ferro");
+            entry_linked_from_a_tree(&path, Linked::Itself);
+            let objects = admin::verify(&path).unwrap().objects;
+            let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+            let compacted = db.compact(keep).unwrap();
+            drop(db);
+            assert_eq!(
+                compacted.objects + compacted.commits_dropped,
+                objects,
+                "{threads} threads, {keep:?}"
+            );
+            assert_eq!(admin::verify(&path).unwrap().objects, compacted.objects);
+        }
     }
 }
 
