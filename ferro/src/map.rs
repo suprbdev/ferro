@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, needs_drop};
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::ptr::NonNull;
-use std::sync::atomic::{self, AtomicPtr};
+use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
@@ -2869,27 +2869,32 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 Reach::Owned(node) => Some(Hold::owned(node)),
                 Reach::Held(_) => unreachable!("an unguarded reach holds no node"),
             };
-            let mut current = root.as_deref().map(Hold::anchored_at);
-            while let Some(node) = current.take() {
+            let mut current = root
+                .as_deref()
+                .map(|root| (Hold::anchored_at(root), Hold::anchored_at(root)));
+            while let Some((node, twin)) = current.take() {
                 let low = node.keys.partition_point(|key| below(key));
                 let high = node.keys.partition_point(|key| within(key));
                 let anchored = node.anchored();
                 depth += 1;
-                if low == high {
-                    let hazard = ahead.below(node.level);
-                    current = hold(store, node.child(low), depth, anchored, hazard)?;
-                }
-                back.push(Frame {
-                    node: node.share_to(behind.at(node.level)),
-                    position: 2 * high as isize - 1,
-                });
                 if low >= high {
+                    if low == high {
+                        current = twins(store, (&node, &twin), low, depth, (ahead, behind))?;
+                    }
+                    back.push(Frame {
+                        node: twin,
+                        position: 2 * high as isize - 1,
+                    });
                     front.push(Frame {
                         node,
                         position: 2 * low as isize + 1,
                     });
                     continue;
                 }
+                back.push(Frame {
+                    node: twin.share(),
+                    position: 2 * high as isize - 1,
+                });
                 front.push(Frame {
                     node: node.share(),
                     position: 2 * low as isize + 1,
@@ -2907,8 +2912,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 )?;
                 let kept = edge(
                     store,
-                    (node.child(high), node.level),
-                    anchored,
+                    (twin.child(high), twin.level),
+                    twin.anchored(),
                     depth,
                     &within,
                     -1,
@@ -3701,15 +3706,8 @@ impl<K, V, S> Hold<K, V, S> {
 
     #[inline]
     fn share(&self) -> Self {
-        self.share_to(None)
-    }
-
-    #[inline]
-    fn share_to(&self, hazard: Option<&AtomicPtr<()>>) -> Self {
         if !self.anchored() {
             unsafe { Shared::increment_strong_count(self.node()) };
-        } else if let Some(hazard) = hazard {
-            hazard.store(Shared::inner_of(self.node()), atomic::Ordering::SeqCst);
         }
         Hold {
             tagged: self.tagged,
@@ -3815,6 +3813,28 @@ fn enter<K: Data, V: Data, S: Data>(
     if let Some(node) = fatal(hold(store.as_deref(), child, depth, anchored, hazard)) {
         path.push(Frame { node, position: 0 });
     }
+}
+
+type Twins<K, V, S> = (Hold<K, V, S>, Hold<K, V, S>);
+
+fn twins<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    (node, twin): (&Hold<K, V, S>, &Hold<K, V, S>),
+    position: usize,
+    depth: usize,
+    (ahead, behind): (Slots<'_>, Slots<'_>),
+) -> Result<Option<Twins<K, V, S>>> {
+    let hazard = ahead.below(node.level);
+    let Some(next) = hold(store, node.child(position), depth, node.anchored(), hazard)? else {
+        return Ok(None);
+    };
+    if !next.anchored() {
+        let other = next.share();
+        return Ok(Some((next, other)));
+    }
+    let hazard = behind.below(twin.level);
+    let other = hold(store, twin.child(position), depth, twin.anchored(), hazard)?;
+    Ok(other.map(|other| (next, other)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5060,5 +5080,56 @@ mod tests {
         assert_eq!(below.strong_count(), 1);
         let pairs: Vec<(u64, u64)> = keys.iter().map(|key| (*key, key * 3)).collect();
         assert_eq!(walk.map(values), Some(pairs));
+    }
+
+    #[test]
+    fn epoch_a_narrow_range_holds_each_end_in_its_own_slots() {
+        let mut keep = Vec::new();
+        let (root, keys) = tree(0, &mut 0, &mut keep);
+        let entries = cache(&keep);
+        let map: Map<u64, u64> = Map {
+            root: Link::Mem(root, Hint::NONE),
+            store: None,
+        };
+        let pairs: Vec<(u64, u64)> = keys.iter().map(|key| (*key, key * 3)).collect();
+        let mut narrow = map.range(keys[2]..keys[6]);
+        assert_eq!(
+            narrow.next().map(|(key, value)| (key, *value)),
+            Some(pairs[2])
+        );
+        let front: Vec<*const Node<u64, u64, ()>> = uncounted(&narrow.front).collect();
+        let back: Vec<*const Node<u64, u64, ()>> = uncounted(&narrow.back).collect();
+        let slots = narrow.hazards.as_ref().unwrap();
+        let held = |node: &*const Node<u64, u64, ()>, base: usize| {
+            entries.iter().any(|entry| {
+                entry.as_ptr() == node.cast()
+                    && (base..base + SPAN).any(|index| {
+                        slots
+                            .entry(index)
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            .addr()
+                            == entry.addr()
+                    })
+            })
+        };
+        let lent: Vec<_> = back.iter().filter(|node| held(node, BACK)).collect();
+        assert!(!lent.is_empty());
+        assert!(
+            lent.iter()
+                .all(|node| front.contains(node) && held(node, FRONT))
+        );
+        let watched: Vec<Weak<Node<u64, u64, ()>>> = keep
+            .iter()
+            .filter(|node| back.contains(&Shared::as_ptr(node)))
+            .map(Shared::downgrade)
+            .collect();
+        evict_all(entries);
+        keep.retain(|node| !back.contains(&Shared::as_ptr(node)));
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 1));
+        let rest: Vec<(u64, u64)> = narrow.rev().map(|(key, value)| (key, *value)).collect();
+        assert!(rest.iter().rev().eq(pairs[3..6].iter()));
+        epoch::flush();
+        assert!(watched.iter().all(|weak| weak.strong_count() == 0));
     }
 }
