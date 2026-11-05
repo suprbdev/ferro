@@ -1,3 +1,11 @@
+//! The commit log of each branch.
+//!
+//! A branch's log is a chain of entries, newest first, each holding a [`Commit`] and links back:
+//! to the entry before it, to one further back so that any version is a few steps away, and for a
+//! merge to the head it merged. [`Log`] is the public view of one branch's retained entries, which
+//! [`Db::log`](crate::Db::log) returns. [History and the commit log](docs/internals/history.md)
+//! describes the chain.
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ops::{Bound, RangeBounds};
@@ -20,6 +28,10 @@ const EXTRA: u8 = 128;
 const STAMPED: u64 = 1;
 const KNOWN_EXTRA: u64 = STAMPED;
 
+/// A merge entry's link to the head it merged, with the bounds of what it brought in.
+///
+/// The merged history is retained from version `floor` up, and, where it is kept by time, from
+/// time `after` on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Merged {
     pub(crate) ptr: Ptr,
@@ -28,19 +40,27 @@ pub(crate) struct Merged {
 }
 
 impl Merged {
+    /// The later of the time bound a walk arrived with and this link's own.
     pub(crate) fn after(&self, path: Option<u64>) -> Option<u64> {
         path.max(self.after)
     }
 }
 
+/// The numbers an entry carries for the merge base search.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Graph {
+    /// How far the entry's generation is above its version.
     pub(crate) lift: u64,
+    /// The highest generation among the merged parents of the merge entries at or below this one
+    /// on its chain.
     pub(crate) reach: u64,
+    /// The version of the nearest merge entry at or below this one on its chain, or 0.
     pub(crate) last_merge: u64,
+    /// Whether a merge at or below this one brought in history that was already pruned.
     pub(crate) bounded: bool,
 }
 
+/// One commit's record in a branch's log.
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub(crate) commit: Arc<Commit>,
@@ -51,6 +71,7 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// One more than the larger of its parents' generations, so a parent always has a lower one.
     pub(crate) fn generation(&self) -> u64 {
         self.commit.version + self.graph.lift
     }
@@ -195,6 +216,7 @@ impl Data for Entry {
     }
 }
 
+/// A log entry and the pointer it was read from.
 #[derive(Clone)]
 pub(crate) struct Node {
     pub(crate) ptr: Ptr,
@@ -225,6 +247,11 @@ impl Node {
         Ok(node)
     }
 
+    /// The entry at `version` on this node's chain, at or below it, reached through skip links.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the chain ends early, skips the version or does not descend.
     pub(crate) fn down_to(&self, store: &Store, version: u64) -> Result<Node> {
         let mut node = self.clone();
         while node.version() > version {
@@ -242,6 +269,11 @@ impl Node {
         Ok(node)
     }
 
+    /// The newest entry at or below this one for which `too_high` is false, or `None` if it holds
+    /// all the way down to version `floor`.
+    ///
+    /// `too_high` must not hold below an entry for which it fails, as a bound on generation does,
+    /// so that skip links can jump over the entries it holds for.
     pub(crate) fn last_where(
         &self,
         store: &Store,
@@ -269,6 +301,10 @@ impl Node {
         Ok(Some(node))
     }
 
+    /// The lowest version, no lower than `floor`, down to which every entry from this one is
+    /// `kept`.
+    ///
+    /// `kept` must fail for every entry below the first that fails it, as a bound on time does.
     pub(crate) fn lowest_kept(
         &self,
         store: &Store,
@@ -308,6 +344,10 @@ impl Node {
 type Seed = (u64, Option<u64>, Hash, u64);
 type Walks = Vec<(u64, Option<u64>)>;
 
+/// A walk over the commits that merges brought into branches, from their merge links down.
+///
+/// Each start is queued with the bounds it was reached with, and a commit already walked with
+/// bounds at least as wide is not walked again.
 #[derive(Default)]
 pub(crate) struct Closures {
     queue: BinaryHeap<Reverse<Seed>>,
@@ -316,6 +356,8 @@ pub(crate) struct Closures {
 }
 
 impl Closures {
+    /// A walk that tells records apart by offset as well as hash, for a copy that must visit
+    /// every stored record and not only every distinct commit.
     pub(crate) fn exact() -> Closures {
         Closures {
             exact: true,
@@ -327,17 +369,21 @@ impl Closures {
         (ptr.hash, if self.exact { ptr.offset } else { 0 })
     }
 
+    /// Queues the head `entry` merged, if it is a merge, under the time bound `after`.
     pub(crate) fn seed(&mut self, entry: &Entry, after: Option<u64>) {
         if let Some(merged) = entry.merged {
             self.push(merged.ptr, merged.floor, merged.after(after));
         }
     }
 
+    /// Queues a walk down from `ptr` that stops below version `floor` and before time `after`.
     pub(crate) fn push(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
         self.queue
             .push(Reverse((floor, after, ptr.hash, ptr.offset)));
     }
 
+    /// Records that the entry at `ptr` was walked with these bounds, so a walk that reaches it
+    /// with bounds no wider stops there.
     pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
         let key = self.key(ptr);
         self.walked.entry(key).or_default().push((floor, after));
@@ -358,6 +404,12 @@ impl Closures {
         })
     }
 
+    /// Walks every queued start, lowest floor first, and every merge link reached on the way,
+    /// calling `each` on each entry; `each` returning `false` stops that chain.
+    ///
+    /// # Errors
+    ///
+    /// The first error from `each` or from reading an entry.
     pub(crate) fn walk(
         &mut self,
         store: &Store,
@@ -368,6 +420,11 @@ impl Closures {
         })
     }
 
+    /// [`Closures::walk`], also handing `each` the bounds each entry was reached with.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Closures::walk`].
     pub(crate) fn walk_bounded(
         &mut self,
         store: &Store,
@@ -409,6 +466,7 @@ impl Closures {
     }
 }
 
+/// The version an entry at `version` skips back to: `version` with its lowest set bit cleared.
 pub(crate) fn skip_version(version: u64) -> u64 {
     version - (version & version.wrapping_neg())
 }
@@ -417,10 +475,14 @@ fn corrupt(what: &str) -> Error {
     Error::Corrupt(format!("commit log {what}"))
 }
 
+/// A branch's retained commit log: its newest entry and the versions it keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Chain {
+    /// The newest entry, or `None` before the first commit.
     pub(crate) tip: Option<Ptr>,
+    /// The oldest retained version. Entries below it may still be in the file, but are pruned.
     pub(crate) first: u64,
+    /// The version of the newest entry.
     pub(crate) last: u64,
 }
 
@@ -433,6 +495,11 @@ impl Chain {
         }
     }
 
+    /// A chain from its parts, as decoded from a branch table.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a chain with a tip keeps no version or more than it holds.
     pub(crate) fn bounded(tip: Option<Ptr>, first: u64, last: u64) -> Result<Chain> {
         if tip.is_some() && (first == 0 || first > last) {
             return Err(corrupt(&format!("keeps versions {first} to {last}")));
@@ -482,6 +549,7 @@ impl Chain {
         }
     }
 
+    /// The retained entry at `version` with its pointer, or `None` outside the retained versions.
     pub(crate) fn node_at(&self, store: &Store, version: u64) -> Result<Option<Node>> {
         let Some(tip) = self
             .tip
@@ -492,6 +560,10 @@ impl Chain {
         Node::load(store, tip)?.down_to(store, version).map(Some)
     }
 
+    /// The time of the oldest retained entry once versions before it are pruned, or `None` while
+    /// version 1 is retained.
+    ///
+    /// Commits that merges brought in from before this time count as pruned too.
     pub(crate) fn after(&self, store: &Store) -> Result<Option<u64>> {
         if self.first <= 1 {
             return Ok(None);
@@ -502,6 +574,7 @@ impl Chain {
         Ok(Some(first.commit.time_ms))
     }
 
+    /// The retained entry at `version`, or `None` outside the retained versions.
     pub(crate) fn get(&self, store: &Store, version: u64) -> Result<Option<Arc<Entry>>> {
         if self.tip.is_none() || version < self.first || version > self.last {
             return Ok(None);
@@ -520,6 +593,8 @@ impl Chain {
         })
     }
 
+    /// The newest retained entry whose time is at most `time_ms`, or `None` if every retained
+    /// entry is later.
     pub(crate) fn at_time(&self, store: &Store, time_ms: u64) -> Result<Option<Arc<Entry>>> {
         let Some(tip) = self.tip else {
             return Ok(None);
@@ -546,6 +621,7 @@ impl Chain {
         Ok(Some(entry))
     }
 
+    /// A walk over every retained entry, newest first.
     pub(crate) fn walk(&self, store: &Store) -> Walk {
         Walk {
             store: store.clone(),
@@ -555,6 +631,7 @@ impl Chain {
         }
     }
 
+    /// A walk from the entry at `to` down to version `floor`, newest first.
     pub(crate) fn walk_down(&self, store: &Store, to: u64, floor: u64) -> Result<Walk> {
         let next = if to == self.last {
             self.tip
@@ -569,6 +646,7 @@ impl Chain {
         })
     }
 
+    /// The first and last retained versions within `versions`, or `None` if there are none.
     pub(crate) fn retained(&self, versions: &impl RangeBounds<u64>) -> Option<(u64, u64)> {
         let from = match versions.start_bound() {
             Bound::Included(version) => *version,
@@ -589,12 +667,15 @@ impl Chain {
         Ok(older.map_or(self.first, |entry| entry.commit.version.saturating_add(1)))
     }
 
+    /// The skip link of `entry`, if it lands on a retained version.
     pub(crate) fn retained_skip(&self, entry: &Entry) -> Option<Ptr> {
         entry
             .skip
             .filter(|_| skip_version(entry.commit.version) >= self.first)
     }
 
+    /// This chain with its oldest retained version raised as `keep` asks, never past the newest,
+    /// so at least one commit stays.
     pub(crate) fn pruned(&self, store: &Store, keep: Keep) -> Result<Chain> {
         if self.tip.is_none() {
             return Ok(*self);
@@ -617,6 +698,13 @@ impl Chain {
         })
     }
 
+    /// Reads every retained entry newest first, decoding each from its record, and calls `each`
+    /// on it until `each` returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the versions do not descend or an entry links pruned history it
+    /// needs, and the first error from `each`.
     pub(crate) fn visit(
         &self,
         store: &Store,
@@ -654,6 +742,11 @@ impl Chain {
         ))
     }
 
+    /// Writes the entry for `commit` on top of this chain into `sink`, and returns the longer
+    /// chain.
+    ///
+    /// `merged` makes it a merge entry that links the head it merged, which raises its generation
+    /// and sets its [`Graph`] from both parents.
     pub(crate) fn append(
         &self,
         store: &Store,
@@ -735,6 +828,7 @@ enum Step {
     Prev,
 }
 
+/// A walk down a chain, newest first, that checks each entry is older than the last.
 pub(crate) struct Walk {
     store: Store,
     next: Option<Ptr>,
@@ -743,6 +837,11 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
+    /// The next older entry, or `None` past the walk's floor.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the versions do not descend, and read errors.
     pub(crate) fn step(&mut self) -> Result<Option<Arc<Entry>>> {
         let Some(ptr) = self.next else {
             return Ok(None);
@@ -757,6 +856,10 @@ impl Walk {
     }
 }
 
+/// The retained commits of one branch, as of the moment [`Db::log`](crate::Db::log) was called.
+///
+/// It reads like a collection of [`Commit`]s keyed by version. It does not change as more commits
+/// land, and it keeps reading the file it came from after a reclamation cycle replaces it.
 #[derive(Clone)]
 pub struct Log {
     pub(crate) chain: Chain,
@@ -764,14 +867,21 @@ pub struct Log {
 }
 
 impl Log {
+    /// The number of retained commits.
     pub fn len(&self) -> usize {
         self.chain.len()
     }
 
+    /// Whether the branch has no commits.
     pub fn is_empty(&self) -> bool {
         self.chain.tip.is_none()
     }
 
+    /// The commit at `version`, or `None` if it is not retained.
+    ///
+    /// # Errors
+    ///
+    /// A read error from the log, such as [`Error::Corrupt`].
     pub fn try_get(&self, version: &u64) -> Result<Option<Arc<Commit>>> {
         Ok(self
             .chain
@@ -779,20 +889,47 @@ impl Log {
             .map(|entry| entry.commit.clone()))
     }
 
+    /// The commit at `version`, or `None` if it is not retained.
+    ///
+    /// It follows skip links, so it reads a few entries whatever the length of the log.
+    ///
+    /// # Panics
+    ///
+    /// On a read error, as collection reads do. [`Log::try_get`] returns it instead.
     pub fn get(&self, version: &u64) -> Option<Arc<Commit>> {
         crate::map::fatal(self.try_get(version))
     }
 
+    /// The oldest retained commit and its version, or `None` before the first commit.
+    ///
+    /// # Panics
+    ///
+    /// On a read error, as collection reads do.
     pub fn first(&self) -> Option<(u64, Arc<Commit>)> {
         self.get(&self.chain.first)
             .map(|commit| (self.chain.first, commit))
     }
 
+    /// The newest commit and its version, or `None` before the first commit.
+    ///
+    /// # Panics
+    ///
+    /// On a read error, as collection reads do.
     pub fn last(&self) -> Option<(u64, Arc<Commit>)> {
         let entry = crate::map::fatal(self.chain.tip_entry(&self.store))?;
         Some((self.chain.last, entry.commit.clone()))
     }
 
+    /// The hash of the log entry at `version`, which covers that version and everything before
+    /// it, or `None` if it is not retained.
+    ///
+    /// For the newest version it is [`Db::head_hash`](crate::Db::head_hash), so an anchor taken
+    /// from `head_hash` earlier matches this at the same version only if nothing up to it has
+    /// changed.
+    ///
+    /// # Panics
+    ///
+    /// On a read error, as collection reads do.
     pub fn hash_at(&self, version: &u64) -> Option<Hash> {
         if self.is_empty() || *version < self.chain.first || *version > self.chain.last {
             return None;
@@ -801,6 +938,11 @@ impl Log {
         ptr.map(|ptr| ptr.hash)
     }
 
+    /// The retained commits with their versions, oldest first.
+    ///
+    /// Taken from the back with `rev`, it reads newest first, one entry a step, and stops when
+    /// you stop. Taken from the front, its first step reads every entry not yet taken from the
+    /// back, since the log links newest to oldest.
     pub fn iter(&self) -> Iter {
         Iter {
             walk: self.chain.walk(&self.store),
@@ -809,11 +951,42 @@ impl Log {
         }
     }
 
+    /// The retained commits, oldest first, walked as [`Log::iter`] walks them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// for message in ["one", "two", "three"] {
+    ///     db.commit(message, |count| *count += 1)?;
+    /// }
+    ///
+    /// let newest: Vec<String> = db
+    ///     .log()
+    ///     .values()
+    ///     .rev()
+    ///     .take(2)
+    ///     .map(|commit| commit.message.clone())
+    ///     .collect();
+    /// assert_eq!(newest, ["three", "two"]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn values(&self) -> impl DoubleEndedIterator<Item = Arc<Commit>> + ExactSizeIterator {
         self.iter().map(|(_, commit)| commit)
     }
 }
 
+/// An iterator over a [`Log`]'s commits and their versions, from [`Log::iter`].
+///
+/// # Panics
+///
+/// A step panics on a read error, as collection reads do.
 pub struct Iter {
     walk: Walk,
     front: VecDeque<Arc<Commit>>,
