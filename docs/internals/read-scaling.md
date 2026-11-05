@@ -146,9 +146,9 @@ epoch's free of a node that was lent and retired.
 `Node` it failed under stacked borrows on 4 of 32 schedules, inside `epoch::flush`. Deferring every
 drop would have cost the 44% above and still raced.
 
-So the flags left the node. `Shared<T>` in `shared.rs` holds the strong count at the front of its
-allocation, the value right after it, and behind the value a 32-bit weak count and the two flags, so
-a node's allocation stays 152 bytes. A reader reaches the flags from its `Weak` without making a
+So the flags left the node. `Shared<T>` in `shared.rs` holds the strong count, a 32-bit weak count
+and the two flags at the front of its allocation and the value right after them, so a node's
+allocation stays 152 bytes. A reader reaches the flags from its `Weak` without making a
 reference to the node, and no reference to them is ever exclusive: the last owner drops only the
 value, through a `&mut` to the value alone, and `get_mut`, `make_mut` and `unwrap_or_clone` lend or
 move the value alone. The allocation is freed when the last `Weak` goes, and a reader's `Weak` sits
@@ -165,10 +165,13 @@ C++ memory model either.
 The first layout kept `Arc`'s order, with the flags beside the counts in a 16-byte header. Index
 lookups then pulled 22 to 26 lines a lookup from the other CCX at 16 and 32 threads, against 18 to
 22, because the flags every guarded descent reads shared a line with the strong count that the row
-finder's upgrades write. Behind the value the flags sit 148 bytes from the count, where before they
-sat 97 bytes into the allocation, and lookups pull 19 to 21 lines from the other CCX against 18 to
+finder's upgrades write. Behind the value the flags sat 148 bytes from the count, where before they
+sat 97 bytes into the allocation, and lookups pulled 19 to 21 lines from the other CCX against 18 to
 22, at the price of about 20 more lines a lookup from the local L3, 127 against 105 on one thread,
-which did not show in the rate.
+which did not show in the rate. Once iterators, cursors and the row finder borrowed under hazards,
+the finder no longer wrote that count, and the line the flags had to themselves cost iterators more
+than the sharing had cost lookups, so they went back to the front, as [The flags'
+line](#the-flags-line) describes.
 
 `Shared` takes the place of `Arc` for nodes everywhere. A cache entry holds a node as `Erased`, a
 pointer and a static table of its type's offsets and drop, and any other object as
@@ -255,7 +258,9 @@ Measured and left out:
 - Moving the weak count to the front beside the strong count, both 32-bit so that the allocation
   stays 152 bytes, so that `make_mut` reads one line of the allocation rather than two. Inserts ran
   2,433 cycles a key against 2,375 with the weak count behind the value, medians of seven
-  alternating runs.
+  alternating runs. The weak count and the flags have since moved to the front beside a 64-bit
+  strong count, as [The flags' line](#the-flags-line) describes, and inserts there ran within 1% of
+  the layout before.
 - Deferring the drop of every evicted node that has a `Weak` memo, not only the lent ones, with the
   flags still in `Node`. With the 16 MiB cache memoized evictions outnumbered lent ones 3 and 9
   times for gets on 1 and 16 threads and 9 and 13 times for index lookups, and ranges, which never
@@ -869,6 +874,64 @@ the instructions they ran before, within 0.5%, at rates within 2% either way: at
 ran 74.0M keys a second against 74.7M, ranges 372,000 against 370,000, index lookups 107,900
 against 106,900 and covered pages 9.40M against 9.22M.
 
+### The flags' line
+
+A range of 1,000 keys, `snap.range(start..).take(1000).count()` on the compare harness's 1M-key
+`Map<u64, String>`, took about 4% longer once iterators borrowed nodes under hazards, 28.1 µs
+against 27.0 in the harness, for the same 160 instructions a key (#79). Such a range borrows about
+130 nodes: a build that counted its borrows found 129,500 in 1,000 ranges, all through a `Weak`
+memo, since a range with no end has no back path to copy into. A probe built the harness's map the
+same way, ran its gets and its full scan, and then timed rounds of 1,000 ranges on one pinned core,
+counting the thread's cycles and instructions through `perf_event_open`, either one round after
+another or each right after a full scan, as the harness runs them. Each tree was copied out with
+`git archive` and built in a directory of its own, and the builds alternated. Cycles a range against
+the build before the hazards, a643acb, as the median of each run's ratio to the a643acb run beside
+it, and the range of those medians over sessions of 10 to 30 runs:
+
+| Build | One round after another | Right after a scan |
+| --- | ---: | ---: |
+| Hazards, flags behind the value, as at db07c34 | +1.0 to +3.0% | +1.9 to +4.6% |
+| The same, writing the slot with a plain store, which is unsound | +0.6 to +1.1% | +2.7% |
+| The same, with the asymmetric fence described below | +1.5 to +1.7% | |
+| The same, reading neither flag, which is unsound | -2.2% | -1.6% |
+| The node's headers moved behind its other fields, beside the flags | -0.6 to +0.1% | +0.6 to +4.3% |
+| The same, with the asymmetric fence | -0.6 to -0.2% | +2.4% |
+| The flags moved to the front, beside the headers | -0.1 to 0.0% | -0.3 to +0.2% |
+| The same, with the asymmetric fence | -0.2% | -1.6% |
+
+The cycles went to the flags' line. The count a frame used to take wrote the strong count at the
+front of the allocation, in the line of the node's headers, which the reader goes on to read anyway.
+A borrow read `cached` and `lent` 148 bytes into the allocation, in a line that held nothing else a
+read wants, and on x86 the exchange that writes the slot completes only once the load of `cached`
+before it has, and no load after it is performed before it completes, so the node's headers were
+asked for only once the flags' line had arrived: two misses in a row where the count had one. That
+cost a borrow about 20 cycles once the ranges had warmed L3 and about 45 right after a scan, when
+both lines come from DRAM. Writing the slot with a plain store, which leaves the line to be fetched
+but lets the loads after it go ahead, took back more than half of the first and less than half of
+the second, and a borrow that kept the exchange but read neither flag ran faster than the count.
+
+`Shared` now holds the strong count, the weak count and the flags in the first 16 bytes of its
+allocation and the value after them, as described under [Where the flags
+live](#where-the-flags-live), so the flags share a line with the front of the node, where `Node`
+keeps the headers of its keys, child links and cells. The exchange then waits for the line the
+reader needs next anyway. The other way round, moving the headers behind the node's other fields so
+that they shared the line of the flags behind the value, took back the cost of ranges one round
+after another but only part of it right after a scan, and slowed bulk loads, as [Measured and left
+out](read-path.md#measured-and-left-out) records.
+
+In 15 alternating runs of the compare harness's ferro child, a 1,000-key range took 27.4 µs against
+28.2 with the flags behind the value and 27.3 at a643acb. In nine alternating runs of `ferro-bench`,
+whose ranges also follow a scan, `map_range_1k_ns` went from 29.7 to 28.8 ns, against 28.9 for
+a643acb in another session, and in seven runs of `bulk` the range phase took 27.1 ms against 28.2. A
+get did not move: 0.317 µs against 0.316 in the harness and 310.8 ns against 311.2 in `ferro-bench`,
+at 1,039 instructions against 1,025, and a table's row get took 157 ns against 155. Bulk loads, the
+CPU of the commit after them and the drop of the working tree stayed within 1%, and peak RSS did not
+move. In `scaling`, two alternating runs of three rounds with no writer at 1, 8 and 32 threads, no
+cell with either cache ran more than 0.4% slower than with the flags behind the value. With the 1
+GiB cache gets ran 3 to 4% faster, index lookups 3 to 5%, `for_each` scans 3 to 6% and covered pages
+at 32 threads 5%, at 9.4M a second, and covered lookups at 32 threads ran 37.6M a second against
+37.1M and pages of rows 1.52M against 1.50M.
+
 ### Measured and left out
 
 - A counted store in iterators, cursors and the row finder, in place of the store's slot, as the
@@ -900,7 +963,9 @@ against 106,900 and covered pages 9.40M against 9.22M.
   before it put the request in every step and cost a covered page 4,000 instructions and 19%.
 - The weak count and both flags in the allocation's first line beside the strong count, so that a
   borrow reads no line a walk does not: no faster, 858,000 covered pages a second on one thread
-  against 879,000.
+  against 879,000. Measured later on ranges, whose nodes come from DRAM rather than L3, it took
+  back what the flags' own line cost them and became the layout, as [The flags'
+  line](#the-flags-line) describes.
 - Records aligned to 64 bytes rather than 128: within noise in one session, 5.7M covered pages a
   second at 32 threads against 5.9M. The records keep 128, which keeps two of them off the pair of
   lines the adjacent-line prefetcher fetches together, as the epoch's slots do.
@@ -920,21 +985,57 @@ against 106,900 and covered pages 9.40M against 9.22M.
 - `epoch::retract` out of line and marked cold. The code around each inlined borrow changed: a
   100-key range ran 8,972 instructions against 8,928, a covered lookup 5,328 against 5,309 and a
   two-key range of an in-memory map 1,383 against 1,371. Inlined, they run what they ran before.
+- An asymmetric fence, as folly's hazard pointers use, in place of the exchange that writes a slot.
+  The two borrows that write a slot and then read `cached`, through a `Weak` memo and the back
+  path's copy, wrote it with a release store and a compiler fence, and a free called
+  `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, registered once when the first record was taken,
+  between its bump of the epoch and its reading of the slots. Where registration failed, borrows
+  kept the exchange and frees made no call. The call acts as a sequentially consistent fence run on
+  every other thread of the process at some point while it runs, and the compiler fence keeps the
+  borrow's store before its read in the code the thread runs. If that fence falls after the store,
+  it orders the store before the free's reading of the slots, which sees it. If it falls before, it
+  comes after the free's bump, which follows the read of the epoch that retired the node and so the
+  cache's clear of `cached` before it, and the borrow's read of `cached`, which follows the fence,
+  sees the clear and gives the slot back. A slot written through a count or under a pin is ordered
+  by the count's release or the unpin and needs neither, and a free's later readings meet only items
+  that a reading after such a call found held, or that an owner parked, so they need no call of
+  their own. With the flags behind the value it took a range's cycles from 1.5 to 1.7% above
+  a643acb's where the exchange left them 2.5 to 2.7% above, one round after another, and with the
+  headers beside those flags it changed them by 0.4% or less. With the flags at the front it left
+  them where they were one round after another and took 1.3% off them right after a scan, in 14 of
+  20 runs. Once the exchange waits on nothing the reader does not need next, there is little left to
+  take away, and the call would interrupt every core running a thread of the process in every batch
+  a free makes. Miri and ThreadSanitizer cannot model it, so they would check only the fallback,
+  leaving the stress tests and AddressSanitizer, and those cannot see the call go missing: a build
+  that wrote the slot with a plain store and no barrier at all, which is unsound, passed 300 runs of
+  `make test-stress`, `epoch_stress` under AddressSanitizer with four seeds, and the unit tests
+  under Miri's stacked borrows over 32 schedules.
+- Fewer slot writes, such as keeping one slot across the leaves of a parent and writing the next
+  leaf's only at a parent's boundary. A leaf is evicted on its own, whatever its parent, so every
+  borrow has to read its own node's `cached` after its slot is written, and that line was the
+  cost; a slot write saves at most what the plain store above saves. Not built.
+- Counts in place of slots while only one thread reads. A build that counted every node below the
+  pinned levels, as before the hazards, ran the ranges above at a643acb's cycles, within the 1%
+  its runs varied by, which is what a fast path could reach, and the flags at the front reach it
+  too. Knowing that only one thread reads would take a count of readers that every
+  iterator writes, the shared line the hazards took away. Not built.
 
 ### What is left
 
-A slot costs a borrowed leaf about 1.5 ns more than the count did on one thread, which covered
-pages, 25 leaves for 200 cheap rows, show as 2 to 5% across alternating runs; a build without the
-slots per node ran them at base speed. Covered pages at 16 and 32 threads also move between about
-5M and 10M a second from one round of a process to the next, where the counted build was steady at
-its lower rate. Each round reopens the files and starts new threads, so the rounds differ in where
-each thread's nodes and allocations land. With mimalloc as the global allocator a covered page
-pulled 13 lines from the local CCX and 3.3 from the other against 25 and 7.5, and the rounds still
-split. A `Val` for a row still clones its leaf's column, which the
-third probe puts at more than half of what pages of rows could gain. `for_each` still counts, and
-so do nodes below the pinned levels that sit above a leaf's grandparent. `Space::retired_bytes`
-counts an old file only while a handle counts its store, so a file that only an iterator still
-reads is left out of it. With a cache smaller than the data the allocator decides, as before.
+With the flags at the front a borrowed node costs a range on one thread what the count did, as [The
+flags' line](#the-flags-line) describes. Before that a slot cost a borrowed leaf about 1.5 ns more
+than the count, which covered pages, 25 leaves for 200 cheap rows, showed as 2 to 5% across
+alternating runs, and they have not been run against a counted build since. Covered pages at 16 and
+32 threads also move between about 5M and 10M a second from one round of a process to the next,
+where the counted build was steady at its lower rate. Each round reopens the files and starts new
+threads, so the rounds differ in where each thread's nodes and allocations land. With mimalloc as
+the global allocator a covered page pulled 13 lines from the local CCX and 3.3 from the other
+against 25 and 7.5, and the rounds still split. A `Val` for a row still clones its leaf's column,
+which the third probe puts at more than half of what pages of rows could gain. `for_each` still
+counts, and so do nodes below the pinned levels that sit above a leaf's grandparent.
+`Space::retired_bytes` counts an old file only while a handle counts its store, so a file that only
+an iterator still reads is left out of it. With a cache smaller than the data the allocator decides,
+as before.
 
 ## Cache weight
 

@@ -44,21 +44,23 @@ This cut peak RSS by 28% and bulk load time by 4 to 14%. `Node` is `repr(C)` wit
 `children` first, so both pointers a walk follows sit at the front of its allocation, which took
 12% off `contains_key` and 6% off `get`.
 
-A node is up to four allocations. The `Shared` that holds it takes 152 bytes: the strong count,
-then the 136 bytes of `Node`, which are the headers of its key vector, its child links and its
-cells, its count, level, origin and prefix, and behind them the weak count and the two flags
-described under [Where the flags live](read-scaling.md#where-the-flags-live). Its keys, its column
-or slots, and an interior node's child links, 72 bytes each, are allocations of their own. glibc
-aligns each to 16 bytes, not to a cache line, so the headers a get reads in an interior node
-straddle two lines three times in four, and in a leaf always. A leaf of eight `u64` keys and short
-strings takes a 160-byte chunk for the node, 80 for its keys and 224 for its column, besides the
-strings.
+A node is up to four allocations. The `Shared` that holds it takes 152 bytes: the strong count, the
+weak count and the two flags described under [Where the flags
+live](read-scaling.md#where-the-flags-live), then the 136 bytes of `Node`, which are the headers of
+its key vector, its child links and its cells, its count, level, origin and prefix. Its keys, its
+column or slots, and an interior node's child links, 72 bytes each, are allocations of their own.
+glibc aligns each to 16 bytes, not to a cache line, so the flags and the headers a get reads in an
+interior node take one line one time in four and two otherwise, and in a leaf two, or three one time
+in four. With the flags behind the value, as they were until [The flags'
+line](read-scaling.md#the-flags-line), the headers took as many lines in an interior node and two in
+a leaf, and the flags a line of their own. A leaf of eight `u64` keys and short strings takes a
+160-byte chunk for the node, 80 for its keys and 224 for its column, besides the strings.
 
 What a get reads of that was counted by a test that replays 200,000 random gets on the 1M-key
 `Map<u64, String>` of the compare harness, right after its load, and records every line each one
 touches. A get reaches a node with a chance in proportion to the keys under it, so the nodes it
 reads hold 12 to 15 keys where the average node holds 8, and a third of them more than 16. Lines a
-get reads in each node:
+get read in each node with the flags behind the value:
 
 | Node | Headers | Flags | Keys | Link, or column and value | All | Pages | Hint prefetches, of them read |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -77,6 +79,9 @@ table; and about 9 misses in flight on average. The lines of one node are asked 
 whatever their number a get waits on one miss a level: the leaf's, nearly always from DRAM, and its
 parent's, often, each behind a page walk. Two layouts that read fewer lines were built, measured
 and left out for that reason, as described under [Measured and left out](#measured-and-left-out).
+An iterator was another matter: the exchange that writes its hazard slot waited for the flags'
+line before the headers' line was asked for, so a borrow's lines did not arrive together until the
+flags moved to the front of the allocation, beside the headers.
 
 ## Prefetching the next level
 
@@ -164,7 +169,7 @@ otherwise:
 | `contains_key` in `reads` | 1,141 | 976 | 297 ns | 290 ns |
 
 A get stays bound by memory, not instructions: it ran about 0.7 instructions a cycle before and
-after. Below the three pinned levels it reaches four nodes, each of whose header, flag line, keys
+after. Below the three pinned levels it reaches four nodes, each of whose header and flags, keys
 and links or column arrive together but only once the link above them has been read, so the get
 waits on four misses in a row. A leaf that a get touches takes about eight lines, its header and
 flags, its keys and its column, so the 125,000 leaves of 1M keys want about 64 MB against the 32
@@ -425,7 +430,10 @@ from 6.1 to 1.5 ns an item and cold scans down about 7%.
   the map of [Node layout](#node-layout) read 36.7 lines rather than 38.3. L1 misses served from L3
   fell from 4.5 to 3.7 a get and from DRAM from 1.5 to 1.2, but lines from DRAM in all stayed at
   about 13.5, and over five alternating runs a get took 323 ns against 321 on the first pass after
-  the load and 316 against 317 on the second.
+  the load and 316 against 317 on the second. Built again for iterators, while the flags still
+  sat behind the value, it took back only part of what borrowing cost a range right after a scan
+  and slowed bulk loads by 2%, as [The flags' line](read-scaling.md#the-flags-line) describes, and
+  the flags moved to the headers instead.
 - A node in one allocation, with its keys inline. `Node` held a 128-byte buffer for its keys,
   right-aligned against their count, which sat before the child and cell headers, so that a node
   whose keys fit, sixteen `u64`s or five `String`s, read its keys, headers and flags as one run of

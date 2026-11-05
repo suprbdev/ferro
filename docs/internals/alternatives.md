@@ -61,9 +61,11 @@ numbers. This index lists them by subsystem.
 - A private lease for `Val`, a lazier row finder, building the column in place, and decoding from
   the read buffer: [Measured and left out](read-scaling.md#measured-and-left-out-1).
 - A counted store in iterators, hazards for the root and the store alone, an epoch lease per
-  iterator, slots chosen by depth, other orders and prefetches for the borrow, the flags beside the
-  count, and counts striped per thread: [Measured and left
-  out](read-scaling.md#measured-and-left-out-2).
+  iterator, slots chosen by depth, other orders and prefetches for the borrow, counts striped per
+  thread, an asymmetric fence in place of the exchange that writes a slot, fewer slot writes, and
+  counts while one thread reads: [Measured and left out](read-scaling.md#measured-and-left-out-2).
+  The headers moved beside the flags behind the value, in place of the flags moved to the front:
+  [The flags' line](read-scaling.md#the-flags-line).
 - Choosing an allocator in the library: [The allocator](read-scaling.md#the-allocator).
 - Weighing entries by disk size, and a size hook on `Data`: [Cache
   weight](read-scaling.md#cache-weight).

@@ -143,7 +143,10 @@ count and `lent`, which sit behind the value on a line of their own, so every no
 a miss there. It prefetches that line too, and the walk of 1M keys went from 16.3 to 9.6 ms, median
 of four alternating runs, out of a drop of about 95 ms: sorting the five lists takes 17 ms and the
 ascending pass 67. That pass used to work out all five heads after every free and now refreshes
-only the one it advanced, 30 instructions a key fewer, with no change in time beyond noise.
+only the one it advanced, 30 instructions a key fewer, with no change in time beyond noise. The
+counts and flags have since moved to the front of the allocation, as [The flags'
+line](read-scaling.md#the-flags-line) describes, so the walk prefetches their line and the first
+two of the node, and the drop took the same 103 ms in seven alternating runs of `bulk`.
 
 ## Bulk load figures
 
