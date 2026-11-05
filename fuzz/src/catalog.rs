@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 use ferro::map::Summary;
 use ferro::{Bytes, Data, List, Map, Record, Set, Table};
 
@@ -270,8 +272,38 @@ where
     seen
 }
 
+fn unique_whole<I: DoubleEndedIterator + ExactSizeIterator>(
+    keys: impl Fn() -> I,
+    len: usize,
+) -> usize {
+    assert_eq!(
+        keys().len(),
+        len,
+        "a unique range's length differs from its index"
+    );
+    assert_eq!(
+        keys().count(),
+        len,
+        "a unique range's length differs from its walk"
+    );
+    assert_eq!(
+        keys().rev().count(),
+        len,
+        "a unique range walks differently backwards"
+    );
+    len
+}
+
 pub fn items_whole(items: &Table<Item>) -> usize {
     let mut seen = whole(items.rows());
+    seen += unique_whole(
+        || items.by_code_range::<str, _>(..).keys(),
+        items.unique_code().len(),
+    );
+    seen += unique_whole(
+        || items.by_shelf_label_range::<(u8, String), _>(..).keys(),
+        items.unique_shelf_label().len(),
+    );
     for row in items.iter() {
         seen += items.by_shelf(&row.shelf).count();
         seen += items.by_shelf(&row.shelf).covered().count();
@@ -279,6 +311,12 @@ pub fn items_whole(items: &Table<Item>) -> usize {
         seen += items.by_coupon_some("abc").count();
         seen += items.by_tags_counts().len();
         seen += items.by_shelf_rank_prefix(&row.shelf).covered().count();
+        seen += items.by_shelf_label_prefix(&row.shelf).count();
+        seen += items
+            .by_shelf_label_prefix(&row.shelf)
+            .covered()
+            .rev()
+            .count();
         seen += usize::from(
             items
                 .covered_by_shelf_label(&(row.shelf, row.label.clone()))
@@ -287,6 +325,10 @@ pub fn items_whole(items: &Table<Item>) -> usize {
         if let Some(code) = &row.code {
             seen += usize::from(items.key_by_code(code).is_some());
             seen += usize::from(items.covered_by_code(code).is_some());
+            seen += items
+                .by_code_range::<str, _>((Bound::Included(code.as_str()), Bound::Unbounded))
+                .take(3)
+                .count();
         }
     }
     seen
@@ -312,6 +354,10 @@ pub fn world_whole(world: &World) -> usize {
         seen += world.people.by_city(&found.city).count();
     }
     seen += world.people.by_city_counts().len();
+    seen += unique_whole(
+        || world.people.by_email_range::<str, _>(..).keys(),
+        world.people.unique_email().len(),
+    );
     seen += items_whole(&world.items);
     seen += whole(&world.blobs);
     for (_, blob) in world.blobs.iter() {
@@ -343,6 +389,7 @@ impl Probe for CatalogV1 {
         guarded(|| items.by_shelf_counts());
         guarded(|| items.by_tags("ab").take(8).count());
         guarded(|| items.unique_code().len());
+        guarded(|| items.by_code_range::<str, _>(..).keys().rev().count());
         guarded(|| {
             for row in items.iter() {
                 if !budgeted(budget) {
@@ -352,6 +399,10 @@ impl Probe for CatalogV1 {
                 let _ = items.by_price_range(..row.price).next_back();
                 if let Some(code) = &row.code {
                     let _ = items.by_code(code);
+                    let _ = items
+                        .by_code_range::<str, _>((Bound::Excluded(code.as_str()), Bound::Unbounded))
+                        .take(2)
+                        .count();
                 }
             }
         });
@@ -391,6 +442,14 @@ impl Probe for Catalog {
         guarded(|| items.unique_code().len());
         guarded(|| items.unique_shelf_label().len());
         guarded(|| items.by_rank_range(1..3).keys().count());
+        guarded(|| items.by_code_range::<str, _>(..).covered().take(8).count());
+        guarded(|| {
+            items
+                .by_shelf_label_range::<(u8, String), _>(..)
+                .rev()
+                .take(8)
+                .count()
+        });
         guarded(|| {
             for row in items.iter() {
                 if !budgeted(budget) {
@@ -403,12 +462,19 @@ impl Probe for Catalog {
                 let _ = items.by_shelf_rank_prefix(&row.shelf).covered().count();
                 let _ = items.covered_by_shelf_label(&(row.shelf, row.label.clone()));
                 let _ = items.by_vendor_sku_prefix(&row.vendor).count();
+                let _ = items.by_shelf_label_prefix(&row.shelf).covered().count();
+                let _ = items.by_shelf_label_prefix(&row.shelf).next_back();
                 for tag in &row.tags {
                     let _ = items.by_tags_after(tag, &row.id).covered().count();
                 }
                 if let Some(code) = &row.code {
                     let _ = items.covered_by_code(code);
                     let _ = items.by_code(code);
+                    let _ = items
+                        .by_code_range::<str, _>((Bound::Unbounded, Bound::Included(code.as_str())))
+                        .rev()
+                        .take(2)
+                        .count();
                 }
             }
         });
@@ -455,11 +521,27 @@ impl Probe for CatalogV3 {
         guarded(|| items.unique_label().len());
         guarded(|| items.unique_shelf_label().len());
         guarded(|| {
+            items
+                .by_label_range::<str, _>(..)
+                .covered()
+                .rev()
+                .take(8)
+                .count()
+        });
+        guarded(|| {
             for row in items.iter() {
                 if !budgeted(budget) {
                     break;
                 }
                 let _ = items.by_shelf(&row.shelf).covered().take(4).count();
+                let _ = items
+                    .by_label_range::<str, _>((
+                        Bound::Included(row.label.as_str()),
+                        Bound::Unbounded,
+                    ))
+                    .take(2)
+                    .count();
+                let _ = items.by_shelf_label_prefix(&row.shelf).keys().count();
                 let _ = items.by_cost_range(row.cost..).take(2).count();
                 let _ = items.by_tags(&row.tags).count();
                 let _ = items.by_vendor_sku_prefix(&row.vendor).take(3).count();
@@ -509,6 +591,8 @@ impl Probe for World {
         guarded(|| self.people.by_city_counts());
         guarded(|| self.people.by_city("city1").take(8).count());
         guarded(|| self.people.by_email("user1@0.example"));
+        guarded(|| self.people.by_email_range::<str, _>(..).take(8).count());
+        guarded(|| self.items.by_code_range::<str, _>(..).rev().take(8).count());
         guarded(|| self.items.by_shelf(&1).covered().take(8).count());
         guarded(|| self.items.unique_shelf_label().len());
         guarded(|| self.items.by_tags_counts().len());
