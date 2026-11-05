@@ -972,19 +972,29 @@ mod tests {
 
     #[test]
     fn shared_a_share_through_a_slot_never_brings_a_value_back() {
+        struct Sent(*const Counted);
+
+        // SAFETY: the pointer is only read on the thread it moves to, while a slot holds the
+        // value it points to, and `Counted` is `Send` and `Sync`.
+        unsafe impl Send for Sent {}
+
+        impl Sent {
+            fn into_ptr(self) -> *const Counted {
+                self.0
+            }
+        }
+
         let rounds = if cfg!(miri) { 4 } else { 400 };
         for round in 0..rounds {
             let (counted, _, drops) = Counted::new(round);
             let owner = Shared::new(counted);
             let hazards = Hazards::new().unwrap();
-            let lent = Shared::lend_to(&owner, hazards.entry(ROOT))
-                .as_ptr()
-                .expose_provenance();
+            let lent = Sent(Shared::lend_to(&owner, hazards.entry(ROOT)).as_ptr());
             let start = Arc::new(std::sync::Barrier::new(2));
             let other = {
                 let start = start.clone();
                 thread::spawn(move || {
-                    let ptr = ptr::with_exposed_provenance::<Counted>(lent);
+                    let ptr = lent.into_ptr();
                     // SAFETY: the slot holds the value, so the pointer reaches a live value, and
                     // the handle made from it takes no count and is never dropped.
                     let borrowed = ManuallyDrop::new(unsafe { Shared::from_raw(ptr) });
