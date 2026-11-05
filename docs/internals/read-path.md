@@ -58,10 +58,11 @@ bytes and `Link` 72. A hint comes from a live node, and once that node is evicte
 prefetches a line nobody wants and nothing more, since a prefetch never faults. That call, the
 guarded borrow described under [Reading from many
 threads](read-scaling.md#guarded-gets-and-the-epoch-scheme), `Shared`, the reference count that
-holds nodes, described under [Where the flags live](read-scaling.md#where-the-flags-live), and the
+holds nodes, described under [Where the flags live](read-scaling.md#where-the-flags-live), the
 tagged pointers of iterator frames, described under [Iterator
-frames](read-scaling.md#iterator-frames), are the tree's only `unsafe` code, and the prefetch does
-nothing on targets other than x86_64.
+frames](read-scaling.md#iterator-frames), and the hazard slots iterators borrow nodes under,
+described under [Iterators under hazards](read-scaling.md#iterators-under-hazards), are the tree's
+only `unsafe` code, and the prefetch does nothing on targets other than x86_64.
 
 On 1M `u64` keys, median of 15 alternating rounds in one process holding two such maps, in
 nanoseconds, the last two per key:

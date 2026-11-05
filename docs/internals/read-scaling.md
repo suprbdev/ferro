@@ -1,8 +1,8 @@
 # Reading from many threads
 
 How reads scale across threads: guarded gets and the epoch scheme, iterator frames, the allocator,
-and how the node cache weighs what it holds. The single-thread read path is in [The read
-path](read-path.md).
+iterators under hazards, and how the node cache weighs what it holds. The single-thread read path
+is in [The read path](read-path.md).
 
 ## The benchmark
 
@@ -101,12 +101,14 @@ entry's clones that `get` hands out are not owners, and the flag is cleared befo
 of its reference. `lent` is set by the first reader that borrows the node. An evicted node that was
 never lent is freed at once, as before. One that was lent is retired with the epoch it was cleared
 at and freed once every pinned slot is at a later epoch, checked when a thread has retired 128 nodes
-or 64 KiB, and on `Store::close`, which waits for readers pinned before it so that retired nodes
-holding nested maps do not keep the file open. A reader stores `lent` before it reads `cached`
-again, and the cache clears `cached` before it reads `lent`, all sequentially consistent, so either
-the reader sees the flag cleared or the cache sees the loan and defers the free. Iterators and
-cursors still hold counts, since they live across the caller's code, and so does `for_each`, whose
-callback could hold a pin, and with it every retired node, for as long as it likes.
+or 64 KiB more than it kept at its last check, and on `Store::close`, which waits for readers
+pinned before it so that retired nodes holding nested maps do not keep the file open. A reader
+stores `lent` before it reads `cached` again, and the cache clears `cached` before it reads `lent`,
+all sequentially consistent, so either the reader sees the flag cleared or the cache sees the loan
+and defers the free. Iterators, cursors and the row finder live across the caller's code, so they
+borrow under hazards rather than a pin, as described under [Iterators under
+hazards](#iterators-under-hazards), and `for_each`, whose callback could hold a pin, and with it
+every retired node, for as long as it likes, still holds counts.
 
 The first version retired every evicted node. Gets with the 16 MiB cache fell by 44% at 16 and 32
 threads, and a profile put 40% of the time in freeing the batches of 128 cold nodes, most of them
@@ -278,15 +280,27 @@ The protocol is checked four ways. `tests/epoch_stress.rs` runs eight readers do
 through the frames described under [Iterator frames](#iterator-frames), against a model of every
 version, on handles with caches of 12 KiB to 1 MiB that read-only readers refresh and reopen, beside
 two writers on a 12 KiB cache with reclamation cycles every 96 KiB and compaction, while the
-writer's `Db` is dropped and reopened four times. It runs under AddressSanitizer and ThreadSanitizer
-clean with its default seed and three others, and with `Shared::release` changed to report no loan,
-so that lent nodes are freed at once, AddressSanitizer reports a use after free and ThreadSanitizer
-data races within the default four seconds. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and
-`shared.rs` race a reader's borrow with an eviction, race readers that pin after an eviction with
-the epoch's free of the node it retired, check that only the cache's own entry releases its value,
-walk iterators and a cursor over pinned and borrowed nodes after their map is dropped or edited, and
-drive `Shared`'s counts, moves, erasure, layout and flags, including flags read after the value is
-dropped. They pass under Miri with stacked borrows and with tree borrows over 32 schedules each.
+writer's `Db` is dropped and reopened four times. Each reader also keeps a range, read forwards or
+backwards, a cursor and an index walk from one round to the next and advances each by a few dozen
+items a round, so that they outlive the snapshot they came from and, once the reader reopens its
+handle, the `Db` and store they read, while the writers commit and the caches evict; one round in
+25 drops each mid-walk. It runs under AddressSanitizer and ThreadSanitizer clean with its default
+seed and three others. With `Shared::release` changed to report no loan, so that lent nodes are
+freed at once, with `free` ignoring the hazard records described under [Iterators under
+hazards](#iterators-under-hazards), with a lent value's last drop no longer deferred while a slot
+holds it, and with the retired list releasing a lent value's last count without reading the records
+again, AddressSanitizer reports a use after free and ThreadSanitizer 28 to 118 data races within
+the default four seconds. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and `shared.rs` race a
+reader's borrow with an eviction, race readers that pin after an eviction with the epoch's free of
+the node it retired, check that only the cache's own entry releases its value, walk iterators and a
+cursor over pinned and borrowed nodes after their map is dropped or edited, and drive `Shared`'s
+counts, moves, erasure, layout and flags, including flags read after the value is dropped. For the
+hazards they hold iterators, a cursor and the row finder across an eviction and a flush, drop
+iterators mid-walk, keep a stored root for the iterators that borrow it after its map is dropped,
+keep a leaf the finder holds once the borrowed node that pinned it is freed, borrow a root through
+its map after a free has scanned the records, and move records between threads. They pass under
+Miri with stacked borrows and with tree borrows over 32 schedules each. Under Miri their assertions
+fail for the first of the four sabotages, and Miri reports a use after free for the other three.
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
@@ -308,7 +322,8 @@ RUSTFLAGS="-Zsanitizer=thread" CARGO_TARGET_DIR=target/tsan cargo +nightly test 
 parent. A key within the leaf's first and last keys is in that leaf or nowhere, so rows in key order
 are found in it without a descent; a key within the parent's span descends one level, and any other
 key descends from the root under the guard. Only a new leaf and parent are upgraded, so a scattered
-row takes two upgrades where the cursor took about five.
+row takes two upgrades where the cursor took about five. The finder now borrows them under hazards
+instead, as described under [Iterators under hazards](#iterators-under-hazards).
 
 ## Measured and left out
 
@@ -472,7 +487,235 @@ leaf it passes. That is what pages of the same 200 rows meet: each page passes a
 and 50 row leaves that every thread also passes. A covering index skips the row leaves, as described
 under [Covering indexes](schema-and-unique-indexes.md#covering-indexes). Each iterator still clones
 the store and the root. With a cache smaller than the data the allocator decides, and the library
-leaves that to the application.
+leaves that to the application. [Iterators under hazards](#iterators-under-hazards) takes up the
+counts.
+
+## Iterators under hazards
+
+An iterator, cursor or row finder took a count on each node below the pinned levels that it passed,
+and every reader of a map passes the same nodes. With two threads on one CCX, a page of the same 200
+rows pulled 77 lines a page from the other core's cache where one thread pulled none, about one for
+each of the 25 index leaves and 50 row leaves the page passes, and a covered page, which passes only
+the index leaves, pulled 25. A short lookup passes few leaves, but its index iterator and its row
+finder each cloned the store and the root and dropped them again, eight locked operations a lookup
+on three lines that every reader of the table writes: a covered lookup pulled 10 lines at two
+threads against 5 on one, and 4 a lookup from the other CCX at 16 threads, where it ran slower than
+at 8.
+
+Three probes bounded what removing the counts could gain. Each skipped them in a way that is unsound
+once nodes are evicted, and leaked one count on every node it borrowed so that the cache's evictions
+could not free what it read. Operations a second at 32 threads with the 1 GiB cache and no writer,
+medians of two alternating runs of two rounds:
+
+| Workload | Before | No counts below the pinned levels | Nor on the root and store | Nor on a row's `Val` |
+| --- | --- | --- | --- | --- |
+| Index lookup | 2.8M | 3.1M | 4.4M | 4.9M |
+| Index lookup, covered | 15.1M | 17.3M | 44.7M | 45.2M |
+| Page of 200 rows | 1.0M | 1.5M | 1.6M | 3.6M |
+| Page of 200 rows, covered | 3.5M | 8.0M | 11.5M | |
+| 100-key range | 7.7M | 8.0M | 8.5M | 8.4M |
+
+### Hazards
+
+`epoch.rs` keeps hazard records, eight pointer slots in a line of their own, in a list that `free`
+reads. An iterator, cursor or row finder takes a record when it is built, from a spare list kept per
+thread, so taking one is a pop from thread-local memory, and clears it and hands it back when it is
+dropped, on whichever thread drops it. With no record to be had, because the thread is exiting or
+4,096 records are in use, it counts as before.
+
+To borrow a node through a `Weak` memo, an iterator runs the protocol of a guarded get with a slot
+written first: it reads `cached`, stores the node's address in a slot, sets `lent` if it is not set
+and reads `cached` again, all sequentially consistent. If `cached` is still set, the cache had not
+cleared it when the slot was written, so the cache's release sees `lent` and retires the node, and
+`free` frees a retired node only once no slot holds it. It reads the slots after the epoch it bumps
+and frees only what was retired before that bump, so a slot written before a release is always
+seen. If `cached` was cleared, the iterator clears the slot and takes a count as before. A frame
+holding a borrowed node is a tagged pointer with no count, like one anchored to the root, and so are
+frames below it reached through pinned memos or in-memory links, which live as long as it does. A
+borrowed node is not changed in place: the cache or the retired list holds a count on it for as long
+as a slot can hold it, so `make_mut` copies it.
+
+The slots of a path are chosen by level: the node a frame enters takes the slot of its parent's
+level minus one, so the leaf, its parent and its grandparent each have one, frames on one path never
+share one, and the front and back paths of an iterator have three each. Nodes higher than that but
+below the pinned levels are counted as before; a scan of the 1M-key map enters one about every
+4,096 keys. The row finder keeps its leaf and the leaf's parent in two slots and also sets `lent` on
+them, since nothing above them stays borrowed once its descent is over, and a leaf that only a
+borrowed node's pinned memo held would otherwise be dropped in place with that node. It lends them
+through the link it reached them by: Miri's stacked borrows rejected a first version that set
+`lent` through a pointer taken from the `&Node`, whose permission covers the node and not the flags
+behind it.
+
+### The root and the store
+
+The root of a stored map is borrowed through the map that builds the iterator: the iterator writes
+the root's address in a slot and sets `lent` while the map still holds its count, so whoever drops
+the root's last count later sees the flag. `Shared`'s last drop now checks `lent`, and a value that
+is lent and held by a slot, which it learns by reading the records, is retired as a dead entry
+rather than dropped. An iterator whose root or store has died while it held them flushes the epoch
+when it is dropped, so a store's file closes when its last iterator goes, as it did when the
+iterator held a count. `Store` keeps its state in a `Shared` for this. A dirty map's root is still
+counted: only its writer reads it, and a borrowed root would make the writer's next edit copy it.
+The cursor and the row finder borrow the root only once its pinned memo is set, so that building one
+reads nothing from the file.
+
+The first version freed a lent value from a retired list as soon as the list's own count was the
+last, trusting the scan of the records that the free began with. A root the cache had retired could
+then be borrowed through its map after that scan, and the map dropped before the list let go, so the
+root was freed under the iterator: `epoch_stress` crashed in release builds when two copies ran at
+once, and AddressSanitizer reported the use after free. When the list's count is the last on a lent
+value, `free` now reads the records again, after the decrement that orders it behind the owner that
+let go, and keeps whatever a slot holds as a dead entry. That costs one more scan a batch, and only
+for batches that free lent values.
+
+### Measurements
+
+Measured on the machine and data of the tables above, alternating the two builds, two runs of two
+rounds each, with other work under one core busy in every cell. Operations a second with the 1 GiB
+cache and no writer, and in brackets the speedup over one thread:
+
+| Workload | | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `get` | before | 3.0M | 6.2M (2.0) | 12.2M (4.1) | 23.6M (7.9) | 43.0M (14.3) | 68.1M (22.6) |
+| `get` | after | 3.0M | 6.1M (2.1) | 12.2M (4.1) | 23.5M (7.9) | 43.6M (14.5) | 68.0M (22.7) |
+| `iter()` scan | before | 58.8M | 58.8M (1.0) | 114.2M (1.9) | 215.4M (3.7) | 417.9M (7.1) | 888.9M (15.1) |
+| `iter()` scan | after | 59.1M | 71.9M (1.2) | 144.4M (2.4) | 278.7M (4.7) | 536.6M (9.1) | 873.7M (14.8) |
+| `for_each` scan | before | 88.7M | 156.6M (1.8) | 243.0M (2.7) | 491.0M (5.5) | 957.8M (10.8) | 1459.4M (16.5) |
+| `for_each` scan | after | 88.5M | 156.7M (1.8) | 243.9M (2.8) | 492.3M (5.6) | 966.0M (10.9) | 1467.7M (16.6) |
+| 100-key range | before | 422k | 817k (1.9) | 1.6M (3.8) | 3.1M (7.3) | 5.2M (12.4) | 7.9M (18.6) |
+| 100-key range | after | 423k | 822k (1.9) | 1.6M (3.8) | 3.2M (7.4) | 5.9M (13.8) | 8.6M (20.3) |
+| Index lookup | before | 228k | 458k (2.0) | 850k (3.7) | 1.6M (6.8) | 1.9M (8.1) | 2.8M (12.1) |
+| Index lookup | after | 234k | 476k (2.0) | 896k (3.8) | 1.7M (7.3) | 2.9M (12.4) | 4.5M (19.4) |
+| Index lookup, covered | before | 2.4M | 4.4M (1.8) | 7.1M (2.9) | 11.1M (4.6) | 9.6M (4.0) | 15.0M (6.2) |
+| Index lookup, covered | after | 2.5M | 5.0M (2.0) | 8.6M (3.5) | 15.4M (6.2) | 27.5M (11.1) | 37.9M (15.2) |
+| Page of 200 rows | before | 180k | 324k (1.8) | 518k (2.9) | 815k (4.5) | 728k (4.0) | 1.0M (5.6) |
+| Page of 200 rows | after | 182k | 348k (1.9) | 567k (3.1) | 912k (5.0) | 1.1M (6.0) | 1.5M (8.3) |
+| Page of 200 rows, covered | before | 817k | 1.4M (1.7) | 2.1M (2.6) | 3.3M (4.0) | 2.7M (3.4) | 3.4M (4.2) |
+| Page of 200 rows, covered | after | 849k | 1.6M (1.9) | 2.7M (3.2) | 4.7M (5.5) | 6.9M (8.2) | 7.4M (8.8) |
+
+With the 16 MiB cache and no writer:
+
+| Workload | | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `get` | before | 337k | 613k (1.8) | 1.1M (3.1) | 1.9M (5.5) | 2.1M (6.2) | 2.9M (8.5) |
+| `get` | after | 336k | 612k (1.8) | 1.1M (3.2) | 1.8M (5.5) | 2.1M (6.1) | 2.9M (8.5) |
+| `iter()` scan | before | 7.5M | 12.2M (1.6) | 21.3M (2.8) | 37.7M (5.0) | 41.8M (5.6) | 70.5M (9.4) |
+| `iter()` scan | after | 7.4M | 12.1M (1.6) | 21.1M (2.9) | 37.4M (5.1) | 43.6M (5.9) | 74.5M (10.1) |
+| `for_each` scan | before | 7.9M | 12.7M (1.6) | 22.3M (2.8) | 39.2M (5.0) | 42.4M (5.4) | 72.6M (9.2) |
+| `for_each` scan | after | 7.9M | 12.7M (1.6) | 22.2M (2.8) | 39.1M (5.0) | 42.1M (5.4) | 71.9M (9.2) |
+| 100-key range | before | 54k | 95k (1.7) | 158k (2.9) | 268k (4.9) | 281k (5.2) | 378k (7.0) |
+| 100-key range | after | 54k | 94k (1.7) | 156k (2.9) | 263k (4.9) | 272k (5.1) | 371k (6.9) |
+| Index lookup | before | 14k | 24k (1.7) | 40k (2.8) | 68k (4.9) | 77k (5.5) | 107k (7.6) |
+| Index lookup | after | 14k | 24k (1.7) | 40k (2.8) | 68k (4.9) | 77k (5.5) | 106k (7.6) |
+| Index lookup, covered | before | 2.1M | 4.0M (1.9) | 6.7M (3.1) | 10.5M (4.9) | 9.7M (4.6) | 15.2M (7.2) |
+| Index lookup, covered | after | 2.2M | 4.4M (2.0) | 7.8M (3.6) | 14.1M (6.4) | 26.1M (12.0) | 35.1M (16.1) |
+| Page of 200 rows | before | 138k | 242k (1.8) | 404k (2.9) | 639k (4.6) | 524k (3.8) | 775k (5.6) |
+| Page of 200 rows | after | 134k | 239k (1.8) | 402k (3.0) | 652k (4.9) | 570k (4.3) | 815k (6.1) |
+| Page of 200 rows, covered | before | 790k | 1.3M (1.6) | 2.0M (2.5) | 3.1M (3.9) | 2.6M (3.3) | 3.6M (4.5) |
+| Page of 200 rows, covered | after | 707k | 1.4M (2.0) | 2.4M (3.4) | 4.2M (5.9) | 6.3M (8.9) | 7.1M (10.0) |
+
+At 32 threads with the 1 GiB cache, covered lookups went from 6.2 to 15.2 times one thread, index
+lookups from 12.1 to 19.4, covered pages from 4.2 to 8.8 and pages of rows from 5.6 to 8.3, and
+`iter()` scans gained 22 to 28% from 2 to 16 threads. Gets and `for_each`, which take no slots, did
+not move, and with the 16 MiB cache only the covered reads, whose index the cache holds whole,
+moved by more than 6%.
+
+On one thread, medians of three alternating runs of three rounds, operations a second and the
+instructions an operation counted by `scaling`:
+
+| Workload | Cache | Before | After | Instructions before | Instructions after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `get` | 1 GiB | 3.0M | 3.0M | 1,222 | 1,221 |
+| `iter()` scan | 1 GiB | 59.0M | 59.4M | 61 | 62 |
+| `for_each` scan | 1 GiB | 88.9M | 89.0M | 29 | 29 |
+| 100-key range | 1 GiB | 425k | 426k | 8,610 | 8,876 |
+| Index lookup | 1 GiB | 230k | 235k | 28,046 | 27,609 |
+| Index lookup, covered | 1 GiB | 2.47M | 2.52M | 5,054 | 5,311 |
+| Page of 200 rows | 1 GiB | 184k | 187k | 79,491 | 80,904 |
+| Page of 200 rows, covered | 1 GiB | 908k | 879k | 29,845 | 30,450 |
+| `get` | 16 MiB | 341k | 343k | 24,171 | 24,251 |
+| `iter()` scan | 16 MiB | 7.56M | 7.51M | 1,224 | 1,229 |
+| 100-key range | 16 MiB | 56k | 56k | 156,392 | 157,733 |
+| Index lookup | 16 MiB | 14k | 14k | 748,427 | 746,003 |
+| Index lookup, covered | 16 MiB | 2.14M | 2.19M | 4,995 | 5,251 |
+| Page of 200 rows | 16 MiB | 140k | 139k | 88,475 | 91,151 |
+| Page of 200 rows, covered | 16 MiB | 904k | 867k | 29,132 | 29,680 |
+
+A short lookup takes and hands back two records and writes a slot for each node it borrows where it
+took and dropped counts, about 250 instructions more and fewer locked operations, and runs 2%
+faster. A plain lookup also stops upgrading a leaf and a parent for each row and runs 440 fewer. A
+covered page passes 25 leaves for 200 cheap rows and runs 3 to 4% slower, the one cell on one
+thread that lost.
+
+Beside one thread committing single-key updates as fast as it can, medians of two alternating runs
+of two rounds, 32 threads with the 1 GiB cache read 61.2M gets a second against 61.1M, 2.9M index
+lookups against 2.6M, 34.9M covered lookups against 15.8M and 7.1M covered pages against 3.4M, and
+with the 16 MiB cache 18.2M covered lookups against 12.5M and 4.1M covered pages against 3.1M.
+One thread beside the writer ran covered lookups 5% slower with either cache, at 5,624 instructions
+against 5,208 with the 1 GiB one, and covered pages 4% and 8% slower. Every commit gives the readers
+new roots, which the first iterator on each lends, and when the last snapshot holding an old root
+lets go of a root that was lent, its drop reads the records.
+
+In `reads` and `ferro-bench`'s main tool, which now count instructions an item beside the time,
+medians of three alternating runs, the heap per key did not move, 56.7 bytes for `u32` values and
+108.5 for strings, nor did peak RSS, 378 MiB, the bytes a commit writes or a commit's instructions,
+179,659 Buffered against 179,609. Bulk loads, commits, warm and cold gets and diffs stayed within 5%
+either way. Scans run one or two more instructions a key, the slot a leaf takes spread over its
+keys, and their times at 5 to 28 ns a key moved by up to 9% either way, as did `for_each`, whose
+code did not change. Batches through a cursor, `get_many` and `contains_many`, run 12 to 38 more
+instructions a key, 3 to 4.5%, at times within the factor of two those cells vary by between runs
+of one build, and a table's page of index rows and its group counts run 2.8% and 7% more
+instructions and 5% faster.
+
+### Measured and left out
+
+- Hazards for the root and the store alone, with the nodes below the pinned levels counted as
+  before. One thread ran covered pages at 910,000 a second against 901,000 before and 885,000 with
+  every hazard, medians of four alternating runs, but 32 threads ran them at 3.5M against 5.2M with
+  every hazard, covered lookups at 28.3M against 35.5M and pages of rows at 1.23M against 1.39M.
+- An epoch lease per iterator, a slot holding the epoch it started at and renewed every few dozen
+  leaves with counts taken at the boundary, in place of a slot per node. Not built. A build that
+  wrote the slots with a plain store, which is unsound and costs a leaf what a lease would, ran
+  covered pages 1% faster on one thread than the exchange, 883,000 a second against 876,000. A lease
+  held by an iterator that sits unused between calls would keep every thread's retired nodes from
+  being freed and make `Store::close` wait out its second, where a record holds back eight nodes at
+  most.
+- Sixteen slots chosen by depth below the pinned levels and cleared one by one: a covered lookup on
+  one thread ran 5,597 instructions against 5,304 with eight slots chosen by level, a covered page
+  32,000 against 30,436 and a 100-key range 9,082 against 8,861.
+- Writing the slot before reading `cached`, so that the exchange need not wait on the flag line: no
+  faster, 869,000 covered pages a second on one thread against 866,000.
+- More prefetching. A node's flag line is prefetched with its hint, which took covered pages on one
+  thread from 860,000 a second to 874,000. Prefetching the node's first line as well made them
+  853,000, and asking for the next child's flag line when an interior frame hands out the key
+  before it put the request in every step and cost a covered page 4,000 instructions and 19%.
+- The weak count and both flags in the allocation's first line beside the strong count, so that a
+  borrow reads no line a walk does not: no faster, 858,000 covered pages a second on one thread
+  against 879,000.
+- Records aligned to 64 bytes rather than 128: within noise in one session, 5.7M covered pages a
+  second at 32 threads against 5.9M. The records keep 128, which keeps two of them off the pair of
+  lines the adjacent-line prefetcher fetches together, as the epoch's slots do.
+- Counts striped per thread for the root and the store. Not built: a stripe would still be a locked
+  operation for every iterator, its count would have to follow the iterator to whichever thread
+  drops it, and a store's file closes when its count reaches zero, which a stripe holding a count
+  for its thread would delay. The probe without these counts bounds what striping could gain, and
+  the hazards come within a sixth of it for covered lookups, 37.9M a second at 32 threads against
+  44.7M in another session.
+
+### What is left
+
+A slot costs a borrowed leaf about 1.5 ns more than the count did on one thread, which covered
+pages, 25 leaves for 200 cheap rows, show as 2 to 5% across alternating runs; a build without the
+slots per node ran them at base speed. Covered pages at 16 and 32 threads also move between about
+5M and 10M a second from one round of a process to the next, where the counted build was steady at
+its lower rate. Each round reopens the files and starts new threads, so the rounds differ in where
+each thread's nodes and allocations land. With mimalloc as the global allocator a covered page
+pulled 13 lines from the local CCX and 3.3 from the other against 25 and 7.5, and the rounds still
+split. A `Val` for a row still clones its leaf's column, which the
+third probe puts at more than half of what pages of rows could gain. `for_each` still counts, and
+so do nodes below the pinned levels that sit above a leaf's grandparent. `Space::retired_bytes`
+counts an old file only while a handle counts its store, so a file that only an iterator still
+reads is left out of it. With a cache smaller than the data the allocator decides, as before.
 
 ## Cache weight
 
