@@ -327,16 +327,18 @@ fn a_sync_after_small_edits_on_a_large_notebook_moves_little() {
 }
 
 #[test]
-fn a_pull_whose_have_went_stale_is_retried_once_and_the_devices_converge() {
+fn a_pull_whose_have_went_stale_tries_again_and_the_devices_converge() {
     type Armed = Option<(Db<Notes>, Bundle)>;
     let dir = tempfile::tempdir().unwrap();
     let slot: Arc<Mutex<Armed>> = Arc::new(Mutex::new(None));
     let refused: Arc<Mutex<Option<ferro::Error>>> = Arc::new(Mutex::new(None));
-    let (armed, seen) = (slot.clone(), refused.clone());
+    let bundled = Arc::new(Mutex::new(0));
+    let (armed, seen, attempts) = (slot.clone(), refused.clone(), bundled.clone());
     let hook = Hook(Arc::new(move |step| {
         if step != "bundled" {
             return;
         }
+        *attempts.lock().unwrap() += 1;
         let held = armed.lock().unwrap().take();
         if let Some((db, bundle)) = held {
             db.compact(Keep::Last(3)).unwrap();
@@ -356,8 +358,11 @@ fn a_pull_whose_have_went_stale_is_retried_once_and_the_devices_converge() {
     laptop.add("six", &[]).unwrap();
     let stale = laptop.db().bundle(&phone.db().have().unwrap()).unwrap();
     *slot.lock().unwrap() = Some((phone.db().clone(), stale));
+    let before = *bundled.lock().unwrap();
     let synced = phone.sync(&laptop).unwrap();
     assert!(slot.lock().unwrap().is_none(), "the hook never ran");
+    let into_phone = synced.steps.iter().filter(|step| step.into == "phone");
+    assert_eq!(*bundled.lock().unwrap() - before, into_phone.count() + 1);
     assert!(
         matches!(*refused.lock().unwrap(), Some(ferro::Error::StaleHave(_))),
         "the first pull's have did not go stale: {:?}",
