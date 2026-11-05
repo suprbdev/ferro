@@ -447,6 +447,7 @@ dependencies = [
 name = "ferro-derive"
 version = "0.1.0"
 dependencies = [
+ "ferro",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

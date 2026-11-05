@@ -1,3 +1,13 @@
+//! The derive macros behind `ferro::Data` and `ferro::Record`.
+//!
+//! Use them through the `ferro` crate, which re-exports both, as `use ferro::{Data, Record};`.
+//! The code they generate names `::ferro`, so the crate must be a dependency under that name.
+//!
+//! - [`Data`](derive@Data) encodes a struct or an enum by field name, so the type can change while
+//!   the data it wrote keeps loading.
+//! - [`Record`](derive@Record) makes a struct a row of `ferro::Table`, generating the secondary
+//!   indexes its attributes declare and the lookups on them.
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -590,6 +600,139 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
+/// Derives `ferro::Data`, the encoding every stored value needs, for a struct or an enum.
+///
+/// Use it through the re-export, `use ferro::Data;`. The type must also be `Clone`, and every
+/// field's type must implement `Data`. Every type parameter gets a `Data` bound. Unions are
+/// refused.
+///
+/// # Encoding
+///
+/// A struct is stored as its fields, each under a 16-bit tag hashed from its name and sorted by
+/// tag, so the struct can change while old data keeps loading:
+///
+/// - Reordering fields changes nothing, not even the value's hash.
+/// - A field the type no longer has is skipped when old data is read.
+/// - A field that old data lacks reads as its type's empty value if it has one: `Option`, `Vec`,
+///   `BTreeMap`, `BTreeSet`, `Bytes`, `Map`, `Set`, `List` and `Table` start empty, and `Box` and
+///   `Arc` follow what they hold. Any other field needs `#[ferro(default)]`, or the read fails with
+///   `Error::MissingField`.
+///
+/// Tuple fields are named by position, `0`, `1` and so on, and a unit struct stores no fields. An
+/// enum stores a tag hashed from the variant's name, then the variant's fields as a struct's, so
+/// variants can be reordered and added. A variant tag the type does not know fails to decode with
+/// `Error::Decode`.
+///
+/// Do not change the encoding or `Ord` of a type used as a key or an indexed value on existing
+/// data. `docs/guide/schema-evolution.md` has the rules.
+///
+/// # Attributes
+///
+/// On a field, of a struct or of an enum variant:
+///
+/// | Attribute | Effect |
+/// | --- | --- |
+/// | `#[ferro(rename = "name")]` | Stores the field under `name`, so a field renamed in Rust keeps reading what it wrote before. |
+/// | `#[ferro(default)]` | Data that lacks the field reads it as `Default::default()`. |
+/// | `#[ferro(default = "path::to::function")]` | Data that lacks the field reads it as `path::to::function()`. |
+/// | `#[ferro(skip)]` | The field is not stored, and every read gives `Default::default()`. |
+///
+/// On an enum variant, `#[ferro(rename = "name")]` stores the variant under `name`.
+///
+/// On a struct with exactly one field, `#[ferro(transparent)]` stores the struct as that field
+/// alone, with no tag, and describes it as that field, so a newtype costs nothing over what it
+/// wraps and wrapping a field in one leaves its encoding and its indexes as they were.
+///
+/// Options can share one attribute, as in `#[ferro(rename = "total", default)]`. Any other option
+/// is a compile error, and so are two fields, or two variants, whose stored names hash to the same
+/// tag: the error names both, and `#[ferro(rename = "...")]` on one of them resolves it.
+///
+/// # Examples
+///
+/// Reordering, renaming and skipping fields leave the stored value as it was:
+///
+/// ```
+/// use ferro::{Data, hash_of};
+///
+/// #[derive(Data, Clone)]
+/// struct Before {
+///     owner: String,
+///     balance: i64,
+/// }
+///
+/// #[derive(Data, Clone)]
+/// struct After {
+///     #[ferro(rename = "balance")]
+///     balance_cents: i64,
+///     owner: String,
+///     #[ferro(skip)]
+///     label: String,
+/// }
+///
+/// let before = Before { owner: "ana".into(), balance: 5 };
+/// let after = After { balance_cents: 5, owner: "ana".into(), label: "cached".into() };
+/// assert_eq!(hash_of(&before), hash_of(&after));
+/// ```
+///
+/// A field that old data lacks reads as its default, and a newtype stores what it wraps:
+///
+/// ```
+/// use ferro::codec::{Decoder, Encoder, HashSink};
+/// use ferro::{Data, hash_of};
+///
+/// fn reread<A: Data, B: Data>(value: &A) -> B {
+///     let mut sink = HashSink;
+///     let mut encoder = Encoder::new(&mut sink);
+///     value.encode(&mut encoder).unwrap();
+///     let body = encoder.into_object().body;
+///     B::decode(&mut Decoder::new(&body, &[], None)).unwrap()
+/// }
+///
+/// #[derive(Data, Clone)]
+/// struct V1 {
+///     name: String,
+/// }
+///
+/// #[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// #[ferro(transparent)]
+/// struct Cents(i64);
+///
+/// #[derive(Data, Clone, Debug, PartialEq)]
+/// enum Plan {
+///     Free,
+///     #[ferro(rename = "Pro")]
+///     Paid { seats: u32 },
+/// }
+///
+/// #[derive(Data, Clone, Debug)]
+/// struct V2 {
+///     name: String,
+///     nickname: Option<String>,
+///     #[ferro(default)]
+///     active: bool,
+///     #[ferro(default = "V2::starting_limit")]
+///     limit: Cents,
+///     #[ferro(default = "V2::free")]
+///     plan: Plan,
+/// }
+///
+/// impl V2 {
+///     fn starting_limit() -> Cents {
+///         Cents(10_000)
+///     }
+///
+///     fn free() -> Plan {
+///         Plan::Free
+///     }
+/// }
+///
+/// let v2: V2 = reread(&V1 { name: "ana".into() });
+/// assert_eq!(v2.nickname, None);
+/// assert!(!v2.active);
+/// assert_eq!(v2.limit, Cents(10_000));
+/// assert_eq!(v2.plan, Plan::Free);
+/// assert_eq!(hash_of(&Cents(7)), hash_of(&7i64));
+/// ```
 #[proc_macro_derive(Data, attributes(ferro))]
 pub fn derive_data(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -1751,3 +1894,219 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
+/// Derives `ferro::Record` for a struct with named fields, making it a row of `ferro::Table` with
+/// the secondary indexes its attributes declare.
+///
+/// Use it through the re-export, `use ferro::{Data, Record, Table};`. The struct must also derive
+/// `Data` and `Clone`, and cannot have generic parameters. Exactly one field is marked `#[key]`,
+/// the primary key, and its type and every indexed type must be `Data + Ord`.
+///
+/// The derive generates a `{Name}Table` struct, with the struct's visibility, that holds the rows
+/// and one map per index, and `Table<{Name}>` derefs to it, so the lookups below are called on the
+/// table. Every write through `Table` keeps every index in step with the rows. With at least one
+/// non-unique index it also generates `{Name}Find`, the view `find()` returns.
+///
+/// `docs/guide/tables.md` describes tables and indexes at more length, and the docs of
+/// `ferro::table` cover `IndexIter`, `Matches` and the rest of what the lookups return.
+///
+/// # Attributes
+///
+/// On fields:
+///
+/// | Attribute | Declares |
+/// | --- | --- |
+/// | `#[key]` | The primary key. Exactly one field has it. |
+/// | `#[index]` | An index on the field's value. |
+/// | `#[index(each)]` | An index on every element of a `Vec<X>`, `BTreeSet<X>`, `Set<X>` or `Option<X>` field. |
+/// | `#[index(cover(a, b))]` | An index that also stores fields `a` and `b` beside each entry. Combines with `each`, as `#[index(each, cover(a))]`. |
+/// | `#[unique]` | A unique index: at most one row holds each value. On an `Option<X>` field `None` is not indexed, so any number of rows can leave it empty. |
+/// | `#[unique(cover(a, b))]` | A unique index that also stores `a` and `b` beside each key. |
+///
+/// On the struct, for an index on two or more fields in the order named:
+///
+/// | Attribute | Declares |
+/// | --- | --- |
+/// | `#[index(a, b)]` | A composite index on `(a, b)`, named `a_b` in its lookups. Takes a cover list too, as `#[index(a, b, cover(c))]`. |
+/// | `#[unique(a, b)]` | A unique composite index: at most one row holds each `(a, b)`. Takes a cover list too. |
+///
+/// `#[ferro(rename = "...")]`, `#[ferro(default)]`, `#[ferro(default = "...")]` and
+/// `#[ferro(skip)]` mean what they do for `Data`. Each index is stored with a fingerprint of its
+/// kind, the key's type, and the stored names, types and defaults of the fields it is keyed on and
+/// stores. When a table is read, an index whose fingerprint no longer matches the struct is rebuilt
+/// from the rows, so changing an index's attribute, its cover list, or the stored name, type or
+/// default of one of its fields rebuilds that index. Turning an `#[index]` into a `#[unique]` fails
+/// to open with `Error::Decode` if two rows share a value. `docs/guide/schema-evolution.md` lists
+/// what rebuilds and what does not.
+///
+/// # Lookups
+///
+/// Lookups take the value by reference, borrowed as the type borrows: `by_customer("wile")` for a
+/// `String` field. `V` below is the indexed type, the element type for an each index and the
+/// tuple of the fields for a composite. `C` holds the covered fields, `()` without a cover list.
+///
+/// For `#[index] x`, `#[index(each)] x` and a composite `#[index(a, b)]` named `x`:
+///
+/// | Method | Returns |
+/// | --- | --- |
+/// | `by_x(&value)` | `IndexIter<Name, C>` of the rows whose `x` is `value`, in key order. |
+/// | `by_x_after(&value, &key)` | The same rows with keys greater than `key`, so a page after the row `key` costs a seek. |
+/// | `by_x_range(range)` | `IndexIter<Name, C>` of the rows whose `x` lies in `range`, by value and then by key. |
+/// | `by_x_counts()` | `Vec<(V, usize)>`: each distinct value with the number of rows that hold it, in value order, from the index alone. |
+///
+/// An each index has an entry for each distinct element of a row, so its range yields a row once
+/// for every element in the range. An index on a field whose type is written `Option<X>` takes
+/// `&Option<X>` in `by_x`, and also has:
+///
+/// | Method | Returns |
+/// | --- | --- |
+/// | `by_x_some(&value)` | The rows whose `x` is `Some(value)`, where `value` borrows as `X` does. |
+/// | `by_x_some_after(&value, &key)` | The same rows with keys greater than `key`. |
+///
+/// A composite `#[index(a, b, ...)]` also has `by_a_b_prefix(&a)`, the rows whose first field is
+/// `a`, ordered by the fields after it and then by key, where `a` borrows as its type does.
+///
+/// For `#[unique] x`, or a composite `#[unique(a, b)]` named `x`:
+///
+/// | Method | Returns |
+/// | --- | --- |
+/// | `by_x(&value)` | `Option<Val<Name>>`, the row that holds `value`. |
+/// | `key_by_x(&value)` | `Option<Key>`, that row's key, from the index alone. |
+/// | `unique_x()` | The whole index: `&Map<V, Key>`, or `&Map<V, (Key, S)>` with a cover list, where `S` is the tuple of the stored fields. |
+/// | `covered_by_x(&value)` | `Option<(Key, C)>`, the key and covered fields, from the index alone. Only with a cover list. |
+///
+/// On an `Option<X>` field a unique index is keyed by `X`, so `by_x` takes `&X`. A clash on
+/// insert or update is reported as `Taken { index, holder }`, where `index` is the index's name.
+///
+/// # Combining lookups
+///
+/// `find()` on the table returns a `{Name}Find<'_>`, which is `Copy`, with the equality lookups of
+/// every non-unique index: `by_x(&value)`, `by_x_after(&value, &key)` and, for an `Option` field,
+/// `by_x_some` and `by_x_some_after`. They return `Matches<Name, C>`, which `and` and `or` combine
+/// by primary key, reading a row only for a key that matches. `and` and `or` also take any
+/// `IndexIter`, such as a range or prefix lookup. `.keys()` reads no rows, and `.covered()` gives
+/// the covered fields of the leftmost lookup.
+///
+/// # Covering indexes
+///
+/// A cover list stores the fields it names beside every entry of the index, so `.covered()` on a
+/// lookup returns `(key, fields)` without reading the rows. One covered field comes back as itself
+/// and several as a tuple in the order listed. A covered field is copied into every entry and
+/// rewritten when it changes, so cover what a hot page shows and what seldom changes.
+///
+/// A cover list names at least one field, and no field twice. It may name the fields a value or
+/// composite index is keyed on, which come from the entry and are not stored twice. It cannot name
+/// the key, which every entry holds already, a `#[ferro(skip)]` field, the field an each index
+/// indexes, or a field a unique index is keyed on, and it stores at most 12 fields.
+///
+/// # Compile errors
+///
+/// The derive refuses, with an error at the attribute or field at fault: anything but a struct
+/// with named fields, generic parameters, no `#[key]` field or two, a struct-level index of fewer
+/// than two fields, a field name that does not exist, an index option other than `each` and
+/// `cover(...)` (only `cover(...)` on `#[unique]`), two cover lists on one struct-level index, and
+/// a cover list that breaks the rules above.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Data, Record, Table};
+///
+/// #[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// enum Status {
+///     Open,
+///     Closed,
+/// }
+///
+/// #[derive(Data, Record, Clone, Debug, PartialEq)]
+/// #[index(project, status)]
+/// struct Issue {
+///     #[key]
+///     id: u64,
+///     #[unique]
+///     slug: String,
+///     #[index]
+///     project: String,
+///     #[index]
+///     status: Status,
+///     #[index]
+///     assignee: Option<String>,
+///     #[index(each)]
+///     labels: Vec<String>,
+/// }
+///
+/// fn issue(id: u64, slug: &str, project: &str, status: Status, who: Option<&str>) -> Issue {
+///     Issue {
+///         id,
+///         slug: slug.into(),
+///         project: project.into(),
+///         status,
+///         assignee: who.map(String::from),
+///         labels: vec!["bug".into()],
+///     }
+/// }
+///
+/// let mut issues: Table<Issue> = Table::new();
+/// issues.insert(issue(1, "crash", "core", Status::Open, Some("ana")));
+/// issues.insert(issue(2, "typo", "docs", Status::Closed, None));
+/// issues.insert(issue(3, "leak", "core", Status::Closed, Some("ben")));
+/// issues.insert(issue(4, "hang", "core", Status::Open, None));
+///
+/// let ids = |rows: ferro::table::IndexIter<Issue>| rows.map(|row| row.id).collect::<Vec<_>>();
+///
+/// assert_eq!(ids(issues.by_status(&Status::Open)), [1, 4]);
+/// assert_eq!(ids(issues.by_status_after(&Status::Open, &1)), [4]);
+/// assert_eq!(ids(issues.by_assignee_some("ben")), [3]);
+/// assert_eq!(ids(issues.by_assignee(&None)), [2, 4]);
+/// assert_eq!(ids(issues.by_labels("bug")), [1, 2, 3, 4]);
+/// assert_eq!(ids(issues.by_project_status(&("core".to_string(), Status::Closed))), [3]);
+/// assert_eq!(ids(issues.by_project_status_prefix("core")), [1, 4, 3]);
+/// assert_eq!(issues.by_status_counts(), [(Status::Open, 2), (Status::Closed, 2)]);
+///
+/// assert_eq!(issues.by_slug("leak").map(|row| row.id), Some(3));
+/// assert_eq!(issues.key_by_slug("typo"), Some(2));
+/// assert!(issues.try_insert(issue(5, "crash", "web", Status::Open, None)).is_err());
+///
+/// let find = issues.find();
+/// let open_core: Vec<u64> = find
+///     .by_project("core")
+///     .and(find.by_status(&Status::Open))
+///     .keys()
+///     .collect();
+/// assert_eq!(open_core, [1, 4]);
+/// ```
+///
+/// A covering index answers from its entries alone:
+///
+/// ```
+/// use ferro::{Data, Record, Table};
+///
+/// #[derive(Data, Record, Clone)]
+/// #[index(customer, first, cover(first, total))]
+/// struct Booking {
+///     #[key]
+///     id: u64,
+///     #[index(cover(nights, total))]
+///     customer: u32,
+///     #[unique(cover(total))]
+///     reference: String,
+///     first: u32,
+///     nights: u32,
+///     total: i64,
+/// }
+///
+/// let mut bookings: Table<Booking> = Table::new();
+/// for (id, first, nights) in [(1, 30, 2), (2, 10, 1), (3, 20, 4)] {
+///     let reference = format!("R{id}");
+///     let total = i64::from(nights) * 100;
+///     bookings.insert(Booking { id, customer: 7, reference, first, nights, total });
+/// }
+///
+/// let newest: Vec<(u64, (u32, i64))> = bookings.by_customer(&7).covered().rev().collect();
+/// assert_eq!(newest, [(3, (4, 400)), (2, (1, 100)), (1, (2, 200))]);
+///
+/// let by_date: Vec<(u64, (u32, i64))> =
+///     bookings.by_customer_first_prefix(&7).covered().collect();
+/// assert_eq!(by_date, [(2, (10, 100)), (3, (20, 400)), (1, (30, 200))]);
+///
+/// assert_eq!(bookings.covered_by_reference("R3"), Some((3, 400)));
+/// ```
