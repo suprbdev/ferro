@@ -15,7 +15,7 @@ figure that came within the spread of its runs of the one measured on 2026-11-04
 | Bulk insert in one commit | 0.66 s |
 | Random `get` | 0.31 µs |
 | Full scan | 18 ns per key |
-| Range read | 30 ns per key |
+| Range read | 29 ns per key |
 | Single-key commit, fsync | 410 µs, about 2,400 per second |
 | Single-key commits, fsync, 8 writers with 8 readers | about 10,100 per second |
 | Reads per second with those writers running | 74M |
@@ -40,10 +40,10 @@ alternating with the build of 2026-11-04 found the same: the bulk insert took 66
 instructions a key against 718 ns and 4,114, and a scan 17.9 ns against 19.1. A random get runs
 1,025 instructions against 1,204 and a table's row get 829 against 988, but a get took 0.31 µs in
 both builds, and the reads beside the writers came to 73M and 72M a second, so those two rows moved
-between the days and not with the code. A range read got slower, as [Slower than
-before](#slower-than-before) describes. The other rows, the booking commits among them, moved by
-less than the spread of their runs, and alternating runs gave a hold 86.4 µs against 85.5 and a
-confirm 106.5 against 105.4 at the same instructions within 0.3%.
+between the days and not with the code. A range read got slower, 30 ns a key, and the fix described
+under [Slower than before](#slower-than-before) took it back to 29. The other rows, the booking
+commits among them, moved by less than the spread of their runs, and alternating runs gave a hold
+86.4 µs against 85.5 and a confirm 106.5 against 105.4 at the same instructions within 0.3%.
 
 ## Against other embedded stores
 
@@ -65,11 +65,11 @@ workload with few overwrites. Full results, including caveats about sled, are in
 [`benchmarks/compare/RESULTS.md`](../../benchmarks/compare/RESULTS.md).
 
 Against 2026-11-04, ferro's bulk load went from 0.71 to 0.67 s and its scan from 19 to 18 ns a key,
-for the changes above, and its range of 1,000 keys from 27 to 29 µs, as [Slower than
-before](#slower-than-before) describes. The get stayed at 0.32 µs against 0.27 µs for redb, as [The
-read path](../internals/read-path.md#one-loop-for-borrowed-nodes) explains, and [Huge
-pages](#huge-pages) takes about a tenth off both the get and the load. The other engines moved by
-less than the spread of their runs.
+for the changes above, and its range of 1,000 keys from 27 to 29 µs, which the fix described under
+[Slower than before](#slower-than-before) took back to 27. The get stayed at 0.32 µs against 0.27 µs
+for redb, as [The read path](../internals/read-path.md#one-loop-for-borrowed-nodes) explains, and
+[Huge pages](#huge-pages) takes about a tenth off both the get and the load. The other engines moved
+by less than the spread of their runs.
 
 ## Writers and branches
 
@@ -204,6 +204,18 @@ same tree built from a copy in another directory ran 160.1 and 28.7 ns, so what 
 of the range loop differs between builds of one tree by about that much. Index lookups beside a
 writer with the 16 MiB cache vary between builds too, as [Reads from many
 threads](#reads-from-many-threads) describes.
+
+The range read is fixed. A borrow under a hazard read its node's flags behind the value, in a line
+of their own, and the exchange that writes the slot waited for that line before the node's headers
+were asked for, so each of the 130 or so nodes a range borrows cost two misses in a row where the
+count had cost one. The weak count and the flags now sit at the front of each allocation, beside
+the headers, as [The flags' line](../internals/read-scaling.md#the-flags-line) describes. In 15
+alternating runs of the harness's ferro child a range took 27.4 µs against 28.2 before the fix and
+27.3 for db07c34's parent, and in nine of `ferro-bench` 28.8 ns a key against 29.7. A get, a scan,
+a bulk load and its commit and drop moved by less than the spread of their runs, a table's row get
+took 157 ns against 155, and in `scaling` at 1, 8 and 32 threads no cell ran more than 0.4% slower
+while gets, index lookups and `for_each` scans with the 1 GiB cache ran 3 to 6% faster. The figures
+under [Reads from many threads](#reads-from-many-threads) were measured before the fix.
 
 On 2026-11-04 four figures came out slower than before, beyond the spread of the runs, and builds of
 older trees run alternately with the tree of that day confirmed each: a filtered scan of table rows,
