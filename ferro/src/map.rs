@@ -77,7 +77,7 @@
 
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::fmt;
@@ -1233,33 +1233,29 @@ fn reach<'a, 'g, K: Data, V: Data, S: Data>(
 }
 
 #[inline(always)]
-fn owned_by<K, V, S>(link: &Link<K, V, S>) -> Option<&Node<K, V, S>> {
-    match link {
-        Link::Mem(node, _) => Some(node),
-        Link::Stored { memo, .. } => match memo.get()? {
-            Memo::Pinned(node) => Some(node),
-            Memo::Weak(..) => None,
-        },
-        Link::Empty => None,
-    }
-}
-
-#[inline(always)]
-fn held<'g, K: Data, V: Data, S: Data>(
+fn descend<'g, K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
     link: &'g Link<K, V, S>,
-    guard: Option<&'g Guard>,
-) -> Option<&'g Node<K, V, S>> {
-    match link {
-        Link::Mem(node, _) => Some(node),
-        Link::Stored { memo, .. } => match memo.get()? {
-            Memo::Pinned(node) => Some(node),
-            Memo::Weak(weak, hint) => {
+    depth: usize,
+    pinned: &'g OnceCell<Option<Guard>>,
+) -> Result<Option<At<'g, K, V, S>>> {
+    let guard = match link {
+        Link::Mem(node, _) => return Ok(Some(At::Ref(node))),
+        Link::Stored { memo, .. } => match memo.get() {
+            Some(Memo::Pinned(node)) => return Ok(Some(At::Ref(node))),
+            Some(Memo::Weak(weak, hint)) => {
                 hint.prefetch(weak);
-                weak.lend(guard?)
+                let guard = pinned.get_or_init(epoch::pin).as_ref();
+                if let Some(node) = guard.and_then(|guard| weak.lend(guard)) {
+                    return Ok(Some(At::Ref(node)));
+                }
+                guard
             }
+            None => pinned.get_or_init(epoch::pin).as_ref(),
         },
-        Link::Empty => None,
-    }
+        Link::Empty => return Ok(None),
+    };
+    Ok(At::of(reach(store, link, depth, guard)?))
 }
 
 enum At<'g, K, V, S> {
@@ -2987,28 +2983,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     fn walk<R>(&self, mut visit: impl FnMut(&Node<K, V, S>) -> Visit<R>) -> Result<Option<R>> {
         let store = self.store();
+        let pinned = OnceCell::new();
         let mut depth = 0;
-        let mut link = &self.root;
-        while let Some(node) = owned_by(link) {
-            depth += 1;
-            match visit(node) {
-                Visit::Done(result) => return Ok(Some(result)),
-                Visit::Descend(position) => link = node.child(position),
-            }
-        }
-        if let Link::Empty = link {
-            return Ok(None);
-        }
-        let guard = epoch::pin();
-        let guard = guard.as_ref();
-        while let Some(node) = held(link, guard) {
-            depth += 1;
-            match visit(node) {
-                Visit::Done(result) => return Ok(Some(result)),
-                Visit::Descend(position) => link = node.child(position),
-            }
-        }
-        let Some(mut at) = At::of(reach(store, link, depth, guard)?) else {
+        let Some(mut at) = descend(store, &self.root, depth, &pinned)? else {
             return Ok(None);
         };
         loop {
@@ -3018,8 +2995,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 Visit::Descend(position) => position,
             };
             let next = match &at {
-                At::Ref(node) => At::of(reach(store, node.child(position), depth, guard)?),
-                At::Shared(node) => At::owned(reach(store, node.child(position), depth, guard)?),
+                At::Ref(node) => descend(store, node.child(position), depth, &pinned)?,
+                At::Shared(node) => {
+                    let guard = pinned.get_or_init(epoch::pin).as_ref();
+                    At::owned(reach(store, node.child(position), depth, guard)?)
+                }
             };
             match next {
                 Some(next) => at = next,
