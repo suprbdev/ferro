@@ -123,6 +123,11 @@ Tests are described next to what they test:
 - The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
   [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).
+- A commit that adds a level and copies a held value: [What is sent](sync.md#what-is-sent).
+- A header whose hints reach one held object many ways: [Memory for each
+  object](sync.md#memory-for-each-object).
+- A damaged raw length, links pointed into a value, and damaged records at every thread count: [The
+  copy on several threads](reclamation.md#the-copy-on-several-threads).
 - Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
 - What runs on Windows: [Tests](windows.md#tests).
 - Crash safety in general: [Durability and crash safety](../guide/durability.md#what-was-tested).

@@ -82,6 +82,18 @@ that the previous one did not, 48, where the skip sent 49.
 Once the old side has nothing left to expand, the rest of the new tree is walked depth first, so a
 clone holds a path through it rather than its widest level.
 
+The objects sent are those the build before #62 sent, in every commit of 28 runs that synced 20 or
+30 commits from one file to another under both builds: seven workloads, values drawn from a shared
+pool, nested maps copied and changed, and values copied between keys, with four seeds each. The
+bytes are not always the same. The old side expands a level in hash order, where it used to follow
+the links in order, so an object two held nodes link is recorded under the one first in hash order,
+and the hint that names it takes that path. Bundles were the same in 17 of the 28 runs, up to 0.1%
+smaller in the eight that drew values from a pool, and at most 10 bytes apart in the other three.
+Following the links in order again made all but one the same, and cost a tenth more time to plan
+200,000 scattered edits. Where nothing is shared the bytes are the same: `notes-scale` still sends
+106,337 bytes in 139 objects after its edits, and the clone of a million objects and the bundle of
+200,000 scattered edits into it come out byte for byte as they did before the expansion above.
+
 A sent merge commit links the commit it merged, and the receiver needs that commit to find later
 merge bases. If the receiver named it in its have, its mark goes into the bundle's list of commits
 the receiver holds, and the link resolves to it there. Otherwise the merged commit is sent, with its
