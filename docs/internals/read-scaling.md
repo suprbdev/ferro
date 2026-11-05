@@ -350,6 +350,12 @@ both none of 3,000, nor of 600 under AddressSanitizer, while under ThreadSanitiz
 all in the race the same section describes, the tests' own doing; once that test was fixed none of
 900 failed under ThreadSanitizer, 600 under AddressSanitizer or 1,500 in a release build. The unit
 test that runs a flush between a free's scan and its pass failed every run before the first fix.
+Once the counts and flags moved to the front of the allocation, as described under [The flags'
+line](#the-flags-line), which changed no step of the protocol, the unit tests passed under Miri
+with stacked and with tree borrows over 32 schedules each, the library's tests, `epoch_stress` with
+four seeds and `tests/reads.rs` passed under each sanitizer, none of 1,200 runs of `make
+test-stress` failed, nor of 600 of the library's tests built with each sanitizer, and `make ci`
+passed.
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
