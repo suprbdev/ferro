@@ -15,6 +15,9 @@ This project uses rustdoc conventions for documentation comments. They are wante
 - Say what an item does and promises, not how it came to be: no issue numbers, measurements, or
   history in doc comments. Link to the guides in `docs/` for longer explanations.
 
-Inline `//` and `/* */` comments are not wanted: no comments that narrate a line or block of code,
-explain why it was added, or restate what it does. That belongs in the commit message or in
+Every `unsafe` block, and every `unsafe impl`, carries a `// SAFETY:` comment directly above it,
+saying which invariants make it sound, as clippy's `undocumented_unsafe_blocks` lint expects.
+
+Other inline `//` and `/* */` comments are not wanted: no comments that narrate a line or block of
+code, explain why it was added, or restate what it does. That belongs in the commit message or in
 `docs/internals/`. Makefile `##` target docs are fine.
