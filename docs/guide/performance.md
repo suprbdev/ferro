@@ -73,28 +73,33 @@ apart from 8 Buffered branches at 139,600 a second, 7% fewer.
 core at a time, so 8 fill one CCD, 16 both, and 32 add the second thread of every core. A lookup
 reads about 20 rows by a range of an index, and a page 200 rows in key order, through a plain index
 and through a twin whose index covers the field read. Operations a second, medians of five rounds
-of a pass with no writer, measured again after the fixes below on 2026-11-04 with nothing else
-running:
+of a pass with no writer, measured again on 2026-11-05 once iterators, cursors and the row finder
+borrowed nodes, roots and stores under hazards instead of counting them, as [Iterators under
+hazards](../internals/read-scaling.md#iterators-under-hazards) describes, with other work under one
+core busy in every cell:
 
 | Workload | Cache | 1 thread | 8 threads | 16 threads | 32 threads |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `get` | 1 GiB | 3.0M | 23.2M | 42.6M | 66.8M |
-| `get` | 16 MiB | 342k | 1.8M | 2.1M | 2.9M |
-| `for_each` scan, keys | 1 GiB | 88M | 488M | 961M | 1,478M |
-| `for_each` scan, keys | 16 MiB | 7.8M | 39M | 42M | 72M |
-| 100-key range | 1 GiB | 422k | 3.1M | 5.1M | 7.8M |
-| 100-key range | 16 MiB | 54k | 264k | 277k | 382k |
-| Index lookup | 1 GiB | 229k | 1.6M | 1.9M | 2.8M |
-| Index lookup, covered | 1 GiB | 2.4M | 11.6M | 9.7M | 15.4M |
-| Index lookup | 16 MiB | 14k | 68k | 77k | 107k |
-| Index lookup, covered | 16 MiB | 2.1M | 9.9M | 8.9M | 13.9M |
-| Page of 200 rows | 1 GiB | 175k | 805k | 722k | 987k |
-| Page of 200 rows, covered | 1 GiB | 882k | 3.4M | 2.8M | 3.4M |
+| `get` | 1 GiB | 3.0M | 23.1M | 42.8M | 65.9M |
+| `get` | 16 MiB | 337k | 1.8M | 2.0M | 2.9M |
+| `for_each` scan, keys | 1 GiB | 88M | 487M | 964M | 1,487M |
+| `for_each` scan, keys | 16 MiB | 7.9M | 39M | 42M | 73M |
+| 100-key range | 1 GiB | 422k | 3.1M | 5.8M | 8.6M |
+| 100-key range | 16 MiB | 53k | 262k | 270k | 377k |
+| Index lookup | 1 GiB | 232k | 1.7M | 2.9M | 4.4M |
+| Index lookup, covered | 1 GiB | 2.5M | 15.3M | 27.6M | 37.7M |
+| Index lookup | 16 MiB | 14k | 67k | 76k | 108k |
+| Index lookup, covered | 16 MiB | 2.2M | 14.0M | 26.0M | 35.9M |
+| Page of 200 rows | 1 GiB | 183k | 914k | 1.1M | 1.5M |
+| Page of 200 rows, covered | 1 GiB | 855k | 4.9M | 8.4M | 9.3M |
 
-In a pass of its own beside one thread committing single-key updates as fast as it can, gets at 32
-threads ran 60M a second with the 1 GiB cache and 2.6M with the 16 MiB one, and index lookups 2.5M
-and 93,000. Run in one pass with the writer's cells, as the tool does by default, the cells without
-a writer read up to 12% slower on one thread.
+Against the figures this page gave on 2026-11-04, covered lookups at 32 threads read 37.7M a second
+against 15.4M, plain lookups 4.4M against 2.8M, covered pages 9.3M against 3.4M and pages of rows
+1.5M against 987,000. Covered pages at 16 and 32 threads move between about 5M and 10M a second from
+one round to the next. In a pass of its own beside one thread committing single-key updates as fast
+as it can, gets at 32 threads ran 61M a second with the 1 GiB cache and 2.6M with the 16 MiB one,
+and index lookups 2.9M and 89,000. Run in one pass with the writer's cells, as the tool does by
+default, the cells without a writer read up to 12% slower on one thread.
 
 ## Many threads and the allocator
 

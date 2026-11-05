@@ -100,13 +100,13 @@ The tuple follows the list, so reordering two covered fields of one type swaps t
 destructures the tuple, and the compiler cannot tell.
 
 A covered field is copied into every entry, and changing it rewrites the entry where a plain index
-is left alone. On 200,000 rows, measured on 2026-11-04, a page of 200 rows read through a covered
-index went from 175,000 to 882,000 a second on one thread and from 987,000 to 3.4 million on 32,
-and a lookup of 20 rows by a range from 229,000 to 2.4 million on one thread. Covering one integer
-grew the indexes 17%, and a commit that changed it wrote 36% more and took 28% more CPU. A commit
-that changed nothing covered cost the same. Cover what a hot page shows and what seldom changes
-after the row is written, and leave wide strings and fields rewritten on most commits out. A plain
-`#[index]` is unchanged and costs nothing more. [Covering
+is left alone. On 200,000 rows, measured on 2026-11-05, a page of 200 rows read through a covered
+index went from 183,000 to 855,000 a second on one thread and from 1.5 million to 9.3 million on
+32, and a lookup of 20 rows by a range from 232,000 to 2.5 million on one thread. Covering one
+integer grew the indexes 17%, and a commit that changed it wrote 36% more and took 28% more CPU. A
+commit that changed nothing covered cost the same. Cover what a hot page shows and what seldom
+changes after the row is written, and leave wide strings and fields rewritten on most commits out.
+A plain `#[index]` is unchanged and costs nothing more. [Covering
 indexes](../internals/schema-and-unique-indexes.md#covering-indexes) has the measurements.
 
 Changing a cover list rebuilds that index the next time the table is read, as [Changing your
