@@ -74,6 +74,8 @@ pub fn scratch() -> &'static Path {
     SCRATCH.get_or_init(|| {
         let dir = scratch_base().join(format!("ferro-fuzz-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
+        // SAFETY: `remove_scratch` is an `extern "C" fn()` that takes no arguments and only removes
+        // the scratch directory, so libc may call it at exit after `main` returns.
         unsafe {
             libc::atexit(remove_scratch);
         }

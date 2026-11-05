@@ -8,6 +8,8 @@
 //! - [`Record`](derive@Record) makes a struct a row of `ferro::Table`, generating the secondary
 //!   indexes its attributes declare and the lookups on them.
 
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};

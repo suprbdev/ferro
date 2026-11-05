@@ -73,6 +73,8 @@
 //! [The documentation index](https://github.com/archlemon/ferro/blob/main/docs/README.md) lists the
 //! internals, which describe how each part works and what it costs.
 
+#![warn(missing_docs)]
+
 extern crate self as ferro;
 
 pub mod admin;

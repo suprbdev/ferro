@@ -1,7 +1,8 @@
 # Development
 
 The Makefile wraps the common commands, and `make help` lists every target. `make ci` checks
-formatting, runs clippy for Linux and Windows and on the fuzz crate, and then every test,
+formatting, runs clippy for Linux and Windows and on the fuzz crate, builds the API docs, and then
+every test,
 `make test-one T=sync` runs the library tests whose names match, and `make bench-tables` times
 booking-style commits. The examples and the `ferro` tool take their paths from variables:
 
@@ -21,11 +22,11 @@ take the machine down. Set `CAP=` to run without the cap.
 | `make test-lib` | The library's tests only. |
 | `make test-one T=filter` | Library tests whose names match `T`. |
 | `make test-pkg P=booking T=filter` | One package's tests. |
-| `make lint`, `make lint-windows` | clippy with warnings as errors, for Linux and for `x86_64-pc-windows-gnu`. |
-| `make ci` | `fmt-check`, `lint`, `lint-windows`, `fuzz-lint` and `test`, the local equivalent of CI. |
+| `make lint`, `make lint-windows` | clippy with warnings as errors, for Linux and for `x86_64-pc-windows-gnu`, with `undocumented_unsafe_blocks` and `missing_safety_doc` on. |
+| `make ci` | `fmt-check`, `lint`, `lint-windows`, `fuzz-lint`, `doc-check` and `test`, the local equivalent of CI. |
 | `make act` | The GitHub workflow's Linux job, locally with `act`. |
 | `make fmt`, `make fmt-check` | Format the workspace with rustfmt, or fail if any file is not formatted. |
-| `make doc` | The library's API docs. |
+| `make doc`, `make doc-check` | The library's API docs, or a build of them that fails on any rustdoc warning, such as a broken link. |
 | `make bench` | The main benchmark, appending to `target/bench/results.jsonl`. |
 | `make bench-reads`, `bench-scaling`, `bench-heap`, `bench-tables`, `bench-bulk`, `bench-merge`, `bench-covered`, `bench-combine` | The `ferro-bench` tools of those names. |
 | `make bench-compare` | ferro against SQLite, redb and fjall. |

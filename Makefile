@@ -12,9 +12,10 @@ SECS ?= 10
 KEEP ?=
 FUZZ ?= open
 FUZZ_TIME ?= 600
+LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt fmt-check doc ci act \
+.PHONY: help build build-debug check test test-lib test-one test-pkg lint lint-windows fmt fmt-check doc doc-check ci act \
 	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-combine bench-compare \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds fuzz-lint clean clean-tmp
@@ -46,10 +47,10 @@ test-pkg: ## Run one package's tests, e.g. make test-pkg P=booking
 	$(RUN) test --release -p $(P) -- $(T)
 
 lint: ## Run clippy on every target with warnings as errors
-	$(RUN) clippy --workspace --all-targets --release -- -D warnings
+	$(RUN) clippy --workspace --all-targets --release -- -D warnings $(LINTS)
 
 lint-windows: ## Run clippy for the Windows target
-	$(RUN) clippy --target $(WIN_TARGET) --workspace --all-targets --release -- -D warnings
+	$(RUN) clippy --target $(WIN_TARGET) --workspace --all-targets --release -- -D warnings $(LINTS)
 
 fmt: ## Format the workspace with rustfmt
 	$(CARGO) fmt --all
@@ -60,7 +61,10 @@ fmt-check: ## Fail if any file is not formatted with rustfmt
 doc: ## Build the library's API docs and open them
 	$(CARGO) doc --no-deps -p ferro --open
 
-ci: fmt-check lint lint-windows fuzz-lint test ## Run the local equivalent of CI
+doc-check: ## Build the API docs with warnings as errors, so broken links fail
+	RUSTDOCFLAGS="-D warnings" $(RUN) doc --no-deps -p ferro -p ferro-derive
+
+ci: fmt-check lint lint-windows fuzz-lint doc-check test ## Run the local equivalent of CI
 
 act: ## Run the GitHub workflow's Linux job locally with act
 	act push -j test
@@ -151,7 +155,7 @@ fuzz-seeds: ## Build a starting corpus for the fuzz targets
 
 fuzz-lint: ## Check the fuzz crate's formatting and run clippy on it with warnings as errors
 	cd fuzz && $(CARGO) fmt -- --check
-	cd fuzz && $(RUN) clippy --all-targets --release -- -D warnings
+	cd fuzz && $(RUN) clippy --all-targets --release -- -D warnings $(LINTS)
 
 fuzz: ## Fuzz target FUZZ for FUZZ_TIME seconds with nightly
 	cd fuzz && $(CAP) cargo +nightly fuzz run $(FUZZ) corpus/seeds/$(FUZZ) -- -max_len=70000 -timeout=10 -malloc_limit_mb=1024 -max_total_time=$(FUZZ_TIME)

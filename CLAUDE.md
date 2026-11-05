@@ -21,3 +21,7 @@ saying which invariants make it sound, as clippy's `undocumented_unsafe_blocks` 
 Other inline `//` and `/* */` comments are not wanted: no comments that narrate a line or block of
 code, explain why it was added, or restate what it does. That belongs in the commit message or in
 `docs/internals/`. Makefile `##` target docs are fine.
+
+`make ci` enforces this: `missing_docs` warns on the `ferro` and `ferro-derive` libraries, clippy
+runs with `undocumented_unsafe_blocks` and `missing_safety_doc` across the workspace and the fuzz
+crate, and `make doc-check` fails on any rustdoc warning, so all three fail the build.
