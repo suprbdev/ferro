@@ -948,6 +948,75 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for Entries<I, 
     }
 }
 
+struct Holders<I, K> {
+    iter: Iter<I, K>,
+}
+
+impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Holders<I, K> {
+    #[inline]
+    fn forward(&mut self) -> Option<K> {
+        self.iter.next_with(|_, key| key.clone())
+    }
+
+    #[inline]
+    fn backward(&mut self) -> Option<K> {
+        self.iter.next_back_with(|_, key| key.clone())
+    }
+
+    fn left(&self) -> usize {
+        self.iter.len()
+    }
+}
+
+impl<I: Data + Ord, K: Data + Ord> EntryCursor<K, ()> for Holders<I, K> {
+    #[inline]
+    fn forward_covered(&mut self) -> Option<(K, ())> {
+        self.forward().map(|key| (key, ()))
+    }
+
+    #[inline]
+    fn backward_covered(&mut self) -> Option<(K, ())> {
+        self.backward().map(|key| (key, ()))
+    }
+}
+
+struct CoveredHolders<I, K, S, C> {
+    iter: Iter<I, (K, S)>,
+    project: fn(S) -> C,
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> KeyCursor<K> for CoveredHolders<I, K, S, C> {
+    #[inline]
+    fn forward(&mut self) -> Option<K> {
+        self.iter.next_with(|_, held| held.0.clone())
+    }
+
+    #[inline]
+    fn backward(&mut self) -> Option<K> {
+        self.iter.next_back_with(|_, held| held.0.clone())
+    }
+
+    fn left(&self) -> usize {
+        self.iter.len()
+    }
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for CoveredHolders<I, K, S, C> {
+    #[inline]
+    fn forward_covered(&mut self) -> Option<(K, C)> {
+        let project = self.project;
+        self.iter
+            .next_with(|_, held| (held.0.clone(), project(held.1.clone())))
+    }
+
+    #[inline]
+    fn backward_covered(&mut self) -> Option<(K, C)> {
+        let project = self.project;
+        self.iter
+            .next_back_with(|_, held| (held.0.clone(), project(held.1.clone())))
+    }
+}
+
 struct Uncovered<K, C>(Box<dyn EntryCursor<K, C>>);
 
 impl<K, C> KeyCursor<K> for Uncovered<K, C> {
@@ -1037,6 +1106,14 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
                 iter: entries,
                 project,
             }),
+        }
+    }
+
+    #[inline(always)]
+    fn held(rows: &Map<T::Key, T>, entries: impl EntryCursor<T::Key, C> + 'static) -> Self {
+        IndexIter {
+            rows: rows.finder(),
+            entries: Box::new(entries),
         }
     }
 
@@ -2207,6 +2284,43 @@ where
     Q: Ord + ?Sized,
 {
     rows.get(&*index.get(value)?)
+}
+
+/// The rows of the unique index entries that `entries` walks, in index order, from either end.
+/// Backs a unique index's generated `by_x_range` and, for a composite, `by_a_b_prefix`.
+///
+/// Each entry of a unique index without a cover list holds the key of the row that holds its
+/// value, which the lookup reads in place to find the row.
+#[inline(always)]
+pub fn unique_rows<I, T>(rows: &Map<T::Key, T>, entries: Iter<I, T::Key>) -> IndexIter<T>
+where
+    I: Data + Ord,
+    T: Record,
+{
+    IndexIter::held(rows, Holders { iter: entries })
+}
+
+/// [`unique_rows`] for a unique index with a cover list, whose entries hold the key beside the
+/// stored fields that `project` turns into the covered ones.
+#[inline(always)]
+pub fn unique_rows_covered<I, T, S, C>(
+    rows: &Map<T::Key, T>,
+    entries: Iter<I, (T::Key, S)>,
+    project: fn(S) -> C,
+) -> IndexIter<T, C>
+where
+    I: Data + Ord,
+    T: Record,
+    S: Data,
+    C: 'static,
+{
+    IndexIter::held(
+        rows,
+        CoveredHolders {
+            iter: entries,
+            project,
+        },
+    )
 }
 
 /// The rows of the index entries whose value lies in the span `below` and `within` mark out, as
