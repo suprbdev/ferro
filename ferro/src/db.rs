@@ -1,3 +1,14 @@
+//! Opening a database, reading it, writing it and branching it.
+//!
+//! A [`Db`] is a handle on one branch of an open file, and [`Options`] opens one with settings
+//! other than the defaults. [`Db::read`] returns a [`Snapshot`] of the branch's newest version. The
+//! commit methods run a closure over a working copy of it and publish what changed as the next
+//! version, which a [`Commit`] describes; the `_with` and `_stamped` forms return a [`Committed`]
+//! and hand the closure a [`Stamp`]. The same handle reads old versions, forks, merges, lists and
+//! drops branches, and makes [`Watcher`]s. Sync between files is in [`sync`](crate::sync), the
+//! lazy walks over history in [`history`](crate::history), and the commit log in
+//! [`log`](crate::log).
+
 use std::cell::OnceCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -39,25 +50,50 @@ const QUIET_BYTES: u64 = 256 << 10;
 const MAX_GROUP: usize = 256;
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
+/// One version of a branch: its number, time and message, and the value it holds.
+///
+/// [`Snapshot::commit`], [`Db::log`] and [`Db::history_of`] hand these out. Equality compares the
+/// root by hash, so the same commit read from two files that synced it compares equal.
 #[derive(Clone, Debug)]
 pub struct Commit {
+    /// The version on its branch, counting from 1.
+    ///
+    /// Version 0, the value before the first commit, has no commit of its own and reads as one with
+    /// this field 0, an empty message and no root.
     pub version: u64,
+    /// When the commit was made, in milliseconds since the Unix epoch.
+    ///
+    /// Times never go back along a branch: a commit's time is the later of the clock and a floor
+    /// set by the commit before it, as [History](docs/guide/history.md#reading-old-versions)
+    /// describes.
     pub time_ms: u64,
+    /// The message given to the commit.
+    ///
+    /// A commit that [`Options::coalesce`] made of several closures holds their messages joined by
+    /// newlines, and [`Commit::messages`] separates them again.
     pub message: String,
+    /// The stored root value, or `None` for version 0 and for the virtual base of a merge after a
+    /// criss-cross.
     pub root: Option<Ptr>,
+    /// The version this commit restored, if [`Db::restore`] made it.
     pub restored: Option<u64>,
     pub(crate) parts: Parts,
     pub(crate) stamped: bool,
 }
 
+/// How a commit's message divides into the messages of the closures that made it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Parts {
+    /// The log entry does not record it, so the message splits at newlines.
     Lines,
+    /// The message is one closure's, whole.
     Whole,
+    /// The message joins messages of these byte lengths with newlines.
     Joined(Arc<[usize]>),
 }
 
 impl Parts {
+    /// Joins `messages` with newlines, recording their lengths when there are two or more.
     pub(crate) fn join(messages: Vec<String>) -> (String, Parts) {
         if messages.len() < 2 {
             return (
@@ -69,6 +105,12 @@ impl Parts {
         (messages.join("\n"), Parts::Joined(lengths))
     }
 
+    /// Checks that joined lengths cut `message` at newlines, on character boundaries, into at least
+    /// two parts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] if they do not, as for a damaged log entry.
     pub(crate) fn check(&self, message: &str) -> Result<()> {
         let Parts::Joined(lengths) = self else {
             return Ok(());
@@ -107,6 +149,12 @@ impl PartialEq for Commit {
 }
 
 impl Commit {
+    /// The messages of the closures this commit holds, in the order they ran.
+    ///
+    /// A commit of one closure yields its message whole, or nothing if it is empty. A commit that
+    /// [`Options::coalesce`] made of several yields each closure's non-empty message, whole even if
+    /// it holds newlines of its own. A commit whose log entry does not record how its message was
+    /// joined yields the message's non-empty lines.
     pub fn messages(&self) -> impl Iterator<Item = &str> {
         let messages: Vec<&str> = match &self.parts {
             Parts::Lines => self
@@ -148,14 +196,32 @@ impl Commit {
     }
 }
 
+/// What a write's closure returned, and the commit that holds its change.
+///
+/// [`Db::commit_with`], [`Db::commit_stamped`], their `try_` and `_async` forms, the merges and
+/// [`Db::restore`] return one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Committed<R> {
+    /// The value the closure returned.
     pub value: R,
+    /// The version of the commit that holds the change, or of the head the closure ran on if it
+    /// changed nothing.
     pub version: u64,
+    /// The time of that commit, in milliseconds since the Unix epoch.
     pub time_ms: u64,
+    /// Whether the write made a new version.
+    ///
+    /// With [`Options::coalesce`] it says whether the closure's group made one, so a closure that
+    /// changed nothing reads `true` when another closure in its group changed something.
     pub changed: bool,
 }
 
+/// The version and time of the commit a closure is writing.
+///
+/// [`Db::commit_stamped`] and its `try_` and `_async` forms hand one to the closure, so that a row
+/// can record the commit that writes it. A stamp describes the commit that would hold the
+/// closure's changes: if the closure returns `Err`, panics or changes nothing, no commit holds
+/// them, and the stamp claims nothing.
 #[derive(Debug)]
 pub struct Stamp<'a> {
     version: u64,
@@ -165,10 +231,26 @@ pub struct Stamp<'a> {
 }
 
 impl Stamp<'_> {
+    /// The version the commit will have, one past the head the closure runs on.
+    ///
+    /// [`Db::at`] of it later shows the state the closure wrote. With [`Options::coalesce`] it is
+    /// the group's version, the same for every closure in the group, so that state includes the
+    /// closures that ran after this one.
     pub fn version(&self) -> u64 {
         self.version
     }
 
+    /// The commit's time, in milliseconds since the Unix epoch.
+    ///
+    /// The first call reads the clock and fixes the time, no earlier than the commit before it
+    /// allows, and later calls return the same. The commit then keeps that millisecond to itself:
+    /// the next commit on the branch gets a later time, so [`Db::as_of`] of this time returns
+    /// exactly this commit for as long as it is retained. A branch that reads the time in more
+    /// than 1,000 commits a second runs ahead of the clock until the rate drops, so read it only
+    /// when it is needed.
+    ///
+    /// With [`Options::coalesce`] the first closure of a group to call it fixes the group's time,
+    /// and if that closure fails, the next one to call it fixes it again.
     pub fn time_ms(&self) -> u64 {
         *self
             .time
@@ -198,11 +280,17 @@ impl Data for Commit {
     }
 }
 
+/// A branch's entry in the branch table.
 #[derive(Clone)]
 pub(crate) struct Head {
+    /// The version of the branch's newest commit.
     pub(crate) version: u64,
+    /// The root value of that commit, or `None` before the first.
     pub(crate) root: Option<Ptr>,
+    /// The branch's retained commit log.
     pub(crate) log: Chain,
+    /// For each branch merged into this one by name, the version of it last merged and this
+    /// branch's version when it was.
     pub(crate) merged: Map<String, (u64, u64)>,
 }
 
@@ -239,6 +327,7 @@ impl Data for Head {
     }
 }
 
+/// The branch table: every branch's [`Head`] by name.
 pub(crate) type Refs = Map<String, Head>;
 
 #[derive(Clone)]
@@ -259,6 +348,8 @@ impl Drop for Byte {
     }
 }
 
+/// The reclamation cycle locks of this process and, with [`Options::shared`], of the file, held
+/// so that no cycle starts until it is dropped.
 pub(crate) struct Cycles<'a> {
     _across: Option<Held>,
     _local: MutexGuard<'a, ()>,
@@ -305,6 +396,12 @@ enum Next {
     Head(String, Head),
 }
 
+/// An immutable view of one version of a branch.
+///
+/// It derefs to `T`, never changes, and stays valid for as long as it is held, whatever is
+/// committed, pruned or reclaimed meanwhile. Cloning one is cheap and shares the value. A snapshot
+/// keeps the file it was read from open, though not the writer lock, so the space of a file that a
+/// reclamation cycle replaced comes back only once the last snapshot of it is dropped.
 pub struct Snapshot<T> {
     value: Arc<T>,
     commit: Arc<Commit>,
@@ -337,10 +434,12 @@ impl<T> fmt::Debug for Snapshot<T> {
 }
 
 impl<T> Snapshot<T> {
+    /// The version this snapshot shows, 0 for the value before the first commit.
     pub fn version(&self) -> u64 {
         self.commit.version
     }
 
+    /// The commit this snapshot shows.
     pub fn commit(&self) -> &Commit {
         &self.commit
     }
@@ -1049,6 +1148,53 @@ impl<T, F, R, E> Drop for Writing<'_, T, F, R, E> {
     }
 }
 
+/// A handle on one branch of an open database file.
+///
+/// `T` is the value the database holds. [`Db::open`] opens or creates a file with the default
+/// [`Options`] and returns a handle on its `main` branch, and [`Db::branch`] and [`Db::fork`]
+/// return handles on other branches of the same file. Cloning a handle is cheap, and the handles
+/// that come from one open share its cache, its writer lock per branch and its sync, so clones are
+/// how threads share a database.
+///
+/// Readers never wait. Writers run one closure at a time on each branch, under that branch's
+/// writer lock, while closures on different branches run at the same time. A write returns once
+/// its commit is published, which under the default [`Durability::Fsync`] means it is on disk.
+///
+/// Other writers stay locked out until the last handle on the file is dropped. Dropping it stops
+/// the background reclamation thread, interrupting a cycle in progress, and writes and syncs what
+/// dropped awaited writes left queued. Snapshots held after that keep reading the file.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Data, Db, Map};
+///
+/// #[derive(Data, Clone, Default)]
+/// struct Site {
+///     hits: Map<String, u64>,
+/// }
+///
+/// # fn main() -> ferro::Result<()> {
+/// # let dir = tempfile::tempdir()?;
+/// # let path = dir.path().join("site.ferro");
+/// let db = Db::<Site>::open(&path)?;
+/// db.commit("first hit", |site| {
+///     site.hits.insert("/".to_string(), 1);
+/// })?;
+///
+/// let before = db.read();
+/// db.update(|site| {
+///     if let Some(hits) = site.hits.get_mut("/") {
+///         *hits += 1;
+///     }
+/// })?;
+///
+/// assert_eq!(before.hits.get("/").as_deref(), Some(&1));
+/// assert_eq!(db.read().hits.get("/").as_deref(), Some(&2));
+/// assert_eq!(db.version(), 2);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Db<T> {
     shared: Arc<Shared<T>>,
     branch: Arc<Branch<T>>,
@@ -1075,9 +1221,14 @@ impl<T> Clone for Db<T> {
     }
 }
 
+/// A callback that commits, cycles and sync call at named steps, for tests that inject faults
+/// between them.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct Hook(pub Arc<dyn Fn(&'static str) + Send + Sync>);
+pub struct Hook(
+    /// The callback, given the step's name.
+    pub Arc<dyn Fn(&'static str) + Send + Sync>,
+);
 
 impl fmt::Debug for Hook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1085,9 +1236,13 @@ impl fmt::Debug for Hook {
     }
 }
 
+/// A source of commit times that replaces the system clock, for tests.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct Clock(pub Arc<dyn Fn() -> u64 + Send + Sync>);
+pub struct Clock(
+    /// Returns the time in milliseconds since the Unix epoch.
+    pub Arc<dyn Fn() -> u64 + Send + Sync>,
+);
 
 impl fmt::Debug for Clock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1099,6 +1254,35 @@ fn read_clock(clock: Option<&Clock>) -> u64 {
     clock.map_or_else(now_ms, |clock| (clock.0)())
 }
 
+/// Settings for opening a database, set by chaining.
+///
+/// [`Options::new`] starts from the defaults that [`Db::open`] uses, each method changes one
+/// setting, and [`Options::open`] or [`Options::open_with`] opens the file. [Getting
+/// started](docs/guide/getting-started.md#options) lists the defaults in a table.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use ferro::{Durability, Keep, Map, Options};
+///
+/// # fn main() -> ferro::Result<()> {
+/// # let dir = tempfile::tempdir()?;
+/// # let path = dir.path().join("jobs.ferro");
+/// let db = Options::new()
+///     .durability(Durability::Buffered)
+///     .history(Keep::Last(1000))
+///     .lock_wait(Duration::from_secs(1))
+///     .open::<Map<u64, String>>(&path)?;
+///
+/// db.update(|jobs| {
+///     jobs.insert(1, "send the invoice".to_string());
+/// })?;
+/// assert_eq!(db.read().len(), 1);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     store: StoreOptions,
@@ -1111,82 +1295,190 @@ pub struct Options {
 }
 
 impl Options {
+    /// The defaults: an fsync for every commit, a 1 GiB cache, all history kept, one writer
+    /// process, no coalescing, and no wait for the writer lock.
     pub fn new() -> Self {
         Options::default()
     }
 
+    /// How each commit reaches the disk.
+    ///
+    /// The default, [`Durability::Fsync`], syncs each commit before acknowledging it, with one
+    /// fsync covering every commit queued meanwhile. [`Durability::Buffered`] skips that sync, so a
+    /// power cut can lose recent commits, back to the last checkpoint at worst, but never the whole
+    /// file. See [Durability and crash safety](docs/guide/durability.md).
     pub fn durability(mut self, durability: Durability) -> Self {
         self.store.durability = durability;
         self
     }
 
+    /// An approximate bound, in bytes, on the decoded nodes and values the cache holds.
+    ///
+    /// The default is 1 GiB. [Cache weight](docs/internals/read-scaling.md#cache-weight) describes
+    /// what counts against it.
     pub fn cache_bytes(mut self, bytes: u64) -> Self {
         self.store.cache_bytes = bytes;
         self
     }
 
+    /// Under [`Durability::Buffered`], how many bytes of log a checkpoint covers.
+    ///
+    /// A checkpoint is an fsync, taken once this much log has been written since the last one and
+    /// when the database closes cleanly, so it bounds what a power cut can lose. The default is 64
+    /// MiB.
     pub fn checkpoint_bytes(mut self, bytes: u64) -> Self {
         self.store.checkpoint_bytes = bytes;
         self
     }
 
+    /// Opens the file without the writer lock, to read while another process writes.
+    ///
+    /// Every write then fails with [`Error::ReadOnly`], and [`Db::refresh`] picks up what the
+    /// writer committed since. Opening a missing file fails with [`Error::NoDatabase`] instead of
+    /// creating it. A read-only handle runs no reclamation and ignores [`Options::shared`] and
+    /// [`Options::coalesce`].
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.store.read_only = read_only;
         self
     }
 
+    /// How much history each branch retains, [`Keep::All`] by default.
+    ///
+    /// [`Keep::Last`] prunes as part of each commit, while [`Keep::Since`] and [`Keep::Within`]
+    /// take effect at each reclamation cycle. A writer that keeps less than everything also runs
+    /// cycles on a background thread, as [`Options::reclaim`] sets, to give the space back. A
+    /// pruned version is gone, whether or not a cycle has reclaimed its bytes yet. See [Retention
+    /// and reclamation](docs/guide/retention.md).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Keep, Options};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Options::new().history(Keep::Last(2)).open::<u64>(&path)?;
+    /// for count in 1..=5 {
+    ///     db.update(|value| *value = count)?;
+    /// }
+    ///
+    /// assert_eq!(db.log().len(), 2);
+    /// assert!(db.at(3).is_err());
+    /// assert_eq!(*db.at(4)?, 4);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn history(mut self, keep: Keep) -> Self {
         self.history = keep;
         self
     }
 
+    /// When background reclamation cycles run.
+    ///
+    /// A cycle runs once the file has grown by [`Reclaim::every_bytes`], or by its size after the
+    /// last cycle if that is larger. Cycles run only on a writer whose [`Options::history`] is not
+    /// [`Keep::All`], and `every_bytes: 0` turns them off.
     pub fn reclaim(mut self, reclaim: Reclaim) -> Self {
         self.reclaim = reclaim;
         self
     }
 
+    /// How many threads a reclamation cycle copies and checks on, counting the one it runs on.
+    ///
+    /// Zero, the default, means the number of cores up to 4, and 1 keeps a cycle on one thread.
     pub fn copy_threads(mut self, threads: usize) -> Self {
         self.store.copy_threads = threads;
         self
     }
 
+    /// Lets closures that queue up on one branch while a sync runs share one version.
+    ///
+    /// They still run one at a time, each on its caller's thread and each seeing what the ones
+    /// before it did, and an `Err` or a panic rolls back that closure alone. They share one write
+    /// of every tree path they touched and one commit, so [`Committed::version`] and
+    /// [`Stamp::version`] are the group's, [`Db::at`] cannot show the state between two of them,
+    /// and if the group cannot be written every closure in it gets [`Error::GroupFailed`].
+    /// [`Db::restore`] and the merges always commit alone. Off by default. See [Sharing a version
+    /// between writers](docs/guide/concurrency.md#sharing-a-version-between-writers).
     pub fn coalesce(mut self, coalesce: bool) -> Self {
         self.coalesce = coalesce;
         self
     }
 
+    /// Lets several processes write to the file, if every one of them opens it with this.
+    ///
+    /// Each commit lands on top of the newest one from any process, and a closure runs under a
+    /// lock on its branch that holds across processes, so it starts from the newest commit on its
+    /// branch. A process sees the others' commits when it next commits, attaches a branch with
+    /// [`Db::branch`] or calls [`Db::refresh`]. A writer without the option and shared writers
+    /// lock each other out with [`Error::Locked`].
+    ///
+    /// It needs open file description locks, so it works on 64-bit Linux only, on one machine and
+    /// a local file system. Elsewhere the open fails with an
+    /// [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) error. See [Several
+    /// processes](docs/guide/concurrency.md#several-processes).
     pub fn shared(mut self, shared: bool) -> Self {
         self.store.shared = shared;
         self
     }
 
+    /// How long [`Options::open`] waits for another writer to close the file before it fails with
+    /// [`Error::Locked`].
+    ///
+    /// It checks every 10 ms. Zero, the default, fails at once.
     pub fn lock_wait(mut self, wait: Duration) -> Self {
         self.lock_wait = wait;
         self
     }
 
+    /// Calls `hook` at named steps of commits, cycles and sync, for fault injection in tests.
     #[doc(hidden)]
     pub fn hook(mut self, hook: Hook) -> Self {
         self.hook = Some(hook);
         self
     }
 
+    /// Takes commit times from `clock` instead of the system clock, for tests.
     #[doc(hidden)]
     pub fn clock(mut self, clock: Clock) -> Self {
         self.clock = Some(clock);
         self
     }
 
+    /// Records the file operations of the store in `trace`, for crash tests.
     #[doc(hidden)]
     pub fn trace(mut self, trace: Trace) -> Self {
         self.store.trace = Some(trace);
         self
     }
 
+    /// Opens the database at `path` with these options, creating the file if it does not exist.
+    ///
+    /// The handle is on the `main` branch, and version 0, the value before the first commit, is
+    /// `T::default()`. A file that a crash left behind opens at its last complete commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Locked`] if another writer has the file open and does not close it within
+    ///   [`Options::lock_wait`].
+    /// - [`Error::NoDatabase`] for a read-only open of a missing file, and [`Error::NotFerro`] for
+    ///   a file that is not a ferro database.
+    /// - [`Error::Corrupt`] or [`Error::Decode`] if what open reads of the file is damaged.
+    /// - [`Error::Io`] if the file cannot be created, opened or read, or [`Options::shared`] is not
+    ///   supported here.
     pub fn open<T: Data + Default>(self, path: impl AsRef<Path>) -> Result<Db<T>> {
         self.open_with(path, T::default)
     }
 
+    /// Opens the database at `path` like [`Options::open`], with version 0 from `init`.
+    ///
+    /// Version 0 is not stored in the file, so `init` runs on every open and should give the same
+    /// value each time. It is also what a branch with no commits holds.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Options::open`].
     pub fn open_with<T: Data>(
         mut self,
         path: impl AsRef<Path>,
@@ -2744,24 +3036,53 @@ impl<T: Data> Shared<T> {
 }
 
 impl<T: Data + Default> Db<T> {
+    /// Opens the database at `path` with the default [`Options`], creating the file if it does not
+    /// exist, and returns a handle on its `main` branch.
+    ///
+    /// Version 0, the value before the first commit, is `T::default()`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Options::open`]: [`Error::Locked`] while another writer has the file open, and
+    /// [`Error::NotFerro`], [`Error::Corrupt`] or [`Error::Io`] for a file it cannot open as a
+    /// database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Options::new().open(path)
     }
 }
 
 impl<T: Data> Db<T> {
+    /// Opens the database at `path` like [`Db::open`], with version 0 from `init`, for a `T` that
+    /// is not [`Default`].
+    ///
+    /// Version 0 is not stored in the file, so `init` runs on every open and should give the same
+    /// value each time.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Options::open`].
     pub fn open_with(path: impl AsRef<Path>, init: impl FnOnce() -> T) -> Result<Self> {
         Options::new().open_with(path, init)
     }
 
+    /// The path the database was opened with, as given.
     pub fn path(&self) -> PathBuf {
         self.shared.path.clone()
     }
 
+    /// The size of the file in bytes.
     pub fn size_on_disk(&self) -> u64 {
         self.shared.store().size()
     }
 
+    /// How the file's size compares with what it holds, and how reclamation has gone.
+    ///
+    /// [`Space::live_bytes`] is an estimate from the share of bytes the last reclamation cycle
+    /// kept, or the whole file before any cycle has run.
+    ///
+    /// # Errors
+    ///
+    /// This call does not fail at present.
     pub fn space(&self) -> Result<Space> {
         let store = self.shared.store();
         let file_bytes = store.size();
@@ -2787,32 +3108,107 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Runs one reclamation cycle now, pruning every branch to `keep` first.
+    ///
+    /// The cycle copies what is retained into a new file beside this one, in passes while writers
+    /// keep running, then holds up writers for a few milliseconds to copy what they wrote
+    /// meanwhile and swap the new file in. Readers do not wait at all, and snapshots held from
+    /// before keep reading the old file. `keep` takes the place of [`Options::history`] for this
+    /// cycle, and nothing already pruned comes back. A cycle needs free disk for everything
+    /// retained. See [Retention and reclamation](docs/guide/retention.md).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReadOnly`] on a read-only handle.
+    /// - [`Error::Reentrant`] when called from inside a closure on this file.
+    /// - [`Error::Corrupt`] or [`Error::Io`] if the copy fails. The partial copy is removed and the
+    ///   database goes on in the old file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Keep, Map, Options};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("log.ferro");
+    /// let db = Options::new().open::<Map<u64, u64>>(&path)?;
+    /// for i in 0..10 {
+    ///     db.update(|root| {
+    ///         root.insert(i, i);
+    ///     })?;
+    /// }
+    ///
+    /// let report = db.compact(Keep::Last(3))?;
+    /// assert_eq!(report.commits_dropped, 7);
+    /// assert_eq!(db.log().len(), 3);
+    /// assert!(db.at(7).is_err());
+    /// assert_eq!(db.at(8)?.len(), 8);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn compact(&self, keep: Keep) -> Result<Compacted> {
         let _crossing = self.entering(Needs::Every)?;
         self.shared.compact(keep, None)
     }
 
+    /// Records `op` in the trace that [`Options::trace`] set, for crash tests.
     #[doc(hidden)]
     pub fn trace_op(&self, op: Op) {
         self.shared.store().trace(op);
     }
 
+    /// The name of the branch this handle reads and writes.
     pub fn branch_name(&self) -> &str {
         &self.branch.name
     }
 
+    /// The newest published version of this branch.
+    ///
+    /// It never blocks. With [`Options::shared`], commits from other processes appear once this
+    /// process catches up with them, as described there.
     pub fn read(&self) -> Snapshot<T> {
         self.branch.state.load().snapshot.clone()
     }
 
+    /// The version [`Db::read`] would show, 0 before the first commit.
     pub fn version(&self) -> u64 {
         self.branch.state.load().snapshot.commit.version
     }
 
+    /// A hash over this branch's whole history, or `None` before its first commit.
+    ///
+    /// It is the hash of the newest commit's log entry, which links the entry before it, and so on
+    /// back, so pruning does not change it. Published somewhere an attacker cannot edit, it is a
+    /// tamper-evidence anchor: check it later with [`Log::hash_at`] of the same version and
+    /// [`Db::verify`], and a match shows that version and everything before it are unchanged. It
+    /// is not a signature and says nothing about later commits, other branches or whether the
+    /// times were true. See [`head_hash` and tamper
+    /// evidence](docs/internals/history.md#head_hash-and-tamper-evidence).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("ledger.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// db.update(|balance| *balance = 100)?;
+    /// let (version, anchor) = (db.version(), db.head_hash());
+    ///
+    /// db.update(|balance| *balance = 80)?;
+    /// assert_eq!(db.log().hash_at(&version), anchor);
+    /// db.verify()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn head_hash(&self) -> Option<Hash> {
         self.branch.state.load().log.tip.map(|ptr| ptr.hash)
     }
 
+    /// The log of this branch's retained commits, as of its newest published version.
     pub fn log(&self) -> Log {
         let state = self.branch.state.load();
         Log {
@@ -2821,16 +3217,96 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// Runs `f` on a working copy of the branch's newest value and commits what it changed, with
+    /// an empty message.
+    ///
+    /// This is [`Db::commit`] without a message.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         self.commit("", f)
     }
 
+    /// Runs `f` on a working copy of the branch's newest value and commits what it changed as the
+    /// next version, with `message`, returning what `f` returned.
+    ///
+    /// The closure runs on the calling thread under the branch's writer lock, once every closure
+    /// before it on this branch has finished, so it sees their changes and nothing else changes the
+    /// branch while it runs. When it returns, its changes commit atomically, and the call returns
+    /// once the commit is published: under [`Durability::Fsync`], once it is on disk. A closure
+    /// that changes nothing makes no version. With [`Options::coalesce`], the closure may share
+    /// its version with others queued behind the same sync.
+    ///
+    /// # Errors
+    ///
+    /// Nothing the closure did is committed when the call fails.
+    ///
+    /// - [`Error::ReadOnly`] on a read-only handle, and [`Error::NoBranch`] if the branch was
+    ///   dropped.
+    /// - [`Error::Reentrant`] when called from inside a closure that holds a writer lock this one
+    ///   would wait on.
+    /// - [`Error::Poisoned`] after an earlier write or sync failed, and [`Error::GroupFailed`] if
+    ///   the coalesced group this closure joined could not be written.
+    /// - [`Error::Io`] if this commit's write or sync fails, and the errors of encoding the value,
+    ///   such as [`Error::TooLarge`].
+    ///
+    /// # Panics
+    ///
+    /// A panic in `f` propagates once the branch's writer lock is released, and nothing `f` did is
+    /// committed. Reads inside `f` panic on an I/O error or a damaged file, as all collection reads
+    /// do.
     pub fn commit<R>(&self, message: impl Into<String>, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         let message = message.into();
         let done = self.transact::<R, Error>(|root, _| Ok((message, f(root))))?;
         Ok(done.value)
     }
 
+    /// Runs `f` like [`Db::commit`], taking the message from what it returns, and reports the
+    /// commit as a [`Committed`].
+    ///
+    /// `f` returns the message and a value. The result holds the value and the version and time
+    /// of the commit that holds the change, or of the head `f` ran on if it changed nothing.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("orders.ferro");
+    /// let db = Db::<Map<u64, String>>::open(&path)?;
+    /// let placed = db.commit_with(|orders| {
+    ///     let id = orders.len() as u64 + 1;
+    ///     orders.insert(id, "anvil".to_string());
+    ///     (format!("order #{id}"), id)
+    /// })?;
+    ///
+    /// assert_eq!(placed.value, 1);
+    /// assert_eq!(placed.version, 1);
+    /// assert!(placed.changed);
+    /// assert_eq!(db.read().commit().message, "order #1");
+    ///
+    /// let idle = db.commit_with(|_| ("nothing", ()))?;
+    /// assert_eq!(idle.version, 1);
+    /// assert!(!idle.changed);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn commit_with<R, S: Into<String>>(
         &self,
         f: impl FnOnce(&mut T) -> (S, R),
@@ -2841,6 +3317,39 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Runs `f` like [`Db::commit_with`], also handing it the [`Stamp`] of the commit it writes.
+    ///
+    /// The stamp's version and time are those the commit will have, so a row can record the
+    /// commit that wrote it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("paid.ferro");
+    /// let db = Db::<Map<u64, (u64, u64)>>::open(&path)?;
+    /// let paid = db.commit_stamped(|paid, stamp| {
+    ///     paid.insert(7, (stamp.version(), stamp.time_ms()));
+    ///     ("pay order 7", ())
+    /// })?;
+    ///
+    /// let (version, time_ms) = *db.read().get(&7).unwrap();
+    /// assert_eq!(version, paid.version);
+    /// assert_eq!(db.as_of(time_ms)?.version(), version);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn commit_stamped<R, S: Into<String>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> (S, R),
@@ -2851,6 +3360,16 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Runs `f` like [`Db::update`], with a closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
     pub fn try_update<R, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
@@ -2858,6 +3377,16 @@ impl<T: Data> Db<T> {
         self.try_commit("", f)
     }
 
+    /// Runs `f` like [`Db::commit`], with a closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
     pub fn try_commit<R, E: From<Error>>(
         &self,
         message: impl Into<String>,
@@ -2868,6 +3397,59 @@ impl<T: Data> Db<T> {
         Ok(done.value)
     }
 
+    /// Runs `f` like [`Db::commit_with`], with a closure that can fail.
+    ///
+    /// When every error in `f` comes through `?` and the caller uses `?` on the result too, Rust
+    /// cannot tell which error type is meant, so name it on the closure, as below.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// #[derive(Debug)]
+    /// enum ShopError {
+    ///     SoldOut,
+    ///     Db(ferro::Error),
+    /// }
+    ///
+    /// impl From<ferro::Error> for ShopError {
+    ///     fn from(error: ferro::Error) -> Self {
+    ///         ShopError::Db(error)
+    ///     }
+    /// }
+    ///
+    /// # fn main() -> Result<(), ShopError> {
+    /// # let dir = tempfile::tempdir().map_err(ferro::Error::from)?;
+    /// # let path = dir.path().join("stock.ferro");
+    /// let db = Db::<Map<String, u32>>::open(&path)?;
+    /// db.update(|stock| {
+    ///     stock.insert("anvil".to_string(), 1);
+    /// })?;
+    ///
+    /// let sell = || {
+    ///     db.try_commit_with(|stock| -> Result<_, ShopError> {
+    ///         let left = stock.get_mut("anvil").ok_or(ShopError::SoldOut)?;
+    ///         *left = left.checked_sub(1).ok_or(ShopError::SoldOut)?;
+    ///         Ok(("sell an anvil", *left))
+    ///     })
+    /// };
+    ///
+    /// assert_eq!(sell()?.value, 0);
+    /// assert!(matches!(sell(), Err(ShopError::SoldOut)));
+    /// assert_eq!(db.version(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn try_commit_with<R, S: Into<String>, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
@@ -2878,6 +3460,16 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Runs `f` like [`Db::commit_stamped`], with a closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit`].
     pub fn try_commit_stamped<R, S: Into<String>, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(S, R), E>,
@@ -2888,10 +3480,61 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// [`Db::update`] as a future that resolves once the commit is published.
+    ///
+    /// This is [`Db::commit_async`] without a message.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit_async`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn update_async<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
         self.commit_async("", f).await
     }
 
+    /// [`Db::commit`] as a future that resolves once the commit is published, which under
+    /// [`Durability::Fsync`] means durable.
+    ///
+    /// No thread waits for the writer lock or the sync. The closure runs in the poll that finds
+    /// the branch's writer lock free, on the thread that polls, under the same lock as a blocking
+    /// write, so it need not be `Send` or `'static`, and the future is `Send` when the closure and
+    /// its result are. Futures waiting for the lock get it in the order they asked, though a
+    /// blocking writer can get in ahead of them. One `ferro-sync` thread per open database,
+    /// started by the first awaited write, syncs each batch and wakes the futures in it through
+    /// their [`Waker`]s, so any executor works and ferro needs no runtime.
+    ///
+    /// Dropping the future before the closure ran writes nothing. Once the closure has run, the
+    /// commit lands as if awaited, and dropping the future gives up only the answer, so whether a
+    /// dropped write landed is exactly whether its closure ran. See [Awaited
+    /// writes](docs/guide/concurrency.md#awaited-writes).
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`]. With [`Options::coalesce`], a future polled inside a closure on the
+    /// same file after its own closure ran also fails with [`Error::Reentrant`], since its commit
+    /// could be waiting for that closure to end.
+    ///
+    /// # Panics
+    ///
+    /// A panic in `f` unwinds out of the poll that ran it, and nothing `f` did is committed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// async fn hit(db: &Db<Map<String, u64>>, page: &str) -> ferro::Result<u64> {
+    ///     db.commit_async(format!("hit {page}"), |hits| {
+    ///         let count = hits.get(page).map_or(0, |count| *count) + 1;
+    ///         hits.insert(page.to_string(), count);
+    ///         count
+    ///     })
+    ///     .await
+    /// }
+    /// ```
     pub async fn commit_async<R>(
         &self,
         message: impl Into<String>,
@@ -2904,6 +3547,15 @@ impl<T: Data> Db<T> {
         Ok(done.value)
     }
 
+    /// [`Db::commit_with`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit_async`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn commit_with_async<R, S: Into<String>>(
         &self,
         f: impl FnOnce(&mut T) -> (S, R),
@@ -2915,6 +3567,16 @@ impl<T: Data> Db<T> {
         .await
     }
 
+    /// [`Db::try_update`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit_async`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn try_update_async<R, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<R, E>,
@@ -2922,6 +3584,16 @@ impl<T: Data> Db<T> {
         self.try_commit_async("", f).await
     }
 
+    /// [`Db::try_commit`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit_async`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn try_commit_async<R, E: From<Error>>(
         &self,
         message: impl Into<String>,
@@ -2934,6 +3606,16 @@ impl<T: Data> Db<T> {
         Ok(done.value)
     }
 
+    /// [`Db::try_commit_with`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit_async`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn try_commit_with_async<R, S: Into<String>, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T) -> std::result::Result<(S, R), E>,
@@ -2945,6 +3627,15 @@ impl<T: Data> Db<T> {
         .await
     }
 
+    /// [`Db::commit_stamped`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit_async`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn commit_stamped_async<R, S: Into<String>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> (S, R),
@@ -2956,6 +3647,16 @@ impl<T: Data> Db<T> {
         .await
     }
 
+    /// [`Db::try_commit_stamped`] as a future, awaited as [`Db::commit_async`] describes.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `f` discards its changes and comes back as it was. The errors of
+    /// [`Db::commit_async`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::commit_async`].
     pub async fn try_commit_stamped_async<R, S: Into<String>, E: From<Error>>(
         &self,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(S, R), E>,
@@ -3162,6 +3863,7 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// The snapshot of version 0, whether or not the branch still retains it.
     pub(crate) fn genesis(&self) -> Snapshot<T> {
         Snapshot {
             value: self.shared.genesis.clone(),
@@ -3169,6 +3871,38 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// The snapshot of `version` on this branch.
+    ///
+    /// Version 0 is the value before the first commit, which the branch keeps until it prunes
+    /// version 1.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoVersion`] if the branch does not retain `version`, because it is newer than the
+    /// head or was pruned, and read errors from loading it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Error};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// db.update(|count| *count = 10)?;
+    /// db.update(|count| *count = 20)?;
+    ///
+    /// assert_eq!(*db.at(0)?, 0);
+    /// assert_eq!(*db.at(1)?, 10);
+    /// assert!(matches!(db.at(3), Err(Error::NoVersion(3))));
+    ///
+    /// db.restore(&db.at(1)?)?;
+    /// assert_eq!(*db.read(), 10);
+    /// assert_eq!(db.read().commit().restored, Some(1));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn at(&self, version: u64) -> Result<Snapshot<T>> {
         let state = self.branch.state.load_full();
         if version == 0 {
@@ -3192,6 +3926,18 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// The snapshot of the newest commit on this branch whose time is at most `time_ms`, in
+    /// milliseconds since the Unix epoch.
+    ///
+    /// Before the first commit that is version 0. Times never go back along a branch, so this is
+    /// the state the branch was in at that time. Several commits can share a millisecond after the
+    /// clock steps back, and then this returns the last of them, but a commit whose closure read
+    /// [`Stamp::time_ms`] keeps its millisecond to itself, so `as_of` of that time returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoVersion`], holding the version below the oldest retained one, for a time before
+    /// the oldest retained commit, and read errors.
     pub fn as_of(&self, time_ms: u64) -> Result<Snapshot<T>> {
         let state = self.branch.state.load_full();
         match state.log.at_time(&state.store, time_ms)? {
@@ -3201,11 +3947,29 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// Commits the value of `snapshot` as a new version, with the message `restore v` and its
+    /// version.
+    ///
+    /// History is not rewritten: the new commit records the version it restored in
+    /// [`Commit::restored`], and every version between stays readable. The snapshot can come from
+    /// any version or branch of this database. A restore always commits alone, even with
+    /// [`Options::coalesce`], and makes no version if the value equals the head's. A snapshot held
+    /// across a reclamation cycle is written again by value, which takes time in proportion to its
+    /// size while the other writers wait.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`].
     pub fn restore(&self, snapshot: &Snapshot<T>) -> Result<Committed<()>> {
         let message = format!("restore v{}", snapshot.commit.version);
         self.restore_with(snapshot, message)
     }
 
+    /// Commits the value of `snapshot` as a new version, like [`Db::restore`], with `message`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::commit`].
     pub fn restore_with(
         &self,
         snapshot: &Snapshot<T>,
@@ -3223,6 +3987,50 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Walks this branch's retained history newest first, yielding each commit that changed what
+    /// `project` sees of the value.
+    ///
+    /// Each item is a commit and the projection at it, for every commit whose projection differs
+    /// from the one before it, a change back to an earlier value included. The oldest retained
+    /// commit counts as a change unless it is version 1 and its projection equals version 0's. The
+    /// walk is lazy: it reads nothing until asked and stops when you stop, so
+    /// [`Iterator::take`], [`Iterator::find`] and [`History::while_some`] cost the commits they
+    /// walk, not the length of the log. It walks the branch as it was when called. To list
+    /// changes oldest first, collect and reverse.
+    ///
+    /// # Panics
+    ///
+    /// The iterator panics on a read error, as collection reads do. [`History::try_next`] returns
+    /// the error instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("prices.ferro");
+    /// let db = Db::<Map<String, u32>>::open(&path)?;
+    /// db.commit("list", |prices| {
+    ///     prices.insert("anvil".to_string(), 50);
+    /// })?;
+    /// db.commit("other", |prices| {
+    ///     prices.insert("rope".to_string(), 5);
+    /// })?;
+    /// db.commit("raise", |prices| {
+    ///     prices.insert("anvil".to_string(), 60);
+    /// })?;
+    ///
+    /// let anvil: Vec<_> = db
+    ///     .history_of(|prices| prices.get("anvil").map(|price| *price))
+    ///     .while_some()
+    ///     .map(|(commit, price)| (commit.message, price))
+    ///     .collect();
+    /// assert_eq!(anvil, [("raise".to_string(), 60), ("list".to_string(), 50)]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn history_of<V, F>(&self, project: F) -> History<T, V, F>
     where
         V: PartialEq,
@@ -3231,6 +4039,16 @@ impl<T: Data> Db<T> {
         self.history_of_range(.., project)
     }
 
+    /// Walks the retained versions in `versions` like [`Db::history_of`].
+    ///
+    /// A commit in the range is yielded when its projection differs from the version before it,
+    /// which can lie just below the range. When the range starts at or below the oldest retained
+    /// commit, that commit counts as a change as in [`Db::history_of`]. The walk costs the span it
+    /// covers.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::history_of`].
     pub fn history_of_range<V, F>(
         &self,
         versions: impl RangeBounds<u64>,
@@ -3246,6 +4064,36 @@ impl<T: Data> Db<T> {
         History::new(state.log, bounds, state.store.clone(), genesis, project)
     }
 
+    /// The first version in `versions` at which `test` holds, for a test that stays true once it
+    /// turns true.
+    ///
+    /// It binary searches the retained versions in the range, in about log2 of their number of
+    /// probes, each of which loads that version's value. It returns `None` if the test fails at the
+    /// newest version in the range or the range holds no retained version. Version 0 is never
+    /// tested, and a test that already holds at the oldest retained version returns that version.
+    ///
+    /// # Errors
+    ///
+    /// Read errors from loading a probed version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// for _ in 0..100 {
+    ///     db.update(|count| *count += 3)?;
+    /// }
+    ///
+    /// assert_eq!(db.bisect(.., |count| *count >= 100)?, Some(34));
+    /// assert_eq!(db.bisect(..=20, |count| *count >= 100)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn bisect(
         &self,
         versions: impl RangeBounds<u64>,
@@ -3269,6 +4117,19 @@ impl<T: Data> Db<T> {
         Ok(Some(low))
     }
 
+    /// The commits in `versions` at which what `project` sees of the value changed, oldest first,
+    /// with the projection at each.
+    ///
+    /// It cuts the range in half until the ends of each part agree, so it costs the number of
+    /// changes rather than the span. In exchange it misses a change and its reversal that fall
+    /// between two probes, so use it only for a value that never returns to an earlier one within
+    /// the range, and [`Db::history_of_range`] otherwise. The first version of the range is
+    /// compared with the one before it, version 0 included, and counts as a change when that
+    /// version is not retained.
+    ///
+    /// # Errors
+    ///
+    /// Read errors from loading a probed version.
     pub fn bisect_changes<V: PartialEq>(
         &self,
         versions: impl RangeBounds<u64>,
@@ -3307,6 +4168,67 @@ impl<T: Data> Db<T> {
             .collect()
     }
 
+    /// Merges the branch of `other` into this one three ways, with `f` deciding the result.
+    ///
+    /// `other` is a handle on another branch of this database, from [`Db::fork`] or
+    /// [`Db::branch`]; [`Db::pull`] brings in another file's commits. `f` gets a working copy of
+    /// this branch's newest value as `ours`, the merge base and `other`'s newest snapshot as
+    /// `theirs`, and returns the commit message and a value. Merge each collection of your type
+    /// in it yourself, typically with [`Map::merge`]. The merge commits alone, under this branch's
+    /// writer lock, and its commit links `other`'s head, so a later merge finds its base from
+    /// there. A merge that keeps only our side still commits, so the link is not lost, and one
+    /// whose `other` head this branch already holds links nothing and commits only what `f`
+    /// changed.
+    ///
+    /// The base is a best common ancestor over the whole merge graph, as git finds it, so a change
+    /// is merged once however it arrived. After a criss-cross, where there are several, `f` first
+    /// merges them into a virtual base, once for each after the first, and what it returns from
+    /// those runs is dropped; that is why it is [`FnMut`]. Branches that share no commit merge
+    /// against version 0. See [Merging](docs/guide/merging.md).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NoCommonAncestor`] when the base could lie in pruned history.
+    /// - [`Error::NoBranch`] if either branch was dropped.
+    /// - The errors of [`Db::commit`].
+    ///
+    /// # Panics
+    ///
+    /// A panic in `f` propagates, and nothing is committed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("prices.ferro");
+    /// let db = Db::<Map<String, u32>>::open(&path)?;
+    /// db.commit("list", |prices| {
+    ///     prices.insert("anvil".to_string(), 50);
+    ///     prices.insert("rope".to_string(), 5);
+    /// })?;
+    ///
+    /// let sale = db.fork("sale")?;
+    /// sale.commit("cut the anvil", |prices| {
+    ///     prices.insert("anvil".to_string(), 40);
+    /// })?;
+    /// db.commit("raise the rope", |prices| {
+    ///     prices.insert("rope".to_string(), 6);
+    /// })?;
+    ///
+    /// db.merge_with(&sale, |prices, base, theirs| {
+    ///     let applied = prices.merge(base, theirs, |conflict| conflict.keep_ours());
+    ///     ("merge the sale", applied)
+    /// })?;
+    ///
+    /// let prices = db.read();
+    /// assert_eq!(prices.get("anvil").as_deref(), Some(&40));
+    /// assert_eq!(prices.get("rope").as_deref(), Some(&6));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn merge_with<R, S: Into<String>>(
         &self,
         other: &Db<T>,
@@ -3315,6 +4237,18 @@ impl<T: Data> Db<T> {
         self.try_merge_with::<R, S, Error>(other, |ours, base, theirs| Ok(f(ours, base, theirs)))
     }
 
+    /// Merges the branch of `other` into this one like [`Db::merge_with`], with a closure that can
+    /// fail.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from any run of `f`, while a virtual base is built included, discards the merge:
+    /// nothing is written or recorded, the next merge finds the same base, and the error comes
+    /// back as it was. The errors of [`Db::merge_with`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::merge_with`].
     pub fn try_merge_with<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
@@ -3344,6 +4278,11 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Merges `other` like [`Db::try_merge_with`] and records its newest version in this branch's
+    /// merge records, as sync does for a remote branch.
+    ///
+    /// When the merge base already holds `other`'s head, `f` does not run, nothing is committed,
+    /// and the inner result is `Err` with `other`'s newest version, for the caller to record.
     pub(crate) fn merge_tracking<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
@@ -3444,6 +4383,35 @@ impl<T: Data> Db<T> {
         Ok(Some(Merged { ptr, floor, after }))
     }
 
+    /// The best common ancestor of this branch and `other`'s, the commit a merge between them
+    /// starts from.
+    ///
+    /// After a criss-cross there are several, and this is the first that [`Db::common_ancestors`]
+    /// returns. Branches that share no commit give version 0.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoCommonAncestor`] when the answer could lie in pruned history, and read errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// db.update(|count| *count = 1)?;
+    /// let side = db.fork("side")?;
+    /// side.update(|count| *count = 2)?;
+    /// db.update(|count| *count = 3)?;
+    ///
+    /// let base = db.common_ancestor(&side)?;
+    /// assert_eq!((base.version(), *base), (1, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn common_ancestor(&self, other: &Db<T>) -> Result<Snapshot<T>> {
         let first = self.common_starts(other)?.into_iter().next();
         match first {
@@ -3452,6 +4420,15 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// Every best common ancestor of this branch and `other`'s, best first.
+    ///
+    /// There is more than one after a criss-cross, when each branch has merged an older state of
+    /// the other. They are ordered by generation, then time, then hash, so both sides and every
+    /// run agree. Branches that share no commit give version 0 alone.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::common_ancestor`].
     pub fn common_ancestors(&self, other: &Db<T>) -> Result<Vec<Snapshot<T>>> {
         let found = self.common_starts(other)?;
         if found.is_empty() {
@@ -3527,6 +4504,44 @@ impl<T: Data> Db<T> {
         graph::best(starts(ours)?, starts(theirs)?)
     }
 
+    /// Creates the branch `name` at this branch's newest commit and returns a handle on it.
+    ///
+    /// A fork is one small write to the file whatever the size of the database, and the new
+    /// branch shares all the history before it, its merge records included. It waits for a closure
+    /// running on this branch, and returns once the new branch is durable.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::BranchExists`] if `name` is `main` or an existing branch.
+    /// - [`Error::ReadOnly`] on a read-only handle, and [`Error::NoBranch`] if this branch was
+    ///   dropped.
+    /// - [`Error::Reentrant`] where waiting for this branch could deadlock, such as from inside a
+    ///   closure on it, and write errors as for [`Db::commit`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("plan.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// db.update(|budget| *budget = 100)?;
+    ///
+    /// let what_if = db.fork("what-if")?;
+    /// what_if.update(|budget| *budget = 250)?;
+    ///
+    /// assert_eq!(*db.read(), 100);
+    /// assert_eq!(*db.branch("what-if")?.read(), 250);
+    /// assert_eq!(db.branches(), ["main", "what-if"]);
+    ///
+    /// db.drop_branch("what-if")?;
+    /// assert!(what_if.update(|budget| *budget = 300).is_err());
+    /// assert_eq!(db.branches(), ["main"]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let mut notices = Vec::new();
@@ -3566,6 +4581,14 @@ impl<T: Data> Db<T> {
         self.branch(name)
     }
 
+    /// A handle on the existing branch `name` of this database.
+    ///
+    /// `main` always exists, even before its first commit. With [`Options::shared`] this first
+    /// catches up with commits from other processes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoBranch`] if no branch has that name, and read errors.
     pub fn branch(&self, name: &str) -> Result<Db<T>> {
         let _crossing = self.entering(Needs::Tip)?;
         let branch = self.shared.attached(name)?;
@@ -3576,6 +4599,20 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Removes the branch `name` from the file.
+    ///
+    /// It waits for a closure running on that branch to finish. Afterwards other handles on it
+    /// keep reading what they had, writes through them fail with [`Error::NoBranch`], and its
+    /// watchers end. Merge records that name it go too. Its bytes stay in the file until the next
+    /// reclamation cycle.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::BranchInUse`] for `main` and for this handle's own branch.
+    /// - [`Error::NoBranch`] if no branch has that name.
+    /// - [`Error::ReadOnly`] on a read-only handle, [`Error::Reentrant`] where waiting for that
+    ///   branch could deadlock, such as from inside a closure on it, and write errors as for
+    ///   [`Db::commit`].
     pub fn drop_branch(&self, name: &str) -> Result<()> {
         if name == MAIN || name == self.branch.name {
             return Err(Error::BranchInUse(name.to_string()));
@@ -3628,6 +4665,7 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// The names of every branch in the file, sorted, `main` included.
     pub fn branches(&self) -> Vec<String> {
         let refs = self.shared.published.lock();
         let mut names: Vec<String> = refs.refs.keys().collect();
@@ -3638,10 +4676,71 @@ impl<T: Data> Db<T> {
         names
     }
 
+    /// A watcher that hands out each new snapshot of this branch.
+    ///
+    /// It starts at the version current now, so its first receive waits for the next commit. It
+    /// does not queue: a receive returns the newest snapshot it has not returned yet, so a slow
+    /// consumer skips versions, costs the writers nothing and holds no backlog. It ends when the
+    /// branch is dropped, when its [`Closer`](crate::Closer) closes it, or when the last [`Db`]
+    /// handle on the file is dropped. A read-only handle fires its watchers on [`Db::refresh`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Db;
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let db = Db::<u64>::open(&path)?;
+    /// let watcher = db.watch();
+    /// assert!(watcher.try_recv().is_err());
+    ///
+    /// db.update(|count| *count = 1)?;
+    /// db.update(|count| *count = 2)?;
+    /// let newest = watcher.try_recv().expect("a new version");
+    /// assert_eq!((newest.version(), *newest), (2, 2));
+    /// assert!(watcher.try_recv().is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn watch(&self) -> Watcher<T> {
         Watcher::new(self.branch.feed.clone(), Filter::All)
     }
 
+    /// A watcher like [`Db::watch`] that hands out only snapshots that pass `test`.
+    ///
+    /// It sleeps through commits whose snapshot fails. While a watcher waits, its test runs on a
+    /// `ferro-watch` thread for the branch, started when a filtered or async watcher first waits;
+    /// a receive that finds a new snapshot already there runs it on the receiving thread. Tests run
+    /// under no lock, so a test may read, commit or refresh, but it must not wait for a watcher,
+    /// and a slow one delays the branch's other watchers. See [Where tests
+    /// run](docs/guide/watchers.md#where-tests-run).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("stock.ferro");
+    /// let db = Db::<Map<String, u32>>::open(&path)?;
+    /// let low = db.watch_when(|stock| stock.get("anvil").is_some_and(|left| *left < 3));
+    ///
+    /// db.update(|stock| {
+    ///     stock.insert("anvil".to_string(), 5);
+    /// })?;
+    /// assert!(low.try_recv().is_err());
+    ///
+    /// db.update(|stock| {
+    ///     stock.insert("anvil".to_string(), 2);
+    /// })?;
+    /// let snapshot = low.try_recv().expect("the stock ran low");
+    /// assert_eq!(snapshot.get("anvil").as_deref(), Some(&2));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn watch_when(
         &self,
         test: impl Fn(&Snapshot<T>) -> bool + Send + Sync + 'static,
@@ -3649,6 +4748,13 @@ impl<T: Data> Db<T> {
         Watcher::new(self.branch.feed.clone(), Filter::When(Box::new(test)))
     }
 
+    /// A watcher like [`Db::watch_when`] whose test compares the snapshot it last handed out with
+    /// the new one.
+    ///
+    /// `test(seen, now)` decides, so "wake me when this changed since I looked" needs no state of
+    /// its own. Until the first receive, `seen` is the snapshot current when the watcher was made,
+    /// which [`Watcher::seen`] returns, so a consumer that starts from it misses nothing that lands
+    /// meanwhile. Clones share what was seen: a receive by one moves it for all.
     pub fn watch_changes(
         &self,
         test: impl Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync + 'static,
@@ -3656,6 +4762,38 @@ impl<T: Data> Db<T> {
         Watcher::new(self.branch.feed.clone(), Filter::Changes(Box::new(test)))
     }
 
+    /// Picks up what other processes committed, and returns whether anything moved.
+    ///
+    /// On a read-only handle it reads the file's newest state, following a file that a
+    /// reclamation cycle replaced, and fires the watchers of branches that moved; branches dropped
+    /// meanwhile end their watchers. On a writer opened with [`Options::shared`] it catches up with
+    /// the other writers' commits. Any other writer is the only one, so it returns `false` at once.
+    ///
+    /// # Errors
+    ///
+    /// Read errors, such as [`Error::Corrupt`] for a damaged branch table, and [`Error::Io`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Options};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let writer = Db::<u64>::open(&path)?;
+    /// writer.update(|count| *count = 1)?;
+    ///
+    /// let reader = Options::new().read_only(true).open::<u64>(&path)?;
+    /// writer.update(|count| *count = 2)?;
+    /// assert_eq!(*reader.read(), 1);
+    ///
+    /// assert!(reader.refresh()?);
+    /// assert_eq!(*reader.read(), 2);
+    /// assert!(!writer.refresh()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn refresh(&self) -> Result<bool> {
         if !self.shared.options.read_only {
             if !self.shared.options.shared {
@@ -3732,6 +4870,16 @@ impl<T: Data> Db<T> {
         Ok(true)
     }
 
+    /// Re-hashes every object reachable from every retained version of every branch.
+    ///
+    /// A match shows that each object is the one its link names, so together with
+    /// [`Db::head_hash`] it shows history is unchanged. It reads everything retained once, without
+    /// decoding it as `T`, as [`Db::verify_typed`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] for the first object whose bytes do not match its hash, and other read
+    /// errors.
     pub fn verify(&self) -> Result<Verified> {
         let (head, store) = {
             let published = self.shared.published.lock();
@@ -3740,6 +4888,18 @@ impl<T: Data> Db<T> {
         crate::admin::verified(&store, head)
     }
 
+    /// Like [`Db::verify`], and also decodes every object reachable from every retained version
+    /// as the type that reads it.
+    ///
+    /// It checks each map node's count, level and key range against its parent, as
+    /// [`Db::receive`] checks what it is sent, so it finds a damaged file or a type change that
+    /// broke stored data before a read panics on it. It costs a full decode of everything
+    /// retained.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode
+    /// or does not fit its parent.
     pub fn verify_typed(&self) -> Result<Verified> {
         let (head, refs, store) = {
             let published = self.shared.published.lock();
@@ -3751,27 +4911,45 @@ impl<T: Data> Db<T> {
     }
 }
 
+/// What [`Db::verify`], [`Db::verify_typed`] or [`admin::verify`](crate::admin::verify) checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Verified {
+    /// The number of distinct objects re-hashed.
     pub objects: u64,
+    /// The bytes those objects take in the file.
     pub bytes: u64,
+    /// The size of the file in bytes.
     pub file_bytes: u64,
 }
 
 impl<T: Data> Db<T> {
+    /// Checks that a call needing `needs` cannot deadlock on a lock this thread holds, or on a
+    /// write waiting on this thread, and records the crossing into this file while it runs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Reentrant`] where it could.
     pub(crate) fn entering(&self, needs: Needs<'_>) -> Result<Option<Crossing>> {
         reentry::check(self.shared.id, self.shared.coalesce, needs)
     }
 
+    /// The current store and the branch table as last published.
     pub(crate) fn published_refs(&self) -> (Store, Refs) {
         let published = self.shared.published.lock();
         (self.shared.store(), published.refs.clone())
     }
 
+    /// Calls the [`Options::hook`] at the step `name`, if one is set.
     pub(crate) fn step(&self, name: &'static str) {
         self.shared.step(name);
     }
 
+    /// Checks that this handle can write: its branch is live and the file is writable and
+    /// healthy.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoBranch`], [`Error::ReadOnly`] or [`Error::Poisoned`].
     pub(crate) fn check_writable(&self) -> Result<()> {
         self.branch.check_live()?;
         let store = self.shared.store();
@@ -3781,6 +4959,11 @@ impl<T: Data> Db<T> {
         store.check_healthy()
     }
 
+    /// Waits for any reclamation cycle to finish and keeps another from starting until the
+    /// returned guard is dropped.
+    ///
+    /// With [`Options::shared`] it holds the cycle lock across processes too, and catches up with
+    /// a cycle another process ran.
     pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_>> {
         let local = self.shared.cycle.lock();
         let across = self.shared.hold_cycle(true)?;
@@ -3790,6 +4973,11 @@ impl<T: Data> Db<T> {
         })
     }
 
+    /// Writes the records `fill` stages as a frame of their own, without moving any branch.
+    ///
+    /// The frame is queued for the next sync behind the file's current branch table, so nothing
+    /// can reach the records until a later frame links them. `fill` runs under the file's tip
+    /// lock.
     pub(crate) fn append_frame<X>(
         &self,
         fill: impl FnOnce(&Store, &mut Txn) -> Result<X>,
@@ -3824,6 +5012,11 @@ impl<T: Data> Db<T> {
         Ok(out)
     }
 
+    /// Replaces the branch table with what `edit` returns, under every writer lock of the file.
+    ///
+    /// `edit` sees the current table and stages any records it needs in the transaction. If it
+    /// returns a new table, that lands, is settled, and every attached branch it moved is
+    /// published to its readers and watchers; `None` writes nothing.
     pub(crate) fn rewrite_refs<X>(
         &self,
         edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,
