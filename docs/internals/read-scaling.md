@@ -283,24 +283,44 @@ two writers on a 12 KiB cache with reclamation cycles every 96 KiB and compactio
 writer's `Db` is dropped and reopened four times. Each reader also keeps a range, read forwards or
 backwards, a cursor and an index walk from one round to the next and advances each by a few dozen
 items a round, so that they outlive the snapshot they came from and, once the reader reopens its
-handle, the `Db` and store they read, while the writers commit and the caches evict; one round in
-25 drops each mid-walk. It runs under AddressSanitizer and ThreadSanitizer clean with its default
-seed and three others. With `Shared::release` changed to report no loan, so that lent nodes are
-freed at once, with `free` ignoring the hazard records described under [Iterators under
-hazards](#iterators-under-hazards), with a lent value's last drop no longer deferred while a slot
-holds it, and with the retired list releasing a lent value's last count without reading the records
-again, AddressSanitizer reports a use after free and ThreadSanitizer 28 to 118 data races within
-the default four seconds. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and `shared.rs` race a
-reader's borrow with an eviction, race readers that pin after an eviction with the epoch's free of
-the node it retired, check that only the cache's own entry releases its value, walk iterators and a
-cursor over pinned and borrowed nodes after their map is dropped or edited, and drive `Shared`'s
-counts, moves, erasure, layout and flags, including flags read after the value is dropped. For the
-hazards they hold iterators, a cursor and the row finder across an eviction and a flush, drop
-iterators mid-walk, keep a stored root for the iterators that borrow it after its map is dropped,
-keep a leaf the finder holds once the borrowed node that pinned it is freed, borrow a root through
-its map after a free has scanned the records, and move records between threads. They pass under
-Miri with stacked borrows and with tree borrows over 32 schedules each. Under Miri their assertions
-fail for the first of the four sabotages, and Miri reports a use after free for the other three.
+handle, the `Db` and store they read, while the writers commit and the caches evict; one round in 25
+drops each mid-walk. The root also keeps a map of values that each hold a nested map, most of them
+large enough to spill, which a third writer replaces: readers get them, walk them with iterators
+held across rounds and keep some of what they read past the iterator, the snapshot and the handle it
+came from, and one round in 33 opens a handle, takes a range and a cursor over them and drops the
+snapshot and the handle before it reads, so that a decoder clones a store that only the iterator's
+slot holds. It runs under AddressSanitizer and ThreadSanitizer clean with its default seed and three
+others, and two copies at once ran clean with eight seeds. With `Shared::release` changed to report
+no loan, so that lent nodes are freed at once, with a lent value's last drop no longer parked while
+a slot holds it, or with the retired list releasing a lent value's last count without reading the
+records again, as described under [Iterators under hazards](#iterators-under-hazards),
+AddressSanitizer reports a use after free with each of the four seeds, and ThreadSanitizer 85 data
+races for the first and 8 for the second within the default four seconds. Against the version that
+left a lent store dead, AddressSanitizer reports one with two of the four seeds. With `free`
+ignoring the records as it picks what to free, only the unit tests fail, under Miri, since its
+second reading still parks what a slot holds. `tests/reads.rs` reads nested maps from iterators and
+cursors that outlived every handle on their store, and edits a stored map beside an iterator and a
+cursor over it, clean under AddressSanitizer. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and
+`shared.rs` race a reader's borrow with an eviction, race readers that pin after an eviction with
+the epoch's free of the node it retired, check that only the cache's own entry releases its value,
+walk iterators and a cursor over pinned and borrowed nodes after their map is dropped or edited, and
+drive `Shared`'s counts, moves, erasure, layout and flags, including flags read after the value is
+dropped. For the hazards they hold iterators, a cursor and the row finder across an eviction and a
+flush, drop iterators mid-walk, keep a stored root for the iterators that borrow it after its map is
+dropped, keep a leaf the finder holds once the borrowed node that pinned it is freed, borrow a root
+through its map after a free has scanned the records, and move records between threads. They also
+check that `make_mut`, `get_mut` and `unwrap_or_clone` copy a value a slot holds, that each end of a
+narrow range holds its nodes in its own slots and that a finder whose descent panicked holds only
+what its slots hold, and race a lent value's last owner with the release of its slot and with a
+clone through it. They pass under Miri with stacked borrows over 32 schedules, and with tree borrows
+over 31 of 32: in the other, two threads contend for the records' lock and Miri stops at
+`parking_lot_core`'s futex call, which passes a reference where the call's prototype has a pointer.
+Under Miri their assertions fail for the sabotages of the loan, the records and the retired list's
+second reading, and Miri reports a data race on the freed value when a last drop is not parked. The
+uniqueness check made to ignore slots and the finder made to keep its fields through a descent fail
+their unit tests on every run. The decoder's clone made to take a count from zero is reported as a
+dangling reference in 3 of 64 schedules, the owner made to read its mark before clearing its slots
+fails the race in 2 of 64, and the parker made to trust its first reading of the slots in 1 of 256.
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
@@ -531,33 +551,74 @@ cleared it when the slot was written, so the cache's release sees `lent` and ret
 and frees only what was retired before that bump, so a slot written before a release is always
 seen. If `cached` was cleared, the iterator clears the slot and takes a count as before. A frame
 holding a borrowed node is a tagged pointer with no count, like one anchored to the root, and so are
-frames below it reached through pinned memos or in-memory links, which live as long as it does. A
-borrowed node is not changed in place: the cache or the retired list holds a count on it for as long
-as a slot can hold it, so `make_mut` copies it.
+frames below it reached through pinned memos or in-memory links, which live as long as it does.
+
+A borrowed node is not changed in place. The cache or the retired list usually holds a count on it
+while a slot can hold it, and an iterator over a dirty map counts its root, which keeps every node
+below it shared, but a writer that fetched a node from the cache just as the cache let go of it
+holds that node's only count while a slot may still hold it. So `make_mut`, `get_mut` and
+`unwrap_or_clone` count a value whose `lent` is set as shared while a slot holds it, reading the
+records to find out, and clear `lent` when no slot does, so that a writer's next edits of the node
+read no records. `lent` sits on the line of the weak count, which `make_mut` reads already.
 
 The slots of a path are chosen by level: the node a frame enters takes the slot of its parent's
 level minus one, so the leaf, its parent and its grandparent each have one, frames on one path never
-share one, and the front and back paths of an iterator have three each. Nodes higher than that but
-below the pinned levels are counted as before; a scan of the 1M-key map enters one about every
-4,096 keys. The row finder keeps its leaf and the leaf's parent in two slots and also sets `lent` on
-them, since nothing above them stays borrowed once its descent is over, and a leaf that only a
-borrowed node's pinned memo held would otherwise be dropped in place with that node. It lends them
-through the link it reached them by: Miri's stacked borrows rejected a first version that set
-`lent` through a pointer taken from the `&Node`, whose permission covers the node and not the flags
-behind it.
+share one, and the front and back paths of an iterator have three each. Where the two paths of a
+range share their top frames, a frame whose node a slot holds is copied into a slot of the back
+path's, and the copy then reads `cached` again, sequentially consistent: if it is still set, the
+cache clears it only after the new slot is written, so any free of the node, which comes after that,
+reads the new slot. If it was cleared, the back path takes a count instead, through the clone that
+waits out a count passing through zero, described below. A first version copied the slot and read
+nothing after, which was sound only because a free reads a record's slots in order, front before
+back: read the other way, a front slot overwritten after the copy could have been read after its
+change and the back slot before it. Borrowing each shared node a second time through its parent's
+link also made the copy independent of that order, but cost a covered lookup 490 instructions and 6
+to 10% of its rate, where reading `cached` after the copy costs 6 instructions. A frame records in
+its pointer's second bit whether a slot holds its node, beside the first bit that says it holds no
+count. Nodes higher than that but below the pinned levels are counted as before; a scan of the
+1M-key map enters one about every 4,096 keys. The row finder keeps its leaf and the leaf's parent in
+two slots and also sets `lent` on them, since nothing above them stays borrowed once its descent is
+over, and a leaf that only a borrowed node's pinned memo held would otherwise be dropped in place
+with that node. It lends them through the link it reached them by: Miri's stacked borrows rejected a
+first version that set `lent` through a pointer taken from the `&Node`, whose permission covers the
+node and not the flags behind it. It takes its leaf and parent out of its fields before a descent
+and puts back what the descent kept. A first version replaced them only after the descent returned,
+so a descent that rewrote the parent's slot and then failed to read a leaf, which panics, left a
+finder that a caller catching the panic could use with a parent no slot held.
 
 ### The root and the store
 
 The root of a stored map is borrowed through the map that builds the iterator: the iterator writes
 the root's address in a slot and sets `lent` while the map still holds its count, so whoever drops
-the root's last count later sees the flag. `Shared`'s last drop now checks `lent`, and a value that
-is lent and held by a slot, which it learns by reading the records, is retired as a dead entry
-rather than dropped. An iterator whose root or store has died while it held them flushes the epoch
-when it is dropped, so a store's file closes when its last iterator goes, as it did when the
-iterator held a count. `Store` keeps its state in a `Shared` for this. A dirty map's root is still
+the root's last count later sees the flag. `Shared`'s last drop checks `lent`, and a value that is
+lent and held by a slot, which it learns by reading the records, is parked: the thread that took its
+count to zero takes the count back and leaves it on the retired list, which lets it go once no slot
+holds the value. `Store` keeps its state in a `Shared` for this. A dirty map's root is still
 counted: only its writer reads it, and a borrowed root would make the writer's next edit copy it.
 The cursor and the row finder borrow the root only once its pinned memo is set, so that building one
 reads nothing from the file.
+
+A first version left such a value dead, its count at zero, until no slot held it. A borrowed store
+could then be cloned back to life: an iterator that outlived its map, its snapshot and its `Db`
+decoded a value holding a nested map, `Map::decode` cloned the store through the iterator's
+uncounted handle, and the count went from zero to one and back, so the store was dropped under the
+iterator and again by the retired list. A review reproduced it under AddressSanitizer. A parked
+value keeps a count, so a clone through a borrowed handle finds one. `Decoder::store`, the one clone
+of a store that can start from a borrowed handle, waits out a count that is passing through zero,
+between a last owner's decrement and its taking the count back, rather than taking one from zero;
+every other clone adds to a count its handle holds, since a loop of compare-and-swaps on the line
+that readers and committers all write costs more than an add. Keeping a counted store in iterators,
+cursors and the row finder would also have fixed it, at the cost measured below.
+
+An iterator whose root or store was parked flushes the epoch when it is dropped, so a store's file
+closes when its last iterator goes, as it did when the iterator held a count. The thread that parks
+a value marks each record that holds it in its root or store slot and then reads that slot again,
+both sequentially consistent. A record's owner clears its slots and reads its mark behind a
+sequentially consistent fence, so either the owner sees the mark and flushes or the parker finds the
+slot cleared and lets the value go itself; one fence ran covered lookups 3% faster than clearing the
+two slots with sequentially consistent stores. A first version had the owner check whether its store
+or root had died before clearing its slots, and missed one that died between the two, which then
+waited for the next free.
 
 The first version freed a lent value from a retired list as soon as the list's own count was the
 last, trusting the scan of the records that the free began with. A root the cache had retired could
@@ -565,8 +626,8 @@ then be borrowed through its map after that scan, and the map dropped before the
 root was freed under the iterator: `epoch_stress` crashed in release builds when two copies ran at
 once, and AddressSanitizer reported the use after free. When the list's count is the last on a lent
 value, `free` now reads the records again, after the decrement that orders it behind the owner that
-let go, and keeps whatever a slot holds as a dead entry. That costs one more scan a batch, and only
-for batches that free lent values.
+let go, and parks whatever a slot holds. That costs one more scan a batch, and only for batches that
+free lent values.
 
 ### Measurements
 
@@ -667,8 +728,29 @@ instructions a key, 3 to 4.5%, at times within the factor of two those cells var
 of one build, and a table's page of index rows and its group counts run 2.8% and 7% more
 instructions and 5% faster.
 
+The fixes after the review, described above, were measured against the build before them, with the
+1 GiB cache and no writer, medians of three alternating runs of two rounds. Covered lookups ran
+2.51M a second on one thread against 2.52M, 27.8M at 16 threads against 28.4M and 37.6M at 32
+against 38.1M, at 5,311 instructions each, and index lookups 4.44M at 32 threads against 4.45M.
+Pages of rows ran 1.52M at 32 threads against 1.49M but 83,972 instructions against 81,392: the row
+finder takes its leaf and parent out of their fields around each descent, about 13 instructions a
+row it does not find in the leaf it holds, and index lookups, which read 20 rows, run 28,135 against
+27,612. Covered pages stayed within the swing they show between rounds. One thread, medians of three
+runs of three rounds with both caches, moved by 2% or less except covered pages, 2% slower with the
+1 GiB cache and 6% with the 16 MiB one, and beside a writer every cell stayed within 1% except
+covered pages, 4% and 5% slower. In `reads` and the main tool the heap per key, peak RSS, the bytes
+a commit writes and the instructions of a bulk load or a commit did not move, and only row reads
+through the finder ran 2 to 3% more instructions.
+
 ### Measured and left out
 
+- A counted store in iterators, cursors and the row finder, in place of the store's slot, as the
+  fix for a store cloned back to life. Medians of two alternating runs of two rounds with the
+  1 GiB cache: one thread did not move, but covered lookups fell from 27.6M a second to 14.5M at
+  16 threads and from 37.4M to 18.2M at 32, covered pages from 6.7M to 5.5M and from 8.2M to
+  6.8M, and index lookups, pages of rows and 100-key ranges lost 2 to 4% at 16 and 32 threads.
+  Each iterator and finder a lookup builds then took and dropped a count on the store's line,
+  which every reader writes.
 - Hazards for the root and the store alone, with the nodes below the pinned levels counted as
   before. One thread ran covered pages at 910,000 a second against 901,000 before and 885,000 with
   every hazard, medians of four alternating runs, but 32 threads ran them at 3.5M against 5.2M with

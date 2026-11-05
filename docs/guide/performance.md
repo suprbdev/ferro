@@ -99,7 +99,10 @@ against 15.4M, plain lookups 4.4M against 2.8M, covered pages 9.3M against 3.4M 
 one round to the next. In a pass of its own beside one thread committing single-key updates as fast
 as it can, gets at 32 threads ran 61M a second with the 1 GiB cache and 2.6M with the 16 MiB one,
 and index lookups 2.9M and 89,000. Run in one pass with the writer's cells, as the tool does by
-default, the cells without a writer read up to 12% slower on one thread.
+default, the cells without a writer read up to 12% slower on one thread. The fixes that followed a
+review of the hazards, described in the same section, moved these cells by 2% or less in
+alternating runs, apart from covered pages, 2 to 6% slower on one thread and within the swing they
+show between rounds on many.
 
 ## Many threads and the allocator
 
