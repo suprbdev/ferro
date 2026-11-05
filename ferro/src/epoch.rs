@@ -590,8 +590,9 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
 /// comes after the decrement, which orders it behind every owner that let go before and any slot
 /// such an owner wrote, so a value lent through a count that has since gone is seen. What a slot
 /// holds is revived, put back on the list as waiting only for slots and marked as [`park`] does,
-/// and what none holds is dropped. Items count in [`FREEING`] while they are out of the list, so
-/// that a flush waits for them.
+/// and what none holds is dropped. Items count in [`FREEING`] from when they leave the list until
+/// they are dropped, or revived with their slots read again and those that no slot still holds
+/// let go, so that a flush that missed them on the list waits for them.
 fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
     let freed = {
         let mut pending = slot.pending.lock();
@@ -604,7 +605,6 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
         .try_with(|here| here.set(here.get() + count))
         .is_ok();
     let dying: Vec<(Dead, usize)> = freed.into_iter().filter_map(Retired::release).collect();
-    let mut loose = Vec::new();
     if !dying.is_empty() {
         let held = hazarded();
         let (kept, gone): (Vec<_>, Vec<_>) = dying
@@ -627,7 +627,10 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
             }
             drop(pending);
             drop(gone);
-            loose = waits(&addrs);
+            let loose = waits(&addrs);
+            if !loose.is_empty() {
+                release(slot, &mut |item| item.held_in(&loose));
+            }
         } else {
             drop(gone);
         }
@@ -636,9 +639,6 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
         let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));
     }
     FREEING.fetch_sub(count, Ordering::SeqCst);
-    if !loose.is_empty() {
-        release(slot, &mut |item| item.held_in(&loose));
-    }
 }
 
 /// Bumps the epoch, then returns the oldest epoch that a pinned slot other than `skip` holds, or
