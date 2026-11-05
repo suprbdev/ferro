@@ -10,9 +10,11 @@ row in [Getting started](getting-started.md#a-first-database) is an example.
 `range` yields rows in key order as `iter` and the index lookups do, `keys` gives the keys alone,
 and `rows()` gives the underlying `Map` for `(key, row)` pairs. For a tuple key, `prefix(&head)`
 gives the rows whose key starts with `head`, as described under [Tuple
-keys](collections.md#tuple-keys). `get_mut` hands out a `RowMut` that updates the indexes when it
-drops. `update(&key, f)` runs `f` on the row and returns what `f` returns, or `None` when no row has
-that key, so a missing row becomes your own error in one line:
+keys](collections.md#tuple-keys). Each yields rows as `Val`s, and `next_ref` and `visit` lend them
+instead, as described under [Reading rows in place](#reading-rows-in-place). `get_mut` hands out a
+`RowMut` that updates the indexes when it drops. `update(&key, f)` runs `f` on the row and returns
+what `f` returns, or `None` when no row has that key, so a missing row becomes your own error in one
+line:
 
 ```rust
 let total = shop
@@ -160,6 +162,42 @@ index, can be passed to `and` or `or` too, but it is not in key order, so its ke
 and sorted first. A combination reads the indexes as they were when you built it, like any lookup.
 [Combining lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the
 measurements.
+
+## Reading rows in place
+
+Every row a lookup, `Matches`, `iter`, `range` or `prefix` yields is a `Val`, which shares the row
+with the table, so it can be kept, sent to another thread and read after the snapshot is gone. For
+a row with a destructor, such as one holding a `String`, that share is a reference count on the
+column of the node that holds the row, and every thread reading the same rows writes it.
+`next_ref` steps to the next row and lends `&T` instead, until the lookup moves again, and `visit`
+lends every row left to a closure:
+
+```rust
+let mut pending = snapshot.orders.by_status(&Status::Pending);
+let mut page = Vec::with_capacity(20);
+while page.len() < 20
+    && let Some(order) = pending.next_ref()
+{
+    page.push((order.id, order.customer.clone(), order.total_cents));
+}
+
+let mut owed = 0;
+snapshot.orders.by_customer("wile").visit(|order| owed += order.total_cents);
+```
+
+`IndexIter`, `Matches` and the `Values` that `iter`, `range` and `prefix` return all have both, and
+a map's `Iter` lends `(&K, &V)` the same way. Read rows this way where the code uses a row where
+it finds it: a page that copies the fields it shows, a total, a filter, a hot path that many
+threads run over the same rows. Keep `next` and the iterator adapters where the rows themselves
+go on, into a `Vec`, a channel or a response built later, since a lent row lasts only until the
+next step and a clone of the row costs more than a `Val`. The loop around `next_ref` can `break`,
+`return` or use `?` as it likes, and the lookup goes on from the next row.
+
+On 200,000 rows, measured on 2026-11-05, 32 threads reading pages of the same 200 rows through
+`next_ref` read 4.1 million pages a second where `next` read 1.5 million, and one thread 305,000
+where it read 185,000. A lookup of about 20 scattered rows through `visit` went from 4.6 million to
+5.1 million a second on 32 threads, and stayed at 236,000 on one. [Rows lent in
+place](../internals/read-scaling.md#rows-lent-in-place) has the measurements.
 
 ## Lookups
 

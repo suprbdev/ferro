@@ -19,7 +19,11 @@ value, which makes an ETag one line.
 
 `sum`, `count`, `for_each` and other folds on the plain iterators take whole nodes at a time.
 `Map::for_each`, `try_for_each`, `for_each_range` and `try_for_each_range` lend `&K` and `&V`, so
-they clone nothing, and the `try_` forms stop on `ControlFlow::Break`. `Map::cursor` gives a
+they clone nothing, and the `try_` forms stop on `ControlFlow::Break`. Any iterator of a map, and
+a table's lookups, lend entries too: `next_ref` steps and lends the next one until the iterator
+moves again, and `visit` lends every one left to a closure, without the reference count that a
+`Val` of a value with a destructor takes, as [Reading rows in
+place](tables.md#reading-rows-in-place) describes. `Map::cursor` gives a
 `Cursor` that keeps its path through the tree, so `seek` and `seek_back` cost the distance moved
 instead of a walk from the root, which suits sorted lookups and merge joins. `get_many` and
 `contains_many` run a cursor over an iterator of keys, and keys out of order still give the right
