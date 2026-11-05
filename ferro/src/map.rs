@@ -1491,30 +1491,17 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
     level: u8,
     value: Arc<V>,
 ) -> Result<Option<Slot<V, S>>> {
-    if let Link::Stored { .. } = link {
-        let node = load(store, link)?.ok_or(Error::Detached)?;
-        *link = Link::Mem(node, Hint::NONE);
-    }
-    let Link::Mem(current, _) = &*link else {
-        let mut keys = Vec::with_capacity(LEAF_CAPACITY);
-        keys.push(key);
-        let mut slots = Vec::with_capacity(LEAF_CAPACITY);
-        slots.push(Slot::Fresh(value));
-        *link = link_from(level, keys, slots, Vec::new(), None);
-        return Ok(None);
+    let Link::Mem(current, hint) = link else {
+        return insert_outside(store, link, key, level, value);
     };
     if level > current.level {
-        let (left, right) = split(store, link.take(), &|probe: &K| probe.cmp(&key))?;
-        *link = link_from(
-            level,
-            vec![key],
-            vec![Slot::Fresh(value)],
-            vec![left, right],
-            None,
-        );
-        return Ok(None);
+        return insert_above(store, link, key, level, value);
     }
-    let (node, hint) = dirty_mut(store, link)?;
+    let shared = Shared::as_ptr(current);
+    let node = Shared::make_mut(current);
+    if !std::ptr::eq(shared, node) {
+        *hint = Hint::NONE;
+    }
     match node.search(&key) {
         Ok(index) => {
             let before = node.buffers();
@@ -1522,19 +1509,16 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             hint.renew(node, before);
             Ok(Some(replaced))
         }
-        Err(position) if level == node.level => {
+        Err(position) if level == node.level && node.children.is_empty() => {
             let before = node.buffers();
-            if !node.children.is_empty() {
-                let (left, right) = split(store, node.children[position].take(), &|probe: &K| {
-                    probe.cmp(&key)
-                })?;
-                node.children[position] = left;
-                node.children.insert(position + 1, right);
-            }
             node.keys.insert(position, key);
             node.cells.slots().insert(position, Slot::Fresh(value));
             node.count += 1;
             hint.renew(node, before);
+            Ok(None)
+        }
+        Err(position) if level == node.level => {
+            insert_between(store, node, hint, position, key, value)?;
             Ok(None)
         }
         Err(position) => {
@@ -1554,6 +1538,68 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             Ok(replaced)
         }
     }
+}
+
+#[inline(never)]
+fn insert_outside<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    key: K,
+    level: u8,
+    value: Arc<V>,
+) -> Result<Option<Slot<V, S>>> {
+    if let Link::Stored { .. } = link {
+        let node = load(store, link)?.ok_or(Error::Detached)?;
+        *link = Link::Mem(node, Hint::NONE);
+        return insert_at(store, link, key, level, value);
+    }
+    let mut keys = Vec::with_capacity(LEAF_CAPACITY);
+    keys.push(key);
+    let mut slots = Vec::with_capacity(LEAF_CAPACITY);
+    slots.push(Slot::Fresh(value));
+    *link = link_from(level, keys, slots, Vec::new(), None);
+    Ok(None)
+}
+
+#[inline(never)]
+fn insert_above<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    key: K,
+    level: u8,
+    value: Arc<V>,
+) -> Result<Option<Slot<V, S>>> {
+    let (left, right) = split(store, link.take(), &|probe: &K| probe.cmp(&key))?;
+    *link = link_from(
+        level,
+        vec![key],
+        vec![Slot::Fresh(value)],
+        vec![left, right],
+        None,
+    );
+    Ok(None)
+}
+
+#[inline(never)]
+fn insert_between<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    node: &mut Node<K, V, S>,
+    hint: &mut Hint,
+    position: usize,
+    key: K,
+    value: Arc<V>,
+) -> Result<()> {
+    let before = node.buffers();
+    let (left, right) = split(store, node.children[position].take(), &|probe: &K| {
+        probe.cmp(&key)
+    })?;
+    node.children[position] = left;
+    node.children.insert(position + 1, right);
+    node.keys.insert(position, key);
+    node.cells.slots().insert(position, Slot::Fresh(value));
+    node.count += 1;
+    hint.renew(node, before);
+    Ok(())
 }
 
 fn remove_at<K, V, S, Q>(
