@@ -4061,6 +4061,8 @@ fn kept<K: Data, V: Data, S: Data>(
         Link::Mem(node, _) => Shared::lend_to(node, hazard),
         Link::Stored { memo, .. } => match memo.get()? {
             Memo::Pinned(node) => Shared::lend_to(node, hazard),
+            // SAFETY: `at` borrows this node under the descent's guard, which is still pinned
+            // and keeps it alive until the flag is set.
             Memo::Weak(node, _) => unsafe { node.lend_held(hazard) },
         },
     };

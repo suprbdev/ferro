@@ -1100,6 +1100,7 @@ impl Drop for Lent {
     #[inline]
     fn drop(&mut self) {
         if self.owned {
+            // SAFETY: an owned `Lent` holds a store it cloned, which is dropped once, here.
             unsafe { ManuallyDrop::drop(&mut self.store) };
         }
     }
@@ -1301,6 +1302,10 @@ impl Store {
         Shared::lend_to(&self.inner, hazard);
         Lent {
             store: ManuallyDrop::new(Store {
+                // SAFETY: the pointer comes from a live `Shared`, and the copy takes no count and
+                // is never dropped. The slot just written keeps the store alive until it is
+                // cleared: whoever lets go of its last count meanwhile finds the slot and parks
+                // that count.
                 inner: unsafe { Shared::from_raw(Shared::as_ptr(&self.inner)) },
             }),
             owned: false,

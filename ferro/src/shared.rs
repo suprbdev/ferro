@@ -68,6 +68,9 @@ unsafe impl Send for Erased {}
 
 unsafe impl Sync for Erased {}
 
+// SAFETY: a `Dead` value is made only for an `Erased`, whose `T` is `Send + Sync`, or for a value
+// whose `lent` flag is set, which only lending functions bounded by `T: Send + Sync` do. Dropping
+// it on another thread is then what dropping the last owner there would do.
 unsafe impl Send for Dead {}
 
 // SAFETY: a `Parked` value holds one count of a value whose `lent` flag is set, which only lending
@@ -86,10 +89,12 @@ impl<T> Inner<T> {
     #[inline]
     unsafe fn lend_to(inner: *mut Inner<T>, hazard: &AtomicPtr<()>) -> NonNull<T> {
         hazard.store(inner.cast(), Ordering::SeqCst);
+        // SAFETY: the caller keeps the allocation alive until the flag is set.
         let lent = unsafe { &(*inner).lent };
         if !lent.load(Ordering::Relaxed) {
             lent.store(true, Ordering::SeqCst);
         }
+        // SAFETY: `inner` is a live allocation, so the address of its value is not null.
         unsafe { NonNull::new_unchecked(&raw mut (*inner).data) }
     }
 
@@ -389,6 +394,7 @@ impl<T: Any + Send + Sync> Shared<T> {
 
     #[inline]
     pub(crate) fn lend_to(this: &Self, hazard: &AtomicPtr<()>) -> NonNull<T> {
+        // SAFETY: `this` holds a count, so the value is alive while the flag is set.
         unsafe { Inner::lend_to(this.ptr.as_ptr(), hazard) }
     }
 
@@ -518,6 +524,8 @@ impl Dead {
 
 impl Drop for Dead {
     fn drop(&mut self) {
+        // SAFETY: a `Dead` value's count is zero and it is dropped only once no slot holds it, so
+        // nothing reaches it, and `drop` is its type's final drop.
         unsafe { (self.drop)(self.ptr) };
     }
 }
@@ -629,6 +637,9 @@ impl<T: Send + Sync + 'static> Weak<T> {
     #[inline]
     pub(crate) fn lend_to(&self, hazard: &AtomicPtr<()>) -> Option<NonNull<T>> {
         let inner = self.ptr.as_ptr();
+        // SAFETY: the weak count keeps the allocation and its flags alive. The value is handed
+        // out only if `cached` is still set after the slot and `lent` are written, so the cache
+        // held a count then, and whoever lets that count go reads `lent` and finds the slot.
         unsafe {
             if !(*inner).cached.load(Ordering::SeqCst) {
                 return None;
@@ -647,6 +658,7 @@ impl<T: Send + Sync + 'static> Weak<T> {
 
     #[inline]
     pub(crate) unsafe fn lend_held(&self, hazard: &AtomicPtr<()>) -> NonNull<T> {
+        // SAFETY: the caller keeps the value alive until the flag is set.
         unsafe { Inner::lend_to(self.ptr.as_ptr(), hazard) }
     }
 }
@@ -836,6 +848,7 @@ mod tests {
         drop(owner);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         epoch::flush();
+        // SAFETY: a slot still holds the value, so it has not been dropped.
         assert_eq!(unsafe { lent.as_ref() }.value, 9);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(hazards);
@@ -874,6 +887,7 @@ mod tests {
         };
         epoch::flush();
         assert!(reader.join().unwrap());
+        // SAFETY: a slot still holds the value, so it has not been dropped.
         assert_eq!(unsafe { lent.as_ref() }.value, 11);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(hazards);
@@ -896,11 +910,9 @@ mod tests {
         let also = Shared::lend_to(&moved, hazards.entry(HAZARDS - 1));
         let taken = Shared::unwrap_or_clone(moved);
         assert_eq!(copies.load(Ordering::SeqCst), 1);
-        // SAFETY: a slot still holds the value, so it has not been dropped.
-        assert_eq!(
-            unsafe { (lent.as_ref().value, also.as_ref().value) },
-            (12, 15)
-        );
+        // SAFETY: a slot still holds each value, so neither has been dropped.
+        let read = unsafe { (lent.as_ref().value, also.as_ref().value) };
+        assert_eq!(read, (12, 15));
         assert_eq!((owner.value, taken.value), (13, 15));
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         assert_eq!(taken_drops.load(Ordering::SeqCst), 0);
