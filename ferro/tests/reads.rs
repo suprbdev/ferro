@@ -568,6 +568,82 @@ fn a_value_outlives_the_map_and_its_node() {
     assert_eq!(*held[1].clone().into_arc(), "value 97");
 }
 
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Nested {
+    blob: String,
+    inner: Map<u64, u64>,
+}
+
+fn nested_db(path: &std::path::Path, blob: usize) -> ferro::Db<Map<u64, Nested>> {
+    let db = fast().open::<Map<u64, Nested>>(path).unwrap();
+    db.update(|root| {
+        for outer in 0..40u64 {
+            let inner = (0..4).map(|key| (key, outer * 10 + key)).collect();
+            let blob = "x".repeat(blob);
+            root.insert(outer, Nested { blob, inner });
+        }
+    })
+    .unwrap();
+    db
+}
+
+fn flush_elsewhere(dir: &std::path::Path) {
+    drop(
+        fast()
+            .open::<Map<u64, u64>>(dir.join("other.ferro"))
+            .unwrap(),
+    );
+}
+
+#[test]
+fn a_nested_map_read_after_its_store_let_go_outlives_the_iterator() {
+    for blob in [8, 700] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.ferro");
+        drop(nested_db(&path, blob));
+        let db = fast().open::<Map<u64, Nested>>(&path).unwrap();
+        let snapshot = db.read();
+        let mut walk = snapshot.iter();
+        drop(snapshot);
+        drop(db);
+        let (first, value) = walk.next().unwrap();
+        let (last, back) = walk.next_back().unwrap();
+        drop(walk);
+        flush_elsewhere(dir.path());
+        assert_eq!((first, last), (0, 39));
+        assert_eq!(value.inner.get(&1).map(|got| *got), Some(1));
+        assert_eq!(back.inner.get(&3).map(|got| *got), Some(393));
+        drop(value);
+        flush_elsewhere(dir.path());
+        assert_eq!(back.inner.iter().map(|(_, got)| *got).sum::<u64>(), 1566);
+    }
+}
+
+#[test]
+fn a_nested_map_dropped_before_its_iterators_leaves_the_file_readable() {
+    for blob in [8, 700] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.ferro");
+        drop(nested_db(&path, blob));
+        let db = fast().open::<Map<u64, Nested>>(&path).unwrap();
+        let snapshot = db.read();
+        let mut walk = snapshot.iter();
+        let mut cursor = snapshot.cursor();
+        drop(snapshot);
+        drop(db);
+        let (_, value) = walk.next().unwrap();
+        assert!(cursor.seek(&20));
+        let row = cursor.value().unwrap();
+        assert_eq!(row.inner.get(&2).map(|got| *got), Some(202));
+        drop(value);
+        drop(row);
+        drop(walk);
+        drop(cursor);
+        let db = fast().open::<Map<u64, Nested>>(&path).unwrap();
+        assert_eq!(db.read().len(), 40);
+    }
+}
+
 #[test]
 fn a_map_edited_beside_its_iterators_leaves_what_they_read() {
     let dir = tempfile::tempdir().unwrap();

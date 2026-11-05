@@ -51,6 +51,11 @@ pub struct Dead {
     drop: unsafe fn(NonNull<u8>),
 }
 
+pub struct Parked {
+    ptr: NonNull<u8>,
+    drop: unsafe fn(NonNull<u8>),
+}
+
 unsafe impl<T: Send + Sync> Send for Shared<T> {}
 
 unsafe impl<T: Send + Sync> Sync for Shared<T> {}
@@ -64,6 +69,10 @@ unsafe impl Send for Erased {}
 unsafe impl Sync for Erased {}
 
 unsafe impl Send for Dead {}
+
+// SAFETY: a `Parked` value holds one count of a value whose `lent` flag is set, which only lending
+// functions bounded by `T: Send + Sync` do, and such a count may be released on any thread.
+unsafe impl Send for Parked {}
 
 impl<T> Inner<T> {
     #[inline]
@@ -86,39 +95,47 @@ impl<T> Inner<T> {
 
     #[inline(never)]
     unsafe fn drop_slow(inner: *mut Inner<T>) {
+        // SAFETY: the count reached zero but the allocation is not freed until the value is
+        // dropped, which only this call may do.
         unsafe { (*inner).strong.load(Ordering::Acquire) };
+        // SAFETY: as above, the allocation is live.
         if unsafe { (*inner).lent.load(Ordering::Relaxed) }
             && crate::epoch::hazarded_at(inner.addr())
         {
-            unsafe { Inner::defer(inner) };
+            // SAFETY: a slot holds the value, so it is parked rather than dropped.
+            unsafe { Inner::park(inner) };
         } else {
+            // SAFETY: the count is zero and no slot holds the value, so nothing can reach it.
             unsafe { Inner::drop_final(inner) };
         }
     }
 
     unsafe fn drop_final(inner: *mut Inner<T>) {
+        // SAFETY: the caller guarantees nothing reaches the value again.
         unsafe { ptr::drop_in_place(&raw mut (*inner).data) };
+        // SAFETY: the owners' weak count is still held and is let go once.
         unsafe { Inner::release_weak(inner) };
     }
 
     #[cold]
-    unsafe fn defer(inner: *mut Inner<T>) {
-        let dead = Dead {
+    unsafe fn park(inner: *mut Inner<T>) {
+        // SAFETY: the value has not been dropped, so its allocation is live.
+        unsafe { (*inner).strong.fetch_add(1, Ordering::Relaxed) };
+        let parked = Parked {
+            // SAFETY: `inner` points to a live allocation, so it is not null.
             ptr: unsafe { NonNull::new_unchecked(inner.cast()) },
             drop: Inner::<T>::drop_last,
         };
-        crate::epoch::defer(dead, size_of::<Inner<T>>());
+        crate::epoch::park(parked, size_of::<Inner<T>>());
     }
 
     unsafe fn drop_last(ptr: NonNull<u8>) {
         let inner = ptr.cast::<Inner<T>>().as_ptr();
+        // SAFETY: the caller guarantees the allocation is live and unreachable.
         unsafe { (*inner).strong.load(Ordering::Acquire) };
+        // SAFETY: as above.
         unsafe { Inner::drop_final(inner) };
     }
-}
-
-pub(crate) unsafe fn is_dead(inner: *const ()) -> bool {
-    unsafe { (*inner.cast::<AtomicUsize>()).load(Ordering::Acquire) == 0 }
 }
 
 impl<T> Shared<T> {
@@ -311,6 +328,41 @@ impl<T> Shared<T> {
         unsafe { &(*self.ptr.as_ptr()).lent }
     }
 
+    pub(crate) fn share(this: &Self) -> Self {
+        let strong = this.strong();
+        let mut count = strong.load(Ordering::Relaxed);
+        let mut spins = 0u32;
+        loop {
+            if count == 0 {
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(64) {
+                    std::thread::yield_now();
+                } else {
+                    hint::spin_loop();
+                }
+                count = strong.load(Ordering::Relaxed);
+                continue;
+            }
+            if count > MAX_STRONG {
+                process::abort();
+            }
+            match strong.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Shared {
+                        ptr: this.ptr,
+                        _owns: PhantomData,
+                    };
+                }
+                Err(seen) => count = seen,
+            }
+        }
+    }
+
     fn unique(&self) -> bool {
         if self
             .weak()
@@ -451,11 +503,42 @@ impl Dead {
     pub(crate) fn addr(&self) -> usize {
         self.ptr.addr().get()
     }
+
+    pub(crate) fn revive(self) -> Parked {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: a `Dead` value has not been dropped, so its allocation is live, and every
+        // `Inner` starts with its strong count.
+        unsafe { (*this.ptr.as_ptr().cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed) };
+        Parked {
+            ptr: this.ptr,
+            drop: this.drop,
+        }
+    }
 }
 
 impl Drop for Dead {
     fn drop(&mut self) {
         unsafe { (self.drop)(self.ptr) };
+    }
+}
+
+impl Parked {
+    pub(crate) fn addr(&self) -> usize {
+        self.ptr.addr().get()
+    }
+
+    pub(crate) fn release(self) -> Option<Dead> {
+        // SAFETY: a `Parked` value holds a count, so its allocation is live, and every `Inner`
+        // starts with its strong count.
+        let strong = unsafe { &*self.ptr.as_ptr().cast::<AtomicUsize>() };
+        if strong.fetch_sub(1, Ordering::Release) != 1 {
+            return None;
+        }
+        strong.load(Ordering::Acquire);
+        Some(Dead {
+            ptr: self.ptr,
+            drop: self.drop,
+        })
     }
 }
 
@@ -833,5 +916,61 @@ mod tests {
         assert_eq!(Shared::as_ptr(&owner), before);
         assert_eq!(clones.load(Ordering::SeqCst), 1);
         assert!(Shared::get_mut(&mut owner).is_some());
+    }
+
+    #[test]
+    fn shared_a_lent_owner_let_go_beside_its_slot_is_dropped_by_one_of_them() {
+        let rounds = if cfg!(miri) { 4 } else { 400 };
+        for round in 0..rounds {
+            let (counted, _, drops) = Counted::new(round);
+            let owner = Shared::new(counted);
+            let hazards = Hazards::new().unwrap();
+            Shared::lend_to(&owner, hazards.entry(ROOT));
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let other = {
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    drop(hazards);
+                })
+            };
+            start.wait();
+            drop(owner);
+            other.join().unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn shared_a_share_through_a_slot_never_brings_a_value_back() {
+        let rounds = if cfg!(miri) { 4 } else { 400 };
+        for round in 0..rounds {
+            let (counted, _, drops) = Counted::new(round);
+            let owner = Shared::new(counted);
+            let hazards = Hazards::new().unwrap();
+            let lent = Shared::lend_to(&owner, hazards.entry(ROOT))
+                .as_ptr()
+                .expose_provenance();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let other = {
+                let start = start.clone();
+                thread::spawn(move || {
+                    let ptr = ptr::with_exposed_provenance::<Counted>(lent);
+                    // SAFETY: the slot holds the value, so the pointer reaches a live value, and
+                    // the handle made from it takes no count and is never dropped.
+                    let borrowed = ManuallyDrop::new(unsafe { Shared::from_raw(ptr) });
+                    start.wait();
+                    let copy = Shared::share(&borrowed);
+                    assert_eq!(copy.value, round);
+                    drop(copy);
+                    drop(hazards);
+                })
+            };
+            start.wait();
+            drop(owner);
+            other.join().unwrap();
+            epoch::flush();
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "round {round}");
+        }
     }
 }

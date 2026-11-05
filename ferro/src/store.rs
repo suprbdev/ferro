@@ -1069,9 +1069,17 @@ struct Inner {
     options: StoreOptions,
 }
 
-#[derive(Clone)]
 pub struct Store {
     inner: Shared<Inner>,
+}
+
+impl Clone for Store {
+    #[inline]
+    fn clone(&self) -> Store {
+        Store {
+            inner: Shared::share(&self.inner),
+        }
+    }
 }
 
 pub(crate) struct Lent {

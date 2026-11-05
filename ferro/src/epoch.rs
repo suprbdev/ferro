@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::shared::{self, Dead, Erased};
+use crate::shared::{Dead, Erased, Parked};
 
 const BATCH: usize = 128;
 const BATCH_BYTES: usize = 64 << 10;
@@ -26,7 +26,7 @@ static SPARE: Mutex<Vec<&'static Record>> = Mutex::new(Vec::new());
 
 enum Value {
     Counted(ManuallyDrop<Erased>),
-    Dead(Dead),
+    Parked(Parked),
 }
 
 struct Retired {
@@ -39,20 +39,16 @@ impl Retired {
     fn addr(&self) -> usize {
         match &self.value {
             Value::Counted(value) => value.addr(),
-            Value::Dead(value) => value.addr(),
+            Value::Parked(value) => value.addr(),
         }
     }
 
     fn release(self) -> Option<(Dead, usize)> {
-        match self.value {
-            Value::Counted(value) => ManuallyDrop::into_inner(value)
-                .release_count()
-                .map(|dead| (dead, self.bytes)),
-            Value::Dead(value) => {
-                drop(value);
-                None
-            }
-        }
+        let dead = match self.value {
+            Value::Counted(value) => ManuallyDrop::into_inner(value).release_count(),
+            Value::Parked(value) => value.release(),
+        };
+        dead.map(|dead| (dead, self.bytes))
     }
 }
 
@@ -65,13 +61,8 @@ struct Pending {
 }
 
 impl Pending {
-    fn take(&mut self, oldest: u64, hazards: &[usize]) -> Vec<Retired> {
-        let freed: Vec<Retired> = self
-            .items
-            .extract_if(.., |item| {
-                item.epoch < oldest && hazards.binary_search(&item.addr()).is_err()
-            })
-            .collect();
+    fn take(&mut self, pick: impl FnMut(&mut Retired) -> bool) -> Vec<Retired> {
+        let freed: Vec<Retired> = self.items.extract_if(.., pick).collect();
         self.bytes -= freed.iter().map(|item| item.bytes).sum::<usize>();
         self.kept = self.items.len();
         self.kept_bytes = self.bytes;
@@ -105,6 +96,7 @@ impl Drop for Local {
 #[repr(align(128))]
 struct Record {
     entries: [AtomicPtr<()>; HAZARDS],
+    hint: AtomicBool,
 }
 
 struct Spares(RefCell<Vec<&'static Record>>);
@@ -194,6 +186,7 @@ impl Hazards {
                 }
                 let record: &'static Record = Box::leak(Box::new(Record {
                     entries: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS],
+                    hint: AtomicBool::new(false),
                 }));
                 records.push(record);
                 record
@@ -210,14 +203,20 @@ impl Hazards {
 
 impl Drop for Hazards {
     fn drop(&mut self) {
-        let dead = [STORE, ROOT].into_iter().any(|index| {
-            let held = self.record.entries[index].load(Ordering::Relaxed);
-            !held.is_null() && unsafe { shared::is_dead(held) }
-        });
-        for entry in &self.record.entries {
-            entry.store(ptr::null_mut(), Ordering::Release);
-        }
         let record = self.record;
+        let mut watched = false;
+        for (index, entry) in record.entries.iter().enumerate() {
+            if index <= ROOT && !entry.load(Ordering::Relaxed).is_null() {
+                entry.store(ptr::null_mut(), Ordering::SeqCst);
+                watched = true;
+            } else {
+                entry.store(ptr::null_mut(), Ordering::Release);
+            }
+        }
+        let hinted = watched && record.hint.load(Ordering::SeqCst);
+        if hinted {
+            record.hint.store(false, Ordering::Relaxed);
+        }
         let kept = SPARES
             .try_with(|spares| {
                 let mut spares = spares.0.borrow_mut();
@@ -231,7 +230,7 @@ impl Drop for Hazards {
         if !kept {
             SPARE.lock().push(record);
         }
-        if dead {
+        if hinted {
             flush();
         }
     }
@@ -262,11 +261,35 @@ pub(crate) fn retire(value: Erased, bytes: usize) {
     push(Value::Counted(ManuallyDrop::new(value)), bytes);
 }
 
-pub(crate) fn defer(value: Dead, bytes: usize) {
-    push(Value::Dead(value), bytes);
+pub(crate) fn park(value: Parked, bytes: usize) {
+    let addr = value.addr();
+    let slot = push(Value::Parked(value), bytes);
+    if !waits(addr) {
+        release(slot, &mut |item| item.addr() == addr);
+    }
 }
 
-fn push(value: Value, bytes: usize) {
+fn waits(addr: usize) -> bool {
+    let records = RECORDS.lock();
+    let mut held = false;
+    for record in records.iter() {
+        for (index, entry) in record.entries.iter().enumerate() {
+            if entry.load(Ordering::SeqCst).addr() != addr {
+                continue;
+            }
+            if index <= ROOT {
+                record.hint.store(true, Ordering::SeqCst);
+                if entry.load(Ordering::SeqCst).addr() != addr {
+                    continue;
+                }
+            }
+            held = true;
+        }
+    }
+    held
+}
+
+fn push(value: Value, bytes: usize) -> &'static Slot {
     let item = Retired {
         epoch: EPOCH.load(Ordering::SeqCst),
         bytes,
@@ -279,7 +302,7 @@ fn push(value: Value, bytes: usize) {
         pending.items.push(item);
         drop(pending);
         slot.taken.store(false, Ordering::Release);
-        return;
+        return slot;
     };
     let due = {
         let mut pending = slot.pending.lock();
@@ -291,12 +314,19 @@ fn push(value: Value, bytes: usize) {
         let oldest = oldest(None);
         free(slot, oldest, &hazarded());
     }
+    slot
 }
 
 fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
+    release(slot, &mut |item| {
+        item.epoch < oldest && hazards.binary_search(&item.addr()).is_err()
+    });
+}
+
+fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
     let freed = {
         let mut pending = slot.pending.lock();
-        let freed = pending.take(oldest, hazards);
+        let freed = pending.take(pick);
         FREEING.fetch_add(freed.len(), Ordering::SeqCst);
         freed
     };
@@ -305,6 +335,7 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
         .try_with(|here| here.set(here.get() + count))
         .is_ok();
     let dying: Vec<(Dead, usize)> = freed.into_iter().filter_map(Retired::release).collect();
+    let mut loose = Vec::new();
     if !dying.is_empty() {
         let held = hazarded();
         let (kept, gone): (Vec<_>, Vec<_>) = dying
@@ -312,6 +343,7 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
             .partition(|(dead, _)| held.binary_search(&dead.addr()).is_ok());
         drop(gone);
         if !kept.is_empty() {
+            let addrs: Vec<usize> = kept.iter().map(|(dead, _)| dead.addr()).collect();
             let epoch = EPOCH.load(Ordering::SeqCst);
             let mut pending = slot.pending.lock();
             for (value, bytes) in kept {
@@ -321,15 +353,20 @@ fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
                 pending.items.push(Retired {
                     epoch,
                     bytes,
-                    value: Value::Dead(value),
+                    value: Value::Parked(value.revive()),
                 });
             }
+            drop(pending);
+            loose = addrs.into_iter().filter(|addr| !waits(*addr)).collect();
         }
     }
     if counted {
         let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));
     }
     FREEING.fetch_sub(count, Ordering::SeqCst);
+    for addr in loose {
+        release(slot, &mut |item| item.addr() == addr);
+    }
 }
 
 fn oldest(skip: Option<&'static Slot>) -> u64 {

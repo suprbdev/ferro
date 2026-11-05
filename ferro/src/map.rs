@@ -4971,7 +4971,7 @@ mod tests {
         let mut finder = map.finder();
         assert!(matches!(walk._root, Some(ref root) if root.anchored()));
         drop(map);
-        assert_eq!(watch.strong_count(), 0);
+        assert_eq!(watch.strong_count(), 1);
         assert_eq!(below.strong_count(), 1);
         epoch::flush();
         seen.extend(values(walk));
@@ -5037,7 +5037,7 @@ mod tests {
         evict_all(vec![entry]);
         drop(middle);
         epoch::flush();
-        assert_eq!(watch.strong_count(), 0);
+        assert_eq!(watch.strong_count(), 1);
         for key in 0..8 {
             assert_eq!(finder.get(&key).map(|value| *value), Some(key * 3));
         }
