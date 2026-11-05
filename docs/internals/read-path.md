@@ -104,6 +104,54 @@ Memoizing every written node grew the live heap of `heap`'s commits and reads ca
 to 48.4 MiB with a 64 MiB cache, because the old paths of single-key commits kept the `Arc`
 allocations of their evicted children. With the rule it is 46.7 MiB.
 
+## One loop for borrowed nodes
+
+`Map::walk` serves `get`, `contains_key`, `value_hash` and `nth`. It used to reach every node
+through `reach`, which the compiler kept out of line and which handed back a `Result<Reach>`
+through memory, and it pinned the epoch before the root. Each step now goes through `descend`,
+which is always inlined: it takes a dirty node, a pinned memo or a `Weak` memo it can borrow
+straight to a reference and leaves anything else to `reach`, which counts nodes and reads from the
+file. The walk is one loop around one call of its visitor, and it pins the epoch only at the first
+`Weak` memo, through a `OnceCell`, so a walk through a dirty map, or through a stored map no deeper
+than the pinned levels, takes no pin at all.
+
+Measured on 2026-11-05, alternating builds before and after on one CCD of the machine described in
+[Performance](../guide/performance.md), on 1M `u64` keys with short string values unless a row says
+otherwise:
+
+| Read | Instructions before | Instructions after | Time before | Time after |
+| --- | ---: | ---: | ---: | ---: |
+| `get`, the compare harness's first pass after its load, seven runs | | | 0.33 µs | 0.32 µs |
+| `get` in the main `ferro-bench`, its second pass, five runs | 1,205 | 1,025 | 320 ns | 312 ns |
+| A table's row get in the main `ferro-bench`, 200,000 rows | 974 | 829 | 163 ns | 161 ns |
+| `get` in `reads`, a reopened handle, three runs | 1,188 | 1,008 | 345 ns | 336 ns |
+| `get` in `reads`, `u64` values | 1,170 | 989 | 265 ns | 261 ns |
+| `get` in `reads`, `()` values | 1,162 | 1,020 | 221 ns | 219 ns |
+| `contains_key` in `reads` | 1,141 | 976 | 297 ns | 290 ns |
+
+A get stays bound by memory, not instructions: it ran about 0.7 instructions a cycle before and
+after. Below the three pinned levels it reaches four nodes, each of whose header, flag line, keys
+and links or column arrive together but only once the link above them has been read, so the get
+waits on four misses in a row. A leaf that a get touches takes about eight lines, its header and
+flags, its keys and its column, so the 125,000 leaves of 1M keys want about 64 MB against the 32
+MB of L3 on one CCD, and most leaf reads go to DRAM, about 140 ns on this machine against 10 ns for
+L3.
+Each of those misses also walks the page table: the process gets no transparent huge pages from
+glibc's heap by default, and with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` gets ran 8 to 12% faster,
+as [Performance](../guide/performance.md#huge-pages) describes. Getting closer to
+redb's 0.27 µs would take fewer lines a leaf or fewer levels, which means a node laid out in one
+allocation or a wider fanout, and the second changes the file format.
+
+Measured and left out:
+
+- Three loops, one through dirty nodes and pinned memos before the pin, one through borrowed
+  nodes under it and the general one: 1,142 instructions a get on 1M keys, and 930 for
+  `contains_key` against 976 now, but each loop inlined the visitor, and for a table's rows the
+  compiler then gave up inlining what the visitor calls, so a row get ran 998 instructions
+  against 974 before.
+- A loop for borrowed nodes beside the general one, each calling the visitor: 1,157 instructions a
+  get.
+
 ## Values
 
 A node holds its values in one `Arc<[V]>` column in key order, beside its keys. There used to be one
@@ -115,6 +163,19 @@ column into slots at the first edit of that node's values, which takes one refer
 and copies none. A node on the path to an edit only gains a new child, so it keeps its column, and
 copying it costs one reference count where it used to cost one per value. That is why commits got
 cheaper: 34% for small values at 1M keys and 18% for short strings.
+
+A `Slot` takes 24 bytes. `Spilled` used to hold its `Ptr`, 40 bytes, and its summary inline, which
+made every slot 48 bytes though `Fresh` needs 8 and `Packed` 20. Spilled values are rare, so their
+slot now holds an `Arc<(Ptr, S)>`, which a copy of the node clones with a reference count, and a
+node's weight counts that allocation. A dirty leaf of a bulk load held 384 or 768 bytes of slots for
+eight keys, every insert shifts them, and 1M per-key inserts of short strings ran 5 to 6% faster and
+peaked 36 MiB lower, as [Inserts and prefetch hints](tree.md#inserts-and-prefetch-hints) describes.
+The change also tipped the compiler out of inlining `Node::value` into `Iter::next` for a
+`Map<u64, ()>`, whose `for` loop in `reads` went from 140 to 156 instructions a key and from 10.5 to
+13.4 ns. `Iter::next` now reads a column's value itself and leaves slots to `Node::value`, which
+brought it back to 141, with the loops over the other value types unchanged. That loop still took
+12.4 ns against 9.8 in `reads`, but the same loop in a function of its own runs 140 instructions in
+9.5 ns with both builds, so what is left is where it lands inside `reads`' large `probe_map`.
 
 `flush` leaves a column behind for every node it writes, putting the values of a changed node into
 key order as they decode from the written bytes. So a process reads what it wrote exactly as it

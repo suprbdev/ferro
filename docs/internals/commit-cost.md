@@ -93,8 +93,36 @@ cancel ran 7.7, 8.8 and 9.7% fewer instructions outside the closure, with the sa
 write. CPU time there was 0 to 4% lower across three sets of runs, not clearly beyond noise.
 Single-key commits ran 5 to 6% fewer instructions.
 
+## A bulk load's commit
+
+A commit of 1M fresh keys is a different shape: 140,000 dirty nodes, a 24 MB frame and a working
+tree of about 190 MB to drop. Timed in one run on 2026-11-05, with timers around each phase of a
+`Map<u64, String>` loaded by per-key inserts:
+
+| Phase | Wall time | On |
+| --- | ---: | --- |
+| Encode, hash and compress subtrees, the [parallel flush](tree.md#parallel-flush)'s first phase | 17 ms | 16 threads |
+| Append the records to the transaction | 24 ms | the committing thread |
+| Decode the cached copies | 12 ms | 16 threads |
+| Hand the copies to the transaction | 7 ms | the committing thread |
+| Write and sync the frame, and publish | 5 ms | the committing thread |
+| Register the records for deduplication and fill the node cache | 13 ms | the committing thread |
+| Drop the working tree | 109 ms | the committing thread |
+
+The drop is most of it, and freeing about 2.4M allocations in address order is most of the drop, as
+[Dropping a large tree](tree.md#dropping-a-large-tree) describes. Smaller slots and a prefetch of
+each node's flag line in the drop's walk took the drop to 96 ms in `bulk`, median of five
+alternating runs, and the rest of the commit from 95 to 92 ms.
+
 ## Measured and left out
 
+- Sizing a bulk load's `seen` table for its 140,000 records up front: the append took 21.4 ms
+  against 23.6 in one run each. It needs the count before the first record, through a new method on
+  `Sink`, and was not kept.
+- Filling the node cache on a thread while the committing thread drops the working tree, which
+  would hide its 13 ms. The cache and deduplication table are filled under the branch's lane so the
+  next commit on the branch finds them, while the drop runs after the lane is released, so the two
+  cannot overlap without holding the lane through the drop or handing it to the helper thread.
 - Encoding, hashing and compressing outside the writer lock. A closure is `FnOnce` and has to run on
   the tip, so it cannot run before the lock is taken and again if the tip moved. What is left is to
   let the next closure run on this one's dirty tree while this one flushes, which bounds the gain by

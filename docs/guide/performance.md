@@ -31,6 +31,14 @@ The booking commits cost 4 and 14% more than the 82 and 93 µs this page gave be
 instructions of a hold and 10% to those of a confirm, whose status it covers. Outside their closures
 the two ran 72 and 92 µs.
 
+Measured again on 2026-11-05 on the second CCD while other work ran on the first, five runs of
+`ferro-bench` alternating the builds before and after smaller slots, a lean insert recursion, a
+faster drop of the working tree and a walk that reaches borrowed nodes through one inlined step: the
+bulk insert went from 0.70 to 0.68 s and its peak RSS from 379 to 345 MiB, a random get from 0.32 to
+0.31 µs for 1,025 instructions against 1,205, and a table's row get from 163 to 161 ns for 829
+instructions against 974. The other rows moved by less than the spread of the runs, and the
+instructions of commits, scans and ranges by under 0.3%.
+
 ## Against other embedded stores
 
 Against other embedded stores on the same workload, with 1 GiB of cache each, medians of seven runs
@@ -48,6 +56,15 @@ bulk loads about 1.2 times faster, 0.60 s against 0.71 s, while fjall takes 1.3 
 ferro and redb 1.8 times, and redb's `get` takes about 16% less time. These numbers come from a warm
 cache, on a workload with few overwrites. Full results, including caveats about sled, are in
 [`benchmarks/compare/RESULTS.md`](../../benchmarks/compare/RESULTS.md).
+
+Measured again on 2026-11-05, each engine run alone on the second CCD while other work ran on the
+first, after smaller slots, a lean insert recursion, a faster drop of the working tree and a walk
+that reaches borrowed nodes through one inlined step: ferro's bulk load went from 0.71 to 0.67 s in
+alternating runs against 0.63 s for SQLite, so SQLite now loads about 1.06 times faster. Loaded with
+one `Map::extend` instead of a loop of `insert`, ferro takes 0.41 s. The get went from 0.33 to 0.32
+µs against 0.27 µs for redb, as [The read
+path](../internals/read-path.md#one-loop-for-borrowed-nodes) explains, and [Huge
+pages](#huge-pages) takes about a tenth off both the get and the load.
 
 ## Writers and branches
 
@@ -116,6 +133,26 @@ did 2.9M gets a second with the default glibc, 4.6M with
 thread gains 2 to 7%. ferro does not choose an allocator, so an application with that workload
 should set one, or the tunable, itself.
 
+## Huge pages
+
+A large map in memory is read and built one dependent miss at a time, and each miss also walks the
+page table, since 1M keys take several hundred MiB of 4 KiB pages, far more than the TLB covers.
+This machine has transparent huge pages set to `always`, yet glibc's heap gets none: it grows a
+little at a time, so no 2 MiB range of it is ever whole when first touched. With
+`GLIBC_TUNABLES=glibc.malloc.hugetlb=1` in the environment glibc asks for huge pages and grows its
+heap in whole ones. Over four alternating runs of a 1M-key load of short strings through per-key
+inserts and then gets, measured on 2026-11-05 with the build before the changes above:
+
+| | Default | `glibc.malloc.hugetlb=1` |
+| --- | ---: | ---: |
+| Inserts | 534 ns a key, 48,888 page faults | 459 ns a key, 501 page faults |
+| Load, commit and drop | 730 ms | 641 ms |
+| `get` | 332 ns | 293 to 303 ns |
+| `contains_key` | 313 ns | 276 ns |
+| Resident memory in huge pages | 0 of 347 MiB | 362 of 368 MiB |
+
+As with the allocator, ferro leaves this to the application.
+
 ## Other tools
 
 The other `ferro-bench` tools, on the same machine and day, with how many runs each figure is the
@@ -123,7 +160,7 @@ median of:
 
 | Tool, runs | Workload | Result |
 | --- | --- | --- |
-| `bulk`, 7 | 1M random keys inserted in one commit | 0.73 s: 0.53 s of inserts and 0.20 s to commit and drop the tree, 378 MiB peak RSS |
+| `bulk`, 5 | 1M random keys inserted in one commit, measured again on 2026-11-05 on one CCD, alternating with the build before | 0.68 s: 0.50 s of inserts and 0.19 s to commit and drop the tree, 343 MiB peak RSS, against 0.75 s, 0.54 s, 0.20 s and 379 MiB before |
 | `tables`, 7 | Booking hold, confirm and cancel, Buffered | 86, 106 and 146 µs of CPU, 14, 14 and 26 µs of it in the closure, 13,362 bytes a write |
 | `covered`, 3 of 3 rounds | A balance update on 200,000 rows, a plain `tier` index against one covering `balance` | 7,660 against 10,415 bytes and 52 against 67 µs of CPU, indexes of 3.90 against 4.56 MiB |
 | `merge`, 3 | Merge base of a fork at 10,000 commits followed by 10,000 and 1,000 more, of a branch that took a side branch 1,000 times, and of one with 1,000 features merged since it forked | 62 µs, 51 µs and 7.7 ms |

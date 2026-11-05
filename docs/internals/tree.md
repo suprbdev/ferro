@@ -101,6 +101,28 @@ fifth: 42% fewer reallocations, inserts 1.7% faster on random keys and 5.7% on a
 to 3% more peak RSS. A booking closure, which copies a few paths from the file, runs 5% more
 instructions and 2.5% more CPU time, about 0.3 µs.
 
+A slot used to take 48 bytes, for the spilled variant's inline `Ptr`, and now takes 24, as
+[Values](read-path.md#values) describes, so a leaf's slots are half the size an insert shifts and
+half the memory a bulk load faults in. The recursion also got lean: `insert_at` used to inline the
+paths that build a new leaf, split a subtree under a new key and load a stored node, and call
+`dirty_mut` out of line, so each level pushed a 728-byte frame. It now makes its node unique in
+place and recurses, and `insert_outside`, `insert_above` and `insert_between` take the rare paths,
+in a 216-byte frame. In `bulk`, median of five alternating runs on one CCD, 1M random keys:
+
+| | Before | After |
+| --- | ---: | ---: |
+| Inserts | 543 ms, 2,977 instructions a key | 496 ms, 2,728 instructions a key |
+| Rest of the commit | 95 ms | 92 ms |
+| Drop | 108 ms | 96 ms |
+| Peak RSS | 379 MiB | 343 MiB |
+
+Most of what is left of an insert is waiting: about a third of its samples sit on the
+compare-and-swap that makes each node on the path unique, which is the first touch of a node
+whose address the level above has only just read, so no prefetch issued from there arrives
+sooner. Another 14% is the page table and page faults: the inserts fault in about 190 MB of 4 KiB
+pages, 49,000 faults and 64 ms of system time, since glibc's heap gets no transparent huge pages by
+default, and with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` they took 501 faults and ran 14% faster.
+
 ## Dropping a large tree
 
 Dropping the tree freed 2.4M allocations in key order: a box and a string for each value and up to
@@ -116,6 +138,13 @@ so each chunk merges with the one freed just before it. At 1M keys the drop went
 and the gets, scans and ranges right after the load did not change. A tree built in key order, by
 ascending inserts or `Extend`, already frees in address order and keeps the plain drop.
 
+The walk prefetched the first two lines of each node 16 ahead, but `Shared::get_mut` reads the weak
+count and `lent`, which sit behind the value on a line of their own, so every node still waited on
+a miss there. It prefetches that line too, and the walk of 1M keys went from 16.3 to 9.6 ms, median
+of four alternating runs, out of a drop of about 95 ms: sorting the five lists takes 17 ms and the
+ascending pass 67. That pass used to work out all five heads after every free and now refreshes
+only the one it advanced, 30 instructions a key fewer, with no change in time beyond noise.
+
 ## Bulk load figures
 
 With the LZ4 change described under [Commits of a few rows](commit-cost.md#the-lz4-encoder), a
@@ -126,8 +155,25 @@ tool's live heap after reads moved by at most 0.2 MiB. Ascending keys and `Exten
 beyond 3%. In the compare harness it went from 1.04 to 0.71 s against 0.60 s for SQLite, as
 `benchmarks/compare/RESULTS.md` describes.
 
+Smaller slots, the lean insert recursion and the drop's flag-line prefetch, described above, took
+the harness's ferro child from 0.71 to 0.67 s, median of seven alternating runs on one CCD of the
+machine, and from 0.73 to 0.69 s and 0.74 to 0.70 s in two noisier sets, where SQLite took 0.63 s
+and redb 1.36 s in three runs each the same way. Loading the same
+keys with one `extend`, which sorts the batch and builds the tree bottom-up as described under
+[Batches](#batches-extend-fromiterator-and-apply), took 0.41 s. A `Map::from_sorted` for input
+already in key order would save only the sort, about 33 ms at 1M pairs, so it was not added.
+
 ## Measured and rejected
 
+- Prefetching the child's header, count and flag lines with its hint as an insert steps into it:
+  inserts 1% faster in one set of six alternating runs and 7% slower in a set of five. The
+  compare-and-swap on the header follows a few instructions later, so the prefetch gains it nothing.
+- Room for 16 keys in new leaves now that slots take 24 bytes: inserts 6% slower than with room for
+  eight over five alternating runs, and the gets after the load 3 to 7% slower, from the larger
+  heap.
+- Sorting the teardown's five lists on threads. Not built: the sort is 17 ms of a 95 ms drop, and
+  sorting in a destructor on threads needs `K` and `V` to be `Send`, which `Map`'s `Drop` cannot
+  ask.
 - Prefetching a node's keys and its children or slots after reading its header, without hints in the
   links: inserts 12% faster for 20% more instructions, against 22 to 31% with the hints.
 - Prefetching from the hints at every level: 1 to 6% faster inserts on random keys than stopping at
