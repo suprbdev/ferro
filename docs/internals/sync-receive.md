@@ -49,10 +49,13 @@ base must still be in one of its chains, or `receive` returns `StaleHave`, the c
 oldest one sent is looked up again, and every sent commit's links, generation and merge numbers are
 worked out and checked against the commits this file holds now. A check that passed against the old
 heads passes against newer ones unless a commit it relied on has been pruned, which only leaves less
-to check. The landing frame holds the copies of the commits whose links changed and the refs that
-point `remote` at the head, and goes to the file 1 MiB at a time as the old frame did, with a header
-written last whose hash reads back the part already written. Type checks and hashes are not
-repeated: they depend only on the bundle and on objects whose hashes do not change.
+to check. A `StaleHave` from these checks or from the first ones comes before the merge closure, so
+a pull tries again from a fresh have, as described under [A stale have in a
+pull](sync.md#a-stale-have-in-a-pull). The landing frame holds the copies of the commits whose links
+changed and the refs that point `remote` at the head, and goes to the file 1 MiB at a time as the
+old frame did, with a header written last whose hash reads back the part already written. Type
+checks and hashes are not repeated: they depend only on the bundle and on objects whose hashes do
+not change.
 
 A reclamation cycle can prune, swap the file and retire the old one while the bundle streams. Before
 placing, `receive` resolves the anchors again in the generation now current: each base by hash and

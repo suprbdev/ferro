@@ -143,9 +143,8 @@ sends 256 objects, with eight chunks in flight between the two.
 - Every commit the bundle says the receiver holds must still be in one of its chains, and so must
   the head of an empty bundle, which the have named. If the receiver pruned or dropped one after it
   sent its have, even while the bundle was streaming, `receive` returns `Error::StaleHave`, lands
-  nothing, and a bundle built from a fresh have lands. `pull` returns it as well rather than
-  retrying, so a caller sees the same error whether it pulls in one process or over a network, and
-  decides itself whether to try again.
+  nothing, and a bundle built from a fresh have lands. `pull` holds both files, so it builds that
+  have itself and tries again, as described under [A stale have in a pull](#a-stale-have-in-a-pull).
 - Every link resolves to an object earlier in the bundle, to a hint whose path ends at the same
   hash, or, for a commit's `prev` or `skip`, to the receiver's entry at that version, checked by
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
@@ -179,6 +178,46 @@ commit, so a crash leaves the previous head: a torn frame is not replayed. Branc
 a `watch_when` test may commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
 was. Flipping every byte of a 3,358 byte bundle with three masks gave 10,073 rejections and one flip
 inside an LZ4 body that decoded to the same bytes, and so landed the same commit.
+
+## A stale have in a pull
+
+A receive is two steps: the landing, which stages the bundle, checks it and writes the frame that
+points `remote` at its head, and [bringing the branch up](#bringing-the-branch-up), which runs the
+merge closure. Every check that can return `StaleHave` is in the landing: the bases and hints are
+resolved before the first object is read, again before a bundle over 1 MiB is placed, and again
+under the writer locks for the frame that lands it. Once that frame is written nothing the bundle
+builds on is looked up again, so no stale have can be found after the closure has run.
+
+`pull` runs the landing on its own, and the landing returns ferro's own `Error`, so a `StaleHave`
+reaches `pull` before `try_pull` converts anything into the caller's type. `pull` then drops that
+attempt and starts again from a new have, which names what this file holds now, and the other side
+bundles against it. The closure is handed only to the second step, once an attempt has landed, so
+it never runs for an attempt that is retried. An error after the landing, the closure's own or one
+from writing the merge, is returned with `remote` landed, as under [Bringing the branch
+up](#bringing-the-branch-up), and not retried: the closure is the caller's code and may have done
+more than merge.
+
+There are three attempts in all. A fresh have names what this file holds when it is built, so an
+attempt goes stale only if another prune or drop removes what it names during that attempt's own
+transfer. The second attempt covers a cycle or a drop that crossed the first, the third one more,
+and the bound keeps a file that is pruned without pause from sending bundles that never land: each
+refused attempt sends its have and as much of its bundle as was read before the check failed, and a
+bundle over 1 MiB that was placed before its landing refused it stays in the log until the next
+reclamation cycle. After three, the caller gets `StaleHave` and decides, as it would from
+`receive`. `receive` and `receive_from` do not retry, because the bundle came from the caller and
+only the caller can fetch another. The `Pulled` a pull returns describes the attempt that landed:
+its have, its bundle and their bytes.
+
+`a_try_pull_retries_a_stale_have_before_its_error_type_and_returns_its_merge_error_once` and
+`a_push_whose_base_goes_before_it_lands_tries_again_and_merges_once` in `ferro/tests/sync.rs` prune
+the base once, the first before the bundle is read and the second once it is staged, and expect one
+more attempt and the closure called once, against the base of the attempt that landed.
+`a_pull_whose_have_goes_stale_on_every_attempt_gives_up_after_three` moves the file under every
+attempt and expects `StaleHave` in the caller's type after three, with nothing landed and the
+closure never called.
+`a_pull_whose_base_is_pruned_between_placing_and_landing_tries_again_and_lands` in
+`ferro/tests/sync_unlocked.rs` prunes the base of a bundle over 1 MiB once it is placed, and expects
+the retry to land and the first attempt's copy to be reclaimed.
 
 ## Bringing the branch up
 
@@ -441,7 +480,8 @@ Measured and left out:
 - `receive` writes a bundle over 1 MiB twice, to the scratch file as it arrives and then into the
   log, so it needs free disk for both until it lands and costs a second write and read of the
   bundle. A crash while it places the bundle, or a landing refused because a base went while the
-  bundle streamed, leaves what was placed in the log until the next reclamation cycle.
+  bundle streamed, leaves what was placed in the log until the next reclamation cycle, once for
+  each attempt of a pull that tried again.
 - Placing a large bundle holds the cycle mutex, so a cycle that is running when the bundle has been
   checked delays the landing until it ends, and one that comes due waits for the copy. The landing
   waits for the closure running on each branch, as a cycle's pause does.

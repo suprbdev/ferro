@@ -82,8 +82,11 @@ it claims, and refuses commits dated more than a day past this machine's clock.
 If this file does not hold the commit a bundle builds on, because the bundle was built for another
 file, or this one pruned or dropped that commit after sending its have, even while the bundle was
 arriving, `receive` returns `Error::StaleHave` and lands nothing: build a new bundle from a fresh
-have and try again. `pull` returns the same error rather than retrying, so call it again, as
-`examples/notes` does once.
+have and try again. Only you can fetch that bundle, so `receive` and `receive_from` leave the retry
+to you. `pull` and `push` hold both files, so they send a fresh have and try again themselves, up
+to three attempts in all, and return `StaleHave` only if this file moved under all three. A stale
+have is found before your merge closure can run, so the closure runs at most once, for the attempt
+that landed, and `try_pull` and `try_push` retry before any error reaches your error type.
 
 ## Versions and hashes across files
 
@@ -118,8 +121,8 @@ so that the new tree can link it. Each object is held whole, so one huge value n
 size. A bundle over 1 MiB is written twice, to a scratch file beside the database while it arrives
 and then into the file, so it needs disk for both until it lands. A crash while it is copied in, or
 a bundle refused because this file pruned what it builds on while it arrived, leaves the copy in the
-file until the next reclamation cycle. Files that share no commit send everything on their first
-pull.
+file until the next reclamation cycle, one for each attempt a pull refused. Files that share no
+commit send everything on their first pull.
 
 [Limits](../internals/sync.md#limits) in the internals lists the rest.
 

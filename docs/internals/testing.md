@@ -123,6 +123,8 @@ Tests are described next to what they test:
 - The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
   [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).
+- A pull whose have goes stale once, on every attempt, and between placing and landing: [A stale
+  have in a pull](sync.md#a-stale-have-in-a-pull).
 - A commit that adds a level and copies a held value: [What is sent](sync.md#what-is-sent).
 - A header whose hints reach one held object many ways: [Memory for each
   object](sync.md#memory-for-each-object).
