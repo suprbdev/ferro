@@ -2682,8 +2682,9 @@ impl<T: Data> Db<T> {
     ///   branch has landed, and this branch is as it was.
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
     ///   is damaged.
-    /// - [`Error::Reentrant`] from inside a closure on either file, [`Error::ReadOnly`] on a
-    ///   read-only handle, and the errors of [`Db::commit`].
+    /// - [`Error::Reentrant`] from inside a closure on this file, or where waiting on `from`'s
+    ///   file could otherwise deadlock, [`Error::ReadOnly`] on a read-only handle, and the errors
+    ///   of [`Db::commit`].
     ///
     /// # Panics
     ///

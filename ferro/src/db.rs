@@ -3249,8 +3249,9 @@ impl<T: Data> Db<T> {
     ///
     /// - [`Error::ReadOnly`] on a read-only handle, and [`Error::NoBranch`] if the branch was
     ///   dropped.
-    /// - [`Error::Reentrant`] when called from inside a closure that holds a writer lock this one
-    ///   would wait on.
+    /// - [`Error::Reentrant`] from inside a closure on this file, where waiting for this branch's
+    ///   writer lock could deadlock, as [Writing from inside a
+    ///   closure](docs/guide/concurrency.md#writing-from-inside-a-closure) lists.
     /// - [`Error::Poisoned`] after an earlier write or sync failed, and [`Error::GroupFailed`] if
     ///   the coalesced group this closure joined could not be written.
     /// - [`Error::Io`] if this commit's write or sync fails, and the errors of encoding the value,
