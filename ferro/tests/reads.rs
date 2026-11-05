@@ -569,6 +569,43 @@ fn a_value_outlives_the_map_and_its_node() {
 }
 
 #[test]
+fn a_map_edited_beside_its_iterators_leaves_what_they_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edited.ferro");
+    let db = uncached().open::<Map<u32, String>>(&path).unwrap();
+    db.update(|root| root.extend((0..4_000).map(|key| (key, format!("value {key}")))))
+        .unwrap();
+    let mut map = (*db.read()).clone();
+    drop(db);
+    let mut walk = map.iter();
+    let mut cursor = map.cursor();
+    assert!(cursor.seek(&2_000));
+    assert_eq!(walk.next().map(|(key, _)| key), Some(0));
+    for key in 0..4_000 {
+        map.insert(key, format!("changed {key}"));
+    }
+    map.remove(&1);
+    map.insert(4_000, "added".to_string());
+    let rest: Vec<(u32, String)> = walk.map(|(key, value)| (key, (*value).clone())).collect();
+    assert_eq!(rest.len(), 3_999);
+    assert!(
+        rest.iter()
+            .all(|(key, value)| *value == format!("value {key}"))
+    );
+    assert_eq!(cursor.advance(), Some(&2_001));
+    assert_eq!(
+        cursor.value().map(|value| (*value).clone()),
+        Some("value 2001".to_string())
+    );
+    drop(cursor);
+    assert_eq!(map.len(), 4_000);
+    assert_eq!(
+        map.get(&2).map(|value| (*value).clone()),
+        Some("changed 2".to_string())
+    );
+}
+
+#[test]
 fn set_ranges_know_their_length_from_both_ends() {
     let set: Set<(u32, u32)> = (0..1_000)
         .flat_map(|a| (0..8).map(move |b| (a, b * 3)))

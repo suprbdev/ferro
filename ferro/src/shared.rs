@@ -158,8 +158,12 @@ impl<T> Shared<T> {
     }
 
     pub(crate) fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.unique()
-            .then(|| unsafe { &mut (*this.ptr.as_ptr()).data })
+        if !this.unique() || this.lent().load(Ordering::Relaxed) && Shared::in_slot(this) {
+            return None;
+        }
+        // SAFETY: this is the only count, no weak or slot reaches the value, and `this` stays
+        // borrowed mutably for as long as the reference lives.
+        Some(unsafe { &mut (*this.ptr.as_ptr()).data })
     }
 
     #[inline]
@@ -173,12 +177,27 @@ impl<T> Shared<T> {
             .is_err()
         {
             Shared::clone_out(this);
+        } else if this.lent().load(Ordering::Relaxed) && Shared::in_slot(this) {
+            this.strong().store(1, Ordering::Release);
+            Shared::clone_out(this);
         } else if this.weak().load(Ordering::Relaxed) != 1 {
             Shared::move_out(this);
         } else {
             this.strong().store(1, Ordering::Release);
         }
+        // SAFETY: `this` now holds the only count of a value no weak or slot reaches, and stays
+        // borrowed mutably for as long as the reference lives.
         unsafe { &mut (*this.ptr.as_ptr()).data }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn in_slot(this: &Self) -> bool {
+        if crate::epoch::hazarded_at(this.ptr.addr().get()) {
+            return true;
+        }
+        this.lent().store(false, Ordering::Relaxed);
+        false
     }
 
     #[cold]
@@ -209,7 +228,13 @@ impl<T> Shared<T> {
         {
             return (*this).clone();
         }
+        if this.lent().load(Ordering::Relaxed) && Shared::in_slot(&this) {
+            this.strong().store(1, Ordering::Release);
+            return (*this).clone();
+        }
         let this = ManuallyDrop::new(this);
+        // SAFETY: the count went from one to zero here and no slot holds the value, so nothing else
+        // reads it, and the allocation is let go without dropping the value read out.
         let data = unsafe { ptr::read(&raw const (*this.ptr.as_ptr()).data) };
         drop(Weak { ptr: this.ptr });
         data
@@ -278,6 +303,12 @@ impl<T> Shared<T> {
     #[inline]
     fn weak(&self) -> &AtomicU32 {
         unsafe { &(*self.ptr.as_ptr()).weak }
+    }
+
+    #[inline]
+    fn lent(&self) -> &AtomicBool {
+        // SAFETY: a `Shared` holds a count, so its allocation is live.
+        unsafe { &(*self.ptr.as_ptr()).lent }
     }
 
     fn unique(&self) -> bool {
@@ -766,5 +797,41 @@ mod tests {
         epoch::flush();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_a_value_in_a_slot_is_copied_rather_than_changed() {
+        let (counted, clones, drops) = Counted::new(12);
+        let mut owner = Shared::new(counted);
+        let hazards = Hazards::new().unwrap();
+        let lent = Shared::lend_to(&owner, hazards.entry(ROOT));
+        assert!(Shared::get_mut(&mut owner).is_none());
+        Shared::make_mut(&mut owner).value = 13;
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+        let (counted, copies, taken_drops) = Counted::new(15);
+        let moved = Shared::new(counted);
+        let also = Shared::lend_to(&moved, hazards.entry(HAZARDS - 1));
+        let taken = Shared::unwrap_or_clone(moved);
+        assert_eq!(copies.load(Ordering::SeqCst), 1);
+        // SAFETY: a slot still holds the value, so it has not been dropped.
+        assert_eq!(
+            unsafe { (lent.as_ref().value, also.as_ref().value) },
+            (12, 15)
+        );
+        assert_eq!((owner.value, taken.value), (13, 15));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(taken_drops.load(Ordering::SeqCst), 0);
+        drop(hazards);
+        epoch::flush();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(taken_drops.load(Ordering::SeqCst), 1);
+        let hazards = Hazards::new().unwrap();
+        Shared::lend_to(&owner, hazards.entry(ROOT));
+        drop(hazards);
+        let before = Shared::as_ptr(&owner);
+        Shared::make_mut(&mut owner).value = 16;
+        assert_eq!(Shared::as_ptr(&owner), before);
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+        assert!(Shared::get_mut(&mut owner).is_some());
     }
 }
