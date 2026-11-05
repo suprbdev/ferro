@@ -679,11 +679,24 @@ impl CopySink<'_> {
         })
     }
 
-    fn settled(&self, link: Ptr) -> Option<Ptr> {
+    fn settled(&self, link: Ptr) -> Result<Option<Ptr>> {
+        match self.remap(link) {
+            None if self.pruned.contains(&link.hash) => Err(Error::Corrupt(format!(
+                "link to the pruned log entry at {}",
+                link.offset
+            ))),
+            done => Ok(done),
+        }
+    }
+
+    fn parent(&self, link: Ptr) -> Option<Ptr> {
         let tombstone = Ptr {
             hash: link.hash,
             offset: 0,
         };
+        if link.offset == 0 {
+            return Some(tombstone);
+        }
         self.remap(link)
             .or_else(|| self.pruned.contains(&link.hash).then_some(tombstone))
     }
@@ -729,7 +742,7 @@ impl CopySink<'_> {
                 hash: link.hash,
                 offset,
             }),
-            Some(_) => self.settled(link),
+            Some(_) => self.parent(link),
         }
     }
 
@@ -768,7 +781,7 @@ impl CopySink<'_> {
         let payload = &record[stored.payload.clone()];
         if entry.is_none() {
             while let Some(link) = held.old.get(held.links.len()) {
-                let Some(done) = self.settled(*link) else {
+                let Some(done) = self.settled(*link)? else {
                     break;
                 };
                 held.links.push(done);
@@ -798,7 +811,8 @@ impl CopySink<'_> {
     }
 
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
-        if let Some(done) = self.settled(root) {
+        let settled = self.settled(root);
+        if let Some(done) = settled.map_err(|error| self.verifier.first(error))? {
             return Ok(done);
         }
         let mut stack = match self.read(root)? {
@@ -810,11 +824,14 @@ impl CopySink<'_> {
             if top.next < top.held.old.len() {
                 let link = top.held.old[top.next];
                 let settled = match top.entry {
-                    Some(rungs) if link.offset == 0 && top.next >= rungs.parents => Some(link),
                     Some(rungs) if rungs.skip == Some(top.next) => {
                         self.skipped(&top.held.links, rungs, link)
                     }
-                    _ => self.settled(link),
+                    Some(rungs) if top.next >= rungs.parents => self.parent(link),
+                    _ => {
+                        let settled = self.settled(link);
+                        settled.map_err(|error| self.verifier.first(error))?
+                    }
                 };
                 let done = match settled {
                     Some(done) => done,

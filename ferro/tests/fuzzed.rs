@@ -499,6 +499,23 @@ fn compacting_a_null_link_outside_a_log_entry_fails_as_verify_does() {
 }
 
 #[test]
+fn compacting_a_tree_that_links_a_pruned_log_entry_fails() {
+    for threads in [1, 4] {
+        let (_dir, path) = fixture("compact-pruned-link");
+        let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+        let outcome = db.compact(Keep::Last(1));
+        assert!(
+            matches!(&outcome, Err(Error::Corrupt(message))
+                if message == "link to the pruned log entry at 16122"),
+            "{threads} threads: {outcome:?}"
+        );
+        db.verify().unwrap();
+        drop(db);
+        admin::verify(&path).unwrap();
+    }
+}
+
+#[test]
 fn a_node_whose_child_counts_overflow_is_rejected() {
     let (_dir, _store, map) = crafted(|txn| {
         let low = node(txn, 0, &[1], &[]);
