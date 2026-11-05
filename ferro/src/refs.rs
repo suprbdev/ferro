@@ -1,3 +1,11 @@
+//! The branch table a file's head points at, and the steps that change it one branch at a time.
+//!
+//! A commit does not rewrite the whole table of branches. It writes a step: one branch's name and
+//! new [`Head`], linking the table or step the head named before. Following the steps back to the
+//! table they start from, the newest step for each name winning, gives every branch's head. After
+//! [`STEPS`] steps the next change writes a whole table again. [Branch-table
+//! steps](docs/internals/commit-path.md#branch-table-steps) describes them.
+
 use std::collections::HashSet;
 
 use crate::codec::{Data, Decoder, Encoder, Kind, Ptr, Sink};
@@ -8,9 +16,11 @@ use crate::map::Map;
 use crate::store::{Store, Txn};
 
 const STEP: u8 = 0x7f;
+/// How many steps a writer stacks on a table before it writes a whole table again.
 pub(crate) const STEPS: usize = 64;
 const MAX_STEPS: usize = 1024;
 
+/// One branch's new head, written on top of the table or step before it.
 #[derive(Clone)]
 pub(crate) struct Step {
     prev: Ptr,
@@ -18,9 +28,12 @@ pub(crate) struct Step {
     head: Head,
 }
 
+/// What a file's head points at.
 #[derive(Clone)]
 pub(crate) enum Root {
+    /// A whole branch table.
     Table(Refs),
+    /// A step on top of an earlier table or step.
     Step(Step),
 }
 
@@ -63,6 +76,9 @@ impl Data for Root {
     }
 }
 
+/// Writes the step that sets branch `name` to `head` on top of the table or step at `prev`.
+///
+/// It returns the step's pointer and the head as decoded back from what was written.
 pub(crate) fn write_step(
     txn: &mut Txn,
     store: &Store,
@@ -124,6 +140,15 @@ fn layers(store: &Store, head: Ptr, since: Option<(Ptr, &Refs, usize)>) -> Resul
     }
 }
 
+/// The branch table at `head`, with its steps applied, and how many steps deep it is.
+///
+/// `since` names a pointer whose table is already loaded, with its depth, so that the walk back
+/// stops there and reads only the steps written after it.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if the steps run back further than any writer stacks them, and read
+/// errors.
 pub(crate) fn load(
     store: &Store,
     head: Option<Ptr>,
@@ -149,11 +174,16 @@ pub(crate) fn load(
     Ok((base, depth))
 }
 
+/// Every commit log a branch table records, from [`heads`].
 pub(crate) struct Heads {
+    /// The log of each branch's newest head.
     pub(crate) current: Vec<Chain>,
+    /// The logs of the older heads that earlier steps record for the same branches.
     pub(crate) superseded: Vec<Chain>,
 }
 
+/// Every commit log the branch table at `head` and its steps record, split into each branch's
+/// newest and the older ones.
 pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
     let Layers { steps, base, .. } = layers(store, head, None)?;
     let mut named = HashSet::new();

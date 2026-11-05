@@ -1,3 +1,12 @@
+//! The search for the best common ancestors of two sets of commits over the merge graph.
+//!
+//! [`best`] paints down from both sides as git's merge-base does, but in jumps: a chain moves
+//! straight to the highest place another chain could join it, found by a binary search on
+//! versions, and merge entries are opened only while what they merged could still matter. A
+//! commit reached from both sides is a candidate, and everything below it is stale. The search
+//! refuses to answer where pruned history could change the answer. [Finding the
+//! base](docs/internals/merging.md#finding-the-base) describes it.
+
 use std::cmp::Reverse;
 
 use crate::codec::Hash;
@@ -10,12 +19,19 @@ const TWO: u8 = 2;
 const BOTH: u8 = ONE | TWO;
 const STALE: u8 = 4;
 
+/// A commit to search down from, with what is retained below it.
 #[derive(Clone)]
 pub(crate) struct Start {
+    /// The file the commit is read from.
     pub(crate) store: Store,
+    /// The commit's log entry.
     pub(crate) node: Node,
+    /// The oldest version retained on the chain it was reached through.
     pub(crate) low: u64,
+    /// The time before which commits on that chain count as pruned, where history is kept by
+    /// time.
     pub(crate) after: Option<u64>,
+    /// Whether only this commit is known, and not the history below it.
     pub(crate) bare: bool,
 }
 
@@ -94,6 +110,17 @@ struct Search {
     hidden: Vec<Hidden>,
 }
 
+/// The best common ancestors of the commits in `ours` and those in `theirs`: the commits both
+/// sides reach through `prev` and merge links that are not below another such commit.
+///
+/// They come back by generation, then time, then entry hash, highest first and without
+/// duplicates, so the order depends only on the set. None come back when the sides share no
+/// commit and nothing is pruned.
+///
+/// # Errors
+///
+/// [`Error::NoCommonAncestor`] when pruned history could hold a better ancestor or hide one, and
+/// [`Error::Corrupt`] or read errors from the logs.
 pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
     let mut search = Search {
         items: Vec::new(),

@@ -1,3 +1,12 @@
+//! The record of the writer locks each thread holds, behind [`Error::Reentrant`].
+//!
+//! A thread notes each branch lock and whole-file lock it takes, and every call that could wait
+//! on a lock checks the list first. A call that could deadlock on a lock this thread holds, or on
+//! a write waiting for this thread, fails with [`Error::Reentrant`] instead of hanging. A thread
+//! that writes into one file while it holds locks in another records the crossing, so that two
+//! threads crossing between the same files in opposite directions are refused as well. [Writes
+//! from inside a closure](docs/internals/reentrancy.md) describes the rules.
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5,11 +14,16 @@ use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
 
+/// The locks a call will wait on, for [`check`].
 #[derive(Clone, Copy)]
 pub(crate) enum Needs<'a> {
+    /// The writer lock of the named branch.
     Lane(&'a str),
+    /// The writer lock of every branch of the file, as a cycle or a landing bundle takes.
     Every,
+    /// Only the file's tip lock, briefly.
     Tip,
+    /// The acknowledgement of a commit whose closure has already run.
     Ack,
 }
 
@@ -36,10 +50,14 @@ thread_local! {
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static CROSSINGS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// A new id for an opened database, unique within the process.
 pub(crate) fn next_db() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Records that this thread holds lock `lane`, of the branch `name`, in database `db`.
+///
+/// Lane 0 stands for the whole file, which [`whole`] records.
 pub(crate) fn hold(db: u64, lane: usize, name: &str) {
     let _ = HOLDS.try_with(|holds| {
         let mut holds = holds.borrow_mut();
@@ -61,6 +79,7 @@ pub(crate) fn hold(db: u64, lane: usize, name: &str) {
     });
 }
 
+/// Removes the newest record that this thread holds lock `lane` in database `db`.
 pub(crate) fn release(db: u64, lane: usize) {
     let _ = HOLDS.try_with(|holds| {
         let mut holds = holds.borrow_mut();
@@ -76,8 +95,10 @@ pub(crate) fn release(db: u64, lane: usize) {
     });
 }
 
+/// A record that this thread holds a lock on all of a database, removed when dropped.
 pub(crate) struct Whole(u64);
 
+/// Records that this thread holds a lock on all of database `db` until the guard is dropped.
 pub(crate) fn whole(db: u64) -> Whole {
     hold(db, 0, "");
     Whole(db)
@@ -89,6 +110,8 @@ impl Drop for Whole {
     }
 }
 
+/// The crossings a call recorded from the databases this thread holds locks in to the one it
+/// entered, removed when dropped.
 pub(crate) struct Crossing(Vec<(u64, u64)>);
 
 impl Drop for Crossing {
@@ -102,6 +125,18 @@ impl Drop for Crossing {
     }
 }
 
+/// Checks that a call on database `db` that waits on `needs` cannot deadlock on this thread's
+/// locks, and records its crossing from other databases while it runs.
+///
+/// A whole-file hold on `db` refuses everything. A branch lock refuses [`Needs::Every`], and a
+/// [`Needs::Lane`] whose name does not sort after the held branch's, since cycles take branches in
+/// name order. With `coalesce` a branch lock also refuses every lane and [`Needs::Ack`], since a
+/// group may be waiting for this thread. [`Needs::Tip`] is safe under any branch lock.
+///
+/// # Errors
+///
+/// [`Error::Reentrant`] where the call could deadlock, including when `db` already reaches back,
+/// through crossings other threads hold, to a database this thread holds locks in.
 pub(crate) fn check(db: u64, coalesce: bool, needs: Needs<'_>) -> Result<Option<Crossing>> {
     let checked = HOLDS.try_with(|holds| {
         let holds = holds.borrow();
