@@ -64,3 +64,10 @@ path = "fuzz_targets/refs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "reclaim"
+path = "fuzz_targets/reclaim.rs"
+test = false
+doc = false
+bench = false

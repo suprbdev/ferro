@@ -59,6 +59,11 @@ impl Corpus {
                 data.extend_from_slice(bytes);
                 self.put("admin", &data);
             }
+            for reclaim_mode in [0, 0x04, 0x02 | ferro_fuzz::reclaim::AGAIN] {
+                let mut data = vec![reclaim_mode];
+                data.extend_from_slice(bytes);
+                self.put("reclaim", &data);
+            }
         }
     }
 
@@ -1009,6 +1014,7 @@ fn collect(corpus: &mut Corpus, path: &Path) {
         if kind == OPAQUE && bytes.len() <= FITS {
             data[0] = 0;
             corpus.put("admin", &data);
+            corpus.put("reclaim", &data);
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod fixup;
 pub mod input;
 pub mod log_entry;
 pub mod map_node;
+pub mod reclaim;
 pub mod refs;
 pub mod sync;
 pub mod types;
