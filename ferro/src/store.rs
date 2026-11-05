@@ -665,12 +665,22 @@ pub(crate) struct Stored {
 }
 
 fn unpack_into(payload: &[u8], raw: usize, at: u64, out: &mut Vec<u8>) -> Result<()> {
-    let from = out.len();
-    out.resize(from + raw, 0);
-    let len = lz4_flex::block::decompress_into(payload, &mut out[from..])
+    out.clear();
+    if out.capacity() < raw {
+        *out = vec![0; raw];
+    } else {
+        out.resize(raw, 0);
+    }
+    let len = lz4_flex::block::decompress_into(payload, out)
         .map_err(|error| Error::Corrupt(format!("bad compressed body at {at}: {error}")))?;
-    out.truncate(from + len);
+    if len != raw {
+        return Err(wrong_length(at));
+    }
     Ok(())
+}
+
+fn wrong_length(at: u64) -> Error {
+    Error::Corrupt(format!("compressed body at {at} has the wrong length"))
 }
 
 pub(crate) fn body_of<'a>(
@@ -683,7 +693,6 @@ pub(crate) fn body_of<'a>(
     if !stored.packed {
         return Ok(payload);
     }
-    out.clear();
     unpack_into(payload, stored.raw, at, out)?;
     Ok(out)
 }
@@ -746,6 +755,13 @@ pub(crate) struct Unpacked {
 }
 
 pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
+    let checked = check_stored(record, ptr, scratch);
+    scratch.body.clear();
+    scratch.body.shrink_to(SCRATCH_KEEP);
+    checked
+}
+
+fn check_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
     let mut reader = RecordReader {
         file: None,
         start: ptr.offset,
@@ -765,15 +781,12 @@ pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> 
     let payload = &record[payload];
     let body = match header.raw {
         Some(raw) => {
-            scratch.body.clear();
             unpack_into(payload, raw, ptr.offset, &mut scratch.body)?;
             &scratch.body
         }
         None => payload,
     };
     let hash = hash_parts(body, scratch.hashes.iter());
-    scratch.body.clear();
-    scratch.body.shrink_to(SCRATCH_KEEP);
     if hash != ptr.hash {
         return Err(Error::Corrupt(format!(
             "hash mismatch for object at {}",
@@ -1838,6 +1851,9 @@ impl Store {
                 let body = lz4_flex::block::decompress(stored, raw_len).map_err(|error| {
                     Error::Corrupt(format!("bad compressed body at {}: {error}", ptr.offset))
                 })?;
+                if body.len() != raw_len {
+                    return Err(wrong_length(ptr.offset));
+                }
                 packed = keep.then(|| stored.to_vec());
                 body
             }

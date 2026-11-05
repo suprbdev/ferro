@@ -132,7 +132,14 @@ take most of the rest away.
   the body's bytes. The copy writes the stored bytes, compressed or not, behind the new links. LZ4
   is deterministic, so a file written by this version copies to the same bytes as before: `cmp`
   found the copies of both files identical to those the old copy made. A body stored raw that would
-  compress, which no writer in this version produces, stays raw.
+  compress, which no writer in this version produces, stays raw. A wrong decoded length would be
+  copied as stored too, since LZ4 decodes into a larger buffer without complaint and the hash
+  covers only the bytes decoded, so the check, `verify` and every read compare the decoded length
+  with the one the record gives, as `receive` does. With the length of a 20 MB body set to 268 MB,
+  the copy kept it and touched all 268 MB on each check, 280 MB of RSS a cycle, where the copy
+  before #63 wrote the true length back. Now the cycle, `verify` and a read of the value fail with
+  `compressed body at 8260 has the wrong length`, and the cycle peaks at 45 MB: a buffer larger
+  than the one the check keeps is allocated zeroed, so only the pages decoded into are touched.
 - Hashes are checked on other threads. The walk reads a record without decompressing it, takes its
   links and appends its bytes to a batch. A batch of 256 KiB or 4,096 records goes to one of up to
   three threads, which decompress each record in it into a buffer of their own, hash it and compare
@@ -229,8 +236,11 @@ left and the database still working, and counts the checking threads at a small 
 `reclaim_crash.rs` cuts the power at every third operation of two cycles whose copies span several
 batches, `reclaim_fault.rs` shuts a writer down while three threads check a copy slowed in its
 writes, and the unit tests damage one record in 30,000 at each batch boundary and drop a verifier
-with batches queued. `epoch_stress.rs`, the unit tests and `reclaim_threads.rs` pass under
-AddressSanitizer and ThreadSanitizer.
+with batches queued. `a_damaged_raw_length_fails_verify_a_read_and_a_cycle` in `compress.rs`
+gives a compressed body a length 100,000 bytes too long and expects `verify`, a read, a cycle at 1
+and 4 threads and `admin::compact` to name its offset and leave the file as it was.
+`epoch_stress.rs`, the unit tests and `reclaim_threads.rs` pass under AddressSanitizer and
+ThreadSanitizer.
 
 ### Measured and left out
 
