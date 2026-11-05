@@ -11,7 +11,9 @@
 //!   thread's retired list with the current epoch. Once the list has grown by a batch since its
 //!   last check, a free bumps the epoch, reads every pinned slot and then every record, and lets
 //!   go of each item that was retired before the oldest pin and that no record's slot holds. An
-//!   item a slot holds has passed its epoch, so from then on it waits only for slots.
+//!   item a slot holds has passed its epoch, so from then on it waits only for slots, and a free
+//!   lets it go only once it has marked the records and read their slots again, never on the
+//!   reading it began with, which may be older than the slot that holds the item.
 //! - **Parking.** The last owner of a lent value that a slot holds takes its count back and hands
 //!   it to [`park`], which keeps it on the retired list until no slot holds the value, so a clone
 //!   through a handle without a count always finds one. When the retired list's own count is the
@@ -88,8 +90,8 @@ const SPARE_RECORDS: usize = 8;
 /// The most records there can be. With every one in use, [`Hazards::new`] returns `None`.
 const MAX_RECORDS: usize = 4096;
 /// The epoch of a retired item that waits only for slots: one that has passed its epoch, or a
-/// parked count, which never had one. The epoch starts at 1, so such an item is older than every
-/// pin.
+/// parked count, which never had one. The epoch starts at 1, so no item retired at an epoch reads
+/// as one.
 const HELD: u64 = 0;
 
 /// The global epoch. A pin records it in its slot, and every free bumps it before it reads the
@@ -135,9 +137,10 @@ impl Retired {
         }
     }
 
-    /// Whether the item waits only for slots and holds the value at `addr`.
-    fn held_at(&self, addr: usize) -> bool {
-        self.epoch == HELD && self.addr() == addr
+    /// Whether the item waits only for slots and holds the value at one of `addrs`, which are
+    /// sorted.
+    fn held_in(&self, addrs: &[usize]) -> bool {
+        self.epoch == HELD && addrs.binary_search(&self.addr()).is_ok()
     }
 
     /// Lets go of the item's count. If it was the last on a lent value, it returns the value and
@@ -470,33 +473,44 @@ pub(crate) fn retire(value: Erased, bytes: usize) {
 /// it lets the count go at once, and otherwise the owner of each record that does sees the mark
 /// and flushes once it drops the record.
 pub(crate) fn park(value: Parked, bytes: usize) {
-    let addr = value.addr();
+    let addr = [value.addr()];
     let slot = push(Value::Parked(value), bytes, HELD);
-    if !waits(addr) {
-        release(slot, &mut |item| item.held_at(addr));
+    let loose = waits(&addr);
+    if !loose.is_empty() {
+        release(slot, &mut |item| item.held_in(&loose));
     }
 }
 
-/// Marks each record with a slot that holds `addr`, then reads that slot again, both sequentially
-/// consistent, and returns whether any still holds it.
+/// Marks each record with a slot that holds one of `addrs`, which are sorted, then reads that slot
+/// again, both sequentially consistent, and returns, sorted, the addresses that no slot still
+/// holds.
 ///
 /// A record's owner clears its slots, when it drops the record or earlier through [`retract`], and
-/// then reads its mark behind a sequentially consistent fence. So if this returns `false`, no slot
-/// holds the value and the caller lets it go, and if it returns `true`, the owner of a record still
-/// holding it sees the mark once it clears the slot, and flushes.
-fn waits(addr: usize) -> bool {
+/// then reads its mark behind a sequentially consistent fence. So the caller lets go of each value
+/// whose address this returns, which no slot holds, and the owner of a record that still holds
+/// any other sees the mark once it clears the slot, and flushes.
+fn waits(addrs: &[usize]) -> Vec<usize> {
     let records = RECORDS.lock();
-    let mut held = false;
+    let mut held = Vec::new();
     for record in records.iter() {
         for entry in &record.entries {
-            if entry.load(Ordering::SeqCst).addr() != addr {
+            let addr = entry.load(Ordering::SeqCst).addr();
+            if addrs.binary_search(&addr).is_err() {
                 continue;
             }
             record.hint.store(true, Ordering::SeqCst);
-            held |= entry.load(Ordering::SeqCst).addr() == addr;
+            if entry.load(Ordering::SeqCst).addr() == addr {
+                held.push(addr);
+            }
         }
     }
-    held
+    drop(records);
+    held.sort_unstable();
+    addrs
+        .iter()
+        .copied()
+        .filter(|addr| held.binary_search(addr).is_err())
+        .collect()
 }
 
 /// Puts `value`, weighing `bytes`, on this thread's retired list at `epoch`, frees a batch if one
@@ -533,30 +547,40 @@ fn push(value: Value, bytes: usize, epoch: u64) -> &'static Slot {
 }
 
 /// Lets go of every item on `slot`'s list retired before `oldest` whose address is not in
-/// `hazards`, and marks the others retired before then as waiting only for slots.
+/// `hazards`, marks the others retired before then as waiting only for slots, and lets go of each
+/// item waiting only for slots that no slot holds once it has read the slots again.
 ///
 /// `hazards` must have been read after the bump of the epoch that returned `oldest`. An item
 /// retired before that bump was retired after the cache cleared `cached`, which came after every
-/// slot a reader wrote to borrow the value, so `hazards` shows each such slot. For an item it
-/// skips, it marks the records that hold it and reads them again, as [`park`] does, and lets go of
-/// any that no slot still holds.
+/// slot a reader wrote to borrow the value, so `hazards` shows each such slot. An item already
+/// waiting only for slots may have been found held by another free, or parked by the value's last
+/// owner, through a slot written after `hazards` was read, so `hazards` decides only for items
+/// still waiting on their epoch. For every item waiting only for slots, those it marks so here and
+/// those marked before, it marks the records that hold it and reads them again, as [`park`] does,
+/// and lets go of those that no slot still holds.
 fn free(slot: &Slot, oldest: u64, hazards: &[usize]) {
     let mut held = Vec::new();
     release(slot, &mut |item| {
-        if item.epoch >= oldest {
-            return false;
+        if item.epoch != HELD {
+            if item.epoch >= oldest {
+                return false;
+            }
+            if hazards.binary_search(&item.addr()).is_err() {
+                return true;
+            }
+            item.epoch = HELD;
         }
-        if hazards.binary_search(&item.addr()).is_err() {
-            return true;
-        }
-        item.epoch = HELD;
         held.push(item.addr());
         false
     });
-    for addr in held {
-        if !waits(addr) {
-            release(slot, &mut |item| item.held_at(addr));
-        }
+    if held.is_empty() {
+        return;
+    }
+    held.sort_unstable();
+    held.dedup();
+    let loose = waits(&held);
+    if !loose.is_empty() {
+        release(slot, &mut |item| item.held_in(&loose));
     }
 }
 
@@ -587,7 +611,9 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
             .into_iter()
             .partition(|(dead, _)| held.binary_search(&dead.addr()).is_ok());
         if !kept.is_empty() {
-            let addrs: Vec<usize> = kept.iter().map(|(dead, _)| dead.addr()).collect();
+            let mut addrs: Vec<usize> = kept.iter().map(|(dead, _)| dead.addr()).collect();
+            addrs.sort_unstable();
+            addrs.dedup();
             let mut pending = slot.pending.lock();
             for (value, bytes) in kept {
                 pending.bytes += bytes;
@@ -601,7 +627,7 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
             }
             drop(pending);
             drop(gone);
-            loose = addrs.into_iter().filter(|addr| !waits(*addr)).collect();
+            loose = waits(&addrs);
         } else {
             drop(gone);
         }
@@ -610,8 +636,8 @@ fn release(slot: &Slot, pick: &mut dyn FnMut(&mut Retired) -> bool) {
         let _ = FREEING_HERE.try_with(|here| here.set(here.get() - count));
     }
     FREEING.fetch_sub(count, Ordering::SeqCst);
-    for addr in loose {
-        release(slot, &mut |item| item.held_at(addr));
+    if !loose.is_empty() {
+        release(slot, &mut |item| item.held_in(&loose));
     }
 }
 
@@ -765,6 +791,40 @@ mod tests {
                 .iter()
                 .all(|entry| entry.load(Ordering::SeqCst).is_null())
         );
+    }
+
+    #[test]
+    fn epoch_a_free_that_read_the_records_early_keeps_what_another_found_held() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let hazards = Hazards::new().unwrap();
+        let value = Shared::erase(Shared::new(Counted(dropped.clone())));
+        let held = std::ptr::without_provenance_mut(value.addr());
+        free_after(|| {
+            hazards.entry(HAZARDS - 1).store(held, Ordering::SeqCst);
+            retire(value, 1);
+            flush();
+        });
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(hazards);
+        flush();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let owner = Shared::new(Counted(dropped.clone()));
+        let cache = Shared::erase(owner.clone());
+        cache.hold();
+        let hazards = Hazards::new().unwrap();
+        free_after(|| {
+            Shared::lend_to(&owner, hazards.entry(HAZARDS - 1));
+            assert!(cache.release());
+            retire(cache, 1);
+            flush();
+        });
+        assert_eq!(Shared::strong_count(&owner), 2);
+        drop(hazards);
+        flush();
+        assert_eq!(Shared::strong_count(&owner), 1);
+        drop(owner);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     #[test]
