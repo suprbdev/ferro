@@ -288,6 +288,19 @@ impl<T> Shared<T> {
     }
 
     #[inline]
+    pub(crate) unsafe fn lend_again(data: *const T, hazard: &AtomicPtr<()>) -> bool {
+        // SAFETY: `data` points to the value of a live `Inner`, which starts that far before it.
+        let inner = unsafe { data.byte_sub(offset_of!(Inner<T>, data)) }.cast::<Inner<T>>();
+        hazard.store(inner.cast_mut().cast(), Ordering::SeqCst);
+        // SAFETY: the caller keeps the allocation alive.
+        if unsafe { (*inner).cached.load(Ordering::SeqCst) } {
+            return true;
+        }
+        hazard.store(ptr::null_mut(), Ordering::Release);
+        false
+    }
+
+    #[inline]
     pub(crate) unsafe fn increment_strong_count(data: *const T) {
         let this = ManuallyDrop::new(unsafe { Shared::from_raw(data) });
         mem::forget(Shared::clone(&this));

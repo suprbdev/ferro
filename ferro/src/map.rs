@@ -2869,32 +2869,27 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 Reach::Owned(node) => Some(Hold::owned(node)),
                 Reach::Held(_) => unreachable!("an unguarded reach holds no node"),
             };
-            let mut current = root
-                .as_deref()
-                .map(|root| (Hold::anchored_at(root), Hold::anchored_at(root)));
-            while let Some((node, twin)) = current.take() {
+            let mut current = root.as_deref().map(Hold::anchored_at);
+            while let Some(node) = current.take() {
                 let low = node.keys.partition_point(|key| below(key));
                 let high = node.keys.partition_point(|key| within(key));
                 let anchored = node.anchored();
                 depth += 1;
+                if low == high {
+                    let hazard = ahead.below(node.level);
+                    current = hold(store, node.child(low), depth, anchored, hazard)?;
+                }
+                back.push(Frame {
+                    node: node.share_to(behind.at(node.level)),
+                    position: 2 * high as isize - 1,
+                });
                 if low >= high {
-                    if low == high {
-                        current = twins(store, (&node, &twin), low, depth, (ahead, behind))?;
-                    }
-                    back.push(Frame {
-                        node: twin,
-                        position: 2 * high as isize - 1,
-                    });
                     front.push(Frame {
                         node,
                         position: 2 * low as isize + 1,
                     });
                     continue;
                 }
-                back.push(Frame {
-                    node: twin.share(),
-                    position: 2 * high as isize - 1,
-                });
                 front.push(Frame {
                     node: node.share(),
                     position: 2 * low as isize + 1,
@@ -2912,8 +2907,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
                 )?;
                 let kept = edge(
                     store,
-                    (twin.child(high), twin.level),
-                    twin.anchored(),
+                    (node.child(high), node.level),
+                    anchored,
                     depth,
                     &within,
                     -1,
@@ -3683,25 +3678,33 @@ impl<K, V, S> Hold<K, V, S> {
 
     #[inline]
     fn anchored_at(node: &Node<K, V, S>) -> Self {
-        Hold::lent(NonNull::from(node))
+        Hold {
+            tagged: NonNull::from(node).map_addr(|addr| addr | 1),
+            _owns: PhantomData,
+        }
     }
 
     #[inline]
     fn lent(node: NonNull<Node<K, V, S>>) -> Self {
         Hold {
-            tagged: node.map_addr(|addr| addr | 1),
+            tagged: node.map_addr(|addr| addr | 3),
             _owns: PhantomData,
         }
     }
 
     #[inline]
     fn node(&self) -> *const Node<K, V, S> {
-        self.tagged.as_ptr().map_addr(|addr| addr & !1).cast_const()
+        self.tagged.as_ptr().map_addr(|addr| addr & !3).cast_const()
     }
 
     #[inline]
     fn anchored(&self) -> bool {
         self.tagged.addr().get() & 1 == 1
+    }
+
+    #[inline]
+    fn slotted(&self) -> bool {
+        self.tagged.addr().get() & 2 == 2
     }
 
     #[inline]
@@ -3713,6 +3716,22 @@ impl<K, V, S> Hold<K, V, S> {
             tagged: self.tagged,
             _owns: PhantomData,
         }
+    }
+
+    #[inline]
+    fn share_to(&self, hazard: Option<&AtomicPtr<()>>) -> Self {
+        if self.slotted()
+            && let Some(hazard) = hazard
+            // SAFETY: a slot holds the node, so its allocation is alive.
+            && !unsafe { Shared::lend_again(self.node(), hazard) }
+        {
+            // SAFETY: the pointer came from a `Shared`, and the node's first slot still holds
+            // it, so its count is above zero or on its way back from zero to be parked. The
+            // handle takes no count and is never dropped.
+            let node = ManuallyDrop::new(unsafe { Shared::from_raw(self.node()) });
+            return Hold::owned(Shared::share(&node));
+        }
+        self.share()
     }
 }
 
@@ -3813,28 +3832,6 @@ fn enter<K: Data, V: Data, S: Data>(
     if let Some(node) = fatal(hold(store.as_deref(), child, depth, anchored, hazard)) {
         path.push(Frame { node, position: 0 });
     }
-}
-
-type Twins<K, V, S> = (Hold<K, V, S>, Hold<K, V, S>);
-
-fn twins<K: Data, V: Data, S: Data>(
-    store: Option<&Store>,
-    (node, twin): (&Hold<K, V, S>, &Hold<K, V, S>),
-    position: usize,
-    depth: usize,
-    (ahead, behind): (Slots<'_>, Slots<'_>),
-) -> Result<Option<Twins<K, V, S>>> {
-    let hazard = ahead.below(node.level);
-    let Some(next) = hold(store, node.child(position), depth, node.anchored(), hazard)? else {
-        return Ok(None);
-    };
-    if !next.anchored() {
-        let other = next.share();
-        return Ok(Some((next, other)));
-    }
-    let hazard = behind.below(twin.level);
-    let other = hold(store, twin.child(position), depth, twin.anchored(), hazard)?;
-    Ok(other.map(|other| (next, other)))
 }
 
 #[allow(clippy::too_many_arguments)]
