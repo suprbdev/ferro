@@ -1,9 +1,46 @@
+//! An append-mostly sequence with indexed access that nests in your database type.
+//!
+//! [`List<T>`] keeps its values in a [`Map<u64, T>`](Map) keyed by position, so it shares the
+//! map's tree: cloning is O(1), `==` compares root hashes in O(1), and reading or writing a
+//! position costs O(log n).
+
 use std::fmt;
 
 use crate::codec::{Data, Decoder, Description, Encoder};
 use crate::error::Result;
 use crate::map::{Map, Val, Values};
 
+/// A sequence of values that grows and shrinks at the end, with indexed access.
+///
+/// Values are addressed by position from 0. [`push`](List::push), [`pop`](List::pop) and
+/// [`truncate`](List::truncate) change the end, and [`set`](List::set) and
+/// [`get_mut`](List::get_mut) change a value in place. Values cannot be inserted or removed in
+/// the middle. A list works in memory without a file.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::List;
+///
+/// let mut events: List<String> = List::new();
+/// events.push("opened".to_string());
+/// events.push("paid".to_string());
+/// events.extend(["shipped".to_string()]);
+///
+/// assert_eq!(events.len(), 3);
+/// assert_eq!(*events.get(1).unwrap(), "paid");
+/// assert_eq!(events.last().unwrap().as_str(), "shipped");
+///
+/// events.set(1, "refunded".to_string());
+/// events.truncate(2);
+/// let kept: Vec<String> = events.iter().map(|event| event.into_owned()).collect();
+/// assert_eq!(kept, ["opened", "refunded"]);
+/// ```
+///
+/// # Panics
+///
+/// As with every collection, a read that cannot load a node from the file, or finds one damaged,
+/// panics.
 pub struct List<T>(Map<u64, T>);
 
 impl<T> Clone for List<T> {
@@ -19,39 +56,52 @@ impl<T> Default for List<T> {
 }
 
 impl<T: Data> List<T> {
+    /// Creates an empty list.
     pub fn new() -> Self {
         List::default()
     }
 
+    /// The number of values, in O(1).
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether the list has no values.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Removes every value.
     pub fn clear(&mut self) {
         self.0.clear();
     }
 
+    /// Appends `value` at the end, in O(log n).
     pub fn push(&mut self, value: T) {
         self.0.insert(self.0.len() as u64, value);
     }
 
+    /// Removes and returns the last value.
     pub fn pop(&mut self) -> Option<Val<T>> {
         let last = self.0.len().checked_sub(1)? as u64;
         self.0.remove(&last)
     }
 
+    /// The value at `index`, in O(log n), or `None` past the end.
     pub fn get(&self, index: usize) -> Option<Val<T>> {
         self.0.get(&(index as u64))
     }
 
+    /// A mutable reference to the value at `index`, or `None` past the end.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.0.get_mut(&(index as u64))
     }
 
+    /// Replaces the value at `index` and returns the old one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not below [`len`](List::len).
     pub fn set(&mut self, index: usize, value: T) -> Option<Val<T>> {
         let key = index as u64;
         assert!(
@@ -62,18 +112,25 @@ impl<T: Data> List<T> {
         self.0.insert(key, value)
     }
 
+    /// The first value.
     pub fn first(&self) -> Option<Val<T>> {
         self.get(0)
     }
 
+    /// The last value.
     pub fn last(&self) -> Option<Val<T>> {
         self.get(self.len().checked_sub(1)?)
     }
 
+    /// Keeps the first `len` values and removes the rest.
+    ///
+    /// Touches O(log n) nodes however many values go, and does nothing when the list is no longer
+    /// than `len`.
     pub fn truncate(&mut self, len: usize) {
         self.0.remove_range(len as u64..);
     }
 
+    /// Every value, in order, from either end.
     pub fn iter(&self) -> Values<u64, T> {
         self.0.values()
     }
