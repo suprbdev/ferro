@@ -28,7 +28,7 @@ fn compact(path: &Path, threads: usize, keep: Keep) -> Outcome {
         .copy_threads(threads)
         .open::<Opaque>(path)
         .map_err(|error| format!("open: {}", text(error)))?;
-    let sound = db.verify().is_ok();
+    let sound = db.verify().is_ok() && db.verify_typed().is_ok();
     let report = db.compact(keep).map_err(text)?;
     drop(db);
     let bytes = fs::read(path).unwrap();
