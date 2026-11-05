@@ -427,7 +427,7 @@ impl<V: hash::Hash> hash::Hash for Val<V> {
 enum Slot<V, S> {
     Packed(Arc<[V]>, u32),
     Fresh(Arc<V>),
-    Spilled(Ptr, S),
+    Spilled(Arc<(Ptr, S)>),
 }
 
 impl<V, S> Slot<V, S> {
@@ -444,7 +444,7 @@ impl<V, S> Slot<V, S> {
         match (self, other) {
             (Slot::Packed(a, i), Slot::Packed(b, j)) => i == j && Arc::ptr_eq(a, b),
             (Slot::Fresh(a), Slot::Fresh(b)) => Arc::ptr_eq(a, b),
-            (Slot::Spilled(a, _), Slot::Spilled(b, _)) => a.hash == b.hash,
+            (Slot::Spilled(a), Slot::Spilled(b)) => a.0.hash == b.0.hash,
             _ => false,
         }
     }
@@ -455,7 +455,7 @@ impl<V, S> Slot<V, S> {
         S: Summary<K, V>,
     {
         match self {
-            Slot::Spilled(_, summary) => summary.clone(),
+            Slot::Spilled(spill) => spill.1.clone(),
             held => S::of(
                 key,
                 held.held()
@@ -470,7 +470,7 @@ impl<V, S: Clone> Clone for Slot<V, S> {
         match self {
             Slot::Packed(column, index) => Slot::Packed(column.clone(), *index),
             Slot::Fresh(value) => Slot::Fresh(value.clone()),
-            Slot::Spilled(ptr, summary) => Slot::Spilled(*ptr, summary.clone()),
+            Slot::Spilled(spill) => Slot::Spilled(spill.clone()),
         }
     }
 }
@@ -910,9 +910,11 @@ impl<K, V, S> Node<K, V, S> {
                 ARC_HEADER + ALLOCATION_BYTES + column.len() * (size_of::<V>() + each)
             }
             Cells::Slots(slots) => {
-                let held = slots.iter().filter(|slot| slot.held().is_some());
+                let held = slots.iter().filter(|slot| slot.held().is_some()).count();
+                let spill = ARC_HEADER + ALLOCATION_BYTES + size_of::<(Ptr, S)>();
                 slots.capacity() * size_of::<Slot<V, S>>()
-                    + held.count() * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
+                    + held * (ARC_HEADER + ALLOCATION_BYTES + size_of::<V>() + ITEM_BYTES)
+                    + (slots.len() - held) * spill
             }
         };
         size_of::<Self>()
@@ -941,7 +943,9 @@ impl<K, V: Data, S> Node<K, V, S> {
         match &self.cells {
             Cells::Column(column) => Ok(f(&column[index])),
             Cells::Slots(slots) => match &slots[index] {
-                Slot::Spilled(ptr, _) => Ok(f(&*store.ok_or(Error::Detached)?.load::<V>(*ptr)?)),
+                Slot::Spilled(spill) => {
+                    Ok(f(&*store.ok_or(Error::Detached)?.load::<V>(spill.0)?))
+                }
                 held => held.held().map(f).ok_or(Error::Detached),
             },
         }
@@ -964,7 +968,10 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
         for index in 0..n {
             match decoder.u8()? {
                 0 => column.push(V::decode(decoder)?),
-                1 => spilled.push((index, Slot::Spilled(decoder.link()?, S::decode(decoder)?))),
+                1 => spilled.push((
+                    index,
+                    Slot::Spilled(Arc::new((decoder.link()?, S::decode(decoder)?))),
+                )),
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
             }
         }
@@ -1612,7 +1619,7 @@ where
                     Some(Arc::new(column[*position as usize].clone()))
                 }
                 Slot::Fresh(_) => None,
-                Slot::Spilled(ptr, _) => Some(store.ok_or(Error::Detached)?.load::<V>(*ptr)?),
+                Slot::Spilled(spill) => Some(store.ok_or(Error::Detached)?.load::<V>(spill.0)?),
             };
             if let Some(value) = value {
                 *slot = Slot::Fresh(value);
@@ -1630,8 +1637,8 @@ fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Val
     match slot {
         Slot::Packed(column, index) => Ok(Val::of_column(column, *index as usize)),
         Slot::Fresh(value) => Ok(Val::of_single(value)),
-        Slot::Spilled(ptr, _) => Ok(Val(Held::Single(
-            store.ok_or(Error::Detached)?.load::<V>(*ptr)?,
+        Slot::Spilled(spill) => Ok(Val(Held::Single(
+            store.ok_or(Error::Detached)?.load::<V>(spill.0)?,
         ))),
     }
 }
@@ -1740,8 +1747,8 @@ fn relocate<K: Data, V: Data, S: Data>(
     }
     if let Cells::Slots(slots) = &mut node.cells {
         for slot in slots {
-            if let Slot::Spilled(ptr, _) = slot {
-                *ptr = moves.ptr(*ptr)?;
+            if let Slot::Spilled(spill) = slot {
+                *spill = Arc::new((moves.ptr(spill.0)?, spill.1.clone()));
             }
         }
     }
@@ -1907,10 +1914,10 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
         let value = match &node.cells {
             Cells::Column(column) => &column[index],
             Cells::Slots(slots) => match &slots[index] {
-                Slot::Spilled(ptr, summary) => {
+                Slot::Spilled(spill) => {
                     encoder.u8(1);
-                    encoder.link(*ptr);
-                    summary.encode(encoder)?;
+                    encoder.link(spill.0);
+                    spill.1.encode(encoder)?;
                     continue;
                 }
                 Slot::Packed(column, position) => &column[*position as usize],
@@ -1936,7 +1943,7 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
             encoder.link(ptr);
             summary.encode(encoder)?;
             if caching && !decoding {
-                spilled.push((index, Slot::Spilled(ptr, summary)));
+                spilled.push((index, Slot::Spilled(Arc::new((ptr, summary)))));
             }
         }
     }
@@ -2131,10 +2138,10 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
         let value = match &node.cells {
             Cells::Column(column) => &column[index],
             Cells::Slots(slots) => match &slots[index] {
-                Slot::Spilled(ptr, summary) => {
+                Slot::Spilled(spill) => {
                     encoder.u8(1);
-                    encoder.link(*ptr);
-                    summary.encode(&mut encoder)?;
+                    encoder.link(spill.0);
+                    spill.1.encode(&mut encoder)?;
                     continue;
                 }
                 Slot::Packed(column, position) => &column[*position as usize],
@@ -2977,7 +2984,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             Ok(index) => Visit::Done(match &node.cells {
                 Cells::Column(column) => try_hash_of(&column[index]),
                 Cells::Slots(slots) => match &slots[index] {
-                    Slot::Spilled(ptr, _) => Ok(ptr.hash),
+                    Slot::Spilled(spill) => Ok(spill.0.hash),
                     held => held.held().map_or(Err(Error::Detached), try_hash_of),
                 },
             }),
@@ -5988,5 +5995,12 @@ mod tests {
         assert_eq!(finder.get(&first).map(|value| *value), Some(first * 3));
         assert_eq!(finder.get(&keys[1]).map(|value| *value), Some(keys[1] * 3));
         evict_all(entries);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_slot_takes_24_bytes_whatever_its_summary() {
+        assert_eq!(size_of::<Slot<String, ()>>(), 24);
+        assert_eq!(size_of::<Slot<u64, (u64, u64)>>(), 24);
     }
 }
