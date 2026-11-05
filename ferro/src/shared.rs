@@ -102,9 +102,9 @@ pub struct Weak<T> {
 
 /// A [`Shared`] whose type is erased, as the cache holds nodes of every type.
 ///
-/// It holds one strong count, and reaches the count, which every [`Inner`] holds at its front, and
-/// through `kind`, a static table of the erased type's offsets and drops, the value and the flags.
-/// [`Erased::downcast`] gives the `Shared` back.
+/// It holds one strong count. It reaches the count directly, since every [`Inner`] holds it at its
+/// front, and the value and the flags through `kind`, a static table of the erased type's offsets
+/// and drops. [`Erased::downcast`] gives the `Shared` back.
 pub struct Erased {
     ptr: NonNull<u8>,
     kind: &'static Kind,
@@ -386,8 +386,8 @@ impl<T> Shared<T> {
         Some(unsafe { &mut (*this.ptr.as_ptr()).data })
     }
 
-    /// A mutable reference to the value, which is first copied into a new allocation unless
-    /// `this` holds its only count and no slot holds it.
+    /// A mutable reference to the value, which is first cloned or moved into a new allocation
+    /// unless `this` holds its only count, no [`Weak`] exists and no slot holds it.
     ///
     /// A value with other owners, or that a slot holds, is cloned. One whose only other handles
     /// are [`Weak`]s is moved to a new allocation instead, so that they stop upgrading. A value
