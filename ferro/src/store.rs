@@ -1,3 +1,30 @@
+//! The store: one generation of a database's file, the cache of what was decoded from it, and the
+//! transactions that append to it.
+//!
+//! The file holds two superblock slots of 4 KiB and then the log, a run of frames, one per commit.
+//! A frame is a 68-byte header, naming the frame's sequence number, the end of the log after it
+//! and its head, followed by the records the commit wrote, and the header's xxh3 check covers them
+//! all, so a frame proves by itself that it reached the disk whole. A record holds one
+//! content-addressed [`Object`], which a [`Ptr`] finds by its hash and offset, and every read
+//! checks the hash. A superblock names the newest frame and an anchor, the newest frame known to be
+//! durable, and an open scans forward from the anchor and keeps only frames that follow each other,
+//! so a torn tail is cut away.
+//!
+//! A [`Txn`] gathers a commit's records, skipping an object the store has already written, or read
+//! if it is as large as a spilled value, and the commit places its frame at the end of the log,
+//! writes it, and syncs it with one fdatasync for every frame queued meanwhile. Reads see every frame already written to the page
+//! cache, so a writer reads what it has not yet published. Decoded nodes and values wait in a
+//! cache bounded by an estimate of their heap, and readers borrow nodes from it without a count.
+//! With [`StoreOptions::shared`], several processes write one file under byte-range locks past its
+//! end.
+//!
+//! [Storage](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md) describes the
+//! format and recovery,
+//! [Writers and the commit path](https://github.com/archlemon/ferro/blob/main/docs/internals/commit-path.md)
+//! how a frame is placed, written and synced, and
+//! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
+//! the locks.
+
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -29,72 +56,148 @@ use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
 use crate::shared::{Erased, Shared, Weak};
 
+/// The magic at the start of a superblock.
 const MAGIC: &[u8; 8] = b"FERRODB3";
+/// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+/// The magic of the marker a reclamation cycle writes at the end of a log it is replacing.
 const RETIRED_MAGIC: &[u8; 8] = b"FERROGEN";
+/// The size of each of the two superblock slots at the front of the file.
 const SLOT_BYTES: u64 = 4096;
+/// Where the log starts, past both superblock slots.
 pub(crate) const LOG_START: u64 = 2 * SLOT_BYTES;
+/// The size of an encoded [`Mark`]: the sequence number, the log's end, and the head's offset and
+/// hash.
 const MARK_BYTES: usize = 24 + HASH_BYTES;
+/// The bytes of a frame's header that its check covers, its magic and its mark, which a
+/// superblock starts with too.
 const FRAME_CHECKED: usize = 8 + MARK_BYTES;
+/// Where a superblock's anchor starts, after its mark and its [`Basis`].
 const ANCHOR_AT: usize = FRAME_CHECKED + 16;
+/// The bytes of a superblock that its BLAKE3 check covers.
 const SUPER_CHECKED: usize = ANCHOR_AT + MARK_BYTES;
+/// The size of an encoded superblock, check included.
 const SUPER_BYTES: usize = SUPER_CHECKED + 32;
+/// The fixed-point one of a [`Basis`]'s survival.
 const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
+/// The size of a frame's header, its xxh3-128 check included.
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
+/// How much of a frame a check reads at a time, and the size of a record past which a read checks
+/// the file's length before it allocates.
 const SCAN_CHUNK: usize = 1 << 20;
+/// The smallest chunk of zeroes the log grows by under [`Durability::Fsync`], after the first
+/// commit of a store, which reserves nothing.
 const FIRST_RESERVE: u64 = 64 << 10;
+/// The largest chunk of zeroes the log grows by, each chunk doubling the last.
 const MAX_RESERVE: u64 = 4 << 20;
+/// How many times an open tries the writer lock again, a millisecond apart, before it fails.
 const LOCK_RETRIES: u32 = 5;
+/// How many bytes a read of a record takes at once, enough for most records whole.
 const READ_AHEAD: usize = 1024;
+/// What a cache entry weighs for itself, beside the object it holds.
 const ENTRY_BYTES: usize = 96;
+/// The fewest entries of the deduplication table.
 const MIN_DEDUPE: u64 = 1 << 10;
+/// The most entries of the deduplication table.
 const MAX_DEDUPE: u64 = 1 << 16;
+/// The ways of each set of the deduplication table.
 const DEDUPE_WAYS: usize = 2;
+/// How many sets of the deduplication table are allocated together, when an entry first lands in
+/// one of them.
 const DEDUPE_CHUNK: usize = 64;
+/// The longest varint, which a `u64` takes.
 const MAX_VARINT: usize = 10;
+/// The shortest body that is LZ4 compressed.
 const COMPRESS_MIN: usize = 96;
+/// The most LZ4 can expand a body by, which a record's claimed raw length may not pass.
 pub(crate) const MAX_RATIO: usize = 255;
+/// The smallest window a replay reads from a staging's scratch file.
 const REPLAY_CHUNK: usize = 256 << 10;
+/// The most capacity a check's scratch body keeps between records.
 const SCRATCH_KEEP: usize = 1 << 20;
+/// The first byte of the byte-range locks, past any real file.
 const LOCKS_AT: u64 = 1 << 62;
+/// The byte every shared writer holds shared for its life, which tells a read-only open that one
+/// is alive.
 const MULTI_AT: u64 = LOCKS_AT + 1;
+/// The placement lock, held exclusive to catch up, place a frame and write it.
 const COMMIT_AT: u64 = LOCKS_AT + 2;
+/// The superblock lock, held exclusive to sync and write a superblock.
 const SUPER_AT: u64 = LOCKS_AT + 3;
+/// The cycle lock, held exclusive for a reclamation cycle and the pieces of a large receive.
 const CYCLE_AT: u64 = LOCKS_AT + 4;
+/// The first byte of the branch locks, each a byte at a 60-bit hash of the branch's name.
 const LANES_AT: u64 = LOCKS_AT + (1 << 20);
+/// How many bytes the branch locks span.
 const LANES: u64 = 1 << 60;
 
+/// The id of the next store this process opens.
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How a commit reaches the disk.
+///
+/// [`Options::durability`](crate::Options::durability) sets it, and
+/// [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md)
+/// describes what each promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Durability {
+    /// Every commit is synced before it is acknowledged, one fdatasync covering every commit
+    /// queued meanwhile, so an acknowledged commit survives a power cut. The default.
     Fsync,
+    /// Commits are written to the page cache and synced only at checkpoints, every
+    /// [`Options::checkpoint_bytes`](crate::Options::checkpoint_bytes) of log, and at a clean
+    /// close. A power cut can lose the commits since the last checkpoint, and the file still
+    /// opens.
     Buffered,
 }
 
+/// A file operation recorded in a [`Trace`], for tests that replay a crash.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// A file was created; it holds the file's inode.
     Create(u64),
+    /// Bytes are about to be written to a file at an offset.
     Write(u64, u64, Vec<u8>),
+    /// A file's length is about to be set.
     SetLen(u64, u64),
+    /// A file was synced.
     Sync(u64),
+    /// A file was renamed over the database's path.
     Rename(u64),
+    /// The directory holding the database was synced.
     SyncDir,
+    /// A test's marker, such as a commit acknowledged at a version.
     Acked(u64),
 }
 
+/// The operations a store's file records, shared with the test that reads them.
 #[doc(hidden)]
 pub type Trace = Arc<Mutex<Vec<Op>>>;
 
+/// How a [`Store`] opens its file.
+///
+/// [`Options`](crate::Options) builds one for a database, and its methods of the same names say
+/// more about each field.
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
+    /// How each commit reaches the disk, [`Durability::Fsync`] by default.
     pub durability: Durability,
+    /// An approximate bound, in bytes, on the decoded nodes and values the cache holds, 1 GiB by
+    /// default. It also sizes the deduplication table, at one entry for every 4 KiB.
     pub cache_bytes: u64,
+    /// Opens the file without the writer lock, to read while another process writes.
     pub read_only: bool,
+    /// Under [`Durability::Buffered`], how many bytes of log a checkpoint covers, 64 MiB by
+    /// default.
     pub checkpoint_bytes: u64,
+    /// Lets several processes write the file, if every one of them opens it with this, through
+    /// byte-range locks that only 64-bit Linux has.
     pub shared: bool,
+    /// How many threads a reclamation cycle copies and checks on, counting its own. Zero, the
+    /// default, means the number of cores up to 4.
     pub copy_threads: usize,
+    /// Records every write, sync and change of length to the file, for crash tests.
     #[doc(hidden)]
     pub trace: Option<Trace>,
 }
@@ -113,33 +216,44 @@ impl Default for StoreOptions {
     }
 }
 
+/// The weight of a cache entry: what the entry weighs for itself, `fixed_bytes` for the decoded
+/// object's fixed parts and `body_bytes` for what its body decoded into, saturating at
+/// `u32::MAX`.
 pub(crate) fn heap_weight(fixed_bytes: usize, body_bytes: usize) -> u32 {
     let weight = ENTRY_BYTES + fixed_bytes + body_bytes;
     u32::try_from(weight).unwrap_or(u32::MAX)
 }
 
+/// An entry of the store's cache, keyed by the hash of the object it holds.
+///
+/// The cache's own copy of a node's entry is marked `owned`. It set the node's `cached` flag when
+/// it took the node, and when it is dropped, by eviction, replacement or a clear, it clears the
+/// flag and retires its count to the epoch if a reader borrowed the node, or lets it go otherwise.
+/// The clones the cache hands out on a hit are not owners, and give their value up with
+/// [`CacheEntry::take`].
 struct CacheEntry(Entry);
 
+/// What a cache entry holds.
 enum Entry {
-    Value {
-        value: Arc<dyn Cached>,
-        weight: u32,
-    },
+    /// A decoded object that is not a tree node, such as a root, a log entry or a spilled value.
+    Value { value: Arc<dyn Cached>, weight: u32 },
+    /// A tree node, `owned` in the cache's own copy, which holds the node's `cached` flag.
     Node {
         node: Erased,
         weight: u32,
         owned: bool,
     },
-    Taken {
-        weight: u32,
-    },
+    /// An entry whose object was taken out, keeping its weight.
+    Taken { weight: u32 },
 }
 
 impl CacheEntry {
+    /// An entry for a decoded object that is not a node.
     fn value(value: Arc<dyn Cached>, weight: u32) -> CacheEntry {
         CacheEntry(Entry::Value { value, weight })
     }
 
+    /// The cache's own entry for `node`, which sets the node's `cached` flag.
     fn node(node: Erased, weight: u32) -> CacheEntry {
         node.hold();
         CacheEntry(Entry::Node {
@@ -149,6 +263,7 @@ impl CacheEntry {
         })
     }
 
+    /// What the entry weighs against the cache's bound.
     fn weight(&self) -> u32 {
         match self.0 {
             Entry::Value { weight, .. } | Entry::Node { weight, .. } | Entry::Taken { weight } => {
@@ -157,6 +272,8 @@ impl CacheEntry {
         }
     }
 
+    /// Takes the entry's object out, leaving its weight, so a hit hands out the count its clone
+    /// took rather than taking another.
     fn take(&mut self) -> Entry {
         let weight = self.weight();
         mem::replace(&mut self.0, Entry::Taken { weight })
@@ -164,6 +281,7 @@ impl CacheEntry {
 }
 
 impl Clone for CacheEntry {
+    /// A copy with a count of its own, which is never the owner.
     fn clone(&self) -> Self {
         CacheEntry(match &self.0 {
             Entry::Value { value, weight } => Entry::Value {
@@ -181,6 +299,8 @@ impl Clone for CacheEntry {
 }
 
 impl Drop for CacheEntry {
+    /// The cache's own entry clears its node's `cached` flag and retires its count if a reader
+    /// borrowed the node; any other entry only lets its count go.
     fn drop(&mut self) {
         if let Entry::Node {
             node,
@@ -194,6 +314,8 @@ impl Drop for CacheEntry {
     }
 }
 
+/// A decoded value with the offset it was decoded from, for a type whose decoded form depends on
+/// where its object sits, so that a hit at another offset decodes the object again.
 struct Located<T> {
     offset: u64,
     value: Arc<T>,
@@ -201,6 +323,7 @@ struct Located<T> {
 
 impl<T: Send + Sync + 'static> Cached for Located<T> {}
 
+/// What weighs a cache entry against the cache's bound.
 #[derive(Clone)]
 struct EntryWeight;
 
@@ -210,13 +333,18 @@ impl Weighter<Hash, CacheEntry> for EntryWeight {
     }
 }
 
+/// What a superblock records of how its generation began: the file's size when the cycle that
+/// made it sealed it, and the share of the previous generation's bytes that survived that cycle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Basis {
+    /// The file's size when the generation began, or zero for a file no cycle made.
     pub(crate) bytes: u64,
+    /// The surviving share, as a fraction of 2^32.
     survival: u64,
 }
 
 impl Basis {
+    /// A basis of `bytes`, with `survival` clamped between 0 and 1.
     pub(crate) fn new(bytes: u64, survival: f64) -> Basis {
         Basis {
             bytes,
@@ -224,11 +352,14 @@ impl Basis {
         }
     }
 
+    /// The surviving share, between 0 and 1.
     pub(crate) fn survival(&self) -> f64 {
         self.survival as f64 / SURVIVAL_ONE
     }
 }
 
+/// A position in the log: a frame's sequence number, the log's end after it, and the head it
+/// names, if any.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Mark {
     seq: u64,
@@ -237,6 +368,8 @@ struct Mark {
 }
 
 impl Mark {
+    /// Writes the mark's [`MARK_BYTES`] to the front of `out`, which must be zeroed: a missing head
+    /// is left as zeroes, which read back as no head.
     fn fill(&self, out: &mut [u8]) {
         out[0..8].copy_from_slice(&self.seq.to_le_bytes());
         out[8..16].copy_from_slice(&self.log_end.to_le_bytes());
@@ -246,6 +379,7 @@ impl Mark {
         }
     }
 
+    /// Reads a mark from the front of `bytes`, where a head offset of zero means no head.
     fn parse(bytes: &[u8]) -> Option<Mark> {
         let seq = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
         let log_end = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
@@ -256,6 +390,11 @@ impl Mark {
     }
 }
 
+/// A superblock: the frame it names, the basis of its generation, and its anchor, the newest
+/// frame known to be durable when it was written.
+///
+/// A frame's header holds the same mark, so a scan reads each frame as the superblock that would
+/// name it.
 #[derive(Clone, Copy)]
 struct Super {
     seq: u64,
@@ -266,6 +405,7 @@ struct Super {
 }
 
 impl Super {
+    /// A superblock naming `mark`, anchored at `anchor`.
     fn new(mark: Mark, anchor: Mark, basis: Basis) -> Super {
         Super {
             seq: mark.seq,
@@ -276,6 +416,7 @@ impl Super {
         }
     }
 
+    /// The frame the superblock names.
     fn mark(&self) -> Mark {
         Mark {
             seq: self.seq,
@@ -284,24 +425,31 @@ impl Super {
         }
     }
 
+    /// Whether the superblock anchors itself, so the frame it names is durable.
     fn settled(&self) -> bool {
         self.anchor == self.mark()
     }
 
+    /// The superblock as of its anchor, which a scan starts from.
     fn at_anchor(&self) -> Super {
         Super::new(self.anchor, self.anchor, self.basis)
     }
 
+    /// Writes `magic` and the mark to the front of `out`, the fields a frame's header shares with a
+    /// superblock.
     fn fill(&self, magic: &[u8; 8], out: &mut [u8]) {
         out[0..8].copy_from_slice(magic);
         self.mark().fill(&mut out[8..]);
     }
 
+    /// Reads the mark after a magic, as a superblock anchored at itself with no basis, as a frame's
+    /// header holds it. The magic is not checked.
     fn fields(bytes: &[u8]) -> Option<Super> {
         let mark = Mark::parse(&bytes[8..])?;
         Some(Super::new(mark, mark, Basis::default()))
     }
 
+    /// The superblock's bytes for a slot, ending in a BLAKE3 check of the rest.
     fn encode(&self) -> [u8; SUPER_BYTES] {
         let mut out = [0u8; SUPER_BYTES];
         self.fill(MAGIC, &mut out);
@@ -313,6 +461,7 @@ impl Super {
         out
     }
 
+    /// Reads a superblock, or `None` if the bytes are too short or the magic or the check is wrong.
     fn decode(bytes: &[u8]) -> Option<Super> {
         if bytes.len() < SUPER_BYTES || &bytes[0..8] != MAGIC {
             return None;
@@ -335,6 +484,8 @@ impl Super {
     }
 }
 
+/// Reads both superblock slots of a file `len` bytes long, and returns the valid superblock with
+/// the highest sequence number, then anchor, and the slot it is in.
 fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
     let mut best: Option<(Super, u64)> = None;
     for slot in 0..2u64 {
@@ -355,6 +506,7 @@ fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
     Ok(best)
 }
 
+/// Fills `out` from the file at `at`, returning `false` if the file ends first.
 fn read_or_end(file: &File, out: &mut [u8], at: u64) -> Result<bool> {
     match file.read_exact_at(out, at) {
         Ok(()) => Ok(true),
@@ -363,6 +515,7 @@ fn read_or_end(file: &File, out: &mut [u8], at: u64) -> Result<bool> {
     }
 }
 
+/// [`read_supers`] in one read of both slots, for a file that holds its header.
 fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
     let mut bytes = vec![0u8; SLOT_BYTES as usize + SUPER_BYTES];
     file.read_exact_at(&mut bytes, 0)?;
@@ -380,6 +533,7 @@ fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
     Ok(best)
 }
 
+/// The frame that follows `tip` in a file `len` bytes long, if one is there whole.
 fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
     let start = tip.log_end;
     let body_start = start.saturating_add(FRAME_BYTES as u64);
@@ -393,6 +547,9 @@ fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
     frame_after(file, tip, &header, len)
 }
 
+/// The frame whose header, read from where `tip`'s log ends, is `header`, if it is whole: its
+/// sequence number is the next after `tip`'s, its end lies past its header and within `len`, and
+/// its check matches its header and every byte of its body. The caller checks the magic.
 fn frame_after(
     file: &File,
     tip: &Super,
@@ -426,6 +583,7 @@ fn frame_after(
     Ok(Some(frame))
 }
 
+/// Follows frames from `sb` while each follows the one before and is whole, and returns the last.
 fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
     let mut tip = sb;
     while let Some(next) = read_frame(file, &tip, len)? {
@@ -434,6 +592,15 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
     Ok(tip)
 }
 
+/// Recovers a writer's file at open from `sb`, the newest superblock, found in `slot`: scans from
+/// its anchor and makes the frames it keeps the file, returning the superblock that names the last
+/// of them and its slot.
+///
+/// If the log moved or the superblock did not anchor itself, it syncs the frames it kept and
+/// writes a superblock anchoring the last of them to the other slot. It truncates anything past
+/// that frame, durably, before any new frame is written, so a frame stranded past a torn one can
+/// never line up with the log later. If the scan ended before the frame the superblock named, it
+/// writes the new superblock to both slots, syncing between them, so no slot names a lost frame.
 fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
     let mut tip = scan(file, sb.at_anchor(), len)?;
     let moved = tip.seq != sb.seq || !sb.settled();
@@ -460,6 +627,13 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
     Ok((tip, slot))
 }
 
+/// The superblock a read-only open trusts: `sb`, unless no writer is alive and a scan from its
+/// anchor finds otherwise.
+///
+/// A superblock that anchors itself with no frame after it is used as it is. Otherwise the open
+/// tries the writer lock shared, and if it gets it and no shared writer holds [`MULTI_AT`], no
+/// writer is alive: it scans from the anchor under the lock and syncs the frames it kept, since a
+/// dead writer's frames may be only in the page cache. With a writer alive, `sb` is current.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let settled = sb.settled() && read_frame(file, &sb, len)?.is_none();
     if settled || platform::try_lock_shared(file).is_err() {
@@ -501,8 +675,12 @@ fn varint_len(mut value: u64) -> usize {
     len
 }
 
+/// A record read back: its object, its length in the log, and its compressed body if it has one
+/// and the reader asked to keep it.
 type Raw = (Object, u32, Option<Vec<u8>>);
 
+/// The LZ4 block of `body`, if the body is long enough to try and the block makes its record
+/// shorter.
 pub(crate) fn compressed(body: &[u8]) -> Option<Vec<u8>> {
     if body.len() < COMPRESS_MIN {
         return None;
@@ -511,11 +689,17 @@ pub(crate) fn compressed(body: &[u8]) -> Option<Vec<u8>> {
     (packed.len() + varint_len(body.len() as u64) < body.len()).then_some(packed)
 }
 
+/// Appends to `buf` the record of an object with `body` and `links`, as it would sit at `offset`
+/// in the log.
+///
+/// The body is LZ4 compressed when that makes the record shorter, and each link is stored as its
+/// hash and the distance back from `offset` to the link's own offset.
 pub fn append_record(buf: &mut Vec<u8>, offset: u64, body: &[u8], links: &[Ptr]) {
     let packed = compressed(body);
     append_staged(buf, offset, staged(body, packed.as_deref(), links));
 }
 
+/// The parts of a record to append: `body`, its compressed form if it has one, and `links`.
 pub(crate) fn staged<'a>(body: &'a [u8], packed: Option<&'a [u8]>, links: &'a [Ptr]) -> Staged<'a> {
     Staged {
         raw: body.len(),
@@ -525,6 +709,7 @@ pub(crate) fn staged<'a>(body: &'a [u8], packed: Option<&'a [u8]>, links: &'a [P
     }
 }
 
+/// Appends to `buf` the record of `staged`, as it would sit at `offset` in the log.
 pub(crate) fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) {
     push_varint(buf, staged.payload.len() as u64);
     if staged.packed {
@@ -540,21 +725,31 @@ pub(crate) fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) 
     }
 }
 
+/// The length in bytes of the record that `object` would take at `offset` in the log.
 pub fn record_len(offset: u64, object: &Object) -> usize {
     let mut buf = Vec::new();
     append_record(&mut buf, offset, &object.body, &object.links);
     buf.len()
 }
 
+/// A reader of one record, from the bytes held of it, reading more from the file as it needs, at
+/// least [`READ_AHEAD`] at a time, and never past `tail`.
 struct RecordReader<'a> {
+    /// The file to read more from, or `None` when `bytes` must hold the whole record.
     file: Option<&'a File>,
+    /// The record's offset in the log.
     start: u64,
+    /// The end of what may be read.
     tail: u64,
+    /// The record's bytes read so far.
     bytes: Cow<'a, [u8]>,
+    /// Where the next read starts in `bytes`.
     pos: usize,
 }
 
 impl RecordReader<'_> {
+    /// Makes sure `bytes` holds the record up to `upto`, failing with `Error::Corrupt` if that runs
+    /// past `tail` or, for a read of more than [`SCAN_CHUNK`], past the end of the file.
     fn ensure(&mut self, upto: usize) -> Result<()> {
         if upto <= self.bytes.len() {
             return Ok(());
@@ -583,6 +778,7 @@ impl RecordReader<'_> {
         Ok(())
     }
 
+    /// Reads a varint, failing with `Error::Corrupt` on one that does not fit a `u64`.
     fn varint(&mut self) -> Result<u64> {
         let mut value = 0u64;
         for index in 0..MAX_VARINT {
@@ -600,6 +796,7 @@ impl RecordReader<'_> {
         Err(Error::Corrupt("varint overflow in record".into()))
     }
 
+    /// Reads the next `n` bytes.
     fn take(&mut self, n: usize) -> Result<&[u8]> {
         let end = self
             .pos
@@ -611,6 +808,8 @@ impl RecordReader<'_> {
         Ok(out)
     }
 
+    /// Reads a record's header, failing with `Error::Corrupt` on a compressed body that claims
+    /// more than LZ4 can expand it to.
     fn header(&mut self) -> Result<Header> {
         let stored = usize::try_from(self.varint()?)
             .map_err(|_| Error::Corrupt("body length overflow".into()))?;
@@ -639,6 +838,7 @@ impl RecordReader<'_> {
         })
     }
 
+    /// Reads one link: its hash and the distance back from the record to its target.
     fn link(&mut self) -> Result<Ptr> {
         let hash: Hash = self
             .take(HASH_BYTES)?
@@ -652,19 +852,28 @@ impl RecordReader<'_> {
     }
 }
 
+/// A record's header: the stored body's length, the number of links, and the body's length once
+/// uncompressed if it is compressed.
 struct Header {
     stored: usize,
     links: usize,
     raw: Option<usize>,
 }
 
+/// Where the parts of a record sit in its bytes.
 pub(crate) struct Stored {
+    /// The body's length once uncompressed.
     pub(crate) raw: usize,
+    /// Whether the body is LZ4 compressed.
     pub(crate) packed: bool,
+    /// Where the stored body sits in the record's bytes.
     pub(crate) payload: std::ops::Range<usize>,
+    /// The record's length, links included.
     pub(crate) len: usize,
 }
 
+/// Decompresses `payload`, a body stored at `at`, into `out`, which it sizes to `raw`, failing
+/// with `Error::Corrupt` if the payload is damaged or decompresses to another length.
 fn unpack_into(payload: &[u8], raw: usize, at: u64, out: &mut Vec<u8>) -> Result<()> {
     out.clear();
     if out.capacity() < raw {
@@ -680,10 +889,13 @@ fn unpack_into(payload: &[u8], raw: usize, at: u64, out: &mut Vec<u8>) -> Result
     Ok(())
 }
 
+/// The error for a compressed body at `at` that decompresses to the wrong length.
 fn wrong_length(at: u64) -> Error {
     Error::Corrupt(format!("compressed body at {at} has the wrong length"))
 }
 
+/// The body of the record at `at` whose bytes are `bytes`: its payload as it is, or decompressed
+/// into `out`.
 pub(crate) fn body_of<'a>(
     bytes: &'a [u8],
     stored: &Stored,
@@ -698,6 +910,8 @@ pub(crate) fn body_of<'a>(
     Ok(out)
 }
 
+/// Reads a varint at `pos` in `bytes`, or `None` if it runs past them or is too long for this
+/// quick path.
 fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for index in 0..MAX_VARINT - 1 {
@@ -711,6 +925,8 @@ fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 
+/// Reads a whole record from `bytes`, which start at `start` in the log, filling `links`, or
+/// `None` if it runs past them or does not parse, for the caller to read it the slow way.
 fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Stored> {
     let mut pos = 0;
     let stored = usize::try_from(varint_within(bytes, &mut pos)?).ok()?;
@@ -749,12 +965,20 @@ fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Store
     })
 }
 
+/// The scratch buffers that [`verify_stored`] reuses from one record to the next.
 #[derive(Default)]
 pub(crate) struct Unpacked {
     body: Vec<u8>,
     hashes: Vec<Hash>,
 }
 
+/// Checks that `record`, the bytes of the record at `ptr`, holds an object whose hash is `ptr`'s,
+/// and lets the scratch body shrink back to [`SCRATCH_KEEP`].
+///
+/// # Errors
+///
+/// `Error::Corrupt` if the record does not parse, its body does not decompress, or the hash
+/// differs.
 pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
     let checked = check_stored(record, ptr, scratch);
     scratch.body.clear();
@@ -762,6 +986,7 @@ pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> 
     checked
 }
 
+/// The check that [`verify_stored`] makes.
 fn check_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
     let mut reader = RecordReader {
         file: None,
@@ -797,6 +1022,9 @@ fn check_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
     Ok(())
 }
 
+/// Seals the file of a new generation: syncs its log, writes a superblock naming `head` at `seq`
+/// with the log ending at `log_end`, anchored at itself with `basis`, to both slots, and syncs
+/// again.
 pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basis) -> Result<()> {
     file.sync_data()?;
     let mark = Mark {
@@ -811,11 +1039,20 @@ pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basi
     Ok(())
 }
 
+/// Takes what a shared writer holds for its life, without waiting: [`MULTI_AT`] and the writer
+/// lock, both shared.
 fn try_lock_shared_writer(file: &File) -> std::result::Result<(), TryLockError> {
     platform::lock_range(file, MULTI_AT, 1, false, false)?;
     platform::try_lock_shared(file)
 }
 
+/// Opens the file at `path` and, for a writer, takes the writer lock: exclusive, or shared with
+/// `shared`.
+///
+/// A writer tries a held lock again [`LOCK_RETRIES`] times, a millisecond apart, before it fails
+/// with `Error::Locked`, and opens the path again if it no longer names the file it locked. A
+/// read-only open takes no lock and fails with `Error::NoDatabase` if the file is missing. A
+/// shared writer fails with an `Unsupported` I/O error where there are no byte-range locks.
 fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
     if shared && !read_only && !platform::RANGES {
         return Err(Error::Io(std::io::Error::new(
@@ -862,11 +1099,15 @@ fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
     }
 }
 
+/// A byte-range lock that an open holds on its file while it recovers, before any other thread
+/// can reach the store, released when dropped.
 struct Range<'a> {
     file: &'a File,
     at: u64,
 }
 
+/// The error for a lock that could not be taken: `Error::Locked` if another holds it, and the I/O
+/// error otherwise.
 fn locked(error: TryLockError) -> Error {
     match error {
         TryLockError::Error(error) => Error::Io(error),
@@ -875,6 +1116,8 @@ fn locked(error: TryLockError) -> Error {
 }
 
 impl<'a> Range<'a> {
+    /// Takes the lock at `at` exclusive, waiting for it, if the open is `shared`, and nothing
+    /// otherwise.
     fn hold(file: &'a File, at: u64, shared: bool) -> Result<Option<Range<'a>>> {
         if !shared {
             return Ok(None);
@@ -890,10 +1133,18 @@ impl Drop for Range<'_> {
     }
 }
 
+/// The byte of the branch lock of the branch called `name`: [`LANES_AT`] plus 60 bits of an xxh3
+/// of the name. Two names can share a byte, which costs only parallelism.
 pub(crate) fn lane_of(name: &str) -> u64 {
     LANES_AT + (xxh3_64(name.as_bytes()) & (LANES - 1))
 }
 
+/// A byte-range lock that one thread of this process holds, released when dropped.
+///
+/// Every thread of a process locks through one open file description, which grants a range it
+/// already holds again at once, so [`Store::hold`] keeps a table of the ranges its threads hold. A
+/// thread waits until no other thread of this process holds the range before it takes it from the
+/// kernel, and the drop unlocks it in the kernel before it frees the table's entry.
 pub(crate) struct Held {
     store: Store,
     at: u64,
@@ -910,12 +1161,17 @@ impl Drop for Held {
     }
 }
 
+/// The branch locks this process holds.
 #[derive(Default)]
 struct Lanes {
+    /// For each byte, how many of this process's lanes hold it, or `None` while a thread is taking
+    /// it from the kernel.
     held: HashMap<u64, Option<usize>>,
+    /// Set while a thread wants or holds every byte at once, so that no thread takes one.
     whole: bool,
 }
 
+/// Every branch lock at once, held by one thread of this process and released when dropped.
 pub(crate) struct AllLanes {
     store: Store,
 }
@@ -930,12 +1186,17 @@ impl Drop for AllLanes {
     }
 }
 
+/// What catching up with other processes found past the end of the log this process knew.
 pub(crate) enum Followed {
+    /// No new frame.
     Still,
+    /// New whole frames, of which this is the last.
     Moved(Frame),
+    /// The marker of a cycle that replaced the file, which the path no longer names.
     Retired,
 }
 
+/// A frame placed in the log: its sequence number, the end of the log after it, and its head.
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
     pub(crate) seq: u64,
@@ -944,6 +1205,7 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// The frame as a position in the log.
     fn mark(&self) -> Mark {
         Mark {
             seq: self.seq,
@@ -952,6 +1214,7 @@ impl Frame {
         }
     }
 
+    /// The frame's header, with its check left zero for the writer to fill in.
     fn header(&self) -> [u8; FRAME_BYTES] {
         let mut header = [0u8; FRAME_BYTES];
         header[0..8].copy_from_slice(FRAME_MAGIC);
@@ -960,63 +1223,87 @@ impl Frame {
     }
 }
 
+/// What placing frames keeps under its lock.
 struct Cursor {
+    /// The sequence number of the last frame placed, followed or refreshed.
     seq: u64,
+    /// How far the zeroes of the [`Durability::Fsync`] preallocation reach, or `u64::MAX` once a
+    /// write of them failed and no more are tried.
     reserved: u64,
+    /// The next chunk of zeroes to add.
     reserve: u64,
 }
 
+/// The newest frame a superblock names, and the anchor, the newest frame known to be durable.
 #[derive(Clone, Copy)]
 struct Marks {
     latest: Mark,
     anchor: Mark,
 }
 
+/// The frames written to the page cache ahead of one before them, and the readers waiting for
+/// `written` to move.
 #[derive(Default)]
 struct Arrivals {
+    /// The start and end of each frame written ahead.
     early: Vec<(u64, u64)>,
+    /// How many readers wait on `landed`.
     waiters: usize,
 }
 
+/// The store's file, recording every write, sync and change of length when a trace is given, for
+/// tests that replay a crash.
+///
+/// A write or a change of length is recorded before it is made, since it may land in part, and a
+/// sync once it has succeeded, since only then does it count.
 pub(crate) struct Traced {
     file: File,
     trace: Option<Trace>,
+    /// The file's identity, which the trace names it by and which tells whether a path still
+    /// names it.
     inode: u64,
 }
 
 impl Traced {
+    /// Wraps `file`, recording to `trace` if one is given.
     pub(crate) fn new(file: File, trace: Option<Trace>) -> Result<Traced> {
         let inode = platform::file_id(&file)?;
         Ok(Traced { file, trace, inode })
     }
 
+    /// Records the operation that `op` makes from the file's identity, if there is a trace.
     fn log(&self, op: impl FnOnce(u64) -> Op) {
         if let Some(trace) = &self.trace {
             trace.lock().push(op(self.inode));
         }
     }
 
+    /// Records that the file was created.
     pub(crate) fn created(&self) {
         self.log(Op::Create);
     }
 
+    /// Writes `bytes` at `at`.
     pub(crate) fn write_all_at(&self, bytes: &[u8], at: u64) -> std::io::Result<()> {
         self.log(|inode| Op::Write(inode, at, bytes.to_vec()));
         self.file.write_all_at(bytes, at)
     }
 
+    /// Syncs the file's data.
     pub(crate) fn sync_data(&self) -> std::io::Result<()> {
         self.file.sync_data()?;
         self.log(Op::Sync);
         Ok(())
     }
 
+    /// Syncs the file's data and metadata.
     fn sync_all(&self) -> std::io::Result<()> {
         self.file.sync_all()?;
         self.log(Op::Sync);
         Ok(())
     }
 
+    /// Sets the file's length.
     pub(crate) fn set_len(&self, len: u64) -> std::io::Result<()> {
         self.log(|inode| Op::SetLen(inode, len));
         self.file.set_len(len)
@@ -1031,9 +1318,11 @@ impl Deref for Traced {
     }
 }
 
+/// A handle on a generation that a cycle replaced, which does not keep its store.
 pub(crate) struct Retired(Weak<Inner>);
 
 impl Retired {
+    /// The old file's size, while some handle still counts its store.
     pub(crate) fn bytes(&self) -> Option<u64> {
         self.0
             .upgrade()
@@ -1041,41 +1330,111 @@ impl Retired {
     }
 }
 
+/// What every clone of a [`Store`] shares.
 struct Inner {
+    /// The store's id, unique in this process.
     id: u64,
+    /// The database's path: canonical for a shared writer, as given otherwise.
     path: PathBuf,
+    /// The file.
     file: Traced,
+    /// The end of the log as of the last published frame, below which every published pointer
+    /// lies.
     tail: AtomicU64,
+    /// The end of the run of frames already in the page cache, which bounds reads.
     written: AtomicU64,
+    /// The end of the last frame placed, where the next one starts.
     placed: AtomicU64,
+    /// Frames written ahead of `written`, and the readers waiting for it.
     arrivals: Mutex<Arrivals>,
+    /// Woken when `written` moves or the store poisons.
     landed: Condvar,
+    /// What placing frames keeps under its lock.
     cursor: Mutex<Cursor>,
+    /// The superblock slot written last.
     slot: AtomicU64,
+    /// The newest frame a superblock names, and the anchor.
     marks: Mutex<Marks>,
+    /// Set while a checkpoint syncs, so that only one does at a time.
     checkpointing: AtomicBool,
+    /// The newer superblock the open found naming frames its scan did not keep, which
+    /// [`Store::refresh`] ignores until a writer replaces it.
     ignored: Option<Mark>,
+    /// The decoded nodes and values, by the hash of their object.
     cache: Cache<Hash, CacheEntry, EntryWeight>,
+    /// Where objects of this file sit, by hash, for transactions to skip writing them again.
     dedupe: Dedupe,
+    /// What the superblock records of how this generation began.
     basis: Basis,
+    /// Set once a write or a sync has failed, after which nothing more is acknowledged.
     poisoned: AtomicBool,
+    /// The start of the first frame whose write failed, which `written` never passes.
     lost_at: AtomicU64,
+    /// Set once an fdatasync has failed, after which no superblock is written and no checkpoint
+    /// moves the anchor.
     unsynced: AtomicBool,
+    /// Set once the store is closed, after which nothing more enters the cache.
     closed: AtomicBool,
+    /// The branch locks this process holds.
     lanes: Mutex<Lanes>,
+    /// Woken when a branch lock is taken or let go.
     lanes_moved: Condvar,
+    /// The offsets of the byte-range locks that threads of this process hold through [`Held`].
     taken: Mutex<Vec<u64>>,
+    /// Woken when one of them is let go.
     freed: Condvar,
+    /// How the store was opened.
     options: StoreOptions,
 }
 
+/// An open file of a database: one generation of its log, with the cache of what was decoded from
+/// it.
+///
+/// Clones share the file, the cache and the deduplication table, and the file closes with the last
+/// of them. [`Store::open`] opens or creates a file, [`Store::begin`] starts a [`Txn`] that
+/// appends to it, and [`Store::read_object`] and [`Store::load`] read objects back, checking each
+/// one's hash. [`Store::close`] lets the writer lock go while clones still read.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::codec::{Data, Encoder};
+/// use ferro::store::{Store, StoreOptions};
+///
+/// # fn main() -> ferro::Result<()> {
+/// # let dir = tempfile::tempdir()?;
+/// # let path = dir.path().join("raw.ferro");
+/// let (store, head) = Store::open(&path, StoreOptions::default())?;
+/// assert!(head.is_none());
+///
+/// let mut txn = store.begin()?;
+/// let mut encoder = Encoder::new(&mut txn);
+/// "hello".to_string().encode(&mut encoder)?;
+/// let ptr = encoder.finish()?;
+/// txn.commit(ptr)?;
+/// assert_eq!(*store.load::<String>(ptr)?, "hello");
+/// store.close();
+///
+/// let (store, head) = Store::open(&path, StoreOptions::default())?;
+/// assert_eq!(head, Some(ptr));
+/// store.close();
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Store {
     inner: Shared<Inner>,
 }
 
+/// The store of an iterator, cursor or row finder: borrowed through a hazard slot without a count,
+/// or a clone it owns when it has no slot.
+///
+/// It derefs to the store. A borrowed one is valid for as long as its slot holds the store, and is
+/// never dropped as a store. Clones through it go through [`Store::share`], since the store's count
+/// may be passing through zero.
 pub(crate) struct Lent {
     store: ManuallyDrop<Store>,
+    /// Whether `store` is a clone this owns, which its drop lets go.
     owned: bool,
 }
 
@@ -1092,12 +1451,16 @@ impl Drop for Lent {
     #[inline]
     fn drop(&mut self) {
         if self.owned {
-            // SAFETY: an owned `Lent` holds a store it cloned, which is dropped once, here.
+            // SAFETY: an owned `Lent` holds a store it cloned, with a count of its own, which is
+            // dropped once, here, and never used again. A borrowed one holds no count and is never
+            // dropped.
             unsafe { ManuallyDrop::drop(&mut self.store) };
         }
     }
 }
 
+/// A store that closes itself when dropped, for a store opened outside a database, so that an
+/// error on the way out still lets the writer lock go and drops the cache.
 pub(crate) struct Closing(pub(crate) Store);
 
 impl Deref for Closing {
@@ -1115,10 +1478,34 @@ impl Drop for Closing {
 }
 
 impl Store {
+    /// Opens the database file at `path`, creating it if it is missing and the store may write,
+    /// and returns the store and the head that the newest frame names, `None` for a new file.
+    ///
+    /// A writer takes the writer lock, recovers the log as the module's docs describe, keeping
+    /// only frames that follow each other from the anchor and truncating the rest, and removes a
+    /// copy that a cycle left beside the file. A read-only store takes no lock, and scans past the
+    /// newest superblock only when no writer is alive.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Locked`] if another writer has the file open.
+    /// - [`Error::NoDatabase`] if a read-only open finds no file.
+    /// - [`Error::NotFerro`] if the file holds something else, or is empty and opened read-only.
+    /// - [`Error::Corrupt`] if both superblocks are invalid, or the newest names a log the file
+    ///   does not hold.
+    /// - [`Error::Io`] if the file cannot be opened, read, written or synced, or, with
+    ///   [`StoreOptions::shared`], where the byte-range locks it needs do not exist.
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
         Store::open_as(path, path, options)
     }
 
+    /// Opens the file at `actual` as the database at `path`, as a cycle opens its copy before it
+    /// renames the copy over the path.
+    ///
+    /// A shared writer takes the placement lock and then checks that `path` still names the file
+    /// it opened, opening it again if a cycle renamed another over it meanwhile, and recovers under
+    /// the placement and superblock locks. A stale copy is removed only by an open of the path
+    /// itself, and for a shared writer only if no cycle runs.
     pub(crate) fn open_as(
         actual: &Path,
         path: &Path,
@@ -1247,48 +1634,75 @@ impl Store {
         Ok((store, head))
     }
 
+    /// The store's id, which no other store this process opens shares, so that a collection can
+    /// tell whether it was read from this store.
     pub fn id(&self) -> u64 {
         self.inner.id
     }
 
+    /// The database's path, as the store was opened by, or made canonical for a shared writer.
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
 
+    /// The end of the log as of the last published frame, in bytes, which leaves out any zeroes
+    /// preallocated past it.
     pub fn size(&self) -> u64 {
         self.inner.tail.load(Ordering::Acquire)
     }
 
+    /// The end of the run of frames already in the page cache, below which every object can be
+    /// read.
     pub(crate) fn written(&self) -> u64 {
         self.inner.written.load(Ordering::Acquire)
     }
 
+    /// Whether the store was opened read-only.
     pub fn is_read_only(&self) -> bool {
         self.inner.options.read_only
     }
 
+    /// The sequence number of the last frame placed, followed or refreshed.
     pub(crate) fn last_seq(&self) -> u64 {
         self.inner.cursor.lock().seq
     }
 
+    /// What the superblock records of how this generation began.
     pub(crate) fn basis(&self) -> Basis {
         self.inner.basis
     }
 
+    /// The file's metadata.
     pub(crate) fn metadata(&self) -> Result<std::fs::Metadata> {
         Ok(self.inner.file.metadata()?)
     }
 
+    /// A clone that waits out a count passing through zero, for a handle that may hold no count of
+    /// its own.
+    ///
+    /// The store that [`Store::lend`] lends into a slot holds no count, and the count may be at
+    /// zero between a last owner's decrement and its parking of the count. A nested map decoded
+    /// through such a store clones it in the decoder, which uses this; every other clone adds to a
+    /// count its handle holds.
     pub(crate) fn share(&self) -> Store {
         Store {
             inner: Shared::share(&self.inner),
         }
     }
 
+    /// A handle on this generation that does not keep its store, for reporting the old file's
+    /// size once a cycle has replaced it.
     pub(crate) fn retired(&self) -> Retired {
         Retired(Shared::downgrade(&self.inner))
     }
 
+    /// Lends the store to `hazard`, so that an iterator, cursor or row finder holds it without a
+    /// count, or clones it when there is no slot.
+    ///
+    /// With a slot, it writes the store's address there and sets its `lent` flag, and returns a
+    /// handle that takes no count and is valid for as long as the slot holds the address: whoever
+    /// lets go of the store's last count meanwhile finds the slot and parks the count. `hazard`
+    /// must be an entry of a [`Hazards`](crate::epoch::Hazards) record.
     #[inline]
     pub(crate) fn lend(&self, hazard: Option<&AtomicPtr<()>>) -> Lent {
         let Some(hazard) = hazard else {
@@ -1300,25 +1714,42 @@ impl Store {
         Shared::lend_to(&self.inner, hazard);
         Lent {
             store: ManuallyDrop::new(Store {
-                // SAFETY: the pointer comes from a live `Shared`, and the copy takes no count and
-                // is never dropped. The slot just written keeps the store alive until it is
-                // cleared: whoever lets go of its last count meanwhile finds the slot and parks
-                // that count.
+                // SAFETY: the pointer is the value's address in the live allocation that
+                // `self.inner` reaches, and the copy takes no count: it sits in a `ManuallyDrop`
+                // that `Lent::drop` leaves alone, since `owned` is false. The slot just written
+                // keeps the store alive until it is cleared, since whoever lets go of its last
+                // count meanwhile finds `lent` and the slot and parks that count.
                 inner: unsafe { Shared::from_raw(Shared::as_ptr(&self.inner)) },
             }),
             owned: false,
         }
     }
 
+    /// Records `op` in the store's trace, for tests.
     #[doc(hidden)]
     pub fn trace(&self, op: Op) {
         self.inner.file.log(|_| op);
     }
 
+    /// Records that this store's file was renamed over the database's path.
     pub(crate) fn trace_rename(&self) {
         self.inner.file.log(Op::Rename);
     }
 
+    /// Reads the newest superblock of a read-only store, moves the store's end of the log to it,
+    /// and returns the head it names.
+    ///
+    /// It returns `None`, changing nothing, for a superblock older than the last frame the store
+    /// knew, or for the superblock that the open refused, until a writer replaces it. It reads
+    /// only the superblocks and never scans, since a frame past the superblock may not be durable
+    /// while a writer is alive.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Replaced`] if the path no longer names this file, since a cycle replaced it.
+    /// - [`Error::Corrupt`] if both superblocks are invalid, or the file is shorter than the log
+    ///   the newest one names.
+    /// - [`Error::Io`] if the file cannot be read.
     pub fn refresh(&self) -> Result<Option<Ptr>> {
         let mut cursor = self.inner.cursor.lock();
         let opened = self.inner.file.metadata()?;
@@ -1345,22 +1776,31 @@ impl Store {
         Ok(sb.head)
     }
 
+    /// Poisons the store, so that nothing more is acknowledged until it is opened again, and wakes
+    /// every reader waiting for `written`.
     pub(crate) fn poison(&self) {
         self.inner.poisoned.store(true, Ordering::Release);
         let _arrivals = self.inner.arrivals.lock();
         self.inner.landed.notify_all();
     }
 
+    /// Poisons the store after a failed fdatasync, after which no superblock is written and no
+    /// checkpoint moves the anchor, since a later sync can succeed without the pages this one
+    /// dropped.
     fn poison_unsynced(&self) {
         self.inner.unsynced.store(true, Ordering::Release);
         self.poison();
     }
 
+    /// Poisons the store after the write of the frame starting at `at` failed, so that `written`
+    /// stops there and readers waiting past it give up.
     fn poison_at(&self, at: u64) {
         self.inner.lost_at.fetch_min(at, Ordering::AcqRel);
         self.poison();
     }
 
+    /// Notes that the frame from `start` to `end` is in the page cache, and moves `written` over
+    /// it and over any frames written ahead of it that now follow on.
     fn arrived(&self, start: u64, end: u64) {
         let inner = &self.inner;
         let mut arrivals = inner.arrivals.lock();
@@ -1378,6 +1818,9 @@ impl Store {
         }
     }
 
+    /// `written`, once it has passed `offset`: waits while `offset` lies in a frame that is placed
+    /// but still being written, returns at once for an offset past every placed frame, and stops
+    /// waiting at a frame whose write failed.
     fn landed_past(&self, offset: u64) -> u64 {
         let inner = &self.inner;
         let written = inner.written.load(Ordering::Acquire);
@@ -1399,10 +1842,18 @@ impl Store {
         }
     }
 
+    /// `written`, once every frame before `end` is in the page cache or one of them failed, as the
+    /// leader of a sync waits for before it syncs.
     pub(crate) fn landed_to(&self, end: u64) -> u64 {
         self.landed_past(end.saturating_sub(1))
     }
 
+    /// The end below which the object at `offset` can be read, once its frame is written.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] if the frame holding `offset` will never be written, since a write
+    /// before it failed.
     fn readable_past(&self, offset: u64) -> Result<u64> {
         let inner = &self.inner;
         let written = self.landed_past(offset);
@@ -1415,6 +1866,7 @@ impl Store {
         Ok(written)
     }
 
+    /// Fails with [`Error::Poisoned`] once a write or a sync has failed.
     pub(crate) fn check_healthy(&self) -> Result<()> {
         if self.inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -1422,6 +1874,20 @@ impl Store {
         Ok(())
     }
 
+    /// Makes `frame` and every frame before it durable and published: syncs the file under
+    /// [`Durability::Fsync`], writes a superblock naming the frame to the other slot, and moves the
+    /// published end of the log to the frame's end.
+    ///
+    /// The leader of a group commit calls it for the last frame of its batch, once every frame in
+    /// the batch is in the page cache. Under [`Durability::Buffered`] it writes the superblock
+    /// without syncing, keeping the last checkpoint's anchor. With [`StoreOptions::shared`] it
+    /// syncs under the superblock lock, as [`Store::sync_shared`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] if a frame before the end of `frame` is not in the page cache or an
+    /// earlier fdatasync failed, and the I/O error of a failed sync or superblock write, which
+    /// poisons the store.
     pub(crate) fn sync(&self, frame: Frame) -> Result<()> {
         let inner = &self.inner;
         if self.landed_to(frame.end) < frame.end || inner.unsynced.load(Ordering::Acquire) {
@@ -1454,6 +1920,13 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::sync`] for a shared writer, under the superblock lock.
+    ///
+    /// Under [`Durability::Fsync`], if the newest superblock already anchors at or past `frame`,
+    /// another process's sync covered it and nothing is written. Otherwise it reads on past `frame`
+    /// to the newest whole frame of any process, syncs, and names that frame, so that the
+    /// processes that queued frames meanwhile find them covered. The superblock goes to the slot
+    /// that does not hold the newest, unless the newest is already as new.
     fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
         let inner = &self.inner;
         let _held = self.hold(SUPER_AT, 1, true)?;
@@ -1496,6 +1969,9 @@ impl Store {
         Ok(())
     }
 
+    /// Syncs the file under [`Durability::Fsync`], poisoning the store if that fails, as a large
+    /// receive does once it has placed its pieces and before it lands them. It does nothing under
+    /// `Buffered`.
     pub(crate) fn flush(&self) -> Result<()> {
         if self.inner.options.durability != Durability::Fsync {
             return Ok(());
@@ -1507,6 +1983,12 @@ impl Store {
         Ok(())
     }
 
+    /// Syncs the file and moves the anchor to `frame` once `frame` takes the log
+    /// [`StoreOptions::checkpoint_bytes`] past the anchor, which bounds what a power cut loses
+    /// under [`Durability::Buffered`].
+    ///
+    /// One checkpoint runs at a time, and a failed sync poisons the store. The leader of a sync
+    /// calls it once it has published and woken its batch, so that only its own commit waits.
     pub(crate) fn checkpoint(&self, frame: Frame) {
         let inner = &self.inner;
         let anchored = inner.marks.lock().anchor.log_end;
@@ -1524,6 +2006,9 @@ impl Store {
         inner.checkpointing.store(false, Ordering::Release);
     }
 
+    /// Syncs and writes a superblock that anchors itself at the newest frame named, if the anchor
+    /// lags behind it, as a writer does as it closes. It does nothing for a read-only or poisoned
+    /// store.
     pub(crate) fn settle_anchor(&self) -> Result<()> {
         let inner = &self.inner;
         let marks = *inner.marks.lock();
@@ -1543,6 +2028,9 @@ impl Store {
         Ok(())
     }
 
+    /// Writes `sb` to the slot other than the one written last, or, for a shared writer, under the
+    /// superblock lock to the slot that does not hold the newest superblock, unless that one is
+    /// already as new.
     fn write_super(&self, sb: &Super) -> Result<()> {
         let inner = &self.inner;
         let _held = match inner.options.shared {
@@ -1564,10 +2052,15 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the store was opened with [`StoreOptions::shared`].
     pub(crate) fn is_shared(&self) -> bool {
         self.inner.options.shared
     }
 
+    /// Takes the `len` bytes from `at` exclusive for this thread: waits until no other thread of
+    /// this process holds them, then locks them in the kernel, waiting there too if `wait` is set.
+    ///
+    /// It returns `None` if `wait` is not set and the range is held, here or in another process.
     fn hold(&self, at: u64, len: u64, wait: bool) -> Result<Option<Held>> {
         let inner = &self.inner;
         let mut taken = inner.taken.lock();
@@ -1596,10 +2089,18 @@ impl Store {
         }
     }
 
+    /// Takes the placement lock, waiting for it.
     pub(crate) fn lock_commit(&self) -> Result<Held> {
         self.hold(COMMIT_AT, 1, true)?.ok_or(Error::Locked)
     }
 
+    /// Takes every branch lock at once, as a cycle's prune and pause and a landing receive do.
+    ///
+    /// It marks the whole range wanted, so that no thread of this process takes a branch byte,
+    /// waits until none holds one, and then locks the range in the kernel. While it waits it calls
+    /// `stale` every millisecond and gives up with `None` once that returns `true`, since a thread
+    /// holding a byte for a branch attached after the caller listed its lanes may be waiting for
+    /// one of those lanes.
     pub(crate) fn lock_lanes(&self, stale: impl Fn() -> bool) -> Result<Option<AllLanes>> {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
@@ -1633,18 +2134,25 @@ impl Store {
         Ok(Some(all))
     }
 
+    /// Takes the cycle lock, waiting for it if `wait` is set, and returns `None` if it is not and
+    /// the lock is held.
     pub(crate) fn lock_cycle(&self, wait: bool) -> Result<Option<Held>> {
         self.hold(CYCLE_AT, 1, wait)
     }
 
+    /// Takes the branch lock at `at`, from [`lane_of`], waiting for it.
     pub(crate) fn lock_lane(&self, at: u64) -> Result<()> {
         self.take_lane(at, true).map(|_| ())
     }
 
+    /// Takes the branch lock at `at` if it can without waiting, and returns whether it did.
     pub(crate) fn try_lock_lane(&self, at: u64) -> Result<bool> {
         self.take_lane(at, false)
     }
 
+    /// Takes the branch lock at `at`: shares the byte with any lane of this process that holds it,
+    /// and otherwise locks it in the kernel. Unless `wait` is set, it returns `false` rather than
+    /// wait for the whole range, for another thread taking the byte, or for another process.
     fn take_lane(&self, at: u64, wait: bool) -> Result<bool> {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
@@ -1682,6 +2190,8 @@ impl Store {
         }
     }
 
+    /// Lets go of one lane's hold on the branch lock at `at`, unlocking the byte in the kernel once
+    /// the last lane of this process lets go of it.
     pub(crate) fn unlock_lane(&self, at: u64) {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
@@ -1695,6 +2205,11 @@ impl Store {
         }
     }
 
+    /// Catches up with the frames other processes placed past `placed`, the end of the log this
+    /// process knew, reading each header and checking each frame, and moves `written` past them.
+    ///
+    /// A process that is alone reads one header. It meets a cycle's marker as the end of the log,
+    /// or, once the path names another file, as [`Followed::Retired`].
     pub(crate) fn follow(&self) -> Result<Followed> {
         let inner = &self.inner;
         let cursor = inner.cursor.lock();
@@ -1738,6 +2253,8 @@ impl Store {
         }))
     }
 
+    /// Moves this process's end of the log past `frame`, a frame another process placed, once the
+    /// caller has loaded its refs.
     pub(crate) fn advance(&self, frame: Frame) {
         let inner = &self.inner;
         let mut cursor = inner.cursor.lock();
@@ -1749,6 +2266,8 @@ impl Store {
         inner.written.fetch_max(frame.end, Ordering::AcqRel);
     }
 
+    /// Writes a cycle's marker at the end of the placed log, so that a process catching up learns
+    /// that the file is being replaced.
     pub(crate) fn mark_retired(&self) -> Result<()> {
         let mut header = [0u8; FRAME_BYTES];
         header[0..8].copy_from_slice(RETIRED_MAGIC);
@@ -1757,10 +2276,22 @@ impl Store {
         Ok(())
     }
 
+    /// Reads the object at `ptr` and checks its hash.
+    ///
+    /// An object in a frame that is placed but still being written is waited for.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Corrupt`] if `ptr` lies outside the log, or the record there does not parse,
+    ///   does not decompress or does not match the hash.
+    /// - [`Error::Poisoned`] if the object's frame will never be written, since a write before it
+    ///   failed.
+    /// - [`Error::Io`] if the read fails.
     pub fn read_object(&self, ptr: Ptr) -> Result<Object> {
         self.read_record(ptr).map(|(object, _)| object)
     }
 
+    /// [`Store::read_object`], with the record's length in the log.
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
@@ -1768,6 +2299,8 @@ impl Store {
         Ok((object, len))
     }
 
+    /// [`Store::read_object`], with the record's compressed body if it has one, for a sync to send
+    /// as it is.
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
@@ -1775,6 +2308,11 @@ impl Store {
         Ok((object, packed))
     }
 
+    /// Reads the record at `ptr` into `bytes` as it is stored, without decompressing it or checking
+    /// its hash, fills `links`, and returns the record's bytes and where its parts sit.
+    ///
+    /// A record longer than the first read is read on only once `claims` accepts its length as its
+    /// header gives it, so the caller can make room or refuse.
     pub(crate) fn read_stored<'a>(
         &self,
         ptr: Ptr,
@@ -1811,6 +2349,7 @@ impl Store {
         Ok((&bytes[..stored.len], stored))
     }
 
+    /// Reads a record that did not fit the first read, once `claims` accepts its length.
     fn stored_in(
         reader: &mut RecordReader<'_>,
         links: &mut Vec<Ptr>,
@@ -1840,6 +2379,7 @@ impl Store {
         })
     }
 
+    /// The links of the record at `ptr`, read without decompressing its body or checking its hash.
     pub(crate) fn read_links(&self, ptr: Ptr) -> Result<Vec<Ptr>> {
         let tail = self.readable_past(ptr.offset)?;
         if ptr.offset < LOG_START || ptr.offset >= tail {
@@ -1877,6 +2417,9 @@ impl Store {
         Ok(links)
     }
 
+    /// Reads the record at `ptr`, never past `tail`, from `held`, bytes that start at the record,
+    /// or from `file` when `held` is empty, checking its hash if `verify` is set and keeping its
+    /// compressed body if `keep` is.
     fn read_within(
         file: Option<&File>,
         ptr: Ptr,
@@ -1939,6 +2482,11 @@ impl Store {
         Ok((object, len, packed))
     }
 
+    /// The value at `ptr`, from the cache or decoded with `decode` and cached, and whether it was
+    /// in the cache.
+    ///
+    /// `weigh` gives a decoded value's weight from the value, its body's length and the heap its
+    /// decode counted.
     pub(crate) fn fetch<T: Cached>(
         &self,
         ptr: Ptr,
@@ -1957,6 +2505,9 @@ impl Store {
         Ok((value, false))
     }
 
+    /// [`Store::fetch`] for a tree node, which the cache holds as an [`Erased`] in its own entry,
+    /// lending it to readers while it does, and which a hit hands out with the count its entry's
+    /// clone took.
     pub(crate) fn fetch_node<T: Any + Send + Sync>(
         &self,
         ptr: Ptr,
@@ -1977,6 +2528,8 @@ impl Store {
         Ok((node, false))
     }
 
+    /// Reads and decodes the object at `ptr`, registers it for deduplication if it is as large as a
+    /// spilled value and the store writes, and weighs it.
     fn decode_fresh<T>(
         &self,
         ptr: Ptr,
@@ -1993,6 +2546,8 @@ impl Store {
         Ok((value, weight))
     }
 
+    /// Puts the entry that `entry` makes in the cache unless the store is closed, and clears the
+    /// cache again if a close came meanwhile, so that a closed store's cache stays empty.
     fn admit(&self, ptr: Ptr, entry: impl FnOnce() -> CacheEntry) {
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(ptr.hash, entry());
@@ -2002,6 +2557,15 @@ impl Store {
         }
     }
 
+    /// Closes the store: drops the cache, flushes the epoch, and for a writer truncates the zeroes
+    /// preallocated past the log and lets the writer lock go.
+    ///
+    /// Clones of the store go on reading what they read before, and a new writer may open the
+    /// file meanwhile. Cached and retired nodes that hold nested maps hold the store too, so
+    /// dropping the cache and flushing the epoch is what lets the file close with the last clone.
+    /// A shared writer truncates nothing, since other writers may be placing frames in the
+    /// preallocation, and neither does a poisoned store. A second close does nothing to the file,
+    /// so it never truncates under a new writer.
     pub fn close(&self) {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
@@ -2024,6 +2588,12 @@ impl Store {
         let _ = platform::unlock(&inner.file);
     }
 
+    /// The value of type `T` stored at `ptr`, from the cache or read, decoded and cached.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::read_object`], and those of decoding a `T`, such as [`Error::Decode`]
+    /// for an object that does not decode as one.
     pub fn load<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
         if T::LOCATED {
             return self.load_located(ptr);
@@ -2036,6 +2606,8 @@ impl Store {
         Ok(value)
     }
 
+    /// [`Store::load`] for a type whose decoded form depends on its object's offset, which decodes
+    /// again when the cached copy came from another offset.
     fn load_located<T: crate::codec::Data>(&self, ptr: Ptr) -> Result<Arc<T>> {
         let (found, _) = self.fetch(
             ptr,
@@ -2056,6 +2628,7 @@ impl Store {
         Ok(Arc::new(self.decode_at(ptr, T::decode)?))
     }
 
+    /// Reads the object at `ptr` and decodes it with `decode`, past the cache.
     pub(crate) fn decode_at<T>(
         &self,
         ptr: Ptr,
@@ -2065,6 +2638,12 @@ impl Store {
         decode(&mut Decoder::new(&object.body, &object.links, Some(self)))
     }
 
+    /// Starts a transaction that appends to the end of the log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] for a read-only store, and [`Error::Poisoned`] once a write or a sync
+    /// has failed.
     pub fn begin(&self) -> Result<Txn> {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -2086,6 +2665,12 @@ impl Store {
         })
     }
 
+    /// Calls `visit` on every object reachable from `head`, once each, reading each one and
+    /// checking its hash.
+    ///
+    /// # Errors
+    ///
+    /// The first error of [`Store::read_object`] on the way.
     pub fn walk(&self, head: Ptr, mut visit: impl FnMut(Ptr, &Object)) -> Result<()> {
         let mut seen = HashSet::new();
         let mut stack = vec![head];
@@ -2101,6 +2686,8 @@ impl Store {
     }
 }
 
+/// A hasher for keys that are hashes already: it folds the first 8 bytes of each write into its
+/// state.
 #[derive(Default)]
 pub(crate) struct Prehashed(u64);
 
@@ -2117,22 +2704,31 @@ impl Hasher for Prehashed {
     }
 }
 
+/// One way of a deduplication set: an object's hash and its offset, which is zero in an empty way.
 #[derive(Clone, Copy, Default)]
 struct Way {
     hash: Hash,
     offset: [u8; 8],
 }
 
+/// A set of the deduplication table, newest way first, behind a lock, on a line of its own.
 #[derive(Default)]
 #[repr(align(64))]
 struct Set(Mutex<[Way; DEDUPE_WAYS]>);
 
+/// The deduplication table: a bounded, two-way set associative map from an object's hash to its
+/// offset in the file.
+///
+/// It holds what this process wrote, and what it read of objects as large as a spilled value, so
+/// that a transaction can skip an object the file already holds. Its sets are allocated in chunks
+/// as entries first land in them.
 struct Dedupe {
     chunks: Box<[OnceLock<Box<[Set]>>]>,
     mask: usize,
 }
 
 impl Dedupe {
+    /// A table of about `entries` entries, in a power of two sets, and at least one chunk of them.
     fn new(entries: usize) -> Dedupe {
         let sets = (entries / DEDUPE_WAYS)
             .next_power_of_two()
@@ -2143,6 +2739,7 @@ impl Dedupe {
         }
     }
 
+    /// The chunk and the set within it of `hash`.
     fn index(&self, hash: &Hash) -> (usize, usize) {
         let mut word = [0u8; 8];
         word.copy_from_slice(&hash[..8]);
@@ -2150,6 +2747,7 @@ impl Dedupe {
         (set / DEDUPE_CHUNK, set % DEDUPE_CHUNK)
     }
 
+    /// The offset recorded for `hash`, which moves to the front of its set.
     fn get(&self, hash: &Hash) -> Option<u64> {
         let (chunk, set) = self.index(hash);
         let mut ways = self.chunks[chunk].get()?[set].0.lock();
@@ -2158,6 +2756,7 @@ impl Dedupe {
         Some(u64::from_le_bytes(ways[0].offset)).filter(|offset| *offset != 0)
     }
 
+    /// Records `hash` at `offset` at the front of its set, pushing the older way out of a full one.
     fn insert(&self, hash: Hash, offset: u64) {
         let (chunk, set) = self.index(&hash);
         let chunk =
@@ -2175,22 +2774,44 @@ impl Dedupe {
     }
 }
 
+/// A transaction: the records of one commit, gathered before its frame is placed.
+///
+/// It lays its records out as if its frame began where the log ended when [`Store::begin`]
+/// started it, and skips an object it already holds or that the store's deduplication table finds
+/// below that start. Its records wait in memory, or for a large commit are written past the end
+/// of the log as they go. [`Txn::commit`] places the frame, writes it and syncs it. A transaction
+/// dropped before its frame is placed truncates what it wrote past the log.
 pub struct Txn {
     store: Store,
+    /// Where the frame begins.
     origin: u64,
+    /// Where the records still in `buf` begin, which is `origin` until the transaction spills.
     start: u64,
+    /// The records not yet spilled, after room for the frame's header if none has spilled.
     buf: Vec<u8>,
+    /// The offset of every object this transaction wrote or found, by hash.
     seen: Seen,
+    /// The cached copies of the nodes this transaction wrote, which go into the cache once its
+    /// frame is placed.
     remembered: Vec<Remembered>,
+    /// Set once the transaction stops taking offsets from the deduplication table.
     unshared: bool,
+    /// The end of the records written before it stopped, which a moved draft looks up again.
     shared_end: u64,
+    /// Whether placing the frame grows the [`Durability::Fsync`] preallocation.
     reserve: bool,
 }
 
+/// The offset of every object a transaction wrote or found, by hash.
 type Seen = HashMap<Hash, u64, BuildHasherDefault<Prehashed>>;
 
+/// A cached copy of a node a transaction wrote: its hash, the cache's entry for it, and, for a
+/// node that can be moved with its frame, how to move it and how many links its record has.
 type Remembered = (Hash, CacheEntry, Option<(Relocate, usize)>);
 
+/// What a draft carries from its rebase until its frame is placed: how its records moved, the
+/// cached copies of the nodes it wrote, and the objects it wrote, for the cache and the
+/// deduplication table.
 pub(crate) struct Settling {
     moves: Option<Moves>,
     remembered: Vec<Remembered>,
@@ -2198,14 +2819,19 @@ pub(crate) struct Settling {
 }
 
 impl Settling {
+    /// How the draft's records moved, if another frame was placed first.
     pub(crate) fn moves(&self) -> Option<&Moves> {
         self.moves.as_ref()
     }
 
+    /// Takes over the record of what `txn` wrote, for [`Settling::finish`] to register.
     pub(crate) fn take_seen(&mut self, txn: &mut Txn) {
         self.seen = mem::take(&mut txn.seen);
     }
 
+    /// Registers the objects written for deduplication and puts the cached copies in the cache,
+    /// moving each node of a moved draft with its records; a copy that cannot be moved is left
+    /// out.
     pub(crate) fn finish(self, store: &Store) {
         let cache = &store.inner.cache;
         for (hash, offset) in self.seen {
@@ -2232,6 +2858,7 @@ impl Settling {
     }
 }
 
+/// Reads a varint at `at` in a drafted frame.
 fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     for index in 0..MAX_VARINT {
@@ -2247,6 +2874,13 @@ fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
     Err(Error::Corrupt("varint overflow in a drafted record".into()))
 }
 
+/// Moves `old`, a frame drafted to start at `from`, to start at `to`, record by record, and returns
+/// it with the table of where each record went.
+///
+/// A link to an older object grows by the distance moved, and a link into the draft goes through
+/// the table. A record whose object `known` finds already in the file, which a frame placed since
+/// may have written, is dropped, and its entry in the table points at that copy. `hashes` gives
+/// the hash of every drafted record, in offset order.
 fn relayout(
     old: &[u8],
     from: u64,
@@ -2367,6 +3001,12 @@ impl Sink for Txn {
     }
 }
 
+/// Grows the [`Durability::Fsync`] preallocation past `end` by its next chunk of zeroes, under
+/// the placement state's lock, so that frames overwrite blocks already written.
+///
+/// The first call reserves nothing, and each chunk after it doubles the last, from
+/// [`FIRST_RESERVE`] to [`MAX_RESERVE`]. A shared writer takes another's longer file as reserved,
+/// and a failed write stops further tries. It does nothing under [`Durability::Buffered`].
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
     if inner.options.durability != Durability::Fsync || end <= cursor.reserved {
         return;
@@ -2388,6 +3028,12 @@ fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
 }
 
 impl Txn {
+    /// The pointer of an object with `hash` that is already written: by this transaction, or,
+    /// unless it is unshared, below its start in the deduplication table.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] for a body of `raw` bytes that is 4 GiB or more.
     fn known(&self, hash: Hash, raw: usize) -> Result<Option<Ptr>> {
         if u32::try_from(raw).is_err() {
             return Err(Error::TooLarge(raw as u64));
@@ -2408,6 +3054,9 @@ impl Txn {
         Ok(offset.map(|offset| Ptr { hash, offset }))
     }
 
+    /// Stops taking offsets from the deduplication table, as a commit does before it writes its log
+    /// entry, and remembers where the records that took them end, so that a moved draft looks up
+    /// again only those.
     pub(crate) fn unshared(&mut self) {
         if !self.unshared {
             self.unshared = true;
@@ -2415,10 +3064,12 @@ impl Txn {
         }
     }
 
+    /// Leaves the [`Durability::Fsync`] preallocation as it is when the frame is placed.
     pub(crate) fn unreserved(&mut self) {
         self.reserve = false;
     }
 
+    /// Adds `object`, whose hash is `hash`, unless it is already written, and returns its pointer.
     pub(crate) fn put_ref(&mut self, object: &Object, hash: Hash) -> Result<Ptr> {
         if let Some(ptr) = self.known(hash, object.body.len())? {
             return Ok(ptr);
@@ -2427,6 +3078,15 @@ impl Txn {
         Ok(self.record(hash, staged(&object.body, packed.as_deref(), &object.links)))
     }
 
+    /// Moves the draft to the end of the log if another frame was placed since it began, and
+    /// returns what its placement must settle.
+    ///
+    /// The caller holds `tip`, so no frame is placed meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the draft spilled and would have to move, or a drafted record does
+    /// not parse.
     pub(crate) fn rebase(&mut self) -> Result<Settling> {
         let remembered = mem::take(&mut self.remembered);
         let now = self.store.inner.placed.load(Ordering::Acquire);
@@ -2467,6 +3127,7 @@ impl Txn {
         })
     }
 
+    /// Appends the record of `staged` to the draft and registers its hash.
     fn record(&mut self, hash: Hash, staged: Staged<'_>) -> Ptr {
         let offset = self.start + self.buf.len() as u64;
         append_staged(&mut self.buf, offset, staged);
@@ -2474,6 +3135,8 @@ impl Txn {
         Ptr { hash, offset }
     }
 
+    /// Adds a received record unless its object is already written, and registers where the
+    /// object is either way.
     pub(crate) fn put_record(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
         if let Some(ptr) = self.known(hash, staged.raw)? {
             self.seen.insert(hash, ptr.offset);
@@ -2482,6 +3145,8 @@ impl Txn {
         Ok(self.record(hash, staged))
     }
 
+    /// Adds a received record unless its object is already written, without registering its hash,
+    /// as a received commit is placed, so that no later record of this transaction finds it.
     pub(crate) fn put_unlisted(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
         if let Some(ptr) = self.known(hash, staged.raw)? {
             return Ok(ptr);
@@ -2491,19 +3156,24 @@ impl Txn {
         Ok(Ptr { hash, offset })
     }
 
+    /// Adds `object`, whose hash is `hash`, without looking for a copy already written.
     pub(crate) fn put_fresh(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
         let packed = compressed(&object.body);
         Ok(self.record(hash, staged(&object.body, packed.as_deref(), &object.links)))
     }
 
+    /// How many bytes of the draft wait in memory.
     pub(crate) fn buffered(&self) -> usize {
         self.buf.len()
     }
 
+    /// The offset of the object with `hash` that this transaction wrote or found.
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
         self.seen.get(hash).copied()
     }
 
+    /// Writes the records waiting in memory past the end of the log, so that a large commit need
+    /// not hold them all, and goes on from there. A draft that has spilled cannot move.
     pub(crate) fn spill(&mut self) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -2514,6 +3184,9 @@ impl Txn {
         Ok(())
     }
 
+    /// Reads the object at `ptr` from this transaction's records or the log. It checks the hash
+    /// only of an object below the transaction's start, since its own records were hashed as they
+    /// were added.
     pub(crate) fn read_object(&self, ptr: Ptr) -> Result<Object> {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
@@ -2530,6 +3203,7 @@ impl Txn {
         Ok(object)
     }
 
+    /// Feeds the records spilled so far, past the room for the frame's header, to `hasher`.
     fn hash_spilled(&self, hasher: &mut Xxh3) -> Result<()> {
         let mut at = self.origin + FRAME_BYTES as u64;
         let mut chunk = vec![0u8; SCAN_CHUNK.min((self.start - at) as usize)];
@@ -2545,6 +3219,20 @@ impl Txn {
         Ok(())
     }
 
+    /// Places the frame at the end of the log, naming `head`: gives it the next sequence number,
+    /// moves `placed` past it, registers the objects it still holds for deduplication and puts the
+    /// nodes it still holds in the cache, those a [`Settling`] has not taken, and returns the
+    /// [`Landing`] that writes it.
+    ///
+    /// A transaction that spilled writes the rest of its frame and its header here, and one that
+    /// did not is written by [`Landing::land`] once the caller has let `tip` go. The caller holds
+    /// `tip` and has rebased the draft.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] once a write has failed, [`Error::Corrupt`] if the frame no longer
+    /// starts at the end of the log or the log has used its last sequence number, and the I/O
+    /// error of a failed write of a spilled frame, which poisons the store.
     pub(crate) fn place(mut self, head: Ptr) -> Result<Landing> {
         let store = self.store.clone();
         let inner = &store.inner;
@@ -2611,6 +3299,8 @@ impl Txn {
         Ok(landing)
     }
 
+    /// Places the frame, naming `head`, and writes it at once, as the frames written under `tip`
+    /// are.
     pub(crate) fn write(self, head: Ptr) -> Result<Frame> {
         let landing = self.place(head)?;
         let frame = landing.frame;
@@ -2618,6 +3308,13 @@ impl Txn {
         Ok(frame)
     }
 
+    /// Places, writes and syncs the frame, naming `head` as the head the next open returns, and
+    /// publishes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] once a write or a sync has failed, and the I/O error of a failed write
+    /// or sync, which poisons the store.
     pub fn commit(self, head: Ptr) -> Result<()> {
         let store = self.store.clone();
         let frame = self.write(head)?;
@@ -2625,19 +3322,29 @@ impl Txn {
     }
 }
 
+/// A placed frame not yet written, which a commit writes once it has let `tip` go.
+///
+/// Dropping one that was never written poisons the store at the frame, since no frame placed
+/// after it could be kept.
 pub(crate) struct Landing {
     store: Store,
     frame: Frame,
+    /// Where the frame starts.
     at: u64,
+    /// The frame, header first, when it is written here.
     buf: Vec<u8>,
+    /// Set until the frame is written, when it is written here.
     pending: bool,
 }
 
 impl Landing {
+    /// The placed frame.
     pub(crate) fn frame(&self) -> Frame {
         self.frame
     }
 
+    /// Writes the frame, with its check, to the page cache and moves `written` over it, or does
+    /// nothing for a frame [`Txn::place`] wrote. A failed write poisons the store at the frame.
     pub(crate) fn land(mut self) -> Result<()> {
         if !self.pending {
             return Ok(());
@@ -2666,8 +3373,11 @@ impl Drop for Landing {
     }
 }
 
+/// The counter that names scratch files.
 static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
+/// Opens a new scratch file beside `near`, named for this process and a counter, that deletes
+/// itself.
 fn scratch(near: &Path) -> Result<File> {
     loop {
         let mut name = near.as_os_str().to_os_string();
@@ -2680,25 +3390,40 @@ fn scratch(near: &Path) -> Result<File> {
     }
 }
 
+/// The records of a received bundle, held until it lands: in memory up to `limit` bytes, and past
+/// that in a scratch file beside the database that deletes itself.
+///
+/// Each record sits behind its hash, in the log's record format, with its links resolved to
+/// offsets, within the staging for objects sent earlier in the bundle. Each object gets a `u32`
+/// id in the order it was put, with its offset in the staging beside it. Offsets start at
+/// [`LOG_START`], as in a log.
 pub(crate) struct Staging {
     near: PathBuf,
     limit: usize,
     file: Option<File>,
+    /// Where the records still in `buf` begin, past those already spilled.
     start: u64,
     buf: Vec<u8>,
     hashes: Hashes,
     offsets: Column<u64>,
 }
 
+/// A record of a staging, read back for placing.
 pub(crate) struct Record {
+    /// The object's hash.
     pub(crate) hash: Hash,
+    /// The body's length once uncompressed.
     pub(crate) raw: usize,
+    /// Whether the payload is LZ4 compressed.
     pub(crate) packed: bool,
+    /// The body as stored.
     pub(crate) payload: Vec<u8>,
+    /// The links, as resolved when the record was staged.
     pub(crate) links: Vec<Ptr>,
 }
 
 impl Record {
+    /// The record's parts to append, with `links` in place of its own.
     pub(crate) fn staged<'a>(&'a self, links: &'a [Ptr]) -> Staged<'a> {
         Staged {
             raw: self.raw,
@@ -2709,6 +3434,8 @@ impl Record {
     }
 }
 
+/// Reads a varint at `pos` in `bytes`, or `None` if it runs past them, failing with
+/// `Error::Corrupt` on one that does not fit a `u64`.
 fn parse_varint(bytes: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     let mut value = 0u64;
     for index in 0..MAX_VARINT {
@@ -2727,6 +3454,8 @@ fn parse_varint(bytes: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     Err(Error::Corrupt("varint overflow in a staged record".into()))
 }
 
+/// Reads the staged record at the front of `bytes`, which start at `at` in the staging, and its
+/// length, or `None` if it runs past them.
 fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
     let Some(hash) = bytes.get(..HASH_BYTES) else {
         return Ok(None);
@@ -2784,6 +3513,7 @@ fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
 }
 
 impl Staging {
+    /// An empty staging, which spills to a scratch file beside `near` once it holds `limit` bytes.
     pub(crate) fn new(near: &Path, limit: usize) -> Staging {
         Staging {
             near: near.to_path_buf(),
@@ -2796,6 +3526,15 @@ impl Staging {
         }
     }
 
+    /// Adds the record of `staged` behind `hash`, spilling what is in memory first if the record
+    /// could take it past the limit, and returns the object's id.
+    ///
+    /// The caller must know that `hash` is not staged yet, as [`Hashes::insert`] requires.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bundle`] once the staging holds as many objects as it has ids, and the I/O error
+    /// of a failed spill.
     pub(crate) fn put(&mut self, hash: Hash, staged: Staged<'_>) -> Result<u32> {
         let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
         let most = HASH_BYTES + staged.payload.len() + 3 * MAX_VARINT + links;
@@ -2812,26 +3551,40 @@ impl Staging {
         Ok(id)
     }
 
+    /// The id of the object with `hash`.
     pub(crate) fn id_of(&self, hash: &Hash) -> Option<u32> {
         self.hashes.find(hash)
     }
 
+    /// The offset in the staging of the object with the id `id`.
+    ///
+    /// # Panics
+    ///
+    /// If no object has that id, or the staging is sealed.
     pub(crate) fn offset(&self, id: u32) -> u64 {
         self.offsets.get(id)
     }
 
+    /// The offset in the staging of the object with `hash`.
+    ///
+    /// # Panics
+    ///
+    /// If the staging is sealed and holds the object.
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
         self.id_of(hash).map(|id| self.offset(id))
     }
 
+    /// The table of every object's hash and id.
     pub(crate) fn hashes(&self) -> &Hashes {
         &self.hashes
     }
 
+    /// Whether any records went to the scratch file.
     pub(crate) fn spilled(&self) -> bool {
         self.file.is_some()
     }
 
+    /// Writes the records in memory to the scratch file, creating it on the first spill.
     pub(crate) fn spill(&mut self) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -2846,6 +3599,8 @@ impl Staging {
         Ok(())
     }
 
+    /// Reads the object at `ptr`, an offset in the staging, without checking its hash, which was
+    /// checked as it arrived.
     pub(crate) fn read_object(&self, ptr: Ptr) -> Result<Object> {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
@@ -2856,6 +3611,8 @@ impl Staging {
         Ok(object)
     }
 
+    /// Drops the offsets, which placing does not need, and if the staging spilled, writes the rest
+    /// to the scratch file and frees the buffer, so that a replay reads only the file.
     pub(crate) fn seal(&mut self) -> Result<()> {
         self.offsets = Column::new();
         if self.spilled() {
@@ -2865,6 +3622,7 @@ impl Staging {
         Ok(())
     }
 
+    /// A reader of the records in the order they were put.
     pub(crate) fn replay(&self) -> Replay<'_> {
         Replay {
             staging: self,
@@ -2875,14 +3633,24 @@ impl Staging {
     }
 }
 
+/// A reader of a staging's records in the order they were put.
 pub(crate) struct Replay<'a> {
     staging: &'a Staging,
+    /// The offset of the next record.
     at: u64,
+    /// The bytes read of the scratch file.
     window: Vec<u8>,
+    /// Where `window` starts.
     window_at: u64,
 }
 
 impl Replay<'_> {
+    /// The next record, or `None` after the last.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a record runs past the end of the staging or does not parse, and the
+    /// I/O error of a failed read of the scratch file.
     pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
         let staging = self.staging;
         if self.at == staging.start + staging.buf.len() as u64 {
@@ -2898,6 +3666,8 @@ impl Replay<'_> {
         Ok(Some(record))
     }
 
+    /// Reads the record at `at` from the scratch file, reading a window at least [`REPLAY_CHUNK`]
+    /// long and doubling it until the record fits.
     fn spilled_record(&mut self) -> Result<Option<(Record, usize)>> {
         let file = self
             .staging
