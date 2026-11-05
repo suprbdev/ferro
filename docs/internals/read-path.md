@@ -41,8 +41,41 @@ with an empty memo, since copying one touches the child's header, a cache miss p
 Leaves are 7 in 8 nodes, and their `children` vector is empty rather than a row of `Link::Empty`.
 `Node::child` reads through that and `Node::children_mut` fills it in when a leaf gains a child.
 This cut peak RSS by 28% and bulk load time by 4 to 14%. `Node` is `repr(C)` with `keys` and
-`children` first, so the first cache line of its allocation holds both pointers a walk follows,
-which took 12% off `contains_key` and 6% off `get`.
+`children` first, so both pointers a walk follows sit at the front of its allocation, which took
+12% off `contains_key` and 6% off `get`.
+
+A node is up to four allocations. The `Shared` that holds it takes 152 bytes: the strong count,
+then the 136 bytes of `Node`, which are the headers of its key vector, its child links and its
+cells, its count, level, origin and prefix, and behind them the weak count and the two flags
+described under [Where the flags live](read-scaling.md#where-the-flags-live). Its keys, its column
+or slots, and an interior node's child links, 72 bytes each, are allocations of their own. glibc
+aligns each to 16 bytes, not to a cache line, so the headers a get reads in an interior node
+straddle two lines three times in four, and in a leaf always. A leaf of eight `u64` keys and short
+strings takes a 160-byte chunk for the node, 80 for its keys and 224 for its column, besides the
+strings.
+
+What a get reads of that was counted by a test that replays 200,000 random gets on the 1M-key
+`Map<u64, String>` of the compare harness, right after its load, and records every line each one
+touches. A get reaches a node with a chance in proportion to the keys under it, so the nodes it
+reads hold 12 to 15 keys where the average node holds 8, and a third of them more than 16. Lines a
+get reads in each node:
+
+| Node | Headers | Flags | Keys | Link, or column and value | All | Pages | Hint prefetches, of them read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pinned, the first three levels | 1.0 to 1.7 | | 1.0 to 2.0 | 1.0 to 1.5 | 3.0 to 5.2 | 2.0 to 2.2 | |
+| Interior, below the pins | 1.7 to 1.8 | 1 | 1.9 | 1.1 to 1.3 | 5.9 to 6.0 | 2.0 to 2.3 | 14.4 to 15.0, 3.1 |
+| Leaf | 2.0 | 1 | 2.0 | 2.3 | 7.0 | 2.0 | 9.7, 4.4 |
+
+A get reads 38 lines on 13 pages in all, and the node cache almost never, since nearly every link
+below the pins carries a memo: 23 of the 200,000 reached a leaf through it. Its hardware counters on
+one core of the machine described in [Performance](../guide/performance.md), medians of five runs
+over the first two passes after the load, per get: 1,600 cycles and 1,035 instructions; 12 L1
+misses on demand, 6.2 of them served from L2, 4.5 from L3 and 1.5 from DRAM; about 53 lines brought
+in by the hints' prefetches, 15 from L2, 30 from L3 and 7 from DRAM; 13 to 16 lines from DRAM in
+all, the rest of them by the hardware prefetcher; 8.5 L1 TLB misses, of which 3.9 walk the page
+table; and about 9 misses in flight on average. The lines of one node are asked for together, so
+whatever their number a get waits on one miss a level: the leaf's, nearly always from DRAM, and its
+parent's, often, each behind a page walk.
 
 ## Prefetching the next level
 
