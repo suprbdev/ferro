@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -204,16 +204,16 @@ impl Hazards {
 impl Drop for Hazards {
     fn drop(&mut self) {
         let record = self.record;
-        let mut watched = false;
-        for (index, entry) in record.entries.iter().enumerate() {
-            if index <= ROOT && !entry.load(Ordering::Relaxed).is_null() {
-                entry.store(ptr::null_mut(), Ordering::SeqCst);
-                watched = true;
-            } else {
-                entry.store(ptr::null_mut(), Ordering::Release);
-            }
+        let held = record.entries[..=ROOT]
+            .iter()
+            .any(|entry| !entry.load(Ordering::Relaxed).is_null());
+        for entry in &record.entries {
+            entry.store(ptr::null_mut(), Ordering::Release);
         }
-        let hinted = watched && record.hint.load(Ordering::SeqCst);
+        let hinted = held && {
+            atomic::fence(Ordering::SeqCst);
+            record.hint.load(Ordering::Relaxed)
+        };
         if hinted {
             record.hint.store(false, Ordering::Relaxed);
         }
