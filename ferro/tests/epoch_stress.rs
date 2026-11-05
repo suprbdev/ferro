@@ -10,6 +10,7 @@ use ferro::map::Iter;
 use ferro::table::IndexIter;
 use ferro::{
     Cursor, Data, Db, Durability, Keep, Map, Options, Reclaim, Record, Snapshot, Summary, Table,
+    Val,
 };
 
 const KEYS: u64 = 20_000;
@@ -20,6 +21,8 @@ const EDITS: u64 = 1 << 21;
 const TINY: u64 = 12 << 10;
 const READERS: u64 = 8;
 const PHASES: u64 = 4;
+const NESTS: u64 = 96;
+const KEPT: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Data)]
 #[ferro(transparent)]
@@ -45,11 +48,20 @@ struct Row {
 }
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Nest {
+    version: u64,
+    blob: String,
+    inner: Map<u64, u64>,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
 struct Root {
     values: Map<u64, u64, Total>,
     rows: Table<Row>,
+    nests: Map<u64, Nest>,
     value_edits: u64,
     row_edits: u64,
+    nest_edits: u64,
 }
 
 fn mix(mut x: u64) -> u64 {
@@ -57,6 +69,68 @@ fn mix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
+}
+
+fn blob(key: u64, version: u64) -> String {
+    let size = if (key + version).is_multiple_of(3) {
+        8
+    } else {
+        600 + (mix(key ^ version) % 400) as usize
+    };
+    format!("{key}:{version}:").repeat(size / 4 + 1)[..size].to_string()
+}
+
+fn inner(key: u64, version: u64) -> Vec<(u64, u64)> {
+    (0..4)
+        .map(|slot| (slot, key * 1_000_000 + version * 10 + slot))
+        .collect()
+}
+
+fn nest(key: u64, version: u64) -> Nest {
+    Nest {
+        version,
+        blob: blob(key, version),
+        inner: inner(key, version).into_iter().collect(),
+    }
+}
+
+fn nest_key(seed: u64, edit: u64) -> u64 {
+    mix(seed ^ edit ^ 0x6666) % NESTS
+}
+
+fn check_nest(seed: u64, key: u64, nest: &Nest, edits: Option<u64>, context: &str) {
+    let version = nest.version;
+    if let Some(edits) = edits {
+        assert!(
+            version <= edits,
+            "{context}: nest {key} at {version} after {edits} edits"
+        );
+    }
+    assert!(
+        version == 0 || nest_key(seed, version - 1) == key,
+        "{context}: nest {key} holds edit {version} of another key"
+    );
+    assert_eq!(
+        nest.blob,
+        blob(key, version),
+        "{context}: blob of nest {key}"
+    );
+    let got: Vec<(u64, u64)> = nest
+        .inner
+        .iter()
+        .map(|(slot, value)| (slot, *value))
+        .collect();
+    assert_eq!(
+        got,
+        inner(key, version),
+        "{context}: inner map of nest {key}"
+    );
+    let probe = mix(key ^ version) % 4;
+    assert_eq!(
+        nest.inner.get(&probe).map(|value| *value),
+        Some(key * 1_000_000 + version * 10 + probe),
+        "{context}: inner get {probe} of nest {key}"
+    );
 }
 
 fn seed() -> u64 {
@@ -180,6 +254,7 @@ fn populate(db: &Db<Root>, model: &Model) {
         for id in 0..ROWS {
             root.rows.insert(model.first_row(id));
         }
+        root.nests.extend((0..NESTS).map(|key| (key, nest(key, 0))));
     })
     .unwrap();
 }
@@ -197,7 +272,7 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
     let rows = root.row_edits;
     let mut checked = 0;
     for _ in 0..24 {
-        match rng.below(8) {
+        match rng.below(9) {
             0 | 1 => {
                 let key = pick(rng, hot);
                 let got = root.values.get(&key).map(|value| *value);
@@ -248,6 +323,14 @@ fn check(model: &Model, root: &Root, rng: &mut Rng, hot: u64, context: &str) -> 
                     None
                 };
                 assert_eq!(got, want, "{context}: row {id} after {rows} edits");
+            }
+            8 => {
+                let key = rng.below(NESTS + 2);
+                let got = root.nests.get(&key);
+                assert_eq!(got.is_some(), key < NESTS, "{context}: nest {key}");
+                if let Some(got) = got {
+                    check_nest(model.seed, key, &got, Some(root.nest_edits), context);
+                }
             }
             5 => {
                 let low = pick(rng, hot).min(KEYS - 1);
@@ -318,11 +401,20 @@ struct Rows {
     context: String,
 }
 
+struct Nests {
+    nests: Iter<u64, Nest>,
+    backwards: bool,
+    edits: u64,
+    context: String,
+}
+
 #[derive(Default)]
 struct Walks {
     values: Option<Walk>,
     seeks: Option<Seeks>,
     rows: Option<Rows>,
+    nests: Option<Nests>,
+    kept: Vec<(u64, Val<Nest>, String)>,
 }
 
 fn values_in(model: &Model, low: u64, high: u64, applied: u64) -> Vec<(u64, u64)> {
@@ -367,9 +459,22 @@ impl Walks {
                 context: format!("{context}: held group {group}"),
             });
         }
+        if self.nests.is_none() && rng.chance(25) {
+            let from = rng.below(NESTS);
+            let backwards = rng.chance(30);
+            self.nests = Some(Nests {
+                nests: match backwards {
+                    true => root.nests.range(..from),
+                    false => root.nests.range(from..),
+                },
+                backwards,
+                edits: root.nest_edits,
+                context: format!("{context}: held nests from {from}"),
+            });
+        }
     }
 
-    fn advance(&mut self, rng: &mut Rng) -> u64 {
+    fn advance(&mut self, seed: u64, rng: &mut Rng) -> u64 {
         let mut checked = 0;
         if let Some(walk) = &mut self.values {
             let mut done = rng.chance(4);
@@ -424,8 +529,71 @@ impl Walks {
                 self.rows = None;
             }
         }
+        if let Some(walk) = &mut self.nests {
+            let mut done = rng.chance(4);
+            for _ in 0..rng.below(12) {
+                let got = if walk.backwards {
+                    walk.nests.next_back()
+                } else {
+                    walk.nests.next()
+                };
+                let Some((key, value)) = got else {
+                    done = true;
+                    break;
+                };
+                check_nest(seed, key, &value, Some(walk.edits), &walk.context);
+                checked += 1;
+                if self.kept.len() < KEPT && rng.chance(30) {
+                    self.kept.push((key, value, walk.context.clone()));
+                }
+            }
+            if done {
+                self.nests = None;
+            }
+        }
+        if !self.kept.is_empty() && rng.chance(25) {
+            let at = rng.below(self.kept.len() as u64) as usize;
+            let (key, value, context) = self.kept.swap_remove(at);
+            check_nest(seed, key, &value, None, &format!("{context}, kept"));
+            checked += 1;
+        }
         checked
     }
+}
+
+fn orphaned(model: &Model, path: &std::path::Path, rng: &mut Rng, context: &str) -> u64 {
+    let Ok(db) = reader_options(TINY).open::<Root>(path) else {
+        return 0;
+    };
+    let snapshot = db.read();
+    let edits = snapshot.nest_edits;
+    let from = rng.below(NESTS);
+    let mut walk = snapshot.nests.range(from..);
+    let mut cursor = snapshot.nests.cursor();
+    drop(snapshot);
+    drop(db);
+    let mut held = Vec::new();
+    for _ in 0..rng.below(8) {
+        let Some((key, value)) = walk.next() else {
+            break;
+        };
+        check_nest(model.seed, key, &value, Some(edits), context);
+        held.push((key, value));
+    }
+    let key = rng.below(NESTS);
+    if cursor.seek(&key)
+        && let Some(value) = cursor.value()
+    {
+        check_nest(model.seed, key, &value, Some(edits), context);
+        held.push((key, value));
+    }
+    drop(walk);
+    drop(cursor);
+    let context = format!("{context}: orphaned");
+    for (key, value) in &held {
+        check_nest(model.seed, *key, value, Some(edits), &context);
+    }
+    held.len() as u64
 }
 
 fn reader(
@@ -453,7 +621,11 @@ fn reader(
         {
             db.refresh().unwrap();
         }
-        checked += walks.advance(&mut rng);
+        checked += walks.advance(model.seed, &mut rng);
+        if rng.chance(3) {
+            let context = format!("reader {seed} round {rounds}");
+            checked += orphaned(&model, &path, &mut rng, &context);
+        }
         let snapshot = match rng.below(3) {
             0 => shared.read().unwrap().as_ref().map(Db::read),
             1 => kept.clone(),
@@ -524,6 +696,19 @@ fn write_rows(db: Db<Root>, model: Arc<Model>, stop: Arc<AtomicBool>, commits: A
     }
 }
 
+fn write_nests(db: Db<Root>, model: Arc<Model>, stop: Arc<AtomicBool>, commits: Arc<AtomicU64>) {
+    while !stop.load(Ordering::Relaxed) {
+        db.update(|root| {
+            let edit = root.nest_edits;
+            let key = nest_key(model.seed, edit);
+            root.nests.insert(key, nest(key, edit + 1));
+            root.nest_edits = edit + 1;
+        })
+        .unwrap();
+        commits.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn guarded_reads_match_the_model_under_eviction_and_reopening() {
     let seed = seed();
@@ -577,6 +762,15 @@ fn guarded_reads_match_the_model_under_eviction_and_reopening() {
                 );
                 thread::spawn(move || write_rows(db, model, stop, commits))
             },
+            {
+                let (db, model, stop, commits) = (
+                    db.clone(),
+                    model.clone(),
+                    stop_writers.clone(),
+                    commits.clone(),
+                );
+                thread::spawn(move || write_nests(db, model, stop, commits))
+            },
         ];
         drop(db);
         let start = Instant::now();
@@ -599,6 +793,9 @@ fn guarded_reads_match_the_model_under_eviction_and_reopening() {
     let reopened = reader_options(TINY).open::<Root>(&path).unwrap();
     let last = reopened.read();
     check(&model, &last, &mut Rng::new(seed ^ 1), 0, "reopened");
+    for (key, nest) in last.nests.iter() {
+        check_nest(seed, key, &nest, Some(last.nest_edits), "reopened");
+    }
     assert!(
         commits.load(Ordering::Relaxed) > PHASES,
         "writers committed too little"
