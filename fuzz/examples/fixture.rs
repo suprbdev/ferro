@@ -5,13 +5,13 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let [target, input, out] = &args[..] else {
-        panic!("usage: fixture <open|admin|log_entry|refs|sync> <fuzz input> <output .db>");
+        panic!("usage: fixture <open|admin|reclaim|log_entry|refs|sync> <fuzz input> <output .db>");
     };
     let data = fs::read(input).unwrap();
     let out = PathBuf::from(out);
     let _ = fs::remove_file(&out);
     match target.as_str() {
-        "open" | "admin" => {
+        "open" | "admin" | "reclaim" => {
             let (mode, bytes) = ferro_fuzz::file_bytes(&data).expect("empty input");
             fs::write(&out, bytes).unwrap();
             println!(

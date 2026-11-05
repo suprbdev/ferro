@@ -20,13 +20,15 @@ fn keep(mode: u8) -> Keep {
 }
 
 fn compact(path: &Path, threads: usize, keep: Keep) -> Outcome {
+    let named = path.display().to_string();
+    let text = |error: ferro::Error| error.to_string().replace(&named, "<file>");
     let db = Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(1 << 20)
         .copy_threads(threads)
         .open::<Opaque>(path)
-        .map_err(|error| format!("open: {error}"))?;
-    let report = db.compact(keep).map_err(|error| error.to_string())?;
+        .map_err(|error| format!("open: {}", text(error)))?;
+    let report = db.compact(keep).map_err(text)?;
     drop(db);
     let bytes = fs::read(path).unwrap();
     assert_eq!(
