@@ -1801,6 +1801,15 @@ impl Kinds {
         };
     }
 
+    fn identity(&self, id: usize) -> (u16, Option<u64>, Option<u8>, usize) {
+        let held = &self.held[id];
+        let range = held
+            .range
+            .as_ref()
+            .map_or(0, |range| Arc::as_ptr(range).cast::<()>() as usize);
+        (held.template, held.count, held.below, range)
+    }
+
     fn get(&self, id: usize) -> Option<Kind> {
         let held = &self.held[id];
         let mut kind = self.templates.get(usize::from(held.template))?.clone();
@@ -1844,10 +1853,41 @@ impl Anchors {
     }
 }
 
-fn by_parent(hints: &[(usize, usize)]) -> Vec<u32> {
+fn by_depth(hints: &[(usize, usize)], roots: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut depth: Vec<u32> = Vec::with_capacity(hints.len());
+    for (parent, _) in hints {
+        let below = parent.checked_sub(roots).map_or(0, |id| depth[id] + 1);
+        depth.push(below);
+    }
     let mut order: Vec<u32> = (0..hints.len() as u32).collect();
-    order.sort_by_key(|id| hints[*id as usize].0);
-    order
+    order.sort_by_key(|id| depth[*id as usize]);
+    (order, depth)
+}
+
+fn level_end(order: &[u32], depth: &[u32], start: usize) -> usize {
+    let level = depth[order[start] as usize];
+    start
+        + order[start..]
+            .iter()
+            .take_while(|id| depth[**id as usize] == level)
+            .count()
+}
+
+fn parent_of(header: &Header, roots: &[Ptr], hinted: &[Ptr], id: u32) -> Ptr {
+    let parent = header.hints[id as usize].0;
+    match parent.checked_sub(roots.len()) {
+        None => roots[parent],
+        Some(at) => hinted[at],
+    }
+}
+
+type ParentKey = (u64, Hash, Option<(u16, Option<u64>, Option<u8>, usize)>);
+
+fn parent_key(header: &Header, roots: &[Ptr], hinted: &[Ptr], kinds: &Kinds, id: u32) -> ParentKey {
+    let from = parent_of(header, roots, hinted, id);
+    let parent = header.hints[id as usize].0;
+    let kind = parent.checked_sub(roots.len()).map(|at| kinds.identity(at));
+    (from.offset, from.hash, kind)
 }
 
 fn located_bases(store: &Store, refs: &Refs, header: &Header) -> Result<Vec<(Ptr, Chain)>> {
@@ -1879,32 +1919,47 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
     }
     let mut hinted = vec![UNRESOLVED; header.hints.len()];
     let mut hint_kinds = Kinds::new(header.hints.len());
-    let order = by_parent(&header.hints);
-    for group in order.chunk_by(|a, b| header.hints[*a as usize].0 == header.hints[*b as usize].0) {
-        let parent = header.hints[group[0] as usize].0;
-        let (from, kind) = match parent.checked_sub(roots.len()) {
-            None => (roots[parent], Some(root_kind.clone())),
-            Some(id) => (hinted[id], hint_kinds.get(id)),
-        };
-        let object = store.read_object(from)?;
-        let kinds: Vec<(usize, Kind)> = kind
-            .and_then(|kind| kind.check(&object.body, &object.links).ok())
-            .map(|(_, found)| found)
-            .unwrap_or_default();
-        for id in group {
-            let slot = header.hints[*id as usize].1;
-            let link = *object
-                .links
-                .get(slot)
-                .ok_or_else(|| bad("a hint names a link that does not exist"))?;
-            if link.offset == 0 {
-                return Err(bad("a hint leads into pruned history"));
+    let (mut order, depth) = by_depth(&header.hints, roots.len());
+    let mut start = 0;
+    while start < order.len() {
+        let end = level_end(&order, &depth, start);
+        order[start..end]
+            .sort_unstable_by_key(|id| parent_key(header, &roots, &hinted, &hint_kinds, *id));
+        let mut read: Option<(Ptr, Object)> = None;
+        let mut at = start;
+        while at < end {
+            let key = parent_key(header, &roots, &hinted, &hint_kinds, order[at]);
+            let from = parent_of(header, &roots, &hinted, order[at]);
+            if read.as_ref().is_none_or(|(ptr, _)| *ptr != from) {
+                read = Some((from, store.read_object(from)?));
             }
-            hinted[*id as usize] = link;
-            if let Some((_, kind)) = kinds.iter().find(|(at, _)| *at == slot) {
-                hint_kinds.set(*id as usize, kind.clone());
+            let (_, object) = read.as_ref().expect("the parent was read");
+            let kind = match header.hints[order[at] as usize].0.checked_sub(roots.len()) {
+                None => Some(root_kind.clone()),
+                Some(parent) => hint_kinds.get(parent),
+            };
+            let kinds: Vec<(usize, Kind)> = kind
+                .and_then(|kind| kind.check(&object.body, &object.links).ok())
+                .map(|(_, found)| found)
+                .unwrap_or_default();
+            while at < end && parent_key(header, &roots, &hinted, &hint_kinds, order[at]) == key {
+                let id = order[at] as usize;
+                let slot = header.hints[id].1;
+                let link = *object
+                    .links
+                    .get(slot)
+                    .ok_or_else(|| bad("a hint names a link that does not exist"))?;
+                if link.offset == 0 {
+                    return Err(bad("a hint leads into pruned history"));
+                }
+                hinted[id] = link;
+                if let Some((_, kind)) = kinds.iter().find(|(at, _)| *at == slot) {
+                    hint_kinds.set(id, kind.clone());
+                }
+                at += 1;
             }
         }
+        start = end;
     }
     Ok(Anchors {
         generation: store.id(),
@@ -1931,29 +1986,35 @@ fn reanchor(store: &Store, refs: &Refs, header: &Header, before: &Anchors) -> Re
         before.hinted.clone()
     } else {
         let mut hinted = vec![UNRESOLVED; before.hinted.len()];
-        let order = by_parent(&header.hints);
-        for group in
-            order.chunk_by(|a, b| header.hints[*a as usize].0 == header.hints[*b as usize].0)
-        {
-            let parent = header.hints[group[0] as usize].0;
-            let from = match parent.checked_sub(roots.len()) {
-                None => roots[parent],
-                Some(id) => hinted[id],
-            };
-            let links = store.read_links(from)?;
-            for id in group {
-                let (slot, was) = (header.hints[*id as usize].1, before.hinted[*id as usize]);
-                let link = links
-                    .get(slot)
-                    .copied()
-                    .filter(|link| link.hash == was.hash && link.offset != 0)
-                    .ok_or_else(|| {
-                        Error::StaleHave(
-                            "an object it builds on is no longer in this database".into(),
-                        )
-                    })?;
-                hinted[*id as usize] = link;
+        let (mut order, depth) = by_depth(&header.hints, roots.len());
+        let mut start = 0;
+        while start < order.len() {
+            let end = level_end(&order, &depth, start);
+            order[start..end].sort_unstable_by_key(|id| {
+                let from = parent_of(header, &roots, &hinted, *id);
+                (from.offset, from.hash)
+            });
+            let mut at = start;
+            while at < end {
+                let from = parent_of(header, &roots, &hinted, order[at]);
+                let links = store.read_links(from)?;
+                while at < end && parent_of(header, &roots, &hinted, order[at]) == from {
+                    let id = order[at] as usize;
+                    let (slot, was) = (header.hints[id].1, before.hinted[id]);
+                    let link = links
+                        .get(slot)
+                        .copied()
+                        .filter(|link| link.hash == was.hash && link.offset != 0)
+                        .ok_or_else(|| {
+                            Error::StaleHave(
+                                "an object it builds on is no longer in this database".into(),
+                            )
+                        })?;
+                    hinted[id] = link;
+                    at += 1;
+                }
             }
+            start = end;
         }
         hinted
     };

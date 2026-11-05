@@ -56,8 +56,8 @@ repeated: they depend only on the bundle and on objects whose hashes do not chan
 
 A reclamation cycle can prune, swap the file and retire the old one while the bundle streams. Before
 placing, `receive` resolves the anchors again in the generation now current: each base by hash and
-version, and each hint by following its path again from the anchors' roots, one read per parent as
-when it was first resolved, which must end at the same hash. Placing holds the cycle mutex from the
+version, and each hint by following its path again from the anchors' roots, one read per parent
+object as when it was first resolved, which must end at the same hash. Placing holds the cycle mutex from the
 first piece to the landing, so no swap can move the pieces from under the frame that links them. A
 cycle that comes due meanwhile waits for the copy, which runs at the speed of the disk and not of
 the peer, and a cycle already running when the bundle has been checked finishes before placing

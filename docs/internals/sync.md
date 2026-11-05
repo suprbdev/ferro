@@ -298,7 +298,16 @@ segment, 88 bytes, and 40 to 60 more in indexes and the order it is checked in. 
 incremental bundle names adds the object it resolves to, the kind it holds with its parent's key
 range, and its place in the header, about 140 bytes. Hints are resolved grouped by parent, so one
 parent's links and kinds are held at a time, where every parent read used to be kept, about 2.3 KB
-each, until the last hint.
+each, until the last hint. They are resolved a level of the paths at a time, and within a level
+grouped by the object their parent resolves to and the kind it holds, not by the parent's place in
+the header, so a held object is read once however many hints lead to it. Grouped by place, a
+1.18 MB header naming the first link of an anchor root 200,000 times, and then the first link of
+each of those hints, read that object 200,000 times. On a map of 100,000 keys that took 111 ms,
+against 36 ms before hints were grouped and 18 ms now.
+`hints_that_name_one_held_object_many_ways_read_it_once` in `ferro/tests/sync_memory.rs` sends that
+header to a map of 20,000 keys and expects it to allocate no more than 400,000 hints on the root's
+link do: 63 MB each now, where it allocated 381 MB in 175 ms. Each hint's depth in its path, 4
+bytes, is held while they resolve.
 
 The sender keeps, for each object it will send, its hash and offset, whether it links anything and
 its state in the post-order walk, 30 bytes in columns, a slot in the same kind of table, and its

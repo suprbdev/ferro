@@ -5,6 +5,7 @@ use std::cell::Cell;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::time::Instant;
 
 use common::{fast, text};
 use ferro::{Bundle, Db, Error, Map, Outcome, Snapshot};
@@ -14,9 +15,11 @@ struct Peak;
 thread_local! {
     static LIVE: Cell<usize> = const { Cell::new(0) };
     static HIGH: Cell<usize> = const { Cell::new(0) };
+    static TOTAL: Cell<usize> = const { Cell::new(0) };
 }
 
 fn grew(size: usize) {
+    let _ = TOTAL.try_with(|total| total.set(total.get() + size));
     let _ = LIVE.try_with(|live| {
         let now = live.get() + size;
         live.set(now);
@@ -214,6 +217,70 @@ fn a_hostile_stream_of_large_objects_costs_one_object_at_a_time() {
     );
     assert_eq!(db.size_on_disk(), size);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+    assert_eq!(db.version(), 1);
+}
+
+fn hints_on_held(db: &Db<Root>, hints: &[(u64, u64)]) -> Bundle {
+    let mut mark = db.head_hash().unwrap().to_vec();
+    varint(&mut mark, db.version());
+    let mut out = b"FERROBDL".to_vec();
+    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&mark);
+    varint(&mut out, 1);
+    out.extend_from_slice(&mark);
+    varint(&mut out, 1);
+    varint(&mut out, 0);
+    varint(&mut out, hints.len() as u64);
+    for (parent, slot) in hints {
+        varint(&mut out, *parent);
+        varint(&mut out, *slot);
+    }
+    varint(&mut out, 0);
+    Bundle::from(out)
+}
+
+fn allocated_by<R>(run: impl FnOnce() -> R) -> (R, usize) {
+    let start = TOTAL.with(Cell::get);
+    let out = run();
+    (out, TOTAL.with(Cell::get) - start)
+}
+
+#[test]
+fn hints_that_name_one_held_object_many_ways_read_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db: Db<Root> = fast()
+        .cache_bytes(1)
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    db.commit("seed", |root| {
+        for key in 0..20_000 {
+            root.insert(key, text(key, 16));
+        }
+    })
+    .unwrap();
+    let count = 200_000;
+    let flat = vec![(0, 0); 2 * count as usize];
+    let many_ways: Vec<(u64, u64)> = (0..count)
+        .map(|_| (0, 0))
+        .chain((0..count).map(|at| (1 + at, 0)))
+        .collect();
+    let mut costs = Vec::new();
+    for (name, hints) in [("one parent", flat), ("one parent many ways", many_ways)] {
+        let bundle = hints_on_held(&db, &hints);
+        let started = Instant::now();
+        let (outcome, allocated) = allocated_by(|| db.receive("evil", &bundle, refuse));
+        let took = started.elapsed();
+        let outcome = outcome.map(|pulled| pulled.outcome);
+        let len = bundle.as_bytes().len();
+        println!("{name}: {len} bytes, {allocated} bytes allocated in {took:?}, {outcome:?}");
+        costs.push(allocated);
+    }
+    assert!(
+        costs[1] < costs[0] + costs[0] / 2 + 8 * MIB,
+        "hints that reach one held object through many hints allocated {} bytes, against {} through one",
+        costs[1],
+        costs[0]
+    );
     assert_eq!(db.version(), 1);
 }
 
