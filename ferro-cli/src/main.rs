@@ -1,3 +1,27 @@
+//! `ferro`, a command-line tool that inspects and maintains database files without their types.
+//!
+//! Each command opens a file through `ferro::admin`, so it works on any database, whatever root
+//! type wrote it:
+//!
+//! - `info` prints the file's size and each branch with its version, commit count and last commit
+//!   time.
+//! - `log` lists a branch's commits newest first, `--branch` naming the branch and `--limit` the
+//!   number shown.
+//! - `verify` re-hashes every object reachable from the file's current head.
+//! - `space` prints the file's size against an estimate of its live bytes.
+//! - `compact` copies what is reachable to a new file and swaps it in atomically, keeping every
+//!   commit, the `--keep-last` newest commits per branch, or those at or after `--since-ms`. It
+//!   takes the writer lock, so it fails while another process writes to the file.
+//!
+//! ```sh
+//! cargo run --release -p ferro-cli -- info shop.ferro
+//! cargo run --release -p ferro-cli -- log shop.ferro --branch main --limit 50
+//! cargo run --release -p ferro-cli -- compact shop.ferro --keep-last 1000
+//! make info DB=shop.ferro
+//! ```
+//!
+//! `docs/guide/cli.md` describes every command.
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
