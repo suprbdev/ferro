@@ -299,11 +299,12 @@ races for the first and 8 for the second within the default four seconds. Agains
 left a lent store dead, AddressSanitizer reports one with two of the four seeds. With `free`
 ignoring the records as it picks what to free, only the unit tests fail, under Miri, since its
 second reading still parks what a slot holds. `tests/reads.rs` reads nested maps from iterators and
-cursors that outlived every handle on their store, and edits a stored map beside an iterator and a
-cursor over it, clean under AddressSanitizer. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and
-`shared.rs` race a reader's borrow with an eviction, race readers that pin after an eviction with
-the epoch's free of the node it retired, check that only the cache's own entry releases its value,
-walk iterators and a cursor over pinned and borrowed nodes after their map is dropped or edited, and
+cursors that outlived every handle on their store, checks on Linux that the file closes as the last
+of them drops, and edits a stored map beside an iterator and a cursor over it, clean under
+AddressSanitizer and ThreadSanitizer. Unit tests in `epoch.rs`, `map.rs`, `store.rs` and `shared.rs`
+race a reader's borrow with an eviction, race readers that pin after an eviction with the epoch's
+free of the node it retired, check that only the cache's own entry releases its value, walk
+iterators and a cursor over pinned and borrowed nodes after their map is dropped or edited, and
 drive `Shared`'s counts, moves, erasure, layout and flags, including flags read after the value is
 dropped. For the hazards they hold iterators, a cursor and the row finder across an eviction and a
 flush, drop iterators mid-walk, keep a stored root for the iterators that borrow it after its map is
@@ -312,15 +313,17 @@ through its map after a free has scanned the records, and move records between t
 check that `make_mut`, `get_mut` and `unwrap_or_clone` copy a value a slot holds, that each end of a
 narrow range holds its nodes in its own slots and that a finder whose descent panicked holds only
 what its slots hold, and race a lent value's last owner with the release of its slot and with a
-clone through it. They pass under Miri with stacked borrows over 32 schedules, and with tree borrows
-over 31 of 32: in the other, two threads contend for the records' lock and Miri stops at
-`parking_lot_core`'s futex call, which passes a reference where the call's prototype has a pointer.
-Under Miri their assertions fail for the sabotages of the loan, the records and the retired list's
-second reading, and Miri reports a data race on the freed value when a last drop is not parked. The
-uniqueness check made to ignore slots and the finder made to keep its fields through a descent fail
-their unit tests on every run. The decoder's clone made to take a count from zero is reported as a
-dangling reference in 3 of 64 schedules, the owner made to read its mark before clearing its slots
-fails the race in 2 of 64, and the parker made to trust its first reading of the slots in 1 of 256.
+clone through it, and `Shared`'s and `Erased`'s clones assert in debug builds that the count they
+add to is not zero. They pass under Miri with stacked borrows and with tree borrows over 32
+schedules each. Under Miri the epoch's lists lock with `std::sync::Mutex` rather than `parking_lot`,
+whose futex call Miri's shim rejects when two threads contend for a lock, which stopped one schedule
+in 32 under tree borrows. Under Miri their assertions fail for the sabotages of the loan, the
+records and the retired list's second reading, and Miri reports a data race on the freed value when
+a last drop is not parked. The uniqueness check made to ignore slots and the finder made to keep its
+fields through a descent fail their unit tests on every run. The decoder's clone made to take a
+count from zero is reported as a dangling reference in 3 of 64 schedules, the owner made to read its
+mark before clearing its slots fails the race in 2 of 64, and the parker made to trust its first
+reading of the slots in 1 of 256.
 
 Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`, as
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
@@ -610,15 +613,24 @@ every other clone adds to a count its handle holds, since a loop of compare-and-
 that readers and committers all write costs more than an add. Keeping a counted store in iterators,
 cursors and the row finder would also have fixed it, at the cost measured below.
 
-An iterator whose root or store was parked flushes the epoch when it is dropped, so a store's file
-closes when its last iterator goes, as it did when the iterator held a count. The thread that parks
-a value marks each record that holds it in its root or store slot and then reads that slot again,
-both sequentially consistent. A record's owner clears its slots and reads its mark behind a
-sequentially consistent fence, so either the owner sees the mark and flushes or the parker finds the
-slot cleared and lets the value go itself; one fence ran covered lookups 3% faster than clearing the
-two slots with sequentially consistent stores. A first version had the owner check whether its store
-or root had died before clearing its slots, and missed one that died between the two, which then
-waited for the next free.
+An iterator, cursor or row finder whose slots kept something from being let go flushes the epoch
+when it is dropped, so a store's file closes when its last iterator goes, as it did when the
+iterator held a count. The thread that parks a value, and a free that skips an item because a slot
+holds it, mark each record that holds it in any slot and then read that slot again, both
+sequentially consistent. A record's owner clears its slots and reads its mark behind a sequentially
+consistent fence, so either the owner sees the mark and flushes or the marker finds the slot cleared
+and lets the item go itself; one fence ran covered lookups 3% faster than clearing the slots with
+sequentially consistent stores. An item a free skips for a slot has passed its epoch, so it is
+flagged as waiting only for slots, and a marker that lets one go picks that item alone. A first
+version had the owner check whether its store or root had died before clearing its slots, and missed
+one that died between the two, which then waited for the next free. A second marked records only
+when it parked a value, in their root and store slots: when `Db::close` cleared the cache, a root an
+iterator borrowed was retired with its count and skipped by the close's flush, and its inline nested
+maps held the store's count, so the store was never parked and the iterator's drop saw no mark. The
+root, the store and its file stayed until an unrelated flush. A test now counts the process's
+descriptors on a file as its last iterator, cursor and nested map's iterator drop. Marking for every
+slot cost the cells with the 16 MiB cache 0.3 to 0.7% more instructions and 1 to 4% of their rate
+across two alternating runs, and moved nothing with the 1 GiB cache.
 
 The first version freed a lent value from a retired list as soon as the list's own count was the
 last, trusting the scan of the records that the free began with. A root the cache had retired could
