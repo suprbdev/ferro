@@ -110,13 +110,13 @@ read-only follower. Under `Durability::Fsync` one fdatasync covers the commits e
 queued, as group commit does within a process.
 
 The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
-file open, and they get it while it does. On one process it costs a few microseconds a commit for
-its locks: one writer made 42,700 single-key Buffered commits a second with it and 47,500 without,
-on 2026-11-04. With fsync, 8 processes made 9,727 commits a second on one branch where 8 threads
-of one process made 10,406. Under `Durability::Buffered` processes on one branch take turns, and
-each reads back the nodes the last one rewrote, where threads share one cache: 2 processes made
-29,134 and 8 made 17,888, against about 41,000 for threads. On branches of their own 4 processes
-made 82,583 and 4 threads 92,915.
+file open, and they get it while it does. On one process it costs about 2 µs a commit for its
+locks: one writer made 45,600 single-key Buffered commits a second with it and 49,500 without, on
+2026-11-05. With fsync, 8 processes made 10,140 commits a second on one branch where 8 threads of
+one process made 10,063. Under `Durability::Buffered` processes on one branch take turns, and each
+reads back the nodes the last one rewrote, where threads share one cache: 2 processes made 32,150
+and 8 made 21,366, against 43,265 and 35,622 for 2 and 8 threads. On branches of their own 4
+processes made 92,528 and 4 threads 93,303.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`. A process killed in the middle of a commit holds up the others only until the

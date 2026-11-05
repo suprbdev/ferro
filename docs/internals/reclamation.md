@@ -477,11 +477,11 @@ comparison was made on one base, before value columns landed:
 ## Limits
 
 A cycle reads and writes everything retained on one thread and checks it on up to three others,
-as described under [The copy on several threads](#the-copy-on-several-threads). On 2026-11-04 the
-copy of a file in the page cache, keeping everything, ran at 489 MB/s on 189 MB of table rows,
-200,000 rows and 40,000 updates in 383,364 objects, and at 2,067 MB/s on 331 MB of a million 320
+as described under [The copy on several threads](#the-copy-on-several-threads). On 2026-11-05 the
+copy of a file in the page cache, keeping everything, ran at 484 MB/s on 189 MB of table rows,
+200,000 rows and 40,000 updates in 383,364 objects, and at 2,238 MB/s on 331 MB of a million 320
 byte values in 124,939 objects, with 4 threads, where it ran at 180 and 596 MB/s on one thread
-before. On one thread it now runs at 236 and 755 MB/s. So a 10 GB database of table rows takes
+before. On one thread it now runs at 233 and 771 MB/s. So a 10 GB database of table rows takes
 about 20 seconds and needs 10 GB free. The trigger keeps that to one extra byte copied per byte
 written, at worst. The walking thread is the limit, at 450 to 500 MB/s on table rows however many
 threads check. `Keep::All` copies all of history, so `history` is what makes background cycles

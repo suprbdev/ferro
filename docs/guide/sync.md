@@ -54,7 +54,7 @@ let pulled = phone.receive_from("laptop", BufReader::new(download), merge)?;
 ## What it costs and what it checks
 
 `bundle` and `receive` are the same calls on a byte buffer, and `pull` streams between the two
-files. Cloning a 330 MB file of a million keys took 0.91 s and 65 MiB at peak on 2026-11-04, and a
+files. Cloning a 330 MB file of a million keys took 0.82 s and 17 MiB at peak on 2026-11-05, and a
 pull of three small commits into it 1.3 ms with fsync. The in-memory version that streaming
 replaced took 1.1 GB, and 2.6 s where streaming took 2.3 s in the same runs, with small pulls as
 fast. Staging the bundle in a scratch file, so that commits go on while it arrives, added about a

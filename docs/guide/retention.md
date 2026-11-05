@@ -57,8 +57,8 @@ to its size.
 ## Limits
 
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
-  miss the node cache are slower for a moment after each swap. On four threads it ran at 489 MB/s
-  on a file of small table rows and 2,067 MB/s on one of 320 byte values, measured on 2026-11-04,
+  miss the node cache are slower for a moment after each swap. On four threads it ran at 484 MB/s
+  on a file of small table rows and 2,238 MB/s on one of 320 byte values, measured on 2026-11-05,
   against 180 and 596 MB/s on one thread before, so a 10 GB database takes about 20 seconds. Past
   four threads it gets no faster, because one thread walks and writes the whole copy.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
