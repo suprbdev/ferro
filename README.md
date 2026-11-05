@@ -15,8 +15,9 @@ ferro is an experiment, not a production database. Its file format is not stable
 - **Persistent collections.** `Map`, `Set`, `List` and `Table` nest inside your type. Cloning is
   O(1), `==` compares root hashes in O(1), and `diff` costs O(changes).
 - **Indexes without a query planner.** `#[derive(Record)]` keeps secondary, composite and unique
-  indexes on a `Table` up to date and generates their lookups. A covering index stores chosen
-  fields beside its entries, so a page of results reads no rows.
+  indexes on a `Table` up to date and generates their lookups. `find()` combines equality lookups
+  with `and` and `or` by key, and a covering index stores chosen fields beside its entries, so a
+  page of results reads no rows.
 - **Range totals in O(log n).** A `Summary` keeps a fold of every subtree of a map.
 - **History.** `at`, `as_of`, `history_of`, `bisect` and `diff` read old versions, and `restore`
   commits one again as a new version.
@@ -38,15 +39,16 @@ ferro is an experiment, not a production database. Its file format is not stable
   into a new file while writers run, pausing them for a few milliseconds.
 - **Schema evolution.** Fields are stored by name, so adding, removing, reordering and renaming
   fields needs no migration.
-- **One file and a tool.** Other processes can read while one writes, and the `ferro` tool inspects,
-  verifies and compacts any file without your types.
+- **One file, several processes and a tool.** Other processes can read while one writes, several
+  can write with `Options::shared` on 64-bit Linux, and the `ferro` tool inspects, verifies and
+  compacts any file without your types.
 
 ## When to use it
 
 ferro suits a program whose state is naturally one typed value, that wants history, undo, audit
-trails or what-if branches without building them, and that fits on one machine with one writing
-process. The example apps include an issue tracker, a booking system, a ledger, a job queue, a chat
-server and an offline-first notes app.
+trails or what-if branches without building them, and that fits on one machine. The example apps
+include an issue tracker, a booking system, a ledger, a job queue, a chat server and an
+offline-first notes app.
 
 What you get for it: queries are iterator code that you test and refactor like the rest of your
 program, a transaction is a closure that is serializable by construction, every change can be
