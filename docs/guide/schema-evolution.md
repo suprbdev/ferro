@@ -5,8 +5,9 @@ the struct:
 
 - Reordering fields is always safe.
 - A removed field is skipped when old data is read.
-- A new field needs a default: `Option`, `Vec`, `Map`, `Set`, `List` and `Table` start empty, and
-  anything else takes `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
+- A new field needs a default: `Option`, `Vec`, `BTreeMap`, `BTreeSet`, `Bytes`, `Map`, `Set`,
+  `List` and `Table` start empty, a `Box` or `Arc` of one of them does too, and anything else takes
+  `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
 - To rename a field, use `#[ferro(rename = "old_name")]`.
 
 Do not change the encoding or `Ord` of a key type on existing data. Tree placement depends on both.

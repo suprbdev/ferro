@@ -93,7 +93,8 @@ totals through `by_customer_first_prefix(&customer).covered()`. `#[index(each, c
 the fields beside each element's entry. `#[unique(cover(...))]` stores them beside the key, and
 `covered_by_x(&value)` returns `Some((key, fields))`. An each index cannot cover the field it
 indexes, a unique index cannot cover its own fields, and no index covers the key, which every entry
-already holds.
+already holds, or a `#[ferro(skip)]` field. A cover list stores at most 12 fields besides the ones
+the index is keyed on.
 
 The tuple follows the list, so reordering two covered fields of one type swaps them in code that
 destructures the tuple, and the compiler cannot tell.
