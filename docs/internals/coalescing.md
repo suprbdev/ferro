@@ -76,10 +76,9 @@ used to then find its own group settled and return, so nobody led the new group'
 closures slept until another commit came. At the end of a run none did, and the booking example's
 `a_coalesced_receipt_lands_on_the_group_that_paid` hung (#78). Copies of its test binary run at once
 on 32 cores beside 16 busy loops, 16 of them free to move and 8 each pinned to one core, hung 4
-times in 65,618 runs over 35 minutes. Each copy was started with `prctl(PR_SET_PTRACER,
-PR_SET_PTRACER_ANY)`, so that `gdb -p` could attach under Yama's ptrace scope 1, and in every hung
-process it found each thread in a futex wait: the rate writer parked in `await_group`, once with a
-buyer beside it, the other buyers done, and the test joining one of the two.
+times in 65,618 runs over 35 minutes. The stacks of every hung process had each thread in a futex
+wait: the rate writer parked in `await_group`, once with a buyer beside it, the other buyers done,
+and the test joining one of the two.
 
 A member that seals a group other than its own now wakes one of that group's members, as `fork`,
 `restore` and a panicking closure do when they seal a group they will not wait for, and that member
