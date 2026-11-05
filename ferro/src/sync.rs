@@ -1,3 +1,15 @@
+//! Sync between files: exchanging commits, so that each device works offline and catches up
+//! later.
+//!
+//! Two files that share a history, or have none yet, exchange only the commits the other lacks.
+//! [`Db::pull`](crate::Db::pull) does it in one call between two open files. Over a network the
+//! same pull is three calls on bytes: the pulling side sends its [`Have`], the other answers with a
+//! [`Bundle`], and the pulling side lands it with [`Db::receive`](crate::Db::receive). Either way
+//! the other side's branch lands in this file as a remote branch, and this branch is brought up to
+//! it by a fast-forward or a merge, as the [`Outcome`] in the returned [`Pulled`] says. Every
+//! object received is checked by hash, and as the type that will read it, before any of it can be
+//! reached from the file. See [Sync between files](docs/guide/sync.md).
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -44,10 +56,17 @@ const UNRESOLVED: Ptr = Ptr {
     offset: 0,
 };
 
+/// What a file holds of the commit graph, sent to another file so that it can bundle what this
+/// one lacks.
+///
+/// [`Db::have`](crate::Db::have) makes one, a few hundred bytes. It crosses a network as bytes:
+/// [`Have::as_bytes`] or `Vec::from` on one side, `Have::from` on the other. Bytes that are not a
+/// have are refused when [`Db::bundle`](crate::Db::bundle) reads them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Have(Vec<u8>);
 
 impl Have {
+    /// The have's bytes, to send to the other file.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -65,10 +84,18 @@ impl From<Have> for Vec<u8> {
     }
 }
 
+/// The commits a file lacks, and the objects they reach that it does not hold, built for it by
+/// another file.
+///
+/// [`Db::bundle`](crate::Db::bundle) builds one from the receiver's [`Have`], and
+/// [`Db::receive`](crate::Db::receive) lands it. It crosses a network as bytes, as a [`Have`]
+/// does. [`Db::bundle_to`](crate::Db::bundle_to) and [`Db::receive_from`](crate::Db::receive_from)
+/// stream it instead, so that neither side holds it whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bundle(Vec<u8>);
 
 impl Bundle {
+    /// The bundle's bytes, to send to the receiving file.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -86,21 +113,37 @@ impl From<Bundle> for Vec<u8> {
     }
 }
 
+/// How a pull or receive brought this branch up to the remote one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    /// This branch already had the remote head or a value equal to it, or the remote branch has
+    /// no commits. This branch did not change.
     UpToDate,
+    /// This branch already holds everything the remote branch has, and more of its own. This
+    /// branch did not change.
     Ahead,
+    /// This branch had nothing the remote branch lacks, so it now points at the remote head, and
+    /// [`Db::head_hash`](crate::Db::head_hash) is the same in both files.
     FastForward,
+    /// Each side had commits the other lacked, so the merge closure ran, and its merge commit is
+    /// this branch's new head.
     Merged,
 }
 
+/// What a pull or receive did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pulled<R> {
+    /// How this branch was brought up to the remote one.
     pub outcome: Outcome,
+    /// What the merge closure returned, if the outcome is [`Outcome::Merged`].
     pub value: Option<R>,
+    /// This branch's version afterwards.
     pub version: u64,
+    /// The number of objects the bundle carried.
     pub objects: u64,
+    /// The bytes of the [`Have`] sent to the other side, which only a pull sends.
     pub sent_bytes: u64,
+    /// The bytes of the bundle read.
     pub received_bytes: u64,
 }
 
@@ -2511,6 +2554,48 @@ fn check_remote(remote: &str, branch: &str) -> Result<()> {
 }
 
 impl<T: Data> Db<T> {
+    /// What this file holds of the commit graph, for another file to build a [`Bundle`] from.
+    ///
+    /// It names the head of every branch in the file, and commits along this branch at doubling
+    /// distances back from its head, so the other side can find the newest commit both hold. It is
+    /// a few hundred bytes.
+    ///
+    /// # Errors
+    ///
+    /// Read errors from the branch table or the log.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Bundle, Db, Have, Map, Outcome, Snapshot};
+    ///
+    /// type Stock = Map<String, u32>;
+    ///
+    /// fn merge(
+    ///     stock: &mut Stock,
+    ///     base: &Snapshot<Stock>,
+    ///     theirs: &Snapshot<Stock>,
+    /// ) -> (&'static str, usize) {
+    ///     ("sync", stock.merge(base, theirs, |conflict| conflict.keep_theirs()))
+    /// }
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// let laptop = Db::<Stock>::open(dir.path().join("laptop.ferro"))?;
+    /// let phone = Db::<Stock>::open(dir.path().join("phone.ferro"))?;
+    /// laptop.commit("receive stock", |stock| {
+    ///     stock.insert("anvil".to_string(), 5);
+    /// })?;
+    ///
+    /// let have: Vec<u8> = phone.have()?.into();
+    /// let bundle: Vec<u8> = laptop.bundle(&Have::from(have))?.into();
+    /// let pulled = phone.receive("laptop", &Bundle::from(bundle), merge)?;
+    ///
+    /// assert_eq!(pulled.outcome, Outcome::FastForward);
+    /// assert_eq!(phone.read().get("anvil").as_deref(), Some(&5));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn have(&self) -> Result<Have> {
         let (store, refs) = self.published_refs();
         let mut marks = Vec::new();
@@ -2542,12 +2627,30 @@ impl<T: Data> Db<T> {
         Ok(Have(Marks { marks, tips }.encode()))
     }
 
+    /// The commits of this branch that the file which sent `have` lacks, with the objects they
+    /// reach that it does not hold.
+    ///
+    /// It costs what changed since the newest commit both files hold, and the first bundle for a
+    /// file that shares no commit with this one carries everything. It reads the branch as last
+    /// published and holds no writer lock.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bundle`] if `have` is not a have, and read errors.
     pub fn bundle(&self, have: &Have) -> Result<Bundle> {
         let mut out = Vec::new();
         self.bundle_to(have, &mut out)?;
         Ok(Bundle(out))
     }
 
+    /// Writes the bundle [`Db::bundle`] would build to `out` as it goes, and returns the bytes
+    /// written.
+    ///
+    /// Neither side holds the bundle whole, so `out` can be a socket or a response body.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::bundle`], and [`Error::Io`] if writing to `out` fails.
     pub fn bundle_to(&self, have: &Have, mut out: impl Write) -> Result<u64> {
         self.emitter(have)?.write_to(&mut out)
     }
@@ -2558,6 +2661,76 @@ impl<T: Data> Db<T> {
         plan(&store, &refs, self.branch_name(), &have)
     }
 
+    /// Copies the branch of `from`, usually a handle on another file, into this file as the branch
+    /// `remote`, then brings this branch up to it.
+    ///
+    /// Only the commits this file lacks are sent, streamed between the two files. If this branch
+    /// has nothing the remote one lacks, it fast-forwards to the remote head; if each has commits
+    /// the other lacks, `merge` runs as in [`Db::merge_with`] and its merge commit links the
+    /// remote head. The base is a best common ancestor over the merge graph of every file the
+    /// commits passed through, so a change that reaches this file through a third device is
+    /// merged once. A pulled commit keeps the version, time, message and hash it had, while a merge
+    /// commits at this branch's next version, so compare commits across files by hash. A pull that
+    /// brings new commits replaces the branch `remote`, so do not commit to it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::BranchInUse`] if `remote` is `main` or this handle's branch.
+    /// - [`Error::StaleHave`] if this file pruned or dropped what the bundle builds on while it was
+    ///   sent. Nothing landed, and calling again sends a fresh have.
+    /// - [`Error::NoCommonAncestor`] when the merge base could lie in pruned history. The remote
+    ///   branch has landed, and this branch is as it was.
+    /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
+    ///   is damaged.
+    /// - [`Error::Reentrant`] from inside a closure on either file, [`Error::ReadOnly`] on a
+    ///   read-only handle, and the errors of [`Db::commit`].
+    ///
+    /// # Panics
+    ///
+    /// A panic in `merge` propagates, and this branch is as it was.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map, Outcome, Snapshot};
+    ///
+    /// type Stock = Map<String, u32>;
+    ///
+    /// fn merge(
+    ///     stock: &mut Stock,
+    ///     base: &Snapshot<Stock>,
+    ///     theirs: &Snapshot<Stock>,
+    /// ) -> (&'static str, usize) {
+    ///     ("sync", stock.merge(base, theirs, |conflict| conflict.keep_theirs()))
+    /// }
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// let laptop = Db::<Stock>::open(dir.path().join("laptop.ferro"))?;
+    /// let phone = Db::<Stock>::open(dir.path().join("phone.ferro"))?;
+    /// laptop.commit("receive anvils", |stock| {
+    ///     stock.insert("anvil".to_string(), 5);
+    /// })?;
+    ///
+    /// let pulled = phone.pull(&laptop, "laptop", merge)?;
+    /// assert_eq!(pulled.outcome, Outcome::FastForward);
+    /// assert_eq!(phone.head_hash(), laptop.head_hash());
+    ///
+    /// phone.commit("receive rope", |stock| {
+    ///     stock.insert("rope".to_string(), 2);
+    /// })?;
+    /// laptop.commit("sell the anvils", |stock| {
+    ///     stock.remove("anvil");
+    /// })?;
+    /// let pulled = phone.pull(&laptop, "laptop", merge)?;
+    /// assert_eq!(pulled.outcome, Outcome::Merged);
+    ///
+    /// let stock = phone.read();
+    /// assert!(stock.get("anvil").is_none());
+    /// assert_eq!(stock.get("rope").as_deref(), Some(&2));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn pull<R, S: Into<String>>(
         &self,
         from: &Db<T>,
@@ -2567,6 +2740,17 @@ impl<T: Data> Db<T> {
         self.try_pull::<R, S, Error>(from, remote, infallible(merge))
     }
 
+    /// Pulls like [`Db::pull`], with a merge closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` from `merge` leaves this branch and its merge records as they were and comes back
+    /// as it was, while the remote branch stays landed, so the next pull sends nothing new and
+    /// merges it again. The errors of [`Db::pull`] come back through `E::from`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn try_pull<R, S: Into<String>, E: From<Error>>(
         &self,
         from: &Db<T>,
@@ -2599,6 +2783,19 @@ impl<T: Data> Db<T> {
         Ok(pulled)
     }
 
+    /// Copies this handle's branch into the file of `to` as the branch `remote`, and brings the
+    /// branch of `to` up to it.
+    ///
+    /// It is [`Db::pull`] from the other side: `to.pull(self, remote, merge)`, so `merge` gets the
+    /// value of `to`'s branch as `ours`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::pull`], for the branch of `to`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn push<R, S: Into<String>>(
         &self,
         to: &Db<T>,
@@ -2608,6 +2805,15 @@ impl<T: Data> Db<T> {
         to.pull(self, remote, merge)
     }
 
+    /// Pushes like [`Db::push`], with a merge closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::try_pull`], for the branch of `to`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn try_push<R, S: Into<String>, E: From<Error>>(
         &self,
         to: &Db<T>,
@@ -2617,6 +2823,28 @@ impl<T: Data> Db<T> {
         to.try_pull(self, remote, merge)
     }
 
+    /// Lands `bundle`, which another file built with [`Db::bundle`] from this file's
+    /// [`Db::have`], as the branch `remote`, then brings this branch up to it as [`Db::pull`] does.
+    ///
+    /// It hashes every object and checks every link as it reads, and checks every object as the
+    /// type that will read it, and it refuses commits dated more than a day past this machine's
+    /// clock. Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch
+    /// file beside the database, under no writer lock, so commits on every branch go on meanwhile.
+    /// Once the whole bundle has passed, its objects are copied into the file, and one frame
+    /// points the branch `remote` at them, so a crash leaves the previous head. A bundle that
+    /// arrives late or twice changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged. Nothing reaches the file.
+    /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
+    ///   it was built for another file, or this one pruned or dropped that commit after sending
+    ///   its have. Nothing lands; build a new bundle from a fresh have.
+    /// - The other errors of [`Db::pull`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn receive<R, S: Into<String>>(
         &self,
         remote: &str,
@@ -2626,6 +2854,15 @@ impl<T: Data> Db<T> {
         self.try_receive::<R, S, Error>(remote, bundle, infallible(merge))
     }
 
+    /// Receives like [`Db::receive`], with a merge closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::try_pull`].
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn try_receive<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
@@ -2635,6 +2872,43 @@ impl<T: Data> Db<T> {
         self.try_receive_from(remote, bundle.as_bytes(), merge)
     }
 
+    /// Receives a bundle like [`Db::receive`], reading it from `input` to its end.
+    ///
+    /// `input` can be a socket or a download, so the bundle is never held whole: this uses a fixed
+    /// buffer, the object being read, and about 40 bytes for each object the bundle carries.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::receive`], and [`Error::Io`] if reading `input` fails.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Map, Outcome};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// let laptop = Db::<Map<u64, u64>>::open(dir.path().join("laptop.ferro"))?;
+    /// let phone = Db::<Map<u64, u64>>::open(dir.path().join("phone.ferro"))?;
+    /// laptop.update(|readings| {
+    ///     readings.insert(1, 20);
+    /// })?;
+    ///
+    /// let mut wire = Vec::new();
+    /// let sent = laptop.bundle_to(&phone.have()?, &mut wire)?;
+    /// let pulled = phone.receive_from("laptop", wire.as_slice(), |readings, base, theirs| {
+    ///     ("sync", readings.merge(base, theirs, |conflict| conflict.keep_theirs()))
+    /// })?;
+    ///
+    /// assert_eq!(pulled.received_bytes, sent);
+    /// assert_eq!(pulled.outcome, Outcome::FastForward);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn receive_from<R, S: Into<String>>(
         &self,
         remote: &str,
@@ -2644,6 +2918,15 @@ impl<T: Data> Db<T> {
         self.try_receive_from::<R, S, Error>(remote, input, infallible(merge))
     }
 
+    /// Receives from `input` like [`Db::receive_from`], with a merge closure that can fail.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::try_pull`], and [`Error::Io`] if reading `input` fails.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Db::pull`].
     pub fn try_receive_from<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
