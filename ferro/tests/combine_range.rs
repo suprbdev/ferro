@@ -793,13 +793,25 @@ fn check(table: &Table<Row>, model: &Model, seed: u64, queries: usize, shape: Sh
     check_in(&[(table, model)], seed, queries, shape);
 }
 
-fn check_in(versions: &[Version<'_>], seed: u64, queries: usize, shape: Shape) {
-    let count = versions.len();
-    let ids = versions
+fn ids_in(versions: &[Version<'_>]) -> u32 {
+    versions
         .iter()
         .filter_map(|(_, model)| model.keys().next_back())
         .max()
-        .map_or(1, |id| id + 1);
+        .map_or(1, |id| id + 1)
+}
+
+fn check_deep_in(versions: &[Version<'_>], seed: u64, queries: usize, shape: Shape) {
+    let (count, ids) = (versions.len(), ids_in(versions));
+    let mut rng = Rng::new(seed);
+    for _ in 0..queries {
+        let query = query(&mut rng, ids, shape, 4, count);
+        agree_in(versions, &query, &mut rng);
+    }
+}
+
+fn check_in(versions: &[Version<'_>], seed: u64, queries: usize, shape: Shape) {
+    let (count, ids) = (versions.len(), ids_in(versions));
     let mut rng = Rng::new(seed);
     for _ in 0..queries {
         let query = if rng.chance(50) {
@@ -884,6 +896,9 @@ proptest! {
 
         let copy = a.clone();
         check_in(&[(&a, &first), (&copy, &first), (&b, &second)], seed ^ 4, 10, shape);
+        let four = [(&a, &first), (&newer, &changed), (&b, &second), (&copy, &first)];
+        check_in(&four, seed ^ 5, 10, shape);
+        check_deep_in(&four, seed ^ 6, 20, shape);
     }
 }
 
