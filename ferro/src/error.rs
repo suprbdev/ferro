@@ -44,9 +44,12 @@ pub enum Error {
     /// The file is damaged, or holds something no file ferro wrote can hold.
     ///
     /// An object whose bytes do not match its hash, a commit log whose versions do not descend, a
-    /// file whose superblocks are both invalid, or a frame past the superblock that reached the
-    /// disk whole and was damaged since ends up here, and so do the type checks of
-    /// [`Db::verify_typed`](crate::Db::verify_typed). The message says what was found and where.
+    /// file whose superblocks are both invalid, a frame past the superblock that reached the disk
+    /// whole and was damaged since, or, for a writer with
+    /// [`Options::shared`](crate::Options::shared) catching up or opening beside a live one, a
+    /// frame the newest superblock names that does not check, ends up here, and so do the type
+    /// checks of [`Db::verify_typed`](crate::Db::verify_typed). The message says what was found and
+    /// where.
     #[error("corrupt database: {0}")]
     Corrupt(String),
     /// Stored bytes do not decode as the type that reads them.
