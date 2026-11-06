@@ -94,6 +94,10 @@ const SECTOR_BYTES: u64 = 512;
 /// to count as damage: fewer could be a sector that kept its older bytes and differs from the
 /// frame's by chance in one bit.
 const SECTOR_MIN: u64 = 8;
+/// The most blocks of a frame's records that may fail their entries in its table for open to
+/// search them for a flipped bit: more point to a torn write, and each costs a search of every bit
+/// of its block.
+const MEND_BLOCKS: usize = 8;
 /// How much of a frame a check reads at a time, and the size of a record past which a read checks
 /// the file's length before it allocates.
 const SCAN_CHUNK: usize = 1 << 20;
@@ -743,8 +747,8 @@ fn examine(
 /// whole frame, given the tables [`examine`] read for it as it stands, if it could.
 ///
 /// A frame reached the disk whole and was damaged since if putting back at most one flipped bit
-/// in its header and table together, and at most one in each block of its records, makes it
-/// whole, and each such bit passes [`judged`]. A torn write leaves the part
+/// in its header and table together, and at most one in each of at most [`MEND_BLOCKS`] blocks of
+/// its records, makes it whole, and each such bit passes [`judged`]. A torn write leaves the part
 /// of a sector it did not reach as it was: zeroes or ones, which [`judged`] refuses, or other
 /// bytes, which differ from what the frame would have put there in many bits, so it leaves a frame
 /// that no single flip mends. Anything else is [`Found::Torn`].
@@ -836,9 +840,9 @@ fn diagnose(
 }
 
 /// Finishes [`diagnose`] for the frame from `start` with `records` bytes of records, whose header
-/// and `table` check once the bits at `flipped` are put back: every block whose check, in
-/// `computed`, differs from its entry must match it once one of its bits is flipped back, and
-/// every bit flipped back must pass [`judged`].
+/// and `table` check once the bits at `flipped` are put back: at most [`MEND_BLOCKS`] blocks may
+/// have a check, in `computed`, that differs from their entry, each must match it once one of its
+/// bits is flipped back, and every bit flipped back must pass [`judged`].
 fn mend(
     file: &File,
     start: u64,
@@ -850,16 +854,21 @@ fn mend(
 ) -> Result<Found> {
     let body_start = start + FRAME_BYTES as u64;
     let end = frame.log_end;
+    let entries = table.chunks(BLOCK_CHECK).zip(computed.chunks(BLOCK_CHECK));
+    let failing: Vec<(usize, &[u8])> = entries
+        .enumerate()
+        .filter(|(_, (want, got))| want != got)
+        .map(|(index, (want, _))| (index, want))
+        .collect();
+    if failing.len() > MEND_BLOCKS {
+        return Ok(Found::Torn);
+    }
     for at in &flipped {
         if !judged(file, *at, start, end)? {
             return Ok(Found::Torn);
         }
     }
-    let entries = table.chunks(BLOCK_CHECK).zip(computed.chunks(BLOCK_CHECK));
-    for (index, (want, got)) in entries.enumerate() {
-        if want == got {
-            continue;
-        }
+    for (index, want) in failing {
         let from = (index * BLOCK_BYTES) as u64;
         let mut block = vec![0u8; (records - from).min(BLOCK_BYTES as u64) as usize];
         if !read_or_end(file, &mut block, body_start + from)? {
@@ -4528,5 +4537,31 @@ mod tests {
         let tip = scanned(&dir.path().join("header.ferro"), &torn).unwrap();
         assert_eq!(tip.seq, 1);
         never_damaged(&frames, None);
+    }
+
+    #[test]
+    fn a_frame_failing_more_blocks_than_open_searches_reads_as_torn() {
+        let frame: Vec<Put> = (0..12).map(|seed| put(noise(seed, BLOCK_BYTES))).collect();
+        let (base, ops) = traced(&[frame], Durability::Buffered);
+        let whole = applied(&base, &ops, |_, _| false, None);
+        let body = LOG_START as usize + FRAME_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.ferro");
+        for blocks in [1, MEND_BLOCKS, MEND_BLOCKS + 1, 12] {
+            let mut image = whole.clone();
+            for block in 0..blocks {
+                image[body + block * BLOCK_BYTES + 1000] ^= 0x04;
+            }
+            match scanned(&path, &image) {
+                Err(Error::Corrupt(message)) if blocks <= MEND_BLOCKS => {
+                    assert!(
+                        message.ends_with(&format!("byte {}", body + 1000)),
+                        "{message}"
+                    );
+                }
+                Ok(tip) if blocks > MEND_BLOCKS => assert_eq!(tip.seq, 0),
+                other => panic!("{blocks} blocks flipped: {:?}", other.map(|tip| tip.seq)),
+            }
+        }
     }
 }
