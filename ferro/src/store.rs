@@ -29,6 +29,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -57,6 +58,19 @@ use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
 use crate::shared::{Erased, Shared, Weak};
+
+thread_local! {
+    static FRESH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many objects this thread has read from a file to decode them, past the cache, so far.
+///
+/// A combination reads it before and after testing a key against a range, to tell a test that
+/// found the row cached from one that read it from the file.
+#[inline]
+pub(crate) fn fresh_reads() -> u64 {
+    FRESH.with(Cell::get)
+}
 
 /// The magic at the start of a superblock, which names the format of the file.
 const MAGIC: &[u8; 8] = b"FERRODB4";
@@ -3310,6 +3324,7 @@ impl Store {
     /// what the view may read, and otherwise the record in the file, counted only if the view
     /// read it before.
     fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
+        FRESH.with(|fresh| fresh.set(fresh.get().wrapping_add(1)));
         let Some(view) = &self.inner.view else {
             return self.read_object(ptr);
         };

@@ -140,6 +140,7 @@ use crate::codec::{Data, Decoder, Description, Encoder, Hash};
 use crate::error::Result;
 use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, same_value};
 use crate::prefix::Prefix;
+use crate::store::fresh_reads;
 
 /// A row type that can be stored in a [`Table`].
 ///
@@ -1216,6 +1217,10 @@ where
             covering: false,
             lead: None,
             landed: None,
+            cold: false,
+            rowless: false,
+            budget: 0,
+            spent: 0,
         })
     }
 }
@@ -1354,6 +1359,10 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
 
     /// The same lookup with the covered fields dropped from its type, so that lookups of
     /// differently covered indexes fit in one collection or one [`Matches::or`].
+    ///
+    /// A range or prefix lookup passed through it to [`Matches::and`] or [`Matches::or`] is read in
+    /// full and sorted rather than tested key by key, as [`IntoMatches`] describes, so a
+    /// combination read through [`Matches::keys`] reads no row for it.
     #[inline]
     pub fn uncovered(self) -> IndexIter<T> {
         IndexIter {
@@ -1536,8 +1545,16 @@ impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 /// left. Otherwise the first time the combination is read the lookup's keys and covered fields are
 /// read in full and sorted, as they are for one that leads the combination through
 /// [`into_matches`](IntoMatches::into_matches), one whose covered fields the combination yields,
-/// and every other [`IndexIter`]. A lookup of one value is in key order already and sorts in one
-/// pass.
+/// one passed through [`IndexIter::uncovered`], and every other [`IndexIter`]. A lookup of one
+/// value is in key order already and sorts in one pass.
+///
+/// A row found in the cache costs about as much to test as a few entries do to read, but one read
+/// from the file costs as much as dozens. So tests count the rows they had to read from the file:
+/// those of every key under [`Matches::keys`] and [`Matches::covered`], which yield no rows, and
+/// otherwise those of keys the lookup does not hold, since a row that matches is read anyway. Once
+/// they come to more than about a 64th of the entries the lookup has, the lookup is read in full
+/// for the keys left, so a combination whose rows are not cached costs at most about twice what
+/// reading the lookup would.
 ///
 /// # Examples
 ///
@@ -1729,16 +1746,20 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     }
 
     /// The primary keys of the matching rows, in key order, reading no row but those tested
-    /// against a range or prefix lookup, as [`IntoMatches`] describes.
-    pub fn keys(self) -> MatchKeys<T> {
+    /// against a range or prefix lookup, as [`IntoMatches`] describes. A range passed through
+    /// [`IndexIter::uncovered`] is read in full instead, and reads no row.
+    pub fn keys(mut self) -> MatchKeys<T> {
+        self.stream.rowless();
         MatchKeys(Box::new(Blind(self.stream)))
     }
 
     /// `(key, fields)` pairs of the matching rows in key order, where `fields` are the covered
     /// fields of the leftmost lookup that holds the row, read from its index. It reads no row but
-    /// those tested against a range or prefix lookup, as [`IntoMatches`] describes.
+    /// those tested against a range or prefix lookup, as [`IntoMatches`] describes, and none for a
+    /// range passed through [`IndexIter::uncovered`].
     pub fn covered(mut self) -> MatchCovered<T, C> {
         self.stream.cover();
+        self.stream.rowless();
         MatchCovered(self.stream)
     }
 
@@ -1981,6 +2002,7 @@ trait Stream<K, C>: Send {
     fn found(&mut self) -> Option<C>;
     fn follow(&mut self, _lead: usize) {}
     fn adopt(&mut self, _rows: &mut dyn std::any::Any) {}
+    fn rowless(&mut self) {}
 }
 
 const STEPS: usize = 16;
@@ -2370,6 +2392,10 @@ struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
     covering: bool,
     lead: Option<usize>,
     landed: Option<(T::Key, bool)>,
+    cold: bool,
+    rowless: bool,
+    budget: u64,
+    spent: u64,
 }
 
 impl<T, I, X, C> Ranged<T, I, X, C>
@@ -2400,6 +2426,9 @@ where
     }
 
     fn testing(&mut self) -> bool {
+        if self.cold {
+            return false;
+        }
         if self.edges.is_some() {
             return true;
         }
@@ -2412,6 +2441,7 @@ where
         {
             return false;
         }
+        self.budget = spanned.cursor.left() as u64;
         self.edges = spanned.cursor.edges();
         self.edges.is_some()
     }
@@ -2473,8 +2503,16 @@ where
         }
         let known = matches!(&self.landed, Some((key, _)) if key == target);
         if !known {
+            let before = fresh_reads();
             let holds = self.holds(target);
             self.landed = Some((target.clone(), holds));
+            if !holds || self.rowless {
+                self.spent += fresh_reads().wrapping_sub(before);
+            }
+            if self.spent.saturating_mul(FRESH) > self.budget {
+                self.cold = true;
+                self.edges = None;
+            }
         }
         match &self.landed {
             Some((key, true)) => Probe::At(key),
@@ -2492,6 +2530,10 @@ where
 
     fn follow(&mut self, lead: usize) {
         self.lead = Some(lead);
+    }
+
+    fn rowless(&mut self) {
+        self.rowless = true;
     }
 
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
@@ -2547,6 +2589,10 @@ impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
         self.0.adopt(rows);
     }
+
+    fn rowless(&mut self) {
+        self.0.rowless();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2557,6 +2603,8 @@ enum Plan {
 }
 
 const RATIO: usize = 4;
+
+const FRESH: u64 = 64;
 
 struct All<K, C> {
     left: Box<dyn Stream<K, C>>,
@@ -2767,6 +2815,11 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
         self.left.adopt(rows);
     }
+
+    fn rowless(&mut self) {
+        self.left.rowless();
+        self.right.rowless();
+    }
 }
 
 struct Any<K, C> {
@@ -2880,6 +2933,12 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
         if let Some(first) = self.sides.first_mut() {
             first.adopt(rows);
+        }
+    }
+
+    fn rowless(&mut self) {
+        for side in &mut self.sides {
+            side.rowless();
         }
     }
 }
