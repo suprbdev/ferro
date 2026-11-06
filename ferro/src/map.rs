@@ -5287,8 +5287,8 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
     /// both from stored roots of one hash, or both from an empty map.
     ///
     /// It answers from the roots alone, in O(1), and says `false` when they cannot tell, such as
-    /// for one root lent through a hazard slot and another of the same map read through a link
-    /// whose node is not pinned, so `false` does not mean the maps differ.
+    /// for a root node lent through a hazard slot and a link to the same root whose node this
+    /// finder had not read, so `false` does not mean the maps differ.
     pub(crate) fn same_map(&self, other: &Finder<K, V, S>) -> bool {
         if let (Top::Link(a), Top::Link(b)) = (&self.root, &other.root)
             && a.same_as(b)
