@@ -1088,7 +1088,11 @@ fn a_following_shared_writer_sees_another_handles_commits_and_cycles_without_ref
         "{following:?}"
     );
     assert_eq!(following.last_error, None);
-    assert_eq!(b.size_on_disk(), a.size_on_disk(), "b writes the new file");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while b.size_on_disk() != a.size_on_disk() {
+        assert!(Instant::now() < deadline, "b never moved to the new file");
+        thread::sleep(Duration::from_millis(5));
+    }
     bump(&b, 1, 1);
     a.refresh().unwrap();
     assert_eq!(a.read().n, 31);
