@@ -17,8 +17,8 @@ use ferro_fuzz::catalog::{
 use ferro_fuzz::sync::{self as fuzz_sync, BOTH, DIRECT, EDITS, PACK_SMART, REHASH, REOPEN};
 use ferro_fuzz::types::{Docs, Nested, Order, Probe, Root, Shop, Status, Summed};
 use ferro_fuzz::{
-    CATALOG, CATALOG_V1, CATALOG_V3, COUNTERS, DOCS, NESTED, OPAQUE, PAIRS, READ_ONLY, ROOT, SHOP,
-    SUMMED, SYNC_OUT, WORLD, WRITES, mode,
+    CATALOG, CATALOG_V1, CATALOG_V3, COUNTERS, DAMAGE, DOCS, NESTED, OPAQUE, PAIRS, READ_ONLY,
+    ROOT, SHOP, SUMMED, SYNC_OUT, WORLD, WRITES, mode,
 };
 
 const LARGEST: u64 = 256 << 10;
@@ -692,6 +692,20 @@ fn out_of_order(corpus: &mut Corpus, dir: &Path) {
     }
 }
 
+fn damage_seeds(corpus: &mut Corpus) {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for seed in 0..48u64 {
+        let mut data = vec![mode(DAMAGE, 0), (seed % 16) as u8];
+        for _ in 0..64 + seed * 3 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.push(state as u8);
+        }
+        corpus.put("open", &data);
+    }
+}
+
 fn refs_seeds(corpus: &mut Corpus) {
     use ferro_fuzz::refs::{ADMIN, COMPACT, FOLLOW, FRAMES, LONG, READ_ONLY, WRITES};
     let controls = [
@@ -1043,6 +1057,7 @@ fn main() {
     mid_receive(&mut corpus, dir.path());
     sync_seeds(&mut corpus, dir.path());
     refs_seeds(&mut corpus);
+    damage_seeds(&mut corpus);
     let generated = corpus.seen.len();
     for extra in args {
         collect(&mut corpus, Path::new(&extra));

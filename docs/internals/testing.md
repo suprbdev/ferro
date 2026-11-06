@@ -29,7 +29,19 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   file through 70 more commits, past a full branch table and a cycle, refreshing on the way. Either
   can bundle the file for an empty one and receive the bundle there, and a read-write handle then
   pulls a commit back from it. `admin` runs `info`, `log`, `verify`, `space`, `layout` and, when its
-  mode says so, `compact`.
+  mode says so, `compact`. One root type of `open`'s mode byte instead takes the rest of the input
+  as a recipe: it writes a valid file of one to five commits of up to four values of up to 14,000
+  bytes each, Buffered or Fsync, puts back the superblocks the file had after an earlier commit,
+  and damages one frame past their anchor, by flipping a bit anywhere in it or one in each of some
+  of its 4 KiB blocks and its header and table, or by filling a sector, or a run of every other
+  sector, with zeroes, ones, an older frame's bytes or input bytes, and sometimes leaves a
+  reservation of zeroes after the log. It then compares the damaged frame with the whole one: if
+  each block and the header and table together differ in at most one bit, the entry of no block
+  differs along with its block, and every bit that differs sits in a sector that holds at least 8
+  of the frame's bytes, both a read-only open and a writer's open must fail with `Corrupt` naming
+  the frame and its first wrong byte and leave the file as it was. Otherwise both must open at the
+  commit before the frame, the writer truncating the file there, `verify` must pass, and a commit
+  must survive a reopen.
 - `reclaim` takes the input `admin` takes, opens the file as the type that decodes nothing and
   compacts it with `copy_threads(1)` and again, from the same image, with `copy_threads(4)`, keeping
   every version, the newest one or three, or those since time 0, and for some modes compacts the

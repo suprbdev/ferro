@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod damage;
 pub mod fixup;
 pub mod input;
 pub mod log_entry;
@@ -121,6 +122,7 @@ pub const WORLD: u8 = 9;
 pub const PAIRS: u8 = 10;
 pub const INTS: u8 = 11;
 pub const OPAQUE: u8 = 12;
+pub const DAMAGE: u8 = 15;
 
 pub const NO_REPAIR: u8 = 1;
 pub const READ_ONLY: u8 = 2;
@@ -149,7 +151,11 @@ pub fn mode(kind: u8, flags: u8) -> u8 {
 }
 
 pub fn run_open(data: &[u8]) {
-    if let Some((mode, bytes)) = file_bytes(data) {
+    if let Some((&mode, rest)) = data.split_first()
+        && (mode >> 2) % KINDS == DAMAGE
+    {
+        damage::run(rest);
+    } else if let Some((mode, bytes)) = file_bytes(data) {
         open_kind(&stage(&bytes), Plan::of(mode), (mode >> 2) & 0x0f);
     }
 }
