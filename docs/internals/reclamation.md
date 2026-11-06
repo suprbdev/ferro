@@ -386,6 +386,8 @@ fine, because the copy rewrote it. One held in memory across a cycle is refused.
 A read-only handle keeps its view, in the old file if need be, and `refresh` notices that the path
 names a new inode, or a new file index on Windows, opens it, and rebinds. Its watchers fire only if
 the version moved. A process that never refreshes never fails, and holds the old file open instead.
+A handle opened with `Options::follow` does this on its own as soon as it sees the rename, as
+described under [Followers](processes.md#followers).
 
 ## Crashes
 

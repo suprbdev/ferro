@@ -92,7 +92,12 @@ keeps its edges to other files between polls, since a thread blocked on it still
 
 A watcher's test on the `ferro-watch` thread holds nothing, so it may write anywhere, as before. A
 test run on the watcher's own thread, by `recv` or `try_recv` inside a closure, is checked like the
-closure. The `Drop` impls that run under a lane or `tip` are covered by the same record: values a
+closure. The `ferro-follow` thread that `Options::follow` starts holds nothing either and runs no
+closure or test. Its look takes `tip` as `refresh` does, and on a shared writer the superblock lock
+to publish what it caught up with, and waits for no lane, so a test or a closure that refreshes
+waits at most for one look, as it would for another thread's `refresh`, and the follower never
+waits for it. In `ferro/tests/follow.rs` a filtered watcher whose test refreshes and attaches a
+branch runs while the follower publishes 50 commits. The `Drop` impls that run under a lane or `tip` are covered by the same record: values a
 closure captured, a coalesced group's working copy, a commit's drafted root when nothing changed or
 when it moves, and the states a cycle's swap replaces. The library's own drop that writes, the flush
 when the last handle of a file goes, takes that file's lanes, but no closure can run on a file once

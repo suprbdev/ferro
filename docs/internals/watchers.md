@@ -15,6 +15,11 @@ is compared rather than versions so that a read-only handle stays right when a b
 forked again at a lower version. The feed starts out holding the branch's snapshot from when the
 branch was attached, so a watcher made before any commit has a snapshot to compare against.
 
+Another process's commits reach the feed when this process catches up and syncs them, at `refresh`,
+or, with `Options::follow`, when its `ferro-follow` thread does either, as described under
+[Followers](processes.md#followers). Publishing from that thread is the same store and wake as from
+a commit, so the watch thread and the waiting watchers cannot tell the difference.
+
 ## Closing a feed or a watcher
 
 A `Branch` closes its feed when it drops, which is when the last `Db` handle goes, because `Shared`
