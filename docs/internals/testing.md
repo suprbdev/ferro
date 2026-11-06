@@ -214,6 +214,17 @@ together, 508 of those left of the damage mode, 109 of them sparse values and 76
 crashed, hung, leaked or passed a memory limit, the peak RSS was 1.56 GB, and no damaged frame met
 a verdict other than the damage mode's.
 
+The round after the rule that nothing at or below the newest superblock is truncated, described
+under [What a superblock names](storage.md#what-a-superblock-names), ran `open` for 10 minutes as
+four jobs, one on each of four cores, each from a quarter of a copy of the 25,628 saved `open`
+inputs, 895 of them of the damage mode, under the flags above and `-rss_limit_mb=3072`, while the
+workspace's tests ran on the other cores. Each loaded its 6,410 or so inputs in about 6,415
+executions, reaching 106,400 to 107,000 edges, and ran 11,504 to 13,385 executions in all, 19 to 22
+a second, 49,719 together, ending at 106,400 to 107,100 edges and adding 350 inputs together, 108 of
+them of the damage mode. No input crashed, hung, leaked or passed a memory limit, the peak RSS was
+1.56 GB, and no damaged frame met a verdict other than the damage mode's. The target opens files
+with no other writer alive, which the change leaves as it was, so the round checks that it did.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
