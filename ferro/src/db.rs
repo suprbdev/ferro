@@ -1452,9 +1452,11 @@ impl Options {
     /// at most once a millisecond; elsewhere, or where inotify cannot be had, it looks every
     /// 10 ms. A look reads the newest superblock and refreshes only when that names a commit the
     /// handle has not seen. On a shared writer it catches up only to what that superblock names,
-    /// so it never syncs for another process and takes no lock another process holds, except to
-    /// open the file a cycle renamed. A writer without [`Options::shared`] is the only one and
-    /// starts no thread. Off by default.
+    /// and waits for a lock another process holds only to open the file a cycle renamed, to sync
+    /// its own process's commits, or, under [`Durability::Fsync`], to sync a commit that a process
+    /// using [`Durability::Buffered`] named without syncing it. Under `Buffered` it syncs the file
+    /// once every [`Options::checkpoint_bytes`] it follows, as every writer does. A writer without
+    /// [`Options::shared`] is the only one and starts no thread. Off by default.
     ///
     /// The thread ends when the last [`Db`] handle on the file is dropped, which waits for a look
     /// in progress, and keeps neither the file nor a lock. A look that fails, as when the file was

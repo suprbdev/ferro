@@ -145,9 +145,11 @@ A thread of its own, `ferro-follow`, waits until the file may have changed, read
 superblock, and refreshes when that names a commit the handle has not seen, so `read` shows each
 commit soon after the writer acknowledges it and the watchers of every branch it moved fire. It
 follows the file a reclamation cycle renames over the path too. On a shared writer it catches up
-only with what a superblock names, so it never syncs for another process and takes no lock that
-another process holds, except to open the file a cycle renamed. A writer without `shared` is the
-only writer and starts no thread.
+only with what a superblock names, and waits for a lock another process holds only to open the
+file a cycle renamed, to sync its own process's commits, or, under `Durability::Fsync`, to sync a
+commit that a process using `Durability::Buffered` named without syncing it. Under `Buffered` it
+syncs the file once every `checkpoint_bytes` it follows, as every writer does. A writer without
+`shared` is the only writer and starts no thread.
 
 On 64-bit Linux inotify wakes the thread when the file is written or a file is renamed over it. On
 the machine the other figures here come from, shared with other work, a commit from another

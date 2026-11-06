@@ -349,8 +349,11 @@ already named, nor did its drop return, until the fdatasync did. So a look that 
 superblock takes no lock another process can hold. A look still leads a real sync, under the
 superblock lock, when this process's own commits have queued frames past what the superblock
 covers, as any leader would, and a look that meets a cycle's marker opens the new file as a shared
-writer's open does, under that file's placement and superblock locks. A look never takes a branch
-lock.
+writer's open does, under that file's placement and superblock locks. Under Fsync a commit that a
+Buffered process named is past the anchor the superblock covers, so a Fsync look that follows it
+syncs under the superblock lock and waits for whoever holds it. A Buffered follower runs the
+checkpoint after each look that led, as any Buffered writer does, so it syncs the file once every
+`checkpoint_bytes` of other processes' commits. A look never takes a branch lock.
 
 ### Waking
 
