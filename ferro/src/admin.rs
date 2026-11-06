@@ -21,6 +21,8 @@ use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::refs::{self, Root};
 use crate::store::{Closing, Store, StoreOptions};
 
+const CONFIRMED_KEPT: usize = 1 << 12;
+
 /// How much history each branch retains.
 ///
 /// [`Options::history`](crate::Options::history) sets it for a database, and
@@ -227,7 +229,6 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>())));
     let mut checked = Checked::default();
     let mut confirmed = HashSet::new();
-    let mut deferred: Vec<(Ptr, Kind, bool)> = Vec::new();
     let corrupt = |kind: &Kind, ptr: Ptr, error: Error| {
         Error::Corrupt(format!(
             "the {} at {} does not decode: {error}",
@@ -239,27 +240,30 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
             Some((shape, true)) => shape,
             Some((shape, false)) => {
                 let memo = kind.claim.as_deref().and_then(|claim| {
-                    let id = (claim as &dyn Any).type_id();
-                    claim.fingerprint().map(|print| (ptr.hash, id, print))
+                    let claimed = (claim as &dyn Any).type_id();
+                    claim
+                        .fingerprint()
+                        .map(|print| (ptr.hash, kind.id, claimed, print))
                 });
-                if memo.is_none_or(|memo| confirmed.insert(memo)) {
-                    deferred.push((ptr, kind.clone(), true));
+                let seen = memo.is_some_and(|memo| confirmed.contains(&memo));
+                if !seen {
+                    (kind.held)(&kind, store, ptr).map_err(|error| corrupt(&kind, ptr, error))?;
+                    if let Some(memo) = memo.filter(|_| confirmed.len() < CONFIRMED_KEPT) {
+                        confirmed.insert(memo);
+                    }
                 }
                 shape
             }
             None => {
                 let object = store.read_object(ptr)?;
                 let (shape, found) = kind
-                    .check(&object.body, &object.links, None)
+                    .check(&object.body, &object.links, Some(store))
                     .map_err(|error| corrupt(&kind, ptr, error))?;
                 queue.extend(
                     found
                         .into_iter()
                         .map(|(index, child)| (object.links[index], child)),
                 );
-                if shape.deferred {
-                    deferred.push((ptr, kind.clone(), false));
-                }
                 checked.insert(ptr.hash, &kind, shape);
                 shape
             }
@@ -270,16 +274,6 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
                 kind.name, ptr.offset, shape.count, shape.level
             )));
         }
-    }
-    for (ptr, kind, again) in deferred {
-        let confirmed = match again {
-            true => (kind.held)(&kind, store, ptr).map(drop),
-            false => store.read_object(ptr).and_then(|object| {
-                kind.check(&object.body, &object.links, Some(store))
-                    .map(drop)
-            }),
-        };
-        confirmed.map_err(|error| corrupt(&kind, ptr, error))?;
     }
     Ok(())
 }
