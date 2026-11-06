@@ -23,7 +23,7 @@
 //! - **Sync.** [`Db::pull`] brings another file's commits into this one, and [`Db::have`],
 //!   [`Db::bundle`] and [`Db::receive`] do the same as bytes over any transport.
 //! - **Watchers.** [`Db::watch`] returns a [`Watcher`] that hands out each new snapshot of a
-//!   branch.
+//!   branch, and [`Options::follow`] fires them for other processes' commits too.
 //!
 //! # Examples
 //!
@@ -83,6 +83,7 @@ pub mod db;
 mod dense;
 mod epoch;
 pub mod error;
+mod follow;
 mod graph;
 pub mod history;
 pub mod list;
@@ -105,6 +106,7 @@ pub use codec::{Bytes, Data, Hash, Ptr, hash_of};
 pub use db::{Commit, Committed, Db, Options, Snapshot, Stamp, Verified};
 pub use error::{Error, Result};
 pub use ferro_derive::{Data, Record};
+pub use follow::Following;
 pub use history::History;
 pub use list::List;
 pub use log::Log;

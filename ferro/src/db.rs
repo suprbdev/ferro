@@ -30,6 +30,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
+use crate::follow::{Follower, Following};
 use crate::graph::{self, Start};
 use crate::history::History;
 use crate::log::{Chain, Entry, Log, Merged, Node};
@@ -39,8 +40,8 @@ use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_pa
 use crate::reentry::{self, Crossing, Needs};
 use crate::refs;
 use crate::store::{
-    Durability, Followed, Frame, Held, Landing, Op, Retired, Settling, Store, StoreOptions, Trace,
-    Txn, lane_of,
+    Durability, Followed, Frame, Held, Landing, News, Op, Retired, Settling, Store, StoreOptions,
+    Trace, Txn, lane_of,
 };
 use crate::watch::{Feed, Filter, Notice, Watcher};
 
@@ -881,10 +882,12 @@ struct Keeper {
     signal: Arc<Signal>,
     thread: Mutex<Option<JoinHandle<()>>>,
     syncer: Mutex<Option<(Arc<Signal>, JoinHandle<()>)>>,
+    follower: Option<Follower>,
 }
 
 impl Drop for Keeper {
     fn drop(&mut self) {
+        drop(self.follower.take());
         self.signal.stop.store(true, Ordering::Release);
         self.signal.raise();
         if let Some(thread) = self.thread.lock().take() {
@@ -1292,13 +1295,15 @@ pub struct Options {
     reclaim: Reclaim,
     coalesce: bool,
     lock_wait: Duration,
+    follow: bool,
+    follow_poll: Option<Duration>,
     hook: Option<Hook>,
     clock: Option<Clock>,
 }
 
 impl Options {
     /// The defaults: an fsync for every commit, a 1 GiB cache, all history kept, one writer
-    /// process, no coalescing, and no wait for the writer lock.
+    /// process, no coalescing, no follower, and no wait for the writer lock.
     pub fn new() -> Self {
         Options::default()
     }
@@ -1338,9 +1343,9 @@ impl Options {
     /// Opens the file without the writer lock, to read while another process writes.
     ///
     /// Every write then fails with [`Error::ReadOnly`], and [`Db::refresh`] picks up what the
-    /// writer committed since. Opening a missing file fails with [`Error::NoDatabase`] instead of
-    /// creating it. A read-only handle runs no reclamation and ignores [`Options::shared`] and
-    /// [`Options::coalesce`].
+    /// writer committed since, as [`Options::follow`] does on its own. Opening a missing file
+    /// fails with [`Error::NoDatabase`] instead of creating it. A read-only handle runs no
+    /// reclamation and ignores [`Options::shared`] and [`Options::coalesce`].
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.store.read_only = read_only;
         self
@@ -1415,8 +1420,9 @@ impl Options {
     /// Each commit lands on top of the newest one from any process, and a closure runs under a
     /// lock on its branch that holds across processes, so it starts from the newest commit on its
     /// branch. A process sees the others' commits when it next commits, attaches a branch with
-    /// [`Db::branch`] or calls [`Db::refresh`]. A writer without the option and shared writers
-    /// lock each other out with [`Error::Locked`].
+    /// [`Db::branch`] or calls [`Db::refresh`], or, with [`Options::follow`], soon after they are
+    /// acknowledged. A writer without the option and shared writers lock each other out with
+    /// [`Error::Locked`].
     ///
     /// It needs open file description locks, so it works on 64-bit Linux only, on one machine and a
     /// local file system. Elsewhere the open fails with an
@@ -1433,6 +1439,59 @@ impl Options {
     /// It checks every 10 ms. Zero, the default, fails at once.
     pub fn lock_wait(mut self, wait: Duration) -> Self {
         self.lock_wait = wait;
+        self
+    }
+
+    /// Follows the file on a thread of its own, so that other processes' commits reach this
+    /// handle without a call to [`Db::refresh`].
+    ///
+    /// A read-only handle, or a writer opened with [`Options::shared`], then picks up each commit
+    /// another process makes soon after it is acknowledged: [`Db::read`] shows it and the watchers
+    /// of every branch it moved fire, also after a reclamation cycle replaced the file. On 64-bit
+    /// Linux inotify wakes the thread when the file changes, and under a busy writer it refreshes
+    /// at most once a millisecond; elsewhere, or where inotify cannot be had, it looks every
+    /// 10 ms. A look reads the newest superblock and refreshes only when that names a commit the
+    /// handle has not seen, so on a shared writer a look that finds nothing takes no lock across
+    /// processes. A writer without [`Options::shared`] is the only one and starts no thread. Off
+    /// by default.
+    ///
+    /// The thread ends when the last [`Db`] handle on the file is dropped and keeps neither the
+    /// file nor a lock. A look that fails, as when the file was removed or is damaged, changes
+    /// nothing: reads show what was seen last, the thread looks again at the next change, and
+    /// [`Db::following`] reports the error. See
+    /// [Following other processes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#following-other-processes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use ferro::{Db, Options};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let writer = Db::<u64>::open(&path)?;
+    /// let reader = Options::new().read_only(true).follow(true).open::<u64>(&path)?;
+    /// let watcher = reader.watch();
+    ///
+    /// writer.update(|count| *count = 1)?;
+    /// let seen = watcher.recv_timeout(Duration::from_secs(10)).expect("the commit arrives");
+    /// assert_eq!(*seen, 1);
+    /// assert_eq!(*reader.read(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn follow(mut self, follow: bool) -> Self {
+        self.follow = follow;
+        self
+    }
+
+    /// Makes a follower look every `every` even where inotify could tell it of changes, for tests
+    /// and benchmarks.
+    #[doc(hidden)]
+    pub fn follow_polling(mut self, every: Duration) -> Self {
+        self.follow_poll = Some(every);
         self
     }
 
@@ -1564,11 +1623,16 @@ impl Options {
             let state = shared.published.lock();
             shared.attach(MAIN, &state.refs)?
         };
+        let follower = match self.follow && (read_only || shared.options.shared) {
+            true => Some(Shared::follow_file(&shared, self.follow_poll)?),
+            false => None,
+        };
         let thread = automatic.then(|| Shared::spawn(&shared));
         let keeper = Arc::new(Keeper {
             signal,
             thread: Mutex::new(thread),
             syncer: Mutex::new(None),
+            follower,
         });
         Ok(Db {
             shared,
@@ -1880,11 +1944,21 @@ impl<T: Data> Shared<T> {
         holds: bool,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Caught> {
+        self.follow_to(tip, holds, u64::MAX, notices)
+    }
+
+    fn follow_to(
+        &self,
+        tip: &mut RefState,
+        holds: bool,
+        upto: u64,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<Caught> {
         if !self.options.shared {
             return Ok(Caught::Still);
         }
         let store = self.store();
-        match store.follow(holds)? {
+        match store.follow(holds, upto)? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
                 self.adopt(tip, &store, frame)?;
@@ -1999,16 +2073,105 @@ impl<T: Data> Shared<T> {
     }
 
     fn catch_up(&self) -> Result<bool> {
+        self.catch_up_to(u64::MAX)
+    }
+
+    fn catch_up_to(&self, upto: u64) -> Result<bool> {
         let mut notices = Vec::new();
         let before = self.published.lock().ptr;
         let mut tip = self.tip.lock();
         let whole = reentry::whole(self.id);
-        let caught = self.follow(&mut tip, false, &mut notices)?;
+        let caught = self.follow_to(&mut tip, false, upto, &mut notices)?;
         let ticket = self.store().last_seq();
         drop(whole);
         drop(tip);
         self.settle(ticket, &mut notices)?;
         Ok(caught == Caught::Swapped || self.published.lock().ptr != before)
+    }
+
+    fn refresh(&self) -> Result<bool> {
+        let mut notices = Vec::new();
+        let mut tip = self.tip.lock();
+        let _whole = reentry::whole(self.id);
+        let current = self.store();
+        let (store, head) = match current.refresh() {
+            Err(Error::Replaced) => Store::open(&self.file, self.options.clone())?,
+            other => (current.clone(), other?),
+        };
+        let replaced = store.id() != current.id();
+        if !replaced && head == tip.ptr {
+            return Ok(false);
+        }
+        let Some(ptr) = head else {
+            return Ok(false);
+        };
+        let since = tip
+            .ptr
+            .filter(|_| !replaced)
+            .map(|known| (known, &tip.refs, tip.depth));
+        let (refs, depth) = refs::load(&store, Some(ptr), since).inspect_err(|_| {
+            if replaced {
+                store.close();
+            }
+        })?;
+        let mut published = self.published.lock();
+        let attached: Vec<_> = self.branches.lock().values().cloned().collect();
+        let mut states = Vec::new();
+        let mut gone = Vec::new();
+        for branch in attached {
+            let head = refs.try_get(&branch.name)?;
+            if head.is_none() && branch.name != MAIN {
+                gone.push(branch.name.clone());
+                continue;
+            }
+            let state = Arc::new(self.state_of(&store, head.as_deref())?);
+            states.push((branch, state));
+        }
+        tip.refs = refs;
+        tip.ptr = Some(ptr);
+        tip.depth = depth;
+        if replaced {
+            self.store.store(Arc::new(store.clone()));
+        }
+        *published = tip.clone();
+        for (branch, state) in states {
+            branch.tip.store(state.clone());
+            if state.snapshot.commit == branch.state.load().snapshot.commit {
+                branch.feed.rebind(state.snapshot.clone());
+                branch.state.store(state);
+            } else {
+                notices.push(branch.publish(state));
+            }
+        }
+        let mut branches = self.branches.lock();
+        for name in gone {
+            if let Some(branch) = branches.remove(&name) {
+                branch.retire();
+            }
+        }
+        drop(branches);
+        drop(published);
+        if replaced {
+            current.close();
+        }
+        Ok(true)
+    }
+
+    fn follow_file(shared: &Arc<Self>, poll: Option<Duration>) -> Result<Follower> {
+        let weak = Arc::downgrade(shared);
+        let look = move || weak.upgrade().map(|shared| shared.look());
+        Ok(Follower::start(&shared.file, poll, look)?)
+    }
+
+    fn look(&self) -> Result<bool> {
+        if self.options.read_only {
+            return self.refresh();
+        }
+        match self.store().news()? {
+            News::Nothing => Ok(false),
+            News::Named(seq) => self.catch_up_to(seq),
+            News::Replaced => self.catch_up(),
+        }
     }
 
     fn place_change(
@@ -4699,7 +4862,8 @@ impl<T: Data> Db<T> {
     /// does not queue: a receive returns the newest snapshot it has not returned yet, so a slow
     /// consumer skips versions, costs the writers nothing and holds no backlog. It ends when the
     /// branch is dropped, when its [`Closer`](crate::Closer) closes it, or when the last [`Db`]
-    /// handle on the file is dropped. A read-only handle fires its watchers on [`Db::refresh`].
+    /// handle on the file is dropped. A read-only handle fires its watchers on [`Db::refresh`], or
+    /// as other processes commit if it was opened with [`Options::follow`].
     ///
     /// # Examples
     ///
@@ -4785,6 +4949,8 @@ impl<T: Data> Db<T> {
     /// reclamation cycle replaced, and fires the watchers of branches that moved; branches dropped
     /// meanwhile end their watchers. On a writer opened with [`Options::shared`] it catches up with
     /// the other writers' commits. Any other writer is the only one, so it returns `false` at once.
+    /// A handle opened with [`Options::follow`] does this on its own, and may still call it, to
+    /// look at once or to see the error a look meets.
     ///
     /// # Errors
     ///
@@ -4812,79 +4978,42 @@ impl<T: Data> Db<T> {
     /// # }
     /// ```
     pub fn refresh(&self) -> Result<bool> {
-        if !self.shared.options.read_only {
-            if !self.shared.options.shared {
-                return Ok(false);
-            }
-            let _crossing = self.entering(Needs::Tip)?;
-            return self.shared.catch_up();
+        if !self.shared.options.read_only && !self.shared.options.shared {
+            return Ok(false);
         }
         let _crossing = self.entering(Needs::Tip)?;
-        let mut notices = Vec::new();
-        let mut tip = self.shared.tip.lock();
-        let _whole = reentry::whole(self.shared.id);
-        let current = self.shared.store();
-        let (store, head) = match current.refresh() {
-            Err(Error::Replaced) => Store::open(&self.shared.file, self.shared.options.clone())?,
-            other => (current.clone(), other?),
-        };
-        let replaced = store.id() != current.id();
-        if !replaced && head == tip.ptr {
-            return Ok(false);
+        match self.shared.options.read_only {
+            true => self.shared.refresh(),
+            false => self.shared.catch_up(),
         }
-        let Some(ptr) = head else {
-            return Ok(false);
-        };
-        let since = tip
-            .ptr
-            .filter(|_| !replaced)
-            .map(|known| (known, &tip.refs, tip.depth));
-        let (refs, depth) = refs::load(&store, Some(ptr), since).inspect_err(|_| {
-            if replaced {
-                store.close();
-            }
-        })?;
-        let mut published = self.shared.published.lock();
-        let attached: Vec<_> = self.shared.branches.lock().values().cloned().collect();
-        let mut states = Vec::new();
-        let mut gone = Vec::new();
-        for branch in attached {
-            let head = refs.try_get(&branch.name)?;
-            if head.is_none() && branch.name != MAIN {
-                gone.push(branch.name.clone());
-                continue;
-            }
-            let state = Arc::new(self.shared.state_of(&store, head.as_deref())?);
-            states.push((branch, state));
-        }
-        tip.refs = refs;
-        tip.ptr = Some(ptr);
-        tip.depth = depth;
-        if replaced {
-            self.shared.store.store(Arc::new(store.clone()));
-        }
-        *published = tip.clone();
-        for (branch, state) in states {
-            branch.tip.store(state.clone());
-            if state.snapshot.commit == branch.state.load().snapshot.commit {
-                branch.feed.rebind(state.snapshot.clone());
-                branch.state.store(state);
-            } else {
-                notices.push(branch.publish(state));
-            }
-        }
-        let mut branches = self.shared.branches.lock();
-        for name in gone {
-            if let Some(branch) = branches.remove(&name) {
-                branch.retire();
-            }
-        }
-        drop(branches);
-        drop(published);
-        if replaced {
-            current.close();
-        }
-        Ok(true)
+    }
+
+    /// How the thread that [`Options::follow`] started has gone, or `None` if this handle does
+    /// not follow the file.
+    ///
+    /// It says whether inotify wakes the thread, how often it looked and refreshed, and the error
+    /// its last look failed with, until a look succeeds. Every handle on the file shares one
+    /// thread, so they all report the same.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Db, Options};
+    ///
+    /// # fn main() -> ferro::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let path = dir.path().join("count.ferro");
+    /// let writer = Db::<u64>::open(&path)?;
+    /// let reader = Options::new().read_only(true).follow(true).open::<u64>(&path)?;
+    ///
+    /// let following = reader.following().expect("the reader follows");
+    /// assert!(following.last_error.is_none());
+    /// assert!(writer.following().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn following(&self) -> Option<Following> {
+        self.keeper.follower.as_ref().map(Follower::status)
     }
 
     /// Re-hashes every object reachable from every retained version of every branch.

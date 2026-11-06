@@ -4,7 +4,8 @@
 //! the directory sync after a create or rename, renaming over an open file, the owner of a new
 //! generation and self-deleting scratch files each have one function here, with the same contract
 //! on every target. The byte-range locks behind `Options::shared` and the early writeback of a copy
-//! exist only on 64-bit Linux, and [`RANGES`] says whether they do.
+//! exist only on 64-bit Linux, and [`RANGES`] says whether they do. So does the inotify [`Watch`]
+//! that a follower waits on, whose [`Watch::new`] fails with `Unsupported` elsewhere.
 //! [Windows](https://github.com/archlemon/ferro/blob/main/docs/internals/windows.md) and
 //! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
 //! describe both sides.
@@ -558,3 +559,298 @@ mod ranges {
 }
 
 pub(crate) use ranges::*;
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod notify {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{self, ErrorKind, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const FILE_EVENTS: u32 = libc::IN_MODIFY;
+    const DIR_EVENTS: u32 = libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_MOVED_FROM
+        | libc::IN_MOVED_TO
+        | libc::IN_ONLYDIR;
+    const EVENT_BYTES: usize = 16;
+
+    /// What one wait on a [`Watch`] ended with.
+    enum Woke {
+        Bell,
+        Events,
+        Timeout,
+    }
+
+    fn checked(result: libc::c_int) -> io::Result<libc::c_int> {
+        match result {
+            -1 => Err(io::Error::last_os_error()),
+            done => Ok(done),
+        }
+    }
+
+    fn owned(fd: libc::c_int) -> File {
+        // SAFETY: `fd` is a descriptor that the call before it just returned, open and owned by
+        // nothing else, so the `File` becomes its only owner and closes it once.
+        File::from(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn add(events: &File, path: &CString, mask: u32) -> io::Result<libc::c_int> {
+        // SAFETY: the descriptor belongs to `events`, which is borrowed for the call, and `path`
+        // is a NUL-terminated string that lives through it and is only read.
+        checked(unsafe { libc::inotify_add_watch(events.as_raw_fd(), path.as_ptr(), mask) })
+    }
+
+    /// Ends a [`Watch`]'s waits from another thread, this one and every later one.
+    pub(crate) struct Bell(File);
+
+    impl Bell {
+        /// Wakes the watch's wait and makes every later one return at once.
+        pub(crate) fn ring(&self) {
+            let _ = (&self.0).write(&1u64.to_ne_bytes());
+        }
+    }
+
+    /// An inotify watch on a database file, for writes to it, and on its directory, for a file
+    /// created, removed or renamed at its name, which a follower waits on.
+    ///
+    /// When the name moves to another file, the watch moves to that file too, so it follows the
+    /// file a reclamation cycle renames over the path.
+    pub(crate) struct Watch {
+        events: File,
+        bell: Arc<Bell>,
+        path: CString,
+        name: Vec<u8>,
+        dir: libc::c_int,
+        file: Option<libc::c_int>,
+    }
+
+    impl Watch {
+        /// Watches the file at `path` and its directory.
+        ///
+        /// # Errors
+        ///
+        /// The error of the inotify or eventfd call that failed, such as `EMFILE` once the user's
+        /// inotify instances are used up, or of watching the directory or the file.
+        pub(crate) fn new(path: &Path) -> io::Result<Watch> {
+            let name = path
+                .file_name()
+                .ok_or(ErrorKind::InvalidInput)?
+                .as_bytes()
+                .to_vec();
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            let dir = CString::new(dir.as_os_str().as_bytes())?;
+            let path = CString::new(path.as_os_str().as_bytes())?;
+            // SAFETY: `inotify_init1` takes only flags and returns a new descriptor or -1.
+            let events =
+                checked(unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) });
+            let events = owned(events?);
+            // SAFETY: `eventfd` takes only a starting count and flags and returns a new
+            // descriptor or -1.
+            let bell = checked(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) });
+            let bell = Arc::new(Bell(owned(bell?)));
+            let dir = add(&events, &dir, DIR_EVENTS)?;
+            let mut watch = Watch {
+                events,
+                bell,
+                path,
+                name,
+                dir,
+                file: None,
+            };
+            watch.rewatch()?;
+            Ok(watch)
+        }
+
+        /// The bell that ends this watch's waits.
+        pub(crate) fn bell(&self) -> Arc<Bell> {
+            self.bell.clone()
+        }
+
+        fn rewatch(&mut self) -> io::Result<()> {
+            let file = match add(&self.events, &self.path, FILE_EVENTS) {
+                Ok(wd) => Some(wd),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(old) = self.file
+                && file != Some(old)
+            {
+                // SAFETY: the descriptor belongs to `self.events`, which is borrowed for the
+                // call, and removing a watch takes only its number; one the kernel removed
+                // already fails without effect.
+                unsafe { libc::inotify_rm_watch(self.events.as_raw_fd(), old) };
+            }
+            self.file = file;
+            Ok(())
+        }
+
+        fn poll(&self, events: bool, timeout: Duration) -> io::Result<Woke> {
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.bell.0.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.events.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let count = if events { 2 } else { 1 };
+            let spec = libc::timespec {
+                tv_sec: timeout.as_secs().min(i64::MAX as u64) as libc::time_t,
+                tv_nsec: timeout.subsec_nanos() as libc::c_long,
+            };
+            loop {
+                // SAFETY: `fds` is a live array of at least `count` initialized `pollfd`s whose
+                // descriptors belong to this watch, `spec` is a live `timespec`, and a null signal
+                // mask leaves the thread's mask as it is. The call keeps no pointer past its
+                // return.
+                let ready =
+                    unsafe { libc::ppoll(fds.as_mut_ptr(), count, &spec, std::ptr::null()) };
+                if ready == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                return Ok(match (fds[0].revents, ready) {
+                    (0, 0) => Woke::Timeout,
+                    (0, _) => Woke::Events,
+                    _ => Woke::Bell,
+                });
+            }
+        }
+
+        fn drain(&mut self) -> io::Result<bool> {
+            let mut buf = [0u8; 4096];
+            let mut changed = false;
+            let mut moved = false;
+            loop {
+                let got = match (&self.events).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(got) => got,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                let mut at = 0;
+                while at + EVENT_BYTES <= got {
+                    let word = |from: usize| -> [u8; 4] {
+                        buf[at + from..at + from + 4].try_into().unwrap_or_default()
+                    };
+                    let wd = libc::c_int::from_ne_bytes(word(0));
+                    let mask = u32::from_ne_bytes(word(4));
+                    let len = u32::from_ne_bytes(word(12)) as usize;
+                    let named =
+                        &buf[(at + EVENT_BYTES).min(got)..(at + EVENT_BYTES + len).min(got)];
+                    let named = &named[..named.iter().position(|b| *b == 0).unwrap_or(named.len())];
+                    at += EVENT_BYTES + len;
+                    if mask & libc::IN_Q_OVERFLOW != 0 {
+                        changed = true;
+                        moved = true;
+                    } else if Some(wd) == self.file {
+                        changed = true;
+                        moved |= mask & libc::IN_IGNORED != 0;
+                    } else if wd == self.dir && named == self.name.as_slice() {
+                        changed = true;
+                        moved = true;
+                    }
+                }
+            }
+            if moved {
+                self.rewatch()?;
+            }
+            Ok(changed)
+        }
+
+        /// Waits until the file is written, a file is created, removed or renamed at its name,
+        /// the inotify queue overflows, or `timeout` passes, and returns `false` once the bell has
+        /// rung.
+        ///
+        /// # Errors
+        ///
+        /// The error of a failed `ppoll` or read of the events, or of watching a new file at the
+        /// name.
+        pub(crate) fn wait(&mut self, timeout: Duration) -> io::Result<bool> {
+            let deadline = Instant::now().checked_add(timeout);
+            loop {
+                let left =
+                    deadline.map_or(timeout, |at| at.saturating_duration_since(Instant::now()));
+                match self.poll(true, left)? {
+                    Woke::Bell => return Ok(false),
+                    Woke::Timeout => return Ok(true),
+                    Woke::Events if self.drain()? => return Ok(true),
+                    Woke::Events => {}
+                }
+            }
+        }
+
+        /// Waits for `pause` or the bell, leaving whatever the file does meanwhile for the next
+        /// [`Watch::wait`], and returns `false` once the bell has rung.
+        ///
+        /// # Errors
+        ///
+        /// The error of a failed `ppoll`.
+        pub(crate) fn rest(&self, pause: Duration) -> io::Result<bool> {
+            Ok(!matches!(self.poll(false, pause)?, Woke::Bell))
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+mod notify {
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Ends a [`Watch`]'s waits. No target but 64-bit Linux has one, since none has a [`Watch`].
+    pub(crate) enum Bell {}
+
+    impl Bell {
+        /// Wakes the watch's wait and makes every later one return at once.
+        pub(crate) fn ring(&self) {
+            match *self {}
+        }
+    }
+
+    /// A watch on a database file and its directory, which only 64-bit Linux has, through
+    /// inotify. Elsewhere a follower looks at the file at intervals instead.
+    pub(crate) enum Watch {}
+
+    impl Watch {
+        /// Fails with an `Unsupported` error, since this target has no watch.
+        pub(crate) fn new(_path: &Path) -> io::Result<Watch> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        /// The bell that ends this watch's waits.
+        pub(crate) fn bell(&self) -> Arc<Bell> {
+            match *self {}
+        }
+
+        /// Waits until the file changes or `timeout` passes, and returns `false` once the bell
+        /// has rung.
+        pub(crate) fn wait(&mut self, _timeout: Duration) -> io::Result<bool> {
+            match *self {}
+        }
+
+        /// Waits for `pause` or the bell, and returns `false` once the bell has rung.
+        pub(crate) fn rest(&self, _pause: Duration) -> io::Result<bool> {
+            match *self {}
+        }
+    }
+}
+
+pub(crate) use notify::*;

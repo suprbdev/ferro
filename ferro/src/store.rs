@@ -1629,6 +1629,18 @@ pub(crate) enum Followed {
     Retired,
 }
 
+/// What [`Store::news`] finds when it looks at the file without catching up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum News {
+    /// Nothing this store has not seen.
+    Nothing,
+    /// A superblock naming a frame past the last one this store knows, with that frame's sequence
+    /// number.
+    Named(u64),
+    /// The path names another file.
+    Replaced,
+}
+
 /// A frame placed in the log: its sequence number, the end of the log after it, and its head.
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
@@ -2218,6 +2230,30 @@ impl Store {
         Ok(sb.head)
     }
 
+    /// Whether the file holds commits this store has not seen, from the path's identity and one
+    /// read of both superblock slots, without catching up and without a lock.
+    ///
+    /// It returns [`News::Replaced`] once the path names another file, [`News::Named`] once the
+    /// newest superblock names a frame past the last one this store placed, followed or
+    /// refreshed, unless it is the superblock the open refused, and [`News::Nothing`] otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if both superblocks are invalid, and [`Error::Io`] if the path cannot
+    /// be looked up or the file cannot be read.
+    pub(crate) fn news(&self) -> Result<News> {
+        let inner = &self.inner;
+        if platform::path_id(&inner.path)? != inner.file.inode {
+            return Ok(News::Replaced);
+        }
+        let (sb, _) = newest_super(&inner.file)?
+            .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
+        if sb.seq <= inner.cursor.lock().seq || inner.ignored == Some(sb.mark()) {
+            return Ok(News::Nothing);
+        }
+        Ok(News::Named(sb.seq))
+    }
+
     /// Poisons the store, so that nothing more is acknowledged until it is opened again, and wakes
     /// every reader waiting for `written`.
     pub(crate) fn poison(&self) {
@@ -2666,7 +2702,12 @@ impl Store {
     /// spilled before its header, behind a stale marker or not, is truncated and the truncation
     /// synced, as [`recover`] does, so that the next frame is written over nothing a power cut
     /// could bring back under it. A failed truncation or sync poisons the store.
-    pub(crate) fn follow(&self, holds: bool) -> Result<Followed> {
+    ///
+    /// It takes no frame whose sequence number is past `upto`, so a follower that read a
+    /// superblock naming that frame follows only what that superblock names and never syncs for
+    /// another process. Every frame up to it was whole when it was named, so one that does not
+    /// check fails such a catch-up with [`Error::Corrupt`] even without the lock.
+    pub(crate) fn follow(&self, holds: bool, upto: u64) -> Result<Followed> {
         let inner = &self.inner;
         let mut cursor = inner.cursor.lock();
         let start = Mark {
@@ -2696,6 +2737,9 @@ impl Store {
             if !frame_like(header) {
                 break written;
             }
+            if Super::fields(header).is_some_and(|next| next.seq > upto) {
+                break false;
+            }
             let len = match len {
                 Some(len) => len,
                 None => *len.insert(inner.file.metadata()?.len()),
@@ -2710,6 +2754,14 @@ impl Store {
                 Found::Whole(_) => break false,
             }
         };
+        if upto != u64::MAX && at.seq < upto {
+            return Err(Error::Corrupt(format!(
+                "frame {} at {} does not check, inside the log the newest superblock names to \
+                 frame {upto}",
+                at.seq.saturating_add(1),
+                at.log_end
+            )));
+        }
         if holds {
             let (named, _) = newest_super(&inner.file)?
                 .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
