@@ -1667,7 +1667,7 @@ struct Vetting<'a> {
     carried: usize,
     rerun_budget: usize,
     view: OnceCell<Store>,
-    recalled: Recalled,
+    recalled: Option<Recalled>,
 }
 
 fn rejected(error: Error) -> Error {
@@ -1878,7 +1878,7 @@ impl Vetting<'_> {
         if deferred.is_empty() {
             return Ok(());
         }
-        let (view, recalled, staging) = (self.view(), &self.recalled, self.staging);
+        let (view, recalled, staging) = (self.view(), self.recalled.as_ref(), self.staging);
         staging.overlaid(view, || {
             for (id, kind) in &deferred {
                 let ptr = Ptr {
@@ -2508,7 +2508,7 @@ fn resolve<O: Objects>(
                 .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
             view: OnceCell::new(),
-            recalled: Recalled::default(),
+            recalled: (order.len() > 1).then(Recalled::default),
         };
         for (_, _, id) in &order {
             let sent = landing

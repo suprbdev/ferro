@@ -1015,8 +1015,9 @@ impl Kind {
     }
 
     /// Checks an object again with `store`, as [`check`](Kind::check) does, once the check
-    /// without one deferred it, taking the summary of each inline entry from `recalled` where an
-    /// earlier recheck computed it and keeping there those it computes.
+    /// without one deferred it, without collecting the typed links that check found. With
+    /// `recalled`, it takes the summary of each inline entry from there where an earlier recheck
+    /// computed it, and keeps there those it computes.
     ///
     /// # Errors
     ///
@@ -1026,12 +1027,10 @@ impl Kind {
         body: &[u8],
         links: &[Ptr],
         store: &Store,
-        recalled: &Recalled,
+        recalled: Option<&Recalled>,
     ) -> Result<Shape> {
-        let found = RefCell::new(Vec::new());
         let mut decoder = Decoder::new(body, links, Some(store));
-        decoder.found = Some(&found);
-        decoder.recalled = Some(recalled);
+        decoder.recalled = recalled;
         (self.check)(self, &mut decoder)
     }
 }

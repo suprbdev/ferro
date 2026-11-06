@@ -245,7 +245,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     while let Some((ptr, kind, settle)) = queue.pop() {
         if settle {
             let object = store.read_object(ptr)?;
-            kind.check(&object.body, &object.links, Some(store))
+            kind.recheck(&object.body, &object.links, store, None)
                 .map_err(|error| corrupt(&kind, ptr, error))?;
             continue;
         }

@@ -93,7 +93,7 @@ use std::vec;
 
 use crate::codec::{
     Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr,
-    Recalled, Shape, Sink, Staged, try_hash_of,
+    Recalled, Shape, Sink, Staged, hash_parts, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -1115,13 +1115,19 @@ fn recall<K: Data, V: Data, S: Summary<K, V>>(
     V::visit(r)?;
     let (bytes, links) = r.read_since(start);
     let mut sink = HashSink;
-    let mut encoder = Encoder::new(&mut sink);
-    key.encode(&mut encoder)?;
+    let mut encoder = Encoder::reusing(&mut sink, KEY_SCRATCH.take());
+    let encoded = key.encode(&mut encoder);
     encoder.raw(bytes);
     for link in links {
         encoder.link(*link);
     }
-    let id = (TypeId::of::<(K, V, S)>(), encoder.finish()?.hash);
+    let hash = hash_parts(
+        encoder.bytes(),
+        encoder.links().iter().map(|link| &link.hash),
+    );
+    KEY_SCRATCH.set(encoder.into_buf());
+    encoded?;
+    let id = (TypeId::of::<(K, V, S)>(), hash);
     if let Some(summary) = recalled.get::<S>(&id) {
         return Ok(summary);
     }
@@ -1300,7 +1306,7 @@ fn outside<K: Ord>(span: Option<&Span<K>>, first: &K, last: &K) -> bool {
 
 enum Part<V, S> {
     Value(V),
-    Spilled(S),
+    Summary(S),
 }
 
 fn node_fold<K, V, S: Summary<K, V>>(
@@ -1316,7 +1322,7 @@ fn node_fold<K, V, S: Summary<K, V>>(
         }
         total = match part {
             Part::Value(value) => fold(total, &S::of(key, value)),
-            Part::Spilled(summary) => fold(total, summary),
+            Part::Summary(summary) => fold(total, summary),
         };
     }
     for (_, child) in children {
@@ -1457,9 +1463,12 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
             match r.u8()? {
                 0 if claim.is_some() && stored => match r.recalled() {
                     Some(recalled) => {
-                        parts.push(Part::Spilled(recall::<K, V, S>(recalled, key, r)?))
+                        parts.push(Part::Summary(recall::<K, V, S>(recalled, key, r)?))
                     }
-                    None => parts.push(Part::Value(V::decode(r)?)),
+                    None => {
+                        let value = V::decode(r)?;
+                        parts.push(Part::Summary(summarize(|| S::of(key, &value))?))
+                    }
                 },
                 0 if claim.is_some() && !deferred => {
                     let links = r.links_read();
@@ -1478,7 +1487,7 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
                     let summary = S::decode(r)?;
                     r.typed_link(|| spill_kind::<K, V, S>(key.clone(), summary.clone()))?;
                     if claim.is_some() {
-                        parts.push(Part::Spilled(summary));
+                        parts.push(Part::Summary(summary));
                     }
                 }
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
