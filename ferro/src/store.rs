@@ -1630,7 +1630,6 @@ pub(crate) enum Followed {
 }
 
 /// What [`Store::news`] finds when it looks at the file without catching up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum News {
     /// Nothing this store has not seen.
     Nothing,
@@ -1802,6 +1801,10 @@ struct Inner {
     marks: Mutex<Marks>,
     /// Set while a checkpoint syncs, so that only one does at a time.
     checkpointing: AtomicBool,
+    /// The newest frame a superblock that [`Store::news`] read covers, by name under
+    /// [`Durability::Buffered`] and by anchor under [`Durability::Fsync`], which a shared sync
+    /// up to it has nothing to write for.
+    covered: AtomicU64,
     /// The newer superblock the open found naming frames its scan did not keep, which
     /// [`Store::refresh`] ignores until a writer replaces it.
     ignored: Option<Mark>,
@@ -2070,6 +2073,7 @@ impl Store {
                     anchor: sb.mark(),
                 }),
                 checkpointing: AtomicBool::new(false),
+                covered: AtomicU64::new(0),
                 ignored: named.filter(|mark| mark.seq > sb.seq),
                 cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
                 dedupe: Dedupe::new(dedupe),
@@ -2230,12 +2234,14 @@ impl Store {
         Ok(sb.head)
     }
 
-    /// Whether the file holds commits this store has not seen, from the path's identity and one
-    /// read of both superblock slots, without catching up and without a lock.
+    /// Whether the file holds commits this store has not seen, from one read of both superblock
+    /// slots and the path's identity, without catching up and without a lock.
     ///
     /// It returns [`News::Replaced`] once the path names another file, [`News::Named`] once the
     /// newest superblock names a frame past the last one this store placed, followed or
     /// refreshed, unless it is the superblock the open refused, and [`News::Nothing`] otherwise.
+    /// It also notes how far that superblock covers, so that a shared sync of a frame it covers
+    /// takes no lock, as [`Store::sync`] describes.
     ///
     /// # Errors
     ///
@@ -2243,11 +2249,16 @@ impl Store {
     /// be looked up or the file cannot be read.
     pub(crate) fn news(&self) -> Result<News> {
         let inner = &self.inner;
+        let (sb, _) = newest_super(&inner.file)?
+            .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
+        let covers = match inner.options.durability {
+            Durability::Fsync => sb.anchor.seq,
+            Durability::Buffered => sb.seq,
+        };
+        inner.covered.fetch_max(covers, Ordering::AcqRel);
         if platform::path_id(&inner.path)? != inner.file.inode {
             return Ok(News::Replaced);
         }
-        let (sb, _) = newest_super(&inner.file)?
-            .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
         if sb.seq <= inner.cursor.lock().seq || inner.ignored == Some(sb.mark()) {
             return Ok(News::Nothing);
         }
@@ -2401,15 +2412,26 @@ impl Store {
     /// [`Store::sync`] for a shared writer, under the superblock lock.
     ///
     /// Under [`Durability::Fsync`], if the newest superblock already anchors at or past `frame`,
-    /// another process's sync covered it and nothing is written. Otherwise it reads on past `frame`
+    /// another process's sync covered it and nothing is written. A frame that a superblock
+    /// [`Store::news`] read covered already, by anchor under Fsync and by name under Buffered,
+    /// needs nothing written either, so it is published without the lock, since superblocks
+    /// only ever grow while this process is alive. Otherwise it reads on past `frame`
     /// to the newest whole frame of any process, syncs, and names that frame, so that the
     /// processes that queued frames meanwhile find them covered. The superblock goes to the slot
     /// that does not hold the newest, unless the newest is already as new.
     fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
         let inner = &self.inner;
+        let mark = frame.mark();
+        if frame.seq <= inner.covered.load(Ordering::Acquire) {
+            let mut marks = inner.marks.lock();
+            marks.latest = mark;
+            if durable {
+                marks.anchor = mark;
+            }
+            return Ok(());
+        }
         let _held = self.hold(SUPER_AT, 1, true)?;
         let newest = newest_super(&inner.file)?;
-        let mark = frame.mark();
         if durable && newest.is_some_and(|(found, _)| found.anchor.seq >= frame.seq) {
             let mut marks = inner.marks.lock();
             marks.latest = mark;
