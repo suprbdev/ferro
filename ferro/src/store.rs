@@ -4452,7 +4452,7 @@ mod tests {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
                     seed ^= seed << 17;
-                    seed % 2 == 0
+                    seed.is_multiple_of(2)
                 },
                 older,
             );
@@ -4460,6 +4460,9 @@ mod tests {
         }
         short
     }
+
+    /// A frame's puts by name, with the byte a lost sector turns to, if not the one it held.
+    type Case = (&'static str, Vec<Vec<Put>>, Option<u8>);
 
     /// `len` bytes of `fill`, but for one bit flipped in every `every` bytes, from `first` on.
     fn sparse(len: usize, fill: u8, first: usize, every: usize) -> Vec<u8> {
@@ -4501,7 +4504,7 @@ mod tests {
 
     #[test]
     fn no_torn_frame_of_zeroes_or_ones_with_a_bit_set_here_and_there_reads_as_damaged() {
-        let cases: [(&str, Vec<Vec<Put>>, Option<u8>); 6] = [
+        let cases: [Case; 6] = [
             (
                 "noise",
                 vec![(1..9).map(|seed| put(noise(seed, 1500))).collect()],
