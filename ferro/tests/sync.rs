@@ -2720,6 +2720,188 @@ fn a_summary_whose_of_reads_a_nested_map_lands_and_verifies() {
     }
 }
 
+type Outer<S> = Map<u64, Inner, S>;
+
+fn deep_inner() -> Inner {
+    (0..20_000u64).map(|key| (key, key * 3)).collect()
+}
+
+fn keep_ours<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
+    ("keep ours".to_string(), ())
+}
+
+fn holding_deep_inner(dir: &TempDir) -> Db<Outer<InnerSum>> {
+    let path = dir.path().join("b.ferro");
+    {
+        let b: Db<Outer<InnerSum>> = common::roomy().open(&path).unwrap();
+        b.update(|root| {
+            root.insert(1, deep_inner());
+        })
+        .unwrap();
+    }
+    let b: Db<Outer<InnerSum>> = common::roomy().open(&path).unwrap();
+    assert_eq!(*b.read().get(&1).unwrap().get(&0).unwrap(), 0);
+    b
+}
+
+fn sender_of_deep_inner<S: Summary<u64, Inner>>(dir: &TempDir) -> Db<Outer<S>> {
+    let a: Db<Outer<S>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        root.insert(1, deep_inner());
+        root.insert(2, inner(9, 5));
+    })
+    .unwrap();
+    a
+}
+
+fn assert_deep_inner_whole(b: &Db<Outer<InnerSum>>) {
+    let read = b.read();
+    let inner = read.get(&1).unwrap();
+    let sum = inner
+        .iter()
+        .fold(0u64, |sum, (_, value)| sum.wrapping_add(*value));
+    let want = (0..20_000u64).fold(0u64, |sum, key| sum.wrapping_add(key * 3));
+    assert_eq!(sum, want);
+    for key in [19_999u64, 10_001, 5_001, 15_000, 2_745] {
+        assert_eq!(*inner.get(&key).unwrap(), key * 3);
+    }
+}
+
+#[test]
+fn a_receive_leaves_the_receivers_own_nested_maps_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = holding_deep_inner(&dir);
+    let a = sender_of_deep_inner::<InnerSum>(&dir);
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    assert_eq!(
+        b.receive("a", &bundle, keep_ours).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_deep_inner_whole(&b);
+    b.update(|root| {
+        root.update(&1, |inner| {
+            for key in [19_999u64, 10_001, 5_001, 2_745] {
+                inner.insert(key, 7);
+            }
+        });
+    })
+    .unwrap();
+    assert_eq!(*b.read().get(&1).unwrap().get(&10_001).unwrap(), 7);
+    drop(b);
+    let reopened: Db<Outer<InnerSum>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    reopened.verify().unwrap();
+    reopened.verify_typed().unwrap();
+    assert_eq!(reopened.read().get(&1).unwrap().iter().count(), 20_000);
+    assert_eq!(
+        reopened
+            .branch("a")
+            .unwrap()
+            .read()
+            .get(&1)
+            .unwrap()
+            .iter()
+            .count(),
+        20_000
+    );
+}
+
+#[test]
+fn a_refused_bundle_leaves_the_receivers_own_nested_maps_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = holding_deep_inner(&dir);
+    let a = sender_of_deep_inner::<InnerCount>(&dir);
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    match b.receive("a", &bundle, keep_ours) {
+        Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+        other => panic!("accepted summaries another `of` made: {other:?}"),
+    }
+    assert_eq!(b.branches(), vec!["main".to_string()]);
+    assert_deep_inner_whole(&b);
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_nested_map_larger_than_the_receivers_file_could_hold_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Outer<InnerSum>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        root.insert(1, (0..2_200_000u64).map(|key| (key, key)).collect());
+    })
+    .unwrap();
+    let b: Db<Outer<InnerSum>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+    assert_eq!(b.read().get(&1).unwrap().len(), 2_200_000);
+}
+
+#[test]
+fn one_nested_map_summarized_under_many_keys_lands_or_is_refused_within_a_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared: Inner = (0..40_000u64).map(|key| (key, key)).collect();
+    let keys = level_zero_keys(1_500);
+    let a: Db<Outer<InnerSum>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        for key in &keys[..20] {
+            root.insert(*key, shared.clone());
+        }
+    })
+    .unwrap();
+    let b: Db<Outer<InnerSum>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+    let cheap: Db<Outer<InnerCount>> = fast().open(dir.path().join("c.ferro")).unwrap();
+    cheap
+        .update(|root| {
+            for key in &keys {
+                root.insert(*key, shared.clone());
+            }
+        })
+        .unwrap();
+    let d: Db<Outer<InnerSum>> = fast().open(dir.path().join("d.ferro")).unwrap();
+    let bundle = cheap.bundle(&d.have().unwrap()).unwrap();
+    let started = Instant::now();
+    match d.receive("a", &bundle, unmerged) {
+        Err(Error::Bundle(message)) => assert!(message.contains("size allows"), "{message}"),
+        other => panic!("read one nested map 1500 times for a small bundle: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(d.version(), 0);
+}
+
+#[test]
+fn small_spilled_values_shared_by_very_many_keys_land() {
+    for (keys, size) in [(500_000u64, 600usize), (100_000, 4_096)] {
+        let dir = tempfile::tempdir().unwrap();
+        let a: Db<Spilled> = fast().open(dir.path().join("a.ferro")).unwrap();
+        let shared = "v".repeat(size);
+        for chunk in 0..10 {
+            a.update(|root| {
+                for key in chunk * keys / 10..(chunk + 1) * keys / 10 {
+                    root.insert(key, shared.clone());
+                }
+            })
+            .unwrap();
+        }
+        let b: Db<Spilled> = fast().open(dir.path().join("b.ferro")).unwrap();
+        assert_eq!(
+            b.pull(&a, "a", unmerged).unwrap().outcome,
+            Outcome::FastForward,
+            "{keys} keys sharing one value of {size} bytes"
+        );
+        assert_eq!(b.read().summary(), a.read().summary());
+    }
+}
+
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Tagged {
     #[key]

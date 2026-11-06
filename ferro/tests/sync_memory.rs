@@ -472,6 +472,30 @@ fn a_value_spilled_under_several_keys_is_not_kept_while_its_links_arrive() {
 }
 
 #[test]
+fn verifying_one_value_spilled_under_many_keys_holds_little() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let db: Db<Map<u64, String, Len>> = fast().open(dir.path().join("v.ferro")).unwrap();
+    let shared = "v".repeat(600);
+    for chunk in 0..10u64 {
+        db.update(|root| {
+            for key in chunk * 30_000..(chunk + 1) * 30_000 {
+                root.insert(key, shared.clone());
+            }
+        })
+        .unwrap();
+    }
+    let (verified, heap) = heap_of(|| db.verify_typed().unwrap());
+    println!(
+        "verified {} objects with {heap} bytes of heap",
+        verified.objects
+    );
+    assert!(
+        heap < 16 * MIB,
+        "verifying 300,000 keys that share one value took {heap} bytes of heap"
+    );
+}
+
+#[test]
 fn a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
