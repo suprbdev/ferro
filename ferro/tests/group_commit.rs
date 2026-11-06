@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use common::fast;
+use common::{assert_damaged, fast, frames_past_the_anchor, judged};
 use ferro::{Db, Error, Map, Options};
 use tempfile::TempDir;
 
@@ -468,6 +468,49 @@ fn a_power_cut_keeps_every_commit_acknowledged_before_it() {
     for (floor, image) in &images {
         check_image(&path, image, *floor);
     }
+}
+
+#[test]
+fn a_flipped_bit_in_a_synced_frame_past_the_superblock_is_reported() {
+    let _turn = serial();
+    let (dir, _, images) = power_cut_run(6, 40);
+    let path = dir.path().join("image.ferro");
+    let (mut reported, mut acknowledged) = (0, 0);
+    for (floor, image) in &images {
+        let Some(&(start, end)) = frames_past_the_anchor(image).last() else {
+            continue;
+        };
+        fs::write(&path, image).unwrap();
+        let version = fast()
+            .read_only(true)
+            .open::<Root>(&path)
+            .unwrap()
+            .version();
+        let at = start + (end - start) / 2;
+        assert!(judged(at, start, end));
+        let mut damaged = image.clone();
+        damaged[at] ^= 0x10;
+        fs::write(&path, &damaged).unwrap();
+        let context = format!("v{version} acknowledged to v{floor}: byte {at} of {start}..{end}");
+        assert_damaged(
+            fast().read_only(true).open::<Root>(&path),
+            start,
+            at,
+            &context,
+        );
+        assert_damaged(Options::new().open::<Root>(&path), start, at, &context);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            damaged,
+            "{context}: the file changed"
+        );
+        reported += 1;
+        if version <= *floor {
+            acknowledged += 1;
+        }
+    }
+    assert!(reported > 10, "only {reported} frames past a superblock");
+    assert!(acknowledged > 0, "no acknowledged frame damaged");
 }
 
 #[test]

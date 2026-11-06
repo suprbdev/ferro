@@ -1792,7 +1792,7 @@ impl<T: Data> Shared<T> {
             let mut tip = self.tip.lock();
             let commit = store.is_shared().then(|| store.lock_commit()).transpose()?;
             let current = self.store().id() == store.id()
-                && self.follow(&mut tip, &mut notices)? != Caught::Swapped;
+                && self.follow(&mut tip, true, &mut notices)? != Caught::Swapped;
             if current && self.covers(&branches) {
                 let whole = reentry::whole(self.id);
                 let out = f(&mut tip);
@@ -1836,7 +1836,7 @@ impl<T: Data> Shared<T> {
             }
             let mut tip = self.tip.lock();
             let caught = match self.store().id() == store.id() {
-                true => self.follow(&mut tip, notices),
+                true => self.follow(&mut tip, false, notices),
                 false => Ok(Caught::Swapped),
             };
             drop(tip);
@@ -1865,7 +1865,7 @@ impl<T: Data> Shared<T> {
             }
             let store = self.store();
             let commit = store.lock_commit()?;
-            if self.follow(&mut guard, notices)? != Caught::Swapped {
+            if self.follow(&mut guard, true, notices)? != Caught::Swapped {
                 return Ok(Tip {
                     guard,
                     commit: Some(commit),
@@ -1874,12 +1874,17 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    fn follow(&self, tip: &mut RefState, notices: &mut Vec<Notice<T>>) -> Result<Caught> {
+    fn follow(
+        &self,
+        tip: &mut RefState,
+        holds: bool,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<Caught> {
         if !self.options.shared {
             return Ok(Caught::Still);
         }
         let store = self.store();
-        match store.follow()? {
+        match store.follow(holds)? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
                 self.adopt(tip, &store, frame)?;
@@ -1998,7 +2003,7 @@ impl<T: Data> Shared<T> {
         let before = self.published.lock().ptr;
         let mut tip = self.tip.lock();
         let whole = reentry::whole(self.id);
-        let caught = self.follow(&mut tip, &mut notices)?;
+        let caught = self.follow(&mut tip, false, &mut notices)?;
         let ticket = self.store().last_seq();
         drop(whole);
         drop(tip);
@@ -2994,7 +2999,7 @@ impl<T: Data> Shared<T> {
             return Ok(self.published.lock().refs.clone());
         }
         let mut tip = self.tip.lock();
-        self.follow(&mut tip, notices)?;
+        self.follow(&mut tip, false, notices)?;
         Ok(tip.refs.clone())
     }
 

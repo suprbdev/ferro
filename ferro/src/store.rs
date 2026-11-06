@@ -8,7 +8,9 @@
 //! that it reached the disk whole. A record holds one content-addressed [`Object`], which a [`Ptr`]
 //! finds by its hash and offset, and every read checks the hash. A superblock names the newest
 //! frame and an anchor, the newest frame known to be durable, and an open scans forward from the
-//! anchor and keeps only frames that follow each other, so a torn tail is cut away.
+//! anchor and keeps only frames that follow each other, so a torn tail is cut away. A frame that a
+//! single flipped bit in a block keeps from checking reached the disk whole and was damaged since,
+//! and fails the open instead.
 //!
 //! A [`Txn`] gathers a commit's records, skipping an object the store has already written, or read
 //! if it is as large as a spilled value, and the commit places its frame at the end of the log,
@@ -86,6 +88,12 @@ const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 const BLOCK_BYTES: usize = 4096;
 /// The size of an entry of a frame's table, the xxh3-64 of one block of its records.
 const BLOCK_CHECK: usize = 8;
+/// The size of the sectors a device writes whole or not at all, which a torn write is made of.
+const SECTOR_BYTES: u64 = 512;
+/// The fewest bytes of a frame that the sector holding a bit found flipped must hold for the flip
+/// to count as damage: fewer could be a sector that kept its older bytes and differs from the
+/// frame's by chance in one bit.
+const SECTOR_MIN: u64 = 8;
 /// How much of a frame a check reads at a time, and the size of a record past which a read checks
 /// the file's length before it allocates.
 const SCAN_CHUNK: usize = 1 << 20;
@@ -537,6 +545,17 @@ fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
     Ok(best)
 }
 
+/// What a scan finds where a frame would follow the one before.
+enum Found {
+    /// A whole frame that follows the one before.
+    Whole(Super),
+    /// No frame, or one that did not reach the disk whole, which ends the log.
+    Torn,
+    /// A frame that reached the disk whole and was damaged since, with the offset of the first
+    /// byte found wrong.
+    Damaged(u64),
+}
+
 /// The size of the table of a frame that holds `records` bytes of records: one entry for each
 /// block of them, the last block shorter.
 fn table_len(records: u64) -> u64 {
@@ -639,6 +658,13 @@ fn shape(tip: &Super, header: &[u8; FRAME_BYTES], len: u64) -> Option<(Super, u6
     Some((frame, records))
 }
 
+/// Reads the table that a frame whose records start at `at` and run for `records` bytes holds,
+/// or `None` if the file ends first.
+fn read_table(file: &File, at: u64, records: u64) -> Result<Option<Vec<u8>>> {
+    let mut table = vec![0u8; table_len(records) as usize];
+    Ok(read_or_end(file, &mut table, at + records)?.then_some(table))
+}
+
 /// Reads the body of a frame whose records start at `at` and run for `records` bytes, and returns
 /// the table it holds and the table its records hash to, or `None` if the file ends first.
 fn read_tables(file: &File, at: u64, records: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -663,46 +689,235 @@ fn read_tables(file: &File, at: u64, records: u64) -> Result<Option<(Vec<u8>, Ve
     Ok(Some((stored, computed)))
 }
 
-/// The frame that follows `tip` in a file `len` bytes long, if one is there whole.
-fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
+/// What follows `tip` in a file `len` bytes long, as [`examine`] judges the header there.
+fn read_frame(file: &File, tip: &Super, len: u64, judge: bool) -> Result<Found> {
     let start = tip.log_end;
     if start.saturating_add(FRAME_BYTES as u64) > len {
-        return Ok(None);
+        return Ok(Found::Torn);
     }
     let mut header = [0u8; FRAME_BYTES];
     if !read_or_end(file, &mut header, start)? {
-        return Ok(None);
+        return Ok(Found::Torn);
     }
-    frame_after(file, tip, &header, len)
+    examine(file, tip, &header, len, judge)
 }
 
-/// The frame whose header, read from where `tip`'s log ends, is `header`, if it is whole: it has
-/// the shape [`shape`] asks for, every block of its records matches its entry in the table, and
-/// its check matches its header and table.
-fn frame_after(
+/// Whether `header` starts with a frame's magic, or with one that differs from it in one bit.
+fn frame_like(header: &[u8]) -> bool {
+    let magic = u64::from_le_bytes(header[0..8].try_into().unwrap_or_default());
+    (magic ^ u64::from_le_bytes(*FRAME_MAGIC)).count_ones() <= 1
+}
+
+/// What the frame whose header, read from where `tip`'s log ends, is `header` turns out to be, in
+/// a file `len` bytes long.
+///
+/// A frame is whole if it has the shape [`shape`] asks for, every block of its records matches
+/// its entry in the table, and its check matches its header and table. Without `judge`, anything
+/// else is [`Found::Torn`]. With it, a frame that is not whole goes to [`diagnose`], which tells
+/// one damaged since it reached the disk from one that never reached it whole. Only a reader that
+/// no write can race may judge, since one racing a write can read a frame in part.
+fn examine(
     file: &File,
     tip: &Super,
     header: &[u8; FRAME_BYTES],
     len: u64,
-) -> Result<Option<Super>> {
-    let Some((frame, records)) = shape(tip, header, len) else {
-        return Ok(None);
+    judge: bool,
+) -> Result<Found> {
+    let mut read = None;
+    if let Some((frame, records)) = shape(tip, header, len) {
+        let body_start = tip.log_end + FRAME_BYTES as u64;
+        if let Some((stored, computed)) = read_tables(file, body_start, records)? {
+            if stored == computed && frame_check(header, &stored) == header[FRAME_CHECKED..] {
+                return Ok(Found::Whole(frame));
+            }
+            read = Some((stored, computed));
+        }
+    }
+    if !judge || !frame_like(header) {
+        return Ok(Found::Torn);
+    }
+    diagnose(file, tip, header, len, read)
+}
+
+/// The verdict on a frame header with a frame's magic, or one a bit from it, that does not start a
+/// whole frame, given the tables [`examine`] read for it as it stands, if it could.
+///
+/// A frame reached the disk whole and was damaged since if putting back at most one flipped bit
+/// in its header and table together, and at most one in each block of its records, makes it
+/// whole, and each such bit sits in a sector that holds at least [`SECTOR_MIN`] of the frame's
+/// bytes. A torn write leaves every sector it did not reach as it was, which differs from what the
+/// frame would have put there in many bits, so it leaves a frame that no single flip mends; the
+/// rule on sectors keeps one that holds only a few of the frame's bytes from mending by chance.
+/// Anything else is [`Found::Torn`].
+fn diagnose(
+    file: &File,
+    tip: &Super,
+    header: &[u8; FRAME_BYTES],
+    len: u64,
+    read: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<Found> {
+    let start = tip.log_end;
+    let body_start = start + FRAME_BYTES as u64;
+    let shaped = shape(tip, header, len);
+    if let (Some((frame, records)), Some((stored, computed))) = (shaped, &read) {
+        let check = frame_check(header, stored);
+        let differ = check
+            .iter()
+            .zip(&header[FRAME_CHECKED..])
+            .map(|(a, b)| a ^ b);
+        match differ.map(u8::count_ones).sum::<u32>() {
+            0 => return mend(file, start, frame, records, stored, computed, Vec::new()),
+            1 => {
+                let byte = check
+                    .iter()
+                    .zip(&header[FRAME_CHECKED..])
+                    .position(|(a, b)| a != b);
+                let flipped = vec![start + (FRAME_CHECKED + byte.unwrap_or_default()) as u64];
+                return mend(file, start, frame, records, stored, computed, flipped);
+            }
+            _ => {}
+        }
+        let mut near = stored
+            .chunks(BLOCK_CHECK)
+            .zip(computed.chunks(BLOCK_CHECK))
+            .enumerate()
+            .filter(|(_, (want, got))| {
+                let differ = want
+                    .iter()
+                    .zip(got.iter())
+                    .map(|(a, b)| (a ^ b).count_ones());
+                differ.sum::<u32>() == 1
+            });
+        if let (Some((index, (want, got))), None) = (near.next(), near.next()) {
+            let byte = want.iter().zip(got.iter()).position(|(a, b)| a != b);
+            let at = index * BLOCK_CHECK + byte.unwrap_or_default();
+            let mut table = stored.clone();
+            table[at] = computed[at];
+            if frame_check(header, &table) == header[FRAME_CHECKED..] {
+                let flipped = vec![body_start + records + at as u64];
+                return mend(file, start, frame, records, &table, computed, flipped);
+            }
+        }
+    }
+    for bit in 0..FRAME_CHECKED * 8 {
+        let mut candidate = *header;
+        candidate[bit / 8] ^= 1 << (bit % 8);
+        let Some((frame, records)) = shape(tip, &candidate, len) else {
+            continue;
+        };
+        let known = match (&read, shaped) {
+            (Some(tables), Some((was, _))) if was.log_end == frame.log_end => Some(tables),
+            _ => None,
+        };
+        let fetched;
+        let stored = match known {
+            Some((stored, _)) => stored,
+            None => match read_table(file, body_start, records)? {
+                Some(table) => {
+                    fetched = table;
+                    &fetched
+                }
+                None => continue,
+            },
+        };
+        if frame_check(&candidate, stored) != candidate[FRAME_CHECKED..] {
+            continue;
+        }
+        let computed = match known {
+            Some((_, computed)) => computed.clone(),
+            None => match read_tables(file, body_start, records)? {
+                Some((_, computed)) => computed,
+                None => return Ok(Found::Torn),
+            },
+        };
+        let flipped = vec![start + (bit / 8) as u64];
+        return mend(file, start, frame, records, stored, &computed, flipped);
+    }
+    Ok(Found::Torn)
+}
+
+/// Finishes [`diagnose`] for the frame from `start` with `records` bytes of records, whose header
+/// and `table` check once the bits at `flipped` are put back: every block whose check, in
+/// `computed`, differs from its entry must match it once one of its bits is flipped back.
+fn mend(
+    file: &File,
+    start: u64,
+    frame: Super,
+    records: u64,
+    table: &[u8],
+    computed: &[u8],
+    mut flipped: Vec<u64>,
+) -> Result<Found> {
+    let body_start = start + FRAME_BYTES as u64;
+    let entries = table.chunks(BLOCK_CHECK).zip(computed.chunks(BLOCK_CHECK));
+    for (index, (want, got)) in entries.enumerate() {
+        if want == got {
+            continue;
+        }
+        let from = (index * BLOCK_BYTES) as u64;
+        let mut block = vec![0u8; (records - from).min(BLOCK_BYTES as u64) as usize];
+        if !read_or_end(file, &mut block, body_start + from)? {
+            return Ok(Found::Torn);
+        }
+        let want = u64::from_le_bytes(want.try_into().unwrap_or_default());
+        match flip_back(&mut block, want) {
+            Some(byte) => flipped.push(body_start + from + byte as u64),
+            None => return Ok(Found::Torn),
+        }
+    }
+    let end = frame.log_end;
+    let judged = |at: &u64| {
+        let sector = at - at % SECTOR_BYTES;
+        (sector + SECTOR_BYTES).min(end) - sector.max(start) >= SECTOR_MIN
     };
-    let body_start = tip.log_end + FRAME_BYTES as u64;
-    let Some((stored, computed)) = read_tables(file, body_start, records)? else {
-        return Ok(None);
-    };
-    let whole = stored == computed && frame_check(header, &stored) == header[FRAME_CHECKED..];
-    Ok(whole.then_some(frame))
+    if !flipped.iter().all(judged) {
+        return Ok(Found::Torn);
+    }
+    Ok(match flipped.into_iter().min() {
+        Some(at) => Found::Damaged(at),
+        None => Found::Whole(frame),
+    })
+}
+
+/// The byte of `block` in which flipping one bit makes its xxh3-64 `want`, if there is one. The
+/// block is left as it was.
+fn flip_back(block: &mut [u8], want: u64) -> Option<usize> {
+    for byte in 0..block.len() {
+        for bit in 0..8 {
+            block[byte] ^= 1 << bit;
+            let mended = xxh3_64(block) == want;
+            block[byte] ^= 1 << bit;
+            if mended {
+                return Some(byte);
+            }
+        }
+    }
+    None
+}
+
+/// The error for the frame after `tip`, which reached the disk whole and is damaged at `at`.
+fn damaged(tip: &Super, at: u64) -> Error {
+    Error::Corrupt(format!(
+        "frame {} at {} reached the disk whole and is damaged at byte {at}",
+        tip.seq.saturating_add(1),
+        tip.log_end
+    ))
 }
 
 /// Follows frames from `sb` while each follows the one before and is whole, and returns the last.
-fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
+///
+/// With `judge`, a frame that reached the disk whole and was damaged since fails the scan with
+/// [`Error::Corrupt`], naming its offset, where it would otherwise end the log. Only a scan that
+/// no write can race may judge, as [`examine`] says.
+fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<Super> {
     let mut tip = sb;
-    while let Some(next) = read_frame(file, &tip, len)? {
-        tip = next;
+    loop {
+        match read_frame(file, &tip, len, judge)? {
+            Found::Whole(next) => tip = next,
+            Found::Torn => return Ok(tip),
+            Found::Damaged(at) => return Err(damaged(&tip, at)),
+        }
     }
-    Ok(tip)
 }
 
 /// Recovers a writer's file at open from `sb`, the newest superblock, found in `slot`: scans from
@@ -714,8 +929,10 @@ fn scan(file: &File, sb: Super, len: u64) -> Result<Super> {
 /// that frame, durably, before any new frame is written, so a frame stranded past a torn one can
 /// never line up with the log later. If the scan ended before the frame the superblock named, it
 /// writes the new superblock to both slots, syncing between them, so no slot names a lost frame.
+/// A frame that reached the disk whole and was damaged since fails it with [`Error::Corrupt`]
+/// before it writes anything.
 fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
-    let mut tip = scan(file, sb.at_anchor(), len)?;
+    let mut tip = scan(file, sb.at_anchor(), len, true)?;
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
     let shrink = len > tip.log_end;
@@ -743,13 +960,17 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
 /// The superblock a read-only open trusts: `sb`, unless no writer is alive and a scan from its
 /// anchor finds otherwise.
 ///
-/// A superblock that anchors itself with no frame after it is used as it is. Otherwise the open
-/// tries the writer lock shared, and if it gets it and no shared writer holds [`MULTI_AT`], no
-/// writer is alive: it scans from the anchor under the lock and syncs the frames it kept, since a
-/// dead writer's frames may be only in the page cache. With a writer alive, `sb` is current.
+/// A superblock that anchors itself with nothing like a frame after it is used as it is.
+/// Otherwise the open tries the writer lock shared, and if it gets it and no shared writer holds
+/// [`MULTI_AT`], no writer is alive: it scans from the anchor under the lock, judging damage as a
+/// writer's open does, and syncs the frames it kept, since a dead writer's frames may be only in
+/// the page cache. With a writer alive, `sb` is current.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
-    let settled = sb.settled() && read_frame(file, &sb, len)?.is_none();
-    if settled || platform::try_lock_shared(file).is_err() {
+    let mut header = [0u8; FRAME_BYTES];
+    let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
+        && read_or_end(file, &mut header, sb.log_end)?
+        && frame_like(&header);
+    if (sb.settled() && !follows) || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
     }
     if platform::range_held(file, MULTI_AT, 1).unwrap_or(false) {
@@ -760,7 +981,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let scanned = file
         .metadata()
         .map_err(Error::from)
-        .and_then(|meta| scan(file, sb.at_anchor(), meta.len()))
+        .and_then(|meta| scan(file, sb.at_anchor(), meta.len(), true))
         .and_then(|tip| {
             if tip.seq != before {
                 platform::sync_reader(file, path)?;
@@ -1604,8 +1825,9 @@ impl Store {
     /// - [`Error::Locked`] if another writer has the file open.
     /// - [`Error::NoDatabase`] if a read-only open finds no file.
     /// - [`Error::NotFerro`] if the file holds something else, or is empty and opened read-only.
-    /// - [`Error::Corrupt`] if both superblocks are invalid, or the newest names a log the file
-    ///   does not hold.
+    /// - [`Error::Corrupt`] if both superblocks are invalid, the newest names a log the file does
+    ///   not hold, or a frame past its anchor reached the disk whole and was damaged since, which
+    ///   leaves the file as it was.
     /// - [`Error::Io`] if the file cannot be opened, read, written or synced, or, with
     ///   [`StoreOptions::shared`], where the byte-range locks it needs do not exist.
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
@@ -2054,7 +2276,7 @@ impl Store {
         let last = match durable {
             true => {
                 let len = inner.file.metadata()?.len();
-                scan(&inner.file, Super::new(mark, mark, inner.basis), len)?.mark()
+                scan(&inner.file, Super::new(mark, mark, inner.basis), len, false)?.mark()
             }
             false => mark,
         };
@@ -2323,7 +2545,12 @@ impl Store {
     ///
     /// A process that is alone reads one header. It meets a cycle's marker as the end of the log,
     /// or, once the path names another file, as [`Followed::Retired`].
-    pub(crate) fn follow(&self) -> Result<Followed> {
+    ///
+    /// A caller that `holds` the placement lock knows that no live process is writing a frame, so
+    /// a frame that reached the disk whole and was damaged since fails it with [`Error::Corrupt`]
+    /// rather than end the log for the next frame to be written over. Without the lock such a
+    /// frame may be one still being written, and ends the log.
+    pub(crate) fn follow(&self, holds: bool) -> Result<Followed> {
         let inner = &self.inner;
         let cursor = inner.cursor.lock();
         let start = Mark {
@@ -2345,18 +2572,19 @@ impl Store {
                 }
                 break;
             }
-            if &header[0..8] != FRAME_MAGIC {
+            if !frame_like(&header) {
                 break;
             }
             let len = match len {
                 Some(len) => len,
                 None => *len.insert(inner.file.metadata()?.len()),
             };
-            match frame_after(&inner.file, &at, &header, len)? {
-                Some(next) if next.head.is_some() => {
+            match examine(&inner.file, &at, &header, len, holds)? {
+                Found::Whole(next) if next.head.is_some() => {
                     at = next;
                     last = Some(next);
                 }
+                Found::Damaged(offset) => return Err(damaged(&at, offset)),
                 _ => break,
             }
         }
@@ -3914,6 +4142,55 @@ mod tests {
                 whole,
                 "spilled after {spill_after}"
             );
+        }
+    }
+
+    #[test]
+    fn a_flipped_bit_counts_as_damage_only_in_a_sector_that_holds_enough_of_the_frame() {
+        let object = Object {
+            body: noise(3, 436),
+            links: Vec::new(),
+        };
+        let bytes = written(&[object], None);
+        let start = LOG_START;
+        let end = bytes.len() as u64;
+        assert_eq!(
+            end % SECTOR_BYTES,
+            3,
+            "the frame ends 3 bytes into a sector"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("judged.ferro");
+        let empty = Mark {
+            seq: 0,
+            log_end: start,
+            head: None,
+        };
+        let tip = Super::new(empty, empty, Basis::default());
+        let judge = |at: u64| {
+            let mut image = bytes.clone();
+            image[at as usize] ^= 0x20;
+            std::fs::write(&path, &image).unwrap();
+            let file = File::open(&path).unwrap();
+            let lenient = read_frame(&file, &tip, end, false).unwrap();
+            assert!(matches!(lenient, Found::Torn), "byte {at} without judging");
+            read_frame(&file, &tip, end, true).unwrap()
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(matches!(
+            read_frame(&file, &tip, end, true).unwrap(),
+            Found::Whole(_)
+        ));
+        let table = end - BLOCK_CHECK as u64;
+        for at in [start, start + 20, start + 60, start + 100, table, end - 4] {
+            assert!(
+                matches!(judge(at), Found::Damaged(found) if found == at),
+                "byte {at}"
+            );
+        }
+        for at in end - 3..end {
+            assert!(matches!(judge(at), Found::Torn), "byte {at}");
         }
     }
 }

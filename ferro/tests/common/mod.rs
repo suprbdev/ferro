@@ -39,12 +39,23 @@ impl Rng {
     }
 }
 
+pub const SLOT: usize = 4096;
 pub const FRAME_CHECKED: usize = 52;
 pub const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 pub const BLOCK: usize = 4096;
+pub const SECTOR: usize = 512;
+
+pub fn field(bytes: &[u8], at: usize) -> usize {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+}
 
 pub fn table_bytes(frame: usize) -> usize {
     8 * (frame - FRAME_BYTES).div_ceil(BLOCK + 8)
+}
+
+pub fn judged(at: usize, start: usize, end: usize) -> bool {
+    let sector = at - at % SECTOR;
+    (sector + SECTOR).min(end) - sector.max(start) >= 8
 }
 
 pub fn frame_table(records: &[u8]) -> Vec<u8> {
@@ -69,6 +80,60 @@ pub fn seal_frame(image: &mut [u8], start: usize, end: usize) {
     image[body + records..end].copy_from_slice(&table);
     let check = frame_check(&image[start..], &table);
     image[start + FRAME_CHECKED..start + FRAME_BYTES].copy_from_slice(&check);
+}
+
+pub fn whole_frame(image: &[u8], start: usize) -> Option<usize> {
+    if start + FRAME_BYTES > image.len() || &image[start..start + 8] != b"FERROFRM" {
+        return None;
+    }
+    let end = field(image, start + 16);
+    if end < start + FRAME_BYTES || end > image.len() {
+        return None;
+    }
+    let body = start + FRAME_BYTES;
+    let records = (end - body).checked_sub(table_bytes(end - start))?;
+    let table = frame_table(&image[body..body + records]);
+    let whole = table[..] == image[body + records..end]
+        && frame_check(&image[start..], &table)
+            == image[start + FRAME_CHECKED..start + FRAME_BYTES];
+    whole.then_some(end)
+}
+
+pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
+    let mut newest = None;
+    for slot in [0, SLOT] {
+        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB4" {
+            continue;
+        }
+        if blake3::hash(&image[slot..slot + 112]).as_bytes()[..] != image[slot + 112..slot + 144] {
+            continue;
+        }
+        let key = (field(image, slot + 8), field(image, slot + 68));
+        if newest.is_none_or(|(best, _)| key > best) {
+            newest = Some((key, field(image, slot + 76)));
+        }
+    }
+    let mut frames = Vec::new();
+    let Some((_, mut at)) = newest else {
+        return frames;
+    };
+    while let Some(end) = whole_frame(image, at) {
+        frames.push((at, end));
+        at = end;
+    }
+    frames
+}
+
+pub fn assert_damaged<T>(result: ferro::Result<T>, frame: usize, byte: usize, context: &str) {
+    match result {
+        Err(ferro::Error::Corrupt(message)) => assert!(
+            message.contains(&format!(" at {frame} "))
+                && message.ends_with(&format!("byte {byte}")),
+            "{context}: {message}"
+        ),
+        Err(other) => panic!("{context}: unexpected error {other}"),
+        Ok(_) => panic!("{context}: opened a damaged frame"),
+    }
 }
 
 pub fn text(seed: u64, len: usize) -> String {

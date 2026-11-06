@@ -668,3 +668,109 @@ fn a_marker_left_by_a_dead_cycle_never_keeps_a_stranded_frame_after_a_power_cut(
     assert_eq!(db.read().n, 6, "a stranded frame lined up with the log");
     db.verify().unwrap();
 }
+
+enum Left {
+    Pages(u64, bool),
+    Flipped(u64),
+}
+
+fn left_by_a_dead_writer(left: Left) {
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dead.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let mut rng = common::Rng::new(7);
+    let mut commit = |db: &Db<Padded>| {
+        let pad: Vec<u64> = (0..3000).map(|_| rng.next()).collect();
+        db.update(|root| {
+            root.n += 1;
+            root.pad = pad;
+            root.n
+        })
+    };
+    let live: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    for _ in 0..3 {
+        commit(&live).unwrap();
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut slots = vec![0u8; 8192];
+    file.read_exact_at(&mut slots, 0).unwrap();
+    let start = live.size_on_disk();
+    let dead: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    commit(&dead).unwrap();
+    let end = dead.size_on_disk();
+    drop(dead);
+    assert!(end - start > 4 * 4096, "a frame of {} bytes", end - start);
+    let mut frame = vec![0u8; (end - start) as usize];
+    file.read_exact_at(&mut frame, start).unwrap();
+    file.write_all_at(&slots, 0).unwrap();
+    let flipped = match left {
+        Left::Pages(pages, zeroes) => {
+            let cut = match pages {
+                0 => start,
+                _ => start.next_multiple_of(4096) + (pages - 1) * 4096,
+            };
+            assert!(cut < end);
+            file.set_len(cut).unwrap();
+            if zeroes {
+                file.set_len(end + 4096).unwrap();
+            }
+            file.write_all_at(&frame[..(cut - start) as usize], start)
+                .unwrap();
+            None
+        }
+        Left::Flipped(offset) => {
+            let at = start + offset;
+            assert!(common::judged(at as usize, start as usize, end as usize));
+            frame[offset as usize] ^= 0x08;
+            file.write_all_at(&frame, start).unwrap();
+            Some(at)
+        }
+    };
+    let image = std::fs::read(&path).unwrap();
+    let outcome = commit(&live);
+    let Some(at) = flipped else {
+        assert_eq!(
+            outcome.unwrap(),
+            4,
+            "the next writer did not write over the half frame"
+        );
+        drop(live);
+        let db: Db<Padded> = Options::new().reclaim(manual).open(&path).unwrap();
+        assert_eq!(db.read().n, 4);
+        db.verify().unwrap();
+        return;
+    };
+    assert!(
+        matches!(&outcome, Err(Error::Corrupt(message)) if message.ends_with(&format!("byte {at}"))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        image,
+        "the damaged frame was written over"
+    );
+    drop(live);
+    let reopened = shared().reclaim(manual).open::<Padded>(&path);
+    assert!(
+        matches!(reopened, Err(Error::Corrupt(_))),
+        "{:?}",
+        reopened.err()
+    );
+}
+
+#[test]
+fn a_frame_half_written_by_a_dead_writer_is_written_over_and_a_damaged_one_is_not() {
+    for pages in 0..5 {
+        for zeroes in [false, true] {
+            left_by_a_dead_writer(Left::Pages(pages, zeroes));
+        }
+    }
+    for offset in [3, 30, 70, 5000, 9000] {
+        left_by_a_dead_writer(Left::Flipped(offset));
+    }
+}

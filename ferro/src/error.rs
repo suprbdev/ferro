@@ -43,8 +43,9 @@ pub enum Error {
     NotFerro(String),
     /// The file is damaged, or holds something no file ferro wrote can hold.
     ///
-    /// An object whose bytes do not match its hash, a commit log whose versions do not descend, or
-    /// a file whose superblocks are both invalid ends up here, and so do the type checks of
+    /// An object whose bytes do not match its hash, a commit log whose versions do not descend, a
+    /// file whose superblocks are both invalid, or a frame past the superblock that reached the
+    /// disk whole and was damaged since ends up here, and so do the type checks of
     /// [`Db::verify_typed`](crate::Db::verify_typed). The message says what was found and where.
     #[error("corrupt database: {0}")]
     Corrupt(String),

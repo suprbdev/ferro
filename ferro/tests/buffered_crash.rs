@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Rng, text};
+use common::{Rng, assert_damaged, frames_past_the_anchor, judged, text};
 use ferro::store::{Op, Trace};
 use ferro::{Db, Durability, Map, Options, Reclaim};
 use parking_lot::Mutex;
@@ -279,6 +279,75 @@ fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
         cut += stride.max(1);
     }
     images
+}
+
+fn damage(recording: &Recording, losses: &[Loss], seed: u64, name: &str) -> (usize, usize) {
+    let dir = dir();
+    let path = dir.path().join("image.ferro");
+    let mut rng = Rng::new(seed);
+    let (mut reported, mut acknowledged) = (0, 0);
+    for cut in 0..=recording.ops.len() {
+        for &loss in losses {
+            let state = crash(recording, cut, loss, &mut rng);
+            let frames = frames_past_the_anchor(&state.image);
+            let Some(&(start, end)) = frames.get(rng.below(frames.len().max(1) as u64) as usize)
+            else {
+                continue;
+            };
+            let at = start + rng.below((end - start) as u64) as usize;
+            if !judged(at, start, end) {
+                continue;
+            }
+            fs::write(&path, &state.image).unwrap();
+            let whole: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
+            let kept = whole.version();
+            drop(whole);
+            let mut image = state.image;
+            image[at] ^= 1 << rng.below(8);
+            fs::write(&path, &image).unwrap();
+            let context = format!("{name}: cut {cut} {loss:?}, byte {at} of the frame at {start}");
+            let readonly = Options::new().read_only(true).open::<Root>(&path);
+            assert_damaged(readonly, start, at, &context);
+            assert_damaged(buffered().open::<Root>(&path), start, at, &context);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                image,
+                "{context}: the file changed"
+            );
+            reported += 1;
+            let index = frames.iter().position(|frame| frame.0 == start).unwrap();
+            if kept as i64 - (frames.len() - 1 - index) as i64 <= state.newest as i64 {
+                acknowledged += 1;
+            }
+        }
+    }
+    (reported, acknowledged)
+}
+
+#[test]
+fn a_flipped_bit_in_a_whole_frame_past_the_anchor_is_reported_after_any_cut() {
+    let dir = dir();
+    let recording = record(&dir.path().join("trace.ferro"), 2, 12, buffered);
+    let losses = [Loss::Nothing, Loss::Some, Loss::Torn, Loss::FramesOnly];
+    let (reported, acknowledged) = damage(&recording, &losses, 45, "buffered");
+    assert!(reported > 100, "only {reported} frames damaged");
+    assert!(
+        acknowledged > 50,
+        "only {acknowledged} acknowledged frames damaged"
+    );
+}
+
+#[test]
+fn a_flipped_bit_in_an_acknowledged_frame_whose_superblock_was_lost_is_reported() {
+    let dir = dir();
+    let fsync = || Options::new().reclaim(MANUAL);
+    let recording = record(&dir.path().join("trace.ferro"), 2, 8, fsync);
+    let (reported, acknowledged) = damage(&recording, &[Loss::FramesOnly], 46, "fsync");
+    assert!(reported > 20, "only {reported} frames damaged");
+    assert!(
+        acknowledged > 10,
+        "only {acknowledged} acknowledged frames damaged"
+    );
 }
 
 #[test]

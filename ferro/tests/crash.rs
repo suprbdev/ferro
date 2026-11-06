@@ -5,18 +5,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{
-    Outcome, Rng, cases, fast, guarded, quiet_ferro_panics, seal_frame, table_bytes, text, uncached,
+    BLOCK, FRAME_BYTES, Outcome, Rng, SECTOR, SLOT, assert_damaged, cases, fast, field, guarded,
+    judged, quiet_ferro_panics, seal_frame, table_bytes, text, uncached,
 };
 use ferro::codec::{HASH_BYTES, Object, Sink};
 use ferro::store::{Store, StoreOptions, record_len};
-use ferro::{Db, Error, Map, Ptr};
+use ferro::{Db, Error, Map, Options, Ptr};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
 type Model = BTreeMap<u64, String>;
 
 const LOG_START: usize = 8192;
-const SLOT: usize = 4096;
 const SUPER: usize = 144;
 
 struct Built {
@@ -27,13 +27,26 @@ struct Built {
     states: Vec<Model>,
 }
 
+fn log_end(header: &[u8]) -> usize {
+    let newest = if field(header, SLOT + 8) > field(header, 8) {
+        SLOT
+    } else {
+        0
+    };
+    field(header, newest + 16)
+}
+
 fn build(commits: u64, keys_per_commit: u64) -> Built {
+    build_as(fast(), commits, keys_per_commit, 600)
+}
+
+fn build_as(options: Options, commits: u64, keys_per_commit: u64, long: usize) -> Built {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.ferro");
-    let db = fast().open::<Root>(&path).unwrap();
+    let db = options.open::<Root>(&path).unwrap();
     let mut rng = Rng::new(commits * 31 + keys_per_commit);
     let mut model = Model::new();
-    let mut lens = vec![fs::metadata(&path).unwrap().len() as usize];
+    let mut lens = vec![log_end(&fs::read(&path).unwrap())];
     let mut headers = vec![fs::read(&path).unwrap()[..LOG_START].to_vec()];
     let mut states = vec![model.clone()];
     for commit in 0..commits {
@@ -41,7 +54,7 @@ fn build(commits: u64, keys_per_commit: u64) -> Built {
         for _ in 0..keys_per_commit {
             let key = rng.below(keys_per_commit * 3);
             let len = if rng.chance(25) {
-                600
+                long
             } else {
                 rng.below(40) as usize
             };
@@ -64,13 +77,14 @@ fn build(commits: u64, keys_per_commit: u64) -> Built {
             model.remove(&key);
         }
         let bytes = fs::read(&path).unwrap();
-        lens.push(bytes.len());
+        lens.push(log_end(&bytes));
         headers.push(bytes[..LOG_START].to_vec());
         states.push(model.clone());
     }
     assert_eq!(db.version(), commits);
     drop(db);
     let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), *lens.last().unwrap());
     Built {
         dir,
         bytes,
@@ -358,7 +372,7 @@ fn recovery_replays_every_complete_frame_past_a_stale_superblock() {
 }
 
 #[test]
-fn recovery_stops_at_the_first_damaged_frame() {
+fn recovery_stops_at_a_frame_two_bits_from_whole_as_at_a_torn_one() {
     let built = build(5, 3);
     let path = built.target();
     let (base, damaged, last) = (1, 3, built.lens.len() - 1);
@@ -375,6 +389,167 @@ fn recovery_stops_at_the_first_damaged_frame() {
             fs::metadata(&path).unwrap().len() as usize,
             built.lens[damaged - 1]
         );
+    }
+}
+
+fn fsync() -> Options {
+    Options::new().cache_bytes(1 << 20)
+}
+
+#[test]
+fn a_frame_one_bit_from_whole_past_the_superblock_is_reported_and_left_alone() {
+    for (name, options) in [("buffered", fast()), ("fsync", fsync())] {
+        let built = build_as(options.clone(), 5, 3, 600);
+        let path = built.target();
+        let (base, damaged, last) = (1, 3, built.lens.len() - 1);
+        let (start, end) = (built.lens[damaged - 1], built.lens[damaged]);
+        let mut reported = 0;
+        for position in start..end {
+            let mut image = built.image(base, built.lens[last]);
+            image[position] ^= 1 << (position % 8);
+            fs::write(&path, &image).unwrap();
+            let context = format!("{name}: byte {position} of the frame at {start}..{end}");
+            if !judged(position, start, end) {
+                let db = options.clone().open::<Root>(&path).unwrap();
+                check_at_version(&db, &built, damaged - 1);
+                continue;
+            }
+            let readonly = options.clone().read_only(true).open::<Root>(&path);
+            assert_damaged(readonly, start, position, &context);
+            assert_damaged(
+                options.clone().open::<Root>(&path),
+                start,
+                position,
+                &context,
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                image,
+                "{context}: the file changed"
+            );
+            reported += 1;
+        }
+        assert!(
+            reported > (end - start) * 9 / 10,
+            "{name}: {reported} reported"
+        );
+    }
+}
+
+#[test]
+fn a_bit_flipped_in_each_block_of_a_large_frame_is_reported() {
+    let built = build_as(fast(), 3, 40, 3000);
+    let path = built.target();
+    let (start, end) = (built.lens[1], built.lens[2]);
+    let table = table_bytes(end - start);
+    let body = start + FRAME_BYTES;
+    let records = end - body - table;
+    assert!(records > 3 * BLOCK, "a frame of {records} bytes of records");
+    let image = |flips: &[usize]| {
+        let mut image = built.image(1, built.lens[3]);
+        for at in flips {
+            image[*at] ^= 1 << (at % 8);
+        }
+        image
+    };
+    let mut positions: Vec<usize> = (start..body).chain(end - table..end).collect();
+    positions.extend((body..end - table).step_by(97));
+    for position in positions {
+        let image = image(&[position]);
+        fs::write(&path, &image).unwrap();
+        let context = format!("byte {position} of the frame at {start}..{end}");
+        if judged(position, start, end) {
+            assert_damaged(fast().open::<Root>(&path), start, position, &context);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                image,
+                "{context}: the file changed"
+            );
+        } else {
+            check_at_version(&fast().open::<Root>(&path).unwrap(), &built, 1);
+        }
+    }
+    for block in 0..(records - 12) / BLOCK {
+        let (first, second) = (body + block * BLOCK + 300, body + (block + 1) * BLOCK + 11);
+        fs::write(&path, image(&[second, first])).unwrap();
+        assert_damaged(
+            fast().open::<Root>(&path),
+            start,
+            first,
+            "flips in two blocks",
+        );
+        let torn = image(&[first, first + 1000]);
+        fs::write(&path, &torn).unwrap();
+        check_at_version(&fast().open::<Root>(&path).unwrap(), &built, 1);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
+    }
+}
+
+#[test]
+fn a_frame_torn_between_sectors_that_landed_is_truncated() {
+    let built = build_as(fast(), 3, 40, 3000);
+    let path = built.target();
+    let (start, end) = (built.lens[1], built.lens[2]);
+    let older = &built.bytes[LOG_START..built.lens[1]];
+    let mut sectors = 0;
+    let mut sector = start.next_multiple_of(SECTOR);
+    while sector + SECTOR <= end {
+        for kept in [
+            vec![0u8; SECTOR],
+            vec![0xFFu8; SECTOR],
+            older[..SECTOR].to_vec(),
+        ] {
+            let mut image = built.image(1, built.lens[3]);
+            if image[sector..sector + SECTOR] == kept[..] {
+                continue;
+            }
+            image[sector..sector + SECTOR].copy_from_slice(&kept);
+            fs::write(&path, &image).unwrap();
+            let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
+            check_at_version(&readonly, &built, 1);
+            drop(readonly);
+            let db = fast().open::<Root>(&path).unwrap();
+            check_at_version(&db, &built, 1);
+            assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
+            sectors += 1;
+        }
+        sector += SECTOR;
+    }
+    assert!(sectors > 40, "only {sectors} torn sectors tried");
+}
+
+#[test]
+fn a_hole_before_whole_frames_ends_the_log() {
+    for (name, options) in [("buffered", fast()), ("fsync", fsync())] {
+        let built = build_as(options.clone(), 6, 3, 600);
+        let path = built.target();
+        let last = built.lens.len() - 1;
+        for hole in 2..last {
+            let (start, end) = (built.lens[hole - 1], built.lens[hole]);
+            for every in [1, 2] {
+                let mut image = built.image(1, built.lens[last]);
+                let mut sector = start - start % SECTOR;
+                while sector < end {
+                    if (sector / SECTOR).is_multiple_of(every) {
+                        let from = sector.max(start);
+                        image[from..(sector + SECTOR).min(end)].fill(0);
+                    }
+                    sector += SECTOR;
+                }
+                fs::write(&path, &image).unwrap();
+                let context = format!("{name}: hole {hole}, every {every}");
+                let readonly = options.clone().read_only(true).open::<Root>(&path).unwrap();
+                assert_eq!(readonly.version(), hole as u64 - 1, "{context}");
+                drop(readonly);
+                let db = options.clone().open::<Root>(&path).unwrap();
+                check_at_version(&db, &built, hole - 1);
+                assert_eq!(
+                    fs::metadata(&path).unwrap().len() as usize,
+                    start,
+                    "{context}"
+                );
+            }
+        }
     }
 }
 
@@ -465,11 +640,16 @@ fn corrupt_superblocks_fall_back_or_report() {
             check_at_version(&db, &built, last);
             drop(db);
 
-            image[built.lens[last - 1]] ^= bit;
+            let (start, end) = (built.lens[last - 1], built.lens[last]);
+            image[start] ^= bit;
             fs::write(&path, &image).unwrap();
-            let db = fast().read_only(true).open::<Root>(&path).unwrap();
-            check_at_version(&db, &built, last - 1);
-            drop(db);
+            let opened = fast().read_only(true).open::<Root>(&path);
+            if judged(start, start, end) {
+                assert_damaged(opened, start, start, "a flipped magic past the older slot");
+                assert_eq!(fs::read(&path).unwrap(), image);
+            } else {
+                check_at_version(&opened.unwrap(), &built, last - 1);
+            }
 
             let mut image = built.bytes.clone();
             image[older + byte] ^= bit;
