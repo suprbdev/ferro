@@ -203,6 +203,17 @@ block search for every block of a torn frame whose table never landed, so the ru
 and damaged frames](storage.md#torn-and-damaged-frames) and the limitations name the case,
 `crash.rs` checks that such a frame is truncated, and the damage mode expects it to be.
 
+The round after the rule on zeroes and ones and the cap of [Torn and damaged
+frames](storage.md#torn-and-damaged-frames), with the damage mode's sparse values and pulls, ran
+`open` for 20 minutes as four jobs, one on each of four cores, each from a quarter of a copy of
+the 23,058 saved `open` inputs, 327 of them of the damage mode, and the 64 seeds of that mode,
+under the flags above and `-rss_limit_mb=3072`. Each loaded its 5,830 or so inputs in about 5,835
+executions, reaching 103,900 to 106,200 edges, and ran 41,446 to 42,873 executions in all, 34 or 35
+a second, 168,693 together, ending at 105,500 to 106,600 edges and adding 638 to 665 inputs, 2,593
+together, 508 of those left of the damage mode, 109 of them sparse values and 76 pulls. No input
+crashed, hung, leaked or passed a memory limit, the peak RSS was 1.56 GB, and no damaged frame met
+a verdict other than the damage mode's.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
