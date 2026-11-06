@@ -77,15 +77,20 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   held trees, a clone into an empty file, merges on both sides, edited covered indexes, a 1.2 MB
   bundle that spills to the scratch file and is placed in pieces, and four taken from devices that
   pull from each other's branches with pruned history and cycles, so that a bundle can carry
-  commits the receiver already holds. The input picks one, then mutates its objects, links, header
-  and count as parsed values and rehashes them up to the head, or edits the encoded bytes, or
-  replaces the bundle outright. It can feed the stream in small reads, interrupt it, break it, or
+  commits the receiver already holds. Two of its maps keep a summary, a wrapping sum over small
+  values and one over spilled blobs, some of them one value under several keys, whose `of` reads
+  the key. The input picks one, then mutates its objects, links, header and count as parsed values,
+  or finds the summaries in the nodes of those maps and changes one, or two of a node by amounts
+  that cancel so that the node's own fold still holds, and rehashes them up to the head, or edits
+  the encoded bytes, or replaces the bundle outright. It can feed the stream in small reads,
+  interrupt it, break it, or
   commit, fork or run a cycle while the checked bundle waits to be placed, or commit or fork
   between placing a spilled bundle's pieces and landing it. A refused bundle must leave both
   branches where they were. An accepted one must read back whole on both branches, with every map's
-  length equal to its iteration, every key found, every index lookup answered and each unique
-  index's range over the whole index as long as its map from either end, and pass `verify` and
-  `verify_typed`, before and after a reopen and a commit.
+  length equal to its iteration, every key found, every index lookup answered, each unique index's
+  range over the whole index as long as its map from either end, and each summarized map's
+  `summary`, and the two halves of it that `range_summary` folds, equal to the fold of its entries,
+  and pass `verify` and `verify_typed`, before and after a reopen and a commit.
 
 The harness treats a panic whose message starts with `ferro:` as expected inside the infallible
 reads, which panic on corruption by design, and as a failure anywhere else. The `seeds` example
@@ -224,6 +229,17 @@ a second, 49,719 together, ending at 106,400 to 107,100 edges and adding 350 inp
 them of the damage mode. No input crashed, hung, leaked or passed a memory limit, the peak RSS was
 1.56 GB, and no damaged frame met a verdict other than the damage mode's. The target opens files
 with no other writer alive, which the change leaves as it was, so the round checks that it did.
+
+The round for [Recomputing summaries](sync-receive.md#recomputing-summaries) first ran the new
+`sync` harness, with its summarized blobs, its forged summaries and its check of every fold,
+against the library from before the recompute. It failed within the first 40 executions on a
+bundle that landed with a summary that was not the fold of its entries, and the same input is
+refused or reads back whole with the recompute. `sync` then ran for 10 minutes as four jobs, one
+on each of four cores, each from a quarter of a copy of the 3,848 saved `sync` inputs under the
+flags above and `-rss_limit_mb=3072`. Each loaded its 962 inputs to 630 to 674 entries reaching
+35,700 to 36,000 edges, and ran 6,476 to 7,104 executions, 10 or 11 a second, 27,296 together,
+ending at 36,200 to 36,400 edges with 1,308 to 1,348 entries, about 2,680 more together. No input
+crashed, hung, leaked or passed a memory limit, and the peak RSS was 954 MB.
 
 ## Where the other tests are described
 
