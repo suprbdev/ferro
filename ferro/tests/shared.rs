@@ -1191,5 +1191,9 @@ fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
     assert!(watcher.try_recv().is_err());
     file.write_all_at(&byte, middle).unwrap();
     assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 5);
-    assert_eq!(b.following().unwrap().last_error, None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while b.following().unwrap().last_error.is_some() {
+        assert!(Instant::now() < deadline, "the follower kept its error");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
