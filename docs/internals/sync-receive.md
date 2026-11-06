@@ -86,11 +86,12 @@ The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written,
 read, and for each object its hash, its offset in the staging and a count of the links to it, about
 38 bytes an object, as described under [Memory for each object](sync.md#memory-for-each-object).
 Placing drops the offsets in the staging first and holds each object's offset in the log in their
-place, one piece and a window on the scratch file. An object is held whole, about three times over
-while it is read, hashed and copied, so the largest value sent bounds memory too. A hostile stream
-gets no more: 48 distinct objects of 1 MiB took 2.1 MiB of heap and never reached the database. A 33
-MB stream of 4,549 objects took 1.66 MB, where the frame it used to fill took 2.80 MB, and 256
-commits with 64 KiB messages, 17 MB, took 2.2 MB.
+place, one piece and a window on the scratch file. An object is held whole, about four times over
+while it is read, compressed again if it arrived uncompressed, as described under
+[Applying](sync.md#applying), hashed and copied, so the largest value sent bounds memory too. A
+hostile stream gets no more: 48 distinct objects of 1 MiB took 2.1 MiB of heap and never reached the
+database. A 33 MB stream of 4,549 objects took 1.66 MB, where the frame it used to fill took 2.80
+MB, and 256 commits with 64 KiB messages, 17 MB, took 2.2 MB.
 
 Three other places were weighed. Writing the staged objects into the log as frames of their own
 while the bundle streams writes each byte once, but a cycle that swaps the file meanwhile copies
