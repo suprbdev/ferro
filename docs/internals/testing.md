@@ -170,6 +170,33 @@ executions in all, 59 to 63 a second on each core, starting at
 101,900 to 103,300 edges and ending at 103,000 to 104,600, and adding 6,973 inputs. No input
 crashed, hung, leaked or passed a memory limit, and the peak RSS was 1.35 GB.
 
+The round after it added the damage mode of `open` described above, rebuilt the seeds, 720 for
+`open` with 48 of that mode, among them frames of up to 11 blocks and up to 65 for `open-large`, and
+ran each job on one core of six under the flags above and `-rss_limit_mb=2048`, from a copy of the
+corpus the round before saved, converted to format 4. `open`, built before the damage mode, ran 30
+minutes over its 22,426 saved inputs and the seeds, which loaded in 23,000 executions to 10,148
+inputs reaching 109,300 edges: 69,800 executions, 38 a second, ending at 109,600 edges and adding
+178 inputs, with a peak RSS of 1.47 GB. With the damage mode it ran 30 minutes from a random sample
+of 1,000 saved inputs and the seeds, 57,000 executions, 31 a second, from 100,100 edges to 102,200,
+adding 1,951 inputs, and 25 minutes from the 48 seeds of that mode and 300 random inputs of it
+alone, 11,500 executions, 7 a second, each building a file and searching its damaged blocks under
+the address sanitizer, from 5,400 edges to 6,700, adding 664. `open-large` ran 30 minutes from a
+sample of 1,000 of its 5,323 inputs and its seeds, 39,600 executions from 50,700 edges to 52,000,
+adding 1,761. `admin` and `reclaim` ran 30 minutes each, 723,000 and 673,000 executions, 400 and 373
+a second, from 6,800 and 8,100 edges to 7,208 and 8,483, adding 1,151 and 586, and `sync` 20
+minutes, 16,100 executions from 37,700 edges to 37,800, adding 258. Merging added 269 inputs to the
+saved `admin` corpus, 214 to `reclaim`, 44 to `sync`, 671 to `open-large` and 632 to `open`.
+
+No input crashed, hung, leaked or passed a memory limit, so the library needed no fix, and no
+damaged frame met a verdict other than the damage mode's. Writing that mode's oracle from the rule
+showed one case the rule as stated and the judgement disagree on: a bit flipped in a block and one
+in that block's entry in the table is one bit in the header and table and one in a block, but the
+judgement finds a flipped entry only as one a bit from its block's hash, so it reads the frame as
+torn and truncates it. Searching each failing block for a hash a bit from its entry would cost a
+block search for every block of a torn frame whose table never landed, so the rule stays, [Torn
+and damaged frames](storage.md#torn-and-damaged-frames) and the limitations name the case,
+`crash.rs` checks that such a frame is truncated, and the damage mode expects it to be.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
