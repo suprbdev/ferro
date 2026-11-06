@@ -778,6 +778,95 @@ fn a_frame_half_written_by_a_dead_writer_is_written_over_and_a_damaged_one_is_no
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Rot {
+    Block,
+    Magic,
+    Zeroed,
+}
+
+fn rotted(file: &std::fs::File, start: u64, rot: Rot) {
+    use std::os::unix::fs::FileExt;
+    let (at, len) = match rot {
+        Rot::Block => (start + 68 + 200, 2),
+        Rot::Magic => (start + 2, 2),
+        Rot::Zeroed => (start, 84),
+    };
+    let mut bytes = vec![0u8; len];
+    file.read_exact_at(&mut bytes, at).unwrap();
+    match rot {
+        Rot::Zeroed => bytes.fill(0),
+        _ => bytes.iter_mut().for_each(|byte| *byte ^= 0x01),
+    }
+    file.write_all_at(&bytes, at).unwrap();
+}
+
+fn below_the_superblock(durability: Durability, rot: Rot) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lag.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let mut rng = common::Rng::new(5);
+    let pads: Vec<Vec<u64>> = (0..5)
+        .map(|_| (0..600).map(|_| rng.next()).collect())
+        .collect();
+    let commit = |db: &Db<Padded>, pad: &[u64]| {
+        db.update(|root| {
+            root.n += 1;
+            root.pad = pad.to_vec();
+            root.n
+        })
+    };
+    let open = || {
+        shared()
+            .durability(durability)
+            .reclaim(manual)
+            .open::<Padded>(&path)
+            .unwrap()
+    };
+    let a = open();
+    let b = open();
+    let mut ends = vec![a.size_on_disk()];
+    for pad in &pads[..4] {
+        commit(&a, pad).unwrap();
+        ends.push(a.size_on_disk());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    rotted(&file, ends[1], rot);
+    let image = std::fs::read(&path).unwrap();
+    let context = format!("{durability:?}, {rot:?}");
+    let outcome = commit(&b, &pads[4]);
+    assert!(
+        matches!(&outcome, Err(Error::Corrupt(message)) if message.contains(&format!("frame 2 at {} ", ends[1]))),
+        "{context}: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        image,
+        "{context}: the lagging writer changed the log a superblock names"
+    );
+    assert_eq!(commit(&a, &pads[4]).unwrap(), 5, "{context}");
+    drop((a, b));
+    let db: Db<Padded> = Options::new()
+        .durability(durability)
+        .reclaim(manual)
+        .open(&path)
+        .unwrap();
+    assert_eq!(db.read().n, 5, "{context}: an acknowledged commit was lost");
+}
+
+#[test]
+fn a_lagging_writer_reports_a_frame_below_the_superblock_that_does_not_check_and_writes_nothing() {
+    for durability in [Durability::Fsync, Durability::Buffered] {
+        for rot in [Rot::Block, Rot::Magic, Rot::Zeroed] {
+            below_the_superblock(durability, rot);
+        }
+    }
+}
+
 #[test]
 fn a_frame_written_where_a_dead_writer_left_a_near_copy_reads_as_torn_after_a_power_cut() {
     use ferro::store::{Op, Trace};

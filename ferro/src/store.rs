@@ -965,6 +965,20 @@ fn damaged(tip: &Super, at: u64) -> Error {
     ))
 }
 
+/// Fails with [`Error::Corrupt`] if `tip`, where a scan or a catch-up stopped, lies before the end
+/// of the log that `named`, the newest superblock, names, so that a frame it names does not check.
+fn reaches(tip: &Super, named: &Super) -> Result<()> {
+    if tip.seq >= named.seq && tip.log_end >= named.log_end {
+        return Ok(());
+    }
+    Err(Error::Corrupt(format!(
+        "frame {} at {} does not check, inside the log the newest superblock names to {}",
+        tip.seq.saturating_add(1),
+        tip.log_end,
+        named.log_end
+    )))
+}
+
 /// Follows frames from `sb` while each follows the one before and is whole, and returns the last.
 ///
 /// With `judge`, a frame that reached the disk whole and was damaged since fails the scan with
@@ -2634,10 +2648,14 @@ impl Store {
     /// rather than end the log for the next frame to be written over. Without the lock such a
     /// frame may be one still being written, and ends the log.
     ///
-    /// Under the lock, what a dead process left past the log, part of a frame or the records a
-    /// frame spilled before its header, is truncated and the truncation synced, as [`recover`]
-    /// does, so that the next frame is written over nothing a power cut could bring back under it.
-    /// A failed truncation or sync poisons the store.
+    /// Under the lock it also reads the newest superblock, and if the frames it followed end
+    /// before the log that superblock names, a frame other processes acknowledged does not check,
+    /// whatever the judgement made of it, since no crash can have taken it back while this process
+    /// is alive: that fails it with [`Error::Corrupt`] too, and nothing is truncated or written
+    /// there. Past that log, what a dead process left, part of a frame or the records a frame
+    /// spilled before its header, is truncated and the truncation synced, as [`recover`] does, so
+    /// that the next frame is written over nothing a power cut could bring back under it. A failed
+    /// truncation or sync poisons the store.
     pub(crate) fn follow(&self, holds: bool) -> Result<Followed> {
         let inner = &self.inner;
         let mut cursor = inner.cursor.lock();
@@ -2682,6 +2700,11 @@ impl Store {
                 Found::Whole(_) => break false,
             }
         };
+        if holds {
+            let (named, _) = newest_super(&inner.file)?
+                .ok_or_else(|| Error::Corrupt("both superblocks are invalid".into()))?;
+            reaches(&at, &named)?;
+        }
         if holds && left {
             let end = at.log_end;
             let cut = inner.file.set_len(end).and_then(|()| inner.file.sync_all());
