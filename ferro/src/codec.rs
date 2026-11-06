@@ -872,7 +872,8 @@ pub(crate) struct Shape {
 /// [`Db::verify_typed`](crate::Db::verify_typed) and of a received sync bundle.
 ///
 /// It names the type stored there and, for a map node, the entry count its parent's link records,
-/// the level the node must be below and the range of keys it must keep within.
+/// the level the node must be below, the range of keys it must keep within and the summary the
+/// link records, which the check recomputes from the node's entries.
 #[derive(Clone)]
 pub(crate) struct Kind {
     /// The type stored at the link.
@@ -883,7 +884,8 @@ pub(crate) struct Kind {
     pub(crate) check: fn(&Kind, &mut Decoder<'_>) -> Result<Shape>,
     /// Checks an object that the receiving store already holds, given by its link, as this kind.
     pub(crate) held: fn(&Kind, &Store, Ptr) -> Result<Shape>,
-    /// Whether an object checked as the first kind is known to be good as the second.
+    /// Whether an object checked as the first kind is known to be good as the second, apart from
+    /// the [`claim`](Kind::claim), which [`vouched_by`](Kind::vouched_by) compares.
     pub(crate) within: fn(&Kind, &Kind) -> bool,
     /// The entry count the object must hold, if the parent records one.
     pub(crate) count: Option<u64>,
@@ -891,6 +893,35 @@ pub(crate) struct Kind {
     pub(crate) below: Option<u8>,
     /// The keys the object's node must keep within, as the parent gives them, if any.
     pub(crate) range: Option<Arc<dyn Any + Send + Sync>>,
+    /// The summary the parent records for what the link leads to, which the check recomputes
+    /// and must find, if the parent records one.
+    pub(crate) claim: Option<Arc<dyn Claim>>,
+}
+
+/// A summary that a parent records for what it links to, held in a [`Kind`]'s
+/// [`claim`](Kind::claim): a map node's summary, which a check of the node recomputes from its
+/// entries, or the key and summary of the entry whose spilled value the object is.
+pub(crate) trait Claim: Any + Send + Sync {
+    /// Whether this claim says what `confirmed`, a claim a check found true, does: the same
+    /// type, and the same encoding.
+    fn agrees(&self, confirmed: &dyn Claim) -> bool;
+
+    /// Decodes the object the link leads to, for [`confirm`](Claim::confirm) to test this claim
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// The errors of decoding the object, and [`Error::Decode`] for a claim about the object
+    /// alone, such as a map node's summary: an object has one such summary, so one that met a
+    /// claim cannot meet another that disagrees with it.
+    fn decode(&self, body: &[u8], links: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>>;
+
+    /// Checks this claim against an object that [`decode`](Claim::decode) gave.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] if the object does not have the summary claimed.
+    fn confirm(&self, decoded: &(dyn Any + Send + Sync)) -> Result<()>;
 }
 
 /// The typed links a check found in an object: each one's index in the object's links, with the
@@ -911,8 +942,8 @@ fn anywhere(_: &Kind, _: &Kind) -> bool {
 }
 
 impl Kind {
-    /// The kind of a link to a value of type `D`, checked by [`Data::visit`], with no count, level
-    /// or range to meet.
+    /// The kind of a link to a value of type `D`, checked by [`Data::visit`], with no count, level,
+    /// range or summary to meet.
     pub(crate) fn value<D: Data>() -> Kind {
         Kind {
             id: TypeId::of::<D>(),
@@ -923,6 +954,16 @@ impl Kind {
             count: None,
             below: None,
             range: None,
+            claim: None,
+        }
+    }
+
+    /// This kind without its [`claim`](Kind::claim), for a check that only needs to learn the
+    /// kinds of an object's links.
+    pub(crate) fn unclaimed(&self) -> Kind {
+        Kind {
+            claim: None,
+            ..self.clone()
         }
     }
 
@@ -932,9 +973,19 @@ impl Kind {
             && self.below.is_none_or(|below| shape.level < below)
     }
 
+    /// Whether an object that passed a check as `seen` is known to have the summary this kind
+    /// claims: this kind claims none, or `seen` claimed one that says the same.
+    pub(crate) fn vouched_by(&self, seen: &Kind) -> bool {
+        match (&self.claim, &seen.claim) {
+            (None, _) => true,
+            (Some(want), Some(had)) => want.agrees(&**had),
+            (Some(_), None) => false,
+        }
+    }
+
     /// Whether an object that passed a check as this kind needs no check as `want`: the same
-    /// type, the count `want` asks for, a level bound at least as tight and a key range within
-    /// `want`'s.
+    /// type, the count `want` asks for, a level bound at least as tight, a key range within
+    /// `want`'s and the summary `want` claims.
     pub(crate) fn implies(&self, want: &Kind) -> bool {
         self.id == want.id
             && want.count.is_none_or(|count| self.count == Some(count))
@@ -942,6 +993,7 @@ impl Kind {
                 .below
                 .is_none_or(|below| self.below.is_some_and(|own| own <= below))
             && (self.within)(self, want)
+            && want.vouched_by(self)
     }
 
     /// Checks an object with this body and these links as this kind, returning its shape and the
@@ -962,29 +1014,36 @@ impl Kind {
 
 /// The objects a typed check has already passed, by hash and type, with the kinds they passed
 /// as, so that an object linked from many places is checked once for each key range it must keep
-/// within rather than once for each link.
+/// within rather than once for each link, and again only for a link whose claimed summary no
+/// earlier check confirmed.
 #[derive(Default)]
 pub(crate) struct Checked {
     seen: HashMap<(Hash, TypeId), (Shape, Vec<Kind>)>,
 }
 
 impl Checked {
-    /// The shape of the object `hash`, if it already passed a check that covers `kind`.
-    pub(crate) fn get(&self, hash: &Hash, kind: &Kind) -> Option<Shape> {
+    /// The shape of the object `hash`, if it already passed a check that covers `kind`, and
+    /// whether one of its checks confirmed the summary `kind` claims.
+    pub(crate) fn get(&self, hash: &Hash, kind: &Kind) -> Option<(Shape, bool)> {
         let (shape, kinds) = self.seen.get(&(*hash, kind.id))?;
         kinds
             .iter()
             .any(|seen| (seen.within)(seen, kind))
-            .then_some(*shape)
+            .then(|| (*shape, kinds.iter().any(|seen| kind.vouched_by(seen))))
     }
 
     /// Records that the object `hash` passed a check as `kind` with `shape`.
+    ///
+    /// It keeps `kind` only if no kind it keeps for the object already covers its range, so it
+    /// keeps one kind for each range however many summaries were claimed under it.
     pub(crate) fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
-        let entry = self.seen.entry((hash, kind.id));
-        entry
-            .or_insert_with(|| (shape, Vec::with_capacity(1)))
-            .1
-            .push(kind.clone());
+        let (_, kinds) = self
+            .seen
+            .entry((hash, kind.id))
+            .or_insert_with(|| (shape, Vec::with_capacity(1)));
+        if !kinds.iter().any(|seen| (seen.within)(seen, kind)) {
+            kinds.push(kind.clone());
+        }
     }
 }
 

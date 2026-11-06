@@ -5047,15 +5047,16 @@ impl<T: Data> Db<T> {
     /// Like [`Db::verify`], and also decodes every object reachable from every retained version
     /// as the type that reads it.
     ///
-    /// It checks each map node's count, level and key range against its parent, as
-    /// [`Db::receive`] checks what it is sent, so it finds a damaged file or a type change that
-    /// broke stored data before a read panics on it. It costs a full decode of everything
-    /// retained.
+    /// It checks each map node's count, level and key range against its parent and recomputes
+    /// each summary from the entries below it, as [`Db::receive`] checks what it is sent, so it
+    /// finds a damaged file or a type change that broke stored data before a read panics on it or
+    /// a fold returns a stale total. It costs a full decode of everything retained.
     ///
     /// # Errors
     ///
     /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode
-    /// or does not fit its parent.
+    /// or does not fit its parent, which includes a summary that is not the fold of its entries
+    /// and one whose `of` or `combine` panics to recompute.
     pub fn verify_typed(&self) -> Result<Verified> {
         let (head, refs, store) = {
             let published = self.shared.published.lock();

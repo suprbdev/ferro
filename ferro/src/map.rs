@@ -92,8 +92,8 @@ use std::sync::{Arc, OnceLock};
 use std::vec;
 
 use crate::codec::{
-    Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr, Shape,
-    Sink, Staged, try_hash_of,
+    Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr,
+    Shape, Sink, Staged, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -160,9 +160,17 @@ thread_local! {
 /// `combine` must be associative, so that the fold of a run does not depend on how the tree
 /// groups it, but it need not be commutative: first, last, minimum and maximum work as well as
 /// sums. `of` must depend only on what the key and value encode, so a `#[ferro(skip)]` field must
-/// not feed it. The summary is stored on every link, so keep it small, and make a wide one a tuple
-/// rather than a derived struct, whose field tags would be stored on every link too. `()`, the
-/// default, keeps nothing and costs nothing.
+/// not feed it, and `combine` only on what its two summaries encode. The summary is stored on
+/// every link, so keep it small, and make a wide one a tuple rather than a derived struct, whose
+/// field tags would be stored on every link too. `()`, the default, keeps nothing and costs
+/// nothing.
+///
+/// [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
+/// recompute every summary they check from the entries below it, with this type's `of` and
+/// `combine`, and refuse one whose encoding differs from what is stored, so two files that sync
+/// need the same `Summary`. A panic in `of` or `combine` while they recompute is caught and
+/// refuses the bundle or reports the file as corrupt; the panic hook still runs, and with
+/// `panic = "abort"` the process aborts.
 ///
 /// # Examples
 ///
@@ -1052,10 +1060,101 @@ fn admit<K, V, S>(node: &Node<K, V, S>, count: u64, ceiling: u8) -> Result<()> {
 
 type Span<K> = (Option<K>, Option<K>);
 
-fn node_kind<K: Data + Ord, V: Data, S: Data>(
+const fn summarized<S>() -> bool {
+    size_of::<S>() != 0
+}
+
+fn summarize<T>(f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let text = match payload.downcast_ref::<&str>() {
+            Some(text) => text,
+            None => payload.downcast_ref::<String>().map_or("", String::as_str),
+        };
+        Error::Decode(format!("summarizing its entries panicked: {text}"))
+    })
+}
+
+fn claim_of<C: 'static>(kind: &Kind) -> Option<&C> {
+    let claim: &dyn Any = kind.claim.as_deref()?;
+    claim.downcast_ref::<C>()
+}
+
+fn refuted(what: &str) -> Error {
+    Error::Decode(format!(
+        "{what} records a summary that is not the fold of its entries"
+    ))
+}
+
+struct NodeClaim<S>(S);
+
+impl<S: Data> NodeClaim<S> {
+    fn holds(&self, found: Option<S>) -> Result<()> {
+        match found {
+            Some(found) if found.same_encoding(&self.0) => Ok(()),
+            _ => Err(refuted("a map node's link")),
+        }
+    }
+}
+
+impl<S: Data> Claim for NodeClaim<S> {
+    fn agrees(&self, confirmed: &dyn Claim) -> bool {
+        let confirmed: &dyn Any = confirmed;
+        confirmed
+            .downcast_ref::<Self>()
+            .is_some_and(|confirmed| confirmed.0.same_encoding(&self.0))
+    }
+
+    fn decode(&self, _: &[u8], _: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>> {
+        Err(refuted("a map node's link"))
+    }
+
+    fn confirm(&self, _: &(dyn Any + Send + Sync)) -> Result<()> {
+        Err(refuted("a map node's link"))
+    }
+}
+
+struct EntryClaim<K, V, S> {
+    key: K,
+    summary: S,
+    value: PhantomData<fn() -> V>,
+}
+
+impl<K: Data, V: Data, S: Summary<K, V>> EntryClaim<K, V, S> {
+    fn holds(&self, value: &V) -> Result<()> {
+        let found = summarize(|| S::of(&self.key, value))?;
+        match found.same_encoding(&self.summary) {
+            true => Ok(()),
+            false => Err(refuted("a spilled value's entry")),
+        }
+    }
+}
+
+impl<K: Data, V: Data, S: Summary<K, V>> Claim for EntryClaim<K, V, S> {
+    fn agrees(&self, confirmed: &dyn Claim) -> bool {
+        let confirmed: &dyn Any = confirmed;
+        confirmed.downcast_ref::<Self>().is_some_and(|confirmed| {
+            confirmed.key.same_encoding(&self.key) && confirmed.summary.same_encoding(&self.summary)
+        })
+    }
+
+    fn decode(&self, body: &[u8], links: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>> {
+        let value = V::decode(&mut Decoder::new(body, links, None))?;
+        Ok(Arc::new(value))
+    }
+
+    fn confirm(&self, decoded: &(dyn Any + Send + Sync)) -> Result<()> {
+        match decoded.downcast_ref::<V>() {
+            Some(value) => self.holds(value),
+            None => Err(refuted("a spilled value's entry")),
+        }
+    }
+}
+
+fn node_kind<K: Data + Ord, V: Data, S: Summary<K, V>>(
     count: u64,
     below: Option<u8>,
     span: Option<Span<K>>,
+    claim: Option<S>,
 ) -> Kind {
     Kind {
         id: TypeId::of::<Node<K, V, S>>(),
@@ -1066,7 +1165,44 @@ fn node_kind<K: Data + Ord, V: Data, S: Data>(
         count: Some(count),
         below,
         range: span.map(|span| Arc::new(span) as Arc<dyn Any + Send + Sync>),
+        claim: claim.map(|claim| Arc::new(NodeClaim(claim)) as Arc<dyn Claim>),
     }
+}
+
+fn spill_kind<K: Data + Ord, V: Data, S: Summary<K, V>>(key: K, summary: S) -> Kind {
+    let claim = EntryClaim::<K, V, S> {
+        key,
+        summary,
+        value: PhantomData,
+    };
+    Kind {
+        check: check_spill::<K, V, S>,
+        held: held_spill::<K, V, S>,
+        claim: Some(Arc::new(claim)),
+        ..Kind::value::<V>()
+    }
+}
+
+fn check_spill<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    kind: &Kind,
+    r: &mut Decoder<'_>,
+) -> Result<Shape> {
+    match claim_of::<EntryClaim<K, V, S>>(kind) {
+        Some(claim) => claim.holds(&V::decode(r)?)?,
+        None => V::visit(r)?,
+    }
+    Ok(Shape::default())
+}
+
+fn held_spill<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    kind: &Kind,
+    store: &Store,
+    ptr: Ptr,
+) -> Result<Shape> {
+    if let Some(claim) = claim_of::<EntryClaim<K, V, S>>(kind) {
+        claim.holds(&*store.load::<V>(ptr)?)?;
+    }
+    Ok(Shape::default())
 }
 
 fn span_of<K: 'static>(kind: &Kind) -> Option<&Span<K>> {
@@ -1103,7 +1239,74 @@ fn outside<K: Ord>(span: Option<&Span<K>>, first: &K, last: &K) -> bool {
     })
 }
 
-fn check_node<K: Data + Ord, V: Data, S: Data>(kind: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
+enum Part<V, S> {
+    Value(V),
+    Spilled(S),
+}
+
+fn node_fold<K, V, S: Summary<K, V>>(
+    keys: &[K],
+    parts: &[Part<V, S>],
+    children: &[(usize, S)],
+) -> Option<S> {
+    let mut total = None;
+    let mut children = children.iter().peekable();
+    for (position, (key, part)) in keys.iter().zip(parts).enumerate() {
+        if let Some((_, child)) = children.next_if(|(at, _)| *at == position) {
+            total = fold(total, child);
+        }
+        total = match part {
+            Part::Value(value) => fold(total, &S::of(key, value)),
+            Part::Spilled(summary) => fold(total, summary),
+        };
+    }
+    for (_, child) in children {
+        total = fold(total, child);
+    }
+    total
+}
+
+fn node_keys<K: Data + Ord>(kind: &Kind, r: &mut Decoder<'_>) -> Result<(u8, Vec<K>)> {
+    let level = r.u8()?;
+    let n = r.varint()?;
+    if n == 0 || n > r.remaining() as u64 {
+        return Err(Error::Decode(format!("node claims {n} keys")));
+    }
+    let mut keys: Vec<K> = Vec::new();
+    for _ in 0..n {
+        let key = K::decode(r)?;
+        if level_of(&key)? != level {
+            return Err(Error::Decode(
+                "a key sits at a level it does not hash to".into(),
+            ));
+        }
+        if keys.last().is_some_and(|previous| *previous >= key) {
+            return Err(Error::Decode("node keys are out of order".into()));
+        }
+        keys.push(key);
+    }
+    if outside(span_of::<K>(kind), &keys[0], &keys[keys.len() - 1]) {
+        return Err(Error::Decode(
+            "node keys fall outside the range their parent gives them".into(),
+        ));
+    }
+    Ok((level, keys))
+}
+
+fn check_node<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    kind: &Kind,
+    r: &mut Decoder<'_>,
+) -> Result<Shape> {
+    if const { summarized::<S>() } {
+        return check_summaries::<K, V, S>(kind, r);
+    }
+    check_plain::<K, V, S>(kind, r)
+}
+
+fn check_plain<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    kind: &Kind,
+    r: &mut Decoder<'_>,
+) -> Result<Shape> {
     let level = r.u8()?;
     let n = r.varint()?;
     if n == 0 || n > r.remaining() as u64 {
@@ -1152,12 +1355,71 @@ fn check_node<K: Data + Ord, V: Data, S: Data>(kind: &Kind, r: &mut Decoder<'_>)
                     Some(key) => Some(key.clone()),
                     None => span.and_then(|(_, high)| high.clone()),
                 };
-                node_kind::<K, V, S>(below, Some(level), Some((low, high)))
+                node_kind::<K, V, S>(below, Some(level), Some((low, high)), None)
             })?;
             count = count
                 .checked_add(below)
                 .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
         }
+    }
+    Ok(Shape { count, level })
+}
+
+fn child_span<K: Clone>(span: Option<&Span<K>>, keys: &[K], position: usize) -> Span<K> {
+    let low = match position {
+        0 => span.and_then(|(low, _)| low.clone()),
+        _ => Some(keys[position - 1].clone()),
+    };
+    let high = match keys.get(position) {
+        Some(key) => Some(key.clone()),
+        None => span.and_then(|(_, high)| high.clone()),
+    };
+    (low, high)
+}
+
+fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    kind: &Kind,
+    r: &mut Decoder<'_>,
+) -> Result<Shape> {
+    let (level, keys) = node_keys::<K>(kind, r)?;
+    let keys = keys.as_slice();
+    let span = span_of::<K>(kind);
+    let claim = claim_of::<NodeClaim<S>>(kind);
+    let mut parts = Vec::with_capacity(if claim.is_some() { keys.len() } else { 0 });
+    for key in keys {
+        match r.u8()? {
+            0 if claim.is_some() => parts.push(Part::Value(V::decode(r)?)),
+            0 => V::visit(r)?,
+            1 => {
+                let summary = S::decode(r)?;
+                r.typed_link(|| spill_kind::<K, V, S>(key.clone(), summary.clone()))?;
+                if claim.is_some() {
+                    parts.push(Part::Spilled(summary));
+                }
+            }
+            other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
+        }
+    }
+    let mut count = keys.len() as u64;
+    let mut children = Vec::new();
+    for position in 0..keys.len() + 1 {
+        let below = r.varint()?;
+        if below != 0 {
+            let summary = S::decode(r)?;
+            r.typed_link(|| {
+                let span = child_span(span, keys, position);
+                node_kind::<K, V, S>(below, Some(level), Some(span), Some(summary.clone()))
+            })?;
+            if claim.is_some() {
+                children.push((position, summary));
+            }
+            count = count
+                .checked_add(below)
+                .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
+        }
+    }
+    if let Some(claim) = claim {
+        claim.holds(summarize(|| node_fold(keys, &parts, &children))?)?;
     }
     Ok(Shape { count, level })
 }
@@ -1184,7 +1446,7 @@ fn extreme<K: Data, V: Data, S: Data>(
         .ok_or_else(|| Error::Corrupt("a stored map node holds no keys".into()))
 }
 
-fn held_node<K: Data + Ord, V: Data, S: Data>(
+fn held_node<K: Data + Ord, V: Data, S: Summary<K, V>>(
     kind: &Kind,
     store: &Store,
     ptr: Ptr,
@@ -1198,6 +1460,11 @@ fn held_node<K: Data + Ord, V: Data, S: Data>(
                 "held keys fall outside the range a new parent gives them".into(),
             ));
         }
+    }
+    if const { summarized::<S>() }
+        && let Some(claim) = claim_of::<NodeClaim<S>>(kind)
+    {
+        claim.holds(summarize(|| node.summary())?)?;
     }
     Ok(Shape {
         count: node.count,
@@ -4132,8 +4399,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
             Link::Empty
         } else {
             let summary = S::decode(r)?;
+            let claim = || const { summarized::<S>() }.then(|| summary.clone());
             Link::stored(
-                r.typed_link(|| node_kind::<K, V, S>(count, None, None))?,
+                r.typed_link(|| node_kind::<K, V, S>(count, None, None, claim()))?,
                 count,
                 summary,
             )

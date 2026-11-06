@@ -11,7 +11,7 @@
 //! reached from the file. See
 //! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
@@ -21,7 +21,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use crate::codec::{
-    Checked, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, push_varint,
+    Checked, Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
@@ -1643,6 +1643,7 @@ impl Landing<'_> {
 struct Kept {
     left: u8,
     checks: Vec<(Shape, Vec<Kind>)>,
+    decoded: Option<(TypeId, Arc<dyn Any + Send + Sync>)>,
 }
 
 struct Vetting<'a> {
@@ -1707,13 +1708,16 @@ impl Vetting<'_> {
                 kinds
                     .iter()
                     .any(|seen| (seen.within)(seen, kind))
-                    .then_some(*shape)
+                    .then(|| (*shape, kinds.iter().any(|seen| kind.vouched_by(seen))))
             });
             if counted && kept.left != u8::MAX {
                 kept.left = kept.left.saturating_sub(1);
             }
-            if let Some(shape) = hit {
-                if kept.left == 0 {
+            if let Some((shape, vouched)) = hit {
+                if !vouched {
+                    self.confirm(id, hash, kind)?;
+                }
+                if self.kept.get(&id).is_some_and(|kept| kept.left == 0) {
                     self.kept.remove(&id);
                 }
                 return Ok(shape);
@@ -1774,6 +1778,7 @@ impl Vetting<'_> {
             let kept = self.kept.entry(id).or_insert_with(|| Kept {
                 left,
                 checks: Vec::new(),
+                decoded: None,
             });
             match kept
                 .checks
@@ -1788,6 +1793,43 @@ impl Vetting<'_> {
             }
         }
         Ok(shape)
+    }
+
+    fn confirm(&mut self, id: u32, hash: Hash, kind: &Kind) -> Result<()> {
+        let Some(claim) = &kind.claim else {
+            return Ok(());
+        };
+        let refused = |error: Error| {
+            bad(format!(
+                "a {} it carries does not decode: {error}",
+                kind.name
+            ))
+        };
+        let cached = self
+            .kept
+            .get(&id)
+            .and_then(|kept| kept.decoded.clone())
+            .filter(|(of, _)| *of == kind.id);
+        let decoded = match cached {
+            Some((_, decoded)) => decoded,
+            None => {
+                let ptr = Ptr {
+                    hash,
+                    offset: self.staging.offset(id),
+                };
+                let object = self.staging.read_object(ptr)?;
+                self.spent = self.spent.saturating_add(object.body.len());
+                if self.spent > self.budget {
+                    return Err(bad("it reuses its objects under too many key ranges"));
+                }
+                let decoded = claim.decode(&object.body, &object.links).map_err(refused)?;
+                if let Some(kept) = self.kept.get_mut(&id) {
+                    kept.decoded = Some((kind.id, decoded.clone()));
+                }
+                decoded
+            }
+        };
+        claim.confirm(&*decoded).map_err(refused)
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
@@ -1808,12 +1850,23 @@ impl Vetting<'_> {
         if known.is_some_and(|known| known.implies(kind)) {
             return Ok(None);
         }
-        if known.is_some_and(|known| known.id == kind.id) {
+        if let Some(known) = known.filter(|known| known.id == kind.id) {
+            let unclaimed;
+            let kind = match kind.vouched_by(known) {
+                true => {
+                    unclaimed = kind.unclaimed();
+                    &unclaimed
+                }
+                false => kind,
+            };
             return (kind.held)(kind, self.store, ptr)
                 .map(Some)
                 .map_err(rejected);
         }
-        if let Some(shape) = self.held.get(&hash, kind) {
+        if let Some((shape, vouched)) = self.held.get(&hash, kind) {
+            if !vouched {
+                (kind.held)(kind, self.store, ptr).map_err(rejected)?;
+            }
             return Ok(Some(shape));
         }
         let object = self.store.read_object(ptr)?;
@@ -1837,6 +1890,7 @@ struct Held {
     count: Option<u64>,
     below: Option<u8>,
     range: Option<Arc<dyn Any + Send + Sync>>,
+    claim: Option<Arc<dyn Claim>>,
 }
 
 #[derive(Default)]
@@ -1852,6 +1906,7 @@ impl Kinds {
             count: None,
             below: None,
             range: None,
+            claim: None,
         };
         Kinds {
             templates: Vec::new(),
@@ -1863,7 +1918,7 @@ impl Kinds {
         let template = match self.templates.iter().position(|seen| seen.id == kind.id) {
             Some(at) => at,
             None => {
-                let mut template = kind.clone();
+                let mut template = kind.unclaimed();
                 (template.count, template.below, template.range) = (None, None, None);
                 self.templates.push(template);
                 self.templates.len() - 1
@@ -1874,6 +1929,7 @@ impl Kinds {
             count: kind.count,
             below: kind.below,
             range: kind.range,
+            claim: kind.claim,
         };
     }
 
@@ -1892,6 +1948,7 @@ impl Kinds {
         kind.count = held.count;
         kind.below = held.below;
         kind.range = held.range.clone();
+        kind.claim = held.claim.clone();
         Some(kind)
     }
 }
@@ -2015,7 +2072,7 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                 Some(parent) => hint_kinds.get(parent),
             };
             let kinds: Vec<(usize, Kind)> = kind
-                .and_then(|kind| kind.check(&object.body, &object.links).ok())
+                .and_then(|kind| kind.unclaimed().check(&object.body, &object.links).ok())
                 .map(|(_, found)| found)
                 .unwrap_or_default();
             while at < end && parent_key(header, &roots, &hinted, &hint_kinds, order[at]) == key {
@@ -2835,8 +2892,9 @@ impl<T: Data> Db<T> {
     /// [`Db::have`], as the branch `remote`, then brings this branch up to it as [`Db::pull`] does.
     ///
     /// It hashes every object and checks every link as it reads, and checks every object as the
-    /// type that will read it, and it refuses commits dated more than a day past this machine's
-    /// clock. Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch
+    /// type that will read it, recomputing each map summary from the entries below it with this
+    /// side's [`Summary`](crate::Summary), and it refuses commits dated more than a day past this
+    /// machine's clock. Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch
     /// file beside the database, under no writer lock, so commits on every branch go on meanwhile.
     /// Once the whole bundle has passed, its objects are copied into the file, and one frame
     /// points the branch `remote` at them, so a crash leaves the previous head. A bundle that
@@ -2844,7 +2902,9 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged. Nothing reaches the file.
+    /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
+    ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute.
+    ///   Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.

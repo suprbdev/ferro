@@ -227,7 +227,16 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     let mut checked = Checked::default();
     while let Some((ptr, kind)) = queue.pop() {
         let shape = match checked.get(&ptr.hash, &kind) {
-            Some(shape) => shape,
+            Some((shape, true)) => shape,
+            Some((shape, false)) => {
+                (kind.held)(&kind, store, ptr).map_err(|error| {
+                    Error::Corrupt(format!(
+                        "the {} at {} does not decode: {error}",
+                        kind.name, ptr.offset
+                    ))
+                })?;
+                shape
+            }
             None => {
                 let object = store.read_object(ptr)?;
                 let (shape, found) = kind.check(&object.body, &object.links).map_err(|error| {
