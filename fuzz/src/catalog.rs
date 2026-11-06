@@ -226,7 +226,8 @@ pub fn fill(world: &mut World, round: u64) {
     }
     for outer in (0..30).step_by(1 + round as usize * 3) {
         let inner = world.nested.get_or_insert_with(outer, Map::new);
-        for key in 0..25 {
+        let deep = if outer == 0 { 5_000 } else { 25 };
+        for key in 0..deep {
             inner.insert(key, outer * 1000 + key + round);
         }
     }

@@ -964,7 +964,7 @@ fn whole_branch(db: &Db<World>, when: &str) {
         }
         if let Err(error) = db.at(version) {
             panic!(
-                "{when}: {} at v{version} after an accepted bundle: {error}",
+                "{when}: {} at v{version} does not open: {error}",
                 db.branch_name()
             );
         }
@@ -1050,6 +1050,7 @@ pub fn receive(prepared: &Prepared, path: &Path) {
                     .map(|landed| landed.head_hash());
                 assert_eq!(landed, landed_before, "a refused bundle moved the remote");
             }
+            whole_branch(&to, "refused");
         }
         Err(Error::Io(_)) if prepared.fail_at < prepared.bundle.len() => {}
         Err(Error::NoCommonAncestor) => {}
