@@ -7,8 +7,9 @@
 //! sizes and overlaps. The strategies range from a merge of the two sorted key lists, leapfrog
 //! searches through the `_after` lookups or through cursors, with or without a few steps before
 //! each seek, and a hash set, to the `and` of the table's find view, read forwards, backwards, as
-//! rows, or as keys followed by `get`s. The `or` of the same two lookups, as keys and as rows, is
-//! checked against a sorted union of their keys instead.
+//! rows, or as keys followed by `get`s. The `or` of the same two lookups, as keys and as rows, and
+//! the `or` of the first lookup with the second made on a newer version of the table, which
+//! changes the name of the last row, are checked against a sorted union of their keys instead.
 //!
 //! The range cases combine `find().by_group(&g)`, whose groups hold 10, 100, 1,000 and 10,000 rows
 //! picked at random and cover the other fields, with a range of the plain `score` index, a range
@@ -20,13 +21,14 @@
 //! seeking the range's index at each `(value, key)`.
 //!
 //! Each strategy named in `--strategies`, by default all of `merge`, `after`, `cursor`, `cursor2`,
-//! `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`, `and-back`, `rows`, `gets`, `or` and
-//! `or-rows` for the equality cases and `and`, `and-back`, `rows`, `collect`, `filter`, `covered`
-//! and `seek` for the range cases, is checked against the merge, the union or the filter and then
-//! run over and over for `--ms` milliseconds (default 40) in each of `--rounds` rounds (default
-//! 5). `--cases` picks `equal`, `range` or both, the default, `crossover`, which runs groups of
-//! 100, 1,000 and 10,000 rows against score ranges from as many keys to 128 times as many, or
-//! `cold`, and `--only` runs just the cases whose title holds the text it gives.
+//! `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`, `and-back`, `rows`, `gets`, `or`,
+//! `or-rows`, `or-versions` and `or-versions-rows` for the equality cases and `and`, `and-back`,
+//! `rows`, `collect`, `filter`, `covered` and `seek` for the range cases, is checked against the
+//! merge, the union or the filter and then run over and over for `--ms` milliseconds (default 40)
+//! in each of `--rounds` rounds (default 5). `--cases` picks `equal`, `range` or both, the
+//! default, `crossover`, which runs groups of 100, 1,000 and 10,000 rows against score ranges from
+//! as many keys to 128 times as many, or `cold`, and `--only` runs just the cases whose title holds
+//! the text it gives.
 //!
 //! The cold cases build a second file of `--wide-rows` rows (default 60,000) whose 4 KiB notes are
 //! stored apart from their leaves, and combine groups of 10, 100 and 1,000 of them with score
@@ -696,6 +698,8 @@ enum Strategy {
     Gets,
     Or,
     OrRows,
+    OrVersions,
+    OrVersionsRows,
 }
 
 impl Strategy {
@@ -713,14 +717,19 @@ impl Strategy {
             Strategy::Gets => "and, keys then get".to_string(),
             Strategy::Or => "or".to_string(),
             Strategy::OrRows => "or, rows".to_string(),
+            Strategy::OrVersions => "or, two versions".to_string(),
+            Strategy::OrVersionsRows => "or, two versions, rows".to_string(),
         }
     }
 
     fn unites(&self) -> bool {
-        matches!(self, Strategy::Or | Strategy::OrRows)
+        matches!(
+            self,
+            Strategy::Or | Strategy::OrRows | Strategy::OrVersions | Strategy::OrVersionsRows
+        )
     }
 
-    fn run(&self, t: &Snapshot, value: u32, out: &mut Vec<u64>) {
+    fn run(&self, t: &Snapshot, newer: &Snapshot, value: u32, out: &mut Vec<u64>) {
         match *self {
             Strategy::Merge => merge(t, value, out),
             Strategy::After => leapfrog_after(t, value, out),
@@ -754,6 +763,14 @@ impl Strategy {
             Strategy::OrRows => {
                 let find = t.find();
                 out.extend(find.by_xs(&value).or(find.by_ys(&value)).map(|row| row.id));
+            }
+            Strategy::OrVersions => {
+                let either = t.find().by_xs(&value).or(newer.find().by_ys(&value));
+                out.extend(either.keys());
+            }
+            Strategy::OrVersionsRows => {
+                let either = t.find().by_xs(&value).or(newer.find().by_ys(&value));
+                out.extend(either.map(|row| row.id));
             }
         }
     }
@@ -1029,6 +1046,8 @@ fn main() {
     db.compact(Keep::Last(1)).unwrap();
     let snapshot = db.read();
     let table = &snapshot.items;
+    let mut newer = table.clone();
+    newer.update(&(rows - 1), |item| item.name.push('!'));
     let all = [
         ("merge", Strategy::Merge),
         ("after", Strategy::After),
@@ -1045,6 +1064,8 @@ fn main() {
         ("gets", Strategy::Gets),
         ("or", Strategy::Or),
         ("or-rows", Strategy::OrRows),
+        ("or-versions", Strategy::OrVersions),
+        ("or-versions-rows", Strategy::OrVersionsRows),
     ];
     let joins = [
         ("and", Joined::And),
@@ -1093,14 +1114,14 @@ fn main() {
         }
         let value = index as u32;
         let mut wanted = Vec::new();
-        Strategy::Merge.run(table, value, &mut wanted);
+        Strategy::Merge.run(table, &newer, value, &mut wanted);
         let mut either = Vec::new();
         union(table, value, &mut either);
         let mut samples = vec![(Vec::new(), Vec::new()); strategies.len()];
         for _ in 0..rounds {
             for (slot, strategy) in strategies.iter().enumerate() {
                 out.clear();
-                strategy.run(table, value, &mut out);
+                strategy.run(table, &newer, value, &mut out);
                 let wanted = if strategy.unites() { &either } else { &wanted };
                 assert_eq!(&out, wanted, "{} on {}", strategy.name(), case.name);
                 let began = Instant::now();
@@ -1108,7 +1129,7 @@ fn main() {
                 let before = counter.read();
                 while began.elapsed().as_secs_f64() * 1000.0 < budget_ms {
                     out.clear();
-                    strategy.run(table, value, &mut out);
+                    strategy.run(table, &newer, value, &mut out);
                     black_box(&out);
                     runs += 1;
                 }
