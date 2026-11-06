@@ -4996,6 +4996,18 @@ impl<K: Data, V: Data, S: Data> Top<K, V, S> {
             Top::Link(link) => fatal(hold(store, link, 0, true, None)),
         }
     }
+
+    fn node(&self) -> Option<*const Node<K, V, S>> {
+        match self {
+            Top::Lent(root) => Some(root.node()),
+            Top::Link(Link::Mem(node, _)) => Some(Shared::as_ptr(node)),
+            Top::Link(Link::Stored { memo, .. }) => match memo.get()? {
+                Memo::Pinned(node) => Some(Shared::as_ptr(node)),
+                Memo::Weak(..) => None,
+            },
+            Top::Link(Link::Empty) => None,
+        }
+    }
 }
 
 /// A position in a [`Map`] that keeps its path through the tree, made by [`Map::cursor`].
@@ -5271,6 +5283,21 @@ where
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
+    /// Whether this finder and `other` read the same version of a map: both from one root node,
+    /// both from stored roots of one hash, or both from an empty map.
+    ///
+    /// It answers from the roots alone, in O(1), and says `false` when they cannot tell, such as
+    /// for one root lent through a hazard slot and another of the same map read through a link
+    /// whose node is not pinned, so `false` does not mean the maps differ.
+    pub(crate) fn same_map(&self, other: &Finder<K, V, S>) -> bool {
+        if let (Top::Link(a), Top::Link(b)) = (&self.root, &other.root)
+            && a.same_as(b)
+        {
+            return true;
+        }
+        matches!((self.root.node(), other.root.node()), (Some(a), Some(b)) if a == b)
+    }
+
     /// The value stored under `key`, starting from the kept leaf or parent when either spans it.
     ///
     /// # Panics

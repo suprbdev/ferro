@@ -74,6 +74,8 @@
 //! primary key and read a row only for a key that matches, as described on [`Matches`]. They also
 //! take a range or prefix lookup made on the table, against which a side with at most a quarter
 //! of its keys tests each of its keys by reading that key's row, as [`IntoMatches`] describes.
+//! Lookups of different tables, or of different versions of one, combine too, each row read from
+//! a lookup that holds its key.
 //!
 //! # Unique indexes
 //!
@@ -1222,6 +1224,7 @@ where
             rowless: false,
             budget: 0,
             spent: 0,
+            source: 0,
         })
     }
 }
@@ -1599,6 +1602,7 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for IndexIter<T, C> {
     fn into_matches(self) -> Matches<T, C> {
         Matches {
             rows: self.rows,
+            more: None,
             stream: self.entries.into_stream(),
             started: false,
         }
@@ -1633,6 +1637,17 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 /// [`keys`](Matches::keys) gives the keys alone and [`covered`](Matches::covered) the covered
 /// fields of the leftmost lookup, so a combination whose first index covers what you show reads
 /// no rows, but those it tests against a range or prefix lookup.
+///
+/// # Lookups of several tables
+///
+/// Lookups made on different tables of one row type, or on different versions of one table, such
+/// as a snapshot's and the one inside a commit, combine as well. Each lookup answers for the table
+/// it was made on, as it was when the lookup was built. Each key's row comes from a lookup that
+/// holds the key: from the left side of an `and`, and from the leftmost side of an `or` that holds
+/// it, the lookup whose fields [`covered`](Matches::covered) yields. So rows, lent rows, keys and
+/// covered fields, read from either end, all give the same keys, and an `or` of two tables yields
+/// every row either holds, a key both hold with the row of the left one. Lookups of one table at
+/// one version read their rows through one finder, as a single lookup does.
 ///
 /// # Examples
 ///
@@ -1679,8 +1694,32 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 /// ```
 pub struct Matches<T: Record, C = ()> {
     rows: Finder<T::Key, T>,
+    more: More<T>,
     stream: Box<dyn Stream<T::Key, C>>,
     started: bool,
+}
+
+type More<T> = Option<Box<Vec<Finder<<T as Record>::Key, T>>>>;
+
+struct Finders<T: Record> {
+    first: Option<Finder<T::Key, T>>,
+    more: Vec<Option<Finder<T::Key, T>>>,
+}
+
+impl<T: Record> Finders<T> {
+    fn of(first: Option<Finder<T::Key, T>>, more: Vec<Finder<T::Key, T>>) -> Self {
+        Finders {
+            first,
+            more: more.into_iter().map(Some).collect(),
+        }
+    }
+
+    fn take(&mut self, source: usize) -> Option<Finder<T::Key, T>> {
+        match source.checked_sub(1) {
+            None => self.first.take(),
+            Some(at) => self.more.get_mut(at)?.take(),
+        }
+    }
 }
 
 impl<T: Record, C: Send + 'static> Matches<T, C> {
@@ -1688,8 +1727,11 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     ///
     /// `other` can be any [`IntoMatches`], so a range or prefix lookup on the table joins too,
     /// tested key by key when this side has at most a quarter of its keys and read in full and
-    /// sorted otherwise. The result keeps this side's covered fields. If this combination has
-    /// already yielded rows, what it has left is read into a sorted list first.
+    /// sorted otherwise. The result keeps this side's covered fields, and reads each row from this
+    /// side. `other` may be a lookup of another table, or of another version of this one: it
+    /// matches the keys its own table holds, and decides only which of this side's rows are
+    /// yielded. If this combination has already yielded rows, what it has left is read into a
+    /// sorted list first.
     ///
     /// # Examples
     ///
@@ -1721,6 +1763,7 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
         let right = other.into_matches().unstarted().adopted();
         Matches {
             rows: left.rows,
+            more: left.more,
             stream: Box::new(All::new(left.stream, Box::new(Blind(right)))),
             started: false,
         }
@@ -1729,19 +1772,50 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// The rows that this combination or `other` matches, each once.
     ///
     /// Both sides must have the same covered fields. Call [`uncovered`](Matches::uncovered), or
-    /// [`IndexIter::uncovered`], on each to combine lookups of differently covered indexes. A row
-    /// both sides hold takes its covered fields from this side. If this combination has already
-    /// yielded rows, what it has left is read into a sorted list first.
+    /// [`IndexIter::uncovered`], on each to combine lookups of differently covered indexes. A key
+    /// both sides hold takes its row and covered fields from this side, and a key only `other`
+    /// holds takes them from `other`. So when `other` is a lookup of another table, or of another
+    /// version of this one, the combination yields every row either holds, each from a table whose
+    /// lookup matched it. If this combination has already yielded rows, what it has left is read
+    /// into a sorted list first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     shipped: bool,
+    /// }
+    ///
+    /// let mut archive: Table<Order> = Table::new();
+    /// archive.insert(Order { id: 1, customer: "wile".into(), shipped: true });
+    /// archive.insert(Order { id: 2, customer: "wile".into(), shipped: false });
+    /// let mut today = archive.clone();
+    /// today.update(&2, |order| order.shipped = true);
+    /// today.insert(Order { id: 3, customer: "wile".into(), shipped: false });
+    /// today.remove(&1);
+    ///
+    /// let wile: Vec<(u64, bool)> = today
+    ///     .find()
+    ///     .by_customer("wile")
+    ///     .or(archive.find().by_customer("wile"))
+    ///     .map(|order| (order.id, order.shipped))
+    ///     .collect();
+    /// assert_eq!(wile, [(1, true), (2, true), (3, false)]);
+    /// ```
     pub fn or<M: IntoMatches<T, Covered = C>>(self, other: M) -> Matches<T, C> {
-        let left = self.unstarted();
-        let right = other.into_matches().unstarted().adopted();
+        let mut left = self.unstarted();
+        let right = left.joined(other.into_matches().unstarted());
         Matches {
             rows: left.rows,
-            stream: Box::new(Any {
-                sides: vec![left.stream, right],
-                landed: None,
-                passed: None,
-            }),
+            more: left.more,
+            stream: Box::new(Any::new(vec![left.stream, right])),
             started: false,
         }
     }
@@ -1751,6 +1825,7 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// [`IndexIter::uncovered`] is read in full instead, and reads no row.
     pub fn keys(mut self) -> MatchKeys<T> {
         self.stream.rowless();
+        self.lend_more();
         MatchKeys(Box::new(Blind(self.stream)))
     }
 
@@ -1761,6 +1836,7 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     pub fn covered(mut self) -> MatchCovered<T, C> {
         self.stream.cover();
         self.stream.rowless();
+        self.lend_more();
         MatchCovered(self.stream)
     }
 
@@ -1768,6 +1844,7 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     pub fn uncovered(self) -> Matches<T> {
         Matches {
             rows: self.rows,
+            more: self.more,
             stream: Box::new(Blind(self.stream)),
             started: self.started,
         }
@@ -1778,20 +1855,87 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
             return self;
         }
         self.stream.cover();
-        let mut items = VecDeque::new();
-        while let Some(item) = self.stream.take(End::Front) {
-            items.push_back(item);
-        }
+        let stream: Box<dyn Stream<T::Key, C>> = if let Some(more) = &self.more {
+            let mut lists: Vec<VecDeque<_>> = (0..=more.len()).map(|_| VecDeque::new()).collect();
+            while let Some(item) = self.stream.take(End::Front) {
+                lists[self.stream.source(End::Front)].push_back(item);
+            }
+            let sides = lists.into_iter().enumerate().map(|(source, items)| {
+                let mut listed = Listed::ready(items);
+                listed.source = source;
+                Box::new(listed) as Box<dyn Stream<T::Key, C>>
+            });
+            Box::new(Any::new(sides.collect()))
+        } else {
+            let mut items = VecDeque::new();
+            while let Some(item) = self.stream.take(End::Front) {
+                items.push_back(item);
+            }
+            Box::new(Listed::ready(items))
+        };
         Matches {
             rows: self.rows,
-            stream: Box::new(Listed::ready(items)),
+            more: self.more,
+            stream,
             started: false,
         }
     }
 
     fn adopted(self) -> Box<dyn Stream<T::Key, C>> {
         let mut stream = self.stream;
-        stream.adopt(&mut Some(self.rows));
+        match self.more {
+            None => stream.adopt(&mut Some(self.rows)),
+            Some(more) => stream.adopt(&mut Finders::<T>::of(Some(self.rows), *more)),
+        }
+        stream
+    }
+
+    fn lend_more(&mut self) {
+        if let Some(more) = self.more.take() {
+            self.stream.adopt(&mut Finders::<T>::of(None, *more));
+        }
+    }
+
+    fn joined(&mut self, right: Matches<T, C>) -> Box<dyn Stream<T::Key, C>> {
+        let Matches {
+            rows, more, stream, ..
+        } = right;
+        let mut stream = stream;
+        if more.is_none() && self.more.is_none() && self.rows.same_map(&rows) {
+            stream.adopt(&mut Some(rows));
+            return stream;
+        }
+        let more = more.map_or_else(Vec::new, |more| *more);
+        let mut spare = Finders::<T> {
+            first: None,
+            more: Vec::with_capacity(more.len()),
+        };
+        let mut sources = Vec::with_capacity(1 + more.len());
+        for (at, finder) in std::iter::once(rows).chain(more).enumerate() {
+            let held = std::iter::once(&self.rows)
+                .chain(self.more.iter().flat_map(|more| more.iter()))
+                .position(|kept| kept.same_map(&finder));
+            let finder = match held {
+                Some(source) => {
+                    sources.push(source);
+                    Some(finder)
+                }
+                None => {
+                    let kept = self.more.get_or_insert_default();
+                    kept.push(finder);
+                    sources.push(kept.len());
+                    None
+                }
+            };
+            match at {
+                0 => spare.first = finder,
+                _ => spare.more.push(finder),
+            }
+        }
+        stream.adopt(&mut spare);
+        if sources.iter().enumerate().any(|(at, source)| at != *source) {
+            stream.renumber(&sources);
+        }
         stream
     }
 }
@@ -1832,7 +1976,10 @@ impl<T: Record, C> Matches<T, C> {
     pub fn next_ref(&mut self) -> Option<&T> {
         self.started = true;
         let (key, _) = self.stream.take(End::Front)?;
-        self.rows.lend(&key)
+        match self.more {
+            None => self.rows.lend(&key),
+            Some(_) => self.lend_from(End::Front, &key),
+        }
     }
 
     /// Calls `f` on each matching row left, in key order, lending each as
@@ -1873,6 +2020,23 @@ impl<T: Record, C> Matches<T, C> {
             f(row);
         }
     }
+
+    fn finder(&mut self, end: End) -> &mut Finder<T::Key, T> {
+        match (self.stream.source(end).checked_sub(1), &mut self.more) {
+            (Some(at), Some(more)) => &mut more[at],
+            _ => &mut self.rows,
+        }
+    }
+
+    #[inline(never)]
+    fn get_from(&mut self, end: End, key: &T::Key) -> Option<Val<T>> {
+        self.finder(end).get(key)
+    }
+
+    #[inline(never)]
+    fn lend_from(&mut self, end: End, key: &T::Key) -> Option<&T> {
+        self.finder(end).lend(key)
+    }
 }
 
 impl<T: Record, C> Iterator for Matches<T, C> {
@@ -1881,7 +2045,10 @@ impl<T: Record, C> Iterator for Matches<T, C> {
     fn next(&mut self) -> Option<Val<T>> {
         self.started = true;
         let (key, _) = self.stream.take(End::Front)?;
-        self.rows.get(&key)
+        match self.more {
+            None => self.rows.get(&key),
+            Some(_) => self.get_from(End::Front, &key),
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1893,7 +2060,10 @@ impl<T: Record, C> DoubleEndedIterator for Matches<T, C> {
     fn next_back(&mut self) -> Option<Val<T>> {
         self.started = true;
         let (key, _) = self.stream.take(End::Back)?;
-        self.rows.get(&key)
+        match self.more {
+            None => self.rows.get(&key),
+            Some(_) => self.get_from(End::Back, &key),
+        }
     }
 }
 
@@ -2001,6 +2171,9 @@ trait Stream<K, C>: Send {
     fn take(&mut self, end: End) -> Option<(K, Option<C>)>;
     fn probe(&mut self, end: End, target: &K) -> Probe<'_, K>;
     fn found(&mut self) -> Option<C>;
+    fn source(&self, end: End) -> usize;
+    fn found_source(&self) -> usize;
+    fn renumber(&mut self, sources: &[usize]);
     fn follow(&mut self, _lead: usize) {}
     fn adopt(&mut self, _rows: &mut dyn std::any::Any) {}
     fn rowless(&mut self) {}
@@ -2021,6 +2194,7 @@ struct EqualStream<I, K, S, C> {
     edge: [Bound<K>; 2],
     cursor: Option<Cursor<(I, K), S>>,
     probe: Option<(I, K)>,
+    source: usize,
 }
 
 impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> EqualStream<I, K, S, C> {
@@ -2038,6 +2212,7 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> EqualStream<I, K, S, C> {
             edge: [Bound::Unbounded, Bound::Unbounded],
             cursor: None,
             probe: None,
+            source: 0,
         }
     }
 
@@ -2253,6 +2428,18 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStrea
             .as_ref()?
             .read(|entry, stored| project(&entry.0, stored.clone()))
     }
+
+    fn source(&self, _end: End) -> usize {
+        self.source
+    }
+
+    fn found_source(&self) -> usize {
+        self.source
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        self.source = sources[self.source];
+    }
 }
 
 type Collect<K, C> = Box<dyn FnOnce() -> Vec<(K, Option<C>)> + Send>;
@@ -2261,6 +2448,7 @@ struct Listed<K, C> {
     pending: Option<(usize, Collect<K, C>)>,
     items: VecDeque<(K, Option<C>)>,
     landed: usize,
+    source: usize,
 }
 
 impl<K: Ord, C> Listed<K, C> {
@@ -2269,6 +2457,7 @@ impl<K: Ord, C> Listed<K, C> {
             pending: Some((left, collect)),
             items: VecDeque::new(),
             landed: 0,
+            source: 0,
         }
     }
 
@@ -2277,6 +2466,7 @@ impl<K: Ord, C> Listed<K, C> {
             pending: None,
             items,
             landed: 0,
+            source: 0,
         }
     }
 
@@ -2288,7 +2478,9 @@ impl<K: Ord, C> Listed<K, C> {
 
     fn items(&mut self) -> &mut VecDeque<(K, Option<C>)> {
         if let Some((_, collect)) = self.pending.take() {
+            let source = self.source;
             *self = Listed::sorted(collect());
+            self.source = source;
         }
         &mut self.items
     }
@@ -2383,6 +2575,18 @@ impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
     fn found(&mut self) -> Option<C> {
         self.items.get_mut(self.landed)?.1.take()
     }
+
+    fn source(&self, _end: End) -> usize {
+        self.source
+    }
+
+    fn found_source(&self) -> usize {
+        self.source
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        self.source = sources[self.source];
+    }
 }
 
 struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
@@ -2397,6 +2601,7 @@ struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
     rowless: bool,
     budget: u64,
     spent: u64,
+    source: usize,
 }
 
 impl<T, I, X, C> Ranged<T, I, X, C>
@@ -2529,6 +2734,18 @@ where
         }
     }
 
+    fn source(&self, _end: End) -> usize {
+        self.source
+    }
+
+    fn found_source(&self) -> usize {
+        self.source
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        self.source = sources[self.source];
+    }
+
     fn follow(&mut self, lead: usize) {
         self.lead = Some(lead);
     }
@@ -2538,10 +2755,15 @@ where
     }
 
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
-        if self.rows.is_none()
-            && let Some(rows) = rows.downcast_mut::<Option<Finder<T::Key, T>>>()
-        {
-            self.rows = rows.take();
+        if self.rows.is_some() {
+            return;
+        }
+        if let Some(rows) = rows.downcast_mut::<Option<Finder<T::Key, T>>>() {
+            if self.source == 0 {
+                self.rows = rows.take();
+            }
+        } else if let Some(rows) = rows.downcast_mut::<Finders<T>>() {
+            self.rows = rows.take(self.source);
         }
     }
 }
@@ -2581,6 +2803,18 @@ impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
 
     fn found(&mut self) -> Option<()> {
         Some(())
+    }
+
+    fn source(&self, end: End) -> usize {
+        self.0.source(end)
+    }
+
+    fn found_source(&self) -> usize {
+        self.0.found_source()
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        self.0.renumber(sources);
     }
 
     fn follow(&mut self, lead: usize) {
@@ -2808,6 +3042,21 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
         self.left.found()
     }
 
+    fn source(&self, end: End) -> usize {
+        match self.plan {
+            Some(Plan::Right) => self.left.found_source(),
+            _ => self.left.source(end),
+        }
+    }
+
+    fn found_source(&self) -> usize {
+        self.left.found_source()
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        self.left.renumber(sources);
+    }
+
     fn follow(&mut self, lead: usize) {
         self.left.follow(lead);
         self.right.follow(lead);
@@ -2825,11 +3074,21 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
 
 struct Any<K, C> {
     sides: Vec<Box<dyn Stream<K, C>>>,
+    took: [usize; 2],
     landed: Option<(usize, K)>,
     passed: Option<K>,
 }
 
 impl<K: Data + Ord, C> Any<K, C> {
+    fn new(sides: Vec<Box<dyn Stream<K, C>>>) -> Self {
+        Any {
+            sides,
+            took: [0, 0],
+            landed: None,
+            passed: None,
+        }
+    }
+
     fn best(&self, end: End) -> Option<usize> {
         let mut best: Option<(usize, &K)> = None;
         for (side, stream) in self.sides.iter().enumerate() {
@@ -2882,17 +3141,19 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
     }
 
     fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
-        let key = self.fill(end)?.clone();
-        let mut taken = None;
         for side in &mut self.sides {
-            if side.peek(end) == Some(&key) {
-                let item = side.take(end);
-                if taken.is_none() {
-                    taken = item;
-                }
+            side.fill(end);
+        }
+        let first = self.best(end)?;
+        self.took[end.slot()] = first;
+        let (side, after) = self.sides[first..].split_first_mut()?;
+        let taken = side.take(end)?;
+        for side in after {
+            if side.peek(end) == Some(&taken.0) {
+                side.take(end);
             }
         }
-        taken
+        Some(taken)
     }
 
     fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
@@ -2925,6 +3186,23 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
         self.sides[side].found()
     }
 
+    fn source(&self, end: End) -> usize {
+        self.sides[self.took[end.slot()]].source(end)
+    }
+
+    fn found_source(&self) -> usize {
+        match &self.landed {
+            Some((side, _)) => self.sides[*side].found_source(),
+            None => 0,
+        }
+    }
+
+    fn renumber(&mut self, sources: &[usize]) {
+        for side in &mut self.sides {
+            side.renumber(sources);
+        }
+    }
+
     fn follow(&mut self, lead: usize) {
         for side in &mut self.sides {
             side.follow(lead);
@@ -2932,8 +3210,8 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
     }
 
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
-        if let Some(first) = self.sides.first_mut() {
-            first.adopt(rows);
+        for side in &mut self.sides {
+            side.adopt(rows);
         }
     }
 
@@ -3312,6 +3590,7 @@ where
 {
     Matches {
         rows: rows.finder(),
+        more: None,
         stream: Box::new(EqualStream::new(index.clone(), entries, project)),
         started: false,
     }
