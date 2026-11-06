@@ -23,9 +23,16 @@
 //! equality cases and `and`, `and-back`, `rows`, `collect`, `filter`, `covered` and `seek` for the
 //! range cases, is checked against the merge or the filter and then run over and over for `--ms`
 //! milliseconds (default 40) in each of `--rounds` rounds (default 5). `--cases` picks `equal`,
-//! `range` or both, the default, or `crossover`, which runs groups of 100, 1,000 and 10,000 rows
-//! against score ranges from as many keys to 128 times as many, and `--only` runs just the cases
-//! whose title holds the text it gives. For each case it prints the two sets' sizes and how many
+//! `range` or both, the default, `crossover`, which runs groups of 100, 1,000 and 10,000 rows
+//! against score ranges from as many keys to 128 times as many, or `cold`, and `--only` runs just
+//! the cases whose title holds the text it gives.
+//!
+//! The cold cases build a second file of `--wide-rows` rows (default 60,000) whose 4 KiB notes are
+//! stored apart from their leaves, and combine groups of 10, 100 and 1,000 of them with score
+//! ranges of 2,000 to 60,000, read as keys and as rows, with the range tested or, through
+//! `uncovered()`, collected. Each round of the cold cache opens the file again before every run,
+//! so the rows and the index are read from the file once each; the 1 MiB cache holds the index but
+//! not 1,000 rows' notes, and the warm cache holds everything after a first run. For each case it prints the two sets' sizes and how many
 //! keys they share, then each strategy's median microseconds and user-space instructions per run,
 //! counted through `perf_event_open` on Linux.
 //!
@@ -747,6 +754,196 @@ fn median(mut values: Vec<f64>) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(0.0)
 }
 
+const WIDE_GROUPS: [u64; 3] = [10, 100, 1_000];
+const NOTE_BYTES: usize = 4096;
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Wide {
+    #[key]
+    id: u64,
+    #[index(cover(score))]
+    group: u8,
+    #[index]
+    score: u32,
+    notes: String,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Wides {
+    rows: Table<Wide>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Warmth {
+    Cold,
+    Small,
+    Warm,
+}
+
+impl Warmth {
+    fn name(self) -> &'static str {
+        match self {
+            Warmth::Cold => "cache cold",
+            Warmth::Small => "1 MiB cache",
+            Warmth::Warm => "cache warm",
+        }
+    }
+
+    fn cache(self) -> u64 {
+        match self {
+            Warmth::Small => 1 << 20,
+            Warmth::Cold | Warmth::Warm => 1 << 30,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Cold {
+    Keys,
+    Rows,
+    CollectedKeys,
+    CollectedRows,
+}
+
+impl Cold {
+    fn name(self) -> &'static str {
+        match self {
+            Cold::Keys => "and, keys",
+            Cold::Rows => "and, rows",
+            Cold::CollectedKeys => "collected, keys",
+            Cold::CollectedRows => "collected, rows",
+        }
+    }
+
+    fn run(self, t: &Table<Wide>, group: u8, size: u32, out: &mut Vec<u64>) {
+        let find = t.find();
+        let lead = find.by_group(&group);
+        match self {
+            Cold::Keys => out.extend(lead.and(t.by_score_range(0..size)).keys()),
+            Cold::Rows => out.extend(lead.and(t.by_score_range(0..size)).map(|row| row.id)),
+            Cold::CollectedKeys => {
+                out.extend(lead.and(t.by_score_range(0..size).uncovered()).keys());
+            }
+            Cold::CollectedRows => out.extend(
+                lead.and(t.by_score_range(0..size).uncovered())
+                    .map(|row| row.id),
+            ),
+        }
+    }
+}
+
+fn note(id: u64) -> String {
+    let mut x = mix(id);
+    (0..NOTE_BYTES)
+        .map(|_| {
+            x = mix(x);
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect()
+}
+
+fn cold(parent: &std::path::Path, rows: u64, rounds: usize, budget_ms: f64, only: &str) {
+    let dir = tempfile::tempdir_in(parent).unwrap();
+    let path = dir.path().join("wide.ferro");
+    let open = |cache: u64| {
+        Options::new()
+            .durability(Durability::Buffered)
+            .cache_bytes(cache)
+            .open::<Wides>(&path)
+            .unwrap()
+    };
+    {
+        let db = open(1 << 30);
+        let scores = permutation(rows, 5);
+        let groups = permutation(rows, 6);
+        for chunk in 0..rows.div_ceil(CHUNK / 10) {
+            let ids = chunk * CHUNK / 10..((chunk + 1) * CHUNK / 10).min(rows);
+            db.update(|root| {
+                for id in ids.clone() {
+                    let at = id as usize;
+                    root.rows.insert(Wide {
+                        id,
+                        group: tier(groups[at], &WIDE_GROUPS),
+                        score: scores[at],
+                        notes: note(id),
+                    });
+                }
+            })
+            .unwrap();
+        }
+        db.compact(Keep::Last(1)).unwrap();
+    }
+    let mut cases: Vec<(u8, u32)> = vec![(1, 50_000), (2, 10_000), (2, 50_000)];
+    cases.extend([2_000, 4_000, 8_000, 16_000, 32_000, 60_000].map(|size| (3, size)));
+    let strategies = [
+        Cold::Keys,
+        Cold::CollectedKeys,
+        Cold::Rows,
+        Cold::CollectedRows,
+    ];
+    let counter = Counter::instructions();
+    let mut out = Vec::new();
+    for warmth in [Warmth::Cold, Warmth::Small, Warmth::Warm] {
+        for &(group, size) in &cases {
+            let size = size.min(rows as u32);
+            let lead = WIDE_GROUPS[usize::from(group) - 1];
+            let title = format!(
+                "{lead} keys and a score range of {size} over {rows} wide rows, {}",
+                warmth.name()
+            );
+            if !title.contains(only) {
+                continue;
+            }
+            let mut wanted = Vec::new();
+            {
+                let db = open(1 << 30);
+                Cold::CollectedKeys.run(&db.read().rows, group, size, &mut wanted);
+            }
+            let mut samples = vec![(Vec::new(), Vec::new()); strategies.len()];
+            let mut held = (warmth != Warmth::Cold).then(|| open(warmth.cache()));
+            for _ in 0..rounds {
+                for (slot, strategy) in strategies.iter().enumerate() {
+                    let fresh = (warmth == Warmth::Cold).then(|| open(warmth.cache()));
+                    let db = fresh.as_ref().or(held.as_ref()).unwrap();
+                    let read = db.read();
+                    if warmth != Warmth::Cold {
+                        out.clear();
+                        strategy.run(&read.rows, group, size, &mut out);
+                    }
+                    let began = Instant::now();
+                    let before = counter.read();
+                    let mut runs = 0u64;
+                    loop {
+                        out.clear();
+                        strategy.run(&read.rows, group, size, &mut out);
+                        runs += 1;
+                        let spent = began.elapsed().as_secs_f64() * 1000.0;
+                        if warmth == Warmth::Cold || spent >= budget_ms {
+                            break;
+                        }
+                    }
+                    let instructions = counter.read() - before;
+                    let ns = began.elapsed().as_nanos() as f64 / runs as f64;
+                    assert_eq!(out, wanted, "{} on {title}", strategy.name());
+                    samples[slot].0.push(ns);
+                    samples[slot].1.push(instructions as f64 / runs as f64);
+                }
+            }
+            held.take();
+            println!("{title} ({lead} and {size}, {} shared)", wanted.len());
+            for (slot, strategy) in strategies.iter().enumerate() {
+                let (ns, instructions) = samples[slot].clone();
+                println!(
+                    "  {:<22} {:>11.1} us {:>13.0} instructions",
+                    strategy.name(),
+                    median(ns) / 1000.0,
+                    median(instructions)
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     let rows: u64 = argument("--rows")
         .and_then(|v| v.parse().ok())
@@ -759,6 +956,18 @@ fn main() {
         .unwrap_or(40.0);
     let parent = PathBuf::from(argument("--dir").unwrap_or_else(|| "target/bench".to_string()));
     std::fs::create_dir_all(&parent).unwrap();
+    let kinds = argument("--cases").unwrap_or_else(|| "equal,range".to_string());
+    let kinds: Vec<&str> = kinds.split(',').collect();
+    let only = argument("--only").unwrap_or_default();
+    if kinds.contains(&"cold") {
+        let wide: u64 = argument("--wide-rows")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000);
+        cold(&parent, wide, rounds, budget_ms, &only);
+        if kinds.len() == 1 {
+            return;
+        }
+    }
     let dir = tempfile::tempdir_in(&parent).unwrap();
     let db = Options::new()
         .durability(Durability::Buffered)
@@ -849,9 +1058,6 @@ fn main() {
         .filter_map(|name| joins.iter().find(|(known, _)| known == name))
         .map(|(_, join)| *join)
         .collect();
-    let kinds = argument("--cases").unwrap_or_else(|| "equal,range".to_string());
-    let kinds: Vec<&str> = kinds.split(',').collect();
-    let only = argument("--only").unwrap_or_default();
     let counter = Counter::instructions();
     let mut out = Vec::new();
     let equal = kinds.contains(&"equal");
