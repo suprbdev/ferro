@@ -477,6 +477,16 @@ where
     let db = fast().open::<Map<u32, String, S>>(&path).unwrap();
     commit_batches(&db, model, seed);
     check(&db.read());
+    db.verify_typed().unwrap();
+    let copy = fast()
+        .open::<Map<u32, String, S>>(dir.path().join("d.ferro"))
+        .unwrap();
+    copy.pull(&db, "c", |_, _, _| -> (String, ()) {
+        panic!("no merge expected")
+    })
+    .unwrap();
+    check(&copy.read());
+    drop(copy);
     let version = db.version();
     db.update(|root| *root = churned::<S>(model, seed ^ 99, keys))
         .unwrap();
@@ -569,6 +579,7 @@ fn large_stored_tree_matches_prefix_sums() {
         .read_only(true)
         .open::<Map<u64, i64, Total>>(&path)
         .unwrap();
+    db.verify_typed().unwrap();
     let map = db.read();
     assert_eq!(map.summary(), Some(Total(sums[values.len()])));
     for _ in 0..2_000 {

@@ -15,7 +15,7 @@ use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Store, StoreOptions, Trace};
 use ferro::{
     Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim,
-    Snapshot,
+    Snapshot, Summary,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -2076,6 +2076,500 @@ fn verify_typed_finds_nodes_that_do_not_decode_as_the_type() {
     match words.verify_typed() {
         Err(Error::Corrupt(message)) => assert!(message.contains("decode"), "{message}"),
         other => panic!("typed verify passed a file whose nodes do not decode: {other:?}"),
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Sum(u64);
+
+impl Summary<u64, u64> for Sum {
+    fn of(key: &u64, value: &u64) -> Self {
+        Sum(key.wrapping_mul(3).wrapping_add(*value))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Sum(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, String> for Sum {
+    fn of(key: &u64, value: &String) -> Self {
+        Sum(key.wrapping_mul(3).wrapping_add(value.len() as u64))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Sum(self.0.wrapping_add(other.0))
+    }
+}
+
+type Summed = Map<u64, u64, Sum>;
+type Spilled = Map<u64, String, Sum>;
+
+enum Slot<'a> {
+    Inline(u64),
+    Spill(&'a Object, u64),
+}
+
+fn summed_node(entries: &[(u64, Slot<'_>)], children: &[(usize, u64, u64, &Object)]) -> Object {
+    let mut body = vec![common::level_of(&entries[0].0) as u8];
+    varint(&mut body, entries.len() as u64);
+    for (key, _) in entries {
+        varint(&mut body, *key);
+    }
+    let mut links = Vec::new();
+    for (_, slot) in entries {
+        match slot {
+            Slot::Inline(value) => {
+                body.push(0);
+                varint(&mut body, *value);
+            }
+            Slot::Spill(value, sum) => {
+                body.push(1);
+                varint(&mut body, *sum);
+                links.push(link_to(value));
+            }
+        }
+    }
+    for position in 0..=entries.len() {
+        match children.iter().find(|(at, ..)| *at == position) {
+            Some((_, count, sum, child)) => {
+                varint(&mut body, *count);
+                varint(&mut body, *sum);
+                links.push(link_to(child));
+            }
+            None => body.push(0),
+        }
+    }
+    Object { body, links }
+}
+
+fn summed_root(count: u64, sum: u64, node: &Object) -> Object {
+    let mut body = Vec::new();
+    varint(&mut body, count);
+    varint(&mut body, sum);
+    Object {
+        body,
+        links: vec![link_to(node)],
+    }
+}
+
+fn unmerged<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+fn level_zero_keys(count: usize) -> Vec<u64> {
+    (0..)
+        .filter(|key| common::level_of(key) == 0)
+        .take(count)
+        .collect()
+}
+
+fn assert_forged<T: Data>(db: &Db<T>, result: ferro::Result<Pulled<()>>) {
+    match &result {
+        Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+        other => panic!("accepted a forged summary: {other:?}"),
+    }
+    assert_refused(db, result);
+}
+
+#[test]
+fn a_bundle_whose_summary_is_not_the_fold_of_its_entries_is_rejected() {
+    let key = key_at_level(0);
+    let leaf = summed_node(&[(key, Slot::Inline(7))], &[]);
+    let honest = Sum::of(&key, &7u64).0;
+    let root = summed_root(1, honest, &leaf);
+    let (b, result, _dir) = receive_tree::<Summed>(&[&leaf, &root]);
+    assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+    assert_eq!(b.read().summary(), Some(Sum(honest)));
+    b.verify_typed().unwrap();
+    for forged in [honest + 1, 0, u64::MAX] {
+        let root = summed_root(1, forged, &leaf);
+        let (b, result, _dir) = receive_tree::<Summed>(&[&leaf, &root]);
+        assert_forged(&b, result);
+    }
+
+    let high = key_at_level(1);
+    let low = (0..high).find(|key| common::level_of(key) == 0).unwrap();
+    let below = summed_node(&[(low, Slot::Inline(5))], &[]);
+    let truth = Sum::of(&low, &5u64).0;
+    let entry = Sum::of(&high, &9u64).0;
+    for claimed in [truth, truth + 1, truth.wrapping_sub(1)] {
+        let top = summed_node(&[(high, Slot::Inline(9))], &[(0, 1, claimed, &below)]);
+        let root = summed_root(2, claimed.wrapping_add(entry), &top);
+        let (b, result, _dir) = receive_tree::<Summed>(&[&below, &top, &root]);
+        if claimed != truth {
+            assert_forged(&b, result);
+            continue;
+        }
+        assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+        let read = b.read();
+        assert_eq!(read.summary(), Some(Sum(truth + entry)));
+        assert_eq!(read.range_summary(..high), Some(Sum(truth)));
+        b.verify_typed().unwrap();
+    }
+}
+
+#[test]
+fn a_bundle_whose_spilled_value_carries_another_entrys_summary_is_rejected() {
+    let keys = level_zero_keys(2);
+    let long = "x".repeat(600);
+    let spill = object_of(&long);
+    let of = |key: u64| Sum::of(&key, &long).0;
+    let leaf = |first: u64, second: u64| {
+        summed_node(
+            &[
+                (keys[0], Slot::Spill(&spill, first)),
+                (keys[1], Slot::Spill(&spill, second)),
+            ],
+            &[],
+        )
+    };
+    let honest = leaf(of(keys[0]), of(keys[1]));
+    let root = summed_root(2, of(keys[0]).wrapping_add(of(keys[1])), &honest);
+    let (b, result, _dir) = receive_tree::<Spilled>(&[&spill, &honest, &root]);
+    assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+    assert_eq!(*b.read().get(&keys[1]).unwrap(), long);
+    assert_eq!(b.read().range_summary(keys[1]..), Some(Sum(of(keys[1]))));
+    b.verify_typed().unwrap();
+    for (first, second) in [
+        (of(keys[0]), of(keys[0])),
+        (of(keys[1]), of(keys[1])),
+        (of(keys[1]), of(keys[0])),
+        (of(keys[0]), of(keys[1]) + 1),
+    ] {
+        let forged = leaf(first, second);
+        let root = summed_root(2, first.wrapping_add(second), &forged);
+        let (b, result, _dir) = receive_tree::<Spilled>(&[&spill, &forged, &root]);
+        assert_forged(&b, result);
+    }
+}
+
+#[test]
+fn a_bundle_that_links_one_node_under_two_summaries_is_rejected() {
+    let key = key_at_level(0);
+    let leaf = summed_node(&[(key, Slot::Inline(3))], &[]);
+    let honest = Sum::of(&key, &3u64).0;
+    let pair = |first: u64, second: u64| {
+        let mut body = Vec::new();
+        for sum in [first, second] {
+            varint(&mut body, 1);
+            varint(&mut body, sum);
+        }
+        Object {
+            body,
+            links: vec![link_to(&leaf), link_to(&leaf)],
+        }
+    };
+    let root = pair(honest, honest);
+    let (b, result, _dir) = receive_tree::<(Summed, Summed)>(&[&leaf, &root]);
+    assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+    assert_eq!(b.read().1.summary(), Some(Sum(honest)));
+    b.verify_typed().unwrap();
+    for (first, second) in [(honest, honest + 1), (honest + 1, honest)] {
+        let root = pair(first, second);
+        let (b, result, _dir) = receive_tree::<(Summed, Summed)>(&[&leaf, &root]);
+        assert_forged(&b, result);
+    }
+}
+
+#[test]
+fn a_bundle_that_reuses_held_data_under_a_forged_summary_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let b: Db<Spilled> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let keys = level_zero_keys(2);
+    let long = "y".repeat(600);
+    let of = |key: u64| Sum::of(&key, &long).0;
+    b.update(|root| {
+        root.insert(keys[0], long.clone());
+    })
+    .unwrap();
+    let spill = object_of(&long);
+    let held = summed_node(&[(keys[0], Slot::Spill(&spill, of(keys[0])))], &[]);
+    assert_eq!(b.read().root_hash(), Some(held.hash()));
+    let v1 = b.log().hash_at(&1).unwrap();
+    let base = Ptr {
+        hash: v1,
+        offset: 0,
+    };
+    let tip_of = |root: &Object| {
+        forged_entry(
+            root,
+            Forged {
+                version: 2,
+                time: now_ms(),
+                prev: Some(base),
+                merged: None,
+                graph: None,
+            },
+        )
+    };
+    let before = (b.head_hash(), b.size_on_disk());
+    for forged in [of(keys[0]) + 1, of(keys[1])] {
+        let root = summed_root(1, forged, &held);
+        let tip = tip_of(&root);
+        let bundle = forged_with(
+            &tip,
+            2,
+            &[(v1, 1)],
+            &[0],
+            &[(0, 0)],
+            &[(&root, &[2]), (&tip, &[0, 0])],
+        );
+        match b.receive("evil", &bundle, unmerged) {
+            Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+            other => panic!("accepted a held node under a forged summary: {other:?}"),
+        }
+        assert_eq!((b.head_hash(), b.size_on_disk()), before);
+    }
+    for (claimed, lands) in [(of(keys[0]), false), (of(keys[1]), true)] {
+        let leaf = summed_node(&[(keys[1], Slot::Spill(&spill, claimed))], &[]);
+        let root = summed_root(1, claimed, &leaf);
+        let tip = tip_of(&root);
+        let bundle = forged_with(
+            &tip,
+            2,
+            &[(v1, 1)],
+            &[0],
+            &[(0, 0), (1, 0)],
+            &[(&leaf, &[3]), (&root, &[0]), (&tip, &[0, 0])],
+        );
+        let result = b.receive("evil", &bundle, unmerged);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let read = b.read();
+            assert_eq!(*read.get(&keys[1]).unwrap(), long);
+            assert_eq!(read.summary(), Some(Sum(of(keys[1]))));
+            continue;
+        }
+        match result {
+            Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+            other => panic!("accepted a held value under another entry's summary: {other:?}"),
+        }
+        assert_eq!((b.head_hash(), b.size_on_disk()), before);
+    }
+    b.verify_typed().unwrap();
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct Tally {
+    count: u64,
+    bytes: u64,
+    first: u64,
+    last: u64,
+    weight: f64,
+}
+
+impl Summary<u64, String> for Tally {
+    fn of(key: &u64, value: &String) -> Self {
+        Tally {
+            count: 1,
+            bytes: value.len() as u64,
+            first: *key,
+            last: *key,
+            weight: *key as f64 * 0.1 + value.len() as f64 / 3.0,
+        }
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Tally {
+            count: self.count + other.count,
+            bytes: self.bytes + other.bytes,
+            first: self.first,
+            last: other.last,
+            weight: self.weight + other.weight,
+        }
+    }
+}
+
+type Tallied = Map<u64, String, Tally>;
+
+fn same_tallies(ours: &Tallied, theirs: &Tallied) {
+    assert_eq!(ours.root_hash(), theirs.root_hash());
+    assert_eq!(ours.summary(), theirs.summary());
+    let (mut count, mut bytes) = (0, 0);
+    for (_, value) in ours.iter() {
+        count += 1;
+        bytes += value.len() as u64;
+    }
+    let summary = ours.summary().unwrap();
+    assert_eq!((summary.count, summary.bytes), (count, bytes));
+    for (low, high) in [
+        (0, 9_000),
+        (1_234, 40_000),
+        (30_001, 30_002),
+        (59_000, u64::MAX),
+    ] {
+        assert_eq!(
+            ours.range_summary(low..high),
+            theirs.range_summary(low..high)
+        );
+    }
+}
+
+#[test]
+fn summarized_maps_land_whole_through_clones_and_scattered_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Tallied> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Tallied> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let mut rng = Rng::new(83);
+    let shared = text(1, 900);
+    let value = |rng: &mut Rng, key: u64| match rng.below(10) {
+        0 => shared.clone(),
+        1 => text(key ^ rng.next(), 520 + rng.below(400) as usize),
+        _ => text(key ^ rng.next(), rng.below(60) as usize),
+    };
+    a.update(|root| {
+        for key in 0..20_000u64 {
+            root.insert(key * 3, value(&mut rng, key));
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    same_tallies(&b.read(), &a.read());
+    for _ in 0..4 {
+        a.update(|root| {
+            for _ in 0..300 {
+                let key = rng.below(64_000);
+                match rng.below(4) {
+                    0 => {
+                        root.remove(&key);
+                    }
+                    _ => {
+                        root.insert(key, value(&mut rng, key));
+                    }
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            b.pull(&a, "a", unmerged).unwrap().outcome,
+            Outcome::FastForward
+        );
+        same_tallies(&b.read(), &a.read());
+    }
+    b.verify_typed().unwrap();
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Doubled(u64);
+
+impl Summary<u64, u64> for Doubled {
+    fn of(key: &u64, value: &u64) -> Self {
+        Doubled(Sum::of(key, value).0.wrapping_mul(2))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Doubled(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, String> for Doubled {
+    fn of(key: &u64, value: &String) -> Self {
+        Doubled(Sum::of(key, value).0.wrapping_mul(2))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Doubled(self.0.wrapping_add(other.0))
+    }
+}
+
+fn assert_stale_summary<T: Data>(db: &Db<T>) {
+    db.verify().unwrap();
+    match db.verify_typed() {
+        Err(Error::Corrupt(message)) => assert!(message.contains("summary"), "{message}"),
+        other => panic!("typed verify passed summaries that are not the fold: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_typed_finds_summaries_that_are_not_the_fold_of_their_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("summed.ferro");
+    let summed: Db<Summed> = fast().open(&path).unwrap();
+    summed
+        .update(|root| root.extend((0..2_000u64).map(|key| (key, key * 7))))
+        .unwrap();
+    summed.verify_typed().unwrap();
+    drop(summed);
+    assert_stale_summary(&fast().open::<Map<u64, u64, Doubled>>(&path).unwrap());
+
+    let path = dir.path().join("spilled.ferro");
+    let spilled: Db<Spilled> = fast().open(&path).unwrap();
+    let values: Vec<String> = (0..4u64)
+        .map(|seed| text(seed, 600 + seed as usize))
+        .collect();
+    spilled
+        .update(|root| root.extend((0..400u64).map(|key| (key, values[key as usize % 4].clone()))))
+        .unwrap();
+    spilled.verify_typed().unwrap();
+    drop(spilled);
+    assert_stale_summary(&fast().open::<Map<u64, String, Doubled>>(&path).unwrap());
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Wrapping(u64);
+
+impl Summary<u64, u64> for Wrapping {
+    fn of(_key: &u64, value: &u64) -> Self {
+        Wrapping(*value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Wrapping(self.0.wrapping_add(other.0))
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Strict(u64);
+
+impl Summary<u64, u64> for Strict {
+    fn of(_key: &u64, value: &u64) -> Self {
+        Strict(*value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Strict(
+            self.0
+                .checked_add(other.0)
+                .expect("ferro: test summary overflowed"),
+        )
+    }
+}
+
+#[test]
+fn a_bundle_whose_summary_panics_to_recompute_is_refused() {
+    common::quiet_ferro_panics();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.ferro");
+    let a: Db<Map<u64, u64, Wrapping>> = fast().open(&path).unwrap();
+    a.update(|root| root.extend((0..500u64).map(|key| (key, u64::MAX / 100))))
+        .unwrap();
+    let b: Db<Map<u64, u64, Strict>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    match b.receive("a", &bundle, unmerged) {
+        Err(Error::Bundle(message)) => assert!(message.contains("panicked"), "{message}"),
+        other => panic!("accepted a bundle whose summary overflows: {other:?}"),
+    }
+    assert_eq!(b.branches(), vec!["main".to_string()]);
+    assert_eq!(b.version(), 0);
+    b.update(|root| {
+        root.insert(1, 2);
+    })
+    .unwrap();
+    assert_eq!(b.read().summary(), Some(Strict(2)));
+    drop(a);
+    let reread: Db<Map<u64, u64, Strict>> = fast().open(&path).unwrap();
+    reread.verify().unwrap();
+    match reread.verify_typed() {
+        Err(Error::Corrupt(message)) => assert!(message.contains("panicked"), "{message}"),
+        other => panic!("typed verify passed a summary that overflows: {other:?}"),
     }
 }
 

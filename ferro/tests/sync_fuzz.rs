@@ -138,11 +138,26 @@ fn read_all(world: &World) -> usize {
         seen += 1;
     }
     assert_eq!(world.totals.len(), world.totals.iter().count());
+    let mut folded: Option<Total> = None;
     for (key, value) in world.totals.iter() {
         assert_eq!(*world.totals.get(&key).unwrap(), *value);
+        let entry = Total::of(&key, &value);
+        folded = Some(match folded {
+            Some(total) => total.combine(&entry),
+            None => entry,
+        });
         seen += 1;
     }
-    world.totals.summary();
+    assert_eq!(world.totals.summary(), folded);
+    if let Some((middle, _)) = world.totals.nth(world.totals.len() / 2) {
+        let below = world.totals.range_summary(..middle);
+        let above = world.totals.range_summary(middle..);
+        let joined = match (below, above) {
+            (Some(below), Some(above)) => Some(below.combine(&above)),
+            (below, above) => below.or(above),
+        };
+        assert_eq!(joined, folded);
+    }
     seen + world.note.as_ref().map_or(0, |note| note.1.len())
 }
 
