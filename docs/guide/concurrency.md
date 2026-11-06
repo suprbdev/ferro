@@ -92,7 +92,8 @@ branch that sorts before its own while a cycle or `receive` waits for this closu
 ## Several processes
 
 Other processes can read while one writes: `Options::new().read_only(true)` takes no lock, and
-`refresh` picks up new commits. A second writer gets `Error::Locked` at once, or with
+`refresh` picks up new commits, or a follower does so on its own, as described under [Following
+other processes](#following-other-processes). A second writer gets `Error::Locked` at once, or with
 `Options::lock_wait(duration)` waits up to that long for the first to close, checking every 10 ms.
 
 Several processes can also write, if every one of them opens the file with `shared`:
@@ -106,7 +107,7 @@ branch that holds across processes, so it starts from the newest commit on its b
 again, and closures on different branches run at the same time in different processes as they do in
 one. A process sees the others' commits when it next commits to the file, attaches a branch or calls
 `refresh`, which also fires its watchers. Until then `read` shows what it last saw, as on a
-read-only follower. Under `Durability::Fsync` one fdatasync covers the commits every process has
+read-only handle, unless it follows the file. Under `Durability::Fsync` one fdatasync covers the commits every process has
 queued, as group commit does within a process.
 
 The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
@@ -119,7 +120,7 @@ and 8 made 21,366, against 43,265 and 35,622 for 2 and 8 threads. On branches of
 processes made 92,528 and 4 threads 93,303.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
-commit or `refresh`. A process killed in the middle of a commit holds up the others only until the
+commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of a commit holds up the others only until the
 operating system releases its locks, and nothing it acknowledged is lost. It needs open file
 description locks, so it runs on 64-bit Linux only, and the processes must share one machine and a
 local file system. Elsewhere, Windows included, the open fails with an `Unsupported` I/O error.
@@ -127,6 +128,43 @@ local file system. Elsewhere, Windows included, the open fails with an `Unsuppor
 A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
 new writer can open once the last `Db` handle is gone. How it works is in [Writers in several
 processes](../internals/processes.md).
+
+## Following other processes
+
+A read-only handle or a shared writer opened with `follow` keeps up with the other processes on its
+own, so a process that serves reads or watches another's writes needs no refresh loop:
+
+```rust
+let db = Options::new().read_only(true).follow(true).open::<Jobs>("jobs.ferro")?;
+for jobs in db.watch() {
+    println!("{} jobs waiting", jobs.len());
+}
+```
+
+A thread of its own, `ferro-follow`, waits until the file may have changed, reads the newest
+superblock, and refreshes when that names a commit the handle has not seen, so `read` shows each
+commit soon after the writer acknowledges it and the watchers of every branch it moved fire. It
+follows the file a reclamation cycle renames over the path too. On a shared writer it catches up
+only with what a superblock names, so it never syncs for another process and takes no lock for a
+look that finds nothing. A writer without `shared` is the only writer and starts no thread.
+
+On 64-bit Linux inotify wakes the thread when the file is written or a file is renamed over it. On
+the machine the other figures here come from, shared with other work, a commit from another
+process reached a watcher at a median of 0.17 ms after the writer acknowledged it, and 0.9 ms at
+p99, and an idle follower woke once a second for 3 ms of CPU a minute. Under a writer making
+96,000 commits a second it refreshed once a millisecond, for 3% of a core, or 6% on a shared
+writer, and the writer made as many commits as with no follower. Elsewhere, Windows included, or
+where inotify cannot be had, as once the user's inotify instances run out, it looks every 10 ms
+instead: a commit waited 5 ms at the median, and an idle follower woke 100 times a second for 0.1
+to 0.5% of a core. `Db::following` says which it does. The `shop` example's replicas follow their
+writer this way.
+
+The thread ends when the last `Db` handle on the file is dropped, and keeps neither the file nor a
+lock, as watchers do. A look that fails, as when the file was removed or its superblocks are
+damaged, changes nothing: `read` shows what it showed, watchers go on waiting, and the thread looks
+again at the next change. `Db::following` reports the error until a look succeeds, and `refresh`
+still works, to look at once or to get the error itself. How it works and what it costs is in
+[Followers](../internals/processes.md#followers).
 
 ## How it works
 
@@ -136,4 +174,4 @@ processes](../internals/processes.md).
   [Writes from inside a closure](../internals/reentrancy.md).
 - [Commits of a few rows](../internals/commit-cost.md): where a small commit's CPU time goes.
 - [Writers in several processes](../internals/processes.md): the locks, catching up, superblocks
-  and cycles across processes.
+  and cycles across processes, and [followers](../internals/processes.md#followers).
