@@ -343,14 +343,24 @@ nodes are either in the bundle, staged and not yet in the file, or held. The wal
 without a store, so it decodes a value for `of` only when that records no typed link and needs no
 store. Any other value is visited as before, and the node or spilled value that holds it is marked
 deferred. Once every root has been walked, and so every object the bundle carries has passed its
-structural check, each deferred object is checked again with the receiving store, inside a scope
-where a read of that store that misses its cache finds an object staged in the bundle by its hash.
-What such a read decodes stays out of the cache and the deduplication table, since its links lead
-into the staging, and the scope is the vetting thread's alone. So `of` reads a nested collection as
-a local read would, only after its nodes passed the checks that bound how long a scan can take,
-and a value whose decode needs a store, such as a `Table` whose index the receiver added and
-rebuilds, is accepted as a local read would accept it. `verify_typed` defers the same objects and
-checks them again with the file's store once its walk is done.
+structural check, each deferred object is checked again through a view of the receiving file: a
+read-only store of its own, with its own id and no cache, that shares the open file and reads
+anything staged in the bundle by its hash, through a scope on the vetting thread that only the
+view's id matches. Every node and value read through the view is decoded afresh and belongs to the
+value that read it, staged or not, so nothing it decodes, and no memo or pin a read leaves in one,
+reaches the receiving store's cache or a node its readers share, and the view writes nothing. It
+lets a node claim as many entries as the file and the bundle's bodies could hold together. So `of`
+reads a nested collection as a local read would, only after its nodes passed the checks that bound
+how long a scan can take, and a value whose decode needs a store, such as a `Table` whose index the
+receiver added and rebuilds, is accepted as a local read would accept it. `verify_typed` reads a
+file it owns, so it decodes those values with the file's store as its walk reaches them.
+
+A first version read the deferred objects through the receiving store itself, keeping only what it
+decoded from the staging out of the cache. A staged node still found its way into a held one: when
+the bundle carried a node the receiver also held, `of` reached it through a held parent from the
+cache, and the read pinned the staged child, whose links lead into the staging, into that parent.
+The receiver's own reads below it then followed staging offsets into its file and panicked, after a
+refused bundle as after an accepted one.
 
 An honest bundle always passes. `flush` and the staged writer of a large commit compute each node's
 summary from scratch, from its entries and its children's link summaries, left to right in key
@@ -366,17 +376,30 @@ under two keys has a summary for each, so a later link whose key and summary no 
 object confirmed reads and decodes the value again and computes `S::of` for that key. Nothing
 decoded is kept between links: a decoded value can be many times its encoding, and a value linked
 under many keys would otherwise stay in memory until its last link arrived. Each confirmed key and
-summary is remembered by the hash of its encoding, up to 65,536 of them, so the same pair met again
-is not computed again. Every such recompute counts its value's bytes against a budget of eight
-times the bundle's body bytes plus 256 MiB, past which the bundle is refused, so a value of 1 MiB
-linked under a few hundred keys lands and one linked under thousands does not, where each key costs
-the bundle a slot of some 25 bytes and the receiver a read of the whole value.
+summary is remembered by the hash of its encoding with the object and the types it is checked as,
+up to 65,536 of them, so the same pair met again is not computed again.
+
+Every such recompute counts its value's bytes against an allowance of eight times the bundle's body
+bytes, plus 4 KiB for each link the bundle carries, plus 256 MiB, past which the bundle is refused.
+The reads of the deferred pass count against what is left of it, object by object, so a nested
+collection that `of` reads under many keys is charged each time it is read. A value of up to 4 KiB
+lands under any number of keys, since each key's slot brings the allowance for one more read of it,
+and a value of 1 MiB lands under about 265 keys and no more, where each key costs the bundle a
+slot of some 25 bytes and the receiver a read of the whole value. A nested map of 40,000 entries
+that `of` sums under 1,500 keys of one node is refused about a second in, where reading it each time
+would take several.
 
 Held objects are trusted. The hint path learns the claims of the links in the held parents it reads,
 and a held link that claims what its held parent records needs nothing more. One that claims
 something else recomputes the held node's fold from what the node stores, or loads the held value
-and computes its summary, remembered and charged as above. The held parents on the hint path are
-checked without their own claims, since only the kinds of their links are wanted.
+and computes its summary, remembered and charged as above, except that the first such recompute of
+a held object is not charged, as the first check of a sent one is not. The held parents on the hint
+path are checked without their own claims, since only the kinds of their links are wanted.
+
+`verify_typed` remembers at most 4,096 confirmed pairs, and checks a link whose claim no earlier
+check of its object confirmed when it reaches it, so that it holds no list of such links: the first
+version kept every one with its kind for a pass after the walk, and verifying 2,000,000 keys that
+share one value of 600 bytes took 785 MB at peak where it had taken 118 MB.
 
 `of` and `combine` are the user's code, run on what a peer sent. A panic in either, from an
 overflowing checked sum say, is caught around each node's fold and each value's summary, and
