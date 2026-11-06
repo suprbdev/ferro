@@ -7,7 +7,8 @@
 //! sizes and overlaps. The strategies range from a merge of the two sorted key lists, leapfrog
 //! searches through the `_after` lookups or through cursors, with or without a few steps before
 //! each seek, and a hash set, to the `and` of the table's find view, read forwards, backwards, as
-//! rows, or as keys followed by `get`s.
+//! rows, or as keys followed by `get`s. The `or` of the same two lookups, as keys and as rows, is
+//! checked against a sorted union of their keys instead.
 //!
 //! The range cases combine `find().by_group(&g)`, whose groups hold 10, 100, 1,000 and 10,000 rows
 //! picked at random and cover the other fields, with a range of the plain `score` index, a range
@@ -19,13 +20,13 @@
 //! seeking the range's index at each `(value, key)`.
 //!
 //! Each strategy named in `--strategies`, by default all of `merge`, `after`, `cursor`, `cursor2`,
-//! `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`, `and-back`, `rows` and `gets` for the
-//! equality cases and `and`, `and-back`, `rows`, `collect`, `filter`, `covered` and `seek` for the
-//! range cases, is checked against the merge or the filter and then run over and over for `--ms`
-//! milliseconds (default 40) in each of `--rounds` rounds (default 5). `--cases` picks `equal`,
-//! `range` or both, the default, `crossover`, which runs groups of 100, 1,000 and 10,000 rows
-//! against score ranges from as many keys to 128 times as many, or `cold`, and `--only` runs just
-//! the cases whose title holds the text it gives.
+//! `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`, `and-back`, `rows`, `gets`, `or` and
+//! `or-rows` for the equality cases and `and`, `and-back`, `rows`, `collect`, `filter`, `covered`
+//! and `seek` for the range cases, is checked against the merge, the union or the filter and then
+//! run over and over for `--ms` milliseconds (default 40) in each of `--rounds` rounds (default
+//! 5). `--cases` picks `equal`, `range` or both, the default, `crossover`, which runs groups of
+//! 100, 1,000 and 10,000 rows against score ranges from as many keys to 128 times as many, or
+//! `cold`, and `--only` runs just the cases whose title holds the text it gives.
 //!
 //! The cold cases build a second file of `--wide-rows` rows (default 60,000) whose 4 KiB notes are
 //! stored apart from their leaves, and combine groups of 10, 100 and 1,000 of them with score
@@ -693,6 +694,8 @@ enum Strategy {
     AndBack,
     Rows,
     Gets,
+    Or,
+    OrRows,
 }
 
 impl Strategy {
@@ -708,7 +711,13 @@ impl Strategy {
             Strategy::AndBack => "and, from the back".to_string(),
             Strategy::Rows => "and, rows".to_string(),
             Strategy::Gets => "and, keys then get".to_string(),
+            Strategy::Or => "or".to_string(),
+            Strategy::OrRows => "or, rows".to_string(),
         }
+    }
+
+    fn unites(&self) -> bool {
+        matches!(self, Strategy::Or | Strategy::OrRows)
     }
 
     fn run(&self, t: &Snapshot, value: u32, out: &mut Vec<u64>) {
@@ -738,8 +747,23 @@ impl Strategy {
                     out.extend(t.get(&key).map(|row| row.id));
                 }
             }
+            Strategy::Or => {
+                let find = t.find();
+                out.extend(find.by_xs(&value).or(find.by_ys(&value)).keys());
+            }
+            Strategy::OrRows => {
+                let find = t.find();
+                out.extend(find.by_xs(&value).or(find.by_ys(&value)).map(|row| row.id));
+            }
         }
     }
+}
+
+fn union(t: &Snapshot, value: u32, out: &mut Vec<u64>) {
+    out.extend(t.by_xs(&value).keys());
+    out.extend(t.by_ys(&value).keys());
+    out.sort_unstable();
+    out.dedup();
 }
 
 fn argument(name: &str) -> Option<String> {
@@ -1019,6 +1043,8 @@ fn main() {
         ("and-back", Strategy::AndBack),
         ("rows", Strategy::Rows),
         ("gets", Strategy::Gets),
+        ("or", Strategy::Or),
+        ("or-rows", Strategy::OrRows),
     ];
     let joins = [
         ("and", Joined::And),
@@ -1068,12 +1094,15 @@ fn main() {
         let value = index as u32;
         let mut wanted = Vec::new();
         Strategy::Merge.run(table, value, &mut wanted);
+        let mut either = Vec::new();
+        union(table, value, &mut either);
         let mut samples = vec![(Vec::new(), Vec::new()); strategies.len()];
         for _ in 0..rounds {
             for (slot, strategy) in strategies.iter().enumerate() {
                 out.clear();
                 strategy.run(table, value, &mut out);
-                assert_eq!(out, wanted, "{} on {}", strategy.name(), case.name);
+                let wanted = if strategy.unites() { &either } else { &wanted };
+                assert_eq!(&out, wanted, "{} on {}", strategy.name(), case.name);
                 let began = Instant::now();
                 let mut runs = 0u64;
                 let before = counter.read();
@@ -1090,11 +1119,12 @@ fn main() {
             }
         }
         println!(
-            "{} ({} and {}, {} shared)",
+            "{} ({} and {}, {} shared, {} in either)",
             case.name,
             sizes[index].0,
             sizes[index].1,
-            wanted.len()
+            wanted.len(),
+            either.len()
         );
         for (slot, strategy) in strategies.iter().enumerate() {
             let (ns, instructions) = samples[slot].clone();
