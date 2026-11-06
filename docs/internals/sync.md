@@ -522,5 +522,8 @@ Measured and left out:
   and does not rebuild the others. Reading it rebuilds the index, and if two rows
   share a value of a unique index that read fails, so a peer can still send a table that does not
   read. Checking it at receive would mean reading every row.
-- A summary is checked as an `S`, not recomputed, so a peer can send a subtree whose summary is not
-  the fold of its entries, and `summary` returns what it sent.
+- The receiver recomputes every summary it is sent with its own `of` and `combine`, so peers need
+  the same `Summary`, not only one that encodes the same, and the same arithmetic: a float
+  `combine` that makes a NaN gets different bits on x86 and ARM, so a bundle from the other
+  architecture is refused, as described under [Recomputing
+  summaries](sync-receive.md#recomputing-summaries).

@@ -306,9 +306,8 @@ from 2.35 to 1.59 s and from 436 to 41 MiB of heap, with the other changes descr
 for each object](sync.md#memory-for-each-object).
 
 Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
-Nothing reads them as a type. Summaries are checked as `S` but not recomputed, because a summary is
-the sender's data like any value, and spilled values are not checked for the size that made them
-spill.
+Nothing reads them as a type. Spilled values are not checked for the size that made them spill.
+Summaries are recomputed, as described under [Recomputing summaries](#recomputing-summaries).
 
 `Db::verify_typed` runs the same check over the whole file: the refs, and the roots of every
 retained commit, as `T`, each object checked once per type. It costs a decode of everything
@@ -318,8 +317,99 @@ A fuzz test parses an honest bundle with hints, applies one or two mutations to 
 flipping, setting, cutting or inserting a byte, or dropping, swapping or retargeting a link,
 including to held objects through the hints, and re-hashes up to the head so the hash checks pass.
 Every result must be refused, or read back whole: each map's `len` equal to its iteration, every
-iterated key found by `get`, every table row found through its indexes, and `verify_typed` passing.
+iterated key found by `get`, every table row found through its indexes, the summarized map's
+`summary` and its two halves equal to the fold of its entries, and `verify_typed` passing.
 Before the check, a single flipped byte landed and a read panicked. With it, 131,000 changed bundles
 over random seeds landed and read back whole one time in seven, and were refused otherwise. The
 first version checked levels and order inside a node but not the range a parent gives it, and the
 fuzz test found a flipped key byte that put a key where iteration saw it and `get` did not.
+
+### Recomputing summaries
+
+A map node's summary is stored on the link to it and a spilled value's in its slot, and reads
+trust both: `summary` returns the root link's, and a fold combines the links it covers without
+reading below them. So the check recomputes them. The kind of each link to a node carries the
+summary the link records, its claim. The check of a node of a map with a summary decodes its inline
+values rather than visiting them, takes each spilled value's summary from its slot and each child's
+from the child's link, folds them in key order, each child before the entry after it, and compares
+the encoding of the result with the claim through `Data::same_encoding`, since `S` need not be
+`PartialEq`. Each child's link carries its own claim down to the child's check, and the kind of a
+spilled value carries the key and the summary of its slot, so the check of the value decodes it
+and compares `S::of(key, value)`. From the leaves up, every summary that lands is then the fold of
+the entries below it, and `verify_typed` runs the same check over a file.
+
+An honest bundle always passes. `flush` and the staged writer of a large commit compute each node's
+summary from scratch, from its entries and its children's link summaries, left to right in key
+order, and never by updating an old one, and a spilled value's summary is `S::of` of the key and
+value when it spilled. `of` sees only what the key and value encode, so the recompute starts from
+the inputs the writer had, and the same `combine` in the same grouping gives the same bits, floats
+included. The history tests of `ferro/tests/summary.rs`, `Float` among them, now pull each file
+they build and run `verify_typed` on it.
+
+An object linked more than once is checked once for each key range, as above. A node has one fold,
+so a later link to it that claims a summary no earlier link claimed is refused. A value
+spilled under two keys has a summary for each, so a later link whose key and summary no earlier
+check confirmed decodes the value, once, keeps it with the object's checks until its last link, and
+computes `S::of` for that key; each such decode counts towards the recheck budget. Held objects are
+trusted. The hint path learns the claims of the links in the held parents it reads, and a held link
+that claims what its held parent records needs nothing more. One that claims something else
+recomputes the held node's fold from what the node stores, or loads the held value and computes
+its summary. The held parents on the hint path are checked without their own claims, since only
+the kinds of their links are wanted.
+
+`of` and `combine` are the user's code, run on what a peer sent. A panic in either, from an
+overflowing checked sum say, is caught around each node's fold and each value's summary, and
+refuses the bundle with `Error::Bundle`, or makes `verify_typed` return `Error::Corrupt`, where a
+local read of the same data would panic: `summary` returns the root link's without calling either,
+but `range_summary` combines the links it covers and a commit folds every node it rewrites. The
+panic hook still runs, and with `panic = "abort"` the process aborts, as it would on that read.
+
+A map without a summary skips all of it. Whether `S` has a size is a constant, a node of a
+zero-sized `S` is checked by the code that checked it before, and its links carry no claim. A first
+version folded both kinds of map in one function, with the summary's parts behind that constant,
+and a clone of a plain map ran 0.7% more user instructions for it, though none of the added code
+ran; checking a plain node in a function of its own brought the count back.
+
+Measured on 2026-11-06 with the receiver's file buffered, each bundle received into a fresh copy
+of its file by a process of its own, the builds before and after alternating over 15 rounds, in
+builds of one codegen unit so that a change elsewhere does not move inlining. The clones are of ten
+commits into an empty file, and each edit bundle rewrites 1,008 random keys in one commit against
+a file that holds the clone. Times are medians, and the user-space instructions varied by under
+0.1% between runs of one build:
+
+| Map | Bundle | Time before | Time after | Instructions |
+| --- | --- | --- | --- | --- |
+| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 120.4 ms | 118.5 ms | 1,055.1M to 1,055.4M (+0.03%) |
+| | Edit, 2.8 MB | 16.6 ms | 16.7 ms | 147.5M to 146.4M (-0.7%) |
+| | `verify_typed` | 160.5 ms | 157.5 ms | 1,045.4M to 1,043.7M (-0.2%) |
+| The same with a `u64` sum of value lengths | Clone, 35.7 MB | 119.5 ms | 127.3 ms (+6.6%) | 1,059.1M to 1,139.6M (+7.6%) |
+| | Edit, 2.8 MB | 17.1 ms | 18.9 ms (+10%) | 149.6M to 165.4M (+11%) |
+| | `verify_typed` | 160.4 ms | 168.2 ms (+4.9%) | 1,049.2M to 1,142.9M (+8.9%) |
+| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 11.6 MB | 121.2 ms | 128.7 ms (+6.2%) | 1,381.1M to 1,473.6M (+6.7%) |
+| | Edit, 0.9 MB | 13.4 ms | 14.8 ms (+10%) | 151.0M to 168.6M (+12%) |
+| | `verify_typed` | 175.5 ms | 193.3 ms (+10%) | 1,598.0M to 1,721.0M (+7.7%) |
+| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.2 MB | 132.9 ms | 135.9 ms (+2.2%) | 1,107.8M to 1,136.7M (+2.6%) |
+| | Edit, 1.4 MB | 12.8 ms | 15.2 ms (+19%) | 131.5M to 149.9M (+14%) |
+| | `verify_typed` | 179.9 ms | 185.3 ms (+3.0%) | 1,058.6M to 1,102.5M (+4.2%) |
+
+The plain map's small differences are in the shared walk, which carries the larger `Kind`. Counted
+by part, almost all of a clone's added instructions are in checking the sent nodes, 76M of the 80M
+for the sum of lengths, most of it decoding each inline value where the check used to step over
+it, which `of` needs. An edit adds less there, 6.9M of 15.6M, and more on the hint path, 3.0M,
+where each held parent's links now carry their claims. Over spilled values the hint path adds
+4.8M of the edit's 18.5M, since each held slot's claim is a key and a summary of its own.
+
+Measured and left out:
+
+- Recomputing only the summaries a range query can reach. A fold uses a link whenever its range
+  covers the whole child, and `summary` uses the root's, so every stored summary is reachable and
+  there is nothing to skip.
+- Recomputing on read: landing a received tree unchecked and refolding a subtree the first time a
+  fold uses its link. The first `summary` of a clone would cost a scan of the map where it costs
+  O(1), the first `range_summary` O(n) where it costs O(log n), the reads would need a mark of what
+  was checked on every link, and a forged summary would surface as a panic in a read after the
+  bundle landed, instead of a refused bundle. The receive check already decodes every node it is
+  sent, so recomputing there adds the decode of the values and the fold, not a read.
+- Comparing a hash of each summary's encoding, which would keep a check's state the size of a
+  hash: a 64-bit hash is not proof against a peer that picks the forged summary, and a
+  cryptographic one costs more than encoding the few bytes of a summary twice.

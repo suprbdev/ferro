@@ -65,8 +65,11 @@ it lacks and the objects their trees reach that it does not hold, so it costs wh
 commits on a 9 MB file of 100,000 keys sent 15 KB. The first pull into an empty file carries
 everything. `receive` hashes every object and checks every link as it reads, and checks every object
 it is sent as the type that will read it: each map node, spilled value, nested collection, table
-index and summary decodes, and each node's count, level and key range agree with its parent. It
-costs about half again the time of applying a bundle, and nothing for the objects it already holds.
+index and summary decodes, each node's count, level and key range agree with its parent, and each
+summary is the fold of the entries below it, recomputed with this side's `Summary`. It costs about
+half again the time of applying a bundle, up to a fifth more for a map with a summary, and nothing
+for the objects it already holds. A `Summary` whose `of` or `combine` panics on what a bundle
+carries, such as an overflowing sum, makes `receive` refuse the bundle rather than unwind.
 Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch file beside the
 database, and `receive` holds no writer lock while it reads, so commits on every branch go on
 however slowly the bundle comes. Only once the whole bundle has passed are its objects copied into
