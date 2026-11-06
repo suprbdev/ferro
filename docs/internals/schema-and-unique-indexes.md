@@ -542,12 +542,33 @@ tested range never yields covered fields. A combination that has started and is 
 reads its covered fields with its keys, and a range it was testing is then collected from the
 entries it has left, which testing never stepped past.
 
+A test costs one row read, and what that costs depends on where the row is. With the row cached
+a test costs a few collected entries, but read from the file, with its spilled value, it costs
+dozens. So the store counts, for each thread, the objects it reads from the file to decode, past
+the cache, and the stream reads that count before and after each test. Under `keys()` and
+`covered()`, which yield no rows, every such read counts, since collecting would have read no
+row. When rows are yielded only the reads of keys the range does not hold count, since a row that
+matches is read for the yield anyway, and found in the cache after the test. Once the reads
+counted, weighted at 64 entries each, pass the number of entries the range had when testing began,
+the stream stops testing and collects the entries it has left, which is the rent-or-buy rule: the
+tests can cost about as much as the collection would, and no more, before the collection is paid
+for. Cached rows count nothing, so testing goes on as before.
+
+The test relies on the index agreeing with the rows, as every lookup does: an entry for exactly
+the values the rows hold. The derive refuses an index on a `#[ferro(skip)]` field, which rows read
+back as its default while the index keeps the values written, and on which the tested and the
+collected plans gave different keys. A table whose stored index matches its fingerprint but not
+its rows, such as one received from a peer that wrote it so, would answer by plan as well.
+
 `combine_range.rs` checks random combinations of `find()` lookups with ranges and prefixes of plain,
 each, `Option`, unique, unique `Option`, covering unique and composite indexes, some read partly
 from either end first, against a filter over the rows: as rows, lent rows, keys and covered fields,
 from either end and from both at once, in memory and from an uncached file, after the table
 changed, inside a commit, and with the range taken from another version of the table. It also
-checks every range of a field with 30 values against six leads.
+checks every range of a field with 30 values against six leads, and counts the rows tested through
+an `IndexEach` that counts its calls: in memory each key of the lead is tested once, through
+`uncovered()`, from the lead and within the factor none, and from an uncached file fewer than the
+lead holds, as keys and as rows.
 
 ### What it measured
 
@@ -643,6 +664,38 @@ walking both sides and looking keys up: at 4 it takes 14% and 10% longer than co
 two smaller leads, a microsecond and 8 µs, though it runs 5% and 25% fewer instructions, since its
 row reads miss the cache where the collection streams, and saves 525 µs for the larger.
 
+Those rows were all cached. The cold cases of the benchmark hold 60,000 rows whose 4 KiB notes are
+stored apart from their leaves, so a row read from the file reads its leaf and its note, 2.4
+objects a test on average, about 7.5 µs where collecting read about 105 ns an entry from the file.
+The first build tested whatever the rows cost, and against 1,000 keys a range of 4,000 took 7.6 ms
+as keys, where reading it in full took 0.54 ms. Medians of two runs of each build, alternated, in
+microseconds, keys first and rows after, the first build, the build that counts the reads from the
+file, and the range collected:
+
+| Lead | Range | Cache | Keys | Rows |
+| --- | --- | --- | --- | --- |
+| 10 | 50,000 | cold | 165 → 157 (5,073) | 170 → 161 (5,214) |
+| 100 | 10,000 | cold | 1,025 → 1,526 (1,047) | 1,032 → 1,753 (1,312) |
+| 100 | 50,000 | cold | 1,030 → 1,026 (5,075) | 1,058 → 1,053 (5,967) |
+| 1,000 | 4,000 | cold | 7,567 → 755 (540) | 7,541 → 1,453 (1,262) |
+| 1,000 | 16,000 | cold | 7,470 → 2,553 (1,771) | 7,559 → 4,698 (3,973) |
+| 1,000 | 32,000 | cold | 7,475 → 4,903 (3,380) | 7,633 → 9,042 (7,605) |
+| 1,000 | 60,000 | cold | 7,629 → 9,267 (6,257) | 7,796 → 7,885 (13,866) |
+| 1,000 | 4,000 | 1 MiB | 6,384 → 367 (104) | 6,590 → 773 (155) |
+| 1,000 | 16,000 | 1 MiB | 6,446 → 2,281 (1,148) | 7,834 → 4,039 (2,855) |
+| 1,000 | 60,000 | 1 MiB | 6,403 → 9,581 (6,108) | 8,263 → 8,205 (12,633) |
+| 1,000 | 16,000 | warm | 152 → 153 (327) | 175 → 178 (380) |
+
+With both the rows and the index read from the file, the combination came within 1.5 times the
+better of the two plans as keys and 1.7 times as rows. With the index cached but not the rows'
+notes it took up to 3.5 times as long as collecting in the same runs, where the first build took
+17 times as long. Counting cost 18 instructions a test, 1.2% of a warm one, and the warm figures
+moved within the spread between runs. The reads of a matching row count only under `keys()` and
+`covered()`: counted as rows too, 1,000 keys against the whole table took 14.2 ms as rows where
+testing them all had taken 7.7 ms. Testing a row and then yielding it reads it from the file once:
+with all 1,000 keys tested against the whole table, the first build took 0.17 ms more as rows than
+as keys.
+
 Collected, a range runs the code it did. Read alone through `into_matches().keys()` it ran 0.1 to
 0.6% more instructions, and within the factor of four, where the range is walked beside the lead,
 0.07 to 0.3% more. A first build of the stream asked whether it was collected through a function
@@ -705,6 +758,16 @@ where `visit` lands no longer matters.
 - Testing the equality lookups made on the table, such as `by_x(&value)` passed to `and`. The
   `find()` view's lookup of the same value walks and seeks, and the table's own lookups sit on the
   read paths whose code the cursor change would move.
+- A larger factor for `keys()` and `covered()` in place of counting reads from the file. Rows read
+  from the file cost as much as rows yielded: as rows, 1,000 keys against a range of 4,000 took
+  7.5 ms tested and 1.3 ms collected. A factor of 64 would also give up the cached cases in
+  between, where 1,000 keys against 32,000 took 92 µs tested and 769 collected.
+- Predicting what the tests will cost from the lead's length and the reads of the first few. A
+  view lookup knows its length, but an `and` or `or` only bounds it, and a loose bound would have
+  the range read in full where testing its few keys cost little. Counting what was spent bounds the
+  loss whatever the lead holds.
+- Weighting a read from the file at 32 entries rather than 64. It stopped testing later, and the
+  cold cases that stop took 28 to 36% longer as keys.
 
 ### What is left
 
@@ -717,9 +780,11 @@ where `visit` lands no longer matters.
   gives its one key.
 - The factor of four suits leads of up to a few thousand keys. Against larger ones testing would
   win from about twice the lead's keys, but the plan within the factor walks both sides.
-- A tested key costs a row read, so `keys()` and `covered()` read rows they did not before, and
-  with rows that do not fit in the cache each one may read the file where the range's entries were
-  cached.
+- A tested key costs a row read, so `keys()` and `covered()` read rows they did not before. Rows
+  read from the file stop the testing once they cost about what collecting would, but a range
+  whose entries are cached while its rows are not still takes up to 3.5 times as long as
+  collecting it, since a read from the file is weighed at 64 entries, where it costs about 130
+  cached ones and 30 read from the file.
 - `Matches` knows only an upper bound on its length, through `size_hint`.
 - Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
   against 0.5 for the merge.

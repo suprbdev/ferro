@@ -172,11 +172,14 @@ let this_month: Vec<_> = find
 
 On 200,000 rows, measured on 2026-11-06, 10 keys against a range of 100,000 took 1.5 µs where
 reading and sorting the range took 2.4 ms, and 1,000 keys took 106 µs against 2.5 ms. Each key
-tested costs a row read, about 100 ns with the rows cached, and `.keys()` and `.covered()` read
-those rows too. When the range has less than four times the keys of the other side, leads the
-combination through `into_matches()`, or gives the combination its covered fields, its keys are
-read in full and sorted first, at 18 to 30 ns a key. A combination reads the indexes and rows as
-they were when you built it, like any lookup. [Combining
+tested costs a row read, about 100 ns with the rows cached, so `.keys()` and `.covered()` read
+those rows too, though they yield none. A row read from the file costs dozens of times as much,
+so once such reads come to about what reading the range would cost, the combination reads the
+range's keys for the rest instead. When the range has less than four times the keys of the other
+side, leads the combination through `into_matches()`, or gives the combination its covered fields,
+its keys are read in full and sorted first, at 18 to 30 ns a key. Pass the range through
+`.uncovered()` to have it read that way from the start, reading no rows for it. A combination
+reads the indexes and rows as they were when you built it, like any lookup. [Combining
 lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
 
 ## Reading rows in place
