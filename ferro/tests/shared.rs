@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Waker};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::fast;
 use ferro::db::Hook;
@@ -1041,4 +1041,155 @@ fn near_copy_left_by_a_dead_writer(marker: bool) {
     let reopened = fast().open::<Padded>(&torn).unwrap();
     assert_eq!(reopened.read().n, 3);
     reopened.verify().unwrap();
+}
+
+type Held = (Hook, Arc<AtomicBool>, mpsc::Receiver<()>, mpsc::Sender<()>);
+
+fn held_at_leading() -> Held {
+    let armed = Arc::new(AtomicBool::new(false));
+    let (reached, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (reached, released) = (
+        parking_lot::Mutex::new(reached),
+        parking_lot::Mutex::new(released),
+    );
+    let arm = armed.clone();
+    let hook = Hook(Arc::new(move |step| {
+        if step == "leading" && arm.swap(false, Ordering::AcqRel) {
+            let _ = reached.lock().send(());
+            let _ = released.lock().recv();
+        }
+    }));
+    (hook, armed, waiting, release)
+}
+
+#[test]
+fn a_following_shared_writer_sees_another_handles_commits_and_cycles_without_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("follow.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let a: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+    let b: Db<Root> = shared().reclaim(manual).follow(true).open(&path).unwrap();
+    let watcher = b.watch();
+    for i in 1..=30 {
+        bump(&a, 0, i);
+        if i % 10 == 0 {
+            a.compact(Keep::Last(5)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while b.read().n < i {
+            let _ = watcher.recv_timeout(Duration::from_millis(20));
+            assert!(Instant::now() < deadline, "b stopped at {}", b.read().n);
+        }
+    }
+    let following = b.following().unwrap();
+    assert!(
+        following.notified && following.refreshes > 0,
+        "{following:?}"
+    );
+    assert_eq!(following.last_error, None);
+    assert_eq!(b.size_on_disk(), a.size_on_disk(), "b writes the new file");
+    bump(&b, 1, 1);
+    a.refresh().unwrap();
+    assert_eq!(a.read().n, 31);
+}
+
+#[test]
+fn a_following_shared_writer_never_takes_a_frame_past_the_newest_superblock() {
+    for poll in [None, Some(Duration::from_millis(2))] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bound.ferro");
+        let (first, first_armed, first_reached, first_release) = held_at_leading();
+        let (second, second_armed, second_reached, second_release) = held_at_leading();
+        let a: Db<Root> = shared().hook(first).open(&path).unwrap();
+        let c: Db<Root> = shared().hook(second).open(&path).unwrap();
+        let follows = shared().follow(true);
+        let follows = match poll {
+            Some(every) => follows.follow_polling(every),
+            None => follows,
+        };
+        let b: Db<Root> = follows.open(&path).unwrap();
+        let watcher = b.watch();
+        bump(&a, 0, 1);
+        assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 1);
+        first_armed.store(true, Ordering::Release);
+        let held = {
+            let a = a.clone();
+            thread::spawn(move || bump(&a, 0, 2))
+        };
+        first_reached.recv().unwrap();
+        second_armed.store(true, Ordering::Release);
+        let later = {
+            let c = c.clone();
+            thread::spawn(move || bump(&c, 2, 1))
+        };
+        second_reached.recv().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            watcher.try_recv().is_err(),
+            "b took a frame no superblock names"
+        );
+        first_release.send(()).unwrap();
+        assert_eq!(held.join().unwrap(), 2);
+        assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 2);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            b.read().n,
+            2,
+            "b synced and published another handle's frame"
+        );
+        assert!(watcher.try_recv().is_err());
+        second_release.send(()).unwrap();
+        assert_eq!(later.join().unwrap(), 3);
+        assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 3);
+        assert_eq!(b.following().unwrap().last_error, None);
+    }
+}
+
+#[test]
+fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("named.ferro");
+    let a: Db<Root> = shared().open(&path).unwrap();
+    let (hook, armed, reached, release) = held_at_leading();
+    armed.store(true, Ordering::Release);
+    let b: Db<Root> = shared().hook(hook).follow(true).open(&path).unwrap();
+    let watcher = b.watch();
+    bump(&a, 0, 1);
+    reached.recv().unwrap();
+    let mut ends = vec![a.size_on_disk()];
+    for i in 2..=5 {
+        bump(&a, 0, i);
+        ends.push(a.size_on_disk());
+    }
+    let middle = (ends[1] + ends[2]) / 2;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut byte = [0u8];
+    file.read_exact_at(&mut byte, middle).unwrap();
+    file.write_all_at(&[byte[0] ^ 0x10], middle).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = b.following().unwrap().last_error {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "the follower reported nothing");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        error.contains("frame 3") && error.contains("does not check"),
+        "{error}"
+    );
+    assert_eq!(b.read().n, 1);
+    assert!(watcher.try_recv().is_err());
+    file.write_all_at(&byte, middle).unwrap();
+    assert_eq!(watcher.recv_timeout(Duration::from_secs(10)).unwrap().n, 5);
+    assert_eq!(b.following().unwrap().last_error, None);
 }

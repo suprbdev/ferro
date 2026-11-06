@@ -73,6 +73,10 @@ fn shared_child() {
         follow(&path, count);
         return;
     }
+    if role == "follower" {
+        follow_on_its_own(Path::new(&path), count);
+        return;
+    }
     if role == "relative" {
         relative(Path::new(&path));
         return;
@@ -128,6 +132,25 @@ fn follow(path: &str, until: u64) {
         assert!(Instant::now() < deadline, "the reader stopped at {seen}");
     }
     println!("FOLLOWED {seen} {refreshes}");
+}
+
+fn follow_on_its_own(path: &Path, until: u64) {
+    let db: Db<Root> = options().follow(true).open(path).unwrap();
+    let watcher = db.watch();
+    println!("READY");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = db.read().n;
+    while seen < until {
+        if let Ok(root) = watcher.recv_timeout(Duration::from_millis(100)) {
+            assert!(root.n >= seen, "went back from {seen} to {}", root.n);
+            assert_eq!(root.order.len() as u64, root.n);
+            seen = root.n;
+        }
+        assert!(Instant::now() < deadline, "the follower stopped at {seen}");
+    }
+    let following = db.following().unwrap();
+    assert_eq!(following.last_error, None);
+    println!("FOLLOWED {seen} {}", following.refreshes);
 }
 
 fn relative(dir: &Path) {
@@ -613,6 +636,41 @@ fn awaited_writes_waiting_on_another_process_share_one_waiting_thread() {
         counts[0],
         counts[1]
     );
+}
+
+#[test]
+fn a_following_shared_writer_in_another_process_sees_commits_and_cycles_without_refresh() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("follower.ferro");
+    let writer: Db<Root> = options().open(&path).unwrap();
+    let mut follower = spawn(&path, "follower", 0, 0, 60, &[]);
+    let stdout = follower.child.stdout.take().unwrap();
+    let (lines, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let wait_for = |prefix: &str| loop {
+        let line = read
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("the follower never printed {prefix}"));
+        if let Some((_, rest)) = line.split_once(prefix) {
+            return rest.to_string();
+        }
+    };
+    wait_for("READY");
+    for i in 1..=60 {
+        commit(&writer, 0, i);
+        if i % 20 == 0 {
+            writer.compact(Keep::Last(10)).unwrap();
+        }
+    }
+    let followed = wait_for("FOLLOWED ");
+    assert!(followed.starts_with("60 "), "{followed}");
+    assert!(follower.child.wait().unwrap().success());
 }
 
 #[test]
