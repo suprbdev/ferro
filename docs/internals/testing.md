@@ -260,6 +260,15 @@ entries reaching 36,800 to 37,100 edges, and ran 4,536 to 5,743 executions, 7 to
 together, ending at 37,100 to 37,400 edges with 1,222 to 1,306 entries. No input crashed, hung,
 leaked or passed a memory limit, and the peak RSS was 983 MB.
 
+The round after the receive made one view for its hint path and its deferred pass, read each held
+record once for free, kept a memo of entry summaries for bundles of several commits and lent the
+staging to every thread, as described under [Recomputing
+summaries](sync-receive.md#recomputing-summaries), ran `sync` the same way for 10 minutes from the
+same quarters. Each loaded its 962 inputs to 654 to 669 entries reaching 37,000 to 37,300 edges, and
+ran 4,550 to 4,882 executions, 7 or 8 a second, 19,072 together, ending at 37,300 to 37,700 edges
+with 1,178 to 1,220 entries, 2,314 more together. No input crashed, hung, leaked or passed a memory
+limit, and the peak RSS was 982 MB.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
