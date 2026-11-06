@@ -32,13 +32,16 @@ Open scans the frames past the newest superblock, where the commits of the last 
 acknowledged under `Durability::Fsync` before the superblock naming them reaches the disk. A frame
 there that a torn write left part-written is truncated, losing only commits that were never
 acknowledged, or under `Durability::Buffered` commits past the last checkpoint. A frame that reached
-the disk whole and has one flipped bit in it, or one in each 4 KiB block of its records, fails the
-open with `Error::Corrupt` naming its offset, and the file is left as it was, in either durability:
-a power cut never leaves such a frame. Truncating the file at that offset gives up that commit and
-the ones after it. Heavier damage there cannot be told from a torn write and is truncated. The tests
-flip bits in frames past the superblock of the crash images above, Fsync frames of acknowledged
-commits among them, and check that every torn image still opens. Bit rot further back is reported
-by the hash checks, not truncated. [Torn and damaged
+the disk whole and has one flipped bit in it, or one in each of up to 8 of its 4 KiB blocks of
+records, fails the open with `Error::Corrupt` naming its offset, and the file is left as it was, in
+either durability: a power cut never leaves such a frame. Truncating the file at that offset gives
+up that commit and the ones after it. Heavier damage there cannot be told from a torn write and is
+truncated, and so is a flipped bit with only zeroes or only ones between it and an end of its
+512-byte sector, since a sector a write did not reach can hold just that whatever the frame held.
+The tests flip bits in frames past the superblock of the crash images above, Fsync frames of
+acknowledged commits among them, and check that every torn image still opens, frames of sparse
+values stored raw and of a pull that spilled among them. Bit rot further back is reported by the
+hash checks, not truncated. [Torn and damaged
 frames](../internals/storage.md#torn-and-damaged-frames) describes the rule and its limits.
 
 On Windows every sync is a `FlushFileBuffers`, and the file must be on NTFS, as described in
