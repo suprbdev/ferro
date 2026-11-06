@@ -3207,7 +3207,8 @@ impl Dedupe {
 /// started it, and skips an object it already holds or that the store's deduplication table finds
 /// below that start. Its records wait in memory, or for a large commit are written past the end
 /// of the log as they go. [`Txn::commit`] places the frame, writes it and syncs it. A transaction
-/// dropped before its frame is placed truncates what it wrote past the log.
+/// dropped before its frame is placed truncates what it wrote past the log and syncs the file, so
+/// that a power cut cannot bring those records back under the next frame written there.
 pub struct Txn {
     store: Store,
     /// Where the frame begins.
@@ -3372,6 +3373,8 @@ impl Drop for Txn {
         cursor.reserved = cursor.reserved.min(self.origin);
         if inner.file.set_len(self.origin).is_err() {
             self.store.poison();
+        } else if inner.file.sync_all().is_err() {
+            self.store.poison_unsynced();
         }
     }
 }
@@ -4600,5 +4603,36 @@ mod tests {
                 other => panic!("{blocks} blocks flipped: {:?}", other.map(|tip| tip.seq)),
             }
         }
+    }
+
+    #[test]
+    fn a_draft_dropped_after_it_spilled_truncates_and_syncs_what_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dropped.ferro");
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let options = StoreOptions {
+            trace: Some(trace.clone()),
+            ..StoreOptions::default()
+        };
+        let (store, _) = Store::open(&path, options).unwrap();
+        let mut txn = store.begin().unwrap();
+        let object = Object {
+            body: noise(9, 5000),
+            links: Vec::new(),
+        };
+        txn.put_ref(&object, object.hash()).unwrap();
+        txn.spill().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > LOG_START);
+        drop(txn);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), LOG_START);
+        let ops = trace.lock().clone();
+        let cut = ops
+            .iter()
+            .position(|op| matches!(op, Op::SetLen(_, len) if *len == LOG_START))
+            .expect("the spilled records are truncated");
+        assert!(
+            matches!(ops.get(cut + 1), Some(Op::Sync(_))),
+            "the truncation is synced"
+        );
     }
 }
