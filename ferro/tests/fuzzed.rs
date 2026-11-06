@@ -515,7 +515,7 @@ fn compacting_a_tree_that_links_a_pruned_log_entry_fails() {
         let outcome = db.compact(Keep::Last(1));
         assert!(
             matches!(&outcome, Err(Error::Corrupt(message))
-                if message == "link to the pruned log entry at 16122"),
+                if message == "link to the pruned log entry at 16130"),
             "{threads} threads: {outcome:?}"
         );
         db.verify().unwrap();

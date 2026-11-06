@@ -39,6 +39,38 @@ impl Rng {
     }
 }
 
+pub const FRAME_CHECKED: usize = 52;
+pub const FRAME_BYTES: usize = FRAME_CHECKED + 16;
+pub const BLOCK: usize = 4096;
+
+pub fn table_bytes(frame: usize) -> usize {
+    8 * (frame - FRAME_BYTES).div_ceil(BLOCK + 8)
+}
+
+pub fn frame_table(records: &[u8]) -> Vec<u8> {
+    let mut table = Vec::new();
+    for block in records.chunks(BLOCK) {
+        table.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(block).to_le_bytes());
+    }
+    table
+}
+
+pub fn frame_check(header: &[u8], table: &[u8]) -> [u8; 16] {
+    let mut check = xxhash_rust::xxh3::Xxh3::new();
+    check.update(&header[..FRAME_CHECKED]);
+    check.update(table);
+    check.digest128().to_le_bytes()
+}
+
+pub fn seal_frame(image: &mut [u8], start: usize, end: usize) {
+    let body = start + FRAME_BYTES;
+    let records = end - body - table_bytes(end - start);
+    let table = frame_table(&image[body..body + records]);
+    image[body + records..end].copy_from_slice(&table);
+    let check = frame_check(&image[start..], &table);
+    image[start + FRAME_CHECKED..start + FRAME_BYTES].copy_from_slice(&check);
+}
+
 pub fn text(seed: u64, len: usize) -> String {
     let mut rng = Rng::new(seed.wrapping_add(1));
     (0..len)

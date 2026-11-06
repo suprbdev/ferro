@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{Outcome, Rng, cases, fast, guarded, quiet_ferro_panics, text, uncached};
+use common::{
+    Outcome, Rng, cases, fast, guarded, quiet_ferro_panics, seal_frame, table_bytes, text, uncached,
+};
 use ferro::codec::{HASH_BYTES, Object, Sink};
 use ferro::store::{Store, StoreOptions, record_len};
 use ferro::{Db, Error, Map, Ptr};
@@ -16,8 +18,6 @@ type Model = BTreeMap<u64, String>;
 const LOG_START: usize = 8192;
 const SLOT: usize = 4096;
 const SUPER: usize = 144;
-const FRAME_CHECKED: usize = 32 + HASH_BYTES;
-const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 
 struct Built {
     dir: TempDir,
@@ -412,11 +412,15 @@ fn recovery_refuses_a_checksummed_frame_with_the_wrong_sequence() {
     let mut image = built.image(commit, end);
     let forged = commit as u64 + 2;
     image[start + 8..start + 16].copy_from_slice(&forged.to_le_bytes());
-    let mut check = xxhash_rust::xxh3::Xxh3::new();
-    check.update(&image[start..start + FRAME_CHECKED]);
-    check.update(&image[start + FRAME_BYTES..end]);
-    image[start + FRAME_CHECKED..start + FRAME_BYTES]
-        .copy_from_slice(&check.digest128().to_le_bytes());
+    seal_frame(&mut image, start, end);
+    let mut unforged = image.clone();
+    unforged[start + 8..start + 16].copy_from_slice(&(commit as u64 + 1).to_le_bytes());
+    seal_frame(&mut unforged, start, end);
+    assert_eq!(
+        unforged,
+        built.image(commit, end),
+        "seal rebuilt another frame"
+    );
     fs::write(&path, &image).unwrap();
     let db = fast().open::<Root>(&path).unwrap();
     check_at_version(&db, &built, commit);
@@ -836,7 +840,7 @@ fn failed_open_of_a_damaged_head_releases_the_lock() {
     let path = built.target();
     let last = built.lens.len() - 1;
     let mut image = built.bytes.clone();
-    let tail = built.lens[last] - 1;
+    let tail = built.lens[last] - 1 - table_bytes(built.lens[last] - built.lens[last - 1]);
     image[tail] ^= 0xFF;
     fs::write(&path, &image).unwrap();
     for _ in 0..3 {

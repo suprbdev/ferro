@@ -4,17 +4,17 @@
 //! `map`, `booking` or `all` (the default). Every commit is `Durability::Buffered` but the
 //! `--fsync` ones. `map` loads `--n` scrambled keys (default 1,000,000) into a `Map<u64, String>`
 //! and makes `--commits` single-key inserts (default 1,000). It reads each commit's frame back
-//! from the file, splits its bytes into header, tree, root, log entry and refs, and walks each new
-//! root against the one before to size the record a delta commit would write. It goes on to time
-//! the commit outside the closure against `hash_of` of the dirty root inside it, to size a
-//! checkpoint of 1 to 65,536 inserts, to time commits to a 16-key map, and to time `--fsync`
-//! commits with `Durability::Fsync` (default 300, 0 to skip) to the large map and the small one
-//! in turn. `booking` splits and walks the frames of `--pairs` (default 2,000) of the `booking`
-//! example's hold and confirm pairs, with a cancel on every fourth, after `--warm` warm-up pairs
-//! (default 4,000). It then times their commits against `hash_of` the same way, and a commit that
-//! changes one root field alone, and sizes checkpoints of 1 to 4,096 writes. It prints bytes per
-//! commit by part, and medians of wall and thread CPU microseconds with mean user-space
-//! instructions, counted through `perf_event_open` on Linux.
+//! from the file, splits its bytes into header and table, tree, root, log entry and refs, and
+//! walks each new root against the one before to size the record a delta commit would write. It
+//! goes on to time the commit outside the closure against `hash_of` of the dirty root inside it,
+//! to size a checkpoint of 1 to 65,536 inserts, to time commits to a 16-key map, and to time
+//! `--fsync` commits with `Durability::Fsync` (default 300, 0 to skip) to the large map and the
+//! small one in turn. `booking` splits and walks the frames of `--pairs` (default 2,000) of the
+//! `booking` example's hold and confirm pairs, with a cancel on every fourth, after `--warm`
+//! warm-up pairs (default 4,000). It then times their commits against `hash_of` the same way, and
+//! a commit that changes one root field alone, and sizes checkpoints of 1 to 4,096 writes. It
+//! prints bytes per commit by part, and medians of wall and thread CPU microseconds with mean
+//! user-space instructions, counted through `perf_event_open` on Linux.
 //!
 //! ```sh
 //! cargo run --release -p ferro-bench --bin delta -- --workload map --n 1000000 --commits 1000
@@ -36,6 +36,8 @@ use ferro::store::{Store, StoreOptions};
 use ferro::{Db, Durability, Map, Options, Ptr, hash_of};
 
 const FRAME_BYTES: usize = 68;
+const BLOCK_BYTES: usize = 4096;
+const BLOCK_CHECK: usize = 8;
 
 #[cfg(target_os = "linux")]
 struct Counter(Option<i32>);
@@ -202,10 +204,14 @@ struct Record {
     links: Vec<Ptr>,
 }
 
+fn table_bytes(frame: usize) -> usize {
+    BLOCK_CHECK * (frame - FRAME_BYTES).div_ceil(BLOCK_BYTES + BLOCK_CHECK)
+}
+
 fn records(frame: &[u8], start: u64) -> Vec<Record> {
     let mut pos = FRAME_BYTES;
     let mut out = Vec::new();
-    while pos < frame.len() {
+    while pos < frame.len() - table_bytes(frame.len()) {
         let at = pos;
         let offset = start + at as u64;
         let stored = varint(frame, &mut pos) as usize;
@@ -316,7 +322,7 @@ fn frame_of(mut file: &File, start: u64, end: u64) -> Framed {
         root,
         parts: Parts {
             commits: 1,
-            header: FRAME_BYTES as u64,
+            header: (FRAME_BYTES + table_bytes(frame.len())) as u64,
             tree,
             root: recs[n - 4].len as u64,
             entry: entry.len as u64,

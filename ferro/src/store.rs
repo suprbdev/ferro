@@ -3,12 +3,12 @@
 //!
 //! The file holds two superblock slots of 4 KiB and then the log, a run of frames, one per commit.
 //! A frame is a 68-byte header, naming the frame's sequence number, the end of the log after it
-//! and its head, followed by the records the commit wrote, and the header's xxh3 check covers them
-//! all, so a frame proves by itself that it reached the disk whole. A record holds one
-//! content-addressed [`Object`], which a [`Ptr`] finds by its hash and offset, and every read
-//! checks the hash. A superblock names the newest frame and an anchor, the newest frame known to be
-//! durable, and an open scans forward from the anchor and keeps only frames that follow each other,
-//! so a torn tail is cut away.
+//! and its head, then the records the commit wrote, then a table of the xxh3-64 of each 4 KiB block
+//! of them. The header's xxh3 check covers the header and the table, so a frame proves by itself
+//! that it reached the disk whole. A record holds one content-addressed [`Object`], which a [`Ptr`]
+//! finds by its hash and offset, and every read checks the hash. A superblock names the newest
+//! frame and an anchor, the newest frame known to be durable, and an open scans forward from the
+//! anchor and keeps only frames that follow each other, so a torn tail is cut away.
 //!
 //! A [`Txn`] gathers a commit's records, skipping an object the store has already written, or read
 //! if it is as large as a spilled value, and the commit places its frame at the end of the log,
@@ -56,8 +56,8 @@ use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
 use crate::shared::{Erased, Shared, Weak};
 
-/// The magic at the start of a superblock.
-const MAGIC: &[u8; 8] = b"FERRODB3";
+/// The magic at the start of a superblock, which names the format of the file.
+const MAGIC: &[u8; 8] = b"FERRODB4";
 /// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 /// The magic of the marker a reclamation cycle writes at the end of a log it is replacing.
@@ -82,6 +82,10 @@ const SUPER_BYTES: usize = SUPER_CHECKED + 32;
 const SURVIVAL_ONE: f64 = (1u64 << 32) as f64;
 /// The size of a frame's header, its xxh3-128 check included.
 const FRAME_BYTES: usize = FRAME_CHECKED + 16;
+/// How many bytes of a frame's records each entry of its table covers.
+const BLOCK_BYTES: usize = 4096;
+/// The size of an entry of a frame's table, the xxh3-64 of one block of its records.
+const BLOCK_CHECK: usize = 8;
 /// How much of a frame a check reads at a time, and the size of a record past which a read checks
 /// the file's length before it allocates.
 const SCAN_CHUNK: usize = 1 << 20;
@@ -533,54 +537,163 @@ fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
     Ok(best)
 }
 
+/// The size of the table of a frame that holds `records` bytes of records: one entry for each
+/// block of them, the last block shorter.
+fn table_len(records: u64) -> u64 {
+    records.div_ceil(BLOCK_BYTES as u64) * BLOCK_CHECK as u64
+}
+
+/// How many bytes of records a frame holds whose records and table together are `body` bytes
+/// long, or `None` if no frame's are.
+fn records_in(body: u64) -> Option<u64> {
+    let blocks = body.div_ceil((BLOCK_BYTES + BLOCK_CHECK) as u64);
+    let records = body.checked_sub(blocks * BLOCK_CHECK as u64)?;
+    (table_len(records) == body - records).then_some(records)
+}
+
+/// Appends to `buf` the table of the records in `buf` from `from` on.
+fn append_table(buf: &mut Vec<u8>, from: usize) {
+    let end = buf.len();
+    buf.reserve(table_len((end - from) as u64) as usize);
+    let mut at = from;
+    while at < end {
+        let next = (at + BLOCK_BYTES).min(end);
+        let check = xxh3_64(&buf[at..next]);
+        buf.extend_from_slice(&check.to_le_bytes());
+        at = next;
+    }
+}
+
+/// The table of records fed to it in pieces of any size, as a frame that spilled reads its
+/// records back.
+struct Blocks {
+    hasher: Xxh3,
+    filled: usize,
+    table: Vec<u8>,
+}
+
+impl Blocks {
+    /// An empty table.
+    fn new() -> Blocks {
+        Blocks {
+            hasher: Xxh3::new(),
+            filled: 0,
+            table: Vec::new(),
+        }
+    }
+
+    /// Feeds the next `bytes` of records.
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let take = (BLOCK_BYTES - self.filled).min(bytes.len());
+            self.hasher.update(&bytes[..take]);
+            self.filled += take;
+            bytes = &bytes[take..];
+            if self.filled == BLOCK_BYTES {
+                self.close();
+            }
+        }
+    }
+
+    /// Ends the block being fed with an entry for it.
+    fn close(&mut self) {
+        self.table
+            .extend_from_slice(&self.hasher.digest().to_le_bytes());
+        self.hasher.reset();
+        self.filled = 0;
+    }
+
+    /// The table, with an entry for the last block if it is short.
+    fn finish(mut self) -> Vec<u8> {
+        if self.filled > 0 {
+            self.close();
+        }
+        self.table
+    }
+}
+
+/// The check of a frame whose header is `header` and whose table is `table`: the xxh3-128 of the
+/// header's magic and mark and of the table, which holds a check of every block of records.
+fn frame_check(header: &[u8], table: &[u8]) -> [u8; 16] {
+    let mut hasher = Xxh3::new();
+    hasher.update(&header[..FRAME_CHECKED]);
+    hasher.update(table);
+    hasher.digest128().to_le_bytes()
+}
+
+/// The frame `header` names if it has a frame's magic and could follow `tip` in a file `len`
+/// bytes long, with the bytes of records it holds: its sequence number is the next after `tip`'s,
+/// and its end lies within `len` at a length a frame can have.
+fn shape(tip: &Super, header: &[u8; FRAME_BYTES], len: u64) -> Option<(Super, u64)> {
+    if &header[0..8] != FRAME_MAGIC {
+        return None;
+    }
+    let body_start = tip.log_end.checked_add(FRAME_BYTES as u64)?;
+    let mut frame = Super::fields(header)?;
+    frame.basis = tip.basis;
+    let follows = tip.seq.checked_add(1) == Some(frame.seq);
+    if !follows || frame.log_end < body_start || frame.log_end > len {
+        return None;
+    }
+    let records = records_in(frame.log_end - body_start)?;
+    Some((frame, records))
+}
+
+/// Reads the body of a frame whose records start at `at` and run for `records` bytes, and returns
+/// the table it holds and the table its records hash to, or `None` if the file ends first.
+fn read_tables(file: &File, at: u64, records: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let tables = table_len(records);
+    let end = at + records + tables;
+    let mut stored = Vec::with_capacity(tables as usize);
+    let mut computed = Vec::with_capacity(tables as usize);
+    let mut chunk = vec![0u8; SCAN_CHUNK.min((end - at) as usize)];
+    let mut pos = at;
+    while pos < end {
+        let take = chunk.len().min((end - pos) as usize);
+        if !read_or_end(file, &mut chunk[..take], pos)? {
+            return Ok(None);
+        }
+        let split = (at + records).saturating_sub(pos).min(take as u64) as usize;
+        for block in chunk[..split].chunks(BLOCK_BYTES) {
+            computed.extend_from_slice(&xxh3_64(block).to_le_bytes());
+        }
+        stored.extend_from_slice(&chunk[split..take]);
+        pos += take as u64;
+    }
+    Ok(Some((stored, computed)))
+}
+
 /// The frame that follows `tip` in a file `len` bytes long, if one is there whole.
 fn read_frame(file: &File, tip: &Super, len: u64) -> Result<Option<Super>> {
     let start = tip.log_end;
-    let body_start = start.saturating_add(FRAME_BYTES as u64);
-    if body_start > len {
+    if start.saturating_add(FRAME_BYTES as u64) > len {
         return Ok(None);
     }
     let mut header = [0u8; FRAME_BYTES];
-    if !read_or_end(file, &mut header, start)? || &header[0..8] != FRAME_MAGIC {
+    if !read_or_end(file, &mut header, start)? {
         return Ok(None);
     }
     frame_after(file, tip, &header, len)
 }
 
-/// The frame whose header, read from where `tip`'s log ends, is `header`, if it is whole: its
-/// sequence number is the next after `tip`'s, its end lies past its header and within `len`, and
-/// its check matches its header and every byte of its body. The caller checks the magic.
+/// The frame whose header, read from where `tip`'s log ends, is `header`, if it is whole: it has
+/// the shape [`shape`] asks for, every block of its records matches its entry in the table, and
+/// its check matches its header and table.
 fn frame_after(
     file: &File,
     tip: &Super,
     header: &[u8; FRAME_BYTES],
     len: u64,
 ) -> Result<Option<Super>> {
-    let body_start = tip.log_end.saturating_add(FRAME_BYTES as u64);
-    let Some(mut frame) = Super::fields(header) else {
+    let Some((frame, records)) = shape(tip, header, len) else {
         return Ok(None);
     };
-    frame.basis = tip.basis;
-    let follows = tip.seq.checked_add(1) == Some(frame.seq);
-    if !follows || frame.log_end < body_start || frame.log_end > len {
+    let body_start = tip.log_end + FRAME_BYTES as u64;
+    let Some((stored, computed)) = read_tables(file, body_start, records)? else {
         return Ok(None);
-    }
-    let mut hasher = Xxh3::new();
-    hasher.update(&header[..FRAME_CHECKED]);
-    let mut chunk = vec![0u8; SCAN_CHUNK.min((frame.log_end - body_start) as usize)];
-    let mut at = body_start;
-    while at < frame.log_end {
-        let take = chunk.len().min((frame.log_end - at) as usize);
-        if !read_or_end(file, &mut chunk[..take], at)? {
-            return Ok(None);
-        }
-        hasher.update(&chunk[..take]);
-        at += take as u64;
-    }
-    if hasher.digest128().to_le_bytes() != header[FRAME_CHECKED..FRAME_BYTES] {
-        return Ok(None);
-    }
-    Ok(Some(frame))
+    };
+    let whole = stored == computed && frame_check(header, &stored) == header[FRAME_CHECKED..];
+    Ok(whole.then_some(frame))
 }
 
 /// Follows frames from `sb` while each follows the one before and is whole, and returns the last.
@@ -2220,6 +2333,7 @@ impl Store {
         };
         let mut at = Super::new(start, start, Basis::default());
         let mut last = None;
+        let mut len = None;
         loop {
             let mut header = [0u8; FRAME_BYTES];
             if !read_or_end(&inner.file, &mut header, at.log_end)? {
@@ -2234,7 +2348,11 @@ impl Store {
             if &header[0..8] != FRAME_MAGIC {
                 break;
             }
-            match frame_after(&inner.file, &at, &header, u64::MAX)? {
+            let len = match len {
+                Some(len) => len,
+                None => *len.insert(inner.file.metadata()?.len()),
+            };
+            match frame_after(&inner.file, &at, &header, len)? {
                 Some(next) if next.head.is_some() => {
                     at = next;
                     last = Some(next);
@@ -3203,8 +3321,8 @@ impl Txn {
         Ok(object)
     }
 
-    /// Feeds the records spilled so far, past the room for the frame's header, to `hasher`.
-    fn hash_spilled(&self, hasher: &mut Xxh3) -> Result<()> {
+    /// Feeds the records spilled so far, past the room for the frame's header, to `blocks`.
+    fn hash_spilled(&self, blocks: &mut Blocks) -> Result<()> {
         let mut at = self.origin + FRAME_BYTES as u64;
         let mut chunk = vec![0u8; SCAN_CHUNK.min((self.start - at) as usize)];
         while at < self.start {
@@ -3213,7 +3331,7 @@ impl Txn {
                 .inner
                 .file
                 .read_exact_at(&mut chunk[..take], at)?;
-            hasher.update(&chunk[..take]);
+            blocks.feed(&chunk[..take]);
             at += take as u64;
         }
         Ok(())
@@ -3236,7 +3354,9 @@ impl Txn {
     pub(crate) fn place(mut self, head: Ptr) -> Result<Landing> {
         let store = self.store.clone();
         let inner = &store.inner;
-        let end = self.start + self.buf.len() as u64;
+        let body_start = self.origin + FRAME_BYTES as u64;
+        let records = self.start + self.buf.len() as u64 - body_start;
+        let end = body_start + records + table_len(records);
         let mut cursor = inner.cursor.lock();
         if inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -3265,12 +3385,14 @@ impl Txn {
             landing.buf = mem::take(&mut self.buf);
             landing.pending = true;
         } else {
+            let mut blocks = Blocks::new();
+            self.hash_spilled(&mut blocks)?;
+            blocks.feed(&self.buf);
+            let table = blocks.finish();
             let mut header = frame.header();
-            let mut hasher = Xxh3::new();
-            hasher.update(&header[..FRAME_CHECKED]);
-            self.hash_spilled(&mut hasher)?;
-            hasher.update(&self.buf);
-            header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+            let check = frame_check(&header, &table);
+            header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&check);
+            self.buf.extend_from_slice(&table);
             if self.reserve {
                 reserve(inner, &mut cursor, end);
             }
@@ -3343,18 +3465,19 @@ impl Landing {
         self.frame
     }
 
-    /// Writes the frame, with its check, to the page cache and moves `written` over it, or does
-    /// nothing for a frame [`Txn::place`] wrote. A failed write poisons the store at the frame.
+    /// Writes the frame, with its table and check, to the page cache and moves `written` over it,
+    /// or does nothing for a frame [`Txn::place`] wrote. A failed write poisons the store at the
+    /// frame.
     pub(crate) fn land(mut self) -> Result<()> {
         if !self.pending {
             return Ok(());
         }
         self.pending = false;
+        let records = self.buf.len();
+        append_table(&mut self.buf, FRAME_BYTES);
         let mut header = self.frame.header();
-        let mut hasher = Xxh3::new();
-        hasher.update(&header[..FRAME_CHECKED]);
-        hasher.update(&self.buf[FRAME_BYTES..]);
-        header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+        let check = frame_check(&header, &self.buf[records..]);
+        header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&check);
         self.buf[..FRAME_BYTES].copy_from_slice(&header);
         if let Err(error) = self.store.inner.file.write_all_at(&self.buf, self.at) {
             self.store.poison_at(self.at);
@@ -3721,6 +3844,76 @@ mod tests {
             assert_eq!(Shared::strong_count(&value), if lent { 2 } else { 1 });
             crate::epoch::flush();
             assert_eq!(Shared::strong_count(&value), 1);
+        }
+    }
+
+    #[test]
+    fn a_frames_length_gives_back_the_records_it_holds() {
+        for records in (0..20_000u64).chain([1 << 20, (1 << 30) + 1]) {
+            let body = records + table_len(records);
+            assert_eq!(
+                records_in(body),
+                Some(records),
+                "{records} bytes of records"
+            );
+        }
+        let block = (BLOCK_BYTES + BLOCK_CHECK) as u64;
+        for blocks in 0..5u64 {
+            for over in 1..=BLOCK_CHECK as u64 {
+                assert_eq!(records_in(blocks * block + over), None);
+            }
+        }
+    }
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn written(objects: &[Object], spill_after: Option<usize>) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            ..StoreOptions::default()
+        };
+        let (store, _) = Store::open(&path, options).unwrap();
+        let mut txn = store.begin().unwrap();
+        let mut head = None;
+        for (index, object) in objects.iter().enumerate() {
+            head = Some(txn.put_ref(object, object.hash()).unwrap());
+            if spill_after == Some(index) {
+                txn.spill().unwrap();
+            }
+        }
+        txn.commit(head.unwrap()).unwrap();
+        store.close();
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn a_frame_that_spilled_is_the_frame_written_whole() {
+        let objects: Vec<Object> = (0..40)
+            .map(|seed| Object {
+                body: noise(seed, 700 + seed as usize * 13),
+                links: Vec::new(),
+            })
+            .collect();
+        let whole = written(&objects, None);
+        assert!(whole.len() > LOG_START as usize + 4 * BLOCK_BYTES);
+        for spill_after in [0, 6, 17, 38] {
+            assert_eq!(
+                written(&objects, Some(spill_after)),
+                whole,
+                "spilled after {spill_after}"
+            );
         }
     }
 }

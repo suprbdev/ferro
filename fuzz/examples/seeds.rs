@@ -983,7 +983,7 @@ fn collect(corpus: &mut Corpus, path: &Path) {
     let Ok(bytes) = fs::read(path) else {
         return;
     };
-    if !bytes.starts_with(b"FERRODB3") {
+    if !bytes.starts_with(ferro_fuzz::fixup::MAGIC) {
         return;
     }
     let kinds: &[u8] = if bytes.len() > FITS {

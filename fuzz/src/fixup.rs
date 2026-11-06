@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use ferro::codec::{HASH_BYTES, Hash, Object, Ptr};
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
-pub const MAGIC: &[u8; 8] = b"FERRODB3";
+pub const MAGIC: &[u8; 8] = b"FERRODB4";
 pub const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 pub const SLOT_BYTES: usize = 4096;
 pub const LOG_START: usize = 2 * SLOT_BYTES;
@@ -13,8 +13,32 @@ pub const FRAME_BYTES: usize = FRAME_CHECKED + 16;
 pub const ANCHOR_AT: usize = FRAME_CHECKED + 16;
 pub const SUPER_CHECKED: usize = ANCHOR_AT + MARK_BYTES;
 pub const SUPER_BYTES: usize = SUPER_CHECKED + 32;
+pub const BLOCK_BYTES: usize = 4096;
+pub const BLOCK_CHECK: usize = 8;
 
 const MAX_RECORDS: usize = 1 << 14;
+
+pub fn records_in(body: usize) -> Option<usize> {
+    let blocks = body.div_ceil(BLOCK_BYTES + BLOCK_CHECK);
+    let records = body.checked_sub(blocks * BLOCK_CHECK)?;
+    (records.div_ceil(BLOCK_BYTES) == blocks).then_some(records)
+}
+
+pub fn seal_frame(bytes: &mut [u8], at: usize, end: usize) {
+    let Some(records) = records_in(end - at - FRAME_BYTES) else {
+        return;
+    };
+    let body = at + FRAME_BYTES;
+    let mut table = Vec::with_capacity(end - body - records);
+    for block in bytes[body..body + records].chunks(BLOCK_BYTES) {
+        table.extend_from_slice(&xxh3_64(block).to_le_bytes());
+    }
+    bytes[body + records..end].copy_from_slice(&table);
+    let mut hasher = Xxh3::new();
+    hasher.update(&bytes[at..at + FRAME_CHECKED]);
+    hasher.update(&table);
+    bytes[at + FRAME_CHECKED..at + FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+}
 const MAX_BODY: usize = 1 << 22;
 
 struct Record {
@@ -131,7 +155,14 @@ pub fn fixup(bytes: &mut [u8]) {
                 break;
             }
             let end = end as usize;
-            run(bytes, at + FRAME_BYTES, end, false, &mut records);
+            let held = records_in(end - at - FRAME_BYTES).unwrap_or(end - at - FRAME_BYTES);
+            run(
+                bytes,
+                at + FRAME_BYTES,
+                at + FRAME_BYTES + held,
+                false,
+                &mut records,
+            );
             frames.push((at, end));
             at = end;
         } else {
@@ -198,11 +229,7 @@ pub fn fixup(bytes: &mut [u8]) {
         .collect();
     for &(at, end) in &frames {
         fix_mark(bytes, at + 8, &by_offset);
-        let mut hasher = Xxh3::new();
-        hasher.update(&bytes[at..at + FRAME_CHECKED]);
-        hasher.update(&bytes[at + FRAME_BYTES..end]);
-        bytes[at + FRAME_CHECKED..at + FRAME_BYTES]
-            .copy_from_slice(&hasher.digest128().to_le_bytes());
+        seal_frame(bytes, at, end);
     }
     for slot in 0..2 {
         let start = slot * SLOT_BYTES;
