@@ -145,8 +145,9 @@ A thread of its own, `ferro-follow`, waits until the file may have changed, read
 superblock, and refreshes when that names a commit the handle has not seen, so `read` shows each
 commit soon after the writer acknowledges it and the watchers of every branch it moved fire. It
 follows the file a reclamation cycle renames over the path too. On a shared writer it catches up
-only with what a superblock names, so it never syncs for another process and takes no lock for a
-look that finds nothing. A writer without `shared` is the only writer and starts no thread.
+only with what a superblock names, so it never syncs for another process and takes no lock that
+another process holds, except to open the file a cycle renamed. A writer without `shared` is the
+only writer and starts no thread.
 
 On 64-bit Linux inotify wakes the thread when the file is written or a file is renamed over it. On
 the machine the other figures here come from, shared with other work, a commit from another
@@ -160,10 +161,13 @@ to 0.5% of a core. `Db::following` says which it does. The `shop` example's repl
 writer this way.
 
 The thread ends when the last `Db` handle on the file is dropped, and keeps neither the file nor a
-lock, as watchers do. A look that fails, as when the file was removed or its superblocks are
-damaged, changes nothing: `read` shows what it showed, watchers go on waiting, and the thread looks
-again at the next change. `Db::following` reports the error until a look succeeds, and `refresh`
-still works, to look at once or to get the error itself. How it works and what it costs is in
+lock, as watchers do. That drop waits for a look in progress, which on a shared writer that is
+opening the file a cycle renamed can mean waiting for another process's lock, as an open does. A
+look that fails, as when the file was removed or its superblocks are damaged, changes nothing:
+`read` shows what it showed, watchers go on waiting, and the thread looks again at the next change.
+`Db::following` reports the error until a look succeeds, and `refresh` still works, to look at once
+or to get the error itself. A shared writer whose writes failed is poisoned until it is reopened,
+so its follower reports `Error::Poisoned` and stops. How it works and what it costs is in
 [Followers](../internals/processes.md#followers).
 
 ## How it works

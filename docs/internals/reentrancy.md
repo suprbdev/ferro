@@ -94,7 +94,8 @@ A watcher's test on the `ferro-watch` thread holds nothing, so it may write anyw
 test run on the watcher's own thread, by `recv` or `try_recv` inside a closure, is checked like the
 closure. The `ferro-follow` thread that `Options::follow` starts holds nothing either and runs no
 closure or test. Its look takes `tip` as `refresh` does, and on a shared writer the superblock lock
-to publish what it caught up with, and waits for no lane, so a test or a closure that refreshes
+only to lead a sync of this process's own frames or to open a file a cycle renamed, and waits for
+no lane, so a test or a closure that refreshes
 waits at most for one look, as it would for another thread's `refresh`, and the follower never
 waits for it. In `ferro/tests/follow.rs` a filtered watcher whose test refreshes and attaches a
 branch runs while the follower publishes 50 commits. The `Drop` impls that run under a lane or `tip` are covered by the same record: values a

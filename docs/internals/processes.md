@@ -332,11 +332,25 @@ synced yet. A catch-up that followed one would sync it before publishing, as `re
 writer does: an fdatasync under the superblock lock on behalf of the other process, and watchers
 that fire before that process has acknowledged its commit. So a look on a shared writer catches up
 only to the frame the superblock it read names. The frames up to it were whole when they were
-named, so the sync that publishes them finds them covered and writes nothing, and the superblock
-lock is held for one read, once for each look that found something. A frame among them that does
-not check fails the catch-up with `Error::Corrupt`, as under the placement lock, rather than end
-the log there, since no crash can have taken it back while this process is alive. A look never
-takes the placement lock or a branch lock.
+named, and a frame among them that does not check fails the catch-up with `Error::Corrupt`, as
+under the placement lock, rather than end the log there, since no crash can have taken it back
+while this process is alive.
+
+The sync that publishes them has nothing to write either: the look notes in the store how far the
+superblock it read covers, by anchor under Fsync and by name under Buffered, and a shared sync of a
+frame up to there returns as the locked path would, without the superblock lock, since superblocks
+only grow while this process is alive. Under Buffered the locked path could still have written a
+superblock carrying this process's newer anchor; one carrying an older anchor only makes a
+recovery scan from further back. The first version took the superblock lock for that sync, so a
+look, and a drop waiting for it, waited as long as another process held the lock through a slow
+fdatasync: `dropping_a_shared_follower_waits_for_no_other_handles_superblock_lock` holds one
+handle's fdatasync under that lock, and the follower did not publish the commit a superblock had
+already named, nor did its drop return, until the fdatasync did. So a look that finds a new
+superblock takes no lock another process can hold. A look still leads a real sync, under the
+superblock lock, when this process's own commits have queued frames past what the superblock
+covers, as any leader would, and a look that meets a cycle's marker opens the new file as a shared
+writer's open does, under that file's placement and superblock locks. A look never takes a branch
+lock.
 
 ### Waking
 
@@ -374,8 +388,12 @@ file open still holds. The last `Db` handle to drop drops the `Keeper`, which se
 rings the eventfd or wakes the condvar, and joins the thread before it stops the reclamation and
 sync threads. A look in progress finishes first, and if it held the last count of `Shared`, the
 file closes on the follower thread before the join returns, so either way the file is closed and
-the inotify instance gone when the drop returns. A look that finds `Shared` gone ends the thread
-too. The thread runs no closure and no watcher test, only what `refresh` runs: decoding the new
+the inotify instance gone when the drop returns. So a drop waits for a look in progress. That is a
+few microseconds for one that finds nothing and the length of a refresh for one that finds
+something; a look that opens the file a cycle renamed waits there for that file's placement and
+superblock locks, as an open would, and the drop waits with it. The drop of a Buffered shared
+writer already takes the superblock lock to write its last anchor. A look that finds `Shared` gone
+ends the thread too. The thread runs no closure and no watcher test, only what `refresh` runs: decoding the new
 states and dropping the ones they replace. A panic there is caught and recorded, and the thread
 goes on.
 
@@ -395,14 +413,22 @@ cannot carry the error.
   check.
 - `Error::Replaced` never reaches it: `refresh` opens the new file when it meets that, and a shared
   writer's catch-up follows the cycle's marker to it.
-- On a shared writer whose store is poisoned, every look that finds something fails with
-  `Error::Poisoned` until the database is reopened.
+- A shared writer whose write or sync failed is poisoned until it is reopened. Its catch-up then
+  fails with `Error::Poisoned` before it reads, decodes or queues anything, at a look and at
+  `refresh` alike, and the follower records the error and stops, so it stays. In the first version
+  a poisoned writer's catch-up still adopted each frame another process named, decoded its states
+  and queued it behind the failed sync, which never drained, and the follower's next look found
+  nothing new and cleared the error. With 300 commits of a 256 KiB root from another handle, a
+  poisoned follower grew by 75 MiB and a poisoned handle that called `refresh` after each by
+  76 MiB, where a healthy follower grew by 6 MiB; with the check neither grows.
+  `a_poisoned_following_shared_writer_follows_nothing_more_and_keeps_its_error` counts the frames
+  it adopts after the failure, which must be none.
 
 ### Reentrancy
 
 The thread holds no lane and runs no user closure, so nothing it could wait for waits for it. A
-look takes `tip`, as `refresh` does, and on a shared writer the superblock lock in the sync that
-publishes, holding nothing else. A watcher test runs on the `ferro-watch` thread holding nothing
+look takes `tip`, as `refresh` does, and on a shared writer the superblock lock only when it leads
+a sync of this process's own frames or opens a file a cycle renamed, holding nothing else. A watcher test runs on the `ferro-watch` thread holding nothing
 and may refresh while the follower does: they take `tip` one after the other. A closure may refresh
 too, as before, since `refresh` needs only `tip`, which a look holds briefly and never while it
 waits for a lane. [Writes from inside a closure](reentrancy.md) has the rules.
@@ -453,7 +479,10 @@ waits on average there.
 - A shared writer's catch-up reads every frame placed since its last look, where a read-only
   refresh reads the newest head and the branch-table steps since the one it knew. So a shared
   follower took 63 µs a refresh at once a millisecond, and 530 µs when it looked every 10 ms and
-  read ten milliseconds of frames each time: a longer interval saves it little under load.
+  read ten milliseconds of frames each time: a longer interval saves it little under load. These
+  rounds ran while a look still took the superblock lock to publish; three more once it no longer
+  did gave 169 µs at the median after the ack, and 268 ms of CPU for 4,841 busy refreshes, 55 µs
+  each.
 
 `examples/shop` ran its replicas on a thread that called `refresh` every 5 ms and now opens them
 with `follow`. Its `shop-load replica-lag`, three runs of 300 commits against a Buffered writer,
@@ -498,12 +527,16 @@ once woken by inotify and once looking every 2 ms:
 - With the file removed, the follower reports `Error::Io`, `refresh` fails the same way, and reads
   keep the last version; a file renamed back with one more commit is followed, and the error clears.
 - Both superblocks damaged are reported as `Error::Corrupt`, and nothing moves.
+- A refresh that fails on a damaged object of a new commit goes on failing and being reported, look
+  after look, until the byte is put back.
 - A filtered watcher whose test refreshes and attaches a branch runs while the follower publishes
   50 commits.
-- A child process counts its `ferro-follow` threads, its descriptors on the file and its inotify and
-  eventfd descriptors before and after it drops every handle of a follower, inotify and polling,
-  with a watcher left waiting, which must end; and does the same for a shared writer that follows,
-  after which a writer without `shared` must open.
+- A child process counts its descriptors on the file and its inotify and eventfd descriptors as soon
+  as it has dropped every handle of a follower, inotify and polling, with a watcher left waiting,
+  which must have ended, and then its `ferro-follow` threads; it does the same for a shared writer
+  that follows, after which a writer without `shared` must open at once. It also drops a shared
+  follower while a hook holds its look for 300 ms, and the drop must take that long and leave
+  nothing open; a drop that did not join the thread returned at once with the watch still open.
 
 `ferro/tests/shared.rs` has a shared writer follow another handle's commits and three cycles
 without committing. It holds one handle between placing a frame and syncing it while a second
@@ -514,6 +547,13 @@ frames that superblocks name while the follower is held in a sync, and the follo
 frame 3 with `Error::Corrupt` and follow all of them once the byte is put back. In
 `ferro/tests/shared_process.rs` a child process follows as a shared writer, without committing,
 while the parent makes 60 commits and three cycles, and must see every one.
+
+`ferro/tests/follow_fault.rs` intercepts `fdatasync`. It fails one sync of a shared writer that
+follows, then has another handle make 100 commits of a 64 KiB root: the poisoned writer's
+`refresh` fails with `Error::Poisoned` each time, its follower keeps that error and stops looking,
+and a hook counts no frame adopted after the failure. It also holds one handle's fdatasync under
+the superblock lock: a shared follower must still publish the commit a superblock already names,
+and its drop must return while the lock is held.
 
 ## Crashes and killed processes
 

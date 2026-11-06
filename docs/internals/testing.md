@@ -267,7 +267,8 @@ Tests are described next to what they test:
   entries](reclamation.md#records-reached-as-entries).
 - Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
 - Followers of a read-only handle and a shared writer, across cycles, a removed file and damaged
-  superblocks, and the end of their thread, `ferro/tests/follow.rs`: [Tests of
+  superblocks, and the end of their thread, `ferro/tests/follow.rs`, and a poisoned follower and a
+  drop beside another handle's sync, `follow_fault.rs`: [Tests of
   followers](processes.md#tests-of-followers).
 - What runs on Windows: [Tests](windows.md#tests).
 - Crash safety in general: [Durability and crash safety](../guide/durability.md#what-was-tested).
