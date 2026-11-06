@@ -2154,6 +2154,7 @@ impl Store {
                 slot: AtomicU64::new(inner.slot.load(Ordering::Acquire)),
                 marks: Mutex::new(marks),
                 checkpointing: AtomicBool::new(false),
+                covered: AtomicU64::new(0),
                 ignored: inner.ignored,
                 cache: Cache::with_weighter(64, 1, EntryWeight),
                 dedupe: Dedupe::new(MIN_DEDUPE as usize),
