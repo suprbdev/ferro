@@ -694,8 +694,13 @@ fn out_of_order(corpus: &mut Corpus, dir: &Path) {
 
 fn damage_seeds(corpus: &mut Corpus) {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for seed in 0..48u64 {
-        let mut data = vec![mode(DAMAGE, 0), (seed % 16) as u8];
+    for seed in 0..64u64 {
+        let recipe = match seed {
+            0..48 => 0,
+            48..56 => 0xc0,
+            _ => 0xe0,
+        };
+        let mut data = vec![mode(DAMAGE, 0), recipe | (seed % 16) as u8];
         for _ in 0..64 + seed * 3 {
             state ^= state << 13;
             state ^= state >> 7;

@@ -35,13 +35,19 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   and damages one frame past their anchor, by flipping a bit anywhere in it or one in each of some
   of its 4 KiB blocks and its header and table, or by filling a sector, or a run of every other
   sector, with zeroes, ones, an older frame's bytes or input bytes, and sometimes leaves a
-  reservation of zeroes after the log. It then compares the damaged frame with the whole one: if
-  each block and the header and table together differ in at most one bit, the entry of no block
-  differs along with its block, and every bit that differs sits in a sector that holds at least 8
-  of the frame's bytes, both a read-only open and a writer's open must fail with `Corrupt` naming
-  the frame and its first wrong byte and leave the file as it was. Otherwise both must open at the
-  commit before the frame, the writer truncating the file there, `verify` must pass, and a commit
-  must survive a reopen.
+  reservation of zeroes after the log. The high half of the recipe's first byte can make the values
+  sparse instead, one or two to a commit, each zeroes with a few bits set, under 96 bytes so that
+  it stays raw, up to 64 KiB so that it compresses to runs of ones, or 400 KB of noise that
+  compression does not shrink around a KiB of zeroes with one bit set; or it can start the file
+  with a pull of three values of such noise from another file, which arrives in pieces that spill.
+  The mode then compares the damaged frame with the whole one: if each block and the header and
+  table together differ in at most one bit, at most 8 blocks differ, the entry of no block differs
+  along with its block, and every bit that differs sits in a sector that holds at least 8 of the
+  frame's bytes and has something other than all zeroes or all ones on either side of it, both a
+  read-only open and a writer's open must fail with `Corrupt` naming the frame and its first wrong
+  byte and leave the file as it was. Otherwise both must open at the version the frames before it
+  hold, which a pull's pieces leave where it was, the writer truncating the file at the frame,
+  `verify` must pass, and a commit must survive a reopen.
 - `reclaim` takes the input `admin` takes, opens the file as the type that decodes nothing and
   compacts it with `copy_threads(1)` and again, from the same image, with `copy_threads(4)`, keeping
   every version, the newest one or three, or those since time 0, and for some modes compacts the
