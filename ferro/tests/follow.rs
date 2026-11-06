@@ -326,6 +326,10 @@ fn a_test_on_a_followers_watcher_may_refresh_while_the_follower_runs() {
 mod lifetime {
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferro::db::Hook;
 
     use super::*;
 
@@ -359,6 +363,17 @@ mod lifetime {
         target == "anon_inode:inotify" || target == "anon_inode:[eventfd]"
     }
 
+    fn ended() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while threads("ferro-follow") > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the follower thread outlived the drop"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     fn released(path: &Path, poll: Option<Duration>) {
         let base = descriptors(on(path));
         let reader = follower(path, poll);
@@ -370,10 +385,17 @@ mod lifetime {
         assert!(descriptors(on(path)) > base);
         assert_eq!(descriptors(watches), 2 * usize::from(poll.is_none()));
         drop((reader, clone, side));
-        until("the follower thread ended", || threads("ferro-follow") == 0);
-        assert_eq!(descriptors(on(path)), base, "the file is still open");
-        assert_eq!(descriptors(watches), 0, "the inotify watch is still open");
-        assert!(watcher.recv_timeout(SOON).is_err());
+        assert_eq!(
+            descriptors(on(path)),
+            base,
+            "the file is open after the drop"
+        );
+        assert_eq!(descriptors(watches), 0, "a watch is open after the drop");
+        assert!(matches!(
+            watcher.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        ended();
     }
 
     fn lone_writer(path: &Path) {
@@ -384,9 +406,50 @@ mod lifetime {
         });
         assert!(matches!(fast().open::<Root>(path), Err(Error::Locked)));
         drop(shared);
-        until("the follower thread ended", || threads("ferro-follow") == 0);
-        assert!(watcher.recv_timeout(SOON).is_err());
+        assert_eq!(descriptors(on(path)), 0, "the file is open after the drop");
+        assert_eq!(descriptors(watches), 0, "a watch is open after the drop");
         drop(fast().open::<Root>(path).unwrap());
+        assert!(matches!(
+            watcher.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        ended();
+    }
+
+    fn joined_inside_a_look(path: &Path) {
+        let writer = fast().shared(true).open::<Root>(path).unwrap();
+        let base = descriptors(on(path));
+        let armed = Arc::new(AtomicBool::new(true));
+        let (entered, inside) = mpsc::channel();
+        let entered = parking_lot::Mutex::new(entered);
+        let hook = Hook(Arc::new(move |step| {
+            if step == "adopted" && armed.swap(false, Ordering::AcqRel) {
+                let _ = entered.lock().send(());
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }));
+        let follower = fast()
+            .shared(true)
+            .follow(true)
+            .hook(hook)
+            .open::<Root>(path)
+            .unwrap();
+        put(&writer, 2, 2);
+        inside.recv_timeout(SOON).unwrap();
+        let started = Instant::now();
+        drop(follower);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200),
+            "the drop returned after {took:?}, before the look in progress"
+        );
+        assert_eq!(
+            descriptors(on(path)),
+            base,
+            "the file is open after the drop"
+        );
+        assert_eq!(descriptors(watches), 0, "a watch is open after the drop");
+        ended();
     }
 
     #[test]
@@ -402,6 +465,7 @@ mod lifetime {
         drop(writer);
         if cfg!(target_pointer_width = "64") {
             lone_writer(path);
+            joined_inside_a_look(path);
         }
         println!("RELEASED");
     }
