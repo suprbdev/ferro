@@ -136,7 +136,9 @@ which fails the open with `Error::Corrupt`, as described below. A torn tail, zer
 stop the scan, and an acknowledged commit survives a stale or torn superblock. A writer then syncs
 the frames it accepted, truncates the rest, and rewrites the superblock, in that order. The
 truncation is durable before any new frame is written, so a frame stranded past a torn one can
-never line up with the log later.
+never line up with the log later. Nothing at or below the newest superblock is truncated but what
+lies past its anchor, which under `Durability::Buffered` a crash may have lost, as described under
+[What a superblock names](#what-a-superblock-names).
 
 ### Torn and damaged frames
 
@@ -201,16 +203,16 @@ read-only open that finds no writer alive scans and reports the same, holding th
 shared as well as the writer lock, so a shared writer that opens meanwhile waits before it recovers
 or writes anything the scan could read in part. Truncating the file at the offset named gives up
 that commit and every one after it, and the file then opens. A shared writer that catches up under
-the placement lock, where no live process can be writing, reports the same and never writes over
-the frame, as described under [Catching up](processes.md#catching-up). Anything else it finds past
-the last whole frame, part of a frame or the records of one that spilled before a process died
-writing its header, it truncates and syncs before the next frame is written there, as recovery at
-open does, so a lost sector of the next frame cannot hold a near copy of the dead one. A transaction
-dropped after it spilled syncs the truncation of its records the same way. A scan that
-a write can race takes any frame that does not check for the end of the log, since it can read a
-frame another process or thread is still writing in part: a shared writer catching up without the
-placement lock, the leader of a shared sync reading past its own frame, and the quick look a
-read-only open takes before it knows whether a writer is alive.
+the placement lock, where no live process can be writing, reports the same and never writes over the
+frame, as described under [Catching up](processes.md#catching-up). Anything else it finds past the
+last whole frame and past the newest superblock, part of a frame or the records of one that spilled
+before a process died writing its header, behind a stale cycle marker or not, it truncates and syncs
+before the next frame is written there, as recovery at open does, so a lost sector of the next frame
+cannot hold a near copy of the dead one. A transaction dropped after it spilled syncs the truncation
+of its records the same way. A scan that a write can race takes any frame that does not check for
+the end of the log, since it can read a frame another process or thread is still writing in part: a
+shared writer catching up without the placement lock, the leader of a shared sync reading past its
+own frame, and the quick look a read-only open takes before it knows whether a writer is alive.
 
 The judgement reads the bytes alone, whatever durability wrote the frame or opens the file. Under
 `Durability::Buffered` a power cut may still take back every commit past the anchor: a torn frame
@@ -227,16 +229,19 @@ older bytes, so the next writer finds it torn, truncates it and writes in its pl
 What it does not catch: two flipped bits in one block, one in the header and one in the table, or
 one in a block's entry in the table and one in that block, which leaves no entry one bit from its
 block's hash, flipped bits in more than 8 blocks, and a flipped bit with only zeroes or only ones
-between it and either end of its sector, read as a torn write and are truncated as before, and so
-does a sector that a lost or misdirected write left holding other bytes whole. The other way round,
-a torn frame reads as damaged only if a lost sector kept older bytes one bit from the frame's with
-something other than zeroes or ones on both sides of that bit: a near copy of the frame, which a
-dead writer's bytes written over could be, and those are now truncated first, so only a file a
-shared writer of an earlier build wrote over a dead one's frame can hold one. Nothing on disk
-records that a sync finished until the next sync carries its superblock, so a frame of the last
-sync with a sector gone cannot be told from one caught by the power cut, and only the bytes can
-tell damage apart. Damage before the anchor is found by the hash checks on read and by `verify`,
-as before.
+between it and either end of its sector, read as a torn write, and so does a sector that a lost or
+misdirected write left holding other bytes whole. Past the newest superblock they are truncated as
+before. In a frame that superblock names they fail a shared writer's catch-up and an open beside a
+live shared writer, as described under [What a superblock names](#what-a-superblock-names), and an
+open with no writer alive truncates them only past the anchor, where a crash may have torn the
+frame. The other way round, a torn frame reads as damaged only if a lost sector kept older bytes one
+bit from the frame's with something other than zeroes or ones on both sides of that bit: a near copy
+of the frame, which a dead writer's bytes written over could be, and those are now truncated first,
+so only a file a shared writer of an earlier build wrote over a dead one's frame can hold one.
+Nothing on disk records that a sync finished until the next sync carries its superblock, so a frame
+of the last sync with a sector gone cannot be told from one caught by the power cut, and only the
+bytes can tell damage apart. Damage before the anchor is found by the hash checks on read and by
+`verify`, as before.
 
 The tests, in `ferro/tests`: `crash.rs` flips each bit position of a frame past a stale superblock
 under both durabilities, and of every header and table byte and a sample of the body of a frame of
@@ -257,20 +262,23 @@ the file, and the next writer writes in its place, and leaves it whole with a bi
 next writer reports without writing. It also leaves the first pages of a dead writer's frame that
 differ from the next writer's in one bit of a sector, checks that the next writer truncates them and
 syncs before it writes, and that its frame with that sector lost reads as torn; without the
-truncation it read as damaged. The unit tests in `ferro/src/store.rs` replay the writes of frames of
-zeroes or of ones with a bit set every few hundred bytes, stored raw and spilled part way, losing
-each sector of each write in turn and each by chance 200 times, the lost bytes left as they were or
-turned to ones, and none reads as damaged. One loses the sector past a spill that ended on a
-sector's last byte, before a record whose first byte is `0x40`, and one the sector holding only the
-last byte of a spilled frame's header, a check byte with one bit set, which both read as damaged
-before. Another flips a bit in 1, 8, 9 and 12 blocks of a frame, and only the first two are
-reported. One opens a file with a damaged frame past its superblock read-only while another
-descriptor holds the placement lock, which trusts the superblock, and once it is released, which
-reports the frame, and one drops a draft that spilled and checks that a sync follows the truncation.
-`compress.rs` pulls a 32 MiB value of zeroes with a byte of 1 every 8 KiB, which the sender sends
-uncompressed, and checks that the receiving file stays under twice the sender's and that a power cut
-over the pulled frame reads as torn. Every existing power-cut, crash and shared-process test opens
-every image it did before.
+truncation it read as damaged. It does the same with a stale cycle marker in front of those pages,
+which the next writer took for the end of the log and wrote over without truncating, so that image
+read as damaged too until the catch-up looked past the marker (#82). Its tests of frames below the
+newest superblock are described under [What a superblock names](#what-a-superblock-names). The unit
+tests in `ferro/src/store.rs` replay the writes of frames of zeroes or of ones with a bit set every
+few hundred bytes, stored raw and spilled part way, losing each sector of each write in turn and
+each by chance 200 times, the lost bytes left as they were or turned to ones, and none reads as
+damaged. One loses the sector past a spill that ended on a sector's last byte, before a record whose
+first byte is `0x40`, and one the sector holding only the last byte of a spilled frame's header, a
+check byte with one bit set, which both read as damaged before. Another flips a bit in 1, 8, 9 and
+12 blocks of a frame, and only the first two are reported. One opens a file with a damaged frame
+past its superblock read-only while another descriptor holds the placement lock, which trusts the
+superblock, and once it is released, which reports the frame, and one drops a draft that spilled and
+checks that a sync follows the truncation. `compress.rs` pulls a 32 MiB value of zeroes with a byte
+of 1 every 8 KiB, which the sender sends uncompressed, and checks that the receiving file stays
+under twice the sender's and that a power cut over the pulled frame reads as torn. Every existing
+power-cut, crash and shared-process test opens every image it did before.
 
 The table costs 8 bytes for each 4 KiB block of a frame's records, and 8 for a frame of one block.
 The hash of each block replaces the one stream over the frame that the check was, so a commit runs
@@ -353,6 +361,58 @@ times vary between runs, and 18 under the rule with zeroes and ones. Also measur
   bytes, and a sector of ones.
 - A budget of hashes rather than of blocks. A block's search is at most 32,768 hashes, so 8 blocks
   is that budget, and counting blocks lets an open give up before it hashes anything.
+
+### What a superblock names
+
+Nothing at or below the newest superblock is ever truncated, and no frame is written there, except
+what lies past its anchor when a crash may have taken it back. The judgement above is for what lies
+past the newest superblock. A frame it names was whole in the page cache before the superblock was
+written, and its commit was acknowledged, so if the frame no longer checks it was damaged since,
+however its bytes read: two bits flipped in one block, a magic two bits from a frame's or a header
+of zeroes read as torn or as the end of the log, and below the newest superblock each is reported as
+`Error::Corrupt`, naming the frame, with nothing written. Where the line falls depends on what can
+have happened since that superblock was written:
+
+- An open with no writer alive cannot tell whether a crash came between, and scans from the anchor
+  as it always has. Under `Durability::Fsync` the newest superblock anchors itself, so the scan
+  starts at the end of the log it names and keeps all of it. Under `Durability::Buffered` a crash
+  may take back what is past the anchor, and the scan rolls those frames back to the first that
+  does not check, as Buffered allows: the frames past a superblock's anchor are the only ones it
+  names that are ever truncated.
+- A shared writer catching up under the placement lock is alive, so no crash has come since it
+  opened, and every superblock written since names frames that were whole. It reads the newest
+  superblock and fails with `Corrupt` if the frames it follows from its own end of the log stop
+  before the end of the log that superblock names, under either durability, and judges a frame
+  torn and truncates it only past that, as described under [Catching
+  up](processes.md#catching-up). It places its own frame where the catch-up ended, so that is never
+  below the newest superblock either.
+- A shared writer that opens while another that has opened is alive knows the same, as described
+  under [Opening and closing](processes.md#opening-and-closing): its scan from the anchor must reach
+  the end of the log the newest superblock names, under either durability, or the open fails with
+  `Corrupt` and writes nothing.
+- A transaction dropped after it spilled truncates its records back to where its frame would have
+  begun, which for a shared writer follows a catch-up under the placement lock it holds throughout,
+  and a writer without the option truncates its reservation at close only past every frame it has
+  written, so neither reaches below the newest superblock.
+
+A lagging shared writer used to judge every frame from its own end of the log (#82). An idle
+handle's commit after another had committed four frames, with two bits flipped in the second's
+first block or its magic, read that frame as torn, truncated the file from 31,905 bytes to 20,022,
+synced, wrote its own frame there and acknowledged it, under either durability; the other handle's
+next commit failed reading past the end of the file, and every open then failed with `file is 20022
+bytes but superblock expects 31905`. With the second frame's first 84 bytes zeroed it wrote over
+that frame in place, and the file failed to open on a bad compressed body. A writer opening beside
+a live Buffered one rolled the same frames back to the first, from 31,900 bytes to 14,104, and the
+live writer's next commit failed the same way. `shared.rs` covers each of these, as listed under
+[Tests](processes.md#tests).
+
+Reading the newest superblock costs one read of both slots and their checks on every placement of
+a shared writer. `tables` with `--shared 1`, median of nine alternating runs against the tree
+before: outside the closure a hold ran 570,530 instructions before and 575,373 after, a confirm
+738,487 and 740,719, and a cancel 900,826 and 904,098, with thread CPU time of 75.6 and 76.5, 95.8
+and 96.6, and 123.1 and 123.9 µs, at 13,393 bytes a write both. Reading it only when the catch-up
+ends on something other than zeroes would save that, but a frame zeroed below the newest
+superblock would then be written over and acknowledged, as the third case above was.
 
 ### Buffered durability and checkpoints
 
