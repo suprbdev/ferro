@@ -28,9 +28,18 @@ Crash safety was tested with simulated crash images, killed processes and a trac
 and fsync failure and power cuts were only modelled by intercepting `fdatasync`, never tested on
 real hardware.
 
-A frame past the superblock that is damaged cannot be told from a torn write, so open stops there
-and truncates it, losing at most the commits of the last sync. Bit rot further back is reported by
-the hash checks, not truncated.
+Open scans the frames past the newest superblock, where the commits of the last sync can sit
+acknowledged under `Durability::Fsync` before the superblock naming them reaches the disk. A frame
+there that a torn write left part-written is truncated, losing only commits that were never
+acknowledged, or under `Durability::Buffered` commits past the last checkpoint. A frame that reached
+the disk whole and has one flipped bit in it, or one in each 4 KiB block of its records, fails the
+open with `Error::Corrupt` naming its offset, and the file is left as it was, in either durability:
+a power cut never leaves such a frame. Truncating the file at that offset gives up that commit and
+the ones after it. Heavier damage there cannot be told from a torn write and is truncated. The tests
+flip bits in frames past the superblock of the crash images above, Fsync frames of acknowledged
+commits among them, and check that every torn image still opens. Bit rot further back is reported
+by the hash checks, not truncated. [Torn and damaged
+frames](../internals/storage.md#torn-and-damaged-frames) describes the rule and its limits.
 
 On Windows every sync is a `FlushFileBuffers`, and the file must be on NTFS, as described in
 [Limitations](limitations.md).

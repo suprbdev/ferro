@@ -2,7 +2,9 @@
 
 This is an experiment, not a production database.
 
-- The file format is not stable and may change without migration.
+- The file format is not stable and may change without migration. It is now format 4, which added
+  a table of checks to every frame: a file of format 3 does not open in this build, nor one of
+  format 4 in an earlier build, and both report `Error::NotFerro`.
 - It runs on Unix and Windows. On Windows the file must be on NTFS: a reclamation cycle renames the
   new file over one that snapshots still hold open, which needs POSIX rename semantics, and Windows
   cannot sync a directory, so the rename is made durable by flushing the renamed file, which relies
@@ -32,8 +34,10 @@ This is an experiment, not a production database.
   processes](concurrency.md#several-processes) and [Limits](retention.md#limits).
 - A reclamation cycle needs free disk for everything retained, as described under
   [Limits](retention.md#limits).
-- Crash safety was never tested on real hardware, and a damaged frame past the superblock is
-  truncated like a torn write, as described under [What was tested](durability.md#what-was-tested).
+- Crash safety was never tested on real hardware. A frame past the superblock damaged in more than
+  one bit of a 4 KiB block cannot be told from a torn write and is truncated like one, which under
+  `Durability::Fsync` can drop the commits of the last sync, as described under [What was
+  tested](durability.md#what-was-tested).
 - After a criss-cross, a merge closure runs more than once, and it refuses when the base of the
   ancestors could lie in pruned history, as described under [Limits](merging.md#limits).
 - Sync keeps memory for every object it moves and writes a large bundle twice, as described under

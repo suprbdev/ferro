@@ -109,7 +109,14 @@ it, then the next, until it finds one that is not. So a process that is alone re
 68 bytes, a reservation of zeroes or the end of the file, each time it looks. In this mode a frame
 is written before the placement lock is released, so a frame that a live process placed is whole
 whenever another can take that lock, and one that a process left half-written when it died fails
-its check, ends the log there, and is written over by the next frame.
+its check, ends the log there, and is written over by the next frame. A process killed in a write
+stops at a page boundary, so the rest of its frame keeps its older bytes and reads as torn. A frame
+that reached the disk whole and was damaged since, one bit from checking as [Torn and damaged
+frames](storage.md#torn-and-damaged-frames) describes, fails a catch-up under the placement lock
+with `Error::Corrupt`, so no commit is written over it. A catch-up without that lock, on taking a
+branch lock, at `refresh` or before a cycle's pass, may meet a frame another process is still
+writing, so it takes any frame that does not check for the end of the log, and the catch-up under
+the placement lock before the next frame is placed judges it.
 
 The frames' head pointers name [steps](commit-path.md#branch-table-steps) on the table each process
 already holds, so loading the new refs reads only the steps since the head this process last knew,
@@ -249,10 +256,11 @@ it was.
 A process killed anywhere in a commit holds up the others only until the kernel releases its locks.
 Killed while it holds a branch lock, its closure is lost. Killed between placing and writing its
 frame, it wrote nothing, and the next frame goes where it would have. Killed while writing it, the
-frame fails its check and is written over. Killed after writing it and before syncing, the frame is
-whole and stays in the log, so its commit may appear though it was never acknowledged, as after a
-crash in one process. Power cuts are unchanged: frames that follow each other from the anchor
-survive, and every process's acknowledged commits were synced before they were acknowledged.
+frame stops at a page boundary, fails its check and is written over. Killed after writing it and
+before syncing, the frame is whole and stays in the log, so its commit may appear though it was
+never acknowledged, as after a crash in one process. Power cuts are unchanged: frames that follow
+each other from the anchor survive, and every process's acknowledged commits were synced before
+they were acknowledged.
 
 ## Tests
 
@@ -292,9 +300,10 @@ handle's closure, a pull landing beside the other handle's commits, background c
 handles at once, four threads on branches of their own in each of two handles, an awaited write
 waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
 a drop and fork that must wait for a closure, a writer opening during the other handle's cycle
-pause, a closure on a branch the other handle dropped, and a stale marker that a power cut leaves in
-front of a whole frame. Each test added for a finding of the review failed before its fix, as
-described above. Both files build on 64-bit Linux only, and
+pause, a closure on a branch the other handle dropped, a stale marker that a power cut leaves in
+front of a whole frame, and a frame a dead writer left cut at a page boundary, which the next
+writer writes over, or whole with a bit flipped, which it reports. Each test added for a finding of
+the review failed before its fix, as described above. Both files build on 64-bit Linux only, and
 `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
