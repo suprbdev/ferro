@@ -1120,6 +1120,18 @@ fn composite(attr: &Attribute, fields: &syn::FieldsNamed) -> syn::Result<Composi
     Ok((indexed, cover.unwrap_or_default()))
 }
 
+fn check_stored(ix: &Indexed, skipped: &[Ident]) -> syn::Result<()> {
+    match ix.fields.iter().find(|(ident, _)| skipped.contains(ident)) {
+        Some((ident, _)) => Err(syn::Error::new(
+            ident.span(),
+            format!(
+                "`{ident}` is not stored, so it cannot be indexed: rows read back would hold its default while the index kept the values written"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 fn check_cover(ix: &Indexed, key: &Ident, skipped: &[Ident]) -> syn::Result<()> {
     for (at, (ident, _)) in ix.cover.iter().enumerate() {
         let fail = |message: String| Err(syn::Error::new(ident.span(), message));
@@ -1290,6 +1302,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
     for ix in &indexes {
+        check_stored(ix, &skipped)?;
         check_cover(ix, &key_ident, &skipped)?;
     }
 
@@ -2241,8 +2254,23 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// The derive refuses, with an error at the attribute or field at fault: anything but a struct
 /// with named fields, generic parameters, no `#[key]` field or two, a struct-level index of fewer
 /// than two fields, a field name that does not exist, an index option other than `each` and
-/// `cover(...)` (only `cover(...)` on `#[unique]`), two cover lists on one struct-level index, and
-/// a cover list that breaks the rules above.
+/// `cover(...)` (only `cover(...)` on `#[unique]`), two cover lists on one struct-level index, a
+/// cover list that breaks the rules above, and an index of any kind on a `#[ferro(skip)]` field,
+/// alone or as part of a composite. A skipped field reads back as its default, so the index would
+/// keep values that the rows no longer hold:
+///
+/// ```compile_fail
+/// use ferro::{Data, Record};
+///
+/// #[derive(Data, Record, Clone)]
+/// struct Order {
+///     #[key]
+///     id: u64,
+///     #[index]
+///     #[ferro(skip)]
+///     cached_total: u64,
+/// }
+/// ```
 ///
 /// # Examples
 ///
@@ -2403,4 +2431,54 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
     expand_record(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(input: DeriveInput) -> String {
+        match expand_record(input) {
+            Ok(_) => panic!("the derive accepted an index on a field it does not store"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_index_on_a_skipped_field_is_refused_whatever_its_kind() {
+        let inputs: [DeriveInput; 5] = [
+            syn::parse_quote! {
+                struct Row { #[key] id: u64, #[index] #[ferro(skip)] ghost: u32 }
+            },
+            syn::parse_quote! {
+                struct Row { #[key] id: u64, #[index(each)] #[ferro(skip)] ghost: Vec<u32> }
+            },
+            syn::parse_quote! {
+                struct Row { #[key] id: u64, #[unique] #[ferro(skip)] ghost: u32 }
+            },
+            syn::parse_quote! {
+                #[index(room, ghost)]
+                struct Row { #[key] id: u64, room: u32, #[ferro(skip)] ghost: u32 }
+            },
+            syn::parse_quote! {
+                #[unique(ghost, room)]
+                struct Row { #[key] id: u64, room: u32, #[ferro(skip)] ghost: u32 }
+            },
+        ];
+        for input in inputs {
+            let message = refused(input);
+            assert!(
+                message.starts_with("`ghost` is not stored, so it cannot be indexed"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_field_beside_an_index_is_accepted() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct Row { #[key] id: u64, #[index] room: u32, #[ferro(skip)] ghost: u32 }
+        };
+        assert!(expand_record(input).is_ok());
+    }
 }
