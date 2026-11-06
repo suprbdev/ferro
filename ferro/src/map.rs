@@ -93,7 +93,7 @@ use std::vec;
 
 use crate::codec::{
     Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr,
-    Recalled, Shape, Sink, Staged, hash_parts, try_hash_of,
+    Shape, Sink, Staged, hash_parts, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -1106,11 +1106,11 @@ fn summarized_value<V: Data>(r: &mut Decoder<'_>) -> Result<Option<V>> {
 }
 
 #[inline(never)]
-fn recall<K: Data, V: Data, S: Summary<K, V>>(
-    recalled: &Recalled,
-    key: &K,
-    r: &mut Decoder<'_>,
-) -> Result<S> {
+fn entry_summary<K: Data, V: Data, S: Summary<K, V>>(key: &K, r: &mut Decoder<'_>) -> Result<S> {
+    let Some(recalled) = r.recalled() else {
+        let value = V::decode(r)?;
+        return summarize(|| S::of(key, &value));
+    };
     let start = r.checkpoint();
     V::visit(r)?;
     let (bytes, links) = r.read_since(start);
@@ -1468,15 +1468,9 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     'slots: loop {
         for key in keys {
             match r.u8()? {
-                0 if claim.is_some() && stored => match r.recalled() {
-                    Some(recalled) => {
-                        parts.push(Part::Summary(recall::<K, V, S>(recalled, key, r)?))
-                    }
-                    None => {
-                        let value = V::decode(r)?;
-                        parts.push(Part::Summary(summarize(|| S::of(key, &value))?))
-                    }
-                },
+                0 if claim.is_some() && stored => {
+                    parts.push(Part::Summary(entry_summary::<K, V, S>(key, r)?))
+                }
                 0 if claim.is_some() && !deferred => {
                     let links = r.links_read();
                     match V::decode(r) {
