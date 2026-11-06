@@ -98,6 +98,9 @@ const SECTOR_MIN: u64 = 8;
 /// search them for a flipped bit: more point to a torn write, and each costs a search of every bit
 /// of its block.
 const MEND_BLOCKS: usize = 8;
+/// How many bytes past the room for a frame's header a catch-up reads, where the first record of
+/// a frame that spilled before its header was written would start.
+const LEFT_PEEK: usize = 16;
 /// How much of a frame a check reads at a time, and the size of a record past which a read checks
 /// the file's length before it allocates.
 const SCAN_CHUNK: usize = 1 << 20;
@@ -529,6 +532,20 @@ fn read_or_end(file: &File, out: &mut [u8], at: u64) -> Result<bool> {
         Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Fills `out` from the file at `at` as far as the file reaches, returning how many bytes it read.
+fn read_some(file: &File, out: &mut [u8], at: u64) -> Result<usize> {
+    let mut got = 0;
+    while got < out.len() {
+        match file.read_at(&mut out[got..], at + got as u64) {
+            Ok(0) => break,
+            Ok(read) => got += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(got)
 }
 
 /// [`read_supers`] in one read of both slots, for a file that holds its header.
@@ -2594,9 +2611,14 @@ impl Store {
     /// a frame that reached the disk whole and was damaged since fails it with [`Error::Corrupt`]
     /// rather than end the log for the next frame to be written over. Without the lock such a
     /// frame may be one still being written, and ends the log.
+    ///
+    /// Under the lock, what a dead process left past the log, part of a frame or the records a
+    /// frame spilled before its header, is truncated and the truncation synced, as [`recover`]
+    /// does, so that the next frame is written over nothing a power cut could bring back under it.
+    /// A failed truncation or sync poisons the store.
     pub(crate) fn follow(&self, holds: bool) -> Result<Followed> {
         let inner = &self.inner;
-        let cursor = inner.cursor.lock();
+        let mut cursor = inner.cursor.lock();
         let start = Mark {
             seq: cursor.seq,
             log_end: inner.placed.load(Ordering::Acquire),
@@ -2605,32 +2627,47 @@ impl Store {
         let mut at = Super::new(start, start, Basis::default());
         let mut last = None;
         let mut len = None;
-        loop {
-            let mut header = [0u8; FRAME_BYTES];
-            if !read_or_end(&inner.file, &mut header, at.log_end)? {
-                break;
-            }
+        let left = loop {
+            let mut peek = [0u8; FRAME_BYTES + LEFT_PEEK];
+            let got = read_some(&inner.file, &mut peek, at.log_end)?;
+            let written = peek[..got].iter().any(|byte| *byte != 0);
+            let Some(header) = peek
+                .first_chunk::<FRAME_BYTES>()
+                .filter(|_| got >= FRAME_BYTES)
+            else {
+                break written;
+            };
             if &header[0..8] == RETIRED_MAGIC {
                 if platform::path_id(&inner.path)? != inner.file.inode {
                     return Ok(Followed::Retired);
                 }
-                break;
+                break false;
             }
-            if !frame_like(&header) {
-                break;
+            if !frame_like(header) {
+                break written;
             }
             let len = match len {
                 Some(len) => len,
                 None => *len.insert(inner.file.metadata()?.len()),
             };
-            match examine(&inner.file, &at, &header, len, holds)? {
+            match examine(&inner.file, &at, header, len, holds)? {
                 Found::Whole(next) if next.head.is_some() => {
                     at = next;
                     last = Some(next);
                 }
                 Found::Damaged(offset) => return Err(damaged(&at, offset)),
-                _ => break,
+                Found::Torn => break true,
+                Found::Whole(_) => break false,
             }
+        };
+        if holds && left {
+            let end = at.log_end;
+            let cut = inner.file.set_len(end).and_then(|()| inner.file.sync_all());
+            if let Err(error) = cut {
+                self.poison_unsynced();
+                return Err(error.into());
+            }
+            cursor.reserved = cursor.reserved.min(end);
         }
         let Some(last) = last else {
             return Ok(Followed::Still);

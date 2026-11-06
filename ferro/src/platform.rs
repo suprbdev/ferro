@@ -140,6 +140,8 @@ mod imp {
     /// They loop over `seek_read` and `seek_write`, which can return short counts, and move the
     /// handle's file pointer, which nothing reads.
     pub(crate) trait FileExt {
+        /// Reads into `buf` from `offset`, returning how many bytes it read, 0 at the file's end.
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
         /// Fills `buf` from `offset`, failing with `UnexpectedEof` if the file ends first.
         fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
         /// Writes all of `buf` at `offset`, failing with `WriteZero` if a write makes no progress.
@@ -147,6 +149,10 @@ mod imp {
     }
 
     impl FileExt for File {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.seek_read(buf, offset)
+        }
+
         fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
             while !buf.is_empty() {
                 match self.seek_read(buf, offset) {

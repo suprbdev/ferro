@@ -777,3 +777,114 @@ fn a_frame_half_written_by_a_dead_writer_is_written_over_and_a_damaged_one_is_no
         left_by_a_dead_writer(Left::Flipped(offset));
     }
 }
+
+#[test]
+fn a_frame_written_where_a_dead_writer_left_a_near_copy_reads_as_torn_after_a_power_cut() {
+    use ferro::store::{Op, Trace};
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("near.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let mut rng = common::Rng::new(11);
+    let pads: Vec<Vec<u64>> = (0..4)
+        .map(|_| (0..3000).map(|_| rng.next() | 1 << 63).collect())
+        .collect();
+    let commit = |db: &Db<Padded>, pad: &[u64]| {
+        db.update(|root| {
+            root.n += 1;
+            root.pad = pad.to_vec();
+        })
+        .unwrap()
+    };
+    let trace: Trace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let live: Db<Padded> = shared()
+        .reclaim(manual)
+        .trace(trace.clone())
+        .open(&path)
+        .unwrap();
+    for pad in &pads[..3] {
+        commit(&live, pad);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut slots = vec![0u8; 8192];
+    file.read_exact_at(&mut slots, 0).unwrap();
+    let start = live.size_on_disk();
+    let dead: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    commit(&dead, &pads[3]);
+    let end = dead.size_on_disk();
+    drop(dead);
+    let mut left = vec![0u8; (end - start) as usize];
+    file.read_exact_at(&mut left, start).unwrap();
+    let mut near = pads[3].clone();
+    near[1500] ^= 1;
+    let cut = start.next_multiple_of(4096) + 4 * 4096;
+    assert!(cut < end, "a frame of {} bytes", end - start);
+    file.set_len(start).unwrap();
+    file.write_all_at(&left[..(cut - start) as usize], start)
+        .unwrap();
+    file.write_all_at(&slots, 0).unwrap();
+    let base = std::fs::read(&path).unwrap();
+    trace.lock().clear();
+    commit(&live, &near);
+    let ops = trace.lock().clone();
+    drop(live);
+    let written = std::fs::read(&path).unwrap();
+    let differ: Vec<u64> = (start..cut)
+        .filter(|at| written[*at as usize] != base[*at as usize])
+        .collect();
+    let at = differ
+        .iter()
+        .copied()
+        .find(|at| *at >= start + 68)
+        .expect("the frames differ past their headers");
+    let sector = at - at % 512;
+    let bits: u32 = (sector..sector + 512)
+        .map(|byte| (written[byte as usize] ^ base[byte as usize]).count_ones())
+        .sum();
+    assert_eq!(
+        bits, 1,
+        "the sector at {sector} differs from the dead writer's in one bit"
+    );
+    let frame = ops
+        .iter()
+        .position(|op| matches!(op, Op::Write(_, offset, _) if *offset == start))
+        .expect("the frame is written where the dead writer's was");
+    let cleared = ops[..frame]
+        .iter()
+        .position(|op| matches!(op, Op::SetLen(_, len) if *len == start));
+    assert!(
+        cleared.is_some_and(|set| ops[set..frame].iter().any(|op| matches!(op, Op::Sync(_)))),
+        "the dead writer's frame was not truncated and synced before the next was written over it"
+    );
+    let mut image = base.clone();
+    for op in &ops {
+        match op {
+            Op::Write(_, offset, bytes) if *offset >= 8192 => {
+                let to = *offset as usize + bytes.len();
+                if image.len() < to {
+                    image.resize(to, 0);
+                }
+                for (index, byte) in bytes.iter().enumerate() {
+                    let byte_at = *offset + index as u64;
+                    if byte_at - byte_at % 512 != sector {
+                        image[byte_at as usize] = *byte;
+                    }
+                }
+            }
+            Op::SetLen(_, len) => image.resize(*len as usize, 0),
+            _ => {}
+        }
+    }
+    let torn = dir.path().join("torn.ferro");
+    std::fs::write(&torn, &image).unwrap();
+    let readonly = fast().read_only(true).open::<Padded>(&torn).unwrap();
+    assert_eq!(readonly.read().n, 3);
+    drop(readonly);
+    let reopened = fast().open::<Padded>(&torn).unwrap();
+    assert_eq!(reopened.read().n, 3);
+    reopened.verify().unwrap();
+}
