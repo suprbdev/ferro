@@ -49,5 +49,6 @@ it used to overflow a count, the stack, or the time a scan takes:
   the bundle check does, but it would cost two key comparisons a level and carry the separators down
   every path into `reach`, for a shape no file `ferro` wrote can have.
 
-Key order, the level each key hashes to and key ranges are not checked on local reads. `Map::len`
-returns the count the root link claims before anything is read. `verify_typed` checks the rest.
+Key order, the level each key hashes to, key ranges and summaries are not checked on local reads.
+`Map::len` returns the count the root link claims before anything is read, and `Map::summary` the
+summary it records. `verify_typed` checks the rest.

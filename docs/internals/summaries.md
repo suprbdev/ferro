@@ -19,7 +19,10 @@ independent of history. A `combine` that is not quite associative keeps that pro
 rounds the same way for the same contents, whatever edits led there. `split`, `merge`, `absorb` and
 the rest move links without looking at them, and any node they change is dirty, so none of them
 needed to know. Applying a delta to the old summary would have been cheaper per edit and would have
-broken canonical form for floats, so it is not done even for sums.
+broken canonical form for floats, so it is not done even for sums. Because the stored summary is
+that fold and nothing else, `receive` and `verify_typed` can recompute it from a node's bytes and
+refuse one that differs, as described under [Recomputing
+summaries](sync-receive.md#recomputing-summaries).
 
 `of` must depend only on the encoded key and value, so a `#[ferro(skip)]` field must not feed it. A
 read of a dirty tree has no stored summary for the nodes changed in this transaction and folds them
@@ -85,8 +88,9 @@ balances:
 The running balance has the smallest file of the hand-kept forms because a bulk commit touches one
 row per account per block, but each backdated entry rewrites every later block. The hand-kept forms
 answer only at day boundaries and are state that can drift from the postings. A summary works on any
-key range and is computed from them. `audit` still compares the fold with the journal, because
-`verify` knows no types and `verify_typed` checks a summary's type, not its value.
+key range and is computed from them, and `verify_typed` recomputes every stored fold from the
+postings below it. `audit` still compares the balances with the journal, which the postings are
+built from and which no summary covers.
 
 `metrics` keeps rollups in a summarized map and folds a bucket that spans at least 8 of them, which
 is where folding starts to beat scanning. On 4.32M rollups of 1,000 series: 978 ms to 5.6 ms for one

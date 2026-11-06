@@ -13,7 +13,8 @@ every `Options::checkpoint_bytes` of log, 64 MiB by default, and on clean close.
 Every read re-hashes the object against the pointer it came from, so corruption surfaces as an
 error, not wrong data. The whole database is a Merkle tree, and `verify` re-hashes all of it.
 `verify_typed` also decodes every object reachable from every retained version as your type, and
-checks each map node's count, level and key range, at the cost of a full decode.
+checks each map node's count, level and key range and recomputes each summary, at the cost of a
+full decode.
 
 ## Errors on read
 
