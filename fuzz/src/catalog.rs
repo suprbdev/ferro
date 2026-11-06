@@ -6,7 +6,7 @@ use ferro::{Bytes, Data, List, Map, Record, Set, Table};
 
 use crate::guarded;
 use crate::input::Input;
-use crate::types::{Gen, Heft, Probe, Total};
+use crate::types::{Gen, Heft, Inner, Probe, Total};
 
 #[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -126,7 +126,7 @@ pub struct Person {
 #[derive(Data, Clone, Debug, Default, PartialEq)]
 pub struct World {
     pub names: Map<u64, String>,
-    pub nested: Map<u64, Map<u64, u64>>,
+    pub nested: Map<u64, Map<u64, u64>, Inner>,
     pub tags: Set<String>,
     pub events: List<u64>,
     pub people: Table<Person>,
@@ -374,6 +374,7 @@ pub fn items_whole(items: &Table<Item>) -> usize {
 pub fn world_whole(world: &World) -> usize {
     let mut seen = whole(&world.names);
     seen += whole(&world.nested);
+    folds(&world.nested);
     for (_, inner) in world.nested.iter() {
         seen += whole(&inner);
     }

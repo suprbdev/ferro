@@ -77,6 +77,32 @@ impl Summary<u64, Bytes> for Heft {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct Inner(pub u64);
+
+impl Data for Inner {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Inner(u64::decode(r)?))
+    }
+}
+
+impl Summary<u64, Map<u64, u64>> for Inner {
+    fn of(key: &u64, value: &Map<u64, u64>) -> Self {
+        let inner = value
+            .iter()
+            .fold(*key, |sum, (_, item)| sum.wrapping_add(*item));
+        Inner(inner.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Inner(self.0.wrapping_add(other.0))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Opaque;
 
 impl Data for Opaque {
