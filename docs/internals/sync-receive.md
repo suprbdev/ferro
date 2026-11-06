@@ -344,31 +344,37 @@ without a store, so it decodes a value for `of` only when that records no typed 
 store. Any other value is visited as before, and the node or spilled value that holds it is marked
 deferred. Once every root has been walked, and so every object the bundle carries has passed its
 structural check, each deferred object is checked again through a view of the receiving file: a
-read-only store of its own, with its own id and no cache, that shares the open file and reads
-anything staged in the bundle by its hash, through a scope on the vetting thread that only the
-view's id matches. Every node and value read through the view is decoded afresh and belongs to the
-value that read it, staged or not, so nothing it decodes, and no memo or pin a read leaves in one,
-reaches the receiving store's cache or a node its readers share, and the view writes nothing. It
-lets a node claim as many entries as the file and the bundle's bodies could hold together. So `of`
-reads a nested collection as a local read would, only after its nodes passed the checks that bound
-how long a scan can take, and a value whose decode needs a store, such as a `Table` whose index the
-receiver added and rebuilds, is accepted as a local read would accept it. `verify_typed` reads a
-file it owns, so it decodes those values with the file's store as its walk reaches them.
+read-only store of its own, with its own id and no cache, that shares the open file. While the
+deferred pass runs, the bundle's staging is lent to the view, and a read through the view takes
+anything staged in the bundle by its hash, on whichever thread reads, so an `of` that hands a
+nested map to a thread of its own reads it as it would read its own. The pass takes the staging
+back under a lock that each read of it holds, so a read still under way finishes first, and a read
+after that finds only the file. Every node and value read through the view is decoded afresh and
+belongs to the value that read it, staged or not, so nothing it decodes, and no memo or pin a read
+leaves in one, reaches the receiving store's cache or a node its readers share, and the view writes
+nothing. It lets a node claim as many entries as the file and the bundle's bodies could hold
+together. So `of` reads a nested collection as a local read would, only after its nodes passed the
+checks that bound how long a scan can take, and a value whose decode needs a store, such as a
+`Table` whose index the receiver added and rebuilds, is accepted as a local read would accept it.
 
 A first version read the deferred objects through the receiving store itself, keeping only what it
 decoded from the staging out of the cache. A staged node still found its way into a held one: when
 the bundle carried a node the receiver also held, `of` reached it through a held parent from the
 cache, and the read pinned the staged child, whose links lead into the staging, into that parent.
 The receiver's own reads below it then followed staging offsets into its file and panicked, after a
-refused bundle as after an accepted one.
+refused bundle as after an accepted one. The next lent the staging through a scope on the vetting
+thread alone, and an `of` that summed a nested map on a thread of its own found none of the
+bundle's objects there, so an honest bundle was refused as one that does not decode.
 
-An honest bundle always passes. `flush` and the staged writer of a large commit compute each node's
-summary from scratch, from its entries and its children's link summaries, left to right in key
-order, and never by updating an old one, and a spilled value's summary is `S::of` of the key and
-value when it spilled. `of` sees only what the key and value encode, so the recompute starts from
-the inputs the writer had, and the same `combine` in the same grouping gives the same bits, floats
-included. The history tests of `ferro/tests/summary.rs`, `Float` among them, now pull each file
-they build and run `verify_typed` on it.
+An honest bundle's summaries always agree with the recompute. `flush` and the staged writer of a
+large commit compute each node's summary from scratch, from its entries and its children's link
+summaries, left to right in key order, and never by updating an old one, and a spilled value's
+summary is `S::of` of the key and value when it spilled. `of` sees only what the key and value
+encode, so the recompute starts from the inputs the writer had, and the same `combine` in the same
+grouping gives the same bits, floats included. The history tests of `ferro/tests/summary.rs`,
+`Float` among them, now pull each file they build and run `verify_typed` on it. An honest bundle can
+still be refused for what the recompute would read, as described below, and for an `of` or
+`combine` that panics on it.
 
 An object linked more than once is checked once for each key range, as above. A node has one fold,
 so a later link to it that claims a summary no earlier link claimed is refused. A value spilled
@@ -379,22 +385,75 @@ under many keys would otherwise stay in memory until its last link arrived. Each
 summary is remembered by the hash of its encoding with the object and the types it is checked as,
 up to 65,536 of them, so the same pair met again is not computed again.
 
-Every such recompute counts its value's bytes against an allowance of eight times the bundle's body
-bytes, plus 4 KiB for each link the bundle carries, plus 256 MiB, past which the bundle is refused.
-The reads of the deferred pass count against what is left of it, object by object, so a nested
-collection that `of` reads under many keys is charged each time it is read. A value of up to 4 KiB
-lands under any number of keys, since each key's slot brings the allowance for one more read of it,
-and a value of 1 MiB lands under about 265 keys and no more, where each key costs the bundle a
-slot of some 25 bytes and the receiver a read of the whole value. A nested map of 40,000 entries
-that `of` sums under 1,500 keys of one node is refused about a second in, where reading it each time
-would take several.
+An inline entry has no summary of its own to remember, and a bundle of several commits carries each
+version of a node it rewrites, so the deferred pass would summarize every entry once for each
+version, and read again each collection those entries hold. Each recheck in the deferred pass
+instead takes an entry's summary from a memo kept for the receive, by the types of the map and the
+hash of the key's encoding, the value's bytes and the hashes of its links, and calls `S::of` only
+for an entry it has not met. The memo keeps two generations of up to 16,384 entries each and drops
+the older when the newer fills, keeping what is found in it.
+
+Recomputing summaries can read far more than the bundle carries: a value spilled under many keys is
+read once for each, and `of` reads a nested collection whole for each entry that holds it. The
+receive makes one view, when it first needs one, for the deferred pass and for the hint path below,
+and charges what it reads against an allowance of eight times the bundle's body bytes, plus 4 KiB
+for each link the bundle carries, plus 256 MiB, past which the bundle is refused. The first read of
+each record of the receiver's file is free. The view keeps a bit for each 8 bytes of the file, in
+chunks of 512 bytes that each cover 32 KiB, allocated as its reads first land in them. A map node's
+record takes at least 8 bytes, and a record that starts in the same 8 bytes as a shorter one read
+before it is charged as read again. A read of an object the bundle carries, a second read of a
+record, and each check of a sent spilled value again under another key are charged. So reading what
+the receiver holds once costs an honest bundle nothing, however much it is, and what a bundle can
+make the receiver read again is paid for by what it carries. A value of up to 4 KiB lands under any
+number of keys, since each key's slot brings the allowance for one more read of it, and a value of
+1 MiB lands under about 265 keys and no more, where each key costs the bundle a slot of some 25
+bytes and the receiver a read of the whole value. A nested map of 40,000 entries that `of` sums
+under 1,500 keys of one node is refused about a second in, where reading it each time would take
+several, and a nested map stored once in the receiver's file and shared by several keys is charged
+from its second read.
+
+The deferred pass used to charge every read, held or staged. Fourteen keys in one node, each holding
+a nested `Map<u64, u64>` of 2,500,000 entries that `of` sums, make a file of 403 MB, and a bundle
+of 555 bytes that added a fifteenth key was refused 2.1 s in, on every attempt, for reading the
+fourteen held maps once each; before the deferred pass it landed in 2.9 s. It now lands in 2.5 to
+2.7 s, with 6.4 MiB at the peak of the heap. Three commits that each add a key land in the same
+time, where without the memo even two were refused, since each later version of the node read all
+fourteen again. Twelve commits that each change the same one of the fourteen maps land in 5.0 s, and
+sixteen are refused 5.2 s in, as each version of that map is a new value to read whole. Measured and
+left out:
+
+- A set of the offsets read, in place of the bits: the same receive peaked at 108 MiB of heap for
+  the five million or so records it read, and took 3.1 s.
+- An allowance that adds the file's size, which needs no record at all. It would let a small
+  bundle buy as many bytes of reads again of one object the receiver holds, a nested map shared
+  under many keys say, as its file holds, so the work that bundle can buy would grow with the
+  receiver's file. With the record, what it can buy again is its own allowance, and what it reads
+  for free is the receiver's data, once.
+- A cache of held objects in the view. It saves the decode of a second read but not the scan `of`
+  makes, so a second read would still be charged, and a cached node would carry pins between reads
+  of the view that the view now never keeps.
 
 Held objects are trusted. The hint path learns the claims of the links in the held parents it reads,
 and a held link that claims what its held parent records needs nothing more. One that claims
 something else recomputes the held node's fold from what the node stores, or loads the held value
-and computes its summary, remembered and charged as above, except that the first such recompute of
-a held object is not charged, as the first check of a sent one is not. The held parents on the hint
-path are checked without their own claims, since only the kinds of their links are wanted.
+and computes its summary, remembered as above, through the same view and charged by the same rule,
+so the collections `of` reads in a held value are charged too. So is the check of held data linked
+as another type. The held parents on the hint path are checked through the receiving store without
+their own claims, since only the kinds of their links are wanted. The recompute used to load a held
+value through the receiving store and charge its body alone, and not the first time: with a note of
+a 600-byte string and a map of 1,000,000 entries held, a bundle of 7,056 bytes that put the note
+under 200 more keys took 15.0 s to land, summing the map once for each key. It is now refused
+2.3 s in, after about twenty sums, and a few keys land.
+
+`verify_typed` checks a file it owns, and trusts nothing in it, so its walk checks each object
+without the store, as the receive does, and checks an object it marked deferred again with the
+file's store once every object below it has passed. The deferred object goes on the walk's stack
+under the links it found, so it comes off once they have all been checked and no list of deferred
+objects is kept. It used to decode those values with the store as its walk reached them, before any
+node of the collections they hold had been checked. A node's count is bounded only by the size of
+the file, so a file of 64 MiB holding a nested map of 21 nodes, each linking the next three times,
+made `of` walk ten billion entries over 69 s before the walk reached the first of those nodes and
+found its keys at the wrong level. That now takes 0.07 s.
 
 `verify_typed` remembers at most 4,096 confirmed pairs, and checks a link whose claim no earlier
 check of its object confirmed when it reaches it, so that it holds no list of such links: the first
@@ -446,6 +505,39 @@ where each held parent's links now carry their claims, and in the held links tha
 Over spilled values the sent nodes add 4.6M of the edit's 18.7M, and the hint path most of the
 rest, since each held slot's claim is a key and a summary of its own. No map in these runs holds a
 collection in its values, so none was deferred.
+
+The free first read of a held record, the memo of entries and `verify_typed`'s check without the
+store were measured the same way on 2026-11-06, over 11 rounds, with bundles a little different
+from those above and a fifth map whose values are maps, so that every node a bundle carries is
+deferred: 20,000 keys, each holding a `Map<u64, u64>` of 60 entries that `of` sums, built in ten
+commits of 2,000 keys, and an edit that adds an entry to 1,008 random inner maps:
+
+| Map | Bundle | Time before | Time after | Instructions |
+| --- | --- | --- | --- | --- |
+| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 121.1 ms | 120.7 ms | 1,053.3M to 1,053.4M (+0.0%) |
+| | Edit, 2.9 MB | 16.2 ms | 16.2 ms | 149.5M to 149.5M (-0.0%) |
+| | `verify_typed` | 152.5 ms | 154.1 ms | 1,042.9M to 1,045.3M (+0.2%) |
+| The same with a `u64` sum of value lengths | Clone, 35.6 MB | 127.2 ms | 126.9 ms | 1,145.4M to 1,146.0M (+0.1%) |
+| | Edit, 2.9 MB | 17.8 ms | 17.7 ms | 168.9M to 169.1M (+0.1%) |
+| | `verify_typed` | 163.1 ms | 162.7 ms | 1,145.7M to 1,151.2M (+0.5%) |
+| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 15.8 MB | 144.7 ms | 145.1 ms | 1,634.0M to 1,636.1M (+0.1%) |
+| | Edit, 1.2 MB | 16.2 ms | 16.3 ms | 182.0M to 182.3M (+0.2%) |
+| | `verify_typed` | 208.0 ms | 211.0 ms | 1,826.3M to 1,840.3M (+0.8%) |
+| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.1 MB | 135.0 ms | 135.6 ms | 1,142.3M to 1,142.3M (-0.0%) |
+| | Edit, 1.4 MB | 14.1 ms | 13.9 ms | 147.5M to 147.5M (-0.0%) |
+| | `verify_typed` | 175.7 ms | 176.9 ms | 1,103.0M to 1,106.5M (+0.3%) |
+| `Map<u64, Map<u64, u64>>` summing each inner map, 20,000 keys | Clone, 15.8 MB | 308.7 ms | 302.6 ms | 3,256.5M to 3,204.9M (-1.6%) |
+| | Edit, 0.7 MB | 84.2 ms | 84.8 ms | 824.7M to 820.5M (-0.5%) |
+| | `verify_typed` | 491.7 ms | 502.6 ms | 3,811.6M to 3,851.1M (+1.0%) |
+
+A clone or an edit of a map whose values hold no collection runs none of the new code but a few
+branches in the node check and the walk, and moved by 0.2% or less. `verify_typed` checks a node
+of a map with a summary without the store first, which tells a value that links from one that does
+not as it decodes, as the receive's walk does, up to 0.8% more, and the map of maps checks each of
+its nodes twice. Its clone summarizes fewer entries, since the memo finds those a later commit's
+version of a node shares with an earlier one. Keeping the memo's lookup out of the node check, in a
+function that is never inlined, took the summed clones from 0.24% and 0.32% more instructions to
+0.05% and 0.13%.
 
 Measured and left out:
 

@@ -68,8 +68,12 @@ it is sent as the type that will read it: each map node, spilled value, nested c
 index and summary decodes, each node's count, level and key range agree with its parent, and each
 summary is the fold of the entries below it, recomputed with this side's `Summary`. It costs about
 half again the time of applying a bundle, up to a fifth more for a map with a summary, and nothing
-for the objects it already holds. A `Summary` whose `of` or `combine` panics on what a bundle
-carries, such as an overflowing sum, makes `receive` refuse the bundle rather than unwind.
+for the objects it already holds, except that an `of` that reads a collection in a value reads it
+again for each entry of a node the bundle rewrites, held or sent. The first read of what this side
+holds is free, and a bundle that would make it read more again than its size allows, such as one
+large value shared by thousands of keys, is refused. A `Summary` whose `of` or `combine` panics on
+what a bundle carries, such as an overflowing sum, makes `receive` refuse the bundle rather than
+unwind.
 Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch file beside the
 database, and `receive` holds no writer lock while it reads, so commits on every branch go on
 however slowly the bundle comes. Only once the whole bundle has passed are its objects copied into

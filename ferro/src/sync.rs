@@ -2986,8 +2986,9 @@ impl<T: Data> Db<T> {
     /// # Errors
     ///
     /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
-    ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute.
-    ///   Nothing reaches the file.
+    ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
+    ///   or if recomputing its summaries would read more again than its size allows, as one large
+    ///   value shared by many keys can. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.

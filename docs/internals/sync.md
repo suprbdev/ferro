@@ -528,7 +528,10 @@ Measured and left out:
   architecture is refused, as described under [Recomputing
   summaries](sync-receive.md#recomputing-summaries).
 - A value spilled under many keys of a map with a summary is read and summarized again for each key,
-  and so is a collection that `of` reads in a value shared by many keys. A bundle whose recomputes
-  would read more than eight times its body bytes, plus 4 KiB for each link it carries, plus
-  256 MiB, is refused, so one value of 1 MiB under more than about 265 keys does not sync, as
-  described under [Recomputing summaries](sync-receive.md#recomputing-summaries).
+  and so is a collection that `of` reads in a value shared by many keys, and a nested collection
+  that `of` reads is read whole again in each version of it a bundle carries. The first read of
+  each record the receiver holds is free, and a bundle whose other reads would pass eight times its
+  body bytes, plus 4 KiB for each link it carries, plus 256 MiB, is refused. So one value of 1 MiB
+  under more than about 265 keys does not sync, nor a bundle of sixteen commits that each change the
+  same nested map of 2,500,000 entries that `of` sums, as described under [Recomputing
+  summaries](sync-receive.md#recomputing-summaries).

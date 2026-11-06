@@ -130,8 +130,9 @@ const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 /// The most LZ4 can expand a body by, which a record's claimed raw length may not pass.
 pub(crate) const MAX_RATIO: usize = 255;
-/// The bytes of file that one bit of a [`Store::view`]'s record of what it read stands for,
-/// fewer than any record takes.
+/// The bytes of file that one bit of a [`Store::view`]'s record of what it read stands for, no
+/// more than a map node's record takes. A record that starts within the same 8 bytes as a shorter
+/// one read before it reads as read again, and is charged.
 const READ_GRAIN: u64 = 8;
 /// The words of bits in each chunk of that record, which is allocated when a read first lands in
 /// it.

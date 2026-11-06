@@ -176,11 +176,13 @@ thread_local! {
 /// [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
 /// recompute every summary they check from the entries below it, with this type's `of` and
 /// `combine`, and refuse one whose encoding differs from what is stored, so two files that sync
-/// need the same `Summary`. `of` may read a collection the value holds: such a value is summarized
-/// once the rest of what is checked has passed, and reads the collection as a local read does. A
-/// panic in `of` or `combine` while they recompute is caught and refuses the bundle or reports
-/// the file as corrupt, and a read inside `of` that fails returns its error; the panic hook still
-/// runs, and with `panic = "abort"` the process aborts.
+/// need the same `Summary`. `of` may read a collection the value holds, on any thread: such a value
+/// is summarized once what is checked below it has passed, and reads the collection as a local
+/// read does. A receive reads what the receiving file holds once for free, and refuses a bundle
+/// whose summaries would read more again than its size allows, such as one large value shared by
+/// many keys. A panic in `of` or `combine` while they recompute is caught and refuses the bundle
+/// or reports the file as corrupt, and a read inside `of` that fails returns its error; the panic
+/// hook still runs, and with `panic = "abort"` the process aborts.
 ///
 /// # Examples
 ///
