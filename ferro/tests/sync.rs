@@ -14,8 +14,8 @@ use ferro::codec::{Encoder, HashSink, Object};
 use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Store, StoreOptions, Trace};
 use ferro::{
-    Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim,
-    Snapshot, Summary,
+    Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Record,
+    Snapshot, Summary, Table,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -2571,6 +2571,340 @@ fn a_bundle_whose_summary_panics_to_recompute_is_refused() {
         Err(Error::Corrupt(message)) => assert!(message.contains("panicked"), "{message}"),
         other => panic!("typed verify passed a summary that overflows: {other:?}"),
     }
+}
+
+type Inner = Map<u64, u64>;
+type Note = (String, Inner);
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct InnerSum(u64);
+
+impl Summary<u64, Inner> for InnerSum {
+    fn of(key: &u64, value: &Inner) -> Self {
+        let inner = value.iter().fold(0u64, |sum, (_, v)| sum.wrapping_add(*v));
+        InnerSum(key.wrapping_add(inner))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        InnerSum(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, Note> for InnerSum {
+    fn of(key: &u64, value: &Note) -> Self {
+        let inner = value
+            .1
+            .iter()
+            .fold(0u64, |sum, (_, v)| sum.wrapping_add(*v));
+        InnerSum(key.wrapping_add(inner).wrapping_add(value.0.len() as u64))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        InnerSum(self.0.wrapping_add(other.0))
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct InnerCount(u64);
+
+impl Summary<u64, Inner> for InnerCount {
+    fn of(_key: &u64, value: &Inner) -> Self {
+        InnerCount(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        InnerCount(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, Note> for InnerCount {
+    fn of(_key: &u64, value: &Note) -> Self {
+        InnerCount(value.1.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        InnerCount(self.0.wrapping_add(other.0))
+    }
+}
+
+#[derive(Data, Clone)]
+struct Nested<S: Summary<u64, Inner> + Summary<u64, Note>> {
+    inline: Map<u64, Inner, S>,
+    spilled: Map<u64, Note, S>,
+}
+
+impl<S: Summary<u64, Inner> + Summary<u64, Note>> Default for Nested<S> {
+    fn default() -> Self {
+        Nested {
+            inline: Map::default(),
+            spilled: Map::default(),
+        }
+    }
+}
+
+fn inner(seed: u64, len: u64) -> Inner {
+    (0..len).map(|key| (key, seed * 1_000 + key)).collect()
+}
+
+fn same_nested(ours: &Nested<InnerSum>, theirs: &Nested<InnerSum>) {
+    assert_eq!(ours.inline.root_hash(), theirs.inline.root_hash());
+    assert_eq!(ours.inline.summary(), theirs.inline.summary());
+    assert_eq!(
+        ours.inline.range_summary(5..60),
+        theirs.inline.range_summary(5..60)
+    );
+    assert_eq!(ours.spilled.root_hash(), theirs.spilled.root_hash());
+    assert_eq!(ours.spilled.summary(), theirs.spilled.summary());
+}
+
+#[test]
+fn a_summary_whose_of_reads_a_nested_map_lands_and_verifies() {
+    common::quiet_ferro_panics();
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Nested<InnerSum>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        for key in 0..120u64 {
+            root.inline.insert(key, inner(key, 1 + key % 40));
+            let note = (
+                text(key, 520 + key as usize % 30),
+                inner(key + 7, 3 + key % 5),
+            );
+            root.spilled.insert(key, note);
+        }
+        root.inline.insert(1_000, Map::new());
+    })
+    .unwrap();
+    a.verify_typed().unwrap();
+    let b: Db<Nested<InnerSum>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    same_nested(&b.read(), &a.read());
+    b.verify_typed().unwrap();
+    for round in 0..3u64 {
+        a.update(|root| {
+            for key in (round..120).step_by(11) {
+                root.inline.update(&key, |value| {
+                    value.insert(500 + round, round);
+                });
+                root.spilled.update(&key, |value| {
+                    value.1.insert(900 + round, key);
+                });
+            }
+            root.inline.insert(2_000 + round, inner(round, 50));
+        })
+        .unwrap();
+        assert_eq!(
+            b.pull(&a, "a", unmerged).unwrap().outcome,
+            Outcome::FastForward
+        );
+        same_nested(&b.read(), &a.read());
+    }
+    b.verify_typed().unwrap();
+
+    let path = dir.path().join("c.ferro");
+    let c: Db<Nested<InnerCount>> = fast().open(&path).unwrap();
+    match c.receive("a", &a.bundle(&c.have().unwrap()).unwrap(), unmerged) {
+        Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+        other => panic!("accepted nested summaries another `of` made: {other:?}"),
+    }
+    assert_eq!(c.version(), 0);
+    drop((a, c));
+    let reread: Db<Nested<InnerCount>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    match reread.verify_typed() {
+        Err(Error::Corrupt(message)) => assert!(message.contains("summary"), "{message}"),
+        other => panic!("typed verify passed nested summaries another `of` made: {other:?}"),
+    }
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Tagged {
+    #[key]
+    id: u32,
+    tag: u32,
+}
+
+mod indexed {
+    use ferro::{Data, Record};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Tagged {
+        #[key]
+        pub id: u32,
+        #[index]
+        pub tag: u32,
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Rows(u64);
+
+impl Summary<u64, Table<Tagged>> for Rows {
+    fn of(_key: &u64, value: &Table<Tagged>) -> Self {
+        Rows(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Rows(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, Table<indexed::Tagged>> for Rows {
+    fn of(_key: &u64, value: &Table<indexed::Tagged>) -> Self {
+        Rows(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Rows(self.0.wrapping_add(other.0))
+    }
+}
+
+#[test]
+fn a_summarized_table_whose_index_the_receiver_added_lands_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.ferro");
+    let a: Db<Map<u64, Table<Tagged>, Rows>> = fast().open(&path).unwrap();
+    a.update(|root| {
+        for key in 0..20u64 {
+            let mut table: Table<Tagged> = Table::new();
+            for id in 0..3u32 {
+                table.insert(Tagged {
+                    id,
+                    tag: id + key as u32,
+                });
+            }
+            root.insert(key, table);
+        }
+    })
+    .unwrap();
+    let b: Db<Map<u64, Table<indexed::Tagged>, Rows>> =
+        fast().open(dir.path().join("b.ferro")).unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), Some(Rows(60)));
+    assert_eq!(b.read().get(&3).unwrap().by_tag(&4).count(), 1);
+    b.verify_typed().unwrap();
+    drop(a);
+    let reread: Db<Map<u64, Table<indexed::Tagged>, Rows>> = fast().open(&path).unwrap();
+    assert_eq!(reread.read().get(&3).unwrap().by_tag(&4).count(), 1);
+    reread.verify_typed().unwrap();
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Scan(u64);
+
+impl Summary<u64, String> for Scan {
+    fn of(key: &u64, value: &String) -> Self {
+        let xs = value.bytes().filter(|byte| *byte == b'x').count() as u64;
+        Scan(key.wrapping_mul(3).wrapping_add(xs))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Scan(self.0.wrapping_add(other.0))
+    }
+}
+
+fn one_value_under(keys: &[u64], spill: &Object, size: usize) -> Received<Map<u64, String, Scan>> {
+    let sums: Vec<u64> = keys
+        .iter()
+        .map(|key| key.wrapping_mul(3).wrapping_add(size as u64))
+        .collect();
+    let entries: Vec<(u64, Slot<'_>)> = keys
+        .iter()
+        .zip(&sums)
+        .map(|(key, sum)| (*key, Slot::Spill(spill, *sum)))
+        .collect();
+    let total = sums
+        .iter()
+        .fold(0u64, |total, sum| total.wrapping_add(*sum));
+    let leaf = summed_node(&entries, &[]);
+    let root = summed_root(keys.len() as u64, total, &leaf);
+    receive_tree(&[spill, &leaf, &root])
+}
+
+#[test]
+fn one_spilled_value_under_many_keys_lands_within_a_budget() {
+    let size = 1 << 20;
+    let long = "x".repeat(size);
+    let spill = object_of(&long);
+    let keys = level_zero_keys(4_000);
+    let started = Instant::now();
+    let (b, result, _dir) = one_value_under(&keys[..200], &spill, size);
+    assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+    assert_eq!(*b.read().get(&keys[199]).unwrap(), long);
+    b.verify_typed().unwrap();
+    let (b, result, _dir) = one_value_under(&keys, &spill, size);
+    match result {
+        Err(Error::Bundle(message)) => assert!(message.contains("too many keys"), "{message}"),
+        other => panic!("recomputed one value's summary under 4000 keys: {other:?}"),
+    }
+    assert_eq!(b.version(), 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+thread_local! {
+    static SUMMED: std::cell::RefCell<BTreeMap<(u64, usize), usize>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Noted(u64);
+
+impl Summary<u64, String> for Noted {
+    fn of(key: &u64, value: &String) -> Self {
+        SUMMED.with(|summed| *summed.borrow_mut().entry((*key, value.len())).or_insert(0) += 1);
+        Noted(key.wrapping_add(value.len() as u64))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Noted(self.0.wrapping_add(other.0))
+    }
+}
+
+#[test]
+fn a_spilled_value_reused_under_a_key_is_summarized_once_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    type Noting = Map<u64, String, Noted>;
+    type Five = (Noting, Noting, Noting, Noting, Noting);
+    let a: Db<Five> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let shared = "s".repeat(700);
+    let keys = level_zero_keys(6);
+    a.update(|root| {
+        root.4.insert(keys[0], shared.clone());
+        for (at, map) in [&mut root.0, &mut root.1, &mut root.2, &mut root.3]
+            .into_iter()
+            .enumerate()
+        {
+            map.insert(keys[1], shared.clone());
+            map.insert(keys[2 + at], "o".repeat(600 + at));
+        }
+    })
+    .unwrap();
+    let b: Db<Five> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    SUMMED.with(|summed| summed.borrow_mut().clear());
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let summed = SUMMED.with(|summed| summed.borrow().clone());
+    assert_eq!(summed.get(&(keys[0], 700)), Some(&1), "{summed:?}");
+    assert_eq!(summed.get(&(keys[1], 700)), Some(&1), "{summed:?}");
+    assert_eq!(summed.len(), 6, "{summed:?}");
+    b.verify_typed().unwrap();
 }
 
 #[test]

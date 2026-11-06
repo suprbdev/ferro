@@ -8,7 +8,7 @@ use std::io::{BufReader, BufWriter};
 use std::time::Instant;
 
 use common::{fast, text};
-use ferro::{Bundle, Db, Error, Map, Outcome, Snapshot};
+use ferro::{Bundle, Data, Db, Error, Map, Outcome, Snapshot, Summary};
 
 struct Peak;
 
@@ -415,6 +415,59 @@ fn a_clone_of_a_large_tree_holds_a_few_dozen_bytes_for_each_object() {
     assert!(
         received < 4 * MIB + 48 * objects,
         "receiving {objects} objects took {received} bytes of heap"
+    );
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Len(u64);
+
+impl Summary<u64, String> for Len {
+    fn of(_key: &u64, value: &String) -> Self {
+        Len(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Len(self.0.wrapping_add(other.0))
+    }
+}
+
+fn spread_heap(dir: &std::path::Path, copies: u64) -> usize {
+    let a: Db<Map<u64, String, Len>> = fast().open(dir.join(format!("a{copies}.ferro"))).unwrap();
+    a.update(|root| {
+        for index in 0..100u64 {
+            let value = text(index * 7_919 + 1, 256 << 10);
+            for copy in 0..copies {
+                root.insert(index + copy * 1_000_000, value.clone());
+            }
+            for filler in 0..20u64 {
+                root.insert(500_000 + index * 20 + filler, format!("f{filler}"));
+            }
+        }
+    })
+    .unwrap();
+    let b: Db<Map<u64, String, Len>> = fast().open(dir.join(format!("b{copies}.ferro"))).unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let (pulled, received) = heap_of(|| {
+        b.receive("a", &bundle, |_, _, _| -> (String, ()) {
+            panic!("no merge expected")
+        })
+        .unwrap()
+    });
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.read().summary(), a.read().summary());
+    received
+}
+
+#[test]
+fn a_value_spilled_under_several_keys_is_not_kept_while_its_links_arrive() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let once = spread_heap(dir.path(), 1);
+    let thrice = spread_heap(dir.path(), 3);
+    println!("received with {once} bytes of heap under one key, {thrice} under three");
+    assert!(
+        thrice < once + 8 * MIB,
+        "100 values of 256 KiB under three keys took {thrice} bytes of heap, under one {once}"
     );
 }
 
