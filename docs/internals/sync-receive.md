@@ -32,7 +32,9 @@ ones, in generation order so that its parents' final copies come first. A clone 
 rewrites none, and an incremental pull rewrites its few commits.
 
 Placing copies the staged records into the log. Each is encoded again at its offset there, keeping
-its stored body, LZ4 bytes and all, so nothing is compressed twice. A link to a sent object takes
+the body it was staged with, the LZ4 bytes it arrived with or those a body that arrived
+uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing is
+compressed at placing. A link to a sent object takes
 the offset it was placed at, and a link to an anchor or hint the offset of that object in the
 generation now current. A bundle that never spilled is placed in the frame that lands it, under the
 writer locks, which is written in one piece like a commit's. A larger one is placed first, in pieces

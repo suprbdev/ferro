@@ -119,7 +119,7 @@ depth first through what it links that is to be sent, so a commit's trees and pa
 it and the stack is as deep as a tree, not as a history. That walk names the hints, so the header,
 with the anchors, the hints and the object count, goes first. Then each object is read once more,
 its hash checked, and written in 64 KiB chunks with the LZ4 bytes the file already holds for it, so
-nothing is compressed twice. Planning holds about 45 bytes for each object sent, as described under
+the sender compresses nothing. Planning holds about 45 bytes for each object sent, as described under
 [Memory for each object](#memory-for-each-object). `pull` runs the sender on a second thread once it
 sends 256 objects, with eight chunks in flight between the two.
 
@@ -133,6 +133,19 @@ sends 256 objects, with eight chunks in flight between the two.
   read, and no body may pass the 4 GiB a record can hold. The sender sends a body uncompressed when
   compressing it would break that rule, so a bundle from `bundle` always passes. The stream must end
   after the last object.
+- A body that arrives uncompressed is compressed and kept as its LZ4 block when that is smaller, as
+  a commit stores a body, so a body the rule above sent raw is not stored raw. The receiver used to
+  store it as it arrived: pulling one value of 32 MiB, zeroes with a byte of 1 every 8 KiB, from a
+  file of 140,324 bytes took the receiving file to 33,628,825 bytes, 240 times the sender's, and
+  left a frame that a power cut could tear into one a bit from whole, as [Torn and damaged
+  frames](storage.md#torn-and-damaged-frames) describes. The receiving file now takes 140,568
+  bytes, and the pull, median of five, took 18.5 ms under `Durability::Fsync` where it took 83.2,
+  and 16.2 ms where it took 42.3 under Buffered. A body the sender's file holds raw, because
+  compression did not make it smaller, is tried once more for nothing: a pull of 1,000,000 values
+  of 320 random bytes into an empty file, 330 MB in 124,937 objects none of which compress, took
+  0.847 s against 0.802 s, median of five alternating runs, with peak RSS 17.5 MiB against 17.3,
+  and an incremental pull of three one-key commits into it, 82 KB in 27 objects, ran 4,663,546
+  instructions against 4,389,510 at a median of 0.56 ms both.
 - The new commits are walked from the head through `prev`, and their versions must descend one at a
   time. A head at 2^63 or above is rejected, so a fast-forward to it cannot leave the next commit to
   wrap the version past `u64::MAX`. The commit below the oldest one sent is looked up in the
