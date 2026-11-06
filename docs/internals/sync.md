@@ -533,5 +533,7 @@ Measured and left out:
   each record the receiver holds is free, and a bundle whose other reads would pass eight times its
   body bytes, plus 4 KiB for each link it carries, plus 256 MiB, is refused. So one value of 1 MiB
   under more than about 265 keys does not sync, nor a bundle of sixteen commits that each change the
-  same nested map of 2,500,000 entries that `of` sums, as described under [Recomputing
-  summaries](sync-receive.md#recomputing-summaries).
+  same nested map of 2,500,000 entries that `of` sums, nor a commit that puts a value holding a
+  16 MiB collection `of` reads under more than about 17 keys, as described under [Recomputing
+  summaries](sync-receive.md#recomputing-summaries). Those reads are free once per receive, so a
+  bundle that is refused and sent again makes the receiver read what it holds again each time.

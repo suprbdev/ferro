@@ -1898,11 +1898,11 @@ impl View {
             return None;
         }
         // SAFETY: `Staging::overlaid` stores a pointer from a shared borrow of a staging that lasts
-        // for the whole call of the closure it runs, and under the write lock puts the previous
-        // pointer back before that call returns or unwinds. The read lock held here keeps it from
-        // doing so, so the staging is alive and unchanged while this reads it, and nothing writes
-        // through the pointer. `Staging` is `Sync`, which `overlaid` requires, so the shared
-        // borrow may be used on any thread.
+        // for the whole call of the closure it runs, only where no staging is lent already, and
+        // under the write lock clears it before that call returns or unwinds. The read lock held
+        // here keeps it from doing so, so the staging is alive and unchanged while this reads it,
+        // and nothing writes through the pointer. `Staging` is `Sync`, which `overlaid` requires,
+        // so the shared borrow may be used on any thread.
         let staging = unsafe { &*staging };
         let at = staging.id_of(&ptr.hash)?;
         Some(staging.read_object(Ptr {
@@ -4411,22 +4411,33 @@ impl Staging {
     /// so what it decodes from one stays with whatever read it. No other store sees the staging,
     /// and no read through `view` once `f` returns or unwinds, which waits for the reads of the
     /// staging under way.
+    ///
+    /// # Panics
+    ///
+    /// If a staging is lent to `view` already, since a view reads one staging at a time.
     pub(crate) fn overlaid<R>(&self, view: &Store, f: impl FnOnce() -> R) -> R {
         fn lend<T: Sync>(staging: &T) -> *mut T {
             std::ptr::from_ref(staging).cast_mut()
         }
-        struct Restore<'a>(&'a RwLock<AtomicPtr<Staging>>, *mut Staging);
+        struct Restore<'a>(&'a RwLock<AtomicPtr<Staging>>);
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
-                *self.0.write().get_mut() = self.1;
+                *self.0.write().get_mut() = std::ptr::null_mut();
             }
         }
         debug_assert!(view.inner.view.is_some(), "only a view reads a staging");
         let Some(lens) = &view.inner.view else {
             return f();
         };
-        let previous = mem::replace(lens.lent.write().get_mut(), lend(self));
-        let _restore = Restore(&lens.lent, previous);
+        {
+            let mut lent = lens.lent.write();
+            assert!(
+                lent.get_mut().is_null(),
+                "a view reads one staging at a time"
+            );
+            *lent.get_mut() = lend(self);
+        }
+        let _restore = Restore(&lens.lent);
         f()
     }
 

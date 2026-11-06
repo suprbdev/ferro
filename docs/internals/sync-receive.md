@@ -412,7 +412,10 @@ the receiver holds once costs an honest bundle nothing, however much it is, and 
 make the receiver read again is paid for by what it carries. A bundle of a few hundred bytes can so
 make the receiver read, once, every collection held in the values of the nodes it rewrites, as
 committing them cost the sender, and the view's record of what it read takes at most 1.7% of the
-stretch of file those reads cover. A value of up to 4 KiB lands under any number of keys, since each
+stretch of file those reads cover. The record lasts one receive, so a bundle that is refused, and
+sent again, makes the receiver read what it holds again each time: a bundle of 1,517 bytes whose
+summary did not check read 1.28 GB of held pages on each attempt, about 380 ms, where before the
+free first read the allowance refused it after 256 MiB. A value of up to 4 KiB lands under any number of keys, since each
 key's slot brings the allowance for one more read of it, and a value of 1 MiB lands under about 265
 keys and no more, where each key costs the bundle a slot of some 25 bytes and the receiver a read of
 the whole value. A nested map of 40,000 entries that `of` sums under 1,500 keys of one node is
