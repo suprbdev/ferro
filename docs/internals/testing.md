@@ -77,9 +77,9 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   held trees, a clone into an empty file, merges on both sides, edited covered indexes, a 1.2 MB
   bundle that spills to the scratch file and is placed in pieces, and four taken from devices that
   pull from each other's branches with pruned history and cycles, so that a bundle can carry
-  commits the receiver already holds. Two of its maps keep a summary, a wrapping sum over small
-  values and one over spilled blobs, some of them one value under several keys, whose `of` reads
-  the key. The input picks one, then mutates its objects, links, header and count as parsed values,
+  commits the receiver already holds. Three of its maps keep a summary: a wrapping sum over small
+  values, one over spilled blobs, some of them one value under several keys, whose `of` reads the
+  key, and one over a map of maps whose `of` reads each inner map. The input picks one, then mutates its objects, links, header and count as parsed values,
   or finds the summaries in the nodes of those maps and changes one, or two of a node by amounts
   that cancel so that the node's own fold still holds, and rehashes them up to the head, or edits
   the encoded bytes, or replaces the bundle outright. It can feed the stream in small reads,

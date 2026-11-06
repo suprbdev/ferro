@@ -338,6 +338,20 @@ spilled value carries the key and the summary of its slot, so the check of the v
 and compares `S::of(key, value)`. From the leaves up, every summary that lands is then the fold of
 the entries below it, and `verify_typed` runs the same check over a file.
 
+A value can hold a collection that `of` reads, `roles.contains(&Admin)` say, and that collection's
+nodes are either in the bundle, staged and not yet in the file, or held. The walk decodes values
+without a store, so it decodes a value for `of` only when that records no typed link and needs no
+store. Any other value is visited as before, and the node or spilled value that holds it is marked
+deferred. Once every root has been walked, and so every object the bundle carries has passed its
+structural check, each deferred object is checked again with the receiving store, inside a scope
+where a read of that store that misses its cache finds an object staged in the bundle by its hash.
+What such a read decodes stays out of the cache and the deduplication table, since its links lead
+into the staging, and the scope is the vetting thread's alone. So `of` reads a nested collection as
+a local read would, only after its nodes passed the checks that bound how long a scan can take,
+and a value whose decode needs a store, such as a `Table` whose index the receiver added and
+rebuilds, is accepted as a local read would accept it. `verify_typed` defers the same objects and
+checks them again with the file's store once its walk is done.
+
 An honest bundle always passes. `flush` and the staged writer of a large commit compute each node's
 summary from scratch, from its entries and its children's link summaries, left to right in key
 order, and never by updating an old one, and a spilled value's summary is `S::of` of the key and
@@ -347,22 +361,31 @@ included. The history tests of `ferro/tests/summary.rs`, `Float` among them, now
 they build and run `verify_typed` on it.
 
 An object linked more than once is checked once for each key range, as above. A node has one fold,
-so a later link to it that claims a summary no earlier link claimed is refused. A value
-spilled under two keys has a summary for each, so a later link whose key and summary no earlier
-check confirmed decodes the value, once, keeps it with the object's checks until its last link, and
-computes `S::of` for that key; each such decode counts towards the recheck budget. Held objects are
-trusted. The hint path learns the claims of the links in the held parents it reads, and a held link
-that claims what its held parent records needs nothing more. One that claims something else
-recomputes the held node's fold from what the node stores, or loads the held value and computes
-its summary. The held parents on the hint path are checked without their own claims, since only
-the kinds of their links are wanted.
+so a later link to it that claims a summary no earlier link claimed is refused. A value spilled
+under two keys has a summary for each, so a later link whose key and summary no check of that
+object confirmed reads and decodes the value again and computes `S::of` for that key. Nothing
+decoded is kept between links: a decoded value can be many times its encoding, and a value linked
+under many keys would otherwise stay in memory until its last link arrived. Each confirmed key and
+summary is remembered by the hash of its encoding, up to 65,536 of them, so the same pair met again
+is not computed again. Every such recompute counts its value's bytes against a budget of eight
+times the bundle's body bytes plus 256 MiB, past which the bundle is refused, so a value of 1 MiB
+linked under a few hundred keys lands and one linked under thousands does not, where each key costs
+the bundle a slot of some 25 bytes and the receiver a read of the whole value.
+
+Held objects are trusted. The hint path learns the claims of the links in the held parents it reads,
+and a held link that claims what its held parent records needs nothing more. One that claims
+something else recomputes the held node's fold from what the node stores, or loads the held value
+and computes its summary, remembered and charged as above. The held parents on the hint path are
+checked without their own claims, since only the kinds of their links are wanted.
 
 `of` and `combine` are the user's code, run on what a peer sent. A panic in either, from an
 overflowing checked sum say, is caught around each node's fold and each value's summary, and
 refuses the bundle with `Error::Bundle`, or makes `verify_typed` return `Error::Corrupt`, where a
 local read of the same data would panic: `summary` returns the root link's without calling either,
-but `range_summary` combines the links it covers and a commit folds every node it rewrites. The
-panic hook still runs, and with `panic = "abort"` the process aborts, as it would on that read.
+but `range_summary` combines the links it covers and a commit folds every node it rewrites. A read
+inside `of` that fails, an I/O error say, panics as reads do, and the check returns that error
+rather than the panic. The panic hook still runs, and with `panic = "abort"` the process aborts, as
+it would on that read.
 
 A map without a summary skips all of it. Whether `S` has a size is a constant, a node of a
 zero-sized `S` is checked by the code that checked it before, and its links carry no claim. A first
@@ -379,25 +402,27 @@ a file that holds the clone. Times are medians, and the user-space instructions 
 
 | Map | Bundle | Time before | Time after | Instructions |
 | --- | --- | --- | --- | --- |
-| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 120.4 ms | 118.5 ms | 1,055.1M to 1,055.4M (+0.03%) |
-| | Edit, 2.8 MB | 16.6 ms | 16.7 ms | 147.5M to 146.4M (-0.7%) |
-| | `verify_typed` | 160.5 ms | 157.5 ms | 1,045.4M to 1,043.7M (-0.2%) |
-| The same with a `u64` sum of value lengths | Clone, 35.7 MB | 119.5 ms | 127.3 ms (+6.6%) | 1,059.1M to 1,139.6M (+7.6%) |
-| | Edit, 2.8 MB | 17.1 ms | 18.9 ms (+10%) | 149.6M to 165.4M (+11%) |
-| | `verify_typed` | 160.4 ms | 168.2 ms (+4.9%) | 1,049.2M to 1,142.9M (+8.9%) |
-| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 11.6 MB | 121.2 ms | 128.7 ms (+6.2%) | 1,381.1M to 1,473.6M (+6.7%) |
-| | Edit, 0.9 MB | 13.4 ms | 14.8 ms (+10%) | 151.0M to 168.6M (+12%) |
-| | `verify_typed` | 175.5 ms | 193.3 ms (+10%) | 1,598.0M to 1,721.0M (+7.7%) |
-| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.2 MB | 132.9 ms | 135.9 ms (+2.2%) | 1,107.8M to 1,136.7M (+2.6%) |
-| | Edit, 1.4 MB | 12.8 ms | 15.2 ms (+19%) | 131.5M to 149.9M (+14%) |
-| | `verify_typed` | 179.9 ms | 185.3 ms (+3.0%) | 1,058.6M to 1,102.5M (+4.2%) |
+| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 124.0 ms | 120.0 ms | 1,055.1M to 1,056.4M (+0.1%) |
+| | Edit, 2.8 MB | 16.9 ms | 17.0 ms | 147.5M to 146.6M (-0.6%) |
+| | `verify_typed` | 161.3 ms | 160.1 ms | 1,045.4M to 1,044.4M (-0.1%) |
+| The same with a `u64` sum of value lengths | Clone, 35.7 MB | 124.3 ms | 128.2 ms (+3.1%) | 1,059.1M to 1,146.7M (+8.3%) |
+| | Edit, 2.8 MB | 17.0 ms | 18.3 ms (+8.0%) | 149.6M to 165.9M (+11%) |
+| | `verify_typed` | 160.3 ms | 168.1 ms (+4.9%) | 1,049.1M to 1,149.3M (+9.6%) |
+| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 11.6 MB | 121.5 ms | 130.5 ms (+7.4%) | 1,381.1M to 1,492.1M (+8.0%) |
+| | Edit, 0.9 MB | 13.7 ms | 15.2 ms (+11%) | 151.0M to 169.3M (+12%) |
+| | `verify_typed` | 174.4 ms | 195.2 ms (+12%) | 1,598.0M to 1,738.6M (+8.8%) |
+| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.2 MB | 133.9 ms | 137.6 ms (+2.8%) | 1,107.8M to 1,139.4M (+2.9%) |
+| | Edit, 1.4 MB | 12.9 ms | 14.9 ms (+15%) | 131.5M to 150.3M (+14%) |
+| | `verify_typed` | 177.5 ms | 186.0 ms (+4.8%) | 1,058.6M to 1,104.9M (+4.4%) |
 
 The plain map's small differences are in the shared walk, which carries the larger `Kind`. Counted
-by part, almost all of a clone's added instructions are in checking the sent nodes, 76M of the 80M
+by part, almost all of a clone's added instructions are in checking the sent nodes, 83M of the 88M
 for the sum of lengths, most of it decoding each inline value where the check used to step over
-it, which `of` needs. An edit adds less there, 6.9M of 15.6M, and more on the hint path, 3.0M,
-where each held parent's links now carry their claims. Over spilled values the hint path adds
-4.8M of the edit's 18.5M, since each held slot's claim is a key and a summary of its own.
+it, which `of` needs. An edit adds less there, 7.3M of 15.9M, and the rest on the hint path,
+where each held parent's links now carry their claims, and in the held links that compare them.
+Over spilled values the sent nodes add 4.6M of the edit's 18.7M, and the hint path most of the
+rest, since each held slot's claim is a key and a summary of its own. No map in these runs holds a
+collection in its values, so none was deferred.
 
 Measured and left out:
 
