@@ -1027,7 +1027,11 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
 /// writer is alive: it scans from the anchor under the locks, judging damage as a writer's open
 /// does, and syncs the frames it kept, since a dead writer's frames may be only in the page cache.
 /// A shared writer that opens meanwhile waits for the placement lock before it recovers or writes,
-/// so nothing it writes races the scan. With a writer alive, `sb` is current.
+/// so nothing it writes races the scan. With a writer alive, `sb` is current. A placement lock
+/// held elsewhere means a writer is placing a frame, so `sb` is used as it is, but a test of the
+/// lock that fails with an error says nothing about writers, and the open goes on to test
+/// [`MULTI_AT`] and scans without the placement lock, as it would where there are no byte-range
+/// locks.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
@@ -1042,10 +1046,11 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
                 file,
                 at: COMMIT_AT,
             }),
-            Err(_) => {
+            Err(TryLockError::WouldBlock) => {
                 platform::unlock(file)?;
                 return Ok(sb);
             }
+            Err(TryLockError::Error(_)) => None,
         },
         false => None,
     };
