@@ -1,10 +1,11 @@
 mod common;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 
 use common::{Rng, fast, uncached};
-use ferro::table::{IndexIter, IntoMatches, Matches};
+use ferro::table::{IndexEach, IndexIter, IntoMatches, Matches};
 use ferro::{Data, Db, Record, Table};
 use proptest::prelude::*;
 
@@ -185,23 +186,47 @@ impl Leaf {
         }
     }
 
-    fn partly(&self, table: &Table<Row>) -> IndexIter<Row> {
-        let Leaf::Partly(leaf, front, back) = self else {
-            return self.iter(table);
+    fn partly(&self, table: &Table<Row>) -> Matches<Row> {
+        let Leaf::Partly(leaf, ..) = self else {
+            return self.iter(table).into_matches();
         };
-        let mut iter = leaf.iter(table);
-        for _ in 0..*front {
-            iter.next();
+        match &**leaf {
+            Leaf::TicketRange(low, high) => read_partly(table.by_ticket_range(*low..*high), self)
+                .into_matches()
+                .uncovered(),
+            Leaf::GroupRange(low, high) => read_partly(table.by_group_range(*low..*high), self)
+                .into_matches()
+                .uncovered(),
+            Leaf::Uncovered(low, high) => {
+                read_partly(table.by_ticket_range(*low..*high).uncovered(), self).into_matches()
+            }
+            _ => read_partly(leaf.iter(table), self).into_matches(),
         }
-        for _ in 0..*back {
-            iter.next_back();
+    }
+
+    fn partly_keys(&self, table: &Table<Row>) -> BTreeSet<u32> {
+        let Leaf::Partly(leaf, ..) = self else {
+            return self.iter(table).keys().collect();
+        };
+        match &**leaf {
+            Leaf::TicketRange(low, high) => read_partly(table.by_ticket_range(*low..*high), self)
+                .keys()
+                .collect(),
+            Leaf::GroupRange(low, high) => read_partly(table.by_group_range(*low..*high), self)
+                .keys()
+                .collect(),
+            Leaf::Uncovered(low, high) => {
+                read_partly(table.by_ticket_range(*low..*high).uncovered(), self)
+                    .keys()
+                    .collect()
+            }
+            _ => read_partly(leaf.iter(table), self).keys().collect(),
         }
-        iter
     }
 
     fn keys(&self, table: &Table<Row>, model: &Model) -> BTreeSet<u32> {
         match self {
-            Leaf::Partly(..) => self.partly(table).keys().collect(),
+            Leaf::Partly(..) => self.partly_keys(table),
             _ => model
                 .values()
                 .filter(|row| self.holds(row))
@@ -230,9 +255,22 @@ impl Leaf {
                 .by_ticket_range(*low..*high)
                 .uncovered()
                 .into_matches(),
-            _ => self.partly(table).into_matches(),
+            _ => self.partly(table),
         }
     }
+}
+
+fn read_partly<C>(mut iter: IndexIter<Row, C>, leaf: &Leaf) -> IndexIter<Row, C> {
+    let Leaf::Partly(_, front, back) = leaf else {
+        return iter;
+    };
+    for _ in 0..*front {
+        iter.next();
+    }
+    for _ in 0..*back {
+        iter.next_back();
+    }
+    iter
 }
 
 #[derive(Clone, Debug)]
@@ -360,11 +398,7 @@ fn ranged(rng: &mut Rng, ids: u32, shape: Shape) -> Leaf {
             Leaf::ScoreRange(Bound::Included(low), Bound::Excluded(high))
         }
     };
-    let plain = !matches!(
-        leaf,
-        Leaf::TicketRange(..) | Leaf::GroupRange(..) | Leaf::Uncovered(..)
-    );
-    if plain && rng.chance(20) {
+    if rng.chance(20) {
         Leaf::Partly(
             Box::new(leaf),
             rng.below(40) as usize,
@@ -573,6 +607,41 @@ fn started_agree(table: &Table<Row>, model: &Model, rng: &mut Rng, ids: u32, sha
         covered, wanted,
         "started covering group {group}..{high} and {score:?}"
     );
+
+    let low = rng.below(u64::from(shape.scores)) as u16;
+    let scores = low..low + 1 + rng.below(3) as u16;
+    let mut lead = find.by_score(&scores.start);
+    for value in scores.start + 1..scores.end {
+        lead = lead.or(find.by_score(&value));
+    }
+    let mut direct = find
+        .by_group(&group)
+        .or(table.by_group_range(group + 1..high))
+        .and(lead);
+    let front: Vec<u32> = (&mut direct)
+        .take(rng.below(3) as usize)
+        .map(|row| row.id)
+        .collect();
+    let back: Vec<u32> = (&mut direct)
+        .rev()
+        .take(rng.below(3) as usize)
+        .map(|row| row.id)
+        .collect();
+    let rest: Vec<(u32, (u16, u8))> = direct.covered().collect();
+    let all: Vec<u32> = model
+        .values()
+        .filter(|row| row.group == group || (group + 1..high).contains(&row.group))
+        .filter(|row| scores.contains(&row.score))
+        .map(|row| row.id)
+        .collect();
+    let mut read = front.clone();
+    read.extend(rest.iter().map(|(id, _)| *id));
+    read.extend(back.iter().rev());
+    let what = format!("covered after reading group {group}..{high} and scores {scores:?}");
+    assert_eq!(read, all, "{what}");
+    for (id, fields) in &rest {
+        assert_eq!(*fields, (model[id].score, model[id].band), "{what}");
+    }
 }
 
 fn check(table: &Table<Row>, model: &Model, seed: u64, queries: usize, shape: Shape) {
@@ -879,5 +948,151 @@ fn a_range_from_another_version_of_the_table_answers_for_its_own() {
             .collect();
         let expected: Vec<Row> = wanted.iter().map(|id| changed[id].clone()).collect();
         assert_eq!(rows, expected);
+    }
+}
+
+thread_local! {
+    static TESTED: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Counted(Vec<u16>);
+
+impl IndexEach for Counted {
+    type Value = u16;
+
+    fn values(&self) -> Vec<u16> {
+        TESTED.with(|tested| tested.set(tested.get() + 1));
+        self.0.clone()
+    }
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Tagged {
+    #[key]
+    id: u32,
+    #[index]
+    group: u8,
+    #[index(each)]
+    tags: Counted,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Tags {
+    rows: Table<Tagged>,
+}
+
+fn counted<R>(read: impl FnOnce() -> R) -> (R, u64) {
+    TESTED.with(|tested| tested.set(0));
+    let out = read();
+    (out, TESTED.with(Cell::get))
+}
+
+#[test]
+fn a_range_against_few_keys_tests_each_once_and_reads_in_full_when_the_rows_are_on_file() {
+    let mut rng = Rng::new(71);
+    let rows: Vec<Tagged> = (0..5_000)
+        .map(|id| Tagged {
+            id,
+            group: if rng.chance(3) {
+                0
+            } else {
+                1 + rng.below(3) as u8
+            },
+            tags: Counted(
+                (0..1 + rng.below(3))
+                    .map(|_| rng.below(200) as u16)
+                    .collect(),
+            ),
+        })
+        .collect();
+    let mut table: Table<Tagged> = Table::new();
+    for row in &rows {
+        table.insert(row.clone());
+    }
+    let lead: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0)
+        .map(|row| row.id)
+        .collect();
+    let wanted: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0 && row.tags.0.iter().any(|tag| *tag < 60))
+        .map(|row| row.id)
+        .collect();
+    assert!(lead.len() > 100 && table.by_tags_range(0..60).len() > 4 * lead.len());
+    let find = table.find();
+
+    let (keys, tested) = counted(|| {
+        find.by_group(&0)
+            .and(table.by_tags_range(0..60))
+            .keys()
+            .collect::<Vec<_>>()
+    });
+    assert_eq!((keys, tested), (wanted.clone(), lead.len() as u64));
+    let (back, tested) = counted(|| {
+        find.by_group(&0)
+            .and(table.by_tags_range(0..60))
+            .rev()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(back, wanted.iter().rev().copied().collect::<Vec<_>>());
+    assert_eq!(tested, lead.len() as u64);
+
+    let (keys, tested) = counted(|| {
+        find.by_group(&0)
+            .and(table.by_tags_range(0..60).uncovered())
+            .keys()
+            .collect::<Vec<_>>()
+    });
+    assert_eq!((keys, tested), (wanted.clone(), 0));
+    let (keys, tested) = counted(|| {
+        table
+            .by_tags_range(0..60)
+            .into_matches()
+            .and(find.by_group(&0))
+            .keys()
+            .collect::<Vec<_>>()
+    });
+    assert_eq!((keys, tested), (wanted.clone(), 0));
+    let many: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group != 0 && row.tags.0.iter().any(|tag| *tag < 60))
+        .map(|row| row.id)
+        .collect();
+    let (keys, tested) = counted(|| {
+        find.by_group(&1)
+            .or(find.by_group(&2))
+            .or(find.by_group(&3))
+            .and(table.by_tags_range(0..60))
+            .keys()
+            .collect::<Vec<_>>()
+    });
+    assert_eq!((keys, tested), (many, 0));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tested.ferro");
+    let db: Db<Tags> = fast().open(&path).unwrap();
+    db.update(|root| root.rows = table.clone()).unwrap();
+    drop(db);
+    let db: Db<Tags> = uncached().open(&path).unwrap();
+    let read = db.read();
+    let stored = &read.rows;
+    for rowless in [true, false] {
+        let (keys, tested) = counted(|| {
+            let matches = stored.find().by_group(&0).and(stored.by_tags_range(0..60));
+            if rowless {
+                matches.keys().collect::<Vec<_>>()
+            } else {
+                matches.map(|row| row.id).collect()
+            }
+        });
+        assert_eq!(keys, wanted);
+        assert!(
+            tested > 0 && tested < lead.len() as u64,
+            "{tested} of {} keys tested with rows read from the file",
+            lead.len()
+        );
     }
 }
