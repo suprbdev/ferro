@@ -148,6 +148,16 @@ cores: 390,000 executions, 53 a second on each core, reaching 7,980 to 7,995 edg
 inputs. No compaction of a file that passed `verify` failed it, and no input crashed, hung or passed
 a memory limit.
 
+The round after the frame table, format 4, with the judgement of [Torn and damaged
+frames](storage.md#torn-and-damaged-frames), rebuilt the seeds, 656 of them for `open`, and
+rewrote a copy of the 15,457 `open` inputs saved before into format 4, as the fixtures were, so
+that they open in the new format. `open` then ran for 30 minutes as four jobs, one on each of four
+cores, each from the seeds and a quarter of those inputs under the flags above and
+`-rss_limit_mb=3072`, while a build and a test run shared the machine for part of it: 437,619
+executions in all, 59 to 63 a second on each core, starting at
+101,900 to 103,300 edges and ending at 103,000 to 104,600, and adding 6,973 inputs. No input
+crashed, hung, leaked or passed a memory limit, and the peak RSS was 1.35 GB.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
