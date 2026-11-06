@@ -920,6 +920,15 @@ fn a_writer_that_opens_beside_a_live_one_reports_a_frame_below_the_superblock_th
 
 #[test]
 fn a_frame_written_where_a_dead_writer_left_a_near_copy_reads_as_torn_after_a_power_cut() {
+    near_copy_left_by_a_dead_writer(false);
+}
+
+#[test]
+fn a_frame_written_over_a_dead_spill_past_a_stale_marker_reads_as_torn_after_a_power_cut() {
+    near_copy_left_by_a_dead_writer(true);
+}
+
+fn near_copy_left_by_a_dead_writer(marker: bool) {
     use ferro::store::{Op, Trace};
     use std::os::unix::fs::FileExt;
     let dir = tempfile::tempdir().unwrap();
@@ -966,6 +975,11 @@ fn a_frame_written_where_a_dead_writer_left_a_near_copy_reads_as_torn_after_a_po
     file.set_len(start).unwrap();
     file.write_all_at(&left[..(cut - start) as usize], start)
         .unwrap();
+    if marker {
+        let mut header = [0u8; 68];
+        header[..8].copy_from_slice(b"FERROGEN");
+        file.write_all_at(&header, start).unwrap();
+    }
     file.write_all_at(&slots, 0).unwrap();
     let base = std::fs::read(&path).unwrap();
     trace.lock().clear();

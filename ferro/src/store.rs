@@ -2663,9 +2663,9 @@ impl Store {
     /// whatever the judgement made of it, since no crash can have taken it back while this process
     /// is alive: that fails it with [`Error::Corrupt`] too, and nothing is truncated or written
     /// there. Past that log, what a dead process left, part of a frame or the records a frame
-    /// spilled before its header, is truncated and the truncation synced, as [`recover`] does, so
-    /// that the next frame is written over nothing a power cut could bring back under it. A failed
-    /// truncation or sync poisons the store.
+    /// spilled before its header, behind a stale marker or not, is truncated and the truncation
+    /// synced, as [`recover`] does, so that the next frame is written over nothing a power cut
+    /// could bring back under it. A failed truncation or sync poisons the store.
     pub(crate) fn follow(&self, holds: bool) -> Result<Followed> {
         let inner = &self.inner;
         let mut cursor = inner.cursor.lock();
@@ -2691,7 +2691,7 @@ impl Store {
                 if platform::path_id(&inner.path)? != inner.file.inode {
                     return Ok(Followed::Retired);
                 }
-                break false;
+                break peek[FRAME_BYTES..got].iter().any(|byte| *byte != 0);
             }
             if !frame_like(header) {
                 break written;
