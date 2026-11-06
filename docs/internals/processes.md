@@ -15,7 +15,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | Lock | Held | For |
 | --- | --- | --- |
 | The writer lock, a `flock` | Shared, for the writer's life | Keeping out writers without the option |
-| 2^62 + 1 | Shared, for the writer's life | Telling a read-only open that a writer is alive |
+| 2^62 + 1 | Shared, from the end of the writer's open for its life | Telling a read-only open, and a writer that opens, that a writer has opened and is alive |
 | 2^62 + 2, placement | Exclusive, per frame, or shared by a read-only open's scan | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the pieces of a large `receive` |
@@ -115,13 +115,30 @@ of its frame keeps its older bytes and reads as torn. A catch-up under the place
 anything but zeroes in those 84 bytes past the last whole frame, part of a dead process's frame or
 the records of one that spilled before its header was written, truncates the file there and syncs
 before the next frame is written in its place, as recovery at open does, so that a power cut cannot
-leave a sector of the next frame holding the dead one's bytes, which can be a bit from it. A frame
-that reached the disk whole and was damaged since, one bit from checking as [Torn and damaged
-frames](storage.md#torn-and-damaged-frames) describes, fails a catch-up under the placement lock
-with `Error::Corrupt`, so no commit is written over it. A catch-up without that lock, on taking a
-branch lock, at `refresh` or before a cycle's pass, may meet a frame another process is still
-writing, so it takes any frame that does not check for the end of the log, and the catch-up under
-the placement lock before the next frame is placed judges it.
+leave a sector of the next frame holding the dead one's bytes, which can be a bit from it. It does
+the same when a stale cycle marker, one the path still names, has anything but zeroes in the 16
+bytes past its 68. A frame that reached the disk whole and was damaged since, one bit from checking
+as [Torn and damaged frames](storage.md#torn-and-damaged-frames) describes, fails a catch-up under
+the placement lock with `Error::Corrupt`, so no commit is written over it. A catch-up without that
+lock, on taking a branch lock, at `refresh` or before a cycle's pass, may meet a frame another
+process is still writing, so it takes any frame that does not check for the end of the log, and the
+catch-up under the placement lock before the next frame is placed judges it.
+
+Nothing at or below the newest superblock is ever truncated or written over. A catch-up under the
+placement lock starts from this process's `placed`, which can lie many frames behind the newest
+superblock when the process has been idle, so it also reads both superblock slots and takes the
+newest. Every frame that superblock names was whole in the page cache when it was named, and no
+crash can have taken one back while this process is alive, so if the frames it follows stop before
+the end of the log that superblock names, the frame where they stop was damaged since, however the
+judgement reads it, and the catch-up fails with `Error::Corrupt` and leaves the file as it is, under
+either durability. Only past that log does it judge a frame torn or truncate anything, as
+[What a superblock names](storage.md#what-a-superblock-names) describes. Its own frames are placed
+where the catch-up ended, so none is ever written below the newest superblock either. The read costs
+about 0.9 µs of CPU on each placement, measured there. The first version judged from `placed` alone:
+an idle handle's commit after another had committed four frames, with two bits flipped in the
+second, read it as torn, truncated it and the two after it, synced, and acknowledged its own frame
+in their place, and the other handle's next commit failed reading past the end of the file, and no
+open succeeded after (#82).
 
 The frames' head pointers name [steps](commit-path.md#branch-table-steps) on the table each process
 already holds, so loading the new refs reads only the steps since the head this process last knew,
@@ -182,6 +199,21 @@ log. A Buffered file with live writers may have up to `checkpoint_bytes` past it
 removes a stale `.compacting` file only if it can take the cycle lock, since another process's cycle
 may be writing it.
 
+If another writer that has opened is alive, which the lock at 2^62 + 1 tells, no crash can have come
+since that writer opened, so the scan from the anchor must reach the end of the log the newest
+superblock names, under either durability, or the open fails with `Error::Corrupt` and writes
+nothing. Under Fsync the newest superblock anchors itself and the scan starts there, but under
+Buffered the anchor can lie far behind, and a frame between them that does not check was damaged
+since, not torn. A writer takes that lock only once it has recovered, still holding the placement
+lock, so two writers that open after a power cut never take each other for live ones: the first to
+recover may roll a Buffered log back past what its superblock names, and the other then finds the
+log that one left. Before, an open beside a live Buffered writer that met a frame with two bits
+flipped in one block rolled the log back to the frame before it, as after a crash, truncating the
+live writer's acknowledged commits from under it, and the live writer's next commit failed reading
+past the end of the file (#82). Checking the lock while it was still taken with the writer lock,
+before recovery, would have failed one of two writers that open together after a power cut on a
+Buffered log the crash cut short.
+
 Once it holds the placement lock it checks again that the path names the file it opened, and opens
 the path again if not. A cycle renames the new file over the path under the old file's placement
 lock, so a file still named by the path once that lock is held is one no cycle has retired. The
@@ -215,12 +247,15 @@ placing frames into it. The next writer to open truncates it, so the file can st
 longer than `size_on_disk` while no shared writer has it open.
 
 A read-only open that can take the writer lock shared takes the placement lock shared too, and
-trusts the superblock if it cannot, then tests the lock that shared writers hold for their lives,
-and treats a held one as a live writer, trusting the superblock instead of scanning and syncing. If
-the test itself fails, it scans, as it would with no writer alive. It holds the placement lock for
-the scan, so a shared writer that opens meanwhile, after the test, waits for it before it recovers
-or writes, and the scan, which judges a frame that does not check as damaged or torn, never reads
-one being written. Read-only handles otherwise behave as before.
+trusts the superblock if another holds it, then tests the lock that shared writers hold once they
+have opened, and treats a held one as a live writer, trusting the superblock instead of scanning and
+syncing. If either test fails with an error rather than finding the lock held, it scans, as it
+would with no writer alive, without the placement lock when that was the test that failed. It holds
+the placement lock for the scan when it has it, so a shared writer that opens meanwhile waits for it
+before it recovers or writes, and the scan, which judges a frame that does not check as damaged or
+torn, never reads one being written. The first version of the placement lock trusted the superblock
+when its test failed with any error, so a reader whose lock failed with `ENOLCK` missed a commit
+whose superblock write a crash had lost (#82). Read-only handles otherwise behave as before.
 
 ## Reclamation
 
@@ -236,11 +271,12 @@ A process that catches up and reads the marker checks the path. If the path name
 syncs and publishes what it had queued in the old one, opens the new one, loads every attached
 branch's state from it and rebinds its watchers' feeds, as a read-only `refresh` of a replaced file
 does. If the path still names this file, the cycle failed before its rename and the marker is
-written over. Every frame placed in the old file before the marker was copied into the new one,
-since the pause caught up under the placement lock and the marker went in under it, and no
-process can place in the old file after the marker without first finding it. Recovery reads the
-marker as the end of the log, so a crash between the marker and the rename leaves the old file as
-it was.
+written over, or, with anything but zeroes past it, truncated with what follows, as described under
+[Catching up](#catching-up). Every frame placed in the old file before the marker was copied into
+the new one, since the pause caught up under the placement lock and the marker went in under it, and
+no process can place in the old file after the marker without first finding it. Recovery reads the
+marker as the end of the log, so a crash between the marker and the rename leaves the old file as it
+was.
 
 ## Watchers, coalescing, awaited writes and receive
 
@@ -310,9 +346,20 @@ waiting through the other handle's cycle pause, a branch attached between catchi
 a drop and fork that must wait for a closure, a writer opening during the other handle's cycle
 pause, a closure on a branch the other handle dropped, a stale marker that a power cut leaves in
 front of a whole frame, and a frame a dead writer left cut at a page boundary, which the next
-writer writes over, or whole with a bit flipped, which it reports. Each test added for a finding of
-the review failed before its fix, as described above. Both files build on 64-bit Linux only, and
-`ferro/tests/smoke.rs` checks elsewhere that the option is refused.
+writer writes over, or whole with a bit flipped, which it reports. It also has an idle handle
+commit after the other committed four frames, with two bits flipped in the second's first block,
+two in its magic, or its first 84 bytes zeroed, under both durabilities, and opens a handle beside
+a live Buffered one over the same frames; both must fail with `Error::Corrupt`, change nothing in
+the file, and leave the live handle's next commit and a reopen with every acknowledged commit. And
+it leaves a dead writer's near copy behind a stale marker, which the next writer must truncate and
+sync before it writes. Each test added for a finding of the review failed before its fix, as
+described above. A unit test in `ferro/src/store.rs` holds the placement lock while two shared
+writers open a Buffered file whose superblock names a frame past its anchor that reads as torn,
+then lets it go, and both must open at the frame before it, which one of them did not with the lock
+at 2^62 + 1 taken before recovery. `ferro/tests/placement_fault.rs` intercepts `fcntl` to fail a
+read-only open's test of the placement lock with `ENOLCK` over a superblock one commit behind, and
+checks that the open scans and finds the commit, where it trusted the superblock before. These files
+build on 64-bit Linux only, and `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
 
