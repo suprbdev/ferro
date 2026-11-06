@@ -87,6 +87,9 @@ numbers. This index lists them by subsystem.
 - Shared writers by default, one cross-process lock for every closure, closures run again on a
   conflict, each process syncing alone, a placement mark in the header, frames written after the
   placement lock, and shared memory: [Measured and left out](processes.md#measured-and-left-out).
+- Followers that only look at an interval, watch only the directory or refresh for every commit, a
+  guard that stops following, watchers that refresh, one inotify instance for a process, and
+  kqueue and `ReadDirectoryChangesW`: [Left out of followers](processes.md#left-out-of-followers).
 - Head records linked from a table of links, the branch table without LZ4, merge records outside
   the head, and a table every 16, 32 or 128 steps: [Branch-table
   steps](commit-path.md#branch-table-steps).

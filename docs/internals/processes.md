@@ -2,8 +2,9 @@
 
 How `Options::shared` lets several processes commit to one file: the locks, how a process catches
 up with the others, how frames and superblocks are written, how reclamation cycles are shared, and
-what was measured and left out (#60). The user-facing rules are in [Writers and
-concurrency](../guide/concurrency.md#several-processes).
+what was measured and left out (#60). [Followers](#followers) describes how `Options::follow` keeps
+a read-only handle or a shared writer up to date with the others on a thread of its own (#84). The
+user-facing rules are in [Writers and concurrency](../guide/concurrency.md#several-processes).
 
 ## The locks
 
@@ -149,8 +150,9 @@ frame order, and fires their watchers. Nothing another process wrote is publishe
 is durable, by that process's sync or by this one's.
 
 Catching up happens when a process takes a branch lock, before it places a frame, when it attaches a
-branch it has not seen, before each pass of a cycle and on `refresh`. A process that does none of
-these sees nothing new, as a read-only handle that never refreshes sees nothing new.
+branch it has not seen, before each pass of a cycle and on `refresh`, and on a look of a
+[follower](#followers) that finds a superblock naming a frame past its own. A process that does none
+of these sees nothing new, as a read-only handle that never refreshes sees nothing new.
 
 Catching up only rebuilds branches that are attached. A branch attached later takes its state from
 the published refs, so attaching first catches up and syncs what is queued, and then attaches only
@@ -287,7 +289,8 @@ was.
 ## Watchers, coalescing, awaited writes and receive
 
 - Watchers fire for another process's commits when this process catches up and syncs them: at its
-  next commit on any branch, at `refresh`, or when it attaches a branch.
+  next commit on any branch, at `refresh`, when it attaches a branch, or when its follower finds a
+  superblock naming them, as described under [Followers](#followers).
 - With `coalesce`, a group holds its branch's lock from its first closure until it is sealed, so
   another process's closures on that branch wait until the group is written. Groups are per process:
   closures in two processes never share a version.
@@ -300,6 +303,217 @@ was.
   (`awaited_writes_waiting_on_another_process_share_one_waiting_thread`).
 - `receive` places a large bundle's pieces under the cycle lock and lands it under every branch
   lock, so its checks run against the newest heads of every process.
+
+## Followers
+
+`Options::follow` gives a read-only handle or a shared writer a thread, `ferro-follow`, that keeps
+it up to date with what other processes commit, so `read` stays current and watchers fire without
+`refresh` (#84). Every handle of one open shares the thread, which the `Keeper` owns beside the
+reclamation thread. A writer without `shared` is the only writer and starts none, and a handle
+opened without the option has no thread, and nothing in its commits, reads or `refresh` changes.
+
+### A look
+
+The thread looks at the file whenever it may have changed. On a read-only handle a look is a
+`refresh`, which reads both superblocks and stats the path under `tip` and loads only what moved.
+On a shared writer a look first stats the path and reads both superblock slots in one read, as a
+sync does, without `tip`: only if the path names another file, or the newest superblock names a
+frame past the last one this process placed or followed, does it catch up. A look that finds
+nothing changes nothing and costs a few microseconds on a core that is awake. The first version
+made a read-only look the same check, against the store's last sequence number. A refresh that
+failed on a damaged object of the new commit, after `Store::refresh` had moved that number, then
+left the next look finding nothing, so the follower cleared the error and stayed at the old
+version, where `refresh` keeps failing until the damage goes
+(`a_follower_whose_refresh_fails_keeps_trying_and_reporting_until_it_succeeds`). A shared writer
+moves the number only once it has loaded what it followed.
+
+A shared writer's catch-up reads on from `placed`, and a frame another process placed may not be
+synced yet. A catch-up that followed one would sync it before publishing, as `refresh` on a shared
+writer does: an fdatasync under the superblock lock on behalf of the other process, and watchers
+that fire before that process has acknowledged its commit. So a look on a shared writer catches up
+only to the frame the superblock it read names. The frames up to it were whole when they were
+named, so the sync that publishes them finds them covered and writes nothing, and the superblock
+lock is held for one read, once for each look that found something. A frame among them that does
+not check fails the catch-up with `Error::Corrupt`, as under the placement lock, rather than end
+the log there, since no crash can have taken it back while this process is alive. A look never
+takes the placement lock or a branch lock.
+
+### Waking
+
+On 64-bit Linux the thread waits in `ppoll` on an inotify instance and an eventfd. The instance
+watches the file for `IN_MODIFY` and its directory for a file created, removed or renamed at the
+file's name. A commit wakes it once for its frame and once for its superblock, and the first look
+usually finds nothing yet. Events for other names in the directory, such as the `.compacting` copy
+a cycle writes, are read and dropped without a look. When the name moves to another file, as at a
+cycle's rename, the file's watch moves to the new file and the old one is removed, so no watch
+outlives the generation it was on. A queue overflow counts as a change. The thread also looks once
+a second whatever happens, for a file system that does not report another process's writes.
+
+After a look that refreshed, the thread waits until a millisecond after that look began before it
+looks again, and events meanwhile stay queued for that next look. Without the wait, a writer
+committing as fast as it can kept the thread refreshing for every commit it could reach: in
+`ferro-bench --bin follow`, with Buffered single-key commits from another process for five
+seconds, the follower refreshed 408,649 times for the writer's 415,355 commits and used 3.26 s of
+CPU, 65% of a core, and the writer made 9% fewer commits than with no follower. With it, the
+follower refreshes about 960 times a second. A look that found nothing does not wait, so the look
+for a commit's superblock is not held up by the one for its frame. The first version waited after
+every look, so the look for a commit's frame held up the one for its superblock by up to a
+millisecond: a commit reached a watcher at a median of 673 µs after the writer's closure began,
+470 µs more than the commit took, where without that wait it took about 90 µs more.
+
+Where inotify cannot be had, on every other target or when `inotify_init1` or a watch fails, as
+once the user's `max_user_instances`, 128 by default, are in use, the thread looks every 10 ms,
+waiting on a condvar. `Following::notified` says which it does. A watch that fails later on falls
+back to looking every 10 ms, and the failure is reported in `last_error`.
+
+### When it ends
+
+The thread holds the handle's `Shared` by a `Weak` and upgrades it only for the length of a look,
+so while it waits it keeps neither the file nor a lock, and a watcher's promise not to keep the
+file open still holds. The last `Db` handle to drop drops the `Keeper`, which sets the stop flag,
+rings the eventfd or wakes the condvar, and joins the thread before it stops the reclamation and
+sync threads. A look in progress finishes first, and if it held the last count of `Shared`, the
+file closes on the follower thread before the join returns, so either way the file is closed and
+the inotify instance gone when the drop returns. A look that finds `Shared` gone ends the thread
+too. The thread runs no closure and no watcher test, only what `refresh` runs: decoding the new
+states and dropping the ones they replace. A panic there is caught and recorded, and the thread
+goes on.
+
+### Errors
+
+A look that fails changes nothing: `read` shows what it showed, watchers go on waiting, and the
+thread looks again at the next change or interval. `Following::last_error` keeps the error as text
+until a look succeeds, as `Space::last_error` keeps a cycle's. Ending the watchers instead would
+end every subscriber over a fault that may pass, such as a file moved away and back, and a watcher
+cannot carry the error.
+
+- A path that names nothing fails with `Error::Io`. Reads go on from the file the handle has open,
+  and when a file appears at the name again, created or renamed there, the directory's watch wakes
+  the thread and the refresh opens it, as it opens a file a cycle renamed there.
+- Superblocks that are both invalid fail with `Error::Corrupt`, and so do a damaged branch table or
+  root on a read-only handle and, on a shared writer, a frame a superblock names that does not
+  check.
+- `Error::Replaced` never reaches it: `refresh` opens the new file when it meets that, and a shared
+  writer's catch-up follows the cycle's marker to it.
+- On a shared writer whose store is poisoned, every look that finds something fails with
+  `Error::Poisoned` until the database is reopened.
+
+### Reentrancy
+
+The thread holds no lane and runs no user closure, so nothing it could wait for waits for it. A
+look takes `tip`, as `refresh` does, and on a shared writer the superblock lock in the sync that
+publishes, holding nothing else. A watcher test runs on the `ferro-watch` thread holding nothing
+and may refresh while the follower does: they take `tip` one after the other. A closure may refresh
+too, as before, since `refresh` needs only `tip`, which a look holds briefly and never while it
+waits for a lane. [Writes from inside a closure](reentrancy.md) has the rules.
+
+### What following costs
+
+`ferro-bench --bin follow` runs a follower in one process against a writer in another, on the
+32-thread machine of the other figures here, pinned to the 16 hardware threads whose siblings
+another job was using. The writer makes Buffered single-key commits. Latency runs from the moment
+the writer's commit returned to a watcher's receipt, over 300 commits a random 0 to 40 ms apart;
+idle is a minute with no writer; busy is five seconds of the writer committing as fast as it can,
+with no follower as the baseline. Medians of three rounds, with a read-only follower beside a plain
+writer:
+
+| Follower | p50 after the ack | p99 | Skipped | Idle CPU a minute | Idle wakes a minute | Writer's busy commits | Follower's busy CPU | Busy refreshes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | | | | | | 478,260 | | |
+| inotify | 169 µs | 926 µs | 1 | 3.0 ms | 59 | 478,565 | 153 ms | 4,808 |
+| Every 1 ms | 579 µs | 1.38 ms | 3 | 140 ms | 59,706 | 487,703 | 114 ms | 4,702 |
+| Every 10 ms | 4.96 ms | 10.5 ms | 35 | 254 ms | 5,920 | 476,084 | 25 ms | 487 |
+| Every 100 ms | 11.0 ms | 35.6 ms | 238 | 42 ms | 598 | 469,164 | 9 ms | 51 |
+
+And with both the follower and the writer shared writers:
+
+| Follower | p50 after the ack | p99 | Skipped | Idle CPU a minute | Idle wakes a minute | Writer's busy commits | Follower's busy CPU | Busy refreshes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | | | | | | 394,418 | | |
+| inotify | 116 µs | 762 µs | 1 | 4.1 ms | 59 | 370,824 | 306 ms | 4,869 |
+| Every 10 ms | 5.04 ms | 10.7 ms | 35 | 274 ms | 5,917 | 346,098 | 251 ms | 471 |
+
+A watcher skips a commit when a later one landed before it looked, and only the commits it handed
+out are timed, the newest in each wait, so the figures for 100 ms understate the 50 ms a commit
+waits on average there.
+
+- Woken by inotify, a follower delivers in a fraction of a millisecond and an idle one costs
+  nothing measurable: one look a second. Its median swung from 32 to 460 µs between rounds with the
+  load on the sibling threads, since two wakes of cores that may be asleep, the follower's and the
+  watcher's, make up most of it.
+- An interval trades latency against wakes, and the wakes cost more than the looks: every 10 ms an
+  idle follower used 80 to 311 ms a minute across the rounds, 13 to 53 µs a wake, where every 1 ms
+  the core never slept deeply and a wake cost 2.3 µs, though it woke a thousand times a second.
+- Under the busy writer the read-only follower refreshed once a millisecond, 32 µs a refresh, and
+  looking every 10 ms took 25 ms. The writer's median was the same with an inotify follower as with
+  none. Over these rounds and three of an earlier run, five of the six with inotify fell within the
+  462,214 to 496,358 commits of the rounds with no follower and one, at 427,054, below them, so the
+  `IN_MODIFY` event that each of the writer's writes queues costs it little if anything. Shared
+  writers' rounds spread from 336,980 to 412,934 whatever followed.
+- A shared writer's catch-up reads every frame placed since its last look, where a read-only
+  refresh reads the newest head and the branch-table steps since the one it knew. So a shared
+  follower took 63 µs a refresh at once a millisecond, and 530 µs when it looked every 10 ms and
+  read ten milliseconds of frames each time: a longer interval saves it little under load.
+
+`examples/shop` ran its replicas on a thread that called `refresh` every 5 ms and now opens them
+with `follow`. Its `shop-load replica-lag`, three runs of 300 commits against a Buffered writer,
+measured a replica reaching each commit 0.06 to 0.14 ms after the writer acknowledged it, at the
+median, where the timer took 0.88 to 0.97 ms, and that only because the tool's own 3 ms pause
+between commits fell in step with it.
+
+So a follower waits on inotify where it can, looks every 10 ms elsewhere, looks once a second
+besides, and waits a millisecond after a look that refreshed.
+
+### Left out of followers
+
+- Looking at an interval only, measured above. The cost is in the wakes, whatever the look does: a
+  thread that only slept 10 ms and then stat a file used 55.7 µs of CPU a wake, 0.54% of a core,
+  while its core was otherwise idle, and 1.1 µs a wake when it slept 1 ms. It is kept for targets
+  without inotify.
+- Watching only the directory, which reports writes to the files in it by name and needs no watch
+  moved at a cycle's rename. Every write to any file beside the database, such as a log, would then
+  wake the follower, where the second watch costs one more call at each rename.
+- No wait after a look that refreshed: 65% of a core under a busy writer, as measured above.
+- A `Db` method that starts following and returns a guard that stops it when dropped. It would let
+  a library follow a handle it was given, but the thread would then have two owners, a guard
+  dropped at once would follow nothing, and two guards on one file would need a rule. Following is
+  a property of how a handle meets the file, like `read_only` and `shared`, so it is an option.
+- Watchers that refresh while they wait. `read` would stay stale while no watcher waited, each
+  waiting watcher, or the watch thread of each branch, would look on its own, and an async waiter
+  would need a timer.
+- One inotify instance and thread for every follower in a process. It would save instances past
+  128 followed opens, at the price of one thread's lifetime shared by unrelated files. Not built.
+- kqueue on macOS and the BSDs and `ReadDirectoryChangesW` on Windows: none of them can run here, so
+  those targets poll.
+
+### Tests of followers
+
+`ferro/tests/follow.rs` opens a writer and a read-only follower of the same file, and runs each test
+once woken by inotify and once looking every 2 ms:
+
+- Watchers, filtered or not, fire for another handle's commits without `refresh`, and a handle on
+  another branch shares the follower.
+- The follower follows three cycles that rename a new file over the path, and reads the new file.
+- A follower that finds nothing new refreshes nothing.
+- With the file removed, the follower reports `Error::Io`, `refresh` fails the same way, and reads
+  keep the last version; a file renamed back with one more commit is followed, and the error clears.
+- Both superblocks damaged are reported as `Error::Corrupt`, and nothing moves.
+- A filtered watcher whose test refreshes and attaches a branch runs while the follower publishes
+  50 commits.
+- A child process counts its `ferro-follow` threads, its descriptors on the file and its inotify and
+  eventfd descriptors before and after it drops every handle of a follower, inotify and polling,
+  with a watcher left waiting, which must end; and does the same for a shared writer that follows,
+  after which a writer without `shared` must open.
+
+`ferro/tests/shared.rs` has a shared writer follow another handle's commits and three cycles
+without committing. It holds one handle between placing a frame and syncing it while a second
+handle places the next, so the newest superblock names only the first: the follower must publish
+the first once its superblock is written and the second only once the second handle syncs, where a
+catch-up past the superblock would sync and publish both. It also damages the middle of three
+frames that superblocks name while the follower is held in a sync, and the follower must report
+frame 3 with `Error::Corrupt` and follow all of them once the byte is put back. In
+`ferro/tests/shared_process.rs` a child process follows as a shared writer, without committing,
+while the parent makes 60 commits and three cycles, and must see every one.
 
 ## Crashes and killed processes
 
@@ -506,8 +720,12 @@ about half of what eight threads make. With 50 µs of work in each closure four 
 - Each process has its own cache, so on one branch a process reads back the nodes another process
   wrote before its closure can change them.
 - A process sees other processes' commits only when it commits, attaches a branch or calls
-  `refresh`. One that does none of these holds the file a cycle replaced, as a read-only follower
-  does.
+  `refresh`, unless it follows the file with `Options::follow`. One that does none of these holds
+  the file a cycle replaced, as a read-only handle that never refreshes does.
+- A follower is woken by inotify only on 64-bit Linux, with one inotify instance and two watches
+  for each open that follows, which count against the user's `max_user_instances` and
+  `max_user_watches`. Elsewhere, and past those limits, it looks every 10 ms, as described under
+  [Followers](#followers).
 - Two shared `Db`s of one file in one process behave as two processes. A closure that writes through
   the other one to the same branch waits for itself, and `Error::Reentrant` cannot see it.
 - An open of a Buffered file with live writers scans up to `checkpoint_bytes`.

@@ -38,7 +38,7 @@ on one idle machine. Start with [Getting started](guide/getting-started.md).
 | [The read path](internals/read-path.md) | Memos, prefetching, value columns, scans, cursors and cold reads |
 | [Reading from many threads](internals/read-scaling.md) | Guarded gets, the epoch scheme, iterator frames, the allocator and cache weight |
 | [Writers and the commit path](internals/commit-path.md) | Lanes, `tip`, group commit, a lock per branch and drafting |
-| [Writers in several processes](internals/processes.md) | `Options::shared`, the locks, catching up, superblocks and cycles across processes |
+| [Writers in several processes](internals/processes.md) | `Options::shared`, the locks, catching up, superblocks and cycles across processes, and followers |
 | [Commits of a few rows](internals/commit-cost.md) | Where a small multi-table commit's CPU time goes |
 | [Coalescing](internals/coalescing.md) | Groups of closures sharing a version |
 | [Awaited writes](internals/async-writes.md) | Futures, the gate and the sync thread |
