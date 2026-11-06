@@ -79,17 +79,18 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   pull from each other's branches with pruned history and cycles, so that a bundle can carry
   commits the receiver already holds. Three of its maps keep a summary: a wrapping sum over small
   values, one over spilled blobs, some of them one value under several keys, whose `of` reads the
-  key, and one over a map of maps whose `of` reads each inner map. The input picks one, then mutates its objects, links, header and count as parsed values,
-  or finds the summaries in the nodes of those maps and changes one, or two of a node by amounts
-  that cancel so that the node's own fold still holds, and rehashes them up to the head, or edits
-  the encoded bytes, or replaces the bundle outright. It can feed the stream in small reads,
-  interrupt it, break it, or
-  commit, fork or run a cycle while the checked bundle waits to be placed, or commit or fork
-  between placing a spilled bundle's pieces and landing it. A refused bundle must leave both
-  branches where they were. An accepted one must read back whole on both branches, with every map's
-  length equal to its iteration, every key found, every index lookup answered, each unique index's
-  range over the whole index as long as its map from either end, and each summarized map's
-  `summary`, and the two halves of it that `range_summary` folds, equal to the fold of its entries,
+  key, and one over a map of maps, one of them four levels deep, whose `of` reads each inner map.
+  The input picks one, then mutates its objects, links, header and count as parsed values, or
+  finds the summaries in the nodes of those maps and changes one, or two of a node by amounts that
+  cancel so that the node's own fold still holds, and rehashes them up to the head, or edits the
+  encoded bytes, or replaces the bundle outright. It can feed the stream in small reads, interrupt
+  it, break it, or commit, fork or run a cycle while the checked bundle waits to be placed, or
+  commit or fork between placing a spilled bundle's pieces and landing it. A refused bundle must
+  leave both branches where they were and the receiving branch readable whole. An accepted one must
+  read back whole on both branches, with every map's length equal to its iteration, every key
+  found, every index lookup answered, each unique index's range over the whole index as long as its
+  map from either end, and each summarized map's `summary`, and the two halves of it that
+  `range_summary` folds, equal to the fold of its entries,
   and pass `verify` and `verify_typed`, before and after a reopen and a commit.
 
 The harness treats a panic whose message starts with `ferro:` as expected inside the infallible
@@ -248,6 +249,16 @@ for 10 minutes from the same quarters. Each loaded its 962 inputs to 633 to 658 
 36,500 to 36,900 edges, and ran 6,625 to 7,535 executions, 11 or 12 a second, 28,271 together,
 ending at 37,000 to 37,200 edges with 1,329 to 1,389 entries. No input crashed, hung, leaked or
 passed a memory limit, and the peak RSS was 954 MB.
+
+That round could not see the bug a review then found, a staged node pinned into a held one that the
+receiver's own deep reads tripped over, since its inner maps were too shallow for a pinned node to
+have links of its own and it read nothing back after a refused bundle. The round after the deferred
+pass moved to a view of the file with no cache gave one inner map 5,000 entries, four levels, and
+reads the receiver's world whole after a refused bundle as after an accepted one. It ran `sync`
+the same way for 10 minutes from the same quarters: each loaded its 962 inputs to 646 to 674
+entries reaching 36,800 to 37,100 edges, and ran 4,536 to 5,743 executions, 7 to 9 a second, 20,508
+together, ending at 37,100 to 37,400 edges with 1,222 to 1,306 entries. No input crashed, hung,
+leaked or passed a memory limit, and the peak RSS was 983 MB.
 
 ## Where the other tests are described
 
