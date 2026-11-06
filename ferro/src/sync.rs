@@ -12,7 +12,7 @@
 //! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
 
 use std::any::{Any, TypeId};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::mem;
@@ -1663,10 +1663,9 @@ struct Vetting<'a> {
     queue: Vec<(Ptr, Kind, Vec<Kind>)>,
     deferred: Vec<(u32, Kind)>,
     confirmed: HashSet<(Hash, TypeId, TypeId, Hash)>,
-    credited: HashSet<Hash>,
     carried: usize,
-    reran: usize,
     rerun_budget: usize,
+    view: OnceCell<Store>,
 }
 
 fn rejected(error: Error) -> Error {
@@ -1850,14 +1849,26 @@ impl Vetting<'_> {
         true
     }
 
-    fn rerun(&mut self, bytes: usize) -> Result<()> {
-        self.reran = self.reran.saturating_add(bytes);
-        if self.reran > self.rerun_budget {
-            return Err(bad(
-                "it spills values under too many keys to recompute their summaries",
-            ));
+    fn view(&self) -> &Store {
+        self.view.get_or_init(|| {
+            self.store
+                .view(self.carried as u64, self.rerun_budget as u64)
+        })
+    }
+
+    fn rerun(&self, bytes: usize) -> Result<()> {
+        self.view()
+            .charge(bytes)
+            .map_err(|_| bad("it spills values under too many keys to recompute their summaries"))
+    }
+
+    fn recompute_held(&self, kind: &Kind, ptr: Ptr) -> Result<Shape> {
+        let view = self.view();
+        let shape = (kind.held)(kind, view, ptr);
+        if let Some(error) = view.overdrawn() {
+            return Err(error);
         }
-        Ok(())
+        shape.map_err(rejected)
     }
 
     fn settle(&mut self) -> Result<()> {
@@ -1865,17 +1876,15 @@ impl Vetting<'_> {
         if deferred.is_empty() {
             return Ok(());
         }
-        let left = self.rerun_budget.saturating_sub(self.reran);
-        let view = self.store.view(self.carried as u64, left as u64);
-        let staging = self.staging;
-        staging.overlaid(&view, || {
+        let (view, staging) = (self.view(), self.staging);
+        staging.overlaid(view, || {
             for (id, kind) in &deferred {
                 let ptr = Ptr {
                     hash: staging.hashes().hash(*id),
                     offset: staging.offset(*id),
                 };
                 let object = staging.read_object(ptr)?;
-                let checked = kind.check(&object.body, &object.links, Some(&view));
+                let checked = kind.check(&object.body, &object.links, Some(view));
                 if let Some(error) = view.overdrawn() {
                     return Err(error);
                 }
@@ -1883,18 +1892,6 @@ impl Vetting<'_> {
             }
             Ok(())
         })
-    }
-
-    fn confirm_held(&mut self, hash: Hash, ptr: Ptr, kind: &Kind) -> Result<bool> {
-        if !self.remember(hash, kind) {
-            return Ok(false);
-        }
-        if self.credited.len() < CONFIRMED_KEPT && self.credited.insert(hash) {
-            return Ok(true);
-        }
-        let object = self.store.read_object(ptr)?;
-        self.rerun(object.body.len())?;
-        Ok(true)
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
@@ -1916,27 +1913,27 @@ impl Vetting<'_> {
             return Ok(None);
         }
         if let Some(known) = known.filter(|known| known.id == kind.id) {
-            let confirm = !kind.vouched_by(known) && self.confirm_held(hash, ptr, kind)?;
-            let unclaimed;
-            let kind = match confirm {
-                true => kind,
-                false => {
-                    unclaimed = kind.unclaimed();
-                    &unclaimed
-                }
-            };
-            return (kind.held)(kind, self.store, ptr)
+            if !kind.vouched_by(known) && self.remember(hash, kind) {
+                return self.recompute_held(kind, ptr).map(Some);
+            }
+            let unclaimed = kind.unclaimed();
+            return (unclaimed.held)(&unclaimed, self.store, ptr)
                 .map(Some)
                 .map_err(rejected);
         }
         if let Some((shape, vouched)) = self.held.get(&hash, kind) {
-            if !vouched && self.confirm_held(hash, ptr, kind)? {
-                (kind.held)(kind, self.store, ptr).map_err(rejected)?;
+            if !vouched && self.remember(hash, kind) {
+                self.recompute_held(kind, ptr)?;
             }
             return Ok(Some(shape));
         }
         let object = self.store.read_object(ptr)?;
-        let shape = match kind.check(&object.body, &object.links, Some(self.store)) {
+        let view = self.view();
+        let checked = kind.check(&object.body, &object.links, Some(view));
+        if let Some(error) = view.overdrawn() {
+            return Err(error);
+        }
+        let shape = match checked {
             Ok((shape, found)) if found.is_empty() => shape,
             _ => {
                 return Err(bad(format!(
@@ -2502,14 +2499,13 @@ fn resolve<O: Objects>(
             queue: Vec::new(),
             deferred: Vec::new(),
             confirmed: HashSet::new(),
-            credited: HashSet::new(),
             carried: streamed.carried,
-            reran: 0,
             rerun_budget: streamed
                 .carried
                 .saturating_mul(RERUN_FACTOR)
                 .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
+            view: OnceCell::new(),
         };
         for (_, _, id) in &order {
             let sent = landing

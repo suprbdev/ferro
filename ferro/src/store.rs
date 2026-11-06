@@ -130,6 +130,12 @@ const MAX_VARINT: usize = 10;
 const COMPRESS_MIN: usize = 96;
 /// The most LZ4 can expand a body by, which a record's claimed raw length may not pass.
 pub(crate) const MAX_RATIO: usize = 255;
+/// The bytes of file that one bit of a [`Store::view`]'s record of what it read stands for,
+/// fewer than any record takes.
+const READ_GRAIN: u64 = 8;
+/// The words of bits in each chunk of that record, which is allocated when a read first lands in
+/// it.
+const READ_WORDS: usize = 64;
 /// The smallest window a replay reads from a staging's scratch file.
 const REPLAY_CHUNK: usize = 256 << 10;
 /// The most capacity a check's scratch body keeps between records.
@@ -1853,7 +1859,7 @@ struct Inner {
 
 /// What a [`Store::view`] keeps beside the file it reads.
 struct View {
-    /// The bytes of object bodies it may still read.
+    /// The bytes of object bodies it may still read at a charge.
     left: AtomicU64,
     /// Whether a read was refused because `left` could not pay for it.
     overdrawn: AtomicBool,
@@ -1863,10 +1869,12 @@ struct View {
     /// The staging that [`Staging::overlaid`] lends the view while its closure runs, or null,
     /// under a lock that every read of the staging holds while it reads.
     lent: RwLock<AtomicPtr<Staging>>,
+    /// The records of the file it has read.
+    read: Mutex<Reads>,
 }
 
 impl View {
-    /// Counts `bytes` against what the view may still read.
+    /// Counts `bytes` against what the view may still read at a charge.
     fn charge(&self, bytes: usize) -> Result<()> {
         let paid = self
             .left
@@ -1906,6 +1914,31 @@ impl View {
 /// The error of a read through a [`Store::view`] that its allowance cannot pay for.
 fn overdrawn() -> Error {
     Error::Bundle("recomputing its summaries reads more than its size allows".into())
+}
+
+/// The records a [`Store::view`] has read from its file, by offset: one bit for each
+/// [`READ_GRAIN`] bytes, in chunks of [`READ_WORDS`] words allocated as reads first land in them.
+#[derive(Default)]
+struct Reads {
+    chunks: HashMap<u64, Box<[u64; READ_WORDS]>>,
+}
+
+impl Reads {
+    /// Marks the record at `offset` read, returning whether it was read before.
+    fn mark(&mut self, offset: u64) -> bool {
+        const BITS: u64 = READ_WORDS as u64 * 64;
+        let grain = offset / READ_GRAIN;
+        let chunk = self
+            .chunks
+            .entry(grain / BITS)
+            .or_insert_with(|| Box::new([0; READ_WORDS]));
+        let bit = grain % BITS;
+        let word = &mut chunk[(bit / 64) as usize];
+        let mask = 1u64 << (bit % 64);
+        let seen = *word & mask != 0;
+        *word |= mask;
+        seen
+    }
 }
 
 /// An open file of a database: one generation of its log, with the cache of what was decoded from
@@ -2167,12 +2200,13 @@ impl Store {
     }
 
     /// A read-only view of this store's file as it stands, with an id of its own and no cache,
-    /// that may read `allowance` bytes of object bodies and also reads `borrowed` bytes of a
-    /// staging that [`Staging::overlaid`] lends it.
+    /// that also reads `borrowed` bytes of a staging that [`Staging::overlaid`] lends it.
     ///
     /// Every node and value read through the view is decoded afresh and belongs to whatever read
     /// it, so nothing it decodes reaches this store's cache or the nodes this store's readers
-    /// share, and a read through it changes nothing of this store. A read past `allowance` fails
+    /// share, and a read through it changes nothing of this store. The first read of each record
+    /// of the file is free. A read of a staged object, a second read of a record and
+    /// [`Store::charge`] count against `allowance` bytes of object bodies, and one past it fails
     /// with [`Error::Bundle`].
     pub(crate) fn view(&self, borrowed: u64, allowance: u64) -> Store {
         let inner = &self.inner;
@@ -2225,6 +2259,7 @@ impl Store {
                     overdrawn: AtomicBool::new(false),
                     borrowed,
                     lent: RwLock::new(AtomicPtr::new(std::ptr::null_mut())),
+                    read: Mutex::new(Reads::default()),
                 }),
             }),
         }
@@ -2236,6 +2271,19 @@ impl Store {
     pub(crate) fn readable_bytes(&self) -> u64 {
         let borrowed = self.inner.view.as_ref().map_or(0, |view| view.borrowed);
         self.written().saturating_add(borrowed)
+    }
+
+    /// Counts `bytes` against what a [`Store::view`] may still read at a charge, and does nothing
+    /// for a store opened on a file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bundle`] if what is left cannot pay for `bytes`, as for a read past it.
+    pub(crate) fn charge(&self, bytes: usize) -> Result<()> {
+        match &self.inner.view {
+            Some(view) => view.charge(bytes),
+            None => Ok(()),
+        }
     }
 
     /// The error of the first read through this [`Store::view`] that its allowance could not pay
@@ -3257,17 +3305,22 @@ impl Store {
     }
 
     /// Reads the object at `ptr` for decoding: for a [`Store::view`], the one staged with its hash
-    /// if [`Staging::overlaid`] lends the view a staging that holds one, and the body counted
-    /// against what the view may read.
+    /// if [`Staging::overlaid`] lends the view a staging that holds one, its body counted against
+    /// what the view may read, and otherwise the record in the file, counted only if the view
+    /// read it before.
     fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
         let Some(view) = &self.inner.view else {
             return self.read_object(ptr);
         };
-        let object = match view.staged(ptr) {
-            Some(object) => object?,
-            None => self.read_object(ptr)?,
-        };
-        view.charge(object.body.len())?;
+        if let Some(object) = view.staged(ptr) {
+            let object = object?;
+            view.charge(object.body.len())?;
+            return Ok(object);
+        }
+        let object = self.read_object(ptr)?;
+        if view.read.lock().mark(ptr.offset) {
+            view.charge(object.body.len())?;
+        }
         Ok(object)
     }
 
