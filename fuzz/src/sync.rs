@@ -275,16 +275,97 @@ fn number(input: &mut Input<'_>, old: u64) -> u64 {
     }
 }
 
+fn summary_spans(body: &[u8], bytes: bool) -> Option<Vec<(usize, usize)>> {
+    let mut r = Reader {
+        bytes: body,
+        pos: 0,
+    };
+    r.take(1)?;
+    let n = r.varint()?;
+    if n == 0 || n > body.len() as u64 {
+        return None;
+    }
+    for _ in 0..n {
+        r.varint()?;
+    }
+    let mut spans = Vec::new();
+    for _ in 0..n {
+        match r.take(1)?[0] {
+            0 if bytes => {
+                let len = usize::try_from(r.varint()?).ok()?;
+                r.take(len)?;
+            }
+            0 => {
+                r.varint()?;
+            }
+            1 => {
+                let start = r.pos;
+                r.varint()?;
+                spans.push((start, r.pos));
+            }
+            _ => return None,
+        }
+    }
+    for _ in 0..=n {
+        if r.varint()? != 0 {
+            let start = r.pos;
+            r.varint()?;
+            spans.push((start, r.pos));
+        }
+    }
+    (r.pos == body.len() && !spans.is_empty()).then_some(spans)
+}
+
+fn read_varint(bytes: &[u8]) -> u64 {
+    Reader { bytes, pos: 0 }.varint().unwrap_or(0)
+}
+
+fn forge_summaries(parsed: &mut Parsed, input: &mut Input<'_>) {
+    let nodes: Vec<(usize, Vec<(usize, usize)>)> = parsed
+        .objects
+        .iter()
+        .enumerate()
+        .filter_map(|(at, object)| {
+            let spans =
+                summary_spans(&object.body, false).or_else(|| summary_spans(&object.body, true))?;
+            Some((at, spans))
+        })
+        .collect();
+    if nodes.is_empty() {
+        return;
+    }
+    let (at, spans) = &nodes[pick(input, nodes.len())];
+    let body = &parsed.objects[*at].body;
+    let first = spans[pick(input, spans.len())];
+    let second = spans[pick(input, spans.len())];
+    let mut changes = vec![(first, number(input, read_varint(&body[first.0..first.1])))];
+    if first != second && input.chance(8) {
+        let delta = changes[0]
+            .1
+            .wrapping_sub(read_varint(&body[first.0..first.1]));
+        let old = read_varint(&body[second.0..second.1]);
+        changes.push((second, old.wrapping_sub(delta)));
+    }
+    changes.sort_by_key(|((start, _), _)| std::cmp::Reverse(*start));
+    let body = &mut parsed.objects[*at].body;
+    for ((start, end), value) in changes {
+        let mut encoded = Vec::new();
+        varint(&mut encoded, value);
+        body.splice(start..end, encoded);
+    }
+}
+
 fn mutate(parsed: &mut Parsed, input: &mut Input<'_>) {
     let targets = parsed.targets();
     let objects = parsed.objects.len();
     let op = input.byte();
     let at = pick(input, objects);
-    match op % 18 {
+    match op % 20 {
+        18 | 19 => forge_summaries(parsed, input),
         0..=3 if objects > 0 => {
             let body = &mut parsed.objects[at].body;
             let spot = pick(input, body.len() + 1);
-            match op % 18 {
+            match op % 20 {
                 0 if spot < body.len() => body[spot] ^= input.byte() | 1,
                 1 if spot < body.len() => body[spot] = input.byte(),
                 2 => body.truncate(spot),
@@ -295,7 +376,7 @@ fn mutate(parsed: &mut Parsed, input: &mut Input<'_>) {
             let links = &mut parsed.objects[at].links;
             let slot = pick(input, links.len());
             let target = targets[pick(input, targets.len())];
-            match op % 18 {
+            match op % 20 {
                 4 if !links.is_empty() => links[slot] = target,
                 5 if !links.is_empty() => {
                     links.remove(slot);

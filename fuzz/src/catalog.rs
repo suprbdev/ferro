@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::ops::Bound;
 
 use ferro::map::Summary;
@@ -5,7 +6,7 @@ use ferro::{Bytes, Data, List, Map, Record, Set, Table};
 
 use crate::guarded;
 use crate::input::Input;
-use crate::types::{Gen, Probe, Total};
+use crate::types::{Gen, Heft, Probe, Total};
 
 #[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -130,7 +131,7 @@ pub struct World {
     pub events: List<u64>,
     pub people: Table<Person>,
     pub items: Table<Item>,
-    pub blobs: Map<u64, Bytes>,
+    pub blobs: Map<u64, Bytes, Heft>,
     pub totals: Map<u64, u64, Total>,
     pub note: Option<Box<(u64, String)>>,
 }
@@ -242,11 +243,47 @@ pub fn fill(world: &mut World, round: u64) {
         world.items.insert(item(id, round));
     }
     for key in (0..12).step_by(1 + round as usize) {
+        let seed = if key % 3 == 0 {
+            round
+        } else {
+            key * 31 + round
+        };
         world
             .blobs
-            .insert(key, Bytes::from(word(key * 31 + round, 700).into_bytes()));
+            .insert(key, Bytes::from(word(seed, 700).into_bytes()));
     }
     world.note = Some(Box::new((round, format!("round {round}"))));
+}
+
+pub fn folds<K, V, S>(map: &Map<K, V, S>)
+where
+    K: Data + Ord,
+    V: Data,
+    S: Summary<K, V> + PartialEq + Debug,
+{
+    let mut folded: Option<S> = None;
+    for (key, value) in map.iter() {
+        let entry = S::of(&key, &value);
+        folded = Some(match folded {
+            Some(total) => total.combine(&entry),
+            None => entry,
+        });
+    }
+    assert_eq!(
+        map.summary(),
+        folded,
+        "a map's summary is not the fold of its entries"
+    );
+    if let Some((middle, _)) = map.nth(map.len() / 2) {
+        let joined = match (
+            map.range_summary::<K, _>(..middle.clone()),
+            map.range_summary::<K, _>(middle..),
+        ) {
+            (Some(below), Some(above)) => Some(below.combine(&above)),
+            (below, above) => below.or(above),
+        };
+        assert_eq!(joined, folded, "a map's halves do not fold to its summary");
+    }
 }
 
 pub fn whole<K, V, S>(map: &Map<K, V, S>) -> usize
@@ -363,8 +400,9 @@ pub fn world_whole(world: &World) -> usize {
     for (_, blob) in world.blobs.iter() {
         seen += blob.len();
     }
+    folds(&world.blobs);
     seen += whole(&world.totals);
-    let _ = world.totals.summary();
+    folds(&world.totals);
     seen + world.note.as_ref().map_or(0, |note| note.1.len())
 }
 
