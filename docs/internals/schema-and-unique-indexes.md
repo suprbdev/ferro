@@ -520,13 +520,15 @@ An index holds an entry for exactly the values its rows hold at the same version
 answers as reading the entries between the two would, whether or not the range was read partly from
 either end first.
 
-The row is read through the finder of the lookup's own `IndexIter`. A combination reads its rows
-through the leftmost lookup's finder, so `and` and `or` used to drop the finder of the side they
-are given. They now hand it to that side's stream first, which passes it down the leftmost lookups
-of a nested combination to a range that came without one. A tested range so reads the table it was
-made on as it was when the range was built, whatever table or version the other side reads. A
-range that leads a combination through `into_matches` has no finder of its own, since the
-combination reads its rows through it, and is collected.
+The row is read through the finder of the lookup's own `IndexIter`. A combination keeps the
+finders it reads rows through, one for each version of a table its lookups read, as [Lookups of
+several tables](#lookups-of-several-tables) describes. `and` hands the finders of the side it is
+given to that side's streams, since it reads no rows through them, and `or` hands over those that
+read a version it already has a finder for, and each range that came without a finder takes the one
+of its own version. A tested range so reads the table it was made on as it was when the range was
+built, whatever table or version the other side reads. A range that leads a combination through
+`into_matches` has no finder of its own, since the combination reads its rows through it, and is
+collected.
 
 A probe of a tested range answers with the key when the range holds it, and otherwise with a new
 answer, `Past(key)`, meaning that it holds nothing from the target up to that key. The lead then
@@ -569,6 +571,63 @@ checks every range of a field with 30 values against six leads, and counts the r
 an `IndexEach` that counts its calls: in memory each key of the lead is tested once, through
 `uncovered()`, from the lead and within the factor none, and from an uncached file fewer than the
 lead holds, as keys and as rows.
+
+### Lookups of several tables
+
+A lookup reads the table it was made on as it was when it was built, and `and` and `or` combine by
+key alone, so lookups of two tables of one row type, or of two versions of one table, such as a
+snapshot's and the one inside a commit, combine like any others. Their keys are what each lookup's
+own table gives. Their rows came through the leftmost lookup's finder, though, so a key that only
+another table held found no row there and ended the iteration: an `or` of a table holding 1, 2, 3,
+5 and 6 with one holding 1 to 6 gave all six keys but rows 1 to 3, and from the back 6 and 5. An
+`and` whose left side was such an `or` stopped the same way, and with two versions it could yield
+the leftmost version's row of a key that another version's lookup had matched.
+
+A combination reads each key's row from a lookup that holds the key: from the left side of an
+`and`, which holds every key the `and` yields, and from the leftmost side of an `or` that holds it.
+That is the lookup whose covered fields `covered()` already gave, so a row and its covered fields
+come from one version, and rows, lent rows, keys and covered fields, from either end, give the same
+keys.
+
+A `Matches` keeps the finder of its leftmost lookup and, behind one pointer that stays null while
+there is none, a list of the finders of the other versions it reads, numbered from 1. `or`
+compares each finder of the side it is given with those it has through `Finder::same_map`: one
+root node, stored roots of one hash, or two empty maps are one version. A finder of a version it
+has is handed to that side's streams, as for ranges above, and one of another version joins the
+list, and the side's streams are renumbered to match. So lookups of one table at one version, the
+common case, keep one finder and no list. A root lent through a hazard slot and one read through a
+link whose node was not yet read compare unequal even when they are one map, which costs a second
+finder and no wrong answer.
+
+Each stream that reads entries, a lookup of one value, a collected list or a range, holds the
+number of its finder. An `or` records which side it took each key from, and an `and` answers with
+its left side, the side it took the key from or, when the other side leads, the side whose probe
+last found it. `next`, `next_back` and `next_ref` ask only when the combination has a list, in a
+function kept out of line, so one of one version runs the code it did and one more test. An `and`
+never asks its right side, so once it is built it neither renumbers that side nor hands it finders
+again. A combination that has yielded rows and is combined again is read to the end first, as
+before, but with several versions its keys go into one list per finder, under an `or` of the lists,
+so each keeps its finder.
+
+The list's finders read rows, so they stay with the combination while it may yield rows. When the
+combination becomes the right side of an `and` they are handed to its streams with the leftmost
+one, and `keys()` and `covered()`, which yield no rows, hand over the list before the first read.
+A range on the right side of an `or` of two versions is so tested when the `or` is the right side
+of an `and`, or the left side of one read through `keys()`, but collected when that `and` yields
+rows or covered fields.
+
+`or` now takes each key from the side that holds the nearest one and compares only the sides after
+it, since an earlier side holding the same key would have been the nearest. Taking it first gives
+the key to compare with, where the key used to be cloned and every side asked.
+
+`combine_range.rs` runs its random combinations over two tables with overlapping and disjoint keys,
+over a table and a version of it with rows changed, removed and added, in memory and from an
+uncached file, and over a table, a clone of it and another table, with each subtree of a query
+moved at random to one of them. Its model gives each key the row of the lookup that should hold it,
+and rows, rows from the back and from both ends, lent rows, visited rows, the first few, covered
+fields of an `or` with another table's range, and combinations read partly and combined again are
+compared with it whole. The counting test checks that a range on the other side of an `or` with
+another version is still tested against a few keys. `combine.rs` runs the example above.
 
 ### What it measured
 
@@ -717,6 +776,42 @@ runs, and over three more runs of `tier-ref` and `index-visit` came within 0.5%.
 `Finder::lend` outside it, a call for every row. `Finder::lend` is now `#[inline(always)]`, so
 where `visit` lands no longer matters.
 
+### What several tables measured
+
+The equality cases of `ferro-bench --bin combine` also run the `or` of the two lookups, as keys and
+as rows, and the `or` of the first with the second made on a newer version of the table, a clone
+whose last row's name changed, which shares every node but those on the way to that row. The
+figures are medians over three runs of each build, alternated, of five rounds each, pinned to one
+CCD of a 16-core Zen 5 machine, the build before taken with the same benchmark. In microseconds and
+millions of instructions, before and after, with two versions after:
+
+| Lookups | In either | `or` keys | `or` rows | Two versions, rows |
+| --- | --- | --- | --- | --- |
+| 50k and 50k | 87,362 | 2,328 → 2,116 (38.0 → 35.7) | 7,221 → 6,821 (64.4 → 62.3) | 7,379 (72.8) |
+| 50k and 50k, none shared | 100,274 | 2,440 → 2,222 (41.0 → 38.3) | 7,568 → 7,584 (70.0 → 67.4) | 8,032 (79.1) |
+| 25k and 50k | 68,889 | 1,720 → 1,548 (29.3 → 27.2) | 6,107 → 5,990 (51.8 → 49.9) | 6,942 (58.8) |
+| 3k and 50k | 52,303 | 1,034 → 908 (21.5 → 19.6) | 4,554 → 4,105 (40.3 → 38.5) | 4,410 (42.8) |
+| 1k and 100k | 100,142 | 1,929 → 1,670 (40.9 → 37.2) | 7,262 → 7,284 (69.9 → 66.4) | 7,294 (71.7) |
+| 100k and 10 | 100,272 | 1,969 → 1,776 (41.3 → 39.5) | 7,203 → 7,060 (70.3 → 68.7) | 7,076 (72.3) |
+| 20 and 20 | 43 | 1.2 → 1.1 (0.024 → 0.023) | 4.4 → 4.3 (0.077 → 0.076) | 4.4 (0.078) |
+
+Taking each key from the nearest side first made `or` run 4 to 9% fewer instructions as keys and 1
+to 5% fewer as rows. Read as keys, two versions ran the same as one. Read as rows, they ran 35 to 55
+instructions a row more where nearly every row came from one version, the cost of asking the
+stream and of the read kept out of line, and up to 130 more, and up to 16% longer, where the rows
+alternated between the two, since each finder then keeps the leaf of fewer of the rows it reads.
+The build before read every row of the two versions through the first finder: the rows were the
+same here, since only one row's name differed, so it ran at the cost of one version.
+
+The other cases ran the code they did. `and` ran within 0.01% of its instructions per key, and as
+rows 0.05 to 0.09% more, about two instructions a row for the test of the list's pointer. Setting
+up an `and` ran 10 to 95 instructions more, at most 0.4% of two lookups of 20 keys or of 10 keys
+against a range. The range cases came within 0.4% of their instructions, and every time within the spread
+between runs. A first build kept the list as a vector, handed finders down as a list even for one
+version, read the row through a call that asked for the finder's number when the list was empty,
+and found the side to record in `or` by counting the sides it went through: `or` ran 2.2% more
+instructions, `and` as rows 5 more a row, and setting up a combination 220 to 260 more.
+
 ### Left out
 
 - The index map in every equality `IndexIter`, so that `by_x` itself could combine. A clone of the
@@ -768,6 +863,26 @@ where `visit` lands no longer matters.
   loss whatever the lead holds.
 - Weighting a read from the file at 32 entries rather than 64. It stopped testing later, and the
   cold cases that stop took 28 to 36% longer as keys.
+- Skipping a key whose row the leftmost table lacks, which would cost nothing while every row is
+  there. The rows would then leave out keys that `keys()` yields, unless `keys()` read each key's
+  row from that table, which is what it exists not to do, and a key the leftmost table holds in
+  another state than the version that matched it would still come back with a row its lookup had
+  not matched.
+- Refusing to combine lookups of different tables or versions. A lifetime on `Matches` tying it to
+  one table would refuse two tables when it compiles but not two versions of one, which share the
+  type, and every combination would carry the lifetime. A check when it runs needs the same
+  comparison of roots, and refuses what a tested range already answered for: a lookup of the table
+  inside a commit combined with one of the snapshot before it.
+- Reading each row from the leftmost table that holds the row rather than from a lookup that holds
+  the key. It would need no numbers, but a table can hold a row its lookup did not match, and that
+  row would disagree with the covered fields and with every lookup that matched the key.
+- Returning the finder's number from `take` with each key. Every stream and every combination
+  would pay for it on every key, where asking after `take` costs only combinations of several
+  versions.
+- A second finder made from a range's, so that a range on the right side of an `or` of two
+  versions could test while the combination reads that version's rows through the first. Making
+  one means lending the store and root through new hazard slots, for a case that collects the
+  range as it did before ranges were tested.
 
 ### What is left
 
@@ -788,3 +903,9 @@ where `visit` lands no longer matters.
 - `Matches` knows only an upper bound on its length, through `size_hint`.
 - Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
   against 0.5 for the merge.
+- A range on the right side of an `or` whose finder reads another version than any lookup to its
+  left is read in full when the `or` is the left side of an `and` that looks keys up in it and
+  yields rows, since the combination reads that version's rows through the range's finder.
+- Two finders of one stored map can compare unequal when the map's root node was first read from
+  the file between the making of the two, since the earlier one holds only the link and the later
+  one only the node, and such a combination reads through both.

@@ -182,6 +182,29 @@ its keys are read in full and sorted first, at 18 to 30 ns a key. Pass the range
 reads the indexes and rows as they were when you built it, like any lookup. [Combining
 lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
 
+Lookups of two tables of the same row type, or of two versions of one table, such as a snapshot's
+and the one inside a commit, combine as well. Each answers for the table and version it was made
+on, and each row comes from a lookup that holds its key: the left side of an `and`, and the
+leftmost side of an `or` that holds it, the lookup `.covered()` takes the fields from too. So an
+`or` yields every row either table holds, and a row both hold from the left one:
+
+```rust
+let wile: Vec<_> = snapshot
+    .orders
+    .find()
+    .by_customer("wile")
+    .or(snapshot.archived.find().by_customer("wile"))
+    .collect();
+```
+
+An `and` of two tables yields the left table's rows whose keys the right table's lookup holds as
+well. Lookups of one table at one version read their rows as a single lookup does. On 200,000 rows,
+measured on 2026-11-06, an `or` of two lookups of 50,000 rows took 6.8 ms read as rows, and 7.4 ms
+with the second lookup made on a newer version of the table, since each version's rows are read
+through a finder of their own. [Lookups of several
+tables](../internals/schema-and-unique-indexes.md#lookups-of-several-tables) describes how, and
+has the measurements.
+
 ## Reading rows in place
 
 Every row a lookup, `Matches`, `iter`, `range` or `prefix` yields is a `Val`, which shares the row
