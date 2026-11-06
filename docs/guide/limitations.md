@@ -48,9 +48,10 @@ This is an experiment, not a production database.
   ancestors could lie in pruned history, as described under [Limits](merging.md#limits).
 - Sync keeps memory for every object it moves and writes a large bundle twice, as described under
   [Limits](sync.md#limits).
-- No query planning happens. You choose the indexes, `and` and `or` combine equality lookups by
-  key, a range or prefix lookup joins them only after its keys are read and sorted, and each
-  matching row is read separately unless the index covers the fields it needs, as described under
+- No query planning happens. You choose the indexes, and `and` and `or` combine equality lookups by
+  key. A range or prefix lookup tests the keys of a side with a quarter of its keys or fewer by
+  reading their rows, and joins otherwise only after its keys are read and sorted. Each matching
+  row is read separately unless the index covers the fields it needs, as described under
   [Combining lookups](tables.md#combining-lookups) and [Lookups](tables.md#lookups).
 
 Each subsystem's own limits are in the internals: [sync](../internals/sync.md#limits),

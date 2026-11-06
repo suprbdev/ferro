@@ -66,8 +66,9 @@ explained or undone from the history, and corruption surfaces as an error rather
   wrote, so on one branch they commit more slowly than threads. It needs 64-bit Linux and one
   machine.
 - **Ad hoc queries.** There is no query language or planner. You choose the indexes, `and` and
-  `or` combine equality lookups by key, a range joins them only after its keys are read and sorted,
-  and each matching row is read separately unless the index covers the fields it needs.
+  `or` combine equality lookups by key, a range tests the keys of a side with a quarter of its keys
+  or fewer by reading their rows and joins otherwise only after its keys are read and sorted, and
+  each matching row is read separately unless the index covers the fields it needs.
 - **Very large files.** A reclamation cycle copies everything retained at 450 MB/s to 2.2 GB/s on
   four threads and needs that much free disk, and a first sync keeps about 40 bytes per object in
   memory on each side, about 2 GB for 50 million objects.

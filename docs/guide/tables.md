@@ -158,10 +158,26 @@ keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where w
 600 µs.
 
 A lookup made on the table itself, such as `by_x_range` or `by_x_prefix` of a unique or a non-unique
-index, can be passed to `and` or `or` too, but it is not in key order, so its keys are read in full
-and sorted first. A combination reads the indexes as they were when you built it, like any lookup.
-[Combining lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the
-measurements.
+index, can be passed to `and` or `or` too. It is not in key order, so when the other side of an
+`and` has at most a quarter of its keys, only that side is walked, and each of its keys is tested
+against the range by reading its row. With `day` indexed:
+
+```rust
+let find = snapshot.orders.find();
+let this_month: Vec<_> = find
+    .by_customer("wile")
+    .and(snapshot.orders.by_day_range(first..=last))
+    .collect();
+```
+
+On 200,000 rows, measured on 2026-11-06, 10 keys against a range of 100,000 took 1.5 µs where
+reading and sorting the range took 2.4 ms, and 1,000 keys took 106 µs against 2.5 ms. Each key
+tested costs a row read, about 100 ns with the rows cached, and `.keys()` and `.covered()` read
+those rows too. When the range has less than four times the keys of the other side, leads the
+combination through `into_matches()`, or gives the combination its covered fields, its keys are
+read in full and sorted first, at 18 to 30 ns a key. A combination reads the indexes and rows as
+they were when you built it, like any lookup. [Combining
+lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
 
 ## Reading rows in place
 

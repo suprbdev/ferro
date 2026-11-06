@@ -58,8 +58,10 @@ a unique index come with `keys`, `covered`, `uncovered`, both ends, a length kno
 place in `and` and `or`, as a non-unique index's do. The derive builds the walk itself, with
 `Map::range` on the index for a range and `Map::range_by` on the value's first field for a prefix,
 and hands the `Iter` to `table::unique_rows`, or `unique_rows_covered` with the projection
-`covered_by_x` uses. Rows come in value order, and a composite's prefix by the fields after the
-first. The bounds borrow as the value type does, so a `String` index takes `&str` bounds, and on an
+`covered_by_x` uses, together with a function that gives the value a row holds, which a
+combination uses to test a row against the lookup, as described under [Ranges and prefixes in a
+combination](#ranges-and-prefixes-in-a-combination). Rows come in value order, and a
+composite's prefix by the fields after the first. The bounds borrow as the value type does, so a `String` index takes `&str` bounds, and on an
 `Option<X>` field they are bounds of `X`, since `None` has no entry.
 
 The cursor behind every other lookup reads the primary key out of a `(value, key)` entry's own key
@@ -73,11 +75,11 @@ for every key it yields, `keys` included. The rows are read through the finder e
 uses, which keeps the last leaf it found.
 
 A range of a unique index is not in key order, so it joins a combination as a range of a
-non-unique one does: its keys and covered fields are read in full and sorted. The `find()` view has
-no unique lookups. `key_by_x` gives the one key of a value, and a range in the view would be
-collected and sorted all the same, which passing the `IndexIter` to `and` or `or` already does.
-There is no `by_x_after` or `by_x_counts`, since a value has one row: the page after a value is a
-range that excludes it.
+non-unique one does: a much smaller side tests its keys against it, and otherwise its keys and
+covered fields are read in full and sorted. The `find()` view has no unique lookups. `key_by_x`
+gives the one key of a value, and a range in the view would be tested or collected all the same,
+which passing the `IndexIter` to `and` or `or` already does. There is no `by_x_after` or
+`by_x_counts`, since a value has one row: the page after a value is a range that excludes it.
 
 `unique_range.rs` checks every range over a few bounds, inverted and empty ones among them, and
 every prefix of six unique indexes, plain and covering, on `String`, integer and `Option` fields and
@@ -458,9 +460,11 @@ An index entry is `(value, key)`, so the entries of one value are in key order, 
 intersect by walking their keys, reading no row until a key is in both. A view lookup holds a clone of
 its index map beside the range `range_by` built, so that it can seek within its value later, and the
 rows map's finder, so it reads the version it was built from, as any lookup does. A lookup made on
-the table, by range, prefix or value, is an `IndexIter` without that map. It joins a combination by
-reading its keys and covered fields into a vector and sorting it, which takes one pass when the
-lookup was of one value and is sorted already.
+the table, by range, prefix or value, is an `IndexIter` without that map. A range or prefix
+lookup that a much smaller side looks keys up in is tested key by key, as described under [Ranges
+and prefixes in a combination](#ranges-and-prefixes-in-a-combination). Otherwise it joins a
+combination by reading its keys and covered fields into a vector and sorting it, which takes one
+pass when the lookup was of one value and is sorted already.
 
 ### Two plans
 
@@ -491,13 +495,68 @@ vector, since a side that is looked up answers for its whole range.
 looked up, where its cursor stopped. A key it read before `covered()` was called is looked up in the
 index again, and a collected lookup keeps the fields of every entry.
 
+### Ranges and prefixes in a combination
+
+A range or prefix lookup is not in key order, so it cannot be walked beside another side, but
+whether it holds a key can be tested. For every index the derive generates a function, of the type
+`table::Indexed`, that calls a closure on each value the index holds for a row: the field, a
+composite's fields as a tuple, each element of an `#[index(each)]` field, and nothing for a unique
+`Option` field that holds `None`. The helpers behind the range and prefix lookups, `index_range`,
+`index_where`, `unique_rows` and `unique_rows_covered`, wrap their cursor in one that keeps that
+function, and `into_matches` on such an `IndexIter` returns a stream that can either test keys or
+collect its entries. The equality lookups made on the table, and a lookup passed through
+`IndexIter::uncovered`, keep the plain cursor and are collected as before.
+
+The stream chooses when the combination is first read. When `and` picks the plan in which one side
+leads, it tells the other side how many keys the lead holds at most, and an `and` or `or` that is
+itself looked up passes that on to each of its sides. A range with at least four times as many
+entries left as the lead has keys is tested. One with fewer is collected, and so is one that is
+walked, which happens within the factor of four and when it leads. To test, the stream reads the
+first and last entries the range has left without stepping past them: `Iter::front_key_with` and
+`back_key_with` take a step and set the frame back. A key is in the range when its row holds a
+value whose entry lies between those two. A non-unique entry is `(value, key)`, so the key is
+compared as well when the value equals that of an end entry, and a unique entry is the value alone.
+An index holds an entry for exactly the values its rows hold at the same version, so the test
+answers as reading the entries between the two would, whether or not the range was read partly from
+either end first.
+
+The row is read through the finder of the lookup's own `IndexIter`. A combination reads its rows
+through the leftmost lookup's finder, so `and` and `or` used to drop the finder of the side they
+are given. They now hand it to that side's stream first, which passes it down the leftmost lookups
+of a nested combination to a range that came without one. A tested range so reads the table it was
+made on as it was when the range was built, whatever table or version the other side reads. A
+range that leads a combination through `into_matches` has no finder of its own, since the
+combination reads its rows through it, and is collected.
+
+A probe of a tested range answers with the key when the range holds it, and otherwise with a new
+answer, `Past(key)`, meaning that it holds nothing from the target up to that key. The lead then
+moves to its first key after that one, through `pass`, and probes again, so each key of the lead
+costs one row read. `pass` and `seek` share one function per stream with the strictness as a
+constant, so the code `seek` compiles to is what it was. An `and` that is looked up answers `Past`
+as soon as either side does, and an `or` answers with the nearest key a side holds unless a side
+that answered `Past` may hold an earlier one. The last answer is kept, since `take` settles again on
+the key that `fill` settled on.
+
+`covered()` reads the fields of the leftmost lookup, which a range is only when it leads, so a
+tested range never yields covered fields. A combination that has started and is combined again
+reads its covered fields with its keys, and a range it was testing is then collected from the
+entries it has left, which testing never stepped past.
+
+`combine_range.rs` checks random combinations of `find()` lookups with ranges and prefixes of plain,
+each, `Option`, unique, unique `Option`, covering unique and composite indexes, some read partly
+from either end first, against a filter over the rows: as rows, lent rows, keys and covered fields,
+from either end and from both at once, in memory and from an uncached file, after the table
+changed, inside a commit, and with the range taken from another version of the table. It also
+checks every range of a field with 30 values against six leads.
+
 ### What it measured
 
 `ferro-bench --bin combine`, which `make bench-combine` runs, builds 200,000 rows with two
 `#[index(each)]` fields. For each case it gives one value of each field to rows picked at random, to
 two spans apart, or, for the second, to rows the first lacks. Every strategy's keys are checked
 against a merge, and the figures are medians over three runs of three rounds on a machine shared
-with other work. Keys only, in microseconds:
+with other work, taken before the rows gained the fields of the range cases described under [What
+ranges and prefixes measured](#what-ranges-and-prefixes-measured). Keys only, in microseconds:
 
 | Lookups | Keys in both | Merge | Set | Leapfrog, `_after` | 32 steps, then `_after` | Leapfrog, cursor | `and` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -535,6 +594,76 @@ Plain lookups are unchanged. Over four interleaved runs of each build, a lookup 
 instructions against 3,164 before, and one of 20 rows 26,642 against 26,497, within the spread
 between processes. A page of 200 rows, `len` and `keys` ran the same, and every time came within 1%.
 
+### What ranges and prefixes measured
+
+The range cases of `ferro-bench --bin combine` combine `find().by_group(&g)` with a range of a plain
+`score` index, a range of a unique `rank` index or the prefix of a band of a composite `(band,
+score)` index, on the same 200,000 rows. Each field is a random permutation of the rows, so both
+sides' keys are scattered across the table, and every row is cached. The figures are medians over
+three runs of each build, alternated, of three rounds each, pinned to one CCD of a 16-core Zen 5
+machine. Keys only, in microseconds, before and after:
+
+| Lead | Range | Plain range | Unique range | Prefix |
+| --- | --- | --- | --- | --- |
+| 10 | 10,000 | 152.8 → 1.4 | 150.4 → 1.3 | 152.9 → 1.4 |
+| 10 | 100,000 | 2,428.7 → 1.5 | 2,416.6 → 1.4 | 2,449.0 → 1.5 |
+| 100 | 10,000 | 157.7 → 8.3 | 153.8 → 8.5 | 155.5 → 8.5 |
+| 100 | 100,000 | 2,453.1 → 9.0 | 2,427.6 → 9.0 | 2,457.0 → 9.3 |
+| 1,000 | 10,000 | 180.9 → 95.8 | 177.7 → 95.5 | 179.7 → 98.4 |
+| 1,000 | 100,000 | 2,525.9 → 105.5 | 2,517.1 → 105.3 | 2,543.2 → 107.6 |
+| 10,000 | 10,000 | 396.3 → 394.4 | 392.0 → 390.8 | 393.6 → 391.3 |
+| 10,000 | 100,000 | 2,995.1 → 884.2 | 2,967.1 → 876.8 | 3,007.1 → 898.4 |
+
+10 keys against a range of 100,000 ran 24,080 instructions where they had run 42.4 million. From
+the back the figures were the same within 1%, or within the 0.1 µs the benchmark prints. Read as rows, the plain range took 2.0 µs against
+2,429.6 for 10 keys, 12.7 against 2,445.6 for 100, 142.9 against 2,603.6 for 1,000 and 1,253.2
+against 3,488.2 for 10,000, the difference from keys being the rows that match, read again through
+the combination's own finder. Ranges of 1,000 against the lead of 10,000, where the range leads and
+is collected, took 55.5 µs against 57.5 and 1,099,120 instructions against 1,091,462.
+
+A tested key costs 88 to 105 ns, against 71 to 85 ns for reading the same rows through the lead's
+`visit` and checking the field by hand, the rest being the lend through a second finder, the
+generated function and the combination's steps. Reading and sorting a range costs 18 to 30 ns a
+key, more the more keys it has, so the crossover depends on the sizes. Against score ranges of 1 to
+128 times the lead's keys, in microseconds before and after:
+
+| Range / lead | Lead of 100 | Lead of 1,000 | Lead of 10,000 |
+| --- | --- | --- | --- |
+| 1 | 2.6 → 2.5 | 27.5 → 26.9 | 401.1 → 398.9 |
+| 2 | 4.2 → 4.1 | 47.2 → 45.9 | 745.2 → 732.9 |
+| 4 | 7.0 → 8.0 | 80.3 → 88.6 | 1,291.7 → 766.4 |
+| 8 | 12.7 → 8.0 | 146.3 → 88.9 | 2,413.3 → 834.4 |
+| 16 | 24.3 → 8.1 | 345.8 → 89.5 | 4,633.5 → 882.5 |
+| 32 | 48.8 → 8.1 | 769.3 → 91.6 | |
+| 128 | 205.1 → 8.2 | 3,232.1 → 101.1 | |
+
+Testing breaks even with collecting at about 4.7 times the lead's keys for a lead of 100, 4.5 for
+1,000 and 2.1 for 10,000. The plan tests from 4 times, the factor that already decides between
+walking both sides and looking keys up: at 4 it takes 14% and 10% longer than collecting for the
+two smaller leads, a microsecond and 8 µs, though it runs 5% and 25% fewer instructions, since its
+row reads miss the cache where the collection streams, and saves 525 µs for the larger.
+
+Collected, a range runs the code it did. Read alone through `into_matches().keys()` it ran 0.1 to
+0.6% more instructions, and within the factor of four, where the range is walked beside the lead,
+0.07 to 0.3% more. A first build of the stream asked whether it was collected through a function
+that moved the whole cursor out of its `Option` on every call and compared keys through the
+strictness flag inside `partition_point`, and ran 21 instructions a key more there and 8 to 17% more
+in the merges, which moving the collection out of line and writing the four comparisons out
+removed. The equality cases ran within 0.6% of their instructions before, and their times within 2%,
+or 0.1 µs, but for `and` read as rows on the even cases, which came out 5% slower over three runs
+and 2% slower over two more, at 2,370 µs, where the build before ranged from 2,260 to 2,380 µs
+with the same instructions.
+
+Lookups read alone are unchanged. Over two runs of `scaling` alternating with the build before, on
+one thread with the 1 GiB cache, a lookup of about 20 rows by a range ran 28,779 instructions
+against 28,761, read through `visit` 28,740 against 28,712, and through `covered` 5,811 against
+5,795, and pages by equality ran the same within 0.1%. Their rates moved within the spread between
+runs, and over three more runs of `tier-ref` and `index-visit` came within 0.5%. A first build ran
+377 more instructions a lookup through `visit`: the range lookup's new cursor type moved
+`IndexIter::visit` into the benchmark's read loop, where it had been compiled apart, and left
+`Finder::lend` outside it, a call for every row. `Finder::lend` is now `#[inline(always)]`, so
+where `visit` lands no longer matters.
+
 ### Left out
 
 - The index map in every equality `IndexIter`, so that `by_x` itself could combine. A clone of the
@@ -555,14 +684,42 @@ between processes. A page of 200 rows, `len` and `keys` ran the same, and every 
 - Seeking both sides with a cursor and walking neither, 1.8 times as long as the merge on even
   sizes. Stepping a cursor up to 4 times before each seek came to 1.14 times the merge there and 82
   µs at 1k against 100k, against 70 for `and`, which keeps cursors for the side it only looks up.
+- Testing a key against a range by seeking the range's index at `(value, key)`, with the value taken
+  from a lead index that covers the range's field, rather than reading the row. In the benchmark
+  the group index covers the score, and checking the covered score against the bounds and seeking
+  the score index for those inside took 5.9 µs for 100 keys against a range of 100,000, 64.9 for
+  1,000 and 839.8 for 10,000, against 9.0, 105.5 and 884.2 for reading rows. It needs a lead that
+  covers the range's field, and the derive to tell which covered field of which index that is, and
+  it saved 35% of the time for 100 keys but 5% for 10,000. A caller whose lead covers the field and reads one
+  version can filter its `covered()` by the bounds, which took 1.6, 14.8 and 176.7 µs.
+- Testing below the factor of four. For a lead of 10,000 keys testing broke even at 2.1 times its
+  keys, but for leads of 100 and 1,000 at 4.5 to 4.7, and within the factor walking both sides
+  beats testing for small leads.
+- A finder of its own for a range that leads a combination through `into_matches`, so that it could
+  be tested too. A finder lends the store and root through hazard slots of its own, and making a
+  second from the first means lending both again; the combination reads its rows through the one
+  it has. A range that leads is collected, as one whose covered fields are wanted must be.
+- Testing a lookup passed through `IndexIter::uncovered`. The cursor it wraps has covered fields
+  that the method does not require to be `Send`, which a stream holding them would need, and
+  requiring it broke callers generic over the covered type. It is collected.
+- Testing the equality lookups made on the table, such as `by_x(&value)` passed to `and`. The
+  `find()` view's lookup of the same value walks and seeks, and the table's own lookups sit on the
+  read paths whose code the cursor change would move.
 
 ### What is left
 
 - Even sizes run 1.3 times as long as a merge written for them. A seek inside the range iterator,
   climbing its frames as a cursor does, would let a walked side skip without building its range
   again, and both that and a cursor that steps backwards would live in `map.rs`.
-- A range or prefix lookup, of a unique index as of a non-unique one, is read in full and sorted
-  before it combines. A unique index has no lookup in the view, since `key_by_x` gives its one key.
+- A range or prefix lookup is read in full and sorted before it combines when the other side has
+  more than a quarter of its keys, when it leads, when the combination yields its covered fields,
+  and after `IndexIter::uncovered`. A unique index has no lookup in the view, since `key_by_x`
+  gives its one key.
+- The factor of four suits leads of up to a few thousand keys. Against larger ones testing would
+  win from about twice the lead's keys, but the plan within the factor walks both sides.
+- A tested key costs a row read, so `keys()` and `covered()` read rows they did not before, and
+  with rows that do not fit in the cache each one may read the file where the range's entries were
+  cached.
 - `Matches` knows only an upper bound on its length, through `size_hint`.
 - Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
   against 0.5 for the merge.
