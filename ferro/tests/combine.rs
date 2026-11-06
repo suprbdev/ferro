@@ -541,3 +541,69 @@ fn started_lookups_and_combinations_combine_from_where_they_are() {
         .collect();
     assert_eq!(covered, wanted);
 }
+
+#[test]
+fn an_or_of_two_tables_reads_each_row_from_the_side_that_holds_it() {
+    let row = |id: u32, b: u8| Row {
+        id,
+        a: 0,
+        b,
+        opt: None,
+        tags: vec![],
+        c: 0,
+    };
+    let mut left: Table<Row> = Table::new();
+    for id in [1, 2, 3, 5, 6] {
+        left.insert(row(id, 1));
+    }
+    let mut right: Table<Row> = Table::new();
+    for id in 1..=6 {
+        right.insert(row(id, 2));
+    }
+    let either = || left.find().by_a(&0).or(right.find().by_a(&0));
+    let wanted: Vec<(u32, u8)> = vec![(1, 1), (2, 1), (3, 1), (4, 2), (5, 1), (6, 1)];
+    let ids: Vec<u32> = wanted.iter().map(|(id, _)| *id).collect();
+    assert_eq!(either().keys().collect::<Vec<_>>(), ids);
+    let rows: Vec<(u32, u8)> = either().map(|row| (row.id, row.b)).collect();
+    assert_eq!(rows, wanted);
+    let mut back: Vec<(u32, u8)> = either().rev().map(|row| (row.id, row.b)).collect();
+    back.reverse();
+    assert_eq!(back, wanted);
+    let mut lent = Vec::new();
+    either().visit(|row| lent.push((row.id, row.b)));
+    assert_eq!(lent, wanted);
+    let covered: Vec<(u32, (u8, u8))> = left
+        .find()
+        .by_c(&0)
+        .or(right.find().by_c(&0))
+        .covered()
+        .collect();
+    let fields: Vec<(u32, (u8, u8))> = wanted.iter().map(|&(id, b)| (id, (0, b))).collect();
+    assert_eq!(covered, fields);
+
+    let nested: Vec<(u32, u8)> = either()
+        .and(right.find().by_b(&2))
+        .map(|row| (row.id, row.b))
+        .collect();
+    assert_eq!(nested, wanted);
+    let mut nested_back: Vec<(u32, u8)> = right
+        .find()
+        .by_b(&2)
+        .uncovered()
+        .and(either().uncovered())
+        .rev()
+        .map(|row| (row.id, row.b))
+        .collect();
+    nested_back.reverse();
+    assert_eq!(
+        nested_back,
+        ids.iter().map(|id| (*id, 2)).collect::<Vec<_>>()
+    );
+    let flipped: Vec<(u32, u8)> = right
+        .find()
+        .by_a(&0)
+        .or(left.find().by_a(&0))
+        .map(|row| (row.id, row.b))
+        .collect();
+    assert_eq!(flipped, ids.iter().map(|id| (*id, 2)).collect::<Vec<_>>());
+}
