@@ -725,13 +725,16 @@ fn left_by_a_dead_writer(left: Left) {
         }
         Left::Flipped(offset) => {
             let at = start + offset;
-            assert!(common::judged(at as usize, start as usize, end as usize));
             frame[offset as usize] ^= 0x08;
             file.write_all_at(&frame, start).unwrap();
             Some(at)
         }
     };
     let image = std::fs::read(&path).unwrap();
+    if let Some(at) = flipped {
+        let (at, start, end) = (at as usize, start as usize, end as usize);
+        assert!(common::judged(&image, at, start, end));
+    }
     let outcome = commit(&live);
     let Some(at) = flipped else {
         assert_eq!(

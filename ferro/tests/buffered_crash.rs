@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::{Rng, assert_damaged, frames_past_the_anchor, judged, text};
 use ferro::store::{Op, Trace};
-use ferro::{Db, Durability, Map, Options, Reclaim};
+use ferro::{Db, Durability, Map, Options, Reclaim, Snapshot};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -40,12 +40,83 @@ struct Recording {
 }
 
 fn commit(db: &Db<Root>, models: &mut BTreeMap<u64, Model>, key: u64, seed: u64) {
+    commit_value(db, models, key, text(seed, 60));
+}
+
+fn commit_value(db: &Db<Root>, models: &mut BTreeMap<u64, Model>, key: u64, value: String) {
     db.update(|root| {
-        root.insert(key, text(seed, 60));
+        root.insert(key, value);
     })
     .unwrap();
     models.insert(db.version(), dump(&db.read()));
     db.trace_op(Op::Acked(db.version()));
+}
+
+const WINDOW: usize = 1024;
+
+fn sparse(seed: u64, len: usize) -> String {
+    let mut rng = Rng::new(seed);
+    let mut value: Vec<u8> = (0..len).map(|_| b' ' + rng.below(95) as u8).collect();
+    let window = len / 2;
+    value[window..window + WINDOW].fill(0);
+    value[window + WINDOW / 2] = 1 << rng.below(7);
+    String::from_utf8(value).unwrap()
+}
+
+fn refuse(_: &mut Root, _: &Snapshot<Root>, _: &Snapshot<Root>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+fn record_sparse(dir: &Path, options: impl Fn() -> Options) -> Recording {
+    let path = dir.join("sparse.ferro");
+    let source = dir.join("source.ferro");
+    let mut models = BTreeMap::new();
+    models.insert(0, Model::new());
+    {
+        let db: Db<Root> = options().open(&path).unwrap();
+        for i in 0..2 {
+            commit(&db, &mut models, i, i);
+        }
+    }
+    let base = fs::read(&path).unwrap();
+    let start = 2;
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    let db: Db<Root> = options().trace(trace.clone()).open(&path).unwrap();
+    fs::copy(&path, &source).unwrap();
+    {
+        let sender: Db<Root> = options().open(&source).unwrap();
+        sender
+            .update(|root| {
+                for key in 100..103 {
+                    root.insert(key, sparse(key, 400_000));
+                }
+            })
+            .unwrap();
+    }
+    let sender: Db<Root> = options().open(&source).unwrap();
+    db.pull(&sender, "source", refuse).unwrap();
+    models.insert(db.version(), dump(&db.read()));
+    db.trace_op(Op::Acked(db.version()));
+    for key in 0..3 {
+        commit_value(&db, &mut models, 200 + key, sparse(200 + key, 300_000));
+    }
+    drop(db);
+    let written = fs::read(&path).unwrap();
+    for key in [100, 200] {
+        let value = sparse(key, if key == 100 { 400_000 } else { 300_000 });
+        let window = &value.as_bytes()[value.len() / 2 - 8..value.len() / 2 + WINDOW + 8];
+        assert!(
+            written.windows(window.len()).any(|bytes| bytes == window),
+            "the value at {key} is stored uncompressed"
+        );
+    }
+    let ops = trace.lock().clone();
+    Recording {
+        base,
+        start,
+        ops,
+        models,
+    }
 }
 
 fn record(path: &Path, sessions: u64, commits: u64, options: impl Fn() -> Options) -> Recording {
@@ -295,15 +366,15 @@ fn damage(recording: &Recording, losses: &[Loss], seed: u64, name: &str) -> (usi
                 continue;
             };
             let at = start + rng.below((end - start) as u64) as usize;
-            if !judged(at, start, end) {
+            let mut image = state.image.clone();
+            image[at] ^= 1 << rng.below(8);
+            if !judged(&image, at, start, end) {
                 continue;
             }
             fs::write(&path, &state.image).unwrap();
             let whole: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
             let kept = whole.version();
             drop(whole);
-            let mut image = state.image;
-            image[at] ^= 1 << rng.below(8);
             fs::write(&path, &image).unwrap();
             let context = format!("{name}: cut {cut} {loss:?}, byte {at} of the frame at {start}");
             let readonly = Options::new().read_only(true).open::<Root>(&path);
@@ -348,6 +419,79 @@ fn a_flipped_bit_in_an_acknowledged_frame_whose_superblock_was_lost_is_reported(
         acknowledged > 10,
         "only {acknowledged} acknowledged frames damaged"
     );
+}
+
+fn sweep(recording: &Recording, name: &str) -> usize {
+    let dir = dir();
+    let path = dir.path().join("image.ferro");
+    let mut image = recording.base.clone();
+    let mut swept = 0;
+    for op in &recording.ops {
+        if let Op::Write(_, at, bytes) = op
+            && *at >= LOG_START
+        {
+            let start = *at as usize;
+            let end = start + bytes.len();
+            let mut sector = start - start % SECTOR;
+            while sector < end {
+                let (from, to) = (sector.max(start), (sector + SECTOR).min(end));
+                let set: u32 = bytes[from - start..to - start]
+                    .iter()
+                    .map(|byte| byte.count_ones())
+                    .sum();
+                if (set > 0 && set <= 8) || from == start || to == end {
+                    let mut torn = image.clone();
+                    if torn.len() < end {
+                        torn.resize(end, 0);
+                    }
+                    torn[start..from].copy_from_slice(&bytes[..from - start]);
+                    torn[to..end].copy_from_slice(&bytes[to - start..]);
+                    fs::write(&path, &torn).unwrap();
+                    let context = format!("{name}: sector {sector} of the write at {start} lost");
+                    let reader: Db<Root> = Options::new()
+                        .read_only(true)
+                        .open(&path)
+                        .unwrap_or_else(|error| panic!("{context}: read-only open: {error}"));
+                    let seen = reader.version();
+                    assert_eq!(dump(&reader.read()), recording.models[&seen], "{context}");
+                    drop(reader);
+                    let db: Db<Root> = buffered()
+                        .open(&path)
+                        .unwrap_or_else(|error| panic!("{context}: open: {error}"));
+                    assert_eq!(db.version(), seen, "{context}");
+                    db.verify()
+                        .unwrap_or_else(|error| panic!("{context}: verify: {error}"));
+                    swept += 1;
+                }
+                sector += SECTOR;
+            }
+        }
+        apply(&mut image, op);
+    }
+    swept
+}
+
+#[test]
+fn a_power_cut_never_leaves_a_database_of_sparse_values_that_will_not_open() {
+    let fsync = || Options::new().reclaim(MANUAL);
+    for (name, options, seed) in [
+        ("buffered", buffered as fn() -> Options, 47),
+        ("fsync", fsync, 48),
+    ] {
+        let dir = dir();
+        let recording = record_sparse(dir.path(), options);
+        let spilled = recording
+            .ops
+            .iter()
+            .filter(
+                |op| matches!(op, Op::Write(_, at, bytes) if *at >= LOG_START && bytes.len() == 68),
+            )
+            .count();
+        assert!(spilled > 2, "{name}: {spilled} frames spilled");
+        assert!(replay(&recording, 2, seed) > 100, "{name}");
+        let swept = sweep(&recording, name);
+        assert!(swept > 30, "{name}: only {swept} sectors swept");
+    }
 }
 
 #[test]

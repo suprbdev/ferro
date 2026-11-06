@@ -53,9 +53,11 @@ pub fn table_bytes(frame: usize) -> usize {
     8 * (frame - FRAME_BYTES).div_ceil(BLOCK + 8)
 }
 
-pub fn judged(at: usize, start: usize, end: usize) -> bool {
+pub fn judged(image: &[u8], at: usize, start: usize, end: usize) -> bool {
     let sector = at - at % SECTOR;
-    (sector + SECTOR).min(end) - sector.max(start) >= 8
+    let (from, to) = (sector.max(start), (sector + SECTOR).min(end));
+    let blank = |bytes: &[u8]| bytes.iter().all(|b| *b == 0) || bytes.iter().all(|b| *b == 0xff);
+    to - from >= 8 && !blank(&image[from..=at]) && !blank(&image[at..to])
 }
 
 pub fn frame_table(records: &[u8]) -> Vec<u8> {

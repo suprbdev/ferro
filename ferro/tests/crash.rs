@@ -409,7 +409,7 @@ fn a_frame_one_bit_from_whole_past_the_superblock_is_reported_and_left_alone() {
             image[position] ^= 1 << (position % 8);
             fs::write(&path, &image).unwrap();
             let context = format!("{name}: byte {position} of the frame at {start}..{end}");
-            if !judged(position, start, end) {
+            if !judged(&image, position, start, end) {
                 let db = options.clone().open::<Root>(&path).unwrap();
                 check_at_version(&db, &built, damaged - 1);
                 continue;
@@ -458,7 +458,7 @@ fn a_bit_flipped_in_each_block_of_a_large_frame_is_reported() {
         let image = image(&[position]);
         fs::write(&path, &image).unwrap();
         let context = format!("byte {position} of the frame at {start}..{end}");
-        if judged(position, start, end) {
+        if judged(&image, position, start, end) {
             assert_damaged(fast().open::<Root>(&path), start, position, &context);
             assert_eq!(
                 fs::read(&path).unwrap(),
@@ -648,7 +648,7 @@ fn corrupt_superblocks_fall_back_or_report() {
             image[start] ^= bit;
             fs::write(&path, &image).unwrap();
             let opened = fast().read_only(true).open::<Root>(&path);
-            if judged(start, start, end) {
+            if judged(&image, start, start, end) {
                 assert_damaged(opened, start, start, "a flipped magic past the older slot");
                 assert_eq!(fs::read(&path).unwrap(), image);
             } else {

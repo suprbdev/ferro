@@ -487,9 +487,9 @@ fn a_flipped_bit_in_a_synced_frame_past_the_superblock_is_reported() {
             .unwrap()
             .version();
         let at = start + (end - start) / 2;
-        assert!(judged(at, start, end));
         let mut damaged = image.clone();
         damaged[at] ^= 0x10;
+        assert!(judged(&damaged, at, start, end));
         fs::write(&path, &damaged).unwrap();
         let context = format!("v{version} acknowledged to v{floor}: byte {at} of {start}..{end}");
         assert_damaged(

@@ -744,11 +744,10 @@ fn examine(
 ///
 /// A frame reached the disk whole and was damaged since if putting back at most one flipped bit
 /// in its header and table together, and at most one in each block of its records, makes it
-/// whole, and each such bit sits in a sector that holds at least [`SECTOR_MIN`] of the frame's
-/// bytes. A torn write leaves every sector it did not reach as it was, which differs from what the
-/// frame would have put there in many bits, so it leaves a frame that no single flip mends; the
-/// rule on sectors keeps one that holds only a few of the frame's bytes from mending by chance.
-/// Anything else is [`Found::Torn`].
+/// whole, and each such bit passes [`judged`]. A torn write leaves the part
+/// of a sector it did not reach as it was: zeroes or ones, which [`judged`] refuses, or other
+/// bytes, which differ from what the frame would have put there in many bits, so it leaves a frame
+/// that no single flip mends. Anything else is [`Found::Torn`].
 fn diagnose(
     file: &File,
     tip: &Super,
@@ -838,7 +837,8 @@ fn diagnose(
 
 /// Finishes [`diagnose`] for the frame from `start` with `records` bytes of records, whose header
 /// and `table` check once the bits at `flipped` are put back: every block whose check, in
-/// `computed`, differs from its entry must match it once one of its bits is flipped back.
+/// `computed`, differs from its entry must match it once one of its bits is flipped back, and
+/// every bit flipped back must pass [`judged`].
 fn mend(
     file: &File,
     start: u64,
@@ -849,6 +849,12 @@ fn mend(
     mut flipped: Vec<u64>,
 ) -> Result<Found> {
     let body_start = start + FRAME_BYTES as u64;
+    let end = frame.log_end;
+    for at in &flipped {
+        if !judged(file, *at, start, end)? {
+            return Ok(Found::Torn);
+        }
+    }
     let entries = table.chunks(BLOCK_CHECK).zip(computed.chunks(BLOCK_CHECK));
     for (index, (want, got)) in entries.enumerate() {
         if want == got {
@@ -860,23 +866,52 @@ fn mend(
             return Ok(Found::Torn);
         }
         let want = u64::from_le_bytes(want.try_into().unwrap_or_default());
-        match flip_back(&mut block, want) {
-            Some(byte) => flipped.push(body_start + from + byte as u64),
-            None => return Ok(Found::Torn),
+        let Some(byte) = flip_back(&mut block, want) else {
+            return Ok(Found::Torn);
+        };
+        let at = body_start + from + byte as u64;
+        if !judged(file, at, start, end)? {
+            return Ok(Found::Torn);
         }
-    }
-    let end = frame.log_end;
-    let judged = |at: &u64| {
-        let sector = at - at % SECTOR_BYTES;
-        (sector + SECTOR_BYTES).min(end) - sector.max(start) >= SECTOR_MIN
-    };
-    if !flipped.iter().all(judged) {
-        return Ok(Found::Torn);
+        flipped.push(at);
     }
     Ok(match flipped.into_iter().min() {
         Some(at) => Found::Damaged(at),
         None => Found::Whole(frame),
     })
+}
+
+/// Whether a bit found flipped at `at`, in the frame from `start` to `end`, counts as damage
+/// rather than as a sector that a write did not reach.
+///
+/// The sector holding it must hold at least [`SECTOR_MIN`] of the frame's bytes, and on disk the
+/// frame's bytes in that sector up to the flipped one, and those from it on, must neither be all
+/// zeroes nor all ones. A write that misses part of a sector leaves it as it was, and within a
+/// sector a frame's writes land in order of offset but for its header, which is written last, so
+/// the part a lost write leaves runs from where that write began in the sector to the sector's
+/// end, or for a header, from the sector's start to the header's end. What it leaves there is the
+/// zeroes of a reservation, of a new extension or of the room past an earlier write, or the ones
+/// of a block a device erased, which differ in a single bit from a frame that held little there.
+fn judged(file: &File, at: u64, start: u64, end: u64) -> Result<bool> {
+    let sector = at - at % SECTOR_BYTES;
+    let from = sector.max(start);
+    let to = (sector + SECTOR_BYTES).min(end);
+    if to - from < SECTOR_MIN {
+        return Ok(false);
+    }
+    let mut bytes = [0u8; SECTOR_BYTES as usize];
+    let bytes = &mut bytes[..(to - from) as usize];
+    if !read_or_end(file, bytes, from)? {
+        return Ok(false);
+    }
+    let split = (at - from) as usize;
+    Ok(!blank(&bytes[..=split]) && !blank(&bytes[split..]))
+}
+
+/// Whether `bytes` are all zeroes or all ones, as the part of a sector that a write did not reach
+/// can be.
+fn blank(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0) || bytes.iter().all(|byte| *byte == 0xff)
 }
 
 /// The byte of `block` in which flipping one bit makes its xxh3-64 `want`, if there is one. The
@@ -4192,5 +4227,306 @@ mod tests {
         for at in end - 3..end {
             assert!(matches!(judge(at), Found::Torn), "byte {at}");
         }
+    }
+
+    /// An object to write in a frame: stored raw whatever compression would make of it, and
+    /// followed by a spill.
+    struct Put {
+        object: Object,
+        raw: bool,
+        spill: bool,
+    }
+
+    fn put(body: Vec<u8>) -> Put {
+        Put {
+            object: Object {
+                body,
+                links: Vec::new(),
+            },
+            raw: false,
+            spill: false,
+        }
+    }
+
+    fn raw(body: Vec<u8>) -> Put {
+        Put {
+            raw: true,
+            ..put(body)
+        }
+    }
+
+    fn spilled(put: Put) -> Put {
+        Put { spill: true, ..put }
+    }
+
+    /// The file a fresh store held and the writes it made, one frame for each of `frames`.
+    fn traced(frames: &[Vec<Put>], durability: Durability) -> (Vec<u8>, Vec<Op>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("traced.ferro");
+        drop(Store::open(&path, StoreOptions::default()).unwrap());
+        let base = std::fs::read(&path).unwrap();
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let options = StoreOptions {
+            durability,
+            trace: Some(trace.clone()),
+            ..StoreOptions::default()
+        };
+        let (store, _) = Store::open(&path, options).unwrap();
+        for frame in frames {
+            let mut txn = store.begin().unwrap();
+            let mut head = None;
+            for put in frame {
+                let hash = put.object.hash();
+                let ptr = match put.raw {
+                    true => txn.record(hash, staged(&put.object.body, None, &put.object.links)),
+                    false => txn.put_ref(&put.object, hash).unwrap(),
+                };
+                head = Some(ptr);
+                if put.spill {
+                    txn.spill().unwrap();
+                }
+            }
+            txn.commit(head.unwrap()).unwrap();
+        }
+        store.close();
+        let ops = trace.lock().clone();
+        (base, ops)
+    }
+
+    /// The image of `base` once `ops` are applied, every write but the bytes `lost` picks from
+    /// it, which keep what they held or become `older`.
+    fn applied(
+        base: &[u8],
+        ops: &[Op],
+        mut lost: impl FnMut(usize, u64) -> bool,
+        older: Option<u8>,
+    ) -> Vec<u8> {
+        let mut image = base.to_vec();
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                Op::Write(_, at, bytes) if *at >= LOG_START => {
+                    let end = *at as usize + bytes.len();
+                    if image.len() < end {
+                        image.resize(end, 0);
+                    }
+                    let mut from = *at;
+                    while from < end as u64 {
+                        let to = (from - from % SECTOR_BYTES + SECTOR_BYTES).min(end as u64);
+                        let (a, b) = (from as usize, to as usize);
+                        match (lost(index, from - from % SECTOR_BYTES), older) {
+                            (false, _) => image[a..b]
+                                .copy_from_slice(&bytes[a - *at as usize..b - *at as usize]),
+                            (true, Some(fill)) => image[a..b].fill(fill),
+                            (true, None) => {}
+                        }
+                        from = to;
+                    }
+                }
+                Op::SetLen(_, len) => image.resize(*len as usize, 0),
+                _ => {}
+            }
+        }
+        image
+    }
+
+    /// What a judging scan from the start of the log makes of `image`.
+    fn scanned(path: &Path, image: &[u8]) -> Result<Super> {
+        std::fs::write(path, image).unwrap();
+        let file = File::open(path).unwrap();
+        let empty = Mark {
+            seq: 0,
+            log_end: LOG_START,
+            head: None,
+        };
+        scan(
+            &file,
+            Super::new(empty, empty, Basis::default()),
+            image.len() as u64,
+            true,
+        )
+    }
+
+    /// Checks that no image of `frames` torn by a power cut reads as damaged: with each sector
+    /// of each write lost in turn, and with each kept by chance, the lost bytes keeping what they
+    /// held or becoming `older`. Returns how many images ended the log early.
+    fn never_damaged(frames: &[Vec<Put>], older: Option<u8>) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.ferro");
+        let (base, ops) = traced(frames, Durability::Buffered);
+        let whole = applied(&base, &ops, |_, _| false, older);
+        let last = scanned(&path, &whole).unwrap().seq;
+        assert_eq!(last, frames.len() as u64);
+        let mut cuts = Vec::new();
+        for (index, op) in ops.iter().enumerate() {
+            if let Op::Write(_, at, bytes) = op
+                && *at >= LOG_START
+            {
+                let mut sector = at - at % SECTOR_BYTES;
+                while sector < at + bytes.len() as u64 {
+                    cuts.push((index, sector));
+                    sector += SECTOR_BYTES;
+                }
+            }
+        }
+        let mut short = 0;
+        let mut judge = |image: Vec<u8>, what: &str| match scanned(&path, &image) {
+            Ok(tip) => short += usize::from(tip.seq < last),
+            Err(error) => panic!("{what}: {error}"),
+        };
+        for &(index, sector) in &cuts {
+            let image = applied(&base, &ops, |at, from| (at, from) == (index, sector), older);
+            judge(image, &format!("sector {sector} of write {index} lost"));
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..200 {
+            let image = applied(
+                &base,
+                &ops,
+                |_, _| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed % 2 == 0
+                },
+                older,
+            );
+            judge(image, &format!("round {round} of sectors kept by chance"));
+        }
+        short
+    }
+
+    /// `len` bytes of `fill`, but for one bit flipped in every `every` bytes, from `first` on.
+    fn sparse(len: usize, fill: u8, first: usize, every: usize) -> Vec<u8> {
+        let mut body = vec![fill; len];
+        for (index, at) in (first..len).step_by(every).enumerate() {
+            body[at] ^= 1 << (index % 8);
+        }
+        body
+    }
+
+    #[test]
+    fn a_sector_left_with_the_zeroes_past_a_spill_reads_as_torn() {
+        let mut frame = vec![spilled(put(noise(1, 4536))), put(noise(2, 64))];
+        frame.extend((3..8).map(|seed| put(noise(seed, 3000))));
+        assert!(compressed(&frame[0].object.body).is_none());
+        let spill_end = LOG_START + FRAME_BYTES as u64 + 4539;
+        assert_eq!(spill_end % SECTOR_BYTES, SECTOR_BYTES - 1);
+        let (base, ops) = traced(&[frame], Durability::Buffered);
+        let whole = applied(&base, &ops, |_, _| false, None);
+        assert_eq!(
+            whole[spill_end as usize], 0x40,
+            "a record whose first byte has one bit"
+        );
+        let next = ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(_, at, _) if *at == spill_end))
+            .unwrap();
+        let torn = applied(
+            &base,
+            &ops,
+            |at, sector| at == next && sector == spill_end - spill_end % SECTOR_BYTES,
+            None,
+        );
+        assert_eq!(torn[spill_end as usize], 0);
+        let dir = tempfile::tempdir().unwrap();
+        let tip = scanned(&dir.path().join("spill.ferro"), &torn).unwrap();
+        assert_eq!(tip.seq, 0);
+    }
+
+    #[test]
+    fn no_torn_frame_of_zeroes_or_ones_with_a_bit_set_here_and_there_reads_as_damaged() {
+        let cases: [(&str, Vec<Vec<Put>>, Option<u8>); 6] = [
+            (
+                "noise",
+                vec![(1..9).map(|seed| put(noise(seed, 1500))).collect()],
+                None,
+            ),
+            (
+                "a spill ending a sector",
+                vec![{
+                    let mut frame = vec![spilled(put(noise(1, 4536))), put(noise(2, 64))];
+                    frame.extend((3..8).map(|seed| put(noise(seed, 3000))));
+                    frame
+                }],
+                None,
+            ),
+            (
+                "zeroes",
+                vec![vec![
+                    raw(sparse(9000, 0, 17, 701)),
+                    spilled(raw(sparse(5000, 0, 3, 523))),
+                    raw(sparse(7000, 0, 300, 1111)),
+                ]],
+                None,
+            ),
+            (
+                "zeroes over ones",
+                vec![vec![
+                    raw(sparse(9000, 0, 17, 701)),
+                    spilled(raw(sparse(5000, 0, 3, 523))),
+                ]],
+                Some(0xff),
+            ),
+            (
+                "ones",
+                vec![vec![
+                    raw(sparse(9000, 0xff, 5, 613)),
+                    spilled(raw(sparse(6000, 0xff, 91, 997))),
+                ]],
+                Some(0xff),
+            ),
+            (
+                "ones over zeroes",
+                vec![vec![
+                    raw(sparse(9000, 0xff, 5, 613)),
+                    spilled(raw(sparse(6000, 0xff, 91, 997))),
+                ]],
+                None,
+            ),
+        ];
+        for (name, frames, older) in &cases {
+            let short = never_damaged(frames, *older);
+            assert!(
+                short > 100,
+                "{name}: only {short} torn images ended the log early"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_written_after_its_records_and_lost_past_a_sector_reads_as_torn() {
+        let before = || vec![put(noise(0, 366))];
+        let mut found = None;
+        for seed in 1..2000 {
+            let frames = [
+                before(),
+                vec![spilled(put(noise(seed, 3000))), put(noise(seed + 1, 900))],
+            ];
+            let (base, ops) = traced(&frames, Durability::Buffered);
+            let whole = applied(&base, &ops, |_, _| false, None);
+            let start = LOG_START as usize + 445;
+            assert_eq!((start + FRAME_BYTES - 1) % SECTOR_BYTES as usize, 0);
+            if whole[start + FRAME_BYTES - 1].count_ones() == 1 {
+                found = Some((frames, base, ops, start));
+                break;
+            }
+        }
+        let (frames, base, ops, start) = found.expect("a check whose last byte has one bit");
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(_, at, bytes) if *at == start as u64 && bytes.len() == FRAME_BYTES))
+            .expect("the header is written on its own, after the records");
+        let last = (start + FRAME_BYTES - 1) as u64;
+        let torn = applied(
+            &base,
+            &ops,
+            |at, sector| at == header && sector == last,
+            None,
+        );
+        assert_eq!(torn[last as usize], 0);
+        let dir = tempfile::tempdir().unwrap();
+        let tip = scanned(&dir.path().join("header.ferro"), &torn).unwrap();
+        assert_eq!(tip.seq, 1);
+        never_damaged(&frames, None);
     }
 }
