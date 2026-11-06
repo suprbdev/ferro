@@ -2683,8 +2683,9 @@ impl<T: Data> Db<T> {
     ///
     /// If this file prunes or drops what the bundle builds on while it is sent, nothing lands, and
     /// the pull sends a fresh have and tries again, up to three attempts in all. That is found
-    /// before `merge` can run, so `merge` runs at most once, for the attempt that landed, and the
-    /// [`Pulled`] describes that attempt.
+    /// before `merge` can run, so `merge` never runs for an attempt that is tried again, only for
+    /// the one that landed, as often as [`Db::merge_with`] runs it, and the [`Pulled`] describes
+    /// that attempt.
     ///
     /// # Errors
     ///

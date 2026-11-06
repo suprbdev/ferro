@@ -85,8 +85,10 @@ arriving, `receive` returns `Error::StaleHave` and lands nothing: build a new bu
 have and try again. Only you can fetch that bundle, so `receive` and `receive_from` leave the retry
 to you. `pull` and `push` hold both files, so they send a fresh have and try again themselves, up
 to three attempts in all, and return `StaleHave` only if this file moved under all three. A stale
-have is found before your merge closure can run, so the closure runs at most once, for the attempt
-that landed, and `try_pull` and `try_push` retry before any error reaches your error type.
+have is found before your merge closure can run, so the closure never runs for an attempt that is
+tried again, only for the one that landed, as often as a merge runs it (more than once after a
+criss-cross, as [Merging](merging.md#limits) describes), and `try_pull` and `try_push` retry before
+any error reaches your error type.
 
 ## Versions and hashes across files
 
