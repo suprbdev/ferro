@@ -20,7 +20,9 @@ skipped. `recv_timeout` and `try_recv` work like `std::sync::mpsc`. `changed()` 
 as a future built on `std::task::Waker`, so it runs on any executor and an async server needs no
 thread per subscriber. Dropping the future stops the wait. A watcher ends when the last `Db` handle
 goes, and it does not keep the file open: a snapshot it had not taken by then is lost. A read-only
-handle fires its watchers on `refresh`.
+handle fires its watchers on `refresh`, and a handle opened with `follow` fires them as other
+processes commit, as described under [Following other
+processes](concurrency.md#following-other-processes).
 
 ## Filtered watchers and closers
 

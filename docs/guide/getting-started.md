@@ -142,6 +142,7 @@ concurrency](concurrency.md#awaited-writes).
 | `reclaim(Reclaim)` | `every_bytes: 64 << 20` | When background reclamation cycles run. |
 | `coalesce(bool)` | `false` | Lets queued closures share one version. See [Sharing a version between writers](concurrency.md#sharing-a-version-between-writers). |
 | `shared(bool)` | `false` | Lets other processes that open the file with it write too. See [Several processes](concurrency.md#several-processes). |
+| `follow(bool)` | `false` | Keeps a read-only handle or a shared writer up to date with other processes' commits on a thread of its own. See [Following other processes](concurrency.md#following-other-processes). |
 | `lock_wait(Duration)` | zero | How long `open` waits for another writer to close before it returns `Error::Locked`. |
 | `copy_threads(usize)` | cores, up to 4 | Threads a reclamation cycle copies and checks on. See [Retention and reclamation](retention.md). |
 

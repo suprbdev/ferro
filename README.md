@@ -40,7 +40,8 @@ ferro is an experiment, not a production database. Its file format is not stable
 - **Schema evolution.** Fields are stored by name, so adding, removing, reordering and renaming
   fields needs no migration.
 - **One file, several processes and a tool.** Other processes can read while one writes, several
-  can write with `Options::shared` on 64-bit Linux, and the `ferro` tool inspects, verifies and
+  can write with `Options::shared` on 64-bit Linux, a handle opened with `Options::follow` picks up
+  the others' commits and fires its watchers on its own, and the `ferro` tool inspects, verifies and
   compacts any file without your types.
 
 ## When to use it

@@ -26,9 +26,14 @@ This is an experiment, not a production database.
   described under [Writing from inside a closure](concurrency.md#writing-from-inside-a-closure).
 - Several processes can write one file only if each opens it with `Options::shared`, which needs
   64-bit Linux and one machine. It was never run on Windows, where it is refused until it can be
-  tested. A process sees the others' commits only when it commits or refreshes, and on one branch
-  processes commit more slowly than threads, since each reads back what the others wrote, as
-  described under [Several processes](concurrency.md#several-processes).
+  tested. A process sees the others' commits only when it commits or refreshes, unless it follows
+  the file with `Options::follow`, and on one branch processes commit more slowly than threads,
+  since each reads back what the others wrote, as described under [Several
+  processes](concurrency.md#several-processes).
+- A follower is woken by inotify only on 64-bit Linux. Elsewhere it looks every 10 ms, which delays
+  a commit by 5 ms on average and wakes an idle core 100 times a second, and macOS's kqueue and
+  Windows' change notifications are not used, as described under [Following other
+  processes](concurrency.md#following-other-processes).
 - A held `Snapshot` or `Map` keeps its file open, and the disk space of a file a cycle replaced
   comes back only when the last such handle is dropped, as described under [Several
   processes](concurrency.md#several-processes) and [Limits](retention.md#limits).
