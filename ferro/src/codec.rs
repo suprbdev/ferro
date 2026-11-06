@@ -849,6 +849,8 @@ impl<'a> Encoder<'a> {
 }
 
 const MAX_EMPTY_ITEMS: u64 = 1 << 24;
+/// The most entries each generation of a [`Recalled`] keeps.
+const RECALLED: usize = 1 << 14;
 /// The bytes an [`Arc`] allocation spends on its counts, for estimating what a value holds on the
 /// heap.
 pub(crate) const ARC_HEADER: usize = 2 * size_of::<usize>();
@@ -1011,6 +1013,72 @@ impl Kind {
         let shape = (self.check)(self, &mut decoder)?;
         Ok((shape, found.into_inner()))
     }
+
+    /// Checks an object again with `store`, as [`check`](Kind::check) does, once the check
+    /// without one deferred it, taking the summary of each inline entry from `recalled` where an
+    /// earlier recheck computed it and keeping there those it computes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`check`](Kind::check).
+    pub(crate) fn recheck(
+        &self,
+        body: &[u8],
+        links: &[Ptr],
+        store: &Store,
+        recalled: &Recalled,
+    ) -> Result<Shape> {
+        let found = RefCell::new(Vec::new());
+        let mut decoder = Decoder::new(body, links, Some(store));
+        decoder.found = Some(&found);
+        decoder.recalled = Some(recalled);
+        (self.check)(self, &mut decoder)
+    }
+}
+
+/// The summaries of single entries that the rechecks of deferred objects computed, by the types
+/// of the map and the hash of the entry's key and encoded value, so that an entry met again in
+/// another node, as in each version of a node a bundle rewrites, is summarized once.
+///
+/// It keeps two generations of at most [`RECALLED`] entries each, and drops the older one when
+/// the newer fills, keeping what is found in it.
+#[derive(Default)]
+pub(crate) struct Recalled {
+    generations: RefCell<[Generation; 2]>,
+}
+
+/// The summaries one generation of a [`Recalled`] keeps, by the type of the map and the hash of
+/// the entry.
+type Generation = HashMap<(TypeId, Hash), Box<dyn Any + Send + Sync>>;
+
+impl Recalled {
+    /// The summary of type `S` kept for the entry `id`, if there is one.
+    pub(crate) fn get<S: Clone + Send + Sync + 'static>(&self, id: &(TypeId, Hash)) -> Option<S> {
+        let mut generations = self.generations.borrow_mut();
+        if let Some(summary) = generations[0].get(id) {
+            return summary.downcast_ref::<S>().cloned();
+        }
+        let summary = generations[1].remove(id)?;
+        let found = summary.downcast_ref::<S>().cloned();
+        Self::keep(&mut generations, *id, summary);
+        found
+    }
+
+    /// Keeps `summary` for the entry `id`.
+    pub(crate) fn put<S: Send + Sync + 'static>(&self, id: (TypeId, Hash), summary: S) {
+        Self::keep(&mut self.generations.borrow_mut(), id, Box::new(summary));
+    }
+
+    fn keep(
+        generations: &mut [Generation; 2],
+        id: (TypeId, Hash),
+        summary: Box<dyn Any + Send + Sync>,
+    ) {
+        if generations[0].len() >= RECALLED {
+            generations[1] = std::mem::take(&mut generations[0]);
+        }
+        generations[0].insert(id, summary);
+    }
 }
 
 /// The objects a typed check has already passed, by hash and type, with the kinds they passed
@@ -1066,6 +1134,7 @@ pub struct Decoder<'a> {
     heap: usize,
     base: usize,
     found: Option<&'a RefCell<Found>>,
+    recalled: Option<&'a Recalled>,
 }
 
 impl<'a> Decoder<'a> {
@@ -1085,6 +1154,7 @@ impl<'a> Decoder<'a> {
             heap: 0,
             base: 0,
             found: None,
+            recalled: None,
         }
     }
 
@@ -1116,6 +1186,20 @@ impl<'a> Decoder<'a> {
     #[inline]
     pub(crate) fn linked_since(&self, checkpoint: Checkpoint) -> bool {
         self.cursor != checkpoint.cursor
+    }
+
+    /// The bytes and the links read since `checkpoint`.
+    pub(crate) fn read_since(&self, checkpoint: Checkpoint) -> (&'a [u8], &'a [Ptr]) {
+        (
+            &self.buf[checkpoint.pos..self.pos],
+            &self.links[checkpoint.cursor..self.cursor],
+        )
+    }
+
+    /// Where a [`Kind::recheck`] keeps the summaries of the entries it computed, or `None` for
+    /// any other decoder.
+    pub(crate) fn recalled(&self) -> Option<&'a Recalled> {
+        self.recalled
     }
 
     /// How many links have been read, which a value that holds a collection or a raw [`Ptr`]
@@ -1332,6 +1416,7 @@ impl<'a> Decoder<'a> {
                 heap: self.heap,
                 base: self.base + self.cursor,
                 found: self.found,
+                recalled: self.recalled,
             };
             self.cursor = end;
             f(tag, &mut sub)?;

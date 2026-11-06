@@ -93,7 +93,7 @@ use std::vec;
 
 use crate::codec::{
     Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr,
-    Shape, Sink, Staged, try_hash_of,
+    Recalled, Shape, Sink, Staged, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -1103,6 +1103,33 @@ fn summarized_value<V: Data>(r: &mut Decoder<'_>) -> Result<Option<V>> {
     }
 }
 
+#[inline(never)]
+fn recall<K: Data, V: Data, S: Summary<K, V>>(
+    recalled: &Recalled,
+    key: &K,
+    r: &mut Decoder<'_>,
+) -> Result<S> {
+    let start = r.checkpoint();
+    V::visit(r)?;
+    let (bytes, links) = r.read_since(start);
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    key.encode(&mut encoder)?;
+    encoder.raw(bytes);
+    for link in links {
+        encoder.link(*link);
+    }
+    let id = (TypeId::of::<(K, V, S)>(), encoder.finish()?.hash);
+    if let Some(summary) = recalled.get::<S>(&id) {
+        return Ok(summary);
+    }
+    r.rewind(start);
+    let value = V::decode(r)?;
+    let summary = summarize(|| S::of(key, &value))?;
+    recalled.put(id, summary.clone());
+    Ok(summary)
+}
+
 fn claim_of<C: 'static>(kind: &Kind) -> Option<&C> {
     let claim: &dyn Any = kind.claim.as_deref()?;
     claim.downcast_ref::<C>()
@@ -1426,7 +1453,12 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     'slots: loop {
         for key in keys {
             match r.u8()? {
-                0 if claim.is_some() && stored => parts.push(Part::Value(V::decode(r)?)),
+                0 if claim.is_some() && stored => match r.recalled() {
+                    Some(recalled) => {
+                        parts.push(Part::Spilled(recall::<K, V, S>(recalled, key, r)?))
+                    }
+                    None => parts.push(Part::Value(V::decode(r)?)),
+                },
                 0 if claim.is_some() && !deferred => {
                     let links = r.links_read();
                     match V::decode(r) {

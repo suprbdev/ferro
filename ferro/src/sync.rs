@@ -21,7 +21,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use crate::codec::{
-    Checked, Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Shape, push_varint,
+    Checked, Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Recalled, Shape,
+    push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
@@ -1666,6 +1667,7 @@ struct Vetting<'a> {
     carried: usize,
     rerun_budget: usize,
     view: OnceCell<Store>,
+    recalled: Recalled,
 }
 
 fn rejected(error: Error) -> Error {
@@ -1876,7 +1878,7 @@ impl Vetting<'_> {
         if deferred.is_empty() {
             return Ok(());
         }
-        let (view, staging) = (self.view(), self.staging);
+        let (view, recalled, staging) = (self.view(), &self.recalled, self.staging);
         staging.overlaid(view, || {
             for (id, kind) in &deferred {
                 let ptr = Ptr {
@@ -1884,7 +1886,7 @@ impl Vetting<'_> {
                     offset: staging.offset(*id),
                 };
                 let object = staging.read_object(ptr)?;
-                let checked = kind.check(&object.body, &object.links, Some(view));
+                let checked = kind.recheck(&object.body, &object.links, view, recalled);
                 if let Some(error) = view.overdrawn() {
                     return Err(error);
                 }
@@ -2506,6 +2508,7 @@ fn resolve<O: Objects>(
                 .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
             view: OnceCell::new(),
+            recalled: Recalled::default(),
         };
         for (_, _, id) in &order {
             let sent = landing
