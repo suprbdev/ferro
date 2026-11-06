@@ -1036,7 +1036,7 @@ type Fetched<K, V, S> = (Shared<Node<K, V, S>>, bool);
 fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetched<K, V, S>> {
     let decode = |decoder: &mut Decoder<'_>| {
         let node = Node::decode(decoder, ptr)?;
-        let written = store.written();
+        let written = store.readable_bytes();
         if node.count > written.saturating_mul(MAX_RATIO as u64) {
             return Err(Error::Decode(format!(
                 "a map node claims {} entries, more than a log of {written} bytes holds",

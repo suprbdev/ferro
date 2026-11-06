@@ -39,6 +39,7 @@ const MAX_RATIO: usize = 255;
 const RECHECK_SLACK: usize = 16 << 20;
 const RERUN_FACTOR: usize = 8;
 const RERUN_SLACK: usize = 256 << 20;
+const RERUN_PER_LINK: usize = 4 << 10;
 const CONFIRMED_KEPT: usize = 1 << 16;
 const EXPANSION: usize = 16;
 const EXPANSION_SLACK: usize = 16 << 20;
@@ -1661,7 +1662,9 @@ struct Vetting<'a> {
     budget: usize,
     queue: Vec<(Ptr, Kind, Vec<Kind>)>,
     deferred: Vec<(u32, Kind)>,
-    confirmed: HashSet<(Hash, TypeId, Hash)>,
+    confirmed: HashSet<(Hash, TypeId, TypeId, Hash)>,
+    credited: HashSet<Hash>,
+    carried: usize,
     reran: usize,
     rerun_budget: usize,
 }
@@ -1675,7 +1678,11 @@ fn rejected(error: Error) -> Error {
 
 fn undecodable(kind: &Kind, error: Error) -> Error {
     match error {
-        Error::Io(_) | Error::Poisoned | Error::Replaced | Error::Interrupted => error,
+        Error::Io(_)
+        | Error::Poisoned
+        | Error::Replaced
+        | Error::Interrupted
+        | Error::Bundle(_) => error,
         error => bad(format!(
             "a {} it carries does not decode: {error}",
             kind.name
@@ -1833,7 +1840,7 @@ impl Vetting<'_> {
         let Some(print) = claim.fingerprint() else {
             return true;
         };
-        let memo = (hash, (claim as &dyn Any).type_id(), print);
+        let memo = (hash, kind.id, (claim as &dyn Any).type_id(), print);
         if self.confirmed.contains(&memo) {
             return false;
         }
@@ -1855,15 +1862,20 @@ impl Vetting<'_> {
 
     fn settle(&mut self) -> Result<()> {
         let deferred = mem::take(&mut self.deferred);
-        let (store, staging) = (self.store, self.staging);
-        staging.overlaid(store, || {
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let left = self.rerun_budget.saturating_sub(self.reran);
+        let view = self.store.view(self.carried as u64, left as u64);
+        let staging = self.staging;
+        staging.overlaid(&view, || {
             for (id, kind) in &deferred {
                 let ptr = Ptr {
                     hash: staging.hashes().hash(*id),
                     offset: staging.offset(*id),
                 };
                 let object = staging.read_object(ptr)?;
-                kind.check(&object.body, &object.links, Some(store))
+                kind.check(&object.body, &object.links, Some(&view))
                     .map_err(|error| undecodable(kind, error))?;
             }
             Ok(())
@@ -1873,6 +1885,9 @@ impl Vetting<'_> {
     fn confirm_held(&mut self, hash: Hash, ptr: Ptr, kind: &Kind) -> Result<bool> {
         if !self.remember(hash, kind) {
             return Ok(false);
+        }
+        if self.credited.len() < CONFIRMED_KEPT && self.credited.insert(hash) {
+            return Ok(true);
         }
         let object = self.store.read_object(ptr)?;
         self.rerun(object.body.len())?;
@@ -2216,6 +2231,7 @@ struct Streamed {
     links: Column<u8>,
     loose: Vec<u32>,
     carried: usize,
+    linked: usize,
 }
 
 fn stream<R: Read>(
@@ -2230,6 +2246,7 @@ fn stream<R: Read>(
         links: Column::new(),
         loose: Vec::new(),
         carried: 0,
+        linked: 0,
     };
     for _ in 0..header.count {
         let (body, packed) = input.body()?;
@@ -2237,6 +2254,7 @@ fn stream<R: Read>(
         let mut open = false;
         for _ in 0..input.varint()? {
             let hash = input.hash()?;
+            found.linked += 1;
             let ptr = match input.below(references)? {
                 0 => match staging.id_of(&hash) {
                     Some(id) => {
@@ -2481,10 +2499,13 @@ fn resolve<O: Objects>(
             queue: Vec::new(),
             deferred: Vec::new(),
             confirmed: HashSet::new(),
+            credited: HashSet::new(),
+            carried: streamed.carried,
             reran: 0,
             rerun_budget: streamed
                 .carried
                 .saturating_mul(RERUN_FACTOR)
+                .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
         };
         for (_, _, id) in &order {

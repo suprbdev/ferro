@@ -1702,7 +1702,7 @@ struct Arrivals {
 /// A write or a change of length is recorded before it is made, since it may land in part, and a
 /// sync once it has succeeded, since only then does it count.
 pub(crate) struct Traced {
-    file: File,
+    file: Arc<File>,
     trace: Option<Trace>,
     /// The file's identity, which the trace names it by and which tells whether a path still
     /// names it.
@@ -1713,7 +1713,21 @@ impl Traced {
     /// Wraps `file`, recording to `trace` if one is given.
     pub(crate) fn new(file: File, trace: Option<Trace>) -> Result<Traced> {
         let inode = platform::file_id(&file)?;
-        Ok(Traced { file, trace, inode })
+        Ok(Traced {
+            file: Arc::new(file),
+            trace,
+            inode,
+        })
+    }
+
+    /// The same open file, without the trace, for a [`Store::view`] that only reads it. Nothing
+    /// is opened or duplicated, so no lock on the file moves.
+    fn reader(&self) -> Traced {
+        Traced {
+            file: self.file.clone(),
+            trace: None,
+            inode: self.inode,
+        }
     }
 
     /// Records the operation that `op` makes from the file's identity, if there is a trace.
@@ -1834,6 +1848,17 @@ struct Inner {
     freed: Condvar,
     /// How the store was opened.
     options: StoreOptions,
+    /// What a [`Store::view`] may still read, or `None` for a store opened on a file.
+    view: Option<View>,
+}
+
+/// What a [`Store::view`] keeps beside the file it reads.
+struct View {
+    /// The bytes of object bodies it may still read.
+    left: AtomicU64,
+    /// The bytes of a staging it reads beside the file, which count towards how many entries a
+    /// node it reads may claim.
+    borrowed: u64,
 }
 
 /// An open file of a database: one generation of its log, with the cache of what was decoded from
@@ -2088,9 +2113,97 @@ impl Store {
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
                 options,
+                view: None,
             }),
         };
         Ok((store, head))
+    }
+
+    /// A read-only view of this store's file as it stands, with an id of its own and no cache,
+    /// that may read `allowance` bytes of object bodies and also reads `borrowed` bytes of a
+    /// staging that [`Staging::overlaid`] lets it see.
+    ///
+    /// Every node and value read through the view is decoded afresh and belongs to whatever read
+    /// it, so nothing it decodes reaches this store's cache or the nodes this store's readers
+    /// share, and a read through it changes nothing of this store. A read past `allowance` fails
+    /// with [`Error::Bundle`].
+    pub(crate) fn view(&self, borrowed: u64, allowance: u64) -> Store {
+        let inner = &self.inner;
+        let (tail, written, placed) = (
+            inner.tail.load(Ordering::Acquire),
+            inner.written.load(Ordering::Acquire),
+            inner.placed.load(Ordering::Acquire),
+        );
+        let cursor = inner.cursor.lock().seq;
+        let marks = *inner.marks.lock();
+        Store {
+            inner: Shared::new(Inner {
+                id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+                path: inner.path.clone(),
+                file: inner.file.reader(),
+                tail: AtomicU64::new(tail),
+                written: AtomicU64::new(written),
+                placed: AtomicU64::new(placed),
+                arrivals: Mutex::new(Arrivals::default()),
+                landed: Condvar::new(),
+                cursor: Mutex::new(Cursor {
+                    seq: cursor,
+                    reserved: placed,
+                    reserve: 0,
+                }),
+                slot: AtomicU64::new(inner.slot.load(Ordering::Acquire)),
+                marks: Mutex::new(marks),
+                checkpointing: AtomicBool::new(false),
+                ignored: inner.ignored,
+                cache: Cache::with_weighter(64, 1, EntryWeight),
+                dedupe: Dedupe::new(MIN_DEDUPE as usize),
+                basis: inner.basis,
+                poisoned: AtomicBool::new(false),
+                lost_at: AtomicU64::new(u64::MAX),
+                unsynced: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+                lanes: Mutex::new(Lanes::default()),
+                lanes_moved: Condvar::new(),
+                taken: Mutex::new(Vec::new()),
+                freed: Condvar::new(),
+                options: StoreOptions {
+                    read_only: true,
+                    shared: false,
+                    trace: None,
+                    ..inner.options.clone()
+                },
+                view: Some(View {
+                    left: AtomicU64::new(allowance),
+                    borrowed,
+                }),
+            }),
+        }
+    }
+
+    /// The bytes the objects this store reads can come from: its log as written, and for a
+    /// [`Store::view`] the staging it reads beside it. A node may claim at most
+    /// [`MAX_RATIO`] times as many entries.
+    pub(crate) fn readable_bytes(&self) -> u64 {
+        let borrowed = self.inner.view.as_ref().map_or(0, |view| view.borrowed);
+        self.written().saturating_add(borrowed)
+    }
+
+    /// Counts `bytes` against what a [`Store::view`] may still read, and does nothing for a store
+    /// opened on a file.
+    fn charge(&self, bytes: usize) -> Result<()> {
+        let Some(view) = &self.inner.view else {
+            return Ok(());
+        };
+        let left = view.left.load(Ordering::Relaxed);
+        match left.checked_sub(bytes as u64) {
+            Some(left) => {
+                view.left.store(left, Ordering::Relaxed);
+                Ok(())
+            }
+            None => Err(Error::Bundle(
+                "recomputing its summaries reads more than its size allows".into(),
+            )),
+        }
     }
 
     /// The store's id, which no other store this process opens shares, so that a collection can
@@ -3056,11 +3169,9 @@ impl Store {
         {
             return Ok((value, true));
         }
-        let (value, weight, staged) = self.decode_fresh(ptr, decode, weigh)?;
+        let (value, weight) = self.decode_fresh(ptr, decode, weigh)?;
         let value = Arc::new(value);
-        if !staged {
-            self.admit(ptr, || CacheEntry::value(value.clone(), weight));
-        }
+        self.admit(ptr, || CacheEntry::value(value.clone(), weight));
         Ok((value, false))
     }
 
@@ -3079,42 +3190,51 @@ impl Store {
         {
             return Ok((node, true));
         }
-        let (node, weight, staged) = self.decode_fresh(ptr, decode, weigh)?;
+        let (node, weight) = self.decode_fresh(ptr, decode, weigh)?;
         let node = Shared::new(node);
-        if !staged {
-            self.admit(ptr, || {
-                CacheEntry::node(Shared::erase(node.clone()), weight)
-            });
-        }
+        self.admit(ptr, || {
+            CacheEntry::node(Shared::erase(node.clone()), weight)
+        });
         Ok((node, false))
     }
 
     /// Reads and decodes the object at `ptr`, registers it for deduplication if it is as large as a
-    /// spilled value and the store writes, weighs it, and says whether it came from a staging that
-    /// [`Staging::overlaid`] lets this thread read, which neither the cache nor the deduplication
-    /// table may keep.
+    /// spilled value and the store writes, and weighs it.
     fn decode_fresh<T>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
         weigh: impl FnOnce(&T, usize, usize) -> u32,
-    ) -> Result<(T, u32, bool)> {
-        let (object, staged) = match staged_object(self.inner.id, ptr) {
-            Some(object) => (object?, true),
-            None => (self.read_object(ptr)?, false),
-        };
-        if !staged && object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
+    ) -> Result<(T, u32)> {
+        let object = self.read_fresh(ptr)?;
+        if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
             self.inner.dedupe.insert(ptr.hash, ptr.offset);
         }
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = decode(&mut decoder)?;
         let weight = weigh(&value, object.body.len(), decoder.heap());
-        Ok((value, weight, staged))
+        Ok((value, weight))
     }
 
-    /// Puts the entry that `entry` makes in the cache unless the store is closed, and clears the
-    /// cache again if a close came meanwhile, so that a closed store's cache stays empty.
+    /// Reads the object at `ptr` for decoding: for a [`Store::view`], the one staged with its hash
+    /// if [`Staging::overlaid`] lets the view see a staging and it holds one, and the body counted
+    /// against what the view may read.
+    fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
+        let object = match staged_object(self.inner.id, ptr) {
+            Some(object) => object?,
+            None => self.read_object(ptr)?,
+        };
+        self.charge(object.body.len())?;
+        Ok(object)
+    }
+
+    /// Puts the entry that `entry` makes in the cache unless the store is closed or a
+    /// [`Store::view`], and clears the cache again if a close came meanwhile, so that a closed
+    /// store's cache stays empty.
     fn admit(&self, ptr: Ptr, entry: impl FnOnce() -> CacheEntry) {
+        if self.inner.view.is_some() {
+            return;
+        }
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(ptr.hash, entry());
             if self.inner.closed.load(Ordering::SeqCst) {
@@ -3194,17 +3314,14 @@ impl Store {
         Ok(Arc::new(self.decode_at(ptr, T::decode)?))
     }
 
-    /// Reads the object at `ptr`, or the one staged with its hash where [`Staging::overlaid`] lets
-    /// this thread read a staging, and decodes it with `decode`, past the cache.
+    /// Reads the object at `ptr` as a cache miss does, staged or counted for a [`Store::view`], and
+    /// decodes it with `decode`, past the cache.
     pub(crate) fn decode_at<T>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
-        let object = match staged_object(self.inner.id, ptr) {
-            Some(object) => object?,
-            None => self.read_object(ptr)?,
-        };
+        let object = self.read_fresh(ptr)?;
         decode(&mut Decoder::new(&object.body, &object.links, Some(self)))
     }
 
@@ -4212,21 +4329,23 @@ impl Staging {
         Ok(object)
     }
 
-    /// Runs `f` with the objects staged here readable through `store` on this thread, by hash.
+    /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`], on this
+    /// thread, by hash.
     ///
-    /// While `f` runs, a read through `store` that misses its cache takes an object staged here
-    /// with the hash it asks for, wherever its pointer leads, and keeps what it decodes from one
-    /// out of the cache and the deduplication table, since the links of a staged object lead into
-    /// the staging. Other threads, and reads after `f` returns or unwinds, do not see the
-    /// staging.
-    pub(crate) fn overlaid<R>(&self, store: &Store, f: impl FnOnce() -> R) -> R {
+    /// While `f` runs, a read through `view` takes an object staged here with the hash it asks
+    /// for, wherever its pointer leads, and reads anything else from the file. The links of a
+    /// staged object lead into the staging, and the view caches nothing, so what it decodes from
+    /// one stays with whatever read it. No other store sees the staging, nor do other threads, nor
+    /// reads after `f` returns or unwinds.
+    pub(crate) fn overlaid<R>(&self, view: &Store, f: impl FnOnce() -> R) -> R {
+        debug_assert!(view.inner.view.is_some(), "only a view reads a staging");
         struct Restore(Option<(u64, *const Staging)>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 OVERLAY.set(self.0);
             }
         }
-        let _restore = Restore(OVERLAY.replace(Some((store.id(), std::ptr::from_ref(self)))));
+        let _restore = Restore(OVERLAY.replace(Some((view.id(), std::ptr::from_ref(self)))));
         f()
     }
 
