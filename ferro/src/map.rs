@@ -1131,8 +1131,15 @@ fn recall<K: Data, V: Data, S: Summary<K, V>>(
     if let Some(summary) = recalled.get::<S>(&id) {
         return Ok(summary);
     }
+    let visited = (bytes.len(), links.len());
     r.rewind(start);
     let value = V::decode(r)?;
+    let (bytes, links) = r.read_since(start);
+    if (bytes.len(), links.len()) != visited {
+        return Err(Error::Decode(
+            "a value decodes other bytes than it visits".into(),
+        ));
+    }
     let summary = summarize(|| S::of(key, &value))?;
     recalled.put(id, summary.clone());
     Ok(summary)
