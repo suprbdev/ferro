@@ -1022,10 +1022,12 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> 
 /// anchor finds otherwise.
 ///
 /// A superblock that anchors itself with nothing like a frame after it is used as it is.
-/// Otherwise the open tries the writer lock shared, and if it gets it and no shared writer holds
-/// [`MULTI_AT`], no writer is alive: it scans from the anchor under the lock, judging damage as a
-/// writer's open does, and syncs the frames it kept, since a dead writer's frames may be only in
-/// the page cache. With a writer alive, `sb` is current.
+/// Otherwise the open tries the writer lock shared, and where there are byte-range locks the
+/// placement lock shared too, and if it gets them and no shared writer holds [`MULTI_AT`], no
+/// writer is alive: it scans from the anchor under the locks, judging damage as a writer's open
+/// does, and syncs the frames it kept, since a dead writer's frames may be only in the page cache.
+/// A shared writer that opens meanwhile waits for the placement lock before it recovers or writes,
+/// so nothing it writes races the scan. With a writer alive, `sb` is current.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
@@ -1034,7 +1036,21 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     if (sb.settled() && !follows) || platform::try_lock_shared(file).is_err() {
         return Ok(sb);
     }
+    let placement = match platform::RANGES {
+        true => match platform::lock_range(file, COMMIT_AT, 1, false, false) {
+            Ok(()) => Some(Range {
+                file,
+                at: COMMIT_AT,
+            }),
+            Err(_) => {
+                platform::unlock(file)?;
+                return Ok(sb);
+            }
+        },
+        false => None,
+    };
     if platform::range_held(file, MULTI_AT, 1).unwrap_or(false) {
+        drop(placement);
         platform::unlock(file)?;
         return Ok(sb);
     }
@@ -1049,6 +1065,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
             }
             Ok(tip)
         });
+    drop(placement);
     platform::unlock(file)?;
     scanned
 }
@@ -4634,5 +4651,34 @@ mod tests {
             matches!(ops.get(cut + 1), Some(Op::Sync(_))),
             "the truncation is synced"
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_read_only_open_trusts_the_superblock_while_the_placement_lock_is_held() {
+        let (base, ops) = traced(&[vec![put(noise(4, 2000))]], Durability::Buffered);
+        let mut image = applied(&base, &ops, |_, _| false, None);
+        image[LOG_START as usize + FRAME_BYTES + 1000] ^= 0x10;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placing.ferro");
+        std::fs::write(&path, &image).unwrap();
+        let read_only = || {
+            let options = StoreOptions {
+                read_only: true,
+                ..StoreOptions::default()
+            };
+            Store::open(&path, options).map(|(store, head)| (store.last_seq(), head))
+        };
+        assert!(matches!(read_only(), Err(Error::Corrupt(_))));
+        let writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        platform::lock_range(&writer, COMMIT_AT, 1, true, false).unwrap();
+        assert!(matches!(read_only(), Ok((0, None))));
+        platform::unlock_range(&writer, COMMIT_AT, 1).unwrap();
+        assert!(matches!(read_only(), Err(Error::Corrupt(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), image);
     }
 }
