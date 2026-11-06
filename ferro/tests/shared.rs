@@ -868,6 +868,57 @@ fn a_lagging_writer_reports_a_frame_below_the_superblock_that_does_not_check_and
 }
 
 #[test]
+fn a_writer_that_opens_beside_a_live_one_reports_a_frame_below_the_superblock_that_does_not_check()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beside.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let mut rng = common::Rng::new(9);
+    let commit = |db: &Db<Padded>, rng: &mut common::Rng| {
+        let pad: Vec<u64> = (0..600).map(|_| rng.next()).collect();
+        db.update(|root| {
+            root.n += 1;
+            root.pad = pad;
+            root.n
+        })
+    };
+    let a: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
+    let mut ends = vec![a.size_on_disk()];
+    for _ in 0..4 {
+        commit(&a, &mut rng).unwrap();
+        ends.push(a.size_on_disk());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    for rot in [Rot::Block, Rot::Magic, Rot::Zeroed] {
+        let mut kept = vec![0u8; (ends[2] - ends[1]) as usize];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut kept, ends[1]).unwrap();
+        rotted(&file, ends[1], rot);
+        let image = std::fs::read(&path).unwrap();
+        let opened = shared().reclaim(manual).open::<Padded>(&path);
+        assert!(
+            matches!(&opened, Err(Error::Corrupt(message)) if message.contains(&format!("frame 2 at {} ", ends[1]))),
+            "{rot:?}: {:?}",
+            opened.map(|db| db.read().n)
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            image,
+            "{rot:?}: the opening writer changed the log a live writer's superblock names"
+        );
+        std::os::unix::fs::FileExt::write_all_at(&file, &kept, ends[1]).unwrap();
+    }
+    assert_eq!(commit(&a, &mut rng).unwrap(), 5);
+    drop(a);
+    let db: Db<Padded> = Options::new().reclaim(manual).open(&path).unwrap();
+    assert_eq!(db.read().n, 5, "an acknowledged commit was lost");
+    db.verify().unwrap();
+}
+
+#[test]
 fn a_frame_written_where_a_dead_writer_left_a_near_copy_reads_as_torn_after_a_power_cut() {
     use ferro::store::{Op, Trace};
     use std::os::unix::fs::FileExt;

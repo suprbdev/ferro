@@ -136,8 +136,8 @@ const REPLAY_CHUNK: usize = 256 << 10;
 const SCRATCH_KEEP: usize = 1 << 20;
 /// The first byte of the byte-range locks, past any real file.
 const LOCKS_AT: u64 = 1 << 62;
-/// The byte every shared writer holds shared for its life, which tells a read-only open that one
-/// is alive.
+/// The byte every shared writer holds shared from the end of its open for the rest of its life,
+/// which tells a read-only open, and a writer that opens, that one has opened and is alive.
 const MULTI_AT: u64 = LOCKS_AT + 1;
 /// The placement lock, held exclusive to catch up, place a frame and write it.
 const COMMIT_AT: u64 = LOCKS_AT + 2;
@@ -1006,8 +1006,17 @@ fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<Super> {
 /// writes the new superblock to both slots, syncing between them, so no slot names a lost frame.
 /// A frame that reached the disk whole and was damaged since fails it with [`Error::Corrupt`]
 /// before it writes anything.
-fn recover(file: &File, sb: Super, slot: u64, len: u64) -> Result<(Super, u64)> {
+///
+/// With `live` set, another shared writer that has opened is alive, so no crash can have taken
+/// back a frame `sb` names since that writer recovered the file, and the scan ending before the
+/// end of the log `sb` names fails it with [`Error::Corrupt`] too, before it writes anything.
+/// Without it, only frames past the anchor can be truncated, which under
+/// [`Durability::Buffered`] a crash may have lost.
+fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(Super, u64)> {
     let mut tip = scan(file, sb.at_anchor(), len, true)?;
+    if live {
+        reaches(&tip, &sb)?;
+    }
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
     let shrink = len > tip.log_end;
@@ -1470,13 +1479,6 @@ pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basi
     Ok(())
 }
 
-/// Takes what a shared writer holds for its life, without waiting: [`MULTI_AT`] and the writer
-/// lock, both shared.
-fn try_lock_shared_writer(file: &File) -> std::result::Result<(), TryLockError> {
-    platform::lock_range(file, MULTI_AT, 1, false, false)?;
-    platform::try_lock_shared(file)
-}
-
 /// Opens the file at `path` and, for a writer, takes the writer lock: exclusive, or shared with
 /// `shared`.
 ///
@@ -1509,7 +1511,7 @@ fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
             return Ok(file);
         }
         let locked = match shared {
-            true => try_lock_shared_writer(&file),
+            true => platform::try_lock_shared(&file),
             false => platform::try_lock(&file),
         };
         match locked {
@@ -1923,8 +1925,9 @@ impl Store {
     /// - [`Error::NoDatabase`] if a read-only open finds no file.
     /// - [`Error::NotFerro`] if the file holds something else, or is empty and opened read-only.
     /// - [`Error::Corrupt`] if both superblocks are invalid, the newest names a log the file does
-    ///   not hold, or a frame past its anchor reached the disk whole and was damaged since, which
-    ///   leaves the file as it was.
+    ///   not hold, or a frame past its anchor reached the disk whole and was damaged since, or,
+    ///   for a shared writer that opens beside another, any frame the newest superblock names
+    ///   does not check, each of which leaves the file as it was.
     /// - [`Error::Io`] if the file cannot be opened, read, written or synced, or, with
     ///   [`StoreOptions::shared`], where the byte-range locks it needs do not exist.
     pub fn open(path: &Path, options: StoreOptions) -> Result<(Store, Option<Ptr>)> {
@@ -1936,8 +1939,11 @@ impl Store {
     ///
     /// A shared writer takes the placement lock and then checks that `path` still names the file
     /// it opened, opening it again if a cycle renamed another over it meanwhile, and recovers under
-    /// the placement and superblock locks. A stale copy is removed only by an open of the path
-    /// itself, and for a shared writer only if no cycle runs.
+    /// the placement and superblock locks. If another shared writer holds [`MULTI_AT`], it has
+    /// opened and no crash can have taken back what the newest superblock names, so recovery
+    /// truncates nothing that superblock names, and only once recovered does this writer take
+    /// [`MULTI_AT`] itself, under the same locks. A stale copy is removed only by an open of the
+    /// path itself, and for a shared writer only if no cycle runs.
     pub(crate) fn open_as(
         actual: &Path,
         path: &Path,
@@ -1993,7 +1999,8 @@ impl Store {
                 if options.read_only {
                     (observe(&file, actual, sb, len)?, slot)
                 } else {
-                    recover(&file, sb, slot, len)?
+                    let live = shared && platform::range_held(&file, MULTI_AT, 1)?;
+                    recover(&file, sb, slot, len, live)?
                 }
             }
             None => {
@@ -2021,6 +2028,9 @@ impl Store {
                 (sb, 0)
             }
         };
+        if shared {
+            platform::lock_range(&file, MULTI_AT, 1, false, false).map_err(locked)?;
+        }
         drop((tops, commit));
         let cache_bytes = options.cache_bytes.max(1);
         let items = ((cache_bytes / 4096).max(64)) as usize;
@@ -4711,5 +4721,59 @@ mod tests {
         platform::unlock_range(&writer, COMMIT_AT, 1).unwrap();
         assert!(matches!(read_only(), Err(Error::Corrupt(_))));
         assert_eq!(std::fs::read(&path).unwrap(), image);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn shared_writers_that_open_together_after_a_crash_roll_a_buffered_log_back_past_its_anchor() {
+        let frames: Vec<Vec<Put>> = (0..3).map(|seed| vec![put(noise(seed, 3000))]).collect();
+        let (base, ops) = traced(&frames, Durability::Buffered);
+        let mut image = applied(&base, &ops, |_, _| false, None);
+        let (at, slot) = ops
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                Op::Write(_, at, bytes) if *at < LOG_START => Some((*at as usize, bytes)),
+                _ => None,
+            })
+            .unwrap();
+        image[at..at + slot.len()].copy_from_slice(slot);
+        let named = Super::decode(&image[at..]).unwrap();
+        assert_eq!((named.seq, named.anchor.seq), (3, 0));
+        let second = LOG_START as usize + 16;
+        let second = u64::from_le_bytes(image[second..second + 8].try_into().unwrap()) as usize;
+        image[second + FRAME_BYTES + 200] ^= 0x01;
+        image[second + FRAME_BYTES + 201] ^= 0x01;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("together.ferro");
+        std::fs::write(&path, &image).unwrap();
+        let placing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        platform::lock_range(&placing, COMMIT_AT, 1, true, false).unwrap();
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            shared: true,
+            ..StoreOptions::default()
+        };
+        let openers: Vec<_> = (0..2)
+            .map(|_| {
+                let (path, options) = (path.clone(), options.clone());
+                thread::spawn(move || Store::open(&path, options).map(|(store, _)| store))
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        platform::unlock_range(&placing, COMMIT_AT, 1).unwrap();
+        for opener in openers {
+            let store = opener.join().unwrap().unwrap();
+            assert_eq!(
+                store.last_seq(),
+                1,
+                "the log was not rolled back to its first frame"
+            );
+            store.close();
+        }
     }
 }
