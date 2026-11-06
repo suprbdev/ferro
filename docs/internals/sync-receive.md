@@ -385,13 +385,18 @@ under many keys would otherwise stay in memory until its last link arrived. Each
 summary is remembered by the hash of its encoding with the object and the types it is checked as,
 up to 65,536 of them, so the same pair met again is not computed again.
 
-An inline entry has no summary of its own to remember, and a bundle of several commits carries each
-version of a node it rewrites, so the deferred pass would summarize every entry once for each
-version, and read again each collection those entries hold. Each recheck in the deferred pass
-instead takes an entry's summary from a memo kept for the receive, by the types of the map and the
-hash of the key's encoding, the value's bytes and the hashes of its links, and calls `S::of` only
-for an entry it has not met. The memo keeps two generations of up to 16,384 entries each and drops
-the older when the newer fills, keeping what is found in it.
+A recheck summarizes each inline entry as it decodes it and drops the value before the next, where
+it used to keep a node's values for the fold, which cost an edit of a map of maps measured below 6%
+more instructions and time. An inline entry has no summary of its own to remember, and a bundle of
+several commits carries each version of a node it rewrites, so the deferred pass would summarize
+every entry once for each version, and read again each collection those entries hold. For a bundle
+of more than one commit, each recheck instead takes an entry's summary from a memo kept for the
+receive, by the types of the map and the hash of the key's encoding, the value's bytes and the
+hashes of its links, and calls `S::of` only for an entry it has not met, after checking that its
+value decodes the bytes it visits. The memo keeps two generations of up to 16,384 entries each and
+drops the older when the newer fills, keeping what is found in it. An entry recurs only in another
+version of its node, so a bundle of one commit keeps no memo: hashing each entry for one cost an
+edit of 1,008 nested maps 2.4 ms of its 84 and found nothing.
 
 Recomputing summaries can read far more than the bundle carries: a value spilled under many keys is
 read once for each, and `of` reads a nested collection whole for each entry that holds it. The
@@ -404,13 +409,15 @@ record takes at least 8 bytes, and a record that starts in the same 8 bytes as a
 before it is charged as read again. A read of an object the bundle carries, a second read of a
 record, and each check of a sent spilled value again under another key are charged. So reading what
 the receiver holds once costs an honest bundle nothing, however much it is, and what a bundle can
-make the receiver read again is paid for by what it carries. A value of up to 4 KiB lands under any
-number of keys, since each key's slot brings the allowance for one more read of it, and a value of
-1 MiB lands under about 265 keys and no more, where each key costs the bundle a slot of some 25
-bytes and the receiver a read of the whole value. A nested map of 40,000 entries that `of` sums
-under 1,500 keys of one node is refused about a second in, where reading it each time would take
-several, and a nested map stored once in the receiver's file and shared by several keys is charged
-from its second read.
+make the receiver read again is paid for by what it carries. A bundle of a few hundred bytes can so
+make the receiver read, once, every collection held in the values of the nodes it rewrites, as
+committing them cost the sender, and the view's record of what it read takes at most 1.7% of the
+stretch of file those reads cover. A value of up to 4 KiB lands under any number of keys, since each
+key's slot brings the allowance for one more read of it, and a value of 1 MiB lands under about 265
+keys and no more, where each key costs the bundle a slot of some 25 bytes and the receiver a read of
+the whole value. A nested map of 40,000 entries that `of` sums under 1,500 keys of one node is
+refused about a second in, where reading it each time would take several, and a nested map stored
+once in the receiver's file and shared by several keys is charged from its second read.
 
 The deferred pass used to charge every read, held or staged. Fourteen keys in one node, each holding
 a nested `Map<u64, u64>` of 2,500,000 entries that `of` sums, make a file of 403 MB, and a bundle
@@ -418,8 +425,8 @@ of 555 bytes that added a fifteenth key was refused 2.1 s in, on every attempt, 
 fourteen held maps once each; before the deferred pass it landed in 2.9 s. It now lands in 2.5 to
 2.7 s, with 6.4 MiB at the peak of the heap. Three commits that each add a key land in the same
 time, where without the memo even two were refused, since each later version of the node read all
-fourteen again. Twelve commits that each change the same one of the fourteen maps land in 5.0 s, and
-sixteen are refused 5.2 s in, as each version of that map is a new value to read whole. Measured and
+fourteen again. Twelve commits that each change the same one of the fourteen maps land in 4.4 s, and
+sixteen are refused 4.7 s in, as each version of that map is a new value to read whole. Measured and
 left out:
 
 - A set of the offsets read, in place of the bits: the same receive peaked at 108 MiB of heap for
@@ -443,7 +450,7 @@ their own claims, since only the kinds of their links are wanted. The recompute 
 value through the receiving store and charge its body alone, and not the first time: with a note of
 a 600-byte string and a map of 1,000,000 entries held, a bundle of 7,056 bytes that put the note
 under 200 more keys took 15.0 s to land, summing the map once for each key. It is now refused
-2.3 s in, after about twenty sums, and a few keys land.
+2.3 s in, after about twenty sums, and five keys land in 0.35 s.
 
 `verify_typed` checks a file it owns, and trusts nothing in it, so its walk checks each object
 without the store, as the receive does, and checks an object it marked deferred again with the
@@ -514,30 +521,31 @@ commits of 2,000 keys, and an edit that adds an entry to 1,008 random inner maps
 
 | Map | Bundle | Time before | Time after | Instructions |
 | --- | --- | --- | --- | --- |
-| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 121.1 ms | 120.7 ms | 1,053.3M to 1,053.4M (+0.0%) |
-| | Edit, 2.9 MB | 16.2 ms | 16.2 ms | 149.5M to 149.5M (-0.0%) |
-| | `verify_typed` | 152.5 ms | 154.1 ms | 1,042.9M to 1,045.3M (+0.2%) |
-| The same with a `u64` sum of value lengths | Clone, 35.6 MB | 127.2 ms | 126.9 ms | 1,145.4M to 1,146.0M (+0.1%) |
-| | Edit, 2.9 MB | 17.8 ms | 17.7 ms | 168.9M to 169.1M (+0.1%) |
-| | `verify_typed` | 163.1 ms | 162.7 ms | 1,145.7M to 1,151.2M (+0.5%) |
-| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 15.8 MB | 144.7 ms | 145.1 ms | 1,634.0M to 1,636.1M (+0.1%) |
-| | Edit, 1.2 MB | 16.2 ms | 16.3 ms | 182.0M to 182.3M (+0.2%) |
-| | `verify_typed` | 208.0 ms | 211.0 ms | 1,826.3M to 1,840.3M (+0.8%) |
-| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.1 MB | 135.0 ms | 135.6 ms | 1,142.3M to 1,142.3M (-0.0%) |
-| | Edit, 1.4 MB | 14.1 ms | 13.9 ms | 147.5M to 147.5M (-0.0%) |
-| | `verify_typed` | 175.7 ms | 176.9 ms | 1,103.0M to 1,106.5M (+0.3%) |
-| `Map<u64, Map<u64, u64>>` summing each inner map, 20,000 keys | Clone, 15.8 MB | 308.7 ms | 302.6 ms | 3,256.5M to 3,204.9M (-1.6%) |
-| | Edit, 0.7 MB | 84.2 ms | 84.8 ms | 824.7M to 820.5M (-0.5%) |
-| | `verify_typed` | 491.7 ms | 502.6 ms | 3,811.6M to 3,851.1M (+1.0%) |
+| `Map<u64, String>`, 400,000 keys of 60 to 99 bytes | Clone, 35.6 MB | 121.2 ms | 120.3 ms | 1,053.3M to 1,053.5M (+0.0%) |
+| | Edit, 2.9 MB | 16.2 ms | 16.4 ms | 149.5M to 149.5M (-0.0%) |
+| | `verify_typed` | 150.1 ms | 150.7 ms | 1,042.9M to 1,045.5M (+0.2%) |
+| The same with a `u64` sum of value lengths | Clone, 35.6 MB | 127.0 ms | 127.3 ms | 1,145.3M to 1,145.5M (+0.0%) |
+| | Edit, 2.9 MB | 17.6 ms | 17.5 ms | 168.9M to 168.9M (-0.0%) |
+| | `verify_typed` | 165.5 ms | 163.3 ms | 1,145.7M to 1,150.9M (+0.5%) |
+| `Map<u64, i64>` with an `i64` sum, 1,000,000 keys | Clone, 15.8 MB | 142.7 ms | 142.8 ms | 1,634.0M to 1,636.5M (+0.2%) |
+| | Edit, 1.2 MB | 16.1 ms | 16.0 ms | 182.0M to 182.1M (+0.1%) |
+| | `verify_typed` | 207.2 ms | 209.8 ms | 1,826.3M to 1,841.2M (+0.8%) |
+| A sum of lengths over 60,000 spilled values of 600 to 799 bytes | Clone, 44.1 MB | 136.2 ms | 134.8 ms | 1,142.3M to 1,142.4M (+0.0%) |
+| | Edit, 1.4 MB | 13.8 ms | 13.8 ms | 147.5M to 147.4M (-0.0%) |
+| | `verify_typed` | 178.0 ms | 178.6 ms | 1,103.1M to 1,106.7M (+0.3%) |
+| `Map<u64, Map<u64, u64>>` summing each inner map, 20,000 keys | Clone, 15.8 MB | 299.6 ms | 302.6 ms | 3,256.5M to 3,197.5M (-1.8%) |
+| | Edit, 0.7 MB | 83.0 ms | 78.8 ms (-5.1%) | 824.8M to 775.8M (-5.9%) |
+| | `verify_typed` | 490.9 ms | 501.8 ms (+2.2%) | 3,811.5M to 3,847.8M (+1.0%) |
 
 A clone or an edit of a map whose values hold no collection runs none of the new code but a few
-branches in the node check and the walk, and moved by 0.2% or less. `verify_typed` checks a node
-of a map with a summary without the store first, which tells a value that links from one that does
-not as it decodes, as the receive's walk does, up to 0.8% more, and the map of maps checks each of
-its nodes twice. Its clone summarizes fewer entries, since the memo finds those a later commit's
-version of a node shares with an earlier one. Keeping the memo's lookup out of the node check, in a
-function that is never inlined, took the summed clones from 0.24% and 0.32% more instructions to
-0.05% and 0.13%.
+branches in the node check and the walk, and moved by 0.2% or less. The memo's lookup and the
+summary of an entry of a recheck sit in a function of their own that is never inlined: inside the
+node check, which the walk runs for every node, they took the summed clones to 0.24% and 0.32% more
+instructions and up to 2% more time. `verify_typed` checks a node of a map with a summary without
+the store first, as the receive's walk does, which tells a value that links from one that does not
+as it decodes, up to 0.8% more, and checks each node of the map of maps twice. That map's edit
+gains from summarizing each entry as it decodes, and its clone of ten commits from the memo too,
+which found 274 of its 20,274 entries.
 
 Measured and left out:
 
