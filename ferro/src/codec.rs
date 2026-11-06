@@ -1033,17 +1033,12 @@ impl Checked {
     }
 
     /// Records that the object `hash` passed a check as `kind` with `shape`.
-    ///
-    /// It keeps `kind` only if no kind it keeps for the object already covers its range, so it
-    /// keeps one kind for each range however many summaries were claimed under it.
     pub(crate) fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
-        let (_, kinds) = self
-            .seen
-            .entry((hash, kind.id))
-            .or_insert_with(|| (shape, Vec::with_capacity(1)));
-        if !kinds.iter().any(|seen| (seen.within)(seen, kind)) {
-            kinds.push(kind.clone());
-        }
+        let entry = self.seen.entry((hash, kind.id));
+        entry
+            .or_insert_with(|| (shape, Vec::with_capacity(1)))
+            .1
+            .push(kind.clone());
     }
 }
 
