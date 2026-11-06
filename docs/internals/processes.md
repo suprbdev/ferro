@@ -16,7 +16,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | --- | --- | --- |
 | The writer lock, a `flock` | Shared, for the writer's life | Keeping out writers without the option |
 | 2^62 + 1 | Shared, for the writer's life | Telling a read-only open that a writer is alive |
-| 2^62 + 2, placement | Exclusive, per frame | Catching up, placing a frame and writing it |
+| 2^62 + 2, placement | Exclusive, per frame, or shared by a read-only open's scan | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the pieces of a large `receive` |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
@@ -105,12 +105,17 @@ failing with `Corrupt` (`a_drop_and_fork_in_another_handle_wait_for_a_closure_on
 
 A process knows where the log ended when it last looked, `placed`. To catch up it reads the frame
 header there. If it is a frame with the next sequence number, it reads the whole frame and checks
-it, then the next, until it finds one that is not. So a process that is alone reads one header of
-68 bytes, a reservation of zeroes or the end of the file, each time it looks. In this mode a frame
+it, then the next, until it finds one that is not. It reads a header's 68 bytes and the 16 after
+them, where the first record of a frame that spilled would start, so a process that is alone reads
+84 bytes, a reservation of zeroes or the end of the file, each time it looks. In this mode a frame
 is written before the placement lock is released, so a frame that a live process placed is whole
 whenever another can take that lock, and one that a process left half-written when it died fails
-its check, ends the log there, and is written over by the next frame. A process killed in a write
-stops at a page boundary, so the rest of its frame keeps its older bytes and reads as torn. A frame
+its check and ends the log there. A process killed in a write stops at a page boundary, so the rest
+of its frame keeps its older bytes and reads as torn. A catch-up under the placement lock that finds
+anything but zeroes in those 84 bytes past the last whole frame, part of a dead process's frame or
+the records of one that spilled before its header was written, truncates the file there and syncs
+before the next frame is written in its place, as recovery at open does, so that a power cut cannot
+leave a sector of the next frame holding the dead one's bytes, which can be a bit from it. A frame
 that reached the disk whole and was damaged since, one bit from checking as [Torn and damaged
 frames](storage.md#torn-and-damaged-frames) describes, fails a catch-up under the placement lock
 with `Error::Corrupt`, so no commit is written over it. A catch-up without that lock, on taking a
@@ -209,10 +214,13 @@ A shared writer does not truncate the Fsync reservation when it closes, since ot
 placing frames into it. The next writer to open truncates it, so the file can stay up to 4 MiB
 longer than `size_on_disk` while no shared writer has it open.
 
-A read-only open that can take the writer lock shared tests the lock that shared writers hold for
-their lives, and treats a held one as a live writer, trusting the superblock instead of scanning and
-syncing. If the test itself fails, it scans, as it would with no writer alive, since scanning beside
-a live writer only costs time. Read-only handles otherwise behave as before.
+A read-only open that can take the writer lock shared takes the placement lock shared too, and
+trusts the superblock if it cannot, then tests the lock that shared writers hold for their lives,
+and treats a held one as a live writer, trusting the superblock instead of scanning and syncing. If
+the test itself fails, it scans, as it would with no writer alive. It holds the placement lock for
+the scan, so a shared writer that opens meanwhile, after the test, waits for it before it recovers
+or writes, and the scan, which judges a frame that does not check as damaged or torn, never reads
+one being written. Read-only handles otherwise behave as before.
 
 ## Reclamation
 
