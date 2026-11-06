@@ -969,7 +969,8 @@ pub fn plain<I>(_value: &I, _stored: ()) {}
 /// The [`Record`](derive@crate::Record) derive generates one for every index and passes it to
 /// the range and prefix lookups, so that [`Matches::and`] can test a row against a lookup without
 /// reading the lookup's entries: one value for most indexes, each element for an
-/// `#[index(each)]`, and none for a unique `Option` field that holds `None`.
+/// `#[index(each)]`, and none for a unique `Option` field that holds `None`. It is for the code
+/// the derive generates, and changes with it.
 pub type Indexed<T, I> = fn(&T, &mut dyn FnMut(&I) -> bool) -> bool;
 
 /// Whether a covered field is unchanged and its index entry can stay as it is.
@@ -3057,6 +3058,9 @@ where
 /// Each entry of a unique index without a cover list holds the key of the row that holds its
 /// value, which the lookup reads in place to find the row. `indexed` gives the value a row holds,
 /// so that [`Matches::and`] can test a row against the lookup's span.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
+/// changes with the derive's, so call the generated lookup rather than this.
 #[inline(always)]
 pub fn unique_rows<I, T>(
     rows: &Map<T::Key, T>,
@@ -3072,6 +3076,9 @@ where
 
 /// [`unique_rows`] for a unique index with a cover list, whose entries hold the key beside the
 /// stored fields that `project` turns into the covered ones.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
+/// changes with the derive's, so call the generated lookup rather than this.
 #[inline(always)]
 pub fn unique_rows_covered<I, T, S, C>(
     rows: &Map<T::Key, T>,
@@ -3097,6 +3104,9 @@ where
 ///
 /// `indexed` gives the value a row holds, so that [`Matches::and`] can test a row against the
 /// lookup's span.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
+/// changes with the derive's, so call the generated lookup rather than this.
 #[inline(always)]
 pub fn index_where<I, T, S, C>(
     rows: &Map<T::Key, T>,
@@ -3175,6 +3185,9 @@ where
 ///
 /// `indexed` gives the values a row holds, so that [`Matches::and`] can test a row against the
 /// range.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
+/// changes with the derive's, so call the generated lookup rather than this.
 #[inline(always)]
 pub fn index_range<I, T, S, C, Q, R>(
     rows: &Map<T::Key, T>,
