@@ -572,6 +572,20 @@ fn an_or_of_two_tables_reads_each_row_from_the_side_that_holds_it() {
     let mut lent = Vec::new();
     either().visit(|row| lent.push((row.id, row.b)));
     assert_eq!(lent, wanted);
+    let blind: Vec<(u32, u8)> = either().uncovered().map(|row| (row.id, row.b)).collect();
+    assert_eq!(blind, wanted);
+    let mut started = either();
+    assert_eq!(started.next().map(|row| (row.id, row.b)), Some((1, 1)));
+    assert_eq!(started.next_back().map(|row| (row.id, row.b)), Some((6, 1)));
+    assert_eq!(started.keys().collect::<Vec<_>>(), [2, 3, 4, 5]);
+    let mut started = either();
+    started.next();
+    let rest: Vec<(u32, u8)> = started
+        .or(right.find().by_b(&9))
+        .rev()
+        .map(|row| (row.id, row.b))
+        .collect();
+    assert_eq!(rest, wanted[1..].iter().rev().copied().collect::<Vec<_>>());
     let covered: Vec<(u32, (u8, u8))> = left
         .find()
         .by_c(&0)
