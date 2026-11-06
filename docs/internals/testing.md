@@ -213,8 +213,9 @@ Tests are described next to what they test:
 - `history_heap`: [Cache weight](read-scaling.md#cache-weight).
 - Modelled power cuts on Buffered checkpoints: [Buffered durability and
   checkpoints](storage.md#buffered-durability-and-checkpoints).
-- Flipped bits in frames past the superblock, torn sectors and holes, and a dead writer's half
-  frame: [Torn and damaged frames](storage.md#torn-and-damaged-frames).
+- Flipped bits in frames past the superblock, torn sectors and holes, frames of zeroes or ones
+  torn sector by sector, and a dead writer's half frame and near copy: [Torn and damaged
+  frames](storage.md#torn-and-damaged-frames).
 - A frame that another branch moves, compared byte for byte: [Drafting outside
   `tip`](commit-path.md#drafting-outside-tip).
 - Power cuts across branch-table steps, a reader from before steps, and a file written before them:

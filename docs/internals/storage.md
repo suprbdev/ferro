@@ -154,30 +154,63 @@ tells them apart is what a sector that a write did not reach holds: its older by
 which are the zeroes of a reservation or of a new extension, or what a dead writer or a failed
 write left. Those differ from the frame's bytes in many bits, where damage to a frame that reached
 the disk changes few. So a frame that fails its checks is judged damaged if putting back one flipped
-bit in its header and table together, and at most one in each 4 KiB block of its records, makes
-every check pass, and torn otherwise. The table keeps the search cheap: only a block whose entry
-fails is searched, by trying each of its 32,768 bits against the entry. A flip in the check shows
-as a check one bit from the one computed, a flip in the table as an entry one bit from its block's
-hash, and a flip in the magic or the mark is found by trying each of their 416 bits against the
-check.
+bit in its header and table together, and at most one in each of at most 8 of its 4 KiB blocks of
+records, makes every check pass, with each such bit passing the rule on sectors below, and torn
+otherwise. The table keeps the search cheap: only a block whose entry fails is searched, by trying
+each of its 32,768 bits against the entry. A flip in the check shows as a check one bit from the
+one computed, a flip in the table as an entry one bit from its block's hash, and a flip in the
+magic or the mark is found by trying each of their 416 bits against the check.
 
-A sector that holds only a few of the frame's bytes, at either end of the frame, could keep older
-bytes that differ from the frame's in one bit by chance: one byte with one bit set over a zero is a
-chance in 32. So a flipped bit counts as damage only in a sector that holds at least 8 of the
-frame's bytes, where that chance is about 2^-58; a sector is 512 bytes, the smallest a device
-writes whole, and anything coarser tears along the same lines. A flipped bit among the first or
-last 7 bytes of a frame, when they are all the frame has in their sector, reads as a torn write.
+Older bytes do not always differ from the frame's in many bits. What decides it is how many bits
+the lost write would have changed, not how many of the frame's bytes its sector holds, and a frame
+that holds little in a sector changes few. A frame's writes reach a sector in order of offset, but
+for the header of a frame that spilled, which is written after its records, so a lost write leaves
+the part of a sector from where that write began in it to the sector's end, or, in the sector
+holding the end of such a header, the part from the sector's start to the header's end. That part
+holds the zeroes of a reservation, of a new extension or of the room past an earlier write to the
+sector, or the ones some devices read from an erased or deallocated block. A frame that held little
+there differs from those in a single bit whatever the odds: a sparse value stored raw, as sync
+stored a body that arrived uncompressed until it compressed it as described under
+[Applying](sync.md#applying), a record whose first byte has one bit just past a spill that ended on
+a sector's last byte, or the last byte of a spilled frame's check alone in its sector. A review
+found the first two read as damaged after a modelled power cut (#81). So a flipped bit counts as
+damage only if, on disk, the frame's bytes in its sector up to the flipped one, and those from it
+on, each hold something other than all zeroes or all ones. A sector that a lost write left as
+zeroes or ones, from some point on or up to the end of a header, then never mends, whatever the
+frame held, with no chance to bound.
+
+Older bytes of another kind, another file's that a file system exposed after a crash, differ from
+the frame's at random, and they are older than every write to the sector, so the part they fill is
+all the frame has there. They can be one bit from the frame's by chance only when the frame has few
+bytes in the sector, at either end of the frame: one byte with one bit set over a random one is a
+chance in 32. So the sector must also hold at least 8 of the frame's bytes, where that chance is
+about 2^-58; a sector is 512 bytes, the smallest a device writes whole, and anything coarser tears
+along the same lines. A flipped bit among the first or last 7 bytes of a frame, when they are all
+the frame has in their sector, reads as a torn write, and so does one with only zeroes or only ones
+between it and either end of its sector, such as a set bit lost from a run of zeroes. A dead
+writer's bytes need not differ at random, since the next writer may write nearly the same frame,
+which is why a shared writer truncates them before it writes, as described below.
+
+The search is capped. A torn write leaves most blocks of what it did not reach failing, where bit
+rot flips a bit or a few, so a frame with more than 8 blocks whose entries fail reads as torn
+without a search, and a frame within the cap costs at most 8 block searches.
 
 A damaged frame fails the open with `Error::Corrupt`, naming the frame's sequence, its offset and
 the first byte found wrong, and the open writes nothing: no sync, no truncation, no superblock. A
-read-only open that finds no writer alive scans and reports the same. Truncating the file at the
-offset named gives up that commit and every one after it, and the file then opens. A shared writer
-that catches up under the placement lock, where no live process can be writing, reports the same
-and never writes over the frame, as described under [Catching up](processes.md#catching-up). A
-scan that a write can race takes any frame that does not check for the end of the log, since it can
-read a frame another process or thread is still writing in part: a shared writer catching up
-without the placement lock, the leader of a shared sync reading past its own frame, and the quick
-look a read-only open takes before it knows whether a writer is alive.
+read-only open that finds no writer alive scans and reports the same, holding the placement lock
+shared as well as the writer lock, so a shared writer that opens meanwhile waits before it recovers
+or writes anything the scan could read in part. Truncating the file at the offset named gives up
+that commit and every one after it, and the file then opens. A shared writer that catches up under
+the placement lock, where no live process can be writing, reports the same and never writes over
+the frame, as described under [Catching up](processes.md#catching-up). Anything else it finds past
+the last whole frame, part of a frame or the records of one that spilled before a process died
+writing its header, it truncates and syncs before the next frame is written there, as recovery at
+open does, so a lost sector of the next frame cannot hold a near copy of the dead one. A transaction
+dropped after it spilled syncs the truncation of its records the same way. A scan that
+a write can race takes any frame that does not check for the end of the log, since it can read a
+frame another process or thread is still writing in part: a shared writer catching up without the
+placement lock, the leader of a shared sync reading past its own frame, and the quick look a
+read-only open takes before it knows whether a writer is alive.
 
 The judgement reads the bytes alone, whatever durability wrote the frame or opens the file. Under
 `Durability::Buffered` a power cut may still take back every commit past the anchor: a torn frame
@@ -189,15 +222,21 @@ Out of order frames and dead writers keep working. A frame that never reached th
 frames after it, leaves its older bytes and reads as torn, so the scan stops there and the frames
 after it are truncated, as before. A process killed while it writes stops at a page boundary, since
 the kernel copies a write into the page cache a page at a time, and the rest of its frame keeps its
-older bytes, so the next writer finds it torn and writes over it.
+older bytes, so the next writer finds it torn, truncates it and writes in its place.
 
 What it does not catch: two flipped bits in one block, one in the header and one in the table, or
 one in a block's entry in the table and one in that block, which leaves no entry one bit from its
-block's hash, read as a torn write and are truncated as before, and so does a sector that a lost or
-misdirected write left holding other bytes whole. Nothing on disk records that a sync finished until
-the next sync carries its superblock, so a frame of the last sync with a sector gone cannot be told
-from one caught by the power cut, and only the bytes can tell damage apart. Damage before the anchor
-is found by the hash checks on read and by `verify`, as before.
+block's hash, flipped bits in more than 8 blocks, and a flipped bit with only zeroes or only ones
+between it and either end of its sector, read as a torn write and are truncated as before, and so
+does a sector that a lost or misdirected write left holding other bytes whole. The other way round,
+a torn frame reads as damaged only if a lost sector kept older bytes one bit from the frame's with
+something other than zeroes or ones on both sides of that bit: a near copy of the frame, which a
+dead writer's bytes written over could be, and those are now truncated first, so only a file a
+shared writer of an earlier build wrote over a dead one's frame can hold one. Nothing on disk
+records that a sync finished until the next sync carries its superblock, so a frame of the last
+sync with a sector gone cannot be told from one caught by the power cut, and only the bytes can
+tell damage apart. Damage before the anchor is found by the hash checks on read and by `verify`,
+as before.
 
 The tests, in `ferro/tests`: `crash.rs` flips each bit position of a frame past a stale superblock
 under both durabilities, and of every header and table byte and a sample of the body of a frame of
@@ -206,12 +245,32 @@ one in its entry, which read as torn; it replaces each sector inside a frame wit
 older frame's bytes, and leaves a hole of zeroes, whole or every other sector, before whole frames.
 `buffered_crash.rs` flips a bit in a whole frame past the anchor of every crash image of a Buffered
 recording, under every loss, and of an Fsync recording whose superblocks since the last sync were
-lost, the frames of acknowledged commits among them. `group_commit.rs` flips one in the last frame
-past the superblock of each image its intercepted fdatasync takes, frames that sync then made
-durable, of acknowledged commits among them. `shared.rs` leaves a dead writer's frame cut at each of
-its first page boundaries, over zeroes and at the end of the file, and the next writer writes over
-it, and leaves it whole with a bit flipped, which the next writer reports without writing. Every
-existing power-cut, crash and shared-process test opens every image it did before.
+lost, the frames of acknowledged commits among them. It also records a Buffered and an Fsync file of
+values of 300 and 400 KB that compression does not shrink, each with a KiB of zeroes holding one set
+bit, three of them pulled from another file in pieces that spill, and every crash image of every
+other cut opens, under every loss, as does every image that lost one sector of a frame's write, for
+each sector where that write's bytes hold at most 8 set bits and for its first and last.
+`group_commit.rs` flips one in the last frame past the superblock of each image its intercepted
+fdatasync takes, frames that sync then made durable, of acknowledged commits among them. `shared.rs`
+leaves a dead writer's frame cut at each of its first page boundaries, over zeroes and at the end of
+the file, and the next writer writes in its place, and leaves it whole with a bit flipped, which the
+next writer reports without writing. It also leaves the first pages of a dead writer's frame that
+differ from the next writer's in one bit of a sector, checks that the next writer truncates them and
+syncs before it writes, and that its frame with that sector lost reads as torn; without the
+truncation it read as damaged. The unit tests in `ferro/src/store.rs` replay the writes of frames of
+zeroes or of ones with a bit set every few hundred bytes, stored raw and spilled part way, losing
+each sector of each write in turn and each by chance 200 times, the lost bytes left as they were or
+turned to ones, and none reads as damaged. One loses the sector past a spill that ended on a
+sector's last byte, before a record whose first byte is `0x40`, and one the sector holding only the
+last byte of a spilled frame's header, a check byte with one bit set, which both read as damaged
+before. Another flips a bit in 1, 8, 9 and 12 blocks of a frame, and only the first two are
+reported. One opens a file with a damaged frame past its superblock read-only while another
+descriptor holds the placement lock, which trusts the superblock, and once it is released, which
+reports the frame, and one drops a draft that spilled and checks that a sync follows the truncation.
+`compress.rs` pulls a 32 MiB value of zeroes with a byte of 1 every 8 KiB, which the sender sends
+uncompressed, and checks that the receiving file stays under twice the sender's and that a power cut
+over the pulled frame reads as torn. Every existing power-cut, crash and shared-process test opens
+every image it did before.
 
 The table costs 8 bytes for each 4 KiB block of a frame's records, and 8 for a frame of one block.
 The hash of each block replaces the one stream over the frame that the check was, so a commit runs
@@ -229,12 +288,26 @@ median of five alternating runs: 49,720 and 49,672 a second from one writer, p50
 
 The search costs only an open that finds a frame that does not check. Trying every bit of a 4 KiB
 block, 32,768 hashes, takes 3.4 ms here, so an open after a power cut that tore a frame takes
-about that much longer, once, for the first block of the torn frame that fails. A flipped bit ends
-its block's search when it is found. Opening a copy of a Buffered file of 40 commits of 3 keys,
-frames of a median 2,621 bytes, scanned from its anchor, took 1.2 ms with every frame whole,
-syncing and writing the superblock that recovery writes; 1.5 ms with a bit of the last frame
-flipped, writing nothing; and 5.0 ms with a sector of it torn. With frames of 1.26 MB it took 2.1,
-3.1 and 5.3 ms.
+about that much longer, once, for the first block of the torn frame that fails, and nothing when
+more than 8 blocks fail. A flipped bit ends its block's search when it is found. Opening a copy of
+a Buffered file of 40 commits of 3 keys, frames of a median 2,621 bytes, scanned from its anchor,
+took 1.2 ms with every frame whole, syncing and writing the superblock that recovery writes; 1.5 ms
+with a bit of the last frame flipped, writing nothing; and 5.0 ms with a sector of it torn. With
+frames of 1.26 MB it took 2.1, 3.1 and 5.3 ms.
+
+Before the cap the search ran over every failing block, so a frame with a bit flipped in each block
+cost a search of each: an open of one of 2 MiB took 1.6 s and one of 16 MiB 12.5 s, about 3 ms a
+block, which comes to about 13 minutes at 1 GiB, for a read-only open, a writer's open and every
+catch-up of a shared writer under the placement lock alike. With the cap, a frame of 64 blocks
+opened read-only in 3.1 ms with one block flipped in its last bit, 6.2 ms with two, 12.3 ms with
+four and 24.7 ms with eight, the most it searches, and in 0.02 ms with 9, 16 or 64, which read as
+torn; the frame of 16 MiB opened in 1.7 ms. Torn as the power-cut tests tear them, each sector kept
+or not by chance, with the header and table kept so that the judgement reaches the blocks, frames
+of 1, 2, 4 and 8 blocks of records left almost every block failing in each of 200 tears, and each
+of more than 8 failing blocks, 112 of the 200 of 8 blocks and all those of 16 and 64, read as torn
+in 0.01 to 0.02 ms, where it took a block's search, 3 ms, before. A read-only open holds the writer
+lock shared while it judges, so a search within the cap can keep a writer opening meanwhile, which
+retries for 5 ms, out with `Error::Locked`, as a long scan could before.
 
 Measured and left out, on the frames of that file and of one of 40 commits of 40 keys, a median of
 18,515 bytes a frame, each frame torn 100 times over zeroes and 100 times over
@@ -265,6 +338,21 @@ another frame's bytes, with each sector kept or not by chance, as the power-cut 
 
 The table judged none of the torn frames damaged, and reports every single flip but those in a
 sector holding fewer than 8 of the frame's bytes, 5 of 107,500 positions and 4 of 755,871.
+
+Those tears missed frames that hold little, and the rule on zeroes and ones came after a review
+found torn frames of them read as damaged (#81). On a file of 40 commits of 3 keys and one of 40
+keys, frames of a median 1,012 and 8,672 bytes, 36,039 and 345,829 positions, flipping each
+position's bit left 5 and 15 unreported under the rule on sectors alone, and 6 or 7, as commit
+times vary between runs, and 18 under the rule with zeroes and ones. Also measured and left out:
+
+- Requiring each flipped bit to sit at least 8 bytes before the end of its sector, which bounds the
+  chance that random older bytes past an earlier write mend. It leaves 761 and 4,999 of those
+  positions unreported, 2.1% and 1.4%, and still mends a sector of a sparse value lost whole.
+- Counting the set bits of the frame's bytes in a sector, the bits a lost write over zeroes would
+  have changed. It mends a sector past a spill, where the earlier write's part holds the frame's
+  bytes, and a sector of ones.
+- A budget of hashes rather than of blocks. A block's search is at most 32,768 hashes, so 8 blocks
+  is that budget, and counting blocks lets an open give up before it hashes anything.
 
 ### Buffered durability and checkpoints
 
