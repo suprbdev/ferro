@@ -35,9 +35,9 @@ This is an experiment, not a production database.
 - A reclamation cycle needs free disk for everything retained, as described under
   [Limits](retention.md#limits).
 - Crash safety was never tested on real hardware. A frame past the superblock damaged in more than
-  one bit of a 4 KiB block cannot be told from a torn write and is truncated like one, which under
-  `Durability::Fsync` can drop the commits of the last sync, as described under [What was
-  tested](durability.md#what-was-tested).
+  one bit of a 4 KiB block, or in a block and in that block's entry in the frame's table, cannot be
+  told from a torn write and is truncated like one, which under `Durability::Fsync` can drop the
+  commits of the last sync, as described under [What was tested](durability.md#what-was-tested).
 - After a criss-cross, a merge closure runs more than once, and it refuses when the base of the
   ancestors could lie in pruned history, as described under [Limits](merging.md#limits).
 - Sync keeps memory for every object it moves and writes a large bundle twice, as described under

@@ -191,27 +191,27 @@ after it are truncated, as before. A process killed while it writes stops at a p
 the kernel copies a write into the page cache a page at a time, and the rest of its frame keeps its
 older bytes, so the next writer finds it torn and writes over it.
 
-What it does not catch: two flipped bits in one block, or one in the header and one in the table,
-read as a torn write and are truncated as before, and so does a sector that a lost or misdirected
-write left holding other bytes whole. Nothing on disk records that a sync finished until the next
-sync carries its superblock, so a frame of the last sync with a sector gone cannot be told from one
-caught by the power cut, and only the bytes can tell damage apart. Damage before the anchor is
-found by the hash checks on read and by `verify`, as before.
+What it does not catch: two flipped bits in one block, one in the header and one in the table, or
+one in a block's entry in the table and one in that block, which leaves no entry one bit from its
+block's hash, read as a torn write and are truncated as before, and so does a sector that a lost or
+misdirected write left holding other bytes whole. Nothing on disk records that a sync finished until
+the next sync carries its superblock, so a frame of the last sync with a sector gone cannot be told
+from one caught by the power cut, and only the bytes can tell damage apart. Damage before the anchor
+is found by the hash checks on read and by `verify`, as before.
 
 The tests, in `ferro/tests`: `crash.rs` flips each bit position of a frame past a stale superblock
 under both durabilities, and of every header and table byte and a sample of the body of a frame of
-more than three blocks, one bit in each of two blocks, and two in one block, which reads as torn;
-it replaces
-each sector inside a frame with zeroes, ones or an older frame's bytes, and leaves a hole of zeroes,
-whole or every other sector, before whole frames. `buffered_crash.rs` flips a bit in a whole frame
-past the anchor of every crash image of a Buffered recording, under every loss, and of an Fsync
-recording whose superblocks since the last sync were lost, the frames of acknowledged commits
-among them. `group_commit.rs` flips one in the last frame past the superblock of each image its
-intercepted fdatasync takes, frames that sync then made durable, of acknowledged commits among
-them. `shared.rs` leaves a dead writer's frame
-cut at each of its first page boundaries, over zeroes and at the end of the file, and the next
-writer writes over it, and leaves it whole with a bit flipped, which the next writer reports without
-writing. Every existing power-cut, crash and shared-process test opens every image it did before.
+more than three blocks, one bit in each of two blocks, and two in one block or one in a block and
+one in its entry, which read as torn; it replaces each sector inside a frame with zeroes, ones or an
+older frame's bytes, and leaves a hole of zeroes, whole or every other sector, before whole frames.
+`buffered_crash.rs` flips a bit in a whole frame past the anchor of every crash image of a Buffered
+recording, under every loss, and of an Fsync recording whose superblocks since the last sync were
+lost, the frames of acknowledged commits among them. `group_commit.rs` flips one in the last frame
+past the superblock of each image its intercepted fdatasync takes, frames that sync then made
+durable, of acknowledged commits among them. `shared.rs` leaves a dead writer's frame cut at each of
+its first page boundaries, over zeroes and at the end of the file, and the next writer writes over
+it, and leaves it whole with a bit flipped, which the next writer reports without writing. Every
+existing power-cut, crash and shared-process test opens every image it did before.
 
 The table costs 8 bytes for each 4 KiB block of a frame's records, and 8 for a frame of one block.
 The hash of each block replaces the one stream over the frame that the check was, so a commit runs

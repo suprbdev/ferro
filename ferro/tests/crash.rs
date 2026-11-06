@@ -482,6 +482,10 @@ fn a_bit_flipped_in_each_block_of_a_large_frame_is_reported() {
         fs::write(&path, &torn).unwrap();
         check_at_version(&fast().open::<Root>(&path).unwrap(), &built, 1);
         assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
+        let entry = end - table + block * 8 + 3;
+        fs::write(&path, image(&[first, entry])).unwrap();
+        check_at_version(&fast().open::<Root>(&path).unwrap(), &built, 1);
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, start);
     }
 }
 
