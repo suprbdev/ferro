@@ -1041,7 +1041,6 @@ async fn retention_reclaims_under_load_and_the_replica_keeps_following() {
         &path,
         Config {
             replica: true,
-            refresh_ms: 2,
             ..Config::default()
         },
     )
@@ -1101,7 +1100,6 @@ async fn replica_serves_reads_follows_primary_and_refuses_writes() {
         &path,
         Config {
             replica: true,
-            refresh_ms: 2,
             ..Config::default()
         },
     )

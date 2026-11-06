@@ -3,7 +3,7 @@
 //! It opens the database at `--db`, builds the server with [`shop::build`] and serves it on
 //! `--addr` until Ctrl-C. Writes are awaited with `try_commit_with_async` unless `--writes` picks
 //! `inline`, `blocking` or `pool:N`, and `--reads` picks where reads run. `--replica` serves a
-//! read-only copy of a file another `shop` process writes, refreshing it every `--refresh-ms`.
+//! read-only copy of a file another `shop` process writes, which follows that process's commits.
 //! `--coalesce` turns on commit coalescing, `--durability` picks `fsync` or `buffered`,
 //! `--keep-versions` and `--reclaim-mb` bound the history kept, and `--workers` sets the number of
 //! Tokio worker threads.
@@ -24,8 +24,8 @@ use tokio::net::TcpListener;
 fn usage() -> ! {
     eprintln!(
         "usage: shop --db PATH [--addr HOST:PORT] [--replica] [--reads inline|blocking] \
-         [--writes async|inline|blocking|pool:N] [--durability fsync|buffered] [--refresh-ms N] \
-         [--workers N] [--keep-versions N] [--reclaim-mb N] [--coalesce]"
+         [--writes async|inline|blocking|pool:N] [--durability fsync|buffered] [--workers N] \
+         [--keep-versions N] [--reclaim-mb N] [--coalesce]"
     );
     std::process::exit(2)
 }
@@ -45,7 +45,6 @@ fn main() {
             "--coalesce" => config.coalesce = true,
             "--reads" => config.reads = value().parse().unwrap_or_else(|_| usage()),
             "--writes" => config.writes = value().parse().unwrap_or_else(|_| usage()),
-            "--refresh-ms" => config.refresh_ms = value().parse().unwrap_or_else(|_| usage()),
             "--keep-versions" => {
                 config.keep_versions = Some(value().parse().unwrap_or_else(|_| usage()));
             }

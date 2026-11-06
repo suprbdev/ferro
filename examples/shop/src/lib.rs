@@ -11,8 +11,8 @@
 //! against the last into one Server-Sent Event, and a client resuming from an older version gets
 //! one diff from there. Order history comes from `history_of_range`, and any read route can be
 //! pinned to a past version under `/admin/snapshot/{version}`. With [`Config::replica`] the server
-//! opens the file read-only, refuses writes, and refreshes to the writer's newest version on a
-//! timer. The modules hold the parts: `model` the rows, `app` the [`App`] and its [`Bridge`],
+//! opens the file read-only, refuses writes, and follows the writer's commits with
+//! `Options::follow`, which also feeds them to its broadcaster. The modules hold the parts: `model` the rows, `app` the [`App`] and its [`Bridge`],
 //! `routes` the axum router, `events` the change feed and `minihttp` a small HTTP and SSE client
 //! for the load tester and the tests. The `shop`, `shop-load` and `shop-probe` binaries and the
 //! tests use this library.
@@ -30,7 +30,6 @@ pub mod routes;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ferro::{Db, Durability, Keep, Options, Reclaim};
 use tokio::net::TcpListener;
@@ -40,15 +39,14 @@ pub use app::{App, Bridge, ReadMode, WriteMode};
 pub use model::*;
 
 /// How [`open_db`] and [`build`] set up the server: as a writer or a read-only replica, how reads
-/// and writes run, durability and coalescing, how often a replica refreshes, how many change frames
-/// the feed buffers, and how much history to keep and reclaim.
+/// and writes run, durability and coalescing, how many change frames the feed buffers, and how much
+/// history to keep and reclaim.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub replica: bool,
     pub reads: ReadMode,
     pub writes: WriteMode,
     pub durability: Durability,
-    pub refresh_ms: u64,
     pub feed_capacity: usize,
     pub keep_versions: Option<usize>,
     pub reclaim_bytes: u64,
@@ -62,7 +60,6 @@ impl Default for Config {
             reads: ReadMode::Inline,
             writes: WriteMode::Async,
             durability: Durability::Fsync,
-            refresh_ms: 5,
             feed_capacity: 1024,
             keep_versions: None,
             reclaim_bytes: Reclaim::default().every_bytes,
@@ -71,7 +68,8 @@ impl Default for Config {
     }
 }
 
-/// Opens or creates the shop database at `path`, read-only when `config` is a replica.
+/// Opens or creates the shop database at `path`, or, for a replica, opens it read-only and follows
+/// the writer's commits.
 ///
 /// # Errors
 ///
@@ -80,7 +78,8 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
     let options = Options::new()
         .durability(config.durability)
         .coalesce(config.coalesce)
-        .read_only(config.replica);
+        .read_only(config.replica)
+        .follow(config.replica);
     let options = match config.keep_versions {
         Some(count) if !config.replica => options.history(Keep::Last(count)).reclaim(Reclaim {
             every_bytes: config.reclaim_bytes,
@@ -90,26 +89,10 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
     options.open::<Shop>(path)
 }
 
-/// Wraps an open database in an [`App`], starting the change broadcaster and, for a replica, the
-/// thread that refreshes it.
+/// Wraps an open database in an [`App`], starting the change broadcaster.
 pub fn build(db: Db<Shop>, config: &Config) -> Arc<App> {
     let (feed, _) = broadcast::channel(config.feed_capacity);
     events::spawn_broadcaster(&db, feed.clone());
-    if config.replica {
-        let db = db.clone();
-        let pause = Duration::from_millis(config.refresh_ms.max(1));
-        std::thread::Builder::new()
-            .name("shop-refresh".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(pause);
-                    if let Err(error) = db.refresh() {
-                        eprintln!("refresh failed: {error}");
-                    }
-                }
-            })
-            .expect("spawn refresh");
-    }
     Arc::new(App {
         db,
         bridge: Bridge::new(config.reads, config.writes),
