@@ -78,7 +78,7 @@
 
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::fmt;
@@ -133,18 +133,26 @@ const PARENT: usize = 3;
 
 /// Unwraps the result of a read that has no error channel of its own.
 ///
+/// The error is also kept for this thread, so that a caller that catches the panic, as the
+/// recompute of a summary does, can return the error itself.
+///
 /// # Panics
 ///
 /// Panics with the error, prefixed by `ferro: `, if `result` is an error.
 pub(crate) fn fatal<T>(result: Result<T>) -> T {
     match result {
         Ok(value) => value,
-        Err(error) => panic!("ferro: {error}"),
+        Err(error) => {
+            let message = format!("ferro: {error}");
+            FATAL.set(Some(error));
+            panic!("{message}")
+        }
     }
 }
 
 thread_local! {
     static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static FATAL: Cell<Option<Error>> = const { Cell::new(None) };
 }
 
 /// A fold of a map's entries that [`Map<K, V, S>`](Map) keeps for every subtree.
@@ -168,9 +176,11 @@ thread_local! {
 /// [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
 /// recompute every summary they check from the entries below it, with this type's `of` and
 /// `combine`, and refuse one whose encoding differs from what is stored, so two files that sync
-/// need the same `Summary`. A panic in `of` or `combine` while they recompute is caught and
-/// refuses the bundle or reports the file as corrupt; the panic hook still runs, and with
-/// `panic = "abort"` the process aborts.
+/// need the same `Summary`. `of` may read a collection the value holds: such a value is summarized
+/// once the rest of what is checked has passed, and reads the collection as a local read does. A
+/// panic in `of` or `combine` while they recompute is caught and refuses the bundle or reports
+/// the file as corrupt, and a read inside `of` that fails returns its error; the panic hook still
+/// runs, and with `panic = "abort"` the process aborts.
 ///
 /// # Examples
 ///
@@ -1065,13 +1075,32 @@ const fn summarized<S>() -> bool {
 }
 
 fn summarize<T>(f: impl FnOnce() -> T) -> Result<T> {
+    FATAL.set(None);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        if let Some(error) = FATAL.take() {
+            return error;
+        }
         let text = match payload.downcast_ref::<&str>() {
             Some(text) => text,
             None => payload.downcast_ref::<String>().map_or("", String::as_str),
         };
         Error::Decode(format!("summarizing its entries panicked: {text}"))
     })
+}
+
+fn summarized_value<V: Data>(r: &mut Decoder<'_>) -> Result<Option<V>> {
+    if r.has_store() {
+        return V::decode(r).map(Some);
+    }
+    let checkpoint = r.checkpoint();
+    match V::decode(r) {
+        Ok(value) if !r.linked_since(checkpoint) => Ok(Some(value)),
+        _ => {
+            r.rewind(checkpoint);
+            V::visit(r)?;
+            Ok(None)
+        }
+    }
 }
 
 fn claim_of<C: 'static>(kind: &Kind) -> Option<&C> {
@@ -1104,12 +1133,8 @@ impl<S: Data> Claim for NodeClaim<S> {
             .is_some_and(|confirmed| confirmed.0.same_encoding(&self.0))
     }
 
-    fn decode(&self, _: &[u8], _: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>> {
-        Err(refuted("a map node's link"))
-    }
-
-    fn confirm(&self, _: &(dyn Any + Send + Sync)) -> Result<()> {
-        Err(refuted("a map node's link"))
+    fn fingerprint(&self) -> Option<Hash> {
+        try_hash_of(&self.0).ok()
     }
 }
 
@@ -1137,16 +1162,12 @@ impl<K: Data, V: Data, S: Summary<K, V>> Claim for EntryClaim<K, V, S> {
         })
     }
 
-    fn decode(&self, body: &[u8], links: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>> {
-        let value = V::decode(&mut Decoder::new(body, links, None))?;
-        Ok(Arc::new(value))
-    }
-
-    fn confirm(&self, decoded: &(dyn Any + Send + Sync)) -> Result<()> {
-        match decoded.downcast_ref::<V>() {
-            Some(value) => self.holds(value),
-            None => Err(refuted("a spilled value's entry")),
-        }
+    fn fingerprint(&self) -> Option<Hash> {
+        let mut sink = HashSink;
+        let mut encoder = Encoder::new(&mut sink);
+        self.key.encode(&mut encoder).ok()?;
+        self.summary.encode(&mut encoder).ok()?;
+        Some(encoder.finish().ok()?.hash)
     }
 }
 
@@ -1187,9 +1208,18 @@ fn check_spill<K: Data + Ord, V: Data, S: Summary<K, V>>(
     kind: &Kind,
     r: &mut Decoder<'_>,
 ) -> Result<Shape> {
-    match claim_of::<EntryClaim<K, V, S>>(kind) {
-        Some(claim) => claim.holds(&V::decode(r)?)?,
-        None => V::visit(r)?,
+    let Some(claim) = claim_of::<EntryClaim<K, V, S>>(kind) else {
+        V::visit(r)?;
+        return Ok(Shape::default());
+    };
+    match summarized_value::<V>(r)? {
+        Some(value) => claim.holds(&value)?,
+        None => {
+            return Ok(Shape {
+                deferred: true,
+                ..Shape::default()
+            });
+        }
     }
     Ok(Shape::default())
 }
@@ -1362,7 +1392,11 @@ fn check_plain<K: Data + Ord, V: Data, S: Summary<K, V>>(
                 .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
         }
     }
-    Ok(Shape { count, level })
+    Ok(Shape {
+        count,
+        level,
+        deferred: false,
+    })
 }
 
 fn child_span<K: Clone>(span: Option<&Span<K>>, keys: &[K], position: usize) -> Span<K> {
@@ -1386,9 +1420,13 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     let span = span_of::<K>(kind);
     let claim = claim_of::<NodeClaim<S>>(kind);
     let mut parts = Vec::with_capacity(if claim.is_some() { keys.len() } else { 0 });
+    let mut deferred = false;
     for key in keys {
         match r.u8()? {
-            0 if claim.is_some() => parts.push(Part::Value(V::decode(r)?)),
+            0 if claim.is_some() && !deferred => match summarized_value::<V>(r)? {
+                Some(value) => parts.push(Part::Value(value)),
+                None => deferred = true,
+            },
             0 => V::visit(r)?,
             1 => {
                 let summary = S::decode(r)?;
@@ -1418,10 +1456,14 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
                 .ok_or_else(|| Error::Decode("node counts overflow".into()))?;
         }
     }
-    if let Some(claim) = claim {
+    if let Some(claim) = claim.filter(|_| !deferred) {
         claim.holds(summarize(|| node_fold(keys, &parts, &children))?)?;
     }
-    Ok(Shape { count, level })
+    Ok(Shape {
+        count,
+        level,
+        deferred,
+    })
 }
 
 fn extreme<K: Data, V: Data, S: Data>(
@@ -1469,6 +1511,7 @@ fn held_node<K: Data + Ord, V: Data, S: Summary<K, V>>(
     Ok(Shape {
         count: node.count,
         level: node.level,
+        deferred: false,
     })
 }
 

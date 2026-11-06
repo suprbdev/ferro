@@ -37,6 +37,9 @@ const FORMAT: u8 = 1;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
 const RECHECK_SLACK: usize = 16 << 20;
+const RERUN_FACTOR: usize = 8;
+const RERUN_SLACK: usize = 256 << 20;
+const CONFIRMED_KEPT: usize = 1 << 16;
 const EXPANSION: usize = 16;
 const EXPANSION_SLACK: usize = 16 << 20;
 const MAX_BODY: usize = u32::MAX as usize;
@@ -1643,7 +1646,6 @@ impl Landing<'_> {
 struct Kept {
     left: u8,
     checks: Vec<(Shape, Vec<Kind>)>,
-    decoded: Option<(TypeId, Arc<dyn Any + Send + Sync>)>,
 }
 
 struct Vetting<'a> {
@@ -1658,12 +1660,26 @@ struct Vetting<'a> {
     spent: usize,
     budget: usize,
     queue: Vec<(Ptr, Kind, Vec<Kind>)>,
+    deferred: Vec<(u32, Kind)>,
+    confirmed: HashSet<(Hash, TypeId, Hash)>,
+    reran: usize,
+    rerun_budget: usize,
 }
 
 fn rejected(error: Error) -> Error {
     match error {
         Error::Decode(message) => bad(message),
         other => other,
+    }
+}
+
+fn undecodable(kind: &Kind, error: Error) -> Error {
+    match error {
+        Error::Io(_) | Error::Poisoned | Error::Replaced | Error::Interrupted => error,
+        error => bad(format!(
+            "a {} it carries does not decode: {error}",
+            kind.name
+        )),
     }
 }
 
@@ -1738,19 +1754,16 @@ impl Vetting<'_> {
         if self.spent > self.budget {
             return Err(bad("it reuses its objects under too many key ranges"));
         }
-        let undecodable = |kind: &Kind, error: Error| {
-            bad(format!(
-                "a {} it carries does not decode: {error}",
-                kind.name
-            ))
-        };
         let (shape, found) = kind
-            .check(&object.body, &object.links)
+            .check(&object.body, &object.links, None)
             .map_err(|error| undecodable(kind, error))?;
+        if shape.deferred {
+            self.deferred.push((id, kind.clone()));
+        }
         let mut earlier = Vec::with_capacity(before.len());
         for old in &before {
             let (_, found) = old
-                .check(&object.body, &object.links)
+                .check(&object.body, &object.links, None)
                 .map_err(|error| undecodable(old, error))?;
             earlier.push(found);
         }
@@ -1778,7 +1791,6 @@ impl Vetting<'_> {
             let kept = self.kept.entry(id).or_insert_with(|| Kept {
                 left,
                 checks: Vec::new(),
-                decoded: None,
             });
             match kept
                 .checks
@@ -1796,40 +1808,75 @@ impl Vetting<'_> {
     }
 
     fn confirm(&mut self, id: u32, hash: Hash, kind: &Kind) -> Result<()> {
-        let Some(claim) = &kind.claim else {
+        if !self.remember(hash, kind) {
             return Ok(());
+        }
+        let ptr = Ptr {
+            hash,
+            offset: self.staging.offset(id),
         };
-        let refused = |error: Error| {
-            bad(format!(
-                "a {} it carries does not decode: {error}",
-                kind.name
-            ))
+        let object = self.staging.read_object(ptr)?;
+        self.rerun(object.body.len())?;
+        let (shape, _) = kind
+            .check(&object.body, &object.links, None)
+            .map_err(|error| undecodable(kind, error))?;
+        if shape.deferred {
+            self.deferred.push((id, kind.clone()));
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, hash: Hash, kind: &Kind) -> bool {
+        let Some(claim) = kind.claim.as_deref() else {
+            return false;
         };
-        let cached = self
-            .kept
-            .get(&id)
-            .and_then(|kept| kept.decoded.clone())
-            .filter(|(of, _)| *of == kind.id);
-        let decoded = match cached {
-            Some((_, decoded)) => decoded,
-            None => {
+        let Some(print) = claim.fingerprint() else {
+            return true;
+        };
+        let memo = (hash, (claim as &dyn Any).type_id(), print);
+        if self.confirmed.contains(&memo) {
+            return false;
+        }
+        if self.confirmed.len() < CONFIRMED_KEPT {
+            self.confirmed.insert(memo);
+        }
+        true
+    }
+
+    fn rerun(&mut self, bytes: usize) -> Result<()> {
+        self.reran = self.reran.saturating_add(bytes);
+        if self.reran > self.rerun_budget {
+            return Err(bad(
+                "it spills values under too many keys to recompute their summaries",
+            ));
+        }
+        Ok(())
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        let deferred = mem::take(&mut self.deferred);
+        let (store, staging) = (self.store, self.staging);
+        staging.overlaid(store, || {
+            for (id, kind) in &deferred {
                 let ptr = Ptr {
-                    hash,
-                    offset: self.staging.offset(id),
+                    hash: staging.hashes().hash(*id),
+                    offset: staging.offset(*id),
                 };
-                let object = self.staging.read_object(ptr)?;
-                self.spent = self.spent.saturating_add(object.body.len());
-                if self.spent > self.budget {
-                    return Err(bad("it reuses its objects under too many key ranges"));
-                }
-                let decoded = claim.decode(&object.body, &object.links).map_err(refused)?;
-                if let Some(kept) = self.kept.get_mut(&id) {
-                    kept.decoded = Some((kind.id, decoded.clone()));
-                }
-                decoded
+                let object = staging.read_object(ptr)?;
+                kind.check(&object.body, &object.links, Some(store))
+                    .map_err(|error| undecodable(kind, error))?;
             }
-        };
-        claim.confirm(&*decoded).map_err(refused)
+            Ok(())
+        })
+    }
+
+    fn confirm_held(&mut self, hash: Hash, ptr: Ptr, kind: &Kind) -> Result<bool> {
+        if !self.remember(hash, kind) {
+            return Ok(false);
+        }
+        let object = self.store.read_object(ptr)?;
+        self.rerun(object.body.len())?;
+        Ok(true)
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
@@ -1851,26 +1898,27 @@ impl Vetting<'_> {
             return Ok(None);
         }
         if let Some(known) = known.filter(|known| known.id == kind.id) {
+            let confirm = !kind.vouched_by(known) && self.confirm_held(hash, ptr, kind)?;
             let unclaimed;
-            let kind = match kind.vouched_by(known) {
-                true => {
+            let kind = match confirm {
+                true => kind,
+                false => {
                     unclaimed = kind.unclaimed();
                     &unclaimed
                 }
-                false => kind,
             };
             return (kind.held)(kind, self.store, ptr)
                 .map(Some)
                 .map_err(rejected);
         }
         if let Some((shape, vouched)) = self.held.get(&hash, kind) {
-            if !vouched {
+            if !vouched && self.confirm_held(hash, ptr, kind)? {
                 (kind.held)(kind, self.store, ptr).map_err(rejected)?;
             }
             return Ok(Some(shape));
         }
         let object = self.store.read_object(ptr)?;
-        let shape = match kind.check(&object.body, &object.links) {
+        let shape = match kind.check(&object.body, &object.links, Some(self.store)) {
             Ok((shape, found)) if found.is_empty() => shape,
             _ => {
                 return Err(bad(format!(
@@ -2072,7 +2120,11 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                 Some(parent) => hint_kinds.get(parent),
             };
             let kinds: Vec<(usize, Kind)> = kind
-                .and_then(|kind| kind.unclaimed().check(&object.body, &object.links).ok())
+                .and_then(|kind| {
+                    kind.unclaimed()
+                        .check(&object.body, &object.links, None)
+                        .ok()
+                })
                 .map(|(_, found)| found)
                 .unwrap_or_default();
             while at < end && parent_key(header, &roots, &hinted, &hint_kinds, order[at]) == key {
@@ -2427,6 +2479,13 @@ fn resolve<O: Objects>(
                 .saturating_mul(2)
                 .saturating_add(RECHECK_SLACK),
             queue: Vec::new(),
+            deferred: Vec::new(),
+            confirmed: HashSet::new(),
+            reran: 0,
+            rerun_budget: streamed
+                .carried
+                .saturating_mul(RERUN_FACTOR)
+                .saturating_add(RERUN_SLACK),
         };
         for (_, _, id) in &order {
             let sent = landing
@@ -2438,6 +2497,7 @@ fn resolve<O: Objects>(
                 vetting.run()?;
             }
         }
+        vetting.settle()?;
         drop(vetting);
         linked = Some(streamed.links);
     }

@@ -5,6 +5,7 @@
 //! inspect a file another program owns. All but [`compact`] open the file read-only, so they run
 //! beside a writer. [`Keep`], which says how much history to retain, is here too.
 
+use std::any::Any;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -225,31 +226,40 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     let mut queue: Vec<(Ptr, Kind)> = roots.into_iter().map(|ptr| (ptr, root.clone())).collect();
     queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>())));
     let mut checked = Checked::default();
+    let mut confirmed = HashSet::new();
+    let mut deferred: Vec<(Ptr, Kind, bool)> = Vec::new();
+    let corrupt = |kind: &Kind, ptr: Ptr, error: Error| {
+        Error::Corrupt(format!(
+            "the {} at {} does not decode: {error}",
+            kind.name, ptr.offset
+        ))
+    };
     while let Some((ptr, kind)) = queue.pop() {
         let shape = match checked.get(&ptr.hash, &kind) {
             Some((shape, true)) => shape,
             Some((shape, false)) => {
-                (kind.held)(&kind, store, ptr).map_err(|error| {
-                    Error::Corrupt(format!(
-                        "the {} at {} does not decode: {error}",
-                        kind.name, ptr.offset
-                    ))
-                })?;
+                let memo = kind.claim.as_deref().and_then(|claim| {
+                    let id = (claim as &dyn Any).type_id();
+                    claim.fingerprint().map(|print| (ptr.hash, id, print))
+                });
+                if memo.is_none_or(|memo| confirmed.insert(memo)) {
+                    deferred.push((ptr, kind.clone(), true));
+                }
                 shape
             }
             None => {
                 let object = store.read_object(ptr)?;
-                let (shape, found) = kind.check(&object.body, &object.links).map_err(|error| {
-                    Error::Corrupt(format!(
-                        "the {} at {} does not decode: {error}",
-                        kind.name, ptr.offset
-                    ))
-                })?;
+                let (shape, found) = kind
+                    .check(&object.body, &object.links, None)
+                    .map_err(|error| corrupt(&kind, ptr, error))?;
                 queue.extend(
                     found
                         .into_iter()
                         .map(|(index, child)| (object.links[index], child)),
                 );
+                if shape.deferred {
+                    deferred.push((ptr, kind.clone(), false));
+                }
                 checked.insert(ptr.hash, &kind, shape);
                 shape
             }
@@ -260,6 +270,16 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
                 kind.name, ptr.offset, shape.count, shape.level
             )));
         }
+    }
+    for (ptr, kind, again) in deferred {
+        let confirmed = match again {
+            true => (kind.held)(&kind, store, ptr).map(drop),
+            false => store.read_object(ptr).and_then(|object| {
+                kind.check(&object.body, &object.links, Some(store))
+                    .map(drop)
+            }),
+        };
+        confirmed.map_err(|error| corrupt(&kind, ptr, error))?;
     }
     Ok(())
 }

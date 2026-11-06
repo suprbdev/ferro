@@ -866,6 +866,10 @@ fn allocation(bytes: usize) -> usize {
 pub(crate) struct Shape {
     pub(crate) count: u64,
     pub(crate) level: u8,
+    /// Whether the summary the kind claims is still to be confirmed, by checking the object again
+    /// with a store once every object the check reaches has passed, because a value it summarizes
+    /// holds a collection or decodes only with a store.
+    pub(crate) deferred: bool,
 }
 
 /// What a link must lead to, for the typed checks of
@@ -906,22 +910,9 @@ pub(crate) trait Claim: Any + Send + Sync {
     /// type, and the same encoding.
     fn agrees(&self, confirmed: &dyn Claim) -> bool;
 
-    /// Decodes the object the link leads to, for [`confirm`](Claim::confirm) to test this claim
-    /// against.
-    ///
-    /// # Errors
-    ///
-    /// The errors of decoding the object, and [`Error::Decode`] for a claim about the object
-    /// alone, such as a map node's summary: an object has one such summary, so one that met a
-    /// claim cannot meet another that disagrees with it.
-    fn decode(&self, body: &[u8], links: &[Ptr]) -> Result<Arc<dyn Any + Send + Sync>>;
-
-    /// Checks this claim against an object that [`decode`](Claim::decode) gave.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Decode`] if the object does not have the summary claimed.
-    fn confirm(&self, decoded: &(dyn Any + Send + Sync)) -> Result<()>;
+    /// The hash of what this claim encodes, which with its type tells it from any claim that
+    /// does not agree with it, or `None` if it does not encode.
+    fn fingerprint(&self) -> Option<Hash>;
 }
 
 /// The typed links a check found in an object: each one's index in the object's links, with the
@@ -999,13 +990,23 @@ impl Kind {
     /// Checks an object with this body and these links as this kind, returning its shape and the
     /// typed links found in it, which the caller checks in turn.
     ///
+    /// Without a store, a check that would need one to confirm the summary the kind claims
+    /// returns a [`Shape`] marked [`deferred`](Shape::deferred). With `store`, the values a summary
+    /// is recomputed from decode with it, so that `of` can read the collections they hold, and
+    /// the check never defers.
+    ///
     /// # Errors
     ///
     /// Returns the error of the first part that does not decode, or does not meet what the kind
     /// asks of it.
-    pub(crate) fn check(&self, body: &[u8], links: &[Ptr]) -> Result<(Shape, Found)> {
+    pub(crate) fn check(
+        &self,
+        body: &[u8],
+        links: &[Ptr],
+        store: Option<&Store>,
+    ) -> Result<(Shape, Found)> {
         let found = RefCell::new(Vec::new());
-        let mut decoder = Decoder::new(body, links, None);
+        let mut decoder = Decoder::new(body, links, store);
         decoder.found = Some(&found);
         let shape = (self.check)(self, &mut decoder)?;
         Ok((shape, found.into_inner()))
@@ -1042,6 +1043,16 @@ impl Checked {
     }
 }
 
+/// A place in a [`Decoder`] that [`Decoder::rewind`] goes back to.
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint {
+    pos: usize,
+    cursor: usize,
+    empty_items: u64,
+    heap: usize,
+    found: usize,
+}
+
 /// Reads one object's body and links, in the order an [`Encoder`] wrote them.
 ///
 /// [`Data::decode`] reads a value from one. Every read checks its bounds and returns
@@ -1076,6 +1087,40 @@ impl<'a> Decoder<'a> {
             base: 0,
             found: None,
         }
+    }
+
+    /// Where the decoder is, for [`rewind`](Decoder::rewind) to come back to.
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            pos: self.pos,
+            cursor: self.cursor,
+            empty_items: self.empty_items,
+            heap: self.heap,
+            found: self.found.map_or(0, |found| found.borrow().len()),
+        }
+    }
+
+    /// Goes back to `checkpoint`, forgetting the typed links recorded since.
+    pub(crate) fn rewind(&mut self, checkpoint: Checkpoint) {
+        self.pos = checkpoint.pos;
+        self.cursor = checkpoint.cursor;
+        self.empty_items = checkpoint.empty_items;
+        self.heap = checkpoint.heap;
+        if let Some(found) = self.found {
+            found.borrow_mut().truncate(checkpoint.found);
+        }
+    }
+
+    /// Whether a typed link was recorded since `checkpoint`.
+    pub(crate) fn linked_since(&self, checkpoint: Checkpoint) -> bool {
+        self.found
+            .is_some_and(|found| found.borrow().len() > checkpoint.found)
+    }
+
+    /// Whether the decoder reads from a store, which the collections it decodes can read their
+    /// nodes from.
+    pub(crate) fn has_store(&self) -> bool {
+        self.store.is_some()
     }
 
     /// The number of body bytes not yet read.

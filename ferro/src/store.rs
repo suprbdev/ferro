@@ -29,6 +29,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -3055,9 +3056,11 @@ impl Store {
         {
             return Ok((value, true));
         }
-        let (value, weight) = self.decode_fresh(ptr, decode, weigh)?;
+        let (value, weight, staged) = self.decode_fresh(ptr, decode, weigh)?;
         let value = Arc::new(value);
-        self.admit(ptr, || CacheEntry::value(value.clone(), weight));
+        if !staged {
+            self.admit(ptr, || CacheEntry::value(value.clone(), weight));
+        }
         Ok((value, false))
     }
 
@@ -3076,30 +3079,37 @@ impl Store {
         {
             return Ok((node, true));
         }
-        let (node, weight) = self.decode_fresh(ptr, decode, weigh)?;
+        let (node, weight, staged) = self.decode_fresh(ptr, decode, weigh)?;
         let node = Shared::new(node);
-        self.admit(ptr, || {
-            CacheEntry::node(Shared::erase(node.clone()), weight)
-        });
+        if !staged {
+            self.admit(ptr, || {
+                CacheEntry::node(Shared::erase(node.clone()), weight)
+            });
+        }
         Ok((node, false))
     }
 
     /// Reads and decodes the object at `ptr`, registers it for deduplication if it is as large as a
-    /// spilled value and the store writes, and weighs it.
+    /// spilled value and the store writes, weighs it, and says whether it came from a staging that
+    /// [`Staging::overlaid`] lets this thread read, which neither the cache nor the deduplication
+    /// table may keep.
     fn decode_fresh<T>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
         weigh: impl FnOnce(&T, usize, usize) -> u32,
-    ) -> Result<(T, u32)> {
-        let object = self.read_object(ptr)?;
-        if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
+    ) -> Result<(T, u32, bool)> {
+        let (object, staged) = match staged_object(self.inner.id, ptr) {
+            Some(object) => (object?, true),
+            None => (self.read_object(ptr)?, false),
+        };
+        if !staged && object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
             self.inner.dedupe.insert(ptr.hash, ptr.offset);
         }
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = decode(&mut decoder)?;
         let weight = weigh(&value, object.body.len(), decoder.heap());
-        Ok((value, weight))
+        Ok((value, weight, staged))
     }
 
     /// Puts the entry that `entry` makes in the cache unless the store is closed, and clears the
@@ -3184,13 +3194,17 @@ impl Store {
         Ok(Arc::new(self.decode_at(ptr, T::decode)?))
     }
 
-    /// Reads the object at `ptr` and decodes it with `decode`, past the cache.
+    /// Reads the object at `ptr`, or the one staged with its hash where [`Staging::overlaid`] lets
+    /// this thread read a staging, and decodes it with `decode`, past the cache.
     pub(crate) fn decode_at<T>(
         &self,
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
-        let object = self.read_object(ptr)?;
+        let object = match staged_object(self.inner.id, ptr) {
+            Some(object) => object?,
+            None => self.read_object(ptr)?,
+        };
         decode(&mut Decoder::new(&object.body, &object.links, Some(self)))
     }
 
@@ -3972,6 +3986,29 @@ pub(crate) struct Staging {
     offsets: Column<u64>,
 }
 
+thread_local! {
+    static OVERLAY: Cell<Option<(u64, *const Staging)>> = const { Cell::new(None) };
+}
+
+/// The object with `ptr`'s hash in the staging that [`Staging::overlaid`] lets this thread read
+/// through the store with the id `store`, or `None` if there is none.
+fn staged_object(store: u64, ptr: Ptr) -> Option<Result<Object>> {
+    let (id, staging) = OVERLAY.get()?;
+    if id != store {
+        return None;
+    }
+    // SAFETY: `Staging::overlaid` set the pointer from a shared borrow of a staging that lasts for
+    // the whole call of the closure it runs, and puts the previous value back when that call
+    // returns or unwinds. The pointer is thread-local, so it is only read on the thread inside that
+    // call, while the borrow keeps the staging alive and unchanged.
+    let staging = unsafe { &*staging };
+    let at = staging.id_of(&ptr.hash)?;
+    Some(staging.read_object(Ptr {
+        hash: ptr.hash,
+        offset: staging.offset(at),
+    }))
+}
+
 /// A record of a staging, read back for placing.
 pub(crate) struct Record {
     /// The object's hash.
@@ -4173,6 +4210,24 @@ impl Staging {
         };
         let (object, _, _) = Store::read_within(self.file.as_ref(), ptr, tail, held, false, false)?;
         Ok(object)
+    }
+
+    /// Runs `f` with the objects staged here readable through `store` on this thread, by hash.
+    ///
+    /// While `f` runs, a read through `store` that misses its cache takes an object staged here
+    /// with the hash it asks for, wherever its pointer leads, and keeps what it decodes from one
+    /// out of the cache and the deduplication table, since the links of a staged object lead into
+    /// the staging. Other threads, and reads after `f` returns or unwinds, do not see the
+    /// staging.
+    pub(crate) fn overlaid<R>(&self, store: &Store, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<(u64, *const Staging)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OVERLAY.set(self.0);
+            }
+        }
+        let _restore = Restore(OVERLAY.replace(Some((store.id(), std::ptr::from_ref(self)))));
+        f()
     }
 
     /// Drops the offsets, which placing does not need, and if the staging spilled, writes the rest
