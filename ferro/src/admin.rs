@@ -199,6 +199,10 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
 /// Decodes every object reachable from every retained version in `refs`, and the branch table at
 /// `head`, as the type that reads it, checking each map node against what its parent records.
 ///
+/// Each object is checked without the store, and one whose summary needs it, because a value it
+/// summarizes holds a collection, is checked again with the store once every object below it has
+/// passed, so that `of` reads only collections whose nodes were checked.
+///
 /// # Errors
 ///
 /// [`Error::Corrupt`] naming the first object that does not decode or does not fit.
@@ -225,8 +229,11 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
         Ok(true)
     })?;
     let root = Kind::value::<T>();
-    let mut queue: Vec<(Ptr, Kind)> = roots.into_iter().map(|ptr| (ptr, root.clone())).collect();
-    queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>())));
+    let mut queue: Vec<(Ptr, Kind, bool)> = roots
+        .into_iter()
+        .map(|ptr| (ptr, root.clone(), false))
+        .collect();
+    queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>(), false)));
     let mut checked = Checked::default();
     let mut confirmed = HashSet::new();
     let corrupt = |kind: &Kind, ptr: Ptr, error: Error| {
@@ -235,7 +242,13 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
             kind.name, ptr.offset
         ))
     };
-    while let Some((ptr, kind)) = queue.pop() {
+    while let Some((ptr, kind, settle)) = queue.pop() {
+        if settle {
+            let object = store.read_object(ptr)?;
+            kind.check(&object.body, &object.links, Some(store))
+                .map_err(|error| corrupt(&kind, ptr, error))?;
+            continue;
+        }
         let shape = match checked.get(&ptr.hash, &kind) {
             Some((shape, true)) => shape,
             Some((shape, false)) => {
@@ -257,12 +270,15 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
             None => {
                 let object = store.read_object(ptr)?;
                 let (shape, found) = kind
-                    .check(&object.body, &object.links, Some(store))
+                    .check(&object.body, &object.links, None)
                     .map_err(|error| corrupt(&kind, ptr, error))?;
+                if shape.deferred {
+                    queue.push((ptr, kind.clone(), true));
+                }
                 queue.extend(
                     found
                         .into_iter()
-                        .map(|(index, child)| (object.links[index], child)),
+                        .map(|(index, child)| (object.links[index], child, false)),
                 );
                 checked.insert(ptr.hash, &kind, shape);
                 shape
