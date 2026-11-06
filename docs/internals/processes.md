@@ -212,7 +212,11 @@ flipped in one block rolled the log back to the frame before it, as after a cras
 live writer's acknowledged commits from under it, and the live writer's next commit failed reading
 past the end of the file (#82). Checking the lock while it was still taken with the writer lock,
 before recovery, would have failed one of two writers that open together after a power cut on a
-Buffered log the crash cut short.
+Buffered log the crash cut short. A shared writer of an earlier build still takes it that way, so
+beside one of those that is recovering after a power cut, a writer of this build takes it for a live
+one, and on a Buffered log the crash cut short its open fails with `Error::Corrupt` and writes
+nothing; opening again once that writer has closed succeeds. The format does not tell the builds
+apart, so processes that share a file should run the same build.
 
 Once it holds the placement lock it checks again that the path names the file it opened, and opens
 the path again if not. A cycle renames the new file over the path under the old file's placement
@@ -253,9 +257,11 @@ syncing. If either test fails with an error rather than finding the lock held, i
 would with no writer alive, without the placement lock when that was the test that failed. It holds
 the placement lock for the scan when it has it, so a shared writer that opens meanwhile waits for it
 before it recovers or writes, and the scan, which judges a frame that does not check as damaged or
-torn, never reads one being written. The first version of the placement lock trusted the superblock
-when its test failed with any error, so a reader whose lock failed with `ENOLCK` missed a commit
-whose superblock write a crash had lost (#82). Read-only handles otherwise behave as before.
+torn, never reads one being written. Without it, a shared writer that opens meanwhile can recover
+and place frames during the scan, so the scan may meet one being written. The first version of the
+placement lock trusted the superblock when its test failed with any error, so a reader whose lock
+failed with `ENOLCK` missed a commit whose superblock write a crash had lost (#82). Read-only
+handles otherwise behave as before.
 
 ## Reclamation
 

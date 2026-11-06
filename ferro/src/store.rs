@@ -1054,7 +1054,7 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
 /// held elsewhere means a writer is placing a frame, so `sb` is used as it is, but a test of the
 /// lock that fails with an error says nothing about writers, and the open goes on to test
 /// [`MULTI_AT`] and scans without the placement lock, as it would where there are no byte-range
-/// locks.
+/// locks, so a shared writer that opens meanwhile can write during that scan.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
