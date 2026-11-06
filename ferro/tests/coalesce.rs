@@ -1042,14 +1042,33 @@ fn restore_merge_fork_and_drop_flush_the_open_group_first() {
 #[test]
 fn a_closure_on_another_branch_flushes_the_open_group() {
     let _turn = serial();
-    let (_dir, path, db) = database();
+    let dir = on_disk();
+    let path = dir.path().join("coalesce.ferro");
+    let drafted = Arc::new(AtomicUsize::new(0));
+    let seen = drafted.clone();
+    let db = coalesced()
+        .hook(ferro::db::Hook(Arc::new(move |step| {
+            if step == "drafted" {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        })))
+        .open::<Root>(&path)
+        .unwrap();
+    db.update(|root| {
+        root.insert(0, 1);
+    })
+    .unwrap();
     let side = db.fork("side").unwrap();
     let ran = Ran::new();
     let leader = stall_leader(&db, &ran);
     let on_main = bump(&db, &ran, "main".to_string());
     ran.reach(2);
+    let before = drafted.load(Ordering::SeqCst);
     let on_side = bump(&side, &ran, "side".to_string());
     ran.reach(3);
+    wait_until("the side commit to seal main's group", || {
+        drafted.load(Ordering::SeqCst) > before
+    });
     let more_main = bump(&db, &ran, "main again".to_string());
     ran.reach(4);
     settle_queue();
