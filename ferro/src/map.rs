@@ -133,8 +133,8 @@ const PARENT: usize = 3;
 
 /// Unwraps the result of a read that has no error channel of its own.
 ///
-/// The error is also kept for this thread, so that a caller that catches the panic, as the
-/// recompute of a summary does, can return the error itself.
+/// The error is also kept for this thread with the panic's message, so that a caller that catches
+/// the panic, as the recompute of a summary does, can return the error itself.
 ///
 /// # Panics
 ///
@@ -144,7 +144,7 @@ pub(crate) fn fatal<T>(result: Result<T>) -> T {
         Ok(value) => value,
         Err(error) => {
             let message = format!("ferro: {error}");
-            FATAL.set(Some(error));
+            FATAL.set(Some((message.clone(), error)));
             panic!("{message}")
         }
     }
@@ -152,7 +152,7 @@ pub(crate) fn fatal<T>(result: Result<T>) -> T {
 
 thread_local! {
     static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static FATAL: Cell<Option<Error>> = const { Cell::new(None) };
+    static FATAL: Cell<Option<(String, Error)>> = const { Cell::new(None) };
 }
 
 /// A fold of a map's entries that [`Map<K, V, S>`](Map) keeps for every subtree.
@@ -1075,19 +1075,19 @@ const fn summarized<S>() -> bool {
 }
 
 fn summarize<T>(f: impl FnOnce() -> T) -> Result<T> {
-    FATAL.set(None);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
-        if let Some(error) = FATAL.take() {
-            return error;
-        }
         let text = match payload.downcast_ref::<&str>() {
             Some(text) => text,
             None => payload.downcast_ref::<String>().map_or("", String::as_str),
         };
-        Error::Decode(format!("summarizing its entries panicked: {text}"))
+        match FATAL.take() {
+            Some((message, error)) if message == text => error,
+            _ => Error::Decode(format!("summarizing its entries panicked: {text}")),
+        }
     })
 }
 
+#[inline]
 fn summarized_value<V: Data>(r: &mut Decoder<'_>) -> Result<Option<V>> {
     if r.has_store() {
         return V::decode(r).map(Some);
@@ -1421,22 +1421,36 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     let claim = claim_of::<NodeClaim<S>>(kind);
     let mut parts = Vec::with_capacity(if claim.is_some() { keys.len() } else { 0 });
     let mut deferred = false;
-    for key in keys {
-        match r.u8()? {
-            0 if claim.is_some() && !deferred => match summarized_value::<V>(r)? {
-                Some(value) => parts.push(Part::Value(value)),
-                None => deferred = true,
-            },
-            0 => V::visit(r)?,
-            1 => {
-                let summary = S::decode(r)?;
-                r.typed_link(|| spill_kind::<K, V, S>(key.clone(), summary.clone()))?;
-                if claim.is_some() {
-                    parts.push(Part::Spilled(summary));
+    let stored = r.has_store();
+    let start = r.checkpoint();
+    'slots: loop {
+        for key in keys {
+            match r.u8()? {
+                0 if claim.is_some() && stored => parts.push(Part::Value(V::decode(r)?)),
+                0 if claim.is_some() && !deferred => {
+                    let links = r.links_read();
+                    match V::decode(r) {
+                        Ok(value) if r.links_read() == links => parts.push(Part::Value(value)),
+                        _ => {
+                            r.rewind(start);
+                            parts.clear();
+                            deferred = true;
+                            continue 'slots;
+                        }
+                    }
                 }
+                0 => V::visit(r)?,
+                1 => {
+                    let summary = S::decode(r)?;
+                    r.typed_link(|| spill_kind::<K, V, S>(key.clone(), summary.clone()))?;
+                    if claim.is_some() {
+                        parts.push(Part::Spilled(summary));
+                    }
+                }
+                other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
             }
-            other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
         }
+        break;
     }
     let mut count = keys.len() as u64;
     let mut children = Vec::new();

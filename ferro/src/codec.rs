@@ -1050,7 +1050,6 @@ pub(crate) struct Checkpoint {
     cursor: usize,
     empty_items: u64,
     heap: usize,
-    found: usize,
 }
 
 /// Reads one object's body and links, in the order an [`Encoder`] wrote them.
@@ -1090,31 +1089,40 @@ impl<'a> Decoder<'a> {
     }
 
     /// Where the decoder is, for [`rewind`](Decoder::rewind) to come back to.
+    #[inline]
     pub(crate) fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             pos: self.pos,
             cursor: self.cursor,
             empty_items: self.empty_items,
             heap: self.heap,
-            found: self.found.map_or(0, |found| found.borrow().len()),
         }
     }
 
-    /// Goes back to `checkpoint`, forgetting the typed links recorded since.
+    /// Goes back to `checkpoint`, forgetting the typed links recorded since, which are those at
+    /// or past the link the decoder was at then.
     pub(crate) fn rewind(&mut self, checkpoint: Checkpoint) {
         self.pos = checkpoint.pos;
         self.cursor = checkpoint.cursor;
         self.empty_items = checkpoint.empty_items;
         self.heap = checkpoint.heap;
         if let Some(found) = self.found {
-            found.borrow_mut().truncate(checkpoint.found);
+            let from = self.base + checkpoint.cursor;
+            found.borrow_mut().retain(|(index, _)| *index < from);
         }
     }
 
-    /// Whether a typed link was recorded since `checkpoint`.
+    /// Whether a link, typed or not, was read since `checkpoint`.
+    #[inline]
     pub(crate) fn linked_since(&self, checkpoint: Checkpoint) -> bool {
-        self.found
-            .is_some_and(|found| found.borrow().len() > checkpoint.found)
+        self.cursor != checkpoint.cursor
+    }
+
+    /// How many links have been read, which a value that holds a collection or a raw [`Ptr`]
+    /// moves on.
+    #[inline]
+    pub(crate) fn links_read(&self) -> usize {
+        self.cursor
     }
 
     /// Whether the decoder reads from a store, which the collections it decodes can read their
