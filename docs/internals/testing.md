@@ -241,6 +241,14 @@ flags above and `-rss_limit_mb=3072`. Each loaded its 962 inputs to 630 to 674 e
 ending at 36,200 to 36,400 edges with 1,308 to 1,348 entries, about 2,680 more together. No input
 crashed, hung, leaked or passed a memory limit, and the peak RSS was 954 MB.
 
+The round after summaries that read a collection in the value were deferred to a second pass over
+the receiving store and the staged objects, with the world's map of maps summarized by an `of`
+that reads each inner map, so that every bundle defers its outer nodes, ran `sync` the same way
+for 10 minutes from the same quarters. Each loaded its 962 inputs to 633 to 658 entries reaching
+36,500 to 36,900 edges, and ran 6,625 to 7,535 executions, 11 or 12 a second, 28,271 together,
+ending at 37,000 to 37,200 edges with 1,329 to 1,389 entries. No input crashed, hung, leaked or
+passed a memory limit, and the peak RSS was 954 MB.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
