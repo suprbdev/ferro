@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::platform::{Bell, Watch};
 
 /// How often a follower looks at the file when nothing tells it of changes.
@@ -44,6 +44,10 @@ pub struct Following {
     /// How many of those looks found commits the handle had not seen and refreshed it.
     pub refreshes: u64,
     /// The error the last look failed with, as text, until a look succeeds.
+    ///
+    /// A shared writer whose writes failed is poisoned until it is opened again, so its follower
+    /// records [`Error::Poisoned`](crate::Error::Poisoned) here and stops looking, and the error
+    /// stays.
     pub last_error: Option<String>,
 }
 
@@ -105,13 +109,19 @@ impl Wait {
 fn run(signal: &Signal, mut wait: Wait, mut look: impl FnMut() -> Option<Result<bool>>) {
     loop {
         let started = Instant::now();
-        let outcome = match panic::catch_unwind(AssertUnwindSafe(&mut look)) {
+        let (outcome, poisoned) = match panic::catch_unwind(AssertUnwindSafe(&mut look)) {
             Ok(None) => return,
-            Ok(Some(outcome)) => outcome.map_err(|error| error.to_string()),
-            Err(_) => Err("the follower's refresh panicked".to_string()),
+            Ok(Some(outcome)) => {
+                let poisoned = matches!(outcome, Err(Error::Poisoned));
+                (outcome.map_err(|error| error.to_string()), poisoned)
+            }
+            Err(_) => (Err("the follower's refresh panicked".to_string()), false),
         };
         let refreshed = matches!(outcome, Ok(true)).then_some(started);
         signal.record(outcome);
+        if poisoned {
+            return;
+        }
         let going = match wait.next(signal, refreshed) {
             Ok(going) => going,
             Err(error) => {

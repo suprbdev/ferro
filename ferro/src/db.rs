@@ -1451,14 +1451,16 @@ impl Options {
     /// Linux inotify wakes the thread when the file changes, and under a busy writer it refreshes
     /// at most once a millisecond; elsewhere, or where inotify cannot be had, it looks every
     /// 10 ms. A look reads the newest superblock and refreshes only when that names a commit the
-    /// handle has not seen, so on a shared writer a look that finds nothing takes no lock across
-    /// processes. A writer without [`Options::shared`] is the only one and starts no thread. Off
-    /// by default.
+    /// handle has not seen. On a shared writer it catches up only to what that superblock names,
+    /// so it never syncs for another process and takes no lock another process holds, except to
+    /// open the file a cycle renamed. A writer without [`Options::shared`] is the only one and
+    /// starts no thread. Off by default.
     ///
-    /// The thread ends when the last [`Db`] handle on the file is dropped and keeps neither the
-    /// file nor a lock. A look that fails, as when the file was removed or is damaged, changes
-    /// nothing: reads show what was seen last, the thread looks again at the next change, and
-    /// [`Db::following`] reports the error. See
+    /// The thread ends when the last [`Db`] handle on the file is dropped, which waits for a look
+    /// in progress, and keeps neither the file nor a lock. A look that fails, as when the file was
+    /// removed or is damaged, changes nothing: reads show what was seen last, the thread looks
+    /// again at the next change, and [`Db::following`] reports the error. A shared writer whose
+    /// writes failed reports [`Error::Poisoned`] and stops following. See
     /// [Following other processes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#following-other-processes).
     ///
     /// # Examples
@@ -1958,6 +1960,7 @@ impl<T: Data> Shared<T> {
             return Ok(Caught::Still);
         }
         let store = self.store();
+        store.check_healthy()?;
         match store.follow(holds, upto)? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
@@ -2006,6 +2009,7 @@ impl<T: Data> Shared<T> {
             drop(branches);
             gone.iter().for_each(|branch| branch.retire());
         }
+        self.step("adopted");
         self.queue.lock().waiting.push(Pending {
             frame,
             refs: tip.clone(),
@@ -2167,7 +2171,9 @@ impl<T: Data> Shared<T> {
         if self.options.read_only {
             return self.refresh();
         }
-        match self.store().news()? {
+        let store = self.store();
+        store.check_healthy()?;
+        match store.news()? {
             News::Nothing => Ok(false),
             News::Named(seq) => self.catch_up_to(seq),
             News::Replaced => self.catch_up(),
@@ -4954,7 +4960,9 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// Read errors, such as [`Error::Corrupt`] for a damaged branch table, and [`Error::Io`].
+    /// Read errors, such as [`Error::Corrupt`] for a damaged branch table, and [`Error::Io`]. A
+    /// shared writer whose earlier write or sync failed returns [`Error::Poisoned`] and catches up
+    /// with nothing.
     ///
     /// # Examples
     ///
