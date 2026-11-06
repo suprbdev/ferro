@@ -2902,6 +2902,407 @@ fn small_spilled_values_shared_by_very_many_keys_land() {
     }
 }
 
+#[test]
+fn a_small_held_value_put_under_very_many_keys_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let shared = "h".repeat(600);
+    let b: Db<Spilled> = fast().open(&path).unwrap();
+    b.update(|root| {
+        root.insert(0, shared.clone());
+    })
+    .unwrap();
+    drop(b);
+    fs::copy(&path, dir.path().join("a.ferro")).unwrap();
+    let a: Db<Spilled> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Spilled> = fast().open(&path).unwrap();
+    a.update(|root| {
+        for key in 1..100_000u64 {
+            root.insert(key, shared.clone());
+        }
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+}
+
+type Pages = Map<u64, String>;
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct PageBytes(u64);
+
+impl Summary<u64, Pages> for PageBytes {
+    fn of(key: &u64, value: &Pages) -> Self {
+        let bytes = value
+            .iter()
+            .fold(0u64, |sum, (_, page)| sum.wrapping_add(page.len() as u64));
+        PageBytes(key.wrapping_add(bytes))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        PageBytes(self.0.wrapping_add(other.0))
+    }
+}
+
+type Books = Map<u64, Pages, PageBytes>;
+
+const PAGE_BYTES: usize = 32 << 10;
+
+fn book(seed: u64, pages: u64) -> Pages {
+    (0..pages)
+        .map(|at| {
+            let mut page = format!("{seed}:{at}:");
+            page.extend(std::iter::repeat_n('p', PAGE_BYTES - page.len()));
+            (at, page)
+        })
+        .collect()
+}
+
+fn shelved(dir: &TempDir, keys: &[u64], pages: u64) -> (Db<Books>, Db<Books>) {
+    let a: Db<Books> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for (seed, key) in keys.iter().enumerate() {
+        a.update(|root| {
+            root.insert(*key, book(seed as u64, pages));
+        })
+        .unwrap();
+    }
+    let b: Db<Books> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    (a, b)
+}
+
+#[test]
+fn small_edits_beside_held_nested_maps_past_the_allowance_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = level_zero_keys(13);
+    let (a, b) = shelved(&dir, &keys[..10], 1_024);
+    let edits: [&[usize]; 2] = [&[10], &[11, 12, 12]];
+    for edit in edits {
+        for (commit, at) in edit.iter().enumerate() {
+            a.update(|root| {
+                root.insert(keys[*at], book(*at as u64, 2 + commit as u64));
+            })
+            .unwrap();
+        }
+        let bundle = a.bundle(&b.have().unwrap()).unwrap();
+        assert!(
+            bundle.as_bytes().len() < 64 << 10,
+            "{}",
+            bundle.as_bytes().len()
+        );
+        assert_eq!(
+            b.receive("a", &bundle, unmerged).unwrap().outcome,
+            Outcome::FastForward,
+            "{} commits beside 320 MiB of pages the receiver holds",
+            edit.len()
+        );
+        assert_eq!(b.read().summary(), a.read().summary());
+    }
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_small_edit_beside_held_nested_maps_of_numbers_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = level_zero_keys(15);
+    let entries = 180_000 * u64::from(cases(1));
+    let a: Db<Outer<InnerSum>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for (seed, key) in keys[..14].iter().enumerate() {
+        a.update(|root| {
+            root.insert(
+                *key,
+                (0..entries).map(|at| (at, at ^ seed as u64)).collect(),
+            );
+        })
+        .unwrap();
+    }
+    let b: Db<Outer<InnerSum>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    a.update(|root| {
+        root.insert(keys[14], inner(3, 5));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    assert!(
+        bundle.as_bytes().len() < 4 << 10,
+        "{}",
+        bundle.as_bytes().len()
+    );
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+}
+
+thread_local! {
+    static SUMMARIZED: std::cell::RefCell<BTreeMap<(u64, usize), usize>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Counted(u64);
+
+impl Summary<u64, Inner> for Counted {
+    fn of(key: &u64, value: &Inner) -> Self {
+        let len = value.iter().count();
+        SUMMARIZED.with(|summarized| *summarized.borrow_mut().entry((*key, len)).or_insert(0) += 1);
+        Counted(key.wrapping_add(len as u64))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Counted(self.0.wrapping_add(other.0))
+    }
+}
+
+#[test]
+fn an_entry_in_every_version_of_a_node_a_bundle_rewrites_is_summarized_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = level_zero_keys(12);
+    let a: Db<Outer<Counted>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        for (seed, key) in keys[..6].iter().enumerate() {
+            root.insert(*key, inner(seed as u64, 10 + seed as u64));
+        }
+    })
+    .unwrap();
+    let b: Db<Outer<Counted>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    for (seed, key) in keys[6..].iter().enumerate() {
+        a.update(|root| {
+            root.insert(*key, inner(seed as u64, 20 + seed as u64));
+        })
+        .unwrap();
+    }
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    SUMMARIZED.with(|summarized| summarized.borrow_mut().clear());
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let summarized = SUMMARIZED.with(|summarized| summarized.borrow().clone());
+    assert_eq!(summarized.len(), 12, "{summarized:?}");
+    assert!(
+        summarized.values().all(|calls| *calls == 1),
+        "{summarized:?}"
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+}
+
+type Notebook = Map<u64, (String, Pages), PageBytes>;
+
+impl Summary<u64, (String, Pages)> for PageBytes {
+    fn of(key: &u64, value: &(String, Pages)) -> Self {
+        let pages = <PageBytes as Summary<u64, Pages>>::of(key, &value.1).0;
+        PageBytes(pages.wrapping_add(value.0.len() as u64))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        PageBytes(self.0.wrapping_add(other.0))
+    }
+}
+
+#[test]
+fn a_held_value_whose_summary_reads_a_large_map_lands_under_a_few_keys_and_not_many() {
+    for (keys, lands) in [(4u64, true), (400, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.ferro");
+        let b: Db<Notebook> = fast().open(&path).unwrap();
+        b.update(|root| {
+            root.insert(0, ("n".repeat(600), book(0, 512)));
+        })
+        .unwrap();
+        drop(b);
+        fs::copy(&path, dir.path().join("a.ferro")).unwrap();
+        let a: Db<Notebook> = fast().open(dir.path().join("a.ferro")).unwrap();
+        let b: Db<Notebook> = fast().open(&path).unwrap();
+        a.update(|root| {
+            let note = (*root.get(&0).unwrap()).clone();
+            for key in 1..=keys {
+                root.insert(key, note.clone());
+            }
+        })
+        .unwrap();
+        let bundle = a.bundle(&b.have().unwrap()).unwrap();
+        assert!(
+            bundle.as_bytes().len() < 64 << 10,
+            "{}",
+            bundle.as_bytes().len()
+        );
+        let started = Instant::now();
+        let result = b.receive("a", &bundle, unmerged);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            assert_eq!(b.read().summary(), a.read().summary());
+            continue;
+        }
+        match result {
+            Err(Error::Bundle(message)) => assert!(message.contains("size allows"), "{message}"),
+            other => panic!("read a held 16 MiB map once for each of {keys} keys: {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(b.branches(), vec!["main".to_string()]);
+    }
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Aside(u64);
+
+impl Summary<u64, Inner> for Aside {
+    fn of(key: &u64, value: &Inner) -> Self {
+        let inner = thread::scope(|scope| {
+            scope
+                .spawn(|| value.iter().fold(0u64, |sum, (_, v)| sum.wrapping_add(*v)))
+                .join()
+                .unwrap()
+        });
+        Aside(key.wrapping_add(inner))
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Aside(self.0.wrapping_add(other.0))
+    }
+}
+
+#[test]
+fn a_summary_that_reads_a_sent_nested_map_on_another_thread_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Outer<Aside>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    a.update(|root| {
+        for key in 0..40u64 {
+            root.insert(key, inner(key, 1 + key * 50));
+        }
+    })
+    .unwrap();
+    let b: Db<Outer<Aside>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    a.update(|root| {
+        root.update(&7, |value| {
+            value.insert(9_000, 1);
+        });
+        root.insert(100, inner(100, 3_000));
+    })
+    .unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().summary(), a.read().summary());
+    b.verify_typed().unwrap();
+}
+
+#[derive(Clone, Default)]
+struct Lattice(u64);
+
+impl Data for Lattice {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        if self.0 == 0 {
+            w.varint(0);
+            return Ok(());
+        }
+        let mut rng = Rng::new(self.0);
+        w.child(|w| {
+            for _ in 0..(64 << 20) / 8 {
+                w.raw(&rng.next().to_le_bytes());
+            }
+            Ok(())
+        })?;
+        let (mut below, mut count) = (None, 0u64);
+        for level in 0..self.0 {
+            below = Some(w.child(|w| {
+                w.u8(level as u8);
+                w.varint(2);
+                w.varint(2 * level);
+                w.varint(2 * level + 1);
+                for _ in 0..2 {
+                    w.u8(0);
+                    w.varint(level);
+                }
+                for _ in 0..3 {
+                    match below {
+                        Some(ptr) => {
+                            w.varint(count);
+                            w.link(ptr);
+                        }
+                        None => w.varint(0),
+                    }
+                }
+                Ok(())
+            })?);
+            count = 3 * count + 2;
+        }
+        let key = key_at_level(0);
+        let node = w.child(|w| {
+            w.u8(0);
+            w.varint(1);
+            w.varint(key);
+            w.u8(0);
+            w.varint(count);
+            w.link(below.expect("the lattice has levels"));
+            w.varint(0);
+            w.varint(0);
+            Ok(())
+        })?;
+        w.varint(1);
+        w.varint(0);
+        w.link(node);
+        Ok(())
+    }
+
+    fn decode(r: &mut ferro::codec::Decoder<'_>) -> ferro::Result<Self> {
+        if r.varint()? == 0 {
+            return Ok(Lattice(0));
+        }
+        r.varint()?;
+        r.link()?;
+        Ok(Lattice(1))
+    }
+}
+
+#[test]
+fn verify_typed_checks_a_nested_map_before_a_summary_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lattice.ferro");
+    let lattice: Db<Lattice> = fast().open(&path).unwrap();
+    lattice.update(|root| *root = Lattice(21)).unwrap();
+    drop(lattice);
+    let outer: Db<Outer<InnerSum>> = fast().open(&path).unwrap();
+    outer.verify().unwrap();
+    let started = Instant::now();
+    match outer.verify_typed() {
+        Err(Error::Corrupt(_)) => {}
+        other => panic!("typed verify passed a nested map whose nodes share children: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Tagged {
     #[key]
