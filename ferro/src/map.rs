@@ -5299,7 +5299,7 @@ impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
     /// # Panics
     ///
     /// Panics if a node or value on the way cannot be read, as [`Map::get`] does.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn lend<Q>(&mut self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
@@ -5687,6 +5687,26 @@ impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
     pub(crate) fn next_back_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
         let index = self.retreat()?;
         self.back.last().map(|frame| f(&frame.node.keys[index]))
+    }
+
+    /// Returns what `f` makes of the key of the next entry from the front, lent rather than
+    /// cloned, and leaves the entry to be yielded next.
+    pub(crate) fn front_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
+        let index = self.advance()?;
+        let frame = self.front.last_mut()?;
+        frame.position -= if frame.node.children.is_empty() { 2 } else { 1 };
+        self.remaining += 1;
+        Some(f(&frame.node.keys[index]))
+    }
+
+    /// Returns what `f` makes of the key of the next entry from the back, lent rather than
+    /// cloned, and leaves the entry to be yielded next from the back.
+    pub(crate) fn back_key_with<R>(&mut self, f: impl FnOnce(&K) -> R) -> Option<R> {
+        let index = self.retreat()?;
+        let frame = self.back.last_mut()?;
+        frame.position += if frame.node.children.is_empty() { 2 } else { 1 };
+        self.remaining += 1;
+        Some(f(&frame.node.keys[index]))
     }
 
     /// Steps to the next entry from the front and returns what `f` makes of its key and value,
@@ -6774,6 +6794,46 @@ mod tests {
         drop((walk, values, in_leaf, in_parent, higher));
         epoch::flush();
         assert!(watched.iter().all(|weak| weak.strong_count() == 0));
+    }
+
+    #[test]
+    fn peeking_at_either_end_leaves_the_entry_to_be_yielded() {
+        let map: Map<u64, u64> = (0..5_000).map(|key| (key * 2, key)).collect();
+        let mut state = 7u64;
+        for (low, high) in [(0, 10_000), (3, 9), (1_001, 8_401), (6, 7), (4_000, 4_000)] {
+            let wanted: Vec<u64> = (low..high).filter(|key| key % 2 == 0).collect();
+            let mut iter = map.range(low..high);
+            let (mut front, mut back) = (Vec::new(), Vec::new());
+            loop {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let left = iter.len();
+                assert_eq!(left, wanted.len() - front.len() - back.len());
+                let head = iter.front_key_with(|key| *key);
+                let tail = iter.back_key_with(|key| *key);
+                assert_eq!(iter.len(), left);
+                let rest = &wanted[front.len()..wanted.len() - back.len()];
+                assert_eq!(head, rest.first().copied(), "{low}..{high}");
+                assert_eq!(tail, rest.last().copied(), "{low}..{high}");
+                let taken = match state >> 61 {
+                    0 | 1 => iter.next().map(|(key, _)| front.push(key)),
+                    2 | 3 => iter.next_back().map(|(key, _)| back.push(key)),
+                    4 => iter.next_key_with(|key| front.push(*key)),
+                    5 => iter.next_back_key_with(|key| back.push(*key)),
+                    _ => {
+                        let rest: Vec<u64> = iter.by_ref().map(|(key, _)| key).collect();
+                        front.extend(rest);
+                        None
+                    }
+                };
+                if taken.is_none() {
+                    break;
+                }
+            }
+            front.extend(back.iter().rev());
+            assert_eq!(front, wanted, "{low}..{high}");
+        }
     }
 
     #[test]

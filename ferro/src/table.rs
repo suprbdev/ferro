@@ -71,7 +71,9 @@
 //!
 //! `find()` returns a view with the equality lookups of each non-unique index, which return
 //! [`Matches`] instead of an [`IndexIter`]. [`Matches::and`] and [`Matches::or`] combine them by
-//! primary key and read a row only for a key that matches, as described on [`Matches`].
+//! primary key and read a row only for a key that matches, as described on [`Matches`]. They also
+//! take a range or prefix lookup made on the table, against which a side with at most a quarter
+//! of its keys tests each of its keys by reading that key's row, as [`IntoMatches`] describes.
 //!
 //! # Unique indexes
 //!
@@ -927,6 +929,26 @@ trait KeyCursor<K>: Send {
 trait EntryCursor<K, C>: KeyCursor<K> {
     fn forward_covered(&mut self) -> Option<(K, C)>;
     fn backward_covered(&mut self) -> Option<(K, C)>;
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<K, C>>
+    where
+        K: Ord + Send + 'static,
+        C: Send + 'static;
+}
+
+fn listed<K, C>(mut entries: Box<dyn EntryCursor<K, C>>) -> Box<dyn Stream<K, C>>
+where
+    K: Ord + Send + 'static,
+    C: Send + 'static,
+{
+    let left = entries.left();
+    let collect: Collect<K, C> = Box::new(move || {
+        let mut items = Vec::with_capacity(left);
+        while let Some((key, covered)) = entries.forward_covered() {
+            items.push((key, Some(covered)));
+        }
+        items
+    });
+    Box::new(Listed::pending(left, collect))
 }
 
 /// Builds an index entry's covered fields `C` from its indexed value `I` and the fields `S` it
@@ -939,6 +961,15 @@ pub type Project<I, S, C> = fn(&I, S) -> C;
 
 /// The [`Project`] of an index that covers nothing.
 pub fn plain<I>(_value: &I, _stored: ()) {}
+
+/// Calls `f` on each value an index holds for the row, until `f` returns `true`, and returns
+/// whether it did.
+///
+/// The [`Record`](derive@crate::Record) derive generates one for every index and passes it to
+/// the range and prefix lookups, so that [`Matches::and`] can test a row against a lookup without
+/// reading the lookup's entries: one value for most indexes, each element for an
+/// `#[index(each)]`, and none for a unique `Option` field that holds `None`.
+pub type Indexed<T, I> = fn(&T, &mut dyn FnMut(&I) -> bool) -> bool;
 
 /// Whether a covered field is unchanged and its index entry can stay as it is.
 ///
@@ -983,6 +1014,44 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for Entries<I, 
         self.iter
             .next_back_with(|entry, stored| (entry.1.clone(), project(&entry.0, stored.clone())))
     }
+
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<K, C>>
+    where
+        K: Ord + Send + 'static,
+        C: Send + 'static,
+    {
+        listed(self)
+    }
+}
+
+trait Span<I, K> {
+    type Edge: Send;
+    fn edges(&mut self) -> Option<[Self::Edge; 2]>;
+    fn holds(edges: &[Self::Edge; 2], value: &I, key: &K) -> bool;
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> Span<I, K> for Entries<I, K, S, C> {
+    type Edge = (I, K);
+
+    fn edges(&mut self) -> Option<[(I, K); 2]> {
+        let low = self.iter.front_key_with(Clone::clone)?;
+        let high = self.iter.back_key_with(Clone::clone)?;
+        Some([low, high])
+    }
+
+    fn holds([low, high]: &[(I, K); 2], value: &I, key: &K) -> bool {
+        let above = match value.cmp(&low.0) {
+            Ordering::Less => false,
+            Ordering::Equal => *key >= low.1,
+            Ordering::Greater => true,
+        };
+        above
+            && match value.cmp(&high.0) {
+                Ordering::Less => true,
+                Ordering::Equal => *key <= high.1,
+                Ordering::Greater => false,
+            }
+    }
 }
 
 struct Holders<I, K> {
@@ -1014,6 +1083,27 @@ impl<I: Data + Ord, K: Data + Ord> EntryCursor<K, ()> for Holders<I, K> {
     #[inline]
     fn backward_covered(&mut self) -> Option<(K, ())> {
         self.backward().map(|key| (key, ()))
+    }
+
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<K, ()>>
+    where
+        K: Ord + Send + 'static,
+    {
+        listed(self)
+    }
+}
+
+impl<I: Data + Ord, K: Data + Ord> Span<I, K> for Holders<I, K> {
+    type Edge = I;
+
+    fn edges(&mut self) -> Option<[I; 2]> {
+        let low = self.iter.front_key_with(Clone::clone)?;
+        let high = self.iter.back_key_with(Clone::clone)?;
+        Some([low, high])
+    }
+
+    fn holds([low, high]: &[I; 2], value: &I, _key: &K) -> bool {
+        low <= value && value <= high
     }
 }
 
@@ -1052,6 +1142,82 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C> EntryCursor<K, C> for CoveredHold
         self.iter
             .next_back_with(|_, held| (held.0.clone(), project(held.1.clone())))
     }
+
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<K, C>>
+    where
+        K: Ord + Send + 'static,
+        C: Send + 'static,
+    {
+        listed(self)
+    }
+}
+
+impl<I: Data + Ord, K: Data + Ord, S: Data, C> Span<I, K> for CoveredHolders<I, K, S, C> {
+    type Edge = I;
+
+    fn edges(&mut self) -> Option<[I; 2]> {
+        let low = self.iter.front_key_with(Clone::clone)?;
+        let high = self.iter.back_key_with(Clone::clone)?;
+        Some([low, high])
+    }
+
+    fn holds([low, high]: &[I; 2], value: &I, _key: &K) -> bool {
+        low <= value && value <= high
+    }
+}
+
+struct Spanned<T: Record, I, X> {
+    cursor: X,
+    indexed: Indexed<T, I>,
+}
+
+impl<T: Record, I, X: KeyCursor<T::Key>> KeyCursor<T::Key> for Spanned<T, I, X> {
+    #[inline(always)]
+    fn forward(&mut self) -> Option<T::Key> {
+        self.cursor.forward()
+    }
+
+    #[inline(always)]
+    fn backward(&mut self) -> Option<T::Key> {
+        self.cursor.backward()
+    }
+
+    fn left(&self) -> usize {
+        self.cursor.left()
+    }
+}
+
+impl<T, I, X, C> EntryCursor<T::Key, C> for Spanned<T, I, X>
+where
+    T: Record,
+    I: 'static,
+    X: EntryCursor<T::Key, C> + Span<I, T::Key> + 'static,
+{
+    #[inline(always)]
+    fn forward_covered(&mut self) -> Option<(T::Key, C)> {
+        self.cursor.forward_covered()
+    }
+
+    #[inline(always)]
+    fn backward_covered(&mut self) -> Option<(T::Key, C)> {
+        self.cursor.backward_covered()
+    }
+
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<T::Key, C>>
+    where
+        T::Key: Ord + Send + 'static,
+        C: Send + 'static,
+    {
+        Box::new(Ranged {
+            spanned: Some(*self),
+            rows: None,
+            edges: None,
+            listed: Listed::ready(VecDeque::new()),
+            covering: false,
+            lead: None,
+            landed: None,
+        })
+    }
 }
 
 struct Uncovered<K, C>(Box<dyn EntryCursor<K, C>>);
@@ -1070,13 +1236,20 @@ impl<K, C> KeyCursor<K> for Uncovered<K, C> {
     }
 }
 
-impl<K, C> EntryCursor<K, ()> for Uncovered<K, C> {
+impl<K, C: 'static> EntryCursor<K, ()> for Uncovered<K, C> {
     fn forward_covered(&mut self) -> Option<(K, ())> {
         self.0.forward().map(|key| (key, ()))
     }
 
     fn backward_covered(&mut self) -> Option<(K, ())> {
         self.0.backward().map(|key| (key, ()))
+    }
+
+    fn into_stream(self: Box<Self>) -> Box<dyn Stream<K, ()>>
+    where
+        K: Ord + Send + 'static,
+    {
+        listed(self)
     }
 }
 
@@ -1153,6 +1326,14 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
             rows: rows.finder(),
             entries: Box::new(entries),
         }
+    }
+
+    #[inline(always)]
+    fn spanned<I: Data + Ord, X>(rows: &Map<T::Key, T>, cursor: X, indexed: Indexed<T, I>) -> Self
+    where
+        X: EntryCursor<T::Key, C> + Span<I, T::Key> + 'static,
+    {
+        IndexIter::held(rows, Spanned { cursor, indexed })
     }
 
     /// The primary keys of the rows this lookup would yield, in the same order, without reading
@@ -1348,8 +1529,15 @@ impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 /// [`IndexIter`].
 ///
 /// An [`IndexIter`] from a lookup on the table, such as `by_x_range` or `by_x_prefix`, is not in
-/// key order, so the first time the combination is read its keys and covered fields are read
-/// in full and sorted. A lookup of one value is in key order already and sorts in one pass.
+/// key order. A range or prefix lookup passed to `and` or `or` is tested rather than read when
+/// the combination only looks keys up in it, because the other side of an `and` has at most a
+/// quarter of its keys: each key that side offers is tested by reading its row from the table the
+/// lookup was made on and checking the indexed value against the span of entries the lookup has
+/// left. Otherwise the first time the combination is read the lookup's keys and covered fields are
+/// read in full and sorted, as they are for one that leads the combination through
+/// [`into_matches`](IntoMatches::into_matches), one whose covered fields the combination yields,
+/// and every other [`IndexIter`]. A lookup of one value is in key order already and sorts in one
+/// pass.
 ///
 /// # Examples
 ///
@@ -1391,18 +1579,9 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for IndexIter<T, C> {
     type Covered = C;
 
     fn into_matches(self) -> Matches<T, C> {
-        let mut entries = self.entries;
-        let left = entries.left();
-        let collect: Collect<T::Key, C> = Box::new(move || {
-            let mut items = Vec::with_capacity(left);
-            while let Some((key, covered)) = entries.forward_covered() {
-                items.push((key, Some(covered)));
-            }
-            items
-        });
         Matches {
             rows: self.rows,
-            stream: Box::new(Listed::pending(left, collect)),
+            stream: self.entries.into_stream(),
             started: false,
         }
     }
@@ -1421,18 +1600,21 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 /// The `find()` view the [`Record`](derive@crate::Record) derive generates returns one for each
 /// equality lookup, `by_x(&value)`, `by_x_after`, `by_x_some`, `by_x_some_after` and a composite's
 /// `by_a_b(&(a, b))`. [`and`](Matches::and) and [`or`](Matches::or) combine them, and any
-/// [`IndexIter`], by primary key. A combination reads no row until a key matches, and yields each
-/// matching row once, from either end.
+/// [`IndexIter`], by primary key. A combination reads a row only for a key that matches or that
+/// it tests against a range or prefix lookup, and yields each matching row once, from either end.
 ///
 /// An index entry is `(value, key)`, so the keys of one value come in key order and two lookups
 /// of similar size are walked side by side. When one side of an `and` has at least four times the
 /// keys of the other, only the smaller is walked and each of its keys is looked up in the larger,
-/// so a few keys against many cost a few searches. The choice is made when the combination is
-/// first read. A combination reads the indexes as they were when its lookups were built.
+/// so a few keys against many cost a few searches. A range or prefix lookup on the table is not
+/// in key order, so it is looked up by reading the row of each key and testing it against the
+/// range, and when it has less than four times the keys of the other side it is read in full and
+/// sorted instead, as [`IntoMatches`] describes. The choice is made when the combination is first
+/// read. A combination reads the indexes and rows as they were when its lookups were built.
 ///
 /// [`keys`](Matches::keys) gives the keys alone and [`covered`](Matches::covered) the covered
 /// fields of the leftmost lookup, so a combination whose first index covers what you show reads
-/// no rows at all.
+/// no rows, but those it tests against a range or prefix lookup.
 ///
 /// # Examples
 ///
@@ -1486,15 +1668,42 @@ pub struct Matches<T: Record, C = ()> {
 impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// The rows that both this combination and `other` match.
     ///
-    /// `other` can be any [`IntoMatches`], so a range or prefix lookup on the table joins too.
-    /// The result keeps this side's covered fields. If this combination has already yielded rows,
-    /// what it has left is read into a sorted list first.
+    /// `other` can be any [`IntoMatches`], so a range or prefix lookup on the table joins too,
+    /// tested key by key when this side has at most a quarter of its keys and read in full and
+    /// sorted otherwise. The result keeps this side's covered fields. If this combination has
+    /// already yielded rows, what it has left is read into a sorted list first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     #[index]
+    ///     day: u32,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=400 {
+    ///     let customer = if id % 100 == 0 { "wile" } else { "road" };
+    ///     orders.insert(Order { id, customer: customer.into(), day: id as u32 % 30 });
+    /// }
+    ///
+    /// let late: Vec<u64> =
+    ///     orders.find().by_customer("wile").and(orders.by_day_range(5..)).keys().collect();
+    /// assert_eq!(late, [100, 200, 400]);
+    /// ```
     pub fn and<M: IntoMatches<T>>(self, other: M) -> Matches<T, C> {
         let left = self.unstarted();
-        let right = other.into_matches().unstarted();
+        let right = other.into_matches().unstarted().adopted();
         Matches {
             rows: left.rows,
-            stream: Box::new(All::new(left.stream, Box::new(Blind(right.stream)))),
+            stream: Box::new(All::new(left.stream, Box::new(Blind(right)))),
             started: false,
         }
     }
@@ -1507,25 +1716,27 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// yielded rows, what it has left is read into a sorted list first.
     pub fn or<M: IntoMatches<T, Covered = C>>(self, other: M) -> Matches<T, C> {
         let left = self.unstarted();
-        let right = other.into_matches().unstarted();
+        let right = other.into_matches().unstarted().adopted();
         Matches {
             rows: left.rows,
             stream: Box::new(Any {
-                sides: vec![left.stream, right.stream],
+                sides: vec![left.stream, right],
                 landed: None,
+                passed: None,
             }),
             started: false,
         }
     }
 
-    /// The primary keys of the matching rows, in key order, without reading any row.
+    /// The primary keys of the matching rows, in key order, reading no row but those tested
+    /// against a range or prefix lookup, as [`IntoMatches`] describes.
     pub fn keys(self) -> MatchKeys<T> {
         MatchKeys(Box::new(Blind(self.stream)))
     }
 
     /// `(key, fields)` pairs of the matching rows in key order, where `fields` are the covered
-    /// fields of the leftmost lookup that holds the row, read from its index without reading any
-    /// row.
+    /// fields of the leftmost lookup that holds the row, read from its index. It reads no row but
+    /// those tested against a range or prefix lookup, as [`IntoMatches`] describes.
     pub fn covered(mut self) -> MatchCovered<T, C> {
         self.stream.cover();
         MatchCovered(self.stream)
@@ -1554,6 +1765,12 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
             stream: Box::new(Listed::ready(items)),
             started: false,
         }
+    }
+
+    fn adopted(self) -> Box<dyn Stream<T::Key, C>> {
+        let mut stream = self.stream;
+        stream.adopt(&mut Some(self.rows));
+        stream
     }
 }
 
@@ -1658,7 +1875,8 @@ impl<T: Record, C> DoubleEndedIterator for Matches<T, C> {
     }
 }
 
-/// The primary keys of [`Matches`], in key order, from [`Matches::keys`]. Reads no rows.
+/// The primary keys of [`Matches`], in key order, from [`Matches::keys`]. Reads no rows but those
+/// tested against a range or prefix lookup.
 pub struct MatchKeys<T: Record>(Box<dyn Stream<T::Key, ()>>);
 
 impl<T: Record> Iterator for MatchKeys<T> {
@@ -1680,7 +1898,7 @@ impl<T: Record> DoubleEndedIterator for MatchKeys<T> {
 }
 
 /// `(key, covered fields)` pairs of [`Matches`], in key order, from [`Matches::covered`]. Reads
-/// no rows.
+/// no rows but those tested against a range or prefix lookup.
 pub struct MatchCovered<T: Record, C = ()>(Box<dyn Stream<T::Key, C>>);
 
 impl<T: Record, C> Iterator for MatchCovered<T, C> {
@@ -1730,6 +1948,25 @@ impl End {
             End::Back => key > target,
         }
     }
+
+    fn short<const PAST: bool, K: Ord>(self, key: &K, target: &K) -> bool {
+        self.before(key, target) || PAST && key == target
+    }
+}
+
+enum Probe<'a, K> {
+    At(&'a K),
+    Past(&'a K),
+    Gone,
+}
+
+impl<'a, K> Probe<'a, K> {
+    fn at(found: Option<&'a K>) -> Self {
+        match found {
+            Some(found) => Probe::At(found),
+            None => Probe::Gone,
+        }
+    }
 }
 
 trait Stream<K, C>: Send {
@@ -1738,9 +1975,12 @@ trait Stream<K, C>: Send {
     fn peek(&self, end: End) -> Option<&K>;
     fn fill(&mut self, end: End) -> Option<&K>;
     fn seek(&mut self, end: End, target: &K) -> Option<&K>;
+    fn pass(&mut self, end: End, target: &K) -> Option<&K>;
     fn take(&mut self, end: End) -> Option<(K, Option<C>)>;
-    fn probe(&mut self, end: End, target: &K) -> Option<&K>;
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K>;
     fn found(&mut self) -> Option<C>;
+    fn follow(&mut self, _lead: usize) {}
+    fn adopt(&mut self, _rows: &mut dyn std::any::Any) {}
 }
 
 const STEPS: usize = 16;
@@ -1881,6 +2121,32 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> EqualStream<I, K, S, C> {
         let stored = self.index.get(&(value.clone(), key.clone()))?;
         Some((self.project)(value, (*stored).clone()))
     }
+
+    fn reach<const PAST: bool>(&mut self, end: End, target: &K) -> Option<&K> {
+        self.start();
+        let slot = end.slot();
+        if let Some((key, _)) = &self.held[slot]
+            && !end.short::<PAST, K>(key, target)
+        {
+            return self.peek(end);
+        }
+        self.held[slot] = None;
+        let mut steps = 0;
+        loop {
+            if steps == STEPS && self.iter.len() > 0 {
+                self.rebuild(end, target);
+            }
+            steps += 1;
+            let next = match self.read(end) {
+                Some(next) => next,
+                None => self.held[end.other().slot()].take()?,
+            };
+            if !end.short::<PAST, K>(&next.0, target) {
+                self.held[slot] = Some(next);
+                return self.peek(end);
+            }
+        }
+    }
 }
 
 impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStream<I, K, S, C> {
@@ -1905,29 +2171,11 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStrea
     }
 
     fn seek(&mut self, end: End, target: &K) -> Option<&K> {
-        self.start();
-        let slot = end.slot();
-        if let Some((key, _)) = &self.held[slot]
-            && !end.before(key, target)
-        {
-            return self.peek(end);
-        }
-        self.held[slot] = None;
-        let mut steps = 0;
-        loop {
-            if steps == STEPS && self.iter.len() > 0 {
-                self.rebuild(end, target);
-            }
-            steps += 1;
-            let next = match self.read(end) {
-                Some(next) => next,
-                None => self.held[end.other().slot()].take()?,
-            };
-            if !end.before(&next.0, target) {
-                self.held[slot] = Some(next);
-                return self.peek(end);
-            }
-        }
+        self.reach::<false>(end, target)
+    }
+
+    fn pass(&mut self, end: End, target: &K) -> Option<&K> {
+        self.reach::<true>(end, target)
     }
 
     fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
@@ -1941,14 +2189,14 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStrea
         Some((key, covered))
     }
 
-    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
         self.start();
         let (Some(first), Some(last), Some(value)) = (&self.first, &self.last, &self.value) else {
-            return None;
+            return Probe::Gone;
         };
         let target = match end {
-            End::Front if target > last => return None,
-            End::Back if target < first => return None,
+            End::Front if target > last => return Probe::Gone,
+            End::Back if target < first => return Probe::Gone,
             End::Front if target < first => first,
             End::Back if target > last => last,
             _ => target,
@@ -1965,13 +2213,15 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStrea
             End::Front => cursor.seek(probe),
             End::Back => cursor.seek_back(probe),
         };
-        let entry = cursor.key()?;
+        let Some(entry) = cursor.key() else {
+            return Probe::Gone;
+        };
         let inside = entry.0 == *value
             && match end {
                 End::Front => entry.1 <= *last,
                 End::Back => entry.1 >= *first,
             };
-        inside.then_some(&entry.1)
+        Probe::at(inside.then_some(&entry.1))
     }
 
     fn found(&mut self) -> Option<C> {
@@ -2007,18 +2257,47 @@ impl<K: Ord, C> Listed<K, C> {
         }
     }
 
+    fn sorted(mut items: Vec<(K, Option<C>)>) -> Self {
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        items.dedup_by(|a, b| a.0 == b.0);
+        Listed::ready(items.into())
+    }
+
     fn items(&mut self) -> &mut VecDeque<(K, Option<C>)> {
         if let Some((_, collect)) = self.pending.take() {
-            let mut items = collect();
-            items.sort_by(|a, b| a.0.cmp(&b.0));
-            items.dedup_by(|a, b| a.0 == b.0);
-            self.items = items.into();
+            *self = Listed::sorted(collect());
         }
         &mut self.items
+    }
+
+    fn reach<const PAST: bool>(&mut self, end: End, target: &K) -> Option<&K> {
+        let items = self.items();
+        match end {
+            End::Front => {
+                let behind = match PAST {
+                    false => items.partition_point(|(key, _)| key < target),
+                    true => items.partition_point(|(key, _)| key <= target),
+                };
+                items.drain(..behind);
+            }
+            End::Back => {
+                let kept = match PAST {
+                    false => items.partition_point(|(key, _)| key <= target),
+                    true => items.partition_point(|(key, _)| key < target),
+                };
+                items.truncate(kept);
+            }
+        }
+        match end {
+            End::Front => self.items.front(),
+            End::Back => self.items.back(),
+        }
+        .map(|(key, _)| key)
     }
 }
 
 impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
+    #[inline]
     fn len(&self) -> usize {
         match &self.pending {
             Some((left, _)) => *left,
@@ -2026,8 +2305,10 @@ impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
         }
     }
 
+    #[inline]
     fn cover(&mut self) {}
 
+    #[inline]
     fn peek(&self, end: End) -> Option<&K> {
         match end {
             End::Front => self.items.front(),
@@ -2036,26 +2317,23 @@ impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
         .map(|(key, _)| key)
     }
 
+    #[inline]
     fn fill(&mut self, end: End) -> Option<&K> {
         self.items();
         self.peek(end)
     }
 
+    #[inline]
     fn seek(&mut self, end: End, target: &K) -> Option<&K> {
-        let items = self.items();
-        match end {
-            End::Front => {
-                let behind = items.partition_point(|(key, _)| key < target);
-                items.drain(..behind);
-            }
-            End::Back => {
-                let kept = items.partition_point(|(key, _)| key <= target);
-                items.truncate(kept);
-            }
-        }
-        self.peek(end)
+        self.reach::<false>(end, target)
     }
 
+    #[inline]
+    fn pass(&mut self, end: End, target: &K) -> Option<&K> {
+        self.reach::<true>(end, target)
+    }
+
+    #[inline]
     fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
         let items = self.items();
         match end {
@@ -2064,20 +2342,164 @@ impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
         }
     }
 
-    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+    #[inline]
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
         let items = self.items();
         let landed = match end {
             End::Front => items.partition_point(|(key, _)| key < target),
-            End::Back => items
-                .partition_point(|(key, _)| key <= target)
-                .checked_sub(1)?,
+            End::Back => match items.partition_point(|(key, _)| key <= target) {
+                0 => return Probe::Gone,
+                kept => kept - 1,
+            },
         };
         self.landed = landed;
-        self.items.get(landed).map(|(key, _)| key)
+        Probe::at(self.items.get(landed).map(|(key, _)| key))
+    }
+
+    #[inline]
+    fn found(&mut self) -> Option<C> {
+        self.items.get_mut(self.landed)?.1.take()
+    }
+}
+
+struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
+    spanned: Option<Spanned<T, I, X>>,
+    rows: Option<Finder<T::Key, T>>,
+    edges: Option<[X::Edge; 2]>,
+    listed: Listed<T::Key, C>,
+    covering: bool,
+    lead: Option<usize>,
+    landed: Option<(T::Key, bool)>,
+}
+
+impl<T, I, X, C> Ranged<T, I, X, C>
+where
+    T: Record,
+    X: EntryCursor<T::Key, C> + Span<I, T::Key>,
+{
+    #[inline]
+    fn listed(&mut self) -> &mut Listed<T::Key, C> {
+        if self.spanned.is_some() {
+            self.collect();
+        }
+        &mut self.listed
+    }
+
+    #[inline(never)]
+    fn collect(&mut self) {
+        if let Some(spanned) = &mut self.spanned {
+            let mut items = Vec::with_capacity(spanned.cursor.left());
+            while let Some((key, covered)) = spanned.cursor.forward_covered() {
+                items.push((key, Some(covered)));
+            }
+            self.listed = Listed::sorted(items);
+            self.spanned = None;
+            self.edges = None;
+            self.landed = None;
+        }
+    }
+
+    fn testing(&mut self) -> bool {
+        if self.edges.is_some() {
+            return true;
+        }
+        let (Some(spanned), Some(lead)) = (&mut self.spanned, self.lead) else {
+            return false;
+        };
+        if self.covering
+            || self.rows.is_none()
+            || lead.saturating_mul(RATIO) > spanned.cursor.left()
+        {
+            return false;
+        }
+        self.edges = spanned.cursor.edges();
+        self.edges.is_some()
+    }
+
+    fn holds(&mut self, key: &T::Key) -> bool {
+        let (Some(spanned), Some(edges), Some(rows)) = (&self.spanned, &self.edges, &mut self.rows)
+        else {
+            return false;
+        };
+        let indexed = spanned.indexed;
+        rows.lend(key)
+            .is_some_and(|row| indexed(row, &mut |value| X::holds(edges, value, key)))
+    }
+}
+
+impl<T, I, X, C> Stream<T::Key, C> for Ranged<T, I, X, C>
+where
+    T: Record,
+    I: 'static,
+    X: EntryCursor<T::Key, C> + Span<I, T::Key> + 'static,
+    C: Send + 'static,
+{
+    fn len(&self) -> usize {
+        match &self.spanned {
+            Some(spanned) => spanned.cursor.left(),
+            None => self.listed.len(),
+        }
+    }
+
+    fn cover(&mut self) {
+        self.covering = true;
+        self.edges = None;
+        self.landed = None;
+    }
+
+    fn peek(&self, end: End) -> Option<&T::Key> {
+        self.listed.peek(end)
+    }
+
+    fn fill(&mut self, end: End) -> Option<&T::Key> {
+        self.listed().fill(end)
+    }
+
+    fn seek(&mut self, end: End, target: &T::Key) -> Option<&T::Key> {
+        self.listed().seek(end, target)
+    }
+
+    fn pass(&mut self, end: End, target: &T::Key) -> Option<&T::Key> {
+        self.listed().pass(end, target)
+    }
+
+    fn take(&mut self, end: End) -> Option<(T::Key, Option<C>)> {
+        self.listed().take(end)
+    }
+
+    fn probe(&mut self, end: End, target: &T::Key) -> Probe<'_, T::Key> {
+        if !self.testing() {
+            return self.listed().probe(end, target);
+        }
+        let known = matches!(&self.landed, Some((key, _)) if key == target);
+        if !known {
+            let holds = self.holds(target);
+            self.landed = Some((target.clone(), holds));
+        }
+        match &self.landed {
+            Some((key, true)) => Probe::At(key),
+            Some((key, false)) => Probe::Past(key),
+            None => Probe::Gone,
+        }
     }
 
     fn found(&mut self) -> Option<C> {
-        self.items.get_mut(self.landed)?.1.take()
+        match self.edges {
+            Some(_) => None,
+            None => self.listed.found(),
+        }
+    }
+
+    fn follow(&mut self, lead: usize) {
+        self.lead = Some(lead);
+    }
+
+    fn adopt(&mut self, rows: &mut dyn std::any::Any) {
+        if self.rows.is_none()
+            && let Some(rows) = rows.downcast_mut::<Option<Finder<T::Key, T>>>()
+        {
+            self.rows = rows.take();
+        }
     }
 }
 
@@ -2102,16 +2524,28 @@ impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
         self.0.seek(end, target)
     }
 
+    fn pass(&mut self, end: End, target: &K) -> Option<&K> {
+        self.0.pass(end, target)
+    }
+
     fn take(&mut self, end: End) -> Option<(K, Option<()>)> {
         self.0.take(end).map(|(key, _)| (key, Some(())))
     }
 
-    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
         self.0.probe(end, target)
     }
 
     fn found(&mut self) -> Option<()> {
         Some(())
+    }
+
+    fn follow(&mut self, lead: usize) {
+        self.0.follow(lead);
+    }
+
+    fn adopt(&mut self, rows: &mut dyn std::any::Any) {
+        self.0.adopt(rows);
     }
 }
 
@@ -2170,14 +2604,19 @@ fn led<K: Ord + Clone, X, Y>(
     };
     let mut key = key.clone();
     loop {
-        let Some(found) = follow.probe(end, &key) else {
-            return false;
+        let next = match follow.probe(end, &key) {
+            Probe::At(found) if *found == key => return true,
+            Probe::At(found) => {
+                let found = found.clone();
+                lead.seek(end, &found)
+            }
+            Probe::Past(found) => {
+                let found = found.clone();
+                lead.pass(end, &found)
+            }
+            Probe::Gone => return false,
         };
-        if *found == key {
-            return true;
-        }
-        let found = found.clone();
-        let Some(next) = lead.seek(end, &found) else {
+        let Some(next) = next else {
             return false;
         };
         key = next.clone();
@@ -2204,8 +2643,10 @@ impl<K: Data + Ord, C> All<K, C> {
         let plan = if left.max(right) < left.min(right).saturating_mul(RATIO) {
             Plan::Merge
         } else if left <= right {
+            self.right.follow(left);
             Plan::Left
         } else {
+            self.left.follow(right);
             Plan::Right
         };
         self.plan = Some(plan);
@@ -2258,6 +2699,14 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
         self.fill(end)
     }
 
+    fn pass(&mut self, end: End, target: &K) -> Option<&K> {
+        match self.plan() {
+            Plan::Merge | Plan::Left => self.left.pass(end, target)?,
+            Plan::Right => self.right.pass(end, target)?,
+        };
+        self.fill(end)
+    }
+
     fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
         if !self.settle(end) {
             return None;
@@ -2281,27 +2730,49 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
         }
     }
 
-    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
         let mut key = target.clone();
         loop {
-            let found = self.left.probe(end, &key)?.clone();
-            let again = self.right.probe(end, &found)?;
-            if *again == found {
-                self.landed = Some(found);
-                return self.landed.as_ref();
+            let found = match self.left.probe(end, &key) {
+                Probe::At(found) => found.clone(),
+                Probe::Past(past) => {
+                    let past = past.clone();
+                    return Probe::Past(self.landed.insert(past));
+                }
+                Probe::Gone => return Probe::Gone,
+            };
+            match self.right.probe(end, &found) {
+                Probe::At(again) if *again == found => {
+                    return Probe::At(self.landed.insert(found));
+                }
+                Probe::At(again) => key = again.clone(),
+                Probe::Past(past) => {
+                    let past = past.clone();
+                    return Probe::Past(self.landed.insert(past));
+                }
+                Probe::Gone => return Probe::Gone,
             }
-            key = again.clone();
         }
     }
 
     fn found(&mut self) -> Option<C> {
         self.left.found()
     }
+
+    fn follow(&mut self, lead: usize) {
+        self.left.follow(lead);
+        self.right.follow(lead);
+    }
+
+    fn adopt(&mut self, rows: &mut dyn std::any::Any) {
+        self.left.adopt(rows);
+    }
 }
 
 struct Any<K, C> {
     sides: Vec<Box<dyn Stream<K, C>>>,
     landed: Option<(usize, K)>,
+    passed: Option<K>,
 }
 
 impl<K: Data + Ord, C> Any<K, C> {
@@ -2349,6 +2820,13 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
         self.peek(end)
     }
 
+    fn pass(&mut self, end: End, target: &K) -> Option<&K> {
+        for side in &mut self.sides {
+            side.pass(end, target);
+        }
+        self.peek(end)
+    }
+
     fn take(&mut self, end: End) -> Option<(K, Option<C>)> {
         let key = self.fill(end)?.clone();
         let mut taken = None;
@@ -2363,22 +2841,46 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
         taken
     }
 
-    fn probe(&mut self, end: End, target: &K) -> Option<&K> {
+    fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
         let mut best: Option<(usize, K)> = None;
+        let mut short: Option<K> = None;
         for (side, stream) in self.sides.iter_mut().enumerate() {
-            if let Some(key) = stream.probe(end, target)
-                && best.as_ref().is_none_or(|(_, held)| end.before(key, held))
-            {
-                best = Some((side, key.clone()));
+            match stream.probe(end, target) {
+                Probe::At(key) if best.as_ref().is_none_or(|(_, held)| end.before(key, held)) => {
+                    best = Some((side, key.clone()));
+                }
+                Probe::Past(key) if short.as_ref().is_none_or(|held| end.before(key, held)) => {
+                    short = Some(key.clone());
+                }
+                _ => {}
             }
         }
-        self.landed = best;
-        self.landed.as_ref().map(|(_, key)| key)
+        self.landed = None;
+        match (best, short) {
+            (Some((_, key)), Some(short)) if end.before(&short, &key) => {
+                Probe::Past(self.passed.insert(short))
+            }
+            (Some(best), _) => Probe::At(&self.landed.insert(best).1),
+            (None, Some(short)) => Probe::Past(self.passed.insert(short)),
+            (None, None) => Probe::Gone,
+        }
     }
 
     fn found(&mut self) -> Option<C> {
         let side = self.landed.as_ref()?.0;
         self.sides[side].found()
+    }
+
+    fn follow(&mut self, lead: usize) {
+        for side in &mut self.sides {
+            side.follow(lead);
+        }
+    }
+
+    fn adopt(&mut self, rows: &mut dyn std::any::Any) {
+        if let Some(first) = self.sides.first_mut() {
+            first.adopt(rows);
+        }
     }
 }
 
@@ -2494,14 +2996,19 @@ where
 /// Backs a unique index's generated `by_x_range` and, for a composite, `by_a_b_prefix`.
 ///
 /// Each entry of a unique index without a cover list holds the key of the row that holds its
-/// value, which the lookup reads in place to find the row.
+/// value, which the lookup reads in place to find the row. `indexed` gives the value a row holds,
+/// so that [`Matches::and`] can test a row against the lookup's span.
 #[inline(always)]
-pub fn unique_rows<I, T>(rows: &Map<T::Key, T>, entries: Iter<I, T::Key>) -> IndexIter<T>
+pub fn unique_rows<I, T>(
+    rows: &Map<T::Key, T>,
+    entries: Iter<I, T::Key>,
+    indexed: Indexed<T, I>,
+) -> IndexIter<T>
 where
     I: Data + Ord,
     T: Record,
 {
-    IndexIter::held(rows, Holders { iter: entries })
+    IndexIter::spanned(rows, Holders { iter: entries }, indexed)
 }
 
 /// [`unique_rows`] for a unique index with a cover list, whose entries hold the key beside the
@@ -2511,6 +3018,7 @@ pub fn unique_rows_covered<I, T, S, C>(
     rows: &Map<T::Key, T>,
     entries: Iter<I, (T::Key, S)>,
     project: fn(S) -> C,
+    indexed: Indexed<T, I>,
 ) -> IndexIter<T, C>
 where
     I: Data + Ord,
@@ -2518,17 +3026,18 @@ where
     S: Data,
     C: 'static,
 {
-    IndexIter::held(
-        rows,
-        CoveredHolders {
-            iter: entries,
-            project,
-        },
-    )
+    let cursor = CoveredHolders {
+        iter: entries,
+        project,
+    };
+    IndexIter::spanned(rows, cursor, indexed)
 }
 
 /// The rows of the index entries whose value lies in the span `below` and `within` mark out, as
 /// [`Map::range_by`] takes them. Backs a composite index's generated `by_a_b_prefix`.
+///
+/// `indexed` gives the value a row holds, so that [`Matches::and`] can test a row against the
+/// lookup's span.
 #[inline(always)]
 pub fn index_where<I, T, S, C>(
     rows: &Map<T::Key, T>,
@@ -2536,6 +3045,7 @@ pub fn index_where<I, T, S, C>(
     project: Project<I, S, C>,
     below: impl Fn(&I) -> bool,
     within: impl Fn(&I) -> bool,
+    indexed: Indexed<T, I>,
 ) -> IndexIter<T, C>
 where
     I: Data + Ord,
@@ -2543,11 +3053,11 @@ where
     S: Data,
     C: 'static,
 {
-    IndexIter::over(
-        rows,
-        index.range_by(|entry| below(&entry.0), |entry| within(&entry.0)),
+    let cursor = Entries {
+        iter: index.range_by(|entry| below(&entry.0), |entry| within(&entry.0)),
         project,
-    )
+    };
+    IndexIter::spanned(rows, cursor, indexed)
 }
 
 /// The rows whose indexed value equals `value`, in key order. Backs the generated `by_x`.
@@ -2603,12 +3113,16 @@ where
 
 /// The rows whose indexed value lies in `range`, by value and then by key. Backs the generated
 /// `by_x_range`.
+///
+/// `indexed` gives the values a row holds, so that [`Matches::and`] can test a row against the
+/// range.
 #[inline(always)]
 pub fn index_range<I, T, S, C, Q, R>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
     project: Project<I, S, C>,
     range: R,
+    indexed: Indexed<T, I>,
 ) -> IndexIter<T, C>
 where
     I: Data + Ord + Borrow<Q>,
@@ -2620,9 +3134,8 @@ where
 {
     let start = range.start_bound();
     let end = range.end_bound();
-    IndexIter::over(
-        rows,
-        index.range_by(
+    let cursor = Entries {
+        iter: index.range_by(
             |entry| match start {
                 Bound::Included(bound) => entry.0.borrow() < bound,
                 Bound::Excluded(bound) => entry.0.borrow() <= bound,
@@ -2635,7 +3148,8 @@ where
             },
         ),
         project,
-    )
+    };
+    IndexIter::spanned(rows, cursor, indexed)
 }
 
 fn past_cursor<K, A>(key: &K, after: &A) -> bool

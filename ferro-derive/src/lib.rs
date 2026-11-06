@@ -908,6 +908,33 @@ impl Indexed {
         format_ident!("__{}_cover", self.field())
     }
 
+    fn values_fn(&self) -> Ident {
+        format_ident!("__{}_values", self.field())
+    }
+
+    fn values(&self) -> TokenStream2 {
+        if let (IndexKind::Each, Some((ident, _))) = (&self.kind, self.sole()) {
+            return quote! {
+                ::ferro::table::IndexEach::values(&__r.#ident).iter().any(|__v| __f(__v))
+            };
+        }
+        if let (Some(_), Some((ident, _))) = (self.sparse(), self.sole()) {
+            return quote! {
+                match &__r.#ident {
+                    ::std::option::Option::Some(__v) => __f(__v),
+                    ::std::option::Option::None => false,
+                }
+            };
+        }
+        match self.sole() {
+            Some((ident, _)) => quote! { __f(&__r.#ident) },
+            None => {
+                let owned = self.owned();
+                quote! { __f(&#owned) }
+            }
+        }
+    }
+
     fn project_path(&self) -> TokenStream2 {
         if self.cover.is_empty() {
             let vt = self.value_ty();
@@ -1330,6 +1357,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
             });
         }
+        let values_fn = ix.values_fn();
+        let values = ix.values();
+        methods.push(quote! {
+            fn #values_fn(__r: &#name, __f: &mut dyn ::std::ops::FnMut(&#vt) -> bool) -> bool {
+                #values
+            }
+        });
         match ix.kind {
             IndexKind::Value if ix.stores_cover() => {
                 reindex.push(quote! {
@@ -1499,11 +1533,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     if ix.stores_cover() {
                         let project_fn = ix.project_fn();
                         quote! {
-                            ::ferro::table::unique_rows_covered::<#vt, #name, #st, #ct>(&self.rows, #entries, Self::#project_fn)
+                            ::ferro::table::unique_rows_covered::<#vt, #name, #st, #ct>(&self.rows, #entries, Self::#project_fn, Self::#values_fn)
                         }
                     } else {
                         quote! {
-                            ::ferro::table::unique_rows::<#vt, #name>(&self.rows, #entries)
+                            ::ferro::table::unique_rows::<#vt, #name>(&self.rows, #entries, Self::#values_fn)
                         }
                     }
                 };
@@ -1669,6 +1703,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #project,
                         |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) < value,
                         |__entry| ::std::borrow::Borrow::<__Q>::borrow(&__entry.0) <= value,
+                        Self::#values_fn,
                     )
                 }
             });
@@ -1794,7 +1829,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __R: ::std::ops::RangeBounds<__Q>,
             {
-                ::ferro::table::index_range::<#vt, #name, #st, #ct, __Q, __R>(&self.rows, &self.#field, #project, range)
+                ::ferro::table::index_range::<#vt, #name, #st, #ct, __Q, __R>(&self.rows, &self.#field, #project, range, Self::#values_fn)
             }
         });
     }
@@ -1803,7 +1838,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let find_doc = format!(
         "The equality lookups of [`{table}`], returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key. [`{table}::find`] makes one."
     );
-    let find_fn_doc = "A view of the equality lookups of every non-unique index, returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key, reading a row only for a key that matches.";
+    let find_fn_doc = "A view of the equality lookups of every non-unique index, returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key, reading a row only for a key that matches or that is tested against a range or prefix lookup.";
     let find_items = if finds.is_empty() {
         quote! {}
     } else {
@@ -2184,9 +2219,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// every non-unique index: `by_x(&value)`, `by_x_after(&value, &key)` and, for an `Option` field,
 /// `by_x_some` and `by_x_some_after`. They return `Matches<Name, C>`, which `and` and `or` combine
 /// by primary key, reading a row only for a key that matches. `and` and `or` also take any
-/// `IndexIter`, such as a range or prefix lookup of a unique or non-unique index, whose keys are
-/// read in full and sorted first. `.keys()` reads no rows, and `.covered()` gives the covered
-/// fields of the leftmost lookup.
+/// `IndexIter`. A range or prefix lookup of a unique or non-unique index is tested key by key when
+/// the other side of an `and` has at most a quarter of its keys, by reading each such key's row,
+/// and its keys are read in full and sorted first otherwise. `.keys()` reads no rows but those,
+/// and `.covered()` gives the covered fields of the leftmost lookup.
 ///
 /// # Covering indexes
 ///
