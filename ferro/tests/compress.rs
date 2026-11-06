@@ -5,7 +5,7 @@ use std::fs;
 use common::fast;
 use ferro::admin::{self, Keep};
 use ferro::store::{Store, StoreOptions};
-use ferro::{Db, Error, Map, Reclaim};
+use ferro::{Db, Error, Map, Reclaim, Snapshot};
 
 type Root = Map<u64, String>;
 
@@ -64,6 +64,54 @@ fn incompressible_values_are_stored_raw() {
         assert_eq!(*snapshot.get(&key).unwrap(), common::text(key, 200));
     }
     db.verify().unwrap();
+}
+
+fn refuse(_: &mut Root, _: &Snapshot<Root>, _: &Snapshot<Root>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+#[test]
+fn a_value_pulled_uncompressed_is_stored_compressed_and_a_power_cut_over_it_is_torn() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let path = dir.path().join("b.ferro");
+    let b: Db<Root> = fast().open(&path).unwrap();
+    let len = 32 << 20;
+    let mut value = vec![0u8; len];
+    for at in (100..len).step_by(8192) {
+        value[at] = 1;
+    }
+    let value = String::from_utf8(value).unwrap();
+    a.commit("sparse", |root| {
+        root.insert(1, value.clone());
+    })
+    .unwrap();
+    let sent = a.size_on_disk();
+    let before = fs::read(&path).unwrap();
+    b.pull(&a, "a", refuse).unwrap();
+    assert!(
+        b.size_on_disk() < 2 * sent,
+        "{} bytes pulled from a file of {sent}",
+        b.size_on_disk()
+    );
+    drop(b);
+    let whole = fs::read(&path).unwrap();
+    let mut image = whole.clone();
+    image[..before.len()].copy_from_slice(&before);
+    for sector in (before.len()..image.len()).step_by(512).skip(5).step_by(7) {
+        image[sector..(sector + 512).min(whole.len())].fill(0);
+    }
+    fs::write(&path, &image).unwrap();
+    let readonly = fast().read_only(true).open::<Root>(&path).unwrap();
+    assert_eq!(readonly.version(), 0);
+    drop(readonly);
+    let torn = fast().open::<Root>(&path).unwrap();
+    assert_eq!(torn.version(), 0);
+    drop(torn);
+    fs::write(&path, &whole).unwrap();
+    let b = fast().cache_bytes(1).open::<Root>(&path).unwrap();
+    assert_eq!(*b.read().get(&1).unwrap(), value);
+    b.verify().unwrap();
 }
 
 fn varint_at(bytes: &[u8], at: &mut usize) -> u64 {

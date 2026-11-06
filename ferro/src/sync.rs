@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Merged, Node};
 use crate::map::Map;
 use crate::reentry::{Crossing, Needs};
-use crate::store::{Record, Staging, Store, Txn, staged};
+use crate::store::{Record, Staging, Store, Txn, compressed, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
 const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
@@ -327,7 +327,8 @@ impl<R: Read> Input<R> {
         self.bodies = bodies;
         let bytes = self.bytes(stored)?;
         if !packed {
-            return Ok((bytes, None));
+            let packed = compressed(&bytes);
+            return Ok((bytes, packed));
         }
         let body = lz4_flex::block::decompress(&bytes, raw)
             .map_err(|error| bad(format!("bad compressed body: {error}")))?;
