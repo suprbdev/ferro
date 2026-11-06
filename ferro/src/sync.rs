@@ -1875,8 +1875,11 @@ impl Vetting<'_> {
                     offset: staging.offset(*id),
                 };
                 let object = staging.read_object(ptr)?;
-                kind.check(&object.body, &object.links, Some(&view))
-                    .map_err(|error| undecodable(kind, error))?;
+                let checked = kind.check(&object.body, &object.links, Some(&view));
+                if let Some(error) = view.overdrawn() {
+                    return Err(error);
+                }
+                checked.map_err(|error| undecodable(kind, error))?;
             }
             Ok(())
         })

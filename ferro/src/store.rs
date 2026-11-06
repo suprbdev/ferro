@@ -29,7 +29,6 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -43,7 +42,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -1856,9 +1855,57 @@ struct Inner {
 struct View {
     /// The bytes of object bodies it may still read.
     left: AtomicU64,
+    /// Whether a read was refused because `left` could not pay for it.
+    overdrawn: AtomicBool,
     /// The bytes of a staging it reads beside the file, which count towards how many entries a
     /// node it reads may claim.
     borrowed: u64,
+    /// The staging that [`Staging::overlaid`] lends the view while its closure runs, or null,
+    /// under a lock that every read of the staging holds while it reads.
+    lent: RwLock<AtomicPtr<Staging>>,
+}
+
+impl View {
+    /// Counts `bytes` against what the view may still read.
+    fn charge(&self, bytes: usize) -> Result<()> {
+        let paid = self
+            .left
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(bytes as u64)
+            });
+        if paid.is_err() {
+            self.overdrawn.store(true, Ordering::Relaxed);
+            return Err(overdrawn());
+        }
+        Ok(())
+    }
+
+    /// The object with `ptr`'s hash in the staging lent to the view, or `None` if none is lent or
+    /// it holds no such object.
+    fn staged(&self, ptr: Ptr) -> Option<Result<Object>> {
+        let lent = self.lent.read();
+        let staging = lent.load(Ordering::Relaxed);
+        if staging.is_null() {
+            return None;
+        }
+        // SAFETY: `Staging::overlaid` stores a pointer from a shared borrow of a staging that lasts
+        // for the whole call of the closure it runs, and under the write lock puts the previous
+        // pointer back before that call returns or unwinds. The read lock held here keeps it from
+        // doing so, so the staging is alive and unchanged while this reads it, and nothing writes
+        // through the pointer. `Staging` is `Sync`, which `overlaid` requires, so the shared
+        // borrow may be used on any thread.
+        let staging = unsafe { &*staging };
+        let at = staging.id_of(&ptr.hash)?;
+        Some(staging.read_object(Ptr {
+            hash: ptr.hash,
+            offset: staging.offset(at),
+        }))
+    }
+}
+
+/// The error of a read through a [`Store::view`] that its allowance cannot pay for.
+fn overdrawn() -> Error {
+    Error::Bundle("recomputing its summaries reads more than its size allows".into())
 }
 
 /// An open file of a database: one generation of its log, with the cache of what was decoded from
@@ -2121,7 +2168,7 @@ impl Store {
 
     /// A read-only view of this store's file as it stands, with an id of its own and no cache,
     /// that may read `allowance` bytes of object bodies and also reads `borrowed` bytes of a
-    /// staging that [`Staging::overlaid`] lets it see.
+    /// staging that [`Staging::overlaid`] lends it.
     ///
     /// Every node and value read through the view is decoded afresh and belongs to whatever read
     /// it, so nothing it decodes reaches this store's cache or the nodes this store's readers
@@ -2175,7 +2222,9 @@ impl Store {
                 },
                 view: Some(View {
                     left: AtomicU64::new(allowance),
+                    overdrawn: AtomicBool::new(false),
                     borrowed,
+                    lent: RwLock::new(AtomicPtr::new(std::ptr::null_mut())),
                 }),
             }),
         }
@@ -2189,22 +2238,12 @@ impl Store {
         self.written().saturating_add(borrowed)
     }
 
-    /// Counts `bytes` against what a [`Store::view`] may still read, and does nothing for a store
-    /// opened on a file.
-    fn charge(&self, bytes: usize) -> Result<()> {
-        let Some(view) = &self.inner.view else {
-            return Ok(());
-        };
-        let left = view.left.load(Ordering::Relaxed);
-        match left.checked_sub(bytes as u64) {
-            Some(left) => {
-                view.left.store(left, Ordering::Relaxed);
-                Ok(())
-            }
-            None => Err(Error::Bundle(
-                "recomputing its summaries reads more than its size allows".into(),
-            )),
-        }
+    /// The error of the first read through this [`Store::view`] that its allowance could not pay
+    /// for, if there was one, which a check that caught the read's panic on another thread
+    /// reports in place of what it caught.
+    pub(crate) fn overdrawn(&self) -> Option<Error> {
+        let view = self.inner.view.as_ref()?;
+        view.overdrawn.load(Ordering::Relaxed).then(overdrawn)
     }
 
     /// The store's id, which no other store this process opens shares, so that a collection can
@@ -3218,14 +3257,17 @@ impl Store {
     }
 
     /// Reads the object at `ptr` for decoding: for a [`Store::view`], the one staged with its hash
-    /// if [`Staging::overlaid`] lets the view see a staging and it holds one, and the body counted
+    /// if [`Staging::overlaid`] lends the view a staging that holds one, and the body counted
     /// against what the view may read.
     fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
-        let object = match staged_object(self.inner.id, ptr) {
+        let Some(view) = &self.inner.view else {
+            return self.read_object(ptr);
+        };
+        let object = match view.staged(ptr) {
             Some(object) => object?,
             None => self.read_object(ptr)?,
         };
-        self.charge(object.body.len())?;
+        view.charge(object.body.len())?;
         Ok(object)
     }
 
@@ -4104,29 +4146,6 @@ pub(crate) struct Staging {
     offsets: Column<u64>,
 }
 
-thread_local! {
-    static OVERLAY: Cell<Option<(u64, *const Staging)>> = const { Cell::new(None) };
-}
-
-/// The object with `ptr`'s hash in the staging that [`Staging::overlaid`] lets this thread read
-/// through the store with the id `store`, or `None` if there is none.
-fn staged_object(store: u64, ptr: Ptr) -> Option<Result<Object>> {
-    let (id, staging) = OVERLAY.get()?;
-    if id != store {
-        return None;
-    }
-    // SAFETY: `Staging::overlaid` set the pointer from a shared borrow of a staging that lasts for
-    // the whole call of the closure it runs, and puts the previous value back when that call
-    // returns or unwinds. The pointer is thread-local, so it is only read on the thread inside that
-    // call, while the borrow keeps the staging alive and unchanged.
-    let staging = unsafe { &*staging };
-    let at = staging.id_of(&ptr.hash)?;
-    Some(staging.read_object(Ptr {
-        hash: ptr.hash,
-        offset: staging.offset(at),
-    }))
-}
-
 /// A record of a staging, read back for placing.
 pub(crate) struct Record {
     /// The object's hash.
@@ -4330,23 +4349,30 @@ impl Staging {
         Ok(object)
     }
 
-    /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`], on this
-    /// thread, by hash.
+    /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`], by hash.
     ///
     /// While `f` runs, a read through `view` takes an object staged here with the hash it asks
-    /// for, wherever its pointer leads, and reads anything else from the file. The links of a
-    /// staged object lead into the staging, and the view caches nothing, so what it decodes from
-    /// one stays with whatever read it. No other store sees the staging, nor do other threads, nor
-    /// reads after `f` returns or unwinds.
+    /// for, wherever its pointer leads, and reads anything else from the file, on whatever thread
+    /// it reads. The links of a staged object lead into the staging, and the view caches nothing,
+    /// so what it decodes from one stays with whatever read it. No other store sees the staging,
+    /// and no read through `view` once `f` returns or unwinds, which waits for the reads of the
+    /// staging under way.
     pub(crate) fn overlaid<R>(&self, view: &Store, f: impl FnOnce() -> R) -> R {
-        debug_assert!(view.inner.view.is_some(), "only a view reads a staging");
-        struct Restore(Option<(u64, *const Staging)>);
-        impl Drop for Restore {
+        fn lend<T: Sync>(staging: &T) -> *mut T {
+            std::ptr::from_ref(staging).cast_mut()
+        }
+        struct Restore<'a>(&'a RwLock<AtomicPtr<Staging>>, *mut Staging);
+        impl Drop for Restore<'_> {
             fn drop(&mut self) {
-                OVERLAY.set(self.0);
+                *self.0.write().get_mut() = self.1;
             }
         }
-        let _restore = Restore(OVERLAY.replace(Some((view.id(), std::ptr::from_ref(self)))));
+        debug_assert!(view.inner.view.is_some(), "only a view reads a staging");
+        let Some(lens) = &view.inner.view else {
+            return f();
+        };
+        let previous = mem::replace(lens.lent.write().get_mut(), lend(self));
+        let _restore = Restore(&lens.lent, previous);
         f()
     }
 
