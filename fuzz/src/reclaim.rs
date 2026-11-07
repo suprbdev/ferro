@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use ferro::admin::{self, Keep};
@@ -48,9 +49,20 @@ fn compact(path: &Path, threads: usize, keep: Keep) -> Outcome {
     ))
 }
 
+fn copy_file(from: &Path, to: &Path) {
+    while let Err(error) = fs::copy(from, to) {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Interrupted,
+            "copying {} failed: {error}",
+            from.display()
+        );
+    }
+}
+
 fn same(path: &Path, threads: [usize; 2], keep: Keep, round: &str) -> Outcome {
     let other = scratch().join("other.ferro");
-    fs::copy(path, &other).unwrap();
+    copy_file(path, &other);
     let one = compact(path, threads[0], keep);
     let many = compact(&other, threads[1], keep);
     match (&one, &many) {
