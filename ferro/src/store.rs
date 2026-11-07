@@ -127,6 +127,9 @@ const MAX_RESERVE: u64 = 4 << 20;
 const LOCK_RETRIES: u32 = 5;
 /// How many bytes a read of a record takes at once, enough for most records whole.
 const READ_AHEAD: usize = 1024;
+/// The most bytes of frames another process placed that a catch-up keeps in memory for reads of
+/// the objects in them, and so the largest frame it keeps.
+const FOLLOWED_BYTES: usize = 4 << 20;
 /// What a cache entry weighs for itself, beside the object it holds.
 const ENTRY_BYTES: usize = 96;
 /// The fewest entries of the deduplication table.
@@ -585,6 +588,68 @@ fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
         }
     }
     Ok(best)
+}
+
+/// Whether the frame whose header is `header`, and whose records and table, `records` bytes of
+/// records and the table after them, are `body`, is whole: every block of records matches its
+/// entry in the table, and the check matches the header and the table.
+fn whole_in(header: &[u8; FRAME_BYTES], body: &[u8], records: u64) -> bool {
+    let Ok(records) = usize::try_from(records) else {
+        return false;
+    };
+    let Some((data, table)) = body.split_at_checked(records) else {
+        return false;
+    };
+    table.len() as u64 == table_len(records as u64)
+        && data
+            .chunks(BLOCK_BYTES)
+            .zip(table.chunks(BLOCK_CHECK))
+            .all(|(block, entry)| xxh3_64(block).to_le_bytes() == entry)
+        && frame_check(header, table) == header[FRAME_CHECKED..]
+}
+
+/// A frame that a catch-up read in one read and checked in memory.
+struct Copied {
+    /// Where the frame starts in the log.
+    start: u64,
+    /// Where it ends.
+    end: u64,
+    /// The frame's header, records and table, and the bytes after it that the read took too, as
+    /// many of the [`FRAME_BYTES`] and [`LEFT_PEEK`] past the frame as the file held.
+    bytes: Vec<u8>,
+}
+
+impl Copied {
+    /// The bytes the read took past the frame's end, where the next frame's header would start.
+    fn after(&self) -> &[u8] {
+        &self.bytes[(self.end - self.start) as usize..]
+    }
+}
+
+/// The frames that a catch-up followed and checked in memory, kept so that reads of the objects
+/// in them take their records from memory rather than from the file.
+struct Kept {
+    /// The frames, in the order of the log.
+    frames: Vec<Copied>,
+}
+
+impl Kept {
+    /// The bytes held from `offset` to the end of its frame or to `tail`, whichever comes first,
+    /// or none if no frame held holds `offset`.
+    fn from(&self, offset: u64, tail: u64) -> &[u8] {
+        let Some(frame) = self
+            .frames
+            .iter()
+            .find(|frame| frame.start <= offset && offset < frame.end)
+        else {
+            return &[];
+        };
+        let end = frame.end.min(tail);
+        if offset >= end {
+            return &[];
+        }
+        &frame.bytes[(offset - frame.start) as usize..(end - frame.start) as usize]
+    }
 }
 
 /// What a scan finds where a frame would follow the one before.
@@ -1866,6 +1931,8 @@ struct Inner {
     taken: Mutex<Vec<u64>>,
     /// Woken when one of them is let go.
     freed: Condvar,
+    /// The frames that the last catch-up to follow any kept, for reads of their objects.
+    followed: Mutex<Option<Arc<Kept>>>,
     /// How the store was opened.
     options: StoreOptions,
     /// What a [`Store::view`] may still read, or `None` for a store opened on a file.
@@ -2207,6 +2274,7 @@ impl Store {
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
+                followed: Mutex::new(None),
                 options,
                 view: None,
             }),
@@ -2263,6 +2331,7 @@ impl Store {
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
+                followed: Mutex::new(None),
                 options: StoreOptions {
                     read_only: true,
                     shared: false,
@@ -2957,9 +3026,18 @@ impl Store {
         let mut at = Super::new(start, start, Basis::default());
         let mut last = None;
         let mut len = None;
+        let mut copied: Vec<Copied> = Vec::new();
+        let mut held = 0;
         let left = loop {
             let mut peek = [0u8; FRAME_BYTES + LEFT_PEEK];
-            let got = read_some(&inner.file, &mut peek, at.log_end)?;
+            let got = match copied.last().filter(|last| last.end == at.log_end) {
+                Some(last) => {
+                    let after = last.after();
+                    peek[..after.len()].copy_from_slice(after);
+                    after.len()
+                }
+                None => read_some(&inner.file, &mut peek, at.log_end)?,
+            };
             let written = peek[..got].iter().any(|byte| *byte != 0);
             let Some(header) = peek
                 .first_chunk::<FRAME_BYTES>()
@@ -2978,6 +3056,35 @@ impl Store {
             }
             if Super::fields(header).is_some_and(|next| next.seq > upto) {
                 break false;
+            }
+            if let Some((frame, records)) = shape(&at, header, u64::MAX) {
+                let whole = frame.log_end - at.log_end;
+                if whole <= FOLLOWED_BYTES as u64 {
+                    let whole = whole as usize;
+                    let mut bytes = vec![0u8; whole + peek.len()];
+                    bytes[..got].copy_from_slice(&peek[..got]);
+                    let read = read_some(&inner.file, &mut bytes[got..], at.log_end + got as u64)?;
+                    bytes.truncate(got + read);
+                    if bytes.len() >= whole && whole_in(header, &bytes[FRAME_BYTES..whole], records)
+                    {
+                        if frame.head.is_none() {
+                            break false;
+                        }
+                        held += whole;
+                        while held > FOLLOWED_BYTES {
+                            let oldest = copied.remove(0);
+                            held -= (oldest.end - oldest.start) as usize;
+                        }
+                        copied.push(Copied {
+                            start: at.log_end,
+                            end: frame.log_end,
+                            bytes,
+                        });
+                        at = frame;
+                        last = Some(frame);
+                        continue;
+                    }
+                }
             }
             let len = match len {
                 Some(len) => len,
@@ -3018,6 +3125,11 @@ impl Store {
         let Some(last) = last else {
             return Ok(Followed::Still);
         };
+        if !copied.is_empty() {
+            let kept = Arc::new(Kept { frames: copied });
+            let replaced = inner.followed.lock().replace(kept);
+            drop(replaced);
+        }
         inner.written.fetch_max(last.log_end, Ordering::AcqRel);
         Ok(Followed::Moved(Frame {
             seq: last.seq,
@@ -3068,7 +3180,14 @@ impl Store {
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
-        let (object, len, _) = Store::read_within(file, ptr, tail, &[], true, false)?;
+        let kept = match self.inner.options.shared {
+            true => self.inner.followed.lock().clone(),
+            false => None,
+        };
+        let held = kept
+            .as_deref()
+            .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
+        let (object, len, _) = Store::read_within(file, ptr, tail, held, true, false)?;
         Ok((object, len))
     }
 
@@ -3373,8 +3492,8 @@ impl Store {
         }
     }
 
-    /// Closes the store: drops the cache, flushes the epoch, and for a writer truncates the zeroes
-    /// preallocated past the log and lets the writer lock go.
+    /// Closes the store: drops the cache and the frames a catch-up kept, flushes the epoch, and for
+    /// a writer truncates the zeroes preallocated past the log and lets the writer lock go.
     ///
     /// Clones of the store go on reading what they read before, and a new writer may open the
     /// file meanwhile. Cached and retired nodes that hold nested maps hold the store too, so
@@ -3386,6 +3505,8 @@ impl Store {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
         inner.cache.clear();
+        let followed = inner.followed.lock().take();
+        drop(followed);
         crate::epoch::flush();
         if closed || inner.options.read_only {
             return;
@@ -5148,5 +5269,102 @@ mod tests {
             );
             store.close();
         }
+    }
+
+    #[test]
+    fn a_frame_checks_in_memory_as_it_does_in_the_file() {
+        let objects: Vec<Object> = (0..12)
+            .map(|seed| Object {
+                body: noise(seed + 60, 900 + seed as usize * 31),
+                links: Vec::new(),
+            })
+            .collect();
+        let whole = written(&objects, None);
+        let start = LOG_START as usize;
+        assert!(whole.len() > start + 2 * BLOCK_BYTES);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checked.ferro");
+        let empty = Mark {
+            seq: 0,
+            log_end: LOG_START,
+            head: None,
+        };
+        let tip = Super::new(empty, empty, Basis::default());
+        let mut images = vec![(whole.clone(), true)];
+        images.extend((start + 8..whole.len()).step_by(997).map(|at| {
+            let mut image = whole.clone();
+            image[at] ^= 0x04;
+            (image, false)
+        }));
+        images.push((whole[..whole.len() - 1].to_vec(), false));
+        for (index, (image, kept)) in images.into_iter().enumerate() {
+            std::fs::write(&path, &image).unwrap();
+            let file = File::open(&path).unwrap();
+            let header: &[u8; FRAME_BYTES] = image[start..].first_chunk().unwrap();
+            let len = image.len() as u64;
+            let in_file = matches!(
+                examine(&file, &tip, header, len, false).unwrap(),
+                Found::Whole(_)
+            );
+            let body = &image[start + FRAME_BYTES..];
+            let in_memory = shape(&tip, header, u64::MAX).is_some_and(|(frame, records)| {
+                let claimed = (frame.log_end - LOG_START) as usize - FRAME_BYTES;
+                body.len() >= claimed && whole_in(header, &body[..claimed], records)
+            });
+            assert_eq!(in_memory, in_file, "image {index}");
+            assert_eq!(in_file, kept, "image {index}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_catch_up_keeps_the_frames_it_followed_for_reads_of_their_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            shared: true,
+            ..StoreOptions::default()
+        };
+        let (writer, _) = Store::open(&path, options.clone()).unwrap();
+        let (follower, _) = Store::open(&path, options).unwrap();
+        let object = |seed, len| Object {
+            body: noise(seed, len),
+            links: Vec::new(),
+        };
+        let commit = |seed, len| {
+            let mut txn = writer.begin().unwrap();
+            let object = object(seed, len);
+            let ptr = txn.put_ref(&object, object.hash()).unwrap();
+            txn.commit(ptr).unwrap();
+            let Followed::Moved(frame) = follower.follow(false, u64::MAX).unwrap() else {
+                panic!("the follower found no frame");
+            };
+            follower.advance(frame);
+            ptr
+        };
+        let first = commit(1, 600);
+        let second = commit(2, 600);
+        let damage = OpenOptions::new().write(true).open(&path).unwrap();
+        for ptr in [first, second] {
+            damage.write_all_at(&[0xff; 8], ptr.offset + 8).unwrap();
+        }
+        assert_eq!(follower.read_object(second).unwrap().body, noise(2, 600));
+        assert!(matches!(
+            follower.read_object(first),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(writer.read_object(second), Err(Error::Corrupt(_))));
+        let large = FOLLOWED_BYTES + 4096;
+        let third = commit(3, large);
+        assert_eq!(follower.read_object(third).unwrap().body, noise(3, large));
+        damage.write_all_at(&[0xff; 8], third.offset + 8).unwrap();
+        assert!(matches!(
+            follower.read_object(third),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(follower.read_object(second).unwrap().body, noise(2, 600));
+        writer.close();
+        follower.close();
     }
 }
