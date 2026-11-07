@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -226,6 +226,88 @@ fn a_read_only_handle_learns_of_the_drop_on_refresh() {
     assert!(reader.refresh().unwrap());
     assert_eq!(reader.branch("side").unwrap().version(), 1);
     assert_eq!(handle.version(), 2);
+}
+
+#[test]
+fn a_read_only_handle_retires_a_branch_dropped_and_forked_again_on_refresh() {
+    for (own_commits, compact) in [(true, false), (false, false), (true, true), (false, true)] {
+        let case = format!("own commits {own_commits}, compact {compact}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.ferro");
+        let db = fast().open::<Root>(&path).unwrap();
+        put(&db, 1, 1);
+        let old = db.fork("side").unwrap();
+        if own_commits {
+            put(&old, 2, 2);
+            put(&old, 3, 3);
+        }
+        let reader = fast().read_only(true).open::<Root>(&path).unwrap();
+        let handle = reader.branch("side").unwrap();
+        let had = handle.version();
+        let watcher = handle.watch();
+
+        drop(old);
+        db.drop_branch("side").unwrap();
+        let new = db.fork("side").unwrap();
+        put(&new, 9, 9);
+        if compact {
+            db.compact(Keep::All).unwrap();
+        }
+        assert!(reader.refresh().unwrap(), "{case}");
+
+        assert_eq!(handle.version(), had, "{case}");
+        assert!(handle.read().get(&9).is_none(), "{case}");
+        assert_eq!(
+            handle.read().get(&2).is_some(),
+            own_commits,
+            "{case}: the handle lost what it read"
+        );
+        assert!(
+            matches!(
+                watcher.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "{case}: the old branch's watcher did not end"
+        );
+        let attached = reader.branch("side").unwrap();
+        assert_eq!(attached.version(), new.version(), "{case}");
+        assert_eq!(attached.read().get(&9).as_deref(), Some(&9), "{case}");
+    }
+}
+
+#[test]
+fn a_branch_forked_again_after_an_offline_compaction_is_a_new_branch() {
+    for between in 0..8 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.ferro");
+        let db = fast().open::<Root>(&path).unwrap();
+        for key in 0..3 {
+            put(&db, key, key);
+        }
+        put(&db.fork("side").unwrap(), 10, 10);
+        let reader = fast().read_only(true).open::<Root>(&path).unwrap();
+        let handle = reader.branch("side").unwrap();
+        let watcher = handle.watch();
+        drop(db);
+        admin::compact(&path, Keep::All).unwrap();
+
+        let db = fast().open::<Root>(&path).unwrap();
+        db.drop_branch("side").unwrap();
+        for key in 0..between {
+            put(&db, 20 + key, key);
+        }
+        db.fork("side").unwrap();
+        assert!(reader.refresh().unwrap());
+        assert_eq!(
+            handle.read().get(&10).as_deref(),
+            Some(&10),
+            "{between} commits between: the old handle moved to the new branch"
+        );
+        assert!(
+            matches!(watcher.try_recv(), Err(TryRecvError::Disconnected)),
+            "{between} commits between: the old branch's watcher did not end"
+        );
+    }
 }
 
 #[test]

@@ -11,9 +11,14 @@ condvar. Publishing stores one snapshot and wakes waiters whatever the number of
 behind gets the newest one and uses `diff` for what it skipped, which costs O(changes). With the
 channel this replaced, a watcher that never read grew RSS by 147 MB over 100,000 order commits
 against 53 MB with no watcher. Now it is 53 MB either way, and commit throughput matches. The count
-is compared rather than versions so that a read-only handle stays right when a branch is dropped and
-forked again at a lower version. The feed starts out holding the branch's snapshot from when the
-branch was attached, so a watcher made before any commit has a snapshot to compare against.
+is compared rather than versions so that a watcher stays right when its branch moves to a lower
+version, as a remote-tracking branch does when a receive replaces it with a history that does not
+continue the one it had. A branch dropped and forked again under the same name is another branch:
+every handle on the old one retires it, in another process when it catches up and on a read-only
+handle at `refresh`, which closes its feed, so its watchers end rather than see the new branch, as
+[A branch of the same name](history.md#a-branch-of-the-same-name) describes. The feed starts out
+holding the branch's snapshot from when the branch was attached, so a watcher made before any commit
+has a snapshot to compare against.
 
 Another process's commits reach the feed when this process catches up and syncs them, at `refresh`,
 or, with `Options::follow`, when its `ferro-follow` thread does either, as described under

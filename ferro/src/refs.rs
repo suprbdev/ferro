@@ -228,6 +228,7 @@ mod tests {
                 ..Chain::empty()
             },
             merged: Map::new(),
+            born: 0,
         }
     }
 

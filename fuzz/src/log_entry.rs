@@ -25,10 +25,13 @@ pub struct Head {
     pub root: Option<Ptr>,
     pub tip: Option<Ptr>,
     pub merged: Map<String, (u64, u64)>,
+    pub born: u64,
 }
 
-fn put_link(w: &mut Encoder<'_>, link: Option<Ptr>) {
-    w.u8(u8::from(link.is_some()));
+const BORN: u8 = 2;
+
+fn put_link(w: &mut Encoder<'_>, link: Option<Ptr>, flags: u8) {
+    w.u8(u8::from(link.is_some()) | flags);
     if let Some(ptr) = link {
         w.link(ptr);
     }
@@ -38,18 +41,36 @@ impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
         self.version.encode(w)?;
         self.first.encode(w)?;
-        put_link(w, self.root);
-        put_link(w, self.tip);
-        self.merged.encode(w)
+        put_link(w, self.root, if self.born == 0 { 0 } else { BORN });
+        put_link(w, self.tip, 0);
+        self.merged.encode(w)?;
+        if self.born != 0 {
+            self.born.encode(w)?;
+        }
+        Ok(())
     }
 
     fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let version = u64::decode(r)?;
+        let first = u64::decode(r)?;
+        let flags = r.u8()?;
+        let root = match flags & 1 {
+            0 => None,
+            _ => Some(r.link()?),
+        };
+        let tip = Option::<Ptr>::decode(r)?;
+        let merged = Map::decode(r)?;
+        let born = match flags & BORN {
+            0 => 0,
+            _ => u64::decode(r)?,
+        };
         Ok(Head {
-            version: u64::decode(r)?,
-            first: u64::decode(r)?,
-            root: Option::<Ptr>::decode(r)?,
-            tip: Option::<Ptr>::decode(r)?,
-            merged: Map::decode(r)?,
+            version,
+            first,
+            root,
+            tip,
+            merged,
+            born,
         })
     }
 }
@@ -210,7 +231,7 @@ fn entry(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> (Object, Buil
     w.varint(time);
     w.varint(message.len() as u64);
     w.raw(message.as_bytes());
-    put_link(&mut w, root);
+    put_link(&mut w, root, 0);
     match restored {
         Some(at) => {
             w.u8(1);
@@ -307,6 +328,7 @@ fn head(input: &mut Input<'_>, built: &[Built], roots: &[Ptr]) -> Head {
             Some(tip.ptr)
         },
         merged,
+        born: 0,
     }
 }
 

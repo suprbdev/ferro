@@ -2544,6 +2544,7 @@ fn resolve<O: Objects>(
     } else {
         Entry::load(store, tip_ptr)?.commit.root
     };
+    let existing = refs.try_get(remote)?;
     let head = Head {
         version: tip.version,
         root,
@@ -2553,8 +2554,10 @@ fn resolve<O: Objects>(
             last: tip.version,
         },
         merged: Map::new(),
+        born: existing
+            .as_ref()
+            .map_or_else(|| Head::born_next(store), |old| old.born),
     };
-    let existing = refs.try_get(remote)?;
     if let Some(old) = &existing
         && (old.log == head.log || hash_at(store, &old.log, tip.version)? == Some(tip.hash))
     {
@@ -2642,6 +2645,7 @@ fn fast_forward(ours: Option<&Head>, theirs: &Head) -> Head {
             ..theirs.log
         },
         merged: ours.map(|ours| ours.merged.clone()).unwrap_or_default(),
+        born: ours.map_or(0, |ours| ours.born),
     }
 }
 

@@ -147,10 +147,16 @@ open succeeded after (#82).
 The frames' head pointers name [steps](commit-path.md#branch-table-steps) on the table each process
 already holds, so loading the new refs reads only the steps since the head this process last knew,
 as a read-only `refresh` does. For every branch attached in this process whose head moved, it loads
-the new state into the branch's tip, and a branch that is gone is retired. The frames go into the
-queue as one entry, so the next sync publishes those states with the process's own commits, in
-frame order, and fires their watchers. Nothing another process wrote is published here before it
-is durable, by that process's sync or by this one's.
+the new state into the branch's tip, and a branch that is gone is retired. So is one whose name now
+has a head with another `born`, the frame that created the branch: another process dropped it and
+forked the name again before this one caught up, and the table this process loads has only the
+newest of those frames' heads, as [A branch of the same name](history.md#a-branch-of-the-same-name)
+describes. The first version took that head for the old branch moved, so a write through an old
+handle landed on the new branch, where a process that caught up between the drop and the fork
+failed it with `Error::NoBranch`. The frames go into the queue as one entry, so the next sync
+publishes those states with the process's own commits, in frame order, and fires their watchers.
+Nothing another process wrote is published here before it is durable, by that process's sync or by
+this one's.
 
 The bytes of the frames a catch-up followed and checked in memory, up to 4 MiB of them, stay in
 memory until a later catch-up keeps the frames it follows, a catch-up truncates the file or the
@@ -305,7 +311,9 @@ the old one, the cycle writes a marker at the end of the old log, a frame header
 A process that catches up and reads the marker checks the path. If the path names another file, it
 syncs and publishes what it had queued in the old one, opens the new one, loads every attached
 branch's state from it and rebinds its watchers' feeds, as a read-only `refresh` of a replaced file
-does. If the path still names this file, the cycle failed before its rename and the marker is
+does. It retires a branch whose name is gone from the new file or has a head with another `born`
+there, since the frames of the old file it had not read and those of any generation between are not
+read at all. If the path still names this file, the cycle failed before its rename and the marker is
 written over, or, with anything but zeroes past it, truncated with what follows, as described under
 [Catching up](#catching-up). Every frame placed in the old file before the marker was copied into
 the new one, since the pause caught up under the placement lock and the marker went in under it, and
@@ -633,10 +641,11 @@ commit and by `refresh`, coalesced and awaited writes, an awaited write held up 
 handle's closure, a pull landing beside the other handle's commits, background cycles in three
 handles at once, four threads on branches of their own in each of two handles, an awaited write
 waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
-a drop and fork that must wait for a closure, a writer opening during the other handle's cycle
-pause, a closure on a branch the other handle dropped, a stale marker that a power cut leaves in
-front of a whole frame, and a frame a dead writer left cut at a page boundary, which the next
-writer writes over, or whole with a bit flipped, which it reports. It also has an idle handle
+a drop and fork that must wait for a closure, a branch the other handle dropped and forked again,
+with and without a cycle between, whose old handles must stay dead, a writer opening during the
+other handle's cycle pause, a closure on a branch the other handle dropped, a stale marker that a
+power cut leaves in front of a whole frame, and a frame a dead writer left cut at a page boundary,
+which the next writer writes over, or whole with a bit flipped, which it reports. It also has an idle handle
 commit after the other committed four frames, with two bits flipped in the second's first block,
 two in its magic, or its first 84 bytes zeroed, under both durabilities, and opens a handle beside
 a live Buffered one over the same frames; both must fail with `Error::Corrupt`, change nothing in

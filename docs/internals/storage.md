@@ -134,8 +134,10 @@ under [Branch-table steps](commit-path.md#branch-table-steps). A table's body is
 its branches and its one link the root of the `Map`, as it always was. A step's body is the byte
 `0x7f`, the branch's name as a varint length and its bytes, and the `Head` as the table stores it:
 the version, the first version kept, the root and the log's tip each as a flag byte and, when set, a
-link, and the map of merge records. Its first link is the table or step before it, followed by the
-head's links. A commit does this:
+link, the map of merge records, and, when bit 2 of the root's flag byte is set, the sequence number
+of the frame that created the branch, as [A branch of the same
+name](history.md#a-branch-of-the-same-name) describes. Its first link is the table or step before
+it, followed by the head's links. A commit does this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.

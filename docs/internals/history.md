@@ -259,3 +259,62 @@ Counting handles and refusing the drop while others exist was rejected: a clone 
 thread would block it forever, and handles in other processes cannot be counted anyway. A read-only
 handle learns of the drop on `refresh`, and retires its `Branch` the same way instead of falling
 back to the genesis value.
+
+### A branch of the same name
+
+Another process learns of a drop when it catches up, and a read-only handle when it refreshes, and
+by then the name can belong to a new branch: a drop and a fork of the same name between two
+catch-ups leave a table that still has the name. The first version compared the head it found with
+the one it had, by log and root, took the new branch for the old one moved, and kept the old handles
+on it: a write through one landed on the new branch, and its watchers fired with the new branch's
+lower version (#101). The outcome hung on whether the process happened to catch up between the drop
+and the fork.
+
+So each `Head` records `born`, the sequence number of the frame that created the branch. A fork
+reads it as the number after the newest frame, under `tip`, where every frame is placed, and with
+`Options::shared` after catching up under the placement lock, so it is past the number of the frame
+that dropped any earlier branch of that name. A receive that creates a remote-tracking branch does
+the same. Commits, fast-forwards, receives into a branch that exists, pruning and cycles carry it
+over, and `main`, which no fork creates, keeps 0. Sequence numbers never go back within a file: a
+cycle seals its copy at the old file's newest number, and `admin::compact` now does too where it
+sealed at 1, which let a read-only handle that outlived an offline compaction meet the same number
+again. A `Branch` keeps the `born` of the head it was attached from, and catching up, `refresh` and
+following a cycle retire every attached branch but `main` whose name is gone or whose head has
+another `born`, so its writes fail with `Error::NoBranch`, its reads keep what they had and its
+watchers end, as when the drop is in the same process. Comparing heads for a move counts `born` too,
+so attaching from the published table waits for a new branch's head as it waits for a moved one. The
+cost is one comparison per attached branch on heads each catch-up loads anyway.
+
+Two ways that leave the format alone were rejected:
+
+- Looking for the handle's tip, version v with entry hash h, in the new branch's chain, a lookup of
+  O(log n) per attached branch: the branch is the old one if its chain holds h at v. But a fork
+  shares its parent's chain. A branch dropped before a commit of its own and forked again from the
+  same parent holds the very entry the handle holds, and so does one forked from a branch that was
+  forked from the dropped one. Both read as the old branch moved on.
+- Reading the table of every frame a catch-up follows, not just the last, for a drop of an attached
+  name, which costs a lookup per attached branch in every table a frame rewrites: it finds every
+  drop in the frames a process reads, and those are not all. A process or a read-only handle that
+  two cycles pass while it is idle opens the newest file, and the frames of the generation between
+  are gone with the file that held them.
+
+In the encoding, bit 2 of the flag byte before the root link says that `born` follows the map of
+merge records, as a varint. A head whose `born` is 0 does not set it and one that sets it with 0 is
+rejected, so a head has one encoding. Heads written before have no such bit and read as 0. A branch
+from before this change that is dropped and forked again gets a number, so its old handles retire;
+only a drop and fork both made by a build from before go unseen, as they always did. `main` never
+sets the bit, so a file whose only branch is `main` is written byte for byte as before. A build from
+before this change rejects a head with the bit, so it cannot read a table once a branch has been
+forked since.
+
+`a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead` drops and forks again
+in one shared writer while another holds a handle and a watcher on the branch, with and without
+commits of the old branch's own, so that the new branch shares the handle's entry, and with and
+without a cycle between, which the other writer follows. The write through the old handle must fail
+with `NoBranch`, its read stay and its watcher end, and a handle the other writer attaches
+afterwards must write to the new branch.
+`a_read_only_handle_retires_a_branch_dropped_and_forked_again_on_refresh` does the same for a
+read-only handle, with and without a compaction, and
+`a_branch_forked_again_after_an_offline_compaction_is_a_new_branch` forks the name again after
+`admin::compact` with zero to seven commits between, one of which gave the new branch the old one's
+number while the copy was sealed at 1.

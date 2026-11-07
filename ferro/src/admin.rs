@@ -453,7 +453,8 @@ fn write_copy(
     let mut copier = Copier::create(store, temp, &StoreOptions::default(), None)?;
     copier.pass(&pruned)?;
     let after = copier.end();
-    let (_, objects) = copier.finish(&pruned, 1, after as f64 / before.max(1) as f64)?;
+    let survival = after as f64 / before.max(1) as f64;
+    let (_, objects) = copier.finish(&pruned, store.last_seq(), survival)?;
     Ok(Compacted {
         after_bytes: copier.end(),
         objects,

@@ -557,6 +557,65 @@ fn a_drop_and_fork_in_another_handle_wait_for_a_closure_on_that_branch() {
 }
 
 #[test]
+fn a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead() {
+    let manual = Reclaim { every_bytes: 0 };
+    for (own_commits, cycle) in [(true, false), (false, false), (true, true), (false, true)] {
+        let case = format!("own commits {own_commits}, cycle {cycle}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refork.ferro");
+        let a: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+        bump(&a, 0, 1);
+        let old = a.fork("x").unwrap();
+        if own_commits {
+            for i in 1..=3 {
+                bump(&old, 1, i);
+            }
+        }
+        let b: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+        let held = b.branch("x").unwrap();
+        let had = (held.version(), held.read().n);
+        let watcher = held.watch();
+        if cycle {
+            a.compact(Keep::All).unwrap();
+            b.refresh().unwrap();
+            assert!(
+                matches!(watcher.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{case}: a cycle alone ended the watcher"
+            );
+        }
+        drop(old);
+        a.drop_branch("x").unwrap();
+        let new = a.fork("x").unwrap();
+        bump(&new, 2, 1);
+        if cycle {
+            a.compact(Keep::All).unwrap();
+        }
+        let now = (new.version(), new.read().n);
+
+        let wrote = held.update(|root| root.n += 100);
+        assert!(
+            matches!(wrote, Err(Error::NoBranch(_))),
+            "{case}: {wrote:?}"
+        );
+        assert_eq!((held.version(), held.read().n), had, "{case}");
+        assert!(
+            matches!(
+                watcher.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "{case}: the old branch's watcher did not end"
+        );
+        a.refresh().unwrap();
+        assert_eq!((new.version(), new.read().n), now, "{case}");
+        let attached = b.branch("x").unwrap();
+        assert_eq!((attached.version(), attached.read().n), now, "{case}");
+        attached.update(|root| root.n += 1).unwrap();
+        a.refresh().unwrap();
+        assert_eq!(new.read().n, now.1 + 1, "{case}");
+    }
+}
+
+#[test]
 fn a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pause.ferro");

@@ -294,10 +294,26 @@ pub(crate) struct Head {
     /// For each branch merged into this one by name, the version of it last merged and this
     /// branch's version when it was.
     pub(crate) merged: Map<String, (u64, u64)>,
+    /// The sequence number of the frame that created the branch, which tells a branch from a
+    /// later one of the same name, or 0 for `main` and for a head encoded without one.
+    pub(crate) born: u64,
 }
 
-fn encode_link(w: &mut Encoder<'_>, link: Option<Ptr>) {
-    w.u8(u8::from(link.is_some()));
+const BORN: u8 = 2;
+
+impl Head {
+    /// The [`Head::born`] of a branch that the next frame placed in `store` creates.
+    ///
+    /// The caller holds the `tip` mutex, under which every frame is placed, and with
+    /// [`Options::shared`] has caught up under the placement lock, so the number is past that of
+    /// every frame that dropped a branch of the same name.
+    pub(crate) fn born_next(store: &Store) -> u64 {
+        store.last_seq().saturating_add(1)
+    }
+}
+
+fn encode_link(w: &mut Encoder<'_>, link: Option<Ptr>, flags: u8) {
+    w.u8(u8::from(link.is_some()) | flags);
     if let Some(ptr) = link {
         w.link(ptr);
     }
@@ -309,17 +325,39 @@ impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         self.version.encode(w)?;
         self.log.first.encode(w)?;
-        encode_link(w, self.root);
-        encode_link(w, self.log.tip);
-        self.merged.encode(w)
+        encode_link(w, self.root, if self.born == 0 { 0 } else { BORN });
+        encode_link(w, self.log.tip, 0);
+        self.merged.encode(w)?;
+        if self.born != 0 {
+            self.born.encode(w)?;
+        }
+        Ok(())
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         let version = u64::decode(r)?;
         let first = u64::decode(r)?;
-        let root = Option::<Ptr>::decode(r)?;
+        let flags = r.u8()?;
+        if flags & !(1 | BORN) != 0 {
+            return Err(Error::Decode(format!("invalid branch head flags {flags}")));
+        }
+        let root = match flags & 1 {
+            0 => None,
+            _ => Some(r.link()?),
+        };
         let tip = Option::<Ptr>::decode(r)?;
         let merged = Map::decode(r)?;
+        let born = match flags & BORN {
+            0 => 0,
+            _ => match u64::decode(r)? {
+                0 => {
+                    return Err(Error::Decode(
+                        "a branch head flags the frame that created it and names none".into(),
+                    ));
+                }
+                born => born,
+            },
+        };
         if tip.is_none() && version != 0 {
             return Err(Error::Corrupt(format!(
                 "a branch with no commit names v{version} as its last"
@@ -335,6 +373,7 @@ impl Data for Head {
             root,
             log: Chain::bounded(tip, first, version)?,
             merged,
+            born,
         })
     }
 }
@@ -396,7 +435,9 @@ enum Caught {
 fn moved(old: Option<&Head>, new: Option<&Head>) -> bool {
     match (old, new) {
         (Some(old), Some(new)) => {
-            old.log != new.log || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
+            old.born != new.born
+                || old.log != new.log
+                || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
         }
         (None, None) => false,
         _ => true,
@@ -516,6 +557,7 @@ struct Slot<T> {
 
 struct Branch<T> {
     name: String,
+    born: u64,
     db: u64,
     lane_at: u64,
     state: ArcSwap<State<T>>,
@@ -591,9 +633,10 @@ impl<T> Drop for Lane<'_, T> {
 }
 
 impl<T> Branch<T> {
-    fn new(name: &str, db: u64, state: Arc<State<T>>) -> Branch<T> {
+    fn new(name: &str, born: u64, db: u64, state: Arc<State<T>>) -> Branch<T> {
         Branch {
             name: name.to_string(),
+            born,
             db,
             lane_at: lane_of(name),
             feed: Arc::new(Feed::new(state.snapshot.clone())),
@@ -689,6 +732,10 @@ impl<T> Branch<T> {
             return Err(Error::NoBranch(self.name.clone()));
         }
         Ok(())
+    }
+
+    fn dropped_in(&self, head: Option<&Head>) -> bool {
+        self.name != MAIN && head.is_none_or(|head| head.born != self.born)
     }
 }
 
@@ -1816,7 +1863,8 @@ impl<T: Data> Shared<T> {
             return Err(Error::NoBranch(name.to_string()));
         }
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
-        let branch = Arc::new(Branch::new(name, self.id, state));
+        let born = head.as_ref().map_or(0, |head| head.born);
+        let branch = Arc::new(Branch::new(name, born, self.id, state));
         branches.insert(name.to_string(), branch.clone());
         Ok(branch)
     }
@@ -2036,7 +2084,7 @@ impl<T: Data> Shared<T> {
         let mut gone = Vec::new();
         for branch in attached {
             let new = refs.try_get(&branch.name)?;
-            if new.is_none() && branch.name != MAIN {
+            if branch.dropped_in(new.as_deref()) {
                 gone.push(branch);
                 continue;
             }
@@ -2089,7 +2137,7 @@ impl<T: Data> Shared<T> {
             let mut gone = Vec::new();
             for branch in attached {
                 let found = refs.try_get(&branch.name)?;
-                if found.is_none() && branch.name != MAIN {
+                if branch.dropped_in(found.as_deref()) {
                     gone.push(branch);
                     continue;
                 }
@@ -2178,7 +2226,7 @@ impl<T: Data> Shared<T> {
         let mut gone = Vec::new();
         for branch in attached {
             let head = refs.try_get(&branch.name)?;
-            if head.is_none() && branch.name != MAIN {
+            if branch.dropped_in(head.as_deref()) {
                 gone.push(branch.name.clone());
                 continue;
             }
@@ -3007,11 +3055,9 @@ impl<T: Data> Shared<T> {
             .version
             .checked_add(1)
             .ok_or_else(|| Error::Corrupt("the branch has reached the last version".into()))?;
-        let mut merged = tip
-            .refs
-            .try_get(&branch.name)?
-            .map(|head| head.merged.clone())
-            .unwrap_or_default();
+        let current = tip.refs.try_get(&branch.name)?;
+        let born = current.as_ref().map_or(0, |head| head.born);
+        let mut merged = current.map(|head| head.merged.clone()).unwrap_or_default();
         let recorded = match intent.record {
             Some((other, theirs)) if merged.try_get(&other)?.map(|seen| seen.0) != Some(theirs) => {
                 merged.insert(other, (theirs, version));
@@ -3086,6 +3132,7 @@ impl<T: Data> Shared<T> {
                 root: Some(root),
                 log,
                 merged,
+                born,
             },
         );
         let state = State {
@@ -4886,6 +4933,7 @@ impl<T: Data> Db<T> {
             .try_get(&self.branch.name)?
             .map(|head| head.merged.clone())
             .unwrap_or_default();
+        let store = self.shared.store();
         let mut next = tip.refs.clone();
         next.insert(
             name.to_string(),
@@ -4894,9 +4942,9 @@ impl<T: Data> Db<T> {
                 root: commit.root,
                 log: state.log,
                 merged,
+                born: Head::born_next(&store),
             },
         );
-        let store = self.shared.store();
         let txn = store.begin()?;
         self.shared
             .stage(&mut tip, Next::Table(next), txn, None, None, None)?
@@ -4930,8 +4978,10 @@ impl<T: Data> Db<T> {
     ///
     /// It waits for a closure running on that branch to finish. Afterwards other handles on it
     /// keep reading what they had, writes through them fail with [`Error::NoBranch`], and its
-    /// watchers end. Merge records that name it go too. Its bytes stay in the file until the next
-    /// reclamation cycle.
+    /// watchers end. A handle in another process, or a read-only one, learns of the drop when it
+    /// catches up or refreshes, and a later fork of the same name is a new branch that the old
+    /// handles never move to. Merge records that name it go too. Its bytes stay in the file until
+    /// the next reclamation cycle.
     ///
     /// # Errors
     ///

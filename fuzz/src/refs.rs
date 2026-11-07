@@ -171,6 +171,7 @@ fn survey(store: &Store, top: Ptr) -> Known {
                 root: None,
                 tip: None,
                 merged: Map::new(),
+                born: 0,
             },
         ));
     }
@@ -236,6 +237,9 @@ fn perturb(input: &mut Input<'_>, known: &Known, head: &Head) -> Head {
         let other = &known.heads[input.pick(known.heads.len())].1;
         head.tip = other.tip;
         head.version = other.version;
+    }
+    if control & 64 != 0 {
+        head.born = number(input, head.born);
     }
     head
 }

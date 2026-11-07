@@ -102,8 +102,10 @@ that already exists, and `branches` lists them. Merging a branch back is describ
 
 `db.drop_branch("what-if")` removes a branch you are done with. It refuses `main` and the branch of
 the handle you call it on, with `Error::BranchInUse`. Other handles on that branch keep reading what
-they had, commits through them fail with `Error::NoBranch`, and its watchers end. The bytes stay in
-the file until the next reclamation cycle.
+they had, commits through them fail with `Error::NoBranch`, and its watchers end. Handles in other
+processes and read-only ones do the same once they catch up or refresh, even if the name was forked
+again by then: a new branch of the same name is another branch, and old handles never move to it.
+The bytes stay in the file until the next reclamation cycle.
 
 ## Tamper evidence
 
