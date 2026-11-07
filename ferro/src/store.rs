@@ -3617,7 +3617,7 @@ impl Store {
     /// if [`Staging::overlaid`] lends the view a staging that holds one, its body counted against
     /// what the view may read, and otherwise the record in the file, counted only if the view
     /// read it before.
-    fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
+    pub(crate) fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
         FRESH.with(|fresh| fresh.set(fresh.get().wrapping_add(1)));
         let Some(view) = &self.inner.view else {
             return self.read_object(ptr);

@@ -2062,6 +2062,363 @@ fn no_merge<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
 }
 
 #[derive(Data, Clone, Default)]
+struct Widened {
+    counts: Map<u64, u32>,
+    #[ferro(default)]
+    wide: Map<u64, u64>,
+}
+
+#[test]
+fn pulls_after_a_map_is_copied_into_a_wider_type_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let laptop: Db<Widened> = fast().open(dir.path().join("laptop.ferro")).unwrap();
+    let phone: Db<Widened> = fast().open(dir.path().join("phone.ferro")).unwrap();
+    laptop
+        .commit("count", |root| {
+            for key in 0..100 {
+                root.counts.insert(key, (key * 3) as u32);
+            }
+        })
+        .unwrap();
+    phone.pull(&laptop, "laptop", no_merge).unwrap();
+    laptop
+        .commit("widen", |root| {
+            root.wide = root
+                .counts
+                .iter()
+                .map(|(key, value)| (key, u64::from(*value)))
+                .collect();
+            root.counts = Map::new();
+        })
+        .unwrap();
+    let pulled = phone.pull(&laptop, "laptop", no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    laptop
+        .commit("more", |root| {
+            root.wide.insert(1_000_000, 1);
+        })
+        .unwrap();
+    let pulled = phone.pull(&laptop, "laptop", no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let root = phone.read();
+    assert!(root.counts.is_empty());
+    assert_eq!(root.wide.len(), 101);
+    for key in 0..100 {
+        assert_eq!(*root.wide.get(&key).unwrap(), key * 3);
+    }
+    assert_eq!(phone.head_hash(), laptop.head_hash());
+    phone.verify_typed().unwrap();
+}
+
+#[derive(Data, Clone, Default)]
+struct Texts {
+    notes: Map<u64, String>,
+    blobs: Map<u64, ferro::Bytes>,
+}
+
+#[derive(Data, Clone, Default)]
+struct Draft {
+    title: String,
+    tags: Map<u32, String>,
+}
+
+#[derive(Data, Clone, Default)]
+struct Published {
+    title: String,
+    tags: Map<u32, String>,
+}
+
+#[derive(Data, Clone, Default)]
+struct Memo {
+    title: String,
+    body: String,
+}
+
+#[derive(Data, Clone, Default)]
+struct Archived {
+    title: String,
+    body: String,
+}
+
+#[derive(Data, Clone, Default)]
+struct Desk {
+    drafts: Map<u64, Draft>,
+    published: Map<u64, Published>,
+    notes: Map<u64, Memo>,
+    archived: Map<u64, Archived>,
+}
+
+#[test]
+fn pulls_that_reach_held_objects_through_maps_of_another_type_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Texts> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Texts> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let text = "n".repeat(600);
+    a.update(|root| {
+        root.notes.insert(1, text.clone());
+    })
+    .unwrap();
+    b.pull(&a, "a", no_merge).unwrap();
+    a.update(|root| {
+        root.blobs
+            .insert(1, ferro::Bytes::from(text.clone().into_bytes()));
+    })
+    .unwrap();
+    assert_eq!(a.read().blobs.root_hash(), a.read().notes.root_hash());
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(&b.read().blobs.get(&1).unwrap()[..], text.as_bytes());
+    b.verify_typed().unwrap();
+
+    let a: Db<Desk> = fast().open(dir.path().join("desk-a.ferro")).unwrap();
+    let b: Db<Desk> = fast().open(dir.path().join("desk-b.ferro")).unwrap();
+    let title = "t".repeat(700);
+    a.commit("draft", |desk| {
+        let mut tags = Map::new();
+        tags.insert(1, "x".to_string());
+        desk.drafts.insert(
+            7,
+            Draft {
+                title: title.clone(),
+                tags,
+            },
+        );
+        desk.notes.insert(
+            7,
+            Memo {
+                title: title.clone(),
+                body: "n".into(),
+            },
+        );
+    })
+    .unwrap();
+    b.pull(&a, "a", no_merge).unwrap();
+    a.commit("publish", |desk| {
+        let draft = desk.drafts.get(&7).unwrap();
+        desk.published.insert(
+            7,
+            Published {
+                title: draft.title.clone(),
+                tags: draft.tags.clone(),
+            },
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    a.commit("archive", |desk| {
+        let note = desk.notes.get(&7).unwrap();
+        desk.archived.insert(
+            7,
+            Archived {
+                title: note.title.clone(),
+                body: note.body.clone(),
+            },
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let desk = b.read();
+    let published = desk.published.get(&7).unwrap();
+    assert_eq!(published.title, title);
+    assert_eq!(*published.tags.get(&1).unwrap(), "x");
+    assert_eq!(desk.archived.get(&7).unwrap().body, "n");
+    b.verify_typed().unwrap();
+}
+
+#[derive(Data, Clone, Default)]
+struct Raw {
+    notes: Map<u64, ferro::Bytes>,
+    blobs: Map<u64, ferro::Bytes>,
+}
+
+#[test]
+fn a_peer_that_reads_held_bytes_as_text_lands_them_only_if_they_are_text() {
+    for (bytes, lands) in [(vec![b'n'; 600], true), (vec![0xff; 600], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let peer: Db<Raw> = fast().open(dir.path().join("peer.ferro")).unwrap();
+        let b: Db<Texts> = fast().open(dir.path().join("b.ferro")).unwrap();
+        let bytes = ferro::Bytes::from(bytes);
+        peer.update(|raw| {
+            raw.blobs.insert(1, bytes.clone());
+        })
+        .unwrap();
+        let bundle = peer.bundle(&b.have().unwrap()).unwrap();
+        b.receive("peer", &bundle, no_merge).unwrap();
+        peer.update(|raw| raw.notes = raw.blobs.clone()).unwrap();
+        let before = (b.head_hash(), b.size_on_disk());
+        let bundle = peer.bundle(&b.have().unwrap()).unwrap();
+        let result = b.receive("peer", &bundle, no_merge);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            assert_eq!(b.read().notes.get(&1).unwrap().as_bytes(), &bytes[..]);
+        } else {
+            match result {
+                Err(Error::Bundle(message)) => assert!(message.contains("another type")),
+                other => panic!("landed bytes that are not text as a String: {other:?}"),
+            }
+            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        }
+        b.verify_typed().unwrap();
+    }
+}
+
+type Pair = (Map<u64, u32>, Map<u64, u64>);
+
+fn retyped(
+    db: &Db<Pair>,
+    hints: &[(u64, u64)],
+    sent: &[(&Object, &[u64])],
+) -> ferro::Result<Pulled<()>> {
+    let v1 = db.log().hash_at(&1).unwrap();
+    let root = sent.last().unwrap().0;
+    let tip = forged_entry(
+        root,
+        Forged {
+            version: 2,
+            time: now_ms(),
+            prev: Some(Ptr {
+                hash: v1,
+                offset: 0,
+            }),
+            merged: None,
+            graph: None,
+        },
+    );
+    let mut objects = sent.to_vec();
+    objects.push((&tip, &[0, 0]));
+    let bundle = forged_with(&tip, 2, &[(v1, 1)], &[0], hints, &objects);
+    db.receive("evil", &bundle, no_merge)
+}
+
+#[test]
+fn a_held_map_linked_as_another_value_type_lands_only_if_every_node_below_checks_as_it() {
+    let keys: Vec<u64> = (0..300).collect();
+    let top = keys.iter().map(common::level_of).max().unwrap();
+    let deep = *keys.iter().find(|key| common::level_of(*key) == 0).unwrap();
+    assert!(top >= 1);
+    for fits in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<Pair> = fast().open(dir.path().join("b.ferro")).unwrap();
+        b.update(|pair| {
+            for key in &keys {
+                let value = if *key == deep && !fits {
+                    u64::MAX
+                } else {
+                    key * 7
+                };
+                pair.1.insert(*key, value);
+            }
+        })
+        .unwrap();
+        let held = Ptr {
+            hash: b.read().1.root_hash().unwrap(),
+            offset: 0,
+        };
+        let mut body = Vec::new();
+        varint(&mut body, keys.len() as u64);
+        varint(&mut body, keys.len() as u64);
+        let root = Object {
+            body,
+            links: vec![held, held],
+        };
+        let before = (b.head_hash(), b.size_on_disk());
+        let result = retyped(&b, &[(0, 0)], &[(&root, &[2, 2])]);
+        if fits {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let pair = b.read();
+            assert_eq!(pair.0.len(), keys.len());
+            for key in &keys {
+                assert_eq!(u64::from(*pair.0.get(key).unwrap()), key * 7);
+            }
+        } else {
+            match result {
+                Err(Error::Bundle(message)) => assert!(message.contains("another type")),
+                other => panic!("landed a u64 past u32::MAX as a u32: {other:?}"),
+            }
+            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        }
+        b.verify_typed().unwrap();
+    }
+}
+
+#[test]
+fn a_held_subtree_linked_as_another_type_must_keep_within_its_new_range() {
+    let mut count = 300;
+    let (keys, top, last_top) = loop {
+        let keys: Vec<u64> = (1..=count).map(|at| at * 100_000).collect();
+        let top = keys.iter().map(common::level_of).max().unwrap();
+        let last_top = *keys
+            .iter()
+            .rfind(|key| common::level_of(*key) == top)
+            .unwrap();
+        if last_top != *keys.last().unwrap() {
+            break (keys, top, last_top);
+        }
+        count += 1;
+    };
+    let last = *keys.last().unwrap();
+    let above = |from: u64| (from..).find(|key| common::level_of(key) > top).unwrap();
+    let inside = above(last_top + 1);
+    assert!(inside < last);
+    for separator in [above(last + 1), inside] {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<Pair> = fast().open(dir.path().join("b.ferro")).unwrap();
+        b.update(|pair| {
+            for key in &keys {
+                pair.0.insert(*key, (key / 1000) as u32);
+            }
+        })
+        .unwrap();
+        let held = Ptr {
+            hash: b.read().0.root_hash().unwrap(),
+            offset: 0,
+        };
+        let mut body = vec![common::level_of(&separator) as u8, 1];
+        varint(&mut body, separator);
+        body.extend_from_slice(&[0, 5]);
+        varint(&mut body, keys.len() as u64);
+        body.push(0);
+        let node = Object {
+            body,
+            links: vec![held],
+        };
+        let mut body = vec![0];
+        varint(&mut body, keys.len() as u64 + 1);
+        let root = Object {
+            body,
+            links: vec![link_to(&node)],
+        };
+        let before = (b.head_hash(), b.size_on_disk());
+        let result = retyped(&b, &[(0, 0)], &[(&node, &[2]), (&root, &[0])]);
+        if separator > last {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let pair = b.read();
+            assert!(pair.0.is_empty());
+            assert_eq!(pair.1.len(), keys.len() + 1);
+            assert_eq!(*pair.1.get(&separator).unwrap(), 5);
+            for key in &keys {
+                assert_eq!(*pair.1.get(key).unwrap(), key / 1000);
+            }
+        } else {
+            match result {
+                Err(Error::Bundle(message)) => assert!(message.contains("another type")),
+                other => panic!("landed keys outside the range their new parent gives: {other:?}"),
+            }
+            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        }
+        b.verify_typed().unwrap();
+    }
+}
+
+#[derive(Data, Clone, Default)]
 struct Shelves {
     maps: Vec<Map<String, u8>>,
     one: Map<String, u8>,

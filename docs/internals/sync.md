@@ -530,6 +530,13 @@ Measured and left out:
   two ranges, one of 1 MiB under about 18, and a hostile bundle that reuses a node under many
   ranges decodes no more than that before it is refused, as described under [Checking
   trees](sync-receive.md#checking-trees).
+- Held data that a bundle links as another type, as after a commit that copies a map into one
+  whose values encode alike, is checked as that type down to its leaves, so the first pull after
+  such a copy reads the copied tree, a million keys in about 0.4 s. The first read of each held
+  record is free and later ones count against the allowance that recomputing summaries draws on,
+  as described under [Held data linked as another
+  type](sync-receive.md#held-data-linked-as-another-type). An object that does not check as the
+  new type refuses the bundle, as a `u64` past `u32::MAX` does in a map read as `Map<u64, u32>`.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. A table without one of its indexes, or holding one under
   another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows

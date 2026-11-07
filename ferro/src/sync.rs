@@ -21,8 +21,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use crate::codec::{
-    Checked, Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Recalled, Shape,
-    push_varint,
+    Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Recalled, Shape, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
@@ -43,6 +42,7 @@ const RERUN_SLACK: usize = 256 << 20;
 const RERUN_PER_LINK: usize = 4 << 10;
 const CONFIRMED_KEPT: usize = 1 << 16;
 const RANGES_KEPT: usize = 16;
+const HELD_KEPT: usize = 1 << 13;
 const EXPANSION: usize = 16;
 const EXPANSION_SLACK: usize = 16 << 20;
 const MAX_BODY: usize = u32::MAX as usize;
@@ -1601,6 +1601,56 @@ struct Kept {
     checks: Vec<(Shape, Vec<Kind>)>,
 }
 
+enum Beneath {
+    Check(Ptr, Option<Kind>, Kind),
+    Settle(Ptr, Kind),
+}
+
+type Retypes = HashMap<(Hash, TypeId), (Shape, Vec<Kind>)>;
+
+#[derive(Default)]
+struct Retyped {
+    recent: Retypes,
+    older: Retypes,
+}
+
+impl Retyped {
+    fn get(&mut self, hash: &Hash, kind: &Kind) -> Option<(Shape, bool)> {
+        let (shape, kinds) = self.entry((*hash, kind.id))?;
+        kinds
+            .iter()
+            .any(|seen| (seen.within)(seen, kind))
+            .then(|| (*shape, kinds.iter().any(|seen| kind.vouched_by(seen))))
+    }
+
+    fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
+        match self.entry((hash, kind.id)) {
+            Some((_, kinds)) => {
+                if kinds.len() >= RANGES_KEPT {
+                    kinds.remove(0);
+                }
+                kinds.push(kind.clone());
+            }
+            None => self.keep((hash, kind.id), (shape, vec![kind.clone()])),
+        }
+    }
+
+    fn entry(&mut self, key: (Hash, TypeId)) -> Option<&mut (Shape, Vec<Kind>)> {
+        if !self.recent.contains_key(&key) {
+            let found = self.older.remove(&key)?;
+            self.keep(key, found);
+        }
+        self.recent.get_mut(&key)
+    }
+
+    fn keep(&mut self, key: (Hash, TypeId), checks: (Shape, Vec<Kind>)) {
+        if self.recent.len() >= HELD_KEPT {
+            self.older = mem::take(&mut self.recent);
+        }
+        self.recent.insert(key, checks);
+    }
+}
+
 struct Vetting<'a> {
     store: &'a Store,
     staging: &'a Staging,
@@ -1609,7 +1659,8 @@ struct Vetting<'a> {
     held_at: &'a Index,
     root_kind: &'a Kind,
     kept: HashMap<u32, Kept>,
-    held: Checked,
+    held: Retyped,
+    beneath: Vec<Beneath>,
     spent: usize,
     budget: usize,
     queue: Vec<(Ptr, Kind, Option<Kind>)>,
@@ -1624,6 +1675,17 @@ struct Vetting<'a> {
 fn rejected(error: Error) -> Error {
     match error {
         Error::Decode(message) => bad(message),
+        other => other,
+    }
+}
+
+fn retyped(kind: &Kind, error: Error) -> Error {
+    match error {
+        Error::Decode(message) => bad(format!(
+            "it links as a {} to an object this database holds as another type, which does not \
+             check as one: {message}",
+            kind.name
+        )),
         other => other,
     }
 }
@@ -1874,7 +1936,36 @@ impl Vetting<'_> {
         if ptr.hash != hash {
             return Err(bad("a link does not match the object it names"));
         }
-        let known = known.as_ref();
+        let shape = self.held_as(ptr, known.as_ref(), kind)?;
+        while let Some(step) = self.beneath.pop() {
+            match step {
+                Beneath::Check(ptr, known, kind) => {
+                    if let Some(shape) = self.held_as(ptr, known.as_ref(), &kind)?
+                        && !kind.fits(shape)
+                    {
+                        return Err(bad(format!(
+                            "a {} it links to holds {} entries at level {}, not what the link claims",
+                            kind.name, shape.count, shape.level
+                        )));
+                    }
+                }
+                Beneath::Settle(ptr, kind) => {
+                    let object = self.store.read_object(ptr)?;
+                    let view = self.view();
+                    let checked =
+                        kind.recheck(&object.body, &object.links, view, self.recalled.as_ref());
+                    if let Some(error) = view.overdrawn() {
+                        return Err(error);
+                    }
+                    checked.map_err(|error| retyped(&kind, error))?;
+                }
+            }
+        }
+        Ok(shape)
+    }
+
+    fn held_as(&mut self, ptr: Ptr, known: Option<&Kind>, kind: &Kind) -> Result<Option<Shape>> {
+        let hash = ptr.hash;
         if known.is_some_and(|known| known.implies(kind)) {
             return Ok(None);
         }
@@ -1893,21 +1984,31 @@ impl Vetting<'_> {
             }
             return Ok(Some(shape));
         }
-        let object = self.store.read_object(ptr)?;
-        let view = self.view();
-        let checked = kind.check(&object.body, &object.links, Some(view));
-        if let Some(error) = view.overdrawn() {
-            return Err(error);
+        let object = self.view().read_fresh(ptr).map_err(rejected)?;
+        let (shape, found) = kind
+            .check(&object.body, &object.links, None)
+            .map_err(|error| retyped(kind, error))?;
+        if shape.deferred {
+            self.beneath.push(Beneath::Settle(ptr, kind.clone()));
         }
-        let shape = match checked {
-            Ok((shape, found)) if found.is_empty() => shape,
-            _ => {
-                return Err(bad(format!(
-                    "it links as a {} to an object this database holds as another type",
-                    kind.name
-                )));
+        if !found.is_empty() {
+            let mut held = known
+                .and_then(|known| {
+                    known
+                        .unclaimed()
+                        .check(&object.body, &object.links, None)
+                        .ok()
+                })
+                .map_or_else(Vec::new, |(_, found)| found)
+                .into_iter()
+                .peekable();
+            for (index, child) in found {
+                while held.next_if(|(at, _)| *at < index).is_some() {}
+                let known = held.next_if(|(at, _)| *at == index).map(|(_, kind)| kind);
+                self.beneath
+                    .push(Beneath::Check(object.links[index], known, child));
             }
-        };
+        }
         self.held.insert(hash, kind, shape);
         Ok(Some(shape))
     }
@@ -2456,7 +2557,8 @@ fn resolve<O: Objects>(
             held_at: &held_at,
             root_kind,
             kept: HashMap::new(),
-            held: Checked::default(),
+            held: Retyped::default(),
+            beneath: Vec::new(),
             spent: 0,
             budget: streamed
                 .carried

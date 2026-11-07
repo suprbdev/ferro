@@ -290,25 +290,25 @@ learn what that gave its children. A child is pushed again only if the new check
 that the earlier one does not imply, which in a narrower range only the edge children get, and it
 carries that kind with it, so a recheck goes down the edge of the subtree. The counts only decide
 what is kept: an object reached more often than it was counted is checked again, never let
-through. A link that resolves to an object the receiver holds is not walked into: what the receiver
-holds is trusted. Its type comes from the hint path. The anchor root is a `T`, and each hint step
-checks the held parent as its kind to learn the kind of the link the step follows, one read per
-parent on a changed path, which the hint resolution already paid. A held child agrees with a sent
-parent when it has the same type and count, its trusted range lies inside the new one and its
-trusted parent's level is no higher. Otherwise the held node is loaded and its leftmost and
-rightmost keys are found down its edges, O(depth). A link that names held data of another type is
-accepted only if that one object checks as the new type and holds no typed links of its own: a
-string spilled in one map and the same bytes as `Bytes` in another are one object. Anything else
-rejects the bundle.
+through. A link that resolves to an object the receiver holds is not walked into while the
+receiver holds it as the type the link names: what the receiver holds is trusted. Its type comes
+from the hint path. The anchor root is a `T`, and each hint step checks the held parent as its kind
+to learn the kind of the link the step follows, one read per parent on a changed path, which the
+hint resolution already paid. A held child agrees with a sent parent when it has the same type and
+count, its trusted range lies inside the new one and its trusted parent's level is no higher.
+Otherwise the held node is loaded and its leftmost and rightmost keys are found down its edges,
+O(depth). A link to held data of another type is checked below it, as described under [Held data
+linked as another type](#held-data-linked-as-another-type). Anything else rejects the bundle.
 
 The check costs the bundle, not the database: every sent object is decoded once, plus one read per
-parent on a hint path and the edges of a reused subtree whose range narrowed. A node reached again
-under a range no earlier check covers is checked again. Every check of a sent object, the first
-ones included, is charged its body bytes, and a recheck that also decodes the object under an
-earlier kind is charged them twice. A bundle whose checks pass twice its body bytes plus 16 MiB is
-refused, so its rechecks may decode about as much as it carries plus 16 MiB. A node of X bytes
-that is most of what a bundle carries can be reached under about 2 + 16 MiB / X ranges in all: a
-node of 17.6 MB under two, of 1 MiB under 18 and of 800 KB under 22.
+parent on a hint path, the edges of a reused subtree whose range narrowed, and what held data
+linked as another type reaches, read once. A node reached again under a range no earlier check
+covers is checked again. Every check of a sent object, the first ones included, is charged its body
+bytes, and a recheck that also decodes the object under an earlier kind is charged them twice. A
+bundle whose checks pass twice its body bytes plus 16 MiB is refused, so its rechecks may decode
+about as much as it carries plus 16 MiB. A node of X bytes that is most of what a bundle carries
+can be reached under about 2 + 16 MiB / X ranges in all: a node of 17.6 MB under two, of 1 MiB
+under 18 and of 800 KB under 22.
 
 A recheck used to decode the node under every earlier kind, and was charged its body once more for
 each, so k narrowings of a node of X bytes cost X(2 + 3 + … + (k + 1)) on top of its first check,
@@ -355,6 +355,44 @@ Before the check, a single flipped byte landed and a read panicked. With it, 131
 over random seeds landed and read back whole one time in seven, and were refused otherwise. The
 first version checked levels and order inside a node but not the range a parent gives it, and the
 fuzz test found a flipped key byte that put a key where iteration saw it and `get` did not.
+
+### Held data linked as another type
+
+Objects are found by hash, and values of different types can encode alike, so a bundle can link
+an object the receiver holds as one type as another. A `Map<u64, u32>` copied into a
+`Map<u64, u64>` keeps every node, since both values are varints. A string spilled in one map and
+the same bytes as `Bytes` in another are one object, and so is a value of a derived struct and of
+another with the same field names. Such a link checks the held object as the new type and then
+walks below it, held objects all the way down: each typed link the check finds is checked as the
+kind it names, with the range its new parent gives it. Beside each new kind the walk carries the
+kind the receiver holds the object under, which it learns by checking the held parent as the kind
+it is held under, as a hint step does, and a child whose held kind implies its new one stops the
+walk, as a nested map does whose type both structs share. A held object that does not decode as
+the new type, or one below it that does not, or a key outside the range its new parent gives it,
+rejects the bundle: a `u64` past `u32::MAX` in a leaf of a map linked as `Map<u64, u32>`, bytes
+that are not UTF-8 linked as a `String`, or a held subtree hung under a new parent whose separator
+falls among its deeper keys.
+
+The walk reads through the view that recomputing summaries uses, described below, so the first read
+of each held record is free and every later one is charged against that allowance. A summary that
+must be recomputed from a value holding a collection is checked after everything below it, as a
+deferred object of the bundle is. The walk remembers the checks it made, with the last 16 ranges of
+each, for the 16,384 objects it checked or found most recently, in two generations of 8,192 that
+drop the older when the newer fills, so a value shared by many keys of the copied map is checked
+once, and a subtree it has forgotten is read and checked again at a charge. A copy of a
+`Map<u64, u32>` of a million keys into a `Map<u64, u64>` landed from a bundle of 154 bytes in
+0.4 s, reading the 124,583 held nodes once, with 5.8 MiB of heap above what the pull started with.
+A copy into a `Map<u64, Bytes>` of a `Map<u64, String>` whose last 600,000 of 750,000 keys share
+one 600-byte value landed in 0.35 s.
+
+A link to held data of another type used to be accepted only if that one object checked as the new
+type and held no typed links. Map nodes with children or spilled values always hold some, so every
+pull after a commit that copied a map of more than one node into another type was refused, retries
+included, while a fresh clone of the same file landed, and so were the identical nodes of the two
+maps when a spilled `String` and the same bytes as `Bytes` sat under the same key. Recording more
+than one kind for each hinted object was weighed: the receiver has only reached such an object
+under its own type, so there is no other kind to record, and its bytes have to be checked as the
+new type all the same.
 
 ### Recomputing summaries
 
