@@ -30,7 +30,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::ErrorKind;
@@ -629,19 +629,34 @@ impl Copied {
 /// The frames that a catch-up followed and checked in memory, kept so that reads of the objects
 /// in them take their records from memory rather than from the file.
 struct Kept {
+    /// Where the first frame starts.
+    start: u64,
+    /// Where the last frame ends.
+    end: u64,
     /// The frames, in the order of the log.
     frames: Vec<Copied>,
 }
 
 impl Kept {
+    /// The frames of `frames`, in the order of the log, or `None` if there are none.
+    fn new(frames: VecDeque<Copied>) -> Option<Kept> {
+        let start = frames.front()?.start;
+        let end = frames.back()?.end;
+        Some(Kept {
+            start,
+            end,
+            frames: frames.into(),
+        })
+    }
+
     /// The bytes held from `offset` to the end of its frame or to `tail`, whichever comes first,
     /// or none if no frame held holds `offset`.
     fn from(&self, offset: u64, tail: u64) -> &[u8] {
-        let Some(frame) = self
-            .frames
-            .iter()
-            .find(|frame| frame.start <= offset && offset < frame.end)
-        else {
+        if offset < self.start || offset >= self.end {
+            return &[];
+        }
+        let index = self.frames.partition_point(|frame| frame.end <= offset);
+        let Some(frame) = self.frames.get(index).filter(|frame| frame.start <= offset) else {
             return &[];
         };
         let end = frame.end.min(tail);
@@ -3026,11 +3041,11 @@ impl Store {
         let mut at = Super::new(start, start, Basis::default());
         let mut last = None;
         let mut len = None;
-        let mut copied: Vec<Copied> = Vec::new();
+        let mut copied: VecDeque<Copied> = VecDeque::new();
         let mut held = 0;
         let left = loop {
             let mut peek = [0u8; FRAME_BYTES + LEFT_PEEK];
-            let got = match copied.last().filter(|last| last.end == at.log_end) {
+            let got = match copied.back().filter(|last| last.end == at.log_end) {
                 Some(last) => {
                     let after = last.after();
                     peek[..after.len()].copy_from_slice(after);
@@ -3071,11 +3086,12 @@ impl Store {
                             break false;
                         }
                         held += whole;
-                        while held > FOLLOWED_BYTES {
-                            let oldest = copied.remove(0);
+                        while held > FOLLOWED_BYTES
+                            && let Some(oldest) = copied.pop_front()
+                        {
                             held -= (oldest.end - oldest.start) as usize;
                         }
-                        copied.push(Copied {
+                        copied.push_back(Copied {
                             start: at.log_end,
                             end: frame.log_end,
                             bytes,
@@ -3125,9 +3141,8 @@ impl Store {
         let Some(last) = last else {
             return Ok(Followed::Still);
         };
-        if !copied.is_empty() {
-            let kept = Arc::new(Kept { frames: copied });
-            let replaced = inner.followed.lock().replace(kept);
+        if let Some(kept) = Kept::new(copied) {
+            let replaced = inner.followed.lock().replace(Arc::new(kept));
             drop(replaced);
         }
         inner.written.fetch_max(last.log_end, Ordering::AcqRel);
@@ -5314,6 +5329,32 @@ mod tests {
             assert_eq!(in_memory, in_file, "image {index}");
             assert_eq!(in_file, kept, "image {index}");
         }
+    }
+
+    #[test]
+    fn the_kept_frames_answer_only_for_offsets_inside_them() {
+        let frame = |start: u64, end: u64| Copied {
+            start,
+            end,
+            bytes: (start..end + LEFT_PEEK as u64).map(|at| at as u8).collect(),
+        };
+        let frames = VecDeque::from([frame(100, 150), frame(150, 160), frame(200, 260)]);
+        let kept = Kept::new(frames).unwrap();
+        for offset in 0..300 {
+            let held = kept.from(offset, 255);
+            let end = match offset {
+                100..150 => 150,
+                150..160 => 160,
+                200..255 => 255,
+                _ => offset,
+            };
+            assert_eq!(held.len() as u64, end - offset, "{offset}");
+            assert!(
+                held.first().is_none_or(|byte| *byte == offset as u8),
+                "{offset}"
+            );
+        }
+        assert!(Kept::new(VecDeque::new()).is_none());
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
