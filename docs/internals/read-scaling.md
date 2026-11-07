@@ -316,7 +316,9 @@ flush, drop iterators mid-walk, keep a stored root for the iterators that borrow
 dropped, keep a leaf the finder holds once the borrowed node that pinned it is freed, borrow a root
 through its map after a free has scanned the records, run a flush between a free's scan and its
 pass over the lists, so that the free meets an item another found held through a slot written
-after its scan, and move records between threads. They also check that `make_mut`, `get_mut` and
+after its scan, run a flush, a loan and a retire between a free's second reading of the slots and
+its pick, so that the pick meets an item another found held since at an address it found loose,
+and move records between threads. They also check that `make_mut`, `get_mut` and
 `unwrap_or_clone` copy a value a slot holds, that each end of a narrow range holds its nodes in its
 own slots and that a finder whose descent panicked holds only what its slots hold, race a lent
 value's last owner with the release of its slot, which must leave the value on no retired list,
@@ -747,6 +749,32 @@ retired list still holds the value, and then that the value is dropped once. Wit
 made to skip its flush, it fails in 7 of 10 runs on its own, where the item stays on the owner's
 list. The release that revives a value, two paragraphs up, was found while reading the protocol for
 this race, not from a failure.
+
+The second reading still picked what to let go by address (#102). A free gathered the items on a
+list that waited only for slots, read the slots for their addresses, and then took from the list
+every item waiting only for slots at an address that no slot held. Between that reading and the
+pick, another thread could let go of one of those items, the value's allocation be freed and a new
+value take its address, and an item of the new value come to wait only for slots, found held by a
+free that read a slot written after the first free's reading. The pick then took the new value's
+item too, and let go of its count while the slot held the value. A park and a release that revives
+a value picked the same way. As under #77, a release that took a lent value's last count read the
+records again and parked what a slot held, so nothing was freed under a reader, but the count could
+go to zero and back while a slot held the value. `make test-stress` failed once in 300 runs, in
+`shared_a_borrow_that_clears_its_slot_after_a_free_marked_it_flushes_at_drop`, which borrows twice:
+the allocator gave the second value the first one's address, and another test's flush, which had
+read the slots for the first value's item and found none holding it, took the second value's item
+from inside the borrow, between its retire and the check that the retired count was kept. Each item
+now has a number that no other item on its list has had, and a free, a park and a revive let go of
+only the items they read the slots for, picked by number. An item that comes to wait only for slots
+afterwards is read for by the free, park or revive that made it so. With a sleep of 300 µs between
+the reading and the pick, that test failed in 13 of 300 runs of the library's tests and in 70 of 600
+runs of the `shared` and `epoch` tests alone, each time after a log line from a pick that took an
+item it had not read for, at that item's address, and in none of 600 runs of the test on its own or
+300 runs at one test thread, where no other test frees. With the fix and the same sleep none of 900
+and none of 1,200 failed. A unit test runs a flush, a new loan and a retire of the same value
+between a free's second reading and its pick, so that the value has a second item, found held, at
+an address the free found loose; it failed on every run with the pick by address. Without the
+sleep, none of 1,800 runs of the library's tests failed before the fix, nor of 3,000 after it.
 
 ### Measurements
 
