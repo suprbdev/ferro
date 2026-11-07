@@ -3204,6 +3204,15 @@ impl Store {
 
     /// [`Store::read_object`], with the record's length in the log.
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
+        self.read_record_into(ptr, None)
+    }
+
+    /// [`Store::read_record`], also appending the record's bytes as stored to `record` if given.
+    pub(crate) fn read_record_into(
+        &self,
+        ptr: Ptr,
+        record: Option<&mut Vec<u8>>,
+    ) -> Result<(Object, u32)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
         let kept = self
@@ -3215,7 +3224,7 @@ impl Store {
             .as_ref()
             .and_then(|kept| kept.as_deref())
             .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
-        let (object, len, _) = Store::read_within(file, ptr, tail, held, true, false)?;
+        let (object, len, _) = Store::read_within(file, ptr, tail, held, true, false, record)?;
         Ok((object, len))
     }
 
@@ -3224,7 +3233,7 @@ impl Store {
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
-        let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true)?;
+        let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true, None)?;
         Ok((object, packed))
     }
 
@@ -3356,8 +3365,8 @@ impl Store {
     }
 
     /// Reads the record at `ptr`, never past `tail`, from `held`, bytes that start at the record,
-    /// or from `file` when `held` is empty, checking its hash if `verify` is set and keeping its
-    /// compressed body if `keep` is.
+    /// or from `file` when `held` is empty, checking its hash if `verify` is set, keeping its
+    /// compressed body if `keep` is, and appending the record's bytes to `record` if given.
     fn read_within(
         file: Option<&File>,
         ptr: Ptr,
@@ -3365,6 +3374,7 @@ impl Store {
         held: &[u8],
         verify: bool,
         keep: bool,
+        record: Option<&mut Vec<u8>>,
     ) -> Result<Raw> {
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
@@ -3417,6 +3427,9 @@ impl Store {
         }
         let len =
             u32::try_from(reader.pos).map_err(|_| Error::Corrupt("record overflow".into()))?;
+        if let Some(record) = record {
+            record.extend_from_slice(&reader.bytes[..reader.pos]);
+        }
         Ok((object, len, packed))
     }
 
@@ -4185,7 +4198,7 @@ impl Txn {
         };
         let verify = ptr.offset < self.origin;
         let file = Some(&*self.store.inner.file);
-        let (object, _, _) = Store::read_within(file, ptr, tail, held, verify, false)?;
+        let (object, _, _) = Store::read_within(file, ptr, tail, held, verify, false, None)?;
         Ok(object)
     }
 
@@ -4598,7 +4611,8 @@ impl Staging {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
             _ => (&[][..], self.start),
         };
-        let (object, _, _) = Store::read_within(self.file.as_ref(), ptr, tail, held, false, false)?;
+        let (object, _, _) =
+            Store::read_within(self.file.as_ref(), ptr, tail, held, false, false, None)?;
         Ok(object)
     }
 

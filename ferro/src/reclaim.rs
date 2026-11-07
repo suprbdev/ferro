@@ -10,6 +10,7 @@
 //! [Reclamation](https://github.com/archlemon/ferro/blob/main/docs/internals/reclamation.md)
 //! describes cycles, generations and crashes.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::BuildHasherDefault;
@@ -29,7 +30,7 @@ pub(crate) use crate::platform::{rename, sync_parent};
 use crate::refs;
 use crate::store::{
     Basis, LOG_START, Prehashed, Store, StoreOptions, Traced, Unpacked, append_staged, body_of,
-    compressed, seal, staged, verify_stored,
+    compressed, seal, staged, stored_within, verify_stored,
 };
 use units::{Key, PENDING, Reserved, Settled, Units};
 
@@ -41,6 +42,8 @@ const SPARE: usize = 64;
 const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 8;
 const AHEAD: usize = 16384;
+const KEEP_BYTES: usize = 16 << 20;
+const KEEP_EACH: usize = 64;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 
@@ -229,6 +232,7 @@ struct CopySink<'a> {
     scratch: Unpacked,
     bytes: Vec<u8>,
     body: Vec<u8>,
+    cache: EntryCache,
     spare: Vec<Buffers>,
     copied: HashMap<Hash, Copied, ByHash>,
     walked: HashMap<u64, Hash>,
@@ -388,14 +392,78 @@ struct Rungs {
 impl Rungs {
     fn of(body: &[u8], links: &[Ptr]) -> Result<Rungs> {
         let entry = Entry::decode(&mut Decoder::new(body, links, None))?;
+        Ok(Rungs::from_entry(&entry))
+    }
+
+    fn from_entry(entry: &Entry) -> Rungs {
         let prev = usize::from(entry.commit.root.is_some());
         let skip = prev + usize::from(entry.prev.is_some());
-        Ok(Rungs {
+        Rungs {
             version: entry.commit.version,
             parents: prev,
             prev: entry.prev.map(|_| prev),
             skip: entry.skip.map(|_| skip),
-        })
+        }
+    }
+}
+
+struct Spot {
+    hash: Hash,
+    start: usize,
+    len: usize,
+    rungs: Rungs,
+}
+
+/// The records of log entries that the walk down the chains read and the copy will want, kept by
+/// offset so that the copy need not read and decode them again.
+///
+/// They take at most [`KEEP_BYTES`], each counted at its length and [`KEEP_EACH`] more for its
+/// place in the map; past that, the copy reads entries from the file.
+#[derive(Default)]
+struct EntryCache {
+    bytes: Vec<u8>,
+    at: HashMap<u64, Spot>,
+    last: Option<usize>,
+}
+
+impl EntryCache {
+    fn read(&mut self, source: &Store, ptr: Ptr) -> Result<(Object, u32)> {
+        self.skip();
+        if self.bytes.len() + KEEP_EACH * self.at.len() >= KEEP_BYTES {
+            return source.read_record(ptr);
+        }
+        let start = self.bytes.len();
+        let read = source.read_record_into(ptr, Some(&mut self.bytes))?;
+        self.last = Some(start);
+        Ok(read)
+    }
+
+    fn keep(&mut self, ptr: Ptr, entry: &Entry) {
+        if let Some(start) = self.last.take() {
+            let spot = Spot {
+                hash: ptr.hash,
+                start,
+                len: self.bytes.len() - start,
+                rungs: Rungs::from_entry(entry),
+            };
+            self.at.insert(ptr.offset, spot);
+        }
+    }
+
+    fn skip(&mut self) {
+        if let Some(start) = self.last.take() {
+            self.bytes.truncate(start);
+        }
+    }
+
+    fn take(&mut self, ptr: Ptr) -> Option<(&[u8], Rungs)> {
+        let spot = self.at.remove(&ptr.offset)?;
+        let record = &self.bytes[spot.start..spot.start + spot.len];
+        (spot.hash == ptr.hash).then_some((record, spot.rungs))
+    }
+
+    fn clear(&mut self) {
+        *self = EntryCache::default();
     }
 }
 
@@ -609,6 +677,21 @@ impl CopySink<'_> {
 
     fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
+        if entry
+            && let Some((record, rungs)) = self.cache.take(ptr)
+            && let Some(stored) = stored_within(record, ptr.offset, &mut held.old)
+        {
+            held.payload.clear();
+            held.payload.extend_from_slice(&record[stored.payload.clone()]);
+            return Ok(Step::Descend(Pending {
+                from: ptr,
+                raw: stored.raw,
+                packed: stored.packed,
+                next: held.links.len(),
+                held,
+                entry: Some(rungs),
+            }));
+        }
         let (units, reserved) = (&self.units, &mut self.reserved);
         let large = |claim: usize| {
             *reserved = None;
@@ -915,6 +998,7 @@ impl<'a> Copier<'a> {
                 scratch: Unpacked::default(),
                 bytes: Vec::new(),
                 body: Vec::new(),
+                cache: EntryCache::default(),
                 spare: Vec::new(),
                 copied: HashMap::default(),
                 walked: HashMap::new(),
@@ -940,12 +1024,15 @@ impl<'a> Copier<'a> {
         let mut edge = Vec::new();
         let mut again = Vec::new();
         let mut closures = Closures::exact();
+        let cache = RefCell::new(mem::take(&mut sink.cache));
+        let read = |ptr| cache.borrow_mut().read(&source, ptr);
         for (_, branch) in refs.try_entries()? {
             let (first, after) = (branch.log.first, branch.log.after(&source)?);
-            branch.log.visit(&source, |ptr, entry, _, _| {
+            branch.log.visit_with(read, |ptr, entry, _, _| {
                 if !sink.wanted(ptr, Need::new(first, after), &mut again) {
                     return Ok(false);
                 }
+                cache.borrow_mut().keep(ptr, entry);
                 retained.insert(ptr.hash);
                 sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
@@ -958,10 +1045,11 @@ impl<'a> Copier<'a> {
             for (ptr, need) in again.drain(..) {
                 closures.push(ptr, need.floor, need.after());
             }
-            closures.walk_bounded(&source, |ptr, entry, _, _, (floor, after)| {
+            closures.walk_bounded(read, |ptr, entry, _, _, (floor, after)| {
                 if !sink.wanted(ptr, Need::new(floor, after), &mut again) {
                     return Ok(false);
                 }
+                cache.borrow_mut().keep(ptr, entry);
                 retained.insert(ptr.hash);
                 sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
@@ -971,6 +1059,8 @@ impl<'a> Copier<'a> {
                 break;
             }
         }
+        sink.cache = cache.into_inner();
+        sink.cache.skip();
         for hash in &retained {
             sink.pruned.remove(hash);
             sink.copied
@@ -989,6 +1079,7 @@ impl<'a> Copier<'a> {
         refs.encode(&mut encoder)?;
         let head = encoder.finish();
         sink.needs.clear();
+        sink.cache.clear();
         let head = head?;
         sink.flush()?;
         if let Some(units) = &mut sink.units {

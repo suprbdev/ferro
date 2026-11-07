@@ -416,19 +416,22 @@ impl Closures {
         store: &Store,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
     ) -> Result<()> {
-        self.walk_bounded(store, |ptr, entry, object, len, _| {
+        let read = |ptr| store.read_record(ptr);
+        self.walk_bounded(read, |ptr, entry, object, len, _| {
             each(ptr, entry, object, len)
         })
     }
 
-    /// [`Closures::walk`], also handing `each` the bounds each entry was reached with.
+    /// [`Closures::walk`], reading each entry's record and its length with `read`, which must
+    /// check its hash as [`Store::read_record`] does, and also handing `each` the bounds each
+    /// entry was reached with.
     ///
     /// # Errors
     ///
     /// As for [`Closures::walk`].
     pub(crate) fn walk_bounded(
         &mut self,
-        store: &Store,
+        mut read: impl FnMut(Ptr) -> Result<(Object, u32)>,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32, (u64, Option<u64>)) -> Result<bool>,
     ) -> Result<()> {
         while let Some(Reverse((floor, after, hash, offset))) = self.queue.pop() {
@@ -438,7 +441,7 @@ impl Closures {
                 if ptr.offset == 0 || self.covered(ptr, floor, after) {
                     break;
                 }
-                let (object, len) = store.read_record(ptr)?;
+                let (object, len) = read(ptr)?;
                 let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
                 let at = entry.commit.version;
                 if at >= above {
@@ -710,13 +713,27 @@ impl Chain {
     pub(crate) fn visit(
         &self,
         store: &Store,
+        each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
+    ) -> Result<()> {
+        self.visit_with(|ptr| store.read_record(ptr), each)
+    }
+
+    /// [`Chain::visit`], reading each entry's record and its length with `read`, which must check
+    /// its hash as [`Store::read_record`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Chain::visit`], and the first error from `read`.
+    pub(crate) fn visit_with(
+        &self,
+        mut read: impl FnMut(Ptr) -> Result<(Object, u32)>,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
     ) -> Result<()> {
         let mut next = self.tip;
         let mut above = u64::MAX;
         let mut skips: Vec<(u64, u64, Hash)> = Vec::new();
         while let Some(ptr) = next {
-            let (object, len) = store.read_record(ptr)?;
+            let (object, len) = read(ptr)?;
             let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
             let at = entry.commit.version;
             if at >= above {
