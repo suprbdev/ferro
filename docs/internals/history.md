@@ -270,7 +270,7 @@ on it: a write through one landed on the new branch, and its watchers fired with
 lower version (#101). The outcome hung on whether the process happened to catch up between the drop
 and the fork.
 
-So each `Head` records `born`, the sequence number of the frame that created the branch. A fork
+So each `Head` records `born`, a sequence number taken when the branch was created. A fork
 reads it as the number after the newest frame, under `tip`, where every frame is placed, and with
 `Options::shared` after catching up under the placement lock, so it is past the number of the frame
 that dropped any earlier branch of that name. A receive that creates a remote-tracking branch does

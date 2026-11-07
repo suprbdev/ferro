@@ -148,12 +148,13 @@ The frames' head pointers name [steps](commit-path.md#branch-table-steps) on the
 already holds, so loading the new refs reads only the steps since the head this process last knew,
 as a read-only `refresh` does. For every branch attached in this process whose head moved, it loads
 the new state into the branch's tip, and a branch that is gone is retired. So is one whose name now
-has a head with another `born`, the frame that created the branch: another process dropped it and
-forked the name again before this one caught up, and the table this process loads has only the
-newest of those frames' heads, as [A branch of the same name](history.md#a-branch-of-the-same-name)
-describes. The first version took that head for the old branch moved, so a write through an old
-handle landed on the new branch, where a process that caught up between the drop and the fork
-failed it with `Error::NoBranch`. The frames go into the queue as one entry, so the next sync
+has a head with another `born`, the number taken when the branch was created: another process
+dropped it and forked the name again before this one caught up, and the table this process loads
+has only the newest of those frames' heads, as [A branch of the same
+name](history.md#a-branch-of-the-same-name) describes. The first version took that head for the
+old branch moved, so a write through an old handle landed on the new branch, where a process that
+caught up between the drop and the fork failed it with `Error::NoBranch`. The frames go into the
+queue as one entry, so the next sync
 publishes those states with the process's own commits, in frame order, and fires their watchers.
 Nothing another process wrote is published here before it is durable, by that process's sync or by
 this one's.
@@ -640,24 +641,24 @@ what is easier to arrange there: forks and drops seen by the other handle, watch
 commit and by `refresh`, coalesced and awaited writes, an awaited write held up by the other
 handle's closure, a pull landing beside the other handle's commits, background cycles in three
 handles at once, four threads on branches of their own in each of two handles, an awaited write
-waiting through the other handle's cycle pause, a branch attached between catching up and syncing,
-a drop and fork that must wait for a closure, a branch the other handle dropped and forked again,
-with and without a cycle between, whose old handles must stay dead, a writer opening during the
-other handle's cycle pause, a closure on a branch the other handle dropped, a stale marker that a
-power cut leaves in front of a whole frame, and a frame a dead writer left cut at a page boundary,
-which the next writer writes over, or whole with a bit flipped, which it reports. It also has an idle handle
-commit after the other committed four frames, with two bits flipped in the second's first block,
-two in its magic, or its first 84 bytes zeroed, under both durabilities, and opens a handle beside
-a live Buffered one over the same frames; both must fail with `Error::Corrupt`, change nothing in
-the file, and leave the live handle's next commit and a reopen with every acknowledged commit. And
-it leaves a dead writer's near copy behind a stale marker, which the next writer must truncate and
-sync before it writes. Each test added for a finding of the review failed before its fix, as
-described above. A unit test in `ferro/src/store.rs` holds the placement lock while two shared
-writers open a Buffered file whose superblock names a frame past its anchor that reads as torn,
-then lets it go, and both must open at the frame before it, which one of them did not with the lock
-at 2^62 + 1 taken before recovery. Three more check the frames a catch-up reads in one read: a frame
-checked in memory must be judged as the file judges it, whole, with a bit flipped in each byte of
-its header past the magic, in every 997th byte of its body and in its table, with its first block
+waiting through the other handle's cycle pause, a branch attached between catching up and syncing, a
+drop and fork that must wait for a closure, a branch the other handle dropped and forked again, with
+and without a cycle between, whose old handles must stay dead, a writer opening during the other
+handle's cycle pause, a closure on a branch the other handle dropped, a stale marker that a power
+cut leaves in front of a whole frame, and a frame a dead writer left cut at a page boundary, which
+the next writer writes over, or whole with a bit flipped, which it reports. It also has an idle
+handle commit after the other committed four frames, with two bits flipped in the second's first
+block, two in its magic, or its first 84 bytes zeroed, under both durabilities, and opens a handle
+beside a live Buffered one over the same frames; both must fail with `Error::Corrupt`, change
+nothing in the file, and leave the live handle's next commit and a reopen with every acknowledged
+commit. And it leaves a dead writer's near copy behind a stale marker, which the next writer must
+truncate and sync before it writes. Each test added for a finding of the review failed before its
+fix, as described above. A unit test in `ferro/src/store.rs` holds the placement lock while two
+shared writers open a Buffered file whose superblock names a frame past its anchor that reads as
+torn, then lets it go, and both must open at the frame before it, which one of them did not with the
+lock at 2^62 + 1 taken before recovery. Three more check the frames a catch-up reads in one read: a
+frame checked in memory must be judged as the file judges it, whole, with a bit flipped in each byte
+of its header past the magic, in every 997th byte of its body and in its table, with its first block
 changed and that block's entry in the table rewritten to match, which only the frame's check finds,
 and cut a byte short; the frames kept must answer for offsets inside them only, up to the end of
 each frame or the readable tail, across a gap between them; and a follower must read the objects of

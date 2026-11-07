@@ -294,15 +294,16 @@ pub(crate) struct Head {
     /// For each branch merged into this one by name, the version of it last merged and this
     /// branch's version when it was.
     pub(crate) merged: Map<String, (u64, u64)>,
-    /// The sequence number of the frame that created the branch, which tells a branch from a
-    /// later one of the same name, or 0 for `main` and for a head encoded without one.
+    /// The sequence number after the newest frame when the branch was created, which tells a
+    /// branch from a later one of the same name, or 0 for `main` and for a head encoded without
+    /// one.
     pub(crate) born: u64,
 }
 
 const BORN: u8 = 2;
 
 impl Head {
-    /// The [`Head::born`] of a branch that the next frame placed in `store` creates.
+    /// The [`Head::born`] of a branch that the next frames placed in `store` create.
     ///
     /// The caller holds the `tip` mutex, under which every frame is placed, and with
     /// [`Options::shared`] has caught up under the placement lock, so the number is past that of
