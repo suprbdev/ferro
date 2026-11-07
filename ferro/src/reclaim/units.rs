@@ -1,7 +1,10 @@
-//! The trees that log entries root, copied on several threads into the bytes one thread writes.
+//! The trees a reclamation cycle reaches, copied on several threads into the bytes one thread
+//! writes.
 //!
 //! The walk hands each tree it reaches through an entry's root link to [`Units::dispatch`] as a
-//! unit and goes on down the chain. Worker threads discover units: they read each record, check
+//! unit and goes on down the chain. Any other tree it reaches, from the branch table or from a tree
+//! it copies itself, it hands out once it has read the tree's root and found no link to a log
+//! entry, a pruned hash or offset 0. Worker threads discover units: they read each record, check
 //! its hash, claim the objects its links name, and list the records the unit copies in the order
 //! one thread writes them, children first. A unit whose root has two or more children that no
 //! earlier unit holds is split, near the top of the tree, into a unit for each such child and one

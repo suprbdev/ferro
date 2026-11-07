@@ -370,5 +370,9 @@ Tests are described next to what they test:
   superblocks, and the end of their thread, `ferro/tests/follow.rs`, and a poisoned follower and a
   drop beside another handle's sync, `follow_fault.rs`: [Tests of
   followers](processes.md#tests-of-followers).
+- Ranges and prefixes combined with smaller lookups, and lookups of two tables or two versions of
+  one, against a filter over the rows, `combine_range.rs` and `combine.rs`: [Ranges and prefixes in
+  a combination](schema-and-unique-indexes.md#ranges-and-prefixes-in-a-combination) and [Lookups of
+  several tables](schema-and-unique-indexes.md#lookups-of-several-tables).
 - What runs on Windows: [Tests](windows.md#tests).
 - Crash safety in general: [Durability and crash safety](../guide/durability.md#what-was-tested).

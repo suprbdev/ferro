@@ -12,8 +12,8 @@ lists them with what each covers.
 The library is `ferro/src`:
 
 - `lib.rs`: the crate root and its documentation. It declares the modules and re-exports the public
-  API; `dense`, `epoch`, `graph`, `platform`, `prefix`, `reclaim`, `reentry`, `refs` and `shared`
-  are private, with `Prefix` re-exported from `prefix`.
+  API; `dense`, `epoch`, `follow`, `graph`, `platform`, `prefix`, `reclaim`, `reentry`, `refs` and
+  `shared` are private, with `Following` re-exported from `follow` and `Prefix` from `prefix`.
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls, and `Object`, `Ptr`,
   `hash_of` and `Bytes`.
 - `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
@@ -41,7 +41,10 @@ The library is `ferro/src`:
 - `reentry.rs`: the per-thread record of the locks a thread holds, behind `Error::Reentrant`,
   described under [Writes from inside a closure](reentrancy.md).
 - `reclaim.rs`: the copy into a new generation, which `Db::compact` and `admin::compact` share, and
-  `Reclaim`, `Space` and `Compacted`.
+  `Reclaim`, `Space` and `Compacted`. `reclaim/units.rs`: the trees the copy hands to its other
+  threads, described under [Trees on several threads](reclamation.md#trees-on-several-threads).
+- `follow.rs`: the thread behind `Options::follow` and `Following`, described under
+  [Followers](processes.md#followers).
 - `admin.rs`: functions that work on a path without user types: `info`, `log`, `verify`, `layout`,
   `space` and `compact`, and `Keep`.
 - `platform.rs`: the file calls that differ between Unix and Windows, described under

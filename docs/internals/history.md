@@ -25,6 +25,10 @@ offset 0. `Options::history(Keep::Last(n))` raises `first` as part of each commi
 extra bytes. `Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each
 reclamation cycle.
 
+A walk of a whole chain, as `verify`, `verify_typed`, a reclamation cycle and `admin::compact` make,
+checks that each retained skip link names by hash the entry the chain reaches at its version, and
+fails with `Error::Corrupt` where it names another, as [Fuzzing](testing.md#fuzzing) describes.
+
 ## What pruning hides
 
 Everything that names a version of a branch follows one rule: a version below `first` is gone. `at`
