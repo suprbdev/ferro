@@ -417,9 +417,11 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 /// # Errors
 ///
 /// [`Error::Io`] with [`NotFound`](std::io::ErrorKind::NotFound) if there is no file at `path`,
-/// [`Error::Locked`] while a writer has the file open, and [`Error::NotFerro`], [`Error::Corrupt`]
-/// or [`Error::Io`] if the file cannot be read or the copy written. A copy that fails is removed,
-/// and the file is left as it was.
+/// [`Error::Locked`] while a writer has the file open, [`Error::NotFerro`] if the file is not a
+/// database, which includes an empty file, as for [`info`], since a compaction does not make a
+/// database of one as a writable [`Db::open`](crate::Db::open) does, and [`Error::Corrupt`] or
+/// [`Error::Io`] if the file cannot be read or the copy written. A copy that fails is removed, and
+/// the file is left as it was.
 ///
 /// # Examples
 ///
@@ -444,7 +446,7 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     let real = fs::canonicalize(path.as_ref())?;
     let path = real.as_path();
-    let (store, head) = Store::open(path, StoreOptions::default())?;
+    let (store, head) = Store::open_existing(path, StoreOptions::default())?;
     let before_bytes = store.size();
     let Some(head) = head else {
         store.close();

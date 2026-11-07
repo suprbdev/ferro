@@ -130,6 +130,22 @@ fn compacting_a_missing_path_fails_and_creates_nothing() {
 }
 
 #[test]
+fn compacting_an_empty_file_is_not_ferro_and_leaves_it_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in [("empty.ferro", 0), ("zeros.ferro", 100)] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        assert!(matches!(admin::info(&path), Err(Error::NotFerro(_))));
+        assert!(matches!(
+            admin::compact(&path, Keep::All),
+            Err(Error::NotFerro(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; bytes]);
+        assert!(!dir.path().join(format!("{name}.compacting")).exists());
+    }
+}
+
+#[test]
 fn read_only_handle_follows_a_replaced_file_on_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.ferro");

@@ -2166,6 +2166,20 @@ impl Store {
         Store::open_as(path, path, options)
     }
 
+    /// Opens the database file at `path` as [`Store::open`] does, but never creates one: an empty
+    /// file, which a writable open would make a database of, is [`Error::NotFerro`] as it is to a
+    /// read-only open.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Store::open`].
+    pub(crate) fn open_existing(
+        path: &Path,
+        options: StoreOptions,
+    ) -> Result<(Store, Option<Ptr>)> {
+        Store::opened(path, path, options, false)
+    }
+
     /// Opens the file at `actual` as the database at `path`, as a cycle opens its copy before it
     /// renames the copy over the path.
     ///
@@ -2180,6 +2194,15 @@ impl Store {
         actual: &Path,
         path: &Path,
         options: StoreOptions,
+    ) -> Result<(Store, Option<Ptr>)> {
+        Store::opened(actual, path, options, true)
+    }
+
+    fn opened(
+        actual: &Path,
+        path: &Path,
+        options: StoreOptions,
+        create: bool,
     ) -> Result<(Store, Option<Ptr>)> {
         let shared = options.shared && !options.read_only;
         let renamed = actual != path;
@@ -2244,7 +2267,7 @@ impl Store {
                 if probe.starts_with(MAGIC) {
                     return Err(Error::Corrupt("both superblocks are invalid".into()));
                 }
-                if len > LOG_START || probe.iter().any(|b| *b != 0) {
+                if !create || len > LOG_START || probe.iter().any(|b| *b != 0) {
                     return Err(Error::NotFerro(path.display().to_string()));
                 }
                 let empty = Mark {

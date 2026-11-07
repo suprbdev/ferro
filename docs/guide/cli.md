@@ -20,7 +20,9 @@ cargo run --release -p ferro-cli -- compact shop.ferro --keep-last 1000
 
 `compact` copies what is reachable to a new file and swaps it in atomically, on as many threads as a
 reclamation cycle takes by default, the cores up to 8, and fails while a writer has the file open.
-See [Retention and reclamation](retention.md) for doing this from a running program.
+Like the other commands, it refuses a file that is not a database, an empty one included, and
+leaves it as it was. See [Retention and reclamation](retention.md) for doing this from a running
+program.
 
 The `Makefile` wraps each command with `DB=path`: `make info`, `make log ARGS='--limit 50'`,
 `make verify`, `make space`, and `make compact KEEP=1000`.

@@ -38,7 +38,8 @@ pub enum Error {
     /// The file at the path, which the error holds, is not a ferro database.
     ///
     /// A writable open returns it for a file with other contents and creates a database only in an
-    /// empty file. A read-only open also returns it for an empty file.
+    /// empty file. A read-only open, and [`admin::compact`](crate::admin::compact), also return it
+    /// for an empty file.
     #[error("not a ferro database: {0}")]
     NotFerro(String),
     /// The file is damaged, or holds something no file ferro wrote can hold.
