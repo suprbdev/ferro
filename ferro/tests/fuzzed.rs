@@ -208,14 +208,22 @@ fn fails_as_corrupt(f: impl FnOnce()) {
     );
 }
 
-fn crafted(build: impl FnOnce(&mut Txn) -> Ptr) -> (TempDir, Store, Arc<Root>) {
+struct Closing(Store);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn crafted(build: impl FnOnce(&mut Txn) -> Ptr) -> (TempDir, Closing, Arc<Root>) {
     let dir = tempfile::tempdir().unwrap();
     let (store, _) = Store::open(&dir.path().join("crafted.ferro"), buffered()).unwrap();
     let mut txn = store.begin().unwrap();
     let head = build(&mut txn);
     txn.commit(head).unwrap();
     let map = store.load::<Root>(head).unwrap();
-    (dir, store, map)
+    (dir, Closing(store), map)
 }
 
 fn node(txn: &mut Txn, level: u8, keys: &[u64], children: &[(usize, u64, Ptr)]) -> Ptr {
@@ -820,6 +828,30 @@ fn a_node_whose_child_counts_overflow_is_rejected() {
     });
     let found = map.try_get(&2);
     assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_crafted_map_lets_its_file_close_after_a_read_fails() {
+    let overflowing = |txn: &mut Txn| {
+        let low = node(txn, 0, &[1], &[]);
+        let high = node(txn, 0, &[3], &[]);
+        let top = node(txn, 1, &[2], &[(0, 1 << 63, low), (1, 1 << 63, high)]);
+        map_root(txn, 1, top)
+    };
+    let miscounted = |txn: &mut Txn| {
+        let leaf = node(txn, 0, &[1], &[]);
+        let top = node(txn, 1, &[2], &[(0, 7, leaf)]);
+        map_root(txn, 8, top)
+    };
+    let builds: [fn(&mut Txn) -> Ptr; 2] = [overflowing, miscounted];
+    for build in builds {
+        let (dir, store, map) = crafted(build);
+        let found = map.try_get(&1);
+        assert!(matches!(found, Err(Error::Decode(_))), "{found:?}");
+        drop((store, map));
+        assert!(closed(&dir.path().join("crafted.ferro")));
+    }
 }
 
 #[test]
