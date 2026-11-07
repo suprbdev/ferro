@@ -122,14 +122,25 @@ struct Plan<T> {
     closed: bool,
 }
 
-/// What publishing a snapshot leaves to do: wake the branch's watch thread and free the snapshot
-/// the feed replaced.
+/// What publishing or replacing a snapshot leaves to do: wake the branch's watch thread after a
+/// publish, and free the snapshot replaced.
 ///
-/// Both happen when it is dropped, so a publisher keeps it until it has released its locks.
+/// Both happen when it is dropped, so a caller keeps it until it has released its locks.
 #[must_use]
 pub(crate) struct Notice<T> {
     feed: Option<Arc<Feed<T>>>,
     replaced: Option<Snapshot<T>>,
+}
+
+impl<T> Notice<T> {
+    /// A notice that only frees `snapshot`, so that a value replaced under a lock is dropped once
+    /// the lock is released.
+    pub(crate) fn freeing(snapshot: Snapshot<T>) -> Self {
+        Notice {
+            feed: None,
+            replaced: Some(snapshot),
+        }
+    }
 }
 
 impl<T> Drop for Notice<T> {
@@ -205,14 +216,19 @@ impl<T> Feed<T> {
 
     /// Replaces the newest snapshot with `snapshot` of the same version, read from another file,
     /// without waking any watcher.
-    pub(crate) fn rebind(&self, snapshot: Snapshot<T>) {
+    ///
+    /// The snapshot it replaced is freed when the returned [`Notice`] is dropped.
+    pub(crate) fn rebind(&self, snapshot: Snapshot<T>) -> Notice<T> {
         let mut slot = self.slot.lock();
         let replaced = match slot.closed {
             true => Some(snapshot),
             false => slot.latest.replace(snapshot),
         };
         drop(slot);
-        drop(replaced);
+        Notice {
+            feed: None,
+            replaced,
+        }
     }
 
     /// Ends every watcher of the feed and stops its watch thread.

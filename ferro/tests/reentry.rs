@@ -782,7 +782,7 @@ fn probed(options: Options, dir: &TempDir) -> (Db<Probed>, Db<Probed>, Db<Probed
 }
 
 #[test]
-fn a_value_dropped_in_a_cycle_pause_cannot_deadlock_a_write() {
+fn a_value_a_cycle_replaces_is_dropped_after_its_locks() {
     for (kind, options) in kinds() {
         let dir = dir();
         let (main, b, c) = probed(options(), &dir);
@@ -802,13 +802,17 @@ fn a_value_dropped_in_a_cycle_pause_cannot_deadlock_a_write() {
                 fired(&ON_DROP)
             })
         };
-        assert!(dropped, "{kind}: nothing was dropped in the pause");
-        check(kind, &seen.lock(), &[]);
+        assert!(dropped, "{kind}: nothing was dropped in the cycle");
+        check(
+            kind,
+            &seen.lock(),
+            &["update", "update_async", "branch", "fork"],
+        );
         b.update(|root| {
             root.rows.insert(100, 100);
         })
         .unwrap();
-        assert_eq!(main.branches(), vec!["b", "c", "main"], "{kind}");
+        assert_eq!(main.branches(), vec!["b", "c", "main", "z"], "{kind}");
         main.verify().unwrap();
     }
 }

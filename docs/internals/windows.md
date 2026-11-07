@@ -123,7 +123,7 @@ copied.
 CI runs the library's tests on `windows-latest`. Tests that interpose libc symbols through `dlsym`
 (`fdatasync`, `fsync`, `pread64`, `pwrite64`, `rename`, `clock_gettime`), run a child under `sh`
 with `ulimit -f`, kill or abort a child process, or make symlinks or check mode bits are
-`#[cfg(unix)]`, and `reentry_sync.rs` runs on Linux only, as do `shared.rs` and `shared_process.rs`,
-since `Options::shared` is refused elsewhere. The traced crash simulations replay
-ferro's own writes and run on both. So on Windows failed syncs, failed renames and process death go
+`#[cfg(unix)]`, and `reentry_sync.rs` runs on Linux only, as do `shared.rs`, `shared_process.rs` and
+`reentry_shared.rs`, since `Options::shared` is refused elsewhere. The traced crash simulations
+replay ferro's own writes and run on both. So on Windows failed syncs, failed renames and process death go
 unexercised, and as on Unix, power loss was never tested on hardware.

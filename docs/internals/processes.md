@@ -159,6 +159,16 @@ publishes those states with the process's own commits, in frame order, and fires
 Nothing another process wrote is published here before it is durable, by that process's sync or by
 this one's.
 
+Loading a state decodes its root as `T`, which runs the user's `Data::decode` under `tip`, so a
+catch-up that adopts a frame or follows a cycle's marker first records the whole file, as [Writes
+from inside a closure](reentrancy.md) describes, and a write, `refresh` or `Db::branch` from that
+decode fails with `Error::Reentrant`. The first version recorded nothing there, and a write took
+`tip` with only its lane recorded, so a `refresh`, a `Db::branch` or a write to a branch that sorts
+after the lane's, made from the decode, passed the check and waited for `tip` for good (#105). The
+states a catch-up replaces, and those of a branch it retires, go into notices its caller drops once
+it has let `tip` and its lanes go, so a `Drop` among them runs outside the locks. A catch-up that
+finds nothing records nothing, so a process alone pays nothing for either.
+
 The bytes of the frames a catch-up followed and checked in memory, up to 4 MiB of them, stay in
 memory until a later catch-up keeps the frames it follows, a catch-up truncates the file or the
 store closes, and a read of an object in them takes its record from there rather than from the file:
@@ -671,8 +681,10 @@ the frames it last kept from memory after their copy on the disk is damaged, and
 larger than 4 MiB, or of one it no longer keeps, from the file. `ferro/tests/placement_fault.rs`
 intercepts `fcntl` to fail a read-only open's test of the placement lock with `ENOLCK` over a
 superblock one commit behind, and checks that the open scans and finds the commit, where it trusted
-the superblock before. These files build on 64-bit Linux only, and `ferro/tests/smoke.rs` checks
-elsewhere that the option is refused.
+the superblock before. `ferro/tests/reentry_shared.rs` opens one file twice and makes reentrant
+calls from a decode and from a `Drop` that run while one handle catches up with the other's commit,
+cycle or `drop_branch`, as [Writes from inside a closure](reentrancy.md) describes. These files
+build on 64-bit Linux only, and `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
 
 ## Measurements
 

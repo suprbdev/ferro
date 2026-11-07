@@ -402,9 +402,12 @@ impl Drop for Byte {
 
 /// The reclamation cycle locks of this process and, with [`Options::shared`], of the file, held
 /// so that no cycle starts until it is dropped.
-pub(crate) struct Cycles<'a> {
+///
+/// The states that the catch-up made on taking them replaced are freed once they are released.
+pub(crate) struct Cycles<'a, T> {
     _across: Option<Held>,
     _local: MutexGuard<'a, ()>,
+    _freed: Vec<Notice<T>>,
 }
 
 struct Tip<'a> {
@@ -1742,6 +1745,21 @@ fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
     })
 }
 
+fn free<T>(notices: &mut Vec<Notice<T>>, state: &State<T>) {
+    notices.push(Notice::freeing(state.snapshot.clone()));
+}
+
+fn rebind<T>(branch: &Branch<T>, state: Arc<State<T>>, notices: &mut Vec<Notice<T>>) {
+    free(notices, &branch.tip.swap(state.clone()));
+    if state.snapshot.commit == branch.state.load().snapshot.commit {
+        notices.push(branch.feed.rebind(state.snapshot.clone()));
+        free(notices, &branch.state.swap(state));
+    } else {
+        free(notices, &branch.state.load());
+        notices.push(branch.publish(state));
+    }
+}
+
 fn holds(found: &[Start], ptr: Ptr) -> bool {
     found.iter().any(|start| start.node.ptr.hash == ptr.hash)
 }
@@ -1873,7 +1891,7 @@ impl<T: Data> Shared<T> {
     fn attached(&self, name: &str) -> Result<Arc<Branch<T>>> {
         loop {
             if self.options.shared {
-                self.catch_up()?;
+                self.catch_up(&mut Vec::new())?;
             }
             if let Some(branch) = self.branches.lock().get(name) {
                 return Ok(branch.clone());
@@ -1943,8 +1961,11 @@ impl<T: Data> Shared<T> {
             .all(|(_, branch)| held(branch))
     }
 
-    fn exclusively<R>(&self, f: impl FnOnce(&mut RefState) -> Result<R>) -> Result<R> {
-        let mut notices = Vec::new();
+    fn exclusively<R>(
+        &self,
+        notices: &mut Vec<Notice<T>>,
+        f: impl FnOnce(&mut RefState, &mut Vec<Notice<T>>) -> Result<R>,
+    ) -> Result<R> {
         loop {
             let branches = self.every_lane();
             let mut lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
@@ -1961,10 +1982,10 @@ impl<T: Data> Shared<T> {
             let mut tip = self.tip.lock();
             let commit = store.is_shared().then(|| store.lock_commit()).transpose()?;
             let current = self.store().id() == store.id()
-                && self.follow(&mut tip, true, &mut notices)? != Caught::Swapped;
+                && self.follow(&mut tip, true, notices)? != Caught::Swapped;
             if current && self.covers(&branches) {
                 let whole = reentry::whole(self.id);
-                let out = f(&mut tip);
+                let out = f(&mut tip, notices);
                 drop(whole);
                 drop(commit);
                 drop(tip);
@@ -2067,17 +2088,25 @@ impl<T: Data> Shared<T> {
         match store.follow(holds, upto)? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
-                self.adopt(tip, &store, frame)?;
+                let _whole = reentry::whole(self.id);
+                self.adopt(tip, &store, frame, notices)?;
                 Ok(Caught::Moved)
             }
             Followed::Retired => {
+                let _whole = reentry::whole(self.id);
                 self.follow_swap(tip, &store, notices)?;
                 Ok(Caught::Swapped)
             }
         }
     }
 
-    fn adopt(&self, tip: &mut RefState, store: &Store, frame: Frame) -> Result<()> {
+    fn adopt(
+        &self,
+        tip: &mut RefState,
+        store: &Store,
+        frame: Frame,
+        notices: &mut Vec<Notice<T>>,
+    ) -> Result<()> {
         let since = tip.ptr.map(|known| (known, &tip.refs, tip.depth));
         let (refs, depth) = refs::load(store, Some(frame.head), since)?;
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
@@ -2100,7 +2129,7 @@ impl<T: Data> Shared<T> {
         tip.ptr = Some(frame.head);
         tip.depth = depth;
         for (branch, state) in &followed {
-            branch.tip.store(state.clone());
+            free(notices, &branch.tip.swap(state.clone()));
             branch.framed.store(frame.seq, Ordering::Release);
         }
         if !gone.is_empty() {
@@ -2110,7 +2139,11 @@ impl<T: Data> Shared<T> {
                 branches.remove(&branch.name);
             }
             drop(branches);
-            gone.iter().for_each(|branch| branch.retire());
+            for branch in &gone {
+                free(notices, &branch.tip.load());
+                free(notices, &branch.state.load());
+                branch.retire();
+            }
         }
         self.step("adopted");
         self.queue.lock().waiting.push(Pending {
@@ -2154,13 +2187,7 @@ impl<T: Data> Shared<T> {
         self.store.store(Arc::new(fresh.clone()));
         *published = tip.clone();
         for (branch, state) in states {
-            branch.tip.store(state.clone());
-            if state.snapshot.commit == branch.state.load().snapshot.commit {
-                branch.feed.rebind(state.snapshot.clone());
-                branch.state.store(state);
-            } else {
-                notices.push(branch.publish(state));
-            }
+            rebind(&branch, state, notices);
         }
         let mut branches = self.branches.lock();
         for branch in &gone {
@@ -2168,7 +2195,11 @@ impl<T: Data> Shared<T> {
         }
         drop(branches);
         drop(published);
-        gone.iter().for_each(|branch| branch.retire());
+        for branch in &gone {
+            free(notices, &branch.tip.load());
+            free(notices, &branch.state.load());
+            branch.retire();
+        }
         let mut retired = self.retired.lock();
         retired.retain(|old| old.bytes().is_some());
         retired.push(old.retired());
@@ -2179,20 +2210,17 @@ impl<T: Data> Shared<T> {
         Ok(())
     }
 
-    fn catch_up(&self) -> Result<bool> {
-        self.catch_up_to(u64::MAX)
+    fn catch_up(&self, notices: &mut Vec<Notice<T>>) -> Result<bool> {
+        self.catch_up_to(u64::MAX, notices)
     }
 
-    fn catch_up_to(&self, upto: u64) -> Result<bool> {
-        let mut notices = Vec::new();
+    fn catch_up_to(&self, upto: u64, notices: &mut Vec<Notice<T>>) -> Result<bool> {
         let before = self.published.lock().ptr;
         let mut tip = self.tip.lock();
-        let whole = reentry::whole(self.id);
-        let caught = self.follow_to(&mut tip, false, upto, &mut notices)?;
+        let caught = self.follow_to(&mut tip, false, upto, notices)?;
         let ticket = self.store().last_seq();
-        drop(whole);
         drop(tip);
-        self.settle(ticket, &mut notices)?;
+        self.settle(ticket, notices)?;
         Ok(caught == Caught::Swapped || self.published.lock().ptr != before)
     }
 
@@ -2242,17 +2270,13 @@ impl<T: Data> Shared<T> {
         }
         *published = tip.clone();
         for (branch, state) in states {
-            branch.tip.store(state.clone());
-            if state.snapshot.commit == branch.state.load().snapshot.commit {
-                branch.feed.rebind(state.snapshot.clone());
-                branch.state.store(state);
-            } else {
-                notices.push(branch.publish(state));
-            }
+            rebind(&branch, state, &mut notices);
         }
         let mut branches = self.branches.lock();
         for name in gone {
             if let Some(branch) = branches.remove(&name) {
+                free(&mut notices, &branch.tip.load());
+                free(&mut notices, &branch.state.load());
                 branch.retire();
             }
         }
@@ -2278,8 +2302,8 @@ impl<T: Data> Shared<T> {
         store.check_healthy()?;
         match store.news()? {
             News::Nothing => Ok(false),
-            News::Named(seq) => self.catch_up_to(seq),
-            News::Replaced => self.catch_up(),
+            News::Named(seq) => self.catch_up_to(seq, &mut Vec::new()),
+            News::Replaced => self.catch_up(&mut Vec::new()),
         }
     }
 
@@ -3181,7 +3205,7 @@ impl<T: Data> Shared<T> {
             return Ok(0);
         }
         let store = self.store();
-        self.exclusively(|tip| {
+        self.exclusively(notices, |tip, notices| {
             let mut next = tip.refs.clone();
             let mut dropped = 0;
             for (name, mut head) in tip.refs.try_entries()? {
@@ -3222,7 +3246,7 @@ impl<T: Data> Shared<T> {
         }
         let mut notices = Vec::new();
         let _only = self.cycle.lock();
-        let _across = self.hold_cycle(stop.is_none())?;
+        let _across = self.hold_cycle(stop.is_none(), &mut notices)?;
         if stop.is_some() && self.options.shared && !self.due() {
             return Err(Error::Interrupted);
         }
@@ -3248,7 +3272,7 @@ impl<T: Data> Shared<T> {
         outcome
     }
 
-    fn hold_cycle(&self, wait: bool) -> Result<Option<Held>> {
+    fn hold_cycle(&self, wait: bool, notices: &mut Vec<Notice<T>>) -> Result<Option<Held>> {
         loop {
             let store = self.store();
             if !store.is_shared() {
@@ -3257,7 +3281,7 @@ impl<T: Data> Shared<T> {
             let Some(held) = store.lock_cycle(wait)? else {
                 return Err(Error::Interrupted);
             };
-            self.catch_up()?;
+            self.catch_up(notices)?;
             if self.store().id() == store.id() {
                 return Ok(Some(held));
             }
@@ -3302,23 +3326,24 @@ impl<T: Data> Shared<T> {
         copier.sync()?;
         self.step("synced");
         let paused = Instant::now();
-        let (fresh, objects) = self.exclusively(|tip| -> Result<(Store, u64)> {
-            self.step("paused");
-            self.settle(store.last_seq(), notices)?;
-            store.check_healthy()?;
-            let basis = store.basis();
-            let (head, objects) = {
-                let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
-                let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
-                copier.finish(&tip.refs, store.last_seq(), survival)?
-            };
-            report.handed_out = copier.handed_out();
-            let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
-            let swapped = self.swap_in(tip, store, &fresh, &temp, head);
-            swapped.inspect_err(|_| fresh.close())?;
-            self.signal.base.store(fresh.size(), Ordering::Relaxed);
-            Ok((fresh, objects))
-        })?;
+        let (fresh, objects) =
+            self.exclusively(notices, |tip, notices| -> Result<(Store, u64)> {
+                self.step("paused");
+                self.settle(store.last_seq(), notices)?;
+                store.check_healthy()?;
+                let basis = store.basis();
+                let (head, objects) = {
+                    let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
+                    let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
+                    copier.finish(&tip.refs, store.last_seq(), survival)?
+                };
+                report.handed_out = copier.handed_out();
+                let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
+                let swapped = self.swap_in(tip, store, &fresh, &temp, head, notices);
+                swapped.inspect_err(|_| fresh.close())?;
+                self.signal.base.store(fresh.size(), Ordering::Relaxed);
+                Ok((fresh, objects))
+            })?;
         report.pause = paused.elapsed();
         self.step("swapped");
         report.after_bytes = fresh.size();
@@ -3348,6 +3373,7 @@ impl<T: Data> Shared<T> {
         fresh: &Store,
         temp: &Path,
         head: Ptr,
+        notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
         let (refs, depth) = refs::load(fresh, Some(head), None)?;
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
@@ -3379,9 +3405,9 @@ impl<T: Data> Shared<T> {
         self.store.store(Arc::new(fresh.clone()));
         *published = tip.clone();
         for (branch, state) in states {
-            branch.feed.rebind(state.snapshot.clone());
-            branch.tip.store(state.clone());
-            branch.state.store(state);
+            notices.push(branch.feed.rebind(state.snapshot.clone()));
+            free(notices, &branch.tip.swap(state.clone()));
+            free(notices, &branch.state.swap(state));
         }
         Ok(())
     }
@@ -4924,6 +4950,7 @@ impl<T: Data> Db<T> {
         self.shared.cross(&mut lane, &mut notices)?;
         self.branch.check_live()?;
         let mut tip = self.shared.lock_tip(&mut notices)?;
+        let whole = reentry::whole(self.shared.id);
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
@@ -4951,6 +4978,7 @@ impl<T: Data> Db<T> {
             .stage(&mut tip, Next::Table(next), txn, None, None, None)?
             .land()?;
         let ticket = store.last_seq();
+        drop(whole);
         drop(tip);
         drop(lane);
         self.shared.settle(ticket, &mut notices)?;
@@ -5192,7 +5220,7 @@ impl<T: Data> Db<T> {
         let _crossing = self.entering(Needs::Tip)?;
         match self.shared.options.read_only {
             true => self.shared.refresh(),
-            false => self.shared.catch_up(),
+            false => self.shared.catch_up(&mut Vec::new()),
         }
     }
 
@@ -5319,12 +5347,14 @@ impl<T: Data> Db<T> {
     ///
     /// With [`Options::shared`] it holds the cycle lock across processes too, and catches up with
     /// a cycle another process ran.
-    pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_>> {
+    pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_, T>> {
+        let mut freed = Vec::new();
         let local = self.shared.cycle.lock();
-        let across = self.shared.hold_cycle(true)?;
+        let across = self.shared.hold_cycle(true, &mut freed)?;
         Ok(Cycles {
             _across: across,
             _local: local,
+            _freed: freed,
         })
     }
 
@@ -5368,7 +5398,7 @@ impl<T: Data> Db<T> {
     ) -> Result<X> {
         let shared = &self.shared;
         let mut notices = Vec::new();
-        shared.exclusively(|tip| {
+        shared.exclusively(&mut notices, |tip, notices| {
             self.branch.check_live()?;
             let store = shared.store();
             let mut txn = store.begin()?;
@@ -5386,14 +5416,14 @@ impl<T: Data> Db<T> {
             let landed = landing.land();
             if landed.is_ok() {
                 for (branch, state) in &states {
-                    branch.tip.store(state.clone());
+                    free(notices, &branch.tip.swap(state.clone()));
                     branch.framed.store(pending.frame.seq, Ordering::Release);
                 }
                 pending.followed = states;
             }
             shared.queue.lock().waiting.push(pending);
             landed?;
-            shared.settle(store.last_seq(), &mut notices)?;
+            shared.settle(store.last_seq(), notices)?;
             Ok(out)
         })
     }

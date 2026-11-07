@@ -1,8 +1,8 @@
 # Writes from inside a closure
 
 A write called from inside a closure used to wait for a lock its own thread held, and so never
-returned (#41). These are the cases, each reproduced with a timeout in `ferro/tests/reentry.rs` and
-`reentry_sync.rs`, and each hung before this change:
+returned (#41). These are the cases, each reproduced with a timeout in `ferro/tests/reentry.rs`,
+`reentry_sync.rs` and `reentry_shared.rs`, and each hung before this change:
 
 ## The cases
 
@@ -29,8 +29,23 @@ returned (#41). These are the cases, each reproduced with a timeout in `ferro/te
   run under the lane only, so a write from them is judged as one from the closure. What still runs
   under `tip` is the drop of the drafted root when nothing changed; when another frame landed during
   the draft, `decode` of the moved root and the drop of the drafted one it replaces; when a cycle
-  swapped the file during the draft, the whole draft again; and in a cycle's swap, the drop of the
-  states it replaces. The tests cover the drops and the moved root's `decode`.
+  swapped the file during the draft, the whole draft again; and in a cycle's swap, the decode of
+  every attached branch's root from the new file. The tests cover the drops and the moved root's
+  `decode`.
+- With `shared`, the decode of another process's roots while catching up with it, which also runs
+  under `tip`. A write takes its lane and then catches up under `tip`, and does so again before it
+  places its frame, and `fork`, `drop_branch`, `Db::branch`, `refresh`, a cycle and a follower's
+  look all catch up too, as [Catching up](processes.md#catching-up) describes. A frame it adopts
+  loads the new state of every attached branch it moved, and a cycle's marker loads every attached
+  branch from the new file, so `Data::decode` ran under `tip` with only the lane recorded, and a
+  `refresh`, a `Db::branch` or a write to a branch that sorts after the lane's passed the check and
+  then waited for `tip` (#105). `reentry_shared.rs` makes those calls, and writes to an earlier
+  branch, `fork`, `drop_branch` and a read, from a decode during `update`, `fork`, `drop_branch`,
+  `compact`, `Db::branch`, `refresh` and a read-only handle's `refresh`, with and without
+  `coalesce`, after another handle's commit and after its cycle. Before the fix 18 of each test's
+  98 cases hung: `refresh`, `branch`, the later write and `drop_branch` of a later branch inside
+  `update`, `fork` and `drop_branch`, and with `coalesce`, which refuses those writes under any
+  lane, `refresh` and `branch`.
 
 A merge closure, pull's merge, an awaited write's closure, a watcher test run on the thread that
 waits for it, and a `Drop` of anything a closure captured all run under the lane, so they are the
@@ -44,9 +59,13 @@ branch's name, and dropping the lane removes them. A file is the `Shared` behind
 `open`, numbered when it opens, since two opens of one path have separate locks. Each place that
 holds `tip` while user code may run records the whole file: a commit's hold of `tip` after its
 draft, a cycle's or `receive`'s hold of every lane, each piece of a bundle that `receive` places,
-attaching a branch, `refresh` and `drop_branch`. The commit's record is taken by its callers rather
-than inside `commit_locked`, so it also covers the draft that `commit_locked` drops when it returns
-early. A write is refused when its thread holds:
+attaching a branch, a read-only handle's `refresh`, `fork` and `drop_branch`, and a catch-up that
+adopts a frame or follows a cycle's marker, wherever it runs. The commit's record is taken by its
+callers rather than inside `commit_locked`, so it also covers the draft that `commit_locked` drops
+when it returns early. The catch-up's is taken in `follow_to` only once the log names something
+new, so a commit in a process alone, which finds nothing, records nothing more. `fork` decodes
+nothing, but the cache of decoded objects may drop a value it evicts at any read under `tip`. A
+write is refused when its thread holds:
 
 - the whole file it writes to;
 - with `coalesce`, any lane of that file;
@@ -99,10 +118,21 @@ lane, so a test or a closure that refreshes waits at most for one look, as it wo
 thread's `refresh`, and the follower never waits for it. In `ferro/tests/follow.rs` a filtered
 watcher whose test refreshes and attaches a branch runs while the follower publishes 50 commits. The
 `Drop` impls that run under a lane or `tip` are covered by the same record: values a closure
-captured, a coalesced group's working copy, a commit's drafted root when nothing changed or when it
-moves, and the states a cycle's swap replaces. The library's own drop that writes, the flush when
-the last handle of a file goes, takes that file's lanes, but no closure can run on a file once its
-last handle is gone, so nothing can hold them.
+captured, a coalesced group's working copy, and a commit's drafted root when nothing changed or when
+it moves. The library's own drop that writes, the flush when the last handle of a file goes, takes
+that file's lanes, but no closure can run on a file once its last handle is gone, so nothing can
+hold them.
+
+The states that a catch-up, a cycle's swap or a read-only `refresh` replace, and those of a branch
+they retire, are not dropped under `tip` at all. Each call keeps their snapshots in notices, as a
+sync keeps the snapshot a publish replaces, and drops them once it has released its locks, a cycle
+after its cycle locks as well, so a `Drop` there may write anywhere, as one after the call may.
+`reentry_shared.rs` makes the calls above from such a `Drop` after another handle's cycle and after
+it dropped a branch this one had attached, and `reentry.rs` writes, awaits a write, attaches and
+forks from one after the handle's own cycle. Before, those under the catch-up of a write, `fork` or
+`drop_branch` hung as the decodes did, and most of the rest failed with `Error::Reentrant`. The
+cache of decoded objects may hold the last copy of a value too, and drops it when it evicts it or
+the store closes, under whatever the call holds then.
 
 ## What stays undetected
 
@@ -111,8 +141,11 @@ condvar or a `Watcher` for another thread's commit can still deadlock: on its ow
 commit needs the lane; on another branch of its file, while a cycle that holds that branch's lane
 waits for this one; and with `coalesce`, for a commit whose closure has already run, since that
 commit may be in this closure's group. Reads that take the published refs, such as `branches`,
-`verify` and `have`, are not checked either, so a `Drop` that reads during a cycle's swap still
-waits for itself.
+`verify` and `have`, are not checked either, so a `decode` that reads while a branch attaches, a
+read-only handle refreshes or a cycle swaps the file still waits for itself, as does a `Drop` the
+cache runs there. Nor is the cycle lock, which a cycle holds without a lane while it copies and
+closes the file it replaced, and a spilled bundle while it lands: a `Drop` the cache runs then may
+call `compact`, `pull`, `push` or `receive`, which wait for it.
 
 ## Cost
 
@@ -140,3 +173,11 @@ moved by 0.7 to 1.0% with the rest of the code generation.
 Run one after the other without pinning, whichever binary ran second in a pair took about 25%
 longer, so an unpinned first try showed `tables` 10 to 16% slower after. That is why these runs were
 pinned, and why `tables` ran side by side.
+
+The record a catch-up takes, and the notices that hold what it replaces, cost a process alone
+nothing, since it finds nothing to adopt. A probe kept out of the tree made single-key Buffered
+commits through a shared handle, one build after the other on one pinned core in alternating
+order: alone, 50,000 a run, 10.70 µs a commit before the change and 10.68 after, with paired ratios
+at a median of 1.000 over twelve runs, from 0.973 to 1.036; with two handles of the file committing
+in turn, so that each commit adopts the other's frame, 15.45 and 15.51 µs, at 1.008, from 0.977 to
+1.033, over ten; and a `fork` and `drop_branch` together 9.95 and 9.96 µs, at 1.000.

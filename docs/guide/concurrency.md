@@ -80,8 +80,9 @@ alone, and a writer alone behaves as without the option. `examples/queue` uses i
 ## Writing from inside a closure
 
 A write from inside a closure fails with `Error::Reentrant` wherever it could deadlock, rather than
-hanging. That covers merge closures, a watcher test run inside a closure, and a `Drop` that runs
-under a writer lock too. A closure may write to another file, and without `coalesce` to a branch of
+hanging. That covers merge closures, a watcher test run inside a closure, a `Drop` that runs under a
+writer lock, and with `shared` a `Data::decode` that runs while a call catches up with another
+process's commits too. A closure may write to another file, and without `coalesce` to a branch of
 its own file whose name sorts after its own, since cycles and `receive` take branches in name order.
 Everything else on its own file is refused, and so is a write into another file while a closure
 there is writing back into this one. A closure that waits on a channel or a watcher for another
