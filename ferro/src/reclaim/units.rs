@@ -14,6 +14,7 @@
 //! entry, a pruned hash or a link at offset 0, or whose discovery fails, is tainted, and the walk
 //! copies it itself where it falls in the order.
 
+use std::any::Any;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::ops::Range;
@@ -25,7 +26,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use super::{ByHash, Failure};
+use super::ByHash;
 use crate::codec::{HASH_BYTES, Hash, Ptr, Staged};
 use crate::error::{Error, Result};
 use crate::platform::start_writeback;
@@ -51,6 +52,11 @@ const JOB_BYTES: u64 = 256 << 10;
 const KEEP_BYTES: usize = 1 << 20;
 const WAIT: Duration = Duration::from_millis(10);
 const BATCH: usize = 16;
+
+enum Failure {
+    Failed(Error),
+    Panicked(Box<dyn Any + Send>),
+}
 
 fn root_key(index: u32) -> Key {
     u64::from(index) << 32 | 0xffff_ffff

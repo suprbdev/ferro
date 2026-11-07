@@ -10,20 +10,15 @@
 //! [Reclamation](https://github.com/archlemon/ferro/blob/main/docs/internals/reclamation.md)
 //! describes cycles, generations and crashes.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::BuildHasherDefault;
 use std::mem;
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
-
-use parking_lot::{Condvar, Mutex};
 
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
 use crate::db::Refs;
@@ -41,8 +36,7 @@ use units::{Key, PENDING, Reserved, Settled, Units};
 mod units;
 
 const FLUSH_BYTES: usize = 1 << 20;
-const BATCH_BYTES: usize = 256 << 10;
-const BATCH_RECORDS: usize = 4096;
+const SPAWN_PAST: u64 = 256 << 10;
 const SPARE: usize = 64;
 const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 8;
@@ -227,265 +221,12 @@ impl Roots {
     }
 }
 
-#[derive(Default)]
-struct Batch {
-    seq: u64,
-    bytes: Vec<u8>,
-    records: Vec<(Ptr, usize)>,
-}
-
-impl Batch {
-    fn full(&self) -> bool {
-        self.bytes.len() >= BATCH_BYTES || self.records.len() >= BATCH_RECORDS
-    }
-
-    fn verify(&self, scratch: &mut Unpacked) -> Result<()> {
-        let mut start = 0;
-        for &(ptr, end) in &self.records {
-            verify_stored(&self.bytes[start..end], ptr, scratch)?;
-            start = end;
-        }
-        Ok(())
-    }
-
-    fn clear(&mut self) {
-        self.bytes.clear();
-        self.bytes.shrink_to(2 * BATCH_BYTES);
-        self.records.clear();
-    }
-}
-
-enum Failure {
-    Failed(Error),
-    Panicked(Box<dyn Any + Send>),
-}
-
-#[derive(Default)]
-struct Progress {
-    queued: usize,
-    failure: Option<(u64, Failure)>,
-}
-
-struct Board {
-    progress: Mutex<Progress>,
-    idle: Condvar,
-    failed: AtomicBool,
-    first: AtomicU64,
-    spare: Mutex<Vec<Batch>>,
-}
-
-impl Board {
-    fn new() -> Board {
-        Board {
-            progress: Mutex::default(),
-            idle: Condvar::new(),
-            failed: AtomicBool::new(false),
-            first: AtomicU64::new(u64::MAX),
-            spare: Mutex::default(),
-        }
-    }
-
-    fn fail(&self, progress: &mut Progress, seq: u64, failure: Failure) {
-        self.failed.store(true, Ordering::Release);
-        self.first.fetch_min(seq, Ordering::AcqRel);
-        if progress
-            .failure
-            .as_ref()
-            .is_none_or(|(first, _)| seq < *first)
-        {
-            progress.failure = Some((seq, failure));
-        }
-    }
-
-    fn take(&self) -> Result<()> {
-        let failure = self.progress.lock().failure.take();
-        match failure {
-            None => Ok(()),
-            Some((_, Failure::Failed(error))) => Err(error),
-            Some((_, Failure::Panicked(payload))) => panic::resume_unwind(payload),
-        }
-    }
-}
-
-fn verify_batches(work: &Mutex<Receiver<Batch>>, board: &Board) {
-    let mut scratch = Unpacked::default();
-    loop {
-        let next = work.lock().recv();
-        let Ok(mut batch) = next else {
-            return;
-        };
-        let seq = batch.seq;
-        let outcome = if seq > board.first.load(Ordering::Acquire) {
-            Ok(Ok(()))
-        } else {
-            panic::catch_unwind(AssertUnwindSafe(|| batch.verify(&mut scratch)))
-        };
-        batch.clear();
-        board.spare.lock().push(batch);
-        let mut progress = board.progress.lock();
-        progress.queued -= 1;
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => board.fail(&mut progress, seq, Failure::Failed(error)),
-            Err(payload) => board.fail(&mut progress, seq, Failure::Panicked(payload)),
-        }
-        if progress.queued == 0 {
-            board.idle.notify_all();
-        }
-    }
-}
-
-struct Pool {
-    queue: Option<SyncSender<Batch>>,
-    board: Arc<Board>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl Pool {
-    fn start(threads: usize) -> Option<Pool> {
-        let (queue, work) = mpsc::sync_channel(threads * 2);
-        let work = Arc::new(Mutex::new(work));
-        let board = Arc::new(Board::new());
-        let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            let (work, board) = (work.clone(), board.clone());
-            let spawned = thread::Builder::new()
-                .name("ferro-verify".to_string())
-                .spawn(move || verify_batches(&work, &board));
-            match spawned {
-                Ok(handle) => handles.push(handle),
-                Err(_) => break,
-            }
-        }
-        if handles.is_empty() {
-            return None;
-        }
-        Some(Pool {
-            queue: Some(queue),
-            board,
-            threads: handles,
-        })
-    }
-
-    fn send(&self, batch: Batch) -> Result<()> {
-        self.board.progress.lock().queued += 1;
-        let queue = self
-            .queue
-            .as_ref()
-            .expect("the queue lives as long as the pool");
-        let seq = batch.seq;
-        if queue.send(batch).is_err() {
-            let mut progress = self.board.progress.lock();
-            progress.queued -= 1;
-            let gone = Error::Io(std::io::Error::other("the copy's verifying threads exited"));
-            self.board.fail(&mut progress, seq, Failure::Failed(gone));
-        }
-        self.check()
-    }
-
-    fn check(&self) -> Result<()> {
-        if self.board.failed.load(Ordering::Acquire) {
-            return self.settle();
-        }
-        Ok(())
-    }
-
-    fn settle(&self) -> Result<()> {
-        let mut progress = self.board.progress.lock();
-        while progress.queued > 0 {
-            self.board.idle.wait(&mut progress);
-        }
-        drop(progress);
-        self.board.take()
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.board.failed.store(true, Ordering::Release);
-        self.board.first.store(0, Ordering::Release);
-        self.queue = None;
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
-
-struct Verifier {
-    threads: usize,
-    batch: Batch,
-    sent: u64,
-    scratch: Unpacked,
-    pool: Option<Pool>,
-}
-
-impl Verifier {
-    fn new(threads: usize) -> Verifier {
-        Verifier {
-            threads,
-            batch: Batch::default(),
-            sent: 0,
-            scratch: Unpacked::default(),
-            pool: None,
-        }
-    }
-
-    fn inline(&mut self, record: &[u8], ptr: Ptr) -> Result<()> {
-        verify_stored(record, ptr, &mut self.scratch)
-    }
-
-    fn add(&mut self, ptr: Ptr, record: &[u8]) -> Result<()> {
-        if self.threads <= 1 {
-            return self.inline(record, ptr);
-        }
-        self.batch.bytes.extend_from_slice(record);
-        self.batch.records.push((ptr, self.batch.bytes.len()));
-        if !self.batch.full() {
-            return Ok(());
-        }
-        if self.pool.is_none() {
-            self.pool = Pool::start(self.threads - 1);
-            if self.pool.is_none() {
-                self.threads = 1;
-            }
-        }
-        let Some(pool) = &self.pool else {
-            let verified = self.batch.verify(&mut self.scratch);
-            self.batch.clear();
-            return verified;
-        };
-        let spare = pool.board.spare.lock().pop().unwrap_or_default();
-        self.sent += 1;
-        let mut batch = mem::replace(&mut self.batch, spare);
-        batch.seq = self.sent;
-        pool.send(batch)
-    }
-
-    fn check(&self) -> Result<()> {
-        self.pool.as_ref().map_or(Ok(()), Pool::check)
-    }
-
-    fn settle(&mut self) -> Result<()> {
-        let verified = self.batch.verify(&mut self.scratch);
-        self.batch.clear();
-        let settled = self.pool.as_ref().map_or(Ok(()), Pool::settle);
-        settled.and(verified)
-    }
-
-    fn first(&mut self, error: Error) -> Error {
-        match self.settle() {
-            Err(earlier) => earlier,
-            Ok(()) => error,
-        }
-    }
-}
-
 struct CopySink<'a> {
     source: Store,
     file: Arc<Traced>,
     buf: Vec<u8>,
     end: u64,
-    verifier: Verifier,
+    scratch: Unpacked,
     bytes: Vec<u8>,
     body: Vec<u8>,
     spare: Vec<Buffers>,
@@ -847,7 +588,6 @@ impl CopySink<'_> {
         if self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
         }
-        self.verifier.check()?;
         let mut bytes = mem::take(&mut self.bytes);
         let step = self.step(ptr, entry, &mut bytes);
         if bytes.capacity() <= SPARE_BYTES {
@@ -858,7 +598,6 @@ impl CopySink<'_> {
     }
 
     fn first(&mut self, error: Error) -> Error {
-        let error = self.verifier.first(error);
         if matches!(error, Error::Interrupted) {
             return error;
         }
@@ -870,31 +609,24 @@ impl CopySink<'_> {
 
     fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
-        let verifier = &mut self.verifier;
         let (units, reserved) = (&self.units, &mut self.reserved);
         let large = |claim: usize| {
             *reserved = None;
             *reserved = units.as_ref().map(|units| units.reserve(claim as u64));
-            match claim > BATCH_BYTES {
-                true => verifier.settle(),
-                false => Ok(()),
-            }
+            Ok(())
         };
         let read = self.source.read_stored(ptr, bytes, &mut held.old, large);
         self.reserved = None;
         let (record, stored) = read?;
-        let entry = if entry {
-            if self.walked.get(&ptr.offset) != Some(&ptr.hash) {
-                self.verifier.inline(record, ptr)?;
+        if !entry || self.walked.get(&ptr.offset) != Some(&ptr.hash) {
+            verify_stored(record, ptr, &mut self.scratch)?;
+        }
+        let entry = match entry {
+            true => {
+                let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
+                Some(Rungs::of(body, &held.old)?)
             }
-            let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
-            Some(Rungs::of(body, &held.old)?)
-        } else if record.len() > BATCH_BYTES {
-            self.verifier.inline(record, ptr)?;
-            None
-        } else {
-            self.verifier.add(ptr, record)?;
-            None
+            false => None,
         };
         let payload = &record[stored.payload.clone()];
         if entry.is_none() {
@@ -941,10 +673,7 @@ impl CopySink<'_> {
             let Some(units) = self.units.as_mut().filter(|units| units.outstanding() > 0) else {
                 return Ok(());
             };
-            match units
-                .settle(stop, until)
-                .map_err(|error| self.verifier.first(error))?
-            {
+            match units.settle(stop, until)? {
                 Settled::Ahead => return Ok(()),
                 Settled::Done { end, objects } => {
                     self.end = end;
@@ -1171,7 +900,7 @@ impl<'a> Copier<'a> {
         file.created();
         file.set_len(LOG_START)?;
         let threads = copy_threads(options);
-        let large = store.size() >= LOG_START + BATCH_BYTES as u64;
+        let large = store.size() >= LOG_START + SPAWN_PAST;
         let spawn = match large || options.copy_threads > 1 {
             true => threads,
             false => 1,
@@ -1183,7 +912,7 @@ impl<'a> Copier<'a> {
                 file,
                 buf: Vec::new(),
                 end: LOG_START,
-                verifier: Verifier::new(if units.is_some() { 1 } else { threads }),
+                scratch: Unpacked::default(),
                 bytes: Vec::new(),
                 body: Vec::new(),
                 spare: Vec::new(),
@@ -1274,7 +1003,6 @@ impl<'a> Copier<'a> {
     pub(crate) fn pass(&mut self, refs: &Refs) -> Result<u64> {
         let before = self.sink.end;
         self.encode(refs)?;
-        self.sink.verifier.settle()?;
         self.sink.drain()?;
         Ok(self.sink.end - before)
     }
@@ -1301,7 +1029,6 @@ impl<'a> Copier<'a> {
     /// It returns the branch table's pointer in the copy and the number of objects copied in all.
     pub(crate) fn finish(&mut self, refs: &Refs, seq: u64, survival: f64) -> Result<(Ptr, u64)> {
         let head = self.encode(refs)?;
-        self.sink.verifier.settle()?;
         self.sink.drain()?;
         let basis = Basis::new(self.sink.end, survival);
         seal(&self.sink.file, self.sink.end, head, seq, basis)?;
@@ -1311,90 +1038,5 @@ impl<'a> Copier<'a> {
     /// Removes a copy that will not be used, ignoring a failure to.
     pub(crate) fn abandon(temp: &Path) {
         let _ = fs::remove_file(temp);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::append_record;
-
-    fn records(count: u64, bad: &[u64]) -> Vec<(Ptr, Vec<u8>)> {
-        (0..count)
-            .map(|index| {
-                let body = format!("record {index} ").repeat(1 + index as usize % 40);
-                let object = Object {
-                    body: body.into_bytes(),
-                    links: Vec::new(),
-                };
-                let mut hash = object.hash();
-                if bad.contains(&index) {
-                    hash[0] ^= 1;
-                }
-                let offset = LOG_START + index * 4096;
-                let mut record = Vec::new();
-                append_record(&mut record, offset, &object.body, &object.links);
-                (Ptr { hash, offset }, record)
-            })
-            .collect()
-    }
-
-    fn verified(threads: usize, records: &[(Ptr, Vec<u8>)]) -> Result<()> {
-        let mut verifier = Verifier::new(threads);
-        for (ptr, record) in records {
-            verifier.check()?;
-            verifier.add(*ptr, record)?;
-        }
-        verifier.settle()
-    }
-
-    #[test]
-    fn every_thread_count_verifies_every_record_and_reports_the_damaged_one() {
-        let good = records(30_000, &[]);
-        for threads in [1, 2, 4] {
-            verified(threads, &good).unwrap();
-            for bad in [0, 4095, 4096, 17_000, 29_999] {
-                let damaged = records(30_000, &[bad]);
-                let at = format!(
-                    "hash mismatch for object at {}",
-                    damaged[bad as usize].0.offset
-                );
-                match verified(threads, &damaged) {
-                    Err(Error::Corrupt(message)) => assert_eq!(message, at, "{threads}"),
-                    other => panic!("{threads} threads, record {bad}: {other:?}"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_first_damaged_record_in_walk_order_is_reported_at_every_thread_count() {
-        for threads in [1, 2, 4] {
-            for bad in [[4095, 4096], [1000, 29_999], [17_000, 17_001], [2000, 9000]] {
-                let damaged = records(30_000, &bad);
-                let at = format!(
-                    "hash mismatch for object at {}",
-                    damaged[bad[0] as usize].0.offset
-                );
-                for _ in 0..20 {
-                    match verified(threads, &damaged) {
-                        Err(Error::Corrupt(message)) => assert_eq!(message, at, "{threads}"),
-                        other => panic!("{threads} threads, records {bad:?}: {other:?}"),
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_verifier_dropped_with_batches_queued_joins_its_threads() {
-        let good = records(40_000, &[]);
-        let mut verifier = Verifier::new(4);
-        for (ptr, record) in &good {
-            verifier.add(*ptr, record).unwrap();
-        }
-        let board = verifier.pool.as_ref().unwrap().board.clone();
-        drop(verifier);
-        assert_eq!(Arc::strong_count(&board), 1);
     }
 }
