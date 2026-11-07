@@ -67,7 +67,10 @@ Two rows that swap values reach `resolve` too, because neither can move first. A
 has already answered for, because both sides changed the key or because it answered a clash, is not
 offered again. If it still clashes when nothing else can move, the key keeps our row. So a merge
 never panics on a clash, the indexes always match the rows, and a row is removed only when theirs
-removed it or `resolve` returned `None` for its key.
+removed it or `resolve` returned `None` for its key. `merge_sequences.rs` runs two tables through
+random inserts, updates, key changes, drains and merges both ways, with every kind of unique and
+covered index and random answers from `resolve`, and checks after each step that no value of a
+unique index is held twice and that every index has the root hash of one rebuilt from the rows.
 
 The kind of an index is part of its fingerprint, so turning an `#[index]` into a `#[unique]`
 rebuilds it instead of reading the old map with new types. The rebuild on decode covers unique
