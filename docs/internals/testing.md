@@ -438,8 +438,8 @@ Tests are described next to what they test:
   that panics in its sync, and the stress of injected failures, `coalesce_failure.rs`, with the
   coalesced runs of `landing_fault.rs` and `poison.rs`: [A group nobody
   led](coalescing.md#a-group-nobody-led).
-- Writes from inside a closure, `ferro/tests/reentry.rs`, `reentry_sync.rs` and
-  `reentry_shared.rs`: [Writes from inside a closure](reentrancy.md#the-cases).
+- Writes from inside a closure, `ferro/tests/reentry.rs`, `reentry_sync.rs`, `reentry_shared.rs`
+  and `reentry_locks.rs`: [Writes from inside a closure](reentrancy.md#the-cases).
 - Model tests of best common ancestors: [Criss-crosses](merging.md#criss-crosses).
 - Power cuts during a receive placed in pieces: [Where checked objects
   wait](sync-receive.md#where-checked-objects-wait).

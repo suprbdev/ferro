@@ -2,7 +2,7 @@
 
 A write called from inside a closure used to wait for a lock its own thread held, and so never
 returned (#41). These are the cases, each reproduced with a timeout in `ferro/tests/reentry.rs`,
-`reentry_sync.rs` and `reentry_shared.rs`, and each hung before this change:
+`reentry_sync.rs`, `reentry_shared.rs` and `reentry_locks.rs`, and each hung before this change:
 
 ## The cases
 
@@ -46,6 +46,21 @@ returned (#41). These are the cases, each reproduced with a timeout in `ferro/te
   98 cases hung: `refresh`, `branch`, the later write and `drop_branch` of a later branch inside
   `update`, `fork` and `drop_branch`, and with `coalesce`, which refuses those writes under any
   lane, `refresh` and `branch`.
+- User code that ran under a lock no record covered (#107). Attaching a branch, as `Db::branch` and
+  `fork` do, a read-only handle's `refresh` and a cycle's swap decoded the states they loaded while
+  they held the published refs, which `branches`, `verify`, `have`, a bundle and a merge base take
+  to read the branch table, and the cache dropped what one insert evicted past the first two
+  entries, and all it held when its store closed, while it held a shard's lock, which every read of
+  the shard takes, so a `decode` or a `Drop` that made such a read waited for itself. A cycle holds the cycle lock without any lane
+  while it copies, and closed the file it replaced under it, and a `receive` whose bundle spilled
+  holds it while its pieces are placed, so a `Drop` run there that called `compact`, or a `pull`,
+  `push` or `receive` whose bundle spilled, waited for it too. `reentry_locks.rs` makes those
+  reads, reads through the cache, `pull`, `push`, a small and a spilled `receive` and `compact`
+  from a `decode` and from a `Drop` that the cache runs as it evicts a value or closes, during a
+  read, `Db::branch`, `fork`, a read-only handle's `refresh`, `compact` and a spilled `receive`,
+  plain and shared, with a cache small enough that one large root evicts several values. Before the
+  fix 51 of its 198 cases hung, the reads through the cache only when they reached the shard being
+  written; after it every one returns at once with the result the check below gives.
 
 A merge closure, pull's merge, an awaited write's closure, a watcher test run on the thread that
 waits for it, and a `Drop` of anything a closure captured all run under the lane, so they are the
@@ -65,11 +80,14 @@ callers rather than inside `commit_locked`, so it also covers the draft that `co
 when it returns early. The catch-up's is taken in `follow_to` only once the log names something
 new, so a commit in a process alone, which finds nothing, records nothing more. `fork` decodes
 nothing, but the cache of decoded objects may drop a value it evicts at any read under `tip`. A
-write is refused when its thread holds:
+cycle records the cycle lock from when it takes it until it lets it go, and so does a `receive`
+whose bundle spilled while its pieces are placed. A write is refused when its thread holds:
 
 - the whole file it writes to;
 - with `coalesce`, any lane of that file;
 - any lane of that file, for `compact`, `pull`, `push` and `receive`, which take every lane;
+- the cycle lock of that file, for `compact`, and for `pull`, `push` and `receive` when their
+  bundle spilled, which take it;
 - a lane of that file whose name sorts at or after the one the write takes.
 
 `pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
@@ -77,7 +95,19 @@ scratch file, as described under [Where checked objects
 wait](sync-receive.md#where-checked-objects-wait). They make the check before they read anything, so
 a call that will be refused reads no stream, but the edge into the receiving file described below is
 listed only from the end of the stream to the merge, and a pull's edge into the sending file only
-while it plans the bundle.
+while it plans the bundle. A bundle spills only as it streams, so the check for the cycle lock comes
+at its landing.
+
+Reads are not checked, and need not be, since no user code runs under the locks they take. They
+take the published refs only to copy the branch table. Attaching a branch, a read-only `refresh`, a
+catch-up that follows a cycle and a cycle's swap decode the states they load before they take the
+published refs, and a sync, a swap and a refresh drop the table they replace, and a catch-up the
+branches it retires, once they have let them go. A read through the cache of decoded objects takes
+a shard's lock, and the cache keeps every entry an insert evicts until the insert has let that lock
+go, the first two in the insert and the rest in a list each thread lends from one insert to the
+next, while a close takes the entries out one at a time. A value the cache drops therefore runs its
+`Drop` under whatever the reader holds: a lane, the whole file or the cycle lock, which the record
+covers, or nothing.
 
 Without `coalesce`, then, a closure may write to a branch whose name sorts after its own, including
 `fork` from it and `drop_branch` of it, and those writes may nest further up the order. Cycles and
@@ -132,7 +162,9 @@ it dropped a branch this one had attached, and `reentry.rs` writes, awaits a wri
 forks from one after the handle's own cycle. Before, those under the catch-up of a write, `fork` or
 `drop_branch` hung as the decodes did, and most of the rest failed with `Error::Reentrant`. The
 cache of decoded objects may hold the last copy of a value too, and drops it when it evicts it or
-the store closes, under whatever the call holds then.
+the store closes, under whatever the call holds then, though never under the cache's own lock, as
+described under [The check](#the-check). A cycle closes the file it replaced once it has let its
+cycle locks go, so a `Drop` that close runs may write anywhere, `compact` included.
 
 ## What stays undetected
 
@@ -140,12 +172,7 @@ What stays undetected is a wait that ferro does not see. A closure that waits on
 condvar or a `Watcher` for another thread's commit can still deadlock: on its own branch, since that
 commit needs the lane; on another branch of its file, while a cycle that holds that branch's lane
 waits for this one; and with `coalesce`, for a commit whose closure has already run, since that
-commit may be in this closure's group. Reads that take the published refs, such as `branches`,
-`verify` and `have`, are not checked either, so a `decode` that reads while a branch attaches, a
-read-only handle refreshes or a cycle swaps the file still waits for itself, as does a `Drop` the
-cache runs there. Nor is the cycle lock, which a cycle holds without a lane while it copies and
-closes the file it replaced, and a spilled bundle while it lands: a `Drop` the cache runs then may
-call `compact`, `pull`, `push` or `receive`, which wait for it.
+commit may be in this closure's group.
 
 ## Cost
 
@@ -181,3 +208,18 @@ order: alone, 50,000 a run, 10.70 µs a commit before the change and 10.68 after
 at a median of 1.000 over twelve runs, from 0.973 to 1.036; with two handles of the file committing
 in turn, so that each commit adopts the other's frame, 15.45 and 15.51 µs, at 1.008, from 0.977 to
 1.033, over ten; and a `fork` and `drop_branch` together 9.95 and 9.96 µs, at 1.000.
+
+Moving user code out from under the published refs and the cycle lock changed nothing a commit or a
+warm read does: the decodes and drops it moved run when a branch attaches, a read-only handle
+refreshes or a cycle swaps the file, and recording the cycle lock costs a cycle or a spilled bundle
+two updates of the record. What a read can pay for is the cache keeping what an insert evicts until
+it has let the shard's lock go, where it used to drop all but two of them under it. A probe kept out
+of the tree, the build before and after this change one after the other on one pinned core in
+alternating order, on a machine shared with other work: a warm single-key get on a 1M-key map, as
+under [Where a get spends its time](read-path.md#where-a-get-spends-its-time), took 252.4 ns before
+and 250.4 after, at a paired median of 0.997 over twelve rounds, from 0.963 to 1.017, and 1.004 and
+1.011 over two more runs of sixteen; a single-key Buffered commit on tmpfs 12.61 and 12.61 µs, at
+0.998, from 0.989 to 1.020, then 1.002 and 0.997. A get through a 4 MiB cache, which misses and
+evicts on nearly every read, took 2.13 µs before and about 1% longer after, at paired medians of
+1.002 to 1.011 over four runs of twelve to sixteen rounds, against 0.998 for the build before run
+against itself and for this one with the cache's old handling of evictions put back.

@@ -45,8 +45,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use parking_lot::{Condvar, Mutex, RwLock};
-use quick_cache::Weighter;
 use quick_cache::sync::Cache;
+use quick_cache::{DefaultHashBuilder, Lifecycle, Weighter};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
@@ -62,6 +62,7 @@ use crate::shared::{Erased, Shared, Weak};
 
 thread_local! {
     static FRESH: Cell<u64> = const { Cell::new(0) };
+    static EVICTED: Cell<Vec<CacheEntry>> = const { Cell::new(Vec::new()) };
 }
 
 /// How many objects this thread has read from a file to decode them, past the cache, so far.
@@ -159,6 +160,9 @@ const READ_WORDS: usize = 64;
 const REPLAY_CHUNK: usize = 256 << 10;
 /// The most capacity a check's scratch body keeps between records.
 const SCRATCH_KEEP: usize = 1 << 20;
+/// The most entries the list of evicted cache entries that a thread lends to its inserts keeps room
+/// for between them.
+const EVICTED_KEEP: usize = 1 << 10;
 /// The first byte of the byte-range locks, past any real file.
 const LOCKS_AT: u64 = 1 << 62;
 /// The byte every shared writer holds shared from the end of its open for the rest of its life,
@@ -375,6 +379,73 @@ impl Weighter<Hash, CacheEntry> for EntryWeight {
     fn weight(&self, _key: &Hash, entry: &CacheEntry) -> u64 {
         u64::from(entry.weight())
     }
+}
+
+/// The entries one insert into the cache evicted, kept until the insert has let its shard's lock
+/// go: the first two in `first`, and any more in `more`, a list the thread lends from one insert to
+/// the next so that it keeps its capacity.
+#[derive(Default)]
+struct Evicted {
+    first: [Option<CacheEntry>; 2],
+    more: Vec<CacheEntry>,
+}
+
+/// What the cache does with the entries an insert evicts: it keeps every one of them until the
+/// insert has let the shard's lock go and drops them then, so that a value they drop, and the
+/// `Drop` of anything it holds, never runs under that lock.
+#[derive(Clone, Default)]
+struct Evictions;
+
+impl Lifecycle<Hash, CacheEntry> for Evictions {
+    type RequestState = Evicted;
+
+    fn begin_request(&self) -> Evicted {
+        Evicted::default()
+    }
+
+    fn on_evict(&self, evicted: &mut Evicted, _: Hash, entry: CacheEntry) {
+        let [first, second] = &mut evicted.first;
+        if first.is_none() {
+            *first = Some(entry);
+        } else if second.is_none() {
+            *second = Some(entry);
+        } else {
+            if evicted.more.capacity() == 0 {
+                evicted.more = EVICTED.try_with(Cell::take).unwrap_or_default();
+            }
+            evicted.more.push(entry);
+        }
+    }
+
+    fn end_request(&self, evicted: Evicted) {
+        let Evicted { first, mut more } = evicted;
+        if more.capacity() != 0 {
+            more.clear();
+            if more.capacity() <= EVICTED_KEEP {
+                let _ = EVICTED.try_with(|list| list.set(more));
+            }
+        }
+        drop(first);
+    }
+}
+
+/// The store's cache of decoded nodes and values.
+type Decoded = Cache<Hash, CacheEntry, EntryWeight, DefaultHashBuilder, Evictions>;
+
+/// A cache of at most `bytes` by weight, expected to hold about `items` entries.
+fn decoded(items: usize, bytes: u64) -> Decoded {
+    Cache::with(
+        items,
+        bytes,
+        EntryWeight,
+        DefaultHashBuilder::default(),
+        Evictions,
+    )
+}
+
+/// Empties `cache`, dropping each entry once its shard's lock is released.
+fn empty(cache: &Decoded) {
+    cache.drain().for_each(drop);
 }
 
 /// What a superblock records of how its generation began: the file's size when the cycle that
@@ -1934,7 +2005,7 @@ struct Inner {
     /// [`Store::refresh`] ignores until a writer replaces it.
     ignored: Option<Mark>,
     /// The decoded nodes and values, by the hash of their object.
-    cache: Cache<Hash, CacheEntry, EntryWeight>,
+    cache: Decoded,
     /// Where objects of this file sit, by hash, for transactions to skip writing them again.
     dedupe: Dedupe,
     /// What the superblock records of how this generation began.
@@ -2315,7 +2386,7 @@ impl Store {
                 checkpointing: AtomicBool::new(false),
                 covered: AtomicU64::new(0),
                 ignored: named.filter(|mark| mark.seq > sb.seq),
-                cache: Cache::with_weighter(items, cache_bytes, EntryWeight),
+                cache: decoded(items, cache_bytes),
                 dedupe: Dedupe::new(dedupe),
                 basis: sb.basis,
                 poisoned: AtomicBool::new(false),
@@ -2372,7 +2443,7 @@ impl Store {
                 checkpointing: AtomicBool::new(false),
                 covered: AtomicU64::new(0),
                 ignored: inner.ignored,
-                cache: Cache::with_weighter(64, 1, EntryWeight),
+                cache: decoded(64, 1),
                 dedupe: Dedupe::new(MIN_DEDUPE as usize),
                 basis: inner.basis,
                 poisoned: AtomicBool::new(false),
@@ -3573,7 +3644,7 @@ impl Store {
         if !self.inner.closed.load(Ordering::SeqCst) {
             self.inner.cache.insert(ptr.hash, entry());
             if self.inner.closed.load(Ordering::SeqCst) {
-                self.inner.cache.clear();
+                empty(&self.inner.cache);
             }
         }
     }
@@ -3590,7 +3661,7 @@ impl Store {
     pub fn close(&self) {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
-        inner.cache.clear();
+        empty(&inner.cache);
         inner.followed.store(None);
         crate::epoch::flush();
         if closed || inner.options.read_only {

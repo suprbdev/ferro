@@ -85,10 +85,14 @@ writer lock, and with `shared` a `Data::decode` that runs while a call catches u
 process's commits too. A closure may write to another file, and without `coalesce` to a branch of
 its own file whose name sorts after its own, since cycles and `receive` take branches in name order.
 Everything else on its own file is refused, and so is a write into another file while a closure
-there is writing back into this one. A closure that waits on a channel or a watcher for another
-thread's commit can still deadlock, because ferro cannot see the wait: on its own branch, on a
-branch that sorts before its own while a cycle or `receive` waits for this closure, and with
-`coalesce` also when that commit's closure has already run.
+there is writing back into this one. Reads such as `branches`, `verify` and `have` take no lock
+that the caller's own thread could be holding, so they work from any closure, `decode` or `Drop`,
+including the `Drop` of a value the cache evicts. A `Drop` that runs while a cycle copies a file, or
+while a large `receive` places its pieces, may write too, except `compact`, or a `pull`, `push` or
+`receive` large enough to be placed in pieces, into that file. A closure that waits on a channel or
+a watcher for another thread's commit can still deadlock, because ferro cannot see the wait: on its
+own branch, on a branch that sorts before its own while a cycle or `receive` waits for this
+closure, and with `coalesce` also when that commit's closure has already run.
 
 ## Several processes
 

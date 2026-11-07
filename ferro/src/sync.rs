@@ -2796,9 +2796,10 @@ impl<T: Data> Db<T> {
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
     ///   was. A merge whose base `T` cannot read returns it too, with the remote branch landed and
     ///   this branch as it was.
-    /// - [`Error::Reentrant`] from inside a closure on this file, or where waiting on `from`'s
-    ///   file could otherwise deadlock, [`Error::ReadOnly`] on a read-only handle, and the errors
-    ///   of [`Db::commit`].
+    /// - [`Error::Reentrant`] from inside a closure on this file, for a bundle large enough to be
+    ///   placed in pieces also from code that runs while this thread holds the file's cycle lock,
+    ///   or where waiting on `from`'s file could otherwise deadlock, [`Error::ReadOnly`] on a
+    ///   read-only handle, and the errors of [`Db::commit`].
     ///
     /// # Panics
     ///
@@ -3173,6 +3174,9 @@ impl<T: Data> Db<T> {
             commits,
         } = received;
         let spilled = staging.spilled();
+        if spilled {
+            drop(self.entering(Needs::Cycle)?);
+        }
         let _cycles = spilled.then(|| self.hold_cycles()).transpose()?;
         let mut placed = Column::new();
         if spilled {

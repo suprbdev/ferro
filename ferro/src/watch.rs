@@ -183,16 +183,22 @@ impl<T> Feed<T> {
         }
     }
 
-    /// Makes `snapshot` the newest and wakes the watchers that take every snapshot.
+    /// Makes `snapshot` the newest in place of `previous` and wakes the watchers that take every
+    /// snapshot.
     ///
-    /// Filtered and async watchers wake when the returned [`Notice`] is dropped. A closed feed
-    /// keeps nothing.
-    pub(crate) fn publish(self: &Arc<Self>, snapshot: Snapshot<T>) -> Notice<T> {
+    /// Filtered and async watchers wake when the returned [`Notice`] is dropped, and the snapshot
+    /// replaced is freed then. A closed feed keeps nothing, and its notice frees `previous`.
+    pub(crate) fn publish(
+        self: &Arc<Self>,
+        snapshot: Snapshot<T>,
+        previous: &Snapshot<T>,
+    ) -> Notice<T> {
         let mut slot = self.slot.lock();
         if slot.closed {
+            drop(slot);
             return Notice {
                 feed: None,
-                replaced: Some(snapshot),
+                replaced: Some(previous.clone()),
             };
         }
         let replaced = slot.latest.replace(snapshot);

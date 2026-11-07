@@ -1,10 +1,11 @@
 //! The record of the writer locks each thread holds, behind [`Error::Reentrant`].
 //!
-//! A thread notes each branch lock and whole-file lock it takes, and every call that could wait on
-//! a lock checks the list first. A call that could deadlock on a lock this thread holds, or on a
-//! write waiting for this thread, fails with [`Error::Reentrant`] instead of hanging. A thread that
-//! writes into one file while it holds locks in another records the crossing, so that two threads
-//! crossing between the same files in opposite directions are refused as well.
+//! A thread notes each branch lock, whole-file lock and reclamation cycle lock it takes, and every
+//! call that could wait on a lock checks the list first. A call that could deadlock on a lock this
+//! thread holds, or on a write waiting for this thread, fails with [`Error::Reentrant`] instead of
+//! hanging. A thread that writes into one file while it holds locks in another records the
+//! crossing, so that two threads crossing between the same files in opposite directions are
+//! refused as well.
 //! [Writes from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/internals/reentrancy.md)
 //! describes the rules.
 
@@ -22,6 +23,9 @@ pub(crate) enum Needs<'a> {
     Lane(&'a str),
     /// The writer lock of every branch of the file, as a cycle or a landing bundle takes.
     Every,
+    /// The file's reclamation cycle lock and then the writer lock of every branch, as a cycle and
+    /// a landing bundle that spilled take.
+    Cycle,
     /// Only the file's tip lock, briefly.
     Tip,
     /// The acknowledgement of a commit whose closure has already run.
@@ -48,6 +52,9 @@ thread_local! {
     };
 }
 
+/// The lane number that stands for a database's reclamation cycle lock, which [`cycle`] records.
+const CYCLE: usize = usize::MAX;
+
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static CROSSINGS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
@@ -58,7 +65,8 @@ pub(crate) fn next_db() -> u64 {
 
 /// Records that this thread holds lock `lane`, of the branch `name`, in database `db`.
 ///
-/// Lane 0 stands for the whole file, which [`whole`] records.
+/// Lane 0 stands for the whole file, which [`whole`] records, and [`CYCLE`] for the reclamation
+/// cycle lock, which [`cycle`] records.
 pub(crate) fn hold(db: u64, lane: usize, name: &str) {
     let _ = HOLDS.try_with(|holds| {
         let mut holds = holds.borrow_mut();
@@ -111,6 +119,26 @@ impl Drop for Whole {
     }
 }
 
+/// A record that this thread holds the reclamation cycle lock of a database, removed when dropped.
+pub(crate) struct Cycle(u64);
+
+/// Records that this thread holds the reclamation cycle lock of database `db` until the guard is
+/// dropped.
+///
+/// A cycle holds it without any branch lock while it copies the file and once it has swapped it
+/// in, and a landing bundle that spilled while it places its pieces, so the record refuses only
+/// [`Needs::Cycle`].
+pub(crate) fn cycle(db: u64) -> Cycle {
+    hold(db, CYCLE, "");
+    Cycle(db)
+}
+
+impl Drop for Cycle {
+    fn drop(&mut self) {
+        release(self.0, CYCLE);
+    }
+}
+
 /// The crossings a call recorded from the databases this thread holds locks in to the one it
 /// entered, removed when dropped.
 pub(crate) struct Crossing(Vec<(u64, u64)>);
@@ -129,10 +157,11 @@ impl Drop for Crossing {
 /// Checks that a call on database `db` that waits on `needs` cannot deadlock on this thread's
 /// locks, and records its crossing from other databases while it runs.
 ///
-/// A whole-file hold on `db` refuses everything. A branch lock refuses [`Needs::Every`], and a
-/// [`Needs::Lane`] whose name does not sort after the held branch's, since cycles take branches in
-/// name order. With `coalesce` a branch lock also refuses every lane and [`Needs::Ack`], since a
-/// group may be waiting for this thread. [`Needs::Tip`] is safe under any branch lock.
+/// A whole-file hold on `db` refuses everything. A branch lock refuses [`Needs::Every`] and
+/// [`Needs::Cycle`], and a [`Needs::Lane`] whose name does not sort after the held branch's, since
+/// cycles take branches in name order. With `coalesce` a branch lock also refuses every lane and
+/// [`Needs::Ack`], since a group may be waiting for this thread. [`Needs::Tip`] is safe under any
+/// branch lock. The cycle lock refuses only [`Needs::Cycle`].
 ///
 /// # Errors
 ///
@@ -154,6 +183,8 @@ pub(crate) fn check(db: u64, coalesce: bool, needs: Needs<'_>) -> Result<Option<
             }
             let safe = match needs {
                 _ if hold.lane == 0 => false,
+                Needs::Cycle => false,
+                _ if hold.lane == CYCLE => true,
                 Needs::Tip => true,
                 _ if coalesce => false,
                 Needs::Ack => true,

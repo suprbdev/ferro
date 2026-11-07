@@ -403,10 +403,13 @@ impl Drop for Byte {
 /// The reclamation cycle locks of this process and, with [`Options::shared`], of the file, held
 /// so that no cycle starts until it is dropped.
 ///
-/// The states that the catch-up made on taking them replaced are freed once they are released.
+/// The thread records that it holds them, so that a call from it that would wait for them fails
+/// with [`Error::Reentrant`]. The states that the catch-up made on taking them replaced are freed
+/// once they are released.
 pub(crate) struct Cycles<'a, T> {
     _across: Option<Held>,
     _local: MutexGuard<'a, ()>,
+    _held: reentry::Cycle,
     _freed: Vec<Notice<T>>,
 }
 
@@ -722,8 +725,8 @@ impl<T> Branch<T> {
 
     fn publish(&self, state: Arc<State<T>>) -> Notice<T> {
         let snapshot = state.snapshot.clone();
-        self.state.store(state);
-        self.feed.publish(snapshot)
+        let replaced = self.state.swap(state);
+        self.feed.publish(snapshot, &replaced.snapshot)
     }
 
     fn retire(&self) {
@@ -1684,10 +1687,8 @@ impl Options {
             lane_waits: Arc::default(),
             flush: Shared::<T>::flush,
         });
-        let branch = {
-            let state = shared.published.lock();
-            shared.attach(MAIN, &state.refs)?
-        };
+        let refs = shared.published.lock().refs.clone();
+        let branch = shared.attach(MAIN, &refs)?;
         let follower = match self.follow && (read_only || shared.options.shared) {
             true => Some(Shared::follow_file(&shared, self.follow_poll)?),
             false => None,
@@ -1878,8 +1879,7 @@ impl<T: Data> Shared<T> {
     }
 
     fn attach(&self, name: &str, refs: &Refs) -> Result<Arc<Branch<T>>> {
-        let mut branches = self.branches.lock();
-        if let Some(branch) = branches.get(name) {
+        if let Some(branch) = self.branches.lock().get(name) {
             return Ok(branch.clone());
         }
         let head = refs.try_get(name)?;
@@ -1889,8 +1889,13 @@ impl<T: Data> Shared<T> {
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
         let born = head.as_ref().map_or(0, |head| head.born);
         let branch = Arc::new(Branch::new(name, born, self.id, state));
-        branches.insert(name.to_string(), branch.clone());
-        Ok(branch)
+        let attached = self
+            .branches
+            .lock()
+            .entry(name.to_string())
+            .or_insert_with(|| branch.clone())
+            .clone();
+        Ok(attached)
     }
 
     fn attached(&self, name: &str) -> Result<Arc<Branch<T>>> {
@@ -1903,15 +1908,15 @@ impl<T: Data> Shared<T> {
             }
             let tip = self.tip.lock();
             let _whole = reentry::whole(self.id);
-            let published = self.published.lock();
+            let published = self.published.lock().refs.clone();
             if self.options.shared {
                 let newest = tip.refs.try_get(name)?;
-                let seen = published.refs.try_get(name)?;
+                let seen = published.try_get(name)?;
                 if moved(seen.as_deref(), newest.as_deref()) {
                     continue;
                 }
             }
-            return self.attach(name, &published.refs);
+            return self.attach(name, &published);
         }
     }
 
@@ -2138,12 +2143,13 @@ impl<T: Data> Shared<T> {
             branch.framed.store(frame.seq, Ordering::Release);
         }
         if !gone.is_empty() {
-            let _published = self.published.lock();
+            let published = self.published.lock();
             let mut branches = self.branches.lock();
             for branch in &gone {
                 branches.remove(&branch.name);
             }
             drop(branches);
+            drop(published);
             for branch in &gone {
                 free(notices, &branch.tip.load());
                 free(notices, &branch.state.load());
@@ -2190,7 +2196,7 @@ impl<T: Data> Shared<T> {
         tip.ptr = head;
         tip.depth = depth;
         self.store.store(Arc::new(fresh.clone()));
-        *published = tip.clone();
+        let replaced = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
             rebind(&branch, state, notices);
         }
@@ -2200,6 +2206,7 @@ impl<T: Data> Shared<T> {
         }
         drop(branches);
         drop(published);
+        drop(replaced);
         for branch in &gone {
             free(notices, &branch.tip.load());
             free(notices, &branch.state.load());
@@ -2254,39 +2261,41 @@ impl<T: Data> Shared<T> {
                 store.close();
             }
         })?;
-        let mut published = self.published.lock();
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         let mut gone = Vec::new();
         for branch in attached {
             let head = refs.try_get(&branch.name)?;
             if branch.dropped_in(head.as_deref()) {
-                gone.push(branch.name.clone());
+                gone.push(branch);
                 continue;
             }
             let state = Arc::new(self.state_of(&store, head.as_deref())?);
             states.push((branch, state));
         }
+        let mut published = self.published.lock();
         tip.refs = refs;
         tip.ptr = Some(ptr);
         tip.depth = depth;
         if replaced {
             self.store.store(Arc::new(store.clone()));
         }
-        *published = tip.clone();
+        let previous = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
             rebind(&branch, state, &mut notices);
         }
         let mut branches = self.branches.lock();
-        for name in gone {
-            if let Some(branch) = branches.remove(&name) {
-                free(&mut notices, &branch.tip.load());
-                free(&mut notices, &branch.state.load());
-                branch.retire();
-            }
+        for branch in &gone {
+            branches.remove(&branch.name);
         }
         drop(branches);
         drop(published);
+        drop(previous);
+        for branch in &gone {
+            free(&mut notices, &branch.tip.load());
+            free(&mut notices, &branch.state.load());
+            branch.retire();
+        }
         if replaced {
             current.close();
         }
@@ -2864,25 +2873,27 @@ impl<T: Data> Shared<T> {
         let mut late = None;
         let published = outcome.as_ref().ok().map(|(_, refs)| {
             let mut published = self.published.lock();
-            *published = refs.clone();
+            let replaced = mem::replace(&mut *published, refs.clone());
             late = panic::catch_unwind(AssertUnwindSafe(|| self.step("publishing"))).err();
-            published
+            (published, replaced)
         });
-        for pending in batch {
-            seals.extend(pending.seal.map(|seal| (seal, synced)));
-            if let (true, Some((branch, state))) = (synced, pending.update) {
+        for pending in &mut batch {
+            seals.extend(pending.seal.take().map(|seal| (seal, synced)));
+            if !synced {
+                continue;
+            }
+            if let Some((branch, state)) = pending.update.take() {
                 notices.push(branch.publish(state));
             }
-            if synced {
-                for (branch, state) in pending.followed {
-                    notices.push(branch.publish(state));
-                }
+            for (branch, state) in pending.followed.drain(..) {
+                notices.push(branch.publish(state));
             }
         }
         if published.is_some() && late.is_none() {
             late = panic::catch_unwind(AssertUnwindSafe(|| self.step("published"))).err();
         }
         drop(published);
+        drop(batch);
         let lost = !cut.is_empty();
         seals.extend(
             cut.into_iter()
@@ -3229,7 +3240,8 @@ impl<T: Data> Shared<T> {
                 .land()?;
             self.settle(store.last_seq(), notices)?;
             let refs = tip.refs.clone();
-            for branch in self.branches.lock().values() {
+            let attached: Vec<_> = self.branches.lock().values().cloned().collect();
+            for branch in &attached {
                 if let Some(head) = refs.try_get(&branch.name)? {
                     let state = branch.tip.load_full();
                     let next = Arc::new(State {
@@ -3250,8 +3262,9 @@ impl<T: Data> Shared<T> {
             return Err(Error::ReadOnly);
         }
         let mut notices = Vec::new();
-        let _only = self.cycle.lock();
-        let _across = self.hold_cycle(stop.is_none(), &mut notices)?;
+        let only = self.cycle.lock();
+        let cycle = reentry::cycle(self.id);
+        let across = self.hold_cycle(stop.is_none(), &mut notices)?;
         if stop.is_some() && self.options.shared && !self.due() {
             return Err(Error::Interrupted);
         }
@@ -3273,6 +3286,14 @@ impl<T: Data> Shared<T> {
             self.signal
                 .base
                 .store(self.store().size(), Ordering::Relaxed);
+        }
+        let swapped = outcome.is_ok() && self.store().id() != store.id();
+        drop(across);
+        drop(cycle);
+        drop(only);
+        if swapped {
+            store.close();
+            self.step("retired");
         }
         outcome
     }
@@ -3357,8 +3378,6 @@ impl<T: Data> Shared<T> {
         retired.retain(|old| old.bytes().is_some());
         retired.push(store.retired());
         drop(retired);
-        store.close();
-        self.step("retired");
         Ok(report)
     }
 
@@ -3382,18 +3401,19 @@ impl<T: Data> Shared<T> {
     ) -> Result<()> {
         let (refs, depth) = refs::load(fresh, Some(head), None)?;
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
-        let mut published = self.published.lock();
-        let branches = self.branches.lock();
         for (_, found) in refs.try_entries()? {
             for ptr in found.root.iter().chain(&found.log.tip) {
                 fresh.read_object(*ptr)?;
             }
         }
+        let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
-        for branch in branches.values() {
+        for branch in attached {
             let found = refs.try_get(&branch.name)?;
-            states.push((branch, Arc::new(self.state_of(fresh, found.as_deref())?)));
+            let state = Arc::new(self.state_of(fresh, found.as_deref())?);
+            states.push((branch, state));
         }
+        let mut published = self.published.lock();
         if old.is_shared() {
             old.mark_retired()?;
         }
@@ -3408,12 +3428,14 @@ impl<T: Data> Shared<T> {
         tip.ptr = Some(head);
         tip.depth = depth;
         self.store.store(Arc::new(fresh.clone()));
-        *published = tip.clone();
+        let replaced = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
             notices.push(branch.feed.rebind(state.snapshot.clone()));
             free(notices, &branch.tip.swap(state.clone()));
             free(notices, &branch.state.swap(state));
         }
+        drop(published);
+        drop(replaced);
         Ok(())
     }
 }
@@ -3503,7 +3525,9 @@ impl<T: Data> Db<T> {
     /// # Errors
     ///
     /// - [`Error::ReadOnly`] on a read-only handle.
-    /// - [`Error::Reentrant`] when called from inside a closure on this file.
+    /// - [`Error::Reentrant`] when called from inside a closure on this file, or from code that
+    ///   runs while this thread holds the file's cycle lock, such as a `Drop` run while a cycle
+    ///   copies the file or a large bundle is placed in it.
     /// - [`Error::Corrupt`] or [`Error::Io`] if the copy fails. The partial copy is removed and the
     ///   database goes on in the old file.
     ///
@@ -3531,7 +3555,7 @@ impl<T: Data> Db<T> {
     /// # }
     /// ```
     pub fn compact(&self, keep: Keep) -> Result<Compacted> {
-        let _crossing = self.entering(Needs::Every)?;
+        let _crossing = self.entering(Needs::Cycle)?;
         self.shared.compact(keep, None)
     }
 
@@ -5358,10 +5382,12 @@ impl<T: Data> Db<T> {
     pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_, T>> {
         let mut freed = Vec::new();
         let local = self.shared.cycle.lock();
+        let held = reentry::cycle(self.shared.id);
         let across = self.shared.hold_cycle(true, &mut freed)?;
         Ok(Cycles {
             _across: across,
             _local: local,
+            _held: held,
             _freed: freed,
         })
     }
