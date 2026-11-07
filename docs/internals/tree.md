@@ -47,6 +47,30 @@ otherwise the node is cloned and each fresh value is the one its check decoded. 
 dirty or foreign collection also forces the decode, so nested collections always come back clean
 and a foreign store is never pinned.
 
+`Map::update` keeps the value as it was if its closure panics, as `Table::update` keeps a row,
+where `get_mut` hands out a plain `&mut V`. It finds the slot as `get_mut` does, runs the closure on
+a copy of the value, and writes the copy into the slot once the closure returns, in place if the
+slot already holds a value of its own that nothing else shares. A value still in its node's
+column, or spilled, is copied out or read either way, so for it the copy costs nothing, and skipping
+the `Arc::make_mut` that `get_mut` makes on the slot saves a little. A value inserted or changed
+since its node was read, which `get_mut` changes where it is, is cloned, and that clone is the
+cost. Measured on 2026-11-07 on one core, medians of 15 runs, on a map of 1,000 keys:
+
+| Update of one key | Before, through `get_mut` | Copy written back | Old slot put back on a panic |
+| --- | --- | --- | --- |
+| In memory, a `u64` | 49.7 ns | 48.1 ns | 53.3 ns |
+| In memory, a `Vec` of four `u64` | 48.5 ns | 58.7 ns | 66.0 ns |
+| In memory, a 40-byte `String` | 50.7 ns | 61.9 ns | 64.3 ns |
+| Committed, each key once, a `u64` | 99.9 ns | 92.1 ns | 99.6 ns |
+| Committed, each key once, a `Vec` of four `u64` | 117.3 ns | 112.1 ns | 118.6 ns |
+| Committed, each key once, a 40-byte `String` | 119.6 ns | 114.0 ns | 120.4 ns |
+| Committed, one key in a fresh clone of the map | 755 ns | 723 ns | 736 ns |
+
+The last column changed the value in place as `get_mut` does, kept the slot it replaced, or a
+clone of a value already in a slot of its own, and put it back from a guard's `Drop` if the closure
+unwound. It cost a little more everywhere, and needed the guard. A first version of the copy read
+the value with `get` and walked the tree again to write it back, which cost 54 to 70 ns in memory.
+
 A node that `flush` writes or decodes keeps the bytes and links of its level, keys and values while
 its values are still one column, which they stop being at the first edit of a key or value, since
 every such edit goes through `Cells::slots`. A node on the path to a change has a new child and the

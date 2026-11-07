@@ -2112,29 +2112,61 @@ where
     S: Data,
     Q: Ord + ?Sized,
 {
+    let Some(slot) = find_slot(store, link, key)? else {
+        return Ok(None);
+    };
+    let value = match &*slot {
+        Slot::Packed(column, position) => Some(Arc::new(column[*position as usize].clone())),
+        Slot::Fresh(_) => None,
+        Slot::Spilled(spill) => Some(store.ok_or(Error::Detached)?.load::<V>(spill.0)?),
+    };
+    if let Some(value) = value {
+        *slot = Slot::Fresh(value);
+    }
+    match slot {
+        Slot::Fresh(value) => Ok(Some(Arc::make_mut(value))),
+        _ => Err(Error::Detached),
+    }
+}
+
+fn find_slot<'a, K, V, S, Q>(
+    store: Option<&Store>,
+    link: &'a mut Link<K, V, S>,
+    key: &Q,
+) -> Result<Option<&'a mut Slot<V, S>>>
+where
+    K: Data + Ord + Borrow<Q>,
+    V: Data,
+    S: Data,
+    Q: Ord + ?Sized,
+{
     if matches!(link, Link::Empty) {
         return Ok(None);
     }
     let node = node_mut(store, link)?;
     match node.search(key) {
-        Ok(index) => {
-            let slot = &mut node.cells.slots()[index];
-            let value = match &*slot {
-                Slot::Packed(column, position) => {
-                    Some(Arc::new(column[*position as usize].clone()))
-                }
-                Slot::Fresh(_) => None,
-                Slot::Spilled(spill) => Some(store.ok_or(Error::Detached)?.load::<V>(spill.0)?),
-            };
-            if let Some(value) = value {
-                *slot = Slot::Fresh(value);
-            }
-            match slot {
-                Slot::Fresh(value) => Ok(Some(Arc::make_mut(value))),
-                _ => Err(Error::Detached),
-            }
+        Ok(index) => Ok(Some(&mut node.cells.slots()[index])),
+        Err(position) => find_slot(store, &mut node.children_mut()[position], key),
+    }
+}
+
+fn copy_of<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<V> {
+    Ok(match slot {
+        Slot::Packed(column, position) => column[*position as usize].clone(),
+        Slot::Fresh(value) => V::clone(value),
+        Slot::Spilled(spill) => {
+            Arc::unwrap_or_clone(store.ok_or(Error::Detached)?.load::<V>(spill.0)?)
         }
-        Err(position) => find_mut(store, &mut node.children_mut()[position], key),
+    })
+}
+
+fn put_back<V, S>(slot: &mut Slot<V, S>, value: V) {
+    if let Slot::Fresh(fresh) = slot
+        && let Some(held) = Arc::get_mut(fresh)
+    {
+        *held = value;
+    } else {
+        *slot = Slot::Fresh(Arc::new(value));
     }
 }
 
@@ -3534,6 +3566,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// first, and the value is copied out of its node's column, or read if it is stored on its
     /// own, so a [`Val`], clone or iterator made before keeps the value it had. An absent key
     /// leaves the map as it was.
+    ///
+    /// As with any `&mut`, what is changed through the reference stays changed: a panic while it
+    /// is held leaves the value changed half way. [`update`](Map::update) keeps the value as it was
+    /// instead.
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -3547,6 +3583,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     /// A mutable reference to the value stored under `key`, inserting `make()` first if the key is
     /// absent.
+    ///
+    /// As with [`get_mut`](Map::get_mut), a panic while the reference is held keeps what was
+    /// changed through it.
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
         if !self.contains_key(&key) {
             self.insert(key.clone(), make());
@@ -3557,13 +3596,30 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// Runs `f` on the value stored under `key` and returns what it returns, or `None` without
     /// calling it if the key is absent.
     ///
-    /// The value is reached as [`get_mut`](Map::get_mut) reaches it.
+    /// `f` runs on a copy of the value, which is written back once `f` returns, as
+    /// [`Table::update`](crate::Table::update) does with a row. The copy costs what
+    /// [`get_mut`](Map::get_mut) costs for a value as the file holds it, which it copies out of its
+    /// node's column or reads, and a clone for a value inserted or changed since, which `get_mut`
+    /// changes where it is.
+    ///
+    /// # Panics
+    ///
+    /// If `f` panics, the panic carries on and the map keeps the value as it was, whatever `f`
+    /// changed before it. Panics, as [`get`](Map::get) does, if a node or value on the way cannot
+    /// be read.
     pub fn update<Q, R>(&mut self, key: &Q, f: impl FnOnce(&mut V) -> R) -> Option<R>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.get_mut(key).map(f)
+        if !self.contains_key(key) {
+            return None;
+        }
+        let slot = fatal(find_slot(self.store.as_ref(), &mut self.root, key))?;
+        let mut value = fatal(copy_of(self.store.as_ref(), slot));
+        let out = f(&mut value);
+        put_back(slot, value);
+        Some(out)
     }
 
     /// Stores `value` under `key`, in O(log n), returning the value it replaced.

@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,6 +82,64 @@ fn map_update_returns_what_the_closure_returns() {
     assert_eq!(hall.prices.get(&4).map(|price| *price), Some(450));
     assert_eq!(hall.prices.update(&40, |price| *price), None);
     assert_eq!(hall.prices.len(), 9);
+}
+
+fn push_then_panic(map: &mut Map<u32, Vec<u32>>, key: u32, item: u32) {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        map.update(&key, |items| {
+            items.push(item);
+            items[0] = item;
+            panic!("ferro: test closure gave up");
+        })
+    }));
+    assert!(outcome.is_err());
+}
+
+fn items(map: &Map<u32, Vec<u32>>, key: u32) -> Vec<u32> {
+    (*map.get(&key).unwrap()).clone()
+}
+
+#[test]
+fn a_panic_in_map_update_keeps_the_old_value() {
+    common::quiet_ferro_panics();
+    let long: Vec<u32> = (0..400).collect();
+    let mut map: Map<u32, Vec<u32>> = Map::new();
+    map.insert(1, vec![1]);
+    map.insert(2, long.clone());
+    push_then_panic(&mut map, 1, 9);
+    assert_eq!(items(&map, 1), vec![1]);
+    let held = map.get(&1).unwrap();
+    push_then_panic(&mut map, 1, 9);
+    assert_eq!(items(&map, 1), vec![1]);
+    assert_eq!(*held, vec![1]);
+    assert_eq!(map.update(&1, |items| items.push(2)), Some(()));
+    assert_eq!(items(&map, 1), vec![1, 2]);
+    assert_eq!(*held, vec![1]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast()
+        .open::<Map<u32, Vec<u32>>>(dir.path().join("m.ferro"))
+        .unwrap();
+    db.update(|root| *root = map.clone()).unwrap();
+    db.update(|root| {
+        push_then_panic(root, 1, 7);
+        push_then_panic(root, 2, 7);
+        assert_eq!(items(root, 1), vec![1, 2]);
+        assert_eq!(items(root, 2), long);
+        root.update(&1, |items| items.push(3));
+        push_then_panic(root, 1, 7);
+        assert_eq!(items(root, 1), vec![1, 2, 3]);
+    })
+    .unwrap();
+    assert_eq!(items(&db.read(), 1), vec![1, 2, 3]);
+    assert_eq!(items(&db.read(), 2), long);
+    drop(db);
+    let db = fast()
+        .open::<Map<u32, Vec<u32>>>(dir.path().join("m.ferro"))
+        .unwrap();
+    assert_eq!(items(&db.read(), 1), vec![1, 2, 3]);
+    assert_eq!(items(&db.read(), 2), long);
+    db.verify().unwrap();
 }
 
 #[test]

@@ -93,6 +93,9 @@ impl<T: Data> List<T> {
     }
 
     /// A mutable reference to the value at `index`, or `None` past the end.
+    ///
+    /// As with [`Map::get_mut`](crate::Map::get_mut), a panic while the reference is held keeps
+    /// what was changed through it.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.0.get_mut(&(index as u64))
     }

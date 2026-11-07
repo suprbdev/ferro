@@ -29,7 +29,8 @@ let total = shop
 A closure that can fail returns a `Result`, and `update(..).ok_or(..)??` passes either error on.
 Inside a commit, returning that error discards the half-changed row with the rest of the
 transaction. A panic in `f`, or while a `RowMut` is held, writes nothing back, so the table keeps
-the row as it was. `Map::update` works the same way on a value.
+the row as it was. `Map::update` works the same way on a value, while a change made through the
+plain `&mut V` that `Map::get_mut` or `List::get_mut` hands out stays made, as through any `&mut`.
 
 ## Secondary indexes
 
