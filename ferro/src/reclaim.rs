@@ -1059,6 +1059,9 @@ impl<'a> Copier<'a> {
                     return Ok(false);
                 }
                 cache.borrow_mut().keep(ptr, entry);
+                if let (Some(units), Some(root)) = (&mut sink.units, entry.commit.root) {
+                    units.check_ahead(root);
+                }
                 retained.insert(ptr.hash);
                 sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
@@ -1076,6 +1079,9 @@ impl<'a> Copier<'a> {
                     return Ok(false);
                 }
                 cache.borrow_mut().keep(ptr, entry);
+                if let (Some(units), Some(root)) = (&mut sink.units, entry.commit.root) {
+                    units.check_ahead(root);
+                }
                 retained.insert(ptr.hash);
                 sink.walked.insert(ptr.offset, ptr.hash);
                 edge.extend(links_of(entry));
@@ -1087,6 +1093,9 @@ impl<'a> Copier<'a> {
         }
         sink.cache = cache.into_inner();
         sink.cache.skip();
+        if let Some(units) = &mut sink.units {
+            units.publish_checks();
+        }
         for hash in &retained {
             sink.pruned.remove(hash);
             sink.copied

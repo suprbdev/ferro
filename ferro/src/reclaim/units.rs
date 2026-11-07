@@ -13,6 +13,12 @@
 //! reading each one again. A unit that reaches anything the walk treats differently, such as a log
 //! entry, a pruned hash or a link at offset 0, or whose discovery fails, is tainted, and the walk
 //! copies it itself where it falls in the order.
+//!
+//! While the walk goes down the chains before it hands out any unit, it passes the root of each
+//! entry to [`Units::check_ahead`], and workers with nothing else to do check the hashes of the
+//! records below, claiming nothing. Each slot records the offset of the record checked under its
+//! hash, so discovery takes a record checked at the offset it reaches as checked, and only reads
+//! and parses it.
 
 use std::any::Any;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -52,6 +58,12 @@ const JOB_BYTES: u64 = 256 << 10;
 const KEEP_BYTES: usize = 1 << 20;
 const WAIT: Duration = Duration::from_millis(10);
 const BATCH: usize = 16;
+/// The most records waiting to be checked ahead of their units, past which no more are queued.
+const CHECKS: usize = 1 << 16;
+/// What a slot's `checked` holds while a thread checks the record.
+const CHECKING: u64 = u64::MAX;
+/// How many records a thread checks ahead between looks at the queue.
+const SHARE: usize = 64;
 
 enum Failure {
     Failed(Error),
@@ -70,6 +82,7 @@ fn child_key(key: Key, depth: u32, index: usize) -> Key {
 struct Slot {
     claim: AtomicU64,
     offset: AtomicU64,
+    checked: AtomicU64,
 }
 
 impl Default for Slot {
@@ -77,6 +90,7 @@ impl Default for Slot {
         Slot {
             claim: AtomicU64::new(u64::MAX),
             offset: AtomicU64::new(0),
+            checked: AtomicU64::new(0),
         }
     }
 }
@@ -281,22 +295,29 @@ impl Job {
 enum Item {
     Unit(Arc<Unit>),
     Job(Job),
+    Check(Ptr),
 }
 
 #[derive(Default)]
 struct Queue {
     units: BinaryHeap<Queued>,
     jobs: VecDeque<Job>,
+    checks: VecDeque<Ptr>,
     writing: usize,
     events: u64,
 }
 
 impl Queue {
-    fn take(&mut self) -> Option<Item> {
+    fn work(&mut self) -> Option<Item> {
         if let Some(job) = self.jobs.pop_front() {
             return Some(Item::Job(job));
         }
         self.units.pop().map(|queued| Item::Unit(queued.0))
+    }
+
+    fn take(&mut self) -> Option<Item> {
+        self.work()
+            .or_else(|| self.checks.pop_front().map(Item::Check))
     }
 }
 
@@ -335,6 +356,7 @@ struct Scratch {
     unpacked: Unpacked,
     spare: Vec<Vec<Ptr>>,
     ids: Vec<Vec<u32>>,
+    checks: Vec<Ptr>,
 }
 
 impl Scratch {
@@ -452,22 +474,37 @@ struct Shared {
     again: AtomicBool,
     failure: Mutex<Option<Failure>>,
     cancel: AtomicBool,
+    clean: HashSet<Hash, ByHash>,
 }
 
 impl Shared {
-    fn read(&self, ptr: Ptr, taint: &HashSet<Hash, ByHash>, s: &mut Scratch) -> Option<Node> {
+    fn read(
+        &self,
+        ptr: Ptr,
+        id: u32,
+        taint: &HashSet<Hash, ByHash>,
+        s: &mut Scratch,
+    ) -> Option<Node> {
         let mut taken = None;
-        let node = self.fetch(ptr, taint, s, &mut taken);
+        let slot = self.claims.slot(id);
+        let checked = slot.checked.load(Ordering::Acquire) == ptr.offset;
+        let node = self.fetch(ptr, checked, taint, s, &mut taken);
         if s.bytes.capacity() > KEEP_BYTES {
             s.bytes = Vec::new();
         }
         drop(taken);
+        if !checked && node.is_some() {
+            let _ =
+                slot.checked
+                    .compare_exchange(0, ptr.offset, Ordering::AcqRel, Ordering::Relaxed);
+        }
         node
     }
 
     fn fetch<'a>(
         &'a self,
         ptr: Ptr,
+        checked: bool,
         taint: &HashSet<Hash, ByHash>,
         s: &mut Scratch,
         taken: &mut Option<Taken<'a>>,
@@ -484,11 +521,13 @@ impl Shared {
             .source
             .read_stored(ptr, &mut s.bytes, &mut links, claims)
             .ok()?;
-        if stored.packed && stored.raw > record.len() {
-            *taken = None;
-            *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
+        if !checked {
+            if stored.packed && stored.raw > record.len() {
+                *taken = None;
+                *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
+            }
+            verify_stored(record, ptr, &mut s.unpacked).ok()?;
         }
-        verify_stored(record, ptr, &mut s.unpacked).ok()?;
         let len = u32::try_from(stored.len).ok()?;
         if links
             .iter()
@@ -510,6 +549,61 @@ impl Shared {
             len,
             links,
         })
+    }
+
+    fn check_ahead(&self, root: Ptr, s: &mut Scratch) {
+        let mut stack = mem::take(&mut s.checks);
+        stack.push(root);
+        let mut count = 0;
+        while let Some(ptr) = stack.pop() {
+            if self.cancel.load(Ordering::Relaxed) {
+                stack.clear();
+                break;
+            }
+            self.check_one(ptr, &mut stack, s);
+            count += 1;
+            if stack.len() >= 2 * SHARE || count % SHARE == 0 {
+                let mut queue = self.queue.lock();
+                let busy = !queue.jobs.is_empty() || !queue.units.is_empty();
+                let share = match busy {
+                    true => stack.len(),
+                    false => stack.len() / 2,
+                };
+                if queue.checks.len() + share <= CHECKS {
+                    queue.checks.extend(stack.drain(..share));
+                    self.ready.notify_all();
+                }
+                if busy {
+                    stack.clear();
+                    break;
+                }
+            }
+        }
+        s.checks = stack;
+    }
+
+    fn check_one(&self, ptr: Ptr, stack: &mut Vec<Ptr>, s: &mut Scratch) {
+        if ptr.offset == 0 {
+            return;
+        }
+        let slot = self.claims.slot(self.claims.id(&ptr.hash));
+        let started =
+            slot.checked
+                .compare_exchange(0, CHECKING, Ordering::AcqRel, Ordering::Relaxed);
+        if started.is_err() {
+            return;
+        }
+        let mut taken = None;
+        let node = self.fetch(ptr, false, &self.clean, s, &mut taken);
+        if s.bytes.capacity() > KEEP_BYTES {
+            s.bytes = Vec::new();
+        }
+        drop(taken);
+        if let Some(node) = node {
+            slot.checked.store(ptr.offset, Ordering::Release);
+            stack.extend(node.links.iter().rev());
+            s.recycle(node.links, Vec::new());
+        }
     }
 
     fn split(&self, unit: &Unit, node: &Node) -> Option<Vec<Arc<Unit>>> {
@@ -547,14 +641,14 @@ impl Shared {
                 records,
             });
         }
-        let mut node = self.read(unit.root, &unit.taint, s)?;
+        let mut node = self.read(unit.root, id, &unit.taint, s)?;
         let mut chain = Vec::new();
         while let [link] = node.links[..] {
             let (child, won) = self.claims.claim(&link.hash, unit.key);
             if !won {
                 break;
             }
-            let next = self.read(link, &unit.taint, s)?;
+            let next = self.read(link, child, &unit.taint, s)?;
             chain.push((id, mem::replace(&mut node, next), child));
             id = child;
         }
@@ -597,7 +691,7 @@ impl Shared {
                 let (child, won) = self.claims.claim(&link.hash, unit.key);
                 ids.push(child);
                 if won {
-                    let node = self.read(link, &unit.taint, s)?;
+                    let node = self.read(link, child, &unit.taint, s)?;
                     let ids = s.ids.pop().unwrap_or_default();
                     stack.push((child, node, ids));
                 }
@@ -841,6 +935,9 @@ impl Shared {
                 }
                 self.queue.lock().writing -= 1;
             }
+            Item::Check(ptr) => {
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| self.check_ahead(ptr, s)));
+            }
         }
         let mut queue = self.queue.lock();
         queue.events += 1;
@@ -851,7 +948,7 @@ impl Shared {
         let mut queue = self.queue.lock();
         let item = match jobs_only {
             true => queue.jobs.pop_front().map(Item::Job),
-            false => queue.take(),
+            false => queue.work(),
         };
         if let Some(item) = item {
             drop(queue);
@@ -887,6 +984,7 @@ pub(super) struct Units {
     outstanding: usize,
     dispatched: u64,
     batch: Vec<Arc<Unit>>,
+    checks: Vec<Ptr>,
     taint: Arc<HashSet<Hash, ByHash>>,
     scratch: Scratch,
 }
@@ -912,6 +1010,7 @@ impl Units {
                 again: AtomicBool::new(false),
                 failure: Mutex::default(),
                 cancel: AtomicBool::new(false),
+                clean: HashSet::default(),
             }),
             threads,
             handles: Vec::new(),
@@ -920,6 +1019,7 @@ impl Units {
             outstanding: 0,
             dispatched: 0,
             batch: Vec::new(),
+            checks: Vec::new(),
             taint: Arc::default(),
             scratch: Scratch::default(),
         }
@@ -967,6 +1067,35 @@ impl Units {
         let mut queue = self.shared.queue.lock();
         queue.units.extend(self.batch.drain(..).map(Queued));
         self.shared.ready.notify_all();
+    }
+
+    /// Queues the tree at `root` to have its records' hashes checked by threads with nothing else
+    /// to do, before any unit reaches them, starting the threads if this is the first. A unit then
+    /// takes a record checked at the offset it reaches it by as checked.
+    pub(super) fn check_ahead(&mut self, root: Ptr) {
+        if self.threads <= 1 {
+            return;
+        }
+        if !self.started {
+            self.start();
+        }
+        self.checks.push(root);
+        if self.checks.len() >= BATCH {
+            self.publish_checks();
+        }
+    }
+
+    /// Hands the trees queued by [`Units::check_ahead`] to the threads.
+    pub(super) fn publish_checks(&mut self) {
+        if self.checks.is_empty() {
+            return;
+        }
+        let mut queue = self.shared.queue.lock();
+        if queue.checks.len() < CHECKS {
+            queue.checks.extend(self.checks.drain(..));
+            self.shared.ready.notify_all();
+        }
+        self.checks.clear();
     }
 
     /// The key the walk claims the objects it writes itself with, after every unit dispatched.
@@ -1098,6 +1227,7 @@ impl Units {
             };
             shared.wait(seen, &mut self.scratch, true);
         }
+        shared.queue.lock().checks.clear();
         shared.check()
     }
 }
