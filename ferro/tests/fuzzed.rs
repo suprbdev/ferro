@@ -751,6 +751,42 @@ fn a_prev_link_past_the_version_below_fails_verify_and_compaction() {
 }
 
 #[test]
+fn a_head_whose_last_version_is_not_its_tips_fails_verify_and_compaction() {
+    for (named, threads) in [(6, 1), (6, 4), (4, 1), (4, 4)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tip.ferro");
+        let (store, _) = Store::open(&path, buffered()).unwrap();
+        let mut txn = store.begin().unwrap();
+        let mut tip = None;
+        for version in 1..=5 {
+            let entry = Entry {
+                version,
+                time_ms: 100 * version,
+                prev: tip,
+                ..Entry::default()
+            };
+            tip = Some(entry.write(&mut txn));
+        }
+        let head = write_refs(&mut txn, named, tip.unwrap());
+        txn.commit(head).unwrap();
+        store.close();
+        let wrong = |outcome: &ferro::Result<()>| {
+            matches!(outcome, Err(Error::Corrupt(message))
+                if message.contains(&format!("names v{named} as its last but its tip is v5")))
+        };
+        let case = format!("v{named} named, {threads} threads");
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(wrong(&outcome), "{case}: {outcome:?}");
+        if let Ok(db) = Options::new().copy_threads(threads).open::<Opaque>(&path) {
+            let outcome = db.compact(Keep::All).map(|_| ());
+            assert!(wrong(&outcome), "{case}: {outcome:?}");
+        }
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(wrong(&outcome), "{case}: the file after: {outcome:?}");
+    }
+}
+
+#[test]
 fn a_merged_chain_whose_prev_link_passes_a_version_fails_verify_and_compaction() {
     let past = |outcome: &ferro::Result<_>| {
         matches!(outcome, Err(Error::Corrupt(message))

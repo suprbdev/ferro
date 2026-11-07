@@ -411,7 +411,8 @@ impl Closures {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if an entry's `prev` link reaches another version than the one below it,
+    /// [`Error::Corrupt`] if the tip is not at the chain's last version, an entry's `prev` link
+    /// reaches another version than the one below it,
     /// and the first error from `each` or from reading an entry.
     pub(crate) fn walk(
         &mut self,
@@ -722,9 +723,10 @@ impl Chain {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if an entry's `prev` link reaches another version than the one below it,
-    /// an entry links pruned history it needs, or a kept skip link names another entry than the
-    /// one the chain reaches at that version, by hash, and the first error from `each`.
+    /// [`Error::Corrupt`] if the tip is not at the chain's last version, an entry's `prev` link
+    /// reaches another version than the one below it, an entry links pruned history it needs, or
+    /// a kept skip link names another entry than the one the chain reaches at that version, by
+    /// hash, and the first error from `each`.
     pub(crate) fn visit(
         &self,
         store: &Store,
@@ -751,6 +753,12 @@ impl Chain {
             let (object, len) = read(ptr)?;
             let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
             let at = entry.commit.version;
+            if above == u64::MAX && at != self.last {
+                return Err(corrupt(&format!(
+                    "names v{} as its last but its tip is v{at}",
+                    self.last
+                )));
+            }
             step_down(above, at)?;
             above = at;
             if let Some(&(from, _, _)) = skips
