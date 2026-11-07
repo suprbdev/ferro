@@ -1395,7 +1395,7 @@ impl Options {
 
     /// How many threads a reclamation cycle copies and checks on, counting the one it runs on.
     ///
-    /// Zero, the default, means the number of cores up to 4, and 1 keeps a cycle on one thread.
+    /// Zero, the default, means the number of cores up to 8, and 1 keeps a cycle on one thread.
     pub fn copy_threads(mut self, threads: usize) -> Self {
         self.store.copy_threads = threads;
         self

@@ -239,7 +239,7 @@ pub struct StoreOptions {
     /// byte-range locks that only 64-bit Linux has.
     pub shared: bool,
     /// How many threads a reclamation cycle copies and checks on, counting its own. Zero, the
-    /// default, means the number of cores up to 4.
+    /// default, means the number of cores up to 8.
     pub copy_threads: usize,
     /// Records every write, sync and change of length to the file, for crash tests.
     #[doc(hidden)]

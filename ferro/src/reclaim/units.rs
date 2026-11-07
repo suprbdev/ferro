@@ -350,6 +350,7 @@ struct Shared {
     claims: Claims,
     dispatched: Mutex<VecDeque<Arc<Unit>>>,
     placed: AtomicU64,
+    writing: Mutex<()>,
     queue: Mutex<Queue>,
     ready: Condvar,
     moved: Condvar,
@@ -653,8 +654,11 @@ impl Shared {
         if s.out.len() as u64 != job.len {
             return Err(misplaced(job.start));
         }
-        self.file.write_all_at(&s.out, job.start)?;
-        start_writeback(&self.file, job.start, job.len);
+        {
+            let _writing = self.writing.lock();
+            self.file.write_all_at(&s.out, job.start)?;
+            start_writeback(&self.file, job.start, job.len);
+        }
         if s.out.capacity() > 2 * KEEP_BYTES {
             s.out = Vec::new();
         }
@@ -775,6 +779,7 @@ impl Units {
                 claims: Claims::new(),
                 dispatched: Mutex::default(),
                 placed: AtomicU64::new(0),
+                writing: Mutex::new(()),
                 queue: Mutex::default(),
                 ready: Condvar::new(),
                 moved: Condvar::new(),
