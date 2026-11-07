@@ -1871,12 +1871,12 @@ impl<T: Data> Shared<T> {
     }
 
     fn attached(&self, name: &str) -> Result<Arc<Branch<T>>> {
-        if let Some(branch) = self.branches.lock().get(name) {
-            return Ok(branch.clone());
-        }
         loop {
             if self.options.shared {
                 self.catch_up()?;
+            }
+            if let Some(branch) = self.branches.lock().get(name) {
+                return Ok(branch.clone());
             }
             let tip = self.tip.lock();
             let _whole = reentry::whole(self.id);

@@ -616,6 +616,48 @@ fn a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead(
 }
 
 #[test]
+fn branch_after_another_handle_dropped_and_forked_again_gives_the_new_branch() {
+    let manual = Reclaim { every_bytes: 0 };
+    for refork in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebranch.ferro");
+        let a: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+        bump(&a, 0, 1);
+        let old = a.fork("x").unwrap();
+        bump(&old, 1, 1);
+        let b: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+        let held = b.branch("x").unwrap();
+        let had = (held.version(), held.read().n);
+        drop(old);
+        a.drop_branch("x").unwrap();
+        if !refork {
+            assert!(
+                matches!(b.branch("x"), Err(Error::NoBranch(_))),
+                "refork {refork}"
+            );
+            assert!(matches!(
+                held.update(|root| root.n += 100),
+                Err(Error::NoBranch(_))
+            ));
+            continue;
+        }
+        let new = a.fork("x").unwrap();
+        bump(&new, 2, 1);
+        let now = (new.version(), new.read().n);
+        let attached = b.branch("x").unwrap();
+        assert_eq!((attached.version(), attached.read().n), now);
+        attached.update(|root| root.n += 1).unwrap();
+        a.refresh().unwrap();
+        assert_eq!(new.read().n, now.1 + 1);
+        assert!(matches!(
+            held.update(|root| root.n += 100),
+            Err(Error::NoBranch(_))
+        ));
+        assert_eq!((held.version(), held.read().n), had);
+    }
+}
+
+#[test]
 fn a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pause.ferro");

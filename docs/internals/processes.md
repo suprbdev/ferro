@@ -183,8 +183,8 @@ they take 115 ms, and four threads 68 and 55 ms, while one thread took 53 and 52
 each from inside some 14,000 kept frames, one thread took 166 ms where it takes 20 ms and sixteen
 threads 726 where they take 29.
 
-Catching up happens when a process takes a branch lock, before it places a frame, when it attaches a
-branch it has not seen, before each pass of a cycle and on `refresh`, and on a look of a
+Catching up happens when a process takes a branch lock, before it places a frame, on each
+`Db::branch`, before each pass of a cycle and on `refresh`, and on a look of a
 [follower](#followers) that finds a superblock naming a frame past its own. A process that does none
 of these sees nothing new, as a read-only handle that never refreshes sees nothing new.
 
@@ -195,7 +195,12 @@ version attached from the published refs alone, so a branch whose newer head ano
 written, and this one had caught up with but not yet synced, attached with the older state and
 never moved: every commit on it failed with `another process moved branch`.
 `a_branch_attached_while_a_followed_frame_waits_for_its_sync_reads_the_newest_head` holds a commit
-on `main` between catching up and syncing while it attaches the branch.
+on `main` between catching up and syncing while it attaches the branch. `Db::branch` catches up
+even for a branch this process has attached, so that one another process dropped, or dropped and
+forked again, is retired first: the first version handed back the attached branch as it was, so
+`branch("x")` after a drop gave the dead handle, and after a drop and fork the old branch rather
+than the new one. `branch_after_another_handle_dropped_and_forked_again_gives_the_new_branch`
+covers both.
 
 The marker a cycle leaves, described under [Reclamation](#reclamation), is checked against the path,
 which a shared writer's store keeps canonical; other stores keep the path they were given, as
