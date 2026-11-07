@@ -2787,6 +2787,9 @@ impl<T: Data> Db<T> {
     ///   branch has landed, and this branch is as it was.
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
     ///   is damaged.
+    /// - [`Error::Decode`] if this branch would fast-forward or merge to a head that `T` cannot
+    ///   read, such as a table whose unique index, rebuilt on this side, finds two rows sharing a
+    ///   value. The remote branch has landed, and this branch is as it was.
     /// - [`Error::Reentrant`] from inside a closure on this file, or where waiting on `from`'s
     ///   file could otherwise deadlock, [`Error::ReadOnly`] on a read-only handle, and the errors
     ///   of [`Db::commit`].
@@ -3263,7 +3266,12 @@ impl<T: Data> Db<T> {
             let decision = decide(store, ours.as_deref(), &theirs)?;
             let head = match decision {
                 Decision::Diverged | Decision::Equal => return Ok((None, decision)),
-                Decision::FastForward => fast_forward(ours.as_deref(), &theirs),
+                Decision::FastForward => {
+                    if let Some(root) = theirs.root {
+                        store.load::<T>(root)?;
+                    }
+                    fast_forward(ours.as_deref(), &theirs)
+                }
                 Decision::UpToDate | Decision::Ahead => match ours {
                     Some(ours) => (*ours).clone(),
                     None => return Ok((None, decision)),

@@ -520,9 +520,19 @@ Measured and left out:
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. A table without one of its indexes, or holding one under
   another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows
-  and does not rebuild the others. Reading it rebuilds the index, and if two rows
-  share a value of a unique index that read fails, so a peer can still send a table that does not
-  read. Checking it at receive would mean reading every row.
+  and does not rebuild the others. Reading it rebuilds the index, and if two rows share a value of a
+  unique index that read fails, so a peer can still send a table that does not read, as a peer
+  whose schema has a plain index where the receiver's has a unique one can. Checking it at receive
+  would mean reading every row. Such a head lands as the branch `remote`, but the receiver's branch
+  never moves to it: a fast-forward reads the new root as `T` before the frame that moves the branch
+  is written, and a merge reads it to merge, so the pull returns that read's `Error::Decode` and the
+  branch stays where it was. The fast-forward used to move the branch first and fail to read it
+  afterwards, which left a file that no longer opened. Until the peer sends a head that reads,
+  every pull from it fails the same way, and opening `remote` as a branch fails. The read before a
+  fast-forward is the one the branch would make right after it, and the store's cache keeps the
+  decoded root for that, so it costs nothing more unless the cache drops it. `sync.rs` sends such a
+  table to an empty file and to one with commits of its own, and checks that both refuse it, reopen
+  at their own head, and take the peer's next head once it reads.
 - The receiver recomputes every summary it is sent with its own `of` and `combine`, so peers need
   the same `Summary`, not only one that encodes the same, and the same arithmetic: a float
   `combine` that makes a NaN gets different bits on x86 and ARM, so a bundle from the other

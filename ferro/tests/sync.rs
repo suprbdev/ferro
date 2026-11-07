@@ -3380,6 +3380,90 @@ fn a_summarized_table_whose_index_the_receiver_added_lands_and_verifies() {
     reread.verify_typed().unwrap();
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Person {
+    #[key]
+    id: u32,
+    #[index]
+    email: String,
+}
+
+mod unique {
+    use ferro::{Data, Record};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Person {
+        #[key]
+        pub id: u32,
+        #[unique]
+        pub email: String,
+    }
+}
+
+fn person(id: u32, email: &str) -> Person {
+    Person {
+        id,
+        email: email.into(),
+    }
+}
+
+fn keep_theirs(
+    people: &mut Table<unique::Person>,
+    base: &Snapshot<Table<unique::Person>>,
+    theirs: &Snapshot<Table<unique::Person>>,
+) -> (String, usize) {
+    let applied = people.merge(base, theirs, |conflict| conflict.keep_theirs());
+    ("merge".to_string(), applied)
+}
+
+#[test]
+fn a_head_the_receiver_cannot_read_lands_as_the_remote_and_moves_no_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let a: Db<Table<Person>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    a.update(|people| {
+        people.insert(person(1, "x"));
+        people.insert(person(2, "x"));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let refused = b.receive("a", &bundle, unmerged);
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    assert_eq!(b.version(), 0);
+    assert_eq!(b.branches(), ["a", "main"]);
+    drop(b);
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    assert_eq!(b.version(), 0);
+    assert_eq!(b.read().len(), 0);
+    b.update(|people| {
+        people.insert(unique::Person {
+            id: 3,
+            email: "z".into(),
+        });
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let refused = b.receive("a", &bundle, keep_theirs);
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    assert_eq!(b.version(), 1);
+    drop(b);
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    let keys: Vec<u32> = b.read().keys().collect();
+    assert_eq!(keys, [3]);
+    a.update(|people| {
+        people.remove(&2);
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, keep_theirs).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    let keys: Vec<u32> = b.read().keys().collect();
+    assert_eq!(keys, [1, 3]);
+    assert_eq!(b.read().key_by_email("x"), Some(1));
+    b.verify_typed().unwrap();
+}
+
 #[derive(Data, Clone, Copy, Debug, PartialEq)]
 #[ferro(transparent)]
 struct Scan(u64);
