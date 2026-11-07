@@ -530,3 +530,69 @@ fn each_with_set_types() {
     table.remove("a");
     assert_eq!(names(Box::new(table.by_tags(&2))), Vec::<String>::new());
 }
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct Scored {
+    id: u32,
+    title_score: u32,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+#[ferro(removed("title_score"))]
+struct Flagged {
+    id: u32,
+    #[ferro(rename = "flag_bits", default)]
+    flags: u32,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+enum Refund {
+    Open,
+    RefundPremium(u32),
+    Paid { at: u64, title_score: u32 },
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+#[ferro(removed("RefundPremium"))]
+enum Taxed {
+    Open,
+    #[ferro(rename = "Levy")]
+    Tax(u32),
+    #[ferro(removed("title_score"))]
+    Paid {
+        at: u64,
+        #[ferro(rename = "flag_bits", default)]
+        flags: u32,
+    },
+}
+
+fn reread<A: Data, B: Data>(value: &A) -> ferro::Result<B> {
+    let body = bytes(value);
+    B::decode(&mut Decoder::new(&body, &[], None))
+}
+
+#[test]
+fn a_name_listed_as_removed_keeps_its_old_bytes_from_a_new_field_or_variant() {
+    use ferro::codec::field_tag;
+    assert_eq!(field_tag("title_score"), field_tag("flags"));
+    assert_eq!(field_tag("RefundPremium"), field_tag("Tax"));
+    let old = Scored {
+        id: 1,
+        title_score: 7,
+    };
+    let flagged: Flagged = reread(&old).unwrap();
+    assert_eq!(flagged, Flagged { id: 1, flags: 0 });
+    roundtrip(Flagged { id: 2, flags: 3 });
+    assert_eq!(reread::<_, Taxed>(&Refund::Open).unwrap(), Taxed::Open);
+    assert!(matches!(
+        reread::<_, Taxed>(&Refund::RefundPremium(9)),
+        Err(ferro::Error::Decode(_))
+    ));
+    let paid = Refund::Paid {
+        at: 5,
+        title_score: 7,
+    };
+    let taxed: Taxed = reread(&paid).unwrap();
+    assert_eq!(taxed, Taxed::Paid { at: 5, flags: 0 });
+    roundtrip(Taxed::Tax(4));
+}

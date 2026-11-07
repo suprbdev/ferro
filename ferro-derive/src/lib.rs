@@ -65,12 +65,24 @@ impl Field {
 struct Attrs {
     rename: Option<String>,
     fallback: Fallback,
+    removed: Vec<LitStr>,
+}
+
+fn removed_list(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<Vec<LitStr>> {
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let names = syn::punctuated::Punctuated::<LitStr, syn::Token![,]>::parse_terminated(&content)?;
+    if names.is_empty() {
+        return Err(meta.error("removed needs at least one name"));
+    }
+    Ok(names.into_iter().collect())
 }
 
 fn parse_attrs(attrs: &[Attribute]) -> syn::Result<Attrs> {
     let mut out = Attrs {
         rename: None,
         fallback: Fallback::Required,
+        removed: Vec::new(),
     };
     for attr in attrs {
         if !attr.path().is_ident("ferro") {
@@ -92,6 +104,9 @@ fn parse_attrs(attrs: &[Attribute]) -> syn::Result<Attrs> {
                     out.fallback = Fallback::Default;
                 }
                 Ok(())
+            } else if meta.path.is_ident("removed") {
+                out.removed.extend(removed_list(&meta)?);
+                Ok(())
             } else {
                 Err(meta.error("unknown ferro attribute"))
             }
@@ -104,6 +119,12 @@ fn parse_fields(fields: &Fields) -> syn::Result<Vec<Field>> {
     let mut out = Vec::new();
     for (index, field) in fields.iter().enumerate() {
         let attrs = parse_attrs(&field.attrs)?;
+        if let Some(first) = attrs.removed.first() {
+            return Err(syn::Error::new(
+                first.span(),
+                "removed lists the names a struct, an enum or a variant no longer has, so it goes on the struct, the enum or the variant",
+            ));
+        }
         let name = attrs.rename.unwrap_or_else(|| match &field.ident {
             Some(ident) => ident.to_string(),
             None => index.to_string(),
@@ -122,9 +143,28 @@ fn parse_fields(fields: &Fields) -> syn::Result<Vec<Field>> {
 fn check_collisions<'a>(
     kind: &str,
     items: impl Iterator<Item = (&'a str, u16, Span)>,
+    removed: &[LitStr],
 ) -> syn::Result<()> {
     let mut seen: Vec<(&str, u16, Span)> = Vec::new();
     for (name, tag, span) in items {
+        if let Some(gone) = removed.iter().find(|gone| field_tag(&gone.value()) == tag) {
+            let gone_name = gone.value();
+            let message = if gone_name == name {
+                format!(
+                    "{kind} `{name}` is listed as removed; take it off the list to bring it back, or store it under another name with #[ferro(rename = \"...\")]"
+                )
+            } else {
+                format!(
+                    "{kind} `{name}` has the same tag ({tag}) as removed {kind} `{gone_name}`, so it would read what old data stored under `{gone_name}`; store it under another name with #[ferro(rename = \"...\")]"
+                )
+            };
+            let mut err = syn::Error::new(span, message);
+            err.combine(syn::Error::new(
+                gone.span(),
+                format!("removed {kind} `{gone_name}` is listed here"),
+            ));
+            return Err(err);
+        }
         if let Some((other, _, other_span)) = seen.iter().find(|(_, t, _)| *t == tag) {
             let mut err = syn::Error::new(
                 span,
@@ -143,13 +183,14 @@ fn check_collisions<'a>(
     Ok(())
 }
 
-fn check_fields(fields: &[Field]) -> syn::Result<()> {
+fn check_fields(fields: &[Field], removed: &[LitStr]) -> syn::Result<()> {
     check_collisions(
         "field",
         fields
             .iter()
             .filter(|f| f.stored())
             .map(|f| (f.name.as_str(), f.tag(), f.span)),
+        removed,
     )
 }
 
@@ -311,22 +352,39 @@ fn vars(count: usize) -> Vec<Ident> {
     (0..count).map(|i| format_ident!("__f{}", i)).collect()
 }
 
-fn is_transparent(attrs: &[Attribute]) -> syn::Result<bool> {
-    let mut found = false;
+struct Container {
+    transparent: bool,
+    removed: Vec<LitStr>,
+}
+
+fn parse_container(attrs: &[Attribute]) -> syn::Result<Container> {
+    let mut out = Container {
+        transparent: false,
+        removed: Vec::new(),
+    };
     for attr in attrs {
         if !attr.path().is_ident("ferro") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("transparent") {
-                found = true;
+                out.transparent = true;
+                Ok(())
+            } else if meta.path.is_ident("removed") {
+                out.removed.extend(removed_list(&meta)?);
                 Ok(())
             } else {
                 Err(meta.error("unknown ferro attribute"))
             }
         })?;
     }
-    Ok(found)
+    if let (true, Some(first)) = (out.transparent, out.removed.first()) {
+        return Err(syn::Error::new(
+            first.span(),
+            "a transparent struct stores its field without a tag, so it has no removed names",
+        ));
+    }
+    Ok(out)
 }
 
 fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
@@ -383,7 +441,8 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
-    if is_transparent(&input.attrs)? {
+    let container = parse_container(&input.attrs)?;
+    if container.transparent {
         return expand_transparent(&input);
     }
     let name = &input.ident;
@@ -392,7 +451,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (encode, decode, visit, describe, same) = match &input.data {
         Data::Struct(data) => {
             let fields = parse_fields(&data.fields)?;
-            check_fields(&fields)?;
+            check_fields(&fields, &container.removed)?;
             let members: Vec<TokenStream2> = data
                 .fields
                 .iter()
@@ -441,9 +500,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
         Data::Enum(data) => {
             let mut variant_names = Vec::new();
+            let mut removed_fields = Vec::new();
             for variant in &data.variants {
                 let attrs = parse_attrs(&variant.attrs)?;
                 variant_names.push(attrs.rename.unwrap_or_else(|| variant.ident.to_string()));
+                removed_fields.push(attrs.removed);
             }
             check_collisions(
                 "variant",
@@ -451,17 +512,23 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     .iter()
                     .zip(&data.variants)
                     .map(|(n, v)| (n.as_str(), field_tag(n), v.span())),
+                &container.removed,
             )?;
             let mut encode_arms = Vec::new();
             let mut decode_arms = Vec::new();
             let mut visit_arms = Vec::new();
             let mut same_arms = Vec::new();
             let mut described = Vec::new();
-            for (variant, vname) in data.variants.iter().zip(&variant_names) {
+            for ((variant, vname), removed) in data
+                .variants
+                .iter()
+                .zip(&variant_names)
+                .zip(&removed_fields)
+            {
                 let vident = &variant.ident;
                 let vtag = field_tag(vname);
                 let fields = parse_fields(&variant.fields)?;
-                check_fields(&fields)?;
+                check_fields(&fields, removed)?;
                 let vs = vars(fields.len());
                 let others: Vec<Ident> = (0..fields.len())
                     .map(|i| format_ident!("__g{}", i))
@@ -630,7 +697,8 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// tag, so the struct can change while old data keeps loading:
 ///
 /// - Reordering fields changes nothing, not even the value's hash.
-/// - A field the type no longer has is skipped when old data is read.
+/// - A field the type no longer has is skipped when old data is read, unless a field added later
+///   has the same tag; listing the removed name in `#[ferro(removed(...))]` rules that out.
 /// - A field that old data lacks reads as its type's empty value if it has one: `Option`, `Vec`,
 ///   `BTreeMap`, `BTreeSet`, `Bytes`, `Map`, `Set`, `List` and `Table` start empty, and `Box` and
 ///   `Arc` follow what they hold. Any other field needs `#[ferro(default)]`, or the read fails with
@@ -639,7 +707,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// Tuple fields are named by position, `0`, `1` and so on, and a unit struct stores no fields. An
 /// enum stores a tag hashed from the variant's name, then the variant's fields as a struct's, so
 /// variants can be reordered and added. A variant tag the type does not know fails to decode with
-/// `Error::Decode`.
+/// `Error::Decode`, as long as no variant added later has the tag of the removed one.
 ///
 /// Do not change the encoding or `Ord` of a type used as a key or an indexed value on existing
 /// data.
@@ -659,13 +727,35 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///
 /// On an enum variant, `#[ferro(rename = "name")]` stores the variant under `name`.
 ///
+/// On a struct, an enum or an enum variant, `#[ferro(removed("name", ...))]` lists the stored
+/// names of the fields, or on an enum the variants, that it once had and no longer has. A tag is
+/// 16 bits, so a field added later can hash to the tag of one that is gone, and would then read the
+/// bytes old data stored under it: the old value if they decode as the new field's type, and a
+/// failed read if not. The derive refuses a field or variant whose stored name has the tag of a
+/// listed name, so that `#[ferro(rename = "...")]` can give it another, and refuses a listed name
+/// that the type still has. Names nobody lists are not checked: list every field or variant you
+/// remove from a type that has stored data.
+///
 /// On a struct with exactly one field, `#[ferro(transparent)]` stores the struct as that field
 /// alone, with no tag, and describes it as that field, so a newtype costs nothing over what it
 /// wraps and wrapping a field in one leaves its encoding and its indexes as they were.
 ///
 /// Options can share one attribute, as in `#[ferro(rename = "total", default)]`. Any other option
 /// is a compile error, and so are two fields, or two variants, whose stored names hash to the same
-/// tag: the error names both, and `#[ferro(rename = "...")]` on one of them resolves it.
+/// tag: the error names both, and `#[ferro(rename = "...")]` on one of them resolves it. A field or
+/// variant whose tag is that of a removed name is refused the same way:
+///
+/// ```compile_fail
+/// use ferro::Data;
+///
+/// #[derive(Data, Clone)]
+/// #[ferro(removed("title_score"))]
+/// struct Post {
+///     id: u32,
+///     #[ferro(default)]
+///     flags: u32,
+/// }
+/// ```
 ///
 /// # Examples
 ///
@@ -2527,5 +2617,122 @@ mod tests {
             struct Row { #[key] id: u64, #[index] room: u32, #[ferro(skip)] ghost: u32 }
         };
         assert!(expand_record(input).is_ok());
+    }
+
+    fn data_refused(input: DeriveInput) -> String {
+        match expand_data(input) {
+            Ok(_) => panic!("the derive accepted a tag that a removed name had"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_field_or_variant_with_the_tag_of_a_removed_one_is_refused() {
+        assert_eq!(field_tag("title_score"), field_tag("flags"));
+        assert_eq!(field_tag("RefundPremium"), field_tag("Tax"));
+        let inputs: [(DeriveInput, &str); 6] = [
+            (
+                syn::parse_quote! {
+                    #[ferro(removed("title_score"))]
+                    struct After { id: u32, flags: u32 }
+                },
+                "field `flags` has the same tag",
+            ),
+            (
+                syn::parse_quote! {
+                    #[ferro(removed("old", "title_score"))]
+                    struct After(u32, #[ferro(rename = "flags")] u32);
+                },
+                "field `flags` has the same tag",
+            ),
+            (
+                syn::parse_quote! {
+                    #[ferro(removed("RefundPremium"))]
+                    enum State { Open, Tax(u32) }
+                },
+                "variant `Tax` has the same tag",
+            ),
+            (
+                syn::parse_quote! {
+                    #[ferro(removed("RefundPremium"))]
+                    enum State { Open, #[ferro(rename = "Tax")] Levy(u32) }
+                },
+                "variant `Tax` has the same tag",
+            ),
+            (
+                syn::parse_quote! {
+                    enum State { Open, #[ferro(removed("title_score"))] Paid { flags: u32 } }
+                },
+                "field `flags` has the same tag",
+            ),
+            (
+                syn::parse_quote! {
+                    #[ferro(removed("note"))]
+                    struct After { note: String }
+                },
+                "field `note` is listed as removed",
+            ),
+        ];
+        for (input, expected) in inputs {
+            let message = data_refused(input);
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_removed_list_where_it_means_nothing_is_refused() {
+        let inputs: [(DeriveInput, &str); 3] = [
+            (
+                syn::parse_quote! {
+                    #[ferro(transparent, removed("old"))]
+                    struct Cents(i64);
+                },
+                "a transparent struct stores its field without a tag",
+            ),
+            (
+                syn::parse_quote! {
+                    struct After { #[ferro(removed("old"))] id: u32 }
+                },
+                "removed lists the names",
+            ),
+            (
+                syn::parse_quote! {
+                    #[ferro(removed())]
+                    struct After { id: u32 }
+                },
+                "removed needs at least one name",
+            ),
+        ];
+        for (input, expected) in inputs {
+            let message = data_refused(input);
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn removed_names_whose_tags_no_field_or_variant_has_are_accepted() {
+        let inputs: [DeriveInput; 3] = [
+            syn::parse_quote! {
+                #[ferro(removed("title_score", "legacy"))]
+                struct After { id: u32, #[ferro(rename = "flag_bits")] flags: u32 }
+            },
+            syn::parse_quote! {
+                #[ferro(removed("RefundPremium"))]
+                enum State {
+                    Open,
+                    #[ferro(rename = "Levy", removed("title_score"))]
+                    Tax { amount: u32 },
+                }
+            },
+            syn::parse_quote! {
+                #[ferro(removed("old"))]
+                struct Empty;
+            },
+        ];
+        for input in inputs {
+            if let Err(error) = expand_data(input) {
+                panic!("{error}");
+            }
+        }
     }
 }

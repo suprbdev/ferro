@@ -4,13 +4,36 @@ Your struct is the schema. Fields are stored by name hash, so old data keeps loa
 the struct:
 
 - Reordering fields is always safe.
-- A removed field is skipped when old data is read.
+- A removed field is skipped when old data is read. List its stored name on the struct, as
+  `#[ferro(removed("title_score"))]`, as described below.
 - A new field needs a default: `Option`, `Vec`, `BTreeMap`, `BTreeSet`, `Bytes`, `Map`, `Set`,
   `List` and `Table` start empty, a `Box` or `Arc` of one of them does too, and anything else takes
   `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
 - To rename a field, use `#[ferro(rename = "old_name")]`.
 
 Do not change the encoding or `Ord` of a key type on existing data. Tree placement depends on both.
+
+A field is stored under a 16-bit hash of its name, so a field you add has a 1 in 65,536 chance of
+hashing to the tag of a field you removed. Old data then still holds bytes under that tag, and the
+new field reads them: the removed field's value if the bytes decode as the new field's type, and a
+failed read if they do not. To rule that out, list every removed field's stored name on the struct:
+
+```rust
+#[derive(Data, Clone)]
+#[ferro(removed("title_score"))]
+struct Post {
+    id: u32,
+    #[ferro(default)]
+    flags: u32,
+}
+```
+
+The derive then refuses a field whose stored name has the tag of a listed one, here `flags`, and
+`#[ferro(rename = "...")]` stores it under another name. It refuses a listed name the struct still
+has too, so take a name off the list to bring its field back. The same attribute on an enum lists
+its removed variants, whose old data otherwise decodes as a new variant with the same tag, and on a
+variant its removed fields. The derive cannot see a field that has gone, so it checks only the names
+you list.
 
 A field marked `#[ferro(skip)]` is not stored and reads back as its `Default`. The `Record` derive
 refuses `#[key]` or an index of any kind on one, alone or in a composite, and a `Summary` must not

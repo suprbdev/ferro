@@ -14,6 +14,23 @@ Unknown fields are skipped. Missing fields use `Data::missing`, or `#[ferro(defa
 `#[ferro(rename = "old")]` keeps the old tag. A table's indexes are not told apart by tag, as
 described under [Index fingerprints](#index-fingerprints).
 
+A tag identifies a field only among the fields stored beside it. The derive refuses two fields, or
+two variants, of one type with the same tag, but it cannot see a field or variant that was removed,
+whose bytes stay in old data. A field added later whose tag is the removed one's, one in 65,536,
+reads those bytes: `title_score: u32` followed by `flags: u32` gave every old row its score as
+flags, and a new variant `Tax(u32)` decoded old `RefundPremium(9)` values as `Tax(9)`, where an
+unknown variant tag fails to decode. `#[ferro(removed("title_score"))]` on a struct lists the stored
+names it no longer has, on an enum its removed variants, and on a variant its removed fields. The
+derive refuses a current field or variant whose tag is that of a listed name, with an error at both,
+and a listed name the type still has. The list changes nothing in the encoding or the description,
+so adding it rebuilds no index.
+
+Widening tags was considered and left out. Thirty-two bits would make a collision with a removed
+name one in four billion rather than make it impossible, and would change the encoding of every
+struct, so every stored hash, every index fingerprint and every file. Storing the names themselves
+costs their length in every row. A list of removed names costs nothing at run time and turns the
+collision into a compile error, at the price of the user keeping the list.
+
 ## Unique indexes
 
 `#[unique]` on a field, or `#[unique(a, b)]` on the struct for a combination of fields, adds a
