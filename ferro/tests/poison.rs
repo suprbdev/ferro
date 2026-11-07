@@ -4,14 +4,54 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
+use std::pin::pin;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
 
 use common::{fast, text, uncached};
 use ferro::{Error, Map, Options};
 
 type Root = Map<u64, String>;
+
+const COALESCED_BRANCHES: [&str; 4] = ["main", "b1", "b2", "b3"];
+
+struct Flag {
+    thread: Thread,
+    woken: AtomicBool,
+}
+
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let flag = Arc::new(Flag {
+        thread: thread::current(),
+        woken: AtomicBool::new(false),
+    });
+    let waker = Waker::from(flag.clone());
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        while !flag.woken.swap(false, Ordering::SeqCst) {
+            thread::park();
+        }
+    }
+}
 
 fn child_body(path: &str) {
     let db = fast().open::<Root>(path).unwrap();
@@ -102,6 +142,97 @@ fn durable_group_child(path: &str) {
 fn durable_write_limit_child() {
     if let Ok(path) = std::env::var("FERRO_POISON_GROUP_PATH") {
         durable_group_child(&path);
+    }
+}
+
+fn coalesced_group_child(path: &str) {
+    let main = Options::new().coalesce(true).open::<Root>(path).unwrap();
+    let mut dbs = vec![main.clone()];
+    for name in &COALESCED_BRANCHES[1..] {
+        dbs.push(main.fork(name).unwrap());
+    }
+    let acked = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = (0..12u64)
+        .map(|writer| {
+            let at = writer as usize % COALESCED_BRANCHES.len();
+            let (db, acked) = (dbs[at].clone(), acked.clone());
+            thread::spawn(move || {
+                for round in 0..200_000u64 {
+                    let key = writer * 1_000_000 + round;
+                    let value = text(key, 700);
+                    let write = |root: &mut Root| {
+                        root.insert(key, value.clone());
+                    };
+                    let done = match writer % 3 {
+                        0 => block_on(db.update_async(write)),
+                        _ => db.update(write),
+                    };
+                    match done {
+                        Ok(()) => acked.lock().unwrap().push((at, key)),
+                        Err(Error::Io(_) | Error::Poisoned | Error::GroupFailed(_)) => return,
+                        Err(other) => panic!("unexpected {other}"),
+                    }
+                }
+                panic!("write limit never hit");
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let acked = acked.lock().unwrap();
+    assert!(!acked.is_empty());
+    for db in &dbs {
+        assert!(matches!(db.update(|_| ()), Err(Error::Poisoned)));
+    }
+    for (at, key) in acked.iter() {
+        let snapshot = dbs[*at].read();
+        assert_eq!(snapshot.get(key).as_deref(), Some(&text(*key, 700)));
+    }
+    let report: Vec<String> = acked
+        .iter()
+        .map(|(at, key)| format!("{at}:{key}"))
+        .collect();
+    fs::write(format!("{path}.report"), report.join(" ")).unwrap();
+}
+
+#[test]
+fn coalesced_write_limit_child() {
+    if let Ok(path) = std::env::var("FERRO_POISON_COALESCED_PATH") {
+        coalesced_group_child(&path);
+    }
+}
+
+#[test]
+fn failed_write_poisons_coalesced_writers_on_every_branch_and_keeps_what_was_acknowledged() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("coalesced.ferro");
+    let exe = std::env::current_exe().unwrap();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 512; exec \"$0\" --exact coalesced_write_limit_child --test-threads=1")
+        .arg(&exe)
+        .env("FERRO_POISON_COALESCED_PATH", &path)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let report = fs::read_to_string(format!("{}.report", path.display())).unwrap();
+    let db = Options::new().open::<Root>(&path).unwrap();
+    db.verify().unwrap();
+    let snapshots: Vec<_> = COALESCED_BRANCHES
+        .iter()
+        .map(|name| db.branch(name).unwrap().read())
+        .collect();
+    for entry in report.split(' ') {
+        let (at, key) = entry.split_once(':').unwrap();
+        let (at, key) = (at.parse::<usize>().unwrap(), key.parse::<u64>().unwrap());
+        assert_eq!(
+            snapshots[at].get(&key).as_deref(),
+            Some(&text(key, 700)),
+            "{} lost acknowledged key {key}",
+            COALESCED_BRANCHES[at]
+        );
     }
 }
 
