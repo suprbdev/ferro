@@ -1116,9 +1116,11 @@ impl<'a> Copier<'a> {
         file.created();
         file.set_len(LOG_START)?;
         let threads = copy_threads(options);
-        let large = store.size() >= LOG_START + BATCH_BYTES as u64;
-        let units =
-            (threads > 1 && large).then(|| Units::new(store.clone(), file.clone(), threads));
+        let spawn = match store.size() >= LOG_START + BATCH_BYTES as u64 {
+            true => threads,
+            false => 1,
+        };
+        let units = (threads > 1).then(|| Units::new(store.clone(), file.clone(), spawn));
         Ok(Copier {
             sink: CopySink {
                 source: store.clone(),

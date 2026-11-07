@@ -770,7 +770,9 @@ pub(super) struct Units {
 }
 
 impl Units {
-    /// Units that copy from `source` into `file` on `threads` threads, the walk's included.
+    /// Units that copy from `source` into `file` on `threads` threads, the walk's included, which
+    /// start with the first unit dispatched. With 1 the walk discovers, places and writes every
+    /// unit itself while it settles them.
     pub(super) fn new(source: Store, file: Arc<Traced>, threads: usize) -> Units {
         Units {
             shared: Arc::new(Shared {
