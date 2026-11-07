@@ -411,7 +411,8 @@ impl Closures {
     ///
     /// # Errors
     ///
-    /// The first error from `each` or from reading an entry.
+    /// [`Error::Corrupt`] if an entry's `prev` link reaches another version than the one below it,
+    /// and the first error from `each` or from reading an entry.
     pub(crate) fn walk(
         &mut self,
         store: &Store,
@@ -445,9 +446,7 @@ impl Closures {
                 let (object, len) = read(ptr)?;
                 let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
                 let at = entry.commit.version;
-                if at >= above {
-                    return Err(corrupt("versions do not descend"));
-                }
+                step_down(above, at)?;
                 let first = above == u64::MAX;
                 above = at;
                 if at < floor {
@@ -478,6 +477,21 @@ pub(crate) fn skip_version(version: u64) -> u64 {
 
 fn corrupt(what: &str) -> Error {
     Error::Corrupt(format!("commit log {what}"))
+}
+
+/// Checks that the entry at `at`, reached through the `prev` link of the entry at `above`, is the
+/// version just below it, where `above` is `u64::MAX` for the first entry of a walk.
+fn step_down(above: u64, at: u64) -> Result<()> {
+    if at >= above {
+        return Err(corrupt("versions do not descend"));
+    }
+    if above != u64::MAX && at != above - 1 {
+        return Err(corrupt(&format!(
+            "v{above} links v{at} as the entry before it, not v{}",
+            above - 1
+        )));
+    }
+    Ok(())
 }
 
 /// A branch's retained commit log: its newest entry and the versions it keeps.
@@ -708,9 +722,9 @@ impl Chain {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if the versions do not descend, an entry links pruned history it
-    /// needs, or a kept skip link names another entry than the one the chain reaches at that
-    /// version, by hash, and the first error from `each`.
+    /// [`Error::Corrupt`] if an entry's `prev` link reaches another version than the one below it,
+    /// an entry links pruned history it needs, or a kept skip link names another entry than the
+    /// one the chain reaches at that version, by hash, and the first error from `each`.
     pub(crate) fn visit(
         &self,
         store: &Store,
@@ -737,9 +751,7 @@ impl Chain {
             let (object, len) = read(ptr)?;
             let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
             let at = entry.commit.version;
-            if at >= above {
-                return Err(corrupt("versions do not descend"));
-            }
+            step_down(above, at)?;
             above = at;
             if let Some(&(from, _, _)) = skips
                 .iter()

@@ -184,6 +184,25 @@ entry than v48` and leave it as it is. `ferro/tests/fuzzed.rs` keeps the input, 
 shapes it stands for: a link with the right offset and a wrong hash, and one that names an intact
 record of another v4, which reads had answered with the wrong commit.
 
+A 20-minute `reclaim` round on 16 cores after that fix found another file that passed `verify` and
+compacted under `Keep::All`, on one thread, into one that failed it with the same message, for v14
+(#94). v13's `prev` link named v1, so the `prev` links ran from v13 straight down to v1, while
+v14's skip link named an intact v12 whose own `prev` links ran down to that v1 one version at a
+time. `verify` and the copy checked only that versions fell along `prev`, so nothing walked v2 to
+v12 and the skip check never met v12. The copy finds a skip target by counting one version down at
+each `prev` step, so it landed on v1's copy for v12, took the v12 that nothing walked for pruned
+history and wrote v14's skip link as a tombstone. A background cycle that kept v12 did the same, on
+any number of threads. No writer makes such a link, since a commit links the tip below it and a
+received chain must descend one version at a time. The walk of a chain, and of the history merges
+brought in, now refuses a `prev` link that reaches another version than the one below, so
+`verify`, `verify_typed`, a cycle and `compact` all refuse the file with `v13 links v1 as the entry
+before it, not v12` and leave it as it is. `ferro/tests/fuzzed.rs` keeps the input, and builds the
+shape on a chain of six versions, where the copy cut the skip link as it did here, and in history
+a merge brought in, where `verify` passed the same damage and the copy kept it. The round also
+stopped once in the harness: copying the image failed with `Interrupted` on the loaded machine,
+since `fs::copy` returns the `EINTR` of `copy_file_range` rather than trying again, so the target
+now tries again.
+
 The round after the frame table, format 4, with the judgement of [Torn and damaged
 frames](storage.md#torn-and-damaged-frames), rebuilt the seeds, 656 of them for `open`, and
 rewrote a copy of the 15,457 `open` inputs saved before into format 4, as the fixtures were, so

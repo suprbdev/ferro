@@ -632,6 +632,146 @@ fn a_skip_link_that_names_another_entry_than_its_version_fails_verify_and_compac
 }
 
 #[test]
+fn a_prev_link_past_a_version_fails_verify_and_compacting_keeps_the_file() {
+    let past = |outcome: &ferro::Result<_>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message.contains("v13 links v1 as the entry before it, not v12"))
+    };
+    for threads in [1, 4] {
+        let (_dir, path) = fixture("compact-prev-link");
+        let before = fs::read(&path).unwrap();
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+        let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+        let outcome = db.verify().map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+        let outcome = db.compact(Keep::All).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+        assert!(fs::read(&path).unwrap() == before, "{threads} threads");
+        let outcome = db.compact(Keep::Last(17)).map(|_| ());
+        assert!(past(&outcome), "{threads} threads, pruned: {outcome:?}");
+        drop(db);
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Prev {
+    Honest,
+    Past,
+    PastMerged,
+}
+
+fn prev_file(path: &Path, prev: Prev) {
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let mut ptrs: Vec<Ptr> = Vec::new();
+    for version in 1..=4 {
+        let ptr = Entry {
+            version,
+            time_ms: 100 * version,
+            prev: ptrs.last().copied(),
+            ..Entry::default()
+        }
+        .write(&mut txn);
+        ptrs.push(ptr);
+    }
+    let below = match prev {
+        Prev::Honest => ptrs[3],
+        Prev::Past | Prev::PastMerged => ptrs[0],
+    };
+    let five = Entry {
+        version: 5,
+        time_ms: 500,
+        prev: Some(below),
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let six = Entry {
+        version: 6,
+        time_ms: 600,
+        prev: Some(five),
+        skip: Some(ptrs[3]),
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let head = match prev {
+        Prev::Honest | Prev::Past => write_refs(&mut txn, 6, six),
+        Prev::PastMerged => {
+            let base = Entry {
+                version: 1,
+                time_ms: 50,
+                ..Entry::default()
+            }
+            .write(&mut txn);
+            let merge = Entry {
+                version: 2,
+                time_ms: 700,
+                prev: Some(base),
+                merged: Some((six, 1, 0)),
+                graph: (5, 6, 2),
+                ..Entry::default()
+            }
+            .write(&mut txn);
+            write_refs(&mut txn, 2, merge)
+        }
+    };
+    txn.commit(head).unwrap();
+    store.close();
+}
+
+#[test]
+fn a_prev_link_past_the_version_below_fails_verify_and_compaction() {
+    for prev in [Prev::Honest, Prev::Past] {
+        for (keep, kept) in [
+            (Keep::All, true),
+            (Keep::Last(3), true),
+            (Keep::Last(2), false),
+        ] {
+            for threads in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("prev.ferro");
+                prev_file(&path, prev);
+                let honest = matches!(prev, Prev::Honest);
+                let case = format!("{prev:?} {keep:?} {threads} threads");
+                assert_eq!(admin::verify(&path).is_ok(), honest, "{case}");
+                let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+                let outcome = db.compact(keep);
+                assert_eq!(outcome.is_ok(), honest || !kept, "{case}: {outcome:?}");
+                drop(db);
+                assert_eq!(
+                    admin::verify(&path).is_ok(),
+                    honest || !kept,
+                    "{case}: the file after"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_merged_chain_whose_prev_link_passes_a_version_fails_verify_and_compaction() {
+    let past = |outcome: &ferro::Result<_>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message.contains("v5 links v1 as the entry before it, not v4"))
+    };
+    for threads in [1, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prev.ferro");
+        prev_file(&path, Prev::PastMerged);
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+        let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+        let outcome = db.compact(Keep::All).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+        drop(db);
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(past(&outcome), "{threads} threads: {outcome:?}");
+    }
+}
+
+#[test]
 fn a_damaged_tree_handed_to_the_copy_threads_fails_before_a_later_error_of_the_walk() {
     for threads in [1, 2, 4] {
         let (_dir, path) = fixture("compact-unit-order");

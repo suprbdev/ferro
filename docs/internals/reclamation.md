@@ -87,7 +87,10 @@ once in ten runs at a scale of 30 and every time with its clock replaced by a co
 now keeps the `prev` and skip offsets of each entry it copies, with the offset it read the entry
 from, and finds a skip target by walking down them from the new entry's `prev` link, a version
 lookup's O(log n) steps in memory. It links the copy it reaches when that copy was read from the
-record the skip link names, and the copy the map names otherwise, which is what it did before.
+record the skip link names, and the copy the map names otherwise, which is what it did before. That
+search counts one version for each `prev` step, which holds because the walk of the chains refuses
+a `prev` link that reaches another version than the one below, as [The commit
+chain](history.md#the-commit-chain) describes.
 
 Four tests in `ferro/tests/sync.rs` land remotes again from a hook at `created`, `copied` and
 `synced` with a fixed clock.

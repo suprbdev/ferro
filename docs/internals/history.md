@@ -26,8 +26,12 @@ extra bytes. `Keep::Since` and `Keep::Within` need a lookup by time, so they app
 reclamation cycle.
 
 A walk of a whole chain, as `verify`, `verify_typed`, a reclamation cycle and `admin::compact` make,
-checks that each retained skip link names by hash the entry the chain reaches at its version, and
-fails with `Error::Corrupt` where it names another, as [Fuzzing](testing.md#fuzzing) describes.
+checks that each `prev` link it follows reaches the version just below, and that each retained skip
+link names by hash the entry the chain reaches at its version, and fails with `Error::Corrupt` where
+one does not, as [Fuzzing](testing.md#fuzzing) describes. Their walk of the history that merges
+brought in checks its `prev` links the same way. A commit links the tip below it, and a received
+chain must descend one version at a time, as [Applying](sync.md#applying) describes, so only a
+damaged file has such a link.
 
 ## What pruning hides
 
