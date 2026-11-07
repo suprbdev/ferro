@@ -153,15 +153,28 @@ frame order, and fires their watchers. Nothing another process wrote is publishe
 is durable, by that process's sync or by this one's.
 
 The bytes of the frames a catch-up followed and checked in memory, up to 4 MiB of them, stay in
-memory until a later catch-up keeps the frames it follows, or the store closes, and a read of an
-object in them takes its record from there rather than from the file: the steps, the new root and
-log entry of each branch that moved, and the nodes of those frames that the next closure reads
-back. Every such read still hashes the object against the pointer it came from, as a read from the
-file does. The bytes are those the catch-up checked, and a frame that checks stays as it is in the
-file for as long as the file is in use, since nothing is written below the end of the log a live
-process has placed and only bytes past the last whole frame are ever truncated. A damaged copy on
-the disk is found by the next read from the file, once a later catch-up has replaced the bytes
-held.
+memory until a later catch-up keeps the frames it follows, a catch-up truncates the file or the
+store closes, and a read of an object in them takes its record from there rather than from the file:
+the steps, the new root and log entry of each branch that moved, and the nodes of those frames that
+the next closure reads back. A read loads the frames through an `ArcSwapOption`, so reads on many
+threads take no lock and change no shared count, tests its offset against where the first frame
+starts and the last ends, and finds its frame by a binary search. Every such read still hashes the
+object against the pointer it came from, as a read from the file does. The bytes are those the
+catch-up checked, and a frame that checks stays as it is in the file for as long as the file is in
+use, since nothing is written below the end of the log a live process has placed and only bytes past
+the last whole frame are ever truncated. A damaged copy on the disk is found by the next read from
+the file, once a later catch-up has replaced the bytes held.
+
+The first form kept them behind a mutex that every read of a shared writer took, found a read's
+frame by a scan, and let the oldest frame go by removing it from the front of a `Vec`, which made a
+long catch-up quadratic. In probes kept out of the tree, median of three alternating runs, a
+follower catching up with 100,000 frames of one object each took 791 ms where it takes 17 ms with
+8-byte objects, 228 and 21 ms with 300-byte ones and 89 and 51 ms with 2.3 KB ones, and each read of
+an 8-byte object after it took 15.3 µs where it takes 0.25 µs. Sixteen threads reading 100,000
+records of 200 bytes each from outside the kept frames took 1.8 s, in runs from 0.25 to 1.9 s, where
+they take 115 ms, and four threads 68 and 55 ms, while one thread took 53 and 52 ms. Reading 50,000
+each from inside some 14,000 kept frames, one thread took 166 ms where it takes 20 ms and sixteen
+threads 726 where they take 29.
 
 Catching up happens when a process takes a branch lock, before it places a frame, when it attaches a
 branch it has not seen, before each pass of a cycle and on `refresh`, and on a look of a
@@ -633,14 +646,18 @@ sync before it writes. Each test added for a finding of the review failed before
 described above. A unit test in `ferro/src/store.rs` holds the placement lock while two shared
 writers open a Buffered file whose superblock names a frame past its anchor that reads as torn,
 then lets it go, and both must open at the frame before it, which one of them did not with the lock
-at 2^62 + 1 taken before recovery. Two more check the frames a catch-up reads in one read: a frame
-checked in memory must be judged as the file judges it, whole, with a bit flipped every 997 bytes
-and cut a byte short, and a follower must read the objects of the frames it last kept from memory
-after their copy on the disk is damaged, and those of a frame larger than 4 MiB, or of one it no
-longer keeps, from the file. `ferro/tests/placement_fault.rs` intercepts `fcntl` to fail a read-only
-open's test of the placement lock with `ENOLCK` over a superblock one commit behind, and checks that
-the open scans and finds the commit, where it trusted the superblock before. These files build on
-64-bit Linux only, and `ferro/tests/smoke.rs` checks elsewhere that the option is refused.
+at 2^62 + 1 taken before recovery. Three more check the frames a catch-up reads in one read: a frame
+checked in memory must be judged as the file judges it, whole, with a bit flipped in each byte of
+its header past the magic, in every 997th byte of its body and in its table, with its first block
+changed and that block's entry in the table rewritten to match, which only the frame's check finds,
+and cut a byte short; the frames kept must answer for offsets inside them only, up to the end of
+each frame or the readable tail, across a gap between them; and a follower must read the objects of
+the frames it last kept from memory after their copy on the disk is damaged, and those of a frame
+larger than 4 MiB, or of one it no longer keeps, from the file. `ferro/tests/placement_fault.rs`
+intercepts `fcntl` to fail a read-only open's test of the placement lock with `ENOLCK` over a
+superblock one commit behind, and checks that the open scans and finds the commit, where it trusted
+the superblock before. These files build on 64-bit Linux only, and `ferro/tests/smoke.rs` checks
+elsewhere that the option is refused.
 
 ## Measurements
 
@@ -793,12 +810,25 @@ by up to 6% either way, as rounds of one build spread: four processes on their o
 2,315 to 5,429 commits a second in the rounds before the changes.
 
 On one process neither change moved a figure beyond its rounds' spread. `group`, one writer making
-single-key Buffered commits into 100,000 keys, median of three alternating rounds, made 51,597 commits a second before and
-51,310 after, and 46,089 and 46,084 with the option. `ferro-bench`'s single-key Buffered map commit
-took 23.5 µs and 179,743 instructions before and 23.4 µs and 178,156 after, and `tables`, median of
-seven rounds, took 86.5, 107.0 and 145.7 µs for a hold, a confirm and a cancel before and 87.2,
-107.6 and 147.8 after, with the instructions outside the closure within 0.15% and each one's runs
-spreading over up to 5.3 µs.
+single-key Buffered commits into 100,000 keys, median of three alternating rounds, made 51,597
+commits a second before and 51,310 after, and 46,089 and 46,084 with the option. `ferro-bench`'s
+single-key Buffered map commit took 23.5 µs and 179,743 instructions before and 23.4 µs and
+178,156 after, and `tables`, median of seven rounds, took 86.5, 107.0 and 145.7 µs for a hold, a
+confirm and a cancel before and 87.2, 107.6 and 147.8 after, with the instructions outside the
+closure within 0.15% and each one's runs spreading over up to 5.3 µs.
+
+The kept frames' first form, described under [Catching up](#catching-up), went in with those
+figures. Measured again with the deque, the binary search and the `ArcSwapOption`, in a second run
+the same day of five Buffered rounds alternating `main`, the first change and both, one branch made
+32,452, 34,990 and 35,759 commits a second at two processes, 26,474, 28,344 and 29,291 at four and
+22,099, 23,658 and 24,742 at eight: 10.2, 10.6 and 12.0% over `main`, with every round of each
+build above every round of the one before. Branches of their own made 66,599, 87,512 and 57,850 at
+two, four and eight processes against 65,017, 87,973 and 57,766 for `main`, and threads moved by
+less than 1% but for eight threads on their own branches, 103,622 against 105,368, whose rounds
+overlap. Six more Fsync rounds at eight processes spread from about 500 to 10,500 commits a second
+in every build as the disk stalled, and the medians, 9,774, 9,450 and 9,422 on one branch and
+9,381, 9,659 and 9,680 on branches of their own for `main`, the first change and both, moved in no
+one direction.
 
 ## Measured and left out
 
@@ -886,13 +916,14 @@ spreading over up to 5.3 µs.
   commits a second, against 34,453, 28,275 and 24,497 with the hash, median of three alternating
   rounds: 7 to 10%. Every read hashes its object.
 - The frames a catch-up keeps in one buffer, grown as it reads each frame, rather than a buffer for
-  each. Swapped in through an `ArcSwap`, on branches of their own, where every placement follows a
-  frame or two under the placement lock, the buffer's reallocations and the swap's wait for
-  readers cost four processes 6%: 82,409 commits a second against 87,224, median of three
-  alternating rounds, where a buffer for each frame and a mutex made 87,395. Sized for the first
-  frame and swapped under a mutex, one buffer still made 84,422 against 86,602 over five rounds,
-  though at eight processes on one branch it made 24,807 against 23,995 for a buffer each. The
-  buffer for each frame stays, since it costs a writer on its own branch nothing.
+  each. On branches of their own, where every placement follows a frame or two under the placement
+  lock, the buffer's reallocations cost four processes 6%: 82,409 commits a second against 87,224,
+  median of three alternating rounds, swapped in through an `ArcSwap`, where a buffer for each
+  frame and a mutex made 87,395. Sized for the first frame and swapped under a mutex, one buffer
+  still made 84,422 against 86,602 over five rounds, though at eight processes on one branch it
+  made 24,807 against 23,995 for a buffer each. The buffer for each frame stays, since it costs a
+  writer on its own branch nothing, and with one for each frame the `ArcSwapOption` that reads now
+  load measured the same as the mutex on one branch and on branches of their own, as above.
 - glibc's `trim_threshold` and `top_pad`, through `GLIBC_TUNABLES`, since the profile showed
   `mprotect` from growing a thread's arena under the 8 KiB hash table that LZ4 allocates for each
   compression: 32,306 and 22,141 commits a second at two and eight processes against 32,106 and

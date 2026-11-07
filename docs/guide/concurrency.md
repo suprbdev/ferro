@@ -116,8 +116,8 @@ locks: one writer made 46,100 single-key Buffered commits a second with it and 5
 2026-11-07 on eight cores. With fsync, 8 processes made 10,126 commits a second on one branch where
 8 threads of one process made 10,014. Under `Durability::Buffered` processes on one branch take
 turns, and each reads back the nodes the last one rewrote, where threads share one cache: 2
-processes made 35,951 and 8 made 24,738, against 43,566 and 39,161 for 2 and 8 threads. On branches
-of their own 4 processes made 88,899 and 4 threads 91,593.
+processes made 35,759 and 8 made 24,742, against 43,581 and 38,806 for 2 and 8 threads. On branches
+of their own 4 processes made 87,512 and 4 threads 90,661.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of a commit holds up the others only until the
