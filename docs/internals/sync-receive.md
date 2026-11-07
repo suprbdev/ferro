@@ -102,7 +102,9 @@ while the bundle streams writes each byte once, but a cycle that swaps the file 
 only what the refs reach, so it would drop them, and holding the swap off until the stream ends lets
 a slow peer stall reclamation instead of commits. It would also leave a refused bundle's bytes in
 the file until the next cycle, so a hostile peer could grow the file with every attempt, where a
-refusal now costs the database nothing. Copying from the scratch file inside the landing frame keeps
+refusal by these checks now costs the database nothing. A head that passes them and does not read
+as `T` is refused only after its objects are written, but such a head used to land, so it grew the
+file by as much. Copying from the scratch file inside the landing frame keeps
 the crash story as it was, with no pieces, but holds every writer for a copy as large as the bundle.
 Holding the checked objects in memory loses the bound above.
 
