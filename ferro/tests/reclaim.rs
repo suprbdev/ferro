@@ -927,12 +927,18 @@ fn a_trigger_raised_during_a_cycle_does_not_run_another() {
     *slot.lock().unwrap() = Some(db.clone());
     let started = Instant::now();
     let mut next = 100;
-    while db.space().unwrap().cycles == 0 && started.elapsed() < Duration::from_secs(20) {
+    while armed.load(Ordering::SeqCst)
+        && db.space().unwrap().cycles == 0
+        && started.elapsed() < Duration::from_secs(20)
+    {
         next += 1;
         db.update(|root| {
             root.insert(next, next.to_string().repeat(4000));
         })
         .unwrap();
+    }
+    while db.space().unwrap().cycles == 0 && started.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(5));
     }
     thread::sleep(Duration::from_millis(300));
     assert_eq!(db.space().unwrap().cycles, 1);
