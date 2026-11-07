@@ -51,6 +51,15 @@ impl Field {
     fn tag(&self) -> u16 {
         field_tag(&self.name)
     }
+
+    fn default_value(&self) -> Option<TokenStream2> {
+        let ty = &self.ty;
+        match &self.fallback {
+            Fallback::Default => Some(quote! { <#ty as ::std::default::Default>::default() }),
+            Fallback::With(path) => Some(quote! { #path() }),
+            Fallback::Required | Fallback::Skip => None,
+        }
+    }
 }
 
 struct Attrs {
@@ -256,9 +265,16 @@ fn describe_stmts(fields: &[Field]) -> TokenStream2 {
     let parts = stored.iter().map(|field| {
         let name = &field.name;
         let ty = &field.ty;
+        let default = field.default_value().map(|value| {
+            quote! {
+                __d.word("default");
+                __d.value::<#ty>(&#value);
+            }
+        });
         quote! {
             __d.word(#name);
             __d.of::<#ty>();
+            #default
         }
     });
     quote! {
@@ -1278,39 +1294,24 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             "Record requires exactly one #[key] field",
         ));
     };
-    let mut skipped = Vec::new();
-    let mut stored_as = Vec::new();
-    let mut defaults = Vec::new();
-    for field in &named.named {
-        let attrs = parse_attrs(&field.attrs)?;
-        let Some(ident) = &field.ident else {
-            continue;
-        };
-        let ty = &field.ty;
-        match &attrs.fallback {
-            Fallback::Skip => skipped.push(ident.clone()),
-            Fallback::Default => defaults.push((
-                ident.clone(),
-                quote! { <#ty as ::std::default::Default>::default() },
-            )),
-            Fallback::With(path) => defaults.push((ident.clone(), quote! { #path() })),
-            Fallback::Required => {}
-        }
-        stored_as.push((
-            ident.clone(),
-            attrs.rename.unwrap_or_else(|| ident.to_string()),
-        ));
-    }
+    let fields = parse_fields(&data.fields)?;
+    let field_of = |ident: &Ident| {
+        fields
+            .iter()
+            .find(|field| field.ident.as_ref() == Some(ident))
+    };
+    let skipped: Vec<Ident> = fields
+        .iter()
+        .filter(|field| !field.stored())
+        .filter_map(|field| field.ident.clone())
+        .collect();
     for ix in &indexes {
         check_stored(ix, &skipped)?;
         check_cover(ix, &key_ident, &skipped)?;
     }
 
     let stored_name = |ident: &Ident| -> String {
-        stored_as
-            .iter()
-            .find(|(field, _)| field == ident)
-            .map_or_else(|| ident.to_string(), |(_, name)| name.clone())
+        field_of(ident).map_or_else(|| ident.to_string(), |field| field.name.clone())
     };
     let rows_ty: Type = syn::parse_quote!(::ferro::Map<#key_ty, #name>);
     let map_tys: Vec<Type> = indexes
@@ -1327,12 +1328,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         })
         .collect();
-    let default_of = |ident: &Ident| -> Option<TokenStream2> {
-        defaults
-            .iter()
-            .find(|(field, _)| field == ident)
-            .map(|(_, value)| value.clone())
-    };
+    let default_of =
+        |ident: &Ident| -> Option<TokenStream2> { field_of(ident).and_then(Field::default_value) };
     let fingerprints: Vec<TokenStream2> = indexes
         .iter()
         .map(|ix| ix.fingerprint(&key_ty, &stored_name, &default_of))
@@ -2173,9 +2170,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// `#[ferro(rename = "...")]`, `#[ferro(default)]`, `#[ferro(default = "...")]` and
 /// `#[ferro(skip)]` mean what they do for `Data`. Each index is stored with a fingerprint of its
 /// kind, the key's type, and the stored names, types and defaults of the fields it is keyed on and
-/// stores. When a table is read, an index whose fingerprint no longer matches the struct is rebuilt
+/// stores, where a type's description holds the defaults of the derived structs and enums it
+/// reaches. When a table is read, an index whose fingerprint no longer matches the struct is rebuilt
 /// from the rows, so changing an index's attribute, its cover list, or the stored name, type or
-/// default of one of its fields rebuilds that index. Turning an `#[index]` into a `#[unique]` fails
+/// default of one of its fields, or a default nested in its type, rebuilds that index. Turning an `#[index]` into a `#[unique]` fails
 /// to open with `Error::Decode` if two rows share a value.
 /// [The schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
 /// lists what rebuilds and what does not.

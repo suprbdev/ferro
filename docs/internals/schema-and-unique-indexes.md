@@ -284,9 +284,10 @@ A type is described by `Data::describe`, which follows the encoding:
 - Primitives, `String` and `Bytes` by name. `Option`, `Vec`, arrays, tuples, `BTreeMap`,
   `BTreeSet`, `Map`, `Set`, `List` and `Table` by their shape and their parameters. `Box<T>` and
   `Arc<T>` as `T`, since they encode as `T`.
-- A derived struct by its stored fields in tag order, each name with its type, and a derived enum
-  by its variants the same way. The struct's Rust name, the order its fields are declared in and its
-  skipped fields take no part. A transparent struct is described as the field it wraps.
+- A derived struct by its stored fields in tag order, each name with its type and, for a field with
+  a default, the hash of the value the default returns, and a derived enum by its variants the same
+  way. The struct's Rust name, the order its fields are declared in and its skipped fields take no
+  part. A transparent struct is described as the field it wraps.
 - A type met again inside its own description, directly or through others, by how many types up the
   first one is, so `struct Tree { kids: Vec<Tree> }` has a finite description.
 - Anything else by `std::any::type_name`, unless its `Data` impl overrides `describe`.
@@ -316,8 +317,17 @@ comes from calling the function, or `Default::default` for `#[ferro(default)]`, 
 fingerprints are computed. Changing what a default returns then rebuilds every index keyed on or
 covering that field, the next time the table is read, as any other change of layout does, and the
 next commit stores the rebuilt map. A field without a default is described as before, so an index
-keeps its fingerprint unless one of its fields has a default, and those indexes are rebuilt once
-after upgrading.
+keeps its fingerprint unless one of its fields has a default, or its type holds a struct or enum
+with a defaulted field, and those indexes are rebuilt once after upgrading.
+
+A default nested in the type of an indexed or covered field counts the same. With `#[index] meta:
+Meta`, where `Meta` gained a `level` with a default, a row written before `level` existed reads it
+as the default, and the index holds whatever `level` read as when it was built. The derive's
+`Data::describe` of a struct or an enum variant describes each field's default as the fingerprint
+does for the row's own fields, so the description of `Meta`, of `Option<Meta>`, of `Vec<Meta>` or of
+any type holding it changes with the default, at any depth, and the index is rebuilt. A struct's
+description held only names and types before, so pointing that default at another value kept the
+fingerprint: rows read the new level while lookups and covered values gave the old one.
 
 The value is described rather than the path of the function. A path misses a function whose body
 changed, and a `#[ferro(default)]` whose type's `Default` changed, and it rebuilds an index when the
@@ -348,7 +358,10 @@ Handling the rows that lack the field another way was considered and left out:
 returns 1, then through one whose default returns 2, and checks that the index keyed on the field
 and the index covering it are rebuilt and agree with a rebuild, and that a third type whose default
 is another function returning 2 keeps them. A pair of transparent types whose `Default` impls differ
-checks `#[ferro(default)]` the same way.
+checks `#[ferro(default)]` the same way. A row whose indexed and covered fields hold a struct, an
+`Option` of an enum whose variant has the defaulted field, and a `Vec` of the struct, is read the
+same three ways, and every one of its four indexes is rebuilt when the nested default changes and
+kept when it does not.
 
 ### Where it is stored
 

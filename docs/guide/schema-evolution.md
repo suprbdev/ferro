@@ -31,7 +31,9 @@ index in every commit. Any of these rebuilds that one index:
 - giving one of its fields another stored name with `#[ferro(rename)]`;
 - changing the type of one of its fields, or of the key;
 - changing what the `#[ferro(default)]` or `#[ferro(default = "...")]` of one of its fields returns,
-  which is what rows written before that field existed hold in the index.
+  which is what rows written before that field existed hold in the index;
+- changing what such a default returns on a field of a struct or enum that one of its fields'
+  types holds, at any depth, as `Meta` is held in `Option<Meta>` or `Vec<Meta>`.
 
 These rebuild nothing: renaming a field in Rust while `#[ferro(rename)]` keeps its stored name,
 writing a type through an alias, a `Box`, an `Arc` or a `#[ferro(transparent)]` wrapper, renaming a

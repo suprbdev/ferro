@@ -396,9 +396,10 @@ pub trait Data: Clone + Send + Sync + 'static {
     /// Describes the type's encoding into `d`, for the fingerprints that tell a table when an
     /// index must be rebuilt.
     ///
-    /// The derive describes a struct by its stored field names and their types. The default
-    /// describes a type by its Rust name, so a hand-written impl whose encoding can change while
-    /// its name stays the same should describe what it writes.
+    /// The derive describes a struct by its stored field names, their types and the values their
+    /// defaults return, and an enum by its variants the same way. The default describes a type by
+    /// its Rust name, so a hand-written impl whose encoding can change while its name stays the
+    /// same should describe what it writes.
     fn describe(d: &mut Description) {
         d.word("rust");
         d.word(type_name::<Self>());

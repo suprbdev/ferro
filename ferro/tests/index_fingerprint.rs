@@ -1058,3 +1058,220 @@ fn a_default_is_described_by_the_value_it_returns() {
     assert_eq!(fingerprint(2), fingerprint(2));
     assert_ne!(fingerprint(1), fingerprint(2));
 }
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Badge {
+    kind: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BadgeOne {
+    kind: u8,
+    #[ferro(default = "tier_one")]
+    level: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BadgeTwo {
+    kind: u8,
+    #[ferro(default = "tier_two")]
+    level: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BadgeAlso {
+    kind: u8,
+    #[ferro(default = "also_two")]
+    level: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+    Idle,
+    Busy { job: u8 },
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PhaseOne {
+    Idle,
+    Busy {
+        job: u8,
+        #[ferro(default = "tier_one")]
+        level: u8,
+    },
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PhaseTwo {
+    Idle,
+    Busy {
+        job: u8,
+        #[ferro(default = "tier_two")]
+        level: u8,
+    },
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PhaseAlso {
+    Idle,
+    Busy {
+        job: u8,
+        #[ferro(default = "also_two")]
+        level: u8,
+    },
+}
+
+macro_rules! badged {
+    ($row:ident, $root:ident, $badge:ident, $phase:ident) => {
+        #[derive(Data, Record, Clone, Debug, PartialEq)]
+        struct $row {
+            #[key]
+            id: u32,
+            #[index(cover(badge))]
+            region: u8,
+            #[index]
+            badge: $badge,
+            #[index]
+            phase: Option<$phase>,
+            #[index(each)]
+            parts: Vec<$badge>,
+        }
+
+        root!($root, $row);
+
+        impl $row {
+            fn dirty(table: &Table<$row>) -> [bool; 4] {
+                [
+                    table.by_region.is_dirty(),
+                    table.by_badge.is_dirty(),
+                    table.by_phase.is_dirty(),
+                    table.by_parts.is_dirty(),
+                ]
+            }
+        }
+    };
+}
+
+badged!(Badged, BadgedRoot, Badge, Phase);
+badged!(BadgedOne, BadgedOneRoot, BadgeOne, PhaseOne);
+badged!(BadgedTwo, BadgedTwoRoot, BadgeTwo, PhaseTwo);
+badged!(BadgedAlso, BadgedAlsoRoot, BadgeAlso, PhaseAlso);
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct GradedHolderA {
+    #[ferro(default)]
+    grade: GradeA,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct GradedHolderB {
+    #[ferro(default)]
+    grade: GradeB,
+}
+
+#[test]
+fn a_description_holds_the_defaults_of_the_types_it_reaches() {
+    assert_eq!(described::<GradeA>(), described::<GradeB>());
+    assert_ne!(described::<GradedHolderA>(), described::<GradedHolderB>());
+    assert_ne!(described::<BadgeOne>(), described::<BadgeTwo>());
+    assert_eq!(described::<BadgeTwo>(), described::<BadgeAlso>());
+    assert_ne!(described::<PhaseOne>(), described::<PhaseTwo>());
+    assert_eq!(described::<PhaseTwo>(), described::<PhaseAlso>());
+    assert_ne!(
+        described::<Option<BadgeOne>>(),
+        described::<Option<BadgeTwo>>()
+    );
+    assert_ne!(described::<Vec<BadgeOne>>(), described::<Vec<BadgeTwo>>());
+    assert_ne!(
+        described::<std::collections::BTreeMap<u8, BadgeOne>>(),
+        described::<std::collections::BTreeMap<u8, BadgeTwo>>()
+    );
+    assert_ne!(
+        described::<Map<u8, BadgeOne>>(),
+        described::<Map<u8, BadgeTwo>>()
+    );
+    assert_ne!(
+        described::<(u8, Box<BadgeOne>)>(),
+        described::<(u8, Box<BadgeTwo>)>()
+    );
+}
+
+#[test]
+fn changing_a_default_nested_in_an_indexed_or_covered_type_rebuilds_the_index() {
+    let (_dir, path) = scratch("badges.ferro");
+    {
+        let db: Db<BadgedRoot> = fast().open(&path).unwrap();
+        db.update(|root| {
+            for id in 0..4u8 {
+                root.rows.insert(Badged {
+                    id: u32::from(id),
+                    region: id % 2,
+                    badge: Badge { kind: 0 },
+                    phase: Some(Phase::Busy { job: id }),
+                    parts: vec![Badge { kind: id }],
+                });
+            }
+        })
+        .unwrap();
+        assert_eq!(Badged::dirty(&db.read().rows), [false; 4]);
+    }
+    let untouched = {
+        let db: Db<BadgedOneRoot> = fast().open(&path).unwrap();
+        let ones: Vec<u32> = db
+            .read()
+            .rows
+            .by_badge(&BadgeOne { kind: 0, level: 1 })
+            .keys()
+            .collect();
+        assert_eq!(ones, vec![0, 1, 2, 3]);
+        db.update(|_| ()).unwrap();
+        db.read().rows.root_hash()
+    };
+    {
+        let db: Db<BadgedOneRoot> = fast().open(&path).unwrap();
+        assert_eq!(BadgedOne::dirty(&db.read().rows), [false; 4]);
+    }
+    {
+        let db: Db<BadgedTwoRoot> = fast().open(&path).unwrap();
+        let read = db.read();
+        assert_eq!(read.rows.root_hash(), untouched);
+        assert_eq!(BadgedTwo::dirty(&read.rows), [true; 4]);
+        assert!(read.rows.iter().all(|row| row.badge.level == 2));
+        let two = BadgeTwo { kind: 0, level: 2 };
+        assert_eq!(
+            read.rows.by_badge(&BadgeTwo { kind: 0, level: 1 }).count(),
+            0
+        );
+        let twos: Vec<u32> = read.rows.by_badge(&two).keys().collect();
+        assert_eq!(twos, vec![0, 1, 2, 3]);
+        let covered: Vec<(u32, BadgeTwo)> = read.rows.by_region(&0).covered().collect();
+        assert_eq!(covered, vec![(0, two.clone()), (2, two)]);
+        let busy: Vec<u32> = read
+            .rows
+            .by_phase(&Some(PhaseTwo::Busy { job: 1, level: 2 }))
+            .keys()
+            .collect();
+        assert_eq!(busy, vec![1]);
+        let parts: Vec<u32> = read
+            .rows
+            .by_parts(&BadgeTwo { kind: 3, level: 2 })
+            .keys()
+            .collect();
+        assert_eq!(parts, vec![3]);
+        let fresh = rebuilt(&read.rows);
+        assert_eq!(read.rows.by_region.root_hash(), fresh.by_region.root_hash());
+        assert_eq!(read.rows.by_badge.root_hash(), fresh.by_badge.root_hash());
+        assert_eq!(read.rows.by_phase.root_hash(), fresh.by_phase.root_hash());
+        assert_eq!(read.rows.by_parts.root_hash(), fresh.by_parts.root_hash());
+        db.update(|_| ()).unwrap();
+    }
+    let db: Db<BadgedAlsoRoot> = fast().open(&path).unwrap();
+    let read = db.read();
+    assert_eq!(BadgedAlso::dirty(&read.rows), [false; 4]);
+    let twos: Vec<u32> = read
+        .rows
+        .by_badge(&BadgeAlso { kind: 0, level: 2 })
+        .keys()
+        .collect();
+    assert_eq!(twos, vec![0, 1, 2, 3]);
+}
