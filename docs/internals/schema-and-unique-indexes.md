@@ -53,16 +53,16 @@ instead of panicking.
 
 ### Ranges and prefixes
 
-`by_x_range(range)` and, on a composite, `by_a_b_prefix(&a)` return an `IndexIter`, so the rows of
-a unique index come with `keys`, `covered`, `uncovered`, both ends, a length known at once and a
-place in `and` and `or`, as a non-unique index's do. The derive builds the walk itself, with
-`Map::range` on the index for a range and `Map::range_by` on the value's first field for a prefix,
-and hands the `Iter` to `table::unique_rows`, or `unique_rows_covered` with the projection
-`covered_by_x` uses, together with a function that gives the value a row holds, which a
-combination uses to test a row against the lookup, as described under [Ranges and prefixes in a
-combination](#ranges-and-prefixes-in-a-combination). Rows come in value order, and a
-composite's prefix by the fields after the first. The bounds borrow as the value type does, so a `String` index takes `&str` bounds, and on an
-`Option<X>` field they are bounds of `X`, since `None` has no entry.
+`by_x_range(range)` and, on a composite, `by_a_b_prefix(&a)` return an `IndexIter`, so the rows of a
+unique index come with `keys`, `covered`, `uncovered`, both ends, a length known at once and a place
+in `and` and `or`, as a non-unique index's do. The derive builds the walk itself, with `Map::range`
+on the index for a range and `Map::range_by` on the value's first field for a prefix, and hands the
+`Iter` to `table::unique_rows`, or `unique_rows_covered` with the projection `covered_by_x` uses,
+together with a function that gives the value a row holds, which a combination uses to test a row
+against the lookup, as described under [Ranges and prefixes in a
+combination](#ranges-and-prefixes-in-a-combination). Rows come in value order, and a composite's
+prefix by the fields after the first. The bounds borrow as the value type does, so a `String` index
+takes `&str` bounds, and on an `Option<X>` field they are bounds of `X`, since `None` has no entry.
 
 The cursor behind every other lookup reads the primary key out of a `(value, key)` entry's own key
 and reads the leaf's values only for `covered`. A unique index keeps the key in the value, so its
@@ -117,12 +117,13 @@ took 3.3 to 3.6 µs as rows where the map and `get` took 3.8 to 4.6 µs, and 367
 
 ## Covering indexes
 
-A plain index is a `Map<(value, key), ()>`. `#[index(cover(a, b))]` makes it a `Map<(value, key),
-(A, B)>`, so the fields sit in the leaf beside the entry they belong to, and `#[unique(cover(a, b))]`
-makes a unique index a `Map<value, (key, (A, B))>`. The tree's shape depends on its keys alone, so
-a covered index has the same nodes as a plain one, each larger by the covered bytes. A field the
-index is keyed on may appear in the list. It is read back from the entry's key and not stored, so a
-list naming nothing else stores `()` and the map is the plain one, byte for byte.
+A plain index is a `Map<(value, key), ()>`. `#[index(cover(a, b))]` makes it a
+`Map<(value, key), (A, B)>`, so the fields sit in the leaf beside the entry they belong to, and
+`#[unique(cover(a, b))]` makes a unique index a `Map<value, (key, (A, B))>`. The tree's shape
+depends on its keys alone, so a covered index has the same nodes as a plain one, each larger by the
+covered bytes. A field the index is keyed on may appear in the list. It is read back from the
+entry's key and not stored, so a list naming nothing else stores `()` and the map is the plain one,
+byte for byte.
 
 `IndexIter` holds its entry cursor as a trait object over the key and the projection, so every
 lookup of an index, whether by value, range, cursor, prefix or `Some`, shares one implementation.
@@ -449,18 +450,18 @@ it, not in a file.
 ## Combining lookups
 
 `find()`, which the derive generates on a table with a non-unique index, returns a view that borrows
-the table. Its methods are the equality lookups of each such index, `by_x`, `by_x_after`, `by_x_some`,
-`by_x_some_after` and a composite's `by_a_b`, and each returns a `Matches<T, C>`. `and` and `or` on a
-`Matches` take another `Matches` or any `IndexIter`, through `IntoMatches`, and return a `Matches`
-over the rows whose keys both lookups hold, or either does. A `Matches` yields rows in key order from
-either end, and `keys`, `covered` and `uncovered` work as they do on an `IndexIter`, with the covered
-fields of the leftmost lookup.
+the table. Its methods are the equality lookups of each such index, `by_x`, `by_x_after`,
+`by_x_some`, `by_x_some_after` and a composite's `by_a_b`, and each returns a `Matches<T, C>`. `and`
+and `or` on a `Matches` take another `Matches` or any `IndexIter`, through `IntoMatches`, and return
+a `Matches` over the rows whose keys both lookups hold, or either does. A `Matches` yields rows in
+key order from either end, and `keys`, `covered` and `uncovered` work as they do on an `IndexIter`,
+with the covered fields of the leftmost lookup.
 
 An index entry is `(value, key)`, so the entries of one value are in key order, and two such lookups
-intersect by walking their keys, reading no row until a key is in both. A view lookup holds a clone of
-its index map beside the range `range_by` built, so that it can seek within its value later, and the
-rows map's finder, so it reads the version it was built from, as any lookup does. A lookup made on
-the table, by range, prefix or value, is an `IndexIter` without that map. A range or prefix
+intersect by walking their keys, reading no row until a key is in both. A view lookup holds a clone
+of its index map beside the range `range_by` built, so that it can seek within its value later, and
+the rows map's finder, so it reads the version it was built from, as any lookup does. A lookup made
+on the table, by range, prefix or value, is an `IndexIter` without that map. A range or prefix
 lookup that a much smaller side looks keys up in is tested key by key, as described under [Ranges
 and prefixes in a combination](#ranges-and-prefixes-in-a-combination). Otherwise it joins a
 combination by reading its keys and covered fields into a vector and sorting it, which takes one
@@ -476,9 +477,9 @@ entries, an `and` the smaller of its sides' and an `or` their sum.
   after 16 steps it builds its range again from the root, starting at the target, so a long gap
   costs one descent.
 - Beyond that, the smaller side leads and steps, and each of its keys is looked up in the larger
-  with `Cursor::seek`, or `seek_back` from the back. A cursor climbs only as far as the target needs,
-  so a key nearby costs a search of one leaf. When the larger side's next key lies past the lead's,
-  the lead seeks to it as above, which skips a run of keys the larger side lacks.
+  with `Cursor::seek`, or `seek_back` from the back. A cursor climbs only as far as the target
+  needs, so a key nearby costs a search of one leaf. When the larger side's next key lies past the
+  lead's, the lead seeks to it as above, which skips a run of keys the larger side lacks.
 
 The larger side is only looked up, never consumed, so it keeps nothing between keys but its cursor,
 and the lead alone decides when the walk ends. `or` walks every side and yields the smallest key,
@@ -652,23 +653,24 @@ ranges and prefixes measured](#what-ranges-and-prefixes-measured). Keys only, in
 | 20 and 20 | 0 | 0.5 | 0.9 | 5.1 | 0.5 | 0.8 | 0.7 |
 
 The merge steps the `keys()` of both lookups. The set collects the smaller lookup's keys into a
-`HashSet` and filters the larger's. The `_after` leapfrog seeks each side with a `by_x_after` lookup,
-built from the root, and the next column steps up to 32 keys before seeking that way. The cursor
-leapfrog seeks both sides with `Cursor::seek` on the index maps, as `and` looks up its larger side.
-From the back, `and` came within 5% of its figures here.
+`HashSet` and filters the larger's. The `_after` leapfrog seeks each side with a `by_x_after`
+lookup, built from the root, and the next column steps up to 32 keys before seeking that way. The
+cursor leapfrog seeks both sides with `Cursor::seek` on the index maps, as `and` looks up its larger
+side. From the back, `and` came within 5% of its figures here.
 
 `and` follows the smaller side: 10 keys against 100,000 took 1.5 µs where the merge took 597, and a
-gap between two spans of 50,000 cost one seek. The price is on even sizes, where it ran 1.28 times as
-long as the merge, 18.5M instructions against 11.1M, for reaching each key through the node and its
-sides rather than a loop over two iterators. The factor of four is where the plans cross. At 12k
-against 50k, looking keys up ran 7.9M instructions against 10.3M for walking both, and at 25k against
-50k, walking ran 12.8M and 942 µs against 13.8M and 1,054 µs. Stepping 4 times rather than 16 before
-building a range again took the even case from 18.5M to 24.0M instructions, and 64 left it unchanged.
+gap between two spans of 50,000 cost one seek. The price is on even sizes, where it ran 1.28 times
+as long as the merge, 18.5M instructions against 11.1M, for reaching each key through the node and
+its sides rather than a loop over two iterators. The factor of four is where the plans cross. At 12k
+against 50k, looking keys up ran 7.9M instructions against 10.3M for walking both, and at 25k
+against 50k, walking ran 12.8M and 942 µs against 13.8M and 1,054 µs. Stepping 4 times rather than
+16 before building a range again took the even case from 18.5M to 24.0M instructions, and 64 left it
+unchanged.
 
-Rows come through the finder an `IndexIter` uses, which keeps the last leaf it found. The 12,557 rows
-of the first case, which lie in key order across the table, took 4.34 ms with their keys against 4.64
-ms for the keys and a `get` each, and 25.4M instructions against 30.7M. Rows scattered across the
-table took the same time either way.
+Rows come through the finder an `IndexIter` uses, which keeps the last leaf it found. The 12,557
+rows of the first case, which lie in key order across the table, took 4.34 ms with their keys
+against 4.64 ms for the keys and a `get` each, and 25.4M instructions against 30.7M. Rows scattered
+across the table took the same time either way.
 
 Plain lookups are unchanged. Over four interleaved runs of each build, a lookup of one row ran 3,174
 instructions against 3,164 before, and one of 20 rows 26,642 against 26,497, within the spread
@@ -694,12 +696,13 @@ machine. Keys only, in microseconds, before and after:
 | 10,000 | 10,000 | 396.3 → 394.4 | 392.0 → 390.8 | 393.6 → 391.3 |
 | 10,000 | 100,000 | 2,995.1 → 884.2 | 2,967.1 → 876.8 | 3,007.1 → 898.4 |
 
-10 keys against a range of 100,000 ran 24,080 instructions where they had run 42.4 million. From
-the back the figures were the same within 1%, or within the 0.1 µs the benchmark prints. Read as rows, the plain range took 2.0 µs against
-2,429.6 for 10 keys, 12.7 against 2,445.6 for 100, 142.9 against 2,603.6 for 1,000 and 1,253.2
-against 3,488.2 for 10,000, the difference from keys being the rows that match, read again through
-the combination's own finder. Ranges of 1,000 against the lead of 10,000, where the range leads and
-is collected, took 55.5 µs against 57.5 and 1,099,120 instructions against 1,091,462.
+10 keys against a range of 100,000 ran 24,080 instructions where they had run 42.4 million. From the
+back the figures were the same within 1%, or within the 0.1 µs the benchmark prints. Read as rows,
+the plain range took 2.0 µs against 2,429.6 for 10 keys, 12.7 against 2,445.6 for 100, 142.9 against
+2,603.6 for 1,000 and 1,253.2 against 3,488.2 for 10,000, the difference from keys being the rows
+that match, read again through the combination's own finder. Ranges of 1,000 against the lead of
+10,000, where the range leads and is collected, took 55.5 µs against 57.5 and 1,099,120 instructions
+against 1,091,462.
 
 A tested key costs 88 to 105 ns, against 71 to 85 ns for reading the same rows through the lead's
 `visit` and checking the field by hand, the rest being the lend through a second finder, the
@@ -804,11 +807,11 @@ The build before read every row of the two versions through the first finder: th
 same here, since only one row's name differed, so it ran at the cost of one version.
 
 The other cases ran the code they did. `and` ran within 0.01% of its instructions per key, and as
-rows 0.05 to 0.09% more, about two instructions a row for the test of the list's pointer. Setting
-up an `and` ran 10 to 95 instructions more, at most 0.4% of two lookups of 20 keys or of 10 keys
-against a range. The range cases came within 0.4% of their instructions, and every time within the spread
-between runs. A first build kept the list as a vector, handed finders down as a list even for one
-version, read the row through a call that asked for the finder's number when the list was empty,
+rows 0.05 to 0.09% more, about two instructions a row for the test of the list's pointer. Setting up
+an `and` ran 10 to 95 instructions more, at most 0.4% of two lookups of 20 keys or of 10 keys
+against a range. The range cases came within 0.4% of their instructions, and every time within the
+spread between runs. A first build kept the list as a vector, handed finders down as a list even for
+one version, read the row through a call that asked for the finder's number when the list was empty,
 and found the side to record in `or` by counting the sides it went through: `or` ran 2.2% more
 instructions, `and` as rows 5 more a row, and setting up a combination 220 to 260 more.
 
@@ -833,12 +836,12 @@ instructions, `and` as rows 5 more a row, and setting up a combination 220 to 26
   sizes. Stepping a cursor up to 4 times before each seek came to 1.14 times the merge there and 82
   µs at 1k against 100k, against 70 for `and`, which keeps cursors for the side it only looks up.
 - Testing a key against a range by seeking the range's index at `(value, key)`, with the value taken
-  from a lead index that covers the range's field, rather than reading the row. In the benchmark
-  the group index covers the score, and checking the covered score against the bounds and seeking
-  the score index for those inside took 5.9 µs for 100 keys against a range of 100,000, 64.9 for
-  1,000 and 839.8 for 10,000, against 9.0, 105.5 and 884.2 for reading rows. It needs a lead that
-  covers the range's field, and the derive to tell which covered field of which index that is, and
-  it saved 35% of the time for 100 keys but 5% for 10,000. A caller whose lead covers the field and reads one
+  from a lead index that covers the range's field, rather than reading the row. In the benchmark the
+  group index covers the score, and checking the covered score against the bounds and seeking the
+  score index for those inside took 5.9 µs for 100 keys against a range of 100,000, 64.9 for 1,000
+  and 839.8 for 10,000, against 9.0, 105.5 and 884.2 for reading rows. It needs a lead that covers
+  the range's field, and the derive to tell which covered field of which index that is, and it saved
+  35% of the time for 100 keys but 5% for 10,000. A caller whose lead covers the field and reads one
   version can filter its `covered()` by the bounds, which took 1.6, 14.8 and 176.7 µs.
 - Testing below the factor of four. For a lead of 10,000 keys testing broke even at 2.1 times its
   keys, but for leads of 100 and 1,000 at 4.5 to 4.7, and within the factor walking both sides

@@ -107,8 +107,8 @@ branch that holds across processes, so it starts from the newest commit on its b
 again, and closures on different branches run at the same time in different processes as they do in
 one. A process sees the others' commits when it next commits to the file, attaches a branch or calls
 `refresh`, which also fires its watchers. Until then `read` shows what it last saw, as on a
-read-only handle, unless it follows the file. Under `Durability::Fsync` one fdatasync covers the commits every process has
-queued, as group commit does within a process.
+read-only handle, unless it follows the file. Under `Durability::Fsync` one fdatasync covers the
+commits every process has queued, as group commit does within a process.
 
 The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
 file open, and they get it while it does. On one process it costs about 2 µs a commit for its
@@ -120,10 +120,11 @@ processes made 35,759 and 8 made 24,742, against 43,581 and 38,806 for 2 and 8 t
 of their own 4 processes made 87,512 and 4 threads 90,661.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
-commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of a commit holds up the others only until the
-operating system releases its locks, and nothing it acknowledged is lost. It needs open file
-description locks, so it runs on 64-bit Linux only, and the processes must share one machine and a
-local file system. Elsewhere, Windows included, the open fails with an `Unsupported` I/O error.
+commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of
+a commit holds up the others only until the operating system releases its locks, and nothing it
+acknowledged is lost. It needs open file description locks, so it runs on 64-bit Linux only, and the
+processes must share one machine and a local file system. Elsewhere, Windows included, the open
+fails with an `Unsupported` I/O error.
 
 A held `Snapshot` or `Map` keeps the file it was read from open, though not the writer lock, so a
 new writer can open once the last `Db` handle is gone. How it works is in [Writers in several

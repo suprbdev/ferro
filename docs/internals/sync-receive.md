@@ -62,12 +62,12 @@ not change.
 A reclamation cycle can prune, swap the file and retire the old one while the bundle streams. Before
 placing, `receive` resolves the anchors again in the generation now current: each base by hash and
 version, and each hint by following its path again from the anchors' roots, one read per parent
-object as when it was first resolved, which must end at the same hash. Placing holds the cycle mutex from the
-first piece to the landing, so no swap can move the pieces from under the frame that links them. A
-cycle that comes due meanwhile waits for the copy, which runs at the speed of the disk and not of
-the peer, and a cycle already running when the bundle has been checked finishes before placing
-starts. A bundle that never spilled needs no such hold, because it is placed under the locks a swap
-takes.
+object as when it was first resolved, which must end at the same hash. Placing holds the cycle mutex
+from the first piece to the landing, so no swap can move the pieces from under the frame that links
+them. A cycle that comes due meanwhile waits for the copy, which runs at the speed of the disk and
+not of the peer, and a cycle already running when the bundle has been checked finishes before
+placing starts. A bundle that never spilled needs no such hold, because it is placed under the locks
+a swap takes.
 
 Until the landing frame is durable, nothing names the placed objects. Readers bound every offset by
 the published end of the log, and the pieces are whole frames that keep the previous refs, so a
@@ -415,12 +415,13 @@ committing them cost the sender, and the view's record of what it read takes at 
 stretch of file those reads cover. The record lasts one receive, so a bundle that is refused, and
 sent again, makes the receiver read what it holds again each time: a bundle of 1,517 bytes whose
 summary did not check read 1.28 GB of held pages on each attempt, about 380 ms, where before the
-free first read the allowance refused it after 256 MiB. A value of up to 4 KiB lands under any number of keys, since each
-key's slot brings the allowance for one more read of it, and a value of 1 MiB lands under about 265
-keys and no more, where each key costs the bundle a slot of some 25 bytes and the receiver a read of
-the whole value. A nested map of 40,000 entries that `of` sums under 1,500 keys of one node is
-refused about a second in, where reading it each time would take several, and a nested map stored
-once in the receiver's file and shared by several keys is charged from its second read.
+free first read the allowance refused it after 256 MiB. A value of up to 4 KiB lands under any
+number of keys, since each key's slot brings the allowance for one more read of it, and a value of 1
+MiB lands under about 265 keys and no more, where each key costs the bundle a slot of some 25 bytes
+and the receiver a read of the whole value. A nested map of 40,000 entries that `of` sums under
+1,500 keys of one node is refused about a second in, where reading it each time would take several,
+and a nested map stored once in the receiver's file and shared by several keys is charged from its
+second read.
 
 The deferred pass used to charge every read, held or staged. Fourteen keys in one node, each holding
 a nested `Map<u64, u64>` of 2,500,000 entries that `of` sums, make a file of 403 MB, and a bundle

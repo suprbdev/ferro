@@ -412,20 +412,19 @@ back to looking every 10 ms, and the failure is reported in `last_error`.
 
 ### When it ends
 
-The thread holds the handle's `Shared` by a `Weak` and upgrades it only for the length of a look,
-so while it waits it keeps neither the file nor a lock, and a watcher's promise not to keep the
-file open still holds. The last `Db` handle to drop drops the `Keeper`, which sets the stop flag,
-rings the eventfd or wakes the condvar, and joins the thread before it stops the reclamation and
-sync threads. A look in progress finishes first, and if it held the last count of `Shared`, the
-file closes on the follower thread before the join returns, so either way the file is closed and
-the inotify instance gone when the drop returns. So a drop waits for a look in progress. That is a
-few microseconds for one that finds nothing and the length of a refresh for one that finds
-something; a look that opens the file a cycle renamed waits there for that file's placement and
-superblock locks, as an open would, and the drop waits with it. The drop of a Buffered shared
-writer already takes the superblock lock to write its last anchor. A look that finds `Shared` gone
-ends the thread too. The thread runs no closure and no watcher test, only what `refresh` runs: decoding the new
-states and dropping the ones they replace. A panic there is caught and recorded, and the thread
-goes on.
+The thread holds the handle's `Shared` by a `Weak` and upgrades it only for the length of a look, so
+while it waits it keeps neither the file nor a lock, and a watcher's promise not to keep the file
+open still holds. The last `Db` handle to drop drops the `Keeper`, which sets the stop flag, rings
+the eventfd or wakes the condvar, and joins the thread before it stops the reclamation and sync
+threads. A look in progress finishes first, and if it held the last count of `Shared`, the file
+closes on the follower thread before the join returns, so either way the file is closed and the
+inotify instance gone when the drop returns. So a drop waits for a look in progress. That is a few
+microseconds for one that finds nothing and the length of a refresh for one that finds something; a
+look that opens the file a cycle renamed waits there for that file's placement and superblock locks,
+as an open would, and the drop waits with it. The drop of a Buffered shared writer already takes the
+superblock lock to write its last anchor. A look that finds `Shared` gone ends the thread too. The
+thread runs no closure and no watcher test, only what `refresh` runs: decoding the new states and
+dropping the ones they replace. A panic there is caught and recorded, and the thread goes on.
 
 ### Errors
 
@@ -456,12 +455,13 @@ cannot carry the error.
 
 ### Reentrancy
 
-The thread holds no lane and runs no user closure, so nothing it could wait for waits for it. A
-look takes `tip`, as `refresh` does, and on a shared writer the superblock lock only when it leads
-a sync of this process's own frames or opens a file a cycle renamed, holding nothing else. A watcher test runs on the `ferro-watch` thread holding nothing
-and may refresh while the follower does: they take `tip` one after the other. A closure may refresh
-too, as before, since `refresh` needs only `tip`, which a look holds briefly and never while it
-waits for a lane. [Writes from inside a closure](reentrancy.md) has the rules.
+The thread holds no lane and runs no user closure, so nothing it could wait for waits for it. A look
+takes `tip`, as `refresh` does, and on a shared writer the superblock lock only when it leads a sync
+of this process's own frames or opens a file a cycle renamed, holding nothing else. A watcher test
+runs on the `ferro-watch` thread holding nothing and may refresh while the follower does: they take
+`tip` one after the other. A closure may refresh too, as before, since `refresh` needs only `tip`,
+which a look holds briefly and never while it waits for a lane. [Writes from inside a
+closure](reentrancy.md) has the rules.
 
 ### What following costs
 

@@ -119,9 +119,9 @@ depth first through what it links that is to be sent, so a commit's trees and pa
 it and the stack is as deep as a tree, not as a history. That walk names the hints, so the header,
 with the anchors, the hints and the object count, goes first. Then each object is read once more,
 its hash checked, and written in 64 KiB chunks with the LZ4 bytes the file already holds for it, so
-the sender compresses nothing. Planning holds about 45 bytes for each object sent, as described under
-[Memory for each object](#memory-for-each-object). `pull` runs the sender on a second thread once it
-sends 256 objects, with eight chunks in flight between the two.
+the sender compresses nothing. Planning holds about 45 bytes for each object sent, as described
+under [Memory for each object](#memory-for-each-object). `pull` runs the sender on a second thread
+once it sends 256 objects, with eight chunks in flight between the two.
 
 ## Applying
 
