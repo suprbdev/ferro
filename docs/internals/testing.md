@@ -98,20 +98,20 @@ reads, which panic on corruption by design, and as a failure anywhere else. The 
 writes a corpus from databases it builds and from any files passed to it. The databases it builds
 include catalogs written under each schema in turn, branches written by concurrent lanes with and
 without coalescing, devices that relay through pulls and cycles, branch tables of 40, 126, 127 and
-200 branches, step chains just below and past multiples of 64, twenty branches whose commits
-rewrite covered index entries across two full tables, crash images cut from the recorded writes of
+200 branches, step chains just below and past multiples of 64, twenty branches whose commits rewrite
+covered index entries across two full tables, crash images cut from the recorded writes of
 concurrent commits with every kind of loss, a frame of objects nothing names, and a file caught
 between placing a bundle's pieces and landing it. Frames that land out of order come from a hook
 that holds one commit's frame before its write until three later frames have landed: the images
 leave a hole where a held frame belongs with every later frame written, or stop just after a later
 frame landed ahead of the held one. Each `refs` seed pairs one of its bases with a forgery and a
 mode. Every image small enough for `admin` goes to `reclaim` too, under three modes. Files captured
-from the tests make a broader corpus: the one used here kept every database file `cargo test --workspace` deleted, copied
-aside by a small `LD_PRELOAD` wrapper around `unlink`, `unlinkat` and `rename`. Images over 69,000
-bytes go to `open-large`, for a run of `open` with a larger `-max_len`.
+from the tests make a broader corpus: the one used here kept every database file `cargo test
+--workspace` deleted, copied aside by a small `LD_PRELOAD` wrapper around `unlink`, `unlinkat` and
+`rename`. Images over 69,000 bytes go to `open-large`, for a run of `open` with a larger `-max_len`.
 `cargo run --example fixture -- <target> <crash> <out.db>` turns a crashing input into the file it
-opens, for `reclaim` the one it compacts, for `refs` the forged file before any handle opens it, and for `sync` also writes the bundle
-beside it, which is how the fixtures behind
+opens, for `reclaim` the one it compacts, for `refs` the forged file before any handle opens it, and
+for `sync` also writes the bundle beside it, which is how the fixtures behind
 `ferro/tests/fuzzed.rs` were made.
 
 The `Makefile` wraps the last two steps: `make fuzz-seeds` builds `corpus/seeds`, and

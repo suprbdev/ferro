@@ -16,16 +16,16 @@ copying stays proportional to what was written.
    `at` stops serving a version before its objects are left behind.
 2. Copy, with no lock. Walk the published refs and write each reachable object to
    `<file>.compacting`, re-emitting links with new offsets behind each body as it is stored. The
-   walk copies log entries itself and hands each tree it reaches to up to seven other threads,
-   which check every object's hash and write the tree where one thread would have, as described
-   under [The copy on several threads](#the-copy-on-several-threads). Chain entries are copied like anything else, but a link
-   to an entry that is past `first` and was not brought in by a retained merge, as described under
-   [Merges and pruning](merging.md#merges-and-pruning), is written with offset 0 instead of being
-   followed, and so is a skip link below where the entry's `prev` links reach. Copies are keyed by
-   hash, and entries by the offset they were read from, as described under [Commits stored
-   twice](sync-receive.md#commits-stored-twice), so a later pass from newer refs visits only what is
-   new. An entry's copy also records how much history it was made for, and a walk that needs more
-   copies the record again, as described under [Copies made for less
+   walk copies log entries itself and hands each tree it reaches to up to seven other threads, which
+   check every object's hash and write the tree where one thread would have, as described under [The
+   copy on several threads](#the-copy-on-several-threads). Chain entries are copied like anything
+   else, but a link to an entry that is past `first` and was not brought in by a retained merge, as
+   described under [Merges and pruning](merging.md#merges-and-pruning), is written with offset 0
+   instead of being followed, and so is a skip link below where the entry's `prev` links reach.
+   Copies are keyed by hash, and entries by the offset they were read from, as described under
+   [Commits stored twice](sync-receive.md#commits-stored-twice), so a later pass from newer refs
+   visits only what is new. An entry's copy also records how much history it was made for, and a
+   walk that needs more copies the record again, as described under [Copies made for less
    history](#copies-made-for-less-history). Data is immutable, so no write barrier is needed. Passes
    repeat, up to six, until one copies less than 256 KiB.
 3. Sync, with no lock, so the pause does not pay for it.
@@ -350,25 +350,25 @@ could not do much better than its share, and the copy now takes the walk itself 
 The walk copies log entries and the branch table as before, and hands the root of each entry it
 reaches to the copy's threads as a unit, then goes on. Any other tree it reaches, from the branch
 table or from a tree it copies itself, it reads first, and hands out only if none of its links names
-a log entry, pruned history or offset 0; otherwise it copies the tree itself and treats its links the
-same way. A node of the branch table links each branch's tip, so it stays with the walk, and the
-current tree it links goes out. A thread discovers a unit: it reads each record, checks its hash before following its links, and
-lists the records the unit copies in the order one thread writes them, children first. Every object
-a unit reaches is claimed for it by hash, under one of 256 locks, with the unit's key, which orders
-units as one thread reaches them: the order the walk handed them out in, then the index of each link
-a unit was split at. The smaller key keeps the claim, so of two units that reach one object, the one
-that comes first copies it, whichever thread got there first, and a thread that finds an object
-claimed by a later unit takes it over and copies what it reaches below it again. A tree whose root
-has two or more children no earlier unit holds is split into a unit for each such child and one for
-the root, down to three levels below the tree's root, and a chain of nodes with one link each counts
-as one level, so the current tree of a file becomes hundreds of units while each version's path in
-history stays one.
+a log entry, pruned history or offset 0; otherwise it copies the tree itself and treats its links
+the same way. A node of the branch table links each branch's tip, so it stays with the walk, and the
+current tree it links goes out. A thread discovers a unit: it reads each record, checks its hash
+before following its links, and lists the records the unit copies in the order one thread writes
+them, children first. Every object a unit reaches is claimed for it by hash, under one of 256 locks,
+with the unit's key, which orders units as one thread reaches them: the order the walk handed them
+out in, then the index of each link a unit was split at. The smaller key keeps the claim, so of two
+units that reach one object, the one that comes first copies it, whichever thread got there first,
+and a thread that finds an object claimed by a later unit takes it over and copies what it reaches
+below it again. A tree whose root has two or more children no earlier unit holds is split into a
+unit for each such child and one for the root, down to three levels below the tree's root, and a
+chain of nodes with one link each counts as one level, so the current tree of a file becomes
+hundreds of units while each version's path in history stays one.
 
 Units are placed in key order, by whichever thread finds the next one discovered. Each record its
 unit still holds takes the next offset, and its length follows from that offset and its links', all
 placed already since a record follows its children, so the second pass the varint offsets need is a
-sum over lengths, done one unit at a time behind the discovery. Placed records are written in jobs of
-256 KiB or more, at their offsets: a thread reads each record again, takes its links' new offsets
+sum over lengths, done one unit at a time behind the discovery. Placed records are written in jobs
+of 256 KiB or more, at their offsets: a thread reads each record again, takes its links' new offsets
 and appends the record as the walk would, and writes the job with `pwrite`, one job at a time, since
 the file system takes the file's lock for each buffered write. The walk waits for units only when it
 writes an entry or a node of the branch table, which come after every tree handed out before them,
@@ -380,12 +380,12 @@ first unit one thread would reach it from, a unit lists its records in one threa
 object two units listed is placed only by the one that holds it. `reclaim_threads.rs` compares the
 copies made at 1, 2 and 4 threads, and the `reclaim` fuzz target those at 1 and 4. Only the cost of
 the work changes with the threads: a unit taken over is discovered twice, 3% more records than are
-copied on the table rows at 4 threads and 11 to 42% more at 16, and all of it costs more CPU than one thread, 1.0 to 1.3 s against
-0.8 s, of which checking hashes is 38%, claims 13% and writing 15%.
+copied on the table rows at 4 threads and 11 to 42% more at 16, and all of it costs more CPU than
+one thread, 1.0 to 1.3 s against 0.8 s, of which checking hashes is 38%, claims 13% and writing 15%.
 
-A record the walk is about to write that a unit's fallback copied meanwhile is not written again: the
-walk takes that copy, as it would have found it before going on on one thread. So the walk can go
-down a chain of entries that a tree handed out before it links, and the bytes stay the same; the
+A record the walk is about to write that a unit's fallback copied meanwhile is not written again:
+the walk takes that copy, as it would have found it before going on on one thread. So the walk can
+go down a chain of entries that a tree handed out before it links, and the bytes stay the same; the
 first version wrote such entries twice. `fuzzed.rs` copies a tree that links a log entry at 1, 4 and
 8 threads and expects the same bytes.
 
@@ -473,8 +473,8 @@ as above, the fastest of three on 2026-11-07:
 | | 8 | 0.18 s | 0.11 s |
 
 `Compacted::handed_out` counts the trees a cycle handed out, and `reclaim_threads.rs` checks that
-copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, and the copy of the file a
-cycle wrote, hand out trees and make the same bytes as one thread.
+copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, and the copy of the file
+a cycle wrote, hand out trees and make the same bytes as one thread.
 
 ### Measured and left out
 
