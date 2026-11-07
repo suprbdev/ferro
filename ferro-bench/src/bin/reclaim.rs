@@ -11,14 +11,16 @@
 //!   line of commit rate and latency, cycle pauses, bytes moved, file sizes, the share of the
 //!   garbage reclaimed, and the read rate and latency of any reader threads.
 //! - `metrics <path> [seconds]` (default 60), `ledger <path> [entries]` (default 200,000),
-//!   `wiki <path> [pages] [edits]` (defaults 100 and 20,000) and `table <path> [rows] [updates]`
-//!   (defaults 200,000 and 200,000) build a `Durability::Buffered` file that keeps every version,
-//!   for `layout` and `copy` to read.
+//!   `wiki <path> [pages] [edits]` (defaults 100 and 20,000) and
+//!   `table <path> [rows] [updates] [per-commit]` (defaults 200,000, 200,000 and 1) build a
+//!   `Durability::Buffered` file that keeps every version, for `layout` and `copy` to read.
 //! - `layout <path> <keep>...` reports, for each `keep`, the live bytes of the last `keep`
 //!   versions, how much of the file reclaiming in units of 4 KiB to 64 MiB would leave, and what
 //!   moving the spans of live data sparser than a range of densities would move and leave.
 //! - `copy <path> <rounds> <threads>...` copies the file aside and times a `compact` that keeps
-//!   everything, with each `copy_threads` count in turn, `rounds` times.
+//!   everything, with each `copy_threads` count in turn, `rounds` times. `RECLAIM_KEEP` keeps only
+//!   that many versions instead, and `RECLAIM_AGAIN=1` times a second `compact` of the file the
+//!   first one wrote.
 //!
 //! `live` commits with `Durability::Fsync` unless `RECLAIM_BUFFERED=1` is set. `RECLAIM_READERS`
 //! starts that many reader threads, of which only `table`'s read anything, `RECLAIM_ROWS` and
@@ -184,7 +186,7 @@ fn build_wiki(path: &Path, pages: u64, edits: u64) {
     }
 }
 
-fn build_table(path: &Path, rows: u64, updates: u64) {
+fn build_table(path: &Path, rows: u64, updates: u64, per: u64) {
     let db: Db<Bank> = fast().open(path).unwrap();
     db.update(|bank| {
         for i in 0..rows {
@@ -192,10 +194,13 @@ fn build_table(path: &Path, rows: u64, updates: u64) {
         }
     })
     .unwrap();
-    for i in 0..updates {
-        let id = mix(i) % rows;
+    let per = per.max(1);
+    for first in (0..updates).step_by(per as usize) {
         db.update(|bank| {
-            bank.accounts.get_mut(&id).unwrap().balance += 1;
+            for i in first..(first + per).min(updates) {
+                let id = mix(i) % rows;
+                bank.accounts.get_mut(&id).unwrap().balance += 1;
+            }
         })
         .unwrap();
     }
@@ -692,9 +697,21 @@ fn copy(path: &Path, rounds: u64, threads: &[usize]) {
     name.push(".copy");
     let work = PathBuf::from(name);
     let bytes = fs::metadata(path).unwrap().len();
+    let keep = match env_number("RECLAIM_KEEP", 0) {
+        0 => Keep::All,
+        versions => Keep::Last(versions as usize),
+    };
+    let again = env_number("RECLAIM_AGAIN", 0) == 1;
     for _ in 0..rounds {
         for &count in threads {
             fs::copy(path, &work).unwrap();
+            if again {
+                let db: Db<Opaque> = Options::new()
+                    .reclaim(Reclaim { every_bytes: 0 })
+                    .open(&work)
+                    .unwrap();
+                db.compact(keep).unwrap();
+            }
             File::open(&work).unwrap().sync_all().unwrap();
             let db: Db<Opaque> = Options::new()
                 .reclaim(Reclaim { every_bytes: 0 })
@@ -702,7 +719,7 @@ fn copy(path: &Path, rounds: u64, threads: &[usize]) {
                 .open(&work)
                 .unwrap();
             let began = Instant::now();
-            let done = db.compact(Keep::All).unwrap();
+            let done = db.compact(keep).unwrap();
             let secs = began.elapsed().as_secs_f64();
             println!(
                 "copy threads={count} secs={secs:.3} mb_per_s={:.0} objects={} after={:.1}MiB pause={:.2}ms",
@@ -734,7 +751,7 @@ fn main() {
         "metrics" => build_metrics(path, number(3, 60)),
         "ledger" => build_ledger(path, number(3, 200_000)),
         "wiki" => build_wiki(path, number(3, 100), number(4, 20_000)),
-        "table" => build_table(path, number(3, 200_000), number(4, 200_000)),
+        "table" => build_table(path, number(3, 200_000), number(4, 200_000), number(5, 1)),
         "copy" => {
             let threads: Vec<usize> = args[4..].iter().map(|text| text.parse().unwrap()).collect();
             copy(path, number(3, 3), &threads);
