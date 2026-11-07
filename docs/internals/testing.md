@@ -320,6 +320,27 @@ match offsets that named another copy of the same bytes. Every mask, in files fr
 million flips a file, found 17,649 such flips in each, again none outside a compressed body, and no
 wrong data.
 
+## A store a test left open
+
+AddressSanitizer's leak check on `ferro/tests/fuzzed.rs` reported 2,457,048 bytes in 627
+allocations at exit, every one an indirect leak below the `Shared` that `Store::open_as` makes for
+the store's state, in stores opened by the test helper `crafted` (#93). The report named
+`a_node_whose_child_counts_overflow_is_rejected`, whose read fails decoding a node whose children's
+counts overflow, which suggested a count the read path took and did not give back on the error. Run
+one at a time, each of the five tests built through `crafted` leaked, 49 KB to 2.1 MB, among them
+reads that succeed, and the other 35 tests leaked nothing. Indirect leaks alone are a cycle:
+`crafted` loads its map with `Store::load`, which keeps the decoded map in the store's cache, and
+the map holds a clone of the store, whose state holds the cache. Nothing on the read path kept a
+count. `Store::close` drops the cache and so breaks the cycle, and every other test and fuzz target
+that opens a store outside a database closes it, but `crafted` handed its store to tests that
+dropped it unclosed. It now hands the store out in a guard that closes it when dropped, and
+`Store`'s docs say that a store that decoded such a value keeps its file open until closed.
+`a_crafted_map_lets_its_file_close_after_a_read_fails` checks that the file closes once the guard
+and the map drop, after a read that fails decoding a node and after one that fails a cached node's
+count, without a sanitizer; it failed before the guard. Built with AddressSanitizer, the 41 tests
+of `fuzzed.rs` then ran clean together and one at a time, and so did the library's 51 unit tests,
+the 84 of `sync.rs`, the 32 of `crash.rs` and the 35 of `reclaim.rs`.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
