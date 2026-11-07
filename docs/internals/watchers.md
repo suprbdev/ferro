@@ -117,7 +117,12 @@ cannot disagree with the place, and `Watcher::seen` returns it. The chat example
 marks in a mutex shared with its test and hold that mutex across `db.read()` for the same guarantee,
 and to refresh them before each `recv`. The reference lives in the gate, so clones share it and a
 return by one moves it for all, only ever forward by count. It holds its snapshot, and so its file
-across a cycle, until the next return, like the snapshot a consumer keeps to diff against.
+across a cycle, until the next return, like the snapshot a consumer keeps to diff against. A closed
+feed holds no snapshot, so a watcher made on a dropped branch's handle takes the one that handle
+reads, which is the last its branch had there and never changes. It ends at once, but `seen` still
+answers as its documentation promises; the first version left it `None`, and the `Watcher::changed`
+example, which expects it, panicked
+(`a_changes_watcher_on_a_dropped_branch_has_seen_what_its_handle_reads`).
 
 ## Idle workers in `queue`
 

@@ -5033,7 +5033,7 @@ impl<T: Data> Db<T> {
     /// # }
     /// ```
     pub fn watch(&self) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone(), Filter::All)
+        Watcher::new(self.branch.feed.clone(), Filter::All, || self.read())
     }
 
     /// A watcher like [`Db::watch`] that hands out only snapshots that pass `test`.
@@ -5073,7 +5073,11 @@ impl<T: Data> Db<T> {
         &self,
         test: impl Fn(&Snapshot<T>) -> bool + Send + Sync + 'static,
     ) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone(), Filter::When(Box::new(test)))
+        Watcher::new(
+            self.branch.feed.clone(),
+            Filter::When(Box::new(test)),
+            || self.read(),
+        )
     }
 
     /// A watcher like [`Db::watch_when`] whose test compares the snapshot it last handed out with
@@ -5087,7 +5091,11 @@ impl<T: Data> Db<T> {
         &self,
         test: impl Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync + 'static,
     ) -> Watcher<T> {
-        Watcher::new(self.branch.feed.clone(), Filter::Changes(Box::new(test)))
+        Watcher::new(
+            self.branch.feed.clone(),
+            Filter::Changes(Box::new(test)),
+            || self.read(),
+        )
     }
 
     /// Picks up what other processes committed, and returns whether anything moved.

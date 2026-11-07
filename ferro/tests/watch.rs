@@ -757,6 +757,25 @@ fn only_a_changes_watcher_reports_what_it_saw() {
 }
 
 #[test]
+fn a_changes_watcher_on_a_dropped_branch_has_seen_what_its_handle_reads() {
+    let (_dir, db) = opened();
+    put(&db, 7, 1);
+    let side = db.fork("side").unwrap();
+    put(&side, 7, 2);
+    let before = side.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+    db.drop_branch("side").unwrap();
+    assert_eq!(before.seen().unwrap().version(), 2);
+    let after = side.watch_changes(|seen, now| seen.get(&7) != now.get(&7));
+    let seen = after
+        .seen()
+        .expect("a watch_changes watcher has seen a snapshot");
+    assert_eq!(seen.version(), side.version());
+    assert_eq!(seen.get(&7).as_deref(), Some(&2));
+    assert!(matches!(after.try_recv(), Err(TryRecvError::Disconnected)));
+    assert!(after.recv().is_err());
+}
+
+#[test]
 fn a_test_may_use_the_feed_it_runs_on() {
     let (_dir, db) = opened();
     let other = db.watch_when(|snapshot| snapshot.contains_key(&3));

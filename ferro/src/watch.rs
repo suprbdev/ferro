@@ -584,11 +584,19 @@ impl<T> fmt::Debug for Watcher<T> {
 
 impl<T> Watcher<T> {
     /// A watcher of `feed` that starts at its current snapshot.
-    pub(crate) fn new(feed: Arc<Feed<T>>, filter: Filter<T>) -> Self {
+    ///
+    /// `read` returns the snapshot of the handle it is made from, which a [`Filter::Changes`]
+    /// watcher has seen instead when the feed is closed and holds none.
+    pub(crate) fn new(
+        feed: Arc<Feed<T>>,
+        filter: Filter<T>,
+        read: impl FnOnce() -> Snapshot<T>,
+    ) -> Self {
         let slot = feed.slot.lock();
         let place = slot.published;
         let seen = match (&filter, &slot.latest) {
             (Filter::Changes(_), Some(latest)) => Some((place, latest.clone())),
+            (Filter::Changes(_), None) => Some((place, read())),
             _ => None,
         };
         drop(slot);
