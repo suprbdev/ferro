@@ -2268,14 +2268,15 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// | `#[index(a, b)]` | A composite index on `(a, b)`, named `a_b` in its lookups. Takes a cover list too, as `#[index(a, b, cover(c))]`. |
 /// | `#[unique(a, b)]` | A unique composite index: at most one row holds each `(a, b)`. Takes a cover list too. |
 ///
-/// `#[ferro(rename = "...")]`, `#[ferro(default)]`, `#[ferro(default = "...")]` and
-/// `#[ferro(skip)]` mean what they do for `Data`. Each index is stored with a fingerprint of its
-/// kind, the key's type, and the stored names, types and defaults of the fields it is keyed on and
-/// stores, where a type's description holds the defaults of the derived structs and enums it
-/// reaches. When a table is read, an index whose fingerprint no longer matches the struct is rebuilt
-/// from the rows, so changing an index's attribute, its cover list, or the stored name, type or
-/// default of one of its fields, or a default nested in its type, rebuilds that index. Turning an `#[index]` into a `#[unique]` fails
-/// to open with `Error::Decode` if two rows share a value.
+/// `#[ferro(rename = "...")]`, `#[ferro(default)]`, `#[ferro(default = "...")]`,
+/// `#[ferro(skip)]` and, on the struct, `#[ferro(removed(...))]` mean what they do for `Data`.
+/// Each index is stored with a fingerprint of its kind, the key's type, and the stored names, types
+/// and defaults of the fields it is keyed on and stores, where a type's description holds the
+/// defaults of the derived structs and enums it reaches. When a table is read, an index whose
+/// fingerprint no longer matches the struct is rebuilt from the rows, so changing an index's
+/// attribute, its cover list, or the stored name, type or default of one of its fields, or a default
+/// nested in its type, rebuilds that index. Turning an `#[index]` into a `#[unique]` fails to open
+/// with `Error::Decode` if two rows share a value.
 /// [The schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
 /// lists what rebuilds and what does not.
 ///
