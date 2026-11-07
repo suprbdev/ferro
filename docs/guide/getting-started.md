@@ -144,7 +144,7 @@ concurrency](concurrency.md#awaited-writes).
 | `shared(bool)` | `false` | Lets other processes that open the file with it write too. See [Several processes](concurrency.md#several-processes). |
 | `follow(bool)` | `false` | Keeps a read-only handle or a shared writer up to date with other processes' commits on a thread of its own. See [Following other processes](concurrency.md#following-other-processes). |
 | `lock_wait(Duration)` | zero | How long `open` waits for another writer to close before it returns `Error::Locked`. |
-| `copy_threads(usize)` | cores, up to 4 | Threads a reclamation cycle copies and checks on. See [Retention and reclamation](retention.md). |
+| `copy_threads(usize)` | cores, up to 8 | Threads a reclamation cycle copies and checks on. See [Retention and reclamation](retention.md). |
 
 `open` needs `T: Default`, since version 0, the value before the first commit, is `T::default()`.
 `Db::open_with(path, init)` and `Options::open_with` take that value from `init` instead.

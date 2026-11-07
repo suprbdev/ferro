@@ -9,6 +9,8 @@ alternating with plain ones. The commits on 16 branches are medians of five runs
 `group` tool, and the booking commits of seven runs of its `tables` tool, pinned to one CCD. Every
 figure on this page but those under [Huge pages](#huge-pages) was measured again that day, and a
 figure that came within the spread of its runs of the one measured on 2026-11-04 is given as it was.
+The copy a reclamation cycle makes, under [Other tools](#other-tools), was measured again on
+2026-11-07, pinned to 16 cores, once it ran on up to 8 threads by default.
 
 | Operation | Result |
 | --- | --- |
@@ -202,7 +204,7 @@ median of:
 | `watchers`, 5 | A Buffered single-key commit with 0, 1,000 and 10,000 parked watchers | 12.3, 12.0 and 12.1 µs, and 23, 57 and 375 µs at p50 to a watcher whose test passes |
 | `reclaim`, 3 | 15 s of fsync commits keeping 100 versions, a cycle every 64 MiB | Longest pause 2.9 ms on `metrics`, 3.2 ms on `ledger`, 3.4 ms on `wiki` and 2.8 ms on table updates, commits a second within 2.2% of no cycles |
 | `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.4 ms |
-| `reclaim copy`, 5 and 15 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on four threads since #63 | 0.39 and 0.15 s, 484 and 2,238 MB/s, against 1.05 and 0.56 s before |
+| `reclaim copy`, 5 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on the default 8 threads, measured on 2026-11-07 | 0.19 and 0.11 s, 1,000 and 2,960 MB/s, against 0.80 and 0.41 s on one thread |
 
 ## Slower than before
 

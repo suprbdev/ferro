@@ -31,7 +31,8 @@ Background cycles run only on a writer with a `history` other than `Keep::All`, 
 `Reclaim { every_bytes: 0 }` turns them off. A cycle walks the log on the calling or background
 thread and copies the trees it reaches, checking every object's hash, on up to seven more.
 `Options::copy_threads` sets the total, which defaults to the number of cores up to 8, and
-`copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads.
+`copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads,
+as [The copy on several threads](../internals/reclamation.md#the-copy-on-several-threads) describes.
 `space` also reports `cycles` run, the `longest_pause` and the `last_error` of a background cycle.
 `compact` returns a `Compacted` with `before_bytes`, `after_bytes`, `objects` copied,
 `commits_dropped`, `passes`, `pause` and `handed_out`, the trees it copied as units.
@@ -58,10 +59,11 @@ so `restore` of a snapshot held across a cycle costs time proportional to its si
 ## Limits
 
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
-  miss the node cache are slower for a moment after each swap. On 16 threads it ran at 870 MB/s on
-  a file of small table rows and 2,780 MB/s on one of 320 byte values, measured on 2026-11-07,
-  against 237 and 806 MB/s on one thread, so a 10 GB database takes about 12 seconds. Past 8
-  threads it gets little faster on table rows, because one thread walks the log.
+  miss the node cache are slower for a moment after each swap. On 8 threads, the default on a
+  machine with 8 cores or more, it ran at 1,000 MB/s on a file of small table rows and 2,960 MB/s on
+  one of 320 byte values, measured on 2026-11-07, against 640 and 2,140 MB/s on 4 threads and 237
+  and 806 MB/s on one, so a 10 GB database takes about 10 seconds. Past 8 threads it gets no faster
+  on table rows, because one thread walks the log.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.
@@ -70,5 +72,5 @@ The `ferro` tool compacts a file with no writer running, as described in [The `f
 
 ## How it works
 
-[Reclamation](../internals/reclamation.md) describes a cycle, generations, crash safety, the
-measurements and the alternatives that lost.
+[Reclamation](../internals/reclamation.md) describes a cycle, the copy on several threads,
+generations, crash safety, the measurements and the alternatives that lost.

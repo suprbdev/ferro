@@ -38,7 +38,8 @@ This is an experiment, not a production database.
   comes back only when the last such handle is dropped, as described under [Several
   processes](concurrency.md#several-processes) and [Limits](retention.md#limits).
 - A reclamation cycle needs free disk for everything retained, and copies small table rows at 237
-  MB/s on one thread and 870 MB/s on sixteen, as described under [Limits](retention.md#limits).
+  MB/s on one thread and 1,000 MB/s on eight, and no faster on more, as described under
+  [Limits](retention.md#limits).
 - Crash safety was never tested on real hardware. A frame past the superblock damaged in more than
   one bit of a 4 KiB block, in a block and in that block's entry in the frame's table, in more than
   8 blocks, or in a bit with only zeroes or only ones between it and an end of its sector, cannot
