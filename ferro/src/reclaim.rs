@@ -835,7 +835,18 @@ impl CopySink<'_> {
         if bytes.capacity() <= SPARE_BYTES {
             self.bytes = bytes;
         }
-        step.map_err(|error| self.verifier.first(error))
+        step.map_err(|error| self.first(error))
+    }
+
+    fn first(&mut self, error: Error) -> Error {
+        let error = self.verifier.first(error);
+        if matches!(error, Error::Interrupted) {
+            return error;
+        }
+        match self.flush() {
+            Err(earlier) => earlier,
+            Ok(()) => error,
+        }
     }
 
     fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
@@ -987,7 +998,7 @@ impl CopySink<'_> {
             self.flush()?;
         }
         let linked = self.linked(root);
-        let entry = match linked.map_err(|error| self.verifier.first(error))? {
+        let entry = match linked.map_err(|error| self.first(error))? {
             Link::Copied(done) => return Ok(done),
             Link::Object if unit => return self.dispatch(root),
             Link::Entry => true,
@@ -1012,7 +1023,7 @@ impl CopySink<'_> {
                             self.flush()?;
                         }
                         let linked = self.linked(link);
-                        linked.map_err(|error| self.verifier.first(error))?
+                        linked.map_err(|error| self.first(error))?
                     }
                 };
                 let done = match linked {

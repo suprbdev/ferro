@@ -623,6 +623,24 @@ fn a_skip_link_that_names_another_entry_than_its_version_fails_verify_and_compac
     }
 }
 
+#[test]
+fn a_damaged_tree_handed_to_the_copy_threads_fails_before_a_later_error_of_the_walk() {
+    for threads in [1, 2, 4] {
+        let (_dir, path) = fixture("compact-unit-order");
+        let db: Db<Opaque> = Options::new()
+            .durability(Durability::Buffered)
+            .copy_threads(threads)
+            .open(&path)
+            .unwrap();
+        let outcome = db.compact(Keep::Since(0));
+        assert!(
+            matches!(&outcome, Err(Error::Corrupt(message))
+                if message == "bad compressed body at 8192: 0 is not a valid match offset"),
+            "{threads} threads: {outcome:?}"
+        );
+    }
+}
+
 fn write_refs(txn: &mut Txn, version: u64, tip: Ptr) -> Ptr {
     let mut refs: Map<String, Head> = Map::new();
     refs.insert(
