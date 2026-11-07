@@ -546,7 +546,7 @@ struct Flagged {
 }
 
 #[derive(Data, Clone, Debug, PartialEq)]
-enum Refund {
+enum Ledger {
     Open,
     RefundPremium(u32),
     Paid { at: u64, title_score: u32 },
@@ -583,12 +583,12 @@ fn a_name_listed_as_removed_keeps_its_old_bytes_from_a_new_field_or_variant() {
     let flagged: Flagged = reread(&old).unwrap();
     assert_eq!(flagged, Flagged { id: 1, flags: 0 });
     roundtrip(Flagged { id: 2, flags: 3 });
-    assert_eq!(reread::<_, Taxed>(&Refund::Open).unwrap(), Taxed::Open);
+    assert_eq!(reread::<_, Taxed>(&Ledger::Open).unwrap(), Taxed::Open);
     assert!(matches!(
-        reread::<_, Taxed>(&Refund::RefundPremium(9)),
+        reread::<_, Taxed>(&Ledger::RefundPremium(9)),
         Err(ferro::Error::Decode(_))
     ));
-    let paid = Refund::Paid {
+    let paid = Ledger::Paid {
         at: 5,
         title_score: 7,
     };
