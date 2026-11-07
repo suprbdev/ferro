@@ -42,6 +42,7 @@ const RERUN_FACTOR: usize = 8;
 const RERUN_SLACK: usize = 256 << 20;
 const RERUN_PER_LINK: usize = 4 << 10;
 const CONFIRMED_KEPT: usize = 1 << 16;
+const RANGES_KEPT: usize = 16;
 const EXPANSION: usize = 16;
 const EXPANSION_SLACK: usize = 16 << 20;
 const MAX_BODY: usize = u32::MAX as usize;
@@ -1611,7 +1612,7 @@ struct Vetting<'a> {
     held: Checked,
     spent: usize,
     budget: usize,
-    queue: Vec<(Ptr, Kind, Vec<Kind>)>,
+    queue: Vec<(Ptr, Kind, Option<Kind>)>,
     deferred: Vec<(u32, Kind)>,
     confirmed: HashSet<(Hash, TypeId, TypeId, Hash)>,
     carried: usize,
@@ -1667,11 +1668,17 @@ impl Vetting<'_> {
         Ok(())
     }
 
-    fn sent(&mut self, id: u32, hash: Hash, kind: &Kind, mut before: Vec<Kind>) -> Result<Shape> {
+    fn sent(
+        &mut self,
+        id: u32,
+        hash: Hash,
+        kind: &Kind,
+        mut before: Option<Kind>,
+    ) -> Result<Shape> {
         let links = self.links.get(id);
         let pinned = links == u8::MAX || self.anchors.find(self.held_at, &hash).is_some();
         let shared = links >= 2 || pinned;
-        let counted = before.is_empty();
+        let counted = before.is_none();
         if shared && let Some(kept) = self.kept.get_mut(&id) {
             let same = kept
                 .checks
@@ -1696,8 +1703,10 @@ impl Vetting<'_> {
                 }
                 return Ok(shape);
             }
-            if let Some(at) = same {
-                before.extend(kept.checks[at].1.iter().cloned());
+            if before.is_none()
+                && let Some(at) = same
+            {
+                before = kept.checks[at].1.last().cloned();
             }
         }
         let ptr = Ptr {
@@ -1705,37 +1714,29 @@ impl Vetting<'_> {
             offset: self.staging.offset(id),
         };
         let object = self.staging.read_object(ptr)?;
-        let checks = 1 + before.len();
-        self.spent = self
-            .spent
-            .saturating_add(object.body.len().saturating_mul(checks));
-        if self.spent > self.budget {
-            return Err(bad("it reuses its objects under too many key ranges"));
-        }
+        self.spend(object.body.len())?;
         let (shape, found) = kind
             .check(&object.body, &object.links, None)
             .map_err(|error| undecodable(kind, error))?;
         if shape.deferred {
             self.deferred.push((id, kind.clone()));
         }
-        let mut earlier = Vec::with_capacity(before.len());
-        for old in &before {
-            let (_, found) = old
-                .check(&object.body, &object.links, None)
-                .map_err(|error| undecodable(old, error))?;
-            earlier.push(found);
-        }
+        let earlier = match before.filter(|_| !found.is_empty()) {
+            Some(old) => {
+                self.spend(object.body.len())?;
+                old.check(&object.body, &object.links, None)
+                    .map_err(|error| undecodable(&old, error))?
+                    .1
+            }
+            None => Vec::new(),
+        };
+        let mut earlier = earlier.into_iter().peekable();
         for (index, child) in found {
-            let covered: Vec<Kind> = earlier
-                .iter()
-                .filter_map(|found| {
-                    found
-                        .iter()
-                        .find(|(at, _)| *at == index)
-                        .map(|(_, kind)| kind.clone())
-                })
-                .collect();
-            if covered.iter().any(|old| old.implies(&child)) {
+            while earlier.next_if(|(at, _)| *at < index).is_some() {}
+            let covered = earlier
+                .next_if(|(at, _)| *at == index)
+                .map(|(_, kind)| kind);
+            if covered.as_ref().is_some_and(|old| old.implies(&child)) {
                 continue;
             }
             self.queue.push((object.links[index], child, covered));
@@ -1755,7 +1756,12 @@ impl Vetting<'_> {
                 .iter_mut()
                 .find(|(_, kinds)| kinds[0].id == kind.id)
             {
-                Some((_, kinds)) => kinds.push(kind.clone()),
+                Some((_, kinds)) => {
+                    if kinds.len() >= RANGES_KEPT {
+                        kinds.remove(0);
+                    }
+                    kinds.push(kind.clone());
+                }
                 None => kept.checks.push((shape, vec![kind.clone()])),
             }
             if kept.left == 0 {
@@ -1763,6 +1769,14 @@ impl Vetting<'_> {
             }
         }
         Ok(shape)
+    }
+
+    fn spend(&mut self, bytes: usize) -> Result<()> {
+        self.spent = self.spent.saturating_add(bytes);
+        if self.spent > self.budget {
+            return Err(bad("it reuses its objects under too many key ranges"));
+        }
+        Ok(())
     }
 
     fn confirm(&mut self, id: u32, hash: Hash, kind: &Kind) -> Result<()> {
@@ -2466,7 +2480,7 @@ fn resolve<O: Objects>(
                 .get(*id)
                 .expect("an ordered commit was walked");
             if let Some(root) = sent.root {
-                vetting.queue.push((root, root_kind.clone(), Vec::new()));
+                vetting.queue.push((root, root_kind.clone(), None));
                 vetting.run()?;
             }
         }
@@ -2790,7 +2804,9 @@ impl<T: Data> Db<T> {
     /// - [`Error::NoCommonAncestor`] when the merge base could lie in pruned history. The remote
     ///   branch has landed, and this branch is as it was.
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
-    ///   is damaged.
+    ///   is damaged, or if checking it would decode or read more again than its size allows, as
+    ///   one large value shared by many keys, or one large node reached under many key ranges,
+    ///   can.
     /// - [`Error::Decode`] if `from` sends a head that `T` cannot read, such as a table whose
     ///   unique index, rebuilt on this side, finds two rows sharing a value. Nothing lands and
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
@@ -2947,8 +2963,9 @@ impl<T: Data> Db<T> {
     ///
     /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
     ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
-    ///   or if recomputing its summaries would read more again than its size allows, as one large
-    ///   value shared by many keys can. Nothing reaches the file.
+    ///   or if checking it would decode or read more again than its size allows, as one large
+    ///   value shared by many keys, or one large node reached under many key ranges, can. Nothing
+    ///   reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.

@@ -282,18 +282,19 @@ and runs each root's tree to the end before the next. A link to a sent object ch
 the kind the link names and pushes its own links. Most objects are linked once, so their checks are
 not kept. While the bundle streams, the receiver counts the links each object gets from other sent
 objects, and only an object linked more than once, or also named by a hint, keeps the kinds it was
-checked as, until its last link has reached it. A later link of the same type whose range contains
-one it was checked under is not checked again. A link under a range no earlier check covers checks
-the object again, and decodes it again under each earlier kind to learn what those gave its
-children. A child is pushed again only if the new check gives it a kind that one of those does not
-imply, which in a narrower range only the edge children get, and it carries the earlier kinds with
-it, so a recheck goes down the edge of the subtree as it did when every check was kept. The counts
-only decide what is kept: an object reached more often than it was counted is checked again, never
-let through. A link that resolves to an object the receiver holds is not walked into: what the
-receiver holds is trusted. Its type comes from the hint path. The anchor root is a `T`, and each
-hint step checks the held parent as its kind to learn the kind of the link the step follows, one
-read per parent on a changed path, which the hint resolution already paid. A held child agrees with
-a sent parent when it has the same type and count, its trusted range lies inside the new one and its
+checked as, the last 16 for each type, until its last link has reached it. A later link of the same
+type whose range contains one it was checked under is not checked again. A link under a range no
+earlier check covers checks the object again, and if that check finds typed links, decodes it again
+under one earlier kind, the one its parent's recheck carried down or else the last one kept, to
+learn what that gave its children. A child is pushed again only if the new check gives it a kind
+that the earlier one does not imply, which in a narrower range only the edge children get, and it
+carries that kind with it, so a recheck goes down the edge of the subtree. The counts only decide
+what is kept: an object reached more often than it was counted is checked again, never let
+through. A link that resolves to an object the receiver holds is not walked into: what the receiver
+holds is trusted. Its type comes from the hint path. The anchor root is a `T`, and each hint step
+checks the held parent as its kind to learn the kind of the link the step follows, one read per
+parent on a changed path, which the hint resolution already paid. A held child agrees with a sent
+parent when it has the same type and count, its trusted range lies inside the new one and its
 trusted parent's level is no higher. Otherwise the held node is loaded and its leftmost and
 rightmost keys are found down its edges, O(depth). A link that names held data of another type is
 accepted only if that one object checks as the new type and holds no typed links of its own: a
@@ -302,14 +303,35 @@ rejects the bundle.
 
 The check costs the bundle, not the database: every sent object is decoded once, plus one read per
 parent on a hint path and the edges of a reused subtree whose range narrowed. A node reached again
-under a range its first check does not cover is checked again, and those rechecks, with the earlier
-kinds each decodes it under, may not exceed twice the bundle's body bytes plus 16 MiB. Cloning a
-`Map<u64, String>` of 400,000 keys, 36 MB in 50,143 objects, took 164 ms against 102 ms without the
-check, and a bundle editing 1,008 keys spread over it, 3.2 MB in 2,480 objects, took 18.8 ms against
-15.5 ms. That was when every check was kept, keyed by hash and type with the kind it was made under.
-Keeping only the checks of objects linked twice took the receive of a clone of a million objects
-from 2.35 to 1.59 s and from 436 to 41 MiB of heap, with the other changes described under [Memory
-for each object](sync.md#memory-for-each-object).
+under a range no earlier check covers is checked again. Every check of a sent object, the first
+ones included, is charged its body bytes, and a recheck that also decodes the object under an
+earlier kind is charged them twice. A bundle whose checks pass twice its body bytes plus 16 MiB is
+refused, so its rechecks may decode about as much as it carries plus 16 MiB. A node of X bytes
+that is most of what a bundle carries can be reached under about 2 + 16 MiB / X ranges in all: a
+node of 17.6 MB under two, of 1 MiB under 18 and of 800 KB under 22.
+
+A recheck used to decode the node under every earlier kind, and was charged its body once more for
+each, so k narrowings of a node of X bytes cost X(2 + 3 + … + (k + 1)) on top of its first check,
+and one narrowing of a node over 16 MiB was refused. That refused honest clones of a
+`Map<String, u8>` whose leaf held eight keys of 2.2 MB: with a key added before the leaf in a
+second commit, which narrowed its range, or in one commit whose root held the map with and without
+that key, and twelve commits that each narrowed a leaf of eight keys of 100 KB. All three now land.
+A bundle that links one node under many ranges is still refused once its checks pass that budget,
+after decoding at most twice its body bytes plus 16 MiB: one of 1.05 MB that links a 1 MiB node
+under 64 narrowing ranges is refused 2 ms in, and one of 16.8 MB that links a 16 MiB node so
+15 ms in, as before. A recheck of a small node costs more than its bytes, but each one follows a
+link the bundle carries, of at least 33 bytes, or a recheck of its parent that paid for the bytes
+naming it: a bundle of 22 MB that links a node of 23 bytes under 400,000 narrowing ranges lands in
+0.72 s, against 0.57 s when the ranges widen and the node is checked once.
+
+Cloning a `Map<u64, String>` of 400,000 keys, 36 MB in 50,143 objects, took 164 ms against 102 ms
+without the check, and a bundle editing 1,008 keys spread over it, 3.2 MB in 2,480 objects, took
+18.8 ms against 15.5 ms. That was when every check was kept, keyed by hash and type with the kind
+it was made under. Keeping only the checks of objects linked twice took the receive of a clone of a
+million objects from 2.35 to 1.59 s and from 436 to 41 MiB of heap, with the other changes
+described under [Memory for each object](sync.md#memory-for-each-object). Rechecking under one
+earlier kind left a clone of that map in ten commits, 35.8 MB, at a median of 130 ms against
+129 ms, and an edit of 1,008 keys at 19 ms against 18 ms, over eleven alternating runs.
 
 Each decode stops past 2^24 items that take no bytes and no links in one object, the limit a commit
 writes each object under, as described under [Zero-width items](storage.md#zero-width-items), so a

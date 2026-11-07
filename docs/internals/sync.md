@@ -524,6 +524,12 @@ Measured and left out:
   Both are stored a second time, as described under [Commits stored
   twice](sync-receive.md#commits-stored-twice), until the copy the receiver had stops being
   retained.
+- A node that a bundle reaches under several key ranges is checked again for each range no earlier
+  check covers, and a bundle whose checks would decode more than twice its body bytes plus 16 MiB
+  is refused. So a node of 17.6 MB in a bundle that carries little else is reached under at most
+  two ranges, one of 1 MiB under about 18, and a hostile bundle that reuses a node under many
+  ranges decodes no more than that before it is refused, as described under [Checking
+  trees](sync-receive.md#checking-trees).
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. A table without one of its indexes, or holding one under
   another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows

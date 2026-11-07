@@ -2057,6 +2057,131 @@ fn a_bundle_that_reuses_held_data_as_another_type_is_rejected() {
     b.verify_typed().unwrap();
 }
 
+fn no_merge<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
+    panic!("no merge expected");
+}
+
+#[derive(Data, Clone, Default)]
+struct Shelves {
+    maps: Vec<Map<String, u8>>,
+    one: Map<String, u8>,
+}
+
+fn key_at(prefix: &str, pad: usize, level: u32, from: &mut u64) -> String {
+    loop {
+        *from += 1;
+        let key = format!("{prefix}{:08}{}", *from, text(*from, pad));
+        if common::level_of(&key) == level {
+            return key;
+        }
+    }
+}
+
+fn narrowed(lefts: &[String], leaf: &[String], right: &str) -> Map<String, u8> {
+    let mut map = Map::new();
+    for key in lefts {
+        map.insert(key.clone(), 1);
+    }
+    for key in leaf {
+        map.insert(key.clone(), 2);
+    }
+    map.insert(right.to_string(), 3);
+    map
+}
+
+#[test]
+fn a_large_node_reached_under_narrower_key_ranges_lands() {
+    let mut from = 0;
+    let lefts: Vec<String> = (0..12).map(|_| key_at("p", 0, 1, &mut from)).collect();
+    let leaf: Vec<String> = (0..8).map(|_| key_at("s", 100_000, 0, &mut from)).collect();
+    let right = key_at("t", 0, 1, &mut from);
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Shelves> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for left in 0..=lefts.len() {
+        a.update(|shelves| shelves.one = narrowed(&lefts[..left], &leaf, &right))
+            .unwrap();
+    }
+    let b: Db<Shelves> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().one.len(), lefts.len() + leaf.len() + 1);
+    b.verify_typed().unwrap();
+
+    let leaf: Vec<String> = (0..8)
+        .map(|_| key_at("s", 2_200_000, 0, &mut from))
+        .collect();
+    let a: Db<Shelves> = fast().open(dir.path().join("pair-a.ferro")).unwrap();
+    a.update(|shelves| {
+        shelves.maps = vec![
+            narrowed(&lefts[..1], &leaf, &right),
+            narrowed(&[], &leaf, &right),
+        ]
+    })
+    .unwrap();
+    let b: Db<Shelves> = fast().open(dir.path().join("pair-b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(b.read().maps[1].len(), leaf.len() + 1);
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_bundle_that_reuses_one_node_under_many_key_ranges_lands_up_to_a_budget() {
+    let low = key_at_level(0);
+    let separators: Vec<u64> = (low + 1..)
+        .filter(|key| common::level_of(key) == 1)
+        .take(64)
+        .collect();
+    let big = text(1, 1 << 20);
+    let leaf = node_of(low, &inline_string(&big), Vec::new());
+    for (parents, lands) in [(12, true), (64, false)] {
+        let mut nodes = Vec::new();
+        for separator in &separators[..parents] {
+            let mut body = vec![1, 1];
+            varint(&mut body, *separator);
+            body.extend_from_slice(&inline_string("p"));
+            body.extend_from_slice(&[1, 0]);
+            nodes.push(Object {
+                body,
+                links: vec![link_to(&leaf)],
+            });
+        }
+        let mut body = Vec::new();
+        varint(&mut body, parents as u64);
+        body.extend(std::iter::repeat_n(2, parents));
+        let root = Object {
+            body,
+            links: nodes.iter().map(link_to).collect(),
+        };
+        let mut objects = vec![&leaf];
+        objects.extend(&nodes);
+        objects.push(&root);
+        let (b, result, _dir) = receive_tree::<Vec<Map<u64, String>>>(&objects);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let maps = b.read();
+            assert_eq!(maps.len(), parents);
+            for (map, separator) in maps.iter().zip(&separators) {
+                assert_eq!(*map.get(&low).unwrap(), big);
+                assert_eq!(*map.get(separator).unwrap(), "p");
+            }
+            b.verify_typed().unwrap();
+        } else {
+            match &result {
+                Err(Error::Bundle(message)) => {
+                    assert!(message.contains("too many key ranges"), "{message}")
+                }
+                other => panic!("landed one node under {parents} ranges: {other:?}"),
+            }
+            assert_refused(&b, result);
+        }
+    }
+}
+
 #[test]
 fn verify_typed_finds_nodes_that_do_not_decode_as_the_type() {
     let dir = tempfile::tempdir().unwrap();

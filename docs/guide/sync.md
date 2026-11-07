@@ -72,7 +72,10 @@ for the objects it already holds, except that an `of` that reads a collection in
 again for each entry of a node the bundle rewrites, held or sent. The first read of what this side
 holds is free, and a bundle that would make it read more again than its size allows is refused: one
 value of 1 MiB shared by more than about 265 keys, or a value holding a collection that `of` reads,
-of 16 MiB, under more than about 17 keys that are new or rewritten. A `Summary` whose `of` or
+of 16 MiB, under more than about 17 keys that are new or rewritten. A node the bundle reaches
+under narrower key ranges, as when keys are added beside it, is checked again for each, and a
+bundle whose checks would decode more than twice its size plus 16 MiB is refused: a node of 1 MiB
+can be reached under about 18 ranges, one of 17.6 MB under two. A `Summary` whose `of` or
 `combine` panics on what a bundle carries, such as an overflowing sum, makes `receive` refuse the
 bundle rather than unwind. Objects are staged as they arrive, in memory up to 1 MiB and past that in
 a scratch file beside the database, and `receive` holds no writer lock while it reads, so commits on
