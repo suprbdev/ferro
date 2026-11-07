@@ -43,7 +43,6 @@ const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 8;
 const AHEAD: usize = 16384;
 const KEEP_BYTES: usize = 16 << 20;
-const KEEP_EACH: usize = 64;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 type ByOffset = BuildHasherDefault<Spread>;
@@ -452,25 +451,38 @@ struct Spot {
 /// The records of log entries that the walk down the chains read and the copy will want, kept by
 /// offset so that the copy need not read and decode them again.
 ///
-/// They take at most [`KEEP_BYTES`], each counted at its length and [`KEEP_EACH`] more for its
-/// place in the map; past that, the copy reads entries from the file.
+/// What its buffer and its map have allocated is counted against [`KEEP_BYTES`]. Once a read
+/// takes that past the cap, the cache keeps nothing more until it is cleared, and the copy reads
+/// the rest of the entries from the file, so it holds at most the cap and the last growth of its
+/// buffer or map.
 #[derive(Default)]
 struct EntryCache {
     bytes: Vec<u8>,
     at: HashMap<u64, Spot, ByOffset>,
     last: Option<usize>,
+    full: bool,
 }
 
 impl EntryCache {
     fn read(&mut self, source: &Store, ptr: Ptr) -> Result<(Object, u32)> {
         self.skip();
-        if self.bytes.len() + KEEP_EACH * self.at.len() >= KEEP_BYTES {
+        if self.full || self.held() >= KEEP_BYTES {
+            self.full = true;
             return source.read_record(ptr);
         }
         let start = self.bytes.len();
         let read = source.read_record_into(ptr, Some(&mut self.bytes))?;
-        self.last = Some(start);
+        if self.held() > KEEP_BYTES {
+            self.bytes.truncate(start);
+            self.full = true;
+        } else {
+            self.last = Some(start);
+        }
         Ok(read)
+    }
+
+    fn held(&self) -> usize {
+        self.bytes.capacity() + self.at.capacity() * (size_of::<(u64, Spot)>() + 1)
     }
 
     fn keep(&mut self, ptr: Ptr, entry: &Entry) {

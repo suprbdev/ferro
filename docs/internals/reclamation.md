@@ -524,10 +524,12 @@ five alternating runs for the first five rows and of six for the last two, in se
   reads, as stored, to one buffer, and keeps their place by offset with the entry's hash and which
   of its links it has. When the copy reaches that record as an entry it parses it from the buffer,
   takes it as checked, as it already did for an entry the walk had read, and decodes nothing.
-  Reading entries in the copy fell from 35 to 12 ms at 16 threads and from 34 to 11 ms at 8. The
-  buffer holds at most 16 MiB, each entry counted at its length and 64 bytes more for its place;
-  past that the copy reads entries from the file as before. The table rows' entries take 70 bytes,
-  so 16 MiB holds about 120,000 of them. It is freed when the pass ends.
+  Reading entries in the copy fell from 35 to 12 ms at 16 threads and from 34 to 11 ms at 8. What
+  the buffer and the map of places have allocated is counted against 16 MiB, and once a read takes
+  it past that the cache keeps nothing more for the pass, so it holds at most 16 MiB and the last
+  growth of its buffer or map; past that the copy reads entries from the file as before. The first
+  form counted each entry at its length and 64 bytes, which held 125,927 entries of about 69 bytes
+  at 27.7 MB, 1.65 times what it counted. It is freed when the pass ends.
 - The budget counts without a lock while the bytes fit. A thread adds its bytes with a
   compare-and-swap, and only one that would pass the budget takes the lock, counts itself and
   waits, so a thread giving bytes back takes the lock to wake waiters only when there are any. On
@@ -797,10 +799,11 @@ more, since the walk down the chains slows as more cores run and handing out uni
 as described under [The walk past eight threads](#the-walk-past-eight-threads). `Keep::All` copies
 all of history, so `history` is what makes background cycles worthwhile. The copy holds its claims,
 about 68 bytes per object, about 80 bytes per commit for where each entry was read and copied and
-what its copy keeps, up to 16 MiB of the entries the walk down the chains read, until the pass
-ends, the lists of the trees waiting to be placed, 24 bytes a record and 4 a link, and 16 MiB of
-records and decompressed bodies the threads and the walk hold at once, or one larger record alone,
-besides a buffer of up to 1 MiB on each thread and the one record the walk is copying.
+what its copy keeps, up to 16 MiB of the entries the walk down the chains read, counted at what
+their buffer and map allocate, until the pass ends, the lists of the trees waiting to be placed,
+24 bytes a record and 4 a link, and 16 MiB of records and decompressed bodies the threads and the
+walk hold at once, or one larger record alone, besides a buffer of up to 1 MiB on each thread and
+the one record the walk is copying.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the
