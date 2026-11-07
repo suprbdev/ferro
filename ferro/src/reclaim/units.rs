@@ -354,25 +354,55 @@ impl Scratch {
 /// thread waits for others to finish, unless it would hold them alone.
 const BUDGET: u64 = 16 << 20;
 
+/// The bytes the copy's threads hold, counted without a lock while they fit [`BUDGET`].
+///
+/// A thread that would pass it counts itself in `waiting` and sleeps on `freed` under `lock`, and
+/// a thread that gives bytes back wakes the sleepers only when `waiting` says there are any.
 #[derive(Default)]
 struct Budget {
-    used: Mutex<u64>,
+    used: AtomicU64,
+    waiting: AtomicU64,
+    lock: Mutex<()>,
     freed: Condvar,
 }
 
 impl Budget {
-    fn hold(&self, bytes: u64) {
-        let mut used = self.used.lock();
-        while *used > 0 && used.saturating_add(bytes) > BUDGET {
-            self.freed.wait(&mut used);
+    fn try_hold(&self, bytes: u64) -> bool {
+        let mut used = self.used.load(Ordering::SeqCst);
+        loop {
+            if used > 0 && used.saturating_add(bytes) > BUDGET {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + bytes,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(now) => used = now,
+            }
         }
-        *used += bytes;
+    }
+
+    fn hold(&self, bytes: u64) {
+        if self.try_hold(bytes) {
+            return;
+        }
+        let mut lock = self.lock.lock();
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while !self.try_hold(bytes) {
+            self.freed.wait(&mut lock);
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn give(&self, bytes: u64) {
-        let mut used = self.used.lock();
-        *used -= bytes;
-        self.freed.notify_all();
+        self.used.fetch_sub(bytes, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            let _lock = self.lock.lock();
+            self.freed.notify_all();
+        }
     }
 
     fn take(&self, bytes: u64) -> Taken<'_> {
