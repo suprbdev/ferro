@@ -667,10 +667,17 @@ fn merge_beside_a_commit_still_syncing(durability: Durability, pulls: bool) {
 }
 
 fn merge_beside_a_commit_being_published(durability: Durability, pulls: bool) {
-    let held = hold_a_side_commit(durability, pulls, "publishing");
-    let (seen, _runs) = mpsc::channel();
+    let held = hold_a_side_commit(durability, pulls, "published");
+    assert!(
+        held.side.version() > held.published,
+        "the branch's state is published before the lock is let go"
+    );
+    let (seen, runs) = mpsc::channel();
     let merge = merging(&held, seen);
-    thread::sleep(Duration::from_millis(100));
+    assert!(
+        runs.recv_timeout(Duration::from_millis(100)).is_err(),
+        "a merge ran while the refs and states were being published"
+    );
     settle_and_merge_again(held, merge);
 }
 

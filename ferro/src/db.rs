@@ -2763,6 +2763,9 @@ impl<T: Data> Shared<T> {
                 }
             }
         }
+        if published.is_some() {
+            self.step("published");
+        }
         drop(published);
         let lost = !cut.is_empty();
         seals.extend(

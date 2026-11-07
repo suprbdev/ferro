@@ -149,12 +149,13 @@ from the state and never pairs with a record. The steps that build a virtual bas
 table under `tip`, where a record counts only for a commit on its head's chain at or above the
 version it was made at, which holds whichever table it comes from.
 
-`merge.rs` holds the leader of `side`'s pull at the start of its sync, and again just after it
-publishes the table, under both durabilities, and checks that `main` keeps r's key, that the merge
-runs once against x with `side`'s published version, and that merging both ways after the sync
-changes nothing. It does the same with a plain merge on `side`, which passed before. The first hold
-lost r's key before the merge read the published table, and the second before the leader published
-both under one lock.
+`merge.rs` holds the leader of `side`'s pull at the start of its sync, and again once it has
+published the table and the states but still holds the lock, under both durabilities, and checks
+that `main` keeps r's key, that the merge runs once against x with `side`'s published version, and
+that merging both ways after the sync changes nothing. It does the same with a plain merge on
+`side`, which passed before. The first hold lost r's key before the merge read the published table.
+The second checks that `side`'s state is already published and that no merge runs while the lock
+is held, so a leader that let the lock go before publishing the states fails it.
 
 ## Handles of other files
 
