@@ -36,7 +36,7 @@ use crate::store::{
     Basis, LOG_START, Prehashed, Store, StoreOptions, Traced, Unpacked, append_staged, body_of,
     compressed, seal, staged, verify_stored,
 };
-use units::{Key, PENDING, Settled, Units};
+use units::{Key, PENDING, Reserved, Settled, Units};
 
 mod units;
 
@@ -495,6 +495,7 @@ struct CopySink<'a> {
     objects: u64,
     stop: Option<&'a AtomicBool>,
     units: Option<Units>,
+    reserved: Option<Reserved>,
     fallback: Option<Key>,
     stale: bool,
 }
@@ -847,6 +848,7 @@ impl CopySink<'_> {
         if bytes.capacity() <= SPARE_BYTES {
             self.bytes = bytes;
         }
+        self.reserved = None;
         step.map_err(|error| self.first(error))
     }
 
@@ -864,9 +866,13 @@ impl CopySink<'_> {
     fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
         let mut held = self.spare.pop().unwrap_or_default();
         let verifier = &mut self.verifier;
-        let large = |claim: usize| match claim > BATCH_BYTES {
-            true => verifier.settle(),
-            false => Ok(()),
+        let (units, reserved) = (&self.units, &mut self.reserved);
+        let large = |claim: usize| {
+            *reserved = units.as_ref().map(|units| units.reserve(claim as u64));
+            match claim > BATCH_BYTES {
+                true => verifier.settle(),
+                false => Ok(()),
+            }
         };
         let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old, large)?;
         let entry = if entry {
@@ -1183,6 +1189,7 @@ impl<'a> Copier<'a> {
                 objects: 0,
                 stop,
                 units,
+                reserved: None,
                 fallback: None,
                 stale: true,
             },

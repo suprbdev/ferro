@@ -355,12 +355,22 @@ struct Budget {
 }
 
 impl Budget {
-    fn take(&self, bytes: u64) -> Taken<'_> {
+    fn hold(&self, bytes: u64) {
         let mut used = self.used.lock();
         while *used > 0 && used.saturating_add(bytes) > BUDGET {
             self.freed.wait(&mut used);
         }
         *used += bytes;
+    }
+
+    fn give(&self, bytes: u64) {
+        let mut used = self.used.lock();
+        *used -= bytes;
+        self.freed.notify_all();
+    }
+
+    fn take(&self, bytes: u64) -> Taken<'_> {
+        self.hold(bytes);
         Taken {
             budget: self,
             bytes,
@@ -375,9 +385,19 @@ struct Taken<'a> {
 
 impl Drop for Taken<'_> {
     fn drop(&mut self) {
-        let mut used = self.budget.used.lock();
-        *used -= self.bytes;
-        self.budget.freed.notify_all();
+        self.budget.give(self.bytes);
+    }
+}
+
+/// Bytes of a record the walk reads, counted against the threads' budget until dropped.
+pub(super) struct Reserved {
+    shared: Arc<Shared>,
+    bytes: u64,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.shared.budget.give(self.bytes);
     }
 }
 
@@ -874,6 +894,16 @@ impl Units {
     /// The number of units dispatched since the walk last settled them all.
     pub(super) fn outstanding(&self) -> usize {
         self.outstanding
+    }
+
+    /// Counts `bytes` the walk reads itself against what the threads may hold at once, until the
+    /// result is dropped.
+    pub(super) fn reserve(&self, bytes: u64) -> Reserved {
+        self.shared.budget.hold(bytes);
+        Reserved {
+            shared: self.shared.clone(),
+            bytes,
+        }
     }
 
     /// The number of units dispatched since the copy began.
