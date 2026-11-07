@@ -1305,6 +1305,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         .filter(|field| !field.stored())
         .filter_map(|field| field.ident.clone())
         .collect();
+    if skipped.contains(&key_ident) {
+        return Err(syn::Error::new(
+            key_ident.span(),
+            format!(
+                "`{key_ident}` is not stored, so it cannot be the key: rows read back would hold its default rather than the key they are stored under"
+            ),
+        ));
+    }
     for ix in &indexes {
         check_stored(ix, &skipped)?;
         check_cover(ix, &key_ident, &skipped)?;
@@ -2153,7 +2161,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///
 /// | Attribute | Declares |
 /// | --- | --- |
-/// | `#[key]` | The primary key. Exactly one field has it. |
+/// | `#[key]` | The primary key. Exactly one field has it, and it cannot be `#[ferro(skip)]`. |
 /// | `#[index]` | An index on the field's value. |
 /// | `#[index(each)]` | An index on every element of a `Vec<X>`, `BTreeSet<X>`, `Set<X>` or `Option<X>` field. |
 /// | `#[index(cover(a, b))]` | An index that also stores fields `a` and `b` beside each entry. Combines with `each`, as `#[index(each, cover(a))]`. |
@@ -2253,9 +2261,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// with named fields, generic parameters, no `#[key]` field or two, a struct-level index of fewer
 /// than two fields, a field name that does not exist, an index option other than `each` and
 /// `cover(...)` (only `cover(...)` on `#[unique]`), two cover lists on one struct-level index, a
-/// cover list that breaks the rules above, and an index of any kind on a `#[ferro(skip)]` field,
-/// alone or as part of a composite. A skipped field reads back as its default, so the index would
-/// keep values that the rows no longer hold:
+/// cover list that breaks the rules above, an index of any kind on a `#[ferro(skip)]` field,
+/// alone or as part of a composite, and `#[key]` on a `#[ferro(skip)]` field. A skipped field reads
+/// back as its default, so the index would keep values that the rows no longer hold:
 ///
 /// ```compile_fail
 /// use ferro::{Data, Record};
@@ -2267,6 +2275,21 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///     #[index]
 ///     #[ferro(skip)]
 ///     cached_total: u64,
+/// }
+/// ```
+///
+/// and a row read back would hold the default key rather than the one it is stored under, so
+/// writing it back would move it there:
+///
+/// ```compile_fail
+/// use ferro::{Data, Record};
+///
+/// #[derive(Data, Record, Clone)]
+/// struct Session {
+///     #[key]
+///     #[ferro(skip)]
+///     token: u64,
+///     user: String,
 /// }
 /// ```
 ///
@@ -2437,7 +2460,9 @@ mod tests {
 
     fn refused(input: DeriveInput) -> String {
         match expand_record(input) {
-            Ok(_) => panic!("the derive accepted an index on a field it does not store"),
+            Ok(_) => {
+                panic!("the derive accepted a field it does not store as indexed or as the key")
+            }
             Err(error) => error.to_string(),
         }
     }
@@ -2467,6 +2492,25 @@ mod tests {
             let message = refused(input);
             assert!(
                 message.starts_with("`ghost` is not stored, so it cannot be indexed"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_key_is_refused() {
+        let inputs: [DeriveInput; 2] = [
+            syn::parse_quote! {
+                struct Row { #[key] #[ferro(skip)] ghost: u64, #[index] room: u32 }
+            },
+            syn::parse_quote! {
+                struct Row { #[ferro(skip)] #[key] ghost: u64, room: u32 }
+            },
+        ];
+        for input in inputs {
+            let message = refused(input);
+            assert!(
+                message.starts_with("`ghost` is not stored, so it cannot be the key"),
                 "{message}"
             );
         }

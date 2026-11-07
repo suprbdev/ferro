@@ -1,7 +1,7 @@
 # Tables and indexes
 
-A `Table<T>` holds rows keyed by the field marked `#[key]`, and keeps a secondary index for every
-field marked `#[index]`. `#[derive(Record)]` generates the indexes and their lookups. The `Order`
+A `Table<T>` holds rows keyed by the field marked `#[key]`, which cannot be `#[ferro(skip)]`, and
+keeps a secondary index for every field marked `#[index]`. `#[derive(Record)]` generates the indexes and their lookups. The `Order`
 row in [Getting started](getting-started.md#a-first-database) is an example.
 
 ## Rows
