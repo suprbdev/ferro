@@ -409,9 +409,9 @@ enum Step {
 #[derive(Clone, Copy)]
 struct Rungs {
     version: u64,
-    parents: usize,
-    prev: Option<usize>,
-    skip: Option<usize>,
+    root: bool,
+    prev: bool,
+    skip: bool,
 }
 
 impl Rungs {
@@ -421,21 +421,31 @@ impl Rungs {
     }
 
     fn from_entry(entry: &Entry) -> Rungs {
-        let prev = usize::from(entry.commit.root.is_some());
-        let skip = prev + usize::from(entry.prev.is_some());
         Rungs {
             version: entry.commit.version,
-            parents: prev,
-            prev: entry.prev.map(|_| prev),
-            skip: entry.skip.map(|_| skip),
+            root: entry.commit.root.is_some(),
+            prev: entry.prev.is_some(),
+            skip: entry.skip.is_some(),
         }
+    }
+
+    fn parents(self) -> usize {
+        usize::from(self.root)
+    }
+
+    fn prev(self) -> Option<usize> {
+        self.prev.then(|| self.parents())
+    }
+
+    fn skip(self) -> Option<usize> {
+        self.skip.then(|| self.parents() + usize::from(self.prev))
     }
 }
 
 struct Spot {
     hash: Hash,
-    start: usize,
-    len: usize,
+    start: u32,
+    len: u32,
     rungs: Rungs,
 }
 
@@ -464,11 +474,16 @@ impl EntryCache {
     }
 
     fn keep(&mut self, ptr: Ptr, entry: &Entry) {
-        if let Some(start) = self.last.take() {
+        if let Some(start) = self.last.take()
+            && let (Ok(at), Ok(len)) = (
+                u32::try_from(start),
+                u32::try_from(self.bytes.len() - start),
+            )
+        {
             let spot = Spot {
                 hash: ptr.hash,
-                start,
-                len: self.bytes.len() - start,
+                start: at,
+                len,
                 rungs: Rungs::from_entry(entry),
             };
             self.at.insert(ptr.offset, spot);
@@ -483,7 +498,8 @@ impl EntryCache {
 
     fn take(&mut self, ptr: Ptr) -> Option<(&[u8], Rungs)> {
         let spot = self.at.remove(&ptr.offset)?;
-        let record = &self.bytes[spot.start..spot.start + spot.len];
+        let start = spot.start as usize;
+        let record = &self.bytes[start..start + spot.len as usize];
         (spot.hash == ptr.hash).then_some((record, spot.rungs))
     }
 
@@ -636,8 +652,8 @@ impl CopySink<'_> {
         let offset = |index: Option<usize>| index.map_or(0, |index| links[index].offset);
         Below {
             from: from.offset,
-            prev: offset(rungs.prev),
-            skip: offset(rungs.skip),
+            prev: offset(rungs.prev()),
+            skip: offset(rungs.skip()),
         }
     }
 
@@ -660,7 +676,7 @@ impl CopySink<'_> {
     fn skipped(&self, links: &[Ptr], rungs: Rungs, link: Ptr) -> Option<Ptr> {
         let target = skip_version(rungs.version);
         let prev = rungs
-            .prev
+            .prev()
             .map(|index| links[index])
             .filter(|prev| prev.offset != 0);
         let found = prev.and_then(|prev| self.on_path(prev.offset, rungs.version - 1, target));
@@ -892,10 +908,10 @@ impl CopySink<'_> {
                 let unit = self.dispatches();
                 let rooted = top.entry.is_some();
                 let linked = match top.entry {
-                    Some(rungs) if rungs.skip == Some(top.next) => {
+                    Some(rungs) if rungs.skip() == Some(top.next) => {
                         Link::parent(self.skipped(&top.held.links, rungs, link))
                     }
-                    Some(rungs) if top.next >= rungs.parents => Link::parent(self.parent(link)),
+                    Some(rungs) if top.next >= rungs.parents() => Link::parent(self.parent(link)),
                     _ => {
                         if !unit {
                             self.flush()?;
