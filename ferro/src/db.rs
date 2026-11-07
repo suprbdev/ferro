@@ -3146,6 +3146,7 @@ impl<T: Data> Shared<T> {
                 let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
                 copier.finish(&tip.refs, store.last_seq(), survival)?
             };
+            report.handed_out = copier.handed_out();
             let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
             let swapped = self.swap_in(tip, store, &fresh, &temp, head);
             swapped.inspect_err(|_| fresh.close())?;

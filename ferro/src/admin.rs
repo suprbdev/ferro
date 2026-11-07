@@ -458,6 +458,7 @@ fn write_copy(
         objects,
         commits_dropped,
         passes: 1,
+        handed_out: copier.handed_out(),
         ..Compacted::default()
     })
 }

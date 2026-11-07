@@ -94,13 +94,24 @@ fn several_threads_copy_the_same_bytes_as_one() {
     build(&source, 1500, 600, 300);
     for keep in [Keep::All, Keep::Last(20)] {
         let mut copies = Vec::new();
-        for threads in [1, 2, 4] {
+        for threads in [1, 2, 4, 8] {
             let path = dir.path().join(format!("copy-{threads}.ferro"));
             fs::copy(&source, &path).unwrap();
             let db: Db<Root> = options(threads).open(&path).unwrap();
             let want = dump(&db.read());
             let report = db.compact(keep).unwrap();
             assert!(report.after_bytes > 512 << 10, "{report:?}");
+            assert_eq!(
+                report.handed_out > 10,
+                threads > 1,
+                "{threads} threads: {report:?}"
+            );
+            let again = db.compact(keep).unwrap();
+            assert_eq!(
+                again.handed_out > 10,
+                threads > 1,
+                "{threads} threads: {again:?}"
+            );
             assert_eq!(dump(&db.read()), want);
             db.verify().unwrap();
             drop(db);
@@ -238,7 +249,7 @@ fn a_small_cycle_verifies_on_the_calling_thread_and_a_large_one_on_more() {
     };
     let small = dir.path().join("small.ferro");
     build(&small, 40, 20, 100);
-    let db: Db<Root> = options(4)
+    let db: Db<Root> = options(0)
         .hook(ferro::db::Hook(std::sync::Arc::new(hook.clone())))
         .open(&small)
         .unwrap();

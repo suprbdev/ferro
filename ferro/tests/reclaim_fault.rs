@@ -36,6 +36,8 @@ static SYNC_RELEASED: AtomicBool = AtomicBool::new(false);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 static COPY_SLOW: AtomicBool = AtomicBool::new(false);
+static COPY_WRITES: AtomicI64 = AtomicI64::new(0);
+static COPY_FAILS: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
@@ -119,13 +121,19 @@ pub extern "C" fn fsync(fd: c_int) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: i64) -> isize {
-    if count > SPLIT && WRITES_FAIL.with(Cell::get) {
+    let copying = std::thread::current().name() == Some("ferro-copy");
+    if count > SPLIT
+        && (WRITES_FAIL.with(Cell::get) || copying && COPY_FAILS.load(Ordering::SeqCst))
+    {
         // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
         // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = ENOSPC };
         return -1;
     }
     if count > SPLIT && COPY_SLOW.load(Ordering::SeqCst) {
+        if copying {
+            COPY_WRITES.fetch_add(1, Ordering::SeqCst);
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
@@ -205,6 +213,7 @@ fn running_out_of_space_during_the_copy_fails_the_cycle_and_commits_continue() {
     let hook = |name: &'static str| {
         if name == "created" {
             WRITES_FAIL.with(|fail| fail.set(true));
+            COPY_FAILS.store(true, Ordering::SeqCst);
         }
     };
     let db: Db<Root> = options().hook(Hook(Arc::new(hook))).open(&path).unwrap();
@@ -212,6 +221,7 @@ fn running_out_of_space_during_the_copy_fails_the_cycle_and_commits_continue() {
     let size = db.size_on_disk();
     let outcome = db.compact(Keep::Last(1));
     WRITES_FAIL.with(|fail| fail.set(false));
+    COPY_FAILS.store(false, Ordering::SeqCst);
     assert!(matches!(outcome, Err(Error::Io(_))), "{outcome:?}");
     assert!(no_temp(&path));
     assert!(db.space().unwrap().last_error.is_some());
@@ -561,6 +571,7 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     }
     #[cfg(target_os = "linux")]
     assert_eq!(verifying_threads(), 3);
+    assert!(COPY_WRITES.load(Ordering::SeqCst) > 0);
     drop(db);
     COPY_SLOW.store(false, Ordering::SeqCst);
     assert_eq!(created.load(Ordering::SeqCst), 1);

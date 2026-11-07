@@ -344,8 +344,46 @@ impl Scratch {
     }
 }
 
+/// The bytes of records the copy's threads hold at once, as read or as written, past which a
+/// thread waits for others to finish, unless it would hold them alone.
+const BUDGET: u64 = 16 << 20;
+
+#[derive(Default)]
+struct Budget {
+    used: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl Budget {
+    fn take(&self, bytes: u64) -> Taken<'_> {
+        let mut used = self.used.lock();
+        while *used > 0 && used.saturating_add(bytes) > BUDGET {
+            self.freed.wait(&mut used);
+        }
+        *used += bytes;
+        Taken {
+            budget: self,
+            bytes,
+        }
+    }
+}
+
+struct Taken<'a> {
+    budget: &'a Budget,
+    bytes: u64,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock();
+        *used -= self.bytes;
+        self.budget.freed.notify_all();
+    }
+}
+
 struct Shared {
     source: Store,
+    budget: Budget,
     file: Arc<Traced>,
     claims: Claims,
     dispatched: Mutex<VecDeque<Arc<Unit>>>,
@@ -362,19 +400,36 @@ struct Shared {
 
 impl Shared {
     fn read(&self, ptr: Ptr, taint: &HashSet<Hash, ByHash>, s: &mut Scratch) -> Option<Node> {
+        let mut taken = None;
+        let node = self.fetch(ptr, taint, s, &mut taken);
+        if s.bytes.capacity() > KEEP_BYTES {
+            s.bytes = Vec::new();
+        }
+        drop(taken);
+        node
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        ptr: Ptr,
+        taint: &HashSet<Hash, ByHash>,
+        s: &mut Scratch,
+        taken: &mut Option<Taken<'a>>,
+    ) -> Option<Node> {
         if ptr.offset == 0 {
             return None;
         }
         let mut links = s.spare.pop().unwrap_or_default();
+        let claims = |claim: usize| {
+            *taken = Some(self.budget.take(claim as u64));
+            Ok(())
+        };
         let (record, stored) = self
             .source
-            .read_stored(ptr, &mut s.bytes, &mut links, |_| Ok(()))
+            .read_stored(ptr, &mut s.bytes, &mut links, claims)
             .ok()?;
         verify_stored(record, ptr, &mut s.unpacked).ok()?;
         let len = u32::try_from(stored.len).ok()?;
-        if s.bytes.capacity() > KEEP_BYTES {
-            s.bytes = Vec::new();
-        }
         if links
             .iter()
             .any(|link| link.offset == 0 || taint.contains(&link.hash))
@@ -597,6 +652,19 @@ impl Shared {
     }
 
     fn write(&self, job: &Job, s: &mut Scratch) -> Result<()> {
+        let taken = self.budget.take(job.len.saturating_mul(2));
+        let written = self.write_job(job, s);
+        if s.out.capacity() > 2 * KEEP_BYTES {
+            s.out = Vec::new();
+        }
+        if s.bytes.capacity() > KEEP_BYTES {
+            s.bytes = Vec::new();
+        }
+        drop(taken);
+        written
+    }
+
+    fn write_job(&self, job: &Job, s: &mut Scratch) -> Result<()> {
         s.out.clear();
         s.out.reserve(job.len as usize);
         for (unit, range) in &job.parts {
@@ -658,12 +726,6 @@ impl Shared {
             let _writing = self.writing.lock();
             self.file.write_all_at(&s.out, job.start)?;
             start_writeback(&self.file, job.start, job.len);
-        }
-        if s.out.capacity() > 2 * KEEP_BYTES {
-            s.out = Vec::new();
-        }
-        if s.bytes.capacity() > KEEP_BYTES {
-            s.bytes = Vec::new();
         }
         Ok(())
     }
@@ -777,6 +839,7 @@ impl Units {
         Units {
             shared: Arc::new(Shared {
                 source,
+                budget: Budget::default(),
                 file,
                 claims: Claims::new(),
                 dispatched: Mutex::default(),
@@ -811,6 +874,11 @@ impl Units {
     /// The number of units dispatched since the walk last settled them all.
     pub(super) fn outstanding(&self) -> usize {
         self.outstanding
+    }
+
+    /// The number of units dispatched since the copy began.
+    pub(super) fn handed_out(&self) -> u64 {
+        u64::from(self.index)
     }
 
     /// The number of dispatched units not yet placed.

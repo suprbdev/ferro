@@ -764,6 +764,31 @@ fn a_tree_that_links_another_record_of_a_log_entry_with_a_null_link_fails_as_ver
 }
 
 #[test]
+fn a_tree_that_links_a_log_entry_copies_to_the_same_bytes_at_any_thread_count() {
+    for linked in [Linked::Itself, Linked::Again] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("linked.ferro");
+        entry_linked_from_a_tree(&source, linked);
+        {
+            let db: Db<Opaque> = Options::new().copy_threads(1).open(&source).unwrap();
+            db.commit_with(|_| ("real", ())).unwrap();
+        }
+        let mut files = Vec::new();
+        for threads in [1, 4, 8] {
+            let path = dir.path().join(format!("{threads}.ferro"));
+            fs::copy(&source, &path).unwrap();
+            let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+            let report = db.compact(Keep::All).unwrap();
+            drop(db);
+            admin::verify(&path).unwrap();
+            assert_eq!(report.handed_out > 0, threads > 1, "{threads} threads");
+            files.push(fs::read(&path).unwrap());
+        }
+        assert!(files.iter().all(|file| *file == files[0]));
+    }
+}
+
+#[test]
 fn a_tree_that_links_the_record_a_chain_reads_shares_its_copy() {
     for threads in [1, 4] {
         for keep in [Keep::All, Keep::Last(2)] {

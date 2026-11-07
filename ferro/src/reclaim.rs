@@ -86,6 +86,8 @@ pub struct Compacted {
     pub passes: u32,
     /// How long writers waited for the last pass and the swap.
     pub pause: Duration,
+    /// The number of trees the cycle handed to its other threads to copy, 0 on one thread.
+    pub handed_out: u64,
 }
 
 /// How a database file's size compares with what it holds, from [`Db::space`](crate::Db::space)
@@ -662,6 +664,16 @@ impl CopySink<'_> {
 
     fn emit(&mut self, from: Ptr, staged: Staged<'_>, below: Option<Below>) -> Result<Ptr> {
         self.flush()?;
+        let copied = match below {
+            Some(_) => self.records.get(&from.offset).map(|offset| Ptr {
+                hash: from.hash,
+                offset: *offset,
+            }),
+            None => self.object(from.hash),
+        };
+        if let Some(copied) = copied {
+            return Ok(copied);
+        }
         let (hash, offset) = (from.hash, self.end);
         let before = self.buf.len();
         append_staged(&mut self.buf, offset, staged);
@@ -950,12 +962,10 @@ impl CopySink<'_> {
                 units.taint(taint);
             }
         }
-        let check = (self.units.as_ref().map_or(0, Units::outstanding)).is_multiple_of(AHEAD / 4);
-        if check
-            && self
-                .units
-                .as_ref()
-                .is_some_and(|units| units.unplaced() >= AHEAD as u64)
+        if self
+            .units
+            .as_ref()
+            .is_some_and(|units| units.unplaced() >= AHEAD as u64)
         {
             self.settle(AHEAD / 2)?;
         }
@@ -992,6 +1002,18 @@ impl CopySink<'_> {
         self.units.is_some() && self.fallback.is_none()
     }
 
+    fn hands_out(&self, pending: &Pending) -> bool {
+        pending.entry.is_none()
+            && !pending.held.old.iter().any(|link| {
+                link.offset == 0
+                    || self.pruned.contains(&link.hash)
+                    || self
+                        .copied
+                        .get(&link.hash)
+                        .is_some_and(|copied| copied.is_entry())
+            })
+    }
+
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
         let unit = self.dispatches();
         if !unit {
@@ -1000,12 +1022,15 @@ impl CopySink<'_> {
         let linked = self.linked(root);
         let entry = match linked.map_err(|error| self.first(error))? {
             Link::Copied(done) => return Ok(done),
-            Link::Object if unit => return self.dispatch(root),
             Link::Entry => true,
             Link::Object => false,
         };
         let mut stack = match self.read(root, entry)? {
             Step::Done(done) => return Ok(done),
+            Step::Descend(pending) if unit && self.hands_out(&pending) => {
+                self.recycle(pending.held);
+                return self.dispatch(root);
+            }
             Step::Descend(pending) => vec![pending],
         };
         loop {
@@ -1013,6 +1038,7 @@ impl CopySink<'_> {
             if top.next < top.held.old.len() {
                 let link = top.held.old[top.next];
                 let unit = self.dispatches();
+                let rooted = top.entry.is_some();
                 let linked = match top.entry {
                     Some(rungs) if rungs.skip == Some(top.next) => {
                         Link::parent(self.skipped(&top.held.links, rungs, link))
@@ -1028,9 +1054,13 @@ impl CopySink<'_> {
                 };
                 let done = match linked {
                     Link::Copied(done) => done,
-                    Link::Object if unit => self.dispatch(link)?,
+                    Link::Object if unit && rooted => self.dispatch(link)?,
                     reached => match self.read(link, matches!(reached, Link::Entry))? {
                         Step::Done(done) => done,
+                        Step::Descend(pending) if unit && self.hands_out(&pending) => {
+                            self.recycle(pending.held);
+                            self.dispatch(link)?
+                        }
                         Step::Descend(pending) => {
                             stack.push(pending);
                             continue;
@@ -1127,7 +1157,8 @@ impl<'a> Copier<'a> {
         file.created();
         file.set_len(LOG_START)?;
         let threads = copy_threads(options);
-        let spawn = match store.size() >= LOG_START + BATCH_BYTES as u64 {
+        let large = store.size() >= LOG_START + BATCH_BYTES as u64;
+        let spawn = match large || options.copy_threads > 1 {
             true => threads,
             false => 1,
         };
@@ -1231,6 +1262,11 @@ impl<'a> Copier<'a> {
         self.sink.verifier.settle()?;
         self.sink.drain()?;
         Ok(self.sink.end - before)
+    }
+
+    /// The number of trees handed to the copy's other threads so far.
+    pub(crate) fn handed_out(&self) -> u64 {
+        self.sink.units.as_ref().map_or(0, Units::handed_out)
     }
 
     /// The size the copy has reached, in bytes.
