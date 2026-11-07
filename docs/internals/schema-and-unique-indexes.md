@@ -27,9 +27,18 @@ channel, and the two ways of carrying on are both wrong: last writer wins delete
 named, and overwriting the index leaves a row that `by_x` cannot find. So `try_insert` and
 `try_update` return `Taken { index, holder }` and leave the table as it was, and `insert`, `update`
 and dropping a `RowMut` panic before changing anything. Inside a commit that discards the
-transaction, which is the honest result when a constraint the schema states does not hold. A
-`RowMut` dropped while its thread is already panicking keeps the old row, since a second panic would
-abort the process. A row may replace itself, and a row changing key may keep the value it holds.
+transaction, which is the honest result when a constraint the schema states does not hold. A row may
+replace itself, and a row changing key may keep the value it holds.
+
+A panic in the closure `update` runs, or while a `RowMut` is held, writes nothing back, so the table
+keeps the old row and its index entries rather than a row changed half way. `update` runs the
+closure on a copy and writes it only once the closure returns, as `try_update` does, and a
+`RowMut` notes whether its thread was panicking when it was made and drops the copy if a panic has
+started since. A `RowMut` made during unwinding, in a `Drop`, writes its row as usual, except that
+a clash keeps the old row, since a second panic would abort the process. Measured on 2026-11-07 on
+a table of 1,000 rows with one index, an `update` that leaves the index entry alone took 119 ns
+against 125 ns when it went through a `RowMut`, one that moves the entry 373 ns against 370 ns, and
+a change through `get_mut` 127 ns either way.
 
 `Table::merge` treats a clash as data, not a bug, and calls `resolve` once at most for each key. An
 answer is the row for that key: `None` removes it, and a row with another key keeps our row. The

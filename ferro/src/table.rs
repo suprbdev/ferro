@@ -494,7 +494,8 @@ impl<T: Record> Table<T> {
     /// A copy of the row with primary key `key` to change in place, written back with its
     /// indexes when the [`RowMut`] drops.
     ///
-    /// Changing the key field moves the row to the new key, replacing any row already there.
+    /// Changing the key field moves the row to the new key, replacing any row already there. A panic
+    /// while the [`RowMut`] is held writes nothing back.
     ///
     /// # Panics
     ///
@@ -512,6 +513,7 @@ impl<T: Record> Table<T> {
             table: self,
             old,
             row: Some(row),
+            made_panicking: std::thread::panicking(),
         })
     }
 
@@ -523,16 +525,16 @@ impl<T: Record> Table<T> {
     ///
     /// # Panics
     ///
-    /// Panics, leaving the table as it was, if the changed row clashes in a unique index. Inside
-    /// a commit that discards the transaction. Use [`try_update`](Table::try_update) to get the
-    /// clash as a [`Taken`] instead.
+    /// If `f` panics, the panic carries on and the table keeps the row as it was, whatever `f`
+    /// changed before it. Panics, leaving the table as it was, if the changed row clashes in a
+    /// unique index. Inside a commit that discards the transaction. Use
+    /// [`try_update`](Table::try_update) to get the clash as a [`Taken`] instead.
     pub fn update<Q, R>(&mut self, key: &Q, f: impl FnOnce(&mut T) -> R) -> Option<R>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut row = self.get_mut(key)?;
-        Some(f(&mut row))
+        self.try_update(key, f).unwrap_or_else(|taken| clash(taken))
     }
 
     /// Runs `f` on the row with primary key `key` and writes it back with its indexes, as
@@ -843,6 +845,10 @@ impl<T: Record> Pending<T> {
 /// index the change touched. A changed key field moves the row to the new key, replacing any row
 /// already there.
 ///
+/// A panic that starts while it is held drops it without writing anything, so the table keeps the
+/// old row rather than one changed half way. One made while its thread was already panicking,
+/// inside a `Drop` that runs during unwinding, writes the row back as usual.
+///
 /// # Panics
 ///
 /// Dropping it panics, and leaves the table as it was, if the changed row clashes in a unique
@@ -852,6 +858,7 @@ pub struct RowMut<'a, T: Record> {
     table: &'a mut Table<T>,
     old: Val<T>,
     row: Option<T>,
+    made_panicking: bool,
 }
 
 impl<T: Record> Deref for RowMut<'_, T> {
@@ -873,9 +880,13 @@ impl<T: Record> Drop for RowMut<'_, T> {
         let Some(row) = self.row.take() else {
             return;
         };
+        let panicking = std::thread::panicking();
+        if panicking && !self.made_panicking {
+            return;
+        }
         match self.table.0.conflict(&row, Some(&self.old.key())) {
             None => self.table.replace(&self.old, row),
-            Some(_) if std::thread::panicking() => {}
+            Some(_) if panicking => {}
             Some(taken) => clash(taken),
         }
     }

@@ -389,9 +389,6 @@ fn run(ops: Vec<Op>) {
                     })
                 }));
                 assert_eq!(result.is_err(), model.contains_key(&id));
-                if let Some(row) = model.get_mut(&id) {
-                    set_fields(row, &f);
-                }
             }
             Op::Forget(id, f) => {
                 if let Some(mut row) = table.get_mut(&id) {
@@ -510,6 +507,63 @@ fn panic_inside_db_update_discards_the_whole_transaction() {
     })
     .unwrap();
     assert_eq!(db.read().rows.by_n(&1).len(), 2);
+}
+
+struct BumpOnDrop<'a>(&'a mut Table<Row>);
+
+impl Drop for BumpOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.update(&1, |row| row.n = 7);
+    }
+}
+
+#[test]
+fn a_panic_while_a_row_is_changed_keeps_the_old_row() {
+    quiet();
+    let row = |id, n, tag: &str| Row {
+        id,
+        n,
+        opt: Some("a".into()),
+        tags: vec![tag.into()],
+    };
+    let mut t = Table::<Row>::new();
+    t.insert(row(1, 1, "x"));
+    t.insert(row(2, 2, "y"));
+    let mut model = BTreeMap::new();
+    model.insert(1, row(1, 1, "x"));
+    model.insert(2, row(2, 2, "y"));
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        t.update(&1, |r| {
+            r.n = 9;
+            r.tags = vec!["z".into()];
+            panic!("boom");
+        });
+    }));
+    assert!(outcome.is_err());
+    check(&t, &model);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        t.update(&1, |r| {
+            r.id = 2;
+            panic!("boom");
+        });
+    }));
+    assert!(outcome.is_err());
+    check(&t, &model);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut held = t.get_mut(&2).unwrap();
+        held.opt = None;
+        held.n = 5;
+        panic!("boom");
+    }));
+    assert!(outcome.is_err());
+    check(&t, &model);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _bump = BumpOnDrop(&mut t);
+        panic!("boom");
+    }));
+    assert!(outcome.is_err());
+    model.insert(1, row(1, 7, "x"));
+    check(&t, &model);
 }
 
 #[test]

@@ -28,7 +28,8 @@ let total = shop
 
 A closure that can fail returns a `Result`, and `update(..).ok_or(..)??` passes either error on.
 Inside a commit, returning that error discards the half-changed row with the rest of the
-transaction. `Map::update` works the same way on a value.
+transaction. A panic in `f`, or while a `RowMut` is held, writes nothing back, so the table keeps
+the row as it was. `Map::update` works the same way on a value.
 
 ## Secondary indexes
 
