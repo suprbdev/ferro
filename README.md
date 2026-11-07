@@ -16,8 +16,9 @@ ferro is an experiment, not a production database. Its file format is not stable
   O(1), `==` compares root hashes in O(1), and `diff` costs O(changes).
 - **Indexes without a query planner.** `#[derive(Record)]` keeps secondary, composite and unique
   indexes on a `Table` up to date and generates their lookups. `find()` combines equality lookups
-  with `and` and `or` by key, and a covering index stores chosen fields beside its entries, so a
-  page of results reads no rows.
+  with `and` and `or` by key, with ranges and with lookups of another table or version of the same
+  rows, and a covering index stores chosen fields beside its entries, so a page of results reads no
+  rows.
 - **Range totals in O(log n).** A `Summary` keeps a fold of every subtree of a map.
 - **History.** `at`, `as_of`, `history_of`, `bisect` and `diff` read old versions, and `restore`
   commits one again as a new version.

@@ -12,8 +12,9 @@ the struct:
 
 Do not change the encoding or `Ord` of a key type on existing data. Tree placement depends on both.
 
-A field marked `#[ferro(skip)]` is not stored and reads back as its `Default`. A `Summary` must not
-depend on one, as described under [Summaries](../internals/summaries.md#how-a-summary-is-kept).
+A field marked `#[ferro(skip)]` is not stored and reads back as its `Default`. The `Record` derive
+refuses an index of any kind on one, alone or in a composite, and a `Summary` must not depend on
+one, as described under [Summaries](../internals/summaries.md#how-a-summary-is-kept).
 Changing a summary type `S` changes a map's encoding under the same field tag, as changing `V` does,
 so rename the field to rebuild it.
 
