@@ -118,7 +118,9 @@ pub(crate) fn disagreement(
         (None, None) => None,
     };
     let consistent = if known {
-        own.generation == parents + 1 && own.reach == reach && own.bounded == bounded
+        Some(own.generation) == parents.checked_add(1)
+            && own.reach == reach
+            && own.bounded == bounded
     } else {
         own.generation > parents && own.reach >= reach && (own.bounded || !bounded)
     };
