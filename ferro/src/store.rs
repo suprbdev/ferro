@@ -1322,7 +1322,8 @@ impl RecordReader<'_> {
         Ok(())
     }
 
-    /// Reads a varint, failing with `Error::Corrupt` on one that does not fit a `u64`.
+    /// Reads a varint, failing with `Error::Corrupt` on one that does not fit a `u64` or that takes
+    /// more bytes than its value needs.
     fn varint(&mut self) -> Result<u64> {
         let mut value = 0u64;
         for index in 0..MAX_VARINT {
@@ -1334,6 +1335,12 @@ impl RecordReader<'_> {
             }
             value |= u64::from(byte & 0x7f) << (7 * index);
             if byte & 0x80 == 0 {
+                if byte == 0 && index > 0 {
+                    return Err(Error::Corrupt(format!(
+                        "overlong varint in record at {}",
+                        self.start
+                    )));
+                }
                 return Ok(value);
             }
         }
@@ -1454,8 +1461,8 @@ pub(crate) fn body_of<'a>(
     Ok(out)
 }
 
-/// Reads a varint at `pos` in `bytes`, or `None` if it runs past them or is too long for this
-/// quick path.
+/// Reads a varint at `pos` in `bytes`, or `None` if it runs past them, is too long for this quick
+/// path, or takes more bytes than its value needs.
 fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for index in 0..MAX_VARINT - 1 {
@@ -1463,7 +1470,7 @@ fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
         *pos += 1;
         value |= u64::from(byte & 0x7f) << (7 * index);
         if byte & 0x80 == 0 {
-            return Some(value);
+            return (byte != 0 || index == 0).then_some(value);
         }
     }
     None

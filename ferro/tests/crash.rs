@@ -911,6 +911,44 @@ fn flipped_log_bytes_never_read_back_as_wrong_data() {
 }
 
 #[test]
+fn a_record_read_on_into_the_byte_after_it_is_reported() {
+    let built = build(5, 3);
+    let path = built.target();
+    fs::write(&path, &built.bytes).unwrap();
+    let ranges = reachable(&path);
+    let live = |at: usize| {
+        ranges
+            .iter()
+            .any(|(start, end, _)| (*start..*end).contains(&at))
+    };
+    let opens_whole = |image: &[u8]| {
+        fs::write(&path, image).unwrap();
+        fast()
+            .open::<Root>(&path)
+            .and_then(|db| db.verify().map(|_| ()))
+    };
+    let mut checked = 0;
+    for (start, end, links) in &ranges {
+        if links.is_empty() || *end == built.bytes.len() || live(*end) {
+            continue;
+        }
+        let mut image = built.bytes.clone();
+        image[*end] = 0;
+        if opens_whole(&image).is_err() {
+            continue;
+        }
+        image[end - 1] ^= 0x80;
+        assert!(
+            opens_whole(&image).is_err(),
+            "FERRO_TEST_CLOCK={} record {start}..{end}: an overlong last link was read",
+            built.clock
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no record ends before a dead byte");
+}
+
+#[test]
 fn every_live_byte_flip_is_reported_by_verify() {
     quiet_ferro_panics();
     let built = build(4, 3);
@@ -957,8 +995,8 @@ fn zigzag_len(offset: u64, target: u64) -> usize {
     len
 }
 
-fn padded_zigzag(offset: u64, target: u64, len: usize) -> Option<Vec<u8>> {
-    if zigzag_len(offset, target) > len {
+fn zigzag_of_len(offset: u64, target: u64, len: usize) -> Option<Vec<u8>> {
+    if zigzag_len(offset, target) != len {
         return None;
     }
     let delta = offset.wrapping_sub(target) as i64;
@@ -990,7 +1028,7 @@ fn redirect_sibling_link(path: &Path) -> usize {
     let mut position = end - lens.iter().sum::<usize>();
     for index in 0..links.len() - 1 {
         let delta_len = lens[index] - HASH_BYTES;
-        if let Some(patch) = padded_zigzag(*start as u64, links[index + 1].offset, delta_len)
+        if let Some(patch) = zigzag_of_len(*start as u64, links[index + 1].offset, delta_len)
             && links[index + 1].offset != links[index].offset
         {
             let delta_at = position + HASH_BYTES;
