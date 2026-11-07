@@ -3131,6 +3131,8 @@ impl Store {
             reaches(&at, &named)?;
         }
         if holds && left {
+            copied.clear();
+            inner.followed.store(None);
             let end = at.log_end;
             let cut = inner.file.set_len(end).and_then(|()| inner.file.sync_all());
             if let Err(error) = cut {
