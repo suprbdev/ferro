@@ -172,6 +172,18 @@ cores: 390,000 executions, 53 a second on each core, reaching 7,980 to 7,995 edg
 inputs. No compaction of a file that passed `verify` failed it, and no input crashed, hung or passed
 a memory limit.
 
+A later `reclaim` round, run for #89, found a file that passed `verify` and compacted under
+`Keep::All` into one that failed it with `commit log keeps versions from 1 but v50 links pruned
+history` (#90). v50's skip link named v50's own record under a hash of zeroes. `verify` and the
+copy checked only that a kept skip link's offset was not 0, the walk of roots dropped the link as
+an entry it had seen by its offset, and the copy took the unknown hash for pruned history and wrote
+the link as a tombstone. A background cycle that kept the first version did the same. The walk of
+a chain now checks each kept skip link's hash against the entry it reaches at that version, so
+`verify`, `verify_typed`, a cycle and `compact` all refuse such a file with `v50 skips to another
+entry than v48` and leave it as it is. `ferro/tests/fuzzed.rs` keeps the input, and builds the two
+shapes it stands for: a link with the right offset and a wrong hash, and one that names an intact
+record of another v4, which reads had answered with the wrong commit.
+
 The round after the frame table, format 4, with the judgement of [Torn and damaged
 frames](storage.md#torn-and-damaged-frames), rebuilt the seeds, 656 of them for `open`, and
 rewrote a copy of the 15,457 `open` inputs saved before into format 4, as the fixtures were, so

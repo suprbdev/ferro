@@ -524,6 +524,105 @@ fn compacting_a_tree_that_links_a_pruned_log_entry_fails() {
     }
 }
 
+#[test]
+fn a_skip_link_to_another_entry_fails_verify_and_compacting_keeps_the_file() {
+    let skips = |outcome: &ferro::Result<_>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message.contains("v50 skips to another entry than v48"))
+    };
+    for threads in [1, 4] {
+        let (_dir, path) = fixture("compact-skip-link");
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(skips(&outcome), "{threads} threads: {outcome:?}");
+        let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+        let outcome = db.verify().map(|_| ());
+        assert!(skips(&outcome), "{threads} threads: {outcome:?}");
+        let outcome = db.compact(Keep::All).map(|_| ());
+        assert!(skips(&outcome), "{threads} threads: {outcome:?}");
+        drop(db);
+        let outcome = admin::verify(&path).map(|_| ());
+        assert!(skips(&outcome), "{threads} threads: {outcome:?}");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Skip {
+    Honest,
+    WrongHash,
+    OtherRecord,
+}
+
+fn skipping_file(path: &Path, skip: Skip) {
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let mut ptrs: Vec<Ptr> = Vec::new();
+    for version in 1..=5 {
+        let ptr = Entry {
+            version,
+            time_ms: 100 * version,
+            prev: ptrs.last().copied(),
+            ..Entry::default()
+        }
+        .write(&mut txn);
+        ptrs.push(ptr);
+    }
+    let other = Entry {
+        version: 4,
+        time_ms: 401,
+        prev: Some(ptrs[2]),
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let target = match skip {
+        Skip::Honest => ptrs[3],
+        Skip::WrongHash => Ptr {
+            hash: [0; ferro::codec::HASH_BYTES],
+            offset: ptrs[4].offset,
+        },
+        Skip::OtherRecord => other,
+    };
+    let six = Entry {
+        version: 6,
+        time_ms: 600,
+        prev: Some(ptrs[4]),
+        skip: Some(target),
+        ..Entry::default()
+    }
+    .write(&mut txn);
+    let head = write_refs(&mut txn, 6, six);
+    txn.commit(head).unwrap();
+    store.close();
+}
+
+#[test]
+fn a_skip_link_that_names_another_entry_than_its_version_fails_verify_and_compaction() {
+    for skip in [Skip::Honest, Skip::WrongHash, Skip::OtherRecord] {
+        for (keep, kept) in [
+            (Keep::All, true),
+            (Keep::Last(3), true),
+            (Keep::Last(2), false),
+        ] {
+            for threads in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("skip.ferro");
+                skipping_file(&path, skip);
+                let honest = matches!(skip, Skip::Honest);
+                let case = format!("{skip:?} {keep:?} {threads} threads");
+                assert_eq!(admin::verify(&path).is_ok(), honest, "{case}");
+                let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
+                let outcome = db.compact(keep);
+                assert_eq!(outcome.is_ok(), honest || !kept, "{case}: {outcome:?}");
+                drop(db);
+                assert_eq!(
+                    admin::verify(&path).is_ok(),
+                    honest || !kept,
+                    "{case}: the file after"
+                );
+            }
+        }
+    }
+}
+
 fn write_refs(txn: &mut Txn, version: u64, tip: Ptr) -> Ptr {
     let mut refs: Map<String, Head> = Map::new();
     refs.insert(

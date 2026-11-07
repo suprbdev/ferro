@@ -704,8 +704,9 @@ impl Chain {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if the versions do not descend or an entry links pruned history it
-    /// needs, and the first error from `each`.
+    /// [`Error::Corrupt`] if the versions do not descend, an entry links pruned history it
+    /// needs, or a kept skip link names another entry than the one the chain reaches at that
+    /// version, by hash, and the first error from `each`.
     pub(crate) fn visit(
         &self,
         store: &Store,
@@ -713,6 +714,7 @@ impl Chain {
     ) -> Result<()> {
         let mut next = self.tip;
         let mut above = u64::MAX;
+        let mut skips: Vec<(u64, u64, Hash)> = Vec::new();
         while let Some(ptr) = next {
             let (object, len) = store.read_record(ptr)?;
             let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
@@ -721,10 +723,20 @@ impl Chain {
                 return Err(corrupt("versions do not descend"));
             }
             above = at;
+            if let Some(&(from, _, _)) = skips
+                .iter()
+                .find(|&&(_, to, hash)| to == at && hash != ptr.hash)
+            {
+                return Err(corrupt(&format!(
+                    "v{from} skips to another entry than v{at}"
+                )));
+            }
+            skips.retain(|&(_, to, _)| to < at);
             if !each(ptr, &entry, &object, len)? {
                 break;
             }
             let skip = entry.skip.filter(|_| skip_version(at) >= self.first);
+            skips.extend(skip.map(|skip| (at, skip_version(at), skip.hash)));
             next = match entry.prev {
                 _ if at <= self.first => None,
                 Some(prev) if prev.offset != 0 && skip.is_none_or(|skip| skip.offset != 0) => {
