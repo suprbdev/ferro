@@ -201,7 +201,11 @@ shape on a chain of six versions, where the copy cut the skip link as it did her
 a merge brought in, where `verify` passed the same damage and the copy kept it. The round also
 stopped once in the harness: copying the image failed with `Interrupted` on the loaded machine,
 since `fs::copy` returns the `EINTR` of `copy_file_range` rather than trying again, so the target
-now tries again.
+now tries again. With both changes `reclaim` ran 10 minutes as 16 forked jobs on 16 cores, from a
+copy of its 7,756 saved inputs, while another campaign held the machine's other cores. Loading
+them took 260 seconds and reached 10,166 edges, and the run made 571,653 executions in all,
+ending at 10,177 edges and adding 104 inputs. No compaction of a file that passed `verify` failed
+it, and no input crashed, hung or passed a memory limit.
 
 The round after the frame table, format 4, with the judgement of [Torn and damaged
 frames](storage.md#torn-and-damaged-frames), rebuilt the seeds, 656 of them for `open`, and
