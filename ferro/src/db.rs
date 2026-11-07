@@ -4420,6 +4420,8 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
+    /// - [`Error::ForeignHandle`] if `other` is a handle on another open database, before `f`
+    ///   runs.
     /// - [`Error::NoCommonAncestor`] when the base could lie in pruned history.
     /// - [`Error::NoBranch`] if either branch was dropped.
     /// - The errors of [`Db::commit`].
@@ -4486,6 +4488,7 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
+        self.same_file(other)?;
         self.alone(Some(&other.branch), |tip, ours, root| {
             let (theirs, published) = other.published_view()?;
             let store = self.shared.store();
@@ -4518,6 +4521,7 @@ impl<T: Data> Db<T> {
         other: &Db<T>,
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
+        self.same_file(other)?;
         let from = Some(&*other.branch);
         let done = self.alone::<std::result::Result<R, u64>, E>(from, |tip, ours, root| {
             let (theirs, published) = other.published_view()?;
@@ -4620,7 +4624,9 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoCommonAncestor`] when the answer could lie in pruned history, and read errors.
+    /// - [`Error::ForeignHandle`] if `other` is a handle on another open database.
+    /// - [`Error::NoBranch`] if either branch was dropped.
+    /// - [`Error::NoCommonAncestor`] when the answer could lie in pruned history, and read errors.
     ///
     /// # Examples
     ///
@@ -4670,8 +4676,11 @@ impl<T: Data> Db<T> {
     }
 
     fn common_starts(&self, other: &Db<T>) -> Result<Vec<Start>> {
+        self.same_file(other)?;
         let (refs, store, ours, theirs) = {
             let published = self.shared.published.lock();
+            self.branch.check_live()?;
+            other.branch.check_live()?;
             let states = (
                 self.branch.state.load_full(),
                 other.branch.state.load_full(),
@@ -4688,6 +4697,13 @@ impl<T: Data> Db<T> {
             (&self.branch.name, &ours, &refs),
             (&other.branch.name, &theirs, &refs),
         )
+    }
+
+    fn same_file(&self, other: &Db<T>) -> Result<()> {
+        match Arc::ptr_eq(&self.shared, &other.shared) {
+            true => Ok(()),
+            false => Err(Error::ForeignHandle),
+        }
     }
 
     fn published_view(&self) -> Result<(Arc<State<T>>, Refs)> {
@@ -4716,7 +4732,7 @@ impl<T: Data> Db<T> {
                 });
             }
             let Some(head) = refs.try_get(name)? else {
-                return Ok(starts);
+                return Err(Error::NoBranch(name.to_string()));
             };
             for (other, seen) in head.merged.try_entries()? {
                 let Some(found) = refs.try_get(&other)? else {

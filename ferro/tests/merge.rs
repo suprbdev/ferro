@@ -5,7 +5,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use ferro::db::Hook;
-use ferro::{Commit, Conflict, Data, Db, Durability, Error, Map, Options, Record, Snapshot, Table};
+use ferro::{
+    Commit, Conflict, Data, Db, Durability, Error, Map, Options, Outcome, Record, Snapshot, Table,
+};
 use tempfile::TempDir;
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
@@ -692,4 +694,83 @@ fn a_merge_waits_for_the_other_branch_to_be_published_with_its_merge_records() {
         merge_beside_a_commit_being_published(durability, true);
         merge_beside_a_commit_being_published(durability, false);
     }
+}
+
+fn messages(found: ferro::Result<Vec<Snapshot<Events>>>) -> ferro::Result<Vec<String>> {
+    Ok(found?.iter().map(|s| s.commit().message.clone()).collect())
+}
+
+#[test]
+fn branch_pairs_refuse_a_handle_on_another_open_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Events> = Db::open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Events> = Db::open(dir.path().join("b.ferro")).unwrap();
+    let c: Db<Events> = Db::open(dir.path().join("c.ferro")).unwrap();
+    event(&c, "c1", 1);
+    event(&b, "b1", 2);
+    let pulled = a.pull(&c, "c", add).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let reader: Db<Events> = Options::new()
+        .read_only(true)
+        .open(dir.path().join("a.ferro"))
+        .unwrap();
+    for (ours, theirs) in [(&a, &b), (&b, &a), (&a, &reader), (&reader, &a)] {
+        assert!(matches!(
+            ours.common_ancestor(theirs),
+            Err(Error::ForeignHandle)
+        ));
+        assert!(matches!(
+            messages(ours.common_ancestors(theirs)),
+            Err(Error::ForeignHandle)
+        ));
+    }
+    let d = a.fork("d").unwrap();
+    assert_eq!(messages(a.common_ancestors(&d)).unwrap(), ["c1"]);
+
+    let mut runs = 0;
+    let merged = b.merge_with(&a, |root, base, theirs| {
+        runs += 1;
+        add(root, base, theirs)
+    });
+    assert!(matches!(merged, Err(Error::ForeignHandle)));
+    let tried = b.try_merge_with(&a, |_, _, _| {
+        runs += 1;
+        Ok::<_, Error>(("never", ()))
+    });
+    assert!(matches!(tried, Err(Error::ForeignHandle)));
+    assert_eq!(runs, 0);
+    assert_eq!((b.version(), events(&b)), (1, BTreeMap::from([(2, 1)])));
+    b.verify().unwrap();
+}
+
+#[test]
+fn branch_pairs_refuse_a_dropped_branch_even_once_its_name_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let main: Db<Events> = Db::open(dir.path().join("m.ferro")).unwrap();
+    let remote: Db<Events> = Db::open(dir.path().join("r.ferro")).unwrap();
+    event(&remote, "r1", 1);
+    let old = main.fork("x").unwrap();
+    event(&old, "x1", 2);
+    let pulled = main.pull(&remote, "r", add).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let refused = |found: ferro::Result<Vec<String>>| matches!(found, Err(Error::NoBranch(name)) if name == "x");
+    main.drop_branch("x").unwrap();
+    assert!(refused(messages(old.common_ancestors(&main))));
+    assert!(refused(messages(main.common_ancestors(&old))));
+    let new = main.fork("x").unwrap();
+    assert_eq!(old.read().commit().message, "x1");
+    assert!(refused(messages(old.common_ancestors(&main))));
+    assert!(refused(messages(main.common_ancestors(&old))));
+    assert!(matches!(
+        old.common_ancestor(&main),
+        Err(Error::NoBranch(_))
+    ));
+    let mut runs = 0;
+    let merged = main.merge_with(&old, |_, _, _| {
+        runs += 1;
+        ("never", ())
+    });
+    assert!(matches!(merged, Err(Error::NoBranch(name)) if name == "x"));
+    assert_eq!(runs, 0);
+    assert_eq!(messages(main.common_ancestors(&new)).unwrap(), ["r1"]);
 }

@@ -98,6 +98,19 @@ pub enum Error {
     /// remote branch over them.
     #[error("cannot drop branch {0}: it is main or this handle's own branch")]
     BranchInUse(String),
+    /// A call that pairs this handle's branch with another was given a handle on another open
+    /// database.
+    ///
+    /// [`Db::merge_with`](crate::Db::merge_with), [`Db::try_merge_with`](crate::Db::try_merge_with),
+    /// [`Db::common_ancestor`](crate::Db::common_ancestor) and
+    /// [`Db::common_ancestors`](crate::Db::common_ancestors) find branches by name in the file
+    /// of the handle they are called on, so they take only a handle from the same open, such as
+    /// one [`Db::fork`](crate::Db::fork) or [`Db::branch`](crate::Db::branch) returned. A handle
+    /// on another file, or from another open of the same file, gets this before any closure runs.
+    /// Branches of two files merge through [`Db::pull`](crate::Db::pull) and
+    /// [`Db::push`](crate::Db::push).
+    #[error("the other handle is on another open database; merge across files with pull or push")]
+    ForeignHandle,
     /// A collection whose nodes are in a file was read without that file.
     ///
     /// A [`Map`](crate::Map) decoded from bytes with no store attached holds links it cannot
