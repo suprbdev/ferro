@@ -169,6 +169,68 @@ deadlocks, because that commit may be waiting for this closure to end. Awaiting 
 there fails with `Error::Reentrant` instead, as described under [Writes from inside a
 closure](reentrancy.md).
 
+### A group nobody led
+
+A closure that leaves its own group open for a thread on its way seals the idle groups of other
+branches, as described under [A lock per branch](commit-path.md#a-lock-per-branch), and leaves their
+sync to whoever seals its own group, since a member that finds its group's frame placed leads every
+frame waiting. When that group failed, its members returned without leading, and a group sealed
+before it sat in the queue with its members parked for good (#97). A frame write that failed was
+the usual way in: the store poisoned, every closure after it failed at once and sealed its own
+branch's group, which failed in turn, and the members each one woke returned with
+`Error::Poisoned`, so nobody led the frame the failure had left waiting, and nothing marked the
+queue failed. A bug hunt found it with 12 writers on 4 branches and one panic injected into a frame
+write: 4 of 8 copies run at once, 400 seeds each, hung, with members parked in `await_group`. Two
+groups that failed to encode, on a store that stayed healthy, stranded a group sealed before them
+the same way.
+
+A member whose group failed now does what its group's leader would have done before it returns:
+with no sync running, it seals the idle groups of other branches and leads what is waiting. On a
+poisoned store that sync acknowledges the frames ahead of the failed write, fails the rest with
+`Error::Poisoned`, marks the queue failed and wakes every member of every group waiting or open, as
+described under [Failed syncs](commit-path.md#failed-syncs). An awaited member rouses the sync
+thread instead, which does the same. A sync that ends with frames waiting wakes a member of the
+first sealed group among them. It used to look at the first frame alone, and that can be a commit
+made alone, a `restore` or a merge, whose write failed and whose writer has returned. Waking a
+member of every group a closure seals for another branch would also have given each group a leader,
+but it would sync idle groups at once where they now wait to share the next sync, which the rules
+measured above were tuned for, and failing every group once the store poisons would have left the
+encode failures stranding groups on a healthy store. The rule chosen changes nothing until a group
+fails.
+
+A member whose frame a sync settled also returns its version now even when a later sync has failed
+the queue before it looked, where it used to check for the failure first and report
+`Error::Poisoned` for a commit that was durable. A leader that panics in its sync, as a test hook
+can make it, poisons the store, fails its batch and wakes every writer before the panic goes on,
+where it left the queue syncing and every writer, coalesced or not, waiting for good.
+
+`a_group_another_branch_sealed_strands_no_one_when_its_frame_write_fails` in `landing_fault.rs`
+holds one branch's leader in its sync while a group opens on a second branch with a writer on its
+way, and one on a third with nobody coming. After the sync, a closure on a fourth branch leaves its
+own group to a writer on its way and seals the third branch's group, whose frame write fails with
+an I/O error, then the writer on its way finds the store poisoned. Without the rule the third
+branch's member never returned, under both durabilities, and
+`a_group_another_branch_sealed_strands_no_one_when_its_sealer_dies_writing_it`, where the write
+panics, is the probe the bug hunt made of it. `coalesce_failure.rs` has the same scene with groups
+that fail to encode, where the stranded group must be written and its member get its version, and a
+leader that panics in its sync with and without `coalesce`. Its stress test runs the bug hunt's 12
+writers for 134 seeds and the seeds that hung, under both durabilities, with a panic in a frame
+write or in a sync, and with blocking writers alone or a third of them awaited, and every
+acknowledged key must reopen. A third awaited is not enough on its own: their sync thread, roused
+by a later closure, led the stranded group, and the blocking runs alone of panics in a frame write
+hung in 6 of 8 copies run at once without the rule, and in none of 60 with it. The landing faults of
+`landing_fault.rs`, and the file size limit of `poison.rs` with coalesced writers on four branches,
+a third of them awaited, now run with `coalesce` as well, where a group's members get
+`Error::Poisoned` rather than the I/O error.
+
+`group` with `coalesce` on one branch, single-key commits into 100,000 keys on the NVMe drive, 11
+rounds alternating with the tree before on 16 hardware threads whose cores other work shared: the
+median of each round's ratio of after to before was 1.03, 1.02, 1.03 and 1.03 at 1, 4, 8 and 16
+writers `Buffered`, and 0.99, 1.01, 1.04 and 1.07 under `Fsync`, with the same closures per version.
+Single runs of either tree moved between two levels, about 48,000 and 27,000 a second `Buffered`,
+so a round's ratio ranged from 0.54 to 1.97. With a branch per writer, five rounds gave 1.00, 1.07,
+1.02 and 1.14 `Buffered` and 1.08, 1.03, 1.01 and 0.98 under `Fsync`.
+
 ## Measurements
 
 `queue-bench throughput`, fsync, each job an enqueue, a lease and an ack, median of five alternating

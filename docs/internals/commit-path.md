@@ -51,7 +51,10 @@ and reappear after reopen: an error means not acknowledged, not guaranteed absen
 write poisons the same way, but frames queued ahead of it are whole, so the leader waits for any of
 them still being written, and they sync and acknowledge. Frames placed after it fail with
 `Error::Poisoned` even when their own bytes were written, the leader's own among them, since
-recovery keeps only a prefix of frames.
+recovery keeps only a prefix of frames. A leader that panics in its sync poisons the store the same
+way, fails its batch and every writer queued behind it, and wakes them all before the panic goes
+on. With `coalesce`, a member whose group failed leads what is left waiting before it returns, as
+described under [A group nobody led](coalescing.md#a-group-nobody-led).
 
 An fdatasync that fails outside a leader's sync, at a Buffered checkpoint or under a `receive`
 that placed its records ahead of its refs, poisons the same way, and after it no superblock is
