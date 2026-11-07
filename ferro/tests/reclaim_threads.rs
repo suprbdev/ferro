@@ -62,7 +62,7 @@ fn verifying_threads() -> usize {
     fs::read_dir("/proc/self/task")
         .unwrap()
         .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim() == "ferro-verify")
+        .filter(|name| name.trim() == "ferro-copy")
         .count()
 }
 

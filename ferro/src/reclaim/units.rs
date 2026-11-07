@@ -41,7 +41,7 @@ pub(super) type Key = u64;
 /// The offset a link to a dispatched unit holds until the unit is placed.
 pub(super) const PENDING: u64 = u64::MAX;
 /// How many levels below a dispatched unit's root a unit may be split at.
-const LEVELS: u32 = 2;
+const LEVELS: u32 = 3;
 /// The most links a node split into units may have, so that each child's index fits its byte.
 const MAX_CHILDREN: usize = 254;
 const SHARDS: usize = 256;
@@ -50,6 +50,7 @@ const CHUNKS: usize = 1 << 16;
 const JOB_BYTES: u64 = 256 << 10;
 const KEEP_BYTES: usize = 1 << 20;
 const WAIT: Duration = Duration::from_millis(10);
+const BATCH: usize = 16;
 
 fn root_key(index: u32) -> Key {
     u64::from(index) << 32 | 0xffff_ffff
@@ -98,7 +99,8 @@ impl Claims {
 
     fn slot(&self, id: u32) -> &Slot {
         let id = id as usize;
-        let chunk = self.chunks[id / CHUNK].get_or_init(|| (0..CHUNK).map(|_| Slot::default()).collect());
+        let chunk =
+            self.chunks[id / CHUNK].get_or_init(|| (0..CHUNK).map(|_| Slot::default()).collect());
         &chunk[id % CHUNK]
     }
 
@@ -295,7 +297,6 @@ impl Queue {
 #[derive(Default)]
 struct Placer {
     end: u64,
-    units: VecDeque<Arc<Unit>>,
     cursor: Vec<(Arc<Unit>, usize)>,
     job: Job,
     objects: u64,
@@ -314,6 +315,9 @@ pub(super) enum Settled {
     Done { end: u64, objects: u64 },
     /// The walk must copy `unit` itself from `end`, then call [`Units::resolved`].
     Tainted { unit: Arc<Unit>, end: u64 },
+    /// No more units than were asked for are left to place, and the threads still hold the end
+    /// of the copy.
+    Ahead,
 }
 
 #[derive(Default)]
@@ -344,6 +348,8 @@ struct Shared {
     source: Store,
     file: Arc<Traced>,
     claims: Claims,
+    dispatched: Mutex<VecDeque<Arc<Unit>>>,
+    placed: AtomicU64,
     queue: Mutex<Queue>,
     ready: Condvar,
     moved: Condvar,
@@ -418,19 +424,53 @@ impl Shared {
 
     fn discover(&self, unit: &Unit, s: &mut Scratch) -> Option<Found> {
         let mut records = Records::default();
-        let (id, won) = self.claims.claim(&unit.root.hash, unit.key);
+        let (mut id, won) = self.claims.claim(&unit.root.hash, unit.key);
         if !won {
             return Some(Found::Copied {
                 children: Vec::new(),
                 records,
             });
         }
-        let root = self.read(unit.root, &unit.taint, s)?;
-        if let Some(children) = self.split(unit, &root) {
-            let ids: Vec<u32> = root.links.iter().map(|link| self.claims.id(&link.hash)).collect();
-            records.push(id, &root, &ids)?;
-            return Some(Found::Copied { children, records });
+        let mut node = self.read(unit.root, &unit.taint, s)?;
+        let mut chain = Vec::new();
+        while let [link] = node.links[..] {
+            let (child, won) = self.claims.claim(&link.hash, unit.key);
+            if !won {
+                break;
+            }
+            let next = self.read(link, &unit.taint, s)?;
+            chain.push((id, mem::replace(&mut node, next), child));
+            id = child;
         }
+        let children = match self.split(unit, &node) {
+            Some(children) => {
+                let ids: Vec<u32> = node
+                    .links
+                    .iter()
+                    .map(|link| self.claims.id(&link.hash))
+                    .collect();
+                records.push(id, &node, &ids)?;
+                children
+            }
+            None => {
+                self.descend(unit, id, node, &mut records, s)?;
+                Vec::new()
+            }
+        };
+        for (id, node, child) in chain.into_iter().rev() {
+            records.push(id, &node, &[child])?;
+        }
+        Some(Found::Copied { children, records })
+    }
+
+    fn descend(
+        &self,
+        unit: &Unit,
+        id: u32,
+        root: Node,
+        records: &mut Records,
+        s: &mut Scratch,
+    ) -> Option<()> {
         let ids = s.ids.pop().unwrap_or_default();
         let mut stack = vec![(id, root, ids)];
         while let Some((_, node, ids)) = stack.last_mut() {
@@ -451,10 +491,7 @@ impl Shared {
             records.push(id, &node, &ids)?;
             s.recycle(node.links, ids);
         }
-        Some(Found::Copied {
-            children: Vec::new(),
-            records,
-        })
+        Some(())
     }
 
     fn place(&self, placer: &mut Placer) -> Result<Progress> {
@@ -463,10 +500,10 @@ impl Shared {
         }
         loop {
             if placer.cursor.is_empty() {
-                let Some(unit) = placer.units.front() else {
+                let Some(unit) = self.dispatched.lock().pop_front() else {
                     return Ok(Progress::Done);
                 };
-                placer.cursor.push((unit.clone(), 0));
+                placer.cursor.push((unit, 0));
             }
             let (unit, next) = placer.cursor.last_mut().expect("the cursor is not empty");
             let unit = unit.clone();
@@ -486,14 +523,23 @@ impl Shared {
                 placer.failed = Some(error.to_string());
                 return Err(error);
             }
-            placer.cursor.pop();
-            if placer.cursor.is_empty() {
-                placer.units.pop_front();
-            }
+            self.pop(placer);
         }
     }
 
-    fn place_records(&self, placer: &mut Placer, unit: &Arc<Unit>, records: &Records) -> Result<()> {
+    fn pop(&self, placer: &mut Placer) {
+        placer.cursor.pop();
+        if placer.cursor.is_empty() {
+            self.placed.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn place_records(
+        &self,
+        placer: &mut Placer,
+        unit: &Arc<Unit>,
+        records: &Records,
+    ) -> Result<()> {
         for (index, rec) in records.list.iter().enumerate() {
             let slot = self.claims.slot(rec.slot);
             if slot.claim.load(Ordering::Relaxed) != unit.key {
@@ -554,7 +600,9 @@ impl Shared {
         s.out.reserve(job.len as usize);
         for (unit, range) in &job.parts {
             let Some(Found::Copied { records, .. }) = unit.found.get() else {
-                return Err(Error::Corrupt("a write job names a unit it cannot copy".into()));
+                return Err(Error::Corrupt(
+                    "a write job names a unit it cannot copy".into(),
+                ));
             };
             for index in range.clone() {
                 let rec = &records.list[index];
@@ -649,12 +697,12 @@ impl Shared {
             Item::Unit(unit) => {
                 let found = panic::catch_unwind(AssertUnwindSafe(|| self.discover(&unit, s)));
                 let found = found.ok().flatten().unwrap_or(Found::Tainted);
-                if let Found::Copied { children, .. } = &found {
-                    if !children.is_empty() {
-                        let mut queue = self.queue.lock();
-                        queue.units.extend(children.iter().cloned().map(Queued));
-                        self.ready.notify_all();
-                    }
+                if let Found::Copied { children, .. } = &found
+                    && !children.is_empty()
+                {
+                    let mut queue = self.queue.lock();
+                    queue.units.extend(children.iter().cloned().map(Queued));
+                    self.ready.notify_all();
                 }
                 let _ = unit.found.set(found);
                 self.try_place();
@@ -691,7 +739,9 @@ impl Shared {
 }
 
 fn misplaced(at: u64) -> Error {
-    Error::Corrupt(format!("the copy of the record at {at} did not land where it was placed"))
+    Error::Corrupt(format!(
+        "the copy of the record at {at} did not land where it was placed"
+    ))
 }
 
 fn interrupted(stop: Option<&AtomicBool>) -> Result<()> {
@@ -709,6 +759,8 @@ pub(super) struct Units {
     started: bool,
     index: u32,
     outstanding: usize,
+    dispatched: u64,
+    batch: Vec<Arc<Unit>>,
     taint: Arc<HashSet<Hash, ByHash>>,
     scratch: Scratch,
 }
@@ -721,6 +773,8 @@ impl Units {
                 source,
                 file,
                 claims: Claims::new(),
+                dispatched: Mutex::default(),
+                placed: AtomicU64::new(0),
                 queue: Mutex::default(),
                 ready: Condvar::new(),
                 moved: Condvar::new(),
@@ -734,6 +788,8 @@ impl Units {
             started: false,
             index: 0,
             outstanding: 0,
+            dispatched: 0,
+            batch: Vec::new(),
             taint: Arc::default(),
             scratch: Scratch::default(),
         }
@@ -748,6 +804,24 @@ impl Units {
     /// The number of units dispatched since the walk last settled them all.
     pub(super) fn outstanding(&self) -> usize {
         self.outstanding
+    }
+
+    /// The number of dispatched units not yet placed.
+    pub(super) fn unplaced(&self) -> u64 {
+        self.dispatched - self.shared.placed.load(Ordering::Acquire)
+    }
+
+    fn publish(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        self.shared
+            .dispatched
+            .lock()
+            .extend(self.batch.iter().cloned());
+        let mut queue = self.shared.queue.lock();
+        queue.units.extend(self.batch.drain(..).map(Queued));
+        self.shared.ready.notify_all();
     }
 
     /// The key the walk claims the objects it writes itself with, after every unit dispatched.
@@ -800,25 +874,25 @@ impl Units {
             taint: self.taint.clone(),
             found: OnceLock::new(),
         });
-        {
-            let mut placer = self.shared.placer.lock();
-            if first {
-                placer.end = end;
-            }
-            placer.units.push_back(unit.clone());
+        if first {
+            self.shared.placer.lock().end = end;
         }
-        let mut queue = self.shared.queue.lock();
-        queue.units.push(Queued(unit));
-        self.shared.ready.notify_one();
+        self.dispatched += 1;
+        self.batch.push(unit);
+        if self.batch.len() >= BATCH {
+            self.publish();
+        }
     }
 
     /// Places units in order, discovering and writing them on this thread too while it waits,
-    /// until every unit is placed or one is tainted.
+    /// until every unit is placed, one is tainted, or, when `until` is not 0, no more than
+    /// `until` units are left.
     ///
     /// # Errors
     ///
     /// [`Error::Interrupted`] once `stop` is set, and the first error a write job met.
-    pub(super) fn settle(&mut self, stop: Option<&AtomicBool>) -> Result<Settled> {
+    pub(super) fn settle(&mut self, stop: Option<&AtomicBool>, until: usize) -> Result<Settled> {
+        self.publish();
         let shared = self.shared.clone();
         loop {
             interrupted(stop)?;
@@ -843,6 +917,9 @@ impl Units {
                             end: placer.end,
                         });
                     }
+                    Progress::Waiting if until > 0 && self.unplaced() <= until as u64 => {
+                        return Ok(Settled::Ahead);
+                    }
                     Progress::Waiting => {}
                 }
             }
@@ -853,10 +930,7 @@ impl Units {
     /// Records that the walk copied the tainted unit [`Units::settle`] returned, ending at `end`.
     pub(super) fn resolved(&mut self, end: u64) {
         let mut placer = self.shared.placer.lock();
-        placer.cursor.pop();
-        if placer.cursor.is_empty() {
-            placer.units.pop_front();
-        }
+        self.shared.pop(&mut placer);
         placer.end = end;
     }
 

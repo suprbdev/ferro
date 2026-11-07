@@ -35,9 +35,10 @@ static SYNC_ENTERED: AtomicBool = AtomicBool::new(false);
 static SYNC_RELEASED: AtomicBool = AtomicBool::new(false);
 static SERIAL: Mutex<()> = Mutex::new(());
 
+static COPY_SLOW: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
-    static WRITES_SLOW: Cell<bool> = const { Cell::new(false) };
     static SYNC_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -124,7 +125,7 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
         unsafe { *__errno_location() = ENOSPC };
         return -1;
     }
-    if count > SPLIT && WRITES_SLOW.with(Cell::get) {
+    if count > SPLIT && COPY_SLOW.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(2));
     }
     // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
@@ -508,7 +509,7 @@ fn verifying_threads() -> usize {
     std::fs::read_dir("/proc/self/task")
         .unwrap()
         .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim() == "ferro-verify")
+        .filter(|name| name.trim() == "ferro-copy")
         .count()
 }
 
@@ -526,7 +527,7 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
         move |name: &'static str| {
             if name == "created" {
                 created.fetch_add(1, Ordering::SeqCst);
-                WRITES_SLOW.with(|slow| slow.set(true));
+                COPY_SLOW.store(true, Ordering::SeqCst);
             }
         }
     };
@@ -561,6 +562,7 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     #[cfg(target_os = "linux")]
     assert_eq!(verifying_threads(), 3);
     drop(db);
+    COPY_SLOW.store(false, Ordering::SeqCst);
     assert_eq!(created.load(Ordering::SeqCst), 1);
     assert!(no_temp(&path));
     #[cfg(target_os = "linux")]
