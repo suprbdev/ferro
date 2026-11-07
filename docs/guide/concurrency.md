@@ -112,12 +112,12 @@ queued, as group commit does within a process.
 
 The option is off by default. A writer without it gets `Error::Locked` while shared writers have the
 file open, and they get it while it does. On one process it costs about 2 µs a commit for its
-locks: one writer made 45,600 single-key Buffered commits a second with it and 49,500 without, on
-2026-11-05. With fsync, 8 processes made 10,140 commits a second on one branch where 8 threads of
-one process made 10,063. Under `Durability::Buffered` processes on one branch take turns, and each
-reads back the nodes the last one rewrote, where threads share one cache: 2 processes made 32,150
-and 8 made 21,366, against 43,265 and 35,622 for 2 and 8 threads. On branches of their own 4
-processes made 92,528 and 4 threads 93,303.
+locks: one writer made 46,100 single-key Buffered commits a second with it and 51,300 without, on
+2026-11-07 on eight cores. With fsync, 8 processes made 10,126 commits a second on one branch where
+8 threads of one process made 10,014. Under `Durability::Buffered` processes on one branch take
+turns, and each reads back the nodes the last one rewrote, where threads share one cache: 2
+processes made 35,951 and 8 made 24,738, against 43,566 and 39,161 for 2 and 8 threads. On branches
+of their own 4 processes made 88,899 and 4 threads 91,593.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of a commit holds up the others only until the

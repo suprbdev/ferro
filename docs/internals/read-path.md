@@ -143,6 +143,25 @@ Memoizing every written node grew the live heap of `heap`'s commits and reads ca
 to 48.4 MiB with a 64 MiB cache, because the old paths of single-key commits kept the `Arc`
 allocations of their evicted children. With the rule it is 46.7 MiB.
 
+## Nodes a commit changes
+
+A node that a closure reads from the file to change it, on the path of a key it inserts, updates
+or removes, or in a bulk edit or a split, is not cached. The closure holds its only count and
+changes it in place, and `flush` caches the node written in its place. Caching it, as such a read
+did before, cost an insert that evicted another entry once the cache's cold section was full, and a
+copy of the node as the closure changed it, since the cache held a count of it, for a version that
+only snapshots older than the commit can still reach. A node found in the cache is handed out as
+before and copied as it is changed. It matters most to writers in several processes, which read
+back the nodes the others rewrote, as described under [Reading back what other processes
+wrote](processes.md#reading-back-what-other-processes-wrote), where it gave two, four and eight
+processes on one branch 7.3% more commits a second, 35,322, 28,499 and 23,787 against 32,921,
+26,557 and 22,162. On one process `ferro-bench`'s single-key Buffered map commit ran 0.9% fewer
+instructions, 178,139 against 179,743, and took 23.2 µs against 23.5, median of three alternating
+rounds. The unit test `the_nodes_a_commit_reads_from_the_file_to_change_stay_out_of_the_cache`
+checks that a snapshot from before a commit reads the path it changed from the file, one after it
+reads the new path from the cache, and a node that a later commit finds in the cache and changes
+stays there for that snapshot.
+
 ## One loop for borrowed nodes
 
 `Map::walk` serves `get`, `contains_key`, `value_hash` and `nth`. It used to reach every node

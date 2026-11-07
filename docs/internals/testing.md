@@ -309,7 +309,10 @@ Tests are described next to what they test:
   copy on several threads](reclamation.md#the-copy-on-several-threads).
 - A tree that links a second record of a log entry, or the record a chain reads: [Records reached as
   entries](reclamation.md#records-reached-as-entries).
-- Processes that write one file at once, die mid-commit and run cycles: [Tests](processes.md#tests).
+- Processes that write one file at once, die mid-commit and run cycles, and the frames a catch-up
+  checks in memory and keeps: [Tests](processes.md#tests).
+- The nodes a commit reads from the file to change, which stay out of the cache: [Nodes a commit
+  changes](read-path.md#nodes-a-commit-changes).
 - Followers of a read-only handle and a shared writer, across cycles, a removed file and damaged
   superblocks, and the end of their thread, `ferro/tests/follow.rs`, and a poisoned follower and a
   drop beside another handle's sync, `follow_fault.rs`: [Tests of
