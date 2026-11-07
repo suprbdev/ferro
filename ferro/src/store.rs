@@ -2056,6 +2056,10 @@ impl Reads {
 /// appends to it, and [`Store::read_object`] and [`Store::load`] read objects back, checking each
 /// one's hash. [`Store::close`] lets the writer lock go while clones still read.
 ///
+/// A decoded value that holds a collection, such as a [`Map`](crate::Map) from [`Store::load`],
+/// holds a clone, and the cache keeps such values, so the file of a store that decoded one stays
+/// open until [`Store::close`] drops the cache. Close a store before dropping it.
+///
 /// # Examples
 ///
 /// ```
