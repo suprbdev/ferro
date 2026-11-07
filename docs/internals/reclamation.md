@@ -249,8 +249,9 @@ check came back. Both now report the hash mismatch.
 default, takes the number of cores, at most 8. With 1 the copy checks each record as it reads it
 and starts no thread. With more, it copies trees as described under [Trees on several
 threads](#trees-on-several-threads), which replaced the batches above for a cycle on several
-threads, and starts its threads with the first tree it hands out in a file of more than 256 KiB.
-In a smaller file the calling thread does that work itself. The threads stop when the cycle ends.
+threads, and starts its threads with the first tree it hands out: always when `copy_threads` asks
+for more than one, and with the default only in a file of more than 256 KiB. Otherwise the calling
+thread does that work itself. The threads stop when the cycle ends.
 `admin::compact` uses the same copy with the default.
 
 `ferro-bench --bin reclaim copy` copies a file aside and times `Db::compact` keeping everything on
@@ -346,9 +347,12 @@ On the 320 byte values, reading took 34%, writing and writeback 30%, appending r
 17% and filling batches 5%. No one step was most of it, so making each cheaper on the same thread
 could not do much better than its share, and the copy now takes the walk itself apart.
 
-The walk copies log entries and the branch table as before, and hands every other tree it reaches,
-the root of an entry or a tree the branch table links, to the copy's threads as a unit, then goes
-on. A thread discovers a unit: it reads each record, checks its hash before following its links, and
+The walk copies log entries and the branch table as before, and hands the root of each entry it
+reaches to the copy's threads as a unit, then goes on. Any other tree it reaches, from the branch
+table or from a tree it copies itself, it reads first, and hands out only if none of its links names
+a log entry, pruned history or offset 0; otherwise it copies the tree itself and treats its links the
+same way. A node of the branch table links each branch's tip, so it stays with the walk, and the
+current tree it links goes out. A thread discovers a unit: it reads each record, checks its hash before following its links, and
 lists the records the unit copies in the order one thread writes them, children first. Every object
 a unit reaches is claimed for it by hash, under one of 256 locks, with the unit's key, which orders
 units as one thread reaches them: the order the walk handed them out in, then the index of each link
@@ -379,13 +383,23 @@ the work changes with the threads: a unit taken over is discovered twice, 3% mor
 copied on the table rows at 4 threads and 11 to 42% more at 16, and all of it costs more CPU than one thread, 1.0 to 1.3 s against
 0.8 s, of which checking hashes is 38%, claims 13% and writing 15%.
 
+A record the walk is about to write that a unit's fallback copied meanwhile is not written again: the
+walk takes that copy, as it would have found it before going on on one thread. So the walk can go
+down a chain of entries that a tree handed out before it links, and the bytes stay the same; the
+first version wrote such entries twice. `fuzzed.rs` copies a tree that links a log entry at 1, 4 and
+8 threads and expects the same bytes.
+
 A unit stops at anything the walk treats otherwise: a link to a log entry or to pruned history, a
 link at offset 0, or a record that fails to read, parse or check. It is tainted, and the walk copies
 it itself, with the code it uses on one thread, when its turn comes in the order. So a failure is
 reported in walk order with the error one thread gives, the threads follow no link of a record they
 have not checked, and the walk checks what it reads itself before following it, so a cycle on
-several threads no longer follows damage into the batches of 256 KiB above. A thread reads a record
-of any length it claims, within the file, as one thread does. An error the walk meets itself waits
+several threads no longer follows damage into the batches of 256 KiB above. Checking the walk's own
+reads in those batches on more threads, alongside the units, put a later error first on the damaged
+file in `fuzzed.rs`, so the walk checks them itself. With the branch table read by the walk, a unit
+falls back to it only where a commit's tree links a log entry or the file is damaged, and there the
+walk checks as one thread does. A thread reads a record of any length it claims, within the file,
+against the budget below. An error the walk meets itself waits
 for the units handed out before it and gives way to the first of their failures, as it waited for
 the batches. The `reclaim` fuzz target found that it once did not: a damaged tree failed one thread
 with `bad compressed body at 8192`, while on four the walk went on past the tree's unit and failed
@@ -393,13 +407,19 @@ on its own with `varint runs off the end of its object`. `fuzzed.rs` keeps the f
 the first error at 1, 2 and 4 threads. The walk also no longer checks an entry again that the walk
 down the chains read and checked in the same cycle.
 
-Memory changes in two ways. The claims take about 60 bytes an object, where the map of copies took
-about 50, and the map of copies now holds only entries and what the walk writes itself. A unit's
-list takes 24 bytes a record and 4 a link from its discovery until it is placed, for at most 16,384
-units the walk has handed out and every unit split from them, and the largest of those is the
-largest tree below the third level of a split. Copying the table rows peaked at 68 to 70 MB of RSS at
-4 and 8 threads, against 155 MB before, which held every object's copy in one map, and the 320 byte
-values at 21 to 22 MB either way. Crash safety is unchanged: the threads write only the temp file,
+Memory changes in three ways. The claims take about 60 bytes an object, where the map of copies
+took about 50, and the map of copies now holds only entries and what the walk writes itself. A
+unit's list takes 24 bytes a record and 4 a link from its discovery until it is placed, for at most
+16,384 units the walk has handed out and every unit split from them, and the largest of those is the
+largest tree below the third level of a split. And the records the threads read, the jobs they write
+and the records over 1 KiB the walk reads share a budget of 16 MiB: a thread that would pass it
+waits for the others, unless it would hold the bytes alone, so one record larger than that is read
+by itself, and every buffer shrinks back once its record is done. Copying the table rows peaked at
+68 to 70 MB of RSS at 4 and 8 threads, against 155 MB before, which held every object's copy in one
+map, and the 320 byte values at 21 to 22 MB either way. Measured on the heap, 48 values of 8 MiB
+peaked at 18 MiB at 4 and 8 threads against 32 MiB on one, and a link pointed at bytes claiming 16
+MiB, as in `reclaim_damage.rs`, at 18 to 20 MiB at 1 to 8 threads, where before the budget it took
+52, 68 and 116 MiB at 2, 4 and 8. Crash safety is unchanged: the threads write only the temp file,
 in any order, and the pass waits for every write before the sync that comes before the rename.
 
 `ferro-bench --bin reclaim copy`, one copy per run, alternating with the build before on 2026-11-07,
@@ -429,7 +449,32 @@ takes the default threads, 4 before and 8 now on this machine, took 0.23 s again
 table rows and 0.14 against 0.18 s on the values. At 16 threads the walk is the limit again: the
 chains before the copy take 37 ms, and its 40,000 entries about 100 ms more. The longest pause of
 `ferro-bench --bin reclaim live table`, as under [Measurements](#measurements), medians of three
-alternating runs, was 2.82 ms against 2.96 ms before, at 5,183 and 5,235 commits a second.
+alternating runs, was 2.91 ms against 2.93 ms before, at 5,114 and 5,190 commits a second.
+
+A review found that the first version of this copy handed a node of the branch table that was still
+a stored record, as it is after a prune or in any file a cycle wrote, to the threads as a unit. Its
+links to the tips tainted it, and the walk then copied everything below it, entries and trees, on
+one thread and with no checking threads, so every background cycle, which always prunes, ran at one
+thread's speed: on a 423 MB file of 6,000 commits of 8 updates, `Keep::Last(3000)` took 0.40 s at 1,
+4 and 8 threads against 0.16 s before. Reading such a node first and handing out what lies below it,
+as above, the fastest of three on 2026-11-07:
+
+| Copy of the 423 MB file | Threads | Before | After |
+| --- | ---: | ---: | ---: |
+| `Keep::All` | 1 | 0.70 s | 0.69 s |
+| | 4 | 0.32 s | 0.26 s |
+| | 8 | 0.31 s | 0.19 s |
+| `Keep::Last(3000)` | 1 | 0.40 s | 0.40 s |
+| | 4 | 0.17 s | 0.15 s |
+| | 8 | 0.21 s | 0.10 s |
+| `Keep::All`, of a file a cycle wrote | 4 | 0.28 s | 0.29 s |
+| | 8 | 0.32 s | 0.18 s |
+| `Keep::Last(3000)`, of a file a cycle wrote | 4 | 0.17 s | 0.15 s |
+| | 8 | 0.18 s | 0.11 s |
+
+`Compacted::handed_out` counts the trees a cycle handed out, and `reclaim_threads.rs` checks that
+copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, and the copy of the file a
+cycle wrote, hand out trees and make the same bytes as one thread.
 
 ### Measured and left out
 
@@ -604,7 +649,8 @@ again on table rows, since it reads each log entry twice, walking the chains and
 `Keep::All` copies all of history, so `history` is what makes background cycles worthwhile. The
 copy holds its claims, about 60 bytes per object, about 80 bytes per commit for where each entry
 was read and copied and what its copy keeps, the lists of the trees waiting to be placed, 24 bytes
-a record and 4 a link, and about 20 MiB of buffers at most.
+a record and 4 a link, and 16 MiB of records the threads and the walk hold at once, or one larger
+record alone, besides a buffer of up to 1 MiB on each thread.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the
