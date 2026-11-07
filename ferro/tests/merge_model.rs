@@ -1841,6 +1841,191 @@ fn a_pruned_search_refuses_when_a_base_could_lie_under_history_no_branch_keeps()
     }
 }
 
+fn ticking() -> Clock {
+    let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
+    Clock(Arc::new(move || ticks.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn pulled_then_forked(
+    dir: &std::path::Path,
+    history: Keep,
+    compact: Option<Keep>,
+    after: u32,
+) -> [Db<Events>; 3] {
+    let clock = ticking();
+    let main: Db<Events> = fast()
+        .history(history)
+        .reclaim(Reclaim { every_bytes: 0 })
+        .clock(clock.clone())
+        .open(dir.join("a.ferro"))
+        .unwrap();
+    let remote: Db<Events> = fast().clock(clock).open(dir.join("b.ferro")).unwrap();
+    for key in 0..3 {
+        event(&main, &format!("m{key}"), key);
+    }
+    assert_eq!(
+        pull_named(&remote, &main, "a", "never").0,
+        Outcome::FastForward
+    );
+    event(&remote, "r1", 10);
+    event(&main, "m3", 3);
+    assert_eq!(
+        pull_named(&main, &remote, "remote", "pull"),
+        (Outcome::Merged, 1)
+    );
+    for key in 0..after {
+        event(&main, &format!("x{key}"), 20 + key);
+    }
+    if let Some(keep) = compact {
+        main.compact(keep).unwrap();
+    }
+    let side = main.fork("side").unwrap();
+    event(&side, "s1", 30);
+    event(&main, "m4", 31);
+    [main, side, remote]
+}
+
+#[test]
+fn a_fork_after_a_pull_whose_merge_left_the_kept_window_merges_against_the_fork_point() {
+    let kept = (2..=4).map(|keep| (Keep::Last(keep), None));
+    let compacted = (1..=3).map(|keep| (Keep::All, Some(Keep::Last(keep))));
+    for (history, compact) in kept.chain(compacted) {
+        for after in 0..4 {
+            let shape = format!("{history:?} compacted to {compact:?}, {after} after the pull");
+            let dir = tempfile::tempdir().unwrap();
+            let [main, side, remote] = pulled_then_forked(dir.path(), history, compact, after);
+            let fork = match after {
+                0 => "pull".to_string(),
+                _ => format!("x{}", after - 1),
+            };
+            assert_eq!(
+                messages(&main.common_ancestors(&side).unwrap()),
+                [fork.as_str()],
+                "{shape}"
+            );
+            assert_eq!(
+                messages(&side.common_ancestors(&main).unwrap()),
+                [fork.as_str()],
+                "{shape}"
+            );
+            let mut all: Vec<u32> = vec![0, 1, 2, 3, 10, 30, 31];
+            all.extend((0..after).map(|key| 20 + key));
+            assert_eq!(merge_named(&main, &side, "main <- side").value, fork);
+            assert_eq!(counts(&main), ones(&all), "{shape}");
+            assert_eq!(merge_named(&side, &main, "side <- main").value, "s1");
+            assert_eq!(counts(&side), ones(&all), "{shape}");
+            event(&remote, "r2", 11);
+            event(&main, "m5", 32);
+            all.extend([11, 32]);
+            assert_eq!(
+                pull_named(&main, &remote, "remote", "pull again"),
+                (Outcome::Merged, 1),
+                "{shape}"
+            );
+            assert_eq!(counts(&main), ones(&all), "{shape}");
+            assert_eq!(
+                pull_named(&remote, &main, "a", "pull back"),
+                (Outcome::Merged, 1),
+                "{shape}"
+            );
+            assert_eq!(counts(&remote), ones(&all), "{shape}");
+            main.verify().unwrap();
+            remote.verify().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_criss_cross_after_a_pull_pruned_past_its_merge_builds_its_virtual_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let [main, side, _remote] = pulled_then_forked(dir.path(), Keep::Last(3), None, 1);
+    let copy = main.fork("copy").unwrap();
+    assert_eq!(merge_named(&main, &side, "main <- side").value, "x0");
+    assert_eq!(merge_named(&side, &copy, "side <- copy").value, "x0");
+    main.drop_branch("copy").unwrap();
+    assert_eq!(main.log().first().unwrap().0, 6);
+    assert_eq!(
+        sorted_messages(&main.common_ancestors(&side).unwrap()),
+        ["m4", "s1"]
+    );
+    let (_, calls) = traced_merge(&main, &side, "main <- side again");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, "x0");
+    assert_eq!(counts(&main), ones(&[0, 1, 2, 3, 10, 20, 30, 31]));
+    main.verify().unwrap();
+}
+
+fn refuses_to_merge(main: &Db<Events>, side: &Db<Events>) {
+    for (ours, theirs) in [(main, side), (side, main)] {
+        assert!(matches!(
+            ours.common_ancestors(theirs),
+            Err(ferro::Error::NoCommonAncestor)
+        ));
+    }
+    let (before, head) = (main.version(), main.head_hash());
+    let merged = main.merge_with(side, |root, base, theirs| {
+        add_deltas(root, base, theirs);
+        ("never", ())
+    });
+    assert!(matches!(merged, Err(ferro::Error::NoCommonAncestor)));
+    assert_eq!((main.version(), main.head_hash()), (before, head));
+}
+
+#[test]
+fn a_fork_point_pruned_after_a_pull_is_refused_and_not_answered_with_the_pulled_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let [main, side, _remote] = pulled_then_forked(dir.path(), Keep::All, None, 1);
+    main.compact(Keep::Last(1)).unwrap();
+    assert_eq!(main.log().first().unwrap().1.message, "m4");
+    assert_eq!(side.log().first().unwrap().1.message, "s1");
+    refuses_to_merge(&main, &side);
+    main.verify().unwrap();
+}
+
+#[test]
+fn a_commit_two_branches_pulled_apart_is_refused_when_pruned_history_could_hold_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = ticking();
+    let open = |name: &str| -> Db<Events> {
+        fast()
+            .reclaim(Reclaim { every_bytes: 0 })
+            .clock(clock.clone())
+            .open(dir.path().join(name))
+            .unwrap()
+    };
+    let (main, remote) = (open("a.ferro"), open("b.ferro"));
+    for key in 0..3 {
+        event(&main, &format!("m{key}"), key);
+    }
+    assert_eq!(
+        pull_named(&remote, &main, "a", "never").0,
+        Outcome::FastForward
+    );
+    event(&remote, "r1", 10);
+    for key in 3..6 {
+        event(&main, &format!("m{key}"), key);
+    }
+    let side = main.fork("side").unwrap();
+    assert_eq!(
+        pull_named(&main, &remote, "remote", "main pull"),
+        (Outcome::Merged, 1)
+    );
+    assert_eq!(
+        pull_named(&side, &remote, "remote", "side pull"),
+        (Outcome::Merged, 1)
+    );
+    event(&main, "m6", 6);
+    event(&side, "s1", 7);
+    assert_eq!(
+        messages(&main.common_ancestors(&side).unwrap()),
+        ["m5", "r1"]
+    );
+    main.compact(Keep::Last(3)).unwrap();
+    assert_eq!(main.log().first().unwrap().1.message, "m5");
+    refuses_to_merge(&main, &side);
+    main.verify().unwrap();
+}
+
 #[test]
 fn a_later_merge_does_not_reach_history_an_earlier_merge_let_go() {
     let dir = tempfile::tempdir().unwrap();

@@ -1781,12 +1781,17 @@ fn recorded((refs, store): (&Refs, &Store), starts: &[Start]) -> Result<Vec<Star
                     continue;
                 };
                 if let Some(node) = found.log.node_at(store, theirs)? {
+                    let at = ours.max(start.low);
+                    let under = (at <= version)
+                        .then(|| start.node.down_to(&start.store, at))
+                        .transpose()?;
                     out.push(Start {
                         store: store.clone(),
                         node,
                         low: found.log.first,
                         after: found.log.after(store)?,
                         bare: false,
+                        under,
                     });
                 }
             }
@@ -4881,6 +4886,7 @@ impl<T: Data> Db<T> {
                     low: state.log.first,
                     after: state.log.after(&state.store)?,
                     bare: false,
+                    under: None,
                 });
             }
             let Some(head) = refs.try_get(name)? else {
@@ -4891,12 +4897,14 @@ impl<T: Data> Db<T> {
                     continue;
                 };
                 if let Some(node) = found.log.node_at(store, seen.0)? {
+                    let at = seen.1.max(state.log.first);
                     starts.push(Start {
                         store: store.clone(),
                         node,
                         low: found.log.first,
                         after: found.log.after(store)?,
                         bare: false,
+                        under: state.log.node_at(&state.store, at)?,
                     });
                 }
             }

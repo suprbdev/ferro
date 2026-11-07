@@ -339,6 +339,35 @@ searches refused for one seed where 2,418 had, and with each commit a millisecon
 oldest retained commit and the remote sends that commit again, the landed branch keeps it, and the
 pull merges against it, or finds itself `Ahead`, where it used to refuse.
 
+A pull's merge record names a commit of `remote` that is below our commit at the recorded version,
+and the search starts from it on our side beside the tip. It used to hang there with nothing above
+it, so once the pull's merge commit was pruned no path led down to it from our chain (#106). With
+`Keep::Last(2)`, a pull merged at v5, a commit v6, and a fork at v6 with one commit on each branch,
+both branches held the record, so both sides started from the pulled commit and it was a candidate
+at once, beside v6. The path below v6 stopped at the pruned v5, the pulled commit was older and two
+generations lower, and the search refused, although everything pruned was below v6. Between
+branches forked after a pull, `common_ancestors` and every merge failed once the pull's merge commit
+left the kept window. A local fork and `merge_with` records nothing, so only pulls and syncs showed
+it. A recorded commit now also counts as a parent of the retained commit on the recording branch at
+the recorded version, or of the oldest retained one when that version is pruned. A chain passing
+that commit stops there and hands the recorded commit its sides, stale included, so v6 makes it
+stale before it is taken, as v5's merge link would have. A record is written only for a commit below
+ours at that version, so the search adds no edge the whole history lacks. The steps that build a
+virtual base hang each record they add the same way, below the commit they start from, and a record
+from before merge links whose commit is not of lower generation keeps only its place beside the
+tip.
+
+The edge starts at the recorded version and no lower, so a record never puts its commit below a
+commit under that version. When two branches fork at f and each then pulls the same remote commit r,
+both records are made above f, r is not below f, and once the commits under f are pruned, r, older
+and two generations lower, could be among them: the search still refuses. `merge_model` builds the
+pull above under `Keep::Last(2)` to `Keep::Last(4)` and after compactions to `Keep::Last(1)` to
+`Keep::Last(3)`, a criss-cross after it, and both refusals. In 6,000 random histories of three
+devices that fork, merge, pull and sync under bounded history, 62 of 9,928 searches refused through
+a candidate below another before, and none do now. Every refusal left comes from a path that is not
+stale running into pruned history, such as a second pull whose remote commit is no newer than our
+oldest retained commit and so could be among what we pruned.
+
 A merged chain is kept down to where its `prev` links stop, and the search finds that place by
 following them, taking a skip link only to a commit the `prev` links also reach. Two writers broke
 that. A pull writes a sent commit's skip link with offset 0 when it lands below the `first` of the

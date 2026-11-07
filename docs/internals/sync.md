@@ -255,14 +255,15 @@ A second step compares the pulling branch with `remote`:
 
 Each outcome that shows their tip is an ancestor of ours records `(their version, our version)`
 under `remote` in our head's `merged` map. The merge link says the same thing, but a record survives
-our side of it being pruned, and the search treats it as a known ancestor of our tip, so a branch
-pruned past its last sync with an idle remote still finds itself `Ahead`. Equal roots without that
-ancestry record nothing, since a record there would make the remote's history look like ours. A
-crash between the landing and this step leaves `remote` landed and our branch as it was. The next
-pull's have names the landed tip, so its bundle is empty and the step runs again. `try_pull`,
-`try_push` and `try_receive` take a merge closure that returns a `Result`, and an `Err` from it
-leaves the file as that crash would, with the error returned in the caller's type. Undoing the
-landing as well would take a frame of its own and make the next pull send the same commits again.
+our side of it being pruned, and the search treats it as a known ancestor of our tip, and of our
+commit at the recorded version, so a branch pruned past its last sync with an idle remote still
+finds itself `Ahead`. Equal roots without that ancestry record nothing, since a record there would
+make the remote's history look like ours. A crash between the landing and this step leaves `remote`
+landed and our branch as it was. The next pull's have names the landed tip, so its bundle is empty
+and the step runs again. `try_pull`, `try_push` and `try_receive` take a merge closure that returns
+a `Result`, and an `Err` from it leaves the file as that crash would, with the error returned in the
+caller's type. Undoing the landing as well would take a frame of its own and make the next pull send
+the same commits again.
 
 ## Commit identity
 

@@ -3,8 +3,10 @@
 //! [`best`] paints down from both sides as git's merge-base does, but in jumps: a chain moves
 //! straight to the highest place another chain could join it, found by a binary search on versions,
 //! and merge entries are opened only while what they merged could still matter. A commit reached
-//! from both sides is a candidate, and everything below it is stale. The search refuses to answer
-//! where pruned history could change the answer.
+//! from both sides is a candidate, and everything below it is stale. A commit a merge record names
+//! hangs below the retained commit the record vouches for, so it turns stale with it even where the
+//! merge that brought it in is pruned. The search refuses to answer where pruned history could
+//! change the answer.
 //! [Finding the base](https://github.com/archlemon/ferro/blob/main/docs/internals/merging.md#finding-the-base)
 //! describes it.
 
@@ -34,6 +36,11 @@ pub(crate) struct Start {
     pub(crate) after: Option<u64>,
     /// Whether only this commit is known, and not the history below it.
     pub(crate) bare: bool,
+    /// For a commit a merge record names, the retained commit on the recording branch's chain that
+    /// it is known to be below: the one at the recorded version, or the oldest retained one when
+    /// that version is pruned. The search gives this commit the sides it reaches that one with,
+    /// stale included.
+    pub(crate) under: Option<Node>,
 }
 
 #[derive(Clone)]
@@ -74,6 +81,12 @@ struct Hidden {
     reached: bool,
 }
 
+struct Anchor {
+    at: Node,
+    item: Item,
+    reached: bool,
+}
+
 impl Item {
     fn live(&self) -> bool {
         self.colors & STALE == 0
@@ -109,6 +122,7 @@ struct Search {
     cut: [Vec<Mark>; 2],
     painted: [Vec<Mark>; 2],
     hidden: Vec<Hidden>,
+    anchors: Vec<Anchor>,
 }
 
 /// The best common ancestors of the commits in `ours` and those in `theirs`: the commits both
@@ -129,10 +143,11 @@ pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
         cut: [Vec::new(), Vec::new()],
         painted: [Vec::new(), Vec::new()],
         hidden: Vec::new(),
+        anchors: Vec::new(),
     };
     for (colors, starts) in [(ONE, ours), (TWO, theirs)] {
         for start in starts {
-            search.push(Item {
+            let item = Item {
                 store: start.store,
                 node: start.node,
                 colors,
@@ -140,7 +155,17 @@ pub(crate) fn best(ours: Vec<Start>, theirs: Vec<Start>) -> Result<Vec<Start>> {
                 after: start.after,
                 merges: None,
                 bare: start.bare,
-            });
+            };
+            if let Some(at) = start.under
+                && at.entry.generation() > item.node.entry.generation()
+            {
+                search.anchors.push(Anchor {
+                    at,
+                    item: item.clone(),
+                    reached: false,
+                });
+            }
+            search.push(item);
         }
     }
     search.run()
@@ -282,8 +307,22 @@ impl Search {
                 low: item.low,
                 after: item.after,
                 bare: item.bare,
+                under: None,
             });
             item.colors |= STALE;
+        }
+        let mut below = Vec::new();
+        for anchor in &mut self.anchors {
+            if anchor.at.ptr.hash == item.node.ptr.hash {
+                anchor.reached = true;
+                below.push(Item {
+                    colors: item.colors,
+                    ..anchor.item.clone()
+                });
+            }
+        }
+        for next in below {
+            self.push(next);
         }
         let at = item.node.version();
         let mut target = (item.low < at).then_some(item.low);
@@ -303,6 +342,16 @@ impl Search {
                 && item.low <= version
                 && version < at
                 && item.node.down_to(&item.store, version)?.ptr.hash == hidden.parent
+            {
+                target = target.max(Some(version));
+            }
+        }
+        for anchor in &self.anchors {
+            let version = anchor.at.version();
+            if !anchor.reached
+                && item.low <= version
+                && version < at
+                && item.node.down_to(&item.store, version)?.ptr.hash == anchor.at.ptr.hash
             {
                 target = target.max(Some(version));
             }
