@@ -1765,6 +1765,13 @@ impl<T: Data> Shared<T> {
     }
 
     fn moved_states(&self, store: &Store, before: &Refs, after: &Refs) -> Result<Vec<Moved<T>>> {
+        for (name, head) in after.try_entries()? {
+            if let Some(root) = head.root
+                && moved(before.try_get(&name)?.as_deref(), Some(&head))
+            {
+                store.load::<T>(root)?;
+            }
+        }
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         for branch in attached {
@@ -1774,6 +1781,29 @@ impl<T: Data> Shared<T> {
             }
         }
         Ok(states)
+    }
+
+    fn write_records(&self, tip: &mut RefState, mut txn: Txn) -> Result<()> {
+        txn.spill()?;
+        txn.unreserved();
+        match tip.ptr {
+            Some(head) => {
+                let frame = txn.write(head)?;
+                self.queue.lock().waiting.push(Pending {
+                    frame,
+                    refs: tip.clone(),
+                    update: None,
+                    seal: None,
+                    followed: Vec::new(),
+                });
+            }
+            None => {
+                let refs = tip.refs.clone();
+                self.stage(tip, Next::Table(refs), txn, None, None, None)?
+                    .land()?;
+            }
+        }
+        Ok(())
     }
 
     fn attach(&self, name: &str, refs: &Refs) -> Result<Arc<Branch<T>>> {
@@ -5255,34 +5285,24 @@ impl<T: Data> Db<T> {
         let store = shared.store();
         let mut txn = store.begin()?;
         let out = fill(&store, &mut txn)?;
-        txn.spill()?;
-        txn.unreserved();
-        match tip.ptr {
-            Some(head) => {
-                let frame = txn.write(head)?;
-                shared.queue.lock().waiting.push(Pending {
-                    frame,
-                    refs: tip.clone(),
-                    update: None,
-                    seal: None,
-                    followed: Vec::new(),
-                });
-            }
-            None => {
-                let refs = tip.refs.clone();
-                shared
-                    .stage(&mut tip, Next::Table(refs), txn, None, None, None)?
-                    .land()?;
-            }
-        }
+        shared.write_records(&mut tip, txn)?;
         Ok(out)
     }
 
     /// Replaces the branch table with what `edit` returns, under every writer lock of the file.
     ///
     /// `edit` sees the current table and stages any records it needs in the transaction. If it
-    /// returns a new table, that lands and is settled, and every attached branch it moved is
-    /// published to its readers and watchers together with the table; `None` writes nothing.
+    /// returns a new table, the records it staged are written first as a frame of their own that
+    /// keeps the current table, and the root of every head the new table moves is read as `T`.
+    /// Only then does the new table land, and it is settled, and every attached branch it moved
+    /// is published to its readers and watchers together with the table. `None` writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The error of `edit`, and of reading a moved head's root, such as [`Error::Decode`] for one
+    /// that `T` cannot read, after which the table and every branch are as they were, and the
+    /// staged records stay unlinked in the log until the next reclamation cycle drops them. Write
+    /// and sync errors as for [`Db::commit`].
     pub(crate) fn rewrite_refs<X>(
         &self,
         edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,
@@ -5297,21 +5317,23 @@ impl<T: Data> Db<T> {
             let Some(next) = next else {
                 return Ok(out);
             };
-            let before = tip.refs.clone();
+            if txn.holds_records() {
+                shared.write_records(tip, txn)?;
+                txn = store.begin()?;
+            }
+            let states = shared.moved_states(&store, &tip.refs, &next)?;
             let (landing, mut pending) =
                 shared.place_frame(tip, Next::Table(next), txn, None, None)?;
-            let states = landing
-                .land()
-                .and_then(|()| shared.moved_states(&store, &before, &tip.refs));
-            if let Ok(states) = &states {
-                for (branch, state) in states {
+            let landed = landing.land();
+            if landed.is_ok() {
+                for (branch, state) in &states {
                     branch.tip.store(state.clone());
                     branch.framed.store(pending.frame.seq, Ordering::Release);
                 }
-                pending.followed.clone_from(states);
+                pending.followed = states;
             }
             shared.queue.lock().waiting.push(pending);
-            states?;
+            landed?;
             shared.settle(store.last_seq(), &mut notices)?;
             Ok(out)
         })

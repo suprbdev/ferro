@@ -3416,8 +3416,15 @@ fn keep_theirs(
     ("merge".to_string(), applied)
 }
 
+fn member(id: u32, email: &str) -> unique::Person {
+    unique::Person {
+        id,
+        email: email.into(),
+    }
+}
+
 #[test]
-fn a_head_the_receiver_cannot_read_lands_as_the_remote_and_moves_no_branch() {
+fn a_head_the_receiver_cannot_read_lands_no_branch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("b.ferro");
     let a: Db<Table<Person>> = fast().open(dir.path().join("a.ferro")).unwrap();
@@ -3431,7 +3438,7 @@ fn a_head_the_receiver_cannot_read_lands_as_the_remote_and_moves_no_branch() {
     let refused = b.receive("a", &bundle, unmerged);
     assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
     assert_eq!(b.version(), 0);
-    assert_eq!(b.branches(), ["a", "main"]);
+    assert_eq!(b.branches(), ["main"]);
     drop(b);
     let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
     assert_eq!(b.version(), 0);
@@ -3461,6 +3468,141 @@ fn a_head_the_receiver_cannot_read_lands_as_the_remote_and_moves_no_branch() {
     let keys: Vec<u32> = b.read().keys().collect();
     assert_eq!(keys, [1, 3]);
     assert_eq!(b.read().key_by_email("x"), Some(1));
+    b.verify_typed().unwrap();
+}
+
+#[test]
+fn a_head_the_receiver_cannot_read_leaves_an_attached_remote_where_the_refs_have_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let a: Db<Table<Person>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    a.update(|people| {
+        people.insert(person(1, "x"));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, unmerged).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let remote = b.branch("a").unwrap();
+    let landed = remote.head_hash();
+    a.update(|people| {
+        people.insert(person(2, "x"));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let refused = b.receive("a", &bundle, keep_theirs);
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    assert_eq!((remote.version(), remote.head_hash()), (1, landed));
+    assert_eq!(remote.read().len(), 1);
+    assert_eq!(b.version(), 1);
+    b.update(|people| {
+        people.insert(member(3, "z"));
+    })
+    .unwrap();
+    let reader: Db<Table<unique::Person>> = fast().read_only(true).open(&path).unwrap();
+    let seen = reader.branch("a").unwrap();
+    assert_eq!((seen.version(), seen.head_hash()), (1, landed));
+    reader.verify_typed().unwrap();
+    drop((seen, reader));
+    remote
+        .update(|people| {
+            people.insert(member(4, "w"));
+        })
+        .unwrap();
+    assert_eq!(remote.version(), 2);
+    assert_eq!(remote.log().hash_at(&1), landed);
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let refused = b.receive("a", &bundle, keep_theirs);
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    assert_eq!(remote.version(), 2);
+    a.update(|people| {
+        people.remove(&2);
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, keep_theirs).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    assert_eq!(remote.head_hash(), a.head_hash());
+    let keys: Vec<u32> = remote.read().keys().collect();
+    assert_eq!(keys, [1]);
+    let keys: Vec<u32> = b.read().keys().collect();
+    assert_eq!(keys, [1, 3]);
+    b.update(|people| {
+        people.insert(member(5, "v"));
+    })
+    .unwrap();
+    drop((remote, b));
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    let keys: Vec<u32> = b.read().keys().collect();
+    assert_eq!(keys, [1, 3, 5]);
+    assert_eq!(b.read().key_by_email("x"), Some(1));
+    b.verify_typed().unwrap();
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[test]
+fn a_head_the_receiver_cannot_read_stops_no_handle_that_follows_the_remote_in_a_shared_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.ferro");
+    let a: Db<Table<Person>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Table<unique::Person>> = fast().shared(true).open(&path).unwrap();
+    a.update(|people| {
+        people.insert(person(1, "x"));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, unmerged).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let other: Db<Table<unique::Person>> = fast().shared(true).open(&path).unwrap();
+    let follower = other.branch("a").unwrap();
+    let landed = follower.head_hash();
+    a.update(|people| {
+        people.insert(person(2, "x"));
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let refused = b.receive("a", &bundle, keep_theirs);
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    other.refresh().unwrap();
+    assert_eq!((follower.version(), follower.head_hash()), (1, landed));
+    other
+        .update(|people| {
+            people.insert(member(3, "z"));
+        })
+        .unwrap();
+    follower
+        .update(|people| {
+            people.insert(member(4, "w"));
+        })
+        .unwrap();
+    b.update(|people| {
+        people.insert(member(5, "v"));
+    })
+    .unwrap();
+    assert_eq!(b.branch("a").unwrap().version(), 2);
+    a.update(|people| {
+        people.remove(&2);
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, keep_theirs).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    other.refresh().unwrap();
+    assert_eq!(follower.head_hash(), a.head_hash());
+    let keys: Vec<u32> = other.read().keys().collect();
+    assert_eq!(keys, [1, 3, 5]);
+    other
+        .update(|people| {
+            people.insert(member(6, "u"));
+        })
+        .unwrap();
+    drop((follower, other, b));
+    let b: Db<Table<unique::Person>> = fast().open(&path).unwrap();
+    assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+    let keys: Vec<u32> = b.read().keys().collect();
+    assert_eq!(keys, [1, 3, 5, 6]);
     b.verify_typed().unwrap();
 }
 

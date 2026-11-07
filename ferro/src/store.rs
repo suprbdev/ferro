@@ -4170,6 +4170,11 @@ impl Txn {
         self.buf.len()
     }
 
+    /// Whether the transaction has added a record, in memory or spilled.
+    pub(crate) fn holds_records(&self) -> bool {
+        self.start != self.origin || self.buf.len() > FRAME_BYTES
+    }
+
     /// The offset of the object with `hash` that this transaction wrote or found.
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
         self.seen.get(hash).copied()

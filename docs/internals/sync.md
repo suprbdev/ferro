@@ -185,11 +185,17 @@ once it sends 256 objects, with eight chunks in flight between the two.
 
 These checks run with no writer lock held, against the heads `receive` started from, as described
 under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). Under the writer
-locks, the ones that depend on what this file holds run again against the heads found there, and the
-sent commits and a `Refs` that points `remote` at the new head go into one frame, synced like a
-commit, so a crash leaves the previous head: a torn frame is not replayed. Branch handles on
-`remote` are rebound and its watchers fire. Their notices drop once the pull has released `tip`, so
-a `watch_when` test may commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
+locks, the ones that depend on what this file holds run again against the heads found there, and
+what the bundle sent that is not in the log yet goes into a frame that keeps the branch table as it
+was: the whole bundle when it is under 1 MiB, and otherwise the sent commits whose links changed, as
+described under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). The new
+head's root is then read as `T`, so a table whose unique index finds two rows sharing a value is
+refused here, as described under [Limits](#limits), and only then does a `Refs` that points `remote`
+at the new head go into the next frame. Both are synced like a commit, so a crash leaves the
+previous head: a torn frame is not replayed, and a whole first frame without the second holds
+records nothing links. Branch handles on `remote` are rebound to the root that was read and its
+watchers fire. Their notices drop once the pull has released `tip`, so a `watch_when` test may
+commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
 was. Flipping every byte of a 3,358 byte bundle with three masks gave 10,073 rejections and one flip
 inside an LZ4 body that decoded to the same bytes, and so landed the same commit.
 
@@ -522,17 +528,44 @@ Measured and left out:
   another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows
   and does not rebuild the others. Reading it rebuilds the index, and if two rows share a value of a
   unique index that read fails, so a peer can still send a table that does not read, as a peer
-  whose schema has a plain index where the receiver's has a unique one can. Checking it at receive
-  would mean reading every row. Such a head lands as the branch `remote`, but the receiver's branch
-  never moves to it: a fast-forward reads the new root as `T` before the frame that moves the branch
-  is written, and a merge reads it to merge, so the pull returns that read's `Error::Decode` and the
-  branch stays where it was. The fast-forward used to move the branch first and fail to read it
-  afterwards, which left a file that no longer opened. Until the peer sends a head that reads,
-  every pull from it fails the same way, and opening `remote` as a branch fails. The read before a
-  fast-forward is the one the branch would make right after it, and the store's cache keeps the
-  decoded root for that, so it costs nothing more unless the cache drops it. `sync.rs` sends such a
-  table to an empty file and to one with commits of its own, and checks that both refuse it, reopen
-  at their own head, and take the peer's next head once it reads.
+  whose schema has a plain index where the receiver's has a unique one can. Checking it while the
+  bundle streams would mean reading every row. Such a head lands nowhere: before the frame that
+  writes a new branch table, the root of every head that table moves is read as `T`, `remote`'s on
+  every landing and our branch's on a fast-forward, so the pull returns that read's `Error::Decode`
+  and every branch, `remote` included, stays where it was, as described under [Applying](#applying).
+  Until the peer sends a head that reads, every pull from it fails the same way and sends the same
+  commits again.
+
+  The first fix read the root only before a fast-forward, whose frame had moved our branch before
+  the read and left a file that no longer opened. `remote` still landed, and its root was read only
+  after its frame was written, to rebind the handles open on it. With a handle open on `remote`,
+  that read failed and the pull returned `Error::Decode` with the frame written but neither synced
+  nor published, and the handle still on the old head. The next commit on any branch synced it, and
+  a commit through the handle wrote its own head over the landed one, or in a shared file failed
+  with `Error::Corrupt` for a branch another process had moved. If nothing else committed, closing
+  the file synced it, after which opening `remote` failed. In a shared file, another process with
+  `remote` open failed every catch-up and every commit, on every branch, with the same error until
+  a later pull moved `remote` to a head that read. `verify_typed` passed throughout, since it does
+  not rebuild indexes. Reading only the roots that handles open in this process need would have
+  left that other process failing, since a process cannot see another's handles, and would have
+  made whether `remote` lands depend on which handles are open, where a merge opens one on `remote`
+  and keeps it.
+
+  The read is the one that would come right after the landing: a fast-forward reads the root to move
+  our branch, a merge opens `remote` to merge it, and a handle on `remote` is rebound to it. The
+  store's cache keeps the decoded root for that, so it costs nothing more unless the cache drops it
+  or the pull ends `UpToDate` or `Ahead` with no handle open on `remote`. A bundle under 1 MiB is
+  written in a frame of its own ahead of the branch table, as the pieces of a larger one are, so
+  that the read finds its objects. That costs a frame header and a write more per pull, synced with
+  the landing: five incremental pulls that each merged one row grew the file by 76 to 80 bytes more
+  than before, and 400 fast-forward pulls of one row into a table of 1,000 rows under
+  `Durability::Buffered` took a median of 40.4 µs against 39.4 µs, middle of three runs each. A
+  landing refused for a head that does not read leaves those objects in the log until the next
+  reclamation cycle, as a refused landing of a larger bundle leaves its pieces.
+  `sync.rs` sends such a table to an empty file, to one with commits of its own, to one with a
+  handle open on `remote`, and to a shared file that a second open follows `remote` in, and checks
+  that each refuses it with `remote` where it was, commits on every branch, reopens at its own head,
+  verifies and takes the peer's next head once it reads.
 - The receiver recomputes every summary it is sent with its own `of` and `combine`, so peers need
   the same `Summary`, not only one that encodes the same, and the same arithmetic: a float
   `combine` that makes a NaN gets different bits on x86 and ARM, so a bundle from the other

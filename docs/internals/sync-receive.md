@@ -36,8 +36,10 @@ the body it was staged with, the LZ4 bytes it arrived with or those a body that 
 uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing is
 compressed at placing. A link to a sent object takes
 the offset it was placed at, and a link to an anchor or hint the offset of that object in the
-generation now current. A bundle that never spilled is placed in the frame that lands it, under the
-writer locks, which is written in one piece like a commit's. A larger one is placed first, in pieces
+generation now current. A bundle that never spilled is placed under the writer locks, in a frame of
+its own that keeps the refs as they were and is written in one piece like a commit's, just before the
+frame that lands it, so the landing can read the new head as `T` first, as described under
+[Limits](sync.md#limits). A larger one is placed first, in pieces
 of 256 KiB, each a frame of its own that keeps the refs as they were, so nothing can find its
 objects yet. A piece takes only the `tip` mutex, for about as long as a commit's encode, and commits
 on every branch go on between pieces. The dedupe cache learns a piece's objects when the piece is
@@ -53,11 +55,11 @@ worked out and checked against the commits this file holds now. A check that pas
 heads passes against newer ones unless a commit it relied on has been pruned, which only leaves less
 to check. A `StaleHave` from these checks or from the first ones comes before the merge closure, so
 a pull tries again from a fresh have, as described under [A stale have in a
-pull](sync.md#a-stale-have-in-a-pull). The landing frame holds the copies of the commits whose links
-changed and the refs that point `remote` at the head, and goes to the file 1 MiB at a time as the
-old frame did, with a header written last whose hash reads back the part already written. Type
-checks and hashes are not repeated: they depend only on the bundle and on objects whose hashes do
-not change.
+pull](sync.md#a-stale-have-in-a-pull). The copies of the commits whose links changed go into one
+more frame that keeps the refs, 1 MiB at a time as the old frame did, with a header written last
+whose hash reads back the part already written. The head's root is read as `T`, and the landing
+frame then holds only the refs that point `remote` at the head. Type checks and hashes are not
+repeated: they depend only on the bundle and on objects whose hashes do not change.
 
 A reclamation cycle can prune, swap the file and retire the old one while the bundle streams. Before
 placing, `receive` resolves the anchors again in the generation now current: each base by hash and
@@ -74,7 +76,9 @@ the published end of the log, and the pieces are whole frames that keep the prev
 crash anywhere leaves the previous head, and pieces that reached the disk stay in the log until the
 next cycle drops them. A landing refused under the locks, because a base was pruned or dropped while
 the bundle streamed, leaves its pieces the same way and writes nothing else: a 3 MB bundle refused
-there left the file 3 MB larger until the next cycle. A piece whose write fails, as when the disk
+there left the file 3 MB larger until the next cycle. One refused because its head does not read as
+`T` has written its objects, or the relinked copies of its commits, in the frame before the landing
+by then, and leaves that frame the same way. A piece whose write fails, as when the disk
 fills, fails the receive without poisoning the store, and the next frame is written over what
 reached the file. A power cut at every write of a receive that placed a 3 MB bundle in pieces, with
 a commit on the pulling branch while the stream was stalled and another on a second branch between
