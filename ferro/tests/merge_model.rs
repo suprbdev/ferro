@@ -824,6 +824,7 @@ enum Act {
     Pull(usize, usize, usize, usize),
     Sync(usize, usize),
     Cross(usize, usize),
+    Compact(usize),
 }
 
 fn act() -> impl Strategy<Value = Act> {
@@ -838,12 +839,20 @@ fn act() -> impl Strategy<Value = Act> {
     ]
 }
 
+fn pruning_act() -> impl Strategy<Value = Act> {
+    prop_oneof![
+        19 => act(),
+        1 => (0..DEVICES).prop_map(Act::Compact),
+    ]
+}
+
 struct Devices {
     graph: Graph,
     dbs: Vec<[Option<Db<Events>>; 2]>,
     heads: Vec<[usize; 2]>,
     events: u32,
     crossed: Crossed,
+    keep: Option<Keep>,
 }
 
 impl Devices {
@@ -869,9 +878,31 @@ impl Devices {
         let (ours, theirs) = if back { (side, main) } else { (main, side) };
         let (ha, hb) = (self.heads[device][a], self.heads[device][b]);
         let best = self.graph.best(ha, hb);
+        let found = ancestor_ids(&ours, &theirs);
+        let back = ancestor_ids(&theirs, &ours);
+        prop_assert_eq!(found.as_ref().ok(), back.as_ref().ok());
+        let answered = match found {
+            Ok(mut seen) => {
+                seen.sort_unstable();
+                prop_assert_eq!(&seen, &best);
+                true
+            }
+            Err(ferro::Error::NoCommonAncestor) if self.keep.is_some() => {
+                prop_assert_ne!(ha, hb);
+                false
+            }
+            Err(error) => panic!("{error}"),
+        };
         let id = self.graph.0.len();
         let (merged, calls) = counted_merge(&ours, &theirs, id);
-        let done = merged.unwrap();
+        let done = match merged {
+            Ok(done) => done,
+            Err(ferro::Error::NoCommonAncestor) if self.keep.is_some() => {
+                prop_assert!(!answered || best.len() > 1);
+                return Ok(());
+            }
+            Err(error) => panic!("{error}"),
+        };
         self.crossed.check(best.len(), &calls)?;
         if best == vec![hb] {
             prop_assert!(!done.changed);
@@ -895,13 +926,16 @@ impl Devices {
         let id = self.graph.0.len();
         let mut calls = Vec::new();
         let remote = format!("d{b}{}", LOCAL[t]);
-        let pulled = ours
-            .pull(&theirs, &remote, |root, base, other| {
-                add_deltas(root, base, other);
-                calls.push(base.version());
-                (format!("n{id}"), ())
-            })
-            .unwrap();
+        let pulled = ours.pull(&theirs, &remote, |root, base, other| {
+            add_deltas(root, base, other);
+            calls.push(base.version());
+            (format!("n{id}"), ())
+        });
+        let pulled = match pulled {
+            Ok(pulled) => pulled,
+            Err(ferro::Error::NoCommonAncestor) if self.keep.is_some() => return Ok(false),
+            Err(error) => panic!("{error}"),
+        };
         match pulled.outcome {
             Outcome::Merged => {
                 prop_assert!(!self.graph.reaches(ha, hb));
@@ -947,7 +981,7 @@ impl Devices {
     }
 }
 
-fn run_devices(acts: Vec<Act>) -> Result<Crossed, TestCaseError> {
+fn run_devices(acts: Vec<Act>, keep: Option<Keep>) -> Result<Crossed, TestCaseError> {
     let dir = tempfile::tempdir().unwrap();
     let mut devices = Devices {
         graph: Graph(Vec::new()),
@@ -955,10 +989,15 @@ fn run_devices(acts: Vec<Act>) -> Result<Crossed, TestCaseError> {
         heads: vec![[0, 0]; DEVICES],
         events: 0,
         crossed: Crossed::default(),
+        keep,
     };
     devices.graph.push(&[], None);
     for device in 0..DEVICES {
-        let db: Db<Events> = fast()
+        let options = match keep {
+            Some(keep) => fast().history(keep).reclaim(Reclaim { every_bytes: 0 }),
+            None => fast(),
+        };
+        let db: Db<Events> = options
             .open(dir.path().join(format!("d{device}.ferro")))
             .unwrap();
         devices.dbs.push([Some(db), None]);
@@ -988,6 +1027,11 @@ fn run_devices(acts: Vec<Act>) -> Result<Crossed, TestCaseError> {
                 devices.pull(c, 0, a, 0)?;
                 devices.pull(a, 0, b, 0)?;
                 devices.pull(b, 0, c, 0)?;
+            }
+            Act::Compact(device) => {
+                if let (Some(keep), Some(db)) = (keep, &devices.dbs[device][0]) {
+                    db.compact(keep).unwrap();
+                }
             }
         }
         devices.check()?;
@@ -1019,7 +1063,15 @@ proptest! {
     fn devices_that_branch_merge_and_sync_apply_every_delta_exactly_once(
         acts in prop::collection::vec(act(), 1..60),
     ) {
-        run_devices(acts)?;
+        run_devices(acts, None)?;
+    }
+
+    #[test]
+    fn devices_that_sync_with_bounded_history_find_the_true_base_or_refuse(
+        acts in prop::collection::vec(pruning_act(), 1..60),
+        keep in 2..8usize,
+    ) {
+        run_devices(acts, Some(Keep::Last(keep)))?;
     }
 }
 
@@ -1037,7 +1089,7 @@ fn random_histories_cross_often_and_each_delta_is_still_applied_once() {
             .new_tree(&mut runner)
             .unwrap()
             .current();
-        devices.add(run_devices(acts).unwrap());
+        devices.add(run_devices(acts, None).unwrap());
     }
     assert!(graphs.merges >= 50, "{} criss-cross merges", graphs.merges);
     assert!(

@@ -362,9 +362,11 @@ commit under that version. When two branches fork at f and each then pulls the s
 both records are made above f, r is not below f, and once the commits under f are pruned, r, older
 and two generations lower, could be among them: the search still refuses. `merge_model` builds the
 pull above under `Keep::Last(2)` to `Keep::Last(4)` and after compactions to `Keep::Last(1)` to
-`Keep::Last(3)`, a criss-cross after it, and both refusals. In 6,000 random histories of three
-devices that fork, merge, pull and sync under bounded history, 62 of 9,928 searches refused through
-a candidate below another before, and none do now. Every refusal left comes from a path that is not
+`Keep::Last(3)`, a criss-cross after it, and both refusals. Its devices, which fork, merge, pull and
+sync, now also run under bounded history with compactions, compare every answer with the whole
+history, and require one whenever the two branches are at the same commit, which the old search
+could refuse. In 6,000 random histories of that kind, 62 of 9,928 searches refused through a
+candidate below another before, and none do now. Every refusal left comes from a path that is not
 stale running into pruned history, such as a second pull whose remote commit is no newer than our
 oldest retained commit and so could be among what we pruned.
 
