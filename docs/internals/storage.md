@@ -45,6 +45,29 @@ dependency on the write path that only ever reads bytes ferro produced, and the 
 safe module, which forbids unsafe code, because it reads bodies from files and sync bundles that may
 be damaged or hostile.
 
+Every varint in a record takes the fewest bytes its value needs, as `push_varint` writes it, and a
+reader refuses a longer one as damage. A longer form reads as the same number: the last byte with
+its continuation bit set, then a zero byte. So a flipped high bit in the last byte of a record, the
+end of its last link's offset, read on into the next byte when that byte was zero, as the first byte
+of a frame's table is about once in 256 frames. The record then gave the same object one byte
+longer, and no read and no `verify` saw the flip (#91). Both readers of records in the log, the one
+that takes a whole record from bytes it already holds and the one that reads on from the file, check
+it with one comparison on the last byte of each varint. Over six alternating runs of `ferro-bench`
+and of its `reads` on a million keys, that added 0.12% to the median user-space instructions of a
+cold `get` with a 1 MiB cache, 56,801 to 56,871, and 0.06% to those of a key of a cold scan, 1,086.3
+to 1,086.9 for `u64` values, while the median times, 5,719 and 5,690 ns a get and 106.1 and 105.5
+ns a key, moved less than the runs of either build spread.
+
+A compressed body is the one part of a record whose bytes are not all checked. LZ4 can encode one
+body in many ways: the decoder ignores the low four bits of the last sequence's token, which holds
+only literals, and a match may name any earlier copy of the bytes it repeats. A flip there
+decompresses to the same body, the hash matches, and nothing reports it. Nothing needs to, since the
+body is all those bytes are for and the hash covers it. A flip that changes the body fails the hash
+check, the decompression, or the check that it decompresses to its raw length. Refusing the rest
+would take compressing every body again on read, and would tie the format to one version of the
+compressor. A cycle and a sync copy a compressed body as it is, so such a flip goes with it, as
+harmless in the copy.
+
 ## Deduplication
 
 A transaction skips an object whose hash it finds in `dedupe`, a bounded table from hash to offset,

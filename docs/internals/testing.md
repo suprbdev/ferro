@@ -281,6 +281,45 @@ ran 4,550 to 4,882 executions, 7 or 8 a second, 19,072 together, ending at 37,30
 with 1,178 to 1,220 entries, 2,314 more together. No input crashed, hung, leaked or passed a memory
 limit, and the peak RSS was 982 MB.
 
+## Flipped bytes in the log
+
+`flipped_log_bytes_never_read_back_as_wrong_data` in `ferro/tests/crash.rs` builds a file of 40
+commits and flips one byte of its log 4,000 times, from a fixed seed, with a single bit half the
+time and a random mask otherwise. A flip inside a record that `Store::walk` reaches must fail the
+open, a read of every version or `verify`, and one outside every such record must pass all three;
+none may read back wrong data. Each commit's entry holds its time, and the hashes of everything
+that links an entry follow from it, so the bytes at one position differ from run to run. The build
+takes its times from a counter that starts at the wall clock, or at `FERRO_TEST_CLOCK` when that is
+set, and a failure names the start: `FERRO_TEST_CLOCK=<start> cargo test --release -p ferro --test
+crash flipped` builds the same file and makes the same flips.
+
+It failed once in a `make ci` run with `byte 42251 mask 0x80 live true: reachable damage went
+unnoticed` (#91). With the counter in place, flipping the high bit of every byte of every reachable
+record, in files built from 240 starts, found 44 flips that nothing noticed, each in the last byte
+of a record followed by a zero byte: a varint read as the same number in a longer form, as
+described under [Records](storage.md#records). Run from 1,500 starts, the test failed at 5, each on
+byte 42,251 with mask 0x80, the failure reported. The other seven single bits of every reachable
+byte, from 96 starts, were all noticed. Every mask of every reachable byte, 12.4 million flips a
+file, stopped partway through files from 12 starts, had found a second hole, the same four flips of
+two to four bits in each: they moved a replaced head's link to its root onto the entry it links as
+its tip, which `verify` took as walked, as described under [Branch-table
+steps](commit-path.md#branch-table-steps). `a_record_read_on_into_the_byte_after_it_is_reported`
+and `a_link_redirected_to_a_sibling_is_reported_by_verify` build each case directly, and failed
+before the changes. After them, every mask of every reachable byte, in files from 20 starts, was
+noticed as far as the run went, more than half of each file's flips before it was stopped for the
+420 MB/s it wrote to the disk.
+
+The test's long values are random letters, which LZ4 does not shorten, so its file holds no
+compressed body. `flipped_bytes_of_compressed_bodies_never_read_back_as_wrong_data` makes the same
+flips in a file whose long values repeat four short words, where 82 of the 295 reachable records
+are compressed, and lets a flip inside a compressed body pass if every read returns the right data,
+since it left the body as it was, as described under [Records](storage.md#records). Every
+single-bit flip of every reachable byte, in files from 12 starts, found 848 such flips in each and
+none elsewhere: 328 in the low four bits of the last token of each of the 82 bodies, and 520 in
+match offsets that named another copy of the same bytes. Every mask, in files from 4 starts, 8.4
+million flips a file, found 17,649 such flips in each, again none outside a compressed body, and no
+wrong data.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:

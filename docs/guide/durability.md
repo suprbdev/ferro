@@ -42,8 +42,9 @@ truncated, and so is a flipped bit with only zeroes or only ones between it and 
 The tests flip bits in frames past the superblock of the crash images above, Fsync frames of
 acknowledged commits among them, and check that every torn image still opens, frames of sparse
 values stored raw and of a pull that spilled among them. Bit rot further back is reported by the
-hash checks, not truncated. [Torn and damaged
-frames](../internals/storage.md#torn-and-damaged-frames) describes the rule and its limits.
+hash checks, not truncated, unless it leaves every object as it was, as a flipped bit in a
+compressed body can, as described under [Records](../internals/storage.md#records). [Torn and
+damaged frames](../internals/storage.md#torn-and-damaged-frames) describes the rule and its limits.
 
 On Windows every sync is a `FlushFileBuffers`, and the file must be on NTFS, as described in
 [Limitations](limitations.md).

@@ -616,6 +616,12 @@ Every guarantee the table gave still holds:
   `verify_holds_while_pruned_branches_fork_drop_and_cycle` finds in its first four seeds.
   `verify_typed` checks a step as a typed object, and its first link as a table or a step. `layout`
   walks the same objects.
+- An object's link that names the record of an entry a chain read counts as walked only if it
+  names that entry's hash. One that names another hash is read, and fails its hash check. The walk
+  used to know entries by offset alone, so a flipped bit that moved a step's or a table's link to a
+  root onto the entry it links as the tip, a record or two along, passed `verify`, since nothing
+  else reads a replaced head's root through the step (#91,
+  `a_link_redirected_to_a_sibling_is_reported_by_verify`).
 - A reclamation cycle copies the table kept in memory, so the new file starts with a table and no
   steps. Entries are still copied by the offset they were read from, as described under [Commits
   stored twice](sync-receive.md#commits-stored-twice), and steps are written without looking in
