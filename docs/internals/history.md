@@ -25,14 +25,67 @@ offset 0. `Options::history(Keep::Last(n))` raises `first` as part of each commi
 extra bytes. `Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each
 reclamation cycle.
 
-A walk of a whole chain, as `verify`, `verify_typed`, a reclamation cycle and `admin::compact` make,
-checks that the tip is at the version the head names as its last, that each `prev` link it follows
-reaches the version just below, and that each retained skip link names by hash the entry the chain
-reaches at its version, and fails with `Error::Corrupt` where one does not, as
-[Fuzzing](testing.md#fuzzing) describes. Their walk of the history that merges brought in checks its
-`prev` links the same way. A commit links the tip below it, and a received chain must descend one
-version at a time, as [Applying](sync.md#applying) describes, so only a damaged file has such a
-link.
+Readers take a head and its chain as they find them, and the walks of whole chains check what they
+rely on, as [What readers rely on](#what-readers-rely-on) lists.
+
+## What readers rely on
+
+`verify`, `verify_typed`, a reclamation cycle and `admin::compact` walk every retained chain and the
+history that merges brought in through the same two walks, so a file that breaks one of these rules
+fails all four with `Error::Corrupt`, and a cycle or `compact` leaves it as it was. Each rule is one
+that a reader or the copy relies on, and no writer breaks one: a commit links the tip below it and
+takes its numbers from its parents, and a received chain is checked against the same rules, as
+[Applying](sync.md#applying) describes. [Fuzzing](testing.md#fuzzing) records what each rule's
+absence led to.
+
+- A head with a tip keeps versions `first` to its version, and `first` is at least 1. `len` and
+  every lookup and walk rely on it, and decoding the head checks it.
+- A head with no tip names version 0 and no root. `read`, `info` and the version of the next commit
+  rely on it, and decoding the head checks it.
+- The tip is at the version the head names. `at`, `Log::last` and sync's have rely on it, and the
+  chain walk checks it.
+- The head's root is the tip's. `read` and `at` of the head's version rely on it to agree, as does a
+  commit's test for a change, and the chain walk checks it.
+- An entry is at version 1 or above, its reach is below its generation, and its last merge is its
+  own version exactly when it is a merge, with a floor of 1 or above. The base search relies on it,
+  and decoding the entry checks it.
+- Each `prev` link reaches the version just below. `history_of`, `Log::iter` and the copy's search
+  for a skip target rely on it, and both walks check it.
+- No link above `first` is cut. Lookups rely on it, and the chain walk checks it.
+- Each kept skip link names by hash the entry the chain reaches at its version. `at`, `as_of`,
+  `hash_at`, the base search and sync rely on it. Both walks check it, and so does the copy, for a
+  chain whose lower part another branch's walk took.
+- In merged history, no skip link leads past where the `prev` links stop, or past where the history
+  kept by time stops to a commit that time keeps. `lowest_kept` relies on it, so that the base
+  search reads only what a cycle keeps, and the merged-history walk checks it.
+- An entry is no older than the entries it links by `prev` and merge links. `as_of`, `Keep::Since`,
+  `Keep::Within`, the time bound of merged history and the base search rely on it, and both walks
+  check it.
+- A merge floor is no higher than the merged commit's version. The base search and the copy of
+  merged history rely on it, and both walks check it.
+- Generation, reach, last merge and the bounded bit follow from the parents. The base search and
+  sync rely on them, and both walks check them.
+- A branch table runs back at most 1,024 steps to a whole table. Loading the table relies on it and
+  checks it.
+
+A receive checks the rules on times, merge floors and merge numbers on each sent commit through
+the same function, so a file that passes `verify` can be pulled from. Where a parent lies in pruned
+history, below where a walk stops, or behind a cut link, only what that parent cannot change is
+checked: the generation must exceed the known parent's, and so on. An entry above version 1 with no
+`prev` link counts as one whose parent is pruned. Checking a merge entry reads the commit it merged
+once more. Where a walk of merged history stops because another walk took the chain from there, it
+checks the skip links it passed against the hashes a chain walk recorded, when one took that chain,
+and otherwise reads on, without walking, until they have met the entries they name. Reading on
+every time made `verify` 29% slower on a file of 202,000 commits and 2,000 merges, and the
+recorded hashes bring that to 1%, as [Fuzzing](testing.md#fuzzing) records.
+
+Some things are left unchecked because no reader is misled by them. The old `merged` records are
+claims a structure cannot confirm, and readers already ignore one whose version is past the commit
+a search starts from or outside the named branch's retained versions. A merge's time bound past
+the merged commit's time makes that commit bare, which the search and the copy treat alike. A
+missing skip link only makes lookups slower. An entry with no root reads as `NoVersion`. A commit
+after a stamped one may share its millisecond in a file another peer sent, since a receive does not
+refuse it.
 
 ## What pruning hides
 

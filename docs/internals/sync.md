@@ -174,7 +174,8 @@ once it sends 256 objects, with eight chunks in flight between the two.
   the merged commit's version. Where a parent lies in pruned history, only what can be checked is:
   the generation must exceed the known parent's, and so on. The numbers are a function of the graph
   alone, so a commit hashes the same in every file, and a forged generation or merge link is
-  rejected rather than landed.
+  rejected rather than landed. `verify` checks a file's own chains with the same function, as
+  [What readers rely on](history.md#what-readers-rely-on) describes.
 - No sent commit may be dated more than a day past the receiver's clock. Commit times only go up
   along a chain and a merge takes the later of its parents' times, so a forged time of `u64::MAX`
   would have pinned every later commit there. A device whose clock runs more than a day fast cannot
