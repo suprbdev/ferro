@@ -30,6 +30,46 @@ content in `==`, `diff` and write deduplication. Nothing in ferro authenticates 
 attacker; the superblock checksum is unkeyed. Raising `HASH_BYTES` to 32 restores the full claim at
 the cost of those bytes.
 
+### Zero-width items
+
+An item of a sequence can encode to nothing: each `()` of a `Vec<()>`, and each `((), ())`,
+`Box<()>` or `[(); 4]`. A `Vec<()>` of a billion items is a varint of five bytes, and decoding it
+loops a billion times, so a forged length in a damaged file or a hostile bundle could keep a read or
+a receive check running for as long as it liked. `Decoder::item`, which `Vec`, arrays, `BTreeMap`
+and `BTreeSet` read each item through, counts the items that consume no bytes and no links, and
+fails with `Error::Decode` past 2^24 of them in one object. The count is per object: struct fields
+share their struct's, the keys, values and summaries of a map node share the node's, and a value
+spilled into an object of its own, or a nested collection's nodes, each start at zero. 2^24 `()`s
+take about 3.5 ms to visit, so the items no object pays bytes for cost a read or a check at most
+that much an object.
+
+`Encoder::item` counts the items it writes the same way and fails with `Error::TooManyZeroWidth`
+past 2^24 in one object, so a commit refuses what a read would refuse instead of writing it, and
+`try_hash_of` returns the error. Every impl that reads items through `Decoder::item` writes them
+through `Encoder::item`, which the `Data` docs ask of a hand-written impl as well. A map node
+encodes each inline value with its items counted apart and adds them to the node's count only if the
+value stays inline, so a value that spills is counted in its own object alone. A node that reuses
+the encoded entries of the node it replaces, because only its children changed, adds the count
+recorded with those entries, and then counts its child summaries on top. The staged encode of a
+large commit counts its nodes the same way. The receive check and `verify_typed` decode each object
+with one decoder, as a read does, so they hold a file to the limit it was written under.
+
+A commit used to check the new values of a node that kept most of its old ones each in a decoder of
+its own, while a read decodes the whole node with one, so the counts of a node's values added up
+only on the read. Three commits that each put six million `()`s under keys of one node all landed,
+`verify` passed, and then `verify_typed` reported the node corrupt and every read of it panicked
+(#109). A root `Vec<()>` of 2^24 + 1 items was refused by the check that decodes a new root, with
+`Error::Decode`, while `hash_of` encoded it.
+
+Counting per value instead, each key, value and summary of a node from zero, would accept every node
+whose values fit one at a time, but a node's cost would then grow with its entries. An entry whose
+value claims 2^24 `()`s takes about seven bytes of its node with its key, slot tag and child count,
+so a hostile node of 1 MiB would buy some 150,000 times 3.5 ms, about nine minutes of one check,
+where a bundle now buys 3.5 ms for each object it sends. Capping a node's entries to keep that down
+would refuse, at commit, any map with enough keys that hash to one level between two higher ones.
+Counting per object refuses only values that fit alone but not together in one node, more than 2^24
+items that take no room between them, which no realistic value holds.
+
 ## Records
 
 A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an optional

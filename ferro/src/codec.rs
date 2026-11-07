@@ -299,6 +299,11 @@ impl Sink for HashSink {
 ///
 /// - **Decoding inverts encoding.** [`decode`](Data::decode) of what [`encode`](Data::encode)
 ///   wrote gives back a value that encodes to the same bytes and links.
+/// - **Items are counted alike.** An impl that reads the items of a sequence with
+///   [`Decoder::item`] writes them with [`Encoder::item`], as `Vec`, arrays, `BTreeMap` and
+///   `BTreeSet` do. A decoder refuses an object with more than 2^24 items that take no bytes and
+///   no links, so that a forged length cannot keep it running, and the encoder refuses to write
+///   one, with [`Error::TooManyZeroWidth`].
 /// - **The encoding is canonical.** It depends only on the value, never on how the value was
 ///   built, its capacity or what it shared. Root hashes, `==` on collections, the skip of a
 ///   commit that changes nothing, [`Map::diff`](crate::Map::diff) and merges all go by
@@ -362,8 +367,9 @@ pub trait Data: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns the errors of what it writes: of a nested value that cannot encode, such as a
-    /// collection whose nodes cannot be read, and of the sink, such as [`Error::StalePointer`] for
-    /// a [`Ptr`] into an earlier generation of the file.
+    /// collection whose nodes cannot be read, of [`Encoder::item`], [`Error::TooManyZeroWidth`]
+    /// for more zero-width items in one object than a decoder reads back, and of the sink, such
+    /// as [`Error::StalePointer`] for a [`Ptr`] into an earlier generation of the file.
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()>;
     /// Reads a value that [`encode`](Data::encode) wrote, consuming exactly what it wrote.
     ///
@@ -431,15 +437,17 @@ pub trait Data: Clone + Send + Sync + 'static {
     }
     /// Writes `items` one after another, as `Vec` and arrays store their items.
     ///
-    /// The default encodes each item in turn. An override, such as `u8`'s, which copies the bytes
-    /// at once, must write exactly what the default would.
+    /// The default encodes each item in turn through [`Encoder::item`]. An override, such as
+    /// `u8`'s, which copies the bytes at once, must write exactly what the default would, and
+    /// count the items that [`decode_vec`](Data::decode_vec) counts.
     ///
     /// # Errors
     ///
-    /// As for [`encode`](Data::encode).
+    /// As for [`encode`](Data::encode), and [`Error::TooManyZeroWidth`] for more zero-width items
+    /// in one object than a decoder reads back.
     fn encode_slice(items: &[Self], w: &mut Encoder<'_>) -> Result<()> {
         for item in items {
-            item.encode(w)?;
+            w.item(|w| item.encode(w))?;
         }
         Ok(())
     }
@@ -650,6 +658,7 @@ pub struct Encoder<'a> {
     links: Vec<Ptr>,
     sink: &'a mut dyn Sink,
     unsettled: bool,
+    empty_items: u64,
 }
 
 /// Appends `value` to `buf` as an LEB128 varint, as [`Encoder::varint`] writes it.
@@ -680,6 +689,7 @@ impl<'a> Encoder<'a> {
             links: Vec::new(),
             sink,
             unsettled: false,
+            empty_items: 0,
         }
     }
 
@@ -690,6 +700,7 @@ impl<'a> Encoder<'a> {
             links: Vec::with_capacity(links),
             sink,
             unsettled: false,
+            empty_items: 0,
         }
     }
 
@@ -702,6 +713,7 @@ impl<'a> Encoder<'a> {
             links: Vec::new(),
             sink,
             unsettled: false,
+            empty_items: 0,
         }
     }
 
@@ -785,9 +797,67 @@ impl<'a> Encoder<'a> {
     }
 
     /// Drops everything written since `mark`, bytes and links.
+    ///
+    /// The zero-width items that [`item`](Encoder::item) counted since `mark` stay counted.
     pub fn rewind(&mut self, mark: (usize, usize)) {
         self.buf.truncate(mark.0);
         self.links.truncate(mark.1);
+    }
+
+    /// Writes one item of a sequence with `write`, counting the items that write no bytes and no
+    /// links, as [`Decoder::item`] counts them when it reads them back.
+    ///
+    /// Use it for each item of a sequence that a decoder reads with [`Decoder::item`], so that a
+    /// value the decoder would refuse, such as a `Vec<()>` of more than 2^24 items, fails to
+    /// encode rather than encodes to an object that does not decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `write`, and [`Error::TooManyZeroWidth`] once more than 2^24
+    /// zero-width items have been written into one object.
+    pub fn item(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let before = self.mark();
+        write(self)?;
+        if self.mark() == before {
+            self.add_zero_width(1)?;
+        }
+        Ok(())
+    }
+
+    /// Writes with `write` into this object, but counts the zero-width items it writes apart from
+    /// the object's and returns them, for a value that may yet move into an object of its own.
+    /// [`add_zero_width`](Encoder::add_zero_width) adds them to the object's count if it stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `write`, such as [`Error::TooManyZeroWidth`] for more than 2^24
+    /// zero-width items in what it writes.
+    pub(crate) fn zero_width_apart(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<u64> {
+        let outer = std::mem::take(&mut self.empty_items);
+        let written = write(self);
+        let inner = std::mem::replace(&mut self.empty_items, outer);
+        written.map(|()| inner)
+    }
+
+    /// Adds `count` zero-width items to this object's count, as if they were written here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooManyZeroWidth`] if the object then holds more than 2^24.
+    pub(crate) fn add_zero_width(&mut self, count: u64) -> Result<()> {
+        self.empty_items = self.empty_items.saturating_add(count);
+        if self.empty_items > MAX_EMPTY_ITEMS {
+            return Err(Error::TooManyZeroWidth);
+        }
+        Ok(())
+    }
+
+    /// The zero-width items written into this object so far.
+    pub(crate) fn zero_width(&self) -> u64 {
+        self.empty_items
     }
 
     /// Encodes a separate object with `f`, hands it to the sink and returns the link to it,
@@ -1340,7 +1410,10 @@ impl<'a> Decoder<'a> {
     /// links.
     ///
     /// Use it for each item of a sequence whose length was decoded, so that a forged length of
-    /// zero-width items, such as a billion `()`s, fails rather than runs on.
+    /// zero-width items, such as a billion `()`s, fails rather than runs on. The count is per
+    /// object: the keys, values and summaries of one map node share it, and a value spilled into
+    /// an object of its own, or a nested collection's nodes, count apart. [`Encoder::item`] counts
+    /// items as they are written and refuses an object with more, so what encodes decodes.
     ///
     /// # Errors
     ///
@@ -2005,8 +2078,10 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         w.varint(self.len() as u64);
         for (key, value) in self {
-            key.encode(w)?;
-            value.encode(w)?;
+            w.item(|w| {
+                key.encode(w)?;
+                value.encode(w)
+            })?;
         }
         Ok(())
     }
@@ -2056,7 +2131,7 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         w.varint(self.len() as u64);
         for item in self {
-            item.encode(w)?;
+            w.item(|w| item.encode(w))?;
         }
         Ok(())
     }

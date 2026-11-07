@@ -797,13 +797,15 @@ impl<K, V, S> Link<K, V, S> {
 struct Prefix {
     bytes: Box<[u8]>,
     links: Box<[Ptr]>,
+    zero_width: u64,
 }
 
 impl Prefix {
-    fn of(object: &Object, at: (usize, usize)) -> Arc<Prefix> {
+    fn of(object: &Object, at: (usize, usize), zero_width: u64) -> Arc<Prefix> {
         Arc::new(Prefix {
             bytes: object.body[..at.0].into(),
             links: object.links[..at.1].into(),
+            zero_width,
         })
     }
 
@@ -2365,11 +2367,13 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
             for link in &prefix.links {
                 encoder.link(*link);
             }
+            encoder.add_zero_width(prefix.zero_width)?;
             (Vec::new(), Vec::new())
         }
         None => entries(node, &mut encoder, store.as_ref(), caching, decoding)?,
     };
     let entries_end = encoder.mark();
+    let entries_zero_width = encoder.zero_width();
     let branching = caching && !node.children.is_empty();
     let rewritten = dirty(node).count();
     let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
@@ -2425,7 +2429,9 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     };
     let cached = cached.map(|mut cached| {
         if let Cells::Column(_) = cached.cells {
-            cached.prefix = Some(reused.unwrap_or_else(|| Prefix::of(&object, entries_end)));
+            cached.prefix = Some(
+                reused.unwrap_or_else(|| Prefix::of(&object, entries_end, entries_zero_width)),
+            );
         }
         cached
     });
@@ -2476,8 +2482,11 @@ fn entries<K: Data, V: Data, S: Summary<K, V>>(
         let mark = encoder.mark();
         encoder.u8(0);
         let body = encoder.mark();
-        value.encode(encoder)?;
+        let zero_width = encoder.zero_width_apart(|encoder| value.encode(encoder))?;
         let spill = encoder.since(mark) > SPILL_BYTES;
+        if !spill {
+            encoder.add_zero_width(zero_width)?;
+        }
         if let (true, true, Some(store)) = (node.is_fresh(index), spill || !decoding, store) {
             let decoded = verify::<V>(encoder, body, store)?;
             if !spill && caching && !decoding {
@@ -2699,8 +2708,10 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
         };
         let mark = encoder.mark();
         encoder.u8(0);
-        value.encode(&mut encoder)?;
-        if encoder.since(mark) > SPILL_BYTES {
+        let zero_width = encoder.zero_width_apart(|encoder| value.encode(encoder))?;
+        if encoder.since(mark) <= SPILL_BYTES {
+            encoder.add_zero_width(zero_width)?;
+        } else {
             encoder.rewind(mark);
             let mut inner = Probe(stager.id);
             let mut spill = Encoder::new(&mut inner);

@@ -311,6 +311,10 @@ Keeping only the checks of objects linked twice took the receive of a clone of a
 from 2.35 to 1.59 s and from 436 to 41 MiB of heap, with the other changes described under [Memory
 for each object](sync.md#memory-for-each-object).
 
+Each decode stops past 2^24 items that take no bytes and no links in one object, the limit a commit
+writes each object under, as described under [Zero-width items](storage.md#zero-width-items), so a
+bundle of objects written under it never meets it.
+
 Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
 Nothing reads them as a type. Spilled values are not checked for the size that made them spill.
 Summaries are recomputed, as described under [Recomputing summaries](#recomputing-summaries).

@@ -7,7 +7,8 @@ corruption during a read panics. `try_get` exists for callers that need to handl
 `update` a panic discards the transaction and leaves the database unchanged.
 
 A decode error on read stays a panic. Every object a file holds was either written by this process,
-which decodes each new key, value and root as it writes them, or checked as its type by `receive`,
+which decodes each new key, value and root as it writes them and counts the items of each object
+that take no room against the limit a decoder holds it to, or checked as its type by `receive`,
 so an object that does not decode is a damaged file or a schema change that broke stored data, the
 same classes as a bad hash. Turning it into an `Error` would put a `Result` on every `get`, iterator
 step and comparison for a case a healthy file cannot reach, and the read would have nothing better

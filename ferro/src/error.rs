@@ -152,6 +152,15 @@ pub enum Error {
     /// its size in bytes.
     #[error("object of {0} bytes exceeds the 4 GiB limit")]
     TooLarge(u64),
+    /// An object, such as one value or one map node, would hold more than 2^24 zero-width items:
+    /// items of a sequence that encode to no bytes and no links, such as the `()`s of a `Vec<()>`.
+    ///
+    /// A decoder refuses an object with more, so that a forged length cannot keep it reading items
+    /// that take no room, and encoding refuses to write one. The keys, values and summaries of a
+    /// map node count together, so a commit can refuse values that each encode alone when their
+    /// keys share a node. [`Decoder::item`](crate::codec::Decoder::item) describes the count.
+    #[error("an object would hold more than 2^24 zero-width items")]
+    TooManyZeroWidth,
     /// With [`Options::coalesce`](crate::Options::coalesce), the group this closure joined could
     /// not be written.
     ///
