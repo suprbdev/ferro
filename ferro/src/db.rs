@@ -2239,10 +2239,17 @@ impl<T: Data> Shared<T> {
     }
 
     fn arrive<'a>(&self, branch: &'a Branch<T>) -> Lane<'a, T> {
+        struct Arriving<'b>(&'b AtomicUsize);
+        impl Drop for Arriving<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
         branch.arriving.fetch_add(1, Ordering::AcqRel);
+        let arriving = Arriving(&branch.arriving);
         self.step("arriving");
         let guard = branch.lane.lock();
-        branch.arriving.fetch_sub(1, Ordering::AcqRel);
+        drop(arriving);
         branch.hold(guard)
     }
 
@@ -2391,7 +2398,7 @@ impl<T: Data> Shared<T> {
                     drop(queue);
                     self.seal_idle(&others);
                     let queue = self.queue.lock();
-                    if !queue.syncing && !queue.waiting.is_empty() {
+                    if !queue.syncing && !queue.failed && !queue.waiting.is_empty() {
                         self.lead(queue, &mut notices)?;
                     }
                     continue;
@@ -2735,7 +2742,7 @@ impl<T: Data> Shared<T> {
         let (kept, synced, panicked) = match attempt {
             Ok((kept, synced)) => (kept, synced, None),
             Err(panicked) => {
-                store.poison();
+                store.poison_unsynced();
                 (0, Err(Error::Poisoned), Some(panicked))
             }
         };
@@ -2746,10 +2753,11 @@ impl<T: Data> Shared<T> {
         });
         let synced = outcome.is_ok();
         let mut seals = Vec::new();
+        let mut late = None;
         let published = outcome.as_ref().ok().map(|(_, refs)| {
             let mut published = self.published.lock();
             *published = refs.clone();
-            self.step("publishing");
+            late = panic::catch_unwind(AssertUnwindSafe(|| self.step("publishing"))).err();
             published
         });
         for pending in batch {
@@ -2763,8 +2771,8 @@ impl<T: Data> Shared<T> {
                 }
             }
         }
-        if published.is_some() {
-            self.step("published");
+        if published.is_some() && late.is_none() {
+            late = panic::catch_unwind(AssertUnwindSafe(|| self.step("published"))).err();
         }
         drop(published);
         let lost = !cut.is_empty();
@@ -2818,7 +2826,7 @@ impl<T: Data> Shared<T> {
         if rouse {
             self.rouse();
         }
-        if let Some(panicked) = panicked {
+        if let Some(panicked) = panicked.or(late) {
             panic::resume_unwind(panicked);
         }
         if let Ok((frame, _)) = &outcome {

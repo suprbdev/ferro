@@ -201,8 +201,14 @@ fails.
 A member whose frame a sync settled also returns its version now even when a later sync has failed
 the queue before it looked, where it used to check for the failure first and report
 `Error::Poisoned` for a commit that was durable. A leader that panics in its sync, as a test hook
-can make it, poisons the store, fails its batch and wakes every writer before the panic goes on,
-where it left the queue syncing and every writer, coalesced or not, waiting for good.
+can make it, poisons the store so that no later sync writes a superblock, fails its batch and wakes
+every writer before the panic goes on, where it left the queue syncing and every writer, coalesced
+or not, waiting for good. A member that sealed other branches' groups after such a failure no
+longer leads them, where it used to sync them on the poisoned store and get its version back for a
+commit whose branch was never published. A panic in the hook's steps once the leader has published
+is held until the queue is settled and everyone woken, and a panic while a writer is on its way to
+its lane no longer leaves the branch counted as having one on the way. `leader_panic.rs` has each:
+a later writer hung, or the member got its version, without those changes.
 
 `a_group_another_branch_sealed_strands_no_one_when_its_frame_write_fails` in `landing_fault.rs`
 holds one branch's leader in its sync while a group opens on a second branch with a writer on its

@@ -2588,10 +2588,10 @@ impl Store {
         self.inner.landed.notify_all();
     }
 
-    /// Poisons the store after a failed fdatasync, after which no superblock is written and no
-    /// checkpoint moves the anchor, since a later sync can succeed without the pages this one
-    /// dropped.
-    fn poison_unsynced(&self) {
+    /// Poisons the store after a failed fdatasync, or a leader that panicked while it synced,
+    /// after which no superblock is written and no checkpoint moves the anchor, since a later sync
+    /// can succeed without the pages this one dropped.
+    pub(crate) fn poison_unsynced(&self) {
         self.inner.unsynced.store(true, Ordering::Release);
         self.poison();
     }
