@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +47,7 @@ fn build(commits: u64, keys_per_commit: u64) -> Built {
 }
 
 fn build_as(options: Options, commits: u64, keys_per_commit: u64, long: usize) -> Built {
-    build_from(options, clock_start(), commits, keys_per_commit, long)
+    build_from(options, clock_start(), commits, keys_per_commit, long, text)
 }
 
 fn clock_start() -> u64 {
@@ -61,12 +62,26 @@ fn clock_start() -> u64 {
         })
 }
 
+fn repetitive(seed: u64, len: usize) -> String {
+    let mut rng = Rng::new(seed);
+    let words: Vec<String> = (0..4)
+        .map(|_| text(rng.next(), 3 + rng.below(6) as usize))
+        .collect();
+    let mut out = String::new();
+    while out.len() < len {
+        out.push_str(&words[rng.below(4) as usize]);
+    }
+    out.truncate(len);
+    out
+}
+
 fn build_from(
     options: Options,
     clock: u64,
     commits: u64,
     keys_per_commit: u64,
     long: usize,
+    value: fn(u64, usize) -> String,
 ) -> Built {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.ferro");
@@ -91,7 +106,7 @@ fn build_from(
             } else {
                 rng.below(40) as usize
             };
-            edits.push((key, text(rng.next(), len)));
+            edits.push((key, value(rng.next(), len)));
         }
         let remove = (commit > 0).then(|| rng.below(keys_per_commit * 3));
         db.commit(format!("c{commit}"), |root| {
@@ -797,6 +812,33 @@ fn reachable(path: &Path) -> Vec<(usize, usize, Vec<Ptr>)> {
     out
 }
 
+fn record_varint(bytes: &[u8], at: &mut usize) -> u64 {
+    let mut value = 0;
+    let mut shift = 0;
+    loop {
+        let byte = bytes[*at];
+        *at += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+    }
+}
+
+fn compressed_bodies(bytes: &[u8], ranges: &[(usize, usize, Vec<Ptr>)]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for (start, _, _) in ranges {
+        let mut at = *start;
+        let stored = record_varint(bytes, &mut at) as usize;
+        if record_varint(bytes, &mut at) & 1 == 1 {
+            record_varint(bytes, &mut at);
+            out.push(at..at + stored);
+        }
+    }
+    out
+}
+
 enum Reads {
     Correct,
     Wrong(String),
@@ -856,10 +898,23 @@ fn read_everything(db: &Db<Root>, built: &Built) -> ferro::Result<Reads> {
 fn flipped_log_bytes_never_read_back_as_wrong_data() {
     quiet_ferro_panics();
     let built = build(40, 6);
+    flip_log_bytes(&built, 0xFACE);
+}
+
+#[test]
+fn flipped_bytes_of_compressed_bodies_never_read_back_as_wrong_data() {
+    quiet_ferro_panics();
+    let built = build_from(fast(), clock_start(), 40, 6, 600, repetitive);
+    let compressed = flip_log_bytes(&built, 0xFADE);
+    assert!(compressed > 20, "only {compressed} bodies compressed");
+}
+
+fn flip_log_bytes(built: &Built, seed: u64) -> usize {
     let path = built.target();
     fs::write(&path, &built.bytes).unwrap();
     let ranges = reachable(&path);
-    let mut rng = Rng::new(0xFACE);
+    let compressed = compressed_bodies(&built.bytes, &ranges);
+    let mut rng = Rng::new(seed);
     let mut detected = 0u64;
     let mut dead = 0u64;
     for trial in 0..cases(4000) {
@@ -885,7 +940,7 @@ fn flipped_log_bytes_never_read_back_as_wrong_data() {
                 Ok(db) => db,
                 Err(error) => return Some(error.to_string()),
             };
-            match read_everything(&db, &built) {
+            match read_everything(&db, built) {
                 Ok(Reads::Correct) => {}
                 Ok(Reads::Wrong(what)) => panic!("ferro: WRONG DATA {what}"),
                 Err(error) => return Some(error.to_string()),
@@ -897,8 +952,12 @@ fn flipped_log_bytes_never_read_back_as_wrong_data() {
                 detected += 1;
             }
             Outcome::Value(None) => {
-                assert!(!live, "{context}: reachable damage went unnoticed");
-                dead += 1;
+                let recoded = compressed.iter().any(|body| body.contains(&position));
+                assert!(
+                    !live || recoded,
+                    "{context}: reachable damage went unnoticed"
+                );
+                dead += u64::from(!live);
             }
             Outcome::FerroPanic(message) => {
                 assert!(!message.contains("WRONG DATA"), "{context}: {message}");
@@ -908,6 +967,7 @@ fn flipped_log_bytes_never_read_back_as_wrong_data() {
     }
     assert!(detected > 100, "only {detected} flips detected");
     assert!(dead > 0, "no flip landed in unreachable bytes");
+    compressed.len()
 }
 
 #[test]
