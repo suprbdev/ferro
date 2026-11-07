@@ -2362,16 +2362,20 @@ impl<T: Data> Shared<T> {
                 return Ok((sealed.version, sealed.time_ms));
             }
             let queue = self.queue.lock();
+            if let Some(Ok(sealed)) = seal.outcome.get()
+                && queue.settled >= sealed.ticket
+            {
+                return Ok((sealed.version, sealed.time_ms));
+            }
             if queue.failed {
                 return Err(Error::Poisoned);
             }
             match seal.outcome.get() {
                 Some(Err(failure)) => {
+                    drop(queue);
+                    self.lead_after_failure(branch, &mut notices);
                     self.store().check_healthy()?;
                     return Err(Error::GroupFailed(failure.clone()));
-                }
-                Some(Ok(sealed)) if queue.settled >= sealed.ticket => {
-                    return Ok((sealed.version, sealed.time_ms));
                 }
                 Some(Ok(sealed)) if !sealed.framed => {
                     drop(queue);
@@ -2447,16 +2451,20 @@ impl<T: Data> Shared<T> {
             return Poll::Ready(Ok(Grouped::Settled(sealed.version, sealed.time_ms)));
         }
         let queue = self.queue.lock();
+        if let Some(Ok(sealed)) = seal.outcome.get()
+            && queue.settled >= sealed.ticket
+        {
+            return Poll::Ready(Ok(Grouped::Settled(sealed.version, sealed.time_ms)));
+        }
         if queue.failed {
             return Poll::Ready(Err(Error::Poisoned));
         }
         match seal.outcome.get() {
             Some(Err(failure)) => {
+                drop(queue);
+                self.rouse();
                 self.store().check_healthy()?;
                 return Poll::Ready(Err(Error::GroupFailed(failure.clone())));
-            }
-            Some(Ok(sealed)) if queue.settled >= sealed.ticket => {
-                return Poll::Ready(Ok(Grouped::Settled(sealed.version, sealed.time_ms)));
             }
             Some(Ok(sealed)) if !sealed.framed => {
                 let Sealed {
@@ -2566,6 +2574,20 @@ impl<T: Data> Shared<T> {
             if let Some(group) = lane.take() {
                 self.seal_group(branch, group);
             }
+        }
+    }
+
+    fn lead_after_failure(&self, branch: &Arc<Branch<T>>, notices: &mut Vec<Notice<T>>) {
+        let queue = self.queue.lock();
+        if queue.syncing || queue.failed {
+            return;
+        }
+        let others = Self::other_groups(&queue, branch);
+        drop(queue);
+        self.seal_idle(&others);
+        let queue = self.queue.lock();
+        if !queue.syncing && !queue.failed && !queue.waiting.is_empty() {
+            let _ = self.lead(queue, notices);
         }
     }
 
@@ -2693,23 +2715,35 @@ impl<T: Data> Shared<T> {
         queue.syncing = true;
         let mut batch = mem::take(&mut queue.waiting);
         drop(queue);
-        self.step("leading");
         let store = self.store();
         let end = batch.last().expect("a leader has queued commits").frame.end;
-        let landed = store.landed_to(end);
-        let kept = batch
-            .iter()
-            .take_while(|pending| pending.frame.end <= landed)
-            .count();
-        let cut = batch.split_off(kept);
-        let started = Instant::now();
-        let outcome = match batch.last() {
-            Some(last) => store
-                .sync(last.frame)
-                .map(|()| (last.frame, last.refs.clone())),
-            None => Err(Error::Poisoned),
+        let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.step("leading");
+            let landed = store.landed_to(end);
+            let kept = batch
+                .iter()
+                .take_while(|pending| pending.frame.end <= landed)
+                .count();
+            let started = Instant::now();
+            let synced = match kept.checked_sub(1) {
+                Some(last) => store.sync(batch[last].frame),
+                None => Err(Error::Poisoned),
+            };
+            self.costs.synced(started.elapsed());
+            (kept, synced)
+        }));
+        let (kept, synced, panicked) = match attempt {
+            Ok((kept, synced)) => (kept, synced, None),
+            Err(panicked) => {
+                store.poison();
+                (0, Err(Error::Poisoned), Some(panicked))
+            }
         };
-        self.costs.synced(started.elapsed());
+        let cut = batch.split_off(kept);
+        let outcome = synced.map(|()| {
+            let last = batch.last().expect("a synced batch has a last frame");
+            (last.frame, last.refs.clone())
+        });
         let synced = outcome.is_ok();
         let mut seals = Vec::new();
         let published = outcome.as_ref().ok().map(|(_, refs)| {
@@ -2746,8 +2780,8 @@ impl<T: Data> Shared<T> {
         }
         let next = queue
             .waiting
-            .first()
-            .and_then(|pending| pending.seal.clone());
+            .iter()
+            .find_map(|pending| pending.seal.clone());
         let next = next.or_else(|| queue.open.first().map(|(seal, _)| seal.clone()));
         if queue.failed {
             seals.extend(
@@ -2780,6 +2814,9 @@ impl<T: Data> Shared<T> {
         }
         if rouse {
             self.rouse();
+        }
+        if let Some(panicked) = panicked {
+            panic::resume_unwind(panicked);
         }
         if let Ok((frame, _)) = &outcome {
             store.checkpoint(*frame);
