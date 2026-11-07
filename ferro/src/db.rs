@@ -1764,6 +1764,18 @@ impl<T: Data> Shared<T> {
         })
     }
 
+    fn moved_states(&self, store: &Store, before: &Refs, after: &Refs) -> Result<Vec<Moved<T>>> {
+        let attached: Vec<_> = self.branches.lock().values().cloned().collect();
+        let mut states = Vec::new();
+        for branch in attached {
+            let new = after.try_get(&branch.name)?;
+            if moved(before.try_get(&branch.name)?.as_deref(), new.as_deref()) {
+                states.push((branch, Arc::new(self.state_of(store, new.as_deref())?)));
+            }
+        }
+        Ok(states)
+    }
+
     fn attach(&self, name: &str, refs: &Refs) -> Result<Arc<Branch<T>>> {
         let mut branches = self.branches.lock();
         if let Some(branch) = branches.get(name) {
@@ -2576,11 +2588,36 @@ impl<T: Data> Shared<T> {
         &self,
         tip: &mut RefState,
         next: Next,
-        mut txn: Txn,
+        txn: Txn,
         branch: Option<(&Arc<Branch<T>>, State<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
         settling: Option<&mut Settling>,
     ) -> Result<Landing> {
+        let (landing, pending) = self.place_frame(tip, next, txn, branch, settling)?;
+        let mut queue = self.queue.lock();
+        if let Some((seal, version, time_ms)) = seal {
+            let _ = seal.outcome.set(Ok(Sealed {
+                version,
+                time_ms,
+                ticket: pending.frame.seq,
+                framed: true,
+            }));
+        }
+        queue.waiting.push(Pending {
+            seal: seal.map(|(seal, _, _)| seal.clone()),
+            ..pending
+        });
+        Ok(landing)
+    }
+
+    fn place_frame(
+        &self,
+        tip: &mut RefState,
+        next: Next,
+        mut txn: Txn,
+        branch: Option<(&Arc<Branch<T>>, State<T>)>,
+        settling: Option<&mut Settling>,
+    ) -> Result<(Landing, Pending<T>)> {
         txn.unshared();
         let store = self.store();
         let (ptr, refs, depth) = match (next, tip.ptr) {
@@ -2617,25 +2654,14 @@ impl<T: Data> Shared<T> {
         tip.refs = refs;
         tip.ptr = Some(ptr);
         tip.depth = depth;
-        let refs = tip.clone();
-        let mut queue = self.queue.lock();
-        if let Some((seal, version, time_ms)) = seal {
-            let _ = seal.outcome.set(Ok(Sealed {
-                version,
-                time_ms,
-                ticket: frame.seq,
-                framed: true,
-            }));
-        }
-        let seal = seal.map(|(seal, _, _)| seal.clone());
-        queue.waiting.push(Pending {
+        let pending = Pending {
             frame,
-            refs,
+            refs: tip.clone(),
             update,
-            seal,
+            seal: None,
             followed: Vec::new(),
-        });
-        Ok(landing)
+        };
+        Ok((landing, pending))
     }
 
     fn settle(&self, ticket: u64, notices: &mut Vec<Notice<T>>) -> Result<()> {
@@ -2686,9 +2712,12 @@ impl<T: Data> Shared<T> {
         self.costs.synced(started.elapsed());
         let synced = outcome.is_ok();
         let mut seals = Vec::new();
-        if let Ok((_, refs)) = &outcome {
-            *self.published.lock() = refs.clone();
-        }
+        let published = outcome.as_ref().ok().map(|(_, refs)| {
+            let mut published = self.published.lock();
+            *published = refs.clone();
+            self.step("publishing");
+            published
+        });
         for pending in batch {
             seals.extend(pending.seal.map(|seal| (seal, synced)));
             if let (true, Some((branch, state))) = (synced, pending.update) {
@@ -2700,6 +2729,7 @@ impl<T: Data> Shared<T> {
                 }
             }
         }
+        drop(published);
         let lost = !cut.is_empty();
         seals.extend(
             cut.into_iter()
@@ -4378,6 +4408,9 @@ impl<T: Data> Db<T> {
     /// whose `other` head this branch already holds links nothing and commits only what `f`
     /// changed.
     ///
+    /// `theirs` is the snapshot [`Db::read`] on `other` returns. A commit on `other` that is still
+    /// waiting for its sync is not merged, and neither is what it merged; a later merge takes it.
+    ///
     /// The base is a best common ancestor over the whole merge graph, as git finds it, so a change
     /// is merged once however it arrived. After a criss-cross, where there are several, `f` first
     /// merges them into a virtual base, once for each after the first, and what it returns from
@@ -4454,14 +4487,12 @@ impl<T: Data> Db<T> {
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         self.alone(Some(&other.branch), |tip, ours, root| {
-            other.branch.check_live()?;
-            let theirs = other.branch.state.load_full();
+            let (theirs, published) = other.published_view()?;
             let store = self.shared.store();
             let found = Self::merge_base(
-                &tip.refs,
                 &store,
-                (&self.branch.name, ours),
-                (&other.branch.name, &theirs),
+                (&self.branch.name, ours, &tip.refs),
+                (&other.branch.name, &theirs, &published),
             )?;
             let link = match theirs.log.tip {
                 Some(ptr) if !holds(&found, ptr) => Self::link_to(tip, other, &theirs, ptr)?,
@@ -4489,14 +4520,12 @@ impl<T: Data> Db<T> {
     ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
         let from = Some(&*other.branch);
         let done = self.alone::<std::result::Result<R, u64>, E>(from, |tip, ours, root| {
-            other.branch.check_live()?;
-            let theirs = other.branch.state.load_full();
+            let (theirs, published) = other.published_view()?;
             let store = self.shared.store();
             let found = Self::merge_base(
-                &tip.refs,
                 &store,
-                (&self.branch.name, ours),
-                (&other.branch.name, &theirs),
+                (&self.branch.name, ours, &tip.refs),
+                (&other.branch.name, &theirs, &published),
             )?;
             let Some(ptr) = theirs.log.tip.filter(|ptr| !holds(&found, *ptr)) else {
                 return Ok((String::new(), Err(theirs.log.last), Intent::default()));
@@ -4586,7 +4615,8 @@ impl<T: Data> Db<T> {
     /// starts from.
     ///
     /// After a criss-cross there are several, and this is the first that [`Db::common_ancestors`]
-    /// returns. Branches that share no commit give version 0.
+    /// returns. Branches that share no commit give version 0. It compares the snapshots
+    /// [`Db::read`] returns on the two branches, as [`Db::merge_with`] takes `other`'s.
     ///
     /// # Errors
     ///
@@ -4654,23 +4684,27 @@ impl<T: Data> Db<T> {
             )
         };
         Self::merge_base(
-            &refs,
             &store,
-            (&self.branch.name, &ours),
-            (&other.branch.name, &theirs),
+            (&self.branch.name, &ours, &refs),
+            (&other.branch.name, &theirs, &refs),
         )
     }
 
+    fn published_view(&self) -> Result<(Arc<State<T>>, Refs)> {
+        let published = self.shared.published.lock();
+        self.branch.check_live()?;
+        Ok((self.branch.state.load_full(), published.refs.clone()))
+    }
+
     fn merge_base(
-        refs: &Refs,
         store: &Store,
-        ours: (&str, &State<T>),
-        theirs: (&str, &State<T>),
+        ours: (&str, &State<T>, &Refs),
+        theirs: (&str, &State<T>, &Refs),
     ) -> Result<Vec<Start>> {
         if ours.1.log.tip.is_none() || theirs.1.log.tip.is_none() {
             return Ok(Vec::new());
         }
-        let starts = |(name, state): (&str, &State<T>)| -> Result<Vec<Start>> {
+        let starts = |(name, state, refs): (&str, &State<T>, &Refs)| -> Result<Vec<Start>> {
             let mut starts = Vec::new();
             if let Some(tip) = state.log.tip {
                 starts.push(Start {
@@ -5183,8 +5217,8 @@ impl<T: Data> Db<T> {
     /// Replaces the branch table with what `edit` returns, under every writer lock of the file.
     ///
     /// `edit` sees the current table and stages any records it needs in the transaction. If it
-    /// returns a new table, that lands, is settled, and every attached branch it moved is
-    /// published to its readers and watchers; `None` writes nothing.
+    /// returns a new table, that lands and is settled, and every attached branch it moved is
+    /// published to its readers and watchers together with the table; `None` writes nothing.
     pub(crate) fn rewrite_refs<X>(
         &self,
         edit: impl FnOnce(&Store, &mut Txn, &Refs) -> Result<(Option<Refs>, X)>,
@@ -5200,31 +5234,21 @@ impl<T: Data> Db<T> {
                 return Ok(out);
             };
             let before = tip.refs.clone();
-            shared
-                .stage(tip, Next::Table(next), txn, None, None, None)?
-                .land()?;
-            shared.settle(store.last_seq(), &mut notices)?;
-            let attached: Vec<_> = shared.branches.lock().values().cloned().collect();
-            let mut states = Vec::new();
-            for branch in attached {
-                let old = before.try_get(&branch.name)?;
-                let new = tip.refs.try_get(&branch.name)?;
-                let moved = match (&old, &new) {
-                    (Some(old), Some(new)) => {
-                        old.log != new.log
-                            || old.root.map(|ptr| ptr.hash) != new.root.map(|ptr| ptr.hash)
-                    }
-                    (None, None) => false,
-                    _ => true,
-                };
-                if moved {
-                    states.push((branch, Arc::new(shared.state_of(&store, new.as_deref())?)));
+            let (landing, mut pending) =
+                shared.place_frame(tip, Next::Table(next), txn, None, None)?;
+            let states = landing
+                .land()
+                .and_then(|()| shared.moved_states(&store, &before, &tip.refs));
+            if let Ok(states) = &states {
+                for (branch, state) in states {
+                    branch.tip.store(state.clone());
+                    branch.framed.store(pending.frame.seq, Ordering::Release);
                 }
+                pending.followed.clone_from(states);
             }
-            for (branch, state) in states {
-                branch.tip.store(state.clone());
-                notices.push(branch.publish(state));
-            }
+            shared.queue.lock().waiting.push(pending);
+            states?;
+            shared.settle(store.last_seq(), &mut notices)?;
             Ok(out)
         })
     }

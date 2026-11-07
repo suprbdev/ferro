@@ -1,4 +1,12 @@
-use ferro::{Commit, Conflict, Data, Db, Error, Map, Record, Table};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use ferro::db::Hook;
+use ferro::{Commit, Conflict, Data, Db, Durability, Error, Map, Options, Record, Snapshot, Table};
+use tempfile::TempDir;
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
 struct Task {
@@ -463,4 +471,225 @@ fn a_root_that_cannot_be_read_back_is_refused_before_it_becomes_durable() {
     let db = Db::<Lopsided>::open(&path).unwrap();
     assert_eq!(db.read().0, 1);
     assert_eq!(db.version(), 1);
+}
+
+type Events = Map<u32, i64>;
+
+const PATIENCE: Duration = Duration::from_secs(30);
+
+fn add_deltas(root: &mut Events, base: &Events, theirs: &Events) {
+    let mut keys: BTreeSet<u32> = base.keys().collect();
+    keys.extend(theirs.keys());
+    for key in keys {
+        let delta = theirs.get(&key).map_or(0, |v| *v) - base.get(&key).map_or(0, |v| *v);
+        if delta == 0 {
+            continue;
+        }
+        match root.get(&key).map_or(0, |v| *v) + delta {
+            0 => {
+                root.remove(&key);
+            }
+            next => {
+                root.insert(key, next);
+            }
+        }
+    }
+}
+
+fn add(
+    root: &mut Events,
+    base: &Snapshot<Events>,
+    theirs: &Snapshot<Events>,
+) -> (&'static str, ()) {
+    add_deltas(root, base, theirs);
+    ("merge", ())
+}
+
+fn events(db: &Db<Events>) -> BTreeMap<u32, i64> {
+    db.read().iter().map(|(k, v)| (k, *v)).collect()
+}
+
+fn event(db: &Db<Events>, message: &str, key: u32) {
+    db.commit(message, |root| {
+        root.insert(key, 1);
+    })
+    .unwrap();
+}
+
+struct Gate {
+    at: &'static str,
+    landed: AtomicBool,
+    held: Mutex<(bool, bool)>,
+    moved: Condvar,
+}
+
+impl Gate {
+    fn new(at: &'static str) -> Self {
+        Gate {
+            at,
+            landed: AtomicBool::new(false),
+            held: Mutex::new((false, false)),
+            moved: Condvar::new(),
+        }
+    }
+
+    fn step(&self, step: &str) {
+        if thread::current().name() != Some("side") {
+            return;
+        }
+        if step == "landed" {
+            self.landed.store(true, Ordering::SeqCst);
+            return;
+        }
+        if step != self.at || !self.landed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut held = self.held.lock().unwrap();
+        held.0 = true;
+        self.moved.notify_all();
+        while !held.1 {
+            held = self.moved.wait(held).unwrap();
+        }
+    }
+
+    fn wait_held(&self) {
+        let mut held = self.held.lock().unwrap();
+        while !held.0 {
+            let (next, waited) = self.moved.wait_timeout(held, PATIENCE).unwrap();
+            assert!(
+                !waited.timed_out(),
+                "the side's commit never reached its sync"
+            );
+            held = next;
+        }
+    }
+
+    fn release(&self) {
+        self.held.lock().unwrap().1 = true;
+        self.moved.notify_all();
+    }
+}
+
+struct Held {
+    gate: Arc<Gate>,
+    main: Db<Events>,
+    side: Db<Events>,
+    want: BTreeMap<u32, i64>,
+    published: u64,
+    syncing: JoinHandle<ferro::Result<()>>,
+    _dir: TempDir,
+}
+
+fn hold_a_side_commit(durability: Durability, pulls: bool, at: &'static str) -> Held {
+    let gate = Arc::new(Gate::new(at));
+    let hook = {
+        let gate = gate.clone();
+        Hook(Arc::new(move |step| gate.step(step)))
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let main: Db<Events> = Options::new()
+        .durability(durability)
+        .hook(hook)
+        .open(dir.path().join("m.ferro"))
+        .unwrap();
+    event(&main, "x", 1);
+    let side = main.fork("side").unwrap();
+    event(&main, "a", 2);
+    event(&side, "b", 3);
+    let remote: Db<Events> = Db::open(dir.path().join("g.ferro")).unwrap();
+    event(&remote, "r", 10);
+    let mut want = BTreeMap::from([(1, 1), (2, 1), (3, 1)]);
+    if pulls {
+        main.pull(&remote, "g", add).unwrap();
+        want.insert(10, 1);
+    }
+    let published = side.version();
+    let syncing = {
+        let (side, main) = (side.clone(), main.clone());
+        thread::Builder::new()
+            .name("side".into())
+            .spawn(move || match pulls {
+                true => side.pull(&remote, "g", add).map(|_| ()),
+                false => side.merge_with(&main, add).map(|_| ()),
+            })
+            .unwrap()
+    };
+    gate.wait_held();
+    Held {
+        gate,
+        main,
+        side,
+        want,
+        published,
+        syncing,
+        _dir: dir,
+    }
+}
+
+fn merging(held: &Held, seen: mpsc::Sender<(u64, u64)>) -> JoinHandle<ferro::Result<()>> {
+    let (main, side) = (held.main.clone(), held.side.clone());
+    thread::spawn(move || {
+        main.merge_with(&side, |root, base, theirs| {
+            seen.send((base.version(), theirs.version())).unwrap();
+            add(root, base, theirs)
+        })
+        .map(|_| ())
+    })
+}
+
+fn settle_and_merge_again(held: Held, merging: JoinHandle<ferro::Result<()>>) {
+    held.gate.release();
+    held.syncing.join().unwrap().unwrap();
+    merging.join().unwrap().unwrap();
+    let Held {
+        main, side, want, ..
+    } = held;
+    assert_eq!(events(&main), want);
+    main.merge_with(&side, add).unwrap();
+    assert_eq!(events(&main), want);
+    side.merge_with(&main, add).unwrap();
+    assert_eq!(events(&side), want);
+    main.verify().unwrap();
+}
+
+fn merge_beside_a_commit_still_syncing(durability: Durability, pulls: bool) {
+    let held = hold_a_side_commit(durability, pulls, "leading");
+    let found = held.main.common_ancestors(&held.side).unwrap();
+    assert_eq!(found.iter().map(Snapshot::version).collect::<Vec<_>>(), [1]);
+    let (seen, runs) = mpsc::channel();
+    let merge = merging(&held, seen);
+    let first = runs.recv_timeout(PATIENCE).unwrap();
+    assert_eq!(first, (1, held.published));
+    settle_and_merge_again(held, merge);
+    assert_eq!(runs.try_iter().count(), 0, "the merge built a virtual base");
+}
+
+fn merge_beside_a_commit_being_published(durability: Durability, pulls: bool) {
+    let held = hold_a_side_commit(durability, pulls, "publishing");
+    let (seen, _runs) = mpsc::channel();
+    let merge = merging(&held, seen);
+    thread::sleep(Duration::from_millis(100));
+    settle_and_merge_again(held, merge);
+}
+
+#[test]
+fn a_merge_leaves_a_pull_still_syncing_on_the_other_branch_for_later() {
+    for durability in [Durability::Buffered, Durability::Fsync] {
+        merge_beside_a_commit_still_syncing(durability, true);
+    }
+}
+
+#[test]
+fn a_merge_leaves_a_merge_still_syncing_on_the_other_branch_for_later() {
+    for durability in [Durability::Buffered, Durability::Fsync] {
+        merge_beside_a_commit_still_syncing(durability, false);
+    }
+}
+
+#[test]
+fn a_merge_waits_for_the_other_branch_to_be_published_with_its_merge_records() {
+    for durability in [Durability::Buffered, Durability::Fsync] {
+        merge_beside_a_commit_being_published(durability, true);
+        merge_beside_a_commit_being_published(durability, false);
+    }
 }
