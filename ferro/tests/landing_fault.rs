@@ -22,6 +22,7 @@ use tempfile::TempDir;
 type Root = Map<u64, u64>;
 type Text = Map<u64, String>;
 type Kind = (&'static str, fn() -> Options);
+type Grouping = (&'static str, fn() -> Options, bool);
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 const EIO: c_int = 5;
@@ -164,8 +165,32 @@ fn buffered() -> Options {
         .reclaim(MANUAL)
 }
 
+fn coalesced_fsync() -> Options {
+    fsync().coalesce(true)
+}
+
+fn coalesced_buffered() -> Options {
+    buffered().coalesce(true)
+}
+
 fn kinds() -> [Kind; 2] {
     [("fsync", fsync), ("buffered", buffered)]
+}
+
+fn coalesced_kinds() -> [Kind; 2] {
+    [
+        ("fsync, coalesced", coalesced_fsync),
+        ("buffered, coalesced", coalesced_buffered),
+    ]
+}
+
+fn every_kind() -> [Grouping; 4] {
+    [
+        ("fsync", fsync, false),
+        ("buffered", buffered, false),
+        ("fsync, coalesced", coalesced_fsync, true),
+        ("buffered, coalesced", coalesced_buffered, true),
+    ]
 }
 
 fn wait_until(what: &str, ready: impl Fn() -> bool) {
@@ -218,6 +243,8 @@ impl Gate {
 struct Stalls {
     landing: BTreeMap<&'static str, Gate>,
     landed: BTreeMap<&'static str, Gate>,
+    arriving: BTreeMap<&'static str, Gate>,
+    leading: BTreeMap<&'static str, Gate>,
     fail_at_landing: Mutex<Vec<&'static str>>,
     panic_at_landing: Mutex<Vec<&'static str>>,
     hold_write: Mutex<Vec<&'static str>>,
@@ -225,10 +252,24 @@ struct Stalls {
 }
 
 fn stalls(names: &[&'static str]) -> Arc<Stalls> {
+    stalls_holding(names, &[], &[])
+}
+
+fn stalls_holding(
+    names: &[&'static str],
+    arriving: &[&'static str],
+    leading: &[&'static str],
+) -> Arc<Stalls> {
     let mut stalls = Stalls::default();
     for name in names {
         stalls.landing.insert(name, Gate::default());
         stalls.landed.insert(name, Gate::default());
+    }
+    for name in arriving {
+        stalls.arriving.insert(name, Gate::default());
+    }
+    for name in leading {
+        stalls.leading.insert(name, Gate::default());
     }
     Arc::new(stalls)
 }
@@ -243,6 +284,8 @@ fn hook(stalls: &Arc<Stalls>) -> Hook {
         let gates = match step {
             "landing" => &stalls.landing,
             "landed" => &stalls.landed,
+            "arriving" => &stalls.arriving,
+            "leading" => &stalls.leading,
             _ => return,
         };
         let Some((name, gate)) = gates.get_key_value(name) else {
@@ -289,39 +332,49 @@ fn seeded(options: Options, path: &Path, branches: &[&str]) -> (Db<Root>, Vec<Db
 #[test]
 fn a_failed_checkpoint_sync_fails_the_commits_queued_behind_it() {
     let _turn = serial();
-    let dir = dir();
-    let path = dir.path().join("checkpoint.ferro");
-    let stalls = stalls(&["queued"]);
-    stalls.landing["queued"].open();
-    let options = buffered().checkpoint_bytes(1).hook(hook(&stalls));
-    let (db, branches) = seeded(options, &path, &["side"]);
-    put(&db, 1, 1).unwrap();
-    SYNC_ARMED.store(true, Ordering::SeqCst);
-    let leader = writer(&db, "leader", 2, 2);
-    wait_until("the checkpoint to start", || {
-        SYNC_ENTERED.load(Ordering::SeqCst)
-    });
-    let queued = writer(&branches[0], "queued", 3, 3);
-    wait_until("the queued frame to land", || {
-        stalls.landed["queued"].reached()
-    });
-    SYNC_RELEASED.store(true, Ordering::SeqCst);
-    let _ = joined("the leader", leader).unwrap();
-    assert!(SYNC_FAILED.load(Ordering::SeqCst));
-    stalls.landed["queued"].open();
-    let queued = joined("the queued writer", queued).unwrap();
-    assert!(
-        matches!(queued, Err(Error::Poisoned)),
-        "a commit queued when its checkpoint's fdatasync failed was acknowledged: {queued:?}"
-    );
-    assert!(matches!(put(&db, 4, 4), Err(Error::Poisoned)));
-    drop((db, branches));
-    let db: Db<Root> = buffered().open(&path).unwrap();
-    assert_eq!(contents(&db).get(&2), Some(&2));
-    db.verify().unwrap();
+    let checkpointed: [Kind; 2] = [
+        ("buffered", buffered),
+        ("buffered, coalesced", coalesced_buffered),
+    ];
+    for (kind, options) in checkpointed {
+        for flag in [&SYNC_ARMED, &SYNC_ENTERED, &SYNC_RELEASED, &SYNC_FAILED] {
+            flag.store(false, Ordering::SeqCst);
+        }
+        let dir = dir();
+        let path = dir.path().join("checkpoint.ferro");
+        let stalls = stalls(&["queued"]);
+        stalls.landing["queued"].open();
+        let held = options().checkpoint_bytes(1).hook(hook(&stalls));
+        let (db, branches) = seeded(held, &path, &["side"]);
+        put(&db, 1, 1).unwrap();
+        SYNC_ARMED.store(true, Ordering::SeqCst);
+        let leader = writer(&db, "leader", 2, 2);
+        wait_until("the checkpoint to start", || {
+            SYNC_ENTERED.load(Ordering::SeqCst)
+        });
+        let queued = writer(&branches[0], "queued", 3, 3);
+        wait_until("the queued frame to land", || {
+            stalls.landed["queued"].reached()
+        });
+        SYNC_RELEASED.store(true, Ordering::SeqCst);
+        let _ = joined("the leader", leader).unwrap();
+        assert!(SYNC_FAILED.load(Ordering::SeqCst), "{kind}");
+        stalls.landed["queued"].open();
+        let queued = joined("the queued writer", queued).unwrap();
+        assert!(
+            matches!(queued, Err(Error::Poisoned)),
+            "{kind}: a commit queued when its checkpoint's fdatasync failed was acknowledged: \
+             {queued:?}"
+        );
+        assert!(matches!(put(&db, 4, 4), Err(Error::Poisoned)), "{kind}");
+        drop((db, branches));
+        let db: Db<Root> = options().open(&path).unwrap();
+        assert_eq!(contents(&db).get(&2), Some(&2), "{kind}");
+        db.verify().unwrap();
+    }
 }
 
-fn check_failed_landing(kind: &str, options: fn() -> Options, panics: bool) {
+fn check_failed_landing((kind, options, coalesced): Grouping, panics: bool) {
     let dir = dir();
     let path = dir.path().join("landing.ferro");
     let names = ["before", "failing", "ahead-1", "ahead-2"];
@@ -356,13 +409,26 @@ fn check_failed_landing(kind: &str, options: fn() -> Options, panics: bool) {
         .into_iter()
         .map(|(name, at)| writer(&branches[at], name, 10 + at as u64, 2))
         .collect();
-    wait_until("the frames ahead to land", || {
-        stalls.landed["ahead-1"].reached() && stalls.landed["ahead-2"].reached()
-    });
+    match coalesced {
+        true => {
+            wait_until("a frame ahead to land", || {
+                stalls.landed["ahead-1"].reached() || stalls.landed["ahead-2"].reached()
+            });
+            thread::sleep(Duration::from_millis(30));
+        }
+        false => wait_until("the frames ahead to land", || {
+            stalls.landed["ahead-1"].reached() && stalls.landed["ahead-2"].reached()
+        }),
+    }
     stalls.landing["failing"].open();
+    if coalesced {
+        stalls.landing["before"].open();
+    }
     let failed = joined("the failing writer", failing);
-    match (panics, &failed) {
-        (true, Err(_)) | (false, Ok(Err(Error::Io(_)))) => {}
+    match (coalesced, panics, &failed) {
+        (true, _, Ok(Err(Error::Poisoned)))
+        | (false, true, Err(_))
+        | (false, false, Ok(Err(Error::Io(_)))) => {}
         _ => panic!("{kind}: the failing writer returned {failed:?}"),
     }
     stalls.landing["before"].open();
@@ -402,8 +468,8 @@ fn check_failed_landing(kind: &str, options: fn() -> Options, panics: bool) {
 #[test]
 fn a_frame_whose_write_fails_after_tip_fails_every_frame_placed_after_it() {
     let _turn = serial();
-    for (kind, options) in kinds() {
-        check_failed_landing(kind, options, false);
+    for kind in every_kind() {
+        check_failed_landing(kind, false);
     }
 }
 
@@ -411,12 +477,12 @@ fn a_frame_whose_write_fails_after_tip_fails_every_frame_placed_after_it() {
 fn a_writer_that_dies_between_placing_and_writing_strands_no_one() {
     let _turn = serial();
     quiet_ferro_panics();
-    for (kind, options) in kinds() {
-        check_failed_landing(kind, options, true);
+    for kind in every_kind() {
+        check_failed_landing(kind, true);
     }
 }
 
-fn check_frame_ahead_of_failure(kind: &str, options: fn() -> Options, in_write: bool) {
+fn check_frame_ahead_of_failure((kind, options, coalesced): Grouping, in_write: bool) {
     for flag in [&WRITE_HELD, &WRITE_ENTERED, &WRITE_RELEASED] {
         flag.store(false, Ordering::SeqCst);
     }
@@ -453,8 +519,15 @@ fn check_frame_ahead_of_failure(kind: &str, options: fn() -> Options, in_write: 
         stalls.landed["after"].reached()
     });
     stalls.landing["failing"].open();
+    if coalesced {
+        WRITE_RELEASED.store(true, Ordering::SeqCst);
+        stalls.landed["before"].open();
+    }
     let failed = joined("the failing writer", failing).unwrap();
-    assert!(matches!(failed, Err(Error::Io(_))), "{kind}: {failed:?}");
+    match coalesced {
+        true => assert!(matches!(failed, Err(Error::Poisoned)), "{kind}: {failed:?}"),
+        false => assert!(matches!(failed, Err(Error::Io(_))), "{kind}: {failed:?}"),
+    }
     WRITE_RELEASED.store(true, Ordering::SeqCst);
     stalls.landed["before"].open();
     let before = joined("the writer before", before).unwrap();
@@ -485,16 +558,16 @@ fn check_frame_ahead_of_failure(kind: &str, options: fn() -> Options, in_write: 
 #[test]
 fn a_frame_still_in_its_write_when_a_later_one_fails_is_acknowledged() {
     let _turn = serial();
-    for (kind, options) in kinds() {
-        check_frame_ahead_of_failure(kind, options, true);
+    for kind in every_kind() {
+        check_frame_ahead_of_failure(kind, true);
     }
 }
 
 #[test]
 fn a_leader_whose_own_frame_follows_a_failed_one_is_not_acknowledged() {
     let _turn = serial();
-    for (kind, options) in kinds() {
-        check_frame_ahead_of_failure(kind, options, false);
+    for kind in every_kind() {
+        check_frame_ahead_of_failure(kind, false);
     }
 }
 
@@ -538,7 +611,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[test]
 fn awaited_writes_behind_a_failed_frame_are_woken_with_the_failure() {
     let _turn = serial();
-    for (kind, options) in kinds() {
+    for (kind, options, coalesced) in every_kind() {
         let dir = dir();
         let path = dir.path().join("awaited.ferro");
         let stalls = stalls(&["failing"]);
@@ -562,10 +635,17 @@ fn awaited_writes_behind_a_failed_frame_are_woken_with_the_failure() {
             .collect();
         thread::sleep(Duration::from_millis(30));
         stalls.landing["failing"].open();
-        assert!(
-            matches!(joined("the failing writer", failing), Ok(Err(Error::Io(_)))),
-            "{kind}"
-        );
+        let failed = joined("the failing writer", failing);
+        match coalesced {
+            true => assert!(
+                matches!(failed, Ok(Err(Error::Poisoned))),
+                "{kind}: {failed:?}"
+            ),
+            false => assert!(
+                matches!(failed, Ok(Err(Error::Io(_)))),
+                "{kind}: {failed:?}"
+            ),
+        }
         for handle in awaited {
             let result = joined("an awaited writer", handle).unwrap();
             assert!(matches!(result, Err(Error::Poisoned)), "{kind}: {result:?}");
@@ -584,7 +664,7 @@ fn awaited_writes_behind_a_failed_frame_are_woken_with_the_failure() {
 #[test]
 fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
     let _turn = serial();
-    for (kind, options) in kinds() {
+    for (kind, options, _) in every_kind() {
         let dir = dir();
         let path = dir.path().join("held.ferro");
         let stalls = stalls(&["held"]);
@@ -723,7 +803,7 @@ fn a_failed_sync_under_a_large_receive_fails_the_commits_queued_behind_it() {
 fn a_closure_after_a_failed_landing_is_told_of_the_poison() {
     let _turn = serial();
     quiet_ferro_panics();
-    for (kind, options) in kinds() {
+    for (kind, options, coalesced) in every_kind() {
         let dir = dir();
         let path = dir.path().join("after.ferro");
         let stalls = stalls(&["failing", "ahead"]);
@@ -745,10 +825,17 @@ fn a_closure_after_a_failed_landing_is_told_of_the_poison() {
             stalls.landed["ahead"].reached()
         });
         stalls.landing["failing"].open();
-        assert!(
-            matches!(joined("the failing writer", failing), Ok(Err(Error::Io(_)))),
-            "{kind}"
-        );
+        let failed = joined("the failing writer", failing);
+        match coalesced {
+            true => assert!(
+                matches!(failed, Ok(Err(Error::Poisoned))),
+                "{kind}: {failed:?}"
+            ),
+            false => assert!(
+                matches!(failed, Ok(Err(Error::Io(_)))),
+                "{kind}: {failed:?}"
+            ),
+        }
         let ahead = joined("the writer ahead", ahead).unwrap();
         assert!(matches!(ahead, Err(Error::Poisoned)), "{kind}: {ahead:?}");
         let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -869,7 +956,7 @@ fn tables_cycles_and_receives_wait_out_a_frame_held_before_its_write() {
 #[test]
 fn a_superblock_that_fails_to_write_fails_its_batch_and_the_frames_reopen() {
     let _turn = serial();
-    for (kind, options) in kinds() {
+    for (kind, options, _) in every_kind() {
         let dir = dir();
         let path = dir.path().join("super.ferro");
         let (db, branches) = seeded(options(), &path, &["b0"]);
@@ -915,4 +1002,115 @@ fn a_reservation_that_fails_to_write_leaves_commits_running() {
     let db: Db<Root> = fsync().open(&path).unwrap();
     assert_eq!(heads(&db), written);
     db.verify().unwrap();
+}
+
+fn grouped(
+    db: &Db<Root>,
+    name: &'static str,
+    key: u64,
+    ran: &Arc<AtomicUsize>,
+    after: Option<(&Arc<Stalls>, &'static str)>,
+) -> JoinHandle<ferro::Result<u64>> {
+    let (db, ran) = (db.clone(), ran.clone());
+    let after = after.map(|(stalls, other)| (stalls.clone(), other));
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            db.commit_with(|root| {
+                if let Some((stalls, other)) = &after {
+                    wait_until("another writer to set out for the lock", || {
+                        stalls.arriving[other].reached()
+                    });
+                }
+                root.insert(key, 1);
+                ran.fetch_add(1, Ordering::SeqCst);
+                ("", ())
+            })
+            .map(|done| done.version)
+        })
+        .unwrap()
+}
+
+fn check_group_sealed_for_another_branch(kind: &str, options: fn() -> Options, panics: bool) {
+    let dir = dir();
+    let path = dir.path().join("sealed.ferro");
+    let stalls = stalls_holding(&["T"], &["X", "Z"], &["L"]);
+    stalls.landing["T"].open();
+    stalls.landed["T"].open();
+    match panics {
+        true => stalls.panic_at_landing.lock().unwrap().push("T"),
+        false => stalls.fail_at_landing.lock().unwrap().push("T"),
+    }
+    let (main, branches) = seeded(options().hook(hook(&stalls)), &path, &["a", "b", "c"]);
+    let (a, b, c) = (&branches[0], &branches[1], &branches[2]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let settle = || thread::sleep(Duration::from_millis(30));
+    let leader = grouped(&main, "L", 1, &ran, None);
+    wait_until("the leader to start its sync", || {
+        stalls.leading["L"].reached()
+    });
+    let tb = grouped(b, "TB", 2, &ran, None);
+    wait_until("b's group to open", || ran.load(Ordering::SeqCst) == 2);
+    settle();
+    let x = grouped(b, "X", 3, &ran, None);
+    wait_until("a writer to set out for b's lock", || {
+        stalls.arriving["X"].reached()
+    });
+    let ta = grouped(a, "TA", 4, &ran, None);
+    wait_until("a's group to open", || ran.load(Ordering::SeqCst) == 3);
+    settle();
+    stalls.leading["L"].open();
+    let led = joined("the leader", leader).unwrap();
+    assert!(matches!(led, Ok(2)), "{kind}: {led:?}");
+    settle();
+    let t = grouped(c, "T", 5, &ran, Some((&stalls, "Z")));
+    let z = grouped(c, "Z", 6, &ran, None);
+    wait_until("c's writer to write a's frame", || {
+        stalls.landing["T"].reached()
+    });
+    settle();
+    stalls.arriving["Z"].open();
+    for (name, handle) in [("T", t), ("Z", z)] {
+        let result = joined(name, handle).unwrap();
+        assert!(
+            matches!(result, Err(Error::Poisoned)),
+            "{kind}: {name} {result:?}"
+        );
+    }
+    stalls.arriving["X"].open();
+    for (name, handle) in [("X", x), ("TB", tb), ("TA", ta)] {
+        let result = joined(name, handle).unwrap();
+        assert!(
+            matches!(result, Err(Error::Poisoned)),
+            "{kind}: {name} {result:?}"
+        );
+    }
+    assert!(matches!(put(&main, 7, 7), Err(Error::Poisoned)), "{kind}");
+    drop((main, branches));
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(contents(&db).get(&1), Some(&1), "{kind}");
+    for (name, keys) in [("a", &[4][..]), ("b", &[2, 3]), ("c", &[5, 6])] {
+        let seen = contents(&db.branch(name).unwrap());
+        for key in keys {
+            assert_eq!(seen.get(key), None, "{kind}: {name} kept {key}");
+        }
+    }
+    db.verify().unwrap();
+}
+
+#[test]
+fn a_group_another_branch_sealed_strands_no_one_when_its_frame_write_fails() {
+    let _turn = serial();
+    for (kind, options) in coalesced_kinds() {
+        check_group_sealed_for_another_branch(kind, options, false);
+    }
+}
+
+#[test]
+fn a_group_another_branch_sealed_strands_no_one_when_its_sealer_dies_writing_it() {
+    let _turn = serial();
+    quiet_ferro_panics();
+    for (kind, options) in coalesced_kinds() {
+        check_group_sealed_for_another_branch(kind, options, true);
+    }
 }
