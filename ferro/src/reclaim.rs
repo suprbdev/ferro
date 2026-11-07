@@ -183,7 +183,7 @@ impl Roots {
         mut visit: impl FnMut(Ptr, &Object, u32),
     ) -> Result<()> {
         let mut stack = Vec::new();
-        let mut entries = HashSet::new();
+        let mut entries: HashMap<u64, Hash> = HashMap::new();
         let mut floors: HashMap<u64, u64> = HashMap::new();
         let mut closures = Closures::default();
         let mut superseded: Vec<&Chain> = self.superseded.iter().collect();
@@ -197,7 +197,7 @@ impl Roots {
                     return Ok(false);
                 }
                 *floor = (*floor).min(chain.first);
-                if entries.insert(ptr.offset) && fresh(ptr) {
+                if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr) {
                     visit(ptr, object, len);
                 }
                 stack.extend(entry.commit.root);
@@ -208,7 +208,7 @@ impl Roots {
             })?;
         }
         closures.walk(store, |ptr, entry, object, len| {
-            if entries.insert(ptr.offset) && fresh(ptr) {
+            if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr) {
                 visit(ptr, object, len);
             }
             stack.extend(entry.commit.root);
@@ -216,7 +216,7 @@ impl Roots {
         })?;
         stack.extend(&self.trees);
         while let Some(ptr) = stack.pop() {
-            if entries.contains(&ptr.offset) || !fresh(ptr) {
+            if entries.get(&ptr.offset) == Some(&ptr.hash) || !fresh(ptr) {
                 continue;
             }
             let (object, len) = store.read_record(ptr)?;

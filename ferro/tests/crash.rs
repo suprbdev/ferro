@@ -1086,6 +1086,46 @@ fn redirected_link_stays_caught_once_child_memos_are_warm() {
 }
 
 #[test]
+fn a_link_redirected_to_a_sibling_is_reported_by_verify() {
+    let built = build(5, 3);
+    let path = built.target();
+    fs::write(&path, &built.bytes).unwrap();
+    let ranges = reachable(&path);
+    let mut redirected = 0;
+    for (start, end, links) in &ranges {
+        let lens: Vec<usize> = links
+            .iter()
+            .map(|link| HASH_BYTES + zigzag_len(*start as u64, link.offset))
+            .collect();
+        let mut at = end - lens.iter().sum::<usize>();
+        for (index, link) in links.iter().enumerate() {
+            let delta_len = lens[index] - HASH_BYTES;
+            let delta_at = at + HASH_BYTES;
+            at += lens[index];
+            for other in links.iter().filter(|other| other.hash != link.hash) {
+                let Some(patch) = zigzag_of_len(*start as u64, other.offset, delta_len) else {
+                    continue;
+                };
+                let mut image = built.bytes.clone();
+                image[delta_at..delta_at + delta_len].copy_from_slice(&patch);
+                fs::write(&path, &image).unwrap();
+                let report = fast()
+                    .open::<Root>(&path)
+                    .and_then(|db| db.verify().map(|_| ()));
+                assert!(
+                    report.is_err(),
+                    "FERRO_TEST_CLOCK={} record {start}..{end}: link {index} named {} and passed",
+                    built.clock,
+                    other.offset
+                );
+                redirected += 1;
+            }
+        }
+    }
+    assert!(redirected > 10, "only {redirected} links redirected");
+}
+
+#[test]
 fn verify_reports_a_link_redirected_to_a_visited_object() {
     let (_dir, path, _) = wide_database();
     redirect_sibling_link(&path);
