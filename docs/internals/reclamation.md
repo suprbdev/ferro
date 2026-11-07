@@ -759,7 +759,14 @@ In `Durability::Buffered` the longest pause was 7.2 ms at 18,000 commits a secon
 ms at 11,700 on `ledger`, and 8.5 ms at 15,800 on table updates.
 
 Three alternatives were built or simulated and left out. Hole punching and segments were worked out
-from the real layout of live records in each workload's file. Relocation ran live, and that
+from the real layout of live records in each workload's file, from `ferro-bench`'s `reclaim
+layout`. Until 2026-11-07, `admin::layout` behind it counted as live the branch table, the steps
+written on top of it and the history the older heads in those steps keep, none of which a cycle
+copies. Run again on 2026-11-07 on a file of each workload as `reclaim` builds it, 0.18 to 1.75
+GB, it now counts 2 to 7% fewer live bytes, at the last 1 or 100 versions, so what is left is up
+to 4% more times the live size, 16.7 to 17.3 times for `ledger` with 4 KiB holes. The share of the
+garbage that each unit or density reclaims moved by at most 1.2 points, 8.2 to 9.4% for `wiki` at
+64 KiB, and by under 0.6 otherwise, so the figures below stand. Relocation ran live, and that
 comparison was made on one base, before value columns landed:
 
 | | Reclaimed per cycle | File after a cycle, 1M rows | Pause | Buffered commits/s | Reads/s, 1M rows | Copied, 1M rows | Lines in `ferro/src` |

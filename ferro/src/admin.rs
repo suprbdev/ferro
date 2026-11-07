@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::codec::{Checked, Data, Decoder, Encoder, Kind, Ptr};
+use crate::codec::{Checked, Data, Decoder, Encoder, HashSink, Kind, Ptr};
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
 use crate::log::Closures;
@@ -186,7 +186,7 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
         let roots = Roots::of(store, ptr)?;
         roots.walk(
             store,
-            |ptr| seen.insert(ptr),
+            |ptr, _| seen.insert(ptr),
             |_, _, len| {
                 report.objects += 1;
                 report.bytes += u64::from(len);
@@ -296,7 +296,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     Ok(())
 }
 
-/// Where the records that a compaction would keep lie in a file, from [`layout`].
+/// Where the records that a compaction would copy lie in a file, from [`layout`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     /// The size of the file in bytes.
@@ -310,21 +310,47 @@ pub struct Layout {
 /// It reaches what a cycle would retain without copying anything, for tests and benchmarks that
 /// damage or measure parts of a file.
 ///
+/// The records are the log entries of the versions each branch keeps under `keep`, those of the
+/// commits that merges brought into them as far as a compaction keeps them, every object the
+/// trees of those versions reach, and the record each branch keeps of the branches merged into
+/// it. A log entry stored at two offsets is listed at each that a kept version reaches, as a
+/// compaction copies each, and any other object stored at two offsets once, at the first offset
+/// reached, as a compaction copies it once.
+///
+/// Not listed are the branch table and the steps written on top of it, with the older heads
+/// those steps record, since a compaction copies none of them: it writes a new branch table from
+/// the pruned branches, so [`Compacted::objects`] counts that table's few records on top of the
+/// extents. Nor is anything that only pruned versions reach. Each length is that of the record in
+/// this file; a copy encodes the offsets of a record's links relative to where it lands, so it can
+/// take a few bytes more or less there.
+///
 /// # Errors
 ///
 /// The errors of [`info`].
 pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let (store, head) = read_only(path.as_ref())?;
     let mut extents = Vec::new();
-    if let Some(ptr) = head {
-        let mut roots = Roots::of(&store, ptr)?;
-        for head in roots.heads.iter_mut().chain(&mut roots.superseded) {
-            head.log = head.log.pruned(&store, keep)?;
+    if head.is_some() {
+        let refs = load_refs(&store, head)?;
+        let (pruned, _) = pruned(&store, &refs, keep)?;
+        let mut roots = Roots {
+            exact: true,
+            ..Roots::default()
+        };
+        for (_, head) in pruned.try_entries()? {
+            let mut sink = HashSink;
+            let mut encoder = Encoder::new(&mut sink);
+            head.encode(&mut encoder)?;
+            roots.trees.extend_from_slice(encoder.links());
+            roots.heads.push(head);
         }
-        let mut seen = HashSet::new();
+        let (mut entries, mut objects) = (HashSet::new(), HashSet::new());
         roots.walk(
             &store,
-            |ptr| seen.insert(ptr.offset),
+            |ptr, entry| match entry {
+                true => entries.insert(ptr.offset),
+                false => objects.insert(ptr.hash),
+            },
             |ptr, _, len| extents.push((ptr.offset, len)),
         )?;
     }

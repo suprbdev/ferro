@@ -174,6 +174,9 @@ pub(crate) struct Roots {
     /// The heads that older steps of the branch table record for the same branches, which the
     /// table still links.
     pub(crate) superseded: Vec<Head>,
+    /// Whether a commit that merges brought in and that is stored at more than one offset is
+    /// walked at each, as a compaction copies each, rather than once.
+    pub(crate) exact: bool,
 }
 
 impl Roots {
@@ -184,14 +187,16 @@ impl Roots {
             trees: vec![head],
             heads: heads.current,
             superseded: heads.superseded,
+            exact: false,
         })
     }
 
     /// Visits each object reachable from these roots through retained versions: log entries, the
     /// commits that merges brought in, the trees they hold and the branch table.
     ///
-    /// `fresh` is asked whether each object is new, and only a new one is visited and descended
-    /// into. `visit` gets each new object with its length in the file.
+    /// `fresh` is asked whether each object is new, with whether it is a log entry, and only a new
+    /// one is visited and descended into. `visit` gets each new object with its length in the
+    /// file.
     ///
     /// # Errors
     ///
@@ -200,13 +205,16 @@ impl Roots {
     pub(crate) fn walk(
         &self,
         store: &Store,
-        mut fresh: impl FnMut(Ptr) -> bool,
+        mut fresh: impl FnMut(Ptr, bool) -> bool,
         mut visit: impl FnMut(Ptr, &Object, u32),
     ) -> Result<()> {
         let mut stack = Vec::new();
         let mut entries: HashMap<u64, Hash> = HashMap::new();
         let mut floors: HashMap<u64, u64> = HashMap::new();
-        let mut closures = Closures::default();
+        let mut closures = match self.exact {
+            true => Closures::exact(),
+            false => Closures::default(),
+        };
         let mut superseded: Vec<&Head> = self.superseded.iter().collect();
         superseded.sort_by_key(|head| head.log.first);
         let heads = self.heads.iter().map(|head| (head, false));
@@ -220,7 +228,7 @@ impl Roots {
                     return Ok(false);
                 }
                 *floor = (*floor).min(chain.first);
-                if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr) {
+                if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr, true) {
                     visit(ptr, object, len);
                 }
                 stack.extend(entry.commit.root);
@@ -231,7 +239,7 @@ impl Roots {
             })?;
         }
         closures.walk(store, |ptr, entry, object, len| {
-            if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr) {
+            if entries.insert(ptr.offset, ptr.hash).is_none() && fresh(ptr, true) {
                 visit(ptr, object, len);
             }
             stack.extend(entry.commit.root);
@@ -239,7 +247,7 @@ impl Roots {
         })?;
         stack.extend(&self.trees);
         while let Some(ptr) = stack.pop() {
-            if entries.get(&ptr.offset) == Some(&ptr.hash) || !fresh(ptr) {
+            if entries.get(&ptr.offset) == Some(&ptr.hash) || !fresh(ptr, false) {
                 continue;
             }
             let (object, len) = store.read_record(ptr)?;

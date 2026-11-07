@@ -621,7 +621,8 @@ Every guarantee the table gave still holds:
   the walk stopped, which the model of pruned devices that sync found at five times its scale, and
   `verify_holds_while_pruned_branches_fork_drop_and_cycle` finds in its first four seeds.
   `verify_typed` checks a step as a typed object, and its first link as a table or a step. `layout`
-  walks the same objects.
+  walks only what a cycle copies: the branch table's current heads, pruned, and what they reach,
+  and not the table, its steps or the heads they replaced, since a cycle writes a new table.
 - An object's link that names the record of an entry a chain read counts as walked only if it
   names that entry's hash. One that names another hash is read, and fails its hash check. The walk
   used to know entries by offset alone, so a flipped bit that moved a step's or a table's link to a

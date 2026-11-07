@@ -1,5 +1,10 @@
+use std::collections::HashSet;
+use std::path::Path;
+
 use ferro::admin::{self, Keep};
-use ferro::{Db, Error, Map};
+use ferro::codec::Object;
+use ferro::store::{Store, StoreOptions, record_len};
+use ferro::{Db, Error, Hash, Map, Ptr};
 
 type Root = Map<u64, String>;
 
@@ -162,4 +167,113 @@ fn nested_collections_copy_with_their_values() {
     let inner = snapshot.get(&1).unwrap();
     assert_eq!(inner.get(&1).unwrap().len(), 4096);
     assert_eq!(inner.get(&2).unwrap().len(), 10);
+}
+
+fn build_branched(path: &Path, commits: u64) {
+    let db = Db::<Root>::open(path).unwrap();
+    let mut side = None;
+    for i in 0..commits {
+        db.commit(format!("c{i}"), |root| {
+            root.insert(i % 50, format!("{i}").repeat(100));
+        })
+        .unwrap();
+        if i == commits / 4 {
+            side = Some(db.fork("side").unwrap());
+        }
+        if let Some(side) = side.as_ref().filter(|_| i % 3 == 0) {
+            side.commit(format!("s{i}"), |root| {
+                root.insert(1_000 + i, format!("side {i}"));
+            })
+            .unwrap();
+        }
+        if i == commits / 2 {
+            let side = side.as_ref().unwrap();
+            db.merge_with(side, |root, base, theirs| {
+                let applied = root.merge(base, theirs, |conflict| conflict.keep_ours());
+                ("merge side", applied)
+            })
+            .unwrap();
+        }
+    }
+}
+
+fn records(path: &Path, mut each: impl FnMut(Ptr, &Object, bool)) {
+    let options = StoreOptions {
+        read_only: true,
+        ..StoreOptions::default()
+    };
+    let (store, head) = Store::open(path, options).unwrap();
+    let head = head.unwrap();
+    let mut seen = HashSet::new();
+    let mut stack = vec![head];
+    while let Some(ptr) = stack.pop() {
+        if ptr.offset == 0 || !seen.insert(ptr) {
+            continue;
+        }
+        let object = store.read_object(ptr).unwrap();
+        each(ptr, &object, ptr == head);
+        stack.extend(object.links.iter().copied());
+    }
+    store.close();
+}
+
+#[test]
+fn layout_lists_exactly_the_records_a_compaction_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    for commits in [20u64, 200] {
+        let path = dir.path().join(format!("{commits}.ferro"));
+        build_branched(&path, commits);
+        for keep in [
+            Keep::All,
+            Keep::Last(1),
+            Keep::Last(5),
+            Keep::Last(100),
+            Keep::Since(u64::MAX),
+        ] {
+            let layout = admin::layout(&path, keep).unwrap();
+            let copy = dir.path().join("copy.ferro");
+            std::fs::copy(&path, &copy).unwrap();
+            let compacted = admin::compact(&copy, keep).unwrap();
+            let verified = admin::verify(&copy).unwrap();
+            assert_eq!(verified.objects, compacted.objects, "{commits} {keep:?}");
+            let mut source: HashSet<Hash> = HashSet::new();
+            records(&path, |ptr, _, _| {
+                source.insert(ptr.hash);
+            });
+            let mut copied: HashSet<Hash> = HashSet::new();
+            let (mut fresh, mut fresh_bytes) = (0, 0);
+            records(&copy, |ptr, object, head| {
+                if head || !source.contains(&ptr.hash) {
+                    fresh += 1;
+                    fresh_bytes += record_len(ptr.offset, object) as u64;
+                } else {
+                    copied.insert(ptr.hash);
+                }
+            });
+            assert_eq!(fresh, 2, "a branch table of one node under its head");
+            let mut kept = Vec::new();
+            records(&path, |ptr, object, _| {
+                if copied.contains(&ptr.hash) {
+                    kept.push((ptr.offset, record_len(ptr.offset, object) as u32));
+                }
+            });
+            kept.sort_unstable();
+            assert_eq!(layout.extents, kept, "{commits} commits, {keep:?}");
+            assert_eq!(
+                layout.extents.len() as u64 + fresh,
+                compacted.objects,
+                "{commits} commits, {keep:?}"
+            );
+            let bytes: u64 = layout
+                .extents
+                .iter()
+                .map(|extent| u64::from(extent.1))
+                .sum();
+            let copied_bytes = verified.bytes - fresh_bytes;
+            assert!(
+                copied_bytes.abs_diff(bytes) * 100 <= bytes,
+                "{commits} commits, {keep:?}: {bytes} bytes here, {copied_bytes} in the copy"
+            );
+        }
+    }
 }
