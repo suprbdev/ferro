@@ -4,10 +4,11 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{Rng, cases, fast, quiet_ferro_panics, roomy, text, uncached};
 use ferro::admin::{self, Keep};
-use ferro::{Change, Data, Db, Map, Options, Summary};
+use ferro::{Change, Data, Db, Error, Map, Options, Outcome, Set, Snapshot, Summary};
 use proptest::prelude::*;
 
 type Model = BTreeMap<u32, String>;
@@ -816,4 +817,238 @@ fn a_plain_map_keeps_its_format() {
     assert_eq!(plain.root_hash(), Some(golden));
     assert_eq!(plain.range_summary(10..20u64), Some(()));
     assert_eq!(plain.range_summary(5_000..6_000u64), None);
+}
+
+#[derive(Clone, Default, Data)]
+#[ferro(transparent)]
+struct Distinct(Set<u32>);
+
+impl Distinct {
+    fn values(&self) -> Vec<u32> {
+        self.0.iter().collect()
+    }
+}
+
+impl Summary<u64, u32> for Distinct {
+    fn of(_key: &u64, value: &u32) -> Self {
+        Distinct([*value].into_iter().collect())
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Distinct(self.0.union(&other.0))
+    }
+}
+
+impl Summary<u64, String> for Distinct {
+    fn of(_key: &u64, value: &String) -> Self {
+        Distinct([value.len() as u32].into_iter().collect())
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Distinct(self.0.union(&other.0))
+    }
+}
+
+static SKEWED_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[derive(Clone, Default, Data)]
+#[ferro(transparent)]
+struct Skewed(Set<u32>);
+
+impl Skewed {
+    fn of_value(key: u64, value: u32) -> Self {
+        let value = match key == SKEWED_KEY.load(Ordering::Relaxed) {
+            true => value + 1_000,
+            false => value,
+        };
+        Skewed([value].into_iter().collect())
+    }
+}
+
+impl Summary<u64, u32> for Skewed {
+    fn of(key: &u64, value: &u32) -> Self {
+        Skewed::of_value(*key, *value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Skewed(self.0.union(&other.0))
+    }
+}
+
+impl Summary<u64, String> for Skewed {
+    fn of(key: &u64, value: &String) -> Self {
+        Skewed::of_value(*key, value.len() as u32)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Skewed(self.0.union(&other.0))
+    }
+}
+
+#[derive(Clone, Data)]
+struct Tallies<S: Summary<u64, u32> + Summary<u64, String>> {
+    inline: Map<u64, u32, S>,
+    spilled: Map<u64, String, S>,
+}
+
+impl<S: Summary<u64, u32> + Summary<u64, String>> Default for Tallies<S> {
+    fn default() -> Self {
+        Tallies {
+            inline: Map::default(),
+            spilled: Map::default(),
+        }
+    }
+}
+
+type Tallied = Tallies<Distinct>;
+type TallyModel = (BTreeMap<u64, u32>, BTreeMap<u64, String>);
+
+fn distinct<V>(
+    model: &BTreeMap<u64, V>,
+    (low, high): (u64, u64),
+    of: impl Fn(&V) -> u32,
+) -> Option<Vec<u32>> {
+    let mut found: Vec<u32> = model.range(low..high).map(|(_, value)| of(value)).collect();
+    found.sort_unstable();
+    found.dedup();
+    (!found.is_empty()).then_some(found)
+}
+
+fn check_tallies(tallies: &Tallied, model: &TallyModel, rng: &mut Rng) {
+    let length = |value: &String| value.len() as u32;
+    assert_eq!(tallies.inline.len(), model.0.len());
+    assert_eq!(tallies.spilled.len(), model.1.len());
+    assert_eq!(
+        tallies.inline.summary().map(|found| found.values()),
+        distinct(&model.0, (0, u64::MAX), |value| *value)
+    );
+    assert_eq!(
+        tallies.spilled.summary().map(|found| found.values()),
+        distinct(&model.1, (0, u64::MAX), length)
+    );
+    for _ in 0..60 {
+        let (a, b) = (rng.below(600), rng.below(600));
+        let span = (a.min(b), a.max(b));
+        assert_eq!(
+            tallies
+                .inline
+                .range_summary(span.0..span.1)
+                .map(|found| found.values()),
+            distinct(&model.0, span, |value| *value),
+            "{span:?}"
+        );
+        assert_eq!(
+            tallies
+                .spilled
+                .range_summary(span.0..span.1)
+                .map(|found| found.values()),
+            distinct(&model.1, span, length),
+            "{span:?}"
+        );
+    }
+}
+
+fn tally_round(db: &Db<Tallied>, model: &mut TallyModel, rng: &mut Rng) {
+    db.update(|root| {
+        for _ in 0..150 {
+            let key = rng.below(500);
+            if rng.chance(25) {
+                root.inline.remove(&key);
+                model.0.remove(&key);
+                root.spilled.remove(&key);
+                model.1.remove(&key);
+                continue;
+            }
+            let value = rng.below(300) as u32;
+            root.inline.insert(key, value);
+            model.0.insert(key, value);
+            let note = text(key ^ u64::from(value), 520 + rng.below(40) as usize);
+            root.spilled.insert(key, note.clone());
+            model.1.insert(key, note);
+        }
+    })
+    .unwrap();
+}
+
+fn unmerged<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+fn key_at_level(tallies: &Tallied, level: u32) -> u64 {
+    tallies
+        .inline
+        .iter()
+        .map(|(key, _)| key)
+        .find(|key| common::level_of(key) == level)
+        .unwrap()
+}
+
+#[test]
+fn a_summary_that_holds_a_collection_verifies_syncs_and_refuses_a_forged_one() {
+    quiet_ferro_panics();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.ferro");
+    let mut rng = Rng::new(7);
+    let mut model = TallyModel::default();
+    let a: Db<Tallied> = fast().open(&path).unwrap();
+    for _ in 0..8 {
+        tally_round(&a, &mut model, &mut rng);
+        check_tallies(&a.read(), &model, &mut rng);
+    }
+    a.verify_typed().unwrap();
+    drop(a);
+    let a: Db<Tallied> = uncached().open(&path).unwrap();
+    check_tallies(&a.read(), &model, &mut rng);
+    a.verify_typed().unwrap();
+    a.compact(Keep::Last(3)).unwrap();
+    check_tallies(&a.read(), &model, &mut rng);
+    a.verify_typed().unwrap();
+
+    let b: Db<Tallied> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    check_tallies(&b.read(), &model, &mut rng);
+    b.verify_typed().unwrap();
+    for _ in 0..3 {
+        tally_round(&b, &mut model, &mut rng);
+    }
+    assert_eq!(
+        a.pull(&b, "b", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    check_tallies(&a.read(), &model, &mut rng);
+    a.verify_typed().unwrap();
+    tally_round(&a, &mut model, &mut rng);
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    assert_eq!(
+        b.receive("a", &bundle, unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    check_tallies(&b.read(), &model, &mut rng);
+    b.verify_typed().unwrap();
+
+    let read = a.read();
+    let skews = [key_at_level(&read, 0), key_at_level(&read, 1)];
+    drop((read, a, b));
+    for (round, skew) in skews.into_iter().enumerate() {
+        SKEWED_KEY.store(skew, Ordering::Relaxed);
+        let forged: Db<Tallies<Skewed>> = fast().read_only(true).open(&path).unwrap();
+        forged.verify().unwrap();
+        match forged.verify_typed() {
+            Err(Error::Corrupt(message)) => assert!(message.contains("summary"), "{message}"),
+            other => panic!("typed verify passed a summary another `of` made: {other:?}"),
+        }
+        let c: Db<Tallies<Skewed>> = fast()
+            .open(dir.path().join(format!("c{round}.ferro")))
+            .unwrap();
+        let theirs: Db<Tallied> = fast().read_only(true).open(&path).unwrap();
+        let bundle = theirs.bundle(&c.have().unwrap()).unwrap();
+        match c.receive("a", &bundle, unmerged) {
+            Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
+            other => panic!("accepted a summary another `of` made: {other:?}"),
+        }
+        assert_eq!(c.version(), 0);
+    }
 }

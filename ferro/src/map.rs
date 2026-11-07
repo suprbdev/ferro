@@ -178,11 +178,14 @@ thread_local! {
 /// `combine`, and refuse one whose encoding differs from what is stored, so two files that sync
 /// need the same `Summary`. `of` may read a collection the value holds, on any thread: such a value
 /// is summarized once what is checked below it has passed, and reads the collection as a local
-/// read does. A receive reads what the receiving file holds once for free, and refuses a bundle
-/// whose summaries would read more again than its size allows, such as one large value shared by
-/// many keys. A panic in `of` or `combine` while they recompute is caught and refuses the bundle
-/// or reports the file as corrupt, and a read inside `of` that fails returns its error; the panic
-/// hook still runs, and with `panic = "abort"` the process aborts.
+/// read does. The summary may hold a collection too, such as a [`Set`](crate::Set) of the values
+/// seen: a node whose stored summaries hold one is folded once their nodes have passed their
+/// checks, and `combine` reads them as a local read does. A receive reads what the receiving file
+/// holds once for free, and refuses a bundle whose summaries would read more again than its size
+/// allows, such as one large value shared by many keys. A panic in `of` or `combine` while they
+/// recompute is caught and refuses the bundle or reports the file as corrupt, and a read inside
+/// `of` or `combine` that fails returns its error; the panic hook still runs, and with
+/// `panic = "abort"` the process aborts.
 ///
 /// # Examples
 ///
@@ -1506,8 +1509,17 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
                 }
                 0 => V::visit(r)?,
                 1 => {
-                    let summary = S::decode(r)?;
-                    r.typed_link(|| spill_kind::<K, V, S>(key.clone(), summary.clone()))?;
+                    let mut linked = false;
+                    let summary = r.typed_link_before(
+                        |r| {
+                            let links = r.links_read();
+                            let summary = S::decode(r)?;
+                            linked = r.links_read() != links;
+                            Ok(summary)
+                        },
+                        |summary| spill_kind::<K, V, S>(key.clone(), summary.clone()),
+                    )?;
+                    deferred |= claim.is_some() && !stored && linked;
                     if claim.is_some() {
                         parts.push(Part::Summary(summary));
                     }
@@ -1522,7 +1534,9 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     for position in 0..keys.len() + 1 {
         let below = r.varint()?;
         if below != 0 {
+            let links = r.links_read();
             let summary = S::decode(r)?;
+            deferred |= claim.is_some() && !stored && r.links_read() != links;
             r.typed_link(|| {
                 let span = child_span(span, keys, position);
                 node_kind::<K, V, S>(below, Some(level), Some(span), Some(summary.clone()))

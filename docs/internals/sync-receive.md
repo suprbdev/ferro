@@ -363,6 +363,20 @@ together. So `of` reads a nested collection as a local read would, only after it
 checks that bound how long a scan can take, and a value whose decode needs a store, such as a
 `Table` whose index the receiver added and rebuilds, is accepted as a local read would accept it.
 
+The summary itself can hold a collection, a `Set` of the values below say, and then each link to a
+child and each spilled value's slot holds that collection's root link too. The walk checks those
+nodes as nodes of their own type, as it would a collection in a value, but folding the summaries
+takes `combine`, which reads them, and without a store it cannot. So a node whose stored summaries
+record a typed link is deferred like one whose values do, and its recheck reads them through the
+same view, charged by the same rule, once their nodes have passed. The check of a spilled value
+needs no store: it compares the encoding of `S::of` with the summary of the slot, and a collection
+encodes as its root link, whose hash the comparison reads. Before this, such a summary failed to
+fold without a store, so `verify_typed` reported a healthy file as corrupt and `receive` refused
+every bundle once the tree had a second level. A spilled value's slot stores the value's link
+before the summary's, and the check also read them the other way round, so a summary holding a
+collection got the value's link and the value the summary's, and an honest spilled entry was
+refused; it now reads the value's link first.
+
 A first version read the deferred objects through the receiving store itself, keeping only what it
 decoded from the staging out of the cache. A staged node still found its way into a held one: when
 the bundle carried a node the receiver also held, `of` reached it through a held parent from the

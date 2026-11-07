@@ -200,8 +200,9 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
 /// `head`, as the type that reads it, checking each map node against what its parent records.
 ///
 /// Each object is checked without the store, and one whose summary needs it, because a value it
-/// summarizes holds a collection, is checked again with the store once every object below it has
-/// passed, so that `of` reads only collections whose nodes were checked.
+/// summarizes or a summary it folds holds a collection, is checked again with the store once every
+/// object below it has passed, so that `of` and `combine` read only collections whose nodes were
+/// checked.
 ///
 /// # Errors
 ///

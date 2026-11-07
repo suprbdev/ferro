@@ -22,7 +22,9 @@ needed to know. Applying a delta to the old summary would have been cheaper per 
 broken canonical form for floats, so it is not done even for sums. Because the stored summary is
 that fold and nothing else, `receive` and `verify_typed` can recompute it from a node's bytes and
 refuse one that differs, as described under [Recomputing
-summaries](sync-receive.md#recomputing-summaries).
+summaries](sync-receive.md#recomputing-summaries). That includes a summary that holds a collection,
+such as a `Set` of the distinct values below, whose `combine` reads the sets it joins: a node whose
+stored summaries hold one is folded once those sets' nodes have been checked.
 
 `of` must depend only on the encoded key and value, so a `#[ferro(skip)]` field must not feed it. A
 read of a dirty tree has no stored summary for the nodes changed in this transaction and folds them

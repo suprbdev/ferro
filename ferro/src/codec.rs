@@ -885,7 +885,7 @@ pub(crate) struct Shape {
     pub(crate) level: u8,
     /// Whether the summary the kind claims is still to be confirmed, by checking the object again
     /// with a store once every object the check reaches has passed, because a value it summarizes
-    /// holds a collection or decodes only with a store.
+    /// holds a collection or decodes only with a store, or a summary it folds holds a collection.
     pub(crate) deferred: bool,
 }
 
@@ -1008,9 +1008,9 @@ impl Kind {
     /// typed links found in it, which the caller checks in turn.
     ///
     /// Without a store, a check that would need one to confirm the summary the kind claims
-    /// returns a [`Shape`] marked [`deferred`](Shape::deferred). With `store`, the values a summary
-    /// is recomputed from decode with it, so that `of` can read the collections they hold, and
-    /// the check never defers.
+    /// returns a [`Shape`] marked [`deferred`](Shape::deferred). With `store`, the values and
+    /// summaries a summary is recomputed from decode with it, so that `of` and `combine` can read
+    /// the collections they hold, and the check never defers.
     ///
     /// # Errors
     ///
@@ -1386,6 +1386,26 @@ impl<'a> Decoder<'a> {
             found.borrow_mut().push((index, kind()));
         }
         Ok(ptr)
+    }
+
+    /// The next link, as [`typed_link`](Decoder::typed_link) reads it, and what `read` then
+    /// reads after it, where the [`Kind`] of the link depends on what `read` returns.
+    ///
+    /// # Errors
+    ///
+    /// As for [`link`](Decoder::link), and the error of `read`.
+    pub(crate) fn typed_link_before<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T>,
+        kind: impl FnOnce(&T) -> Kind,
+    ) -> Result<T> {
+        let index = self.base + self.cursor;
+        self.link()?;
+        let after = read(self)?;
+        if let Some(found) = self.found {
+            found.borrow_mut().push((index, kind(&after)));
+        }
+        Ok(after)
     }
 
     /// A handle on the store the object was read from, for a collection to read its nodes from,
