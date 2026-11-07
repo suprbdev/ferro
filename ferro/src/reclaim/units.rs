@@ -474,6 +474,7 @@ struct Shared {
     again: AtomicBool,
     failure: Mutex<Option<Failure>>,
     cancel: AtomicBool,
+    checking: AtomicBool,
     clean: HashSet<Hash, ByHash>,
 }
 
@@ -556,7 +557,7 @@ impl Shared {
         stack.push(root);
         let mut count = 0;
         while let Some(ptr) = stack.pop() {
-            if self.cancel.load(Ordering::Relaxed) {
+            if !self.checking.load(Ordering::Relaxed) || self.cancel.load(Ordering::Relaxed) {
                 stack.clear();
                 break;
             }
@@ -1010,6 +1011,7 @@ impl Units {
                 again: AtomicBool::new(false),
                 failure: Mutex::default(),
                 cancel: AtomicBool::new(false),
+                checking: AtomicBool::new(false),
                 clean: HashSet::default(),
             }),
             threads,
@@ -1090,6 +1092,7 @@ impl Units {
         if self.checks.is_empty() {
             return;
         }
+        self.shared.checking.store(true, Ordering::Relaxed);
         let mut queue = self.shared.queue.lock();
         if queue.checks.len() < CHECKS {
             queue.checks.extend(self.checks.drain(..));
@@ -1227,6 +1230,7 @@ impl Units {
             };
             shared.wait(seen, &mut self.scratch, true);
         }
+        shared.checking.store(false, Ordering::Relaxed);
         shared.queue.lock().checks.clear();
         shared.check()
     }
