@@ -107,6 +107,75 @@ same for `resolve`, which matters when one conflict decides that the merge canno
 at the first `Err` and put back an O(1) clone of the collection taken before they started, since a
 half merged collection is of no use to anyone but a closure that is about to fail.
 
+## The other branch's state
+
+A merge runs on our tip under our lane, while the other branch may be committing: its newest commit
+can be placed and still waiting in its sync. The merge takes the other branch's published state, the
+snapshot `read` on that branch returns, and that branch's merge records from the branch table
+published with it. Our side takes our tip and the table under `tip`, which name the same commit while
+we hold our lane. A record says that a version of the named branch is below its head's commit at the
+recorded version, so it describes a state only when it comes from a table that names that state's
+commit, and each side of the search now reads its records from such a table.
+
+The merge used to take the published state with the records of the table under `tip` (#96). A pull
+or sync on the other branch that had placed its merge commit and was waiting in its sync had already
+recorded the remote's version there, so the search counted the remote's commit as below a published
+state that did not contain it. When our side held that commit too, it became a second best common
+ancestor, the virtual base took its changes, and applying theirs against that base took them out of
+ours again. With `main` and `side` forked at x, `main` pulling the remote's r and committing a, and
+`side` committing b and then pulling r, `main.merge_with(&side)` during `side`'s sync merged b
+against x merged with r and dropped r's key from `main`. `common_ancestors`, which read both from the
+published table, answered x alone. A plain merge records nothing, so only a pull or a sync showed it.
+
+Taking their tip with the table under `tip` would be consistent too, but their tip need not be
+durable: under `Durability::Fsync` the closure would see a commit that a failed sync takes back,
+which no reader may, and a merge that ends without a frame would have to wait for the other branch's
+sync as well as for its own. Waiting for the other branch's commit to be published before merging
+would make a merge wait on another branch's writers, which lanes exist to avoid. So a commit on the
+other branch that is still syncing is left for the next merge, which finds it published: what `read`
+shows on that branch is what is merged, and `common_ancestor` answers for the same two states.
+
+That needs a published state and the published table to agree, and they did not always. The leader
+of a sync stored its batch's table under the `published` lock and published each branch's state
+after releasing it, so a merge that took the lock between the two found the other branch's new head,
+records included, beside its old state, and dropped r's key the same way. The leader now publishes
+the states before releasing the lock, as `refresh` and a cycle's swap already did. `rewrite_refs`,
+which lands a pulled branch and moves or records ours after a pull, published the states it moved
+only after its frame had settled. It now builds them once its frame is written and hands them to the
+frame's entry in the queue, so the leader publishes them with the table. A merge holds its lane,
+which `rewrite_refs` waits for, so only `common_ancestor` could meet that gap. Pruning still sets
+each state after its table, but it moves only the oldest retained version, which the search takes
+from the state and never pairs with a record. The steps that build a virtual base still read the
+table under `tip`, where a record counts only for a commit on its head's chain at or above the
+version it was made at, which holds whichever table it comes from.
+
+`merge.rs` holds the leader of `side`'s pull at the start of its sync, and again just after it
+publishes the table, under both durabilities, and checks that `main` keeps r's key, that the merge
+runs once against x with `side`'s published version, and that merging both ways after the sync
+changes nothing. It does the same with a plain merge on `side`, which passed before. The first hold
+lost r's key before the merge read the published table, and the second before the leader published
+both under one lock.
+
+## Handles of other files
+
+`merge_base` finds each side's records by branch name, so it trusted the handle it was given to be a
+branch of its own file (#98). A handle on another file was looked up by its name: with b in another
+file, `a.common_ancestors(&b)` took the records of a's own `main` as b's and answered a commit of a
+third file that a had pulled, while `b.common_ancestors(&a)` answered version 0. A merge across
+files ran its closure and then failed with `Corrupt("hash mismatch")`, when its commit linked an
+entry of the other file. A handle on a dropped branch whose name had been forked again took the new
+branch's records.
+
+`common_ancestor`, `common_ancestors`, `merge_with` and `try_merge_with` now refuse a handle from
+another open with `Error::ForeignHandle` before any closure runs. Two opens of one file keep their
+own tables and states in memory, and a cycle may have swapped the file under one and not yet the
+other, so a handle from another open of the same file counts as foreign too. No variant fitted:
+`NoBranch` names a branch, which the other file may well have, and `Corrupt` says this file is
+damaged. A dropped branch on either side gets `NoBranch`, checked with the states under the
+`published` lock: either the branch is retired, or the published table, which loses the branch
+before `drop_branch` retires it, has no head for it, and a search that finds no head for a branch
+now answers `NoBranch` instead of searching without its records.
+
 ## Before merge links
 
 Only direct merges used to be recorded, as `(their version, our version)` per branch name in the

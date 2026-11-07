@@ -163,7 +163,10 @@ entry to an offset in the old file, which came back after the swap as
 Each frame's refs are built under `tip` from the refs of the frame before, so every frame and every
 superblock names one consistent set of heads, and a read-only follower's `refresh` sees whole
 commits on every branch as before. In the process, the leader publishes the refs of its batch's last
-frame and each branch's state in frame order, and notices still drop after every lock is released.
+frame and each branch's state in frame order, all under the `published` lock, so a reader that takes
+it finds each branch's state beside the head that names its commit, and notices still drop after
+every lock is released. A merge reads the other branch's state and its merge records that way, as described
+under [The other branch's state](merging.md#the-other-branchs-state).
 
 `ferro-bench`'s `group` tool takes `--branches own`, which forks a branch for every writer. Each
 writer commits single-key updates spread over 100,000 keys from a closure that spins for the given

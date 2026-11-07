@@ -25,6 +25,17 @@ values, `None` where the key is absent. `resolve` returns the value to keep, or 
 `keep_ours` and `keep_theirs` return one side as it stands, a deletion included, without cloning a
 value nothing else holds.
 
+## Which branches merge
+
+`merge_with` takes the other branch as `read` on it shows it. A commit there that is still waiting
+for its sync, such as a pull that has placed its merge, is not merged yet; the next merge takes it.
+`common_ancestor` and `common_ancestors` compare the same two snapshots.
+
+The other handle comes from the same open database, from `fork` or `branch`. A handle on another
+file, or from another open of this one, gets `Error::ForeignHandle` before your closure runs, and a
+dropped branch on either side gets `Error::NoBranch`. Branches of two files merge through `pull` and
+`push`, described in [Sync](sync.md).
+
 ## What counts as a change
 
 Merges and `diff` compare values as they are stored, not with `==`: two values are the same when

@@ -14,7 +14,7 @@ machine, most of them on 2026-11-05. Start with [Getting started](guide/getting-
 | [Collections](guide/collections.md) | `Map`, `Set`, `List`, `Bytes`, bulk reads, cursors, prefixes, range edits and summaries |
 | [Tables and indexes](guide/tables.md) | `Table`, `#[derive(Record)]`, secondary, composite, unique and covering indexes, combined lookups |
 | [History, versions and branches](guide/history.md) | `at`, `as_of`, `diff`, `history_of`, `bisect`, stamps, forks, dropping branches, `head_hash` |
-| [Merging](guide/merging.md) | Three-way merges, criss-crosses and merges that can fail |
+| [Merging](guide/merging.md) | Three-way merges, which branches merge, criss-crosses and merges that can fail |
 | [Watchers](guide/watchers.md) | `watch`, `watch_when`, `watch_changes`, closers and async waits |
 | [Sync between files](guide/sync.md) | `pull`, `push`, `have`, `bundle` and `receive`, streaming and converging devices |
 | [Durability and crash safety](guide/durability.md) | Fsync and Buffered, recovery, verification and errors on read |
@@ -45,7 +45,7 @@ machine, most of them on 2026-11-05. Start with [Getting started](guide/getting-
 | [Writes from inside a closure](internals/reentrancy.md) | Deadlocks refused with `Error::Reentrant` |
 | [Watchers](internals/watchers.md) | The feed, the watch thread and its cost |
 | [History and the commit log](internals/history.md) | The chain, skip links, pruning, `head_hash`, commit times and dropping a branch |
-| [Merging and the merge graph](internals/merging.md) | Merge links, the base search, criss-crosses and pruning |
+| [Merging and the merge graph](internals/merging.md) | Merge links, the other branch's state, the base search, criss-crosses and pruning |
 | [Sync](internals/sync.md) | Haves, bundles, landing, bringing the branch up, measurements and limits |
 | [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice, type checks and recomputed summaries |
 | [Reclamation](internals/reclamation.md) | Cycles, the copy on several threads, generations, crashes, measurements and offline compaction |
