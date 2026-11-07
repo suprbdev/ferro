@@ -1035,8 +1035,11 @@ impl<K: Data, V: Data, S: Data> Node<K, V, S> {
 
 type Fetched<K, V, S> = (Shared<Node<K, V, S>>, bool);
 
-fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetched<K, V, S>> {
-    let decode = |decoder: &mut Decoder<'_>| {
+fn decode_node<K: Data, V: Data, S: Data>(
+    store: &Store,
+    ptr: Ptr,
+) -> impl Fn(&mut Decoder<'_>) -> Result<Node<K, V, S>> {
+    move |decoder: &mut Decoder<'_>| {
         let node = Node::decode(decoder, ptr)?;
         let written = store.readable_bytes();
         if node.count > written.saturating_mul(MAX_RATIO as u64) {
@@ -1046,12 +1049,30 @@ fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetc
             )));
         }
         Ok(node)
-    };
-    let (node, cached) = store.fetch_node(ptr, decode, Node::weight)?;
+    }
+}
+
+fn fetch_node<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Fetched<K, V, S>> {
+    let decode = decode_node(store, ptr);
+    let (node, cached) = store.fetch_node(ptr, &decode, Node::weight)?;
     if (K::LOCATED || V::LOCATED) && node.origin != Some(ptr) {
         return Ok((Shared::new(store.decode_at(ptr, decode)?), false));
     }
     Ok((node, cached))
+}
+
+/// [`fetch_node`] for a node the caller is about to change, which leaves one it reads from the
+/// file out of the cache, as [`Store::fetch_node_to_change`] does.
+fn fetch_node_to_change<K: Data, V: Data, S: Data>(
+    store: &Store,
+    ptr: Ptr,
+) -> Result<Shared<Node<K, V, S>>> {
+    let decode = decode_node(store, ptr);
+    let node = store.fetch_node_to_change(ptr, &decode)?;
+    if (K::LOCATED || V::LOCATED) && node.origin != Some(ptr) {
+        return Ok(Shared::new(store.decode_at(ptr, decode)?));
+    }
+    Ok(node)
 }
 
 fn admit<K, V, S>(node: &Node<K, V, S>, count: u64, ceiling: u8) -> Result<()> {
@@ -1732,6 +1753,28 @@ fn load<K: Data, V: Data, S: Data>(
     }
 }
 
+/// [`load`] for a node the caller is about to change, so that one it reads from the file is not
+/// cached and the caller holds its only count.
+fn load_to_change<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &Link<K, V, S>,
+) -> Result<Option<Shared<Node<K, V, S>>>> {
+    match link {
+        Link::Empty => Ok(None),
+        Link::Mem(node, _) => Ok(Some(node.clone())),
+        Link::Stored {
+            ptr,
+            count,
+            ceiling,
+            ..
+        } => {
+            let node = fetch_node_to_change(store.ok_or(Error::Detached)?, *ptr)?;
+            admit(&node, *count, *ceiling)?;
+            Ok(Some(node))
+        }
+    }
+}
+
 enum Visit<R> {
     Done(R),
     Descend(usize),
@@ -1749,7 +1792,7 @@ fn dirty_mut<'a, K: Data, V: Data, S: Data>(
     link: &'a mut Link<K, V, S>,
 ) -> Result<(&'a mut Node<K, V, S>, &'a mut Hint)> {
     if let Link::Stored { .. } = link {
-        let node = load(store, link)?.ok_or(Error::Detached)?;
+        let node = load_to_change(store, link)?.ok_or(Error::Detached)?;
         *link = Link::Mem(node, Hint::NONE);
     }
     match link {
@@ -1807,7 +1850,7 @@ fn split<K: Data + Ord, V: Data, S: Data>(
     link: Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
 ) -> Result<Parts<K, V, S>> {
-    let Some(node) = load(store, &link)? else {
+    let Some(node) = load_to_change(store, &link)? else {
         return Ok((Link::Empty, Link::Empty));
     };
     drop(link);
@@ -1951,7 +1994,7 @@ fn insert_outside<K: Data + Ord, V: Data, S: Data>(
     value: Arc<V>,
 ) -> Result<Option<Slot<V, S>>> {
     if let Link::Stored { .. } = link {
-        let node = load(store, link)?.ok_or(Error::Detached)?;
+        let node = load_to_change(store, link)?.ok_or(Error::Detached)?;
         *link = Link::Mem(node, Hint::NONE);
         return insert_at(store, link, key, level, value);
     }
@@ -2965,7 +3008,10 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
         return Ok(());
     }
     if let Link::Stored { .. } = link {
-        *link = Link::Mem(load(store, link)?.ok_or(Error::Detached)?, Hint::NONE);
+        *link = Link::Mem(
+            load_to_change(store, link)?.ok_or(Error::Detached)?,
+            Hint::NONE,
+        );
     }
     let top = edits.as_slice()[..count]
         .iter()
@@ -6868,5 +6914,47 @@ mod tests {
     fn a_slot_takes_24_bytes_whatever_its_summary() {
         assert_eq!(size_of::<Slot<String, ()>>(), 24);
         assert_eq!(size_of::<Slot<u64, (u64, u64)>>(), 24);
+    }
+
+    #[test]
+    fn the_nodes_a_commit_reads_from_the_file_to_change_stay_out_of_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("change.ferro");
+        let keys = 0..4096u64;
+        crate::Db::<Map<u64, u64>>::open(&path)
+            .unwrap()
+            .update(|map| {
+                for key in keys {
+                    map.insert(key, key);
+                }
+            })
+            .unwrap();
+        let db = crate::Db::<Map<u64, u64>>::open(&path).unwrap();
+        let before = db.read();
+        db.update(|map| {
+            map.insert(7, 70);
+        })
+        .unwrap();
+        let reads = crate::store::fresh_reads();
+        assert_eq!(before.get(&7).as_deref(), Some(&7));
+        assert!(
+            crate::store::fresh_reads() > reads,
+            "the old path was cached"
+        );
+        let after = db.read();
+        let reads = crate::store::fresh_reads();
+        assert_eq!(after.get(&7).as_deref(), Some(&70));
+        assert_eq!(crate::store::fresh_reads(), reads, "the new path was read");
+        db.update(|map| {
+            map.insert(7, 71);
+        })
+        .unwrap();
+        let reads = crate::store::fresh_reads();
+        assert_eq!(after.get(&7).as_deref(), Some(&70));
+        assert_eq!(
+            crate::store::fresh_reads(),
+            reads,
+            "a cached node a commit changed left the cache"
+        );
     }
 }

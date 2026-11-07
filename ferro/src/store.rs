@@ -3301,6 +3301,24 @@ impl Store {
         Ok((node, false))
     }
 
+    /// [`Store::fetch_node`] for a node its caller is about to change: one found in the cache is
+    /// handed out as a hit would be, and one read from the file is not cached, so the caller holds
+    /// its only count and changes it in place.
+    pub(crate) fn fetch_node_to_change<T: Any + Send + Sync>(
+        &self,
+        ptr: Ptr,
+        decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+    ) -> Result<Shared<T>> {
+        if let Some(mut entry) = self.inner.cache.get(&ptr.hash)
+            && let Entry::Node { node, .. } = entry.take()
+            && let Ok(node) = node.downcast::<T>()
+        {
+            return Ok(node);
+        }
+        let (node, _) = self.decode_fresh(ptr, decode, |_, _, _| 0)?;
+        Ok(Shared::new(node))
+    }
+
     /// Reads and decodes the object at `ptr`, registers it for deduplication if it is as large as a
     /// spilled value and the store writes, and weighs it.
     fn decode_fresh<T>(
