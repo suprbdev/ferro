@@ -1200,7 +1200,8 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     scanned
 }
 
-fn zigzag(value: i64) -> u64 {
+/// Maps a signed link delta to the unsigned value a record stores, small magnitudes first.
+pub(crate) fn zigzag(value: i64) -> u64 {
     ((value << 1) ^ (value >> 63)) as u64
 }
 
@@ -1208,7 +1209,8 @@ fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
-fn varint_len(mut value: u64) -> usize {
+/// The number of bytes the varint of `value` takes.
+pub(crate) fn varint_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 0x80 {
         value >>= 7;
@@ -1469,7 +1471,7 @@ fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
 
 /// Reads a whole record from `bytes`, which start at `start` in the log, filling `links`, or
 /// `None` if it runs past them or does not parse, for the caller to read it the slow way.
-fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Stored> {
+pub(crate) fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Stored> {
     let mut pos = 0;
     let stored = usize::try_from(varint_within(bytes, &mut pos)?).ok()?;
     let flagged = varint_within(bytes, &mut pos)?;
@@ -3258,6 +3260,24 @@ impl Store {
         *bytes = reader.bytes.into_owned();
         let stored = stored?;
         Ok((&bytes[..stored.len], stored))
+    }
+
+    /// Reads the `bytes.len()` bytes at `at` in the log, which must lie within what has been
+    /// written, without parsing or checking them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the range runs outside the log, and [`Error::Io`] if the read fails.
+    pub(crate) fn read_exact(&self, at: u64, bytes: &mut [u8]) -> Result<()> {
+        let tail = self.readable_past(at)?;
+        let end = at.checked_add(bytes.len() as u64);
+        if at < LOG_START || end.is_none_or(|end| end > tail) {
+            return Err(Error::Corrupt(format!(
+                "pointer {at} outside log of {tail} bytes"
+            )));
+        }
+        self.inner.file.read_exact_at(bytes, at)?;
+        Ok(())
     }
 
     /// Reads a record that did not fit the first read, once `claims` accepts its length.

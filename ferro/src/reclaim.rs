@@ -36,6 +36,9 @@ use crate::store::{
     Basis, LOG_START, Prehashed, Store, StoreOptions, Traced, Unpacked, append_staged, body_of,
     compressed, seal, staged, verify_stored,
 };
+use units::{Key, PENDING, Settled, Units};
+
+mod units;
 
 const FLUSH_BYTES: usize = 1 << 20;
 const BATCH_BYTES: usize = 256 << 10;
@@ -43,6 +46,7 @@ const BATCH_RECORDS: usize = 4096;
 const SPARE: usize = 64;
 const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 4;
+const AHEAD: usize = 4096;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 
@@ -472,7 +476,7 @@ impl Verifier {
 
 struct CopySink<'a> {
     source: Store,
-    file: Traced,
+    file: Arc<Traced>,
     buf: Vec<u8>,
     end: u64,
     verifier: Verifier,
@@ -488,6 +492,8 @@ struct CopySink<'a> {
     pruned: HashSet<Hash, ByHash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
+    units: Option<Units>,
+    fallback: Option<Key>,
 }
 
 #[derive(Clone, Copy)]
@@ -654,6 +660,7 @@ impl CopySink<'_> {
     }
 
     fn emit(&mut self, from: Ptr, staged: Staged<'_>, below: Option<Below>) -> Result<Ptr> {
+        self.flush()?;
         let (hash, offset) = (from.hash, self.end);
         let before = self.buf.len();
         append_staged(&mut self.buf, offset, staged);
@@ -672,6 +679,10 @@ impl CopySink<'_> {
                 let copied = self.copied.entry(hash).or_insert(Copied::Object(offset));
                 if let Copied::Entry = copied {
                     *copied = Copied::Both(offset);
+                }
+                if let Some(units) = &self.units {
+                    let key = self.fallback.unwrap_or_else(|| units.walk_key());
+                    units.place(&hash, key, offset);
                 }
             }
         }
@@ -699,8 +710,16 @@ impl CopySink<'_> {
         true
     }
 
+    fn placed(&self, hash: Hash) -> Option<Ptr> {
+        let offset = self.units.as_ref()?.placed(&hash)?;
+        Some(Ptr { hash, offset })
+    }
+
     fn object(&self, hash: Hash) -> Option<Ptr> {
-        match self.copied.get(&hash)? {
+        let Some(copied) = self.copied.get(&hash) else {
+            return self.placed(hash);
+        };
+        match copied {
             Copied::Object(offset) | Copied::Both(offset) => Some(Ptr {
                 hash,
                 offset: *offset,
@@ -730,7 +749,7 @@ impl CopySink<'_> {
                     link.offset
                 )));
             }
-            None => return Ok(Link::Object),
+            None => return Ok(self.placed(link.hash).map_or(Link::Object, Link::Copied)),
             Some(copied) => *copied,
         };
         let walked = || self.walked.get(&link.offset) == Some(&link.hash);
@@ -869,7 +888,65 @@ impl CopySink<'_> {
         }))
     }
 
+    fn flush(&mut self) -> Result<()> {
+        if self.fallback.is_some() {
+            return Ok(());
+        }
+        loop {
+            let stop = self.stop;
+            let Some(units) = self.units.as_mut().filter(|units| units.outstanding() > 0) else {
+                return Ok(());
+            };
+            match units.settle(stop).map_err(|error| self.verifier.first(error))? {
+                Settled::Done { end, objects } => {
+                    self.end = end;
+                    self.objects += objects;
+                    return Ok(());
+                }
+                Settled::Tainted { unit, end } => {
+                    self.end = end;
+                    self.fallback = Some(unit.key());
+                    let copied = self.copy(unit.root());
+                    self.fallback = None;
+                    copied?;
+                    self.drain()?;
+                    let end = self.end;
+                    if let Some(units) = &mut self.units {
+                        units.resolved(end);
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch(&mut self, link: Ptr) -> Result<Ptr> {
+        if self.units.as_ref().is_some_and(|units| units.outstanding() >= AHEAD) {
+            self.flush()?;
+        }
+        if self.units.as_ref().is_some_and(|units| units.outstanding() == 0) {
+            self.drain()?;
+        }
+        let end = self.end;
+        if let Some(units) = &mut self.units {
+            units.dispatch(link, end);
+        }
+        Ok(Ptr {
+            hash: link.hash,
+            offset: PENDING,
+        })
+    }
+
+    fn resolve(&self, links: &mut [Ptr]) -> Result<()> {
+        for link in links.iter_mut().filter(|link| link.offset == PENDING) {
+            link.offset = self.placed(link.hash).map(|placed| placed.offset).ok_or_else(|| {
+                Error::Corrupt(format!("the copy lost the tree at {}", link.offset))
+            })?;
+        }
+        Ok(())
+    }
+
     fn copy(&mut self, root: Ptr) -> Result<Ptr> {
+        self.flush()?;
         let linked = self.linked(root);
         let entry = match linked.map_err(|error| self.verifier.first(error))? {
             Link::Copied(done) => return Ok(done),
@@ -884,18 +961,25 @@ impl CopySink<'_> {
             let top = stack.last_mut().expect("stack is not empty");
             if top.next < top.held.old.len() {
                 let link = top.held.old[top.next];
+                let unit = self.units.is_some()
+                    && self.fallback.is_none()
+                    && top.entry.is_some_and(|rungs| top.next < rungs.parents);
                 let linked = match top.entry {
                     Some(rungs) if rungs.skip == Some(top.next) => {
                         Link::parent(self.skipped(&top.held.links, rungs, link))
                     }
                     Some(rungs) if top.next >= rungs.parents => Link::parent(self.parent(link)),
                     _ => {
+                        if !unit {
+                            self.flush()?;
+                        }
                         let linked = self.linked(link);
                         linked.map_err(|error| self.verifier.first(error))?
                     }
                 };
                 let done = match linked {
                     Link::Copied(done) => done,
+                    Link::Object if unit => self.dispatch(link)?,
                     reached => match self.read(link, matches!(reached, Link::Entry))? {
                         Step::Done(done) => done,
                         Step::Descend(pending) => {
@@ -909,7 +993,9 @@ impl CopySink<'_> {
                 top.next += 1;
                 continue;
             }
-            let done = stack.pop().expect("stack is not empty");
+            let mut done = stack.pop().expect("stack is not empty");
+            self.flush()?;
+            self.resolve(&mut done.held.links)?;
             let below = done
                 .entry
                 .map(|rungs| Self::below(done.from, &done.held.links, rungs));
@@ -986,16 +1072,18 @@ impl<'a> Copier<'a> {
         let source = store.metadata()?;
         file.set_permissions(source.permissions())?;
         copy_owner(&file, &source);
-        let file = Traced::new(file, options.trace.clone())?;
+        let file = Arc::new(Traced::new(file, options.trace.clone())?);
         file.created();
         file.set_len(LOG_START)?;
+        let threads = copy_threads(options);
+        let units = (threads > 1).then(|| Units::new(store.clone(), file.clone(), threads));
         Ok(Copier {
             sink: CopySink {
                 source: store.clone(),
                 file,
                 buf: Vec::new(),
                 end: LOG_START,
-                verifier: Verifier::new(copy_threads(options)),
+                verifier: Verifier::new(threads),
                 bytes: Vec::new(),
                 body: Vec::new(),
                 spare: Vec::new(),
@@ -1008,6 +1096,8 @@ impl<'a> Copier<'a> {
                 pruned: HashSet::default(),
                 objects: 0,
                 stop,
+                units,
+                fallback: None,
             },
         })
     }
@@ -1063,11 +1153,23 @@ impl<'a> Copier<'a> {
                 sink.pruned.insert(hash);
             }
         }
+        if let Some(units) = &mut sink.units {
+            let mut taint = sink.pruned.clone();
+            let entries = sink.copied.iter().filter(|(_, copied)| copied.is_entry());
+            taint.extend(entries.map(|(hash, _)| *hash));
+            units.taint(taint);
+        }
         let mut encoder = Encoder::new(&mut *sink);
         refs.encode(&mut encoder)?;
         let head = encoder.finish();
         sink.needs.clear();
-        head
+        let head = head?;
+        sink.flush()?;
+        if let Some(units) = &mut sink.units {
+            let stop = sink.stop;
+            units.written(stop)?;
+        }
+        Ok(head)
     }
 
     /// Copies everything `refs` retains that earlier passes did not, checking every object's
