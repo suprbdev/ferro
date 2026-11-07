@@ -9,6 +9,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use crate::admin::Keep;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink};
 use crate::db::{Commit, Parts, now_ms};
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Prehashed, Store};
 
 const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
@@ -352,7 +353,7 @@ type Walks = Vec<(u64, Option<u64>)>;
 #[derive(Default)]
 pub(crate) struct Closures {
     queue: BinaryHeap<Reverse<Seed>>,
-    walked: HashMap<(Hash, u64), Walks>,
+    walked: HashMap<(Hash, u64), Walks, BuildHasherDefault<Prehashed>>,
     exact: bool,
 }
 

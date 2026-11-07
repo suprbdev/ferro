@@ -13,7 +13,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +46,32 @@ const KEEP_BYTES: usize = 16 << 20;
 const KEEP_EACH: usize = 64;
 
 type ByHash = BuildHasherDefault<Prehashed>;
+type ByOffset = BuildHasherDefault<Spread>;
+
+/// A hasher for offsets in the file, which folds the 128-bit product of each word and an odd
+/// constant, so that the low bits a table picks a group by and the high bits it tags a slot with
+/// both depend on every bit of the offset.
+#[derive(Default)]
+struct Spread(u64);
+
+impl Hasher for Spread {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        let product = u128::from(self.0 ^ word) * 0x9e37_79b9_7f4a_7c15;
+        self.0 = product as u64 ^ (product >> 64) as u64;
+    }
+}
 
 /// When background reclamation cycles run, set with [`Options::reclaim`](crate::Options::reclaim).
 ///
@@ -114,15 +140,14 @@ pub struct Space {
     pub last_error: Option<String>,
 }
 
-fn links_of(entry: &Entry) -> Vec<Hash> {
+fn links_of(entry: &Entry) -> impl Iterator<Item = Hash> {
     let merged = entry.merged.map(|merged| merged.ptr);
     entry
         .prev
-        .iter()
-        .chain(&entry.skip)
-        .chain(&merged)
+        .into_iter()
+        .chain(entry.skip)
+        .chain(merged)
         .map(|link| link.hash)
-        .collect()
 }
 
 fn copy_threads(options: &StoreOptions) -> usize {
@@ -235,11 +260,11 @@ struct CopySink<'a> {
     cache: EntryCache,
     spare: Vec<Buffers>,
     copied: HashMap<Hash, Copied, ByHash>,
-    walked: HashMap<u64, Hash>,
-    records: HashMap<u64, u64>,
+    walked: HashMap<u64, Hash, ByOffset>,
+    records: HashMap<u64, u64, ByOffset>,
     kept: Needs,
     needs: Needs,
-    below: HashMap<u64, Below>,
+    below: HashMap<u64, Below, ByOffset>,
     pruned: HashSet<Hash, ByHash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
@@ -312,8 +337,8 @@ impl Need {
 
 #[derive(Default)]
 struct Needs {
-    one: HashMap<u64, Need>,
-    more: HashMap<u64, Vec<Need>>,
+    one: HashMap<u64, Need, ByOffset>,
+    more: HashMap<u64, Vec<Need>, ByOffset>,
 }
 
 impl Needs {
@@ -422,7 +447,7 @@ struct Spot {
 #[derive(Default)]
 struct EntryCache {
     bytes: Vec<u8>,
-    at: HashMap<u64, Spot>,
+    at: HashMap<u64, Spot, ByOffset>,
     last: Option<usize>,
 }
 
@@ -682,7 +707,8 @@ impl CopySink<'_> {
             && let Some(stored) = stored_within(record, ptr.offset, &mut held.old)
         {
             held.payload.clear();
-            held.payload.extend_from_slice(&record[stored.payload.clone()]);
+            held.payload
+                .extend_from_slice(&record[stored.payload.clone()]);
             return Ok(Step::Descend(Pending {
                 from: ptr,
                 raw: stored.raw,
@@ -1001,11 +1027,11 @@ impl<'a> Copier<'a> {
                 cache: EntryCache::default(),
                 spare: Vec::new(),
                 copied: HashMap::default(),
-                walked: HashMap::new(),
-                records: HashMap::new(),
+                walked: HashMap::default(),
+                records: HashMap::default(),
                 kept: Needs::default(),
                 needs: Needs::default(),
-                below: HashMap::new(),
+                below: HashMap::default(),
                 pruned: HashSet::default(),
                 objects: 0,
                 stop,
@@ -1020,7 +1046,7 @@ impl<'a> Copier<'a> {
     fn encode(&mut self, refs: &Refs) -> Result<Ptr> {
         let sink = &mut self.sink;
         let source = sink.source.clone();
-        let mut retained = HashSet::new();
+        let mut retained: HashSet<Hash, ByHash> = HashSet::default();
         let mut edge = Vec::new();
         let mut again = Vec::new();
         let mut closures = Closures::exact();
