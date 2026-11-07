@@ -139,4 +139,5 @@ commit send everything on their first pull.
 ## How it works
 
 - [Sync](../internals/sync.md): haves, bundles, the checks on landing and bringing the branch up.
-- [Receiving a bundle](../internals/sync-receive.md): staging, commits stored twice and type checks.
+- [Receiving a bundle](../internals/sync-receive.md): staging, commits stored twice, type checks
+  and recomputed summaries.

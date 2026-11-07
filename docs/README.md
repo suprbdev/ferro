@@ -3,8 +3,8 @@
 The guides describe what ferro does and how to use it. The internals describe how it works, what
 each part costs, and what was measured and left out on the way. Their figures were measured when
 each change landed, often on a machine shared with other work, and record the decisions they
-informed. [Performance](guide/performance.md) has the current figures, all measured on 2026-11-04
-on one idle machine. Start with [Getting started](guide/getting-started.md).
+informed. [Performance](guide/performance.md) has the current figures, measured on one idle
+machine, most of them on 2026-11-05. Start with [Getting started](guide/getting-started.md).
 
 ## Guides
 
@@ -18,8 +18,8 @@ on one idle machine. Start with [Getting started](guide/getting-started.md).
 | [Watchers](guide/watchers.md) | `watch`, `watch_when`, `watch_changes`, closers and async waits |
 | [Sync between files](guide/sync.md) | `pull`, `push`, `have`, `bundle` and `receive`, streaming and converging devices |
 | [Durability and crash safety](guide/durability.md) | Fsync and Buffered, recovery, verification and errors on read |
-| [Retention and reclamation](guide/retention.md) | `Keep`, background cycles, `compact` and what pruning means |
-| [Writers and concurrency](guide/concurrency.md) | Branch locks, awaited writes, `coalesce`, reentrancy and several processes |
+| [Retention and reclamation](guide/retention.md) | `Keep`, background cycles and their threads, `compact` and what pruning means |
+| [Writers and concurrency](guide/concurrency.md) | Branch locks, awaited writes, `coalesce`, reentrancy, several processes and following them |
 | [Changing your types](guide/schema-evolution.md) | Adding, removing, reordering and renaming fields, and when an index rebuilds |
 | [The `ferro` tool](guide/cli.md) | Inspecting, verifying and compacting a file without your types |
 | [Performance](guide/performance.md) | Headline numbers, the comparison with other stores, and allocators |
@@ -47,8 +47,8 @@ on one idle machine. Start with [Getting started](guide/getting-started.md).
 | [History and the commit log](internals/history.md) | The chain, skip links, pruning, `head_hash`, commit times and dropping a branch |
 | [Merging and the merge graph](internals/merging.md) | Merge links, the base search, criss-crosses and pruning |
 | [Sync](internals/sync.md) | Haves, bundles, landing, bringing the branch up, measurements and limits |
-| [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice and type checks |
-| [Reclamation](internals/reclamation.md) | Cycles, generations, crashes, measurements and offline compaction |
+| [Receiving a bundle](internals/sync-receive.md) | Staging, commits stored twice, type checks and recomputed summaries |
+| [Reclamation](internals/reclamation.md) | Cycles, the copy on several threads, generations, crashes, measurements and offline compaction |
 | [Windows](internals/windows.md) | Locks, durability and renaming over an open file |
 | [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints and ranges, covered fields and their cost, index fingerprints and combined lookups |
 | [Errors and checks on local reads](internals/errors.md) | Panics, `Result` and bounds on crafted files |
