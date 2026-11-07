@@ -3,12 +3,16 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{
     BLOCK, FRAME_BYTES, Outcome, Rng, SECTOR, SLOT, assert_damaged, cases, fast, field, guarded,
     judged, quiet_ferro_panics, seal_frame, table_bytes, text, uncached,
 };
 use ferro::codec::{HASH_BYTES, Object, Sink};
+use ferro::db::Clock;
 use ferro::store::{Store, StoreOptions, record_len};
 use ferro::{Db, Error, Map, Options, Ptr};
 use tempfile::TempDir;
@@ -21,6 +25,7 @@ const SUPER: usize = 144;
 
 struct Built {
     dir: TempDir,
+    clock: u64,
     bytes: Vec<u8>,
     lens: Vec<usize>,
     headers: Vec<Vec<u8>>,
@@ -41,9 +46,37 @@ fn build(commits: u64, keys_per_commit: u64) -> Built {
 }
 
 fn build_as(options: Options, commits: u64, keys_per_commit: u64, long: usize) -> Built {
+    build_from(options, clock_start(), commits, keys_per_commit, long)
+}
+
+fn clock_start() -> u64 {
+    std::env::var("FERRO_TEST_CLOCK")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        })
+}
+
+fn build_from(
+    options: Options,
+    clock: u64,
+    commits: u64,
+    keys_per_commit: u64,
+    long: usize,
+) -> Built {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.ferro");
-    let db = options.open::<Root>(&path).unwrap();
+    let ticks = Arc::new(AtomicU64::new(clock));
+    let db = options
+        .clock(Clock(Arc::new(move || {
+            ticks.fetch_add(1, Ordering::Relaxed)
+        })))
+        .open::<Root>(&path)
+        .unwrap();
     let mut rng = Rng::new(commits * 31 + keys_per_commit);
     let mut model = Model::new();
     let mut lens = vec![log_end(&fs::read(&path).unwrap())];
@@ -87,6 +120,7 @@ fn build_as(options: Options, commits: u64, keys_per_commit: u64, long: usize) -
     assert_eq!(bytes.len(), *lens.last().unwrap());
     Built {
         dir,
+        clock,
         bytes,
         lens,
         headers,
@@ -842,7 +876,10 @@ fn flipped_log_bytes_never_read_back_as_wrong_data() {
             .iter()
             .any(|(start, end, _)| (*start..*end).contains(&position));
         let options = if trial % 2 == 0 { uncached() } else { fast() };
-        let context = format!("byte {position} mask {mask:#x} live {live}");
+        let context = format!(
+            "FERRO_TEST_CLOCK={} byte {position} mask {mask:#x} live {live}",
+            built.clock
+        );
         match guarded(|| {
             let db = match options.open::<Root>(&path) {
                 Ok(db) => db,
