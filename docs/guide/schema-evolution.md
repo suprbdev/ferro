@@ -56,7 +56,9 @@ index in every commit. Any of these rebuilds that one index:
 - changing what the `#[ferro(default)]` or `#[ferro(default = "...")]` of one of its fields returns,
   which is what rows written before that field existed hold in the index;
 - changing what such a default returns on a field of a struct or enum that one of its fields'
-  types holds, at any depth, as `Meta` is held in `Option<Meta>` or `Vec<Meta>`.
+  types holds, at any depth, as `Meta` is held in `Option<Meta>` or `Vec<Meta>`;
+- changing what `Data::missing` returns for a type with a hand-written `Data` impl that one of its
+  fields is or holds, at any depth, unless that impl overrides `describe`.
 
 These rebuild nothing: renaming a field in Rust while `#[ferro(rename)]` keeps its stored name,
 writing a type through an alias, a `Box`, an `Arc` or a `#[ferro(transparent)]` wrapper, renaming a
@@ -70,8 +72,10 @@ indexes](../internals/schema-and-unique-indexes.md#unique-indexes).
 The fingerprint follows encodings, not ordering. The values of an indexed field are keys of its
 index, so the rule above for key types applies to them: changing how an indexed type compares, for
 example reordering the fields of a struct that derives `Ord`, is not noticed and leaves lookups
-missing rows. A type with a hand-written `Data` impl is fingerprinted by its type name, so give it a
-`describe` of its own if its encoding can change while its name stays. [Index
+missing rows. A type with a hand-written `Data` impl is fingerprinted by its type name and the value
+its `missing` returns, so give it a `describe` of its own if its encoding can change while its name
+stays, and have that `describe` include the value `missing` returns, if it returns one, since an
+index holds that value for rows written before the field existed. [Index
 fingerprints](../internals/schema-and-unique-indexes.md#index-fingerprints) has the details.
 
 A file written before indexes carried fingerprints opens normally. Its indexes are rebuilt the first

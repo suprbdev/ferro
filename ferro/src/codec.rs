@@ -314,7 +314,7 @@ impl Sink for HashSink {
 ///   bare values must not change what it writes once data is stored.
 /// - [`same_encoding`](Data::same_encoding), when overridden, gives the answer comparing the two
 ///   encodings would, and [`describe`](Data::describe), when overridden, changes whenever the
-///   encoding does.
+///   encoding does, and whenever the value [`missing`](Data::missing) returns does.
 ///
 /// # Examples
 ///
@@ -390,6 +390,10 @@ pub trait Data: Clone + Send + Sync + 'static {
     /// The collections, `Option`, `Vec`, `BTreeMap`, `BTreeSet` and [`Bytes`] return their empty
     /// value, so a field of one of them can be added to a type that already has data, and `Box`
     /// and `Arc` follow what they hold.
+    ///
+    /// An index holds this value for the rows that lack the field, so it must be rebuilt when the
+    /// value changes. The default [`describe`](Data::describe) describes it; an impl that
+    /// overrides both must describe it too.
     fn missing() -> Option<Self> {
         None
     }
@@ -398,11 +402,21 @@ pub trait Data: Clone + Send + Sync + 'static {
     ///
     /// The derive describes a struct by its stored field names, their types and the values their
     /// defaults return, and an enum by its variants the same way. The default describes a type by
-    /// its Rust name, so a hand-written impl whose encoding can change while its name stays the
-    /// same should describe what it writes.
+    /// its Rust name and, when [`missing`](Data::missing) returns a value, by the hash of that
+    /// value. A hand-written impl whose encoding can change while its name stays the same should
+    /// describe what it writes, and the value `missing` returns if there is one.
+    ///
+    /// # Panics
+    ///
+    /// The default panics if the value `missing` returns fails to encode, as
+    /// [`Description::value`] does.
     fn describe(d: &mut Description) {
         d.word("rust");
         d.word(type_name::<Self>());
+        if let Some(value) = Self::missing() {
+            d.word("missing");
+            d.value(&value);
+        }
     }
     /// Whether `self` and `other` encode to the same bytes and links, the test that
     /// [`Map::diff`](crate::Map::diff) and merges compare values by.

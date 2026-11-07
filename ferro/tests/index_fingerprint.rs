@@ -1,6 +1,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use common::fast;
 use ferro::codec::{Decoder, Description, Encoder, field_tag};
@@ -1273,5 +1274,167 @@ fn changing_a_default_nested_in_an_indexed_or_covered_type_rebuilds_the_index() 
         .by_badge(&BadgeAlso { kind: 0, level: 2 })
         .keys()
         .collect();
+    assert_eq!(twos, vec![0, 1, 2, 3]);
+}
+
+static MISSING: [AtomicU8; 2] = [AtomicU8::new(1), AtomicU8::new(1)];
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank<const SLOT: usize>(u8);
+
+impl<const SLOT: usize> Data for Rank<SLOT> {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.u8(self.0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Rank(r.u8()?))
+    }
+
+    fn missing() -> Option<Self> {
+        Some(Rank(MISSING[SLOT].load(Ordering::Relaxed)))
+    }
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct Ranked {
+    rank: Rank<1>,
+}
+
+#[test]
+fn the_default_description_holds_the_value_missing_returns() {
+    let mut named = Description::new();
+    named.word("rust");
+    named.word(std::any::type_name::<Forged>());
+    assert_eq!(described::<Forged>(), named.bytes());
+    let all = || {
+        [
+            described::<Rank<1>>(),
+            described::<Ranked>(),
+            described::<Option<Box<Rank<1>>>>(),
+        ]
+    };
+    MISSING[1].store(1, Ordering::Relaxed);
+    let ones = all();
+    MISSING[1].store(2, Ordering::Relaxed);
+    let twos = all();
+    for (one, two) in ones.iter().zip(&twos) {
+        assert_ne!(one, two);
+    }
+    MISSING[1].store(1, Ordering::Relaxed);
+    assert_eq!(all(), ones);
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Crest {
+    kind: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RankedCrest {
+    kind: u8,
+    rank: Rank<0>,
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Unranked {
+    #[key]
+    id: u32,
+    region: u8,
+    crest: Crest,
+}
+
+root!(UnrankedRoot, Unranked);
+
+macro_rules! ranked {
+    ($row:ident, $root:ident) => {
+        #[derive(Data, Record, Clone, Debug, PartialEq)]
+        struct $row {
+            #[key]
+            id: u32,
+            #[index(cover(rank))]
+            region: u8,
+            #[index]
+            rank: Rank<0>,
+            #[index]
+            crest: RankedCrest,
+        }
+
+        root!($root, $row);
+
+        impl $row {
+            fn dirty(table: &Table<$row>) -> [bool; 3] {
+                [
+                    table.by_region.is_dirty(),
+                    table.by_rank.is_dirty(),
+                    table.by_crest.is_dirty(),
+                ]
+            }
+        }
+    };
+}
+
+ranked!(RankedOne, RankedOneRoot);
+ranked!(RankedTwo, RankedTwoRoot);
+ranked!(RankedAlso, RankedAlsoRoot);
+
+#[test]
+fn changing_what_missing_returns_for_an_indexed_hand_written_type_rebuilds_the_index() {
+    let (_dir, path) = scratch("ranks.ferro");
+    MISSING[0].store(1, Ordering::Relaxed);
+    {
+        let db: Db<UnrankedRoot> = fast().open(&path).unwrap();
+        db.update(|root| {
+            for id in 0..4u8 {
+                root.rows.insert(Unranked {
+                    id: u32::from(id),
+                    region: id % 2,
+                    crest: Crest { kind: id },
+                });
+            }
+        })
+        .unwrap();
+    }
+    let untouched = {
+        let db: Db<RankedOneRoot> = fast().open(&path).unwrap();
+        let ones: Vec<u32> = db.read().rows.by_rank(&Rank(1)).keys().collect();
+        assert_eq!(ones, vec![0, 1, 2, 3]);
+        db.update(|_| ()).unwrap();
+        assert_eq!(RankedOne::dirty(&db.read().rows), [false; 3]);
+        db.read().rows.root_hash()
+    };
+    MISSING[0].store(2, Ordering::Relaxed);
+    {
+        let db: Db<RankedTwoRoot> = fast().open(&path).unwrap();
+        let read = db.read();
+        assert_eq!(read.rows.root_hash(), untouched);
+        assert_eq!(RankedTwo::dirty(&read.rows), [true; 3]);
+        assert!(
+            read.rows
+                .iter()
+                .all(|row| row.rank == Rank(2) && row.crest.rank == Rank(2))
+        );
+        assert_eq!(read.rows.by_rank(&Rank(1)).count(), 0);
+        let twos: Vec<u32> = read.rows.by_rank(&Rank(2)).keys().collect();
+        assert_eq!(twos, vec![0, 1, 2, 3]);
+        let covered: Vec<(u32, Rank<0>)> = read.rows.by_region(&0).covered().collect();
+        assert_eq!(covered, vec![(0, Rank(2)), (2, Rank(2))]);
+        let crest = RankedCrest {
+            kind: 3,
+            rank: Rank(2),
+        };
+        let crests: Vec<u32> = read.rows.by_crest(&crest).keys().collect();
+        assert_eq!(crests, vec![3]);
+        let fresh = rebuilt(&read.rows);
+        assert_eq!(read.rows.by_region.root_hash(), fresh.by_region.root_hash());
+        assert_eq!(read.rows.by_rank.root_hash(), fresh.by_rank.root_hash());
+        assert_eq!(read.rows.by_crest.root_hash(), fresh.by_crest.root_hash());
+        db.update(|_| ()).unwrap();
+    }
+    let db: Db<RankedAlsoRoot> = fast().open(&path).unwrap();
+    let read = db.read();
+    assert_eq!(RankedAlso::dirty(&read.rows), [false; 3]);
+    let twos: Vec<u32> = read.rows.by_rank(&Rank(2)).keys().collect();
     assert_eq!(twos, vec![0, 1, 2, 3]);
 }

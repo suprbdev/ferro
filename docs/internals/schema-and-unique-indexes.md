@@ -332,7 +332,9 @@ A type is described by `Data::describe`, which follows the encoding:
   part. A transparent struct is described as the field it wraps.
 - A type met again inside its own description, directly or through others, by how many types up the
   first one is, so `struct Tree { kids: Vec<Tree> }` has a finite description.
-- Anything else by `std::any::type_name`, unless its `Data` impl overrides `describe`.
+- Anything else by `std::any::type_name` and, if its `Data::missing` returns a value, the hash of
+  that value, as described under [Defaults](#defaults), unless its `Data` impl overrides
+  `describe`.
 
 The derive's code names a field's type, and the compiler resolves it, so `type Amount = i64`
 describes as `i64`, and pointing the alias at another type changes the fingerprint. The description
@@ -371,6 +373,21 @@ any type holding it changes with the default, at any depth, and the index is reb
 description held only names and types before, so pointing that default at another value kept the
 fingerprint: rows read the new level while lookups and covered values gave the old one.
 
+A field without a default reads as its type's `Data::missing` when stored data lacks it, and that
+value can change too. ferro's own types return a fixed empty value there, or `None`, and describe
+themselves; a derived struct or enum returns `None`, and a transparent one follows the field it
+wraps. A hand-written impl can return anything, and the default `describe` held only its Rust name,
+so one whose `missing` went from 1 to 2 kept its fingerprint, at the top level or nested in a
+derived struct, and the index kept 1 for the rows that read 2. The default `describe` now goes on
+with the word `missing` and the hash of the value when `missing` returns one, so that change
+rebuilds the index as a changed default does. A type whose `missing` returns `None` is described as
+before, and so is every type ferro provides and every derived one, since they override `describe`.
+After upgrading, the only indexes rebuilt are those whose description reaches a hand-written impl
+that returns a value from `missing` and keeps the default `describe`, once each. An impl that
+overrides both must describe the value itself, as the `Data` docs say: ferro cannot add it there
+without changing the description of every `Option`, `Vec` and collection, which return their empty
+value, and so rebuilding every index that holds one.
+
 The value is described rather than the path of the function. A path misses a function whose body
 changed, and a `#[ferro(default)]` whose type's `Default` changed, and it rebuilds an index when the
 function is moved or renamed but returns the same thing. The value changes exactly when the index
@@ -403,7 +420,12 @@ is another function returning 2 keeps them. A pair of transparent types whose `D
 checks `#[ferro(default)]` the same way. A row whose indexed and covered fields hold a struct, an
 `Option` of an enum whose variant has the defaulted field, and a `Vec` of the struct, is read the
 same three ways, and every one of its four indexes is rebuilt when the nested default changes and
-kept when it does not.
+kept when it does not. Rows written without a field of a hand-written type whose `missing` reads a
+static are read through a table with three indexes, one keyed on the field, one covering it and one
+keyed on a derived struct that holds it, with the static at 1, then 2, then 2 again, and the three
+indexes are rebuilt the second time and kept the third. The descriptions of the type, of a derived
+struct holding it and of an `Option<Box<_>>` of it change with the static, and a hand-written type
+whose `missing` returns `None` is described by its name alone, as before.
 
 ### Where it is stored
 
