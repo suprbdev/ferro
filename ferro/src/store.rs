@@ -43,6 +43,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use parking_lot::{Condvar, Mutex, RwLock};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache;
@@ -1947,7 +1948,7 @@ struct Inner {
     /// Woken when one of them is let go.
     freed: Condvar,
     /// The frames that the last catch-up to follow any kept, for reads of their objects.
-    followed: Mutex<Option<Arc<Kept>>>,
+    followed: ArcSwapOption<Kept>,
     /// How the store was opened.
     options: StoreOptions,
     /// What a [`Store::view`] may still read, or `None` for a store opened on a file.
@@ -2289,7 +2290,7 @@ impl Store {
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
-                followed: Mutex::new(None),
+                followed: ArcSwapOption::empty(),
                 options,
                 view: None,
             }),
@@ -2346,7 +2347,7 @@ impl Store {
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
-                followed: Mutex::new(None),
+                followed: ArcSwapOption::empty(),
                 options: StoreOptions {
                     read_only: true,
                     shared: false,
@@ -3142,8 +3143,7 @@ impl Store {
             return Ok(Followed::Still);
         };
         if let Some(kept) = Kept::new(copied) {
-            let replaced = inner.followed.lock().replace(Arc::new(kept));
-            drop(replaced);
+            inner.followed.store(Some(Arc::new(kept)));
         }
         inner.written.fetch_max(last.log_end, Ordering::AcqRel);
         Ok(Followed::Moved(Frame {
@@ -3195,12 +3195,14 @@ impl Store {
     pub(crate) fn read_record(&self, ptr: Ptr) -> Result<(Object, u32)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
-        let kept = match self.inner.options.shared {
-            true => self.inner.followed.lock().clone(),
-            false => None,
-        };
+        let kept = self
+            .inner
+            .options
+            .shared
+            .then(|| self.inner.followed.load());
         let held = kept
-            .as_deref()
+            .as_ref()
+            .and_then(|kept| kept.as_deref())
             .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
         let (object, len, _) = Store::read_within(file, ptr, tail, held, true, false)?;
         Ok((object, len))
@@ -3520,8 +3522,7 @@ impl Store {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
         inner.cache.clear();
-        let followed = inner.followed.lock().take();
-        drop(followed);
+        inner.followed.store(None);
         crate::epoch::flush();
         if closed || inner.options.read_only {
             return;
