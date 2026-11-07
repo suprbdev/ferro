@@ -252,7 +252,9 @@ threads](#trees-on-several-threads), which replaced the batches above for a cycl
 threads, and starts its threads with the first tree it hands out: always when `copy_threads` asks
 for more than one, and with the default only in a file of more than 256 KiB. Otherwise the calling
 thread does that work itself. The threads stop when the cycle ends.
-`admin::compact` uses the same copy with the default.
+`admin::compact` uses the same copy with the default. Once units took the trees, no cycle started
+the checking threads of the batches above any more, so #92 removed them and their unit tests: the
+walk checks each record it reads itself, at any number of threads.
 
 `ferro-bench --bin reclaim copy` copies a file aside and times `Db::compact` keeping everything on
 it, one thread count after another, against the same tool built on the tree before. On 2026-11-04,
@@ -313,11 +315,12 @@ twelve table runs, two of each build.
 `reclaim_threads.rs` compares the files copied at 1, 2 and 4 threads byte for byte, checks that
 every record follows its children and that the records tile the copy, damages a record only old
 history reaches and expects the cycle and `admin::compact` to fail at its offset with no temp file
-left and the database still working, and counts the checking threads at a small and a large cycle.
+left and the database still working, and counts the copy's threads at a small and a large cycle.
 `reclaim_crash.rs` cuts the power at every third operation of two cycles whose copies span several
-batches, `reclaim_fault.rs` shuts a writer down while three threads copy with every write slowed,
-and the unit tests damage one record in 30,000 at each batch boundary, damage two and
-expect the first at every thread count, and drop a verifier with batches queued.
+batches, and `reclaim_fault.rs` shuts a writer down while three threads copy with every write
+slowed. Unit tests damaged one record in 30,000 at each batch boundary, damaged two and expected
+the first at every thread count, and dropped a verifier with batches queued, until the batches
+went.
 `reclaim_damage.rs` points a link of a node into a value three ways, at bytes that parse as a small
 record linking garbage, at bytes claiming 16 MiB, and at those bytes with the node damaged too, and
 expects a cycle at 1 and 4 threads to fail with the same hash mismatch and four to peak within 12
@@ -449,7 +452,8 @@ seconds, on the large values most of all, whose figures are the fastest of three
 threads lose 0.02 s to the extra CPU, and 8 or more gain 0.02 to 0.04 s. `ferro compact`, which
 takes the default threads, 4 before and 8 now on this machine, took 0.23 s against 0.39 s on the
 table rows and 0.14 against 0.18 s on the values. At 16 threads the walk is the limit again: the
-chains before the copy take 37 ms, and its 40,000 entries about 100 ms more. The longest pause of
+chains before the copy take 37 ms, and its 40,000 entries about 100 ms more, as described under
+[The walk past eight threads](#the-walk-past-eight-threads). The longest pause of
 `ferro-bench --bin reclaim live table`, as under [Measurements](#measurements), medians of three
 alternating runs, was 2.91 ms against 2.93 ms before, at 5,114 and 5,190 commits a second.
 
@@ -477,6 +481,133 @@ as above, the fastest of three on 2026-11-07:
 `Compacted::handed_out` counts the trees a cycle handed out, and `reclaim_threads.rs` checks that
 copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, hand out trees and make
 the same bytes as one thread, both in the first copy and in the copy of the file a cycle wrote.
+
+### The walk past eight threads
+
+With units, the walk was the limit again past eight threads (#92): the table rows took 0.22 s at 8
+threads and no less at 16. Timers around the walking thread's steps, copying the table rows under
+[Limits](#limits) on 2026-11-07, pinned to cores 0-15 with nothing else running, medians of three
+copies in a build the timers slow to 0.24 s:
+
+| The walking thread | 8 threads | 16 threads |
+| --- | ---: | ---: |
+| Walking the chains before the copy | 46 ms | 43 ms |
+| of which reading and checking 40,001 entries | 21 ms | 22 ms |
+| of which recording what the copy needs of them | 13 ms | 12 ms |
+| Reading and decoding the same entries again in the copy | 34 ms | 35 ms |
+| Handing out units, besides waiting | 4 ms | 22 ms |
+| Writing the entries | 14 ms | 14 ms |
+| Waiting for units, at the limit of 16,384 and at the end | 99 ms | 74 ms |
+| All of it | 228 ms | 225 ms |
+
+So the other threads sat idle while the walk went down the chains, and the walk then waited for
+them. Sampling every thread on `SIGPROF` at each millisecond of its CPU, over eight copies at 16
+threads, put 36% of all their CPU in checking hashes, decompressing and running BLAKE3, 33% in
+discovering units, reading records and claiming them, and 12% in writing. With other work on the
+sibling cores 16-31, the threads spent 23% of their samples on the lock of the byte budget, which
+every compressed record takes and gives back, and most copies at 16 threads took 0.4 to 0.9 s.
+
+Four changes went in. Each was measured on the table rows on top of those above it, medians of
+five alternating runs for the first five rows and of six for the last two, in seconds:
+
+| Build | 1 thread | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| Before | 0.815 | 0.318 | 0.229 | 0.346 |
+| Entries kept from the walk down the chains | 0.810 | 0.321 | 0.238 | 0.242 |
+| And the budget counted without a lock | 0.804 | 0.316 | 0.225 | 0.225 |
+| The budget alone | 0.806 | 0.319 | 0.221 | 0.237 |
+| And cheaper maps | 0.789 | 0.308 | 0.211 | 0.221 |
+| The same, in a second set of runs | 0.800 | 0.308 | 0.206 | 0.216 |
+| And hashes checked ahead | 0.790 | 0.288 | 0.186 | 0.192 |
+
+- Entries are read once. The walk down the chains appends the bytes of each entry's record it
+  reads, as stored, to one buffer, and keeps their place by offset with the entry's hash and which
+  of its links it has. When the copy reaches that record as an entry it parses it from the buffer,
+  takes it as checked, as it already did for an entry the walk had read, and decodes nothing.
+  Reading entries in the copy fell from 35 to 12 ms at 16 threads and from 34 to 11 ms at 8. The
+  buffer holds at most 16 MiB, each entry counted at its length and 64 bytes more for its place;
+  past that the copy reads entries from the file as before. The table rows' entries take 70 bytes,
+  so 16 MiB holds about 120,000 of them. It is freed when the pass ends.
+- The budget counts without a lock while the bytes fit. A thread adds its bytes with a
+  compare-and-swap, and only one that would pass the budget takes the lock, counts itself and
+  waits, so a thread giving bytes back takes the lock to wake waiters only when there are any. On
+  its own it took the copies at 16 threads, which ran from 0.22 to 0.72 s, to 0.22 to 0.24 s.
+- The maps keyed by offset hash it with one multiply, folded, where they used SipHash, and the walk
+  keeps the hashes of the entries it retains in a set that takes them as they are. Writing the
+  entries fell from 14 to 10 ms, and the walk down the chains by 2 to 4 ms.
+- Hashes are checked ahead. While the walk goes down the chains it hands the root of each entry it
+  will copy to the copy's threads, which start then. A thread with no unit or job to take checks
+  the records below that root, each before the links it follows, from a stack of its own, gives
+  half of the stack back to the queue past 128 records, and gives it all back and stops once a unit
+  or a job waits or the pass has written its units. It claims nothing and writes nothing: the slot
+  of each record's hash records the offset at which the record was checked, 8 bytes more for each
+  object, and a unit that reaches the record at that offset reads and parses it without
+  decompressing or hashing it again. A unit records the records it checks the same way, so no
+  thread checks them again. Of about 350,000 reads of records in units on the table rows, 53,000
+  took the record as checked at 4 threads, 143,000 at 8 and 161,000 at 16. The threads would
+  otherwise wait, but the walk slows as more cores run beside it: it took 37 ms down the chains on
+  one thread, and 42, 46 and 51 ms beside 3, 7 and 15 threads checking. A record that fails its
+  check is left for its unit, which fails it in walk order as before.
+
+The copy is the same bytes at any number of threads: the entries kept, the budget and the checks
+change only where a record's bytes come from and whether its hash is computed again, never which
+unit holds a record or where it goes. `reclaim_threads.rs`, `fuzzed.rs`, `reclaim_damage.rs` and
+the `reclaim` fuzz target pass unchanged.
+
+`ferro-bench --bin reclaim copy`, alternating with the build before on 2026-11-07, pinned to cores
+0-15 with nothing else running, `sync` and a pause of a second between runs, medians of five runs
+for the first two files and the fastest of three for the large values, which writeback of earlier
+runs slowed up to tenfold in both builds:
+
+| File | Threads | Before | After |
+| --- | ---: | ---: | ---: |
+| 189 MB of table rows, 383,364 objects | 1 | 0.82 s | 0.80 s |
+| | 4 | 0.32 s | 0.30 s |
+| | 8 | 0.22 s | 0.19 s |
+| | 16 | 0.55 s | 0.19 s |
+| 331 MB of 320 byte values, 124,939 objects | 1 | 0.41 s | 0.41 s |
+| | 4 | 0.15 s | 0.16 s |
+| | 8 | 0.11 s | 0.11 s |
+| | 16 | 0.16 s | 0.11 s |
+| 601 MB of 600 KB values, 1,183 objects | 1 | 0.18 s | 0.19 s |
+| | 4 | 0.13 s | 0.13 s |
+| | 8 | 0.13 s | 0.13 s |
+| | 16 | 0.12 s | 0.12 s |
+
+Before, four of the five copies of the table rows at 16 threads took 0.44 to 0.85 s on the lock of
+the budget, and the fastest 0.23 s. The values have ten commits, so they have no chain to speak of
+and gain only where the budget's lock cost them. `ferro-bench --bin reclaim table` takes a third
+number now, the updates in each commit. A file of a million rows and 6,000 commits of 8 updates,
+255 MB in 501,635 objects, copied as `RECLAIM_KEEP` and `RECLAIM_AGAIN` set, medians of three:
+
+| Copy of the 255 MB file | Threads | Before | After |
+| --- | ---: | ---: | ---: |
+| `Keep::All` | 1 | 1.04 s | 1.04 s |
+| | 4 | 0.38 s | 0.37 s |
+| | 8 | 0.28 s | 0.23 s |
+| | 16 | 0.31 s | 0.23 s |
+| `Keep::Last(3000)` | 1 | 0.68 s | 0.67 s |
+| | 4 | 0.27 s | 0.25 s |
+| | 8 | 0.18 s | 0.16 s |
+| | 16 | 0.43 s | 0.16 s |
+| `Keep::All`, of a file a cycle wrote | 4 | 0.36 s | 0.37 s |
+| | 8 | 0.27 s | 0.21 s |
+| | 16 | 0.27 s | 0.23 s |
+| `Keep::Last(3000)`, of a file a cycle wrote | 4 | 0.24 s | 0.24 s |
+| | 8 | 0.17 s | 0.15 s |
+| | 16 | 0.19 s | 0.16 s |
+
+Peak RSS copying the table rows rose from 158 to 162 MB on one thread and from 70 to 83 MB at 4
+threads: the entries kept, the slots' checked offsets and the roots waiting to be checked. An
+entry's rungs, which links of its record are its root, `prev` and skip links, now take three flags
+where they took five words, on the copy's stack as well. The longest pause of `ferro-bench --bin
+reclaim live table`, as under [Measurements](#measurements), medians of three alternating runs, was
+2.69 ms against 2.74 ms before, at 5,277 and 5,267 commits a second, and a cycle took 0.53 s
+against 0.54 s.
+
+16 threads still copy no faster than 8. The walk down the chains takes 51 ms beside 15 threads
+checking against 46 beside 7, and handing out units cost the walk 22 ms at 16 threads against 4 at
+8, on the lock of the queue the threads take units from.
 
 ### Measured and left out
 
@@ -510,6 +641,21 @@ the same bytes as one thread, both in the first copy and in the copy of the file
   objects itself, the values' tree, whose root has one link, was never split, and each wait left
   the threads idle for 5 to 9 ms. The table rows took 0.33 s at 4 threads and 0.23 s at 8, and the
   values 0.15 s at any count.
+- Keeping each entry's decoded body and links for the copy instead of its record's bytes, moved
+  into the copy's stack whole, with a compressed body kept as stored. With the budget and the
+  cheaper maps under both, the table rows took 0.782, 0.306, 0.206 and 0.222 s at 1, 4, 8 and 16
+  threads against 0.789, 0.308, 0.211 and 0.221 with the buffer, within the runs' spread, for
+  three allocations an entry where the buffer takes about 130 bytes.
+- Checking ahead one record at a time, each record a turn of the queue's lock. The threads queued
+  on the lock and checked 88,000 to 97,000 records while the walk went down the chains, and the
+  table rows took 0.299, 0.207 and 0.209 s at 4, 8 and 16 threads against 0.313, 0.207 and 0.214.
+- Checking ahead without units recording what they checked. At 16 threads 91,000 records were
+  checked after their unit had checked them, and the table rows took 0.293, 0.192 and 0.203 s at 4,
+  8 and 16 threads against 0.288, 0.186 and 0.192.
+- Reading the chains on another thread, ahead of the walk's bookkeeping. Not built. Reading and
+  checking entries is about half of the walk down the chains, at most 22 ms of a 0.19 s copy at 16
+  threads, and the walk would have to take the other thread's records in the order it asks for
+  them, with any error at the record that gave it.
 
 ## Generations
 
@@ -641,19 +787,20 @@ comparison was made on one base, before value columns landed:
 A cycle walks the log on one thread and copies the trees it reaches on up to seven others, checking
 every object's hash as it goes, as described under [The copy on several
 threads](#the-copy-on-several-threads). On 2026-11-07 the copy of a file in the page cache, keeping
-everything, ran at 870 MB/s on 189 MB of table rows, 200,000 rows and 40,000 updates in 383,364
-objects, and at 2,780 MB/s on 331 MB of a million 320 byte values in 124,939 objects, with 16
-threads, where it ran at 500 and 2,450 MB/s before with 4 or more. With 4 threads it now runs at
-620 and 2,150 MB/s, with 8 at 720 and 2,900, and on one thread at 237 and 806 MB/s as before. So a
-10 GB database of table rows takes about 12 seconds and needs 10 GB free. The trigger keeps that to
-one extra byte copied per byte written, at worst. Past 8 threads the walking thread is the limit
-again on table rows, since it reads each log entry twice, walking the chains and copying them.
-`Keep::All` copies all of history, so `history` is what makes background cycles worthwhile. The
-copy holds its claims, about 60 bytes per object, about 80 bytes per commit for where each entry
-was read and copied and what its copy keeps, the lists of the trees waiting to be placed, 24 bytes
-a record and 4 a link, and 16 MiB of records and decompressed bodies the threads and the walk hold
-at once, or one larger record alone, besides a buffer of up to 1 MiB on each thread and the one
-record the walk is copying.
+everything, ran at 1,000 MB/s on 189 MB of table rows, 200,000 rows and 40,000 updates in 383,364
+objects, and at 2,960 MB/s on 331 MB of a million 320 byte values in 124,939 objects, with 8
+threads, where it ran at 870 and 2,780 MB/s at best before. With 4 threads it now runs at 640 and
+2,140 MB/s, with 16 at 980 and 3,130, and on one thread at 237 and 806 MB/s as before. So a 10 GB
+database of table rows takes about 10 seconds and needs 10 GB free. The trigger keeps that to one
+extra byte copied per byte written, at worst. Past 8 threads the copy of table rows gains nothing
+more, since the walk down the chains slows as more cores run and handing out units costs it more,
+as described under [The walk past eight threads](#the-walk-past-eight-threads). `Keep::All` copies
+all of history, so `history` is what makes background cycles worthwhile. The copy holds its claims,
+about 68 bytes per object, about 80 bytes per commit for where each entry was read and copied and
+what its copy keeps, up to 16 MiB of the entries the walk down the chains read, until the pass
+ends, the lists of the trees waiting to be placed, 24 bytes a record and 4 a link, and 16 MiB of
+records and decompressed bodies the threads and the walk hold at once, or one larger record alone,
+besides a buffer of up to 1 MiB on each thread and the one record the walk is copying.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the

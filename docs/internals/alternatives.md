@@ -141,8 +141,10 @@ numbers. This index lists them by subsystem.
 - Hole punching, copying sparse runs to the tail, and a segmented log:
   [Measurements](reclamation.md#measurements).
 - Reading a node's children in one read, reading the file from memory, fetching ahead on the
-  checking threads, writing the copy on another thread, a larger first read, and units for the
-  roots of entries only: [Measured and left out](reclamation.md#measured-and-left-out).
+  checking threads, writing the copy on another thread, a larger first read, units for the roots of
+  entries only, keeping decoded entries for the copy, checking ahead one record at a time or
+  without units recording their checks, and reading the chains on another thread: [Measured and
+  left out](reclamation.md#measured-and-left-out).
 - `File::lock`, `ReOpenFile`, generation-numbered files, and deleting before renaming:
   [Windows](windows.md).
 
