@@ -213,7 +213,8 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     for (_, branch) in refs.try_entries()? {
         let chain = branch.log;
         let after = chain.after(store)?;
-        chain.visit(store, |ptr, entry, _, _| {
+        closures.chain(&chain);
+        chain.visit(store, branch.root, |ptr, entry, _, _| {
             if commits.insert(ptr.hash) {
                 roots.extend(entry.commit.root);
             }
@@ -316,8 +317,8 @@ pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let mut extents = Vec::new();
     if let Some(ptr) = head {
         let mut roots = Roots::of(&store, ptr)?;
-        for chain in roots.chains.iter_mut().chain(&mut roots.superseded) {
-            *chain = chain.pruned(&store, keep)?;
+        for head in roots.heads.iter_mut().chain(&mut roots.superseded) {
+            head.log = head.log.pruned(&store, keep)?;
         }
         let mut seen = HashSet::new();
         roots.walk(

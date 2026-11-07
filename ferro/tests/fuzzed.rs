@@ -24,21 +24,26 @@ const HAS_PREV: u8 = 1;
 const HAS_SKIP: u8 = 2;
 const MERGED: u8 = 16;
 const GRAPH: u8 = 32;
+const BOUNDED: u8 = 64;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Head {
     version: u64,
     first: u64,
-    tip: Ptr,
+    root: Option<Ptr>,
+    tip: Option<Ptr>,
 }
 
 impl Data for Head {
     fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
         self.version.encode(w)?;
         self.first.encode(w)?;
-        w.u8(0);
-        w.u8(1);
-        w.link(self.tip);
+        for link in [self.root, self.tip] {
+            w.u8(u8::from(link.is_some()));
+            if let Some(link) = link {
+                w.link(link);
+            }
+        }
         w.varint(0);
         Ok(())
     }
@@ -46,12 +51,13 @@ impl Data for Head {
     fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
         let version = u64::decode(r)?;
         let first = u64::decode(r)?;
-        Option::<Ptr>::decode(r)?;
-        let tip = Option::<Ptr>::decode(r)?.ok_or(Error::Decode("no tip".into()))?;
+        let root = Option::<Ptr>::decode(r)?;
+        let tip = Option::<Ptr>::decode(r)?;
         Map::<String, (u64, u64)>::decode(r)?;
         Ok(Head {
             version,
             first,
+            root,
             tip,
         })
     }
@@ -64,8 +70,9 @@ struct Entry {
     root: Option<Ptr>,
     prev: Option<Ptr>,
     skip: Option<Ptr>,
-    merged: Option<(Ptr, u64, u64)>,
+    merged: Option<(Ptr, u64, Option<u64>)>,
     graph: (u64, u64, u64),
+    bounded: bool,
 }
 
 impl Entry {
@@ -86,10 +93,11 @@ impl Entry {
         w.u8(u8::from(self.prev.is_some()) * HAS_PREV
             + u8::from(self.skip.is_some()) * HAS_SKIP
             + u8::from(self.merged.is_some()) * MERGED
-            + u8::from(wide) * GRAPH);
+            + u8::from(wide) * GRAPH
+            + u8::from(self.bounded) * BOUNDED);
         if let Some((_, floor, after)) = self.merged {
             w.varint(floor);
-            w.varint(after + 1);
+            w.varint(after.map_or(0, |after| after + 1));
         }
         if wide {
             w.varint(self.graph.0);
@@ -425,7 +433,7 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
     };
     let other = at(1, 300).write(&mut txn);
     let zero = Entry {
-        merged: Some((other, 1, 0)),
+        merged: Some((other, 1, Some(0))),
         graph: (1, 0, 0),
         ..at(0, 100)
     }
@@ -449,7 +457,7 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
     let base = at(1, 100).write(&mut txn);
     let main = Entry {
         prev: Some(base),
-        merged: Some((merged, 1, 50)),
+        merged: Some((merged, 1, Some(50))),
         graph: (2, 3, 2),
         ..at(2, 100)
     }
@@ -461,7 +469,8 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
         Head {
             version: 2,
             first: 1,
-            tip: main,
+            tip: Some(main),
+            ..Head::default()
         },
     );
     refs.insert(
@@ -469,7 +478,8 @@ fn a_merge_that_reaches_a_version_zero_entry_is_rejected() {
         Head {
             version: 1,
             first: 1,
-            tip: side,
+            tip: Some(side),
+            ..Head::default()
         },
     );
     let mut encoder = Encoder::new(&mut txn);
@@ -660,7 +670,7 @@ fn a_prev_link_past_a_version_fails_verify_and_compacting_keeps_the_file() {
 enum Prev {
     Honest,
     Past,
-    PastMerged,
+    PastMerge,
 }
 
 fn prev_file(path: &Path, prev: Prev) {
@@ -679,7 +689,7 @@ fn prev_file(path: &Path, prev: Prev) {
     }
     let below = match prev {
         Prev::Honest => ptrs[3],
-        Prev::Past | Prev::PastMerged => ptrs[0],
+        Prev::Past | Prev::PastMerge => ptrs[0],
     };
     let five = Entry {
         version: 5,
@@ -698,7 +708,7 @@ fn prev_file(path: &Path, prev: Prev) {
     .write(&mut txn);
     let head = match prev {
         Prev::Honest | Prev::Past => write_refs(&mut txn, 6, six),
-        Prev::PastMerged => {
+        Prev::PastMerge => {
             let base = Entry {
                 version: 1,
                 time_ms: 50,
@@ -709,7 +719,7 @@ fn prev_file(path: &Path, prev: Prev) {
                 version: 2,
                 time_ms: 700,
                 prev: Some(base),
-                merged: Some((six, 1, 0)),
+                merged: Some((six, 1, None)),
                 graph: (5, 6, 2),
                 ..Entry::default()
             }
@@ -795,7 +805,7 @@ fn a_merged_chain_whose_prev_link_passes_a_version_fails_verify_and_compaction()
     for threads in [1, 4] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prev.ferro");
-        prev_file(&path, Prev::PastMerged);
+        prev_file(&path, Prev::PastMerge);
         let outcome = admin::verify(&path).map(|_| ());
         assert!(past(&outcome), "{threads} threads: {outcome:?}");
         let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
@@ -809,19 +819,85 @@ fn a_merged_chain_whose_prev_link_passes_a_version_fails_verify_and_compaction()
 
 #[test]
 fn a_damaged_tree_handed_to_the_copy_threads_fails_before_a_later_error_of_the_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("order.ferro");
+    let mut damaged = None;
+    built(&source, |txn| {
+        let mut w = Encoder::new(&mut *txn);
+        w.raw(b"handed out");
+        let child = w.finish().unwrap();
+        let mut w = Encoder::new(&mut *txn);
+        w.raw(b"read later");
+        let other = w.finish().unwrap();
+        damaged = Some(child.offset);
+        let mut w = Encoder::new(&mut *txn);
+        w.raw(b"tree");
+        w.link(Ptr {
+            hash: [9; ferro::codec::HASH_BYTES],
+            ..child
+        });
+        let tree = w.finish().unwrap();
+        let main = chain(txn, &[10], &[]);
+        let aside = Entry {
+            version: 2,
+            time_ms: 20,
+            root: Some(tree),
+            prev: Some(Ptr {
+                offset: other.offset,
+                ..main[0]
+            }),
+            ..Entry::default()
+        }
+        .write(txn);
+        let root = value(txn, 1);
+        let heads = [
+            ("aside", on(2, 2, tree, aside)),
+            ("main", on(1, 1, root, main[0])),
+        ];
+        write_heads(txn, &heads)
+    });
+    let first = format!("hash mismatch for object at {}", damaged.unwrap());
     for threads in [1, 2, 4] {
-        let (_dir, path) = fixture("compact-unit-order");
+        let path = dir.path().join(format!("{threads}.ferro"));
+        fs::copy(&source, &path).unwrap();
         let db: Db<Opaque> = Options::new()
             .durability(Durability::Buffered)
             .copy_threads(threads)
             .open(&path)
             .unwrap();
-        let outcome = db.compact(Keep::Since(0));
+        let outcome = db.compact(Keep::All);
         assert!(
-            matches!(&outcome, Err(Error::Corrupt(message))
-                if message == "bad compressed body at 8192: 0 is not a valid match offset"),
+            matches!(&outcome, Err(Error::Corrupt(message)) if *message == first),
             "{threads} threads: {outcome:?}"
         );
+    }
+}
+
+#[test]
+fn a_fuzzed_merged_chain_that_skips_past_where_its_prev_links_stop_fails_on_any_thread_count() {
+    for (keep, message) in [
+        (
+            Keep::Since(0),
+            "v20 skips to v16, past where the history below v18 was cut",
+        ),
+        (
+            Keep::Last(3),
+            "v20 skips past v18, where the history it keeps stops, to v16",
+        ),
+    ] {
+        for threads in [1, 2, 4] {
+            let (_dir, path) = fixture("compact-skip-past-cut");
+            let db: Db<Opaque> = Options::new()
+                .durability(Durability::Buffered)
+                .copy_threads(threads)
+                .open(&path)
+                .unwrap();
+            let outcome = db.compact(keep);
+            assert!(
+                matches!(&outcome, Err(Error::Corrupt(found)) if found.ends_with(message)),
+                "{keep:?}, {threads} threads: {outcome:?}"
+            );
+        }
     }
 }
 
@@ -832,7 +908,8 @@ fn write_refs(txn: &mut Txn, version: u64, tip: Ptr) -> Ptr {
         Head {
             version,
             first: 1,
-            tip,
+            tip: Some(tip),
+            ..Head::default()
         },
     );
     let mut encoder = Encoder::new(txn);
@@ -891,7 +968,7 @@ fn entry_linked_from_a_tree(path: &Path, linked: Linked) -> Ptr {
         ..at(3, 300)
     }
     .write(&mut txn);
-    let head = write_refs(&mut txn, 3, three);
+    let head = write_heads(&mut txn, &[("main", on(3, 1, tree, three))]);
     txn.commit(head).unwrap();
     store.close();
     drop(store);
@@ -1173,7 +1250,8 @@ fn damaged_branch_table(path: &Path, aside: Option<&str>) {
     let head = Head {
         version: 1,
         first: 1,
-        tip,
+        tip: Some(tip),
+        ..Head::default()
     };
     let leaf = aside.map(|name| {
         let mut w = Encoder::new(&mut txn);
@@ -1337,7 +1415,8 @@ fn a_commit_after_the_last_version_is_corrupt() {
         Head {
             version: u64::MAX,
             first: u64::MAX,
-            tip,
+            tip: Some(tip),
+            ..Head::default()
         },
     );
     let mut encoder = Encoder::new(&mut txn);
@@ -1457,4 +1536,514 @@ fn a_cycle_counts_the_commits_it_prunes_without_overflow() {
         matches!(compacted, Ok(_) | Err(Error::Corrupt(_))),
         "{compacted:?}"
     );
+}
+
+fn value(txn: &mut Txn, n: u64) -> Ptr {
+    let mut w = Encoder::new(txn);
+    n.encode(&mut w).unwrap();
+    w.finish().unwrap()
+}
+
+fn write_heads(txn: &mut Txn, heads: &[(&str, Head)]) -> Ptr {
+    let mut refs: Map<String, Head> = Map::new();
+    for (name, head) in heads {
+        refs.insert(name.to_string(), head.clone());
+    }
+    let mut encoder = Encoder::new(txn);
+    refs.encode(&mut encoder).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn skip_of(version: u64) -> u64 {
+    version - (version & version.wrapping_neg())
+}
+
+fn chain(txn: &mut Txn, times: &[u64], below: &[Ptr]) -> Vec<Ptr> {
+    let mut ptrs: Vec<Ptr> = below.to_vec();
+    for &time_ms in times {
+        let version = ptrs.len() as u64 + 1;
+        let target = skip_of(version);
+        let skip = (target >= 1 && target != version - 1).then(|| ptrs[target as usize - 1]);
+        let root = value(txn, version);
+        let ptr = Entry {
+            version,
+            time_ms,
+            root: Some(root),
+            prev: ptrs.last().copied(),
+            skip,
+            ..Entry::default()
+        }
+        .write(txn);
+        ptrs.push(ptr);
+    }
+    ptrs
+}
+
+fn built(path: &Path, build: impl FnOnce(&mut Txn) -> Ptr) {
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let head = build(&mut txn);
+    txn.commit(head).unwrap();
+    store.close();
+}
+
+fn on(version: u64, first: u64, root: Ptr, tip: Ptr) -> Head {
+    Head {
+        version,
+        first,
+        root: Some(root),
+        tip: Some(tip),
+    }
+}
+
+fn passes_everywhere(path: &Path) {
+    admin::verify(path).unwrap();
+    for threads in [1, 4] {
+        let db: Db<u64> = Options::new().copy_threads(threads).open(path).unwrap();
+        db.verify_typed().unwrap();
+        db.compact(Keep::All).unwrap();
+        db.verify_typed().unwrap();
+    }
+    admin::compact(path, Keep::All).unwrap();
+    admin::verify(path).unwrap();
+}
+
+fn refused_everywhere(path: &Path, message: &str) {
+    let refused = |outcome: &ferro::Result<()>| matches!(outcome, Err(Error::Corrupt(found)) if found.ends_with(message));
+    let outcome = admin::verify(path).map(|_| ());
+    assert!(refused(&outcome), "verify: {outcome:?}");
+    for threads in [1, 4] {
+        let db: Db<u64> = Options::new().copy_threads(threads).open(path).unwrap();
+        let outcome = db.verify_typed().map(|_| ());
+        assert!(
+            refused(&outcome),
+            "{threads} threads, verify_typed: {outcome:?}"
+        );
+        let before = fs::read(path).unwrap();
+        let outcome = db.compact(Keep::All).map(|_| ());
+        assert!(refused(&outcome), "{threads} threads, compact: {outcome:?}");
+        assert!(fs::read(path).unwrap() == before, "{threads} threads");
+    }
+    let before = fs::read(path).unwrap();
+    let outcome = admin::compact(path, Keep::All).map(|_| ());
+    assert!(refused(&outcome), "admin::compact: {outcome:?}");
+    assert!(fs::read(path).unwrap() == before);
+    let outcome = admin::verify(path).map(|_| ());
+    assert!(refused(&outcome), "the file after: {outcome:?}");
+}
+
+#[test]
+fn a_head_whose_root_is_not_its_tips_fails_verify_and_compaction() {
+    for named in [2, 7] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.ferro");
+        built(&path, |txn| {
+            let ptrs = chain(txn, &[100, 200], &[]);
+            let root = value(txn, named);
+            write_heads(txn, &[("main", on(2, 1, root, ptrs[1]))])
+        });
+        let db = read_only().open::<u64>(&path).unwrap();
+        assert_eq!((*db.read(), *db.at(2).unwrap()), (named, 2));
+        drop(db);
+        match named {
+            2 => passes_everywhere(&path),
+            _ => refused_everywhere(
+                &path,
+                "tip v2 holds another root than its branch's head names",
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_branch_with_no_commit_names_version_zero_and_no_root() {
+    for (version, rooted) in [(0, false), (5, false), (0, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.ferro");
+        built(&path, |txn| {
+            let ptrs = chain(txn, &[100, 200], &[]);
+            let root = value(txn, 2);
+            let empty = Head {
+                version,
+                root: rooted.then(|| value(txn, 7)),
+                ..Head::default()
+            };
+            let heads = [("main", on(2, 1, root, ptrs[1])), ("empty", empty)];
+            write_heads(txn, &heads)
+        });
+        if version == 0 && !rooted {
+            let db = read_only().open::<u64>(&path).unwrap();
+            assert_eq!(*db.branch("empty").unwrap().read(), 0);
+            drop(db);
+            passes_everywhere(&path);
+            continue;
+        }
+        let case = format!("v{version}, rooted {rooted}");
+        let outcome = read_only().open::<u64>(&path).map(drop);
+        assert!(
+            matches!(outcome, Err(Error::Corrupt(_))),
+            "{case}: {outcome:?}"
+        );
+        corrupt(admin::info(&path));
+        corrupt(admin::verify(&path));
+    }
+}
+
+#[test]
+fn a_commit_older_than_the_one_below_it_fails_verify_and_compaction() {
+    for fourth in [400, 900] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("time.ferro");
+        built(&path, |txn| {
+            let ptrs = chain(txn, &[100, 200, 300, fourth, 500, 600, 700, 800], &[]);
+            let root = value(txn, 8);
+            write_heads(txn, &[("main", on(8, 1, root, ptrs[7]))])
+        });
+        let db = read_only().open::<u64>(&path).unwrap();
+        let found = db.as_of(550).unwrap().version();
+        assert_eq!(found, if fourth == 400 { 5 } else { 3 });
+        drop(db);
+        if fourth == 400 {
+            passes_everywhere(&path);
+            continue;
+        }
+        refused_everywhere(&path, "v5 is older than a commit it links to");
+        for (keep, kept) in [(Keep::Last(5), true), (Keep::Last(4), false)] {
+            let outcome = admin::compact(&path, keep).map(|_| ());
+            assert_eq!(outcome.is_ok(), !kept, "{keep:?}: {outcome:?}");
+        }
+        admin::verify(&path).unwrap();
+    }
+}
+
+fn merging(txn: &mut Txn, side: &[u64], merge: Entry, floor: u64, heads: &[(&str, u64)]) -> Ptr {
+    let theirs = chain(txn, side, &[]);
+    let base = chain(txn, &[1], &[]);
+    let tip = theirs[theirs.len() - 1];
+    let root = value(txn, 102);
+    let merged = Entry {
+        version: 2,
+        root: Some(root),
+        prev: Some(base[0]),
+        merged: Some((tip, floor, None)),
+        ..merge
+    }
+    .write(txn);
+    let mut named = vec![("main", on(2, 1, root, merged))];
+    for &(name, version) in heads {
+        let root = value(txn, version);
+        named.push((name, on(version, 1, root, theirs[version as usize - 1])));
+    }
+    write_heads(txn, &named)
+}
+
+#[test]
+fn a_merge_older_than_the_commit_it_merged_fails_verify_and_compaction() {
+    for time_ms in [40, 20] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merge.ferro");
+        built(&path, |txn| {
+            let merge = Entry {
+                time_ms,
+                graph: (2, 3, 2),
+                ..Entry::default()
+            };
+            merging(txn, &[10, 20, 30], merge, 1, &[("side", 3)])
+        });
+        match time_ms {
+            40 => passes_everywhere(&path),
+            _ => refused_everywhere(&path, "v2 is older than a commit it links to"),
+        }
+    }
+}
+
+#[test]
+fn merge_numbers_that_do_not_follow_from_the_parents_fail_verify_and_compaction() {
+    let honest = ((2, 3, 2), false);
+    let cases = [
+        (honest, Some(3)),
+        (((2, 3, 0), false), Some(0)),
+        (((2, 0, 2), false), Some(0)),
+        (((9, 3, 2), false), Some(3)),
+        (((2, 3, 2), true), Some(3)),
+    ];
+    for ((graph, bounded), ancestor) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.ferro");
+        built(&path, |txn| {
+            let merge = Entry {
+                time_ms: 40,
+                graph: (2, 3, 2),
+                ..Entry::default()
+            };
+            let theirs = chain(txn, &[10, 20, 30], &[]);
+            let base = chain(txn, &[1], &[]);
+            let two = value(txn, 102);
+            let merged = Entry {
+                version: 2,
+                root: Some(two),
+                prev: Some(base[0]),
+                merged: Some((theirs[2], 1, None)),
+                ..merge
+            }
+            .write(txn);
+            let three = value(txn, 103);
+            let tip = Entry {
+                version: 3,
+                time_ms: 50,
+                root: Some(three),
+                prev: Some(merged),
+                graph,
+                bounded,
+                ..Entry::default()
+            }
+            .write(txn);
+            let side = value(txn, 3);
+            let heads = [
+                ("main", on(3, 1, three, tip)),
+                ("side", on(3, 1, side, theirs[2])),
+            ];
+            write_heads(txn, &heads)
+        });
+        let case = format!("{graph:?} bounded {bounded}");
+        let db = read_only().open::<u64>(&path).unwrap();
+        let side = db.branch("side").unwrap();
+        let found = db.common_ancestor(&side).map(|base| base.version());
+        assert_eq!(found.ok(), ancestor, "{case}");
+        let dir = tempfile::tempdir().unwrap();
+        let copy = Db::<u64>::open(dir.path().join("copy.ferro")).unwrap();
+        let pulled = copy.pull(&db, "remote", |_, _, _| ("merge", ()));
+        assert_eq!(
+            pulled.is_ok(),
+            (graph, bounded) == honest,
+            "{case}: {pulled:?}"
+        );
+        drop((side, db));
+        match (graph, bounded) == honest {
+            true => passes_everywhere(&path),
+            false => refused_everywhere(&path, "v3 does not agree with the commits it links to"),
+        }
+    }
+}
+
+#[test]
+fn a_merge_floor_past_the_merged_commit_fails_verify_and_compaction() {
+    for floor in [3, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("floor.ferro");
+        built(&path, |txn| {
+            let merge = Entry {
+                time_ms: 40,
+                graph: (2, 3, 2),
+                bounded: true,
+                ..Entry::default()
+            };
+            merging(txn, &[10, 20, 30], merge, floor, &[("side", 3)])
+        });
+        let db = read_only().open::<u64>(&path).unwrap();
+        let side = db.branch("side").unwrap();
+        let found = db.common_ancestor(&side).map(|base| base.version());
+        drop((side, db));
+        if floor == 3 {
+            assert_eq!(found.unwrap(), 3);
+            passes_everywhere(&path);
+            continue;
+        }
+        assert!(
+            matches!(&found, Err(Error::Corrupt(message))
+                if message == "merge link below its floor 4"),
+            "{found:?}"
+        );
+        refused_everywhere(
+            &path,
+            "v2 keeps the history it merged from past the merged commit",
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MergedSkip {
+    Honest,
+    OtherEntry,
+    PastCovered,
+    PastMerge,
+    PastTime,
+    PastCut,
+}
+
+fn merged_history(path: &Path, merged: MergedSkip) {
+    built(path, |txn| {
+        let times: Vec<u64> = match merged {
+            MergedSkip::PastTime => vec![1, 2, 3, 4, 5, 60],
+            _ => (1..=12).map(|version| 10 * version).collect(),
+        };
+        let mut side = chain(txn, &times[..times.len() - 1], &[]);
+        let top = times.len() as u64;
+        let target = skip_of(top);
+        let other = Entry {
+            version: target,
+            time_ms: times[top as usize - 1] - 5,
+            root: Some(value(txn, 100 + target)),
+            prev: Some(side[target as usize - 2]),
+            ..Entry::default()
+        }
+        .write(txn);
+        let below = side[top as usize - 2];
+        if merged == MergedSkip::PastCut {
+            let cut = Entry {
+                version: top - 1,
+                time_ms: times[top as usize - 2] + 1,
+                root: Some(value(txn, top - 1)),
+                prev: Some(Ptr {
+                    offset: 0,
+                    ..side[top as usize - 3]
+                }),
+                ..Entry::default()
+            }
+            .write(txn);
+            side[top as usize - 2] = cut;
+        }
+        let skip = match merged {
+            MergedSkip::Honest | MergedSkip::PastCut => side[target as usize - 1],
+            _ => other,
+        };
+        let tip = Entry {
+            version: top,
+            time_ms: times[top as usize - 1],
+            root: Some(value(txn, top)),
+            prev: Some(match merged {
+                MergedSkip::PastCut => side[top as usize - 2],
+                _ => below,
+            }),
+            skip: Some(skip),
+            ..Entry::default()
+        }
+        .write(txn);
+        let base = chain(txn, &[1], &[]);
+        let (mut below, mut reach) = (base[0], 0);
+        if merged == MergedSkip::PastMerge {
+            below = Entry {
+                version: 2,
+                time_ms: 999,
+                root: Some(value(txn, 102)),
+                prev: Some(below),
+                merged: Some((side[top as usize - 3], 1, None)),
+                graph: (top - 3, top - 2, 2),
+                ..Entry::default()
+            }
+            .write(txn);
+            reach = top - 2;
+        }
+        let version = 2 + u64::from(reach != 0);
+        let root = value(txn, 100 + version);
+        let after = (merged == MergedSkip::PastTime).then_some(50);
+        let floor = 1 + u64::from(reach != 0);
+        let merge = Entry {
+            version,
+            time_ms: 1000,
+            root: Some(root),
+            prev: Some(below),
+            merged: Some((tip, floor, after)),
+            graph: (top + 1 - version, top.max(reach), version),
+            bounded: after.is_some() || floor > 1,
+            ..Entry::default()
+        }
+        .write(txn);
+        let mut heads = vec![("main", on(version, 1, root, merge))];
+        let other_root = value(txn, 100 + target);
+        heads.push(("other", on(target, 1, other_root, other)));
+        if merged == MergedSkip::PastCovered {
+            let low = top - 2;
+            let low_root = value(txn, low);
+            heads.push(("low", on(low, 1, low_root, side[low as usize - 1])));
+        }
+        write_heads(txn, &heads)
+    });
+}
+
+#[test]
+fn a_skip_link_in_merged_history_that_names_another_entry_fails_verify_and_compaction() {
+    let cases = [
+        MergedSkip::Honest,
+        MergedSkip::OtherEntry,
+        MergedSkip::PastCovered,
+        MergedSkip::PastMerge,
+    ];
+    for merged in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merged.ferro");
+        merged_history(&path, merged);
+        let db = read_only().open::<u64>(&path).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let copy = Db::<u64>::open(dir.path().join("copy.ferro")).unwrap();
+        let pulled = copy.pull(&db, "remote", |_, _, _| ("merge", ()));
+        assert_eq!(
+            pulled.is_ok(),
+            merged == MergedSkip::Honest,
+            "{merged:?}: {pulled:?}"
+        );
+        drop(db);
+        match merged {
+            MergedSkip::Honest => passes_everywhere(&path),
+            _ => refused_everywhere(&path, "v12 skips to another entry than v8"),
+        }
+    }
+}
+
+#[test]
+fn a_skip_link_past_where_merged_history_stops_fails_verify_and_compaction() {
+    for (merged, message) in [
+        (
+            MergedSkip::PastTime,
+            "v6 skips past v5, where the history it keeps stops, to v4",
+        ),
+        (
+            MergedSkip::PastCut,
+            "v12 skips to v8, past where the history below v11 was cut",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merged.ferro");
+        merged_history(&path, merged);
+        refused_everywhere(&path, message);
+    }
+}
+
+#[test]
+fn a_fork_whose_skip_link_names_another_entry_in_shared_history_fails_compaction() {
+    for skip in [Skip::Honest, Skip::OtherRecord] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.ferro");
+        built(&path, |txn| {
+            let ptrs = chain(txn, &[10, 20, 30, 40, 50], &[]);
+            let other = Entry {
+                version: 4,
+                time_ms: 41,
+                root: Some(value(txn, 44)),
+                prev: Some(ptrs[2]),
+                ..Entry::default()
+            }
+            .write(txn);
+            let six = value(txn, 6);
+            let fork = Entry {
+                version: 6,
+                time_ms: 60,
+                root: Some(six),
+                prev: Some(ptrs[4]),
+                skip: Some(match skip {
+                    Skip::OtherRecord => other,
+                    _ => ptrs[3],
+                }),
+                ..Entry::default()
+            }
+            .write(txn);
+            let five = value(txn, 5);
+            let heads = [("a", on(5, 1, five, ptrs[4])), ("b", on(6, 1, six, fork))];
+            write_heads(txn, &heads)
+        });
+        match skip {
+            Skip::OtherRecord => refused_everywhere(&path, "v6 skips to another entry than v4"),
+            _ => passes_everywhere(&path),
+        }
+    }
 }

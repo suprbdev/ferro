@@ -27,7 +27,7 @@ use crate::codec::{
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
 use crate::error::{Error, Result};
-use crate::log::{Chain, Entry, Merged, Node};
+use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
 use crate::map::Map;
 use crate::reentry::{Crossing, Needs};
 use crate::store::{Record, Staging, Store, Txn, compressed, staged};
@@ -1249,63 +1249,13 @@ fn hint_for(
     }
 }
 
-#[derive(Clone, Copy)]
-struct Facts {
-    version: u64,
-    time: u64,
-    generation: u64,
-    reach: u64,
-    last_merge: u64,
-    bounded: bool,
-}
-
-impl Facts {
-    fn of(entry: &Entry) -> Facts {
-        Facts {
-            version: entry.commit.version,
-            time: entry.commit.time_ms,
-            generation: entry.generation(),
-            reach: entry.graph.reach,
-            last_merge: entry.graph.last_merge,
-            bounded: entry.graph.bounded,
-        }
-    }
-}
-
 fn check_graph(
     own: Facts,
     link: Option<Merged>,
     prev: Option<Option<Facts>>,
     merged: Option<Option<Facts>>,
 ) -> Result<()> {
-    let known = prev.is_none_or(|facts| facts.is_some()) && merged.is_none_or(|f| f.is_some());
-    let (prev, linked) = (prev.flatten(), merged.flatten());
-    let generation = |facts: Option<Facts>| facts.map_or(0, |facts| facts.generation);
-    let parents = generation(prev).max(generation(linked));
-    let reach = prev
-        .map_or(0, |facts| facts.reach)
-        .max(linked.map_or(0, |facts| facts.generation));
-    let bounded = prev.is_some_and(|facts| facts.bounded)
-        || link.is_some_and(|link| link.floor > 1 || link.after.is_some())
-        || linked.is_some_and(|facts| facts.bounded);
-    let last_merge = match (link, prev) {
-        (Some(_), _) => Some(own.version),
-        (None, Some(prev)) => Some(prev.last_merge),
-        (None, None) if known => Some(0),
-        (None, None) => None,
-    };
-    let consistent = if known {
-        own.generation == parents + 1 && own.reach == reach && own.bounded == bounded
-    } else {
-        own.generation > parents && own.reach >= reach && (own.bounded || !bounded)
-    };
-    let later = prev.is_none_or(|facts| own.time >= facts.time)
-        && linked.is_none_or(|facts| own.time >= facts.time);
-    let floored = match (link, linked) {
-        (Some(link), Some(facts)) => link.floor <= facts.version,
-        _ => true,
-    };
-    if !consistent || !later || !floored || last_merge.is_some_and(|last| own.last_merge != last) {
+    if disagreement(own, link, prev, merged).is_some() {
         return Err(bad(format!(
             "v{} does not agree with the commits it links to",
             own.version

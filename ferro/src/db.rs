@@ -320,6 +320,16 @@ impl Data for Head {
         let root = Option::<Ptr>::decode(r)?;
         let tip = Option::<Ptr>::decode(r)?;
         let merged = Map::decode(r)?;
+        if tip.is_none() && version != 0 {
+            return Err(Error::Corrupt(format!(
+                "a branch with no commit names v{version} as its last"
+            )));
+        }
+        if tip.is_none() && root.is_some() {
+            return Err(Error::Corrupt(
+                "a branch with no commit names a root".into(),
+            ));
+        }
         Ok(Head {
             version,
             root,

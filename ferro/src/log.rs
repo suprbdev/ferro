@@ -10,6 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
+use std::mem;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -60,6 +61,81 @@ pub(crate) struct Graph {
     pub(crate) last_merge: u64,
     /// Whether a merge at or below this one brought in history that was already pruned.
     pub(crate) bounded: bool,
+}
+
+/// The numbers of a log entry that the entries linking to it are checked against.
+#[derive(Clone, Copy)]
+pub(crate) struct Facts {
+    pub(crate) version: u64,
+    pub(crate) time: u64,
+    pub(crate) generation: u64,
+    pub(crate) reach: u64,
+    pub(crate) last_merge: u64,
+    pub(crate) bounded: bool,
+}
+
+impl Facts {
+    pub(crate) fn of(entry: &Entry) -> Facts {
+        Facts {
+            version: entry.commit.version,
+            time: entry.commit.time_ms,
+            generation: entry.generation(),
+            reach: entry.graph.reach,
+            last_merge: entry.graph.last_merge,
+            bounded: entry.graph.bounded,
+        }
+    }
+}
+
+/// What is wrong with an entry with `own` facts and merge link `link`, given its parents, or
+/// `None` if it agrees with them.
+///
+/// It agrees when its time is no earlier than either parent's, its merge floor is not past the
+/// merged commit's version, and its generation, reach, last merge and bounded bit are what
+/// [`Chain::append`] computes from its parents. A parent is `None` where there is none and
+/// `Some(None)` where it is not known, as when it lies in pruned history, and then only what that
+/// parent cannot change is checked: the generation must exceed the known parent's, and so on.
+pub(crate) fn disagreement(
+    own: Facts,
+    link: Option<Merged>,
+    prev: Option<Option<Facts>>,
+    merged: Option<Option<Facts>>,
+) -> Option<&'static str> {
+    let known = prev.is_none_or(|facts| facts.is_some()) && merged.is_none_or(|f| f.is_some());
+    let (prev, linked) = (prev.flatten(), merged.flatten());
+    let generation = |facts: Option<Facts>| facts.map_or(0, |facts| facts.generation);
+    let parents = generation(prev).max(generation(linked));
+    let reach = prev
+        .map_or(0, |facts| facts.reach)
+        .max(linked.map_or(0, |facts| facts.generation));
+    let bounded = prev.is_some_and(|facts| facts.bounded)
+        || link.is_some_and(|link| link.floor > 1 || link.after.is_some())
+        || linked.is_some_and(|facts| facts.bounded);
+    let last_merge = match (link, prev) {
+        (Some(_), _) => Some(own.version),
+        (None, Some(prev)) => Some(prev.last_merge),
+        (None, None) if known => Some(0),
+        (None, None) => None,
+    };
+    let consistent = if known {
+        own.generation == parents + 1 && own.reach == reach && own.bounded == bounded
+    } else {
+        own.generation > parents && own.reach >= reach && (own.bounded || !bounded)
+    };
+    if prev.is_some_and(|facts| own.time < facts.time)
+        || linked.is_some_and(|facts| own.time < facts.time)
+    {
+        return Some("is older than a commit it links to");
+    }
+    if let (Some(link), Some(facts)) = (link, linked)
+        && link.floor > facts.version
+    {
+        return Some("keeps the history it merged from past the merged commit");
+    }
+    if !consistent || last_merge.is_some_and(|last| own.last_merge != last) {
+        return Some("does not agree with the commits it links to");
+    }
+    None
 }
 
 /// One commit's record in a branch's log.
@@ -353,8 +429,17 @@ type Walks = Vec<(u64, Option<u64>)>;
 #[derive(Default)]
 pub(crate) struct Closures {
     queue: BinaryHeap<Reverse<Seed>>,
-    walked: HashMap<(Hash, u64), Walks, BuildHasherDefault<Prehashed>>,
+    walked: HashMap<(Hash, u64), Walked, BuildHasherDefault<Prehashed>>,
     exact: bool,
+    chains: Vec<(u64, Vec<Hash>)>,
+    open: bool,
+}
+
+/// The bounds an entry was walked with, and where it sits on a chain [`Closures::chain`] recorded.
+#[derive(Default)]
+struct Walked {
+    bounds: Walks,
+    place: Option<(usize, u64)>,
 }
 
 impl Closures {
@@ -384,18 +469,45 @@ impl Closures {
             .push(Reverse((floor, after, ptr.hash, ptr.offset)));
     }
 
+    /// Starts taking the entries [`Closures::mark`] is given, until the next call or the walk, as
+    /// those of `chain` from its tip down, so that a walk of merged history that stops on one can
+    /// check the skip links it passed against the chain without reading it.
+    pub(crate) fn chain(&mut self, chain: &Chain) {
+        self.chains.push((chain.last, Vec::new()));
+        self.open = true;
+    }
+
     /// Records that the entry at `ptr` was walked with these bounds, so a walk that reaches it
     /// with bounds no wider stops there.
     pub(crate) fn mark(&mut self, ptr: Ptr, floor: u64, after: Option<u64>) {
         let key = self.key(ptr);
-        self.walked.entry(key).or_default().push((floor, after));
+        let index = self.chains.len().wrapping_sub(1);
+        let place = match self.chains.last_mut().filter(|_| self.open) {
+            Some((last, hashes)) => {
+                let version = last.checked_sub(hashes.len() as u64);
+                hashes.push(ptr.hash);
+                version.map(|version| (index, version))
+            }
+            None => None,
+        };
+        let walked = self.walked.entry(key).or_default();
+        walked.bounds.push((floor, after));
+        walked.place = walked.place.or(place);
+    }
+
+    /// The hashes of the entries from `ptr` down a chain [`Closures::chain`] recorded, newest
+    /// first, and the version of the first.
+    fn placed(&self, ptr: Ptr) -> Option<(&[Hash], u64)> {
+        let (index, version) = self.walked.get(&self.key(ptr))?.place?;
+        let (last, hashes) = &self.chains[index];
+        Some((&hashes[(last - version) as usize..], version))
     }
 
     fn covered(&self, ptr: Ptr, floor: u64, after: Option<u64>) -> bool {
         let walks = self
             .walked
             .get(&self.key(ptr))
-            .map_or(&[][..], Vec::as_slice);
+            .map_or(&[][..], |walked| walked.bounds.as_slice());
         walks.iter().any(|(walked, bound)| {
             *walked <= floor
                 && match (bound, after) {
@@ -411,9 +523,11 @@ impl Closures {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if the tip is not at the chain's last version, an entry's `prev` link
-    /// reaches another version than the one below it,
-    /// and the first error from `each` or from reading an entry.
+    /// [`Error::Corrupt`] if an entry's `prev` link reaches another version than the one below
+    /// it, an entry does not agree with the commits it links to as [`disagreement`] has it, a skip
+    /// link above the floor names another entry than the one the chain reaches at its version, or
+    /// leads past where the chain stops to a commit kept by time, and the first error from `each`
+    /// or from reading an entry.
     pub(crate) fn walk(
         &mut self,
         store: &Store,
@@ -437,35 +551,208 @@ impl Closures {
         mut read: impl FnMut(Ptr) -> Result<(Object, u32)>,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32, (u64, Option<u64>)) -> Result<bool>,
     ) -> Result<()> {
+        self.open = false;
         while let Some(Reverse((floor, after, hash, offset))) = self.queue.pop() {
             let mut next = Some(Ptr { hash, offset });
-            let mut above = u64::MAX;
+            let mut trail = Trail::new(floor);
             while let Some(ptr) = next.take() {
-                if ptr.offset == 0 || self.covered(ptr, floor, after) {
+                if ptr.offset == 0 {
+                    break;
+                }
+                if self.covered(ptr, floor, after) {
+                    trail.settle(&mut read, Some(ptr), self.placed(ptr))?;
                     break;
                 }
                 let (object, len) = read(ptr)?;
-                let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+                let entry = decode(&object)?;
                 let at = entry.commit.version;
-                step_down(above, at)?;
-                let first = above == u64::MAX;
-                above = at;
+                let first = trail.above == u64::MAX;
+                trail.reach(ptr, &entry)?;
                 if at < floor {
                     break;
                 }
-                if after.is_some_and(|after| entry.commit.time_ms < after) {
+                if let Some(after) = after.filter(|after| entry.commit.time_ms < *after) {
                     if first {
-                        each(ptr, &entry, &object, len, (floor, after))?;
+                        each(ptr, &entry, &object, len, (floor, Some(after)))?;
                     }
+                    trail.stop_by_time(&mut read, after)?;
                     break;
                 }
                 self.mark(ptr, floor, after);
                 if !each(ptr, &entry, &object, len, (floor, after))? {
+                    trail.settle(&mut read, entry.prev, None)?;
                     break;
                 }
                 self.seed(&entry, after);
+                trail.pass(&mut read, &entry)?;
                 next = entry.prev.filter(|_| at > floor);
             }
+            trail.end()?;
+        }
+        Ok(())
+    }
+}
+
+fn decode(object: &Object) -> Result<Entry> {
+    Entry::decode(&mut Decoder::new(&object.body, &object.links, None))
+}
+
+/// An entry a walk has passed, waiting for the walk to read the one its `prev` link reaches.
+struct Waiting {
+    facts: Facts,
+    link: Option<Merged>,
+    merged: Option<Option<Facts>>,
+    orphan: bool,
+}
+
+impl Waiting {
+    /// Checks the entry against its parent through `prev`, given as for [`disagreement`].
+    fn check(self, prev: Option<Option<Facts>>) -> Result<()> {
+        match disagreement(self.facts, self.link, prev, self.merged) {
+            Some(what) => Err(corrupt(&format!("v{} {what}", self.facts.version))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What a walk down one chain still has to check: the entry it passed last, against the entry
+/// below it, and the skip links it passed, against the entries at the versions they name.
+struct Trail {
+    floor: u64,
+    above: u64,
+    waiting: Option<Waiting>,
+    skips: Vec<(u64, u64, Ptr)>,
+}
+
+impl Trail {
+    fn new(floor: u64) -> Trail {
+        Trail {
+            floor,
+            above: u64::MAX,
+            waiting: None,
+            skips: Vec::new(),
+        }
+    }
+
+    /// Checks the entry the walk read at `ptr` against the entry above it and the skip links that
+    /// name its version.
+    fn reach(&mut self, ptr: Ptr, entry: &Entry) -> Result<()> {
+        let at = entry.commit.version;
+        step_down(self.above, at)?;
+        self.above = at;
+        if let Some(waiting) = self.waiting.take() {
+            waiting.check(Some(Some(Facts::of(entry))))?;
+        }
+        if let Some(&(from, _, _)) = self
+            .skips
+            .iter()
+            .find(|&&(_, to, skip)| to == at && skip.hash != ptr.hash)
+        {
+            return Err(corrupt(&format!(
+                "v{from} skips to another entry than v{at}"
+            )));
+        }
+        self.skips.retain(|&(_, to, _)| to < at);
+        Ok(())
+    }
+
+    /// Records that the walk goes on below `entry`, reading the commit it merged, if any, to
+    /// check it against.
+    fn pass(
+        &mut self,
+        read: &mut impl FnMut(Ptr) -> Result<(Object, u32)>,
+        entry: &Entry,
+    ) -> Result<()> {
+        let at = entry.commit.version;
+        let merged = match entry.merged {
+            None => None,
+            Some(merged) if merged.ptr.offset == 0 => Some(None),
+            Some(merged) => Some(Some(Facts::of(&decode(&read(merged.ptr)?.0)?))),
+        };
+        self.waiting = Some(Waiting {
+            facts: Facts::of(entry),
+            link: entry.merged,
+            merged,
+            orphan: entry.prev.is_none() && at == 1,
+        });
+        let skip = entry
+            .skip
+            .filter(|skip| skip.offset != 0 && skip_version(at) >= self.floor);
+        self.skips
+            .extend(skip.map(|skip| (at, skip_version(at), skip)));
+        Ok(())
+    }
+
+    /// Reads on down from `next` without walking, where another walk took the chain from there,
+    /// until nothing is left to check.
+    ///
+    /// `known` holds the hashes of the entries from `next` down, newest first, with the version
+    /// of the first, where a chain walk recorded them, so the skip links that land there need no
+    /// read.
+    fn settle(
+        &mut self,
+        read: &mut impl FnMut(Ptr) -> Result<(Object, u32)>,
+        mut next: Option<Ptr>,
+        known: Option<(&[Hash], u64)>,
+    ) -> Result<()> {
+        if let Some((hashes, top)) = known {
+            let held = |to: u64| top.checked_sub(to).and_then(|at| hashes.get(at as usize));
+            for &(from, to, skip) in &self.skips {
+                if held(to).is_some_and(|hash| *hash != skip.hash) {
+                    return Err(corrupt(&format!(
+                        "v{from} skips to another entry than v{to}"
+                    )));
+                }
+            }
+            self.skips.retain(|&(_, to, _)| held(to).is_none());
+        }
+        while self.waiting.is_some() || !self.skips.is_empty() {
+            let Some(ptr) = next.filter(|ptr| ptr.offset != 0) else {
+                return Ok(());
+            };
+            let entry = decode(&read(ptr)?.0)?;
+            self.reach(ptr, &entry)?;
+            next = entry.prev;
+        }
+        Ok(())
+    }
+
+    /// Checks, where the walk stops because the history before time `after` is not kept, that
+    /// each skip link still waiting lands on a commit from before that time too, so that no
+    /// reader of the history kept follows one past where the walk stopped.
+    fn stop_by_time(
+        &mut self,
+        read: &mut impl FnMut(Ptr) -> Result<(Object, u32)>,
+        after: u64,
+    ) -> Result<()> {
+        for (from, to, skip) in mem::take(&mut self.skips) {
+            if decode(&read(skip)?.0)?.commit.time_ms >= after {
+                return Err(corrupt(&format!(
+                    "v{from} skips past v{}, where the history it keeps stops, to v{to}",
+                    self.above
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops what is left to check where the caller stopped the walk.
+    fn leave(&mut self) {
+        self.skips.clear();
+    }
+
+    /// Checks what is left once the walk has ended: the last entry passed against a parent it
+    /// did not read, and that no skip link leads past where the `prev` links stopped.
+    fn end(mut self) -> Result<()> {
+        if let Some(&(from, to, _)) = self.skips.first() {
+            return Err(corrupt(&format!(
+                "v{from} skips to v{to}, past where the history below v{} was cut",
+                self.above
+            )));
+        }
+        if let Some(waiting) = self.waiting.take() {
+            let prev = if waiting.orphan { None } else { Some(None) };
+            waiting.check(prev)?;
         }
         Ok(())
     }
@@ -721,18 +1008,22 @@ impl Chain {
     /// Reads every retained entry newest first, decoding each from its record, and calls `each`
     /// on it until `each` returns `false`.
     ///
+    /// `root` is the root the branch's head names, which must be the tip's.
+    ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if the tip is not at the chain's last version, an entry's `prev` link
-    /// reaches another version than the one below it, an entry links pruned history it needs, or
-    /// a kept skip link names another entry than the one the chain reaches at that version, by
-    /// hash, and the first error from `each`.
+    /// [`Error::Corrupt`] if the tip is not at the chain's last version or holds another root than
+    /// `root`, an entry's `prev` link reaches another version than the one below it, an entry
+    /// links pruned history it needs or does not agree with the commits it links to as
+    /// [`disagreement`] has it, or a kept skip link names another entry than the one the chain
+    /// reaches at that version, by hash, and the first error from `each`.
     pub(crate) fn visit(
         &self,
         store: &Store,
+        root: Option<Ptr>,
         each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
     ) -> Result<()> {
-        self.visit_with(|ptr| store.read_record(ptr), each)
+        self.visit_with(root, |ptr| store.read_record(ptr), each)
     }
 
     /// [`Chain::visit`], reading each entry's record and its length with `read`, which must check
@@ -743,38 +1034,36 @@ impl Chain {
     /// As for [`Chain::visit`], and the first error from `read`.
     pub(crate) fn visit_with(
         &self,
+        root: Option<Ptr>,
         mut read: impl FnMut(Ptr) -> Result<(Object, u32)>,
         mut each: impl FnMut(Ptr, &Entry, &Object, u32) -> Result<bool>,
     ) -> Result<()> {
         let mut next = self.tip;
-        let mut above = u64::MAX;
-        let mut skips: Vec<(u64, u64, Hash)> = Vec::new();
+        let mut trail = Trail::new(self.first);
         while let Some(ptr) = next {
             let (object, len) = read(ptr)?;
-            let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None))?;
+            let entry = decode(&object)?;
             let at = entry.commit.version;
-            if above == u64::MAX && at != self.last {
-                return Err(corrupt(&format!(
-                    "names v{} as its last but its tip is v{at}",
-                    self.last
-                )));
+            if trail.above == u64::MAX {
+                if at != self.last {
+                    return Err(corrupt(&format!(
+                        "names v{} as its last but its tip is v{at}",
+                        self.last
+                    )));
+                }
+                if entry.commit.root.map(|root| root.hash) != root.map(|root| root.hash) {
+                    return Err(corrupt(&format!(
+                        "tip v{at} holds another root than its branch's head names"
+                    )));
+                }
             }
-            step_down(above, at)?;
-            above = at;
-            if let Some(&(from, _, _)) = skips
-                .iter()
-                .find(|&&(_, to, hash)| to == at && hash != ptr.hash)
-            {
-                return Err(corrupt(&format!(
-                    "v{from} skips to another entry than v{at}"
-                )));
-            }
-            skips.retain(|&(_, to, _)| to < at);
+            trail.reach(ptr, &entry)?;
             if !each(ptr, &entry, &object, len)? {
+                trail.leave();
                 break;
             }
-            let skip = entry.skip.filter(|_| skip_version(at) >= self.first);
-            skips.extend(skip.map(|skip| (at, skip_version(at), skip.hash)));
+            trail.pass(&mut read, &entry)?;
+            let skip = self.retained_skip(&entry);
             next = match entry.prev {
                 _ if at <= self.first => None,
                 Some(prev) if prev.offset != 0 && skip.is_none_or(|skip| skip.offset != 0) => {
@@ -783,7 +1072,7 @@ impl Chain {
                 _ => return Err(self.cut(at)),
             };
         }
-        Ok(())
+        trail.end()
     }
 
     fn cut(&self, at: u64) -> Error {

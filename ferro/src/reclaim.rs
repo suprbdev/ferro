@@ -22,9 +22,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
-use crate::db::Refs;
+use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
-use crate::log::{Chain, Closures, Entry, skip_version};
+use crate::log::{Closures, Entry, skip_version};
 use crate::platform::{copy_owner, start_writeback};
 pub(crate) use crate::platform::{rename, sync_parent};
 use crate::refs;
@@ -169,11 +169,11 @@ pub(crate) fn sibling(path: &Path) -> PathBuf {
 pub(crate) struct Roots {
     /// Objects walked as trees, such as the branch table itself.
     pub(crate) trees: Vec<Ptr>,
-    /// The retained commit log of each branch.
-    pub(crate) chains: Vec<Chain>,
-    /// The logs that older steps of the branch table record for the same branches, which the
+    /// The head of each branch, with its retained commit log.
+    pub(crate) heads: Vec<Head>,
+    /// The heads that older steps of the branch table record for the same branches, which the
     /// table still links.
-    pub(crate) superseded: Vec<Chain>,
+    pub(crate) superseded: Vec<Head>,
 }
 
 impl Roots {
@@ -182,7 +182,7 @@ impl Roots {
         let heads = refs::heads(store, head)?;
         Ok(Roots {
             trees: vec![head],
-            chains: heads.current,
+            heads: heads.current,
             superseded: heads.superseded,
         })
     }
@@ -207,12 +207,14 @@ impl Roots {
         let mut entries: HashMap<u64, Hash> = HashMap::new();
         let mut floors: HashMap<u64, u64> = HashMap::new();
         let mut closures = Closures::default();
-        let mut superseded: Vec<&Chain> = self.superseded.iter().collect();
-        superseded.sort_by_key(|chain| chain.first);
-        let chains = self.chains.iter().map(|chain| (chain, false));
-        for (chain, replaced) in chains.chain(superseded.into_iter().map(|chain| (chain, true))) {
+        let mut superseded: Vec<&Head> = self.superseded.iter().collect();
+        superseded.sort_by_key(|head| head.log.first);
+        let heads = self.heads.iter().map(|head| (head, false));
+        for (head, replaced) in heads.chain(superseded.into_iter().map(|head| (head, true))) {
+            let chain = &head.log;
             let after = chain.after(store)?;
-            chain.visit(store, |ptr, entry, object, len| {
+            closures.chain(chain);
+            chain.visit(store, head.root, |ptr, entry, object, len| {
                 let floor = floors.entry(ptr.offset).or_insert(u64::MAX);
                 if replaced && *floor <= chain.first {
                     return Ok(false);
@@ -685,14 +687,26 @@ impl CopySink<'_> {
         (version == target).then_some(at)
     }
 
-    fn skipped(&self, links: &[Ptr], rungs: Rungs, link: Ptr) -> Option<Ptr> {
+    fn skipped(&self, links: &[Ptr], rungs: Rungs, link: Ptr) -> Result<Option<Ptr>> {
         let target = skip_version(rungs.version);
         let prev = rungs
             .prev()
             .map(|index| links[index])
             .filter(|prev| prev.offset != 0);
         let found = prev.and_then(|prev| self.on_path(prev.offset, rungs.version - 1, target));
-        match found.map(|offset| (offset, self.below.get(&offset))) {
+        let found = found.map(|offset| (offset, self.below.get(&offset)));
+        if let Some((_, Some(below))) = found
+            && self
+                .walked
+                .get(&below.from)
+                .is_some_and(|hash| *hash != link.hash)
+        {
+            return Err(Error::Corrupt(format!(
+                "commit log v{} skips to another entry than v{target}",
+                rungs.version
+            )));
+        }
+        Ok(match found {
             None => Some(Ptr {
                 hash: link.hash,
                 offset: 0,
@@ -702,7 +716,7 @@ impl CopySink<'_> {
                 offset,
             }),
             Some(_) => self.parent(link),
-        }
+        })
     }
 
     fn read(&mut self, ptr: Ptr, entry: bool) -> Result<Step> {
@@ -921,7 +935,8 @@ impl CopySink<'_> {
                 let rooted = top.entry.is_some();
                 let linked = match top.entry {
                     Some(rungs) if rungs.skip() == Some(top.next) => {
-                        Link::parent(self.skipped(&top.held.links, rungs, link))
+                        let skipped = self.skipped(&top.held.links, rungs, link);
+                        Link::parent(skipped.map_err(|error| self.first(error))?)
                     }
                     Some(rungs) if top.next >= rungs.parents() => Link::parent(self.parent(link)),
                     _ => {
@@ -1082,7 +1097,9 @@ impl<'a> Copier<'a> {
         let read = |ptr| cache.borrow_mut().read(&source, ptr);
         for (_, branch) in refs.try_entries()? {
             let (first, after) = (branch.log.first, branch.log.after(&source)?);
-            branch.log.visit_with(read, |ptr, entry, _, _| {
+            let root = branch.root;
+            closures.chain(&branch.log);
+            branch.log.visit_with(root, read, |ptr, entry, _, _| {
                 if !sink.wanted(ptr, Need::new(first, after), &mut again) {
                     return Ok(false);
                 }

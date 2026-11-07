@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use crate::codec::{Data, Decoder, Encoder, Kind, Ptr, Sink};
 use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
-use crate::log::Chain;
 use crate::map::Map;
 use crate::store::{Store, Txn};
 
@@ -175,16 +174,16 @@ pub(crate) fn load(
     Ok((base, depth))
 }
 
-/// Every commit log a branch table records, from [`heads`].
+/// Every head a branch table records, from [`heads`].
 pub(crate) struct Heads {
-    /// The log of each branch's newest head.
-    pub(crate) current: Vec<Chain>,
-    /// The logs of the older heads that earlier steps record for the same branches.
-    pub(crate) superseded: Vec<Chain>,
+    /// Each branch's newest head.
+    pub(crate) current: Vec<Head>,
+    /// The older heads that earlier steps record for the same branches.
+    pub(crate) superseded: Vec<Head>,
 }
 
-/// Every commit log the branch table at `head` and its steps record, split into each branch's
-/// newest and the older ones.
+/// Every head the branch table at `head` and its steps record, split into each branch's newest
+/// and the older ones.
 pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
     let Layers { steps, base, .. } = layers(store, head, None)?;
     let mut named = HashSet::new();
@@ -195,8 +194,8 @@ pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
     let found = steps.into_iter().map(|step| (step.name, step.head));
     for (name, head) in found.chain(base.try_entries()?) {
         match named.insert(name) {
-            true => heads.current.push(head.log),
-            false => heads.superseded.push(head.log),
+            true => heads.current.push(head),
+            false => heads.superseded.push(head),
         }
     }
     Ok(heads)
@@ -205,6 +204,7 @@ pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::Chain;
     use crate::store::{Closing, Durability, StoreOptions};
 
     fn open(dir: &tempfile::TempDir) -> Closing {
@@ -219,11 +219,14 @@ mod tests {
         )
     }
 
-    fn head(version: u64) -> Head {
+    fn head(mark: u64) -> Head {
         Head {
-            version,
+            version: 0,
             root: None,
-            log: Chain::empty(),
+            log: Chain {
+                first: mark,
+                ..Chain::empty()
+            },
             merged: Map::new(),
         }
     }
@@ -250,7 +253,7 @@ mod tests {
 
     fn versions(refs: &Refs) -> Vec<(String, u64)> {
         let entries = refs.try_entries().unwrap().into_iter();
-        entries.map(|(name, head)| (name, head.version)).collect()
+        entries.map(|(name, head)| (name, head.log.first)).collect()
     }
 
     #[test]
@@ -301,7 +304,7 @@ mod tests {
             let top = step(&store, base, "b5", 99);
             let (refs, depth) = load(&store, Some(top), None).unwrap();
             assert_eq!((refs.len(), depth), (branches as usize, 1));
-            assert_eq!(refs.try_get("b5").unwrap().unwrap().version, 99);
+            assert_eq!(refs.try_get("b5").unwrap().unwrap().log.first, 99);
         }
     }
 
