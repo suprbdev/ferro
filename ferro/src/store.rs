@@ -5308,12 +5308,23 @@ mod tests {
             head: None,
         };
         let tip = Super::new(empty, empty, Basis::default());
-        let mut images = vec![(whole.clone(), true)];
-        images.extend((start + 8..whole.len()).step_by(997).map(|at| {
+        let (_, records) = shape(&tip, whole[start..].first_chunk().unwrap(), u64::MAX).unwrap();
+        let body_at = start + FRAME_BYTES;
+        let table_at = body_at + records as usize;
+        let flipped = |at: usize| {
             let mut image = whole.clone();
             image[at] ^= 0x04;
             (image, false)
-        }));
+        };
+        let mut images = vec![(whole.clone(), true)];
+        images.extend((start + 8..body_at).map(flipped));
+        images.extend((body_at..whole.len()).step_by(997).map(flipped));
+        images.extend([table_at, whole.len() - 1].map(flipped));
+        let mut rehashed = whole.clone();
+        rehashed[body_at] ^= 0x04;
+        let entry = xxh3_64(&rehashed[body_at..body_at + BLOCK_BYTES]).to_le_bytes();
+        rehashed[table_at..table_at + BLOCK_CHECK].copy_from_slice(&entry);
+        images.push((rehashed, false));
         images.push((whole[..whole.len() - 1].to_vec(), false));
         for (index, (image, kept)) in images.into_iter().enumerate() {
             std::fs::write(&path, &image).unwrap();

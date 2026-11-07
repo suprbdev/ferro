@@ -6916,6 +6916,19 @@ mod tests {
         assert_eq!(size_of::<Slot<u64, (u64, u64)>>(), 24);
     }
 
+    fn path_reads(map: &Map<u64, u64>, key: u64) -> u64 {
+        let store = map.store.as_ref();
+        let reads = crate::store::fresh_reads();
+        let mut next = load(store, &map.root).unwrap();
+        while let Some(node) = next {
+            next = match node.search(&key) {
+                Ok(_) => None,
+                Err(position) => load(store, node.child(position)).unwrap(),
+            };
+        }
+        crate::store::fresh_reads() - reads
+    }
+
     #[test]
     fn the_nodes_a_commit_reads_from_the_file_to_change_stay_out_of_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -6935,26 +6948,25 @@ mod tests {
             map.insert(7, 70);
         })
         .unwrap();
-        let reads = crate::store::fresh_reads();
-        assert_eq!(before.get(&7).as_deref(), Some(&7));
-        assert!(
-            crate::store::fresh_reads() > reads,
-            "the old path was cached"
-        );
+        assert!(path_reads(&before, 7) > 0, "the old path was cached");
         let after = db.read();
-        let reads = crate::store::fresh_reads();
-        assert_eq!(after.get(&7).as_deref(), Some(&70));
-        assert_eq!(crate::store::fresh_reads(), reads, "the new path was read");
+        assert_eq!(path_reads(&after, 7), 0, "the new path was not cached");
         db.update(|map| {
             map.insert(7, 71);
         })
         .unwrap();
-        let reads = crate::store::fresh_reads();
-        assert_eq!(after.get(&7).as_deref(), Some(&70));
         assert_eq!(
-            crate::store::fresh_reads(),
-            reads,
+            path_reads(&after, 7),
+            0,
             "a cached node a commit changed left the cache"
         );
+        assert_eq!(
+            path_reads(&db.read(), 7),
+            0,
+            "the newest path was not cached"
+        );
+        assert_eq!(before.get(&7).as_deref(), Some(&7));
+        assert_eq!(after.get(&7).as_deref(), Some(&70));
+        assert_eq!(db.read().get(&7).as_deref(), Some(&71));
     }
 }
