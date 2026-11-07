@@ -387,8 +387,11 @@ bounded by a few columns an object. The receiver keeps, for each object in the b
 
 That is 35 to 40 bytes. Placing drops the staging offsets and keeps each object's offset in the log
 in their place. A check is kept only while a later link may still need it, as described under
-[Checking trees](sync-receive.md#checking-trees). Each sent commit adds its graph facts, root and
-segment, 88 bytes, and 40 to 60 more in indexes and the order it is checked in. Each hint an
+[Checking trees](sync-receive.md#checking-trees). The walk below held data linked as another type
+keeps at most 16,384 checks, about 6 MiB, however much of the file it reads, as described under
+[Held data linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent
+commit adds its graph facts, root and segment, 88 bytes, and 40 to 60 more in indexes and the
+order it is checked in. Each hint an
 incremental bundle names adds the object it resolves to, the kind it holds with its parent's key
 range, and its place in the header, about 140 bytes. Hints are resolved grouped by parent, so one
 parent's links and kinds are held at a time, where every parent read used to be kept, about 2.3 KB
