@@ -28,12 +28,13 @@ does. A cycle copies what is retained to a new file and swaps it in. Writers wai
 for the swap, and readers do not wait at all.
 
 Background cycles run only on a writer with a `history` other than `Keep::All`, and
-`Reclaim { every_bytes: 0 }` turns them off. A cycle copies on the calling or background thread and
-checks every object's hash on up to three more. `Options::copy_threads` sets the total, which
-defaults to the number of cores up to 4, and `copy_threads(1)` keeps a cycle on one thread. `space`
-also reports `cycles` run, the `longest_pause` and the `last_error` of a background cycle. `compact`
-returns a `Compacted` with `before_bytes`, `after_bytes`, `objects` copied, `commits_dropped`,
-`passes` and `pause`.
+`Reclaim { every_bytes: 0 }` turns them off. A cycle walks the log on the calling or background
+thread and copies the trees it reaches, checking every object's hash, on up to seven more.
+`Options::copy_threads` sets the total, which defaults to the number of cores up to 8, and
+`copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads.
+`space` also reports `cycles` run, the `longest_pause` and the `last_error` of a background cycle.
+`compact` returns a `Compacted` with `before_bytes`, `after_bytes`, `objects` copied,
+`commits_dropped`, `passes` and `pause`.
 
 ## What pruning means
 
@@ -57,10 +58,10 @@ to its size.
 ## Limits
 
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
-  miss the node cache are slower for a moment after each swap. On four threads it ran at 484 MB/s
-  on a file of small table rows and 2,238 MB/s on one of 320 byte values, measured on 2026-11-05,
-  against 180 and 596 MB/s on one thread before, so a 10 GB database takes about 20 seconds. Past
-  four threads it gets no faster, because one thread walks and writes the whole copy.
+  miss the node cache are slower for a moment after each swap. On 16 threads it ran at 870 MB/s on
+  a file of small table rows and 2,780 MB/s on one of 320 byte values, measured on 2026-11-07,
+  against 237 and 806 MB/s on one thread, so a 10 GB database takes about 12 seconds. Past 8
+  threads it gets little faster on table rows, because one thread walks the log.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.

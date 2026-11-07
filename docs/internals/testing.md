@@ -319,6 +319,8 @@ Tests are described next to what they test:
   object](sync.md#memory-for-each-object).
 - A damaged raw length, links pointed into a value, and damaged records at every thread count: [The
   copy on several threads](reclamation.md#the-copy-on-several-threads).
+- A damaged tree handed to the copy's threads before an error the walk meets itself: [Trees on
+  several threads](reclamation.md#trees-on-several-threads).
 - A tree that links a second record of a log entry, or the record a chain reads: [Records reached as
   entries](reclamation.md#records-reached-as-entries).
 - Processes that write one file at once, die mid-commit and run cycles, and the frames a catch-up
