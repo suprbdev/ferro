@@ -448,6 +448,10 @@ impl Shared {
             .source
             .read_stored(ptr, &mut s.bytes, &mut links, claims)
             .ok()?;
+        if stored.packed && stored.raw > record.len() {
+            *taken = None;
+            *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
+        }
         verify_stored(record, ptr, &mut s.unpacked).ok()?;
         let len = u32::try_from(stored.len).ok()?;
         if links

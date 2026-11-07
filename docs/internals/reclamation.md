@@ -412,7 +412,9 @@ took about 50, and the map of copies now holds only entries and what the walk wr
 unit's list takes 24 bytes a record and 4 a link from its discovery until it is placed, for at most
 16,384 units the walk has handed out and every unit split from them, and the largest of those is the
 largest tree below the third level of a split. And the records the threads read, the jobs they write
-and the records over 1 KiB the walk reads share a budget of 16 MiB: a thread that would pass it
+and the records over 1 KiB the walk reads share a budget of 16 MiB, a compressed record a thread
+checks counted at its stored and decompressed sizes together, and the walk holding its share only
+while it reads, never while it hands out or waits for units: a thread that would pass it
 waits for the others, unless it would hold the bytes alone, so one record larger than that is read
 by itself, and every buffer shrinks back once its record is done. Copying the table rows peaked at
 68 to 70 MB of RSS at 4 and 8 threads, against 155 MB before, which held every object's copy in one
@@ -473,8 +475,8 @@ as above, the fastest of three on 2026-11-07:
 | | 8 | 0.18 s | 0.11 s |
 
 `Compacted::handed_out` counts the trees a cycle handed out, and `reclaim_threads.rs` checks that
-copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, and the copy of the file
-a cycle wrote, hand out trees and make the same bytes as one thread.
+copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, hand out trees and make
+the same bytes as one thread, both in the first copy and in the copy of the file a cycle wrote.
 
 ### Measured and left out
 
@@ -649,8 +651,9 @@ again on table rows, since it reads each log entry twice, walking the chains and
 `Keep::All` copies all of history, so `history` is what makes background cycles worthwhile. The
 copy holds its claims, about 60 bytes per object, about 80 bytes per commit for where each entry
 was read and copied and what its copy keeps, the lists of the trees waiting to be placed, 24 bytes
-a record and 4 a link, and 16 MiB of records the threads and the walk hold at once, or one larger
-record alone, besides a buffer of up to 1 MiB on each thread.
+a record and 4 a link, and 16 MiB of records and decompressed bodies the threads and the walk hold
+at once, or one larger record alone, besides a buffer of up to 1 MiB on each thread and the one
+record the walk is copying.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the

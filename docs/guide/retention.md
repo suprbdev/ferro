@@ -34,7 +34,7 @@ thread and copies the trees it reaches, checking every object's hash, on up to s
 `copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads.
 `space` also reports `cycles` run, the `longest_pause` and the `last_error` of a background cycle.
 `compact` returns a `Compacted` with `before_bytes`, `after_bytes`, `objects` copied,
-`commits_dropped`, `passes` and `pause`.
+`commits_dropped`, `passes`, `pause` and `handed_out`, the trees it copied as units.
 
 ## What pruning means
 

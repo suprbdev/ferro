@@ -93,6 +93,7 @@ fn several_threads_copy_the_same_bytes_as_one() {
     let source = dir.path().join("source.ferro");
     build(&source, 1500, 600, 300);
     for keep in [Keep::All, Keep::Last(20)] {
+        let mut firsts = Vec::new();
         let mut copies = Vec::new();
         for threads in [1, 2, 4, 8] {
             let path = dir.path().join(format!("copy-{threads}.ferro"));
@@ -106,6 +107,7 @@ fn several_threads_copy_the_same_bytes_as_one() {
                 threads > 1,
                 "{threads} threads: {report:?}"
             );
+            firsts.push(fs::read(&path).unwrap());
             let again = db.compact(keep).unwrap();
             assert_eq!(
                 again.handed_out > 10,
@@ -117,6 +119,10 @@ fn several_threads_copy_the_same_bytes_as_one() {
             drop(db);
             copies.push(fs::read(&path).unwrap());
         }
+        assert!(
+            firsts.windows(2).all(|pair| pair[0] == pair[1]),
+            "{keep:?}: the first copies"
+        );
         assert!(copies.windows(2).all(|pair| pair[0] == pair[1]), "{keep:?}");
     }
 }

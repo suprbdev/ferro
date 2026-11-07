@@ -86,7 +86,11 @@ pub struct Compacted {
     pub passes: u32,
     /// How long writers waited for the last pass and the swap.
     pub pause: Duration,
-    /// The number of trees the cycle handed to its other threads to copy, 0 on one thread.
+    /// The number of trees the cycle handed out to copy as units, 0 with `copy_threads(1)`.
+    ///
+    /// In a file under 256 KiB with the default thread count, no other thread starts and the
+    /// calling thread copies the units itself, so a count above 0 does not mean other threads
+    /// ran.
     pub handed_out: u64,
 }
 
@@ -494,8 +498,8 @@ struct CopySink<'a> {
     pruned: HashSet<Hash, ByHash>,
     objects: u64,
     stop: Option<&'a AtomicBool>,
-    units: Option<Units>,
     reserved: Option<Reserved>,
+    units: Option<Units>,
     fallback: Option<Key>,
     stale: bool,
 }
@@ -660,6 +664,7 @@ impl CopySink<'_> {
         self.file.write_all_at(&self.buf, start)?;
         start_writeback(&self.file, start, self.buf.len() as u64);
         self.buf.clear();
+        self.buf.shrink_to(2 * FLUSH_BYTES);
         Ok(())
     }
 
@@ -868,13 +873,16 @@ impl CopySink<'_> {
         let verifier = &mut self.verifier;
         let (units, reserved) = (&self.units, &mut self.reserved);
         let large = |claim: usize| {
+            *reserved = None;
             *reserved = units.as_ref().map(|units| units.reserve(claim as u64));
             match claim > BATCH_BYTES {
                 true => verifier.settle(),
                 false => Ok(()),
             }
         };
-        let (record, stored) = self.source.read_stored(ptr, bytes, &mut held.old, large)?;
+        let read = self.source.read_stored(ptr, bytes, &mut held.old, large);
+        self.reserved = None;
+        let (record, stored) = read?;
         let entry = if entry {
             if self.walked.get(&ptr.offset) != Some(&ptr.hash) {
                 self.verifier.inline(record, ptr)?;
