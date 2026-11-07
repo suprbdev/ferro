@@ -184,8 +184,21 @@ but changes a covered field overwrites the entry in place, where a plain index d
 update that changes neither touches nothing. A covered field counts as unchanged only when `==`
 holds and it encodes to the same bytes, so a float that turns from `0.0` to `-0.0` is rewritten.
 The equal-looking case costs a `Data::same_encoding` call, which encodes the field twice only for a
-hand-written `Data` impl, as described under [Comparing values](merging.md#comparing-values). An
-`#[index(each)]` entry is rewritten for every element when a covered field changes. `Table::merge`
+hand-written `Data` impl, as described under [Comparing values](merging.md#comparing-values).
+
+The same test applies to a covered field the index is keyed on, which `.covered()` reads from the
+entry's key. A type whose `==` holds between values that encode differently, such as a name
+compared without case, would otherwise keep the bytes the entry was first written with, so
+`.covered()` gave the old spelling while the row and a rebuilt index gave the new one, and the
+index's root hash differed from a rebuild's. The entry is removed and inserted again under the new
+bytes. An indexed field that no cover list names is compared by `==` alone, which is all its
+lookups need, so its entry keeps the old bytes, which `by_x_counts` returns. Such a type breaks
+the rule that an indexed value's encoding agrees with its `Ord`, as described under [Changing your
+types](../guide/schema-evolution.md), but what `.covered()` returns no longer depends on how the
+rows got there. `covered_model.rs` checks a value, a composite and a self-covering index against a
+rebuild after such an update.
+
+An `#[index(each)]` entry is rewritten for every element when a covered field changes. `Table::merge`
 and sync move rows and let the indexes follow, so they need nothing more, which `covered_merge.rs`
 checks against a plain-indexed twin.
 

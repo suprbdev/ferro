@@ -1357,10 +1357,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let stored_of = ix.stored_of();
         let same_cover = ix.same_cover();
         let project = ix.project_path();
-        let same = ix
-            .fields
-            .iter()
-            .map(|(ident, _)| quote! { __o.#ident == __n.#ident });
+        let same = ix.fields.iter().map(|(ident, _)| {
+            if ix.cover.iter().any(|(covered, _)| covered == ident) {
+                quote! { ::ferro::table::same_stored(&__o.#ident, &__n.#ident) }
+            } else {
+                quote! { __o.#ident == __n.#ident }
+            }
+        });
         let same = quote! { #(#same &&)* __o.#key_ident == __n.#key_ident };
         if !ix.cover.is_empty() {
             let project_fn = ix.project_fn();
@@ -2248,7 +2251,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// A cover list stores the fields it names beside every entry of the index, so `.covered()` on a
 /// lookup returns `(key, fields)` without reading the rows. One covered field comes back as itself
 /// and several as a tuple in the order listed. A covered field is copied into every entry and
-/// rewritten when it changes, so cover what a hot page shows and what seldom changes.
+/// rewritten when it changes, so cover what a hot page shows and what seldom changes. A field
+/// counts as changed when `==` fails or it encodes to other bytes, including a field the index is
+/// keyed on that its cover list names, whose entry is then moved.
 ///
 /// A cover list names at least one field, and no field twice. It may name the fields a value or
 /// composite index is keyed on, which come from the entry and are not stored twice. It cannot name

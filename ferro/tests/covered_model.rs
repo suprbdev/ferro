@@ -756,6 +756,109 @@ fn a_covered_float_that_turns_to_negative_zero_is_rewritten() {
     assert_eq!(hashes(&table), before);
 }
 
+#[derive(Data, Clone, Debug)]
+#[ferro(transparent)]
+struct Folded(String);
+
+impl Folded {
+    fn folded(&self) -> String {
+        self.0.to_lowercase()
+    }
+}
+
+impl PartialEq for Folded {
+    fn eq(&self, other: &Self) -> bool {
+        self.folded() == other.folded()
+    }
+}
+
+impl Eq for Folded {}
+
+impl PartialOrd for Folded {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Folded {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.folded().cmp(&other.folded())
+    }
+}
+
+#[derive(Data, Record, Clone, Debug)]
+#[index(team, name, cover(name, balance))]
+struct Member {
+    #[key]
+    id: u8,
+    #[index(cover(name, balance))]
+    name: Folded,
+    #[index(cover(alias))]
+    alias: Folded,
+    #[index(cover(name))]
+    team: u8,
+    balance: i64,
+}
+
+fn member_hashes(table: &Table<Member>) -> Vec<Option<Hash>> {
+    vec![
+        table.rows.root_hash(),
+        table.by_name.root_hash(),
+        table.by_alias.root_hash(),
+        table.by_team.root_hash(),
+        table.by_team_name.root_hash(),
+    ]
+}
+
+#[test]
+fn a_covered_keyed_field_whose_encoding_changes_while_eq_holds_is_rewritten() {
+    let member = |id: u8, name: &str, alias: &str| Member {
+        id,
+        name: Folded(name.into()),
+        alias: Folded(alias.into()),
+        team: 0,
+        balance: i64::from(id),
+    };
+    let mut table: Table<Member> = Table::new();
+    table.insert(member(1, "Ana", "BO"));
+    table.insert(member(2, "Cy", "Di"));
+    table.update(&1, |row| {
+        row.name = Folded("ana".into());
+        row.alias = Folded("bo".into());
+    });
+    let names = |covered: Vec<(u8, Folded)>| -> Vec<(u8, String)> {
+        covered.into_iter().map(|(id, name)| (id, name.0)).collect()
+    };
+    let by_name: Vec<(u8, String, i64)> = table
+        .by_name(&Folded("ANA".into()))
+        .covered()
+        .map(|(id, (name, balance))| (id, name.0, balance))
+        .collect();
+    assert_eq!(by_name, vec![(1, "ana".to_string(), 1)]);
+    let by_alias = names(table.by_alias(&Folded("Bo".into())).covered().collect());
+    assert_eq!(by_alias, vec![(1, "bo".to_string())]);
+    let by_team = names(table.by_team(&0).covered().collect());
+    assert_eq!(by_team, vec![(1, "ana".to_string()), (2, "Cy".to_string())]);
+    let by_team_name: Vec<(u8, String)> = table
+        .by_team_name_prefix(&0)
+        .covered()
+        .map(|(id, (name, _))| (id, name.0))
+        .collect();
+    assert_eq!(
+        by_team_name,
+        vec![(1, "ana".to_string()), (2, "Cy".to_string())]
+    );
+    let mut fresh: Table<Member> = Table::new();
+    for row in table.iter() {
+        fresh.insert((*row).clone());
+    }
+    assert_eq!(member_hashes(&table), member_hashes(&fresh));
+    assert!(table.same_encoding(&fresh));
+    let before = member_hashes(&table);
+    table.update(&1, |row| row.name = Folded("ana".into()));
+    assert_eq!(member_hashes(&table), before);
+}
+
 #[test]
 fn changing_only_a_nested_covered_field_rewrites_the_entries_that_cover_it() {
     let mut table: Table<Item> = Table::new();
