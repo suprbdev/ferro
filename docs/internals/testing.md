@@ -207,6 +207,56 @@ them took 260 seconds and reached 10,166 edges, and the run made 571,653 executi
 ending at 10,177 edges and adding 104 inputs. No compaction of a file that passed `verify` failed
 it, and no input crashed, hung or passed a memory limit.
 
+#90, #94 and a tip at another version than its head named were each a rule that reads or the copy
+relied on and `verify` did not check, found one at a time. #95 listed every such rule of the heads
+and the chains, as [What readers rely on](history.md#what-readers-rely-on) has them, and
+`ferro/tests/fuzzed.rs` now builds a file that breaks each one `verify` did not check. Each of those
+files passed `verify`:
+
+- A head whose root was not its tip's: `read` answered with one value and `at` of the same version
+  with another, and a cycle kept both.
+- A branch with no tip that named v5 and a root: `read` gave that root's value at version 0, and the
+  next commit, v1, was built on it.
+- A commit older than the one below it: with v4 at 900 and v5 at 500, `as_of(550)` jumped from v6
+  through its skip link to v4 and answered v3.
+- A merge older than the commit it merged, generation, reach, last merge or bounded bit other than
+  its parents give, or a merge floor past the merged commit's version: a pull from the file refused
+  each with `does not agree with the commits it links to`. A last merge or a reach of 0 above a
+  merge made `common_ancestor` answer version 0 where the base was v3, so a merge would have
+  applied every change again, and the floor made it fail with `merge link below its floor`.
+- A skip link in merged history that named another entry: the walk of merged history did not check
+  skip links, a pull from the file refused it, and a cycle kept it.
+- A skip link in merged history past where the `prev` links stop, or past where the history kept by
+  time stops to a commit that time keeps: `lowest_kept` followed it below what a cycle keeps, and a
+  cycle cut it, so the base search could answer differently after one.
+- A fork whose skip link named another entry in the history it shares with its parent branch:
+  `verify` refused it, but a cycle walked the shared history once, for the other branch, wrote the
+  link as a tombstone, and left a file that failed `verify` with `links pruned history`.
+
+The heads' rules are checked where a head is decoded and at the tip, the times and the merge
+numbers with the function a receive checks a sent commit with, so the two cannot disagree, and the
+merged history's skip links as the chain walk checks them. The copy also refuses a skip link whose
+target its own copy of the chain holds under another hash. Every such file now fails `verify`,
+`verify_typed`, a cycle and `compact` on one thread and on four, and is left as it was. The fixture
+of the fix that made the first failure in walk order win turned out to hold one: a v18 with no
+`prev` link under a v20 that skipped to v16, in history a merge brought in. It fails at the walk
+now, on any number of threads, and the test of that ordering builds its own file, where a tree
+handed to the copy's threads fails before a record the walk reads later.
+
+The checks read little more. A merge entry's merged commit is read once more, and a walk of merged
+history that stops where another took the chain must still meet the targets of the skip links it
+passed. Reading on down the chain for them made `verify` of a 210 MB file of 202,000 commits, in
+which `main` took 2,000 branches of 50 commits each by merging and dropping them, take 1.38 s where
+it took 1.06 s, and `verify_typed` 3.71 s where it took 3.11 s, medians of five and three runs.
+The chain walks now record the hashes they pass, and a stop on a recorded chain checks the skip
+links against those, which brought the two to 1.07 s and 3.13 s.
+
+With the checks, `reclaim` ran 10 minutes as 12 forked jobs on 24 cores, from a copy of its 7,859
+saved inputs, under `-rss_limit_mb=1280` and the flags above. Loading them took 230 seconds and
+reached 10,353 edges, and the run made 871,757 executions in all, ending at 10,390 edges and adding
+117 inputs. No compaction of a file that passed `verify` failed it, no thread count failed
+differently from another, and no input crashed, hung or passed a memory limit.
+
 The round after the frame table, format 4, with the judgement of [Torn and damaged
 frames](storage.md#torn-and-damaged-frames), rebuilt the seeds, 656 of them for `open`, and
 rewrote a copy of the 15,457 `open` inputs saved before into format 4, as the fixtures were, so
