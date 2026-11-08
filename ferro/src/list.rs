@@ -125,6 +125,12 @@ impl<T: Data> List<T> {
         self.get(self.len().checked_sub(1)?)
     }
 
+    /// Marks every value changed, so that the next commit writes it again as its type encodes it
+    /// now, as [`Map::rewrite`] does for a map.
+    pub fn rewrite(&mut self) {
+        self.0.rewrite();
+    }
+
     /// Keeps the first `len` values and removes the rest.
     ///
     /// Touches O(log n) nodes however many values go, and does nothing when the list is no longer

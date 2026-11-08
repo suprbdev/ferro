@@ -859,24 +859,41 @@ was trusted from then on, as described below. Its rows are now checked as those 
 table, against the version before where there is one, and `verify_typed` reports a row under
 another key in a table of the file's own as well.
 
-A table can also hold an index under a fingerprint the receiver does not know, as a peer whose
-type has an index the receiver's lacks, or declares it otherwise, sends, and so does every version
-written before such a change. Nothing can check that index as it lands. It was skipped and kept,
-and once the receiver's type gained an index with that fingerprint, every read trusted it, and so
-did the check of every later pull, which starts from the version the receiver holds: a peer that
-stored garbage under the fingerprint `#[unique] email` would have landed a table whose `insert`
-panicked on a value no row held, after the receiver added that index (#115). So a receive refuses
-a table that holds an index under a fingerprint its type does not know, a type that declares no
-index included, with `Error::Bundle` naming the table, and nothing lands. That sets an order on
-upgrades: when a table gains an index,
-or an index changes kind, fields, cover list or the types and defaults of its fields, the side
-that receives runs the new schema before it pulls from a peer that already does. The other way
-round still syncs: a table without one of the receiver's indexes lands, and the index is rebuilt
-when the table is read. A side that dropped or changed an index refuses tables that still hold the
-old one, so a clone into the new schema of a history whose older versions were written under the
-old one is refused too, until those versions are pruned from the sender. `verify_typed` does not
-refuse such an index, which a file's own versions keep for an index its schema has since changed:
-nothing landed it unchecked.
+A table can also hold an index under a fingerprint the receiver does not know, as a peer whose type
+has an index the receiver's lacks, or declares it otherwise, sends, and so does every version
+written before such a change. Nothing can check that index as it lands. It was skipped and kept, and
+once the receiver's type gained an index with that fingerprint, every read trusted it, and so did
+the check of every later pull, which starts from the version the receiver holds: a peer that stored
+garbage under the fingerprint `#[unique] email` would have landed a table whose `insert` panicked on
+a value no row held, after the receiver added that index (#115). So a receive refuses a table that
+holds an index under a fingerprint its type does not know, a type that declares no index included,
+with `Error::Bundle` naming the table, and nothing lands. That sets an order on upgrades: when a
+table gains an index, or an index changes kind, fields, cover list or the types and defaults of its
+fields, the side that receives runs the new schema before it pulls from a peer that already does.
+The other way round still syncs: a table without one of the receiver's indexes lands, and the index
+is rebuilt when the table is read. A side that dropped or changed an index refuses tables that still
+hold the old one, so a clone into the new schema of a history whose versions hold tables written
+under the old one is refused too, until the sender writes them again and prunes the versions before.
+`verify_typed` does not refuse such an index, which a file's own versions keep for an index its
+schema has since changed: nothing landed it unchecked.
+
+A table keeps the layout it was written with until a commit writes it again. One in the root is
+written again by every commit, but one in the values of a map only when a commit changes its node,
+so after a change of index most nested tables kept the old layout in every later version, and a
+clone into the new schema was refused even of a sender pruned to its newest version: 2,000 tables of
+three rows in a `Map`, each with an `#[index]` turned `#[unique]`, two commits under the new schema
+and `Keep::Last(1)` left a head whose untouched nodes still held the old index (#116).
+`Map::rewrite`, and `List::rewrite` through it, puts every value of a map back as a changed entry,
+so the next commit writes every node again, each value encoded from its decoded form: the decode of
+a table rebuilds the indexes it stores under another fingerprint and leaves out those its type no
+longer declares, so the commit stores the table as the type now declares it. A sender rewrites each
+such map, a level at a time for maps of maps, then prunes the versions before, and [Changing your
+types](../guide/schema-evolution.md#index-changes-and-sync) gives the steps. Relaxing the refusal
+instead, to land an index under a fingerprint the receiver's type does not know when its type has
+the same fields indexed under another kind, would need that old index to be told apart from one
+planted for a later schema of the receiver's own, which it cannot be: a type that turns an
+`#[index]` into a `#[unique]` may turn it back, and would then trust whatever a peer stored under
+the old fingerprint.
 
 Two other ways were weighed. Trusting a stored index only where the file records that it was
 checked would let peers that declare a table's indexes differently keep syncing, and a branch the

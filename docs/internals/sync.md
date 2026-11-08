@@ -564,24 +564,25 @@ Measured and left out:
   read as `Vec<()>` under 200,000 keys.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. Each index a sent table holds under a fingerprint the
-  receiver knows must hold exactly the entries its rows give, as described under [Indexes that
-  agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows), and every row must
-  sit under its own key, in a table whose type declares no index too. A table holding an index
-  under a fingerprint the receiver does not know is refused, whatever indexes its type declares,
-  since nothing could check that index as it lands and a later schema that declares it
-  would trust it: when a table gains an index, or an index changes kind or fields, the receiving
-  side runs the new schema before it pulls from a peer that already does, and a side that dropped
-  or changed an index cannot pull, or clone, versions that still hold the old one. A table without
-  one of the receiver's indexes passes for that index, because the check does not rebuild it.
-  Reading the table rebuilds the index, and if two rows share a value of a unique index that read
-  fails, so a peer can still send a table that does not read, as a peer whose schema has no index
-  where the receiver's has a unique one can. Checking that index too would mean reading every row
-  of the table in every pull, where an index the receiver knows costs what changed. Such a head
-  lands nowhere: before the frame that writes a new branch table, the
-  root of every head that table moves is read as `T`, `remote`'s on every landing and our branch's
-  on a fast-forward, so the pull returns that read's `Error::Decode` and every branch, `remote`
-  included, stays where it was, as described under [Applying](#applying). Until the peer sends a
-  head that reads, every pull from it fails the same way and sends the same commits again.
+  receiver knows must hold exactly the entries its rows give, as described under [Indexes that agree
+  with their rows](sync-receive.md#indexes-that-agree-with-their-rows), and every row must sit under
+  its own key, in a table whose type declares no index too. A table holding an index under a
+  fingerprint the receiver does not know is refused, whatever indexes its type declares, since
+  nothing could check that index as it lands and a later schema that declares it would trust it:
+  when a table gains an index, or an index changes kind or fields, the receiving side runs the new
+  schema before it pulls from a peer that already does, and a side that dropped or changed an index
+  cannot pull, or clone, versions that still hold the old one, which a table in a map's values keeps
+  in every version until `Map::rewrite` writes the map again. A table without one of the receiver's
+  indexes passes for that index, because the check does not rebuild it. Reading the table rebuilds
+  the index, and if two rows share a value of a unique index that read fails, so a peer can still
+  send a table that does not read, as a peer whose schema has no index where the receiver's has a
+  unique one can. Checking that index too would mean reading every row of the table in every pull,
+  where an index the receiver knows costs what changed. Such a head lands nowhere: before the frame
+  that writes a new branch table, the root of every head that table moves is read as `T`, `remote`'s
+  on every landing and our branch's on a fast-forward, so the pull returns that read's
+  `Error::Decode` and every branch, `remote` included, stays where it was, as described under
+  [Applying](#applying). Until the peer sends a head that reads, every pull from it fails the same
+  way and sends the same commits again.
 
   The first fix read the root only before a fast-forward, whose frame had moved our branch before
   the read and left a file that no longer opened. `remote` still landed, and its root was read only

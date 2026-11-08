@@ -5028,6 +5028,144 @@ fn a_table_without_indexes_is_refused_when_a_row_sits_under_another_key() {
     assert_eq!(mine.head_hash(), landed);
 }
 
+mod plain_n {
+    use ferro::{Data, Record};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Sub {
+        #[key]
+        pub id: u64,
+        #[index]
+        pub n: u32,
+        pub label: String,
+    }
+}
+
+mod unique_n {
+    use ferro::{Data, Record};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Sub {
+        #[key]
+        pub id: u64,
+        #[unique]
+        pub n: u32,
+        pub label: String,
+    }
+}
+
+#[derive(Data, Clone, Default)]
+struct TeamsBefore {
+    teams: Map<u64, Table<plain_n::Sub>>,
+    counter: u64,
+}
+
+#[derive(Data, Clone, Default)]
+struct TeamsAfter {
+    teams: Map<u64, Table<unique_n::Sub>>,
+    counter: u64,
+}
+
+fn refused_for_its_fingerprint(received: ferro::Result<Pulled<()>>, case: &str) {
+    match received {
+        Err(Error::Bundle(message)) => assert!(
+            message.contains("fingerprint this type does not know"),
+            "{case}: {message}"
+        ),
+        other => panic!("{case}: a table written under the old index landed: {other:?}"),
+    }
+}
+
+#[test]
+fn a_clone_of_tables_rewritten_under_a_changed_index_lands_once_older_versions_are_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sender.ferro");
+    {
+        let sender: Db<TeamsBefore> = fast().open(&path).unwrap();
+        sender
+            .update(|root| {
+                for team in 0..300 {
+                    let mut table: Table<plain_n::Sub> = Table::new();
+                    for id in 0..3 {
+                        let (n, label) = ((team * 10 + id) as u32, format!("t{team}r{id}"));
+                        table.insert(plain_n::Sub { id, n, label });
+                    }
+                    root.teams.insert(team, table);
+                }
+            })
+            .unwrap();
+    }
+    let sender: Db<TeamsAfter> = fast().open(&path).unwrap();
+    sender.update(|root| root.counter += 1).unwrap();
+    sender
+        .update(|root| {
+            root.teams.update(&5, |table| {
+                table.insert(unique_n::Sub {
+                    id: 9,
+                    n: 99_999,
+                    label: "new".into(),
+                });
+            });
+        })
+        .unwrap();
+    sender.compact(Keep::Last(1)).unwrap();
+    let early: Db<TeamsAfter> = fast().open(dir.path().join("early.ferro")).unwrap();
+    refused_for_its_fingerprint(from_peer(&early, &sender), "untouched nodes");
+    assert_eq!(early.version(), 0);
+
+    sender.update(|root| root.teams.rewrite()).unwrap();
+    let early: Db<TeamsAfter> = fast().open(dir.path().join("history.ferro")).unwrap();
+    refused_for_its_fingerprint(from_peer(&early, &sender), "versions before the rewrite");
+    sender.compact(Keep::Last(1)).unwrap();
+    sender.verify_typed().unwrap();
+    let fresh: Db<TeamsAfter> = fast().open(dir.path().join("fresh.ferro")).unwrap();
+    assert_eq!(
+        from_peer(&fresh, &sender).unwrap().outcome,
+        Outcome::FastForward
+    );
+    fresh.verify_typed().unwrap();
+    let read = fresh.read();
+    assert_eq!(read.counter, 1);
+    assert_eq!(read.teams.len(), 300);
+    assert_eq!(read.teams.get(&7).unwrap().key_by_n(&71), Some(1));
+    assert_eq!(read.teams.get(&5).unwrap().key_by_n(&99_999), Some(9));
+    drop(read);
+
+    let path = dir.path().join("root.ferro");
+    {
+        let sender: Db<Table<plain_n::Sub>> = fast().open(&path).unwrap();
+        sender
+            .update(|table| {
+                for id in 0..30 {
+                    let label = format!("r{id}");
+                    table.insert(plain_n::Sub {
+                        id,
+                        n: id as u32,
+                        label,
+                    });
+                }
+            })
+            .unwrap();
+    }
+    let sender: Db<Table<unique_n::Sub>> = fast().open(&path).unwrap();
+    sender
+        .update(|table| {
+            table.insert(unique_n::Sub {
+                id: 40,
+                n: 40,
+                label: "r40".into(),
+            });
+        })
+        .unwrap();
+    sender.compact(Keep::Last(1)).unwrap();
+    let fresh: Db<Table<unique_n::Sub>> = fast().open(dir.path().join("root-fresh.ferro")).unwrap();
+    assert_eq!(
+        from_peer(&fresh, &sender).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(fresh.read().key_by_n(&40), Some(40));
+}
+
 type Drift = (&'static str, fn(&mut shadow::Shadow));
 
 #[test]

@@ -4404,6 +4404,58 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         );
     }
 
+    /// Marks every entry changed, so that the next commit writes every node of the map again,
+    /// with each value encoded as its type encodes it now.
+    ///
+    /// A commit writes only the nodes its changes reach, so a value in a node it does not touch
+    /// keeps the encoding it was written with. A [`Table`](crate::Table) in such a value keeps its
+    /// indexes under the fingerprints its type gave when it was written, and a peer whose type
+    /// gives another fingerprint for one of them refuses it in a pull. After a table type held in
+    /// a map's values gains, drops or changes an index, rewrite the map in a commit, then prune
+    /// the versions before it with [`Keep`](crate::Keep), so that every version the file keeps
+    /// holds its tables as the type now declares them. Reading each value rebuilds the indexes a
+    /// table in it stores under another fingerprint, and drops those its type no longer declares.
+    ///
+    /// It reads every value and holds them all, with the nodes, until the commit. A collection
+    /// inside a value is written as it was, so a map whose values hold maps of tables is rewritten
+    /// a level at a time, by rewriting each inner map too, as with [`update`](Map::update).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Map, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Member {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     team: u32,
+    /// }
+    ///
+    /// let mut teams: Map<String, Table<Member>> = Map::new();
+    /// let mut red: Table<Member> = Table::new();
+    /// red.insert(Member { id: 1, team: 7 });
+    /// teams.insert("red".to_string(), red);
+    ///
+    /// teams.rewrite();
+    /// assert_eq!(teams.get("red").unwrap().by_team(&7).len(), 1);
+    ///
+    /// let mut nested: Map<u32, Map<String, Table<Member>>> = Map::new();
+    /// nested.insert(1, teams);
+    /// nested.rewrite();
+    /// for key in nested.keys().collect::<Vec<_>>() {
+    ///     nested.update(&key, |inner| inner.rewrite());
+    /// }
+    /// ```
+    pub fn rewrite(&mut self) {
+        let every: Vec<(K, Option<Arc<V>>)> = self
+            .iter()
+            .map(|(key, value)| (key, Some(value.into_arc())))
+            .collect();
+        self.batch(every);
+    }
+
     fn batch(&mut self, items: Vec<(K, Option<Arc<V>>)>) {
         let items = sorted_unique(items);
         let count = items.len();

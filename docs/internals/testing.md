@@ -453,17 +453,19 @@ Tests are described next to what they test:
   a table whose type declares no index with rows under other keys, cloned, pulled and nested, and
   holding an index, which is refused, and a table that drifts in a pull at each place a table can
   sit, a field, an `Option`, a `Vec`, a `BTreeMap`, a `Map`, a `List`, an enum, a `Box` and a tuple,
-  checked against its own previous version, in `sync.rs`, written to a file for `verify_typed`, the
-  same with no index declared, and versions holding an index the type dropped, which pass, read
-  without its indexes, with every kind of index, and pulled with an `each` index over a `Set`, in
-  `index_agreement.rs`, and the diff the check makes, against `Map::diff`, on maps small enough to
-  diff on one thread and large enough to split among threads, with runs that only one side holds, in
-  `map.rs`. What the check reads of a set an `each` index names, and how many jobs 2,000 small
-  tables take, in `table.rs`; a check beside the walk that must panic on no thread, counted by a
-  panic hook, `index_check_panics.rs`; the bytes a receive allocates for a forged map of rows that
-  links one node many times, `index_check_cost.rs`; the bytes a pull and `verify_typed` allocate for
-  one-row edits to tables in a map against the same at the root, and for an optional table placed
-  before another against one placed after, `index_check_pairing.rs`; the threads a receive and
+  checked against its own previous version, and a clone of tables in a map whose index changed kind,
+  refused until the map is rewritten and the versions before pruned, and of a table in the root
+  after one commit, in `sync.rs`, written to a file for `verify_typed`, the same with no index
+  declared, and versions holding an index the type dropped, which pass, read without its indexes,
+  with every kind of index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`,
+  and the diff the check makes, against `Map::diff`, on maps small enough to diff on one thread and
+  large enough to split among threads, with runs that only one side holds, in `map.rs`. What the
+  check reads of a set an `each` index names, and how many jobs 2,000 small tables take, in
+  `table.rs`; a check beside the walk that must panic on no thread, counted by a panic hook,
+  `index_check_panics.rs`; the bytes a receive allocates for a forged map of rows that links one
+  node many times, `index_check_cost.rs`; the bytes a pull and `verify_typed` allocate for one-row
+  edits to tables in a map against the same at the root, and for an optional table placed before
+  another against one placed after, `index_check_pairing.rs`; the threads a receive and
   `verify_typed` take, `index_check_threads.rs`; and the threads of a pool that run work, in
   `pool.rs`: [Indexes that agree with their
   rows](sync-receive.md#indexes-that-agree-with-their-rows).

@@ -102,8 +102,28 @@ So when peers sync a table, upgrade in this order:
   new unique index that two rows share a value of fails that read, and the pull lands nothing.
 - A side that dropped or changed an index refuses tables that still hold the old one, so a changed
   index syncs only between peers that both run the change, and a clone into the new schema of a
-  history whose older versions were written under the old one is refused, until those versions are
-  pruned from the sender with `Keep`.
+  history whose versions hold tables written under the old one is refused, until the sender has
+  written those tables again under the new schema and pruned the versions before, as below.
+
+A table is stored as it was written until a commit writes it again. A table held in the root struct,
+directly or inside an `Option`, a `Vec`, a tuple or another struct, is written again by the next
+commit, whatever that commit changes. A table in the values of a `Map` or a `List` is written again
+only when a commit changes the node that holds it, so after an index change most such tables keep
+the old index in every new version too, and a clone into the new schema stays refused however much
+history is pruned. So after an index change, rewrite each map whose values hold such tables in one
+commit, then prune the versions before it:
+
+```rust
+db.update(|root| root.teams.rewrite())?;
+db.compact(Keep::Last(1))?;
+```
+
+`Map::rewrite` and `List::rewrite` read every value, which rebuilds the changed indexes of its
+tables and drops the indexes the struct no longer declares, and the commit writes every node again.
+They hold the whole map in memory until the commit. A collection inside a value is written as it
+was, so a map whose values hold maps of tables is rewritten a level at a time, rewriting each inner
+map in the same commit. Until the versions before the rewrite are pruned, a clone of them is
+refused, and a peer that already holds them pulls the new versions as usual.
 
 A struct's own file is never refused: its older versions keep their indexes under the old
 fingerprints and rebuild them when read through `at`. [Indexes that agree with their
