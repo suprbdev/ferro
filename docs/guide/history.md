@@ -52,7 +52,7 @@ collection, and `.rev()` walks newest first the same lazy way.
 Three forms take a range of versions, for when you know where to look or can find out:
 
 ```rust
-let created = db.bisect(.., |shop| shop.orders.contains(&order_id))?.expect("placed");
+let created = db.bisect(.., |shop| shop.next_order >= order_id)?.expect("placed");
 let ended = db.bisect(created.., |shop| !shop.orders.contains(&order_id))?;
 let alive = created..ended.unwrap_or(u64::MAX);
 
@@ -61,11 +61,17 @@ let edits = db.bisect_changes(alive, |shop| shop.orders.get(&order_id))?;
 ```
 
 `bisect` finds the first version where a test holds, for a test that stays true once it turns true,
-in about log2 of the log's length in probes. `history_of_range` is `history_of` between two versions
-and costs the span. `bisect_changes` cuts the range in half until the ends agree, so it costs the
-changes instead of the span, but it can miss a change and its reversal that fall between two probes,
-so use it only for a value that never returns to an earlier one in that range. A row's absence comes
-back when the row goes, which is why `alive` stops short of `ended`. It returns oldest first.
+in about log2 of the log's length in probes. Whether the order is there does not stay true: it turns
+false again once the order is removed, so for a removed order `bisect` over the whole log can probe
+only versions without it and return `None`. The shop of [Getting started](getting-started.md) takes
+each order's id from `next_order`, which only grows, so `next_order >= order_id` holds from the
+commit that placed the order on, whether or not the order is still there. Once `created` is known,
+the order's absence after it does stay true, since an id is not used twice. `history_of_range` is
+`history_of` between two versions and costs the span. `bisect_changes` cuts the range in half until
+the ends agree, so it costs the changes instead of the span, but it can miss a change and its
+reversal that fall between two probes, so use it only for a value that never returns to an earlier
+one in that range. A row's absence comes back when the row goes, which is why `alive` stops short of
+`ended`. It returns oldest first.
 
 ## Stamping a commit
 
