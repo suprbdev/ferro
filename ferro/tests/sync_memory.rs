@@ -518,3 +518,61 @@ fn a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object() {
         "receiving {objects} objects in 50,000 commits took {received} bytes of heap"
     );
 }
+
+#[derive(Data, Clone, Default)]
+struct Widened {
+    counts: Map<String, u32>,
+    wide: Map<String, u64>,
+}
+
+fn widen(_: &mut Widened, _: &Snapshot<Widened>, _: &Snapshot<Widened>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+fn widened_heap(dir: &std::path::Path, keys: u64, pad: usize) -> usize {
+    let open = |name: &str| -> Db<Widened> {
+        fast()
+            .cache_bytes(1 << 20)
+            .open(dir.join(format!("{name}{pad}.ferro")))
+            .unwrap()
+    };
+    let (laptop, phone) = (open("laptop"), open("phone"));
+    let filler = "k".repeat(pad);
+    laptop
+        .commit("count", |root| {
+            for key in 0..keys {
+                root.counts.insert(format!("{key:012}{filler}"), key as u32);
+            }
+        })
+        .unwrap();
+    phone.pull(&laptop, "laptop", widen).unwrap();
+    laptop
+        .commit("widen", |root| {
+            root.wide = root
+                .counts
+                .iter()
+                .map(|(key, value)| (key, u64::from(*value)))
+                .collect();
+            root.counts = Map::new();
+        })
+        .unwrap();
+    let bundle = laptop.bundle(&phone.have().unwrap()).unwrap();
+    let (pulled, heap) = heap_of(|| phone.receive("laptop", &bundle, widen).unwrap());
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(phone.read().wide.len() as u64, keys);
+    heap
+}
+
+#[test]
+fn checking_held_data_linked_as_another_type_holds_no_more_for_long_keys() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let short = widened_heap(dir.path(), 40_000, 8);
+    let long = widened_heap(dir.path(), 40_000, 2_048);
+    println!(
+        "checked a copy of 40,000 keys with {short} bytes of heap for 20-byte keys, {long} for 2 KiB"
+    );
+    assert!(
+        long < short + 8 * MIB,
+        "checking a copy of 40,000 keys of 2 KiB took {long} bytes of heap, of 20 bytes {short}"
+    );
+}

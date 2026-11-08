@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
+use hashbrown::HashTable;
+use hashbrown::hash_table as table;
+
 use crate::codec::{
     Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, Plans, Ptr, Recalled, Shape,
     Tables, push_varint,
@@ -45,7 +48,12 @@ const ZERO_WIDTH_SLACK: u64 = 1 << 28;
 const ZERO_WIDTH_PER_BYTE: u64 = 16;
 const CONFIRMED_KEPT: usize = 1 << 16;
 const RANGES_KEPT: usize = 16;
-const HELD_KEPT: usize = 1 << 13;
+const HELD_SLOTS: usize = 1 << 18;
+const HELD_KEPT: usize = HELD_SLOTS / 8 * 7;
+const HELD_FIRST: usize = 1 << 10;
+const HELD_EPOCH: usize = HELD_KEPT / 16;
+const HELD_AGES: usize = 64;
+const HINT_KINDS: usize = 4;
 const EXPANSION: usize = 16;
 const EXPANSION_SLACK: usize = 16 << 20;
 const MAX_BODY: usize = u32::MAX as usize;
@@ -1609,48 +1617,126 @@ enum Beneath {
     Settle(Ptr, Kind),
 }
 
-type Retypes = HashMap<(Hash, TypeId), (Shape, Vec<Kind>)>;
+#[derive(Clone, Copy)]
+struct Walked {
+    at: u64,
+    count: u64,
+    used: u32,
+    ty: u16,
+    level: u8,
+}
+
+fn walked_at(at: u64, ty: u16) -> u64 {
+    let product = u128::from(at ^ (u64::from(ty) << 48)) * 0x9e37_79b9_7f4a_7c15;
+    product as u64 ^ (product >> 64) as u64
+}
 
 #[derive(Default)]
 struct Retyped {
-    recent: Retypes,
-    older: Retypes,
+    walked: HashTable<Walked>,
+    types: Vec<TypeId>,
+    full: usize,
+    epoch: u32,
+    since: usize,
 }
 
 impl Retyped {
-    fn get(&mut self, hash: &Hash, kind: &Kind) -> Option<(Shape, bool)> {
-        let (shape, kinds) = self.entry((*hash, kind.id))?;
-        kinds
-            .iter()
-            .any(|seen| (seen.within)(seen, kind))
-            .then(|| (*shape, kinds.iter().any(|seen| kind.vouched_by(seen))))
+    fn get(&mut self, ptr: Ptr, kind: &Kind) -> Option<Shape> {
+        let ty = u16::try_from(self.types.iter().position(|id| *id == kind.id)?).ok()?;
+        let epoch = self.epoch;
+        let walked = self.walked.find_mut(walked_at(ptr.offset, ty), |walked| {
+            walked.at == ptr.offset && walked.ty == ty
+        })?;
+        walked.used = epoch;
+        Some(Shape {
+            count: walked.count,
+            level: walked.level,
+            deferred: false,
+        })
     }
 
-    fn insert(&mut self, hash: Hash, kind: &Kind, shape: Shape) {
-        match self.entry((hash, kind.id)) {
-            Some((_, kinds)) => {
-                if kinds.len() >= RANGES_KEPT {
-                    kinds.remove(0);
-                }
-                kinds.push(kind.clone());
+    fn insert(&mut self, ptr: Ptr, kind: &Kind, shape: Shape) {
+        if ptr.offset == 0 {
+            return;
+        }
+        let ty = match self.types.iter().position(|id| *id == kind.id) {
+            Some(at) => at,
+            None => {
+                self.types.push(kind.id);
+                self.types.len() - 1
             }
-            None => self.keep((hash, kind.id), (shape, vec![kind.clone()])),
+        };
+        let Ok(ty) = u16::try_from(ty) else {
+            return;
+        };
+        self.room();
+        self.since += 1;
+        if self.since >= HELD_EPOCH {
+            self.since = 0;
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        let walked = Walked {
+            at: ptr.offset,
+            count: shape.count,
+            used: self.epoch,
+            ty,
+            level: shape.level,
+        };
+        match self.walked.entry(
+            walked_at(walked.at, ty),
+            |seen| seen.at == walked.at && seen.ty == ty,
+            |seen| walked_at(seen.at, seen.ty),
+        ) {
+            table::Entry::Occupied(mut seen) => *seen.get_mut() = walked,
+            table::Entry::Vacant(free) => {
+                free.insert(walked);
+            }
         }
     }
 
-    fn entry(&mut self, key: (Hash, TypeId)) -> Option<&mut (Shape, Vec<Kind>)> {
-        if !self.recent.contains_key(&key) {
-            let found = self.older.remove(&key)?;
-            self.keep(key, found);
+    fn room(&mut self) {
+        if self.walked.len() < self.walked.capacity() {
+            return;
         }
-        self.recent.get_mut(&key)
+        if self.full < HELD_KEPT {
+            self.full = (self.full * 2).clamp(HELD_FIRST / 8 * 7, HELD_KEPT);
+            let more = self.full.saturating_sub(self.walked.len());
+            self.walked
+                .reserve(more, |seen| walked_at(seen.at, seen.ty));
+        } else if self.walked.len() >= HELD_KEPT / 2 {
+            self.evict();
+        }
     }
 
-    fn keep(&mut self, key: (Hash, TypeId), checks: (Shape, Vec<Kind>)) {
-        if self.recent.len() >= HELD_KEPT {
-            self.older = mem::take(&mut self.recent);
+    fn evict(&mut self) {
+        let epoch = self.epoch;
+        let class = |walked: &Walked| {
+            let age = epoch.wrapping_sub(walked.used) as usize;
+            (
+                usize::from(walked.level).min(HELD_AGES - 1),
+                age.min(HELD_AGES - 1),
+            )
+        };
+        let mut counts = vec![[0usize; HELD_AGES]; HELD_AGES];
+        for walked in &self.walked {
+            let (level, age) = class(walked);
+            counts[level][age] += 1;
         }
-        self.recent.insert(key, checks);
+        let mut left = self.walked.len() / 2 + 1;
+        let mut cut = (HELD_AGES, 0);
+        'levels: for (level, ages) in counts.iter().enumerate() {
+            for age in (0..HELD_AGES).rev() {
+                left = left.saturating_sub(ages[age]);
+                if left == 0 {
+                    cut = (level, age);
+                    break 'levels;
+                }
+            }
+        }
+        self.walked.retain(|walked| {
+            let (level, age) = class(walked);
+            level > cut.0 || (level == cut.0 && age < cut.1)
+        });
     }
 }
 
@@ -2031,19 +2117,30 @@ impl Vetting<'_> {
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
         let roots = self.anchors.roots.len();
-        let (ptr, known) = if reference <= roots {
+        let (ptr, first, also) = if reference <= roots {
             (
                 self.anchors.roots[reference - 1],
                 Some(self.root_kind.clone()),
+                Vec::new(),
             )
         } else {
             let id = reference - 1 - roots;
-            (self.anchors.hinted[id], self.anchors.hint_kinds.get(id))
+            let kinds = &self.anchors.hint_kinds;
+            (self.anchors.hinted[id], kinds.get(id), kinds.also(id))
         };
         if ptr.hash != hash {
             return Err(bad("a link does not match the object it names"));
         }
-        let shape = self.held_as(ptr, known.as_ref(), kind)?;
+        if first.iter().chain(&also).any(|known| known.implies(kind)) {
+            return Ok(None);
+        }
+        let known = first
+            .iter()
+            .chain(&also)
+            .find(|known| known.id == kind.id)
+            .or(first.as_ref())
+            .or(also.first());
+        let shape = self.held_as(ptr, known, kind)?;
         while let Some(step) = self.beneath.pop() {
             match step {
                 Beneath::Check(ptr, known, kind) => {
@@ -2064,11 +2161,21 @@ impl Vetting<'_> {
                     if let Some(error) = view.overdrawn() {
                         return Err(error);
                     }
-                    checked.map_err(|error| retyped(&kind, error))?;
+                    let (_, zero_width) = checked.map_err(|error| retyped(&kind, error))?;
+                    self.tally(zero_width)?;
                 }
             }
         }
         Ok(shape)
+    }
+
+    fn walking(&self, error: Error) -> Error {
+        if self.view().out_of_reads() {
+            return bad(
+                "checking held data it links as another type reads more than its size allows",
+            );
+        }
+        error
     }
 
     fn held_as(&mut self, ptr: Ptr, known: Option<&Kind>, kind: &Kind) -> Result<Option<Shape>> {
@@ -2085,20 +2192,37 @@ impl Vetting<'_> {
                 .map(Some)
                 .map_err(rejected);
         }
-        if let Some((shape, vouched)) = self.held.get(&hash, kind) {
-            if !vouched && self.remember(hash, kind) {
-                self.recompute_held(kind, ptr)?;
+        if let Some(shape) = self.held.get(ptr, kind) {
+            let claimed = kind.claim.is_some() && self.remember(hash, kind);
+            let ranged =
+                kind.range.is_some() && !known.is_some_and(|known| (kind.within)(known, kind));
+            if claimed || ranged {
+                let kind = if claimed {
+                    kind.clone()
+                } else {
+                    kind.unclaimed()
+                };
+                let view = self.view();
+                let checked = (kind.held)(&kind, view, ptr);
+                if let Some(error) = view.overdrawn() {
+                    return Err(if claimed { error } else { self.walking(error) });
+                }
+                checked.map_err(|error| retyped(&kind, error))?;
             }
             return Ok(Some(shape));
         }
-        let (object, charged) = self.view().read_fresh(ptr).map_err(rejected)?;
+        let (object, charged) = self
+            .view()
+            .read_fresh(ptr)
+            .map_err(|error| self.walking(rejected(error)))?;
         let tables = RefCell::new(Vec::new());
         let (shape, found, zero_width) = kind
             .check_tables(&object.body, &object.links, &tables)
             .map_err(|error| retyped(kind, error))?;
         self.tables.note(tables.into_inner());
-        if charged {
-            self.tally(zero_width)?;
+        self.tally(zero_width)?;
+        if kind.claim.is_some() {
+            self.remember(hash, kind);
         }
         if shape.deferred {
             self.beneath.push(Beneath::Settle(ptr, kind.clone()));
@@ -2126,7 +2250,7 @@ impl Vetting<'_> {
                     .push(Beneath::Check(object.links[index], known, child));
             }
         }
-        self.held.insert(hash, kind, shape);
+        self.held.insert(ptr, kind, shape);
         Ok(Some(shape))
     }
 }
@@ -2144,6 +2268,7 @@ struct Held {
 struct Kinds {
     templates: Vec<Kind>,
     held: Vec<Held>,
+    also: HashMap<usize, Vec<Held>>,
 }
 
 impl Kinds {
@@ -2158,10 +2283,11 @@ impl Kinds {
         Kinds {
             templates: Vec::new(),
             held: vec![none; len],
+            also: HashMap::new(),
         }
     }
 
-    fn set(&mut self, id: usize, kind: Kind) {
+    fn keep(&mut self, kind: Kind) -> Held {
         let template = match self.templates.iter().position(|seen| seen.id == kind.id) {
             Some(at) => at,
             None => {
@@ -2171,13 +2297,61 @@ impl Kinds {
                 self.templates.len() - 1
             }
         };
-        self.held[id] = Held {
+        Held {
             template: u16::try_from(template).unwrap_or(u16::MAX),
             count: kind.count,
             below: kind.below,
             range: kind.range,
             claim: kind.claim,
-        };
+        }
+    }
+
+    fn set(&mut self, id: usize, kind: Kind) {
+        self.held[id] = self.keep(kind);
+    }
+
+    fn add(&mut self, id: usize, kind: Kind) {
+        let held = self.keep(kind);
+        self.also.entry(id).or_default().push(held);
+    }
+
+    fn get(&self, id: usize) -> Option<Kind> {
+        self.kind(&self.held[id])
+    }
+
+    fn also(&self, id: usize) -> Vec<Kind> {
+        if self.also.is_empty() {
+            return Vec::new();
+        }
+        self.also.get(&id).map_or_else(Vec::new, |also| {
+            also.iter().filter_map(|held| self.kind(held)).collect()
+        })
+    }
+
+    #[inline(never)]
+    fn also_from(
+        &mut self,
+        id: usize,
+        hash: Hash,
+        primary: Option<&Kind>,
+        found: &[(usize, Kind)],
+        more: &[Vec<(usize, Kind)>],
+        links: &[Ptr],
+    ) {
+        let mut types: Vec<TypeId> = Vec::new();
+        for (at, kind) in found.iter().chain(more.iter().flatten()) {
+            if links[*at].hash != hash
+                || primary.is_some_and(|primary| primary.id == kind.id)
+                || types.contains(&kind.id)
+            {
+                continue;
+            }
+            if types.len() + usize::from(primary.is_some()) >= HINT_KINDS {
+                break;
+            }
+            types.push(kind.id);
+            self.add(id, kind.clone());
+        }
     }
 
     fn identity(&self, id: usize) -> (u16, Option<u64>, Option<u8>, usize) {
@@ -2189,8 +2363,7 @@ impl Kinds {
         (held.template, held.count, held.below, range)
     }
 
-    fn get(&self, id: usize) -> Option<Kind> {
-        let held = &self.held[id];
+    fn kind(&self, held: &Held) -> Option<Kind> {
         let mut kind = self.templates.get(usize::from(held.template))?.clone();
         kind.count = held.count;
         kind.below = held.below;
@@ -2285,6 +2458,23 @@ fn located_bases(store: &Store, refs: &Refs, header: &Header) -> Result<Vec<(Ptr
     Ok(bases)
 }
 
+fn linked_twice(found: &[(usize, Kind)], links: &[Ptr]) -> bool {
+    let Some((_, first)) = found.first() else {
+        return false;
+    };
+    if found.iter().all(|(_, kind)| kind.id == first.id) {
+        return false;
+    }
+    let mut typed: Vec<(&Hash, TypeId)> = found
+        .iter()
+        .map(|(at, kind)| (&links[*at].hash, kind.id))
+        .collect();
+    typed.sort_unstable_by_key(|(hash, _)| *hash);
+    typed
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+}
+
 fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Result<Anchors> {
     let bases = located_bases(store, refs, header)?;
     let mut roots = Vec::with_capacity(header.roots.len());
@@ -2314,18 +2504,19 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                 read = Some((from, store.read_object(from)?));
             }
             let (_, object) = read.as_ref().expect("the parent was read");
-            let kind = match header.hints[order[at] as usize].0.checked_sub(roots.len()) {
-                None => Some(root_kind.clone()),
-                Some(parent) => hint_kinds.get(parent),
+            let (first, also) = match header.hints[order[at] as usize].0.checked_sub(roots.len()) {
+                None => (Some(root_kind.clone()), Vec::new()),
+                Some(parent) => (hint_kinds.get(parent), hint_kinds.also(parent)),
             };
-            let kinds: Vec<(usize, Kind)> = kind
-                .and_then(|kind| {
-                    kind.unclaimed()
-                        .check(&object.body, &object.links, None)
-                        .ok()
-                })
-                .map(|(_, found, _)| found)
-                .unwrap_or_default();
+            let found_as = |kind: &Kind| {
+                kind.unclaimed()
+                    .check(&object.body, &object.links, None)
+                    .map(|(_, found, _)| found)
+                    .unwrap_or_default()
+            };
+            let found = first.as_ref().map(found_as).unwrap_or_default();
+            let more: Vec<Vec<(usize, Kind)>> = also.iter().map(found_as).collect();
+            let twice = !more.is_empty() || linked_twice(&found, &object.links);
             while at < end && parent_key(header, &roots, &hinted, &hint_kinds, order[at]) == key {
                 let id = order[at] as usize;
                 let slot = header.hints[id].1;
@@ -2337,8 +2528,15 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                     return Err(bad("a hint leads into pruned history"));
                 }
                 hinted[id] = link;
-                if let Some((_, kind)) = kinds.iter().find(|(at, _)| *at == slot) {
+                let primary = found
+                    .iter()
+                    .find(|(at, _)| *at == slot)
+                    .map(|(_, kind)| kind);
+                if let Some(kind) = primary {
                     hint_kinds.set(id, kind.clone());
+                }
+                if twice {
+                    hint_kinds.also_from(id, link.hash, primary, &found, &more, &object.links);
                 }
                 at += 1;
             }

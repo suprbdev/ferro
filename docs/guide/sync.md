@@ -81,7 +81,8 @@ visit more than 2^28 of them, plus 16 for each byte it carries, is refused, whic
 values of the 2^24 an object may hold, and one more for each MiB. Data this side holds as one type
 and the bundle links as another is checked as the new type: after a commit copies a
 `Map<u64, u32>` into a `Map<u64, u64>`, whose nodes encode alike and so are the same objects, the
-next pull reads the copied map once, a million keys in about 0.4 s. A `Summary` whose `of` or
+next pull reads the copied map once, however many commits it brings, a million keys in about
+0.11 s, and counts the zero-width items of the new type as it goes. A `Summary` whose `of` or
 `combine` panics on what a bundle carries, such as an overflowing sum, makes `receive` refuse the
 bundle rather than unwind. Objects are staged as they arrive, in memory up to 1 MiB and past that in
 a scratch file beside the database, and `receive` holds no writer lock while it reads, so commits on

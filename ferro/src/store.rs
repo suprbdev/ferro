@@ -2549,6 +2549,15 @@ impl Store {
         view.too_wide.load(Ordering::Relaxed).then(too_wide)
     }
 
+    /// Whether a read through this [`Store::view`], or a [`Store::charge`], was refused because
+    /// the bytes it may still read at a charge could not pay for it.
+    pub(crate) fn out_of_reads(&self) -> bool {
+        self.inner
+            .view
+            .as_ref()
+            .is_some_and(|view| view.overdrawn.load(Ordering::Relaxed))
+    }
+
     /// The store's id, which no other store this process opens shares, so that a collection can
     /// tell whether it was read from this store.
     pub fn id(&self) -> u64 {

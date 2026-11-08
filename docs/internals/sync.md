@@ -391,8 +391,9 @@ bounded by a few columns an object. The receiver keeps, for each object in the b
 That is 35 to 40 bytes. Placing drops the staging offsets and keeps each object's offset in the log
 in their place. A check is kept only while a later link may still need it, as described under
 [Checking trees](sync-receive.md#checking-trees). The walk below held data linked as another type
-keeps at most 16,384 checks, about 6 MiB, however much of the file it reads, as described under
-[Held data linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent
+keeps at most 229,376 checks of 24 bytes, in a table of 6.25 MiB that peaks at 9.4 MiB while it
+grows, however much of the file it reads and however long its keys, as described under [Held data
+linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent
 commit adds its graph facts, root and segment, 88 bytes, and 40 to 60 more in indexes and the
 order it is checked in. Each hint an
 incremental bundle names adds the object it resolves to, the kind it holds with its parent's key
@@ -539,19 +540,28 @@ Measured and left out:
   trees](sync-receive.md#checking-trees).
 - An object may hold 2^24 items that encode to nothing, such as the `()`s of a `Vec<()>`, in a few
   bytes, and each takes about 0.2 ns to visit. A bundle whose checks would visit more than 2^28 of
-  them, plus 16 for each body byte it carries, is refused, counting every check of a sent object
-  and every read at a charge while summaries are recomputed or held data of another type is
-  checked, but not the first read of a held record. So a bundle carries up to 16 objects of 2^24
-  such items, and one more for each MiB, and one of 1.27 MB whose 40,000 values each claim 2^24
-  `()`s is refused 86 ms in, where it took 131 s to check and land, as described under
-  [Zero-width items in a bundle](sync-receive.md#zero-width-items-in-a-bundle).
+  them, plus 16 for each body byte it carries, is refused, counting every check of a sent object,
+  every check of held data as another type and every read at a charge while summaries are
+  recomputed, but not the first read of a held record as the type it is held under. So a bundle
+  carries up to 16 objects of 2^24 such items, and one more for each MiB, and one of 1.27 MB whose
+  40,000 values each claim 2^24 `()`s is refused 86 ms in, where it took 131 s to check and land,
+  as described under [Zero-width items in a bundle](sync-receive.md#zero-width-items-in-a-bundle).
 - Held data that a bundle links as another type, as after a commit that copies a map into one
   whose values encode alike, is checked as that type down to its leaves, so the first pull after
-  such a copy reads the copied tree, a million keys in about 0.4 s. The first read of each held
-  record is free and later ones count against the allowance that recomputing summaries draws on,
-  as described under [Held data linked as another
-  type](sync-receive.md#held-data-linked-as-another-type). An object that does not check as the
-  new type refuses the bundle, as a `u64` past `u32::MAX` does in a map read as `Map<u64, u32>`.
+  such a copy reads the copied tree once, however many commits it carries, a million keys in about
+  0.11 s and three million in 0.34 s. The first read of each held record is free and later ones
+  count against the allowance that recomputing summaries draws on, and the zero-width items of the
+  new type count from the first read, as described under [Held data linked as another
+  type](sync-receive.md#held-data-linked-as-another-type). A bundle that runs out of the allowance
+  there is refused with "checking held data it links as another type reads more than its size
+  allows". The walk remembers at most 229,376 checks, so past about 1.8 million keys of a copied
+  map it drops leaves, and a later commit of the same bundle reads the ones it links again, at a
+  charge. Two maps kept as two types and written alike share their nodes and are not walked on
+  later pulls, but two that share subtrees under roots that differ walk a shared subtree on each
+  pull that links it as the other type. An object that does not check as the new type refuses the
+  bundle, as a `u64` past `u32::MAX` does in a map read as `Map<u64, u32>`, and so does a copy into
+  a type whose zero-width items pass the count above, such as `Map<u64, u64>` values of 200,000
+  read as `Vec<()>` under 200,000 keys.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. Each index a sent table holds under a fingerprint the
   receiver knows must hold exactly the entries its rows give, as described under [Indexes that

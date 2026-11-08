@@ -378,27 +378,109 @@ that are not UTF-8 linked as a `String`, or a held subtree hung under a new pare
 falls among its deeper keys.
 
 The walk reads through the view that recomputing summaries uses, described below, so the first read
-of each held record is free and every later one is charged against that allowance, and counts the
-zero-width items it visits in it, as described under [Zero-width items in a
-bundle](#zero-width-items-in-a-bundle). A summary that
-must be recomputed from a value holding a collection is checked after everything below it, as a
-deferred object of the bundle is. The walk remembers the checks it made, with the last 16 ranges of
-each, for the 16,384 objects it checked or found most recently, in two generations of 8,192 that
-drop the older when the newer fills, so a value shared by many keys of the copied map is checked
-once, and a subtree it has forgotten is read and checked again at a charge. A copy of a
-`Map<u64, u32>` of a million keys into a `Map<u64, u64>` landed from a bundle of 154 bytes in
-0.4 s, reading the 124,583 held nodes once, with 5.8 MiB of heap above what the pull started with.
-A copy into a `Map<u64, Bytes>` of a `Map<u64, String>` whose last 600,000 of 750,000 keys share
-one 600-byte value landed in 0.35 s.
+of each held record is free and every later one is charged against that allowance. It counts the
+zero-width items of every check it makes as the new type, the one on a free first read included,
+since the new type decides how many there are, as described under [Zero-width items in a
+bundle](#zero-width-items-in-a-bundle). A summary that must be recomputed from a value holding a
+collection is checked after everything below it, as a deferred object of the bundle is. A bundle
+whose walk would read more again than the allowance has left is refused with `Error::Bundle`,
+"checking held data it links as another type reads more than its size allows".
+
+The walk remembers each record it has checked as each type, by the record's offset in the file and
+the type, with the count and level the check found, and so checks a copied tree once in a receive,
+however many commits of the bundle link into it: a value shared by many keys of the copied map is
+checked once, and so is each sibling of the paths that later commits rewrite. A check covers a link
+under any key range. A node that passed under one range, with everything below it checked as well,
+has its keys in order and each below it inside the separators around it, so it passes under any
+range that holds its leftmost and rightmost keys. A later link is let through when the range the
+receiver holds the record under, from its hint or from its held parent, lies inside the new one, as
+it does for each sibling of a rewritten path, whose separators are the ones its old parent gave it.
+Otherwise the walk reads down the record's two edges to its extreme keys through the view, O(depth)
+reads at a charge, as a held node of its own type is checked against a new range. A later link
+whose summary no check confirmed recomputes it, as above. An offset names one record for the whole
+receive, which keeps the store of the generation it started in, and a record written twice at two
+offsets is two records to the walk, each read once for free.
+
+The memo keeps no key ranges, so what it holds does not grow with the keys. Each check takes 24
+bytes, the offset, the count, the type as an index, the level and when it was last used, in a table
+of at most 262,144 slots of 25 bytes, 6.25 MiB, holding up to 229,376 checks, and growing by
+doubling, so 9.4 MiB at the peak while it moves into its largest size. When it is full the walk
+drops the half that is cheapest to check again: the lowest levels first, leaves and spilled values,
+and within a level those met longest ago. The nodes above the one the walk is at and the top of the
+tree, whose subtrees a later link would walk again, go last, and a value that keys keep reaching
+goes after those no key has reached since. A check dropped and needed again is made again, at a
+charge. A copy of a million keys, 124,583 nodes, fits whole, and so does one of 500,000 keys over
+100,000 distinct values; a copy of three million keys, 374,000 nodes, drops leaves, which a later
+commit's link reads again one at a time.
+
+A hint's kind comes from the held parent it names, checked as the kind that parent is held under,
+and the sender names one parent for each object it hints, the first that reached it. When that
+parent links the same object in more than one place as two types, as the root of a struct links two
+maps that hold the same nodes as two types, the hint keeps the kind of each, up to four types, and
+so does each hint below it, whose parent is then checked as each of its kinds. Two maps written
+alike, kept in two fields as two types, then share every node, and a pull that edits both checks
+the edits as each type and walks nothing it holds. Two maps that share subtrees under roots that
+differ still get the kind of one of them, so a pull that links a shared subtree as the other type
+walks it, once. A parent whose typed links are all of one type, as a map node's are unless it
+spills values, is not searched for an object it links twice, and one that does is searched among
+links of different types only: a pull of three one-key commits into a clone of 400,000 keys ran
+3.40 million instructions at the median against 3.38, 0.7% more, in the same 1.2 ms, where
+searching every parent cost 4.7%. The clone of those 400,000 keys of 80 bytes in ten commits,
+35.8 MB, received in a median of 0.143 s against 0.144 s, and an edit of 1,008 of them, 2.9 MB, in
+25 ms against 26 ms, over eleven alternating runs.
+
+Measured on 2026-11-08 with the probes of #111, Buffered, a million keys a `Map<u64, u32>` copied
+into a `Map<u64, u64>` in one commit, before and after, one run each:
+
+| Case | Before | After |
+| --- | --- | --- |
+| The copy and one edit of the copy, in one pull, 2.6 KB | 0.267 s | 0.112 s |
+| The copy and 30 edits, 73 KB | 4.07 s | 0.112 s |
+| The copy and 40 edits, 98 KB | refused 4.57 s in, and on every retry | 0.110 s |
+| The copy and 100 edits, 245 KB | refused 4.87 s in | 0.114 s |
+| Three million keys, the copy and 100 edits, 251 KB | refused 4.93 s in | 0.346 s |
+| The copy alone, both maps kept, 178 bytes | 0.135 s | 0.110 s |
+| Then each pull of one edit to both maps, 2.6 KB | 0.133 s | under 1 ms |
+| 100 edits to both in one pull, 248 KB | refused 4.92 s in | 4 ms |
+| Three million keys, the copy alone | 0.415 s | 0.339 s |
+| Three million keys, each pull of one edit to both | 0.405 s | under 1 ms |
+| A `Map<u64, String>` of 500,000 keys over 10,000 distinct values of 700 bytes, copied into a `Map<u64, Bytes>`, 164 bytes | 0.425 s | 0.140 s |
+| The same over 20,000 values | refused 0.65 s in | 0.152 s |
+| The same over 100,000 values | refused 0.78 s in | 0.245 s |
+
+A copy of a `Map<String, u32>` of 150,000 keys into a `Map<String, u64>` in a bundle of 154 bytes
+took 6.5, 37.9 and 263.4 MiB of heap above what the pull started with for keys of 8 bytes, 1 KiB and
+8 KiB, and now takes 1.3, 1.5 and 4.2 MiB. The copy of a million `u64` keys takes 9.7 MiB against
+5.8, as its 124,583 checks move the table into its largest size, and one of three million the same
+9.7 MiB against 6.2. `checking_held_data_linked_as_another_type_holds_no_more_for_long_keys` in
+`ferro/tests/sync_memory.rs` copies 40,000 keys of 20 bytes and of 2 KiB and bounds the second's
+heap to the first's plus 8 MiB: 0.4 and 0.8 MB, where the memo before took 1.9 and 22.7 MB.
+
+The memo used to keep the kinds it checked each record under, with the last 16 key ranges of each,
+for the 16,384 records it checked or found most recently, in two generations of 8,192 that dropped
+the older when the newer filled. Each range held a copy of the two separators around it, so the heap
+grew with the keys, and a walk over more than 16,384 nodes dropped the top of its own tree, the
+nodes it checked first, before it was done. Every later commit in the bundle then walked most of the
+copied tree again, from its second read on at a charge, until the allowance refused the bundle, on
+every retry, though a fresh clone of the same head landed in 0.3 s. A spilled value shared by keys
+far apart was dropped before its next key reached it, so a copy of more than about 16,000 distinct
+shared values was refused. And a pull of two maps kept and written alike walked the whole copy on
+every pull, as its hints gave the held nodes the kind of the first map alone. Weighed and left out:
+keeping the range each record was checked under, counted in bytes with its separators, which would
+bound the memory but drop the checks of long keys sooner, where the range the receiver holds a
+record under already covers the honest case; keying the memo by hash, which takes 48 bytes a check
+where the offset takes 24; and a record in the file of the held trees checked as each type, which
+would spare the walk on later pulls of maps whose roots differ, but needs a place in the file and a
+way to drop it when the tree goes.
 
 A link to held data of another type used to be accepted only if that one object checked as the new
 type and held no typed links. Map nodes with children or spilled values always hold some, so every
 pull after a commit that copied a map of more than one node into another type was refused, retries
 included, while a fresh clone of the same file landed, and so were the identical nodes of the two
 maps when a spilled `String` and the same bytes as `Bytes` sat under the same key. Recording more
-than one kind for each hinted object was weighed: the receiver has only reached such an object
-under its own type, so there is no other kind to record, and its bytes have to be checked as the
-new type all the same.
+than one kind for each hinted object was weighed then: the receiver had reached such an object
+under the one kind its hint gives, and its bytes have to be checked as the new type all the same.
+A hint whose parent links the object in more than one place now records each, as above.
 
 ### Recomputing summaries
 
@@ -492,7 +574,11 @@ Recomputing summaries can read far more than the bundle carries: a value spilled
 read once for each, and `of` reads a nested collection whole for each entry that holds it. The
 receive makes one view, when it first needs one, for the deferred pass and for the hint path below,
 and charges what it reads against an allowance of eight times the bundle's body bytes, plus 4 KiB
-for each link the bundle carries, plus 256 MiB, past which the bundle is refused. The first read of
+for each link the bundle carries, plus 256 MiB, past which the bundle is refused with
+`Error::Bundle`, "recomputing its summaries reads more than its size allows", or "checking held
+data it links as another type reads more than its size allows" when the read that ran out was the
+walk described under [Held data linked as another
+type](#held-data-linked-as-another-type). The first read of
 each record of the receiver's file is free. The view keeps a bit for each 8 bytes of the file, in
 chunks of 512 bytes that each cover 32 KiB, allocated as its reads first land in them. A map node's
 record takes at least 8 bytes, and a record that starts in the same 8 bytes as a shorter one read
@@ -677,9 +763,20 @@ reads it or the check of held data of another type does. The count is the decode
 that goes back to decode what it visited counts those items once, though it visits them twice. A
 bundle whose checks would count more than 2^28 zero-width items, plus 16 for each body byte it
 carries, is refused with `Error::Bundle`, "checking it would visit more zero-width items than its
-size allows". The first read of each held record is not counted, as its bytes are not charged, so a
-pull that walks held data of another type visits what the receiver holds once for free, as a local
-scan of it would, and neither are the held parents the hint path reads once each.
+size allows". The first read of each held record is not counted when it decodes the record as the
+type the receiver holds it under, as its bytes are not charged and a local scan would visit those
+items too, and neither are the held parents the hint path reads once each. The check of held data
+linked as another type counts every check it makes as the new type, the one on the free first read
+included, as the new type decides how many items there are: a `u64` of 200,000 read as a `Vec<()>`
+is 200,000 of them.
+
+That first check used to be counted only when its read was charged. A peer whose schema has
+`units: Map<u64, u64>` where the receiver's has `units: Map<u64, Vec<()>>` set its `units` to a
+copy of a `counts` map of 200,000 keys, each 200,000, and sent it in 173 bytes. The receiver held
+`counts`, so every node of the copy was a free first read, and the bundle landed after 7.9 s and
+4×10^10 zero-width items, against a count of 2.7×10^8 its size allows; with one value of 2^24 + 1 it
+was refused 7.9 s in, for that object, on every resend. Both are now refused 0.06 s in. A copy into
+a type with no zero-width items counts none, and one of 16,384 keys of 4 such items each lands.
 
 The bundle of 1.27 MB above visited 2^24 items in 3.28 ms an object, about 0.2 ns an item, and the
 clone of a `Map<u64, String>` of 400,000 keys of 80 bytes, 35.8 MB, was received in 0.153 s,
