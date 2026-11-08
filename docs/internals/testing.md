@@ -446,6 +446,10 @@ Tests are described next to what they test:
 - The three-device sync model with small caches: [Commits stored
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
+- Tables whose indexes a peer set apart from their rows, sent whole, drifting in a pull, behind
+  the head and nested in a map, in `sync.rs`, and written to a file for `verify_typed`, with every
+  kind of index, in `index_agreement.rs`: [Indexes that agree with their
+  rows](sync-receive.md#indexes-that-agree-with-their-rows).
 - The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
   [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).

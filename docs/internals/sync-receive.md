@@ -341,7 +341,9 @@ bundle](#zero-width-items-in-a-bundle).
 
 Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
 Nothing reads them as a type. Spilled values are not checked for the size that made them spill.
-Summaries are recomputed, as described under [Recomputing summaries](#recomputing-summaries).
+Summaries are recomputed, as described under [Recomputing summaries](#recomputing-summaries), and
+the indexes of each table are checked against its rows, as described under [Indexes that agree
+with their rows](#indexes-that-agree-with-their-rows).
 
 `Db::verify_typed` runs the same check over the whole file: the refs, and the roots of every
 retained commit, as `T`, each object checked once per type. It costs a decode of everything
@@ -700,3 +702,107 @@ was weighed. At about their time, 16 items a byte, that allowance's 4 KiB for ea
 the first check of each sent object, which that allowance does not charge, would have to draw on
 it as well. A count of its own keeps the bound in the items themselves and refuses with a message
 that names them.
+
+### Indexes that agree with their rows
+
+A table stores its rows and each of its indexes as maps of their own, and the walk checks each map
+only as a map. A peer whose schema had a type that encodes as the receiver's `Table<Row>` does, with
+its index maps set apart from its rows, sent a table whose `by_n(&6)` missed the row that held 6,
+whose `by_n(&9)` returned a row holding 6, whose `by_n(&8).len()` was 1 for a lookup that yielded
+nothing, and in which `insert` of a row with a value no row held panicked with a clash, since a
+write trusts what the index says (#112). It landed as a fast-forward, and `verify_typed` passed.
+
+So each table value the walk finds is checked against its rows. The derived `decode` and `visit`
+of a table with indexes note the bytes and links they read when the decoder belongs to a typed
+check that collects them, which the check of each sent object and of held data linked as another
+type does. Each value is kept once, by its type and the hash of its encoding, so the many versions
+of a node that hold the same table, and the rechecks of a node under other ranges, note it once.
+Once every root's tree has been walked and the deferred summaries settled, each noted table is
+read through the view with the staging lent to it, as the deferred pass reads, and each index it
+stores under a fingerprint the receiver knows must hold exactly the entries its rows give: the
+same keys, compared by `Ord`, with values that encode the same, so a covered field must be the
+row's. Every row must sit under its own key, and no two rows may share a value of such a unique
+index. A table that fails refuses the bundle with `Error::Bundle`. An index the table lacks, or
+holds under another fingerprint, is rebuilt from the rows when the table is read, as before, and
+[Limits](sync.md#limits) describes what that leaves.
+
+A table in a version's root is checked against the table of its type at the same place in the
+root of the version's parent: the nth table of that type that a check of each root reads. A parent
+the receiver holds is trusted, its tables with it; a parent the bundle carries is checked in the
+same receive. The rows that changed between the two give the entries to take out of the parent's
+indexes and those to put in. They are found as `Map::diff` finds them, skipping every subtree the
+two share, but from the nodes' bytes: each value of a node the two do not share is visited, not
+decoded, and compared by its bytes and the hashes of its links, so only the rows that changed are
+decoded. An entry both sides hold with the same encoding is left alone, so a change to a field no
+index names touches no index. What is left goes into each index in one batch, with `Map::apply`,
+and the result must have the root hash of the index the table stores. Where it does not, the two
+are diffed, so an index whose keys compare equal to the expected ones but are stored as other
+bytes, as a type whose `==` ignores case leaves after an update, still agrees. An index left with
+fewer entries than it should hold took an entry onto a key another entry held, which in a unique
+index is two rows sharing a value. So the check costs what changed: the nodes of rows that differ
+on both sides, the changed rows, the index nodes along their entries, and the hash of the nodes it
+rewrote.
+
+Any other table is checked by building its indexes from its rows, 65,536 rows at a time, and
+comparing them the same way: the tables of a clone's first version, a table nested in a
+collection, a table whose parent holds no table at that place or lacks one of its indexes, and
+held data of another type. A table is checked against another only if the other's check is
+planned already, so no chain of checks comes back to where it started, and every table rests on
+one that was trusted or built. A table with several indexes, and a thousand or more rows to
+work through, works on each index with a thread of its own.
+
+The reads go through the view, so they are charged as the deferred pass's are. The first read of
+each record of the receiver's file is free, and a read of a sent object or a second read of a
+record is charged against the allowance. A clone reads what it carries a second time, and an
+incremental pull reads the old versions of the rows it changes, once each. A bundle of a few
+hundred bytes that hangs a table's index on a large tree of rows the receiver holds makes it read
+those rows once for free and build the index from them, and every other such table it carries
+pays for its reads.
+
+`verify_typed` runs the same check on the file's store, over every table its walk finds: each
+retained version's root tables against its parent's, versions taken oldest first, and every other
+table by building its indexes.
+
+Measured on 2026-11-08 with the receiver's file buffered, on a table of 200,000 rows of five
+fields with a plain index on a `u32`, a unique index on a `u64` and a plain index on a `String`,
+cloned into an empty file and then sent an edit of 1,000 random rows. Times are the middle of
+three medians of five rounds each, the build before and after alternating:
+
+| Bundle | Before | After |
+| --- | --- | --- |
+| Clone in ten commits of 20,000 rows, 30.6 MB | 379 ms | 749 ms |
+| Edit of both plain indexed fields, 2.9 MB | 43.2 ms | 64.5 ms |
+| Edit of a field no index names | 14.5 ms | 25.8 ms |
+| `verify_typed` of the eleven versions | 606 ms | 1,010 ms |
+| Clone in 100 commits of 2,000 rows | 1,906 ms | 2,958 ms |
+| Edit of both plain indexed fields after it | 49.7 ms | 70.5 ms |
+| `verify_typed` of the 101 versions | 2,249 ms | 3,278 ms |
+
+Most of the cost is reading nodes a second time. The walk visits each sent node without building
+its values, and the check reads the nodes of the rows that differ on both sides and the index
+nodes along the changed entries through a view that caches nothing, each read a copy out of the
+file or the staging, an LZ4 decompress and a decode. In the edit the diff of rows reads some 1,700
+leaves in about 13 ms, where decoding their values as well took 4 ms more. A clone's index entries
+fall all over each index in every commit, so each commit's check reads most of the index the commit
+before left and hashes most of what it rewrote, which is what the commit carries. Putting the
+entries of each changed row in with the derive's `reindex`, one map insert at a time, took the
+clone to about 960 ms and the edit to about 85 ms, and dropping the indexes built took a quarter of
+the clone's check before each index was dropped on its own thread.
+
+Left out:
+
+- Checking each table as the walk reaches it. Its rows and indexes have only all passed their own
+  checks once the walk is done, and reading them needs the view.
+- Comparing the diff of each index with the expected changes, which reads the changed nodes of the
+  index on both sides, where applying the changes to the parent's index reads them on one side and
+  hashes what it rewrote.
+- Finding the parent of a table nested in a collection by its key, which would mean following the
+  path to the collection through the parent version's tree. Such a table is built in each version
+  that changes the node that holds it.
+- Keeping the indexes built for one version to check the next. A map's nodes in memory do not keep
+  their hashes, so each check would hash every node built so far, and a pull of many small commits
+  would hash the whole index for each.
+- Checking the tables of several versions on threads of their own. A clone's checks do not depend
+  on each other, but each holds the indexes it builds, which in a clone of large commits is most of
+  each index, so the memory a receive holds would grow with the threads.
+- Checking that each row sits under its own key in a table without indexes, which no lookup reads.

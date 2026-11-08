@@ -47,6 +47,18 @@ and dropping a `RowMut` panic before changing anything. Inside a commit that dis
 transaction, which is the honest result when a constraint the schema states does not hold. A row may
 replace itself, and a row changing key may keep the value it holds.
 
+A clash is found in the index alone, which every write trusts to hold exactly the entries the rows
+give. Writes keep it so, and `receive` and `verify_typed` check every table they read against its
+rows, as described under [Indexes that agree with their
+rows](sync-receive.md#indexes-that-agree-with-their-rows). Before that check a peer whose type set
+index maps apart from its rows could land a table whose unique index held a value for a row that
+did not hold it, and `insert` of a row with that value, which no row held, panicked as a clash
+(#112). Only a damaged file can hold such a table now, and `verify_typed` reports it as
+`Error::Corrupt`. The panic is kept for it rather than turned into an error. `insert` has no error
+channel, and telling a damaged index from a real clash would cost each write that finds a value
+taken a read of the holder's row, for a file that `verify_typed` already flags. Lookups on such a
+table miss rows or return others, as they would on any damaged node.
+
 A panic in the closure `update` runs, or while a `RowMut` is held, writes nothing back, so the table
 keeps the old row and its index entries rather than a row changed half way. `update` runs the
 closure on a copy and writes it only once the closure returns, as `try_update` does, and a
@@ -439,6 +451,17 @@ skipped. Each declared index left without a map is rebuilt: the rows are read on
 is filled from them, unique ones are checked for clashes as they fill, and the indexes that were
 found are kept as they are. `visit`, which `verify_typed` and the check on receiving a sync use,
 reads index fields the same way and checks only those it can match.
+
+Those checks then hold each index they matched to the rows. The derived `decode` and `visit` note
+the table value they read when they run inside such a check, and once the check has passed every
+object it reaches, it reads each noted table with the hidden `TableData::decode_stored`, which
+decodes as `decode` does, the last field of a fingerprint winning, but rebuilds nothing and says
+which indexes were stored. The derive generates the entries each kind of index holds for a row,
+the same ones `reindex` writes, and `TableData::apply_slots` takes those of the rows that left out
+of each stored index and puts those of the rows that came in, in one `Map::apply` per index;
+`differing` then compares each with the stored map. Indexes the table does not store under a known
+fingerprint are left to the rebuild above, as described under [Indexes that agree with their
+rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 That is the whole format change. The tag of an index no longer depends on its name, and its field
 holds eight bytes before the map. Nothing global moved: no file format version, and no change to

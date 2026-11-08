@@ -182,6 +182,9 @@ once it sends 256 objects, with eight chunks in flight between the two.
   be pulled from until the puller's clock catches up.
 - Every object the bundle sends is checked as the type it will be read as, as described under
   [Checking trees](sync-receive.md#checking-trees).
+- Every table the bundle sends must have indexes that hold exactly the entries its rows give, as
+  described under [Indexes that agree with their
+  rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 These checks run with no writer lock held, against the heads `receive` started from, as described
 under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). Under the writer
@@ -550,17 +553,19 @@ Measured and left out:
   type](sync-receive.md#held-data-linked-as-another-type). An object that does not check as the
   new type refuses the bundle, as a `u64` past `u32::MAX` does in a map read as `Map<u64, u32>`.
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
-  other's trees, not only their roots. A table without one of its indexes, or holding one under
-  another fingerprint, passes, because the check visits only the indexes whose fingerprint it knows
-  and does not rebuild the others. Reading it rebuilds the index, and if two rows share a value of a
-  unique index that read fails, so a peer can still send a table that does not read, as a peer
-  whose schema has a plain index where the receiver's has a unique one can. Checking it while the
-  bundle streams would mean reading every row. Such a head lands nowhere: before the frame that
-  writes a new branch table, the root of every head that table moves is read as `T`, `remote`'s on
-  every landing and our branch's on a fast-forward, so the pull returns that read's `Error::Decode`
-  and every branch, `remote` included, stays where it was, as described under [Applying](#applying).
-  Until the peer sends a head that reads, every pull from it fails the same way and sends the same
-  commits again.
+  other's trees, not only their roots. Each index a sent table holds under a fingerprint the
+  receiver knows must hold exactly the entries its rows give, as described under [Indexes that
+  agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows). A table without one
+  of its indexes, or holding one under another fingerprint, passes for that index, because the
+  check does not rebuild it. Reading the table rebuilds the index, and if two rows share a value of
+  a unique index that read fails, so a peer can still send a table that does not read, as a peer
+  whose schema has a plain index where the receiver's has a unique one can. Checking that index too
+  would mean reading every row of the table in every pull, where an index the receiver knows costs
+  what changed. Such a head lands nowhere: before the frame that writes a new branch table, the
+  root of every head that table moves is read as `T`, `remote`'s on every landing and our branch's
+  on a fast-forward, so the pull returns that read's `Error::Decode` and every branch, `remote`
+  included, stays where it was, as described under [Applying](#applying). Until the peer sends a
+  head that reads, every pull from it fails the same way and sends the same commits again.
 
   The first fix read the root only before a fast-forward, whose frame had moved our branch before
   the read and left a file that no longer opened. `remote` still landed, and its root was read only
@@ -607,3 +612,14 @@ Measured and left out:
   16 MiB collection `of` reads under more than about 17 keys, as described under [Recomputing
   summaries](sync-receive.md#recomputing-summaries). Those reads are free once per receive, so a
   bundle that is refused and sent again makes the receiver read what it holds again each time.
+- Checking that a table's indexes agree with its rows reads the nodes of the rows a pull changes on
+  both sides and the index nodes their entries touch, and most of what a clone carries a second
+  time, so on a table of 200,000 rows with three indexes a clone took about twice as long to
+  receive, an edit of 1,000 rows half as long again, and `verify_typed` two thirds as long again.
+  A table nested in a collection, rather than held in the root, is checked by building its
+  indexes from all its rows, in each version that changes the node holding it, and a table hung
+  on rows the receiver holds makes it read those rows once for free, then at a charge against the
+  allowance above, as described under [Indexes that agree with their
+  rows](sync-receive.md#indexes-that-agree-with-their-rows). Each table value is kept, a few
+  hundred bytes, until the check runs once the walk is done, and a check holds the indexes it
+  builds, up to the size of the table's indexes in memory for a commit that rewrites most of them.
