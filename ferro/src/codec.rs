@@ -1238,9 +1238,10 @@ enum Plan {
 pub(crate) struct Plans(HashMap<(TypeId, Hash), Plan>);
 
 impl Plans {
-    /// Takes `table` as agreeing with its rows, unless its check is already planned.
-    pub(crate) fn trust(&mut self, table: &FoundTable) {
-        self.0.entry(table.identity()).or_insert(Plan::Trusted);
+    /// Takes the table value with this type and hash, as [`FoundTable::identity`] gives them, as
+    /// agreeing with its rows, unless its check is already planned.
+    pub(crate) fn trust(&mut self, identity: (TypeId, Hash)) {
+        self.0.entry(identity).or_insert(Plan::Trusted);
     }
 
     /// Plans to build the indexes of `table` from its rows, unless its check is already planned.
@@ -1501,11 +1502,15 @@ pub(crate) fn holds_tables<D: Data>() -> bool {
 /// A map is paired after the value that holds it, one map at a time, so that maps nested in the
 /// values of maps, however deep, do not deepen the stack: only the levels of one value at a time
 /// do, as [`MAX_DEPTH`] bounds them.
+///
+/// It keeps a table that both versions hold at a place only by its type and hash, and only when
+/// asked to, since only a parent the receiver holds vouches for such a table, and it builds a
+/// [`FoundTable`] only for the two tables of a pair that differ.
 #[doc(hidden)]
 pub struct Pairing<'s> {
     store: &'s Store,
     pairs: Vec<(FoundTable, FoundTable)>,
-    same: Vec<FoundTable>,
+    same: Option<Vec<(TypeId, Hash)>>,
     maps: HashSet<(Hash, Hash)>,
     opened: [HashSet<Hash>; 2],
     waiting: Vec<Waiting>,
@@ -1521,22 +1526,24 @@ type Waiting = (PairMaps, (Ptr, u64), (Ptr, u64));
 
 /// The tables a [`Pairing`] paired: each table of the later version with the one at the same
 /// place in the earlier version, when the two differ, and each table that is the same at its
-/// place in both.
+/// place in both, if the pairing kept them.
 #[derive(Default)]
 pub(crate) struct Paired {
     /// Each table of the earlier version, with the table at its place in the later one.
     pub(crate) pairs: Vec<(FoundTable, FoundTable)>,
-    /// The tables that both versions hold at the same place.
-    pub(crate) same: Vec<FoundTable>,
+    /// The type and hash of each table that both versions hold at the same place, as
+    /// [`FoundTable::identity`] gives them, if the pairing kept them.
+    pub(crate) same: Vec<(TypeId, Hash)>,
 }
 
 impl<'s> Pairing<'s> {
-    /// A pairing that reads through `store`.
-    pub(crate) fn new(store: &'s Store) -> Pairing<'s> {
+    /// A pairing that reads through `store`, which with `keep_same` keeps the tables that both
+    /// versions hold at the same place as well as those it pairs.
+    pub(crate) fn new(store: &'s Store, keep_same: bool) -> Pairing<'s> {
         Pairing {
             store,
             pairs: Vec::new(),
-            same: Vec::new(),
+            same: keep_same.then(Vec::new),
             maps: HashSet::new(),
             opened: [HashSet::new(), HashSet::new()],
             waiting: Vec::new(),
@@ -1552,7 +1559,7 @@ impl<'s> Pairing<'s> {
     pub(crate) fn into_paired(self) -> Paired {
         Paired {
             pairs: self.pairs,
-            same: self.same,
+            same: self.same.unwrap_or_default(),
         }
     }
 
@@ -1636,13 +1643,30 @@ impl<'s> Pairing<'s> {
         D::visit(new)
     }
 
-    /// Records `new`, a table of the later version, as paired with `old`, the table at its place
-    /// in the earlier one, or as the same table when the two are one value.
-    pub(crate) fn table(&mut self, old: FoundTable, new: FoundTable) {
-        if old.identity() == new.identity() {
-            self.same.push(new);
-        } else {
-            self.pairs.push((old, new));
+    /// Records the table of type `id` that `new` read since `from_new`, a table of the later
+    /// version, as paired with the one `old` read since `from_old`, the table at its place in the
+    /// earlier one, each as `found` makes a [`FoundTable`] of it, or as the same table when the two
+    /// encode alike.
+    pub(crate) fn table(
+        &mut self,
+        id: TypeId,
+        (old, from_old): (&Decoder<'_>, Checkpoint),
+        (new, from_new): (&Decoder<'_>, Checkpoint),
+        found: impl Fn(&Decoder<'_>, Checkpoint) -> FoundTable,
+    ) {
+        let (old_body, old_links) = old.read_since(from_old);
+        let (new_body, new_links) = new.read_since(from_new);
+        let alike = old_body == new_body
+            && old_links
+                .iter()
+                .map(|link| link.hash)
+                .eq(new_links.iter().map(|link| link.hash));
+        if !alike {
+            self.pairs
+                .push((found(old, from_old), found(new, from_new)));
+        } else if let Some(same) = &mut self.same {
+            let hash = hash_parts(new_body, new_links.iter().map(|link| &link.hash));
+            same.push((id, hash));
         }
     }
 

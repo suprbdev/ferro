@@ -341,7 +341,7 @@ fn agreed(
         let (Some(ptr), Some(prev)) = (ptr, prev.and_then(|prev| roots.get(&prev))) else {
             continue;
         };
-        let mut pairing = Pairing::new(store);
+        let mut pairing = Pairing::new(store, false);
         pair_roots(&mut pairing, *prev, *ptr).map_err(|error| match error {
             Error::Decode(message) => Error::Corrupt(format!(
                 "the {} at {} does not decode: {message}",

@@ -1059,6 +1059,15 @@ the walk noted them, whose check failed refuses the bundle. A bundle whose first
 is walked first and the tables it noted, nested or in held data, checked after, so a receive of a
 type without tables starts no thread.
 
+What a receive keeps of each pairing for the plan after the walk is the pairs of tables that
+differ, which cost what changed, and the tables that both versions hold at a place only for a
+version whose parent the receiver holds, since only such a parent vouches for them, by type and
+hash alone. A pairing builds a table's record of its bytes and links only for a pair that differs.
+Every such table of every version used to be kept with its bytes and links until the receive
+ended: a pull of 100 commits that each edited one of 50,000 tables in a `Vec` of the root peaked
+977 MB higher, and one of 300 commits 2,685 MB, where 9e9341e peaked 14 and 16 MB higher; they now
+peak 14 and 2 MB higher.
+
 The checks read through a view of their own, with the staging lent to it for the whole walk and an
 allowance as large as that of the view the walk and the deferred pass read through, so they are
 charged as the deferred pass's are, apart from it. The first read of each record of the receiver's

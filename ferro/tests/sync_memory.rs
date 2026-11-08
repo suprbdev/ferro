@@ -8,7 +8,7 @@ use std::io::{BufReader, BufWriter};
 use std::time::Instant;
 
 use common::{fast, text};
-use ferro::{Bundle, Data, Db, Error, Map, Outcome, Snapshot, Summary};
+use ferro::{Bundle, Data, Db, Error, Map, Outcome, Record, Snapshot, Summary, Table};
 
 struct Peak;
 
@@ -574,5 +574,56 @@ fn checking_held_data_linked_as_another_type_holds_no_more_for_long_keys() {
     assert!(
         long < short + 8 * MIB,
         "checking a copy of 40,000 keys of 2 KiB took {long} bytes of heap, of 20 bytes {short}"
+    );
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Row {
+    #[key]
+    id: u64,
+    #[index]
+    n: u32,
+}
+
+#[derive(Data, Clone, Default)]
+struct Shelves {
+    tables: Vec<Table<Row>>,
+}
+
+fn shelved(_: &mut Shelves, _: &Snapshot<Shelves>, _: &Snapshot<Shelves>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+#[test]
+fn a_pull_of_many_versions_holds_the_tables_that_changed_between_them() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let open = |name: &str| -> Db<Shelves> { fast().open(dir.path().join(name)).unwrap() };
+    let (sender, receiver) = (open("sender.ferro"), open("receiver.ferro"));
+    let tables = 20_000u64;
+    sender
+        .commit("fill", |root| {
+            root.tables = (0..tables).map(|_| Table::new()).collect();
+        })
+        .unwrap();
+    receiver.pull(&sender, "sender", shelved).unwrap();
+    for at in 0..50u64 {
+        sender
+            .commit(format!("edit {at}"), |root| {
+                root.tables[(at * 7_919 % tables) as usize].insert(Row {
+                    id: at,
+                    n: at as u32,
+                });
+            })
+            .unwrap();
+    }
+    let bundle = sender.bundle(&receiver.have().unwrap()).unwrap();
+    let len = bundle.as_bytes().len();
+    let (pulled, heap) = heap_of(|| receiver.receive("sender", &bundle, shelved).unwrap());
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(receiver.head_hash(), sender.head_hash());
+    println!("a pull of 50 versions of {tables} tables, {len} bytes, took {heap} bytes of heap");
+    assert!(
+        heap < 8 * len + 16 * MIB,
+        "a pull of 50 versions of {tables} tables, {len} bytes, took {heap} bytes of heap"
     );
 }

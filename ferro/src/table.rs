@@ -1418,7 +1418,12 @@ impl<T: Record> Data for Table<T> {
     fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
         let (from_old, from_new) = (old.checkpoint(), new.checkpoint());
         T::Table::pair(old, new, pairing)?;
-        pairing.table(found::<T>(old, from_old), found::<T>(new, from_new));
+        pairing.table(
+            TypeId::of::<T::Table>(),
+            (old, from_old),
+            (new, from_new),
+            found::<T>,
+        );
         Ok(())
     }
 }
@@ -4622,12 +4627,13 @@ mod tests {
     }
 
     fn paired<D: Data>(store: &Store, old: &Object, new: &Object) -> Result<Paired> {
-        let mut pairing = Pairing::new(store);
+        let mut pairing = Pairing::new(store, true);
         D::pair(
             &mut Decoder::new(&old.body, &old.links, Some(store)),
             &mut Decoder::new(&new.body, &new.links, Some(store)),
             &mut pairing,
         )?;
+        pairing.settle()?;
         Ok(pairing.into_paired())
     }
 
@@ -4723,7 +4729,7 @@ mod tests {
             .map(|(old, new)| (old.hash, new.hash))
             .collect();
         assert_eq!(hashes, [(found(&table(2)).hash, found(&table(4)).hash)]);
-        let same: Vec<_> = paired.same.iter().map(|table| table.hash).collect();
+        let same: Vec<_> = paired.same.iter().map(|(_, hash)| *hash).collect();
         assert_eq!(same, [found(&table(3)).hash]);
     }
 }

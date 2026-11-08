@@ -2167,14 +2167,14 @@ impl Vetting<'_> {
         let found = match paired.entry(root.hash) {
             hash_map::Entry::Occupied(found) => found.into_mut(),
             hash_map::Entry::Vacant(slot) => {
-                let mut pairing = Pairing::new(view);
+                let mut pairing = Pairing::new(view, *kept);
                 (self.pair_roots)(&mut pairing, *parent, *root)?;
                 slot.insert(pairing.into_paired())
             }
         };
         if *kept {
-            for table in &found.same {
-                plans.trust(table);
+            for identity in &found.same {
+                plans.trust(*identity);
             }
         }
         let mut planned = Vec::new();
@@ -2189,7 +2189,7 @@ impl Vetting<'_> {
 
     fn vouch(&self, plans: &mut Plans, table: &FoundTable, kept: bool) {
         if kept || !self.tables.holds(table) {
-            plans.trust(table);
+            plans.trust(table.identity());
         } else {
             plans.build(table);
         }
