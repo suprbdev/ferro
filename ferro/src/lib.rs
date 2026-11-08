@@ -90,6 +90,7 @@ pub mod list;
 pub mod log;
 pub mod map;
 mod platform;
+mod pool;
 mod prefix;
 mod reclaim;
 mod reentry;

@@ -80,11 +80,12 @@ use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::hash;
 use std::marker::PhantomData;
-use std::mem::{ManuallyDrop, needs_drop};
+use std::mem::{self, ManuallyDrop, needs_drop};
 use std::ops::{Bound, ControlFlow, Deref, Range, RangeBounds};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::AtomicPtr;
@@ -97,6 +98,7 @@ use crate::codec::{
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
+use crate::pool::{Job, Latch, Pool};
 use crate::prefix::Prefix as KeyPrefix;
 use crate::shared::{Erased, Shared, Weak};
 use crate::store::{Lent, MAX_RATIO, Store, compressed, heap_weight};
@@ -2942,7 +2944,7 @@ fn remember<K: Data, V: Data, S: Data>(deferred: Deferred<'_, K, V, S>, sink: &m
     }
 }
 
-fn workers() -> usize {
+pub(crate) fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
         std::thread::available_parallelism().map_or(1, |cores| cores.get().min(MAX_WORKERS))
@@ -6466,35 +6468,323 @@ fn expand_bare<K: Data, V: Data, S: Data>(store: &Store, steps: &mut Vec<Bared<K
 /// through `store`, in key order, each with its value in `old` and in `new`, `None` where the key
 /// is absent: what [`Map::diff`] gives.
 ///
-/// It skips every subtree the two share, as the diff does, and reads the nodes it does not
-/// without decoding their values: it compares each value's bytes and the hashes of its links, and
-/// decodes only the values that differ, so it costs the diff's reads less the decoding of every
-/// value that did not change. A map held in memory has nodes that are not in `store`, and is
-/// diffed as [`Map::diff`] does.
+/// It runs [`differ`] on threads of its own and waits for it.
 ///
 /// # Errors
 ///
 /// Returns the error of a node or value that cannot be read or decoded.
+#[cfg(test)]
 pub(crate) fn changed<K: Data + Ord, V: Data, S: Summary<K, V>>(
     old: &Map<K, V, S>,
     new: &Map<K, V, S>,
     store: &Store,
 ) -> Result<Changed<K, V>> {
+    crate::pool::scope(|pool| differ(pool, store, old, new).wait(pool))
+}
+
+/// The keys whose values differ between `old` and `new`, two versions of a map that both read
+/// through `store`, in key order, each with its value in `old` and in `new`, `None` where the key
+/// is absent, as [`Map::diff`] gives them, found on the threads of `pool`.
+///
+/// It skips every subtree the two share, as the diff does, and reads the nodes it does not
+/// without decoding their values: it compares each value's bytes and the hashes of its links, and
+/// decodes only the values that differ, so it costs the diff's reads less the decoding of every
+/// value that did not change. Two maps with one root read nothing, and a map held in memory, whose
+/// nodes are not in `store`, is diffed as [`Map::diff`] does, here.
+///
+/// The diff runs as work queued on `pool`. Each run of it opens the subtrees of
+/// [`SPLIT_ENTRIES`] entries or more that only one side holds, the largest first, and cuts the two
+/// sides, at the keys both then hold as entries, into runs it queues in turn, leaving out those in
+/// which the two sides are the same; a run without such a subtree is diffed where it is. So the
+/// threads of the pool share the reads, and each node is read once. [`Differing::wait`] waits for
+/// the runs and puts what they found in key order.
+pub(crate) fn differ<'p, K: Data + Ord, V: Data, S: Summary<K, V>>(
+    pool: &Pool<'p>,
+    store: &'p Store,
+    old: &Map<K, V, S>,
+    new: &Map<K, V, S>,
+) -> Differing<K, V> {
     let start = |map: &Map<K, V, S>| match &map.root {
         Link::Empty => Some(Vec::new()),
         Link::Stored { ptr, count, .. } => Some(vec![Bared::Sub(*ptr, *count)]),
         Link::Mem(..) => None,
     };
-    let (Some(mut old_steps), Some(mut new_steps)) = (start(old), start(new)) else {
-        return Ok(old
-            .diff(new)
-            .map(|change| match change {
-                Change::Added(key, value) => (key, None, Some(value)),
-                Change::Removed(key, value) => (key, Some(value), None),
-                Change::Changed(key, before, after) => (key, Some(before), Some(after)),
-            })
-            .collect());
+    let differing = Differing {
+        found: Arc::new(Gathered {
+            latch: Latch::new(0),
+            parts: parking_lot::Mutex::new(Vec::new()),
+        }),
     };
+    match (start(old), start(new)) {
+        (Some(old_steps), Some(new_steps)) => {
+            let same = match (old_steps.first(), new_steps.first()) {
+                (Some(Bared::Sub(a, _)), Some(Bared::Sub(b, _))) => a.hash == b.hash,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                differing.found.latch.add();
+                pool.queue(run::<K, V, S>(
+                    store,
+                    differing.found.clone(),
+                    Box::new([]),
+                    old_steps,
+                    new_steps,
+                ));
+            }
+        }
+        _ => {
+            let found = old
+                .diff(new)
+                .map(|change| match change {
+                    Change::Added(key, value) => (key, None, Some(value)),
+                    Change::Removed(key, value) => (key, Some(value), None),
+                    Change::Changed(key, before, after) => (key, Some(before), Some(after)),
+                })
+                .collect();
+            differing.found.parts.lock().push((Box::new([]), Ok(found)));
+        }
+    }
+    differing
+}
+
+/// A diff that [`differ`] queued.
+pub(crate) struct Differing<K, V> {
+    found: Arc<Gathered<K, V>>,
+}
+
+struct Gathered<K, V> {
+    latch: Latch,
+    parts: parking_lot::Mutex<Vec<FoundRun<K, V>>>,
+}
+
+impl<K, V> Differing<K, V> {
+    /// Waits, running the work queued on `pool` meanwhile, until every run of the diff has run,
+    /// and returns what they found in key order.
+    ///
+    /// # Errors
+    ///
+    /// The error of the first run, in key order, that failed.
+    pub(crate) fn wait(self, pool: &Pool<'_>) -> Result<Changed<K, V>> {
+        pool.help_until(false, || self.found.latch.is_open());
+        let mut parts = mem::take(&mut *self.found.parts.lock());
+        parts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::new();
+        for (_, part) in parts {
+            out.extend(part?);
+        }
+        Ok(out)
+    }
+}
+
+/// The entries a subtree that one side of a run of [`differ`] holds and the other does not must
+/// hold for the run to open it and be cut into runs of its own.
+const SPLIT_ENTRIES: u64 = 1 << 12;
+
+fn run<'p, K: Data + Ord, V: Data, S: Data>(
+    store: &'p Store,
+    found: Arc<Gathered<K, V>>,
+    path: Box<[u32]>,
+    old: Vec<Bared<K>>,
+    new: Vec<Bared<K>>,
+) -> Job<'p> {
+    Box::new(move |pool: &Pool<'p>| {
+        if pool.stopped() {
+            let stopped = Error::Decode("its check was stopped".into());
+            found.parts.lock().push((path, Err(stopped)));
+            found.latch.done(pool);
+            return;
+        }
+        let divided = unwound("diffing a map", || {
+            divide::<K, V, S>(store, old, new).and_then(|divided| match divided {
+                Divided::Runs(runs) => {
+                    for (at, (old, new)) in (0u32..).zip(runs) {
+                        let mut path = path.to_vec();
+                        path.push(at);
+                        found.latch.add();
+                        pool.queue(run::<K, V, S>(store, found.clone(), path.into(), old, new));
+                    }
+                    Ok(None)
+                }
+                Divided::Whole(mut old, mut new) => {
+                    old.reverse();
+                    new.reverse();
+                    diffed::<K, V, S>(store, old, new).map(Some)
+                }
+            })
+        });
+        match divided.and_then(|divided| divided) {
+            Ok(None) => {}
+            Ok(Some(changes)) => found.parts.lock().push((path, Ok(changes))),
+            Err(error) => found.parts.lock().push((path, Err(error))),
+        }
+        found.latch.done(pool);
+    })
+}
+
+/// The steps of a run of [`differ`] on each side, in key order.
+type Sides<K> = (Vec<Bared<K>>, Vec<Bared<K>>);
+
+/// What one run of [`differ`] found, with where the run lies among the others.
+type FoundRun<K, V> = (Box<[u32]>, Result<Changed<K, V>>);
+
+/// What a run of [`differ`] does with its steps.
+enum Divided<K> {
+    /// Queues each of these runs.
+    Runs(Vec<Sides<K>>),
+    /// Diffs the two sides where it is.
+    Whole(Vec<Bared<K>>, Vec<Bared<K>>),
+}
+
+/// Opens, in rounds from the largest down, the subtrees among `old` and `new`, steps in key order,
+/// of [`SPLIT_ENTRIES`] entries or more whose hash no subtree of the other side has, until the two
+/// sides can be cut into runs, or until none is left to open.
+fn divide<K: Data + Ord, V: Data, S: Data>(
+    store: &Store,
+    mut old: Vec<Bared<K>>,
+    mut new: Vec<Bared<K>>,
+) -> Result<Divided<K>> {
+    let subtrees = |steps: &[Bared<K>]| -> HashSet<Hash> {
+        steps
+            .iter()
+            .filter_map(|step| match step {
+                Bared::Sub(ptr, _) => Some(ptr.hash),
+                Bared::Entry(..) => None,
+            })
+            .collect()
+    };
+    let largest = |steps: &[Bared<K>], other: &HashSet<Hash>| {
+        steps
+            .iter()
+            .filter_map(|step| match step {
+                Bared::Sub(ptr, count) if !other.contains(&ptr.hash) => Some(*count),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let mut opened = false;
+    loop {
+        if opened {
+            let runs = cut(old, new);
+            match <[_; 1]>::try_from(runs) {
+                Ok([(one_old, one_new)]) => (old, new) = (one_old, one_new),
+                Err(runs) => return Ok(Divided::Runs(runs)),
+            }
+        }
+        let (old_subtrees, new_subtrees) = (subtrees(&old), subtrees(&new));
+        let top = largest(&old, &new_subtrees).max(largest(&new, &old_subtrees));
+        if top < SPLIT_ENTRIES {
+            return Ok(Divided::Whole(old, new));
+        }
+        let floor = (top / 8).max(SPLIT_ENTRIES);
+        old = open::<K, V, S>(store, old, &new_subtrees, floor)?;
+        new = open::<K, V, S>(store, new, &old_subtrees, floor)?;
+        opened = true;
+    }
+}
+
+/// `steps` with each subtree of `floor` entries or more whose hash is not among `other` replaced
+/// by the steps of its node.
+fn open<K: Data, V: Data, S: Data>(
+    store: &Store,
+    steps: Vec<Bared<K>>,
+    other: &HashSet<Hash>,
+    floor: u64,
+) -> Result<Vec<Bared<K>>> {
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        match step {
+            Bared::Sub(ptr, count) if count >= floor && !other.contains(&ptr.hash) => {
+                out.extend(bare::<K, V, S>(store, ptr)?);
+            }
+            step => out.push(step),
+        }
+    }
+    Ok(out)
+}
+
+/// Cuts `old` and `new`, steps in key order, after each key both hold as an entry, and returns
+/// the runs between the cuts in which the two differ, in key order.
+///
+/// Where one side of a run holds nothing, its other side is cut after each subtree as well, as
+/// every entry there is one the two do not share.
+fn cut<K: Ord>(old: Vec<Bared<K>>, new: Vec<Bared<K>>) -> Vec<Sides<K>> {
+    fn entries<K>(steps: &[Bared<K>]) -> Vec<(usize, &K)> {
+        steps
+            .iter()
+            .enumerate()
+            .filter_map(|(at, step)| match step {
+                Bared::Entry(key, _) => Some((at, key)),
+                Bared::Sub(..) => None,
+            })
+            .collect()
+    }
+    let mut cuts = Vec::new();
+    {
+        let (old_entries, new_entries) = (entries(&old), entries(&new));
+        let (mut i, mut j) = (0, 0);
+        while let (Some(&(a, x)), Some(&(b, y))) = (old_entries.get(i), new_entries.get(j)) {
+            match x.cmp(y) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    cuts.push((a + 1, b + 1));
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    }
+    cuts.push((old.len(), new.len()));
+    let (mut old, mut new) = (old.into_iter(), new.into_iter());
+    let (mut from_old, mut from_new) = (0, 0);
+    let mut runs = Vec::new();
+    for (to_old, to_new) in cuts {
+        let run_old: Vec<Bared<K>> = old.by_ref().take(to_old - from_old).collect();
+        let run_new: Vec<Bared<K>> = new.by_ref().take(to_new - from_new).collect();
+        (from_old, from_new) = (to_old, to_new);
+        let same = run_old.len() == run_new.len()
+            && run_old.iter().zip(&run_new).all(|pair| match pair {
+                (Bared::Sub(a, _), Bared::Sub(b, _)) => a.hash == b.hash,
+                (Bared::Entry(a, x), Bared::Entry(b, y)) => a.cmp(b).is_eq() && x.same(y),
+                _ => false,
+            });
+        if same {
+            continue;
+        }
+        match (run_old.is_empty(), run_new.is_empty()) {
+            (true, false) => runs.extend(apart(run_new).map(|run| (Vec::new(), run))),
+            (false, true) => runs.extend(apart(run_old).map(|run| (run, Vec::new()))),
+            _ => runs.push((run_old, run_new)),
+        }
+    }
+    runs
+}
+
+/// `steps` cut after each subtree.
+fn apart<K>(steps: Vec<Bared<K>>) -> impl Iterator<Item = Vec<Bared<K>>> {
+    let mut steps = steps.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let mut run = Vec::new();
+        for step in steps.by_ref() {
+            let sub = matches!(step, Bared::Sub(..));
+            run.push(step);
+            if sub {
+                break;
+            }
+        }
+        (!run.is_empty()).then_some(run)
+    })
+}
+
+/// The changes between `old_steps` and `new_steps`, two runs of steps over the same keys, each
+/// reversed so that the step first in key order is last.
+fn diffed<K: Data + Ord, V: Data, S: Data>(
+    store: &Store,
+    mut old_steps: Vec<Bared<K>>,
+    mut new_steps: Vec<Bared<K>>,
+) -> Result<Changed<K, V>> {
     let mut out = Vec::new();
     loop {
         match (old_steps.last(), new_steps.last()) {
@@ -7305,6 +7595,92 @@ mod tests {
                 })
                 .collect();
             assert_eq!(found, expected);
+        }
+    }
+
+    #[test]
+    fn changed_finds_what_diff_finds_when_split_among_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::<Map<u64, String>>::open(dir.path().join("split.ferro")).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        db.update(|map| {
+            for key in 0..40_000u64 {
+                map.insert(key * 7, format!("v{key}"));
+            }
+        })
+        .unwrap();
+        db.update(|map| {
+            for _ in 0..2_000 {
+                let key = next() % 300_000;
+                match next() % 4 {
+                    0 => {
+                        map.remove(&key);
+                    }
+                    1 => {
+                        map.insert(key, "s".repeat(1000));
+                    }
+                    _ => {
+                        map.insert(key, format!("e{}", next() % 9));
+                    }
+                }
+            }
+        })
+        .unwrap();
+        db.update(|map| {
+            for key in 0..20_000u64 {
+                map.insert(1_000_000 + key, format!("a{key}"));
+                map.insert(100_000 + key * 7 + 3, format!("m{key}"));
+            }
+        })
+        .unwrap();
+        db.update(|map| {
+            for key in 10_000..20_000u64 {
+                map.remove(&(key * 7));
+            }
+        })
+        .unwrap();
+        db.update(|map| *map = Map::new()).unwrap();
+        let versions: Vec<_> = (1..=5).map(|version| db.at(version).unwrap()).collect();
+        let store = versions[0].store.clone().unwrap();
+        let pairs = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (0, 3),
+            (3, 0),
+            (2, 0),
+            (0, 4),
+            (4, 2),
+            (1, 1),
+        ];
+        for (old, new) in pairs {
+            let (old, new) = (&*versions[old], &*versions[new]);
+            let found: Vec<(u64, Option<String>, Option<String>)> = changed(old, new, &store)
+                .unwrap()
+                .into_iter()
+                .map(|(key, before, after)| {
+                    let owned = |value: Option<Val<String>>| value.map(Val::into_owned);
+                    (key, owned(before), owned(after))
+                })
+                .collect();
+            let expected: Vec<(u64, Option<String>, Option<String>)> = old
+                .diff(new)
+                .map(|change| match change {
+                    Change::Added(key, value) => (key, None, Some(value.into_owned())),
+                    Change::Removed(key, value) => (key, Some(value.into_owned()), None),
+                    Change::Changed(key, before, after) => {
+                        (key, Some(before.into_owned()), Some(after.into_owned()))
+                    }
+                })
+                .collect();
+            assert_eq!(found.len(), expected.len());
+            assert!(found == expected);
         }
     }
 }

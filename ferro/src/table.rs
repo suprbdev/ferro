@@ -148,9 +148,10 @@ use std::sync::Arc;
 use crate::codec::{Data, Decoder, Description, Encoder, FoundTable, Hash};
 use crate::error::{Error, Result};
 use crate::map::{
-    Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, changed, fatal, same_value,
-    unwound,
+    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ,
+    fatal, same_value, unwound,
 };
+use crate::pool::Pool;
 use crate::prefix::Prefix;
 use crate::store::{Store, fresh_reads};
 
@@ -282,6 +283,159 @@ pub trait TableData<T: Record>: Data + Default {
     fn differing(self, _other: &Self, _slots: &[bool], _wide: bool) -> Option<&'static str> {
         None
     }
+    /// Whether working out the entries a row gives reads the file, as an `each` index over a
+    /// [`Set`](crate::Set) does. The default, for a table without such an index, is `false`.
+    #[doc(hidden)]
+    fn indexing_reads() -> bool {
+        false
+    }
+    /// Checks that each index of `later` whose place in `slots` is `true` differs from the same
+    /// index of `self` by exactly what taking out the entries of the rows that `rows` returns as
+    /// gone and putting in those of the rows it returns as come changes.
+    ///
+    /// It starts the diff of each such index with [`Differ::start`], then calls `rows`, then
+    /// checks each index in turn with [`Differ::index`], so the diffs of the indexes and of the
+    /// rows share the threads of `differ`.
+    ///
+    /// Returns the name of the first index that differs by anything else, with how.
+    ///
+    /// # Errors
+    ///
+    /// The error of `rows`, and of a node of either index that cannot be read or decoded.
+    #[doc(hidden)]
+    fn diff_slots(
+        &self,
+        _later: &Self,
+        _slots: &[bool],
+        _differ: &Differ<'_, '_>,
+        rows: &mut dyn FnMut() -> Result<RowChanges<T>>,
+    ) -> Result<Option<(&'static str, Fault)>> {
+        rows().map(|_| None)
+    }
+}
+
+/// The rows that changed between two versions of a table, which [`TableData::diff_slots`] takes
+/// the entries of out of each index and puts in.
+#[doc(hidden)]
+pub struct RowChanges<T> {
+    /// The rows of the earlier version that the later one does not hold as they were.
+    pub gone: Vec<Val<T>>,
+    /// The rows of the later version that the earlier one did not hold as they are.
+    pub come: Vec<Val<T>>,
+}
+
+/// Diffs the maps of two versions of a table, which the check that the later one's indexes agree
+/// with its rows compares, on the threads of a pool, reading through a store.
+#[doc(hidden)]
+pub struct Differ<'a, 'p> {
+    pool: &'a Pool<'p>,
+    store: &'p Store,
+}
+
+/// A diff of two versions of an index that [`Differ::start`] started.
+#[doc(hidden)]
+pub struct Started<K, V>(Differing<K, V>);
+
+impl<'p> Differ<'_, 'p> {
+    /// Starts the diff of `old` and `new`, two versions of one index, on the threads of the pool.
+    pub fn start<K: Data + Ord, V: Data>(&self, old: &Map<K, V>, new: &Map<K, V>) -> Started<K, V> {
+        Started(differ(self.pool, self.store, old, new))
+    }
+
+    /// Waits for the diff `started`, of an index that holds exactly the entries its rows give
+    /// and a later version of it, and checks that it is exactly what taking `gone`, the entries
+    /// of the rows that left or changed, out and putting `come`, those of the rows that came or
+    /// changed, in changes: keys compared by `Ord` and values by their encoding. An entry that
+    /// `gone` and `come` both hold with the same encoding stays.
+    ///
+    /// Returns [`Fault::Shared`] when two entries of `come` fall on one key, or one falls on a
+    /// key that the earlier version holds and `gone` does not take out, as two rows that share a
+    /// value of a unique index give, and [`Fault::Differs`] for any other difference.
+    ///
+    /// # Errors
+    ///
+    /// The error of a node of either version that cannot be read or decoded.
+    pub fn index<K: Data + Ord, V: Data>(
+        &self,
+        started: Started<K, V>,
+        gone: Vec<(K, V)>,
+        come: Vec<(K, V)>,
+    ) -> Result<Option<Fault>> {
+        Ok(diff_index(started.0.wait(self.pool)?, gone, come))
+    }
+}
+
+/// How an index differs from what the rows that changed give, as [`Differ::index`] finds it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Two rows share a value of a unique index: an entry of the rows that came falls on a key
+    /// that another of them, or a row that did not change, holds.
+    Shared,
+    /// The index changed by anything else than the entries of the rows that left and came.
+    Differs,
+}
+
+/// The check [`Differ::index`] makes of `found`, the diff it waited for.
+fn diff_index<K: Data + Ord, V: Data>(
+    found: Changed<K, V>,
+    mut gone: Vec<(K, V)>,
+    mut come: Vec<(K, V)>,
+) -> Option<Fault> {
+    gone.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    come.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let repeats = |entries: &[(K, V)]| entries.windows(2).any(|pair| pair[0].0 == pair[1].0);
+    if repeats(&come) {
+        return Some(Fault::Shared);
+    }
+    if repeats(&gone) {
+        return Some(Fault::Differs);
+    }
+    let mut expected = Vec::with_capacity(gone.len().max(come.len()));
+    let (mut gone, mut come) = (gone.into_iter().peekable(), come.into_iter().peekable());
+    loop {
+        let order = match (gone.peek(), come.peek()) {
+            (Some(out), Some(into)) => out.0.cmp(&into.0),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
+        match order {
+            Ordering::Less => expected.extend(gone.next().map(|(key, out)| (key, Some(out), None))),
+            Ordering::Greater => {
+                expected.extend(come.next().map(|(key, into)| (key, None, Some(into))));
+            }
+            Ordering::Equal => {
+                if let (Some((_, out)), Some((key, into))) = (gone.next(), come.next())
+                    && !V::same_encoding(&out, &into)
+                {
+                    expected.push((key, Some(out), Some(into)));
+                }
+            }
+        }
+    }
+    let same = |found: &Option<Val<V>>, expected: &Option<V>| match (found, expected) {
+        (None, None) => true,
+        (Some(found), Some(expected)) => V::same_encoding(found, expected),
+        _ => false,
+    };
+    if found.len() == expected.len()
+        && found.iter().zip(&expected).all(|(found, expected)| {
+            found.0 == expected.0 && same(&found.1, &expected.1) && same(&found.2, &expected.2)
+        })
+    {
+        return None;
+    }
+    let mut expected = expected.iter().peekable();
+    for (key, before, _) in &found {
+        while expected.next_if(|(other, ..)| other < key).is_some() {}
+        if let Some((_, None, Some(_))) = expected.next_if(|(other, ..)| other == key)
+            && before.is_some()
+        {
+            return Some(Fault::Shared);
+        }
+    }
+    Some(Fault::Differs)
 }
 
 /// Work on one index of a table that [`run_slots`] runs, which answers with the name of the
@@ -353,6 +507,7 @@ pub fn noted<'a, T: Record, R>(
         TypeId::of::<T::Table>(),
         type_name::<T::Table>(),
         agree::<T>,
+        !T::Table::indexing_reads(),
     );
     Ok(value)
 }
@@ -377,9 +532,15 @@ pub fn same_index<K: Data + Ord, V: Data>(built: &Map<K, V>, stored: &Map<K, V>)
 /// its rows give, and that each row is stored under its own key, reading both through `store`.
 ///
 /// With `base`, a table of the same type whose indexes agree with its rows and which stores every
-/// index `table` does, it applies the rows that changed from `base` to `table` to `base`'s indexes,
+/// index `table` does, it diffs the rows of the two and each index of the two on the threads of
+/// `pool`, and checks that each index changed by exactly the entries of the rows that changed,
 /// which costs what changed. Without one it builds the indexes from every row.
-fn agree<T: Record>(table: &FoundTable, base: Option<&FoundTable>, store: &Store) -> Result<()> {
+fn agree<'p, T: Record>(
+    table: &FoundTable,
+    base: Option<&FoundTable>,
+    store: &'p Store,
+    pool: &Pool<'p>,
+) -> Result<()> {
     let read = |found: &FoundTable| {
         T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))
     };
@@ -387,23 +548,48 @@ fn agree<T: Record>(table: &FoundTable, base: Option<&FoundTable>, store: &Store
     if !slots.contains(&true) {
         return Ok(());
     }
-    let base = match base {
-        Some(base) => {
-            let (base, held) = read(base)?;
-            let covers = slots.iter().zip(&held).all(|(slot, held)| !slot || *held);
-            covers.then_some(base)
+    if let Some(base) = base {
+        let (base, held) = read(base)?;
+        if slots.iter().zip(&held).all(|(slot, held)| !slot || *held) {
+            return diffed::<T>(&base, &table, &slots, &Differ { pool, store });
         }
-        None => None,
-    };
-    let (indexes, rows) = match base {
-        Some(base) => applied::<T>(base, &table, &slots, store)?,
-        None => built::<T>(&table, &slots)?,
-    };
+    }
+    let (indexes, rows) = built::<T>(&table, &slots)?;
     match indexes.differing(&table, &slots, rows >= WIDE_ROWS) {
         Some(index) => Err(Error::Decode(format!(
             "index {index} does not hold exactly the entries its rows give"
         ))),
         None => Ok(()),
+    }
+}
+
+fn diffed<T: Record>(
+    base: &T::Table,
+    table: &T::Table,
+    slots: &[bool],
+    differ: &Differ<'_, '_>,
+) -> Result<()> {
+    let mut rows = Some(differ.start(base.rows(), table.rows()));
+    let mut moved = || -> Result<RowChanges<T>> {
+        let (mut gone, mut come) = (Vec::new(), Vec::new());
+        let started = rows.take().ok_or(Error::Detached)?;
+        for (key, before, after) in started.0.wait(differ.pool)? {
+            gone.extend(before);
+            if let Some(after) = after {
+                owned::<T>(&key, &after)?;
+                come.push(after);
+            }
+        }
+        Ok(RowChanges { gone, come })
+    };
+    match base.diff_slots(table, slots, differ, &mut moved)? {
+        None => Ok(()),
+        Some((index, Fault::Shared)) => Err(Error::Decode(format!(
+            "two rows share a value of unique index {index}"
+        ))),
+        Some((index, Fault::Differs)) => Err(Error::Decode(format!(
+            "index {index} does not hold exactly the entries its rows give"
+        ))),
     }
 }
 
@@ -413,25 +599,6 @@ const BUILT_BATCH: usize = 1 << 16;
 
 /// The rows past which the check of a table works on its indexes with a thread each.
 const WIDE_ROWS: usize = 1 << 10;
-
-fn applied<T: Record>(
-    mut indexes: T::Table,
-    table: &T::Table,
-    slots: &[bool],
-    store: &Store,
-) -> Result<(T::Table, usize)> {
-    let (mut gone, mut come) = (Vec::new(), Vec::new());
-    for (key, before, after) in changed(indexes.rows(), table.rows(), store)? {
-        gone.extend(before);
-        if let Some(after) = after {
-            owned::<T>(&key, &after)?;
-            come.push(after);
-        }
-    }
-    let rows = gone.len() + come.len();
-    placed::<T>(&mut indexes, &gone, &come, slots)?;
-    Ok((indexes, rows))
-}
 
 fn built<T: Record>(table: &T::Table, slots: &[bool]) -> Result<(T::Table, usize)> {
     let mut indexes = T::Table::default();
@@ -4032,6 +4199,10 @@ pub fn index_counts<I: Data + Ord, K: Data + Ord, S: Data>(
 pub trait IndexEach {
     /// The element type, which the index is keyed on.
     type Value: Data + Ord;
+    /// Whether [`values`](IndexEach::values) reads the file, as the nodes of a
+    /// [`Set`](crate::Set) are read.
+    #[doc(hidden)]
+    const READS: bool = false;
 
     /// The elements to index.
     fn values(&self) -> Vec<Self::Value>;
@@ -4055,6 +4226,7 @@ impl<X: Data + Ord> IndexEach for std::collections::BTreeSet<X> {
 
 impl<X: Data + Ord> IndexEach for crate::set::Set<X> {
     type Value = X;
+    const READS: bool = true;
 
     fn values(&self) -> Vec<X> {
         self.iter().collect()

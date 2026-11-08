@@ -2013,6 +2013,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let total = count as u64 + 1;
     let slots: Vec<usize> = (0..count).collect();
     let vars: Vec<Ident> = (0..count).map(|i| format_ident!("__index{}", i)).collect();
+    let started: Vec<Ident> = (0..count)
+        .map(|i| format_ident!("__started{}", i))
+        .collect();
+    let each_tys: Vec<&Type> = indexes
+        .iter()
+        .filter(|ix| matches!(ix.kind, IndexKind::Each))
+        .map(|ix| &ix.fields[0].1)
+        .collect();
     let reindex_fns: Vec<Ident> = index_fields
         .iter()
         .map(|field| format_ident!("__reindex_{}", field))
@@ -2220,6 +2228,42 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         }
                     )*
                     ::ferro::table::run_slots(__tasks, __wide)
+                }
+
+                fn indexing_reads() -> bool {
+                    false #(|| <#each_tys as ::ferro::table::IndexEach>::READS)*
+                }
+
+                fn diff_slots(
+                    &self,
+                    __later: &Self,
+                    __slots: &[bool],
+                    __differ: &::ferro::table::Differ<'_, '_>,
+                    __rows: &mut dyn ::std::ops::FnMut() -> ::ferro::Result<::ferro::table::RowChanges<#name>>,
+                ) -> ::ferro::Result<::std::option::Option<(&'static str, ::ferro::table::Fault)>> {
+                    #(
+                        let #started = (__slots.get(#slots) == ::std::option::Option::Some(&true))
+                            .then(|| __differ.start(&self.#index_fields, &__later.#index_fields));
+                    )*
+                    let __moved = __rows()?;
+                    #(
+                        if let ::std::option::Option::Some(__started) = #started {
+                            let mut __old = ::std::vec::Vec::new();
+                            for __r in &__moved.gone {
+                                let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (&**__r, &mut __old);
+                                #entries
+                            }
+                            let mut __new = ::std::vec::Vec::new();
+                            for __r in &__moved.come {
+                                let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (&**__r, &mut __new);
+                                #entries
+                            }
+                            if let ::std::option::Option::Some(__fault) = __differ.index(__started, __old, __new)? {
+                                return ::std::result::Result::Ok(::std::option::Option::Some((#index_names, __fault)));
+                            }
+                        }
+                    )*
+                    ::std::result::Result::Ok(::std::option::Option::None)
                 }
 
                 fn differing(

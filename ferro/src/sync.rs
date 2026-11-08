@@ -24,14 +24,15 @@ use hashbrown::HashTable;
 use hashbrown::hash_table as table;
 
 use crate::codec::{
-    Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, Plans, Ptr, Recalled, Shape,
-    Tables, push_varint,
+    Checks, Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, Plans, Ptr, Recalled,
+    Shape, Tables, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
-use crate::map::{Map, unwound};
+use crate::map::Map;
+use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
 use crate::store::{Record, Staging, Store, Txn, compressed, staged};
 
@@ -1991,13 +1992,15 @@ impl Vetting<'_> {
     }
 
     fn view(&self) -> &Store {
-        self.view.get_or_init(|| {
-            self.store.view(
-                self.carried as u64,
-                self.rerun_budget as u64,
-                self.zero_width_budget,
-            )
-        })
+        self.view.get_or_init(|| self.fresh_view())
+    }
+
+    fn fresh_view(&self) -> Store {
+        self.store.view(
+            self.carried as u64,
+            self.rerun_budget as u64,
+            self.zero_width_budget,
+        )
     }
 
     fn tally(&self, zero_width: u64) -> Result<()> {
@@ -2047,8 +2050,14 @@ impl Vetting<'_> {
     }
 
     fn tables_of(&self, root: Ptr) -> Result<(Vec<FoundTable>, bool)> {
+        let (tables, held, zero_width) = self.root_tables(root)?;
+        self.tally(zero_width)?;
+        Ok((tables, held))
+    }
+
+    fn root_tables(&self, root: Ptr) -> Result<(Vec<FoundTable>, bool, u64)> {
         let tables = RefCell::new(Vec::new());
-        let held = match self.staging.id_of(&root.hash) {
+        let (held, zero_width) = match self.staging.id_of(&root.hash) {
             Some(id) => {
                 let object = self.staging.read_object(Ptr {
                     hash: root.hash,
@@ -2058,67 +2067,105 @@ impl Vetting<'_> {
                     .root_kind
                     .check_tables(&object.body, &object.links, &tables)
                     .map_err(|error| undecodable(self.root_kind, error))?;
-                self.tally(zero_width)?;
-                false
+                (false, zero_width)
             }
             None => {
                 let object = self.store.read_object(root)?;
                 self.root_kind
                     .check_tables(&object.body, &object.links, &tables)
                     .map_err(rejected)?;
-                true
+                (true, 0)
             }
         };
-        Ok((tables.into_inner(), held))
+        Ok((tables.into_inner(), held, zero_width))
     }
 
-    fn agree(&mut self, lineage: &[Descent]) -> Result<()> {
-        if self.tables.is_empty() {
-            return Ok(());
+    fn plan(
+        &self,
+        plans: &mut Plans,
+        listed: &mut HashSet<Hash>,
+        (root, parent): &Descent,
+        tables_of: impl Fn(Ptr) -> Result<(Vec<FoundTable>, bool)>,
+    ) -> Result<Vec<FoundTable>> {
+        if self.staging.id_of(&root.hash).is_none() || !listed.insert(root.hash) {
+            return Ok(Vec::new());
         }
+        let (tables, _) = tables_of(*root)?;
+        if tables.is_empty() {
+            return Ok(tables);
+        }
+        let base = match parent {
+            Some((parent, kept)) => {
+                let (base, held) = tables_of(*parent)?;
+                for table in base.iter().filter(|_| held) {
+                    if *kept || !self.tables.holds(table) {
+                        plans.trust(table);
+                    } else {
+                        plans.build(table);
+                    }
+                }
+                base
+            }
+            None => Vec::new(),
+        };
+        plans.pair(&tables, &base);
+        Ok(tables)
+    }
+
+    fn walk(&mut self, roots: &[Ptr], mut before: impl FnMut(&Self, usize)) -> Result<()> {
+        for (at, root) in roots.iter().enumerate() {
+            before(self, at);
+            self.queue.push((*root, self.root_kind.clone(), None));
+            self.run()?;
+        }
+        self.settle()
+    }
+
+    fn early<'p>(&self, early: &mut Early, descent: &Descent, pool: &Pool<'p>, view: &'p Store) {
+        if !early.on {
+            return;
+        }
+        let planned = self.plan(&mut early.plans, &mut early.listed, descent, |root| {
+            self.root_tables(root)
+                .map(|(tables, held, _)| (tables, held))
+        });
+        match planned {
+            Ok(tables) => {
+                for table in &tables {
+                    if table.beside
+                        && let Some(Some(base)) = early.plans.base(table)
+                    {
+                        early.checks.start(pool, view, table, Some(base));
+                    }
+                }
+            }
+            Err(_) => early.on = false,
+        }
+    }
+
+    fn agree<'p>(
+        &mut self,
+        lineage: &[Descent],
+        checks: Checks,
+        pool: &Pool<'p>,
+        view: &'p Store,
+    ) -> Result<()> {
         let mut plans = Plans::default();
         let mut listed = HashSet::new();
-        for (root, parent) in lineage {
-            if self.staging.id_of(&root.hash).is_none() || !listed.insert(root.hash) {
-                continue;
-            }
-            let (tables, _) = self.tables_of(*root)?;
-            if tables.is_empty() {
-                continue;
-            }
-            let base = match parent {
-                Some((parent, kept)) => {
-                    let (base, held) = self.tables_of(*parent)?;
-                    for table in base.iter().filter(|_| held) {
-                        if *kept || !self.tables.holds(table) {
-                            plans.trust(table);
-                        } else {
-                            plans.build(table);
-                        }
-                    }
-                    base
-                }
-                None => Vec::new(),
-            };
-            plans.pair(&tables, &base);
+        for descent in lineage {
+            self.plan(&mut plans, &mut listed, descent, |root| {
+                self.tables_of(root)
+            })?;
         }
         let found = mem::take(&mut self.tables).into_found();
-        let (view, staging) = (self.view(), self.staging);
-        staging.overlaid(view, || {
-            for table in &found {
-                let Some(base) = plans.base(table) else {
-                    continue;
-                };
-                let agreed = unwound("checking its indexes", || (table.agree)(table, base, view));
-                if let Some(error) = view.overdrawn() {
-                    return Err(error);
-                }
-                agreed
-                    .and_then(|agreed| agreed)
-                    .map_err(|error| disagreeing(table, error))?;
-            }
-            Ok(())
-        })
+        let failed = checks.finish(pool, view, &plans, &found);
+        if let Some(error) = view.overdrawn() {
+            return Err(error);
+        }
+        match failed {
+            Some((table, error)) => Err(disagreeing(table, error)),
+            None => Ok(()),
+        }
     }
 
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
@@ -2746,6 +2793,19 @@ struct Arrival {
 
 type Descent = (Ptr, Option<(Ptr, bool)>);
 
+/// The checks that the tables of each version's root agree with their rows, planned and queued
+/// before the walk reaches the version, so that they run beside the walk: those against the table
+/// of the version before, whose diffs read what the walk has not checked yet as data that may not
+/// decode. A table built from its rows, or one whose rows give entries only by reading the file,
+/// as an `each` index over a `Set` does, waits for the walk, since that reads as a map reads,
+/// which takes a node that does not decode for a damaged file.
+struct Early {
+    on: bool,
+    plans: Plans,
+    listed: HashSet<Hash>,
+    checks: Checks,
+}
+
 fn lineage(
     store: &Store,
     objects: &impl Objects,
@@ -2939,20 +2999,61 @@ fn resolve<O: Objects>(
             view: OnceCell::new(),
             recalled: (order.len() > 1).then(Recalled::default),
         };
-        for (_, _, id) in &order {
-            let sent = landing
-                .commits
-                .get(*id)
-                .expect("an ordered commit was walked");
-            if let Some(root) = sent.root {
-                vetting.queue.push((root, root_kind.clone(), None));
-                vetting.run()?;
+        let roots: Vec<Ptr> = order
+            .iter()
+            .filter_map(|(_, _, id)| {
+                landing
+                    .commits
+                    .get(*id)
+                    .expect("an ordered commit was walked")
+                    .root
+            })
+            .collect();
+        let tabled = roots.first().is_some_and(|root| {
+            vetting
+                .root_tables(*root)
+                .is_ok_and(|(tables, ..)| !tables.is_empty())
+        });
+        if tabled {
+            let descents = lineage(store, objects, &landing, &order);
+            let agreeing = vetting.fresh_view();
+            staging.overlaid(&agreeing, || {
+                pool::scope(|pool| {
+                    let mut early = Early {
+                        on: descents.is_ok(),
+                        plans: Plans::default(),
+                        listed: HashSet::new(),
+                        checks: Checks::default(),
+                    };
+                    let walked = vetting.walk(&roots, |vetting, at| {
+                        if let Ok(descents) = &descents
+                            && let Some(descent) = descents.get(at)
+                        {
+                            vetting.early(&mut early, descent, pool, &agreeing);
+                        }
+                    });
+                    if walked.is_err() || vetting.tables.is_empty() {
+                        pool.stop();
+                        return walked;
+                    }
+                    match descents {
+                        Ok(lineage) => vetting.agree(&lineage, early.checks, pool, &agreeing),
+                        Err(error) => {
+                            pool.stop();
+                            Err(error)
+                        }
+                    }
+                })
+            })?;
+        } else {
+            vetting.walk(&roots, |_, _| {})?;
+            if !vetting.tables.is_empty() {
+                let lineage = lineage(store, objects, &landing, &order)?;
+                let agreeing = vetting.fresh_view();
+                staging.overlaid(&agreeing, || {
+                    pool::scope(|pool| vetting.agree(&lineage, Checks::default(), pool, &agreeing))
+                })?;
             }
-        }
-        vetting.settle()?;
-        if !vetting.tables.is_empty() {
-            let lineage = lineage(store, objects, &landing, &order)?;
-            vetting.agree(&lineage)?;
         }
         drop(vetting);
         linked = Some(streamed.links);

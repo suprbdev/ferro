@@ -19,7 +19,7 @@ use crate::codec::{
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
 use crate::log::{Closures, Entry};
-use crate::map::{Map, unwound};
+use crate::map::Map;
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::refs::{self, Root};
@@ -364,23 +364,15 @@ fn agreed(
         };
         plans.pair(&found, &base);
     }
-    for table in tables.into_found() {
-        let Some(base) = plans.base(&table) else {
-            continue;
-        };
-        unwound("checking its indexes", || {
-            (table.agree)(&table, base, store)
-        })
-        .and_then(|agreed| agreed)
-        .map_err(|error| match error {
-            Error::Decode(message) => Error::Corrupt(format!(
-                "a table ({}) has indexes that do not agree with its rows: {message}",
-                table.name
-            )),
-            other => other,
-        })?;
+    let found = tables.into_found();
+    match plans.check(&found, store) {
+        Some((table, Error::Decode(message))) => Err(Error::Corrupt(format!(
+            "a table ({}) has indexes that do not agree with its rows: {message}",
+            table.name
+        ))),
+        Some((_, error)) => Err(error),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Where the records that a compaction would copy lie in a file, from [`layout`].

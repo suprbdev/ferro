@@ -43,8 +43,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
+use crate::map::unwound;
+use crate::pool::{self, Pool};
 use crate::shared::Erased;
 use crate::store::Store;
 
@@ -1007,13 +1012,14 @@ pub(crate) trait Claim: Any + Send + Sync {
 pub(crate) type Found = Vec<(usize, Kind)>;
 
 /// What checks that the indexes of a table agree with its rows: given the table, a table of the
-/// same type to work from, whose indexes are known to agree with its rows, and the store both read
-/// from, it returns [`Error::Decode`] for an index that does not hold exactly the entries the rows
-/// give.
-pub(crate) type Agree = fn(&FoundTable, Option<&FoundTable>, &Store) -> Result<()>;
+/// same type to work from, whose indexes are known to agree with its rows, the store both read
+/// from and the pool whose threads share the work, it returns [`Error::Decode`] for an index that
+/// does not hold exactly the entries the rows give.
+pub(crate) type Agree =
+    for<'p> fn(&FoundTable, Option<&FoundTable>, &'p Store, &Pool<'p>) -> Result<()>;
 
 /// A table value that a typed check found, kept for the check that its indexes agree with its
-/// rows, which reads the rows and so runs once every object the check reaches has passed.
+/// rows, which reads the rows and so counts only once every object the check reaches has passed.
 #[derive(Clone)]
 pub(crate) struct FoundTable {
     /// The table's type.
@@ -1022,6 +1028,10 @@ pub(crate) struct FoundTable {
     pub(crate) name: &'static str,
     /// Checks the table's indexes against its rows.
     pub(crate) agree: Agree,
+    /// Whether the check against the table of the version before may run before the rows it
+    /// reads have passed their own checks, which it may unless working out the entries of a row
+    /// reads the file.
+    pub(crate) beside: bool,
     /// The table value's bytes, as its parent encodes it.
     pub(crate) body: Box<[u8]>,
     /// The table value's links.
@@ -1142,6 +1152,105 @@ impl Plans {
             Some(Plan::From(base)) => Some(Some(base)),
             Some(Plan::Built) | None => Some(None),
         }
+    }
+
+    /// Checks, as planned, each table among `found` that is not trusted, reading through `store`,
+    /// and returns the first, in the order of `found`, whose check failed, with its error.
+    ///
+    /// The checks run on the threads of a [`pool::scope`], as [`Checks::finish`] runs them.
+    pub(crate) fn check<'a>(
+        &self,
+        found: &'a [FoundTable],
+        store: &Store,
+    ) -> Option<(&'a FoundTable, Error)> {
+        pool::scope(|pool| Checks::default().finish(pool, store, self, found))
+    }
+}
+
+/// The checks that tables agree with their rows that are queued on a [`Pool`], each once, by the
+/// table it checks and the table it checks it against, so that a receive can queue the check of a
+/// version's tables as soon as it knows how to check them and run it beside its walk.
+#[derive(Default)]
+pub(crate) struct Checks(HashMap<CheckOf, Arc<Verdict>>);
+
+/// The table a check of [`Checks`] checks and the table it checks it against, by type and hash.
+type CheckOf = ((TypeId, Hash), Option<(TypeId, Hash)>);
+
+/// What one check of [`Checks`] found, once it has run.
+#[derive(Default)]
+struct Verdict {
+    done: AtomicBool,
+    failed: Mutex<Option<Error>>,
+}
+
+impl Checks {
+    /// Queues on `pool` the check of `table` against `base`, as [`Plans::base`] gives it, reading
+    /// through `store`, unless it is queued already.
+    pub(crate) fn start<'p>(
+        &mut self,
+        pool: &Pool<'p>,
+        store: &'p Store,
+        table: &FoundTable,
+        base: Option<&FoundTable>,
+    ) {
+        self.queued(pool, store, table, base);
+    }
+
+    fn queued<'p>(
+        &mut self,
+        pool: &Pool<'p>,
+        store: &'p Store,
+        table: &FoundTable,
+        base: Option<&FoundTable>,
+    ) -> Arc<Verdict> {
+        let key = (table.identity(), base.map(FoundTable::identity));
+        if let Some(verdict) = self.0.get(&key) {
+            return verdict.clone();
+        }
+        let verdict = Arc::new(Verdict::default());
+        self.0.insert(key, verdict.clone());
+        let (table, base, told) = (table.clone(), base.cloned(), verdict.clone());
+        pool.check(pool::job(move |pool| {
+            if !pool.stopped() {
+                let agreed = unwound("checking its indexes", || {
+                    (table.agree)(&table, base.as_ref(), store, pool)
+                });
+                if let Err(error) = agreed.and_then(|agreed| agreed) {
+                    *told.failed.lock() = Some(error);
+                }
+            }
+            told.done.store(true, Ordering::Release);
+            pool.wake();
+        }));
+        verdict
+    }
+
+    /// Checks each table among `found` that `plans` does not trust, against the table it plans,
+    /// queuing on `pool` those checks not queued yet, waits for them while it helps run what is
+    /// queued, and returns the first table, in the order of `found`, whose check failed, with its
+    /// error.
+    pub(crate) fn finish<'a, 'p>(
+        mut self,
+        pool: &Pool<'p>,
+        store: &'p Store,
+        plans: &Plans,
+        found: &'a [FoundTable],
+    ) -> Option<(&'a FoundTable, Error)> {
+        let waiting: Vec<_> = found
+            .iter()
+            .filter_map(|table| {
+                let base = plans.base(table)?;
+                Some((table, self.queued(pool, store, table, base)))
+            })
+            .collect();
+        pool.help_until(true, || {
+            waiting
+                .iter()
+                .all(|(_, verdict)| verdict.done.load(Ordering::Acquire))
+        });
+        waiting
+            .into_iter()
+            .find_map(|(table, verdict)| verdict.failed.lock().take().map(|error| (table, error)))
     }
 }
 
@@ -1459,14 +1568,15 @@ impl<'a> Decoder<'a> {
     }
 
     /// Notes the table value read since `start`, of the table type `id` named `name`, for
-    /// `agree` to check once the typed check this decoder belongs to has passed, if it collects
-    /// tables.
+    /// `agree` to check once the typed check this decoder belongs to has passed, or beside it
+    /// with `beside`, as [`FoundTable::beside`] says, if it collects tables.
     pub(crate) fn found_table(
         &self,
         start: Checkpoint,
         id: TypeId,
         name: &'static str,
         agree: Agree,
+        beside: bool,
     ) {
         let Some(tables) = self.tables else {
             return;
@@ -1477,6 +1587,7 @@ impl<'a> Decoder<'a> {
             id,
             name,
             agree,
+            beside,
             body: body.into(),
             links: links.into(),
             hash,

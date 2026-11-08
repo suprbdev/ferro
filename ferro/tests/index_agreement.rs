@@ -164,6 +164,61 @@ fn every_kind_of_index_is_held_to_the_rows_it_was_built_from() {
     b.verify_typed().unwrap();
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Tagged {
+    #[key]
+    id: u32,
+    #[index(each)]
+    tags: ferro::Set<u16>,
+    #[index]
+    group: u8,
+}
+
+#[derive(Data, Clone, Default)]
+struct Tags {
+    items: Table<Tagged>,
+}
+
+#[test]
+fn a_table_indexing_each_element_of_a_set_is_held_to_its_rows_after_the_walk() {
+    use ferro::TableData;
+    assert!(<TaggedTable as TableData<Tagged>>::indexing_reads());
+    assert!(!<EveryTable as TableData<Every>>::indexing_reads());
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Tags> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Tags> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let mut rng = Rng::new(113);
+    for version in 1..=4u32 {
+        a.update(|shelf| {
+            for _ in 0..300 {
+                let id = rng.below(500) as u32;
+                let tags = (0..rng.below(5)).map(|_| rng.below(30) as u16).collect();
+                let group = (rng.below(4) as u32 + version) as u8;
+                shelf.items.insert(Tagged { id, tags, group });
+            }
+        })
+        .unwrap();
+        if version != 2 {
+            assert_eq!(
+                b.pull(&a, "a", unmerged).unwrap().outcome,
+                Outcome::FastForward
+            );
+        }
+    }
+    b.verify_typed().unwrap();
+    let (mine, theirs) = (b.read(), a.read());
+    for tag in 0..30u16 {
+        let keys: Vec<u32> = mine.items.by_tags(&tag).keys().collect();
+        let expected: Vec<u32> = theirs
+            .items
+            .iter()
+            .filter(|row| row.tags.contains(&tag))
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(keys, expected, "tag {tag}");
+    }
+}
+
 fn corrupt<T: ferro::Data>(db: &Db<T>, case: &str) {
     db.verify().unwrap();
     match db.verify_typed() {

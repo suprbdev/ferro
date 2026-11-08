@@ -4974,6 +4974,56 @@ fn a_table_nested_in_a_map_whose_indexes_disagree_is_refused() {
     }
 }
 
+#[derive(Data, Clone, Default)]
+struct CountedTable {
+    rows: Table<shadow::Row>,
+    counts: Map<u64, u32>,
+}
+
+#[derive(Data, Clone, Default)]
+struct WideCountedShadow {
+    rows: shadow::Shadow,
+    counts: Map<u64, u64>,
+}
+
+#[test]
+fn a_bundle_whose_walk_fails_is_refused_for_the_walk_while_its_tables_are_checked_beside_it() {
+    for (case, forged) in shadow::forgeries() {
+        for versions in [1, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let peer: Db<WideCountedShadow> = fast().open(dir.path().join("peer.ferro")).unwrap();
+            let mine: Db<CountedTable> = fast().open(dir.path().join("mine.ferro")).unwrap();
+            for version in 1..versions {
+                peer.update(|root| {
+                    root.rows.put(shadow::row(version + 10, 1, version + 1000));
+                    root.counts.insert(version, version);
+                })
+                .unwrap();
+            }
+            peer.update(|root| {
+                for (key, row) in forged.rows.iter() {
+                    root.rows.rows.insert(key, (*row).clone());
+                }
+                root.rows.by_n = forged.by_n.clone();
+                root.rows.by_email = forged.by_email.clone();
+                root.counts.insert(0, u64::MAX);
+            })
+            .unwrap();
+            match from_peer(&mine, &peer) {
+                Err(Error::Bundle(message)) => assert!(
+                    message.contains("does not decode") && !message.contains("agree"),
+                    "{case}, {versions} versions: {message}"
+                ),
+                other => {
+                    panic!("{case}, {versions} versions: a bundle that fails its walk: {other:?}")
+                }
+            }
+            assert_eq!(mine.version(), 0, "{case}");
+            mine.verify_typed().unwrap();
+        }
+    }
+}
+
 #[derive(Data, Clone, Copy, Debug, PartialEq)]
 #[ferro(transparent)]
 struct Scan(u64);
