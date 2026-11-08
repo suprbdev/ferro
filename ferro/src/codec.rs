@@ -1013,10 +1013,11 @@ pub(crate) type Found = Vec<(usize, Kind)>;
 
 /// What checks that the indexes of a table agree with its rows: given the table, a table of the
 /// same type to work from, whose indexes are known to agree with its rows, the store both read
-/// from and the pool whose threads share the work, it returns [`Error::Decode`] for an index that
-/// does not hold exactly the entries the rows give.
+/// from, the pool whose threads share the work, and whether an index under a fingerprint the
+/// type does not know fails it, it returns [`Error::Decode`] for an index that does not hold
+/// exactly the entries the rows give.
 pub(crate) type Agree =
-    for<'p> fn(&FoundTable, Option<&FoundTable>, &'p Store, &Pool<'p>) -> Result<()>;
+    for<'p> fn(&FoundTable, Option<&FoundTable>, &'p Store, &Pool<'p>, bool) -> Result<()>;
 
 /// A table value that a typed check found, kept for the check that its indexes agree with its
 /// rows, which reads the rows and so counts only once every object the check reaches has passed.
@@ -1171,7 +1172,10 @@ impl Plans {
 /// table it checks and the table it checks it against, so that a receive can queue the check of a
 /// version's tables as soon as it knows how to check them and run it beside its walk.
 #[derive(Default)]
-pub(crate) struct Checks(HashMap<CheckOf, Arc<Verdict>>);
+pub(crate) struct Checks {
+    queued: HashMap<CheckOf, Arc<Verdict>>,
+    strict: bool,
+}
 
 /// The table a check of [`Checks`] checks and the table it checks it against, by type and hash.
 type CheckOf = ((TypeId, Hash), Option<(TypeId, Hash)>);
@@ -1184,6 +1188,16 @@ struct Verdict {
 }
 
 impl Checks {
+    /// Checks for a receive, which also fail a table that holds an index under a fingerprint its
+    /// type does not know: nothing checked such an index as it lands, so the file must not hold
+    /// it for a later version of the type that knows the fingerprint to trust.
+    pub(crate) fn strict() -> Checks {
+        Checks {
+            queued: HashMap::new(),
+            strict: true,
+        }
+    }
+
     /// Queues on `pool` the check of `table` against `base`, as [`Plans::base`] gives it, reading
     /// through `store`, unless it is queued already.
     pub(crate) fn start<'p>(
@@ -1204,16 +1218,17 @@ impl Checks {
         base: Option<&FoundTable>,
     ) -> Arc<Verdict> {
         let key = (table.identity(), base.map(FoundTable::identity));
-        if let Some(verdict) = self.0.get(&key) {
+        if let Some(verdict) = self.queued.get(&key) {
             return verdict.clone();
         }
         let verdict = Arc::new(Verdict::default());
-        self.0.insert(key, verdict.clone());
-        let (table, base, told) = (table.clone(), base.cloned(), verdict.clone());
+        self.queued.insert(key, verdict.clone());
+        let (table, base, told, strict) =
+            (table.clone(), base.cloned(), verdict.clone(), self.strict);
         pool.check(pool::job(move |pool| {
             if !pool.stopped() {
                 let agreed = unwound("checking its indexes", || {
-                    (table.agree)(&table, base.as_ref(), store, pool)
+                    (table.agree)(&table, base.as_ref(), store, pool, strict)
                 });
                 if let Err(error) = agreed.and_then(|agreed| agreed) {
                     *told.failed.lock() = Some(error);

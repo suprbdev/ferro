@@ -4067,16 +4067,16 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         Ok(entries)
     }
 
-    /// Every value in key order, or the error that stopped the walk where the public reads would
-    /// panic.
-    pub(crate) fn try_values(&self) -> Result<Vec<Val<V>>> {
+    /// Every key, cloned, with its value, in key order, or the error that stopped the walk where
+    /// the public reads would panic.
+    pub(crate) fn try_keyed_values(&self) -> Result<Vec<(K, Val<V>)>> {
         let store = self.store();
-        let mut values = Vec::new();
+        let mut entries = Vec::new();
         self.try_walk(|node, index| {
-            values.push(node.value(store, index)?);
+            entries.push((node.keys[index].clone(), node.value(store, index)?));
             Ok(())
         })?;
-        Ok(values)
+        Ok(entries)
     }
 
     /// Calls `f` on every entry whose key lies in `range`, in key order, lending each entry as

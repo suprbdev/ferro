@@ -3023,7 +3023,7 @@ fn resolve<O: Objects>(
                         on: descents.is_ok(),
                         plans: Plans::default(),
                         listed: HashSet::new(),
-                        checks: Checks::default(),
+                        checks: Checks::strict(),
                     };
                     let walked = vetting.walk(&roots, |vetting, at| {
                         if let Ok(descents) = &descents
@@ -3051,7 +3051,7 @@ fn resolve<O: Objects>(
                 let lineage = lineage(store, objects, &landing, &order)?;
                 let agreeing = vetting.fresh_view();
                 staging.overlaid(&agreeing, || {
-                    pool::scope(|pool| vetting.agree(&lineage, Checks::default(), pool, &agreeing))
+                    pool::scope(|pool| vetting.agree(&lineage, Checks::strict(), pool, &agreeing))
                 })?;
             }
         }
@@ -3378,8 +3378,9 @@ impl<T: Data> Db<T> {
     ///   one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a `Vec<()>`,
     ///   than its size allows. A table whose index, stored under a fingerprint this side knows,
-    ///   holds other entries than its rows give, a row stored under a key other than its own, or
-    ///   two rows sharing a value of a unique index fail the checks too.
+    ///   holds other entries than its rows give, a table that holds an index under a fingerprint
+    ///   this side does not know, a row stored under a key other than its own, or two rows
+    ///   sharing a value of a unique index fail the checks too.
     /// - [`Error::Decode`] if `from` sends a head that `T` cannot read, such as a table whose
     ///   unique index, rebuilt on this side, finds two rows sharing a value. Nothing lands and
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
@@ -3538,7 +3539,9 @@ impl<T: Data> Db<T> {
     ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
     ///   and a table whose index, stored under a fingerprint this side knows, does not hold
     ///   exactly the entries its rows give, as a peer whose schema sets index maps apart from the
-    ///   rows can send, or if checking it would decode or read more again than its size allows,
+    ///   rows can send, or that holds an index under a fingerprint this side does not know, as a
+    ///   peer whose type has an index this side's lacks or declares otherwise sends, or if
+    ///   checking it would decode or read more again than its size allows,
     ///   as one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a
     ///   `Vec<()>`, than its size allows. Nothing reaches the file.

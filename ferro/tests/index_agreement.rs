@@ -238,6 +238,35 @@ fn written(path: &Path, versions: Vec<shadow::Shadow>) {
 }
 
 #[test]
+fn reading_a_table_that_stores_no_index_fails_when_a_row_sits_under_another_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.ferro");
+    {
+        let peer: Db<shadow::UnindexedPeer> = fast().open(&path).unwrap();
+        peer.update(|root| {
+            root.rows.rows.insert(1, shadow::row(7, 5, 100));
+            root.rows.rows.insert(7, shadow::row(7, 5, 100));
+            root.rows.rows.insert(3, shadow::row(4, 9, 300));
+        })
+        .unwrap();
+    }
+    let failed = match fast().open::<shadow::Mine>(&path) {
+        Err(error) => error,
+        Ok(mine) => match mine.at(1) {
+            Err(error) => error,
+            Ok(read) => panic!(
+                "a table with a row under another key read as {:?}",
+                read.rows.by_email(&100)
+            ),
+        },
+    };
+    match failed {
+        Error::Decode(message) => assert!(message.contains("other than its own"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn verify_typed_reports_a_table_whose_indexes_disagree_with_its_rows() {
     for (case, forged) in shadow::forgeries() {
         let dir = tempfile::tempdir().unwrap();

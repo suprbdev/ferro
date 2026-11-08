@@ -27,6 +27,48 @@ pub struct Peer {
     pub rows: Shadow,
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+pub struct Narrow {
+    #[key]
+    pub id: u64,
+    #[index]
+    pub n: u32,
+    pub email: u64,
+}
+
+#[derive(Data, Clone, Default)]
+pub struct MineNarrow {
+    pub rows: Table<Narrow>,
+}
+
+#[derive(Clone, Default)]
+pub struct Unindexed {
+    pub rows: Map<u64, Row>,
+}
+
+impl Data for Unindexed {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.varint(1);
+        w.field(field_tag("rows"), |w| self.rows.encode(w))
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let mut table = Unindexed::default();
+        r.fields(|tag, r| {
+            if tag == field_tag("rows") {
+                table.rows = Map::decode(r)?;
+            }
+            Ok(())
+        })?;
+        Ok(table)
+    }
+}
+
+#[derive(Data, Clone, Default)]
+pub struct UnindexedPeer {
+    pub rows: Unindexed,
+}
+
 #[derive(Clone, Default)]
 pub struct Shadow {
     pub rows: Map<u64, Row>,

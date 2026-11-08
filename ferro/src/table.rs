@@ -240,15 +240,20 @@ pub trait TableData<T: Record>: Data + Default {
     }
     /// Reads a table as [`Data::decode`] does, without rebuilding an index it does not store
     /// under a fingerprint this type knows, and returns it with whether it stores each index, in
-    /// the order the derive declares them. The default, for a table without indexes, reads it
-    /// with [`Data::decode`] and lists none.
+    /// the order the derive declares them, and whether it holds an index under a fingerprint
+    /// this type does not know. The default, for a table without indexes, reads it with
+    /// [`Data::decode`] and lists none.
     ///
     /// # Errors
     ///
     /// As for [`Data::decode`].
     #[doc(hidden)]
-    fn decode_stored(r: &mut Decoder<'_>) -> Result<(Self, Vec<bool>)> {
-        Ok((Self::decode(r)?, Vec::new()))
+    fn decode_stored(r: &mut Decoder<'_>) -> Result<Stored<Self>> {
+        Ok(Stored {
+            table: Self::decode(r)?,
+            held: Vec::new(),
+            unknown: false,
+        })
     }
     /// Takes the entries of the rows in `gone` out of each index whose place in `slots` is
     /// `true`, and puts those of the rows in `come` in, in one batch per index, with
@@ -312,6 +317,19 @@ pub trait TableData<T: Record>: Data + Default {
     ) -> Result<Option<(&'static str, Fault)>> {
         rows().map(|_| None)
     }
+}
+
+/// A table as [`TableData::decode_stored`] reads it.
+#[doc(hidden)]
+pub struct Stored<D> {
+    /// The table, with an empty map for each index it does not store under a fingerprint its
+    /// type knows.
+    pub table: D,
+    /// Whether it stores each index under the fingerprint its type gives, in the order the
+    /// derive declares them.
+    pub held: Vec<bool>,
+    /// Whether it holds an index under a fingerprint its type does not know.
+    pub unknown: bool,
 }
 
 /// The rows that changed between two versions of a table, which [`TableData::diff_slots`] takes
@@ -530,6 +548,8 @@ pub fn same_index<K: Data + Ord, V: Data>(built: &Map<K, V>, stored: &Map<K, V>)
 
 /// Checks that each index `table` stores under a fingerprint `T` knows holds exactly the entries
 /// its rows give, and that each row is stored under its own key, reading both through `store`.
+/// With `strict`, a table that holds an index under a fingerprint `T` does not know fails too,
+/// since that index would be trusted unchecked once `T` gains an index with that fingerprint.
 ///
 /// With `base`, a table of the same type whose indexes agree with its rows and which stores every
 /// index `table` does, it diffs the rows of the two and each index of the two on the threads of
@@ -540,16 +560,27 @@ fn agree<'p, T: Record>(
     base: Option<&FoundTable>,
     store: &'p Store,
     pool: &Pool<'p>,
+    strict: bool,
 ) -> Result<()> {
     let read = |found: &FoundTable| {
         T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))
     };
-    let (table, slots) = read(table)?;
-    if !slots.contains(&true) {
-        return Ok(());
+    let Stored {
+        table,
+        held: slots,
+        unknown,
+    } = read(table)?;
+    if strict && unknown {
+        return Err(Error::Bundle(format!(
+            "a table it carries ({}) holds an index under a fingerprint this type does not know, \
+             which nothing here can check",
+            type_name::<T::Table>()
+        )));
     }
     if let Some(base) = base {
-        let (base, held) = read(base)?;
+        let Stored {
+            table: base, held, ..
+        } = read(base)?;
         if slots.iter().zip(&held).all(|(slot, held)| !slot || *held) {
             return diffed::<T>(&base, &table, &slots, &Differ { pool, store });
         }
@@ -3791,9 +3822,16 @@ pub fn encode_index<M: Data>(fingerprint: u64, index: &M, w: &mut Encoder<'_>) -
 /// # Errors
 ///
 /// Returns a read or decode error where a plain read would panic, so a damaged row node fails the
-/// open instead.
+/// open instead, and [`Error::Decode`] for a row stored under a key other than its own, which an
+/// index built from it would file under the wrong key.
 pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
-    rows.try_values()
+    rows.try_keyed_values()?
+        .into_iter()
+        .map(|(key, row)| {
+            owned::<T>(&key, &row)?;
+            Ok(row)
+        })
+        .collect()
 }
 
 /// The row whose unique index entry is `value`. Backs a unique index's generated `by_x`.

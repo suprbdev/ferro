@@ -2065,7 +2065,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
                 #(::std::option::Option::Some(#slots) => #vars = ::std::option::Option::Some(::ferro::Data::decode(__r)?),)*
-                _ => {}
+                _ => __unknown = true,
             },
         }
     };
@@ -2119,8 +2119,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     };
+    let unknown_of = if count == 0 {
+        quote! {}
+    } else {
+        quote! { let mut __unknown = false; }
+    };
     let read_fields = quote! {
         #fingerprints_of
+        #unknown_of
         let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
         #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
         __r.fields(|__tag, __r| {
@@ -2166,7 +2172,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         (
             quote! {
                 fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                    let (mut __table, __stale) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                    let (mut __table, __stale, _) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
                     #rebuild
                     ::std::result::Result::Ok(__table)
                 }
@@ -2179,22 +2185,26 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
             },
             quote! {
-                fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count])> {
+                fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count], bool)> {
                     #read_fields
                     let __stale = [#(#vars.is_none()),*];
                     let __table = #table {
                         rows: ::ferro::codec::required(__rows, "rows")?,
                         #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
                     };
-                    ::std::result::Result::Ok((__table, __stale))
+                    ::std::result::Result::Ok((__table, __stale, __unknown))
                 }
             },
             quote! {
                 fn decode_stored(
                     __r: &mut ::ferro::codec::Decoder<'_>,
-                ) -> ::ferro::Result<(Self, ::std::vec::Vec<bool>)> {
-                    let (__table, __stale) = Self::__stored(__r)?;
-                    ::std::result::Result::Ok((__table, __stale.iter().map(|__stale| !*__stale).collect()))
+                ) -> ::ferro::Result<::ferro::table::Stored<Self>> {
+                    let (__table, __stale, __unknown) = Self::__stored(__r)?;
+                    ::std::result::Result::Ok(::ferro::table::Stored {
+                        table: __table,
+                        held: __stale.iter().map(|__stale| !*__stale).collect(),
+                        unknown: __unknown,
+                    })
                 }
 
                 fn apply_slots(
