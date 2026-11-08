@@ -616,6 +616,42 @@ fn a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead(
 }
 
 #[test]
+fn a_prune_another_handle_writes_moves_no_watcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prune.ferro");
+    let manual = Reclaim { every_bytes: 0 };
+    let other: Arc<std::sync::OnceLock<Db<Root>>> = Arc::default();
+    let hook = {
+        let other = other.clone();
+        Hook(Arc::new(move |step| {
+            if step == "created"
+                && let Some(b) = other.get()
+            {
+                b.refresh().unwrap();
+            }
+        }))
+    };
+    let a: Db<Root> = shared().reclaim(manual).hook(hook).open(&path).unwrap();
+    let b: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
+    for i in 1..=5 {
+        bump(&a, 0, i);
+    }
+    b.refresh().unwrap();
+    let watcher = b.watch();
+    let changes = b.watch_changes(|old, new| old.n != new.n);
+    other.set(b.clone()).ok();
+    a.compact(Keep::Last(2)).unwrap();
+    b.refresh().unwrap();
+    assert!(matches!(watcher.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(changes.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(b.version(), 5);
+    assert_eq!(b.log().len(), 2);
+    bump(&a, 0, 6);
+    b.refresh().unwrap();
+    assert_eq!(watcher.try_recv().unwrap().version(), 6);
+}
+
+#[test]
 fn branch_after_another_handle_dropped_and_forked_again_gives_the_new_branch() {
     let manual = Reclaim { every_bytes: 0 };
     for refork in [false, true] {

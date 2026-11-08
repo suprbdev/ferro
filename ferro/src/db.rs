@@ -726,6 +726,9 @@ impl<T> Branch<T> {
     fn publish(&self, state: Arc<State<T>>) -> Notice<T> {
         let snapshot = state.snapshot.clone();
         let replaced = self.state.swap(state);
+        if replaced.snapshot.commit == snapshot.commit {
+            return self.feed.rebind(snapshot);
+        }
         self.feed.publish(snapshot, &replaced.snapshot)
     }
 

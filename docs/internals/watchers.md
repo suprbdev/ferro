@@ -20,6 +20,14 @@ handle at `refresh`, which closes its feed, so its watchers end rather than see 
 holding the branch's snapshot from when the branch was attached, so a watcher made before any commit
 has a snapshot to compare against.
 
+A state whose commit is the one the branch already shows is rebound into the feed without bumping
+the count, as a cycle's swap is. That happens when another process prunes history: its frame changes
+each head's log but not the commit, and catching up takes such a head for a moved one. Publishing it
+as new had every shared writer's watchers hand out the same version again, once for each prune
+another process wrote, while read-only handles, which rebind on `refresh`, stayed quiet.
+`a_prune_another_handle_writes_moves_no_watcher` in `ferro/tests/shared.rs` holds a watcher and a
+`watch_changes` watcher on one handle while the other compacts with `Keep::Last(2)`.
+
 Another process's commits reach the feed when this process catches up and syncs them, at `refresh`,
 or, with `Options::follow`, when its `ferro-follow` thread does either, as described under
 [Followers](processes.md#followers). Publishing from that thread is the same store and wake as from
