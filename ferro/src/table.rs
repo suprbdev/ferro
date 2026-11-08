@@ -151,7 +151,7 @@ use crate::codec::{
 };
 use crate::error::{Error, Result};
 use crate::map::{
-    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ,
+    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ, kin,
     same_value, unwound, walked, walked_until,
 };
 use crate::pool::{Latch, Pool};
@@ -636,7 +636,9 @@ fn found<T: Record>(r: &Decoder<'_>, start: Checkpoint) -> FoundTable {
 /// With `base`, a table of the same type whose indexes agree with its rows and which stores every
 /// index `table` does, it diffs the rows of the two and each index of the two on the threads of
 /// `pool`, and checks that each index changed by exactly the entries of the rows that changed,
-/// which costs what changed. Without one it builds the indexes from every row.
+/// which costs what changed. Without one, or with one whose rows share no node with those of
+/// `table` near their roots, as [`kin`] tells, so that the diff would read every row of both, it
+/// builds the indexes from every row.
 fn agree<'p, T: Record>(
     table: &FoundTable,
     base: Option<&FoundTable>,
@@ -664,7 +666,9 @@ fn agree<'p, T: Record>(
         let Stored {
             table: base, held, ..
         } = read(base)?;
-        if slots.iter().zip(&held).all(|(slot, held)| !slot || *held) {
+        if slots.iter().zip(&held).all(|(slot, held)| !slot || *held)
+            && kin(base.rows(), table.rows(), store)?
+        {
             return faulted(diffed::<T>(&base, &table, &slots, &differ)?);
         }
     }
@@ -4524,25 +4528,62 @@ mod tests {
     }
 
     fn checked(db: &Db<Shelf>, old: u64, new: u64) -> (Result<()>, u64, u32) {
+        checked_from(db, Some(old), new)
+    }
+
+    fn checked_from(db: &Db<Shelf>, old: Option<u64>, new: u64) -> (Result<()>, u64, u32) {
         let allowance = 1 << 40;
-        let (old, new) = (db.at(old).unwrap(), db.at(new).unwrap());
+        let old = old.map(|old| found(&db.at(old).unwrap().rows));
+        let new = db.at(new).unwrap();
         let view = new
             .rows
             .rows()
             .store()
             .unwrap()
             .view(0, allowance, u64::MAX);
-        let agreed = pool::scope(|pool| {
-            agree::<Tagged>(
-                &found(&new.rows),
-                Some(&found(&old.rows)),
-                &view,
-                pool,
-                true,
-            )
-        });
+        let agreed =
+            pool::scope(|pool| agree::<Tagged>(&found(&new.rows), old.as_ref(), &view, pool, true));
         let (left, records) = view.reads_left().unwrap();
         (agreed, allowance - left, records)
+    }
+
+    #[test]
+    fn a_table_that_shares_no_node_with_its_base_is_built_rather_than_diffed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db: Db<Shelf> = Options::new()
+            .durability(Durability::Buffered)
+            .open(dir.path().join("shelf.ferro"))
+            .unwrap();
+        let fill = |shelf: &mut Shelf, first: u64| {
+            shelf.rows = Table::new();
+            for id in first..first + 20_000 {
+                shelf.rows.insert(Tagged {
+                    id,
+                    tags: Set::new(),
+                    group: (id % 5) as u8,
+                    note: 0,
+                });
+            }
+        };
+        db.update(|shelf| fill(shelf, 0)).unwrap();
+        db.update(|shelf| fill(shelf, 1_000_000)).unwrap();
+        db.update(|shelf| {
+            shelf.rows.update(&1_000_007, |row| row.group = 9);
+        })
+        .unwrap();
+
+        let (built, _, whole) = checked_from(&db, None, 2);
+        built.unwrap();
+        let (agreed, _, records) = checked(&db, 1, 2);
+        agreed.unwrap();
+        assert!(
+            records < whole + whole / 8,
+            "a table checked against one it shares no row with read {records} records, built \
+             from its rows {whole}"
+        );
+        let (agreed, _, records) = checked(&db, 2, 3);
+        agreed.unwrap();
+        assert!(records < 64, "an edit of one row read {records} records");
     }
 
     #[test]

@@ -6767,6 +6767,59 @@ pub(crate) fn differ<'p, K: Data + Ord, V: Data, S: Summary<K, V>>(
     differing
 }
 
+/// Whether `old` and `new`, two versions of a map that read through `store`, share enough of
+/// their trees that diffing them costs less than reading all of `new`: they share their root, one
+/// of them holds fewer than [`SPLIT_ENTRIES`] entries or is held in memory, or a node of one
+/// within two levels below its root is a node of the other.
+///
+/// It reads the two roots, and the nodes below them only when the roots share no child, so two
+/// versions that one write apart read two nodes, and two maps with no node in common read the
+/// first two levels of each, which a diff would read too.
+///
+/// # Errors
+///
+/// The error of a node that cannot be read or decoded.
+pub(crate) fn kin<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    old: &Map<K, V, S>,
+    new: &Map<K, V, S>,
+    store: &Store,
+) -> Result<bool> {
+    let (
+        Link::Stored {
+            ptr: old, count: a, ..
+        },
+        Link::Stored {
+            ptr: new, count: b, ..
+        },
+    ) = (&old.root, &new.root)
+    else {
+        return Ok(true);
+    };
+    if old.hash == new.hash || *a < SPLIT_ENTRIES || *b < SPLIT_ENTRIES {
+        return Ok(true);
+    }
+    let below = |ptrs: &[Ptr]| -> Result<Vec<Ptr>> {
+        let mut out = Vec::new();
+        for ptr in ptrs {
+            for step in bare::<K, V, S>(store, *ptr)? {
+                if let Bared::Sub(child, _) = step {
+                    out.push(child);
+                }
+            }
+        }
+        Ok(out)
+    };
+    let (mut olds, mut news) = (vec![*old], vec![*new]);
+    for _ in 0..2 {
+        (olds, news) = (below(&olds)?, below(&news)?);
+        let held: HashSet<Hash> = olds.iter().map(|ptr| ptr.hash).collect();
+        if news.iter().any(|ptr| held.contains(&ptr.hash)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A diff that [`differ`] queued.
 pub(crate) struct Differing<K, V> {
     found: Arc<Gathered<K, V>>,

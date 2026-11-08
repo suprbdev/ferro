@@ -1012,18 +1012,32 @@ that differ, on both sides, and the entries that changed, and it writes and hash
 of the index is held as keys and values, and compared with the entries the rows give as it is
 walked.
 
+A table whose rows share no node with those of the table it is paired with, near their roots, is
+built from its rows instead, as below: a diff of the two would read every row of both and hold
+every row of each as a change. The check reads the roots of the two maps of rows, and when they
+share no child the nodes below them, and builds the table when no node of either within two levels
+below its root is a node of the other and each holds 4,096 rows or more. Two versions one write
+apart share all but a path, so this reads their two roots, and a table that changed in every part
+of its rows is cheaper to build than to diff. Such a table is built where its check runs, beside
+the walk when it was planned there, since the diff it replaces would read every row of both there.
+A `Map` value of a `Vec` of two tables of 1.5 million rows that lost its first, whose second gained
+an edit, paired the second with the first, by position, and the pull of 2 KB took 1.05 s and
+511 MB, where 9e9341e built it in 0.60 s; built again, it takes 0.63 s, and the same `Vec` at the
+root, which 9e9341e paired the same way in 1.04 s, 0.65 s.
+
 Any other table is checked against its rows whole: the tables of a clone's first version, a table
 whose parent holds no table at its place, as under a key a version adds to a map or in an `Option`
-that was `None`, one whose parent lacks one of its indexes, one a pairing left unpaired, one inside
-a type whose `Data` is written by hand, which pairs nothing, and held data of another type. Its rows
-are walked once in key order, each node read once, and the entries each index should hold gathered
-in a vector; each vector is then sorted and walked beside the stored index, which must hold exactly
-those keys, by `Ord`, with values of the same encoding, and a key the rows give twice is two rows
-sharing a value of a unique index. An index of 4,096 entries or more is compared as a job of the
-pool, a smaller one by the check itself. So the check holds the entries rather than a map of them,
-and writes and hashes nothing. A table is checked against another only if the other's check is
-planned already, so no chain of checks comes back to where it started, and every table rests on one
-that was trusted or built whole.
+that was `None`, one whose parent lacks one of its indexes, one whose rows share no node with its
+parent's near their roots, one a pairing left unpaired, one inside a type whose `Data` is written by
+hand, which pairs nothing, and held data of another type. Its rows are walked once in key order,
+each node read once, and the entries each index should hold gathered in a vector; each vector is
+then sorted and walked beside the stored index, which must hold exactly those keys, by `Ord`, with
+values of the same encoding, and a key the rows give twice is two rows sharing a value of a unique
+index. An index of 4,096 entries or more is compared as a job of the pool, a smaller one by the
+check itself. So the check holds the entries rather than a map of them, and writes and hashes
+nothing. A table is checked against another only if the other's check is planned already, so no
+chain of checks comes back to where it started, and every table rests on one that was trusted or
+built whole.
 
 The checks run on a pool of threads, `pool.rs`, whose own thread starts another whenever more work
 waits than threads are idle, so that it has eight threads at most, its own included, and no more
