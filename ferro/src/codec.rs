@@ -1513,6 +1513,7 @@ pub struct Decoder<'a> {
     found: Option<&'a RefCell<Found>>,
     tables: Option<&'a RefCell<Vec<FoundTable>>>,
     recalled: Option<&'a Recalled>,
+    rebuilds: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -1534,7 +1535,26 @@ impl<'a> Decoder<'a> {
             found: None,
             tables: None,
             recalled: None,
+            rebuilds: true,
         }
+    }
+
+    /// Makes this decoder leave empty each index of a table it decodes that the table does not
+    /// store under a fingerprint its type knows, rather than rebuild it from the rows.
+    ///
+    /// The check that a table's indexes agree with its rows decodes the rows it reads with one: it
+    /// uses only the fields their indexes name, and a table nested in a row would otherwise read
+    /// its own rows, which the walk may not have checked yet, to rebuild an index.
+    pub(crate) fn skip_rebuilds(&mut self) {
+        self.rebuilds = false;
+    }
+
+    /// Whether a table this decoder decodes rebuilds the indexes it does not store, as
+    /// [`Data::decode`] does unless the decoder belongs to the check that a table's indexes agree
+    /// with its rows.
+    #[doc(hidden)]
+    pub fn rebuilds(&self) -> bool {
+        self.rebuilds
     }
 
     /// Where the decoder is, for [`rewind`](Decoder::rewind) to come back to.
@@ -1860,6 +1880,7 @@ impl<'a> Decoder<'a> {
                 found: self.found,
                 tables: self.tables,
                 recalled: self.recalled,
+                rebuilds: self.rebuilds,
             };
             self.cursor = end;
             f(tag, &mut sub)?;

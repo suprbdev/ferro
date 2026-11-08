@@ -6392,12 +6392,19 @@ impl Bare {
 
     fn value<V: Data>(&self, store: &Store) -> Result<Val<V>> {
         let value = match self {
-            Bare::Inline(object, bytes, links) => Arc::new(V::decode(&mut Decoder::new(
-                &object.body[bytes.clone()],
-                &object.links[links.clone()],
-                Some(store),
-            ))?),
-            Bare::Spilled(ptr) => store.load::<V>(*ptr)?,
+            Bare::Inline(object, bytes, links) => {
+                let mut r = Decoder::new(
+                    &object.body[bytes.clone()],
+                    &object.links[links.clone()],
+                    Some(store),
+                );
+                r.skip_rebuilds();
+                Arc::new(V::decode(&mut r)?)
+            }
+            Bare::Spilled(ptr) => Arc::new(store.decode_at(*ptr, |r| {
+                r.skip_rebuilds();
+                V::decode(r)
+            })?),
         };
         Ok(Val::of_single(&value))
     }

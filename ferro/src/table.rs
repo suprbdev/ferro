@@ -4244,6 +4244,18 @@ pub trait IndexEach {
 
     /// The elements to index.
     fn values(&self) -> Vec<Self::Value>;
+
+    /// The elements to index, or the error of a read that [`values`](IndexEach::values) would
+    /// panic on, as a damaged node of a [`Set`](crate::Set) gives. The default returns
+    /// [`values`](IndexEach::values).
+    ///
+    /// # Errors
+    ///
+    /// The error of a node that cannot be read or decoded.
+    #[doc(hidden)]
+    fn try_values(&self) -> Result<Vec<Self::Value>> {
+        Ok(self.values())
+    }
 }
 
 impl<X: Data + Ord> IndexEach for Vec<X> {
@@ -4268,6 +4280,15 @@ impl<X: Data + Ord> IndexEach for crate::set::Set<X> {
 
     fn values(&self) -> Vec<X> {
         self.iter().collect()
+    }
+
+    fn try_values(&self) -> Result<Vec<X>> {
+        Ok(self
+            .map()
+            .try_entries()?
+            .into_iter()
+            .map(|(value, ())| value)
+            .collect())
     }
 }
 

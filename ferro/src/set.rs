@@ -73,6 +73,11 @@ impl<T: Data + Ord> Set<T> {
         Set::default()
     }
 
+    /// The map that holds the values as its keys.
+    pub(crate) fn map(&self) -> &Map<T, ()> {
+        &self.0
+    }
+
     /// The number of values, in O(1).
     pub fn len(&self) -> usize {
         self.0.len()
