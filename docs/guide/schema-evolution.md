@@ -107,22 +107,28 @@ So when peers sync a table, upgrade in this order:
 
 A table is stored as it was written until a commit writes it again. A table held in the root struct,
 directly or inside an `Option`, a `Vec`, a tuple or another struct, is written again by the next
-commit, whatever that commit changes. A table in the values of a `Map` or a `List` is written again
-only when a commit changes the node that holds it, so after an index change most such tables keep
-the old index in every new version too, and a clone into the new schema stays refused however much
-history is pruned. So after an index change, rewrite each map whose values hold such tables in one
-commit, then prune the versions before it:
+commit, whatever that commit changes, with its indexes as its struct now declares them, so it needs
+no step of its own. Its rows, like the values of a `Map` or a `List`, are written again only where
+a commit changes the node that holds them. So after an index change most tables in the values of a
+map, or in the rows of another table, keep the old index in every new version too, and a clone into
+the new schema stays refused however much history is pruned. So after an index change, rewrite each
+map whose values hold such tables, and each table whose rows hold them, in one commit, then prune
+the versions before it:
 
 ```rust
-db.update(|root| root.teams.rewrite())?;
+db.update(|root| {
+    root.teams.rewrite();
+    root.projects.rewrite();
+})?;
 db.compact(Keep::Last(1))?;
 ```
 
-`Map::rewrite` and `List::rewrite` read every value, which rebuilds the changed indexes of its
-tables and drops the indexes the struct no longer declares, and the commit writes every node again.
-They hold the whole map in memory until the commit. A collection inside a value is written as it
-was, so a map whose values hold maps of tables is rewritten a level at a time, rewriting each inner
-map in the same commit. Until the versions before the rewrite are pruned, a clone of them is
+`Map::rewrite`, `List::rewrite` and `Table::rewrite` read every value or row, which rebuilds the
+changed indexes of the tables in it and drops the indexes their struct no longer declares, and the
+commit writes every node again. They hold the whole map or table in memory until the commit. A
+collection inside a value is written as it was, so a map whose values hold maps of tables, or a
+table whose rows hold tables of tables, is rewritten a level at a time, rewriting each inner map or
+table in the same commit. Until the versions before the rewrite are pruned, a clone of them is
 refused, and a peer that already holds them pulls the new versions as usual.
 
 A struct's own file is never refused: its older versions keep their indexes under the old

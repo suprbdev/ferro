@@ -154,7 +154,8 @@ does: a pull of a table holding an index the receiver does not declare is refuse
 lands, and the index is rebuilt when the table is read. A clone into the new schema of a history
 whose versions hold a table written under an index the new schema changed or dropped is refused for
 the same reason, until the sender has written its tables again under the new schema, with
-`Map::rewrite` for those in the values of a map, and pruned the versions before. [Changing your
+`Map::rewrite` for those in the values of a map and `Table::rewrite` for those in the rows of a
+table, and pruned the versions before. [Changing your
 types](schema-evolution.md#index-changes-and-sync) gives the order and the steps.
 
 [Limits](../internals/sync.md#limits) in the internals lists the rest.

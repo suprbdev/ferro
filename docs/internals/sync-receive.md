@@ -899,22 +899,30 @@ under the old one is refused too, until the sender writes them again and prunes 
 schema has since changed: nothing landed it unchecked.
 
 A table keeps the layout it was written with until a commit writes it again. One in the root is
-written again by every commit, but one in the values of a map only when a commit changes its node,
-so after a change of index most nested tables kept the old layout in every later version, and a
-clone into the new schema was refused even of a sender pruned to its newest version: 2,000 tables of
-three rows in a `Map`, each with an `#[index]` turned `#[unique]`, two commits under the new schema
-and `Keep::Last(1)` left a head whose untouched nodes still held the old index (#116).
-`Map::rewrite`, and `List::rewrite` through it, puts every value of a map back as a changed entry,
-so the next commit writes every node again, each value encoded from its decoded form: the decode of
-a table rebuilds the indexes it stores under another fingerprint and leaves out those its type no
-longer declares, so the commit stores the table as the type now declares it. A sender rewrites each
-such map, a level at a time for maps of maps, then prunes the versions before, and [Changing your
+written again by every commit, but one in the values of a map, or in the rows of a table, only when
+a commit changes its node, so after a change of index most nested tables kept the old layout in
+every later version, and a clone into the new schema was refused even of a sender pruned to its
+newest version: 2,000 tables of three rows in a `Map`, each with an `#[index]` turned `#[unique]`,
+two commits under the new schema and `Keep::Last(1)` left a head whose untouched nodes still held
+the old index (#116). `Map::rewrite`, and `List::rewrite` and `Table::rewrite` through it, puts
+every value of a map back as a changed entry, so the next commit writes every node again, each value
+encoded from its decoded form: the decode of a table rebuilds the indexes it stores under another
+fingerprint and leaves out those its type no longer declares, so the commit stores the table as the
+type now declares it. A sender rewrites each such map or table, a level at a time for maps of maps,
+then prunes the versions before, and [Changing your
 types](../guide/schema-evolution.md#index-changes-and-sync) gives the steps. Relaxing the refusal
 instead, to land an index under a fingerprint the receiver's type does not know when its type has
 the same fields indexed under another kind, would need that old index to be told apart from one
 planted for a later schema of the receiver's own, which it cannot be: a type that turns an
 `#[index]` into a `#[unique]` may turn it back, and would then trust whatever a peer stored under
 the old fingerprint.
+
+The guide said a table in the root needed no step, which holds for the table and its indexes but
+not for a table in its rows: a root `Table` of 64 rows each holding a table of 50 rows whose
+`#[index]` turned `#[unique]` stayed refused after a commit under the new schema and
+`Keep::Last(1)`, and a no-op `update` of every row was the only way to write those rows again.
+`Table::rewrite` writes them again as `Map::rewrite` does a map's values, and such a clone lands
+after it and a compaction.
 
 Two other ways were weighed. Trusting a stored index only where the file records that it was
 checked would let peers that declare a table's indexes differently keep syncing, and a branch the

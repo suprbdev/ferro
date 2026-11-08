@@ -928,6 +928,55 @@ impl<T: Record> Table<T> {
         self.0.rows().last().map(|(_, row)| row)
     }
 
+    /// Marks every row changed, so that the next commit writes every node of the rows again, with
+    /// each row encoded as its type encodes it now, as [`Map::rewrite`] does for a map.
+    ///
+    /// A table is written by a commit as it is held, its indexes as its type now declares them,
+    /// but its rows only in the nodes the commit changes. A [`Table`] inside a row of a node the
+    /// commit does not touch keeps its indexes under the fingerprints its type gave when the row
+    /// was written, and a peer whose type gives another fingerprint for one of them refuses it in a
+    /// pull. After a table type held in the rows of another table gains, drops or changes an
+    /// index, rewrite the outer table in a commit, then prune the versions before it with
+    /// [`Keep`](crate::Keep). Reading each row rebuilds the indexes a table in it stores under
+    /// another fingerprint, and drops those its type no longer declares. The rows encode as they
+    /// did apart from those tables, so the indexes of this table are left as they are.
+    ///
+    /// It reads every row and holds them all, with the nodes, until the commit. A collection inside
+    /// a row is written as it was, so a table whose rows hold tables whose rows hold tables is
+    /// rewritten a level at a time, by rewriting each inner table too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone, Debug, PartialEq)]
+    /// struct Member {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     team: u32,
+    /// }
+    ///
+    /// #[derive(Data, Record, Clone, Debug, PartialEq)]
+    /// struct Team {
+    ///     #[key]
+    ///     id: u32,
+    ///     members: Table<Member>,
+    /// }
+    ///
+    /// let mut members: Table<Member> = Table::new();
+    /// members.insert(Member { id: 1, team: 7 });
+    /// let mut teams: Table<Team> = Table::new();
+    /// teams.insert(Team { id: 7, members });
+    ///
+    /// teams.rewrite();
+    /// assert_eq!(teams.get(&7).unwrap().members.by_team(&7).len(), 1);
+    /// ```
+    pub fn rewrite(&mut self) {
+        self.0.rows_mut().rewrite();
+    }
+
     /// Inserts `row` under its key and updates every index, returning the row it replaced.
     ///
     /// # Panics

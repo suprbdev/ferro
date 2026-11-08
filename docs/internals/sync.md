@@ -635,7 +635,8 @@ Measured and left out:
   when a table gains an index, or an index changes kind or fields, the receiving side runs the new
   schema before it pulls from a peer that already does, and a side that dropped or changed an index
   cannot pull, or clone, versions that still hold the old one, which a table in a map's values keeps
-  in every version until `Map::rewrite` writes the map again. A table without one of the receiver's
+  in every version until `Map::rewrite` writes the map again, and one in a table's rows until
+  `Table::rewrite` writes the table again. A table without one of the receiver's
   indexes passes for that index, because the check does not rebuild it. Reading the table rebuilds
   the index, and if two rows share a value of a unique index that read fails, so a peer can still
   send a table that does not read, as a peer whose schema has no index where the receiver's has a

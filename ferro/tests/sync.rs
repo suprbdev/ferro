@@ -5293,6 +5293,28 @@ mod unique_n {
     }
 }
 
+mod plain_outer {
+    use ferro::{Data, Record, Table};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Outer {
+        #[key]
+        pub id: u64,
+        pub inner: Table<super::plain_n::Sub>,
+    }
+}
+
+mod unique_outer {
+    use ferro::{Data, Record, Table};
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    pub struct Outer {
+        #[key]
+        pub id: u64,
+        pub inner: Table<super::unique_n::Sub>,
+    }
+}
+
 #[derive(Data, Clone, Default)]
 struct TeamsBefore {
     teams: Map<u64, Table<plain_n::Sub>>,
@@ -5403,6 +5425,62 @@ fn a_clone_of_tables_rewritten_under_a_changed_index_lands_once_older_versions_a
         Outcome::FastForward
     );
     assert_eq!(fresh.read().key_by_n(&40), Some(40));
+}
+
+#[test]
+fn a_clone_of_a_root_table_whose_rows_hold_tables_lands_once_it_is_rewritten_and_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("outer.ferro");
+    {
+        let sender: Db<Table<plain_outer::Outer>> = fast().open(&path).unwrap();
+        sender
+            .update(|table| {
+                for id in 0..200 {
+                    let mut inner: Table<plain_n::Sub> = Table::new();
+                    for sub in 0..3 {
+                        let (n, label) = ((id * 10 + sub) as u32, format!("o{id}s{sub}"));
+                        inner.insert(plain_n::Sub { id: sub, n, label });
+                    }
+                    table.insert(plain_outer::Outer { id, inner });
+                }
+            })
+            .unwrap();
+    }
+    let sender: Db<Table<unique_outer::Outer>> = fast().open(&path).unwrap();
+    sender
+        .update(|table| {
+            table.update(&5, |outer| {
+                outer.inner.insert(unique_n::Sub {
+                    id: 9,
+                    n: 99_999,
+                    label: "new".into(),
+                });
+            });
+        })
+        .unwrap();
+    sender.compact(Keep::Last(1)).unwrap();
+    let early: Db<Table<unique_outer::Outer>> =
+        fast().open(dir.path().join("early.ferro")).unwrap();
+    refused_for_its_fingerprint(from_peer(&early, &sender), "rows untouched");
+    assert_eq!(early.version(), 0);
+
+    sender.update(|table| table.rewrite()).unwrap();
+    let early: Db<Table<unique_outer::Outer>> =
+        fast().open(dir.path().join("history.ferro")).unwrap();
+    refused_for_its_fingerprint(from_peer(&early, &sender), "versions before the rewrite");
+    sender.compact(Keep::Last(1)).unwrap();
+    sender.verify_typed().unwrap();
+    let fresh: Db<Table<unique_outer::Outer>> =
+        fast().open(dir.path().join("fresh.ferro")).unwrap();
+    assert_eq!(
+        from_peer(&fresh, &sender).unwrap().outcome,
+        Outcome::FastForward
+    );
+    fresh.verify_typed().unwrap();
+    let read = fresh.read();
+    assert_eq!(read.len(), 200);
+    assert_eq!(read.get(&7).unwrap().inner.key_by_n(&71), Some(1));
+    assert_eq!(read.get(&5).unwrap().inner.key_by_n(&99_999), Some(9));
 }
 
 type Drift = (&'static str, fn(&mut shadow::Shadow));
