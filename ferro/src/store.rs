@@ -2549,6 +2549,22 @@ impl Store {
         view.too_wide.load(Ordering::Relaxed).then(too_wide)
     }
 
+    /// For a [`Store::view`], the bytes it may still read at a charge and how many records of its
+    /// file it has read.
+    #[cfg(test)]
+    pub(crate) fn reads_left(&self) -> Option<(u64, u32)> {
+        let view = self.inner.view.as_ref()?;
+        let records = view
+            .read
+            .lock()
+            .chunks
+            .values()
+            .flat_map(|chunk| chunk.iter())
+            .map(|word| word.count_ones())
+            .sum();
+        Some((view.left.load(Ordering::Relaxed), records))
+    }
+
     /// Whether a read through this [`Store::view`], or a [`Store::charge`], was refused because
     /// the bytes it may still read at a charge could not pay for it.
     pub(crate) fn out_of_reads(&self) -> bool {

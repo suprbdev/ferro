@@ -2159,6 +2159,12 @@ impl Vetting<'_> {
         }
         let found = mem::take(&mut self.tables).into_found();
         let failed = checks.finish(pool, view, &plans, &found);
+        if view.out_of_reads() {
+            return Err(bad(
+                "checking that the indexes of the tables it carries agree with their rows reads \
+                 more than its size allows",
+            ));
+        }
         if let Some(error) = view.overdrawn() {
             return Err(error);
         }

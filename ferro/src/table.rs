@@ -149,9 +149,9 @@ use crate::codec::{Data, Decoder, Description, Encoder, FoundTable, Hash};
 use crate::error::{Error, Result};
 use crate::map::{
     Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ,
-    fatal, same_value, unwound,
+    same_value, unwound, walked,
 };
-use crate::pool::Pool;
+use crate::pool::{Latch, Pool};
 use crate::prefix::Prefix;
 use crate::store::{Store, fresh_reads};
 
@@ -255,39 +255,6 @@ pub trait TableData<T: Record>: Data + Default {
             unknown: false,
         })
     }
-    /// Takes the entries of the rows in `gone` out of each index whose place in `slots` is
-    /// `true`, and puts those of the rows in `come` in, in one batch per index, with
-    /// [`apply_index`], and leaves the other indexes and the rows as they were. With `wide`,
-    /// the indexes are worked on by threads of their own, as [`run_slots`] runs them.
-    ///
-    /// Returns the name of the first index left with fewer entries than it should hold, as a
-    /// unique index is when two rows share a value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a node of an index cannot be read, as a write to a map does.
-    #[doc(hidden)]
-    fn apply_slots(
-        &mut self,
-        _gone: &[&T],
-        _come: &[&T],
-        _slots: &[bool],
-        _wide: bool,
-    ) -> Option<&'static str> {
-        None
-    }
-    /// The name of the first index whose place in `slots` is `true` that holds other entries
-    /// than the same index of `other`, comparing keys by `Ord` and values by their encoding, as
-    /// [`same_index`] does. With `wide`, the indexes are compared, and dropped, by threads of
-    /// their own.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a node of either index cannot be read, as a read of a map does.
-    #[doc(hidden)]
-    fn differing(self, _other: &Self, _slots: &[bool], _wide: bool) -> Option<&'static str> {
-        None
-    }
     /// Whether working out the entries a row gives reads the file, as an `each` index over a
     /// [`Set`](crate::Set) does. The default, for a table without such an index, is `false`.
     #[doc(hidden)]
@@ -295,27 +262,51 @@ pub trait TableData<T: Record>: Data + Default {
         false
     }
     /// Checks that each index of `later` whose place in `slots` is `true` differs from the same
-    /// index of `self` by exactly what taking out the entries of the rows that `rows` returns as
-    /// gone and putting in those of the rows it returns as come changes.
+    /// index of `self` by exactly what the rows that `rows` returns as changed, each as it was
+    /// and as it is, `None` where it is absent, change in its entries.
     ///
     /// It starts the diff of each such index with [`Differ::start`], then calls `rows`, then
     /// checks each index in turn with [`Differ::index`], so the diffs of the indexes and of the
-    /// rows share the threads of `differ`.
+    /// rows share the threads of `differ`. A row whose fields the index names, and stores, encode
+    /// as they did changes nothing in it, and of an `each` field that changed only the elements
+    /// that came and went, as [`IndexEach::delta`] finds them, change its entries.
     ///
     /// Returns the name of the first index that differs by anything else, with how.
     ///
     /// # Errors
     ///
-    /// The error of `rows`, and of a node of either index that cannot be read or decoded.
+    /// The error of `rows`, and of a node of either index, or of an `each` field, that cannot be
+    /// read or decoded.
     #[doc(hidden)]
     fn diff_slots(
         &self,
         _later: &Self,
         _slots: &[bool],
         _differ: &Differ<'_, '_>,
-        rows: &mut dyn FnMut() -> Result<RowChanges<T>>,
+        rows: &mut dyn FnMut() -> Result<Vec<RowChange<T>>>,
     ) -> Result<Option<(&'static str, Fault)>> {
         rows().map(|_| None)
+    }
+    /// Checks that each index of this table whose place in `slots` is `true` holds exactly the
+    /// entries the rows give, where `rows` calls the function it is given on every row.
+    ///
+    /// It gathers the entries of each such index from the rows, then compares each index with
+    /// them, sorted, on the threads of `differ`, as [`Differ::verify`] does.
+    ///
+    /// Returns the name of the first index that holds anything else, with how.
+    ///
+    /// # Errors
+    ///
+    /// The error of `rows`, and of a node of an index, or of an `each` field, that cannot be read
+    /// or decoded.
+    #[doc(hidden)]
+    fn built_slots(
+        &self,
+        _slots: &[bool],
+        _differ: &Differ<'_, '_>,
+        rows: &mut EveryRow<'_, T>,
+    ) -> Result<Option<(&'static str, Fault)>> {
+        rows(&mut |_| Ok(())).map(|()| None)
     }
 }
 
@@ -332,15 +323,20 @@ pub struct Stored<D> {
     pub unknown: bool,
 }
 
-/// The rows that changed between two versions of a table, which [`TableData::diff_slots`] takes
-/// the entries of out of each index and puts in.
+/// A row that changed between two versions of a table, as it was and as it is, `None` on the
+/// side that does not hold it, which [`TableData::diff_slots`] takes the entries that left and
+/// came from.
 #[doc(hidden)]
-pub struct RowChanges<T> {
-    /// The rows of the earlier version that the later one does not hold as they were.
-    pub gone: Vec<Val<T>>,
-    /// The rows of the later version that the earlier one did not hold as they are.
-    pub come: Vec<Val<T>>,
-}
+pub type RowChange<T> = (Option<T>, Option<T>);
+
+/// What [`TableData::built_slots`] reads the rows of a table with: given a function, it calls it
+/// on every row, and returns the first error either gives.
+#[doc(hidden)]
+pub type EveryRow<'a, T> = dyn FnMut(&mut dyn FnMut(&T) -> Result<()>) -> Result<()> + 'a;
+
+/// What [`IndexEach::delta`] finds: the elements that left, and those that came.
+#[doc(hidden)]
+pub type Delta<X> = (Vec<X>, Vec<X>);
 
 /// Diffs the maps of two versions of a table, which the check that the later one's indexes agree
 /// with its rows compares, on the threads of a pool, reading through a store.
@@ -381,6 +377,120 @@ impl<'p> Differ<'_, 'p> {
     ) -> Result<Option<Fault>> {
         Ok(diff_index(started.0.wait(self.pool)?, gone, come))
     }
+
+    /// The keys whose values differ between `old` and `new`, two versions of a map, with the
+    /// value each held and holds, as [`Differ::start`] diffs an index, waited for.
+    pub(crate) fn changed<K: Data + Ord, V: Data>(
+        &self,
+        old: &Map<K, V>,
+        new: &Map<K, V>,
+    ) -> Result<Changed<K, V>> {
+        differ(self.pool, self.store, old, new).wait(self.pool)
+    }
+
+    /// Every key of `map`, in order, read as [`walked`] reads it.
+    pub(crate) fn keys<K: Data + Ord, V: Data>(&self, map: &Map<K, V>) -> Result<Vec<K>> {
+        let mut keys = Vec::with_capacity(map.len().min(1 << 16));
+        walked(self.pool, self.store, map, |key, _| {
+            keys.push(key);
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+
+    /// Calls `f` on every key and value of `map` in key order, read as [`walked`] reads them.
+    fn walked<K: Data + Ord, V: Data>(
+        &self,
+        map: &Map<K, V>,
+        f: impl FnMut(K, V) -> Result<()>,
+    ) -> Result<()> {
+        walked(self.pool, self.store, map, f)
+    }
+
+    /// Queues on the threads of the pool the check that `index` holds exactly `entries`: the same
+    /// keys, by `Ord`, with values that encode the same.
+    pub fn verify<K: Data + Ord, V: Data>(
+        &self,
+        index: &Map<K, V>,
+        entries: Vec<(K, V)>,
+    ) -> Verifying {
+        let told = Arc::new(Told {
+            latch: Latch::new(1),
+            found: parking_lot::Mutex::new(None),
+        });
+        let (index, store, answer) = (index.clone(), self.store, told.clone());
+        self.pool.queue(Box::new(move |pool: &Pool<'p>| {
+            let found = unwound("checking an index", || {
+                matched(pool, store, &index, entries)
+            })
+            .and_then(|found| found);
+            *answer.found.lock() = Some(found);
+            answer.latch.done(pool);
+        }));
+        Verifying(told)
+    }
+
+    /// Waits for the check `verifying`, running the work queued on the pool meanwhile, and
+    /// returns how the index differs from its entries: [`Fault::Shared`] when two of the entries
+    /// fall on one key, as two rows that share a value of a unique index give, and
+    /// [`Fault::Differs`] for any other difference.
+    ///
+    /// # Errors
+    ///
+    /// The error of a node of the index that cannot be read or decoded.
+    pub fn verified(&self, verifying: Verifying) -> Result<Option<Fault>> {
+        self.pool.help_until(false, || verifying.0.latch.is_open());
+        verifying
+            .0
+            .found
+            .lock()
+            .take()
+            .unwrap_or(Err(Error::Detached))
+    }
+}
+
+/// A check that an index holds exactly the entries of its rows, which [`Differ::verify`] queued.
+#[doc(hidden)]
+pub struct Verifying(Arc<Told>);
+
+struct Told {
+    latch: Latch,
+    found: parking_lot::Mutex<Option<Result<Option<Fault>>>>,
+}
+
+/// The check [`Differ::verify`] makes.
+fn matched<K: Data + Ord, V: Data>(
+    pool: &Pool<'_>,
+    store: &Store,
+    index: &Map<K, V>,
+    mut entries: Vec<(K, V)>,
+) -> Result<Option<Fault>> {
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].0.cmp(&pair[1].0).is_eq())
+    {
+        return Ok(Some(Fault::Shared));
+    }
+    if entries.len() != index.len() {
+        return Ok(Some(Fault::Differs));
+    }
+    let mut expected = entries.into_iter();
+    let mut differs = false;
+    let walked = walked(pool, store, index, |key, value| match expected.next() {
+        Some((held, should)) if held.cmp(&key).is_eq() && V::same_encoding(&value, &should) => {
+            Ok(())
+        }
+        _ => {
+            differs = true;
+            Err(Error::Detached)
+        }
+    });
+    if differs {
+        return Ok(Some(Fault::Differs));
+    }
+    walked?;
+    Ok(expected.next().map(|_| Fault::Differs))
 }
 
 /// How an index differs from what the rows that changed give, as [`Differ::index`] finds it.
@@ -409,45 +519,24 @@ fn diff_index<K: Data + Ord, V: Data>(
     if repeats(&gone) {
         return Some(Fault::Differs);
     }
-    let mut expected = Vec::with_capacity(gone.len().max(come.len()));
-    let (mut gone, mut come) = (gone.into_iter().peekable(), come.into_iter().peekable());
-    loop {
-        let order = match (gone.peek(), come.peek()) {
-            (Some(out), Some(into)) => out.0.cmp(&into.0),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => break,
-        };
-        match order {
-            Ordering::Less => expected.extend(gone.next().map(|(key, out)| (key, Some(out), None))),
-            Ordering::Greater => {
-                expected.extend(come.next().map(|(key, into)| (key, None, Some(into))));
-            }
-            Ordering::Equal => {
-                if let (Some((_, out)), Some((key, into))) = (gone.next(), come.next())
-                    && !V::same_encoding(&out, &into)
-                {
-                    expected.push((key, Some(out), Some(into)));
-                }
-            }
-        }
-    }
-    let same = |found: &Option<Val<V>>, expected: &Option<V>| match (found, expected) {
+    let same = |found: &Option<V>, expected: Option<&V>| match (found, expected) {
         (None, None) => true,
         (Some(found), Some(expected)) => V::same_encoding(found, expected),
         _ => false,
     };
-    if found.len() == expected.len()
-        && found.iter().zip(&expected).all(|(found, expected)| {
-            found.0 == expected.0 && same(&found.1, &expected.1) && same(&found.2, &expected.2)
+    let mut changes = expected(&gone, &come);
+    let agrees = found.iter().all(|(key, before, after)| {
+        changes.next().is_some_and(|(other, out, into)| {
+            other == key && same(before, out) && same(after, into)
         })
-    {
+    });
+    if agrees && changes.next().is_none() {
         return None;
     }
-    let mut expected = expected.iter().peekable();
+    let mut changes = expected(&gone, &come).peekable();
     for (key, before, _) in &found {
-        while expected.next_if(|(other, ..)| other < key).is_some() {}
-        if let Some((_, None, Some(_))) = expected.next_if(|(other, ..)| other == key)
+        while changes.next_if(|(other, ..)| *other < key).is_some() {}
+        if let Some((_, None, Some(_))) = changes.next_if(|(other, ..)| *other == key)
             && before.is_some()
         {
             return Some(Fault::Shared);
@@ -456,52 +545,36 @@ fn diff_index<K: Data + Ord, V: Data>(
     Some(Fault::Differs)
 }
 
-/// Work on one index of a table that [`run_slots`] runs, which answers with the name of the
-/// index when it finds that index wrong.
-#[doc(hidden)]
-pub type SlotTask<'a> = Box<dyn FnOnce() -> Option<&'static str> + Send + 'a>;
-
-/// Runs each of `tasks`, on threads of their own when `wide` and there are several, and returns
-/// the first answer that is `Some`, in the order of `tasks`.
-///
-/// # Panics
-///
-/// A panic in a task carries on in the calling thread, with the error of the read that failed in
-/// it, where one did, for [`Map`]'s reads to report.
-#[doc(hidden)]
-pub fn run_slots(tasks: Vec<SlotTask<'_>>, wide: bool) -> Option<&'static str> {
-    if !wide || tasks.len() < 2 {
-        for task in tasks {
-            if let Some(index) = task() {
-                return Some(index);
+/// The changes that taking `gone` out of an index and putting `come` in make, both sorted by key,
+/// in key order: each key with the value it loses and the one it gains, leaving out a key that
+/// both hold with the same encoding.
+fn expected<'e, K: Ord, V: Data>(
+    gone: &'e [(K, V)],
+    come: &'e [(K, V)],
+) -> impl Iterator<Item = (&'e K, Option<&'e V>, Option<&'e V>)> + 'e {
+    let (mut gone, mut come) = (gone.iter().peekable(), come.iter().peekable());
+    std::iter::from_fn(move || {
+        loop {
+            let order = match (gone.peek(), come.peek()) {
+                (Some(out), Some(into)) => out.0.cmp(&into.0),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => return None,
+            };
+            match order {
+                Ordering::Less => return gone.next().map(|(key, out)| (key, Some(out), None)),
+                Ordering::Greater => {
+                    return come.next().map(|(key, into)| (key, None, Some(into)));
+                }
+                Ordering::Equal => {
+                    let ((_, out), (key, into)) = (gone.next()?, come.next()?);
+                    if !V::same_encoding(out, into) {
+                        return Some((key, Some(out), Some(into)));
+                    }
+                }
             }
         }
-        return None;
-    }
-    let answers: Vec<Result<Option<&'static str>>> = std::thread::scope(|scope| {
-        let mut tasks = tasks.into_iter();
-        let first = tasks.next();
-        let helpers: Vec<_> = tasks
-            .map(|task| scope.spawn(move || unwound("checking an index", task)))
-            .collect();
-        let mut answers: Vec<_> = first
-            .map(|task| unwound("checking an index", task))
-            .into_iter()
-            .collect();
-        for helper in helpers {
-            match helper.join() {
-                Ok(answer) => answers.push(answer),
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        }
-        answers
-    });
-    for answer in answers {
-        if let Some(index) = fatal(answer) {
-            return Some(index);
-        }
-    }
-    None
+    })
 }
 
 /// Reads a table value of `T` with `read` and, when `r` belongs to a typed check that collects
@@ -528,22 +601,6 @@ pub fn noted<'a, T: Record, R>(
         !T::Table::indexing_reads(),
     );
     Ok(value)
-}
-
-/// Whether `built`, an index built from rows, and `stored`, the same index as a table stores it,
-/// hold the same entries: keys equal by `Ord` and values that encode the same.
-///
-/// Equal root hashes settle it. Otherwise the two are diffed, which reads only the subtrees whose
-/// hashes differ, so an index whose keys compare equal to the rebuilt ones but are stored as other
-/// bytes, as a type whose `==` ignores case can leave, still agrees.
-///
-/// # Panics
-///
-/// Panics if a node of either index cannot be read, as [`Map::diff`] does.
-#[doc(hidden)]
-pub fn same_index<K: Data + Ord, V: Data>(built: &Map<K, V>, stored: &Map<K, V>) -> bool {
-    built.len() == stored.len()
-        && (built.root_hash() == stored.root_hash() || built.diff(stored).next().is_none())
 }
 
 /// Checks that each index `table` stores under a fingerprint `T` knows holds exactly the entries
@@ -577,21 +634,22 @@ fn agree<'p, T: Record>(
             type_name::<T::Table>()
         )));
     }
+    let differ = Differ { pool, store };
     if let Some(base) = base {
         let Stored {
             table: base, held, ..
         } = read(base)?;
         if slots.iter().zip(&held).all(|(slot, held)| !slot || *held) {
-            return diffed::<T>(&base, &table, &slots, &Differ { pool, store });
+            return faulted(diffed::<T>(&base, &table, &slots, &differ)?);
         }
     }
-    let (indexes, rows) = built::<T>(&table, &slots)?;
-    match indexes.differing(&table, &slots, rows >= WIDE_ROWS) {
-        Some(index) => Err(Error::Decode(format!(
-            "index {index} does not hold exactly the entries its rows give"
-        ))),
-        None => Ok(()),
-    }
+    let found = table.built_slots(&slots, &differ, &mut |each| {
+        differ.walked(table.rows(), |key, row| {
+            owned::<T>(&key, &row)?;
+            each(&row)
+        })
+    })?;
+    faulted(found)
 }
 
 fn diffed<T: Record>(
@@ -599,21 +657,25 @@ fn diffed<T: Record>(
     table: &T::Table,
     slots: &[bool],
     differ: &Differ<'_, '_>,
-) -> Result<()> {
+) -> Result<Option<(&'static str, Fault)>> {
     let mut rows = Some(differ.start(base.rows(), table.rows()));
-    let mut moved = || -> Result<RowChanges<T>> {
-        let (mut gone, mut come) = (Vec::new(), Vec::new());
+    let mut moved = || -> Result<Vec<RowChange<T>>> {
         let started = rows.take().ok_or(Error::Detached)?;
-        for (key, before, after) in started.0.wait(differ.pool)? {
-            gone.extend(before);
-            if let Some(after) = after {
-                owned::<T>(&key, &after)?;
-                come.push(after);
+        let changed = started.0.wait(differ.pool)?;
+        let mut moved = Vec::with_capacity(changed.len());
+        for (key, before, after) in changed {
+            if let Some(after) = &after {
+                owned::<T>(&key, after)?;
             }
+            moved.push((before, after));
         }
-        Ok(RowChanges { gone, come })
+        Ok(moved)
     };
-    match base.diff_slots(table, slots, differ, &mut moved)? {
+    base.diff_slots(table, slots, differ, &mut moved)
+}
+
+fn faulted(found: Option<(&'static str, Fault)>) -> Result<()> {
+    match found {
         None => Ok(()),
         Some((index, Fault::Shared)) => Err(Error::Decode(format!(
             "two rows share a value of unique index {index}"
@@ -622,100 +684,6 @@ fn diffed<T: Record>(
             "index {index} does not hold exactly the entries its rows give"
         ))),
     }
-}
-
-/// The rows a rebuild reads before it puts their entries in, so that it holds a batch of rows at
-/// a time rather than the whole table.
-const BUILT_BATCH: usize = 1 << 16;
-
-/// The rows past which the check of a table works on its indexes with a thread each.
-const WIDE_ROWS: usize = 1 << 10;
-
-fn built<T: Record>(table: &T::Table, slots: &[bool]) -> Result<(T::Table, usize)> {
-    let mut indexes = T::Table::default();
-    let (mut come, mut rows) = (Vec::new(), 0);
-    for (key, row) in table.rows().iter() {
-        owned::<T>(&key, &row)?;
-        come.push(row);
-        rows += 1;
-        if come.len() == BUILT_BATCH {
-            placed::<T>(&mut indexes, &[], &come, slots)?;
-            come.clear();
-        }
-    }
-    placed::<T>(&mut indexes, &[], &come, slots)?;
-    Ok((indexes, rows))
-}
-
-fn placed<T: Record>(
-    indexes: &mut T::Table,
-    gone: &[Val<T>],
-    come: &[Val<T>],
-    slots: &[bool],
-) -> Result<()> {
-    let wide = gone.len() + come.len() >= WIDE_ROWS;
-    let gone: Vec<&T> = gone.iter().map(|row| &**row).collect();
-    let come: Vec<&T> = come.iter().map(|row| &**row).collect();
-    match indexes.apply_slots(&gone, &come, slots, wide) {
-        Some(index) => Err(Error::Decode(format!(
-            "two rows share a value of unique index {index}"
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// Takes the entries in `old` out of `index` and puts those in `new` in, in one batch, leaving
-/// alone an entry that both hold with the same encoding, and returns whether `index` ends up with
-/// as many entries as that should leave it.
-///
-/// Each entry of `old` must be in `index`. It ends up with fewer when an entry of `new` falls on
-/// a key that another entry of `new`, or one that `old` does not take out, already holds, as two
-/// rows that share a value of a unique index give.
-#[doc(hidden)]
-pub fn apply_index<K: Data + Ord, V: Data>(
-    index: &mut Map<K, V>,
-    mut old: Vec<(K, V)>,
-    mut new: Vec<(K, V)>,
-) -> bool {
-    old.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    new.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let mut edits = Vec::with_capacity(old.len().max(new.len()));
-    let (mut taken, mut put) = (0usize, 0usize);
-    let (mut old, mut new) = (old.into_iter().peekable(), new.into_iter().peekable());
-    loop {
-        let order = match (old.peek(), new.peek()) {
-            (Some(out), Some(into)) => out.0.cmp(&into.0),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => break,
-        };
-        match order {
-            Ordering::Less => {
-                if let Some((key, _)) = old.next() {
-                    edits.push((key, None));
-                    taken += 1;
-                }
-            }
-            Ordering::Greater => {
-                if let Some((key, value)) = new.next() {
-                    edits.push((key, Some(value)));
-                    put += 1;
-                }
-            }
-            Ordering::Equal => {
-                if let (Some((_, out)), Some((key, into))) = (old.next(), new.next())
-                    && !V::same_encoding(&out, &into)
-                {
-                    edits.push((key, Some(into)));
-                }
-            }
-        }
-    }
-    let Some(expected) = index.len().checked_sub(taken).map(|left| left + put) else {
-        return false;
-    };
-    index.apply(edits);
-    index.len() == expected
 }
 
 fn owned<T: Record>(key: &T::Key, row: &T) -> Result<()> {
@@ -4256,6 +4224,80 @@ pub trait IndexEach {
     fn try_values(&self) -> Result<Vec<Self::Value>> {
         Ok(self.values())
     }
+
+    /// The elements to index, read through `differ` as the check that a table's indexes agree
+    /// with its rows reads, so that a read that fails returns its error. The default returns
+    /// [`values`](IndexEach::values).
+    ///
+    /// # Errors
+    ///
+    /// The error of a node that cannot be read or decoded.
+    #[doc(hidden)]
+    fn read_values(&self, _differ: &Differ<'_, '_>) -> Result<Vec<Self::Value>> {
+        Ok(self.values())
+    }
+
+    /// The elements `self` holds that `newer` does not, and those `newer` holds that `self` does
+    /// not, compared by `Ord`, each once and in order, read through `differ`. The default reads
+    /// both whole with [`read_values`](IndexEach::read_values); a [`Set`](crate::Set) diffs its
+    /// two versions, which reads only the nodes they do not share.
+    ///
+    /// # Errors
+    ///
+    /// The error of a node that cannot be read or decoded.
+    #[doc(hidden)]
+    fn delta(&self, newer: &Self, differ: &Differ<'_, '_>) -> Result<Delta<Self::Value>> {
+        let (old, new) = (
+            distinct(self.read_values(differ)?),
+            distinct(newer.read_values(differ)?),
+        );
+        let (mut gone, mut come) = (Vec::new(), Vec::new());
+        let (mut old, mut new) = (old.into_iter().peekable(), new.into_iter().peekable());
+        loop {
+            let order = match (old.peek(), new.peek()) {
+                (Some(left), Some(came)) => left.cmp(came),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => return Ok((gone, come)),
+            };
+            match order {
+                Ordering::Less => gone.extend(old.next()),
+                Ordering::Greater => come.extend(new.next()),
+                Ordering::Equal => {
+                    old.next();
+                    new.next();
+                }
+            }
+        }
+    }
+}
+
+/// `values` sorted, each once, as an index keeps them.
+fn distinct<X: Ord>(mut values: Vec<X>) -> Vec<X> {
+    values.sort_unstable();
+    values.dedup_by(|a, b| Ord::cmp(&*a, &*b).is_eq());
+    values
+}
+
+/// The elements of `field` that an `each` index holds an entry for, sorted and each once, read
+/// through `differ` with [`IndexEach::read_values`] where the check that a table's indexes agree
+/// with its rows reads them, and with [`IndexEach::try_values`] otherwise.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates.
+///
+/// # Errors
+///
+/// The error of a node of `field` that cannot be read or decoded.
+#[doc(hidden)]
+pub fn each_values<E: IndexEach>(
+    field: &E,
+    differ: Option<&Differ<'_, '_>>,
+) -> Result<Vec<E::Value>> {
+    let values = match differ {
+        Some(differ) => field.read_values(differ)?,
+        None => field.try_values()?,
+    };
+    Ok(distinct(values))
 }
 
 impl<X: Data + Ord> IndexEach for Vec<X> {
@@ -4290,6 +4332,22 @@ impl<X: Data + Ord> IndexEach for crate::set::Set<X> {
             .map(|(value, ())| value)
             .collect())
     }
+
+    fn read_values(&self, differ: &Differ<'_, '_>) -> Result<Vec<X>> {
+        differ.keys(self.map())
+    }
+
+    fn delta(&self, newer: &Self, differ: &Differ<'_, '_>) -> Result<Delta<X>> {
+        let (mut gone, mut come) = (Vec::new(), Vec::new());
+        for (value, before, after) in differ.changed(self.map(), newer.map())? {
+            match (before, after) {
+                (Some(_), None) => gone.push(value),
+                (None, Some(_)) => come.push(value),
+                _ => {}
+            }
+        }
+        Ok((gone, come))
+    }
 }
 
 impl<X: Data + Ord> IndexEach for Option<X> {
@@ -4297,5 +4355,115 @@ impl<X: Data + Ord> IndexEach for Option<X> {
 
     fn values(&self) -> Vec<X> {
         self.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::HashSink;
+    use crate::{Db, Durability, Options, Set, pool};
+
+    #[derive(crate::Data, crate::Record, Clone, Debug, PartialEq)]
+    struct Tagged {
+        #[key]
+        id: u64,
+        #[index(each)]
+        tags: Set<u32>,
+        #[index]
+        group: u8,
+        note: u64,
+    }
+
+    #[derive(crate::Data, Clone, Default)]
+    struct Shelf {
+        rows: Table<Tagged>,
+    }
+
+    fn found(table: &Table<Tagged>) -> FoundTable {
+        let mut sink = HashSink;
+        let mut encoder = Encoder::new(&mut sink);
+        table.encode(&mut encoder).unwrap();
+        let object = encoder.into_object();
+        FoundTable {
+            id: TypeId::of::<TaggedTable>(),
+            name: "TaggedTable",
+            agree: agree::<Tagged>,
+            beside: true,
+            hash: object.hash(),
+            body: object.body.into(),
+            links: object.links.into(),
+        }
+    }
+
+    fn checked(db: &Db<Shelf>, old: u64, new: u64) -> (Result<()>, u64, u32) {
+        let allowance = 1 << 40;
+        let (old, new) = (db.at(old).unwrap(), db.at(new).unwrap());
+        let view = new
+            .rows
+            .rows()
+            .store()
+            .unwrap()
+            .view(0, allowance, u64::MAX);
+        let agreed = pool::scope(|pool| {
+            agree::<Tagged>(
+                &found(&new.rows),
+                Some(&found(&old.rows)),
+                &view,
+                pool,
+                true,
+            )
+        });
+        let (left, records) = view.reads_left().unwrap();
+        (agreed, allowance - left, records)
+    }
+
+    #[test]
+    fn an_edit_reads_of_a_set_an_each_index_names_only_what_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db: Db<Shelf> = Options::new()
+            .durability(Durability::Buffered)
+            .open(dir.path().join("shelf.ferro"))
+            .unwrap();
+        db.update(|shelf| {
+            for id in 0..200 {
+                let tags = (0..if id == 7 { 40_000 } else { 3 }).collect();
+                shelf.rows.insert(Tagged {
+                    id,
+                    tags,
+                    group: (id % 5) as u8,
+                    note: 0,
+                });
+            }
+        })
+        .unwrap();
+        db.update(|shelf| {
+            shelf.rows.update(&7, |row| row.note = 1);
+        })
+        .unwrap();
+        db.update(|shelf| {
+            shelf.rows.update(&7, |row| {
+                row.tags.remove(&20_000);
+                row.tags.insert(50_000);
+                row.group = 9;
+            });
+        })
+        .unwrap();
+
+        let (agreed, charged, records) = checked(&db, 1, 2);
+        agreed.unwrap();
+        assert_eq!(
+            charged, 0,
+            "an edit of a field no index names read the set again"
+        );
+        assert!(
+            records < 12,
+            "an edit of a field no index names read {records} records"
+        );
+
+        let (agreed, charged, records) = checked(&db, 2, 3);
+        agreed.unwrap();
+        assert_eq!(charged, 0, "an edit of the set read it again");
+        assert!(records < 100, "an edit of two tags read {records} records");
     }
 }

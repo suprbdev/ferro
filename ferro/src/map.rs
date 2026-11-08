@@ -3460,7 +3460,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         self.root = Link::Empty;
     }
 
-    fn store(&self) -> Option<&Store> {
+    pub(crate) fn store(&self) -> Option<&Store> {
         self.store.as_ref()
     }
 
@@ -6390,8 +6390,8 @@ impl Bare {
         }
     }
 
-    fn value<V: Data>(&self, store: &Store) -> Result<Val<V>> {
-        let value = match self {
+    fn value<V: Data>(&self, store: &Store) -> Result<V> {
+        match self {
             Bare::Inline(object, bytes, links) => {
                 let mut r = Decoder::new(
                     &object.body[bytes.clone()],
@@ -6399,14 +6399,13 @@ impl Bare {
                     Some(store),
                 );
                 r.skip_rebuilds();
-                Arc::new(V::decode(&mut r)?)
+                V::decode(&mut r)
             }
-            Bare::Spilled(ptr) => Arc::new(store.decode_at(*ptr, |r| {
+            Bare::Spilled(ptr) => store.decode_at(*ptr, |r| {
                 r.skip_rebuilds();
                 V::decode(r)
-            })?),
-        };
-        Ok(Val::of_single(&value))
+            }),
+        }
     }
 }
 
@@ -6462,6 +6461,56 @@ fn bare<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Vec<Bared<
         store.count_zero_width(r.zero_width())?;
     }
     Ok(steps)
+}
+
+/// Calls `f` on every key and value of `map` in key order, reading each node once through
+/// `store` without decoding the values it does not hand to `f`, so that a read that fails, a node
+/// that does not decode or one linked from two places returns an error rather than panicking or
+/// walking the node again. It stops with an error once `pool` is told to stop.
+///
+/// A map held in memory is walked as [`Map::try_entries`] walks it.
+pub(crate) fn walked<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    pool: &Pool<'_>,
+    store: &Store,
+    map: &Map<K, V, S>,
+    mut f: impl FnMut(K, V) -> Result<()>,
+) -> Result<()> {
+    let mut steps = match &map.root {
+        Link::Empty => return Ok(()),
+        Link::Stored { ptr, count, .. } => vec![Bared::Sub(*ptr, *count)],
+        Link::Mem(..) => {
+            for (key, value) in map.try_entries()? {
+                f(key, value)?;
+            }
+            return Ok(());
+        }
+    };
+    let mut opened = HashSet::new();
+    while let Some(step) = steps.pop() {
+        match step {
+            Bared::Sub(ptr, _) => {
+                if pool.stopped() {
+                    return Err(stopped());
+                }
+                if !opened.insert(ptr.hash) {
+                    return Err(linked_twice());
+                }
+                steps.extend(bare::<K, V, S>(store, ptr)?.into_iter().rev());
+            }
+            Bared::Entry(key, value) => f(key, value.value::<V>(store)?)?,
+        }
+    }
+    Ok(())
+}
+
+/// The error of a walk or a diff that its pool told to stop.
+fn stopped() -> Error {
+    Error::Decode("its check was stopped".into())
+}
+
+/// The error of a map that links one node from two places, which no map built by its writes does.
+fn linked_twice() -> Error {
+    Error::Decode("a map links one node from two places".into())
 }
 
 fn expand_bare<K: Data, V: Data, S: Data>(store: &Store, steps: &mut Vec<Bared<K>>) -> Result<()> {
@@ -6544,9 +6593,11 @@ pub(crate) fn differ<'p, K: Data + Ord, V: Data, S: Summary<K, V>>(
             let found = old
                 .diff(new)
                 .map(|change| match change {
-                    Change::Added(key, value) => (key, None, Some(value)),
-                    Change::Removed(key, value) => (key, Some(value), None),
-                    Change::Changed(key, before, after) => (key, Some(before), Some(after)),
+                    Change::Added(key, value) => (key, None, Some(value.into_owned())),
+                    Change::Removed(key, value) => (key, Some(value.into_owned()), None),
+                    Change::Changed(key, before, after) => {
+                        (key, Some(before.into_owned()), Some(after.into_owned()))
+                    }
                 })
                 .collect();
             differing.found.parts.lock().push((Box::new([]), Ok(found)));
@@ -6597,8 +6648,7 @@ fn run<'p, K: Data + Ord, V: Data, S: Data>(
 ) -> Job<'p> {
     Box::new(move |pool: &Pool<'p>| {
         if pool.stopped() {
-            let stopped = Error::Decode("its check was stopped".into());
-            found.parts.lock().push((path, Err(stopped)));
+            found.parts.lock().push((path, Err(stopped())));
             found.latch.done(pool);
             return;
         }
@@ -6833,7 +6883,7 @@ fn diffed<K: Data + Ord, V: Data, S: Data>(
     }
 }
 
-pub(crate) type Changed<K, V> = Vec<(K, Option<Val<V>>, Option<Val<V>>)>;
+pub(crate) type Changed<K, V> = Vec<(K, Option<V>, Option<V>)>;
 
 fn removed<K, V: Data>(
     store: &Store,
@@ -7587,7 +7637,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|(key, before, after)| {
-                    let owned = |value: Option<Val<String>>| value.map(Val::into_owned);
+                    let owned = |value: Option<String>| value;
                     (key, owned(before), owned(after))
                 })
                 .collect();
@@ -7672,7 +7722,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|(key, before, after)| {
-                    let owned = |value: Option<Val<String>>| value.map(Val::into_owned);
+                    let owned = |value: Option<String>| value;
                     (key, owned(before), owned(after))
                 })
                 .collect();

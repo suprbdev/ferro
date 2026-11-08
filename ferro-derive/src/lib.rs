@@ -1449,10 +1449,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         .iter()
         .map(|field| format_ident!("__entries_{}", field))
         .collect();
+    let delta_fns: Vec<Ident> = index_fields
+        .iter()
+        .map(|field| format_ident!("__delta_{}", field))
+        .collect();
 
     let mut reindex = Vec::new();
-    let mut entries = Vec::new();
     let mut try_entries = Vec::new();
+    let mut deltas = Vec::new();
     let mut clashes = Vec::new();
     let mut methods = Vec::new();
     let mut finds = Vec::new();
@@ -1473,6 +1477,50 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         });
         let same = quote! { #(#same &&)* __o.#key_ident == __n.#key_ident };
+        let stored_alike = ix
+            .stored()
+            .into_iter()
+            .map(|(ident, _)| quote! { ::ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
+        let stored_alike = quote! { true #(&& #stored_alike)* };
+        let indexed_alike = ix
+            .fields
+            .iter()
+            .map(|(ident, _)| quote! { ::ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
+        let each_delta = match (&ix.kind, ix.sole()) {
+            (IndexKind::Each, Some((ident, _))) => quote! {
+                if #stored_alike {
+                    let (__left, __came) = ::ferro::table::IndexEach::delta(&__o.#ident, &__n.#ident, __differ)?;
+                    let __r = __o;
+                    let __stored = #stored_of;
+                    for __v in __left {
+                        __gone.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
+                    }
+                    let __r = __n;
+                    let __stored = #stored_of;
+                    for __v in __came {
+                        __come.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
+                    }
+                    return ::std::result::Result::Ok(());
+                }
+            },
+            _ => quote! {},
+        };
+        let entries_fn = &entries_fns[slot];
+        deltas.push(quote! {
+            if let (::std::option::Option::Some(__o), ::std::option::Option::Some(__n)) = (__old, __new) {
+                if #stored_alike #(&& #indexed_alike)* {
+                    return ::std::result::Result::Ok(());
+                }
+                #each_delta
+            }
+            if let ::std::option::Option::Some(__r) = __old {
+                Self::#entries_fn(__r, ::std::option::Option::Some(__differ), __gone)?;
+            }
+            if let ::std::option::Option::Some(__r) = __new {
+                Self::#entries_fn(__r, ::std::option::Option::Some(__differ), __come)?;
+            }
+            ::std::result::Result::Ok(())
+        });
         if !ix.cover.is_empty() {
             let project_fn = ix.project_fn();
             let projected = ix.projected();
@@ -1495,10 +1543,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         });
         match ix.kind {
             IndexKind::Value if ix.stores_cover() => {
-                entries.push(quote! {
+                try_entries.push(quote! {
                     __out.push(((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of));
                 });
-                try_entries.push(entries[slot].clone());
                 reindex.push(quote! {
                     {
                         let (__same, __same_cover) = match (__old, __new) {
@@ -1519,10 +1566,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 });
             }
             IndexKind::Value => {
-                entries.push(quote! {
+                try_entries.push(quote! {
                     __out.push(((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
                 });
-                try_entries.push(entries[slot].clone());
                 reindex.push(quote! {
                     {
                         let __same = match (__old, __new) {
@@ -1556,12 +1602,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         quote! { #key_ty },
                     )
                 };
-                entries.push(quote! {
+                try_entries.push(quote! {
                     if let ::std::option::Option::Some(__value) = #optional {
                         __out.push((__value, #entry));
                     }
                 });
-                try_entries.push(entries[slot].clone());
                 reindex.push(quote! {
                     {
                         let (__same, __same_cover) = match (__old, __new) {
@@ -1736,19 +1781,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             IndexKind::Each if ix.stores_cover() => {
                 let ident = &ix.fields[0].0;
-                entries.push(quote! {
-                    let __stored = #stored_of;
-                    let __each: ::std::collections::BTreeSet<#vt> =
-                        ::ferro::table::IndexEach::values(&__r.#ident).into_iter().collect();
-                    for __v in __each {
-                        __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
-                    }
-                });
                 try_entries.push(quote! {
                     let __stored = #stored_of;
-                    let __each: ::std::collections::BTreeSet<#vt> =
-                        ::ferro::table::IndexEach::try_values(&__r.#ident)?.into_iter().collect();
-                    for __v in __each {
+                    for __v in ::ferro::table::each_values(&__r.#ident, __differ)? {
                         __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
                     }
                 });
@@ -1785,17 +1820,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             IndexKind::Each => {
                 let ident = &ix.fields[0].0;
-                entries.push(quote! {
-                    let __each: ::std::collections::BTreeSet<#vt> =
-                        ::ferro::table::IndexEach::values(&__r.#ident).into_iter().collect();
-                    for __v in __each {
-                        __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
-                    }
-                });
                 try_entries.push(quote! {
-                    let __each: ::std::collections::BTreeSet<#vt> =
-                        ::ferro::table::IndexEach::try_values(&__r.#ident)?.into_iter().collect();
-                    for __v in __each {
+                    for __v in ::ferro::table::each_values(&__r.#ident, __differ)? {
                         __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
                     }
                 });
@@ -2135,7 +2161,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     #(
                         if __stale[#slots] {
                             let mut __entries = ::std::vec::Vec::new();
-                            Self::#entries_fns(&*__row, &mut __entries)?;
+                            Self::#entries_fns(&*__row, ::std::option::Option::None, &mut __entries)?;
                             for (__key, __value) in __entries {
                                 __table.#index_fields.insert(__key, __value);
                             }
@@ -2246,39 +2272,6 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     })
                 }
 
-                fn apply_slots(
-                    &mut self,
-                    __gone: &[&#name],
-                    __come: &[&#name],
-                    __slots: &[bool],
-                    __wide: bool,
-                ) -> ::std::option::Option<&'static str> {
-                    let mut __tasks: ::std::vec::Vec<::ferro::table::SlotTask<'_>> = ::std::vec::Vec::new();
-                    #(
-                        if __slots.get(#slots) == ::std::option::Option::Some(&true) {
-                            let __index = &mut self.#index_fields;
-                            __tasks.push(::std::boxed::Box::new(move || {
-                                let mut __old = ::std::vec::Vec::new();
-                                for __r in __gone {
-                                    let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (*__r, &mut __old);
-                                    #entries
-                                }
-                                let mut __new = ::std::vec::Vec::new();
-                                for __r in __come {
-                                    let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (*__r, &mut __new);
-                                    #entries
-                                }
-                                if ::ferro::table::apply_index(__index, __old, __new) {
-                                    ::std::option::Option::None
-                                } else {
-                                    ::std::option::Option::Some(#index_names)
-                                }
-                            }));
-                        }
-                    )*
-                    ::ferro::table::run_slots(__tasks, __wide)
-                }
-
                 fn indexing_reads() -> bool {
                     false #(|| <#each_tys as ::ferro::table::IndexEach>::READS)*
                 }
@@ -2288,7 +2281,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     __later: &Self,
                     __slots: &[bool],
                     __differ: &::ferro::table::Differ<'_, '_>,
-                    __rows: &mut dyn ::std::ops::FnMut() -> ::ferro::Result<::ferro::table::RowChanges<#name>>,
+                    __rows: &mut dyn ::std::ops::FnMut() -> ::ferro::Result<::std::vec::Vec<::ferro::table::RowChange<#name>>>,
                 ) -> ::ferro::Result<::std::option::Option<(&'static str, ::ferro::table::Fault)>> {
                     #(
                         let #started = (__slots.get(#slots) == ::std::option::Option::Some(&true))
@@ -2297,17 +2290,18 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     let __moved = __rows()?;
                     #(
                         if let ::std::option::Option::Some(__started) = #started {
-                            let mut __old = ::std::vec::Vec::new();
-                            for __r in &__moved.gone {
-                                let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (&**__r, &mut __old);
-                                #entries
+                            let mut __gone = ::std::vec::Vec::new();
+                            let mut __come = ::std::vec::Vec::new();
+                            for (__old, __new) in &__moved {
+                                Self::#delta_fns(
+                                    __old.as_ref(),
+                                    __new.as_ref(),
+                                    __differ,
+                                    &mut __gone,
+                                    &mut __come,
+                                )?;
                             }
-                            let mut __new = ::std::vec::Vec::new();
-                            for __r in &__moved.come {
-                                let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (&**__r, &mut __new);
-                                #entries
-                            }
-                            if let ::std::option::Option::Some(__fault) = __differ.index(__started, __old, __new)? {
+                            if let ::std::option::Option::Some(__fault) = __differ.index(__started, __gone, __come)? {
                                 return ::std::result::Result::Ok(::std::option::Option::Some((#index_names, __fault)));
                             }
                         }
@@ -2315,28 +2309,35 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::std::result::Result::Ok(::std::option::Option::None)
                 }
 
-                fn differing(
-                    self,
-                    __other: &Self,
+                fn built_slots(
+                    &self,
                     __slots: &[bool],
-                    __wide: bool,
-                ) -> ::std::option::Option<&'static str> {
-                    let #table { #(#index_fields,)* .. } = self;
-                    let mut __tasks: ::std::vec::Vec<::ferro::table::SlotTask<'_>> = ::std::vec::Vec::new();
+                    __differ: &::ferro::table::Differ<'_, '_>,
+                    __rows: &mut ::ferro::table::EveryRow<'_, #name>,
+                ) -> ::ferro::Result<::std::option::Option<(&'static str, ::ferro::table::Fault)>> {
                     #(
-                        if __slots.get(#slots) == ::std::option::Option::Some(&true) {
-                            let __stored = &__other.#index_fields;
-                            let __built = #index_fields;
-                            __tasks.push(::std::boxed::Box::new(move || {
-                                if ::ferro::table::same_index(&__built, __stored) {
-                                    ::std::option::Option::None
-                                } else {
-                                    ::std::option::Option::Some(#index_names)
-                                }
-                            }));
+                        let mut #vars: ::std::option::Option<::std::vec::Vec<#entry_tys>> =
+                            (__slots.get(#slots) == ::std::option::Option::Some(&true)).then(::std::vec::Vec::new);
+                    )*
+                    __rows(&mut |__r| {
+                        #(
+                            if let ::std::option::Option::Some(__out) = &mut #vars {
+                                Self::#entries_fns(__r, ::std::option::Option::Some(__differ), __out)?;
+                            }
+                        )*
+                        ::std::result::Result::Ok(())
+                    })?;
+                    #(
+                        let #started = #vars.map(|__entries| __differ.verify(&self.#index_fields, __entries));
+                    )*
+                    #(
+                        if let ::std::option::Option::Some(__verifying) = #started {
+                            if let ::std::option::Option::Some(__fault) = __differ.verified(__verifying)? {
+                                return ::std::result::Result::Ok(::std::option::Option::Some((#index_names, __fault)));
+                            }
                         }
                     )*
-                    ::ferro::table::run_slots(__tasks, __wide)
+                    ::std::result::Result::Ok(::std::option::Option::None)
                 }
             },
         )
@@ -2441,10 +2442,21 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             #(
                 fn #entries_fns(
                     __r: &#name,
+                    __differ: ::std::option::Option<&::ferro::table::Differ<'_, '_>>,
                     __out: &mut ::std::vec::Vec<#entry_tys>,
                 ) -> ::ferro::Result<()> {
                     #try_entries
                     ::std::result::Result::Ok(())
+                }
+
+                fn #delta_fns(
+                    __old: ::std::option::Option<&#name>,
+                    __new: ::std::option::Option<&#name>,
+                    __differ: &::ferro::table::Differ<'_, '_>,
+                    __gone: &mut ::std::vec::Vec<#entry_tys>,
+                    __come: &mut ::std::vec::Vec<#entry_tys>,
+                ) -> ::ferro::Result<()> {
+                    #deltas
                 }
             )*
 
