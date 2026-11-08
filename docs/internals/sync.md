@@ -389,7 +389,7 @@ bounded by a few columns an object. The receiver keeps, for each object in the b
   copies a sixteenth.
 
 That is 35 to 40 bytes. Placing drops the staging offsets and keeps each object's offset in the log
-in their place. A check is kept only while a later link may still need it, as described under
+in their place. A check is kept only while a later link of its type may need it, as described under
 [Checking trees](sync-receive.md#checking-trees). The walk below held data linked as another type
 keeps at most 229,376 checks of 24 bytes, in a table of 6.25 MiB that peaks at 9.4 MiB while it
 grows, however much of the file it reads and however long its keys, as described under [Held data

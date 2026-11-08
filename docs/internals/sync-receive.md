@@ -282,15 +282,17 @@ and runs each root's tree to the end before the next. A link to a sent object ch
 the kind the link names and pushes its own links. Most objects are linked once, so their checks are
 not kept. While the bundle streams, the receiver counts the links each object gets from other sent
 objects, and only an object linked more than once, or also named by a hint, keeps the kinds it was
-checked as, the last 16 for each type, until its last link has reached it. A later link of the same
-type whose range contains one it was checked under is not checked again. A link under a range no
-earlier check covers checks the object again, and if that check finds typed links, decodes it again
-under one earlier kind, the one its parent's recheck carried down or else the last one kept, to
-learn what that gave its children. A child is pushed again only if the new check gives it a kind
-that the earlier one does not imply, which in a narrower range only the edge children get, and it
-carries that kind with it, so a recheck goes down the edge of the subtree. The counts only decide
-what is kept: an object reached more often than it was counted is checked again, never let
-through. A link that resolves to an object the receiver holds is not walked into while the
+checked as, the last 16 for each type. It keeps those of each type until as many links as it has
+have reached it as that type, since a parent checked as two types reaches each child once as each
+through one link, and a type that fewer links reach it as keeps its check until the walk ends. A
+later link of the same type whose range contains one it was checked under is not checked again. A
+link under a range no earlier check covers checks the object again, and if that check finds typed
+links, decodes it again under one earlier kind, the one its parent's recheck carried down or else
+the last one kept, to learn what that gave its children. A child is pushed again only if the new
+check gives it a kind that the earlier one does not imply, which in a narrower range only the edge
+children get, and it carries that kind with it, so a recheck goes down the edge of the subtree. The
+counts only decide what is kept: an object reached more often than it was counted is checked again,
+never let through. A link that resolves to an object the receiver holds is not walked into while the
 receiver holds it as the type the link names: what the receiver holds is trusted. Its type comes
 from the hint path. The anchor root is a `T`, and each hint step checks the held parent as its kind
 to learn the kind of the link the step follows, one read per parent on a changed path, which the
@@ -323,6 +325,30 @@ under 64 narrowing ranges is refused 2 ms in, and one of 16.8 MB that links a 16
 link the bundle carries, of at least 33 bytes, or a recheck of its parent that paid for the bytes
 naming it: a bundle of 22 MB that links a node of 23 bytes under 400,000 narrowing ranges lands in
 0.72 s, against 0.57 s when the ranges widen and the node is checked once.
+
+A tree linked as two types is checked as each, which spends its bytes twice and leaves the 16 MiB
+for rechecks. The links an object keeps its checks for used to be counted for all its types
+together, so an object reached through one link as two types lost its checks one link early, and its
+last link checked it and everything below it again as if for the first time. A `Map<u64, u32>`
+copied into a `Map<u64, u64>` holds the same nodes, since the values encode alike, so a clone of the
+commit before the copy and the copy checks each node as both types, and a node that an edit after
+the copy also links is reached once more than it is linked. A clone of 3,000,000 keys copied that
+way and edited 100 times, 35.8 MB, was refused with "it reuses its objects under too many key
+ranges" 0.69 s in: its first checks came to 27.1 MB, its checks as the second type to 27.0 MB, and
+13 nodes the edits also link had checked 225,281 objects below them again, 16.8 MB, when the budget
+ran out. One edit after a copy of 2,000,000 keys, 23.3 MB, was refused too, and so were two maps of
+24,000 keys of 1 KB written alike in two fields as two types and edited three times, whose every
+link reaches a node as both types. Counted for each type, all of them land: the copy of 3,000,000
+keys and 100 edits in 0.62 s, after checking 54.1 MB, 74 bytes of it again under narrower ranges. A
+copy of 1,000,000 keys and 100 edits, 11.4 MB, which landed before, lands in 0.20 s against 0.27 s,
+at the median of five alternating runs. A type that fewer links reach an object as keeps its check
+until the walk ends, 75 checks of 74 objects in the copy of 3,000,000 keys, and each check still
+keeps at most 16 kinds. The budget is unchanged, and so is what a node linked under many ranges as
+one type may cost: a node of 1 MiB lands under 18 narrowing ranges and is refused under 19 and 64,
+and one of 16 MiB under 64, as before. `a_clone_of_a_map_copied_into_a_wider_type_and_edited_lands`
+and `a_clone_of_two_maps_written_alike_as_two_types_lands` in `ferro/tests/sync.rs` clone such a
+copy of 24,000 keys of 1 KB with three edits, and those two maps, with the copy of 3,000,000 keys
+and 100 edits behind `--ignored`; each failed before.
 
 Cloning a `Map<u64, String>` of 400,000 keys, 36 MB in 50,143 objects, took 164 ms against 102 ms
 without the check, and a bundle editing 1,008 keys spread over it, 3.2 MB in 2,480 objects, took

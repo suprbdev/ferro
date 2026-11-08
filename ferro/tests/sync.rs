@@ -2504,6 +2504,133 @@ fn many_edits_pulled_after_a_map_of_a_million_keys_is_copied_into_a_wider_type_l
     copied_then_edited(1_000_000, 100);
 }
 
+fn long_label(key: u64) -> String {
+    format!("{key:010}{}", "w".repeat(1014))
+}
+
+#[test]
+fn a_clone_of_a_map_copied_into_a_wider_type_and_edited_lands() {
+    let (keys, edits) = (24_000, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let laptop: Db<Labels> = fast().open(dir.path().join("laptop.ferro")).unwrap();
+    laptop
+        .commit("count", |root| {
+            for key in 0..keys {
+                root.counts.insert(long_label(key * 2), (key % 1000) as u32);
+            }
+        })
+        .unwrap();
+    laptop
+        .commit("widen", |root| {
+            root.wide = root
+                .counts
+                .iter()
+                .map(|(key, value)| (key, u64::from(*value)))
+                .collect();
+            root.counts = Map::new();
+        })
+        .unwrap();
+    for edit in 0..edits {
+        laptop
+            .commit("edit", |root| {
+                root.wide.insert(long_label(edit * 2 + 1), 5_000 + edit);
+            })
+            .unwrap();
+    }
+    let fresh: Db<Labels> = fast().open(dir.path().join("fresh.ferro")).unwrap();
+    let pulled = fresh.pull(&laptop, "laptop", no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(fresh.head_hash(), laptop.head_hash());
+    let root = fresh.read();
+    assert!(root.counts.is_empty());
+    assert_eq!(root.wide.len() as u64, keys + edits);
+    for key in (0..keys).step_by(997) {
+        assert_eq!(*root.wide.get(&long_label(key * 2)).unwrap(), key % 1000);
+    }
+    for edit in 0..edits {
+        assert_eq!(
+            *root.wide.get(&long_label(edit * 2 + 1)).unwrap(),
+            5_000 + edit
+        );
+    }
+    fresh.verify_typed().unwrap();
+}
+
+#[test]
+fn a_clone_of_two_maps_written_alike_as_two_types_lands() {
+    let (keys, edits) = (24_000, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let laptop: Db<Labels> = fast().open(dir.path().join("laptop.ferro")).unwrap();
+    laptop
+        .commit("both", |root| {
+            for key in 0..keys {
+                root.counts.insert(long_label(key * 2), (key % 1000) as u32);
+                root.wide.insert(long_label(key * 2), key % 1000);
+            }
+        })
+        .unwrap();
+    for edit in 0..edits {
+        laptop
+            .commit("dual write", |root| {
+                root.counts.insert(long_label(edit * 2 + 1), 7);
+                root.wide.insert(long_label(edit * 2 + 1), 7);
+            })
+            .unwrap();
+    }
+    let fresh: Db<Labels> = fast().open(dir.path().join("fresh.ferro")).unwrap();
+    let pulled = fresh.pull(&laptop, "laptop", no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(fresh.head_hash(), laptop.head_hash());
+    let root = fresh.read();
+    assert_eq!(root.wide.len() as u64, keys + edits);
+    assert_eq!(root.counts.root_hash(), root.wide.root_hash());
+    fresh.verify_typed().unwrap();
+}
+
+#[test]
+#[ignore = "builds a map of three million keys; run with --ignored"]
+fn a_clone_of_three_million_keys_copied_into_a_wider_type_and_edited_lands() {
+    let (keys, edits) = (3_000_000, 100);
+    let dir = tempfile::tempdir().unwrap();
+    let laptop: Db<Widened> = fast().open(dir.path().join("laptop.ferro")).unwrap();
+    laptop
+        .commit("count", |root| {
+            for key in 0..keys {
+                root.counts.insert(key * 2, (key % 1_000_000) as u32);
+            }
+        })
+        .unwrap();
+    laptop
+        .commit("widen", |root| {
+            root.wide = root
+                .counts
+                .iter()
+                .map(|(key, value)| (key, u64::from(*value)))
+                .collect();
+            root.counts = Map::new();
+        })
+        .unwrap();
+    for edit in 0..edits {
+        laptop
+            .commit("edit", |root| {
+                root.wide.insert(edit * 2 + 1, 7);
+            })
+            .unwrap();
+    }
+    let fresh: Db<Widened> = fast().open(dir.path().join("fresh.ferro")).unwrap();
+    let pulled = fresh.pull(&laptop, "laptop", no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(fresh.head_hash(), laptop.head_hash());
+    let root = fresh.read();
+    assert_eq!(root.wide.len() as u64, keys + edits);
+    assert_eq!(
+        *root.wide.get(&(2 * (keys - 1))).unwrap(),
+        (keys - 1) % 1_000_000
+    );
+    assert_eq!(*root.wide.get(&(2 * edits - 1)).unwrap(), 7);
+    fresh.verify_typed().unwrap();
+}
+
 fn shared_values_copied(keys: u64, distinct: u64) {
     let dir = tempfile::tempdir().unwrap();
     let a: Db<Texts> = fast().open(dir.path().join("a.ferro")).unwrap();

@@ -1609,7 +1609,8 @@ impl Landing<'_> {
 
 struct Kept {
     left: u8,
-    checks: Vec<(Shape, Vec<Kind>)>,
+    shape: Shape,
+    kinds: Vec<Kind>,
 }
 
 enum Beneath {
@@ -1747,7 +1748,7 @@ struct Vetting<'a> {
     anchors: &'a Anchors,
     held_at: &'a Index,
     root_kind: &'a Kind,
-    kept: HashMap<u32, Kept>,
+    kept: HashMap<u32, Vec<Kept>>,
     held: Retyped,
     beneath: Vec<Beneath>,
     spent: usize,
@@ -1842,34 +1843,38 @@ impl Vetting<'_> {
         let pinned = links == u8::MAX || self.anchors.find(self.held_at, &hash).is_some();
         let shared = links >= 2 || pinned;
         let counted = before.is_none();
-        if shared && let Some(kept) = self.kept.get_mut(&id) {
-            let same = kept
-                .checks
-                .iter()
-                .position(|(_, kinds)| kinds[0].id == kind.id);
-            let hit = same.and_then(|at| {
-                let (shape, kinds) = &kept.checks[at];
-                kinds
-                    .iter()
-                    .any(|seen| (seen.within)(seen, kind))
-                    .then(|| (*shape, kinds.iter().any(|seen| kind.vouched_by(seen))))
-            });
+        if shared
+            && let Some(checks) = self.kept.get_mut(&id)
+            && let Some(at) = checks.iter().position(|kept| kept.kinds[0].id == kind.id)
+        {
+            let kept = &mut checks[at];
             if counted && kept.left != u8::MAX {
                 kept.left = kept.left.saturating_sub(1);
             }
+            let hit = kept
+                .kinds
+                .iter()
+                .any(|seen| (seen.within)(seen, kind))
+                .then(|| {
+                    (
+                        kept.shape,
+                        kept.kinds.iter().any(|seen| kind.vouched_by(seen)),
+                    )
+                });
             if let Some((shape, vouched)) = hit {
+                if kept.left == 0 {
+                    checks.swap_remove(at);
+                    if checks.is_empty() {
+                        self.kept.remove(&id);
+                    }
+                }
                 if !vouched {
                     self.confirm(id, hash, kind)?;
                 }
-                if self.kept.get(&id).is_some_and(|kept| kept.left == 0) {
-                    self.kept.remove(&id);
-                }
                 return Ok(shape);
             }
-            if before.is_none()
-                && let Some(at) = same
-            {
-                before = kept.checks[at].1.last().cloned();
+            if before.is_none() {
+                before = kept.kinds.last().cloned();
             }
         }
         let ptr = Ptr {
@@ -1915,24 +1920,25 @@ impl Vetting<'_> {
             } else {
                 links - u8::from(counted)
             };
-            let kept = self.kept.entry(id).or_insert_with(|| Kept {
-                left,
-                checks: Vec::new(),
-            });
-            match kept
-                .checks
-                .iter_mut()
-                .find(|(_, kinds)| kinds[0].id == kind.id)
-            {
-                Some((_, kinds)) => {
+            let checks = self.kept.entry(id).or_default();
+            match checks.iter().position(|kept| kept.kinds[0].id == kind.id) {
+                Some(at) if checks[at].left == 0 => {
+                    checks.swap_remove(at);
+                }
+                Some(at) => {
+                    let kinds = &mut checks[at].kinds;
                     if kinds.len() >= RANGES_KEPT {
                         kinds.remove(0);
                     }
                     kinds.push(kind.clone());
                 }
-                None => kept.checks.push((shape, vec![kind.clone()])),
+                None => checks.push(Kept {
+                    left,
+                    shape,
+                    kinds: vec![kind.clone()],
+                }),
             }
-            if kept.left == 0 {
+            if checks.is_empty() {
                 self.kept.remove(&id);
             }
         }
