@@ -914,20 +914,21 @@ back to where it started, and every table rests on one that was trusted or built
 
 The checks run on a pool of threads, `pool.rs`, whose own thread starts another whenever more work
 waits than threads are idle, so that it has eight threads at most, its own included, and no more
-than the machine's cores, and once it has started all it may works beside them; it runs at most
-four checks at once, bounding the rows and entries they hold. Before #115 a check that built a
-table's indexes spawned a thread for each, and a map's own parallel work spread over up to sixteen
-more inside them: a clone of eight nested tables of 100,000 rows took 80 threads beside the
-receive's own, and `verify_typed` 98. A job runs with `map::alone` held, under which the work a map would spread over threads
-of its own runs on the job's thread. The checks a receive finds once the walk is done are queued in
-groups, about 128 of them and at most 64 checks each, so that many small tables cost a few jobs. A
-diff splits itself among the threads: each run of it opens the subtrees of 4,096 entries or more
-that only one side holds, the largest first, cuts the two sides at each key both then hold as an
-entry, and queues the runs between in which the two differ, a side that holds nothing being cut
-after each subtree; a run with no such subtree left is diffed where it is, and what the runs find
-is put back in key order. A check starts the diff of each index it checks, waits for the diff of
-the rows while it helps run what is queued, then checks each index in turn, so the diffs of one
-check, and the checks of several versions, share the threads, and each node is still read once.
+than the machine's cores, and once it has started all it may works beside them; it runs at most four
+checks at once, bounding the rows and entries they hold. Before #115 a check that built a table's
+indexes spawned a thread for each, and a map's own parallel work spread over up to sixteen more
+inside them: a clone of eight nested tables of 100,000 rows took 80 threads beside the receive's
+own, and `verify_typed` 98. A job runs with `map::alone` held, under which the work a map would
+spread over threads of its own runs on the job's thread. The checks a receive finds once the walk is
+done are queued in groups, about 128 of them and at most 64 checks each, so that many small tables
+cost a few jobs. A diff splits itself among the threads: each run of it opens the subtrees of 4,096
+entries or more that only one side holds, the largest first, cuts the two sides at each key both
+then hold as an entry, and queues the runs between in which the two differ, a side that holds
+nothing being cut after each subtree; a run with no such subtree left is diffed where it is, and
+what the runs find is put back in key order. A check starts the diff of each index it checks, waits
+for the diff of the rows while it helps run what is queued, then checks each index in turn, so the
+diffs of one check, and the checks of several versions, share the threads, and each node is still
+read once.
 
 Each side of a diff keeps, for all its runs, the nodes it has opened, and one opened again fails
 the diff with "a map links one node from two places", as the walk of a whole table's rows does:

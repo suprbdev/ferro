@@ -446,12 +446,12 @@ Tests are described next to what they test:
 - The three-device sync model with small caches: [Commits stored
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
-- Tables whose indexes a peer set apart from their rows, sent whole, drifting in a pull, behind
-  the head, nested in a map, and beside a value the receiver cannot read, whose walk's error must
-  be the one returned, a table storing no index with rows under other keys, one holding an index
-  the receiver's type lacks, which is refused, and one lacking an index the receiver's has, which
-  lands, in `sync.rs`, written to a file for `verify_typed`, read without its indexes, with every kind
-  of index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`, and the diff the
+- Tables whose indexes a peer set apart from their rows, sent whole, drifting in a pull, behind the
+  head, nested in a map, and beside a value the receiver cannot read, whose walk's error must be the
+  one returned, a table storing no index with rows under other keys, one holding an index the
+  receiver's type lacks, which is refused, and one lacking an index the receiver's has, which lands,
+  in `sync.rs`, written to a file for `verify_typed`, read without its indexes, with every kind of
+  index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`, and the diff the
   check makes, against `Map::diff`, on maps small enough to diff on one thread and large enough to
   split among threads, with runs that only one side holds, in `map.rs`. What the check reads of a
   set an `each` index names, and how many jobs 2,000 small tables take, in `table.rs`; a check
