@@ -1438,3 +1438,135 @@ fn changing_what_missing_returns_for_an_indexed_hand_written_type_rebuilds_the_i
     let twos: Vec<u32> = read.rows.by_rank(&Rank(2)).keys().collect();
     assert_eq!(twos, vec![0, 1, 2, 3]);
 }
+
+type MaybeCode = Option<u32>;
+
+#[derive(Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[ferro(transparent)]
+struct WrappedCode(Option<u32>);
+
+macro_rules! coded {
+    ($record:ident, $root:ident, $code:ty, $wrap:expr, $lookup:ty, $look:expr) => {
+        #[derive(Data, Record, Clone, Debug, PartialEq)]
+        struct $record {
+            #[key]
+            id: u32,
+            #[unique]
+            code: $code,
+            #[index]
+            label: $code,
+        }
+
+        root!($root, $record);
+
+        impl Coded for $root {
+            fn fill(&mut self, id: u32, code: Option<u32>) {
+                let wrap: fn(Option<u32>) -> $code = $wrap;
+                self.rows.insert($record {
+                    id,
+                    code: wrap(code),
+                    label: wrap(code.map(|code| code % 2)),
+                });
+            }
+
+            fn holder(&self, code: u32) -> Option<u32> {
+                let wrap: fn(Option<u32>) -> $code = $wrap;
+                let look: fn(u32) -> $lookup = $look;
+                let by_unique = self.rows.key_by_code(&look(code));
+                let by_label: Vec<u32> = self.rows.by_label(&wrap(Some(code % 2))).keys().collect();
+                assert!(by_unique.is_none_or(|id| by_label.contains(&id)));
+                by_unique
+            }
+
+            fn coded(&self) -> usize {
+                self.rows.unique_code().len()
+            }
+
+            fn dirty(&self) -> [bool; 2] {
+                [
+                    self.rows.unique_code.is_dirty(),
+                    self.rows.by_label.is_dirty(),
+                ]
+            }
+        }
+    };
+}
+
+trait Coded: Data + Default {
+    fn fill(&mut self, id: u32, code: Option<u32>);
+    fn holder(&self, code: u32) -> Option<u32>;
+    fn coded(&self) -> usize;
+    fn dirty(&self) -> [bool; 2];
+}
+
+coded!(
+    SpelledRow,
+    SpelledRoot,
+    Option<u32>,
+    |code| code,
+    u32,
+    |code| code
+);
+coded!(
+    AliasedRow,
+    AliasedRoot,
+    MaybeCode,
+    |code| code,
+    MaybeCode,
+    Some
+);
+coded!(
+    BoxedRow,
+    BoxedRoot,
+    Box<Option<u32>>,
+    Box::new,
+    Box<Option<u32>>,
+    |code| Box::new(Some(code))
+);
+coded!(
+    WrappedRow,
+    WrappedRoot,
+    WrappedCode,
+    WrappedCode,
+    WrappedCode,
+    |code| WrappedCode(Some(code))
+);
+
+fn reopened<R: Coded>(path: &Path, next: u32) {
+    let db: Db<R> = fast().open(path).unwrap();
+    assert_eq!(
+        db.read().dirty(),
+        [false, false],
+        "{}",
+        std::any::type_name::<R>()
+    );
+    assert_eq!(db.read().coded(), next as usize - 3);
+    for code in 0..next - 3 {
+        assert_eq!(db.read().holder(code), Some(code + 3));
+    }
+    db.update(|root| {
+        root.fill(next + 100, None);
+        root.fill(next, Some(next - 3));
+    })
+    .unwrap();
+    assert_eq!(db.read().holder(next - 3), Some(next));
+}
+
+#[test]
+fn an_option_written_through_an_alias_a_box_or_a_wrapper_keeps_its_indexes() {
+    let (_dir, path) = scratch("spelled.ferro");
+    {
+        let db: Db<SpelledRoot> = fast().open(&path).unwrap();
+        db.update(|root| {
+            for id in 0..3 {
+                root.fill(id, None);
+            }
+            root.fill(3, Some(0));
+        })
+        .unwrap();
+    }
+    reopened::<AliasedRoot>(&path, 4);
+    reopened::<BoxedRoot>(&path, 5);
+    reopened::<WrappedRoot>(&path, 6);
+    reopened::<SpelledRoot>(&path, 7);
+}

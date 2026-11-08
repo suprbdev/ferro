@@ -3953,6 +3953,72 @@ where
     rows.get(&*index.get(value)?)
 }
 
+/// The value a unique index holds for a row's field, or `None` for a value that stands for no
+/// value, as `None` does, which the index leaves out.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates.
+#[doc(hidden)]
+#[inline]
+pub fn present<V: Data>(value: &V) -> Option<V> {
+    (!value.absent()).then(|| value.clone())
+}
+
+/// The entry of a unique index on a field written `Option<X>` whose value is `Some(value)`, where
+/// `value` may be borrowed as `X` is. Backs that index's generated `by_x`, `key_by_x` and
+/// `covered_by_x`.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates.
+#[doc(hidden)]
+pub fn unique_some<X, V, Q>(index: &Map<Option<X>, V>, value: &Q) -> Option<Val<V>>
+where
+    X: Data + Ord + Borrow<Q>,
+    V: Data,
+    Q: Ord + ?Sized,
+{
+    index
+        .range_by(
+            |entry| entry.as_ref().is_none_or(|x| x.borrow() < value),
+            |entry| entry.as_ref().is_none_or(|x| x.borrow() <= value),
+        )
+        .next()
+        .map(|(_, held)| held)
+}
+
+/// The entries of a unique index on a field written `Option<X>` whose value is `Some(x)` for an
+/// `x` in `range`, in value order, where the bounds may be borrowed as `X` is. Backs that index's
+/// generated `by_x_range`.
+///
+/// It is for the code the [`Record`](derive@crate::Record) derive generates.
+#[doc(hidden)]
+pub fn unique_some_range<X, V, Q, R>(index: &Map<Option<X>, V>, range: R) -> Iter<Option<X>, V>
+where
+    X: Data + Ord + Borrow<Q>,
+    V: Data,
+    Q: Ord + ?Sized,
+    R: RangeBounds<Q>,
+{
+    let start = range.start_bound();
+    let end = range.end_bound();
+    index.range_by(
+        |entry| match entry {
+            None => true,
+            Some(x) => match start {
+                Bound::Included(bound) => x.borrow() < bound,
+                Bound::Excluded(bound) => x.borrow() <= bound,
+                Bound::Unbounded => false,
+            },
+        },
+        |entry| match entry {
+            None => true,
+            Some(x) => match end {
+                Bound::Included(bound) => x.borrow() <= bound,
+                Bound::Excluded(bound) => x.borrow() < bound,
+                Bound::Unbounded => true,
+            },
+        },
+    )
+}
+
 /// The rows of the unique index entries that `entries` walks, in index order, from either end.
 /// Backs a unique index's generated `by_x_range` and, for a composite, `by_a_b_prefix`.
 ///

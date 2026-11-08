@@ -334,14 +334,15 @@ fn check(table: &Table<Order>, model: &BTreeMap<u32, Order>) {
             );
         }
     }
-    let codes: Vec<(String, CodeEntry)> = table
+    let codes: Vec<(Option<String>, CodeEntry)> = table
         .unique_code()
         .iter()
         .map(|(code, entry)| (code, *entry))
         .collect();
-    let wanted: BTreeMap<String, CodeEntry> = model
+    let wanted: BTreeMap<Option<String>, CodeEntry> = model
         .values()
-        .filter_map(|row| Some((row.code.clone()?, (row.id, (row.customer, row.state)))))
+        .filter(|row| row.code.is_some())
+        .map(|row| (row.code.clone(), (row.id, (row.customer, row.state))))
         .collect();
     assert_eq!(codes, wanted.into_iter().collect::<Vec<_>>());
 }

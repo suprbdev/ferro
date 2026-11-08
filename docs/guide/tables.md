@@ -37,9 +37,9 @@ plain `&mut V` that `Map::get_mut` or `List::get_mut` hands out stays made, as t
 `#[derive(Record)]` generates index lookups directly on the table: `by_status(&value)`,
 `by_status_range(range)` and `by_status_counts()`, which needs no row reads.
 `by_status_after(&value, &key)` continues after a row's key within that value, so a filtered page
-costs a seek, not a walk over the rows already shown. An `Option<T>` index also gets
-`by_field_some(&value)` and `by_field_some_after(&value, &key)`, and `#[index(each)]` indexes every
-element of a collection field.
+costs a seek, not a walk over the rows already shown. An index on a field written `Option<T>` also
+gets `by_field_some(&value)` and `by_field_some_after(&value, &key)`, which take a `T`, and
+`#[index(each)]` indexes every element of a collection field.
 
 `#[index(a, b)]` on the struct indexes a combination of fields in that order. It gets the same
 `by_a_b(&(a, b))`, `by_a_b_range` and `by_a_b_counts`, and `by_a_b_prefix(&a)` for every row with
@@ -63,9 +63,12 @@ let from_tonight: Vec<_> = snapshot
 ```
 
 Both return the same `IndexIter` as the lookups of a non-unique index, so they run from either end,
-and `.keys()` and `.covered()` read the index alone. On an `Option` field the range is over the
-inner type, and a row holding `None` is in none of them. There is no `by_slug_after` or
-`by_slug_counts`, since each value has one row: the page after a slug is
+and `.keys()` and `.covered()` read the index alone. A row whose field is `None` is in none of them
+and clashes with no other, however the field's `Option` is written: as `Option<T>`, through a
+`type` alias, a `Box` or a `#[ferro(transparent)]` wrapper. On a field written `Option<T>`, the
+lookups and the range take a `T`. A derive cannot see through an alias or a wrapper, so on those
+they take the field's own type, as `key_by_code(&Some(7))`, with the same rows. There is no
+`by_slug_after` or `by_slug_counts`, since each value has one row: the page after a slug is
 `by_slug_range((Bound::Excluded(slug), Bound::Unbounded))`.
 
 `try_insert` and `try_update` return `Err(Taken { index, holder })` on a clash, and `try_update`

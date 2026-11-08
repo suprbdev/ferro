@@ -39,6 +39,20 @@ the key alone, `by_x_range(range)` and a composite's `by_a_b_prefix(&a)` for row
 as described under [Ranges and prefixes](#ranges-and-prefixes), and `unique_x()` for the whole map.
 On an `Option<T>` field `None` is not indexed, so any number of rows can leave it empty.
 
+Whether a field is an `Option` is decided by its type, not by how it is written. The derive cannot
+see through `type Code = Option<u32>`, so it used to key the index of a field written `Option<T>`
+by `T` and index the aliased field as a plain value, `None` included: two rows without a code
+clashed, and a file written under one spelling failed to open under the other (#125). Now the
+index is a `Map<Option<T>, Key>` however the field is written, the generated code leaves out a
+value whose `Data::absent` is true, which only `None` is, and the fingerprint takes the kind from
+`Data::OPTIONAL`. What the index holds, the clashes it finds and its fingerprint are the same for
+`Option<u32>`, an alias, `Box<Option<u32>>` and a `#[ferro(transparent)]` wrapper. The lookups
+still follow the spelling, since naming `T` needs the syntax: on a field written `Option<T>`,
+`by_x`, `key_by_x`, `covered_by_x` and `by_x_range` take a `T` and find `Some` through
+`Map::range_by`, and on any other spelling they take the field's own type. The new layout has its
+own kind, unique sparse, so a file written before it rebuilds each unique `Option` index once, the
+first time it is read.
+
 A clash cannot be repaired where it is found. `Table::insert` returns the old row and has no error
 channel, and the two ways of carrying on are both wrong: last writer wins deletes a row nobody
 named, and overwriting the index leaves a row that `by_x` cannot find. So `try_insert` and
@@ -321,9 +335,12 @@ identity it did not capture.
 Each index is identified by a 64-bit fingerprint of a description of what decides its encoding and
 meaning:
 
-- its kind as the derive generates it: value, option for a value index on a field written
-  `Option<T>`, composite, each, unique, unique option for a unique index that leaves `None` out, or
-  unique composite;
+- its kind: value, option for a value index on an `Option`, composite, each, unique, unique sparse
+  for a unique index on an `Option`, which leaves `None` out, or unique composite. Whether a field
+  is an `Option` comes from its type, through the hidden `Data::OPTIONAL`, which `Option` sets and
+  `Box`, `Arc` and `#[ferro(transparent)]` types take from what they hold, not from how the field
+  is written, so `Option<u32>`, an alias of it, `Box<Option<u32>>` and a transparent wrapper of it
+  give one fingerprint;
 - the key's type;
 - the stored names of the fields it is keyed on, in order, each with its type;
 - the stored names of the covered fields it stores, in list order, each with its type. Covered

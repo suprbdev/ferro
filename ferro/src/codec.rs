@@ -403,6 +403,19 @@ impl Sink for HashSink {
 pub trait Data: Clone + Send + Sync + 'static {
     #[doc(hidden)]
     const LOCATED: bool = false;
+    /// Whether a value of this type can stand for no value, as `None` does, which a `#[unique]`
+    /// index leaves out, so that any number of rows can hold it.
+    ///
+    /// `Option` sets it, `Box`, `Arc` and a `#[ferro(transparent)]` type take it from what they
+    /// hold, and every other type leaves it `false`, so an index treats an `Option` the same
+    /// however its type is spelled. An index's fingerprint holds it.
+    #[doc(hidden)]
+    const OPTIONAL: bool = false;
+    /// Whether `self` stands for no value, as `None` does, for a type that sets `OPTIONAL`.
+    #[doc(hidden)]
+    fn absent(&self) -> bool {
+        false
+    }
     /// Writes the value into `w`: its bytes with [`Encoder::u8`], [`Encoder::varint`] and the
     /// like, and its links with [`Encoder::link`].
     ///
@@ -2874,6 +2887,12 @@ impl Data for String {
 }
 
 impl<T: Data> Data for Option<T> {
+    const OPTIONAL: bool = true;
+
+    fn absent(&self) -> bool {
+        self.is_none()
+    }
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         match self {
             None => w.u8(0),
@@ -3120,6 +3139,12 @@ impl<T: Data, const N: usize> Data for [T; N] {
 }
 
 impl<T: Data> Data for Box<T> {
+    const OPTIONAL: bool = T::OPTIONAL;
+
+    fn absent(&self) -> bool {
+        (**self).absent()
+    }
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         w.nested(|w| (**self).encode(w))
     }
@@ -3156,6 +3181,12 @@ impl<T: Data> Data for Box<T> {
 }
 
 impl<T: Data> Data for Arc<T> {
+    const OPTIONAL: bool = T::OPTIONAL;
+
+    fn absent(&self) -> bool {
+        (**self).absent()
+    }
+
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         w.nested(|w| (**self).encode(w))
     }

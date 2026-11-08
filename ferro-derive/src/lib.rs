@@ -445,6 +445,12 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 <#ty as ::ferro::Data>::visit(__r)
             }
 
+            const OPTIONAL: bool = <#ty as ::ferro::Data>::OPTIONAL;
+
+            fn absent(&self) -> bool {
+                ::ferro::Data::absent(#access)
+            }
+
             fn missing() -> ::std::option::Option<Self> {
                 ::ferro::Data::missing().map(|__v| #build)
             }
@@ -930,8 +936,11 @@ enum IndexKind {
 }
 
 fn option_inner(ty: &Type) -> Option<&Type> {
-    let Type::Path(path) = ty else {
-        return None;
+    let path = match ty {
+        Type::Group(group) => return option_inner(&group.elem),
+        Type::Paren(paren) => return option_inner(&paren.elem),
+        Type::Path(path) => path,
+        _ => return None,
     };
     let segment = path.path.segments.last()?;
     if segment.ident != "Option" {
@@ -1001,19 +1010,19 @@ impl Indexed {
         quote! { true #(&& #same)* }
     }
 
-    fn kind_word(&self) -> &'static str {
-        let composite = self.fields.len() > 1;
-        let option = self
-            .sole()
-            .is_some_and(|(_, ty)| option_inner(ty).is_some());
-        match self.kind {
-            IndexKind::Value if composite => "composite",
-            IndexKind::Value if option => "option",
-            IndexKind::Value => "value",
-            IndexKind::Each => "each",
-            IndexKind::Unique if composite => "unique composite",
-            IndexKind::Unique if option => "unique option",
-            IndexKind::Unique => "unique",
+    fn kind_word(&self) -> TokenStream2 {
+        let optional = |sparse: &str, dense: &str| match self.sole() {
+            Some((_, ty)) => quote! {
+                if <#ty as ::ferro::Data>::OPTIONAL { #sparse } else { #dense }
+            },
+            None => quote! { #dense },
+        };
+        match (&self.kind, self.sole()) {
+            (IndexKind::Value, None) => quote! { "composite" },
+            (IndexKind::Value, Some(_)) => optional("option", "value"),
+            (IndexKind::Each, _) => quote! { "each" },
+            (IndexKind::Unique, None) => quote! { "unique composite" },
+            (IndexKind::Unique, Some(_)) => optional("unique sparse", "unique"),
         }
     }
 
@@ -1096,12 +1105,9 @@ impl Indexed {
                 ::ferro::table::IndexEach::values(&__r.#ident).iter().any(|__v| __f(__v))
             };
         }
-        if let (Some(_), Some((ident, _))) = (self.sparse(), self.sole()) {
+        if let (IndexKind::Unique, Some((ident, _))) = (&self.kind, self.sole()) {
             return quote! {
-                match &__r.#ident {
-                    ::std::option::Option::Some(__v) => __f(__v),
-                    ::std::option::Option::None => false,
-                }
+                !::ferro::Data::absent(&__r.#ident) && __f(&__r.#ident)
             };
         }
         match self.sole() {
@@ -1151,7 +1157,7 @@ impl Indexed {
         }
     }
 
-    fn sparse(&self) -> Option<&Type> {
+    fn spelled_option(&self) -> Option<&Type> {
         match self.kind {
             IndexKind::Unique => self.sole().and_then(|(_, ty)| option_inner(ty)),
             _ => None,
@@ -1159,9 +1165,6 @@ impl Indexed {
     }
 
     fn value_ty(&self) -> TokenStream2 {
-        if let Some(inner) = self.sparse() {
-            return quote! { #inner };
-        }
         let tys = self.fields.iter().map(|(_, ty)| ty);
         match (&self.kind, self.sole()) {
             (IndexKind::Each, Some((_, ty))) => {
@@ -1184,11 +1187,12 @@ impl Indexed {
     }
 
     fn optional(&self) -> TokenStream2 {
-        let owned = self.owned();
-        if self.sparse().is_some() {
-            owned
-        } else {
-            quote! { ::std::option::Option::Some(#owned) }
+        match self.sole() {
+            Some((ident, _)) => quote! { ::ferro::table::present(&__r.#ident) },
+            None => {
+                let owned = self.owned();
+                quote! { ::std::option::Option::Some(#owned) }
+            }
         }
     }
 
@@ -1219,7 +1223,7 @@ impl Indexed {
         let subject = self.subject();
         match self.kind {
             IndexKind::Each => format!("whose {subject} holds `value`"),
-            IndexKind::Unique if self.sparse().is_some() => {
+            IndexKind::Unique if self.spelled_option().is_some() => {
                 format!("whose {subject} is `Some(value)`")
             }
             _ => format!("whose {subject} is `value`"),
@@ -1733,6 +1737,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let key_by_doc =
                     format!("The key of the row {matching}, read from the index alone.");
                 let by_doc = format!("The row {matching}.");
+                let spelled = ix.spelled_option();
+                let (bound_ty, entry_of) = match spelled {
+                    Some(inner) => (
+                        quote! { #inner },
+                        quote! { ::ferro::table::unique_some(&self.#field, value) },
+                    ),
+                    None => (quote! { #vt }, quote! { self.#field.get(value) }),
+                };
                 methods.push(quote! {
                     #[doc = #index_doc]
                     pub fn #field(&self) -> &::ferro::Map<#vt, #entry_ty> {
@@ -1742,10 +1754,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     #[doc = #key_by_doc]
                     pub fn #key_by<__Q>(&self, value: &__Q) -> ::std::option::Option<#key_ty>
                     where
-                        #vt: ::std::borrow::Borrow<__Q>,
+                        #bound_ty: ::std::borrow::Borrow<__Q>,
                         __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                     {
-                        self.#field.get(value).map(|__holder| {
+                        #entry_of.map(|__holder| {
                             let __held: &#key_ty = #held;
                             ::std::clone::Clone::clone(__held)
                         })
@@ -1761,34 +1773,43 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #[doc = #by_doc]
                         pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
                         where
-                            #vt: ::std::borrow::Borrow<__Q>,
+                            #bound_ty: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                         {
-                            let __holder = self.#field.get(value)?;
+                            let __holder = #entry_of?;
                             self.rows.get::<#key_ty>(&__holder.0)
                         }
 
                         #[doc = #covered_doc]
                         pub fn #covered_by<__Q>(&self, value: &__Q) -> ::std::option::Option<(#key_ty, #ct)>
                         where
-                            #vt: ::std::borrow::Borrow<__Q>,
+                            #bound_ty: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                         {
-                            self.#field.get(value).map(|__holder| {
+                            #entry_of.map(|__holder| {
                                 let (__key, __stored) = ::ferro::Val::into_owned(__holder);
                                 (__key, Self::#project_fn(__stored))
                             })
                         }
                     });
                 } else {
+                    let row_of = match spelled {
+                        Some(_) => quote! {
+                            let __holder = #entry_of?;
+                            self.rows.get::<#key_ty>(&*__holder)
+                        },
+                        None => quote! {
+                            ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                        },
+                    };
                     methods.push(quote! {
                         #[doc = #by_doc]
                         pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
                         where
-                            #vt: ::std::borrow::Borrow<__Q>,
+                            #bound_ty: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                         {
-                            ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                            #row_of
                         }
                     });
                 }
@@ -1806,7 +1827,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 };
                 let covers = ix.covers();
                 let range = format_ident!("{}_range", by);
-                let range_doc = if ix.sparse().is_some() {
+                let range_doc = if spelled.is_some() {
                     format!(
                         "The rows whose {subject} is `Some(value)` for a `value` in `range`, ordered by that value. A row whose {subject} is `None` is not indexed.{covers}"
                     )
@@ -1815,13 +1836,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         "The rows whose {subject} lies in `range`, ordered by {subject}.{covers}"
                     )
                 };
-                let range_rows = rows_of(quote! { self.#field.range::<__Q, __R>(range) });
+                let range_rows = rows_of(match spelled {
+                    Some(_) => quote! { ::ferro::table::unique_some_range(&self.#field, range) },
+                    None => quote! { self.#field.range::<__Q, __R>(range) },
+                });
                 methods.push(quote! {
                     #[doc = #range_doc]
                     #[inline]
                     pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
                     where
-                        #vt: ::std::borrow::Borrow<__Q>,
+                        #bound_ty: ::std::borrow::Borrow<__Q>,
                         __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                         __R: ::std::ops::RangeBounds<__Q>,
                     {
@@ -2587,7 +2611,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// | `#[index]` | An index on the field's value. |
 /// | `#[index(each)]` | An index on every element of a `Vec<X>`, `BTreeSet<X>`, `Set<X>` or `Option<X>` field. |
 /// | `#[index(cover(a, b))]` | An index that also stores fields `a` and `b` beside each entry. Combines with `each`, as `#[index(each, cover(a))]`. |
-/// | `#[unique]` | A unique index: at most one row holds each value. On an `Option<X>` field `None` is not indexed, so any number of rows can leave it empty. |
+/// | `#[unique]` | A unique index: at most one row holds each value. On an `Option` field `None` is not indexed, so any number of rows can leave it empty, however the `Option` is written. |
 /// | `#[unique(cover(a, b))]` | A unique index that also stores `a` and `b` beside each key. |
 ///
 /// On the struct, for an index on two or more fields in the order named:
@@ -2651,9 +2675,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// `IndexIter` as the lookups of a non-unique index, so `.keys()` and `.covered()` read the index
 /// alone, and the iterator runs from either end.
 ///
-/// On an `Option<X>` field a unique index is keyed by `X`, so `by_x` takes `&X` and `by_x_range` a
-/// range of `X`, and a row whose `x` is `None` is in no lookup. A clash on insert or update is
-/// reported as `Taken { index, holder }`, where `index` is the index's name.
+/// A unique index on an `Option` field holds the rows whose `x` is `Some`, and a row whose `x` is
+/// `None` is in no lookup, whether the field is written `Option<X>`, through a `type` alias, a `Box`
+/// or a `#[ferro(transparent)]` wrapper. On a field written `Option<X>`, `by_x`, `key_by_x` and
+/// `covered_by_x` take `&X` and `by_x_range` a range of `X`, while on any other spelling they take
+/// the field's own type, since the derive sees only how the field is written. A clash on insert or
+/// update is reported as `Taken { index, holder }`, where `index` is the index's name.
 ///
 /// # Combining lookups
 ///

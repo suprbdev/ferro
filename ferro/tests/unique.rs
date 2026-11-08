@@ -125,8 +125,11 @@ fn check(table: &Table<Item>, model: &BTreeMap<u32, Item>) {
         model.values().map(|r| ((r.tenant, r.code), r.id)).collect();
     let got: Vec<(String, u32)> = table.unique_slug().iter().map(|(k, v)| (k, *v)).collect();
     assert_eq!(got, slugs.clone().into_iter().collect::<Vec<_>>());
-    let got: Vec<(String, u32)> = table.unique_email().iter().map(|(k, v)| (k, *v)).collect();
-    assert_eq!(got, emails.clone().into_iter().collect::<Vec<_>>());
+    let got: Vec<(Option<String>, u32)> =
+        table.unique_email().iter().map(|(k, v)| (k, *v)).collect();
+    let held: Vec<(Option<String>, u32)> =
+        emails.iter().map(|(k, v)| (Some(k.clone()), *v)).collect();
+    assert_eq!(got, held);
     let got: Vec<((u8, u8), u32)> = table
         .unique_tenant_code()
         .iter()
@@ -593,4 +596,38 @@ fn a_rename_into_a_value_added_by_ours_keeps_the_row_when_asked() {
         conflict.base.as_deref().cloned()
     });
     assert_eq!(listing(&out), listing(&ours));
+}
+
+type Email = Option<String>;
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Contact {
+    #[key]
+    id: u32,
+    #[unique]
+    email: Email,
+}
+
+#[test]
+fn a_unique_option_written_through_an_alias_leaves_none_out() {
+    let mut table: Table<Contact> = Table::new();
+    for id in 1..=3 {
+        let email = (id == 3).then(|| "a".to_string());
+        assert!(table.try_insert(Contact { id, email }).is_ok());
+    }
+    assert_eq!(table.unique_email().len(), 1);
+    assert_eq!(table.key_by_email(&Some("a".to_string())), Some(3));
+    assert!(table.by_email(&None::<String>).is_none());
+    let taken = table.try_insert(Contact {
+        id: 4,
+        email: Some("a".into()),
+    });
+    assert_eq!(taken.unwrap_err().holder, 3);
+    let all: Vec<u32> = table.by_email_range::<Email, _>(..).keys().collect();
+    assert_eq!(all, [3]);
+    table.update(&1, |row| row.email = Some("b".into()));
+    assert_eq!(table.key_by_email(&Some("b".to_string())), Some(1));
+    table.update(&1, |row| row.email = None);
+    assert_eq!(table.unique_email().len(), 1);
+    assert_eq!(table.len(), 3);
 }
