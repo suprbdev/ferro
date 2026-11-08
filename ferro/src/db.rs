@@ -4772,7 +4772,7 @@ impl<T: Data> Db<T> {
                 (&other.branch.name, &theirs, &published),
             )?;
             let link = match theirs.log.tip {
-                Some(ptr) if !holds(&found, ptr) => Self::link_to(tip, other, &theirs, ptr)?,
+                Some(ptr) if !holds(&found, ptr) => Some(Self::link_to(&theirs, ptr)?),
                 _ => None,
             };
             let base = self.base_of((&tip.refs, &store), found, &mut f)?;
@@ -4820,7 +4820,7 @@ impl<T: Data> Db<T> {
                     return Ok((String::new(), Err(None), Intent::default()));
                 }
             }
-            let link = Self::link_to(tip, other, &theirs, ptr)?;
+            let link = Some(Self::link_to(&theirs, ptr)?);
             let base = self.base_of((&tip.refs, &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
@@ -4879,26 +4879,12 @@ impl<T: Data> Db<T> {
         Ok(base)
     }
 
-    fn link_to(
-        tip: &RefState,
-        other: &Db<T>,
-        theirs: &State<T>,
-        ptr: Ptr,
-    ) -> Result<Option<Merged>> {
-        let head = tip.refs.try_get(&other.branch.name)?;
-        let floor = head
-            .map_or(1, |head| head.log.first)
-            .max(theirs.log.first)
-            .max(1);
-        if floor > theirs.log.last {
-            return Ok(None);
-        }
-        let kept = Chain {
-            first: floor,
-            ..theirs.log
-        };
-        let after = kept.after(&theirs.store)?;
-        Ok(Some(Merged { ptr, floor, after }))
+    fn link_to(theirs: &State<T>, ptr: Ptr) -> Result<Merged> {
+        Ok(Merged {
+            ptr,
+            floor: theirs.log.first.max(1),
+            after: theirs.log.after(&theirs.store)?,
+        })
     }
 
     /// The best common ancestor of this branch and `other`'s, the commit a merge between them

@@ -2,15 +2,16 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::fast;
-use ferro::db::Hook;
-use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim};
+use ferro::db::{Clock, Hook};
+use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim, Snapshot};
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
 struct Root {
@@ -173,6 +174,169 @@ fn a_cycle_in_one_handle_is_followed_by_another_that_keeps_writing() {
     let db: Db<Root> = Options::new().open(&path).unwrap();
     check_chain(&db.read(), 2, 60);
     db.verify().unwrap();
+}
+
+type Counts = Map<u32, i64>;
+
+fn count(db: &Db<Counts>, key: u32) {
+    db.commit(format!("k{key}"), |root| {
+        root.insert(key, 1);
+    })
+    .unwrap();
+}
+
+fn add_counts(
+    root: &mut Counts,
+    base: &Snapshot<Counts>,
+    theirs: &Snapshot<Counts>,
+) -> (&'static str, ()) {
+    let mut keys: Vec<u32> = base.keys().chain(theirs.keys()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        let delta = theirs.get(&key).map_or(0, |n| *n) - base.get(&key).map_or(0, |n| *n);
+        if delta != 0 {
+            let next = root.get(&key).map_or(0, |n| *n) + delta;
+            root.insert(key, next);
+        }
+    }
+    ("merge", ())
+}
+
+fn counts(db: &Db<Counts>) -> Vec<(u32, i64)> {
+    db.read().iter().map(|(key, n)| (key, *n)).collect()
+}
+
+fn once(keys: impl IntoIterator<Item = u32>) -> Vec<(u32, i64)> {
+    keys.into_iter().map(|key| (key, 1)).collect()
+}
+
+fn bases(found: ferro::Result<Vec<Snapshot<Counts>>>) -> Vec<String> {
+    let found = found.unwrap();
+    found.iter().map(|s| s.commit().message.clone()).collect()
+}
+
+fn ticking() -> Clock {
+    let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
+    Clock(Arc::new(move || ticks.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn counted(path: &Path, keep: Keep, clock: &Clock) -> Db<Counts> {
+    shared()
+        .history(keep)
+        .reclaim(Reclaim { every_bytes: 0 })
+        .clock(clock.clone())
+        .open(path)
+        .unwrap()
+}
+
+fn checked(db: &Db<Counts>) {
+    db.verify().unwrap();
+    db.verify_typed().unwrap();
+}
+
+#[test]
+fn a_merge_after_another_handle_pruned_the_other_branch_links_the_state_it_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pruned.ferro");
+    let clock = ticking();
+    let a = counted(&path, Keep::Last(2), &clock);
+    count(&a, 1);
+    let side = a.fork("side").unwrap();
+    count(&side, 2);
+    count(&a, 3);
+    let b = counted(&path, Keep::Last(2), &clock);
+    let theirs = b.branch("side").unwrap();
+    count(&theirs, 4);
+    count(&theirs, 5);
+    let mut seen = Vec::new();
+    a.merge_with(&side, |root, base, theirs| {
+        seen.push((base.version(), theirs.version()));
+        add_counts(root, base, theirs)
+    })
+    .unwrap();
+    assert_eq!(seen, [(1, 2)]);
+    assert_eq!(counts(&a), once([1, 2, 3]));
+    a.refresh().unwrap();
+    assert_eq!((side.version(), side.log().first().unwrap().0), (4, 3));
+    assert_eq!(bases(a.common_ancestors(&side)), ["k2"]);
+
+    a.compact(Keep::Last(2)).unwrap();
+    checked(&a);
+    assert_eq!(bases(a.common_ancestors(&side)), ["k2"]);
+    assert_eq!(bases(side.common_ancestors(&a)), ["k2"]);
+    let log: Vec<String> = a.log().values().map(|c| c.message.clone()).collect();
+    assert_eq!(log, ["k3", "merge"]);
+    let sizes: Vec<(u64, usize)> = a
+        .history_of(|root| root.len())
+        .map(|(commit, len)| (commit.version, len))
+        .collect();
+    assert_eq!(sizes, [(3, 3), (2, 2)]);
+
+    seen.clear();
+    a.merge_with(&side, |root, base, theirs| {
+        seen.push((base.version(), theirs.version()));
+        add_counts(root, base, theirs)
+    })
+    .unwrap();
+    assert_eq!(seen, [(2, 4)]);
+    assert_eq!(counts(&a), once(1..=5));
+    theirs
+        .merge_with(&b.branch("main").unwrap(), add_counts)
+        .unwrap();
+    assert_eq!(counts(&theirs), once(1..=5));
+    b.compact(Keep::Last(2)).unwrap();
+    a.refresh().unwrap();
+    checked(&a);
+    checked(&b);
+}
+
+fn merged_back_and_pruned(keep: Keep) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("back.ferro");
+    let clock = ticking();
+    let a = counted(&path, keep, &clock);
+    count(&a, 1);
+    let side = a.fork("side").unwrap();
+    count(&side, 2);
+    count(&a, 3);
+    count(&side, 4);
+    let b = counted(&path, keep, &clock);
+    let theirs = b.branch("side").unwrap();
+    theirs
+        .merge_with(&b.branch("main").unwrap(), add_counts)
+        .unwrap();
+    count(&theirs, 5);
+    count(&theirs, 6);
+    assert_eq!(counts(&theirs), once(1..=6));
+    let mut seen = Vec::new();
+    a.merge_with(&side, |root, base, theirs| {
+        seen.push((base.version(), theirs.version()));
+        add_counts(root, base, theirs)
+    })
+    .unwrap();
+    assert_eq!(seen, [(1, 3)], "{keep:?}");
+    assert_eq!(counts(&a), once(1..=4), "{keep:?}");
+    a.refresh().unwrap();
+    assert_eq!(side.version(), 6);
+    a.merge_with(&side, add_counts).unwrap();
+    assert_eq!(counts(&a), once(1..=6), "{keep:?}");
+
+    a.compact(keep).unwrap();
+    checked(&a);
+    let head = a.head_hash();
+    a.merge_with(&side, add_counts).unwrap();
+    assert_eq!(a.head_hash(), head, "{keep:?}");
+    side.merge_with(&a, add_counts).unwrap();
+    assert_eq!(counts(&side), once(1..=6), "{keep:?}");
+    checked(&a);
+}
+
+#[test]
+fn a_merge_after_another_handle_merged_back_and_pruned_applies_each_change_once() {
+    for keep in [Keep::All, Keep::Last(3)] {
+        merged_back_and_pruned(keep);
+    }
 }
 
 struct Unpark(thread::Thread);

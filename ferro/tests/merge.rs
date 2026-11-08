@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use ferro::db::Hook;
 use ferro::{
-    Commit, Conflict, Data, Db, Durability, Error, Map, Options, Outcome, Record, Snapshot, Table,
+    Commit, Conflict, Data, Db, Durability, Error, Keep, Map, Options, Outcome, Reclaim, Record,
+    Snapshot, Table,
 };
 use tempfile::TempDir;
 
@@ -780,4 +781,145 @@ fn branch_pairs_refuse_a_dropped_branch_even_once_its_name_is_reused() {
     assert!(matches!(merged, Err(Error::NoBranch(name)) if name == "x"));
     assert_eq!(runs, 0);
     assert_eq!(messages(main.common_ancestors(&new)).unwrap(), ["r1"]);
+}
+
+#[derive(Default)]
+struct Queued {
+    held: bool,
+    placed: bool,
+    released: bool,
+    done: bool,
+}
+
+struct Leader {
+    state: Mutex<Queued>,
+    moved: Condvar,
+}
+
+impl Leader {
+    fn step(&self, step: &str) {
+        let name = thread::current().name().map(str::to_string);
+        let mut state = self.state.lock().unwrap();
+        match (name.as_deref(), step) {
+            (Some("placed"), "landed") => {
+                state.placed = true;
+                self.moved.notify_all();
+            }
+            (Some("held"), "leading") if !state.done => {
+                state.held = true;
+                self.moved.notify_all();
+                while !state.released {
+                    state = self.moved.wait(state).unwrap();
+                }
+                state.done = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn wait(&self, ready: impl Fn(&Queued) -> bool) {
+        let mut state = self.state.lock().unwrap();
+        while !ready(&state) {
+            let (next, waited) = self.moved.wait_timeout(state, PATIENCE).unwrap();
+            assert!(!waited.timed_out(), "the side's commits never queued");
+            state = next;
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.moved.notify_all();
+    }
+}
+
+fn commit_on(db: &Db<Events>, thread: &str, message: &'static str, key: u32) -> JoinHandle<()> {
+    let db = db.clone();
+    thread::Builder::new()
+        .name(thread.into())
+        .spawn(move || event(&db, message, key))
+        .unwrap()
+}
+
+fn merge_beside_pruning_commits_in_their_sync(durability: Durability) {
+    let leader = Arc::new(Leader {
+        state: Mutex::new(Queued::default()),
+        moved: Condvar::new(),
+    });
+    let hook = {
+        let leader = leader.clone();
+        Hook(Arc::new(move |step| leader.step(step)))
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let main: Db<Events> = Options::new()
+        .durability(durability)
+        .history(Keep::Last(2))
+        .reclaim(Reclaim { every_bytes: 0 })
+        .hook(hook)
+        .open(dir.path().join("m.ferro"))
+        .unwrap();
+    event(&main, "x", 1);
+    let side = main.fork("side").unwrap();
+    event(&side, "b", 2);
+    event(&main, "a", 3);
+    let held = commit_on(&side, "held", "c", 4);
+    leader.wait(|state| state.held);
+    let placed = commit_on(&side, "placed", "d", 5);
+    leader.wait(|state| state.placed);
+    let (seen, runs) = mpsc::channel();
+    let merging = {
+        let (main, side) = (main.clone(), side.clone());
+        thread::spawn(move || {
+            main.merge_with(&side, |root, base, theirs| {
+                seen.send((base.version(), theirs.version())).unwrap();
+                add(root, base, theirs)
+            })
+            .unwrap();
+        })
+    };
+    assert_eq!(runs.recv_timeout(PATIENCE).unwrap(), (1, 2));
+    leader.release();
+    held.join().unwrap();
+    placed.join().unwrap();
+    merging.join().unwrap();
+    assert_eq!(side.version(), 4);
+    assert_eq!(side.log().first().unwrap().0, 3);
+    let merged = BTreeMap::from([(1, 1), (2, 1), (3, 1)]);
+    assert_eq!(events(&main), merged);
+    assert_eq!(messages(main.common_ancestors(&side)).unwrap(), ["b"]);
+
+    main.compact(Keep::Last(2)).unwrap();
+    main.verify().unwrap();
+    main.verify_typed().unwrap();
+    assert_eq!(messages(main.common_ancestors(&side)).unwrap(), ["b"]);
+    assert_eq!(messages(side.common_ancestors(&main)).unwrap(), ["b"]);
+    let log: Vec<String> = main.log().values().map(|c| c.message.clone()).collect();
+    assert_eq!(log, ["a", "merge"]);
+    let sizes: Vec<(u64, usize)> = main
+        .history_of(|root| root.len())
+        .map(|(commit, len)| (commit.version, len))
+        .collect();
+    assert_eq!(sizes, [(3, 3), (2, 2)]);
+    assert_eq!(*main.at(3).unwrap(), *main.read());
+
+    let mut bases = Vec::new();
+    main.merge_with(&side, |root, base, theirs| {
+        bases.push(base.commit().message.clone());
+        add(root, base, theirs)
+    })
+    .unwrap();
+    assert_eq!(bases, ["b"]);
+    let all = BTreeMap::from([(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]);
+    assert_eq!(events(&main), all);
+    side.merge_with(&main, add).unwrap();
+    assert_eq!(events(&side), all);
+    main.compact(Keep::Last(2)).unwrap();
+    main.verify().unwrap();
+    main.verify_typed().unwrap();
+}
+
+#[test]
+fn a_merge_beside_pruning_commits_still_in_the_other_branchs_sync_links_what_it_merged() {
+    for durability in [Durability::Buffered, Durability::Fsync] {
+        merge_beside_pruning_commits_in_their_sync(durability);
+    }
 }

@@ -157,6 +157,30 @@ that merging both ways after the sync changes nothing. It does the same with a p
 The second checks that `side`'s state is already published and that no merge runs while the lock
 is held, so a leader that let the lock go before publishing the states fails it.
 
+The merge link took its floor from the table under `tip` as well (#122). The floor is the oldest
+version that the merged state retains, but it was raised to the `first` of the other branch's head
+there. Under `Keep::Last` each commit raises `first`, so while commits of the other branch waited in
+their sync, or, with `Options::shared`, while frames of another process that crossing our lane had
+caught up with were not yet settled, that head could have pruned past the version being merged. The
+merge then wrote no link at all, as if their tip were already ours. The next merge found the old
+base: with `Keep::Last(2)` it refused with `NoCommonAncestor`, and in a shared file where the other
+process had also merged `main` into `side`, it found the commit both had merged from and applied two
+of `side`'s changes a second time. The floor now comes from the state the merge takes and nothing
+else.
+
+The table under `tip` was read so that a merge never claims more than the other branch still had,
+but what the published state retains is in the file the merge writes to: no cycle swaps it while a
+lane is held, and crossing a lane follows another process's cycle and rebinds every state first. A
+floor below where the other branch's head now stops is also the shape every merge reaches once the
+other branch commits and prunes after it, which a cycle copies and the search reads as before.
+
+`merge.rs` holds the leader of `side`'s sync while a second commit of `side` is placed, under both
+durabilities, merges, and checks that the merge linked what it merged: after a cycle `verify` and
+`verify_typed` pass, `common_ancestors` answers `side`'s merged commit from both sides, the log and
+`history_of` walk through the merge, and merging again applies each change once. `shared.rs` does
+the same with a second shared writer committing on `side`, and with one that also merges `main`
+into `side` first, where the second merge applied two changes twice.
+
 ## Handles of other files
 
 `merge_base` finds each side's records by branch name, so it trusted the handle it was given to be a
@@ -290,12 +314,12 @@ the closure.
 ## Merges and pruning
 
 A branch keeps its retained versions and, through every merge entry among them, the commits that
-merge brought in: the merged chain from the merged tip down to the oldest version the other branch
-had retained when the merge was made, and no older than either that version's commit or the oldest
-retained commit of the branch that keeps the merge. The version and its time are stored in the merge
-entry. Merge entries reached that way bring in theirs under the later of the two time limits. A
-reclamation cycle copies exactly that. Every limit only rises, and a merge never claims more than
-the other branch still had, so a commit that has gone never comes back through a later merge: a
+merge brought in: the merged chain from the merged tip down to the oldest version that the state the
+merge took retained, and no older than either that version's commit or the oldest retained commit
+of the branch that keeps the merge. The version and its time are stored in the merge entry. Merge
+entries reached that way bring in theirs under the later of the two time limits. A reclamation
+cycle copies exactly that. Every limit only rises, and a merge never claims more than the state it
+merged still had, so a commit that has gone never comes back through a later merge: a
 nested merge does not take the looser limit of whichever branch reached it, which would let a branch
 that never pruned reach, through a merge of a pruned branch, commits that branch had already let go.
 The merged tip itself is kept whatever its age, with its value but nothing below it, because it is
