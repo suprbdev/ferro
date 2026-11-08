@@ -7100,9 +7100,10 @@ fn paired_root<S: Data>(r: &mut Decoder<'_>) -> Result<Option<(Ptr, u64)>> {
 /// map with the entry counts their links record, both hold, as [`Data::pair`] pairs those of a
 /// value, reading through the pairing's store only the nodes the two do not share.
 ///
-/// Each side opens a node once in a pairing: a map that reaches one its side opened before, in
-/// this map or another, is left unpaired from there on, and its tables are checked against all
-/// their rows. Two maps paired before are not paired again.
+/// Each side opens a node once in the pairing of this map, and a node another map opened only as
+/// [`Pairing::may_open`] allows: a node it may not open, as one reached again, which no map a
+/// write builds links from two places, leaves the map unpaired from there on, and its tables are
+/// checked against all their rows. Two maps paired before are not paired again.
 ///
 /// # Errors
 ///
@@ -7117,6 +7118,7 @@ fn paired<K: Data + Ord, V: Data, S: Data>(
     }
     let mut old_steps = vec![Bared::<K>::Sub(old, old_count)];
     let mut new_steps = vec![Bared::<K>::Sub(new, new_count)];
+    let mut opened = [HashSet::new(), HashSet::new()];
     loop {
         let later = match (old_steps.last(), new_steps.last()) {
             (None, _) | (_, None) => return Ok(()),
@@ -7155,7 +7157,7 @@ fn paired<K: Data + Ord, V: Data, S: Data>(
         let Some(Bared::Sub(ptr, _)) = steps.pop() else {
             continue;
         };
-        if !pairing.unopened(later, ptr.hash) {
+        if !pairing.may_open(&mut opened, later, ptr.hash) {
             return Ok(());
         }
         steps.extend(bare::<K, V, S>(pairing.store(), ptr)?.into_iter().rev());

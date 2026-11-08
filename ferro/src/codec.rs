@@ -1495,13 +1495,18 @@ pub(crate) fn holds_tables<D: Data>() -> bool {
 /// It reads through a store, the view of a receive or the file `verify_typed` checks, and skips
 /// what the two versions share: a value both encode alike holds the same tables, and a map whose
 /// root is the same in both holds the same entries. Of a map, it reads only the nodes the two do
-/// not share, as a diff does, and pairs the values of each key both hold. Each node is opened
-/// once on each side: a map that reaches one already opened is left unpaired from there, so a
-/// pairing reads each node of the two versions once at most, however the maps share them.
+/// not share, as a diff does, and pairs the values of each key both hold. The diff of one map
+/// opens each node once on each side, and one that reaches a node its side opened already, which
+/// no map a write builds does, is left unpaired from there. Maps that share nodes, as clones of
+/// one map do, are each paired in full, opening again the nodes another map opened, as long as
+/// the nodes opened again number no more than those opened once; a map that would open more is
+/// left unpaired from there, so a pairing opens at most twice as many nodes as the two versions
+/// hold, however the maps share them. Two maps paired once are not paired again.
 ///
 /// A map is paired after the value that holds it, one map at a time, so that maps nested in the
 /// values of maps, however deep, do not deepen the stack: only the levels of one value at a time
-/// do, as [`MAX_DEPTH`] bounds them.
+/// do, as [`MAX_DEPTH`] bounds them. The maps it queues so count their nodes under the same bound
+/// as the others.
 ///
 /// It keeps a table that both versions hold at a place only by its type and hash, and only when
 /// asked to, since only a parent the receiver holds vouches for such a table, and it builds a
@@ -1513,6 +1518,7 @@ pub struct Pairing<'s> {
     same: Option<Vec<(TypeId, Hash)>>,
     maps: HashSet<(Hash, Hash)>,
     opened: [HashSet<Hash>; 2],
+    again: usize,
     waiting: Vec<Waiting>,
 }
 
@@ -1546,6 +1552,7 @@ impl<'s> Pairing<'s> {
             same: keep_same.then(Vec::new),
             maps: HashSet::new(),
             opened: [HashSet::new(), HashSet::new()],
+            again: 0,
             waiting: Vec::new(),
         }
     }
@@ -1676,10 +1683,29 @@ impl<'s> Pairing<'s> {
         self.maps.insert((old, new))
     }
 
-    /// Whether the node `hash` of the earlier version, or with `later` of the later one, is yet
-    /// to be opened, which it notes it no longer is.
-    pub(crate) fn unopened(&mut self, later: bool, hash: Hash) -> bool {
-        self.opened[usize::from(later)].insert(hash)
+    /// Whether the pairing of one map may open the node `hash` of the earlier version, or with
+    /// `later` of the later one, which it then notes as opened in `map`, the nodes that map's
+    /// pairing opened on each side: a node is opened once in each map, and a node another map
+    /// opened is opened again only while the nodes opened again number no more than those opened
+    /// once.
+    pub(crate) fn may_open(
+        &mut self,
+        map: &mut [HashSet<Hash>; 2],
+        later: bool,
+        hash: Hash,
+    ) -> bool {
+        let side = usize::from(later);
+        if !map[side].insert(hash) {
+            return false;
+        }
+        if self.opened[side].insert(hash) {
+            return true;
+        }
+        if self.again >= self.opened[0].len() + self.opened[1].len() {
+            return false;
+        }
+        self.again += 1;
+        true
     }
 
     /// Queues the pairing of two versions of a map, with roots `old` and `new`, by `pair`, for

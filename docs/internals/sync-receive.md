@@ -936,15 +936,29 @@ same variant. Of a map it diffs the two versions as below, opening only the node
 share, and pairs the value of each key both hold. A map whose root is the same in both holds the
 same tables, and so does a value both encode alike: the parent holds that table value at that place,
 so it is trusted when the parent is held and checked once, with the parent's, when the parent is
-carried. Each node is opened once on each side in the pairing of two versions, so a map that reaches
-a node its side opened already is left unpaired from there, and the pairing reads each node of the
-two trees once at most, however a forged tree shares them; two maps paired once are not paired
-again. A map is paired after the value that holds it: `Data::pair` of a map queues the two roots,
-and the pairing takes the queue one map at a time once the root is paired, so maps nested in the
-values of maps pair in a loop, however deep, as described under [Nesting
+carried. The diff of one map opens each node once on each side, so a map that reaches a node its
+side opened already, which no map a write builds does, is left unpaired from there; two maps paired
+once are not paired again. A map is paired after the value that holds it: `Data::pair` of a map
+queues the two roots, and the pairing takes the queue one map at a time once the root is paired, so
+maps nested in the values of maps pair in a loop, however deep, as described under [Nesting
 depth](storage.md#nesting-depth). A parent the receiver holds is trusted, its tables with it; a
 parent the bundle carries is checked in the same receive, and a table of a carried parent that the
 walk did not note, since it lies in data the receiver holds as its own type, is trusted too.
+
+Maps that share nodes, as the clones of one map do, are each paired in full: each opens the nodes it
+does not share with its own version before, though another map opened them already, as long as the
+nodes the pairing opens again number no more than those it opens once. A map that would open more
+is left unpaired from there, so the pairing of two versions opens at most twice the nodes of the two
+trees, however their maps share them, as a forged tree that links many maps to the same large
+subtrees would have them; the maps it queues count under the same bound as the root's. The rule was
+once for all the maps of a pairing, so eight tenants whose inner maps were clones of one template
+holding a table of 1.5 million rows, sent one edit each in a bundle of 320 KB, left seven of those
+tables unpaired, to be checked against all their rows, and were refused for reading more than their
+size allows after 0.66 s on every retry, where inner maps apart landed in 4 ms; both now land in
+4 ms. With the rule for each map alone and no bound across them, 100 tenants cloned from one map of
+50,000 tables, each then set to a clone of another such map with one entry added, a bundle of
+4.9 MB, paired the two large maps in full for each tenant and landed after 8.7 s, peaking 913 MB
+higher; with the bound it lands in 0.76 s, as it did in 0.71 s when each node was opened once.
 
 A pairing counts the zero-width items it reads as the walk counts them, as described under
 [Zero-width items in a bundle](#zero-width-items-in-a-bundle): those of one object together, across
