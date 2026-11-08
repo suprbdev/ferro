@@ -4439,6 +4439,7 @@ impl<X: Data + Ord> IndexEach for Option<X> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::codec::{HashSink, Object, Paired, Pairing, field_tag};
@@ -4663,6 +4664,35 @@ mod tests {
         assert!(wide(paired::<Wides>(&store, &over, &none).map(drop)));
         Wides::visit(&mut Decoder::new(&half.body, &half.links, None)).unwrap();
         paired::<Wides>(&store, &none, &half).unwrap();
+    }
+
+    fn junk(count: u64, tag: u16) -> Object {
+        let mut sink = HashSink;
+        let mut w = Encoder::new(&mut sink);
+        w.varint(1 + count);
+        w.field(field_tag("rows"), |w| Table::<Tagged>::new().encode(w))
+            .unwrap();
+        for _ in 0..count {
+            w.field(tag, |_| Ok(())).unwrap();
+        }
+        w.into_object()
+    }
+
+    #[test]
+    fn a_pairing_matches_the_fields_of_two_versions_in_one_pass() {
+        let (_dir, store) = scratch();
+        let rows = field_tag("rows");
+        let (old, new) = (junk(200_000, rows ^ 1), junk(200_000, rows ^ 2));
+        let started = Instant::now();
+        let many = paired::<Shelf>(&store, &old, &new).unwrap();
+        let took = started.elapsed();
+        assert_eq!(many.same.len(), 1);
+        assert!(
+            took < Duration::from_secs(5),
+            "pairing two roots of 200,000 unknown fields took {took:?}"
+        );
+        let mixed = paired::<Shelf>(&store, &junk(3, rows ^ 1), &junk(2, rows ^ 1)).unwrap();
+        assert_eq!(mixed.same.len(), 1);
     }
 
     #[test]

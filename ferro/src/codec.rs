@@ -41,7 +41,7 @@ use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1557,7 +1557,13 @@ impl<'s> Pairing<'s> {
     }
 
     /// Reads the fields of a struct from `old` and `new`, as [`Decoder::fields`] does, and calls
-    /// `f` on each tag both hold, with a decoder over that field on each side.
+    /// `f` on each tag both hold, with a decoder over that field on each side, in the order of
+    /// their tags.
+    ///
+    /// It merges the two lists in the order they are stored, which the derive writes sorted by
+    /// tag, so it reads each field of either once and holds none it is not pairing. A tag stored
+    /// more than once is paired in the order stored, and of a list stored out of order it pairs
+    /// only the fields the merge meets.
     ///
     /// The zero-width items `f` reads count as those of the object each side's field lies in, as
     /// [`Decoder::item`] counts them, so the fields of one object share the limit.
@@ -1572,17 +1578,24 @@ impl<'s> Pairing<'s> {
         new: &mut Decoder<'b>,
         mut f: impl FnMut(&mut Self, u16, &mut Decoder<'a>, &mut Decoder<'b>) -> Result<()>,
     ) -> Result<()> {
-        let mut olds = old.field_list()?;
-        let news = new.field_list()?;
-        for (tag, mut new_field) in news {
-            if let Some(at) = olds.iter().position(|(other, _)| *other == tag) {
-                let (_, mut old_field) = olds.swap_remove(at);
+        let (mut olds, news) = (old.varint()?, new.varint()?);
+        let mut ahead: Option<(u16, Decoder<'a>)> = None;
+        for _ in 0..news {
+            let (tag, mut new_field) = new.next_field()?;
+            while olds > 0 && ahead.as_ref().is_none_or(|(other, _)| *other < tag) {
+                olds -= 1;
+                ahead = Some(old.next_field()?);
+            }
+            if let Some((_, mut old_field)) = ahead.take_if(|(other, _)| *other == tag) {
                 old_field.empty_items = old.empty_items;
                 new_field.empty_items = new.empty_items;
                 f(self, tag, &mut old_field, &mut new_field)?;
                 old.empty_items = old_field.empty_items;
                 new.empty_items = new_field.empty_items;
             }
+        }
+        for _ in 0..olds {
+            old.next_field()?;
         }
         Ok(())
     }
@@ -2372,35 +2385,22 @@ impl<'a> Decoder<'a> {
     pub fn fields(&mut self, mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>) -> Result<()> {
         let count = self.varint()?;
         for _ in 0..count {
-            let tag = self.u16()?;
-            let prefix = self.varint()?;
-            let link_count = if prefix & 1 == 1 {
-                self.varint()? as usize
-            } else {
-                0
-            };
-            let body = self.take((prefix >> 1) as usize)?;
-            let end = self
-                .cursor
-                .checked_add(link_count)
-                .filter(|end| *end <= self.links.len())
-                .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
+            let (tag, body, links) = self.field_parts()?;
             let mut sub = Decoder {
                 buf: body,
                 pos: 0,
-                links: &self.links[self.cursor..end],
+                links: &self.links[links.clone()],
                 cursor: 0,
                 store: self.store,
                 empty_items: self.empty_items,
                 heap: self.heap,
-                base: self.base + self.cursor,
+                base: self.base + links.start,
                 found: self.found,
                 tables: self.tables,
                 recalled: self.recalled,
                 rebuilds: self.rebuilds,
                 depth: self.depth,
             };
-            self.cursor = end;
             f(tag, &mut sub)?;
             self.empty_items = sub.empty_items;
             self.heap = sub.heap;
@@ -2408,41 +2408,45 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    /// Reads a struct's fields as [`fields`](Decoder::fields) does, and returns each field's tag
-    /// with a decoder over that field's bytes and links alone, in the order they are stored.
+    /// Reads the next field of a struct, one of those that [`fields`](Decoder::fields) reads
+    /// after their count, and returns its tag with a decoder over that field's bytes and links
+    /// alone.
     ///
-    /// Each decoder starts its count of zero-width items at nothing: one read as part of this
+    /// The decoder reads at this decoder's depth of nesting, as [`fields`](Decoder::fields)
+    /// does, and starts its count of zero-width items at nothing: one read as part of this
     /// decoder's object takes the count from it first and gives it back after, as
     /// [`fields`](Decoder::fields) does, so that all the fields of one object share it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Decode`] for a field list that runs past the end of the object.
-    pub(crate) fn field_list(&mut self) -> Result<Vec<(u16, Decoder<'a>)>> {
-        let count = self.varint()?;
-        let mut list =
-            Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(self.remaining()));
-        for _ in 0..count {
-            let tag = self.u16()?;
-            let prefix = self.varint()?;
-            let link_count = if prefix & 1 == 1 {
-                self.varint()? as usize
-            } else {
-                0
-            };
-            let body = self.take((prefix >> 1) as usize)?;
-            let end = self
-                .cursor
-                .checked_add(link_count)
-                .filter(|end| *end <= self.links.len())
-                .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
-            let mut field = Decoder::new(body, &self.links[self.cursor..end], self.store);
-            field.rebuilds = self.rebuilds;
-            field.depth = self.depth;
-            self.cursor = end;
-            list.push((tag, field));
-        }
-        Ok(list)
+    /// Returns [`Error::Decode`] for a field that runs past the end of the object.
+    pub(crate) fn next_field(&mut self) -> Result<(u16, Decoder<'a>)> {
+        let (tag, body, links) = self.field_parts()?;
+        let mut field = Decoder::new(body, &self.links[links], self.store);
+        field.rebuilds = self.rebuilds;
+        field.depth = self.depth;
+        Ok((tag, field))
+    }
+
+    /// Reads the tag, the length and the link count of the next field of a struct, and returns
+    /// the tag, the field's bytes and the range of its links among this decoder's, moving past
+    /// both.
+    fn field_parts(&mut self) -> Result<(u16, &'a [u8], Range<usize>)> {
+        let tag = self.u16()?;
+        let prefix = self.varint()?;
+        let link_count = if prefix & 1 == 1 {
+            self.varint()? as usize
+        } else {
+            0
+        };
+        let body = self.take((prefix >> 1) as usize)?;
+        let start = self.cursor;
+        let end = start
+            .checked_add(link_count)
+            .filter(|end| *end <= self.links.len())
+            .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
+        self.cursor = end;
+        Ok((tag, body, start..end))
     }
 }
 

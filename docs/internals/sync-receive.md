@@ -955,6 +955,14 @@ its own, so a forged version whose 10,000 values in one `Vec` of the root each h
 claimed 2^24 `()`s, a bundle of 970 bytes, was paired for 32.8 s before the walk refused it, which
 9e9341e did in 7 ms; it is now refused in 8 ms.
 
+It merges the fields of the two versions of a struct as they are stored, sorted by tag as the
+derive writes them, so it reads each once and holds none but the two it pairs; of a list stored
+out of order it pairs only the fields the merge meets, and the tables it misses are built from
+their rows. It used to collect each side's fields and look up each of one side's among the other's,
+so two carried roots of 200,000 empty fields of unknown tags, a bundle of 5.1 KB whose tags
+differed between the versions, took 24.1 s to receive and as long again in each `verify_typed`;
+they now take 15 ms and 11 ms, against 12 ms and 6 ms at 9e9341e.
+
 Before #116 only the tables of each root were paired, the nth table of a type with the nth of that
 type in the parent's root, so an `Option` of a table placed before another shifted the pairs as it
 came and went: nine commits of 2 KB that toggled a table of one row beside one of 1.5 million rows
