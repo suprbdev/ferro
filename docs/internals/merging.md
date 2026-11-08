@@ -145,9 +145,8 @@ only after its frame had settled. It now builds them once its frame is written a
 frame's entry in the queue, so the leader publishes them with the table. A merge holds its lane,
 which `rewrite_refs` waits for, so only `common_ancestor` could meet that gap. Pruning still sets
 each state after its table, but it moves only the oldest retained version, which the search takes
-from the state and never pairs with a record. The steps that build a virtual base still read the
-table under `tip`, where a record counts only for a commit on its head's chain at or above the
-version it was made at, which holds whichever table it comes from.
+from the state and never pairs with a record. The steps that build a virtual base read the records
+of both tables, as described below.
 
 `merge.rs` holds the leader of `side`'s pull at the start of its sync, and again once it has
 published the table and the states but still holds the lock, under both durabilities, and checks
@@ -174,12 +173,21 @@ lane is held, and crossing a lane follows another process's cycle and rebinds ev
 floor below where the other branch's head now stops is also the shape every merge reaches once the
 other branch commits and prunes after it, which a cycle copies and the search reads as before.
 
+The steps that build a virtual base lost records the same way. They read records from the table
+under `tip`, where a record counts for a commit only while the head that holds it keeps that commit
+on its chain. A commit that the published state of the other branch holds can be below the `first`
+of that branch's head under `tip`, so its records were dropped, and the step ran into the pruned
+history they bridge and refused. The steps now read both tables. A record holds whichever table it
+comes from, so the union is sound, and a start found in both is added once.
+
 `merge.rs` holds the leader of `side`'s sync while a second commit of `side` is placed, under both
 durabilities, merges, and checks that the merge linked what it merged: after a cycle `verify` and
 `verify_typed` pass, `common_ancestors` answers `side`'s merged commit from both sides, the log and
 `history_of` walk through the merge, and merging again applies each change once. `shared.rs` does
-the same with a second shared writer committing on `side`, and with one that also merges `main`
-into `side` first, where the second merge applied two changes twice.
+the same with a second shared writer committing on `side`, with one that also merges `main` into
+`side` first, where the second merge applied two changes twice, and with a criss-cross over a
+pull's record while the second writer commits on `side`, which refused before the steps read both
+tables.
 
 ## Handles of other files
 

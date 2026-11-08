@@ -1771,35 +1771,47 @@ fn holds(found: &[Start], ptr: Ptr) -> bool {
     found.iter().any(|start| start.node.ptr.hash == ptr.hash)
 }
 
-fn recorded((refs, store): (&Refs, &Store), starts: &[Start]) -> Result<Vec<Start>> {
+fn same_start(a: &Start, b: &Start) -> bool {
+    let under = |start: &Start| start.under.as_ref().map(|node| node.ptr.hash);
+    a.node.ptr.hash == b.node.ptr.hash
+        && under(a) == under(b)
+        && (a.low, a.after, a.bare) == (b.low, b.after, b.bare)
+}
+
+fn recorded((tables, store): (&[&Refs], &Store), starts: &[Start]) -> Result<Vec<Start>> {
     let mut out = starts.to_vec();
-    for (_, head) in refs.try_entries()? {
-        if head.merged.is_empty() {
-            continue;
-        }
-        for start in starts {
-            let version = start.node.version();
-            let on = head.log.node_at(store, version)?;
-            if on.is_none_or(|node| node.ptr.hash != start.node.ptr.hash) {
+    for refs in tables {
+        for (_, head) in refs.try_entries()? {
+            if head.merged.is_empty() {
                 continue;
             }
-            for (other, (theirs, ours)) in head.merged.try_entries()? {
-                let Some(found) = refs.try_get(&other)?.filter(|_| ours <= version) else {
+            for start in starts {
+                let version = start.node.version();
+                let on = head.log.node_at(store, version)?;
+                if on.is_none_or(|node| node.ptr.hash != start.node.ptr.hash) {
                     continue;
-                };
-                if let Some(node) = found.log.node_at(store, theirs)? {
-                    let at = ours.max(start.low);
-                    let under = (at <= version)
-                        .then(|| start.node.down_to(&start.store, at))
-                        .transpose()?;
-                    out.push(Start {
-                        store: store.clone(),
-                        node,
-                        low: found.log.first,
-                        after: found.log.after(store)?,
-                        bare: false,
-                        under,
-                    });
+                }
+                for (other, (theirs, ours)) in head.merged.try_entries()? {
+                    let Some(found) = refs.try_get(&other)?.filter(|_| ours <= version) else {
+                        continue;
+                    };
+                    if let Some(node) = found.log.node_at(store, theirs)? {
+                        let at = ours.max(start.low);
+                        let under = (at <= version)
+                            .then(|| start.node.down_to(&start.store, at))
+                            .transpose()?;
+                        let start = Start {
+                            store: store.clone(),
+                            node,
+                            low: found.log.first,
+                            after: found.log.after(store)?,
+                            bare: false,
+                            under,
+                        };
+                        if !out.iter().any(|known| same_start(known, &start)) {
+                            out.push(start);
+                        }
+                    }
                 }
             }
         }
@@ -4775,7 +4787,7 @@ impl<T: Data> Db<T> {
                 Some(ptr) if !holds(&found, ptr) => Some(Self::link_to(&theirs, ptr)?),
                 _ => None,
             };
-            let base = self.base_of((&tip.refs, &store), found, &mut f)?;
+            let base = self.base_of((&[&tip.refs, &published], &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -4821,7 +4833,7 @@ impl<T: Data> Db<T> {
                 }
             }
             let link = Some(Self::link_to(&theirs, ptr)?);
-            let base = self.base_of((&tip.refs, &store), found, &mut f)?;
+            let base = self.base_of((&[&tip.refs, &published], &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -4841,7 +4853,7 @@ impl<T: Data> Db<T> {
 
     fn base_of<R, S: Into<String>, E: From<Error>>(
         &self,
-        file: (&Refs, &Store),
+        file: (&[&Refs], &Store),
         found: Vec<Start>,
         f: &mut impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Snapshot<T>, E> {

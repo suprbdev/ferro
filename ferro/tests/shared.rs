@@ -339,6 +339,68 @@ fn a_merge_after_another_handle_merged_back_and_pruned_applies_each_change_once(
     }
 }
 
+fn criss_cross_over_a_pull_record(race: bool) -> ferro::Result<Vec<(u32, i64)>> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.ferro");
+    let clock = ticking();
+    let a = counted(&path, Keep::All, &clock);
+    let remote: Db<Counts> = fast()
+        .clock(clock.clone())
+        .open(dir.path().join("r.ferro"))
+        .unwrap();
+    count(&remote, 10);
+    let side = a.fork("side").unwrap();
+    count(&side, 1);
+    assert_eq!(
+        a.pull(&remote, "g", add_counts).unwrap().outcome,
+        ferro::Outcome::FastForward
+    );
+    assert_eq!(
+        side.pull(&remote, "g", add_counts).unwrap().outcome,
+        ferro::Outcome::Merged
+    );
+    let b = counted(&path, Keep::Last(2), &clock);
+    let theirs = b.branch("side").unwrap();
+    count(&theirs, 2);
+    count(&theirs, 3);
+    a.refresh().unwrap();
+    count(&a, 4);
+    b.refresh().unwrap();
+    theirs
+        .merge_with(&b.branch("main").unwrap(), add_counts)
+        .unwrap();
+    a.merge_with(&side, add_counts).unwrap();
+    a.refresh().unwrap();
+    assert_eq!(bases(a.common_ancestors(&side)), ["k3", "k4"]);
+    if race {
+        count(&theirs, 5);
+    }
+    let mut runs = Vec::new();
+    a.merge_with(&side, |root, base, theirs| {
+        runs.push((base.version(), theirs.version()));
+        add_counts(root, base, theirs)
+    })?;
+    assert_eq!(runs, [(1, 2), (0, 5)]);
+    let merged = counts(&a);
+    a.refresh().unwrap();
+    a.merge_with(&side, add_counts).unwrap();
+    a.compact(Keep::Last(2)).unwrap();
+    checked(&a);
+    let mut all = once([1, 2, 3, 4, 10]);
+    if race {
+        all.insert(4, (5, 1));
+    }
+    assert_eq!(counts(&a), all);
+    Ok(merged)
+}
+
+#[test]
+fn a_criss_cross_over_a_pull_record_merges_while_another_handle_prunes_the_other_branch() {
+    let all = once([1, 2, 3, 4, 10]);
+    assert_eq!(criss_cross_over_a_pull_record(false).unwrap(), all);
+    assert_eq!(criss_cross_over_a_pull_record(true).unwrap(), all);
+}
+
 struct Unpark(thread::Thread);
 
 impl std::task::Wake for Unpark {
