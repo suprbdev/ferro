@@ -36,14 +36,19 @@ Every holder of the lock, blocking or not, holds it through a guard whose drop w
 future in the queue, usually from an executor thread that has just finished another write, so on
 tokio the next writer runs right after it on the same worker. A woken future that finds the lock
 taken again, by a blocking writer or by a future that has just arrived, goes back to the head of the
-queue. Futures therefore keep their order among themselves, and the lock never sits idle waiting for
-a woken one to be polled. Blocking writers still park in `parking_lot` and can take the lock between
-a release and that poll. A future waiting at the gate counts as on its way to the lock, so a
-coalescing group is handed to it as to a thread blocked in `arrive`. The waiter count is stored
-before a second `try_lock`, and read after the release, with a `SeqCst` fence on each side, so a
-release and a future queuing at the same moment cannot both miss each other. The lock a future waits
-for is now its branch's lane, so each branch has a gate of its own, as described under [A lock per
-branch](commit-path.md#a-lock-per-branch).
+queue. Futures polled only when woken therefore get the lock in about the order they queued, and the
+lock never sits idle waiting for a woken one to be polled. The order is not exact, because any poll
+that finds the lock free takes it: a future polled for the first time between a release and the
+woken one's poll goes first, and so does a queued future that its executor polls without a wake, as
+a `join` of several writes polls them all. Keeping the order exactly would mean refusing a free lock
+to every future but the first in line, which leaves the lock idle from each release until that
+future's poll, the wait the gate was built to remove. Blocking writers still park in `parking_lot`
+and can take the lock between a release and that poll. A future waiting at the gate counts as on its
+way to the lock, so a coalescing group is handed to it as to a thread blocked in `arrive`. The
+waiter count is stored before a second `try_lock`, and read after the release, with a `SeqCst` fence
+on each side, so a release and a future queuing at the same moment cannot both miss each other. The
+lock a future waits for is now its branch's lane, so each branch has a gate of its own, as described
+under [A lock per branch](commit-path.md#a-lock-per-branch).
 
 ## The sync thread
 

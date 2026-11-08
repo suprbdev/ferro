@@ -39,13 +39,17 @@ let order = db
 The closure runs in the poll that finds its branch's writer lock free, on the thread that polls,
 under the same lock as a blocking write. So it need not be `Send` or `'static`, the future is `Send`
 when the closure and its result are, a panic unwinds out of that poll, and awaited and blocking
-writers share one sync. If the lock is taken, the future waits in line and the writer that lets go
-wakes the first in line, so futures get the lock in the order they asked for it, though a blocking
-writer can get in ahead of them. A write dropped before its closure ran, polled or not, writes
-nothing. Once the closure has run its outcome is decided: dropping the future gives up only the
-answer, the commit lands as if awaited, and closing the database first writes and syncs it. So
-whether a dropped write landed is exactly whether its closure ran. With `coalesce`, awaited closures
-join the same groups as blocking ones. `restore` and the merges have no awaited form.
+writers share one sync. If the lock is taken, the future waits in line, and the writer that lets go
+wakes the first in line, which keeps its place if it finds the lock taken again. Futures therefore
+get the lock roughly in the order they asked for it, but not exactly: any poll that finds the lock
+free takes it. A future polled for the first time between a release and the woken future's poll gets
+in ahead of the line, a future in line that its executor polls without a wake, as a `join` of
+several writes does, can pass those before it, and a blocking writer can get in ahead of them all. A
+write dropped before its closure ran, polled or not, writes nothing. Once the closure has run its
+outcome is decided: dropping the future gives up only the answer, the commit lands as if awaited,
+and closing the database first writes and syncs it. So whether a dropped write landed is exactly
+whether its closure ran. With `coalesce`, awaited closures join the same groups as blocking ones.
+`restore` and the merges have no awaited form.
 
 ## Sharing a version between writers
 

@@ -3995,13 +3995,15 @@ impl<T: Data> Db<T> {
     /// [`Db::commit`] as a future that resolves once the commit is published, which under
     /// [`Durability::Fsync`] means durable.
     ///
-    /// No thread waits for the writer lock or the sync. The closure runs in the poll that finds
-    /// the branch's writer lock free, on the thread that polls, under the same lock as a blocking
+    /// No thread waits for the writer lock or the sync. The closure runs in the poll that finds the
+    /// branch's writer lock free, on the thread that polls, under the same lock as a blocking
     /// write, so it need not be `Send` or `'static`, and the future is `Send` when the closure and
-    /// its result are. Futures waiting for the lock get it in the order they asked, though a
-    /// blocking writer can get in ahead of them. One `ferro-sync` thread per open database,
-    /// started by the first awaited write, syncs each batch and wakes the futures in it through
-    /// their [`Waker`]s, so any executor works and ferro needs no runtime.
+    /// its result are. A future that finds the lock taken waits in line and is woken in turn, but
+    /// any poll that finds the lock free takes it, so a future polled for the first time, one in
+    /// line that is polled without a wake, or a blocking writer can get in ahead of those in line:
+    /// futures get the lock roughly in the order they asked, not exactly. One `ferro-sync` thread
+    /// per open database, started by the first awaited write, syncs each batch and wakes the
+    /// futures in it through their [`Waker`]s, so any executor works and ferro needs no runtime.
     ///
     /// Dropping the future before the closure ran writes nothing. Once the closure has run, the
     /// commit lands as if awaited, and dropping the future gives up only the answer, so whether a
