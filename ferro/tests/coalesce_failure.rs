@@ -1,5 +1,6 @@
 mod common;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -519,4 +520,162 @@ fn a_leader_that_panics_fails_its_batch_and_wakes_every_writer() {
             db.verify().unwrap();
         }
     }
+}
+
+thread_local! {
+    static BRITTLE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Brittle(u64);
+
+impl Clone for Brittle {
+    fn clone(&self) -> Self {
+        if BRITTLE.with(|armed| armed.replace(false)) {
+            panic!("ferro: a value refused to clone");
+        }
+        Brittle(self.0)
+    }
+}
+
+impl Data for Brittle {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.varint(self.0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Brittle(r.varint()?))
+    }
+}
+
+fn refused_to_clone(what: &str, ran: thread::Result<impl std::fmt::Debug>) {
+    let payload = match ran {
+        Ok(ran) => panic!("{what} returned {ran:?}"),
+        Err(payload) => payload,
+    };
+    let text = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(text, Some("ferro: a value refused to clone"), "{what}");
+}
+
+fn brittle_db(hook: Hook) -> (tempfile::TempDir, Db<Brittle>) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Options::new()
+        .coalesce(true)
+        .reclaim(MANUAL)
+        .hook(hook)
+        .open(dir.path().join("brittle.ferro"))
+        .unwrap();
+    (dir, db)
+}
+
+fn reopened(dir: &tempfile::TempDir, branch: &str) -> u64 {
+    let db: Db<Brittle> = Options::new()
+        .open(dir.path().join("brittle.ferro"))
+        .unwrap();
+    db.verify().unwrap();
+    db.branch(branch).unwrap().read().0
+}
+
+fn a_clone_that_panics_as_a_closure_joins(awaited: bool) {
+    let case = if awaited { "awaited" } else { "blocking" };
+    let gates = Arc::new(Gates::default());
+    let hook = {
+        let gates = gates.clone();
+        Hook(Arc::new(move |step| {
+            let current = thread::current();
+            let name = current.name().unwrap_or("");
+            if matches!((step, name), ("leading", "leader") | ("handed", "member")) {
+                gates.hold(name);
+            }
+        }))
+    };
+    let (dir, main) = brittle_db(hook);
+    let b = main.fork("b").unwrap();
+    gates.arm("leader");
+    let leader = {
+        let main = main.clone();
+        thread::Builder::new()
+            .name("leader".into())
+            .spawn(move || main.update(|root| root.0 += 1))
+            .unwrap()
+    };
+    gates.reached("leader");
+    gates.arm("member");
+    gates.release("member");
+    let member = {
+        let b = b.clone();
+        thread::Builder::new()
+            .name("member".into())
+            .spawn(move || {
+                let add = |root: &mut Brittle| ("", root.0 += 2);
+                match awaited {
+                    true => block_on(b.commit_with_async(add)),
+                    false => b.commit_with(add),
+                }
+                .map(|done| done.version)
+            })
+            .unwrap()
+    };
+    gates.reached("member");
+    let brittle = {
+        let b = b.clone();
+        thread::spawn(move || {
+            BRITTLE.with(|armed| armed.set(true));
+            b.update(|root| root.0 += 4)
+        })
+    };
+    refused_to_clone(case, joined("the closure whose clone panicked", brittle));
+    gates.release("leader");
+    joined("the leader", leader).unwrap().unwrap();
+    let version = joined("the member", member).unwrap().unwrap();
+    assert_eq!(b.read().0, 2, "{case}");
+    let after = b.commit_with(|root| ("", root.0 += 8)).unwrap();
+    assert!(
+        after.version > version,
+        "{case}: {} after {version}",
+        after.version
+    );
+    assert_eq!((main.read().0, b.read().0), (1, 10), "{case}");
+    main.verify().unwrap();
+    drop((main, b));
+    assert_eq!(reopened(&dir, "b"), 10, "{case}");
+}
+
+#[test]
+fn a_clone_that_panics_as_a_closure_joins_a_group_strands_none_of_its_members() {
+    quiet_ferro_panics();
+    for awaited in [false, true] {
+        a_clone_that_panics_as_a_closure_joins(awaited);
+    }
+}
+
+#[test]
+fn a_clone_that_panics_while_a_failed_closure_rolls_back_leaves_the_branch_writable() {
+    quiet_ferro_panics();
+    let (dir, db) = brittle_db(Hook(Arc::new(|_| ())));
+    for fails in [false, true] {
+        let rolled = {
+            let db = db.clone();
+            thread::spawn(move || {
+                db.try_update(|root| -> ferro::Result<()> {
+                    root.0 += 4;
+                    BRITTLE.with(|armed| armed.set(true));
+                    match fails {
+                        true => Err(Error::Corrupt("refused".to_string())),
+                        false => panic!("ferro: the closure gave up"),
+                    }
+                })
+            })
+        };
+        refused_to_clone("the rollback", joined("the rolled back closure", rolled));
+    }
+    db.update(|root| root.0 += 8).unwrap();
+    assert_eq!(db.read().0, 8);
+    db.verify().unwrap();
+    drop(db);
+    assert_eq!(reopened(&dir, "main"), 8);
 }

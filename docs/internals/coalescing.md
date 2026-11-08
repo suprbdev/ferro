@@ -49,7 +49,13 @@ between closures and each closure takes it under that lane on its own thread. So
 bound, `update` closures keep borrowing local state, and a panic unwinds where it should. Cloning
 the working copy first is the checkpoint, O(1) per collection, and an `Err` or a panic puts it back.
 That closure still waits for the group, since it may have read state that never becomes durable,
-except that a panic does not wait, as it never did.
+except that a panic does not wait, as it never did. A panic in `T::clone`, taking the checkpoint or
+putting back the copy of a group the closure opened, is that closure's panic: the group is handed
+on or sealed as for a closure that panics. The checkpoint's clone used to run outside the catch, so
+the group unwound with the stack and the members that joined it before waited for good (#124).
+`a_clone_that_panics_as_a_closure_joins_a_group_strands_none_of_its_members` in
+`coalesce_failure.rs` has a blocking or awaited member join a group left open during a sync, then a
+closure whose clone panics, and the member hung without the change.
 
 A closure ending under the lock does not flush if someone else will finish the group: either a sync
 is running, whose leader wakes one member when it ends, or a thread has announced it is on its way

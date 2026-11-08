@@ -4318,7 +4318,7 @@ impl<T: Data> Db<T> {
             return Err(error.into());
         }
         let mut group = shared.join_group(&mut lane, branch);
-        let checkpoint = (group.members > 0).then(|| group.working.clone());
+        let members = group.members;
         let before = group.state.snapshot.commit.version;
         let seal = group.seal.clone();
         let timed = group.time.get().is_some();
@@ -4328,16 +4328,22 @@ impl<T: Data> Db<T> {
             time: &group.time,
             clock: shared.clock.as_ref(),
         };
+        let base = &group.state.snapshot.value;
         let working = &mut group.working;
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(working, &stamp)));
-        if !matches!(ran, Ok(Ok(_))) {
-            group.working = match checkpoint {
-                Some(checkpoint) => checkpoint,
-                None => (*group.state.snapshot.value).clone(),
-            };
-            if !timed {
-                group.time = OnceCell::new();
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+            let checkpoint = (members > 0).then(|| working.clone());
+            let ran = panic::catch_unwind(AssertUnwindSafe(|| f(working, &stamp)));
+            if !matches!(ran, Ok(Ok(_))) {
+                *working = match checkpoint {
+                    Some(checkpoint) => checkpoint,
+                    None => (**base).clone(),
+                };
             }
+            ran
+        }));
+        let ran = ran.and_then(|ran| ran);
+        if !timed && !matches!(ran, Ok(Ok(_))) {
+            group.time = OnceCell::new();
         }
         let mut others = Vec::new();
         let result = match ran {
