@@ -596,3 +596,74 @@ fn a_name_listed_as_removed_keeps_its_old_bytes_from_a_new_field_or_variant() {
     assert_eq!(taxed, Taxed::Paid { at: 5, flags: 0 });
     roundtrip(Taxed::Tax(4));
 }
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+#[index(r#type, r#use)]
+struct Keyword {
+    #[key]
+    id: u32,
+    #[index(cover(r#use))]
+    r#type: u8,
+    #[unique]
+    r#use: String,
+    #[index(each)]
+    r#in: Vec<u8>,
+}
+
+#[test]
+fn raw_identifier_fields_are_indexed_under_their_plain_names() {
+    let mut table: Table<Keyword> = Table::new();
+    for id in 0..4u32 {
+        table.insert(Keyword {
+            id,
+            r#type: (id % 2) as u8,
+            r#use: format!("u{id}"),
+            r#in: vec![id as u8, 9],
+        });
+    }
+    let odd: Vec<(u32, String)> = table.by_type(&1).covered().collect();
+    assert_eq!(odd, [(1, "u1".to_string()), (3, "u3".to_string())]);
+    assert_eq!(table.key_by_use("u2"), Some(2));
+    assert_eq!(table.by_in(&9).len(), 4);
+    let pair: Vec<u32> = table.by_type_use(&(0, "u2".to_string())).keys().collect();
+    assert_eq!(pair, [2]);
+    let find = table.find();
+    let found: Vec<u32> = find.by_type(&0).and(find.by_in(&2)).keys().collect();
+    assert_eq!(found, [2]);
+    let taken = table.try_update(&3, |row| row.r#use = "u0".into());
+    assert_eq!(taken.unwrap_err().index, "use");
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct RawField {
+    r#type: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct PlainField {
+    #[ferro(rename = "type")]
+    kind: u8,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+enum RawVariant {
+    r#Type(u8),
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+enum PlainVariant {
+    #[ferro(rename = "Type")]
+    Kind(u8),
+}
+
+#[test]
+fn a_raw_identifier_is_stored_under_its_name_without_the_prefix() {
+    assert_eq!(
+        reread::<_, PlainField>(&RawField { r#type: 7 }).unwrap(),
+        PlainField { kind: 7 }
+    );
+    assert_eq!(
+        reread::<_, PlainVariant>(&RawVariant::r#Type(4)).unwrap(),
+        PlainVariant::Kind(4)
+    );
+}

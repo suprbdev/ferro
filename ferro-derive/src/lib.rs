@@ -13,6 +13,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{
     Attribute, Data, DeriveInput, Fields, Generics, Ident, LitStr, Path, Type, Visibility,
@@ -126,7 +127,7 @@ fn parse_fields(fields: &Fields) -> syn::Result<Vec<Field>> {
             ));
         }
         let name = attrs.rename.unwrap_or_else(|| match &field.ident {
-            Some(ident) => ident.to_string(),
+            Some(ident) => ident.unraw().to_string(),
             None => index.to_string(),
         });
         out.push(Field {
@@ -539,7 +540,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let mut removed_fields = Vec::new();
             for variant in &data.variants {
                 let attrs = parse_attrs(&variant.attrs)?;
-                variant_names.push(attrs.rename.unwrap_or_else(|| variant.ident.to_string()));
+                variant_names.push(
+                    attrs
+                        .rename
+                        .unwrap_or_else(|| variant.ident.unraw().to_string()),
+                );
                 removed_fields.push(attrs.removed);
             }
             check_collisions(
@@ -1397,7 +1402,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     })?;
                 }
                 indexes.push(Indexed {
-                    name: ident.to_string(),
+                    name: ident.unraw().to_string(),
                     span: ident.span(),
                     fields: vec![(ident.clone(), field.ty.clone())],
                     kind,
@@ -1418,7 +1423,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     attr.meta.require_path_only()?;
                 }
                 indexes.push(Indexed {
-                    name: ident.to_string(),
+                    name: ident.unraw().to_string(),
                     span: ident.span(),
                     fields: vec![(ident.clone(), field.ty.clone())],
                     kind: IndexKind::Unique,
@@ -1436,7 +1441,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             continue;
         };
         let (fields, cover) = composite(attr, named)?;
-        let names: Vec<String> = fields.iter().map(|(ident, _)| ident.to_string()).collect();
+        let names: Vec<String> = fields
+            .iter()
+            .map(|(ident, _)| ident.unraw().to_string())
+            .collect();
         indexes.push(Indexed {
             name: names.join("_"),
             span: attr.span(),
@@ -1476,7 +1484,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     }
 
     let stored_name = |ident: &Ident| -> String {
-        field_of(ident).map_or_else(|| ident.to_string(), |field| field.name.clone())
+        field_of(ident).map_or_else(|| ident.unraw().to_string(), |field| field.name.clone())
     };
     let rows_ty: Type = syn::parse_quote!(::ferro::Map<#key_ty, #name>);
     let map_tys: Vec<Type> = indexes

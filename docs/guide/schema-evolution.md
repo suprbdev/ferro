@@ -11,6 +11,11 @@ the struct:
   `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
 - To rename a field, use `#[ferro(rename = "old_name")]`.
 
+A field or variant written as a raw identifier, such as `r#type`, is stored under its name without
+the `r#`, here `type`, and its indexes and lookups are named the same way, as `by_type`. Earlier
+builds stored it under `r#type` and could not index it, so to read data they wrote, mark the field
+`#[ferro(rename = "r#type")]`.
+
 Do not change the encoding or `Ord` of a key type on existing data. Tree placement depends on both.
 
 A field is stored under a 16-bit hash of its name, so a field you add has a 1 in 65,536 chance of
