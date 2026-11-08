@@ -2041,6 +2041,11 @@ struct View {
     left: AtomicU64,
     /// Whether a read was refused because `left` could not pay for it.
     overdrawn: AtomicBool,
+    /// The zero-width items it may still decode from what it reads at a charge, and count with
+    /// [`Store::count_zero_width`].
+    zero_width: AtomicU64,
+    /// Whether a read or a count was refused because `zero_width` could not cover it.
+    too_wide: AtomicBool,
     /// The bytes of a staging it reads beside the file, which count towards how many entries a
     /// node it reads may claim.
     borrowed: u64,
@@ -2062,6 +2067,23 @@ impl View {
         if paid.is_err() {
             self.overdrawn.store(true, Ordering::Relaxed);
             return Err(overdrawn());
+        }
+        Ok(())
+    }
+
+    /// Counts `items` zero-width items against what the view may still decode.
+    fn count_zero_width(&self, items: u64) -> Result<()> {
+        if items == 0 {
+            return Ok(());
+        }
+        let covered = self
+            .zero_width
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(items)
+            });
+        if covered.is_err() {
+            self.too_wide.store(true, Ordering::Relaxed);
+            return Err(too_wide());
         }
         Ok(())
     }
@@ -2092,6 +2114,12 @@ impl View {
 /// The error of a read through a [`Store::view`] that its allowance cannot pay for.
 fn overdrawn() -> Error {
     Error::Bundle("recomputing its summaries reads more than its size allows".into())
+}
+
+/// The error of a read through a [`Store::view`], or a count, that takes the zero-width items it
+/// has decoded past what it may.
+fn too_wide() -> Error {
+    Error::Bundle("checking it would visit more zero-width items than its size allows".into())
 }
 
 /// The records a [`Store::view`] has read from its file, by offset: one bit for each
@@ -2413,8 +2441,10 @@ impl Store {
     /// share, and a read through it changes nothing of this store. The first read of each record
     /// of the file is free. A read of a staged object, a second read of a record and
     /// [`Store::charge`] count against `allowance` bytes of object bodies, and one past it fails
-    /// with [`Error::Bundle`].
-    pub(crate) fn view(&self, borrowed: u64, allowance: u64) -> Store {
+    /// with [`Error::Bundle`]. The zero-width items that such a read decodes, as
+    /// [`Decoder::item`] counts them, and [`Store::count_zero_width`] count against `zero_width`
+    /// in the same way.
+    pub(crate) fn view(&self, borrowed: u64, allowance: u64, zero_width: u64) -> Store {
         let inner = &self.inner;
         let (tail, written, placed) = (
             inner.tail.load(Ordering::Acquire),
@@ -2464,6 +2494,8 @@ impl Store {
                 view: Some(View {
                     left: AtomicU64::new(allowance),
                     overdrawn: AtomicBool::new(false),
+                    zero_width: AtomicU64::new(zero_width),
+                    too_wide: AtomicBool::new(false),
                     borrowed,
                     lent: RwLock::new(AtomicPtr::new(std::ptr::null_mut())),
                     read: Mutex::new(Reads::default()),
@@ -2493,12 +2525,28 @@ impl Store {
         }
     }
 
-    /// The error of the first read through this [`Store::view`] that its allowance could not pay
-    /// for, if there was one, which a check that caught the read's panic on another thread
+    /// Counts `items` zero-width items against what a [`Store::view`] may still decode, as a read
+    /// at a charge counts those it decodes, and does nothing for a store opened on a file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bundle`] if what is left cannot cover `items`.
+    pub(crate) fn count_zero_width(&self, items: u64) -> Result<()> {
+        match &self.inner.view {
+            Some(view) => view.count_zero_width(items),
+            None => Ok(()),
+        }
+    }
+
+    /// The error of the first read through this [`Store::view`] that its allowances could not
+    /// pay for, if there was one, which a check that caught the read's panic on another thread
     /// reports in place of what it caught.
     pub(crate) fn overdrawn(&self) -> Option<Error> {
         let view = self.inner.view.as_ref()?;
-        view.overdrawn.load(Ordering::Relaxed).then(overdrawn)
+        if view.overdrawn.load(Ordering::Relaxed) {
+            return Some(overdrawn());
+        }
+        view.too_wide.load(Ordering::Relaxed).then(too_wide)
     }
 
     /// The store's id, which no other store this process opens shares, so that a collection can
@@ -3603,12 +3651,15 @@ impl Store {
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
         weigh: impl FnOnce(&T, usize, usize) -> u32,
     ) -> Result<(T, u32)> {
-        let object = self.read_fresh(ptr)?;
+        let (object, charged) = self.read_fresh(ptr)?;
         if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
             self.inner.dedupe.insert(ptr.hash, ptr.offset);
         }
         let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
         let value = decode(&mut decoder)?;
+        if charged {
+            self.count_zero_width(decoder.zero_width())?;
+        }
         let weight = weigh(&value, object.body.len(), decoder.heap());
         Ok((value, weight))
     }
@@ -3616,22 +3667,24 @@ impl Store {
     /// Reads the object at `ptr` for decoding: for a [`Store::view`], the one staged with its hash
     /// if [`Staging::overlaid`] lends the view a staging that holds one, its body counted against
     /// what the view may read, and otherwise the record in the file, counted only if the view
-    /// read it before.
-    pub(crate) fn read_fresh(&self, ptr: Ptr) -> Result<Object> {
+    /// read it before. It also returns whether the read was counted, which a read of a store
+    /// opened on a file never is.
+    pub(crate) fn read_fresh(&self, ptr: Ptr) -> Result<(Object, bool)> {
         FRESH.with(|fresh| fresh.set(fresh.get().wrapping_add(1)));
         let Some(view) = &self.inner.view else {
-            return self.read_object(ptr);
+            return Ok((self.read_object(ptr)?, false));
         };
         if let Some(object) = view.staged(ptr) {
             let object = object?;
             view.charge(object.body.len())?;
-            return Ok(object);
+            return Ok((object, true));
         }
         let object = self.read_object(ptr)?;
-        if view.read.lock().mark(ptr.offset) {
+        let again = view.read.lock().mark(ptr.offset);
+        if again {
             view.charge(object.body.len())?;
         }
-        Ok(object)
+        Ok((object, again))
     }
 
     /// Puts the entry that `entry` makes in the cache unless the store is closed or a
@@ -3728,8 +3781,13 @@ impl Store {
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
-        let object = self.read_fresh(ptr)?;
-        decode(&mut Decoder::new(&object.body, &object.links, Some(self)))
+        let (object, charged) = self.read_fresh(ptr)?;
+        let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
+        let value = decode(&mut decoder)?;
+        if charged {
+            self.count_zero_width(decoder.zero_width())?;
+        }
+        Ok(value)
     }
 
     /// Starts a transaction that appends to the end of the log.

@@ -500,7 +500,8 @@ Measured and left out:
   about 140 bytes on the receiver and 80 on the sender, and each hint about 140 on the receiver, so
   a pull of scattered edits, which names about three held nodes for each one it sends, costs a few
   hundred bytes an object there. Each object is held whole, so one huge value needs a few times its
-  size. A hostile stream costs the same, for what it carries and not for what it claims.
+  size. A hostile stream costs the same, for what it carries and not for what it claims, and so
+  does checking it, as the limits on checks below describe.
 - `receive` writes a bundle over 1 MiB twice, to the scratch file as it arrives and then into the
   log, so it needs free disk for both until it lands and costs a second write and read of the
   bundle. A crash while it places the bundle, or a landing refused because a base went while the
@@ -533,6 +534,14 @@ Measured and left out:
   two ranges, one of 1 MiB under about 18, and a hostile bundle that reuses a node under many
   ranges decodes no more than that before it is refused, as described under [Checking
   trees](sync-receive.md#checking-trees).
+- An object may hold 2^24 items that encode to nothing, such as the `()`s of a `Vec<()>`, in a few
+  bytes, and each takes about 0.2 ns to visit. A bundle whose checks would visit more than 2^28 of
+  them, plus 16 for each body byte it carries, is refused, counting every check of a sent object
+  and every read at a charge while summaries are recomputed or held data of another type is
+  checked, but not the first read of a held record. So a bundle carries up to 16 objects of 2^24
+  such items, and one more for each MiB, and one of 1.27 MB whose 40,000 values each claim 2^24
+  `()`s is refused 86 ms in, where it took 131 s to check and land, as described under
+  [Zero-width items in a bundle](sync-receive.md#zero-width-items-in-a-bundle).
 - Held data that a bundle links as another type, as after a commit that copies a map into one
   whose values encode alike, is checked as that type down to its leaves, so the first pull after
   such a copy reads the copied tree, a million keys in about 0.4 s. The first read of each held

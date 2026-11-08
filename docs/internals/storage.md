@@ -41,7 +41,9 @@ fails with `Error::Decode` past 2^24 of them in one object. The count is per obj
 share their struct's, the keys, values and summaries of a map node share the node's, and a value
 spilled into an object of its own, or a nested collection's nodes, each start at zero. 2^24 `()`s
 take about 3.5 ms to visit, so the items no object pays bytes for cost a read or a check at most
-that much an object.
+that much an object. A receive also counts them across the whole bundle and refuses one whose
+checks would visit more than its size allows, as described under [Zero-width items in a
+bundle](sync-receive.md#zero-width-items-in-a-bundle).
 
 `Encoder::item` counts the items it writes the same way and fails with `Error::TooManyZeroWidth`
 past 2^24 in one object, so a commit refuses what a read would refuse instead of writing it, and
@@ -65,7 +67,8 @@ Counting per value instead, each key, value and summary of a node from zero, wou
 whose values fit one at a time, but a node's cost would then grow with its entries. An entry whose
 value claims 2^24 `()`s takes about seven bytes of its node with its key, slot tag and child count,
 so a hostile node of 1 MiB would buy some 150,000 times 3.5 ms, about nine minutes of one check,
-where a bundle now buys 3.5 ms for each object it sends. Capping a node's entries to keep that down
+where a bundle buys at most 3.5 ms for each object it sends, and no more in all than its size
+allows. Capping a node's entries to keep that down
 would refuse, at commit, any map with enough keys that hash to one level between two higher ones.
 Counting per object refuses only values that fit alone but not together in one node, more than 2^24
 items that take no room between them, which no realistic value holds.

@@ -2272,8 +2272,8 @@ fn a_peer_that_reads_held_bytes_as_text_lands_them_only_if_they_are_text() {
 
 type Pair = (Map<u64, u32>, Map<u64, u64>);
 
-fn retyped(
-    db: &Db<Pair>,
+fn retyped<T: Data>(
+    db: &Db<T>,
     hints: &[(u64, u64)],
     sent: &[(&Object, &[u64])],
 ) -> ferro::Result<Pulled<()>> {
@@ -2536,6 +2536,284 @@ fn a_bundle_that_reuses_one_node_under_many_key_ranges_lands_up_to_a_budget() {
             }
             assert_refused(&b, result);
         }
+    }
+}
+
+const ZERO_WIDTH: u64 = 1 << 24;
+
+type Units = Map<u64, Vec<()>>;
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Width(u64);
+
+impl Summary<u64, Vec<()>> for Width {
+    fn of(_key: &u64, value: &Vec<()>) -> Self {
+        Width(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Width(self.0.wrapping_add(other.0))
+    }
+}
+
+impl Summary<u64, Units> for Width {
+    fn of(_key: &u64, value: &Units) -> Self {
+        Width(value.iter().map(|(_, units)| units.len() as u64).sum())
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Width(self.0.wrapping_add(other.0))
+    }
+}
+
+fn keys_at(level: u32, count: usize) -> Vec<u64> {
+    (0..)
+        .filter(|key| common::level_of(key) == level)
+        .take(count)
+        .collect()
+}
+
+fn units_object(count: u64) -> Object {
+    let mut body = Vec::new();
+    varint(&mut body, count);
+    Object {
+        body,
+        links: Vec::new(),
+    }
+}
+
+fn units_slot(tag: u8, count: u64) -> Vec<u8> {
+    let mut slot = vec![tag];
+    varint(&mut slot, count);
+    slot
+}
+
+fn leaf_of(keys: &[u64], slots: &[Vec<u8>], links: Vec<Ptr>) -> Object {
+    let mut body = vec![0];
+    varint(&mut body, keys.len() as u64);
+    for key in keys {
+        varint(&mut body, *key);
+    }
+    for slot in slots {
+        body.extend_from_slice(slot);
+    }
+    body.extend(std::iter::repeat_n(0, keys.len() + 1));
+    Object { body, links }
+}
+
+fn narrowing_parents(separators: &[u64], leaf: Ptr) -> Vec<Object> {
+    separators
+        .iter()
+        .map(|separator| {
+            let mut body = vec![1, 1];
+            varint(&mut body, *separator);
+            body.extend_from_slice(&[0, 0, 1, 0]);
+            Object {
+                body,
+                links: vec![leaf],
+            }
+        })
+        .collect()
+}
+
+fn refused_for_zero_width<R: std::fmt::Debug>(result: &ferro::Result<R>, started: Instant) {
+    let took = started.elapsed();
+    match result {
+        Err(Error::Bundle(message)) => assert!(message.contains("zero-width"), "{message}"),
+        other => panic!("landed more zero-width items than the bundle carries: {other:?}"),
+    }
+    assert!(took < Duration::from_secs(30), "refused after {took:?}");
+}
+
+#[test]
+fn a_bundle_of_values_that_claim_many_zero_width_items_is_refused_while_honest_ones_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Map<u64, (Vec<()>, String)>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    for batch in 0..2u64 {
+        a.update(|root| {
+            for key in batch * 4..batch * 4 + 4 {
+                root.insert(key, (vec![(); ZERO_WIDTH as usize], "x".repeat(600)));
+            }
+        })
+        .unwrap();
+    }
+    let b: Db<Map<u64, (Vec<()>, String)>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    assert_eq!(
+        b.pull(&a, "a", no_merge).unwrap().outcome,
+        Outcome::FastForward
+    );
+    b.verify_typed().unwrap();
+    let pulled = b.read();
+    assert_eq!(pulled.len(), 8);
+    for (_, value) in pulled.iter() {
+        assert_eq!(value.0.len(), ZERO_WIDTH as usize);
+    }
+
+    let keys = keys_at(0, 40_000);
+    let values: Vec<Object> = (0..keys.len() as u64)
+        .map(|at| units_object(ZERO_WIDTH - at))
+        .collect();
+    let node = leaf_of(
+        &keys,
+        &vec![vec![1]; keys.len()],
+        values.iter().map(link_to).collect(),
+    );
+    let root = map_root(keys.len() as u64, &node);
+    let mut objects: Vec<&Object> = values.iter().collect();
+    objects.extend([&node, &root]);
+    let started = Instant::now();
+    let (b, result, _dir) = receive_tree::<Units>(&objects);
+    refused_for_zero_width(&result, started);
+    assert_refused(&b, result);
+}
+
+#[test]
+fn a_node_rechecked_under_narrower_key_ranges_counts_its_zero_width_items_each_time() {
+    let low = key_at_level(0);
+    let separators: Vec<u64> = (low + 1..)
+        .filter(|key| common::level_of(key) == 1)
+        .take(400)
+        .collect();
+    let leaf = node_of(low, &units_slot(0, ZERO_WIDTH), Vec::new());
+    for (count, lands) in [(8, true), (400, false)] {
+        let parents = narrowing_parents(&separators[..count], link_to(&leaf));
+        let mut body = Vec::new();
+        varint(&mut body, count as u64);
+        body.extend(std::iter::repeat_n(2, count));
+        let root = Object {
+            body,
+            links: parents.iter().map(link_to).collect(),
+        };
+        let mut objects = vec![&leaf];
+        objects.extend(&parents);
+        objects.push(&root);
+        let started = Instant::now();
+        let (b, result, _dir) = receive_tree::<Vec<Units>>(&objects);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let maps = b.read();
+            assert_eq!(maps.len(), count);
+            for (map, separator) in maps.iter().zip(&separators) {
+                assert_eq!(map.get(&low).unwrap().len(), ZERO_WIDTH as usize);
+                assert!(map.get(separator).unwrap().is_empty());
+            }
+            b.verify_typed().unwrap();
+        } else {
+            refused_for_zero_width(&result, started);
+            assert_refused(&b, result);
+        }
+    }
+}
+
+#[test]
+fn a_value_spilled_under_many_keys_counts_its_zero_width_items_for_each_summary_it_confirms() {
+    let value = units_object(ZERO_WIDTH);
+    for (count, lands) in [(8, true), (400, false)] {
+        let keys = keys_at(0, count);
+        let node = leaf_of(
+            &keys,
+            &vec![units_slot(1, ZERO_WIDTH); count],
+            vec![link_to(&value); count],
+        );
+        let root = summed_root(count as u64, ZERO_WIDTH * count as u64, &node);
+        let started = Instant::now();
+        let (b, result, _dir) = receive_tree::<Map<u64, Vec<()>, Width>>(&[&value, &node, &root]);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let map = b.read();
+            assert_eq!(map.summary(), Some(Width(ZERO_WIDTH * count as u64)));
+            for key in &keys {
+                assert_eq!(map.get(key).unwrap().len(), ZERO_WIDTH as usize);
+            }
+            b.verify_typed().unwrap();
+        } else {
+            refused_for_zero_width(&result, started);
+            assert_refused(&b, result);
+        }
+    }
+}
+
+#[test]
+fn summaries_that_read_nested_maps_count_the_zero_width_items_they_read() {
+    let low = key_at_level(0);
+    let inner = node_of(low, &units_slot(0, ZERO_WIDTH), Vec::new());
+    for (count, lands) in [(4, true), (400, false)] {
+        let keys = keys_at(0, count);
+        let node = leaf_of(
+            &keys,
+            &vec![vec![0, 1]; count],
+            vec![link_to(&inner); count],
+        );
+        let root = summed_root(count as u64, ZERO_WIDTH * count as u64, &node);
+        let started = Instant::now();
+        let (b, result, _dir) = receive_tree::<Map<u64, Units, Width>>(&[&inner, &node, &root]);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let outer = b.read();
+            assert_eq!(outer.summary(), Some(Width(ZERO_WIDTH * count as u64)));
+            for key in &keys {
+                assert_eq!(
+                    outer.get(key).unwrap().get(&low).unwrap().len(),
+                    ZERO_WIDTH as usize
+                );
+            }
+            b.verify_typed().unwrap();
+        } else {
+            refused_for_zero_width(&result, started);
+            assert_refused(&b, result);
+        }
+    }
+}
+
+type Retyped = (Units, Vec<Map<u64, Vec<((), ())>>>);
+
+#[test]
+fn held_data_linked_as_another_type_counts_its_zero_width_items_from_its_second_read() {
+    let low = key_at_level(0);
+    let separators: Vec<u64> = (low + 1..)
+        .filter(|key| common::level_of(key) == 1)
+        .take(400)
+        .collect();
+    for (count, lands) in [(8, true), (400, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let b: Db<Retyped> = fast().open(dir.path().join("b.ferro")).unwrap();
+        b.update(|both| {
+            both.0.insert(low, vec![(); ZERO_WIDTH as usize]);
+        })
+        .unwrap();
+        let held = Ptr {
+            hash: b.read().0.root_hash().unwrap(),
+            offset: 0,
+        };
+        let parents = narrowing_parents(&separators[..count], held);
+        let mut body = vec![1];
+        varint(&mut body, count as u64);
+        body.extend(std::iter::repeat_n(2, count));
+        let mut links = vec![held];
+        links.extend(parents.iter().map(link_to));
+        let root = Object { body, links };
+        let mut references = vec![2];
+        references.extend(std::iter::repeat_n(0, count));
+        let mut sent: Vec<(&Object, &[u64])> =
+            parents.iter().map(|node| (node, &[2][..])).collect();
+        sent.push((&root, &references));
+        let before = (b.head_hash(), b.size_on_disk());
+        let started = Instant::now();
+        let result = retyped(&b, &[(0, 0)], &sent);
+        if lands {
+            assert_eq!(result.unwrap().outcome, Outcome::FastForward);
+            let both = b.read();
+            assert_eq!(both.1.len(), count);
+            for (map, separator) in both.1.iter().zip(&separators) {
+                assert_eq!(map.get(&low).unwrap().len(), ZERO_WIDTH as usize);
+                assert!(map.get(separator).unwrap().is_empty());
+            }
+        } else {
+            refused_for_zero_width(&result, started);
+            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        }
+        b.verify_typed().unwrap();
     }
 }
 

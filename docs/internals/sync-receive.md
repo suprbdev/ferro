@@ -335,7 +335,9 @@ earlier kind left a clone of that map in ten commits, 35.8 MB, at a median of 13
 
 Each decode stops past 2^24 items that take no bytes and no links in one object, the limit a commit
 writes each object under, as described under [Zero-width items](storage.md#zero-width-items), so a
-bundle of objects written under it never meets it.
+bundle of objects written under it never meets it. The checks also count those items across the
+whole bundle, against a count its size allows, as described under [Zero-width items in a
+bundle](#zero-width-items-in-a-bundle).
 
 Links a type does not name are not checked: a raw `Ptr`, or a field this schema no longer knows.
 Nothing reads them as a type. Spilled values are not checked for the size that made them spill.
@@ -374,7 +376,9 @@ that are not UTF-8 linked as a `String`, or a held subtree hung under a new pare
 falls among its deeper keys.
 
 The walk reads through the view that recomputing summaries uses, described below, so the first read
-of each held record is free and every later one is charged against that allowance. A summary that
+of each held record is free and every later one is charged against that allowance, and counts the
+zero-width items it visits in it, as described under [Zero-width items in a
+bundle](#zero-width-items-in-a-bundle). A summary that
 must be recomputed from a value holding a collection is checked after everything below it, as a
 deferred object of the bundle is. The walk remembers the checks it made, with the last 16 ranges of
 each, for the 16,384 objects it checked or found most recently, in two generations of 8,192 that
@@ -493,7 +497,9 @@ record takes at least 8 bytes, and a record that starts in the same 8 bytes as a
 before it is charged as read again. A read of an object the bundle carries, a second read of a
 record, and each check of a sent spilled value again under another key are charged. So reading what
 the receiver holds once costs an honest bundle nothing, however much it is, and what a bundle can
-make the receiver read again is paid for by what it carries. A bundle of a few hundred bytes can so
+make the receiver read again is paid for by what it carries. The zero-width items a read decodes
+are counted when its bytes are charged, as described under [Zero-width items in a
+bundle](#zero-width-items-in-a-bundle). A bundle of a few hundred bytes can so
 make the receiver read, once, every collection held in the values of the nodes it rewrites, as
 committing them cost the sender, and the view's record of what it read takes at most 1.7% of the
 stretch of file those reads cover. The record lasts one receive, so a bundle that is refused, and
@@ -649,3 +655,48 @@ Measured and left out:
 - Comparing a hash of each summary's encoding, which would keep a check's state the size of a
   hash: a 64-bit hash is not proof against a peer that picks the forged summary, and a
   cryptographic one costs more than encoding the few bytes of a summary twice.
+
+### Zero-width items in a bundle
+
+An object may hold 2^24 items that take no bytes, such as the `()`s of a `Vec<()>`, and visiting
+them takes about 3.3 ms, while a value that claims them is a varint of four bytes. Each check paid
+only for its object's bytes, so a bundle bought 3.3 ms of checking for every object it sent that
+claimed that many, whatever their size: 40,000 such values spilled under the keys of one node, a
+bundle of 1.27 MB, took 131 s to check and landed (#110). A bundle could buy the same again with a
+link: a node checked under each of many narrowing ranges, a spilled value checked for each key whose
+summary it confirms, a nested map that `of` reads for each entry that holds it, and held data of
+another type checked again under each range, each visit their object's items once more.
+
+So a receive counts the zero-width items of every check whose bytes it charges: each check of a
+sent object, the first one and each one after it, the decode under an earlier kind, the check that
+confirms a spilled value's summary under another key, the recheck of a deferred object, and every
+object read through the view at a charge, a sent object or a held record read again, whether `of`
+reads it or the check of held data of another type does. The count is the decoder's own, so a check
+that goes back to decode what it visited counts those items once, though it visits them twice. A
+bundle whose checks would count more than 2^28 zero-width items, plus 16 for each body byte it
+carries, is refused with `Error::Bundle`, "checking it would visit more zero-width items than its
+size allows". The first read of each held record is not counted, as its bytes are not charged, so a
+pull that walks held data of another type visits what the receiver holds once for free, as a local
+scan of it would, and neither are the held parents the hint path reads once each.
+
+The bundle of 1.27 MB above visited 2^24 items in 3.28 ms an object, about 0.2 ns an item, and the
+clone of a `Map<u64, String>` of 400,000 keys of 80 bytes, 35.8 MB, was received in 0.153 s,
+about 4.3 ns a byte. So 16 items for each byte carried cost at most about three quarters of what
+receiving those bytes does, and the constant, 16 objects at the limit of one, about 53 ms.
+That bundle is now refused 86 ms in, and one of 12.8 MB that sends 400,000 such values 245 ms in.
+Tests forge a node checked under 400 narrowing ranges, a spilled value under 400 keys of a map with
+a summary, a nested map that `of` sums under 400 keys, and a held node linked as another type under
+400 ranges, each object with 2^24 `()`s. All four landed before and are refused now, and with
+eight ranges, eight keys, four entries and eight ranges they land. An honest bundle carries up to 16
+objects of 2^24 zero-width items, and one more for each MiB it carries: a pull of eight spilled
+values of 2^24 `()`s each, sent in two commits, lands, and so does the pull of
+`ferro/tests/zero_width.rs`, whose versions of one node and its spilled value hold several times
+2^24 between them. The clone above received in a median of 0.154 s against 0.153 s, over nine
+alternating runs, since a check that meets no zero-width item adds only a branch.
+
+Charging the items against the allowance that recomputing summaries draws on, at a weight per item,
+was weighed. At about their time, 16 items a byte, that allowance's 4 KiB for each link and its
+256 MiB would let a bundle of 1 MB buy over a second of visits, and one of 10 MB about five, and
+the first check of each sent object, which that allowance does not charge, would have to draw on
+it as well. A count of its own keeps the bound in the items themselves and refuses with a message
+that names them.

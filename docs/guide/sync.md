@@ -75,7 +75,10 @@ value of 1 MiB shared by more than about 265 keys, or a value holding a collecti
 of 16 MiB, under more than about 17 keys that are new or rewritten. A node the bundle reaches
 under narrower key ranges, as when keys are added beside it, is checked again for each, and a
 bundle whose checks would decode more than twice its size plus 16 MiB is refused: a node of 1 MiB
-can be reached under about 18 ranges, one of 17.6 MB under two. Data this side holds as one type
+can be reached under about 18 ranges, one of 17.6 MB under two. Items that encode to nothing, such
+as the `()`s of a `Vec<()>`, cost no bytes, so the checks count them: a bundle whose checks would
+visit more than 2^28 of them, plus 16 for each byte it carries, is refused, which lets it carry 16
+values of the 2^24 an object may hold, and one more for each MiB. Data this side holds as one type
 and the bundle links as another is checked as the new type: after a commit copies a
 `Map<u64, u32>` into a `Map<u64, u64>`, whose nodes encode alike and so are the same objects, the
 next pull reads the copied map once, a million keys in about 0.4 s. A `Summary` whose `of` or

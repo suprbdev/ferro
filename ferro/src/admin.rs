@@ -271,7 +271,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
             }
             None => {
                 let object = store.read_object(ptr)?;
-                let (shape, found) = kind
+                let (shape, found, _) = kind
                     .check(&object.body, &object.links, None)
                     .map_err(|error| corrupt(&kind, ptr, error))?;
                 if shape.deferred {

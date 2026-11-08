@@ -40,6 +40,8 @@ const RECHECK_SLACK: usize = 16 << 20;
 const RERUN_FACTOR: usize = 8;
 const RERUN_SLACK: usize = 256 << 20;
 const RERUN_PER_LINK: usize = 4 << 10;
+const ZERO_WIDTH_SLACK: u64 = 1 << 28;
+const ZERO_WIDTH_PER_BYTE: u64 = 16;
 const CONFIRMED_KEPT: usize = 1 << 16;
 const RANGES_KEPT: usize = 16;
 const HELD_KEPT: usize = 1 << 13;
@@ -1668,6 +1670,7 @@ struct Vetting<'a> {
     confirmed: HashSet<(Hash, TypeId, TypeId, Hash)>,
     carried: usize,
     rerun_budget: usize,
+    zero_width_budget: u64,
     view: OnceCell<Store>,
     recalled: Option<Recalled>,
 }
@@ -1777,18 +1780,21 @@ impl Vetting<'_> {
         };
         let object = self.staging.read_object(ptr)?;
         self.spend(object.body.len())?;
-        let (shape, found) = kind
+        let (shape, found, zero_width) = kind
             .check(&object.body, &object.links, None)
             .map_err(|error| undecodable(kind, error))?;
+        self.tally(zero_width)?;
         if shape.deferred {
             self.deferred.push((id, kind.clone()));
         }
         let earlier = match before.filter(|_| !found.is_empty()) {
             Some(old) => {
                 self.spend(object.body.len())?;
-                old.check(&object.body, &object.links, None)
-                    .map_err(|error| undecodable(&old, error))?
-                    .1
+                let (_, earlier, zero_width) = old
+                    .check(&object.body, &object.links, None)
+                    .map_err(|error| undecodable(&old, error))?;
+                self.tally(zero_width)?;
+                earlier
             }
             None => Vec::new(),
         };
@@ -1851,9 +1857,10 @@ impl Vetting<'_> {
         };
         let object = self.staging.read_object(ptr)?;
         self.rerun(object.body.len())?;
-        let (shape, _) = kind
+        let (shape, _, zero_width) = kind
             .check(&object.body, &object.links, None)
             .map_err(|error| undecodable(kind, error))?;
+        self.tally(zero_width)?;
         if shape.deferred {
             self.deferred.push((id, kind.clone()));
         }
@@ -1879,9 +1886,19 @@ impl Vetting<'_> {
 
     fn view(&self) -> &Store {
         self.view.get_or_init(|| {
-            self.store
-                .view(self.carried as u64, self.rerun_budget as u64)
+            self.store.view(
+                self.carried as u64,
+                self.rerun_budget as u64,
+                self.zero_width_budget,
+            )
         })
+    }
+
+    fn tally(&self, zero_width: u64) -> Result<()> {
+        if zero_width == 0 {
+            return Ok(());
+        }
+        self.view().count_zero_width(zero_width)
     }
 
     fn rerun(&self, bytes: usize) -> Result<()> {
@@ -1916,7 +1933,8 @@ impl Vetting<'_> {
                 if let Some(error) = view.overdrawn() {
                     return Err(error);
                 }
-                checked.map_err(|error| undecodable(kind, error))?;
+                let (_, zero_width) = checked.map_err(|error| undecodable(kind, error))?;
+                view.count_zero_width(zero_width)?;
             }
             Ok(())
         })
@@ -1984,24 +2002,32 @@ impl Vetting<'_> {
             }
             return Ok(Some(shape));
         }
-        let object = self.view().read_fresh(ptr).map_err(rejected)?;
-        let (shape, found) = kind
+        let (object, charged) = self.view().read_fresh(ptr).map_err(rejected)?;
+        let (shape, found, zero_width) = kind
             .check(&object.body, &object.links, None)
             .map_err(|error| retyped(kind, error))?;
+        if charged {
+            self.tally(zero_width)?;
+        }
         if shape.deferred {
             self.beneath.push(Beneath::Settle(ptr, kind.clone()));
         }
         if !found.is_empty() {
-            let mut held = known
+            let (held, zero_width) = known
                 .and_then(|known| {
                     known
                         .unclaimed()
                         .check(&object.body, &object.links, None)
                         .ok()
                 })
-                .map_or_else(Vec::new, |(_, found)| found)
-                .into_iter()
-                .peekable();
+                .map_or_else(
+                    || (Vec::new(), 0),
+                    |(_, found, zero_width)| (found, zero_width),
+                );
+            if charged {
+                self.tally(zero_width)?;
+            }
+            let mut held = held.into_iter().peekable();
             for (index, child) in found {
                 while held.next_if(|(at, _)| *at < index).is_some() {}
                 let known = held.next_if(|(at, _)| *at == index).map(|(_, kind)| kind);
@@ -2207,7 +2233,7 @@ fn anchors(store: &Store, refs: &Refs, header: &Header, root_kind: &Kind) -> Res
                         .check(&object.body, &object.links, None)
                         .ok()
                 })
-                .map(|(_, found)| found)
+                .map(|(_, found, _)| found)
                 .unwrap_or_default();
             while at < end && parent_key(header, &roots, &hinted, &hint_kinds, order[at]) == key {
                 let id = order[at] as usize;
@@ -2573,6 +2599,9 @@ fn resolve<O: Objects>(
                 .saturating_mul(RERUN_FACTOR)
                 .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
+            zero_width_budget: (streamed.carried as u64)
+                .saturating_mul(ZERO_WIDTH_PER_BYTE)
+                .saturating_add(ZERO_WIDTH_SLACK),
             view: OnceCell::new(),
             recalled: (order.len() > 1).then(Recalled::default),
         };
@@ -2908,7 +2937,8 @@ impl<T: Data> Db<T> {
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
     ///   is damaged, or if checking it would decode or read more again than its size allows, as
     ///   one large value shared by many keys, or one large node reached under many key ranges,
-    ///   can.
+    ///   can, or would visit more items that encode to nothing, such as the `()`s of a `Vec<()>`,
+    ///   than its size allows.
     /// - [`Error::Decode`] if `from` sends a head that `T` cannot read, such as a table whose
     ///   unique index, rebuilt on this side, finds two rows sharing a value. Nothing lands and
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
@@ -3066,8 +3096,9 @@ impl<T: Data> Db<T> {
     /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
     ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
     ///   or if checking it would decode or read more again than its size allows, as one large
-    ///   value shared by many keys, or one large node reached under many key ranges, can. Nothing
-    ///   reaches the file.
+    ///   value shared by many keys, or one large node reached under many key ranges, can, or would
+    ///   visit more items that encode to nothing, such as the `()`s of a `Vec<()>`, than its size
+    ///   allows. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.

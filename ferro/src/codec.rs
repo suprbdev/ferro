@@ -1074,8 +1074,9 @@ impl Kind {
             && want.vouched_by(self)
     }
 
-    /// Checks an object with this body and these links as this kind, returning its shape and the
-    /// typed links found in it, which the caller checks in turn.
+    /// Checks an object with this body and these links as this kind, returning its shape, the
+    /// typed links found in it, which the caller checks in turn, and the zero-width items it
+    /// read, as [`Decoder::item`] counts them.
     ///
     /// Without a store, a check that would need one to confirm the summary the kind claims
     /// returns a [`Shape`] marked [`deferred`](Shape::deferred). With `store`, the values and
@@ -1091,18 +1092,20 @@ impl Kind {
         body: &[u8],
         links: &[Ptr],
         store: Option<&Store>,
-    ) -> Result<(Shape, Found)> {
+    ) -> Result<(Shape, Found, u64)> {
         let found = RefCell::new(Vec::new());
         let mut decoder = Decoder::new(body, links, store);
         decoder.found = Some(&found);
         let shape = (self.check)(self, &mut decoder)?;
-        Ok((shape, found.into_inner()))
+        let zero_width = decoder.zero_width();
+        Ok((shape, found.into_inner(), zero_width))
     }
 
     /// Checks an object again with `store`, as [`check`](Kind::check) does, once the check
-    /// without one deferred it, without collecting the typed links that check found. With
-    /// `recalled`, it takes the summary of each inline entry from there where an earlier recheck
-    /// computed it, and keeps there those it computes.
+    /// without one deferred it, without collecting the typed links that check found, and returns
+    /// its shape and the zero-width items it read in this object. With `recalled`, it takes the
+    /// summary of each inline entry from there where an earlier recheck computed it, and keeps
+    /// there those it computes.
     ///
     /// # Errors
     ///
@@ -1113,10 +1116,11 @@ impl Kind {
         links: &[Ptr],
         store: &Store,
         recalled: Option<&Recalled>,
-    ) -> Result<Shape> {
+    ) -> Result<(Shape, u64)> {
         let mut decoder = Decoder::new(body, links, Some(store));
         decoder.recalled = recalled;
-        (self.check)(self, &mut decoder)
+        let shape = (self.check)(self, &mut decoder)?;
+        Ok((shape, decoder.zero_width()))
     }
 }
 
@@ -1316,6 +1320,12 @@ impl<'a> Decoder<'a> {
     /// the cache.
     pub(crate) fn heap(&self) -> usize {
         self.heap
+    }
+
+    /// The zero-width items [`item`](Decoder::item) has counted in this object so far, less those
+    /// read since a checkpoint it went back to.
+    pub(crate) fn zero_width(&self) -> u64 {
+        self.empty_items
     }
 
     fn allocated(&mut self, count: usize, bytes: usize) {
