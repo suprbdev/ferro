@@ -836,18 +836,28 @@ nothing, and in which `insert` of a row with a value no row held panicked with a
 write trusts what the index says (#112). It landed as a fast-forward, and `verify_typed` passed.
 
 So each table value the walk finds is checked against its rows. The derived `decode` and `visit`
-of a table with indexes note the bytes and links they read when the decoder belongs to a typed
-check that collects them, which the check of each sent object and of held data linked as another
-type does. Each value is kept once, by its type and the hash of its encoding, so the many versions
-of a node that hold the same table, and the rechecks of a node under other ranges, note it once.
-Each noted table is read through a view with the staging lent to it, and each index it stores
-under a fingerprint the receiver knows must hold exactly the entries its rows give: the same keys,
-compared by `Ord`, with values that encode the same, so a covered field must be the row's. Every
-row must sit under its own key, whether or not the table stores an index the receiver knows, and
-no two rows may share a value of such a unique index. A table that fails refuses the bundle with
-`Error::Bundle`. An index the table lacks is rebuilt from the rows when the table is read, as
-before, and [Limits](sync.md#limits) describes what that leaves; the rebuild fails the read of a
-row stored under a key other than its own, which it would otherwise file under the row's key.
+of every table, whether or not its type declares an index, note the bytes and links they read
+when the decoder belongs to a typed check that collects them, which the check of each sent object
+and of held data linked as another type does. Each value is kept once, by its type and the hash of
+its encoding, so the many versions of a node that hold the same table, and the rechecks of a node
+under other ranges, note it once. Each noted table is read through a view with the staging lent to
+it, and each index it stores under a fingerprint the receiver knows must hold exactly the entries
+its rows give: the same keys, compared by `Ord`, with values that encode the same, so a covered
+field must be the row's. Every row must sit under its own key, whether or not the table stores an
+index the receiver knows or its type declares any, and no two rows may share a value of such a
+unique index. A table that fails refuses the bundle with `Error::Bundle`. An index the table lacks
+is rebuilt from the rows when the table is read, as before, and [Limits](sync.md#limits) describes
+what that leaves; the rebuild fails the read of a row stored under a key other than its own, which
+it would otherwise file under the row's key.
+
+Until #116 a table whose type declares no index was not noted at all, since there was no index to
+check: a peer could land rows under keys other than their own, which `get` then returned for the
+wrong key, and which failed the first open after the receiver's type gained an index, as the
+rebuild read them, where `verify_typed` had passed. And such a table could hold an index under a
+fingerprint the receiver's type would give once it declared that index, which landed unchecked and
+was trusted from then on, as described below. Its rows are now checked as those of any other
+table, against the version before where there is one, and `verify_typed` reports a row under
+another key in a table of the file's own as well.
 
 A table can also hold an index under a fingerprint the receiver does not know, as a peer whose
 type has an index the receiver's lacks, or declares it otherwise, sends, and so does every version
@@ -856,8 +866,9 @@ and once the receiver's type gained an index with that fingerprint, every read t
 did the check of every later pull, which starts from the version the receiver holds: a peer that
 stored garbage under the fingerprint `#[unique] email` would have landed a table whose `insert`
 panicked on a value no row held, after the receiver added that index (#115). So a receive refuses
-a table that holds an index under a fingerprint its type does not know, with `Error::Bundle`
-naming the table, and nothing lands. That sets an order on upgrades: when a table gains an index,
+a table that holds an index under a fingerprint its type does not know, a type that declares no
+index included, with `Error::Bundle` naming the table, and nothing lands. That sets an order on
+upgrades: when a table gains an index,
 or an index changes kind, fields, cover list or the types and defaults of its fields, the side
 that receives runs the new schema before it pulls from a peer that already does. The other way
 round still syncs: a table without one of the receiver's indexes lands, and the index is rebuilt
@@ -1063,7 +1074,6 @@ Left out:
   of each root are planned before the walk reaches them; the others are found by the walk, and
   are checked once it is done. A root table checked against all its rows, or with an `each` index
   over a `Set`, waits for the walk too, though every read it makes returns its errors.
-- Checking that each row sits under its own key in a table without indexes, which no lookup reads.
 - Landing a table that holds an index the receiver cannot check, recorded so that no read trusts
   it, which would keep peers that declare a table's indexes differently syncing, as described
   above. A branch of the file's own held the record in a commit of #115 that was reverted.

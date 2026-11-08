@@ -1409,7 +1409,7 @@ impl Kind {
     }
 
     /// Checks an object without a store, as [`check`](Kind::check) does, and also adds to
-    /// `tables` each table value with indexes that the check reads, in the order it reads them.
+    /// `tables` each table value that the check reads, in the order it reads them.
     ///
     /// # Errors
     ///

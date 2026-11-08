@@ -566,8 +566,9 @@ Measured and left out:
   other's trees, not only their roots. Each index a sent table holds under a fingerprint the
   receiver knows must hold exactly the entries its rows give, as described under [Indexes that
   agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows), and every row must
-  sit under its own key. A table holding an index under a fingerprint the receiver does not know
-  is refused, since nothing could check that index as it lands and a later schema that declares it
+  sit under its own key, in a table whose type declares no index too. A table holding an index
+  under a fingerprint the receiver does not know is refused, whatever indexes its type declares,
+  since nothing could check that index as it lands and a later schema that declares it
   would trust it: when a table gains an index, or an index changes kind or fields, the receiving
   side runs the new schema before it pulls from a peer that already does, and a side that dropped
   or changed an index cannot pull, or clone, versions that still hold the old one. A table without
@@ -631,12 +632,13 @@ Measured and left out:
   changes against the version before, reading the nodes that differ on both sides, so a clone reads
   most of what it carries a second time and an incremental pull reads the old versions of what it
   changes. Of a row that changed it reads only what each index names: a field whose encoding did
-  not change costs nothing, and of a `Set` an `each` index names, only the nodes that differ. The
-  checks run on up to eight threads, the one that starts the others included, beside the walk when
-  the first version's root holds a table, so the receive takes several cores for a while: on a
-  table of 200,000 rows with three indexes a clone in ten commits took 11% longer than with no
-  check, an edit of 1,000 rows 6 to 10% longer, and `verify_typed` 14 to 15% longer, for about
-  twice the processor time. A table nested in a collection, rather than held in the root, is checked
+  not change costs nothing, and of a `Set` an `each` index names, only the nodes that differ. A
+  table whose type declares no index is checked too, for the key each row sits under, which costs
+  the diff of its rows. The checks run on up to eight threads, the one that starts the others
+  included, beside the walk when the first version's root holds a table, so the receive takes
+  several cores for a while: on a table of 200,000 rows with three indexes a clone in ten commits
+  took 11% longer than with no check, an edit of 1,000 rows 6 to 10% longer, and `verify_typed`
+  14 to 15% longer, for about twice the processor time. A table nested in a collection, rather than held in the root, is checked
   against all its rows, in each version that changes the node holding it, and a table hung on rows
   the receiver holds makes it read those rows once for free, then at a charge against an allowance
   like the one above but apart from it, as described under [Indexes that agree with their

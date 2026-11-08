@@ -267,6 +267,44 @@ fn reading_a_table_that_stores_no_index_fails_when_a_row_sits_under_another_key(
 }
 
 #[test]
+fn verify_typed_reports_a_table_without_indexes_whose_row_sits_under_another_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.ferro");
+    {
+        let peer: Db<shadow::UnindexedPeer> = fast().open(&path).unwrap();
+        peer.update(|root| {
+            root.rows.rows.insert(1, shadow::row(7, 5, 100));
+            root.rows.rows.insert(7, shadow::row(7, 5, 100));
+        })
+        .unwrap();
+    }
+    let db: Db<shadow::MinePlain> = fast().open(&path).unwrap();
+    assert_eq!(db.read().rows.get(&1).map(|row| row.id), Some(7));
+    db.verify().unwrap();
+    match db.verify_typed() {
+        Err(Error::Corrupt(message)) => {
+            assert!(message.contains("other than its own"), "{message}")
+        }
+        other => panic!("verify_typed passed a row under another key: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_typed_passes_versions_of_a_table_that_hold_an_index_its_type_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dropped.ferro");
+    written(&path, vec![shadow::Shadow::of(&shadow::honest())]);
+    let db: Db<shadow::MinePlain> = fast().open(&path).unwrap();
+    db.verify_typed().unwrap();
+    db.update(|root| {
+        root.rows.insert(shadow::plain(9, 1, 900));
+    })
+    .unwrap();
+    db.verify_typed().unwrap();
+    assert_eq!(db.read().rows.len(), 4);
+}
+
+#[test]
 fn verify_typed_reports_a_table_whose_indexes_disagree_with_its_rows() {
     for (case, forged) in shadow::forgeries() {
         let dir = tempfile::tempdir().unwrap();

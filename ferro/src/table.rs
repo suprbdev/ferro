@@ -241,8 +241,7 @@ pub trait TableData<T: Record>: Data + Default {
     /// Reads a table as [`Data::decode`] does, without rebuilding an index it does not store
     /// under a fingerprint this type knows, and returns it with whether it stores each index, in
     /// the order the derive declares them, and whether it holds an index under a fingerprint
-    /// this type does not know. The default, for a table without indexes, reads it with
-    /// [`Data::decode`] and lists none.
+    /// this type does not know. The default reads it with [`Data::decode`] and lists none.
     ///
     /// # Errors
     ///
@@ -592,8 +591,8 @@ fn expected<'e, K: Ord, V: Data>(
 /// Reads a table value of `T` with `read` and, when `r` belongs to a typed check that collects
 /// tables, notes it for the check that its indexes agree with its rows.
 ///
-/// The [`Record`](derive@crate::Record) derive calls it from the `decode` and `visit` of a table
-/// with indexes.
+/// The [`Record`](derive@crate::Record) derive calls it from the `decode` and `visit` of every
+/// table, with or without indexes.
 ///
 /// # Errors
 ///

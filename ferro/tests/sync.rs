@@ -4918,6 +4918,116 @@ fn a_table_that_holds_an_index_under_a_fingerprint_the_receiver_does_not_know_is
     mine.verify_typed().unwrap();
 }
 
+#[test]
+fn a_table_without_indexes_is_refused_when_it_holds_an_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<shadow::Peer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<shadow::MinePlain> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    peer.update(|root| {
+        root.rows = shadow::Shadow::of(&shadow::honest());
+        root.rows.by_email.insert(999, 1);
+    })
+    .unwrap();
+    match from_peer(&mine, &peer) {
+        Err(Error::Bundle(message)) => assert!(
+            message.contains("fingerprint this type does not know"),
+            "{message}"
+        ),
+        other => panic!("a table without indexes landed an index nothing checked: {other:?}"),
+    }
+    assert_eq!(mine.version(), 0);
+    assert_eq!(mine.branches(), ["main"]);
+    drop(mine);
+    let mine: Db<shadow::Mine> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    assert_eq!(mine.read().rows.len(), 0);
+
+    let plain: Db<shadow::MinePlain> = fast().open(dir.path().join("plain.ferro")).unwrap();
+    plain
+        .update(|root| {
+            for row in shadow::honest() {
+                root.rows.insert(shadow::plain(row.id, row.n, row.email));
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        from_peer(&mine, &plain).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(mine.read().rows.key_by_email(&400), Some(3));
+    mine.verify_typed().unwrap();
+    let other: Db<shadow::MinePlain> = fast().open(dir.path().join("other.ferro")).unwrap();
+    assert_eq!(
+        from_peer(&other, &plain).unwrap().outcome,
+        Outcome::FastForward
+    );
+    other.verify_typed().unwrap();
+}
+
+#[test]
+fn a_table_without_indexes_is_refused_when_a_row_sits_under_another_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<shadow::UnindexedPeer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<shadow::MinePlain> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    peer.update(|root| {
+        root.rows.rows.insert(1, shadow::row(7, 5, 100));
+        root.rows.rows.insert(7, shadow::row(7, 5, 100));
+    })
+    .unwrap();
+    assert_disagrees(from_peer(&mine, &peer), &mine, "a clone");
+    assert_eq!(mine.version(), 0);
+    assert_eq!(mine.branches(), ["main"]);
+
+    let peer: Db<shadow::UnindexedPeer> = fast().open(dir.path().join("honest.ferro")).unwrap();
+    let mine: Db<shadow::MinePlain> = fast().open(dir.path().join("pulled.ferro")).unwrap();
+    peer.update(|root| {
+        for id in 0..300 {
+            root.rows
+                .rows
+                .insert(id, shadow::row(id, (id % 7) as u32, id * 10));
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        from_peer(&mine, &peer).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let landed = mine.head_hash();
+    peer.update(|root| {
+        let moved = root.rows.rows.remove(&120).unwrap();
+        root.rows.rows.insert(1000, (*moved).clone());
+    })
+    .unwrap();
+    assert_disagrees(from_peer(&mine, &peer), &mine, "a pull");
+    assert_eq!(mine.head_hash(), landed);
+    assert_eq!(mine.read().rows.get(&1000), None);
+
+    let peer: Db<Map<u64, shadow::Unindexed>> =
+        fast().open(dir.path().join("nested.ferro")).unwrap();
+    let mine: Db<Map<u64, Table<shadow::Plain>>> =
+        fast().open(dir.path().join("nested-mine.ferro")).unwrap();
+    peer.update(|root| {
+        for key in 0..40 {
+            let mut table = shadow::Unindexed::default();
+            table.rows.insert(key, shadow::row(key, 1, key));
+            root.insert(key, table);
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        from_peer(&mine, &peer).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let landed = mine.head_hash();
+    peer.update(|root| {
+        root.update(&9, |table| {
+            table.rows.insert(10, shadow::row(11, 1, 11));
+        });
+    })
+    .unwrap();
+    assert_disagrees(from_peer(&mine, &peer), &mine, "a nested table");
+    assert_eq!(mine.head_hash(), landed);
+}
+
 type Drift = (&'static str, fn(&mut shadow::Shadow));
 
 #[test]

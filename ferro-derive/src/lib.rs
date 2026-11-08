@@ -2121,7 +2121,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! { let __fingerprints = Self::__fingerprints(); }
     };
     let decode_arm = if count == 0 {
-        quote! {}
+        quote! {
+            #index_tag => __unknown = true,
+        }
     } else {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
@@ -2184,14 +2186,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     };
-    let unknown_of = if count == 0 {
-        quote! {}
-    } else {
-        quote! { let mut __unknown = false; }
-    };
     let read_fields = quote! {
         #fingerprints_of
-        #unknown_of
+        let mut __unknown = false;
         let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
         #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
         __r.fields(|__tag, __r| {
@@ -2215,23 +2212,45 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         })
     };
     let index_names: Vec<&str> = indexes.iter().map(|ix| ix.name.as_str()).collect();
-    let (decode_fn, visit_fn, stored_fn, slot_fns) = if count == 0 {
+    let visit_fn = quote! {
+        fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+            ::ferro::table::noted::<#name, _>(__r, |__r| {
+                #visit_fields
+            })
+        }
+    };
+    let stored_fn = quote! {
+        fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count], bool)> {
+            #read_fields
+            let __stale = [#(#vars.is_none()),*];
+            let __table = #table {
+                rows: ::ferro::codec::required(__rows, "rows")?,
+                #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
+            };
+            ::std::result::Result::Ok((__table, __stale, __unknown))
+        }
+    };
+    let decode_stored_fn = quote! {
+        fn decode_stored(
+            __r: &mut ::ferro::codec::Decoder<'_>,
+        ) -> ::ferro::Result<::ferro::table::Stored<Self>> {
+            let (__table, __stale, __unknown) = Self::__stored(__r)?;
+            ::std::result::Result::Ok(::ferro::table::Stored {
+                table: __table,
+                held: __stale.iter().map(|__stale| !*__stale).collect(),
+                unknown: __unknown,
+            })
+        }
+    };
+    let (decode_fn, slot_fns) = if count == 0 {
         (
             quote! {
                 fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                    #read_fields
-                    ::std::result::Result::Ok(#table {
-                        rows: ::ferro::codec::required(__rows, "rows")?,
-                    })
+                    let (__table, _, _) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                    ::std::result::Result::Ok(__table)
                 }
             },
-            quote! {
-                fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-                    #visit_fields
-                }
-            },
-            quote! {},
-            quote! {},
+            decode_stored_fn,
         )
     } else {
         (
@@ -2243,34 +2262,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
             },
             quote! {
-                fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-                    ::ferro::table::noted::<#name, _>(__r, |__r| {
-                        #visit_fields
-                    })
-                }
-            },
-            quote! {
-                fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count], bool)> {
-                    #read_fields
-                    let __stale = [#(#vars.is_none()),*];
-                    let __table = #table {
-                        rows: ::ferro::codec::required(__rows, "rows")?,
-                        #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
-                    };
-                    ::std::result::Result::Ok((__table, __stale, __unknown))
-                }
-            },
-            quote! {
-                fn decode_stored(
-                    __r: &mut ::ferro::codec::Decoder<'_>,
-                ) -> ::ferro::Result<::ferro::table::Stored<Self>> {
-                    let (__table, __stale, __unknown) = Self::__stored(__r)?;
-                    ::std::result::Result::Ok(::ferro::table::Stored {
-                        table: __table,
-                        held: __stale.iter().map(|__stale| !*__stale).collect(),
-                        unknown: __unknown,
-                    })
-                }
+                #decode_stored_fn
 
                 fn indexing_reads() -> bool {
                     false #(|| <#each_tys as ::ferro::table::IndexEach>::READS)*

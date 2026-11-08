@@ -88,10 +88,11 @@ encoding.
 
 ### Index changes and sync
 
-A pull refuses a table that holds an index the receiving struct does not declare, with
-`Error::Bundle`, because nothing could check that index as it landed, and a later version of the
-struct that declared it would trust what it holds. So when peers sync a table, upgrade in this
-order:
+A pull refuses a table that holds an index the receiving struct does not declare, a struct with no
+index at all included, with `Error::Bundle`, because nothing could check that index as it landed,
+and a later version of the struct that declared it would trust what it holds. A pull also refuses
+a table with a row stored under a key other than its own, whether or not the struct has indexes.
+So when peers sync a table, upgrade in this order:
 
 - When a table gains an index, or an index changes kind (`#[index]`, `#[index(each)]`,
   `#[unique]`), fields, cover list, or the stored names, types or defaults of its fields, the

@@ -41,6 +41,23 @@ pub struct MineNarrow {
     pub rows: Table<Narrow>,
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+pub struct Plain {
+    #[key]
+    pub id: u64,
+    pub n: u32,
+    pub email: u64,
+}
+
+pub fn plain(id: u64, n: u32, email: u64) -> Plain {
+    Plain { id, n, email }
+}
+
+#[derive(Data, Clone, Default)]
+pub struct MinePlain {
+    pub rows: Table<Plain>,
+}
+
 #[derive(Clone, Default)]
 pub struct Unindexed {
     pub rows: Map<u64, Row>,
