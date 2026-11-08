@@ -91,6 +91,14 @@ with fsync, and wrote 1,515 and 1,427 bytes a closure against 2,464 and 2,385 wi
 alone on its branch has nothing to share, and `coalesce` there ran within 5% of the plain figures,
 apart from 8 Buffered branches at 139,600 a second, 7% fewer.
 
+Past 8 Buffered writers on their own branches, commits queue for `tip`, the one lock that places
+every frame in the file. It is held about 6 µs a commit at 8 writers and 7 to 8 µs at 16, against
+1.2 to 1.5 µs for one, mostly to move drafts that other frames overtook and to insert heads into a
+larger branch table, and a waiter woken from it takes 1 to 2 µs more to run, so from 8 writers on
+it is never free. [Where own-branch writers stop
+scaling](../internals/commit-path.md#where-own-branch-writers-stop-scaling) has the measurements
+and what was tried.
+
 ## Reads from many threads
 
 `scaling` reads a 1M-key `Map<u64, String>` and a 200,000-row table from 1 to 32 threads pinned a

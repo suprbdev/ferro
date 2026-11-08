@@ -686,10 +686,99 @@ gave 0.97, 0.98 and 1.00 of the commits a second at 8 branches, 0.89, 0.97 and 1
 Left open:
 
 - Inserting the head into the table kept in memory, 1.0 µs at 16 branches and 1.6 µs at 64, is
-  still under `tip`, and so is moving the draft, now the largest part at 16 branches.
+  still under `tip`, and so is moving the draft, now the largest part at 16 branches. [Where
+  own-branch writers stop scaling](#where-own-branch-writers-stop-scaling) measures both.
 - A fork, `drop_branch` and a pull write a table, with every node the steps since the last one
   changed, under `tip`.
 - Open reads the steps one record at a time, up to 64 reads. They sit in the frames written since
   their table, so one read over that stretch of the log would serve them all.
 - Placing and queueing grows to 4.0 µs and 10,100 instructions at 64 branches, against 1.2 µs and
   3,500 at 16, which looks like contention on the queue's mutex and was not looked into.
+
+## Where own-branch writers stop scaling
+
+With a writer on each of its own branches, `Durability::Buffered` commits stop gaining at about 8
+writers and lose at 16: 150,000 a second against 123,800 in [Writers and
+branches](../guide/performance.md#writers-and-branches). The limit is `tip`. Timers and instruction
+counters were put around it for a while, in `group` with `--branches own` and no closure on the
+32-thread machine. Per commit, with the timers in, over three runs:
+
+| Writers | `tip` held | Idle between holders | Waiting for `tip` | Commits a second |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.2 to 1.5 µs | none | 0.04 µs | 44,900 to 47,600 |
+| 8 | 5.7 to 6.0 µs | 1.0 µs | 10.4 to 10.7 µs | 136,000 to 144,900 |
+| 16 | 7.2 to 8.4 µs | 2.0 µs | 92 to 109 µs | 96,100 to 114,800 |
+
+Idle, timed in the last of those runs, is the time from a release to the next holder, for holders
+that had to wait: a writer parked on the mutex takes that long to run once woken. In that run held
+and idle came to 6.7 µs a commit at 8 writers, at most 149,000 a second, and 9.8 µs at 16, at most
+102,000, so from 8 writers on `tip` is never free. The rest of a commit runs on the writer's own
+thread, 37 to 39 µs of closure, draft, frame write, cache inserts and waiting for the sync, so about
+six writers fill `tip`. Running the 16 writers on one CCD, its 8 cores and their second threads,
+gave 122,700 and 123,200 against 100,400 and 117,800 unpinned in the same runs, so the traffic
+between CCDs is not what limits them.
+
+The hold grows with the writers because the work under `tip` does. It ran about 10,500 instructions
+in 8,800 cycles for one writer and 24,600 to 28,000 in 27,500 to 30,100 at 16. Moving the draft
+went from 170 instructions to 9,000 to 12,200, since with 16 writers nearly every draft is
+overtaken before it gets `tip`, and inserting the head into the table kept in memory from 1,900 to
+5,100, since the leaf of 16 branches is copied for each commit while the queued frame before still
+holds it. Writing the step went from 3,600 to 4,100. Instructions a cycle fell from 1.2 to between
+0.8 and 1.0, and the clock fell too: with 15 other cores busy they ran at 3.4 to 4.1 GHz against up
+to 5.1 for one, and a lone writer beside 15 busy loops, on a machine not otherwise quiet, committed
+30,500 times a second against about 48,000 alone. From 8 to 16 writers the hold grew by 1.5 to
+2 µs, about 0.3 µs of it inserting the head, 0.45 µs storing the branch's new tip and 0.2 µs
+reading its head from the table, and the idle time doubled.
+
+On one branch without `coalesce` the branch's lane is the limit instead, since a closure, its draft,
+its placing and its frame write all run under it. It was held for 19.0 µs a commit with one writer,
+22.9 µs at 4 and 8 and 24.8 µs at 16, with 1.4 to 1.7 µs idle between holders, which bounds them at
+41,000 and 38,000 a second against the 40,100 to 40,500 and 36,000 those runs made. Each commit
+runs on another core than the one before it, so the branch's nodes, its cache entries and its part
+of the deduplication table come from another core's cache every time: the clone and closure went
+from 2.4 to 3.8 µs, the draft from 10.6 to 13.1 µs, the frame write from 1.2 to 2.2 µs and the
+cache inserts after it from 3.2 to 3.8 µs. `coalesce` runs many closures in one hold, as
+[Coalescing](coalescing.md) describes.
+
+Measured and left out, with commits a second at 8 and 16 writers, medians of four to six runs
+alternating with the tree before unless said:
+
+- Storing the branch's new tip after `tip` is released rather than under it, still under the lane.
+  It took 0.6 µs at 8 writers and 1.0 µs at 16 under `tip`, but the hold did not shrink, as other
+  parts grew by as much: 150,400 against 149,000 and 121,400 against 119,900.
+- A writer that takes `tip` placing the frames the writers waiting for it queued, so that the table,
+  the cursor and the queue stay in one core's cache. Each frame took the combiner 7.7 µs, as long as
+  a writer placing its own, so the cost travels with the draft rather than with what `tip` guards.
+  Single runs gave 90,700 and 69,900 a second, and 117,500 and 88,600 with the waiting writers
+  spinning rather than parking, against about 150,000 and 120,000.
+- Moving a draft by rewriting in place the distance of each link to an object before the frame,
+  where the varint keeps its length. A move by tens of kilobytes pushes some distance over a varint
+  boundary in most frames, so it succeeded for 41% of moves at 8 writers and 27% at 16, and the pass
+  cost 2.0 to 2.2 µs: 130,000 against 145,000 and 106,700 against 117,500.
+- Planning the move before `tip`: finding the draft's records and links and doing the
+  deduplication lookups a move does, so that under `tip` it only writes the moved frame, the frame
+  a move under `tip` would write. Instructions under `tip` fell from 24,800 to 20,600 at 8 writers
+  and from 28,000 to 23,800 at 16, the move from 12,000 to 7,800. But the plan cost 9,200
+  instructions and 2.6 µs on each writer's thread: 97,800 against 102,000 at 4 writers, 141,400
+  against 147,800 at 8 and 126,500 against 122,200 at 16.
+- Spinning for up to 20 µs before parking on `tip`: 152,500 against 145,000 and 138,900 against
+  117,500, and 62,800 against 57,100 and 51,500 against 48,600 with 24 busy loops beside the
+  writers. But the spinners take the lock ahead of parked writers until `parking_lot`'s fairness
+  hands it over, and p99 at 16 writers went from 367 to 937 µs.
+- Turns at `tip` in arrival order: each commit takes a ticket, the next two spin, and the rest park
+  and are woken two turns ahead, so the next holder is already running when `tip` is let go. On a
+  quiet machine it gave 156,100 against 147,800 and 138,500 against 122,200, p99 at 16 writers fell
+  from 360 to 217 µs, and one writer ran 48,500 against 48,600. But a writer whose turn comes while
+  the scheduler has it off its core holds up every writer behind it, where the mutex lets whoever is
+  running take it. With 24 busy loops beside the writers it gave 52,300 against 60,400 and 28,000
+  against 47,500, and with more load still 1,500 against 16,000 at 16.
+- Those turns, letting a waiter take a turn its holder has not claimed within a set time, with `tip`
+  still keeping writers apart. At 5 µs, 26% of turns were taken over on a quiet machine, p99 at 16
+  writers rose to 745 µs and the gain fell to 8%. At 30 µs, 0.1% were, and a quiet machine ran as
+  with plain turns, but under heavy load it still gave 8,600 against 16,000 at 16.
+
+Left open:
+
+- Taking work out from under `tip` without adding it to the writer's own path. Moving the draft and
+  inserting the head are most of what grows with the branches.
+- Handing `tip` to a waiter that is already running, without waiting for one that is not.
