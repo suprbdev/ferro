@@ -85,3 +85,25 @@ which includes every version written before fingerprints.
 
 [Schema evolution](../internals/schema-and-unique-indexes.md#schema-evolution) describes the
 encoding.
+
+### Index changes and sync
+
+A pull refuses a table that holds an index the receiving struct does not declare, with
+`Error::Bundle`, because nothing could check that index as it landed, and a later version of the
+struct that declared it would trust what it holds. So when peers sync a table, upgrade in this
+order:
+
+- When a table gains an index, or an index changes kind (`#[index]`, `#[index(each)]`,
+  `#[unique]`), fields, cover list, or the stored names, types or defaults of its fields, the
+  receiving side must run the new schema before it pulls from a peer that already does.
+- The older direction still syncs: a side on the new schema pulls from a peer still on the old one,
+  whose tables lack the index, and each such table lands and rebuilds the index when it is read. A
+  new unique index that two rows share a value of fails that read, and the pull lands nothing.
+- A side that dropped or changed an index refuses tables that still hold the old one, so a changed
+  index syncs only between peers that both run the change, and a clone into the new schema of a
+  history whose older versions were written under the old one is refused, until those versions are
+  pruned from the sender with `Keep`.
+
+A struct's own file is never refused: its older versions keep their indexes under the old
+fingerprints and rebuild them when read through `at`. [Indexes that agree with their
+rows](../internals/sync-receive.md#indexes-that-agree-with-their-rows) describes the check.

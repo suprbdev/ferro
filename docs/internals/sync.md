@@ -182,9 +182,9 @@ once it sends 256 objects, with eight chunks in flight between the two.
   be pulled from until the puller's clock catches up.
 - Every object the bundle sends is checked as the type it will be read as, as described under
   [Checking trees](sync-receive.md#checking-trees).
-- Every table the bundle sends must have indexes that hold exactly the entries its rows give, as
-  described under [Indexes that agree with their
-  rows](sync-receive.md#indexes-that-agree-with-their-rows).
+- Every table the bundle sends must have indexes that hold exactly the entries its rows give, rows
+  under their own keys, and no index under a fingerprint the receiver does not know, as described
+  under [Indexes that agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 These checks run with no writer lock held, against the heads `receive` started from, as described
 under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). Under the writer
@@ -565,13 +565,18 @@ Measured and left out:
 - The receiver checks every sent object as its own `T`, so peers need schemas that decode each
   other's trees, not only their roots. Each index a sent table holds under a fingerprint the
   receiver knows must hold exactly the entries its rows give, as described under [Indexes that
-  agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows). A table without one
-  of its indexes, or holding one under another fingerprint, passes for that index, because the
-  check does not rebuild it. Reading the table rebuilds the index, and if two rows share a value of
-  a unique index that read fails, so a peer can still send a table that does not read, as a peer
-  whose schema has a plain index where the receiver's has a unique one can. Checking that index too
-  would mean reading every row of the table in every pull, where an index the receiver knows costs
-  what changed. Such a head lands nowhere: before the frame that writes a new branch table, the
+  agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows), and every row must
+  sit under its own key. A table holding an index under a fingerprint the receiver does not know
+  is refused, since nothing could check that index as it lands and a later schema that declares it
+  would trust it: when a table gains an index, or an index changes kind or fields, the receiving
+  side runs the new schema before it pulls from a peer that already does, and a side that dropped
+  or changed an index cannot pull, or clone, versions that still hold the old one. A table without
+  one of the receiver's indexes passes for that index, because the check does not rebuild it.
+  Reading the table rebuilds the index, and if two rows share a value of a unique index that read
+  fails, so a peer can still send a table that does not read, as a peer whose schema has no index
+  where the receiver's has a unique one can. Checking that index too would mean reading every row
+  of the table in every pull, where an index the receiver knows costs what changed. Such a head
+  lands nowhere: before the frame that writes a new branch table, the
   root of every head that table moves is read as `T`, `remote`'s on every landing and our branch's
   on a fast-forward, so the pull returns that read's `Error::Decode` and every branch, `remote`
   included, stays where it was, as described under [Applying](#applying). Until the peer sends a
@@ -625,15 +630,18 @@ Measured and left out:
 - Checking that a table's indexes agree with its rows diffs the rows and each index that a version
   changes against the version before, reading the nodes that differ on both sides, so a clone reads
   most of what it carries a second time and an incremental pull reads the old versions of what it
-  changes. The checks run on up to eight threads, beside the walk when the first version's root
-  holds a table, so the receive takes several cores for a while: on a table of 200,000 rows with
-  three indexes a clone in ten commits took 15% longer than with no check, an edit of 1,000 rows
-  4 to 8% longer, and `verify_typed` 14% longer, for about twice the processor time. A table nested in
-  a collection, rather than held in the root, is checked by building its indexes from all its rows,
-  in each version that changes the node holding it, and a table hung on rows the receiver holds
-  makes it read those rows once for free, then at a charge against an allowance like the one above
-  but apart from it, as described under [Indexes that agree with their
-  rows](sync-receive.md#indexes-that-agree-with-their-rows). Each table value is kept, a few
+  changes. Of a row that changed it reads only what each index names: a field whose encoding did
+  not change costs nothing, and of a `Set` an `each` index names, only the nodes that differ. The
+  checks run on up to eight threads, the one that starts the others included, beside the walk when
+  the first version's root holds a table, so the receive takes several cores for a while: on a
+  table of 200,000 rows with three indexes a clone in ten commits took 11% longer than with no
+  check, an edit of 1,000 rows 6 to 10% longer, and `verify_typed` 14 to 15% longer, for about
+  twice the processor time. A table nested in a collection, rather than held in the root, is checked
+  against all its rows, in each version that changes the node holding it, and a table hung on rows
+  the receiver holds makes it read those rows once for free, then at a charge against an allowance
+  like the one above but apart from it, as described under [Indexes that agree with their
+  rows](sync-receive.md#indexes-that-agree-with-their-rows); 200,000 nested tables of one row with
+  two indexes take 0.74 s to clone against 0.16 s with no indexes. Each table value is kept, a few
   hundred bytes, until its check runs, and up to four checks run at once, each holding the rows and
-  index entries that changed, or for a table it builds, up to the size of the table's indexes in
-  memory.
+  index entries that changed, or for a table checked against all its rows, the entries its indexes
+  should hold, in vectors, a few times what a row's indexed fields encode to.

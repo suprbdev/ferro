@@ -54,7 +54,9 @@ rows](sync-receive.md#indexes-that-agree-with-their-rows). Before that check a p
 index maps apart from its rows could land a table whose unique index held a value for a row that
 did not hold it, and `insert` of a row with that value, which no row held, panicked as a clash
 (#112). Only a damaged file can hold such a table now, and `verify_typed` reports it as
-`Error::Corrupt`. The panic is kept for it rather than turned into an error. `insert` has no error
+`Error::Corrupt`; a receive refuses a table holding an index under a fingerprint its type does not
+know, which a later schema declaring that index would otherwise trust unchecked (#115). The panic
+is kept for it rather than turned into an error. `insert` has no error
 channel, and telling a damaged index from a real clash would cost each write that finds a value
 taken a read of the holder's row, for a file that `verify_typed` already flags. Lookups on such a
 table miss rows or return others, as they would on any damaged node.
@@ -449,21 +451,30 @@ each index field's first eight bytes and keeps the map under the declared index 
 fingerprint. A field shorter than eight bytes, or whose fingerprint no declared index has, is
 skipped. Each declared index left without a map is rebuilt: the rows are read once, every such index
 is filled from them, unique ones are checked for clashes as they fill, and the indexes that were
-found are kept as they are. `visit`, which `verify_typed` and the check on receiving a sync use,
-reads index fields the same way and checks only those it can match.
+found are kept as they are. The rebuild fails on a row stored under a key other than its own, and
+reads the elements of an `each` index over a `Set` with `IndexEach::try_values`, so a damaged set
+fails the read rather than panicking. A decoder of the check that a table's indexes agree with its
+rows rebuilds nothing, as `Decoder::rebuilds` says. `visit`, which `verify_typed` and the check on
+receiving a sync use, reads index fields the same way and checks only those it can match, and a
+receive refuses a table holding an index field it cannot match, as described under [Indexes that
+agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 Those checks then hold each index they matched to the rows. The derived `decode` and `visit` note
 the table value they read when they run inside such a check, and the check reads each noted table
 with the hidden `TableData::decode_stored`, which decodes as `decode` does, the last field of a
-fingerprint winning, but rebuilds nothing and says which indexes were stored. The derive generates
-the entries each kind of index holds for a row, the same ones `reindex` writes. Against the same
+fingerprint winning, but rebuilds nothing and says which indexes were stored and whether one was
+stored under a fingerprint no declared index has. The derive generates, for each index, an
+`__entries_` function that gives the entries the index holds for a row, the same ones `reindex`
+writes, returning the error of a set it cannot read, and a `__delta_` function that gives the
+entries a row's change takes out and puts in: none when the fields the index names and stores
+encode as they did, the elements that left and came of an `each` field, as `IndexEach::delta`
+finds them, when only it changed, and all the entries of both versions otherwise. Against the same
 table of the version before, `TableData::diff_slots` starts the diff of each stored index, takes
-the rows that changed, and checks that each index changed by exactly the entries of the rows that
-left and came; a table with nothing to check against has `TableData::apply_slots` put the entries
-of all its rows into empty indexes, in one `Map::apply` per index, and `differing` compares each
-with the stored map. Indexes the table does not store under a known fingerprint are left to the
-rebuild above, as described under [Indexes that agree with their
-rows](sync-receive.md#indexes-that-agree-with-their-rows).
+the rows that changed, and checks that each index changed by exactly what their deltas give; a
+table with nothing to check against has `TableData::built_slots` gather the entries of all its
+rows for each index, and `Differ::verify` sort them and walk the stored map beside them. Indexes
+the table does not store under a known fingerprint are left to the rebuild above, as described
+under [Indexes that agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 That is the whole format change. The tag of an index no longer depends on its name, and its field
 holds eight bytes before the map. Nothing global moved: no file format version, and no change to

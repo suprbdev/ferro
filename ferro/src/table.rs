@@ -408,8 +408,8 @@ impl<'p> Differ<'_, 'p> {
     }
 
     /// Queues on the threads of the pool the check that `index` holds exactly `entries`: the same
-    /// keys, by `Ord`, with values that encode the same. With fewer than [`QUEUED_ENTRIES`]
-    /// entries it makes the check here, which costs less than handing it to another thread.
+    /// keys, by `Ord`, with values that encode the same. With fewer than 4,096 entries it makes
+    /// the check here, which costs less than handing it to another thread.
     pub fn verify<K: Data + Ord, V: Data>(
         &self,
         index: &Map<K, V>,

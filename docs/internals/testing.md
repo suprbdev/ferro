@@ -448,11 +448,18 @@ Tests are described next to what they test:
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
 - Tables whose indexes a peer set apart from their rows, sent whole, drifting in a pull, behind
   the head, nested in a map, and beside a value the receiver cannot read, whose walk's error must
-  be the one returned, in `sync.rs`, written to a file for `verify_typed`, with every kind of
-  index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`, and the diff the
+  be the one returned, a table storing no index with rows under other keys, one holding an index
+  the receiver's type lacks, which is refused, and one lacking an index the receiver's has, which
+  lands, in `sync.rs`, written to a file for `verify_typed`, read without its indexes, with every kind
+  of index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`, and the diff the
   check makes, against `Map::diff`, on maps small enough to diff on one thread and large enough to
-  split among threads, with runs that only one side holds, in `map.rs`: [Indexes that agree with
-  their rows](sync-receive.md#indexes-that-agree-with-their-rows).
+  split among threads, with runs that only one side holds, in `map.rs`. What the check reads of a
+  set an `each` index names, and how many jobs 2,000 small tables take, in `table.rs`; a check
+  beside the walk that must panic on no thread, counted by a panic hook, `index_check_panics.rs`;
+  the bytes a receive allocates for a forged map of rows that links one node many times,
+  `index_check_cost.rs`; the threads a receive and `verify_typed` take, `index_check_threads.rs`;
+  and the threads of a pool that run work, in `pool.rs`: [Indexes that agree with their
+  rows](sync-receive.md#indexes-that-agree-with-their-rows).
 - The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
   [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).

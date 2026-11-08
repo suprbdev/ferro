@@ -146,6 +146,16 @@ a bundle refused because this file pruned what it builds on while it arrived, le
 file until the next reclamation cycle, one for each attempt a pull refused. Files that share no
 commit send everything on their first pull.
 
+Peers need the same `Summary` of each map, and the receiving side must declare every index of a
+table that the sending side's tables hold. When a table gains an index, or an index changes kind
+or fields, the side that receives must run the new schema before it pulls from a peer that
+already does: a pull of a table holding an index the receiver does not declare is refused with
+`Error::Bundle`. The older direction still lands: a table without one of the receiver's indexes
+lands, and the index is rebuilt when the table is read. A clone into the new schema of a history
+whose older versions hold an index the new schema changed or dropped is refused for the same
+reason, until those versions are pruned from the sender. [Changing your
+types](schema-evolution.md#index-changes-and-sync) gives the order.
+
 [Limits](../internals/sync.md#limits) in the internals lists the rest.
 
 ## How it works
