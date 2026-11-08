@@ -440,6 +440,35 @@ pub trait Data: Clone + Send + Sync + 'static {
     fn same_encoding(&self, other: &Self) -> bool {
         encodings_match(self, other)
     }
+    /// Adds to `t` whether a value of this type can hold a [`Table`](crate::Table), by naming
+    /// the types it holds with [`Tabled::of`], or with [`Tabled::table`] for a table itself.
+    ///
+    /// The check that the indexes of a received table agree with its rows reads only the values
+    /// that can hold one when it pairs each table with the table at the same place in the
+    /// version before. The default holds none, so a table inside a type whose `Data` is written
+    /// by hand is checked against all its rows.
+    #[doc(hidden)]
+    fn tables(_t: &mut Tabled) {}
+    /// Reads one value of this type from each of `old` and `new`, the encodings it has at the
+    /// same place in two versions, and adds to the [`Pairing`] each table the later one holds with
+    /// the table at the same place in the earlier one: the same field of a struct, of the same
+    /// variant of an enum, the same element of a sequence or the value under the same key of a
+    /// map.
+    ///
+    /// The default visits both and pairs nothing.
+    ///
+    /// # Errors
+    ///
+    /// The error of a value that does not decode, or of a node of a map that cannot be read.
+    #[doc(hidden)]
+    fn pair(
+        old: &mut Decoder<'_>,
+        new: &mut Decoder<'_>,
+        _pairing: &mut Pairing<'_>,
+    ) -> Result<()> {
+        Self::visit(old)?;
+        Self::visit(new)
+    }
     /// Writes `items` one after another, as `Vec` and arrays store their items.
     ///
     /// The default encodes each item in turn through [`Encoder::item`]. An override, such as
@@ -1094,8 +1123,8 @@ enum Plan {
 }
 
 /// How the check of each table value that a typed check found goes: against the table at the
-/// same place in its version's parent, which costs what changed between the two, or by building
-/// its indexes from its rows.
+/// same place in its version's parent, as a [`Pairing`] finds it, which costs what changed
+/// between the two, or by building its indexes from its rows, as a table with no plan is checked.
 ///
 /// A table is checked against another only if that one's own check is already planned, so no
 /// chain of checks leads back to where it started and every table that is checked rests on one
@@ -1114,35 +1143,18 @@ impl Plans {
         self.0.entry(table.identity()).or_insert(Plan::Built);
     }
 
-    /// Plans the check of each table of a version's root, `tables`, whose check is not planned
-    /// yet: against the table of the same type at the same place among `base`, the tables of its
-    /// parent's root, if that one's check is planned and it is another value, and otherwise by
-    /// building its indexes.
-    pub(crate) fn pair(&mut self, tables: &[FoundTable], base: &[FoundTable]) {
-        let mut bases: HashMap<TypeId, Vec<&FoundTable>> = HashMap::new();
-        for table in base {
-            bases.entry(table.id).or_default().push(table);
+    /// Plans to check `table` against `base`, the table at the same place in the version before,
+    /// unless the check of `table` is already planned, that of `base` is not, or the two are one
+    /// value. Returns whether it planned it.
+    pub(crate) fn from(&mut self, table: &FoundTable, base: &FoundTable) -> bool {
+        if base.identity() == table.identity()
+            || self.0.contains_key(&table.identity())
+            || !self.0.contains_key(&base.identity())
+        {
+            return false;
         }
-        let mut places: HashMap<TypeId, usize> = HashMap::new();
-        for table in tables {
-            let place = places.entry(table.id).or_default();
-            let at = *place;
-            *place += 1;
-            if self.0.contains_key(&table.identity()) {
-                continue;
-            }
-            let paired = bases.get(&table.id).and_then(|list| list.get(at));
-            let plan = match paired {
-                Some(base)
-                    if base.identity() != table.identity()
-                        && self.0.contains_key(&base.identity()) =>
-                {
-                    Plan::From((*base).clone())
-                }
-                _ => Plan::Built,
-            };
-            self.0.insert(table.identity(), plan);
-        }
+        self.0.insert(table.identity(), Plan::From(base.clone()));
+        true
     }
 
     /// How to check `table`: `None` if it is trusted, and otherwise the table to check it
@@ -1317,6 +1329,271 @@ const GROUPS: usize = 128;
 
 /// The most checks [`Checks::finish`] queues as one job.
 const GROUPED: usize = 64;
+
+/// Whether a type's values can hold a [`Table`](crate::Table), as [`Data::tables`] adds it up.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct Tabled {
+    open: Vec<TypeId>,
+    found: bool,
+}
+
+impl Tabled {
+    /// Adds whether `D` can hold a table, as its [`Data::tables`] says.
+    pub fn of<D: Data>(&mut self) {
+        if !self.found {
+            D::tables(self);
+        }
+    }
+
+    /// Adds what the named type `D` holds, as `holds` adds it, unless `D` is already being looked
+    /// into further out, so that a recursive type's search ends.
+    ///
+    /// The derive wraps every struct and enum in it.
+    pub fn named<D: Data>(&mut self, holds: impl FnOnce(&mut Tabled)) {
+        let id = TypeId::of::<D>();
+        if self.found || self.open.contains(&id) {
+            return;
+        }
+        self.open.push(id);
+        holds(self);
+        self.open.pop();
+    }
+
+    /// Marks the type as one whose values can hold a table.
+    pub fn table(&mut self) {
+        self.found = true;
+    }
+}
+
+/// Whether values of `D` can hold a [`Table`](crate::Table), as [`Data::tables`] says, worked out
+/// once for each type.
+pub(crate) fn holds_tables<D: Data>() -> bool {
+    static KNOWN: std::sync::OnceLock<parking_lot::RwLock<HashMap<TypeId, bool>>> =
+        std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let id = TypeId::of::<D>();
+    if let Some(holds) = known.read().get(&id) {
+        return *holds;
+    }
+    let mut tabled = Tabled::default();
+    tabled.of::<D>();
+    known.write().insert(id, tabled.found);
+    tabled.found
+}
+
+/// Pairs each table of one version with the table at the same place in the version before, the
+/// place being the field tags, variant tags, element positions and map keys from the root down,
+/// which [`Data::pair`] reads from the two encodings side by side.
+///
+/// It reads through a store, the view of a receive or the file `verify_typed` checks, and skips
+/// what the two versions share: a value both encode alike holds the same tables, and a map whose
+/// root is the same in both holds the same entries. Of a map, it reads only the nodes the two do
+/// not share, as a diff does, and pairs the values of each key both hold. Each node is opened
+/// once on each side: a map that reaches one already opened is left unpaired from there, so a
+/// pairing reads each node of the two versions once at most, however the maps share them.
+#[doc(hidden)]
+pub struct Pairing<'s> {
+    store: &'s Store,
+    pairs: Vec<(FoundTable, FoundTable)>,
+    same: Vec<FoundTable>,
+    maps: HashSet<(Hash, Hash)>,
+    opened: [HashSet<Hash>; 2],
+}
+
+/// The tables a [`Pairing`] paired: each table of the later version with the one at the same
+/// place in the earlier version, when the two differ, and each table that is the same at its
+/// place in both.
+#[derive(Default)]
+pub(crate) struct Paired {
+    /// Each table of the earlier version, with the table at its place in the later one.
+    pub(crate) pairs: Vec<(FoundTable, FoundTable)>,
+    /// The tables that both versions hold at the same place.
+    pub(crate) same: Vec<FoundTable>,
+}
+
+impl<'s> Pairing<'s> {
+    /// A pairing that reads through `store`.
+    pub(crate) fn new(store: &'s Store) -> Pairing<'s> {
+        Pairing {
+            store,
+            pairs: Vec::new(),
+            same: Vec::new(),
+            maps: HashSet::new(),
+            opened: [HashSet::new(), HashSet::new()],
+        }
+    }
+
+    /// The store the pairing reads through.
+    pub(crate) fn store(&self) -> &'s Store {
+        self.store
+    }
+
+    /// What the pairing paired.
+    pub(crate) fn into_paired(self) -> Paired {
+        Paired {
+            pairs: self.pairs,
+            same: self.same,
+        }
+    }
+
+    /// Reads the fields of a struct from `old` and `new`, as [`Decoder::fields`] does, and calls
+    /// `f` on each tag both hold, with a decoder over that field on each side.
+    ///
+    /// # Errors
+    ///
+    /// The error of a field list that does not decode, and the first error of `f`.
+    pub fn fields<'a, 'b>(
+        &mut self,
+        old: &mut Decoder<'a>,
+        new: &mut Decoder<'b>,
+        mut f: impl FnMut(&mut Self, u16, &mut Decoder<'a>, &mut Decoder<'b>) -> Result<()>,
+    ) -> Result<()> {
+        let mut olds = old.field_list()?;
+        let news = new.field_list()?;
+        for (tag, mut new) in news {
+            if let Some(at) = olds.iter().position(|(other, _)| *other == tag) {
+                let (_, mut old) = olds.swap_remove(at);
+                f(self, tag, &mut old, &mut new)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pairs the tables of a value of `D` that `old` and `new` each hold to their end, as a field
+    /// does, unless `D` cannot hold a table, when it reads neither.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Data::pair`].
+    pub fn field<D: Data>(&mut self, old: &mut Decoder<'_>, new: &mut Decoder<'_>) -> Result<()> {
+        if !holds_tables::<D>() {
+            return Ok(());
+        }
+        D::pair(old, new, self)
+    }
+
+    /// Reads the variant tag of an enum `D` from `old` and `new`, and calls `same` with it when
+    /// the two match, to pair what follows, or otherwise visits the rest of each as a `D`.
+    ///
+    /// # Errors
+    ///
+    /// The error of a tag or value that does not decode, and that of `same`.
+    pub fn variant<'a, 'b, D: Data>(
+        &mut self,
+        old: &mut Decoder<'a>,
+        new: &mut Decoder<'b>,
+        same: impl FnOnce(&mut Self, u16, &mut Decoder<'a>, &mut Decoder<'b>) -> Result<()>,
+    ) -> Result<()> {
+        let (from_old, from_new) = (old.checkpoint(), new.checkpoint());
+        let (tag, other) = (old.u16()?, new.u16()?);
+        if tag == other {
+            return same(self, tag, old, new);
+        }
+        old.rewind(from_old);
+        new.rewind(from_new);
+        D::visit(old)?;
+        D::visit(new)
+    }
+
+    /// Records `new`, a table of the later version, as paired with `old`, the table at its place
+    /// in the earlier one, or as the same table when the two are one value.
+    pub(crate) fn table(&mut self, old: FoundTable, new: FoundTable) {
+        if old.identity() == new.identity() {
+            self.same.push(new);
+        } else {
+            self.pairs.push((old, new));
+        }
+    }
+
+    /// Whether the maps with roots `old` and `new` are yet to be paired, which it notes they no
+    /// longer are.
+    pub(crate) fn unpaired_maps(&mut self, old: Hash, new: Hash) -> bool {
+        self.maps.insert((old, new))
+    }
+
+    /// Whether the node `hash` of the earlier version, or with `later` of the later one, is yet
+    /// to be opened, which it notes it no longer is.
+    pub(crate) fn unopened(&mut self, later: bool, hash: Hash) -> bool {
+        self.opened[usize::from(later)].insert(hash)
+    }
+}
+
+/// Pairs the tables of the first `olds` items of a sequence of `T` that `old` holds and the first
+/// `news` that `new` holds, item by item, as far as both reach, and visits the rest of the longer.
+///
+/// # Errors
+///
+/// The error of an item that does not decode.
+fn paired_items<T: Data>(
+    old: &mut Decoder<'_>,
+    new: &mut Decoder<'_>,
+    pairing: &mut Pairing<'_>,
+    olds: u64,
+    news: u64,
+) -> Result<()> {
+    let tabled = holds_tables::<T>();
+    let both = olds.min(news);
+    for _ in 0..both {
+        if tabled {
+            old.item(|old| new.item(|new| T::pair(old, new, pairing)))?;
+        } else {
+            old.item(T::visit)?;
+            new.item(T::visit)?;
+        }
+    }
+    for _ in both..olds {
+        old.item(T::visit)?;
+    }
+    for _ in both..news {
+        new.item(T::visit)?;
+    }
+    Ok(())
+}
+
+/// The entries of a `BTreeMap<K, V>` that `r` holds, each key with a decoder over its value alone.
+///
+/// # Errors
+///
+/// The error of a key or value that does not decode.
+fn valued<'a, K: Data, V: Data>(r: &mut Decoder<'a>) -> Result<Vec<(K, Decoder<'a>)>> {
+    let len = r.varint()?;
+    let mut entries = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(r.remaining()));
+    for _ in 0..len {
+        let entry = r.item(|r| {
+            let key = K::decode(r)?;
+            let start = r.checkpoint();
+            V::visit(r)?;
+            Ok((key, r.since(start)))
+        })?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// What pairs the tables of two versions' roots, given their links: [`pair_roots`] for the type of
+/// the root.
+pub(crate) type PairRoots = for<'s> fn(&mut Pairing<'s>, Ptr, Ptr) -> Result<()>;
+
+/// Pairs each table of the root at `new`, a value of `D`, with the table at the same place in the
+/// root at `old`, as [`Data::pair`] pairs them, reading both through the pairing's store.
+///
+/// # Errors
+///
+/// The error of a read, and of a value or node that does not decode.
+pub(crate) fn pair_roots<D: Data>(pairing: &mut Pairing<'_>, old: Ptr, new: Ptr) -> Result<()> {
+    if old.hash == new.hash || !holds_tables::<D>() {
+        return Ok(());
+    }
+    let store = pairing.store();
+    let (old, _) = store.read_fresh(old)?;
+    let (new, _) = store.read_fresh(new)?;
+    D::pair(
+        &mut Decoder::new(&old.body, &old.links, Some(store)),
+        &mut Decoder::new(&new.body, &new.links, Some(store)),
+        pairing,
+    )
+}
 
 fn check_value<D: Data>(_: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
     D::visit(r)?;
@@ -1643,6 +1920,14 @@ impl<'a> Decoder<'a> {
         self.cursor != checkpoint.cursor
     }
 
+    /// A decoder over what was read since `checkpoint` alone.
+    pub(crate) fn since(&self, checkpoint: Checkpoint) -> Decoder<'a> {
+        let (body, links) = self.read_since(checkpoint);
+        let mut part = Decoder::new(body, links, self.store);
+        part.rebuilds = self.rebuilds;
+        part
+    }
+
     /// The bytes and the links read since `checkpoint`.
     pub(crate) fn read_since(&self, checkpoint: Checkpoint) -> (&'a [u8], &'a [Ptr]) {
         (
@@ -1665,9 +1950,24 @@ impl<'a> Decoder<'a> {
         let Some(tables) = self.tables else {
             return;
         };
+        tables
+            .borrow_mut()
+            .push(self.table_since(start, id, name, agree, beside));
+    }
+
+    /// The table value read since `start`, of the table type `id` named `name`, as
+    /// [`found_table`](Decoder::found_table) notes it.
+    pub(crate) fn table_since(
+        &self,
+        start: Checkpoint,
+        id: TypeId,
+        name: &'static str,
+        agree: Agree,
+        beside: bool,
+    ) -> FoundTable {
         let (body, links) = self.read_since(start);
         let hash = hash_parts(body, links.iter().map(|link| &link.hash));
-        tables.borrow_mut().push(FoundTable {
+        FoundTable {
             id,
             name,
             agree,
@@ -1675,7 +1975,7 @@ impl<'a> Decoder<'a> {
             body: body.into(),
             links: links.into(),
             hash,
-        });
+        }
     }
 
     /// Where a [`Kind::recheck`] keeps the summaries of the entries it computed, or `None` for
@@ -1937,6 +2237,38 @@ impl<'a> Decoder<'a> {
             self.heap = sub.heap;
         }
         Ok(())
+    }
+
+    /// Reads a struct's fields as [`fields`](Decoder::fields) does, and returns each field's tag
+    /// with a decoder over that field's bytes and links alone, in the order they are stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Decode`] for a field list that runs past the end of the object.
+    pub(crate) fn field_list(&mut self) -> Result<Vec<(u16, Decoder<'a>)>> {
+        let count = self.varint()?;
+        let mut list =
+            Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(self.remaining()));
+        for _ in 0..count {
+            let tag = self.u16()?;
+            let prefix = self.varint()?;
+            let link_count = if prefix & 1 == 1 {
+                self.varint()? as usize
+            } else {
+                0
+            };
+            let body = self.take((prefix >> 1) as usize)?;
+            let end = self
+                .cursor
+                .checked_add(link_count)
+                .filter(|end| *end <= self.links.len())
+                .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
+            let mut field = Decoder::new(body, &self.links[self.cursor..end], self.store);
+            field.rebuilds = self.rebuilds;
+            self.cursor = end;
+            list.push((tag, field));
+        }
+        Ok(list)
     }
 }
 
@@ -2264,6 +2596,21 @@ impl<T: Data> Data for Option<T> {
             _ => false,
         }
     }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        let (from_old, from_new) = (old.checkpoint(), new.checkpoint());
+        if (old.u8()?, new.u8()?) == (1, 1) {
+            return T::pair(old, new, pairing);
+        }
+        old.rewind(from_old);
+        new.rewind(from_new);
+        Self::visit(old)?;
+        Self::visit(new)
+    }
 }
 
 impl<T: Data> Data for Vec<T> {
@@ -2298,6 +2645,15 @@ impl<T: Data> Data for Vec<T> {
 
     fn same_encoding(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
+    }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        let (olds, news) = (old.varint()?, new.varint()?);
+        paired_items::<T>(old, new, pairing, olds, news)
     }
 }
 
@@ -2422,6 +2778,14 @@ impl<T: Data, const N: usize> Data for [T; N] {
     fn same_encoding(&self, other: &Self) -> bool {
         self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
     }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        paired_items::<T>(old, new, pairing, N as u64, N as u64)
+    }
 }
 
 impl<T: Data> Data for Box<T> {
@@ -2450,6 +2814,14 @@ impl<T: Data> Data for Box<T> {
     fn same_encoding(&self, other: &Self) -> bool {
         (**self).same_encoding(other)
     }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        T::pair(old, new, pairing)
+    }
 }
 
 impl<T: Data> Data for Arc<T> {
@@ -2477,6 +2849,14 @@ impl<T: Data> Data for Arc<T> {
 
     fn same_encoding(&self, other: &Self) -> bool {
         Arc::ptr_eq(self, other) || (**self).same_encoding(other)
+    }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        T::pair(old, new, pairing)
     }
 }
 
@@ -2530,6 +2910,25 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
                 .iter()
                 .zip(other)
                 .all(|(a, b)| a.0.same_encoding(b.0) && a.1.same_encoding(b.1))
+    }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<V>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        if !holds_tables::<V>() {
+            Self::visit(old)?;
+            return Self::visit(new);
+        }
+        let mut olds = valued::<K, V>(old)?.into_iter().peekable();
+        for (key, mut new) in valued::<K, V>(new)? {
+            while olds.next_if(|(other, _)| *other < key).is_some() {}
+            if let Some((_, mut old)) = olds.next_if(|(other, _)| *other == key) {
+                V::pair(&mut old, &mut new, pairing)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2599,6 +2998,19 @@ macro_rules! tuple {
 
             fn same_encoding(&self, other: &Self) -> bool {
                 $(self.$index.same_encoding(&other.$index))&&+
+            }
+
+            fn tables(t: &mut Tabled) {
+                $(t.of::<$name>();)+
+            }
+
+            fn pair(
+                old: &mut Decoder<'_>,
+                new: &mut Decoder<'_>,
+                pairing: &mut Pairing<'_>,
+            ) -> Result<()> {
+                $($name::pair(old, new, pairing)?;)+
+                Ok(())
             }
         }
     };

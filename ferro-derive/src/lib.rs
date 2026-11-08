@@ -299,6 +299,25 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
     }
 }
 
+fn pair_stmts(fields: &[Field]) -> TokenStream2 {
+    let arms = fields.iter().filter(|f| f.stored()).map(|field| {
+        let tag = field.tag();
+        let ty = &field.ty;
+        quote! { #tag => __p.field::<#ty>(__old, __new), }
+    });
+    quote! {
+        __p.fields(__old, __new, |__p, __tag, __old, __new| match __tag {
+            #(#arms)*
+            _ => ::std::result::Result::Ok(()),
+        })
+    }
+}
+
+fn tables_stmts(fields: &[Field]) -> TokenStream2 {
+    let types = fields.iter().filter(|f| f.stored()).map(|f| &f.ty);
+    quote! { #(__t.of::<#types>();)* }
+}
+
 fn describe_stmts(fields: &[Field]) -> TokenStream2 {
     let mut stored: Vec<&Field> = fields.iter().filter(|f| f.stored()).collect();
     stored.sort_by(|a, b| (a.tag(), &a.name).cmp(&(b.tag(), &b.name)));
@@ -436,6 +455,18 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn same_encoding(&self, __other: &Self) -> bool {
                 ::ferro::Data::same_encoding(#access, #other)
             }
+
+            fn tables(__t: &mut ::ferro::codec::Tabled) {
+                __t.named::<Self>(|__t| __t.of::<#ty>());
+            }
+
+            fn pair(
+                __old: &mut ::ferro::codec::Decoder<'_>,
+                __new: &mut ::ferro::codec::Decoder<'_>,
+                __p: &mut ::ferro::codec::Pairing<'_>,
+            ) -> ::ferro::Result<()> {
+                <#ty as ::ferro::Data>::pair(__old, __new, __p)
+            }
         }
     })
 }
@@ -448,7 +479,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let generics = bound_generics(&input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let (encode, decode, visit, describe, same) = match &input.data {
+    let (encode, decode, visit, describe, same, pair, tables) = match &input.data {
         Data::Struct(data) => {
             let fields = parse_fields(&data.fields)?;
             check_fields(&fields, &container.removed)?;
@@ -496,6 +527,8 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     #described
                 },
                 same,
+                pair_stmts(&fields),
+                tables_stmts(&fields),
             )
         }
         Data::Enum(data) => {
@@ -518,6 +551,8 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let mut decode_arms = Vec::new();
             let mut visit_arms = Vec::new();
             let mut same_arms = Vec::new();
+            let mut pair_arms = Vec::new();
+            let mut held = Vec::new();
             let mut described = Vec::new();
             for ((variant, vname), removed) in data
                 .variants
@@ -590,6 +625,9 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                         ::std::result::Result::Ok(())
                     }
                 });
+                let pair = pair_stmts(&fields);
+                pair_arms.push(quote! { #vtag => #pair, });
+                held.push(tables_stmts(&fields));
                 let fields_described = describe_stmts(&fields);
                 described.push((
                     vtag,
@@ -648,6 +686,13 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     #(#variants_described)*
                 },
                 same_match,
+                quote! {
+                    __p.variant::<Self>(__old, __new, |__p, __variant, __old, __new| match __variant {
+                        #(#pair_arms)*
+                        #unknown
+                    })
+                },
+                quote! { #(#held)* },
             )
         }
         Data::Union(_) => {
@@ -680,6 +725,20 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             #[allow(unreachable_patterns)]
             fn same_encoding(&self, __other: &Self) -> bool {
                 #same
+            }
+
+            fn tables(__t: &mut ::ferro::codec::Tabled) {
+                __t.named::<Self>(|__t| {
+                    #tables
+                });
+            }
+
+            fn pair(
+                __old: &mut ::ferro::codec::Decoder<'_>,
+                __new: &mut ::ferro::codec::Decoder<'_>,
+                __p: &mut ::ferro::codec::Pairing<'_>,
+            ) -> ::ferro::Result<()> {
+                #pair
             }
         }
     })
@@ -2378,6 +2437,21 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn same_encoding(&self, __other: &Self) -> bool {
                 ::ferro::Data::same_encoding(&self.rows, &__other.rows)
                     #(&& ::ferro::Data::same_encoding(&self.#index_fields, &__other.#index_fields))*
+            }
+
+            fn tables(__t: &mut ::ferro::codec::Tabled) {
+                __t.table();
+            }
+
+            fn pair(
+                __old: &mut ::ferro::codec::Decoder<'_>,
+                __new: &mut ::ferro::codec::Decoder<'_>,
+                __p: &mut ::ferro::codec::Pairing<'_>,
+            ) -> ::ferro::Result<()> {
+                __p.fields(__old, __new, |__p, __tag, __old, __new| match __tag {
+                    #rows_tag => __p.field::<#rows_ty>(__old, __new),
+                    _ => ::std::result::Result::Ok(()),
+                })
             }
         }
 

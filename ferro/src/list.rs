@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::codec::{Data, Decoder, Description, Encoder};
+use crate::codec::{Data, Decoder, Description, Encoder, Pairing, Tabled};
 use crate::error::Result;
 use crate::map::{Map, Val, Values};
 
@@ -159,6 +159,14 @@ impl<T: Data> Data for List<T> {
 
     fn same_encoding(&self, other: &Self) -> bool {
         self.0.same_encoding(&other.0)
+    }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<T>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        Map::<u64, T>::pair(old, new, pairing)
     }
 }
 

@@ -887,41 +887,71 @@ retained version to find the values to check, or a rebuild on every read of a ta
 had. Refusing it needs nothing in the file, and asks of a table's indexes what a map's `Summary`
 already asks of peers.
 
-A table in a version's root is checked against the table of its type at the same place in the
-root of the version's parent: the nth table of that type that a check of each root reads. A parent
-the receiver holds is trusted, its tables with it; a parent the bundle carries is checked in the
-same receive. The rows of the two, and each index the table stores, are diffed as `Map::diff`
-diffs them, skipping every subtree the two share, but from the nodes' bytes: each value of a node
-the two do not share is visited, not decoded, and compared by its bytes and the hashes of its
-links, so only the entries that changed are decoded, and an index with the parent's root reads
-nothing. For each row that changed, each index then takes the entries its old version gave out and
-puts those its new version gives in, less those both hold with the same encoding, and what that
-changes must be exactly what the diff of the index found: the same keys, by `Ord`, each with the
-value it had and the value it has, by encoding. A row whose fields the index names, and stores,
-encode as they did gives no change, which costs a comparison of those fields' encodings: a `Set`'s
-is its length and root hash, so an edit of a field no index names reads no set an `each` index
-names. Of an `each` field that changed, under stored fields that did not, only the elements that
-left and came change entries: a `Set` diffs its two versions as an index is diffed, reading only
-the nodes they do not share, and a `Vec`, `BTreeSet` or `Option` compares its two lists, sorted.
-A row that came or went gives all its entries. So a change to a field no index names must leave
-every index as it was, and an index whose keys compare equal to the expected ones but are stored
-as other bytes, as a type whose `==` ignores case leaves after an update, still agrees. An entry
-of a new row that falls on a key another new row's entry holds, or one that a row that did not
-change holds, is two rows sharing a value of a unique index. The check costs what changed: the
-nodes of the rows, of each index and of each set that differ, on both sides, and the entries that
-changed, and it writes and hashes nothing. The diff of the index is held as keys and values, and
-compared with the entries the rows give as it is walked.
+A table in a version is checked against the table at the same place in the version's parent. The
+place is the path from the root down: the tag of each field, the tag of each variant, the position
+of each element of a `Vec`, an array or a tuple, and the key of each entry of a `Map`, a `List` or a
+`BTreeMap`. A `Pairing` reads the two roots side by side through `Data::pair`, which the derive
+writes for each struct and enum and ferro for its own types, and which goes into a field, an element
+or an entry only when its type can hold a table, as `Data::tables` says. It pairs a field only when
+both versions hold it, an `Option` only when both are `Some`, and an enum only when both are the
+same variant. Of a map it diffs the two versions as below, opening only the nodes the two do not
+share, and pairs the value of each key both hold. A map whose root is the same in both holds the
+same tables, and so does a value both encode alike: the parent holds that table value at that place,
+so it is trusted when the parent is held and checked once, with the parent's, when the parent is
+carried. Each node is opened once on each side in the pairing of two versions, so a map that reaches
+a node its side opened already is left unpaired from there, and the pairing reads each node of the
+two trees once at most, however a forged tree shares them; two maps paired once are not paired
+again. A parent the receiver holds is trusted, its tables with it; a parent the bundle carries is
+checked in the same receive, and a table of a carried parent that the walk did not note, since it
+lies in data the receiver holds as its own type, is trusted too.
+
+Before #116 only the tables of each root were paired, the nth table of a type with the nth of that
+type in the parent's root, so an `Option` of a table placed before another shifted the pairs as it
+came and went: nine commits of 2 KB that toggled a table of one row beside one of 1.5 million rows
+paired the two, and were refused for reading more than their size allows, after 0.58 s and 1,118 MB,
+on every retry, where the same commits with the optional table placed after landed in under a
+millisecond, as both now do. A table in a collection had nothing to be checked against, so it was
+checked against all its rows in each version that changed the node holding it, and so were the
+tables beside it in that node: thirty commits of 84 KB that each edited one row of a table of
+300,000 rows under one key of a `Map` were refused after 0.49 s, and four that edited one of 1.5
+million rows after 0.63 s, where the same table at the root, or without indexes, landed in 1 to 2
+ms. Both now land in 1 to 2 ms. In `verify_typed`, ten such edits to sixteen tables of 2,000 rows in
+a map took 100 MB of allocations against 77 MB at the root, and now take 78 MB.
+
+The rows of the two, and each index the table stores, are diffed as `Map::diff` diffs them, skipping
+every subtree the two share, but from the nodes' bytes: each value of a node the two do not share is
+visited, not decoded, and compared by its bytes and the hashes of its links, so only the entries
+that changed are decoded, and an index with the parent's root reads nothing. For each row that
+changed, each index then takes the entries its old version gave out and puts those its new version
+gives in, less those both hold with the same encoding, and what that changes must be exactly what
+the diff of the index found: the same keys, by `Ord`, each with the value it had and the value it
+has, by encoding. A row whose fields the index names, and stores, encode as they did gives no
+change, which costs a comparison of those fields' encodings: a `Set`'s is its length and root hash,
+so an edit of a field no index names reads no set an `each` index names. Of an `each` field that
+changed, under stored fields that did not, only the elements that left and came change entries: a
+`Set` diffs its two versions as an index is diffed, reading only the nodes they do not share, and a
+`Vec`, `BTreeSet` or `Option` compares its two lists, sorted. A row that came or went gives all its
+entries. So a change to a field no index names must leave every index as it was, and an index whose
+keys compare equal to the expected ones but are stored as other bytes, as a type whose `==` ignores
+case leaves after an update, still agrees. An entry of a new row that falls on a key another new
+row's entry holds, or one that a row that did not change holds, is two rows sharing a value of a
+unique index. The check costs what changed: the nodes of the rows, of each index and of each set
+that differ, on both sides, and the entries that changed, and it writes and hashes nothing. The diff
+of the index is held as keys and values, and compared with the entries the rows give as it is
+walked.
 
 Any other table is checked against its rows whole: the tables of a clone's first version, a table
-nested in a collection, a table whose parent holds no table at that place or lacks one of its
-indexes, and held data of another type. Its rows are walked once in key order, each node read once,
-and the entries each index should hold gathered in a vector; each vector is then sorted and walked
-beside the stored index, which must hold exactly those keys, by `Ord`, with values of the same
-encoding, and a key the rows give twice is two rows sharing a value of a unique index. An index of
-4,096 entries or more is compared as a job of the pool, a smaller one by the check itself. So the
-check holds the entries rather than a map of them, and writes and hashes nothing. A table is
-checked against another only if the other's check is planned already, so no chain of checks comes
-back to where it started, and every table rests on one that was trusted or built whole.
+whose parent holds no table at its place, as under a key a version adds to a map or in an `Option`
+that was `None`, one whose parent lacks one of its indexes, one a pairing left unpaired, one inside
+a type whose `Data` is written by hand, which pairs nothing, and held data of another type. Its rows
+are walked once in key order, each node read once, and the entries each index should hold gathered
+in a vector; each vector is then sorted and walked beside the stored index, which must hold exactly
+those keys, by `Ord`, with values of the same encoding, and a key the rows give twice is two rows
+sharing a value of a unique index. An index of 4,096 entries or more is compared as a job of the
+pool, a smaller one by the check itself. So the check holds the entries rather than a map of them,
+and writes and hashes nothing. A table is checked against another only if the other's check is
+planned already, so no chain of checks comes back to where it started, and every table rests on one
+that was trusted or built whole.
 
 The checks run on a pool of threads, `pool.rs`, whose own thread starts another whenever more work
 waits than threads are idle, so that it has eight threads at most, its own included, and no more
@@ -949,25 +979,27 @@ again and queue a run for each, 1.39 s and 1,455 MB more for a bundle of 1.03 MB
 refused in 2 ms, since a run looked whether its pool was told to stop only as it started. Each step
 of a diff and each subtree it opens now looks, and such a bundle costs 3 ms and 2 MB.
 
-When the first version's root holds a table, the check of each version's root tables against the
-tables of its parent is planned and queued before the walk reaches that version, from the root and
-its parent as the final plan reads them, so that it runs beside the walk. Its diffs read nodes the
-walk has not checked yet, and return an error for one that does not decode, but its result counts
-only once the walk has passed: a walk that fails returns its own error, and the checks and runs not
-started yet do nothing. Every read a check makes returns an error rather than panicking: the rows
-and index values it decodes are decoded without rebuilding the indexes of a table nested in them,
-which would read that table's own rows as a map reads them, and a set an `each` index names is read
-by a walk or a diff that returns its errors. A table checked against its rows whole waits for the
-walk, as does a table with an `each` index over a `Set`, so that a bundle the walk refuses never
-costs a read of all a table's rows. Before, decoding a changed row decoded a table nested in it,
-which rebuilt an `each` index over a `Set` the peer's type did not have, and reading that set
-panicked on a pool thread on a value the walk then refused (#115). Once the walk and the deferred
-summaries are done, the plan is made again from every table the walk noted, a check already queued
-for the same table against the same table is waited for rather than made again, the others are
-queued, and the first table, in the order the walk noted them, whose check failed refuses the
-bundle. A bundle whose first root holds
-no table is walked first and the tables it noted, nested or in held data, checked after, so a
-receive of a type without tables starts no thread.
+When the first version's root holds a table, the check of each table a version's pairing with its
+parent pairs is planned and queued before the walk reaches that version, from the root and its
+parent as the final plan reads them, so that it runs beside the walk, and the pairing is kept for
+the plan made after the walk, so that the two trees are read side by side once. The pairing reads
+nodes of the version the walk has not checked yet, returns an error for one that does not decode,
+and then plans nothing more before the walk. Its diffs read nodes the walk has not checked yet, and
+return an error for one that does not decode, but its result counts only once the walk has passed: a
+walk that fails returns its own error, and the checks and runs not started yet do nothing. Every
+read a check makes returns an error rather than panicking: the rows and index values it decodes are
+decoded without rebuilding the indexes of a table nested in them, which would read that table's own
+rows as a map reads them, and a set an `each` index names is read by a walk or a diff that returns
+its errors. A table checked against its rows whole waits for the walk, as does a table with an
+`each` index over a `Set`, so that a bundle the walk refuses never costs a read of all a table's
+rows. Before, decoding a changed row decoded a table nested in it, which rebuilt an `each` index
+over a `Set` the peer's type did not have, and reading that set panicked on a pool thread on a value
+the walk then refused (#115). Once the walk and the deferred summaries are done, the plan is made
+again from every table the walk noted, a check already queued for the same table against the same
+table is waited for rather than made again, the others are queued, and the first table, in the order
+the walk noted them, whose check failed refuses the bundle. A bundle whose first root holds no table
+is walked first and the tables it noted, nested or in held data, checked after, so a receive of a
+type without tables starts no thread.
 
 The checks read through a view of their own, with the staging lent to it for the whole walk and an
 allowance as large as that of the view the walk and the deferred pass read through, so they are
@@ -985,8 +1017,9 @@ million elements of 32 bytes was refused after 2.1 s, for reading the set a seco
 message of the recompute of summaries.
 
 `verify_typed` runs the same checks on the file's store, on a pool of its own once its walk is
-done, over every table its walk finds: each retained version's root tables against its parent's,
-and every other table against its rows whole.
+done, over every table its walk finds: each table of a retained version against the table at its
+place in the version's parent, as a pairing of the two roots finds it, and every other table
+against its rows whole.
 
 Measured on 2026-11-08 with the receiver's file buffered, on a table of 200,000 rows of five
 fields, a `u64` key, a plain index on a `u32`, a unique index on a `u64`, a plain index on a
@@ -1028,6 +1061,26 @@ in 100 commits and what follows it:
 571 and 2,612 ms for the two clones, 47.5 and 16.5 ms for the edits, and 870 and 3,145 ms for
 `verify_typed`.
 
+After #116 paired each table with the one at its place and checked tables without indexes, the
+same cases were measured again with a benchmark of the same design, whose clone in ten commits
+carries 47.8 MB and in 100 carries 136.2 MB and whose edits carry 4.1 and 2.3 MB, the builds at
+9e9341e and after #116 alternating, medians of ten runs, five for the clone in 100 commits and what
+follows it:
+
+| Bundle | Before #116 | After #116 |
+| --- | --- | --- |
+| Clone in ten commits of 20,000 rows | 475 ms | 470 ms |
+| Edit of both plain indexed fields | 49.6 ms | 50.6 ms |
+| Edit of the field no index names | 17.2 ms | 16.5 ms |
+| `verify_typed` of the eleven versions | 710 ms | 716 ms |
+| Clone in 100 commits of 2,000 rows | 1,782 ms | 1,780 ms |
+| Edit of both plain indexed fields after it | 52.1 ms | 51.8 ms |
+| Edit of the field no index names after it | 16.8 ms | 16.9 ms |
+| `verify_typed` of the 101 versions | 2,423 ms | 2,380 ms |
+
+A table in the root is paired by reading the two roots, a few hundred bytes, so these move by no
+more than the noise.
+
 The checks take about the processor time they took when they applied the rows: a clone in ten
 commits spent 1.5 s of it against 0.55 s before the check, an edit of both indexed fields 0.12 s
 against 0.06 s, and `verify_typed` of the eleven versions 1.7 s against 0.8 s, process time each,
@@ -1067,13 +1120,13 @@ Left out:
   part of each read, for memory up to the size of what a clone carries.
 - Checking only the versions a receiver keeps under its retention. Every version a receive lands
   can be read with `at` until it is pruned, so each is checked.
-- Finding the parent of a table nested in a collection by its key, which would mean following the
-  path to the collection through the parent version's tree. Such a table is checked against all
-  its rows in each version that changes the node that holds it.
-- Checking a nested table, or one in held data of another type, beside the walk. Only the tables
-  of each root are planned before the walk reaches them; the others are found by the walk, and
-  are checked once it is done. A root table checked against all its rows, or with an `each` index
-  over a `Set`, waits for the walk too, though every read it makes returns its errors.
+- Pairing a table with one at another place in the parent, as when a value moves to another key
+  or a table to another field: such a table is checked against all its rows. The tables of a held
+  parent's root are trusted wherever they move in the root, as before.
+- Checking a table in held data of another type, or any table of a bundle whose first root holds
+  none, beside the walk: such tables are found by the walk, and are checked once it is done. A
+  table checked against all its rows, or with an `each` index over a `Set`, waits for the walk too,
+  though every read it makes returns its errors.
 - Landing a table that holds an index the receiver cannot check, recorded so that no read trusts
   it, which would keep peers that declare a table's indexes differently syncing, as described
   above. A branch of the file's own held the record in a commit of #115 that was reverted.

@@ -476,6 +476,13 @@ rows for each index, and `Differ::verify` sort them and walk the stored map besi
 the table does not store under a known fingerprint are left to the rebuild above, as described
 under [Indexes that agree with their rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
+Which table of the version before a table is checked against comes from the hidden `Data::pair` and
+`Data::tables`, which the `Data` derive writes for each struct and enum, the `Record` derive for
+each table type, and ferro for its own containers. `tables` says whether a type's values can hold a
+table, and `pair` reads a value's encodings in two versions side by side and pairs the table at each
+place, a field, a variant, an element or a key, with the table at the same place before. A table
+inside a type whose `Data` is written by hand is never paired, and is checked against all its rows.
+
 That is the whole format change. The tag of an index no longer depends on its name, and its field
 holds eight bytes before the map. Nothing global moved: no file format version, and no change to
 rows, maps, nodes, commits, or structs that are not tables. A table without indexes encodes as it

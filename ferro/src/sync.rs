@@ -13,7 +13,7 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::mem;
 use std::sync::Arc;
@@ -24,8 +24,8 @@ use hashbrown::HashTable;
 use hashbrown::hash_table as table;
 
 use crate::codec::{
-    Checks, Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, Plans, Ptr, Recalled,
-    Shape, Tables, push_varint,
+    Checks, Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, PairRoots, Paired,
+    Pairing, Plans, Ptr, Recalled, Shape, Tables, pair_roots, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
@@ -1749,6 +1749,7 @@ struct Vetting<'a> {
     anchors: &'a Anchors,
     held_at: &'a Index,
     root_kind: &'a Kind,
+    pair_roots: PairRoots,
     kept: HashMap<u32, Vec<Kept>>,
     held: Retyped,
     beneath: Vec<Beneath>,
@@ -1781,6 +1782,13 @@ fn retyped(kind: &Kind, error: Error) -> Error {
         )),
         other => other,
     }
+}
+
+fn overread() -> Error {
+    bad(
+        "checking that the indexes of the tables it carries agree with their rows reads more than \
+         its size allows",
+    )
 }
 
 fn disagreeing(table: &FoundTable, error: Error) -> Error {
@@ -2086,30 +2094,48 @@ impl Vetting<'_> {
         listed: &mut HashSet<Hash>,
         (root, parent): &Descent,
         tables_of: impl Fn(Ptr) -> Result<(Vec<FoundTable>, bool)>,
+        paired: &mut HashMap<Hash, Paired>,
+        view: &Store,
     ) -> Result<Vec<FoundTable>> {
         if self.staging.id_of(&root.hash).is_none() || !listed.insert(root.hash) {
             return Ok(Vec::new());
         }
-        let (tables, _) = tables_of(*root)?;
-        if tables.is_empty() {
-            return Ok(tables);
-        }
-        let base = match parent {
-            Some((parent, kept)) => {
-                let (base, held) = tables_of(*parent)?;
-                for table in base.iter().filter(|_| held) {
-                    if *kept || !self.tables.holds(table) {
-                        plans.trust(table);
-                    } else {
-                        plans.build(table);
-                    }
-                }
-                base
-            }
-            None => Vec::new(),
+        let Some((parent, kept)) = parent else {
+            return Ok(Vec::new());
         };
-        plans.pair(&tables, &base);
-        Ok(tables)
+        let (base, held) = tables_of(*parent)?;
+        for table in base.iter().filter(|_| held) {
+            self.vouch(plans, table, *kept);
+        }
+        let found = match paired.entry(root.hash) {
+            hash_map::Entry::Occupied(found) => found.into_mut(),
+            hash_map::Entry::Vacant(slot) => {
+                let mut pairing = Pairing::new(view);
+                (self.pair_roots)(&mut pairing, *parent, *root)?;
+                slot.insert(pairing.into_paired())
+            }
+        };
+        if *kept {
+            for table in &found.same {
+                plans.trust(table);
+            }
+        }
+        let mut planned = Vec::new();
+        for (old, new) in &found.pairs {
+            self.vouch(plans, old, *kept);
+            if plans.from(new, old) {
+                planned.push(new.clone());
+            }
+        }
+        Ok(planned)
+    }
+
+    fn vouch(&self, plans: &mut Plans, table: &FoundTable, kept: bool) {
+        if kept || !self.tables.holds(table) {
+            plans.trust(table);
+        } else {
+            plans.build(table);
+        }
     }
 
     fn walk(&mut self, roots: &[Ptr], mut before: impl FnMut(&Self, usize)) -> Result<()> {
@@ -2125,10 +2151,17 @@ impl Vetting<'_> {
         if !early.on {
             return;
         }
-        let planned = self.plan(&mut early.plans, &mut early.listed, descent, |root| {
-            self.root_tables(root)
-                .map(|(tables, held, _)| (tables, held))
-        });
+        let planned = self.plan(
+            &mut early.plans,
+            &mut early.listed,
+            descent,
+            |root| {
+                self.root_tables(root)
+                    .map(|(tables, held, _)| (tables, held))
+            },
+            &mut early.paired,
+            view,
+        );
         match planned {
             Ok(tables) => {
                 for table in &tables {
@@ -2146,24 +2179,33 @@ impl Vetting<'_> {
     fn agree<'p>(
         &mut self,
         lineage: &[Descent],
-        checks: Checks,
+        (checks, mut paired): (Checks, HashMap<Hash, Paired>),
         pool: &Pool<'p>,
         view: &'p Store,
     ) -> Result<()> {
         let mut plans = Plans::default();
         let mut listed = HashSet::new();
         for descent in lineage {
-            self.plan(&mut plans, &mut listed, descent, |root| {
-                self.tables_of(root)
-            })?;
+            let planned = self.plan(
+                &mut plans,
+                &mut listed,
+                descent,
+                |root| self.tables_of(root),
+                &mut paired,
+                view,
+            );
+            if let Err(error) = planned {
+                return Err(if view.out_of_reads() {
+                    overread()
+                } else {
+                    rejected(error)
+                });
+            }
         }
         let found = mem::take(&mut self.tables).into_found();
         let failed = checks.finish(pool, view, &plans, &found);
         if view.out_of_reads() {
-            return Err(bad(
-                "checking that the indexes of the tables it carries agree with their rows reads \
-                 more than its size allows",
-            ));
+            return Err(overread());
         }
         if let Some(error) = view.overdrawn() {
             return Err(error);
@@ -2778,6 +2820,7 @@ fn place(
 struct Vetted<'a> {
     streamed: Streamed,
     root_kind: &'a Kind,
+    pair_roots: PairRoots,
 }
 
 struct Resolved {
@@ -2799,17 +2842,20 @@ struct Arrival {
 
 type Descent = (Ptr, Option<(Ptr, bool)>);
 
-/// The checks that the tables of each version's root agree with their rows, planned and queued
-/// before the walk reaches the version, so that they run beside the walk: those against the table
-/// of the version before, whose diffs read what the walk has not checked yet as data that may not
-/// decode. A table built from its rows, or one whose rows give entries only by reading the file,
-/// as an `each` index over a `Set` does, waits for the walk, since that reads as a map reads,
-/// which takes a node that does not decode for a damaged file.
+/// The checks that the tables of each version agree with their rows, planned and queued before the
+/// walk reaches the version, so that they run beside the walk: those against the table at the
+/// same place in the version before, as the pairing of the two roots finds it, whose diffs read
+/// what the walk has not checked yet as data that may not decode. A table built from its rows, or
+/// one whose rows give entries only by reading the file, as an `each` index over a `Set` does,
+/// waits for the walk, since that reads as a map reads, which takes a node that does not decode
+/// for a damaged file. The pairing of each version is kept, by its root, for the plan made once
+/// the walk is done.
 struct Early {
     on: bool,
     plans: Plans,
     listed: HashSet<Hash>,
     checks: Checks,
+    paired: HashMap<Hash, Paired>,
 }
 
 fn lineage(
@@ -2942,6 +2988,7 @@ fn resolve<O: Objects>(
     if let Some(Vetted {
         streamed,
         root_kind,
+        pair_roots,
     }) = vetted
     {
         let staging = objects
@@ -2981,6 +3028,7 @@ fn resolve<O: Objects>(
             anchors,
             held_at: &held_at,
             root_kind,
+            pair_roots,
             kept: HashMap::new(),
             held: Retyped::default(),
             beneath: Vec::new(),
@@ -3030,6 +3078,7 @@ fn resolve<O: Objects>(
                         plans: Plans::default(),
                         listed: HashSet::new(),
                         checks: Checks::strict(),
+                        paired: HashMap::new(),
                     };
                     let walked = vetting.walk(&roots, |vetting, at| {
                         if let Ok(descents) = &descents
@@ -3043,7 +3092,9 @@ fn resolve<O: Objects>(
                         return walked;
                     }
                     match descents {
-                        Ok(lineage) => vetting.agree(&lineage, early.checks, pool, &agreeing),
+                        Ok(lineage) => {
+                            vetting.agree(&lineage, (early.checks, early.paired), pool, &agreeing)
+                        }
                         Err(error) => {
                             pool.stop();
                             Err(error)
@@ -3057,7 +3108,14 @@ fn resolve<O: Objects>(
                 let lineage = lineage(store, objects, &landing, &order)?;
                 let agreeing = vetting.fresh_view();
                 staging.overlaid(&agreeing, || {
-                    pool::scope(|pool| vetting.agree(&lineage, Checks::strict(), pool, &agreeing))
+                    pool::scope(|pool| {
+                        vetting.agree(
+                            &lineage,
+                            (Checks::strict(), HashMap::new()),
+                            pool,
+                            &agreeing,
+                        )
+                    })
                 })?;
             }
         }
@@ -3749,6 +3807,7 @@ impl<T: Data> Db<T> {
         let vetted = Vetted {
             streamed,
             root_kind: &root_kind,
+            pair_roots: pair_roots::<T>,
         };
         let sent = resolve(
             &store,

@@ -10,11 +10,11 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
 use std::time::Duration;
 
 use crate::codec::{
-    Checked, Data, Decoder, Encoder, FoundTable, Hash, HashSink, Kind, Plans, Ptr, Tables,
+    Checked, Data, Decoder, Encoder, Hash, HashSink, Kind, PairRoots, Pairing, Plans, Ptr, Tables,
+    pair_roots,
 };
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
@@ -305,7 +305,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
         }
     }
     if !tables.is_empty() {
-        agreed(store, &root, versions, tables)?;
+        agreed(store, &root, pair_roots::<T>, versions, tables)?;
     }
     Ok(())
 }
@@ -319,13 +319,15 @@ fn version_of(ptr: Ptr, entry: &Entry) -> (u64, Hash, Option<Ptr>, Option<Hash>)
     )
 }
 
-/// Checks that the indexes of each table in `tables` agree with its rows: the tables of each
-/// version's root against those at the same place in its parent's, which costs what changed
-/// between them, and every other table, those of the oldest versions among them, by building its
-/// indexes from its rows.
+/// Checks that the indexes of each table in `tables` agree with their rows: each table of a
+/// version against the table at the same place in its parent, as `pair_roots` pairs them, which
+/// costs what changed between them, and every other table, those of the oldest versions among
+/// them and those with no table at their place in the parent, by building its indexes from its
+/// rows.
 fn agreed(
     store: &Store,
     root: &Kind,
+    pair_roots: PairRoots,
     mut versions: Vec<(u64, Hash, Option<Ptr>, Option<Hash>)>,
     tables: Tables,
 ) -> Result<()> {
@@ -334,35 +336,23 @@ fn agreed(
         .filter_map(|(_, commit, root, _)| root.map(|root| (*commit, root)))
         .collect();
     versions.sort_unstable_by_key(|(version, commit, _, _)| (*version, *commit));
-    let mut listed: HashMap<Hash, Rc<Vec<FoundTable>>> = HashMap::new();
-    let mut tables_of = |ptr: Ptr| -> Result<Rc<Vec<FoundTable>>> {
-        if let Some(found) = listed.get(&ptr.hash) {
-            return Ok(found.clone());
-        }
-        let object = store.read_object(ptr)?;
-        let found = RefCell::new(Vec::new());
-        root.check_tables(&object.body, &object.links, &found)
-            .map_err(|error| {
-                Error::Corrupt(format!(
-                    "the {} at {} does not decode: {error}",
-                    root.name, ptr.offset
-                ))
-            })?;
-        let found = Rc::new(found.into_inner());
-        listed.insert(ptr.hash, found.clone());
-        Ok(found)
-    };
     let mut plans = Plans::default();
     for (_, _, ptr, prev) in &versions {
-        let Some(ptr) = ptr else {
+        let (Some(ptr), Some(prev)) = (ptr, prev.and_then(|prev| roots.get(&prev))) else {
             continue;
         };
-        let found = tables_of(*ptr)?;
-        let base = match prev.and_then(|prev| roots.get(&prev)) {
-            Some(prev) => tables_of(*prev)?,
-            None => Rc::default(),
-        };
-        plans.pair(&found, &base);
+        let mut pairing = Pairing::new(store);
+        pair_roots(&mut pairing, *prev, *ptr).map_err(|error| match error {
+            Error::Decode(message) => Error::Corrupt(format!(
+                "the {} at {} does not decode: {message}",
+                root.name, ptr.offset
+            )),
+            other => other,
+        })?;
+        for (old, new) in pairing.into_paired().pairs {
+            plans.build(&old);
+            plans.from(&new, &old);
+        }
     }
     let found = tables.into_found();
     match plans.check(&found, store) {

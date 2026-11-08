@@ -631,19 +631,24 @@ Measured and left out:
 - Checking that a table's indexes agree with its rows diffs the rows and each index that a version
   changes against the version before, reading the nodes that differ on both sides, so a clone reads
   most of what it carries a second time and an incremental pull reads the old versions of what it
-  changes. Of a row that changed it reads only what each index names: a field whose encoding did
-  not change costs nothing, and of a `Set` an `each` index names, only the nodes that differ. A
-  table whose type declares no index is checked too, for the key each row sits under, which costs
-  the diff of its rows. The checks run on up to eight threads, the one that starts the others
-  included, beside the walk when the first version's root holds a table, so the receive takes
-  several cores for a while: on a table of 200,000 rows with three indexes a clone in ten commits
-  took 11% longer than with no check, an edit of 1,000 rows 6 to 10% longer, and `verify_typed`
-  14 to 15% longer, for about twice the processor time. A table nested in a collection, rather than held in the root, is checked
-  against all its rows, in each version that changes the node holding it, and a table hung on rows
-  the receiver holds makes it read those rows once for free, then at a charge against an allowance
-  like the one above but apart from it, as described under [Indexes that agree with their
+  changes. Of a row that changed it reads only what each index names: a field whose encoding did not
+  change costs nothing, and of a `Set` an `each` index names, only the nodes that differ. A table
+  whose type declares no index is checked too, for the key each row sits under, which costs the diff
+  of its rows. The checks run on up to eight threads, the one that starts the others included,
+  beside the walk when the first version's root holds a table, so the receive takes several cores
+  for a while: on a table of 200,000 rows with three indexes a clone in ten commits took 11% longer
+  than with no check, an edit of 1,000 rows 6 to 10% longer, and `verify_typed` 14 to 15% longer,
+  for about twice the processor time. A table nested in a collection, in an `Option` or in an enum
+  is checked against the table at the same place in the version before, as one in a root field is,
+  found by reading the two versions side by side and opening only the nodes of a collection that the
+  two do not share, so an edit of one row of a table under one key of a map costs what the same edit
+  at the root does. A table with no table at its place before, as under a key a version adds, is
+  checked against all its rows. A table hung on rows the receiver holds makes it read those rows
+  once for free, then at a charge against an allowance like the one above but apart from it, as
+  described under [Indexes that agree with their
   rows](sync-receive.md#indexes-that-agree-with-their-rows); 200,000 nested tables of one row with
-  two indexes take 0.74 s to clone against 0.16 s with no indexes. Each table value is kept, a few
-  hundred bytes, until its check runs, and up to four checks run at once, each holding the rows and
-  index entries that changed, or for a table checked against all its rows, the entries its indexes
-  should hold, in vectors, a few times what a row's indexed fields encode to.
+  two indexes take 0.73 s to clone, and with no indexes 0.35 s, where they took 0.16 s before the
+  key of each row was checked in a table without indexes. Each table value is kept, a few hundred
+  bytes, until its check runs, and up to four checks run at once, each holding the rows and index
+  entries that changed, or for a table checked against all its rows, the entries its indexes should
+  hold, in vectors, a few times what a row's indexed fields encode to.

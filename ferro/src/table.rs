@@ -145,7 +145,9 @@ use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Description, Encoder, FoundTable, Hash};
+use crate::codec::{
+    Checkpoint, Data, Decoder, Description, Encoder, FoundTable, Hash, Pairing, Tabled,
+};
 use crate::error::{Error, Result};
 use crate::map::{
     Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ,
@@ -612,6 +614,17 @@ pub fn noted<'a, T: Record, R>(
         !T::Table::indexing_reads(),
     );
     Ok(value)
+}
+
+/// The table value of `T` that `r` read since `start`, as [`noted`] notes it.
+fn found<T: Record>(r: &Decoder<'_>, start: Checkpoint) -> FoundTable {
+    r.table_since(
+        start,
+        TypeId::of::<T::Table>(),
+        type_name::<T::Table>(),
+        agree::<T>,
+        !T::Table::indexing_reads(),
+    )
 }
 
 /// Checks that each index `table` stores under a fingerprint `T` knows holds exactly the entries
@@ -1395,6 +1408,17 @@ impl<T: Record> Data for Table<T> {
 
     fn same_encoding(&self, other: &Self) -> bool {
         self.0.same_encoding(&other.0)
+    }
+
+    fn tables(t: &mut Tabled) {
+        t.table();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        let (from_old, from_new) = (old.checkpoint(), new.checkpoint());
+        T::Table::pair(old, new, pairing)?;
+        pairing.table(found::<T>(old, from_old), found::<T>(new, from_new));
+        Ok(())
     }
 }
 

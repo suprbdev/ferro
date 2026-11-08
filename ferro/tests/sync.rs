@@ -5167,6 +5167,130 @@ fn a_table_nested_in_a_map_whose_indexes_disagree_is_refused() {
 }
 
 #[derive(Data, Clone, Default)]
+enum Holder<T> {
+    #[default]
+    Empty,
+    Held(T),
+}
+
+#[derive(Data, Clone, Default)]
+struct Places<T> {
+    field: T,
+    optional: Option<T>,
+    listed: Vec<T>,
+    sorted: BTreeMap<u64, T>,
+    mapped: Map<u64, T>,
+    sequence: ferro::List<T>,
+    held: Holder<T>,
+    boxed: Box<T>,
+    paired: (u64, T),
+}
+
+const PLACES: usize = 9;
+
+fn place_rows(base: u64) -> Vec<shadow::Row> {
+    (0..60)
+        .map(|id| shadow::row(id, (id % 7) as u32, base * 1000 + id))
+        .collect()
+}
+
+fn filled() -> Places<shadow::Shadow> {
+    let table = |base: u64| shadow::Shadow::of(&place_rows(base));
+    let mut places = Places {
+        field: table(1),
+        optional: Some(table(2)),
+        listed: vec![table(3), table(4)],
+        sorted: BTreeMap::from([(5, table(5)), (6, table(6))]),
+        held: Holder::Held(table(9)),
+        boxed: Box::new(table(10)),
+        paired: (11, table(11)),
+        ..Places::default()
+    };
+    for key in 0..20 {
+        places.mapped.insert(key, table(100 + key));
+    }
+    places.sequence.push(table(7));
+    places.sequence.push(table(8));
+    places
+}
+
+fn at_place(
+    places: &mut Places<shadow::Shadow>,
+    place: usize,
+    f: impl FnOnce(&mut shadow::Shadow),
+) {
+    match place {
+        0 => f(&mut places.field),
+        1 => f(places.optional.as_mut().unwrap()),
+        2 => f(&mut places.listed[1]),
+        3 => f(places.sorted.get_mut(&6).unwrap()),
+        4 => {
+            places.mapped.update(&13, f);
+        }
+        5 => f(places.sequence.get_mut(1).unwrap()),
+        6 => match &mut places.held {
+            Holder::Held(table) => f(table),
+            Holder::Empty => unreachable!(),
+        },
+        7 => f(&mut places.boxed),
+        _ => f(&mut places.paired.1),
+    }
+}
+
+#[test]
+fn a_table_that_drifts_at_any_place_in_a_pull_is_refused_against_its_own_previous_version() {
+    for place in 0..PLACES {
+        let dir = tempfile::tempdir().unwrap();
+        let peer: Db<Places<shadow::Shadow>> = fast().open(dir.path().join("peer.ferro")).unwrap();
+        let mine: Db<Places<Table<shadow::Row>>> =
+            fast().open(dir.path().join("mine.ferro")).unwrap();
+        peer.update(|root| *root = filled()).unwrap();
+        assert_eq!(
+            from_peer(&mine, &peer).unwrap().outcome,
+            Outcome::FastForward
+        );
+        peer.update(|root| {
+            for other in 0..PLACES {
+                at_place(root, other, |table| table.put(shadow::row(500, 3, 999_000)));
+            }
+            root.optional = None;
+        })
+        .unwrap();
+        peer.update(|root| {
+            root.optional = Some(shadow::Shadow::of(&place_rows(2)));
+            at_place(root, 4, |table| table.remove(7));
+        })
+        .unwrap();
+        assert_eq!(
+            from_peer(&mine, &peer).unwrap().outcome,
+            Outcome::FastForward
+        );
+        mine.verify_typed().unwrap();
+        let landed = mine.head_hash();
+        assert_eq!(
+            mine.read().mapped.get(&13).unwrap().key_by_email(&999_000),
+            Some(500)
+        );
+        peer.update(|root| {
+            at_place(root, place, |table| {
+                table.rows.update(&2, |row| row.n = 99);
+            });
+        })
+        .unwrap();
+        peer.update(|root| {
+            at_place(root, place, |table| {
+                table.by_n.remove(&(2, 2));
+                table.by_n.insert((99, 2), ());
+                table.put(shadow::row(501, 4, 999_001));
+            });
+        })
+        .unwrap();
+        assert_disagrees(from_peer(&mine, &peer), &mine, &format!("place {place}"));
+        assert_eq!(mine.head_hash(), landed, "place {place}");
+    }
+}
+
+#[derive(Data, Clone, Default)]
 struct CountedTable {
     rows: Table<shadow::Row>,
     counts: Map<u64, u32>,

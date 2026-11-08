@@ -93,8 +93,8 @@ use std::sync::{Arc, OnceLock};
 use std::vec;
 
 use crate::codec::{
-    Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object, Ptr,
-    Shape, Sink, Staged, hash_parts, try_hash_of,
+    Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object,
+    Pairing, Ptr, Shape, Sink, Staged, Tabled, hash_parts, holds_tables, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -4686,6 +4686,20 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
         self.len() == other.len()
             && (self.root.same_as(&other.root) || self.root_hash() == other.root_hash())
     }
+
+    fn tables(t: &mut Tabled) {
+        t.of::<V>();
+    }
+
+    fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
+        let (old, new) = (paired_root::<S>(old)?, paired_root::<S>(new)?);
+        if let (Some(old), Some(new)) = (old, new)
+            && holds_tables::<V>()
+        {
+            paired::<K, V, S>(pairing, old, new)?;
+        }
+        Ok(())
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> PartialEq for Map<K, V, S> {
@@ -6430,6 +6444,21 @@ impl Bare {
             }),
         }
     }
+
+    /// The object the value lies in, with the ranges of its bytes and links there, reading a
+    /// spilled value through `store`.
+    fn object(&self, store: &Store) -> Result<(Arc<Object>, Range<usize>, Range<usize>)> {
+        match self {
+            Bare::Inline(object, bytes, links) => {
+                Ok((object.clone(), bytes.clone(), links.clone()))
+            }
+            Bare::Spilled(ptr) => {
+                let (object, _) = store.read_fresh(*ptr)?;
+                let (bytes, links) = (0..object.body.len(), 0..object.links.len());
+                Ok((Arc::new(object), bytes, links))
+            }
+        }
+    }
 }
 
 /// A step of [`changed`]: a subtree, by its link and the entries it holds, or an entry.
@@ -6966,6 +6995,96 @@ fn added<K, V: Data>(
         out.push((key, None, Some(after.value::<V>(store)?)));
     }
     Ok(())
+}
+
+/// The root of a map as its encoding gives it, with the entry count the link records, or `None`
+/// for an empty map.
+fn paired_root<S: Data>(r: &mut Decoder<'_>) -> Result<Option<(Ptr, u64)>> {
+    let count = r.varint()?;
+    if count == 0 {
+        return Ok(None);
+    }
+    S::visit(r)?;
+    Ok(Some((r.link()?, count)))
+}
+
+/// Pairs the tables in the value of each key that `old` and `new`, the roots of two versions of a
+/// map with the entry counts their links record, both hold, as [`Data::pair`] pairs those of a
+/// value, reading through the pairing's store only the nodes the two do not share.
+///
+/// Each side opens a node once in a pairing: a map that reaches one its side opened before, in
+/// this map or another, is left unpaired from there on, and its tables are checked against all
+/// their rows. Two maps paired before are not paired again.
+///
+/// # Errors
+///
+/// The error of a node or value that cannot be read or decoded.
+fn paired<K: Data + Ord, V: Data, S: Data>(
+    pairing: &mut Pairing<'_>,
+    (old, old_count): (Ptr, u64),
+    (new, new_count): (Ptr, u64),
+) -> Result<()> {
+    if old.hash == new.hash || !pairing.unpaired_maps(old.hash, new.hash) {
+        return Ok(());
+    }
+    let mut old_steps = vec![Bared::<K>::Sub(old, old_count)];
+    let mut new_steps = vec![Bared::<K>::Sub(new, new_count)];
+    loop {
+        let later = match (old_steps.last(), new_steps.last()) {
+            (None, _) | (_, None) => return Ok(()),
+            (Some(Bared::Sub(a, _)), Some(Bared::Sub(b, _))) if a.hash == b.hash => {
+                old_steps.pop();
+                new_steps.pop();
+                continue;
+            }
+            (Some(Bared::Sub(_, a)), Some(Bared::Sub(_, b))) => a < b,
+            (Some(Bared::Sub(..)), Some(Bared::Entry(..))) => false,
+            (Some(Bared::Entry(..)), Some(Bared::Sub(..))) => true,
+            (Some(Bared::Entry(a, _)), Some(Bared::Entry(b, _))) => {
+                match a.cmp(b) {
+                    Ordering::Less => {
+                        old_steps.pop();
+                    }
+                    Ordering::Greater => {
+                        new_steps.pop();
+                    }
+                    Ordering::Equal => {
+                        if let (Some(Bared::Entry(_, before)), Some(Bared::Entry(_, after))) =
+                            (old_steps.pop(), new_steps.pop())
+                        {
+                            pair_values::<V>(pairing, &before, &after)?;
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        let steps = if later {
+            &mut new_steps
+        } else {
+            &mut old_steps
+        };
+        let Some(Bared::Sub(ptr, _)) = steps.pop() else {
+            continue;
+        };
+        if !pairing.unopened(later, ptr.hash) {
+            return Ok(());
+        }
+        steps.extend(bare::<K, V, S>(pairing.store(), ptr)?.into_iter().rev());
+    }
+}
+
+/// Pairs the tables of `before` and `after`, the values of one key of a map in two versions, as
+/// [`Data::pair`] does.
+fn pair_values<V: Data>(pairing: &mut Pairing<'_>, before: &Bare, after: &Bare) -> Result<()> {
+    let store = pairing.store();
+    let (old, old_bytes, old_links) = before.object(store)?;
+    let (new, new_bytes, new_links) = after.object(store)?;
+    V::pair(
+        &mut Decoder::new(&old.body[old_bytes], &old.links[old_links], Some(store)),
+        &mut Decoder::new(&new.body[new_bytes], &new.links[new_links], Some(store)),
+        pairing,
+    )
 }
 
 #[cfg(test)]
