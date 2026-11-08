@@ -453,14 +453,16 @@ found are kept as they are. `visit`, which `verify_typed` and the check on recei
 reads index fields the same way and checks only those it can match.
 
 Those checks then hold each index they matched to the rows. The derived `decode` and `visit` note
-the table value they read when they run inside such a check, and once the check has passed every
-object it reaches, it reads each noted table with the hidden `TableData::decode_stored`, which
-decodes as `decode` does, the last field of a fingerprint winning, but rebuilds nothing and says
-which indexes were stored. The derive generates the entries each kind of index holds for a row,
-the same ones `reindex` writes, and `TableData::apply_slots` takes those of the rows that left out
-of each stored index and puts those of the rows that came in, in one `Map::apply` per index;
-`differing` then compares each with the stored map. Indexes the table does not store under a known
-fingerprint are left to the rebuild above, as described under [Indexes that agree with their
+the table value they read when they run inside such a check, and the check reads each noted table
+with the hidden `TableData::decode_stored`, which decodes as `decode` does, the last field of a
+fingerprint winning, but rebuilds nothing and says which indexes were stored. The derive generates
+the entries each kind of index holds for a row, the same ones `reindex` writes. Against the same
+table of the version before, `TableData::diff_slots` starts the diff of each stored index, takes
+the rows that changed, and checks that each index changed by exactly the entries of the rows that
+left and came; a table with nothing to check against has `TableData::apply_slots` put the entries
+of all its rows into empty indexes, in one `Map::apply` per index, and `differing` compares each
+with the stored map. Indexes the table does not store under a known fingerprint are left to the
+rebuild above, as described under [Indexes that agree with their
 rows](sync-receive.md#indexes-that-agree-with-their-rows).
 
 That is the whole format change. The tag of an index no longer depends on its name, and its field

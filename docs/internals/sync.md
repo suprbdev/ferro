@@ -622,14 +622,18 @@ Measured and left out:
   16 MiB collection `of` reads under more than about 17 keys, as described under [Recomputing
   summaries](sync-receive.md#recomputing-summaries). Those reads are free once per receive, so a
   bundle that is refused and sent again makes the receiver read what it holds again each time.
-- Checking that a table's indexes agree with its rows reads the nodes of the rows a pull changes on
-  both sides and the index nodes their entries touch, and most of what a clone carries a second
-  time, so on a table of 200,000 rows with three indexes a clone took about twice as long to
-  receive, an edit of 1,000 rows half as long again, and `verify_typed` two thirds as long again.
-  A table nested in a collection, rather than held in the root, is checked by building its
-  indexes from all its rows, in each version that changes the node holding it, and a table hung
-  on rows the receiver holds makes it read those rows once for free, then at a charge against the
-  allowance above, as described under [Indexes that agree with their
+- Checking that a table's indexes agree with its rows diffs the rows and each index that a version
+  changes against the version before, reading the nodes that differ on both sides, so a clone reads
+  most of what it carries a second time and an incremental pull reads the old versions of what it
+  changes. The checks run on up to eight threads, beside the walk when the first version's root
+  holds a table, so the receive takes several cores for a while: on a table of 200,000 rows with
+  three indexes a clone in ten commits took 15% longer than with no check, an edit of 1,000 rows
+  4 to 8% longer, and `verify_typed` 14% longer, for about twice the processor time. A table nested in
+  a collection, rather than held in the root, is checked by building its indexes from all its rows,
+  in each version that changes the node holding it, and a table hung on rows the receiver holds
+  makes it read those rows once for free, then at a charge against an allowance like the one above
+  but apart from it, as described under [Indexes that agree with their
   rows](sync-receive.md#indexes-that-agree-with-their-rows). Each table value is kept, a few
-  hundred bytes, until the check runs once the walk is done, and a check holds the indexes it
-  builds, up to the size of the table's indexes in memory for a commit that rewrites most of them.
+  hundred bytes, until its check runs, and up to four checks run at once, each holding the rows and
+  index entries that changed, or for a table it builds, up to the size of the table's indexes in
+  memory.

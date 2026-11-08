@@ -447,9 +447,12 @@ Tests are described next to what they test:
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).
 - Tables whose indexes a peer set apart from their rows, sent whole, drifting in a pull, behind
-  the head and nested in a map, in `sync.rs`, and written to a file for `verify_typed`, with every
-  kind of index, in `index_agreement.rs`: [Indexes that agree with their
-  rows](sync-receive.md#indexes-that-agree-with-their-rows).
+  the head, nested in a map, and beside a value the receiver cannot read, whose walk's error must
+  be the one returned, in `sync.rs`, written to a file for `verify_typed`, with every kind of
+  index, and pulled with an `each` index over a `Set`, in `index_agreement.rs`, and the diff the
+  check makes, against `Map::diff`, on maps small enough to diff on one thread and large enough to
+  split among threads, with runs that only one side holds, in `map.rs`: [Indexes that agree with
+  their rows](sync-receive.md#indexes-that-agree-with-their-rows).
 - The heap a clone of a large tree and of a long history holds on each side, `sync_memory.rs`:
   [Memory for each object](sync.md#memory-for-each-object).
 - Flipped bytes in a bundle: [Applying](sync.md#applying).
