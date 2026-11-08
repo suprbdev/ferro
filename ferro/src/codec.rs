@@ -56,6 +56,18 @@ use crate::store::Store;
 /// The length of a [`Hash`](type@Hash) in bytes.
 pub const HASH_BYTES: usize = 20;
 
+/// The most levels a value may nest within one object.
+///
+/// Each `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` a value holds opens a level for what it
+/// holds, and so does each [`Encoder::nested`] and [`Decoder::nested`] call of a hand-written impl.
+/// A type can hold itself only behind a pointer or in a collection, so the count bounds how deep
+/// decoding, checking, pairing and encoding any value recurse: a [`Decoder`] refuses a value that
+/// nests deeper with [`Error::Decode`], so that a forged object cannot run the thread out of
+/// stack, and an [`Encoder`] refuses to write one with [`Error::TooDeep`]. An encoding counts on
+/// through the nodes of the collections it writes: the values in the nodes of a map, set, list or
+/// table that it writes nest two levels below the value that holds the collection.
+pub const MAX_DEPTH: usize = 128;
+
 /// The hash of an [`Object`]: the first [`HASH_BYTES`] bytes of a BLAKE3 hash over its body
 /// length, link count, body and the hashes of its links.
 ///
@@ -309,6 +321,12 @@ impl Sink for HashSink {
 ///   `BTreeSet` do. A decoder refuses an object with more than 2^24 items that take no bytes and
 ///   no links, so that a forged length cannot keep it running, and the encoder refuses to write
 ///   one, with [`Error::TooManyZeroWidth`].
+/// - **Nesting is counted alike.** A value nests at most [`MAX_DEPTH`] levels within one object,
+///   counted at each `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet`. An impl for a pointer or a
+///   collection of its own, or for a type that reads a value of its own type without going through
+///   one of those, such as one that boxes what it decodes itself, writes and reads it through
+///   [`Encoder::nested`] and [`Decoder::nested`], so that a forged object cannot make it recurse
+///   until the thread runs out of stack.
 /// - **The encoding is canonical.** It depends only on the value, never on how the value was
 ///   built, its capacity or what it shared. Root hashes, `==` on collections, the skip of a
 ///   commit that changes nothing, [`Map::diff`](crate::Map::diff) and merges all go by
@@ -325,6 +343,25 @@ impl Sink for HashSink {
 /// - [`same_encoding`](Data::same_encoding), when overridden, gives the answer comparing the two
 ///   encodings would, and [`describe`](Data::describe), when overridden, changes whenever the
 ///   encoding does, and whenever the value [`missing`](Data::missing) returns does.
+///
+/// # Nesting depth
+///
+/// A value nests at most [`MAX_DEPTH`] levels within one object, one for each `Box`, `Arc`, `Vec`,
+/// `BTreeMap` and `BTreeSet` on the way down to its deepest part: a chain of 128
+/// `Option<Box<Node>>`, or a tree of 127 levels of `Vec<Node>` children. A decoder refuses a value
+/// that nests deeper with [`Error::Decode`], whether it comes from the file or from a sync bundle,
+/// which [`Db::receive`](crate::Db::receive) then refuses whole, so that no input can make a
+/// decode, a check or a pairing recurse until the thread runs out of stack, which would abort the
+/// process. Writing such a value fails with [`Error::TooDeep`] instead, so that no commit stores
+/// what cannot be read back. A commit counts on through the collections it writes as it encodes:
+/// the values in the nodes of a map, set, list or table whose nodes the commit writes nest two
+/// levels below the value that holds it. A collection read from the file encodes as its root link
+/// alone, and its nodes count apart, as they decode apart.
+///
+/// At the limit, decoding fits within the 2 MiB stack that Rust gives the threads it spawns, in a
+/// debug build, with room to spare for types of ordinary size, such as structs of a few dozen
+/// fields. A type that stores large values inline, such as big arrays, uses more stack for each
+/// level.
 ///
 /// # Examples
 ///
@@ -373,15 +410,17 @@ pub trait Data: Clone + Send + Sync + 'static {
     ///
     /// Returns the errors of what it writes: of a nested value that cannot encode, such as a
     /// collection whose nodes cannot be read, of [`Encoder::item`], [`Error::TooManyZeroWidth`]
-    /// for more zero-width items in one object than a decoder reads back, and of the sink, such
-    /// as [`Error::StalePointer`] for a [`Ptr`] into an earlier generation of the file.
+    /// for more zero-width items in one object than a decoder reads back, [`Error::TooDeep`] for
+    /// a value that nests deeper than [`MAX_DEPTH`] levels, and of the sink, such as
+    /// [`Error::StalePointer`] for a [`Ptr`] into an earlier generation of the file.
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()>;
     /// Reads a value that [`encode`](Data::encode) wrote, consuming exactly what it wrote.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Decode`] if the bytes do not form a value of the type, and
-    /// [`Error::MissingField`] for a stored struct that lacks a field with no default.
+    /// Returns [`Error::Decode`] if the bytes do not form a value of the type or nest deeper than
+    /// [`MAX_DEPTH`] levels, and [`Error::MissingField`] for a stored struct that lacks a field
+    /// with no default.
     fn decode(r: &mut Decoder<'_>) -> Result<Self>;
     /// Checks a value's encoding and moves past it, without keeping the value.
     ///
@@ -668,6 +707,17 @@ pub const fn field_tag(name: &str) -> u16 {
     ((hash >> 16) ^ (hash & 0xffff)) as u16
 }
 
+/// Decodes a value of `T` from `r` into `slot`, as the derive reads each stored field.
+///
+/// # Errors
+///
+/// As for [`Data::decode`].
+#[doc(hidden)]
+pub fn decode_into<T: Data>(slot: &mut Option<T>, r: &mut Decoder<'_>) -> Result<()> {
+    *slot = Some(T::decode(r)?);
+    Ok(())
+}
+
 /// The value of the field `name`: `value` if the stored data held the field, and otherwise the
 /// type's [`missing`](Data::missing) value.
 ///
@@ -693,6 +743,7 @@ pub struct Encoder<'a> {
     sink: &'a mut dyn Sink,
     unsettled: bool,
     empty_items: u64,
+    depth: usize,
 }
 
 /// Appends `value` to `buf` as an LEB128 varint, as [`Encoder::varint`] writes it.
@@ -724,6 +775,7 @@ impl<'a> Encoder<'a> {
             sink,
             unsettled: false,
             empty_items: 0,
+            depth: 0,
         }
     }
 
@@ -735,6 +787,7 @@ impl<'a> Encoder<'a> {
             sink,
             unsettled: false,
             empty_items: 0,
+            depth: 0,
         }
     }
 
@@ -748,6 +801,7 @@ impl<'a> Encoder<'a> {
             sink,
             unsettled: false,
             empty_items: 0,
+            depth: 0,
         }
     }
 
@@ -858,6 +912,47 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
+    /// Writes with `write` one level deeper, as [`Decoder::nested`] reads it back.
+    ///
+    /// The impls of `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` each write what they hold
+    /// through it, so a hand-written impl needs it only where it holds a value of its own type
+    /// without going through one of them, as [`MAX_DEPTH`] describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `write`, and [`Error::TooDeep`] if the value would nest deeper than
+    /// [`MAX_DEPTH`] levels.
+    #[inline(always)]
+    pub fn nested<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.deeper()?;
+        let written = write(self);
+        self.depth -= 1;
+        written
+    }
+
+    /// Opens one more level of nesting, or returns [`Error::TooDeep`] if [`MAX_DEPTH`] are open.
+    #[inline]
+    fn deeper(&mut self) -> Result<()> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// How many levels of nesting are open where the encoder is writing, counting those of the
+    /// values that hold this object in the same encoding.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// This encoder, writing `depth` levels deep, for the object of a collection that a value
+    /// holds at that depth.
+    pub(crate) fn at_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
     /// Writes with `write` into this object, but counts the zero-width items it writes apart from
     /// the object's and returns them, for a value that may yet move into an object of its own.
     /// [`add_zero_width`](Encoder::add_zero_width) adds them to the object's count if it stays.
@@ -897,11 +992,14 @@ impl<'a> Encoder<'a> {
     /// Encodes a separate object with `f`, hands it to the sink and returns the link to it,
     /// which the caller records with [`link`](Encoder::link).
     ///
+    /// The child starts as deep as this encoder is, so that the levels of a value and of the
+    /// objects it writes as it encodes count together against [`MAX_DEPTH`].
+    ///
     /// # Errors
     ///
     /// Returns the errors of `f` and of the sink.
     pub fn child(&mut self, f: impl FnOnce(&mut Encoder<'_>) -> Result<()>) -> Result<Ptr> {
-        let mut encoder = Encoder::new(&mut *self.sink);
+        let mut encoder = Encoder::new(&mut *self.sink).at_depth(self.depth);
         f(&mut encoder)?;
         self.unsettled |= encoder.unsettled;
         encoder.finish()
@@ -968,6 +1066,13 @@ impl<'a> Encoder<'a> {
 }
 
 const MAX_EMPTY_ITEMS: u64 = 1 << 24;
+
+/// The error of a decoder asked to read deeper than [`MAX_DEPTH`] levels.
+#[cold]
+fn too_deep() -> Error {
+    Error::Decode(format!("a value nests deeper than {MAX_DEPTH} levels"))
+}
+
 /// The most entries each generation of a [`Recalled`] keeps.
 const RECALLED: usize = 1 << 14;
 /// The bytes an [`Arc`] allocation spends on its counts, for estimating what a value holds on the
@@ -1392,6 +1497,10 @@ pub(crate) fn holds_tables<D: Data>() -> bool {
 /// not share, as a diff does, and pairs the values of each key both hold. Each node is opened
 /// once on each side: a map that reaches one already opened is left unpaired from there, so a
 /// pairing reads each node of the two versions once at most, however the maps share them.
+///
+/// A map is paired after the value that holds it, one map at a time, so that maps nested in the
+/// values of maps, however deep, do not deepen the stack: only the levels of one value at a time
+/// do, as [`MAX_DEPTH`] bounds them.
 #[doc(hidden)]
 pub struct Pairing<'s> {
     store: &'s Store,
@@ -1399,7 +1508,16 @@ pub struct Pairing<'s> {
     same: Vec<FoundTable>,
     maps: HashSet<(Hash, Hash)>,
     opened: [HashSet<Hash>; 2],
+    waiting: Vec<Waiting>,
 }
+
+/// What pairs the tables of two versions of a map, given their roots with the entry counts their
+/// links record.
+pub(crate) type PairMaps = for<'s> fn(&mut Pairing<'s>, (Ptr, u64), (Ptr, u64)) -> Result<()>;
+
+/// The pairing of two versions of a map that a [`Pairing`] has queued: what pairs them, and the
+/// root of each with the entry count its link records.
+type Waiting = (PairMaps, (Ptr, u64), (Ptr, u64));
 
 /// The tables a [`Pairing`] paired: each table of the later version with the one at the same
 /// place in the earlier version, when the two differ, and each table that is the same at its
@@ -1421,6 +1539,7 @@ impl<'s> Pairing<'s> {
             same: Vec::new(),
             maps: HashSet::new(),
             opened: [HashSet::new(), HashSet::new()],
+            waiting: Vec::new(),
         }
     }
 
@@ -1517,6 +1636,25 @@ impl<'s> Pairing<'s> {
     pub(crate) fn unopened(&mut self, later: bool, hash: Hash) -> bool {
         self.opened[usize::from(later)].insert(hash)
     }
+
+    /// Queues the pairing of two versions of a map, with roots `old` and `new`, by `pair`, for
+    /// [`settle`](Pairing::settle) to make once the value that holds them is paired.
+    pub(crate) fn defer(&mut self, pair: PairMaps, old: (Ptr, u64), new: (Ptr, u64)) {
+        self.waiting.push((pair, old, new));
+    }
+
+    /// Pairs the maps queued by [`defer`](Pairing::defer), and those their values queue in turn,
+    /// until none is left.
+    ///
+    /// # Errors
+    ///
+    /// The first error of a map's pairing.
+    pub(crate) fn settle(&mut self) -> Result<()> {
+        while let Some((pair, old, new)) = self.waiting.pop() {
+            pair(self, old, new)?;
+        }
+        Ok(())
+    }
 }
 
 /// Pairs the tables of the first `olds` items of a sequence of `T` that `old` holds and the first
@@ -1592,7 +1730,8 @@ pub(crate) fn pair_roots<D: Data>(pairing: &mut Pairing<'_>, old: Ptr, new: Ptr)
         &mut Decoder::new(&old.body, &old.links, Some(store)),
         &mut Decoder::new(&new.body, &new.links, Some(store)),
         pairing,
-    )
+    )?;
+    pairing.settle()
 }
 
 fn check_value<D: Data>(_: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
@@ -1840,6 +1979,7 @@ pub struct Decoder<'a> {
     tables: Option<&'a RefCell<Vec<FoundTable>>>,
     recalled: Option<&'a Recalled>,
     rebuilds: bool,
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -1862,6 +2002,7 @@ impl<'a> Decoder<'a> {
             tables: None,
             recalled: None,
             rebuilds: true,
+            depth: 0,
         }
     }
 
@@ -1925,6 +2066,7 @@ impl<'a> Decoder<'a> {
         let (body, links) = self.read_since(checkpoint);
         let mut part = Decoder::new(body, links, self.store);
         part.rebuilds = self.rebuilds;
+        part.depth = self.depth;
         part
     }
 
@@ -2135,6 +2277,34 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
+    /// Reads with `read` one level deeper, as [`Encoder::nested`] wrote it.
+    ///
+    /// The impls of `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` each read what they hold
+    /// through it, so a hand-written impl needs it only where it holds a value of its own type
+    /// without going through one of them, as [`MAX_DEPTH`] describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `read`, and [`Error::Decode`] if the value nests deeper than
+    /// [`MAX_DEPTH`] levels.
+    #[inline(always)]
+    pub fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.depth = self.deeper()?;
+        let value = read(self);
+        self.depth -= 1;
+        value
+    }
+
+    /// The depth one level below where the decoder is reading, or [`Error::Decode`] if that is
+    /// past [`MAX_DEPTH`].
+    #[inline]
+    fn deeper(&self) -> Result<usize> {
+        if self.depth >= MAX_DEPTH {
+            return Err(too_deep());
+        }
+        Ok(self.depth + 1)
+    }
+
     /// The next link, in the order [`Encoder::link`] added them.
     ///
     /// # Errors
@@ -2230,6 +2400,7 @@ impl<'a> Decoder<'a> {
                 tables: self.tables,
                 recalled: self.recalled,
                 rebuilds: self.rebuilds,
+                depth: self.depth,
             };
             self.cursor = end;
             f(tag, &mut sub)?;
@@ -2265,6 +2436,7 @@ impl<'a> Decoder<'a> {
                 .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
             let mut field = Decoder::new(body, &self.links[self.cursor..end], self.store);
             field.rebuilds = self.rebuilds;
+            field.depth = self.depth;
             self.cursor = end;
             list.push((tag, field));
         }
@@ -2615,23 +2787,29 @@ impl<T: Data> Data for Option<T> {
 
 impl<T: Data> Data for Vec<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        w.varint(self.len() as u64);
-        T::encode_slice(self, w)
+        w.nested(|w| {
+            w.varint(self.len() as u64);
+            T::encode_slice(self, w)
+        })
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let len = r.varint()? as usize;
-        let items = T::decode_vec(r, len)?;
-        r.allocated(1, items.capacity() * size_of::<T>());
-        Ok(items)
+        r.nested(|r| {
+            let len = r.varint()? as usize;
+            let items = T::decode_vec(r, len)?;
+            r.allocated(1, items.capacity() * size_of::<T>());
+            Ok(items)
+        })
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        let len = r.varint()?;
-        for _ in 0..len {
-            r.item(T::visit)?;
-        }
-        Ok(())
+        r.nested(|r| {
+            let len = r.varint()?;
+            for _ in 0..len {
+                r.item(T::visit)?;
+            }
+            Ok(())
+        })
     }
 
     fn missing() -> Option<Self> {
@@ -2652,8 +2830,12 @@ impl<T: Data> Data for Vec<T> {
     }
 
     fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
-        let (olds, news) = (old.varint()?, new.varint()?);
-        paired_items::<T>(old, new, pairing, olds, news)
+        old.nested(|old| {
+            new.nested(|new| {
+                let (olds, news) = (old.varint()?, new.varint()?);
+                paired_items::<T>(old, new, pairing, olds, news)
+            })
+        })
     }
 }
 
@@ -2790,17 +2972,17 @@ impl<T: Data, const N: usize> Data for [T; N] {
 
 impl<T: Data> Data for Box<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        (**self).encode(w)
+        w.nested(|w| (**self).encode(w))
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let value = Box::new(T::decode(r)?);
+        let value = Box::new(r.nested(T::decode)?);
         r.allocated(1, size_of::<T>());
         Ok(value)
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        T::visit(r)
+        r.nested(T::visit)
     }
 
     fn missing() -> Option<Self> {
@@ -2820,23 +3002,23 @@ impl<T: Data> Data for Box<T> {
     }
 
     fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
-        T::pair(old, new, pairing)
+        old.nested(|old| new.nested(|new| T::pair(old, new, pairing)))
     }
 }
 
 impl<T: Data> Data for Arc<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        (**self).encode(w)
+        w.nested(|w| (**self).encode(w))
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let value = Arc::new(T::decode(r)?);
+        let value = Arc::new(r.nested(T::decode)?);
         r.allocated(1, ARC_HEADER + size_of::<T>());
         Ok(value)
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        T::visit(r)
+        r.nested(T::visit)
     }
 
     fn missing() -> Option<Self> {
@@ -2856,42 +3038,48 @@ impl<T: Data> Data for Arc<T> {
     }
 
     fn pair(old: &mut Decoder<'_>, new: &mut Decoder<'_>, pairing: &mut Pairing<'_>) -> Result<()> {
-        T::pair(old, new, pairing)
+        old.nested(|old| new.nested(|new| T::pair(old, new, pairing)))
     }
 }
 
 impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        w.varint(self.len() as u64);
-        for (key, value) in self {
-            w.item(|w| {
-                key.encode(w)?;
-                value.encode(w)
-            })?;
-        }
-        Ok(())
+        w.nested(|w| {
+            w.varint(self.len() as u64);
+            for (key, value) in self {
+                w.item(|w| {
+                    key.encode(w)?;
+                    value.encode(w)
+                })?;
+            }
+            Ok(())
+        })
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let len = r.varint()?;
-        let mut out = BTreeMap::new();
-        for _ in 0..len {
-            let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
-            out.insert(key, value);
-        }
-        r.tree::<K, V>(out.len());
-        Ok(out)
+        r.nested(|r| {
+            let len = r.varint()?;
+            let mut out = BTreeMap::new();
+            for _ in 0..len {
+                let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
+                out.insert(key, value);
+            }
+            r.tree::<K, V>(out.len());
+            Ok(out)
+        })
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        let len = r.varint()?;
-        for _ in 0..len {
-            r.item(|r| {
-                K::visit(r)?;
-                V::visit(r)
-            })?;
-        }
-        Ok(())
+        r.nested(|r| {
+            let len = r.varint()?;
+            for _ in 0..len {
+                r.item(|r| {
+                    K::visit(r)?;
+                    V::visit(r)
+                })?;
+            }
+            Ok(())
+        })
     }
 
     fn missing() -> Option<Self> {
@@ -2921,42 +3109,52 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
             Self::visit(old)?;
             return Self::visit(new);
         }
-        let mut olds = valued::<K, V>(old)?.into_iter().peekable();
-        for (key, mut new) in valued::<K, V>(new)? {
-            while olds.next_if(|(other, _)| *other < key).is_some() {}
-            if let Some((_, mut old)) = olds.next_if(|(other, _)| *other == key) {
-                V::pair(&mut old, &mut new, pairing)?;
-            }
-        }
-        Ok(())
+        old.nested(|old| {
+            new.nested(|new| {
+                let mut olds = valued::<K, V>(old)?.into_iter().peekable();
+                for (key, mut new) in valued::<K, V>(new)? {
+                    while olds.next_if(|(other, _)| *other < key).is_some() {}
+                    if let Some((_, mut old)) = olds.next_if(|(other, _)| *other == key) {
+                        V::pair(&mut old, &mut new, pairing)?;
+                    }
+                }
+                Ok(())
+            })
+        })
     }
 }
 
 impl<T: Data + Ord> Data for BTreeSet<T> {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
-        w.varint(self.len() as u64);
-        for item in self {
-            w.item(|w| item.encode(w))?;
-        }
-        Ok(())
+        w.nested(|w| {
+            w.varint(self.len() as u64);
+            for item in self {
+                w.item(|w| item.encode(w))?;
+            }
+            Ok(())
+        })
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let len = r.varint()?;
-        let mut out = BTreeSet::new();
-        for _ in 0..len {
-            out.insert(r.item(T::decode)?);
-        }
-        r.tree::<T, ()>(out.len());
-        Ok(out)
+        r.nested(|r| {
+            let len = r.varint()?;
+            let mut out = BTreeSet::new();
+            for _ in 0..len {
+                out.insert(r.item(T::decode)?);
+            }
+            r.tree::<T, ()>(out.len());
+            Ok(out)
+        })
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        let len = r.varint()?;
-        for _ in 0..len {
-            r.item(T::visit)?;
-        }
-        Ok(())
+        r.nested(|r| {
+            let len = r.varint()?;
+            for _ in 0..len {
+                r.item(T::visit)?;
+            }
+            Ok(())
+        })
     }
 
     fn missing() -> Option<Self> {

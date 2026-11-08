@@ -73,6 +73,110 @@ would refuse, at commit, any map with enough keys that hash to one level between
 Counting per object refuses only values that fit alone but not together in one node, more than 2^24
 items that take no room between them, which no realistic value holds.
 
+### Nesting depth
+
+Decoding, visiting, encoding and pairing a value recurse once for each level it nests, so a value
+nested deeply enough runs its thread out of stack, and Rust aborts the process on a stack overflow
+rather than unwinding. A chain of 5,200 `Option<Box<Node>>` in a bundle of about 25 KB aborted the
+receiver on an 8 MiB stack, and `Vec` and `BTreeMap` chains did so below 4,000 levels (#118). So a
+value nests at most `MAX_DEPTH`, 128, levels within one object.
+
+A type can hold itself only behind a pointer or in a collection, since a type that holds itself
+inline has no size, and of the types ferro implements `Data` for, that means a `Box`, an `Arc`, a
+`Vec`, a `BTreeMap` or a `BTreeSet`; `Map`, `Set`, `List` and `Table` hold their entries in nodes of
+their own, which decode apart. So those five impls each read and write what they hold one level
+deeper, through `Decoder::nested` and `Encoder::nested`, and every recursion over a value, whatever
+mix of structs, enums, `Option`s, tuples and arrays lies between, passes one of them at each turn. A
+`Vec` or a map counts once, not once for each item, so a long `Vec<u64>` costs one check, and a
+derived struct, a transparent one and an `Option` cost none. A decoder past the limit fails with
+`Error::Decode`, "a value nests deeper than 128 levels", which a receive turns into `Error::Bundle`
+and `verify_typed` reports, and an encoder fails with `Error::TooDeep`, so a commit refuses what a
+read would refuse. A hand-written impl for a pointer or a collection of its own, or one that boxes a
+value of its own type that it decodes itself, has to call `nested` too, which the `Data` docs ask
+of it.
+
+Counting at each struct and each item, in `Decoder::fields` and `Decoder::item`, was tried first,
+and catches recursion through derived types without asking anything of a hand-written collection.
+It put a compare and two stores around every item of every sequence and a check in every struct,
+and together with reading each field's header in a function of its own, to shrink the debug frame of
+`fields`, it cost a release build 20 to 30% on decoding a struct of eight fields that holds three
+collections, 70 to 90% on visiting it, and about a nanosecond on each `u64` of a `Vec`. Counting at
+the five indirections, with `nested` always inlined, costs nothing measurable there, as the
+benchmarks at the end of this section show.
+
+Collections link their nodes, and a node decodes in a decoder of its own, starting from zero, as
+the values a node holds are read only when asked for. The paths that cross from a value into the
+nodes of a collection it holds within one call each keep the stack bounded:
+
+- Encoding: a map whose nodes a commit writes encodes them with encoders that start two levels
+  below the value holding the map, since writing a node takes about the stack of two levels of a
+  value, and `Encoder::child` starts as deep as its parent, so the levels of a value, of the maps it
+  holds and of the values in their nodes add up, and a commit that writes 64 maps nested in each
+  other's values refuses the next. Each map or table read from the file encodes as its root link
+  alone and adds nothing, so a commit can stack maps deeper one commit at a time, which reads and
+  pairs as below.
+- Pairing: `Data::pair` of a map queues the pair of roots on the `Pairing` and returns, and
+  `pair_roots` pairs the queued maps one at a time once the root value is paired, each with
+  decoders of its own. Maps nested in the values of maps pair in a loop rather than a recursion,
+  however deep, and the stack holds the levels of one value at a time.
+- Index rebuilds: a table that decodes without one of the indexes its type declares rebuilds it
+  from its rows, which decodes every row, and a row that held a stale table rebuilt that one within
+  the same decode, so a chain of tables nested in rows took 14 KB of stack a level in a debug build
+  and recursed through every level. A table that decodes while its thread already reads rows for a
+  rebuild now reads its own rows from the file without caching them and without rebuilding the
+  tables they hold, which its index entries do not need, so each read rebuilds one level and a
+  level below rebuilds when it is read. Opening a file whose root holds 3,000 such tables takes 50
+  KB of stack, as one of 30 does.
+- The typed checks of a receive and of `verify_typed` follow links through a queue, each object
+  checked by a decoder of its own.
+
+`Data::tables` and `Data::describe` recurse over types rather than values, and stop at a type
+already open, so no input reaches them.
+
+128 was measured against the stack each level takes, by filling a thread's stack with a pattern,
+running the operation, and finding the deepest byte it changed, for chains of 300 and 900 levels.
+Each level of the shapes below took, in bytes:
+
+| Shape | Levels | Debug decode | Debug visit | Debug encode | Release decode | Release encode |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Option<Box<Node>>` field | 1 | 3,360 | 2,240 | 1,248 | 1,392 | 176 |
+| `Vec<Node>` field | 1 | 4,560 | 2,448 | 1,712 | 2,000 | 208 |
+| `BTreeMap<u8, Node>` field | 1 | 5,840 | 2,576 | 1,904 | 2,192 | 240 |
+| enum variant `More(Box<Node>)` | 1 | 3,232 | 2,368 | 1,104 | 1,104 | 208 |
+| `Option<Box<(u8, Node)>>` field | 1 | 4,272 | 2,480 | 1,504 | 1,376 | 240 |
+| struct of 34 fields | 1 | 6,512 | 2,784 | 4,352 | 3,232 | 208 |
+| enum variant of 17 fields | 1 | 4,176 | 2,656 | 2,912 | 2,032 | 224 |
+| `Map<u8, Node>` field, nodes written | 2 | | | 12,672 | | 4,688 |
+| `Table<Row>` in a row, nodes written | 2 | | | 13,280 | | 4,656 |
+
+The derive's debug frames were larger before: a decode kept a slot for each field's `Result` in the
+closure that reads the fields, and the temporaries of building the value in the frame that recurses,
+so the struct of 34 fields took 16,928 bytes a level and `Option<Box<Node>>` 4,768. A field now
+decodes through `codec::decode_into`, whose frame holds one field's temporaries and only while that
+field decodes, the value is built in a closure called once the fields are read, and a visit checks
+its required fields the same way. Release builds inline all of these, and changed little.
+
+At 128 levels, each of these shapes, with a table at the bottom, committed, opened, received twice
+with the bundle's pairing, and passed `verify_typed` on a debug build using at most 879 KB of stack,
+for tables nested in rows that one commit writes, 863 KB for the struct of 34 fields, and under 780
+KB for the rest; a release build used at most 423 KB. That leaves more than half of the 2 MiB that
+Rust gives a spawned thread, so the pool threads of the checks, reclamation's threads, the follower,
+the watch threads and the thread that writes asynchronous commits, which all run with that default,
+need no larger stack of their own, and neither does a caller's thread a few hundred KB deep. A type
+that stores larger values inline, such as a struct of hundreds of fields or one holding big arrays,
+takes more for each level. A depth of 256 would have needed up to 1.8 MB in a debug build, too close
+to 2 MiB, and 1,000 levels, as first suggested, would need several MiB even in release builds.
+
+Over seven alternating runs of a release benchmark against the build before the limit, on a machine
+that other builds shared, the fastest run of each was within 4% of the old: 437 against 423 ns to
+hash a struct of eight fields that holds three collections, 433 against 428 to decode it and 170
+against 167 to visit it, 3.5 ns an item to decode a `Vec<u64>` either way, 21.0 against 20.6 ns an
+entry of a `BTreeMap<u32, u32>`, 36 µs to commit one entry and 16 µs to commit one table row either
+way, 55.1 against 54.2 µs for a cold get and 230 against 228 ns for a warm one, 1.20 against 1.18 s
+to receive a clone of 220,000 entries and 105,000 rows and 1.39 against 1.36 s for its
+`verify_typed`. The medians of those last two were 6.5% and 5.5% slower, 1.29 against 1.21 s and
+1.52 against 1.44 s, within the spread of each build's runs.
+
 ## Records
 
 A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an optional

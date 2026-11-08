@@ -138,6 +138,7 @@
 
 use std::any::{TypeId, type_name};
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
@@ -151,7 +152,7 @@ use crate::codec::{
 use crate::error::{Error, Result};
 use crate::map::{
     Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ,
-    same_value, unwound, walked,
+    same_value, unwound, walked, walked_until,
 };
 use crate::pool::{Latch, Pool};
 use crate::prefix::Prefix;
@@ -3820,7 +3821,33 @@ pub fn encode_index<M: Data>(fingerprint: u64, index: &M, w: &mut Encoder<'_>) -
     index.encode(w)
 }
 
+thread_local! {
+    static REBUILDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as rebuilding the indexes of a table until it drops.
+struct Rebuilding;
+
+impl Rebuilding {
+    fn start() -> Rebuilding {
+        REBUILDING.set(true);
+        Rebuilding
+    }
+}
+
+impl Drop for Rebuilding {
+    fn drop(&mut self) {
+        REBUILDING.set(false);
+    }
+}
+
 /// Every row in key order, for rebuilding a stale index on decode.
+///
+/// The rows are read through the cache, where they stay. A table that decodes while its thread
+/// already reads rows for a rebuild, because a row holds it, reads its own rows from the file
+/// without caching them and without rebuilding the indexes of the tables they hold, which its
+/// index entries do not need, so that tables nested in rows, however deep, rebuild one level at a
+/// time rather than all within one decode.
 ///
 /// # Errors
 ///
@@ -3828,6 +3855,22 @@ pub fn encode_index<M: Data>(fingerprint: u64, index: &M, w: &mut Encoder<'_>) -
 /// open instead, and [`Error::Decode`] for a row stored under a key other than its own, which an
 /// index built from it would file under the wrong key.
 pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
+    if REBUILDING.get() {
+        let store = rows.store().ok_or(Error::Detached)?;
+        let mut out = Vec::with_capacity(rows.len().min(1 << 16));
+        walked_until(
+            || false,
+            store,
+            rows,
+            |key, row| {
+                owned::<T>(&key, &row)?;
+                out.push(Val::from(Arc::new(row)));
+                Ok(())
+            },
+        )?;
+        return Ok(out);
+    }
+    let _rebuilding = Rebuilding::start();
     rows.try_keyed_values()?
         .into_iter()
         .map(|(key, row)| {

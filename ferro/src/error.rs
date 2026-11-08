@@ -161,6 +161,15 @@ pub enum Error {
     /// keys share a node. [`Decoder::item`](crate::codec::Decoder::item) describes the count.
     #[error("an object would hold more than 2^24 zero-width items")]
     TooManyZeroWidth,
+    /// A value being written nests deeper than [`MAX_DEPTH`](crate::codec::MAX_DEPTH) levels, such
+    /// as a chain of `Option<Box<Node>>` longer than that.
+    ///
+    /// A decoder refuses a value that nests deeper, so that a forged object cannot run a thread
+    /// out of stack, and encoding refuses to write one, so that nothing is stored that cannot be
+    /// read back. A commit counts the levels on through the nodes of the collections it writes,
+    /// so a value in a map that a commit writes inside another value nests below that value.
+    #[error("a value would nest deeper than {} levels", crate::codec::MAX_DEPTH)]
+    TooDeep,
     /// With [`Options::coalesce`](crate::Options::coalesce), the group this closure joined could
     /// not be written.
     ///

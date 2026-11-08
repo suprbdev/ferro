@@ -826,6 +826,27 @@ the first check of each sent object, which that allowance does not charge, would
 it as well. A count of its own keeps the bound in the items themselves and refuses with a message
 that names them.
 
+### Nesting depth in a bundle
+
+Every check of a received object decodes or visits its values, and pairing a version with its parent
+reads both side by side, each recursing once for each level a value nests. A bundle of about 25 KB
+holding a chain of 5,200 `Option<Box<Node>>` aborted the receiving process on an 8 MiB stack, and
+chains of `Vec` and `BTreeMap` did so below 4,000 levels; a process abort cannot be caught, so any
+peer could crash a receiver (#118). A decoder now refuses a value that nests deeper than
+`MAX_DEPTH`, 128 levels, within one object, as described under [Nesting
+depth](storage.md#nesting-depth), and the receive refuses the bundle with `Error::Bundle`, naming
+the type and "a value nests deeper than 128 levels", before anything lands. A sender's commit
+refuses the same values with `Error::TooDeep`, so an honest peer never sends one.
+
+The checks follow links through a queue, so a tree of objects deeper than that, such as maps nested
+in the values of maps across many commits, costs no stack for its depth, and neither does its
+pairing, which queues each nested map. A chain of 3,000 maps, each in a value of the one above, and
+of 3,000 tables, each in a row of the one above, built one level a commit with their bottoms changed
+in the last, is received and passes `verify_typed` on a 2 MiB stack; before, the pairing of that
+last commit recursed through every level and aborted. Forged bundles of 20,000 levels of each shape
+the tests cover, `Option<Box<Node>>`, `Vec`, `BTreeMap`, an enum, a tuple and a struct of 34 fields,
+are refused on a 2 MiB stack, and the same shapes as deep as the limit allows land and pair there.
+
 ### Indexes that agree with their rows
 
 A table stores its rows and each of its indexes as maps of their own, and the walk checks each map
@@ -918,9 +939,12 @@ so it is trusted when the parent is held and checked once, with the parent's, wh
 carried. Each node is opened once on each side in the pairing of two versions, so a map that reaches
 a node its side opened already is left unpaired from there, and the pairing reads each node of the
 two trees once at most, however a forged tree shares them; two maps paired once are not paired
-again. A parent the receiver holds is trusted, its tables with it; a parent the bundle carries is
-checked in the same receive, and a table of a carried parent that the walk did not note, since it
-lies in data the receiver holds as its own type, is trusted too.
+again. A map is paired after the value that holds it: `Data::pair` of a map queues the two roots,
+and the pairing takes the queue one map at a time once the root is paired, so maps nested in the
+values of maps pair in a loop, however deep, as described under [Nesting
+depth](storage.md#nesting-depth). A parent the receiver holds is trusted, its tables with it; a
+parent the bundle carries is checked in the same receive, and a table of a carried parent that the
+walk did not note, since it lies in data the receiver holds as its own type, is trusted too.
 
 Before #116 only the tables of each root were paired, the nth table of a type with the nth of that
 type in the parent's root, so an `Option` of a table placed before another shifted the pairs as it

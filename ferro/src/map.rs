@@ -93,8 +93,8 @@ use std::sync::{Arc, OnceLock};
 use std::vec;
 
 use crate::codec::{
-    Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, Moved, Moves, Object,
-    Pairing, Ptr, Shape, Sink, Staged, Tabled, hash_parts, holds_tables, try_hash_of,
+    Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, MAX_DEPTH, Moved, Moves,
+    Object, Pairing, Ptr, Shape, Sink, Staged, Tabled, hash_parts, holds_tables, try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -107,6 +107,10 @@ use xxhash_rust::xxh3::xxh3_64;
 /// The most encoded bytes a value can take and still be stored inside its node; a larger value is
 /// written as an object of its own, which its node links to.
 pub(crate) const SPILL_BYTES: usize = 512;
+/// The levels of nesting, as [`MAX_DEPTH`] counts them, that a map opens when an encoding writes
+/// its nodes, below the value that holds it: writing a node takes about the stack of two levels of
+/// a value.
+const NODE_LEVELS: usize = 2;
 const LEVEL_BITS: u32 = 3;
 const LEVELS: u8 = (u64::BITS / LEVEL_BITS) as u8 + 1;
 const PIN_DEPTH: usize = 3;
@@ -2249,10 +2253,12 @@ impl Sink for Probe {
 fn flush<K: Data, V: Data, S: Summary<K, V>>(
     link: &Link<K, V, S>,
     sink: &mut dyn Sink,
-    depth: usize,
-    dense: bool,
+    nesting: usize,
 ) -> Result<Link<K, V, S>> {
-    flush_with(link, sink, depth, dense, true)
+    if matches!(link, Link::Mem(..)) && nesting > MAX_DEPTH {
+        return Err(Error::TooDeep);
+    }
+    flush_with(link, sink, 0, false, true, nesting)
 }
 
 fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
@@ -2261,6 +2267,7 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
     depth: usize,
     dense: bool,
     mut fan: bool,
+    nesting: usize,
 ) -> Result<Link<K, V, S>> {
     let Link::Mem(node, _) = link else {
         return Ok(link.clone());
@@ -2270,6 +2277,7 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
             id: sink.store_id(),
             store: sink.store(),
             pack: sink.packs(),
+            nesting,
         };
         if let Ok(mut staged) = stage_tree(node, &stager) {
             emit_staged(&mut staged, &mut Arena::default(), sink)?;
@@ -2285,7 +2293,7 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
         }
         fan = false;
     }
-    let flushed = prepare(node, sink, depth, fan)?;
+    let flushed = prepare(node, sink, depth, fan, nesting)?;
     emit(flushed, sink, depth, dense)
 }
 
@@ -2374,6 +2382,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     sink: &mut dyn Sink,
     depth: usize,
     fan: bool,
+    nesting: usize,
 ) -> Result<Flushed<K, V, S>> {
     let store = sink.store();
     let caching = store.is_some();
@@ -2387,7 +2396,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     let bytes = reused.as_ref().map_or(64 + 24 * width, |prefix| {
         prefix.bytes.len() + 24 * (width + 1)
     });
-    let mut encoder = Encoder::with_capacity(&mut *sink, bytes, width + 1);
+    let mut encoder = Encoder::with_capacity(&mut *sink, bytes, width + 1).at_depth(nesting);
     let (spilled, checked) = match &reused {
         Some(prefix) => {
             encoder.raw(&prefix.bytes);
@@ -2407,7 +2416,14 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     let mut total = None;
     for position in 0..=width {
         let child = node.child(position);
-        let flushed = flush_with(child, encoder.sink(), depth + 1, rewritten > 1, fan)?;
+        let flushed = flush_with(
+            child,
+            encoder.sink(),
+            depth + 1,
+            rewritten > 1,
+            fan,
+            nesting,
+        )?;
         match &flushed {
             Link::Empty => encoder.varint(0),
             Link::Stored {
@@ -2577,6 +2593,7 @@ struct Stager {
     id: u64,
     store: Option<Store>,
     pack: bool,
+    nesting: usize,
 }
 
 #[derive(Default)]
@@ -2712,7 +2729,8 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
     children.reverse();
     let mut probe = Probe(stager.id);
     let width = node.keys.len();
-    let mut encoder = Encoder::with_capacity(&mut probe, 64 + 24 * width, width + 1);
+    let mut encoder =
+        Encoder::with_capacity(&mut probe, 64 + 24 * width, width + 1).at_depth(stager.nesting);
     encoder.u8(node.level);
     encoder.varint(width as u64);
     for key in &node.keys {
@@ -2741,7 +2759,7 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
         } else {
             encoder.rewind(mark);
             let mut inner = Probe(stager.id);
-            let mut spill = Encoder::new(&mut inner);
+            let mut spill = Encoder::new(&mut inner).at_depth(stager.nesting);
             value.encode(&mut spill)?;
             let object = spill.into_object();
             if let (true, Some(store)) = (node.is_fresh(index), &stager.store) {
@@ -4653,7 +4671,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             Link::Stored { ptr, .. } => Some(ptr.hash),
             Link::Mem(..) => {
                 let mut sink = HashSink;
-                match flush(&self.root, &mut sink, 0, false) {
+                match flush(&self.root, &mut sink, NODE_LEVELS) {
                     Ok(Link::Stored { ptr, .. }) => Some(ptr.hash),
                     Ok(_) => None,
                     Err(error) => panic!("ferro: {error}"),
@@ -4682,10 +4700,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
         if foreign || matches!(self.root, Link::Mem(..)) {
             w.mark_unsettled();
         }
+        let nesting = w.depth() + NODE_LEVELS;
         let stored = if foreign {
-            flush(&self.rebuilt().root, w.sink(), 0, false)?
+            flush(&self.rebuilt().root, w.sink(), nesting)?
         } else {
-            flush(&self.root, w.sink(), 0, false)?
+            flush(&self.root, w.sink(), nesting)?
         };
         match stored {
             Link::Empty => w.varint(0),
@@ -4748,7 +4767,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
         if let (Some(old), Some(new)) = (old, new)
             && holds_tables::<V>()
         {
-            paired::<K, V, S>(pairing, old, new)?;
+            pairing.defer(paired::<K, V, S>, old, new);
         }
         Ok(())
     }
@@ -6577,6 +6596,17 @@ pub(crate) fn walked<K: Data + Ord, V: Data, S: Summary<K, V>>(
     pool: &Pool<'_>,
     store: &Store,
     map: &Map<K, V, S>,
+    f: impl FnMut(K, V) -> Result<()>,
+) -> Result<()> {
+    walked_until(|| pool.stopped(), store, map, f)
+}
+
+/// Calls `f` on every key and value of `map` in key order, as [`walked`] does, stopping with an
+/// error once `stopped` returns `true`.
+pub(crate) fn walked_until<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    stopped: impl Fn() -> bool,
+    store: &Store,
+    map: &Map<K, V, S>,
     mut f: impl FnMut(K, V) -> Result<()>,
 ) -> Result<()> {
     let mut steps = match &map.root {
@@ -6593,8 +6623,8 @@ pub(crate) fn walked<K: Data + Ord, V: Data, S: Summary<K, V>>(
     while let Some(step) = steps.pop() {
         match step {
             Bared::Sub(ptr, _) => {
-                if pool.stopped() {
-                    return Err(stopped());
+                if stopped() {
+                    return Err(self::stopped());
                 }
                 if !opened.insert(ptr.hash) {
                     return Err(linked_twice());

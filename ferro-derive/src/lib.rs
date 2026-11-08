@@ -221,16 +221,16 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
         let value = match &field.fallback {
             Fallback::Skip => quote! { ::std::default::Default::default() },
             Fallback::Required => {
-                quote! { ::ferro::codec::required(#var, #name)? }
+                quote! { ::ferro::codec::required(#var.take(), #name)? }
             }
             Fallback::Default => quote! {
-                match #var {
+                match #var.take() {
                     ::std::option::Option::Some(__v) => __v,
                     ::std::option::Option::None => ::std::default::Default::default(),
                 }
             },
             Fallback::With(path) => quote! {
-                match #var {
+                match #var.take() {
                     ::std::option::Option::Some(__v) => __v,
                     ::std::option::Option::None => #path(),
                 }
@@ -238,21 +238,21 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
         };
         if field.stored() {
             let tag = field.tag();
-            decls.push(quote! { let mut #var = ::std::option::Option::None; });
+            let ty = &field.ty;
+            decls.push(
+                quote! { let mut #var: ::std::option::Option<#ty> = ::std::option::Option::None; },
+            );
             arms.push(quote! {
-                #tag => #var = ::std::option::Option::Some(::ferro::Data::decode(__r)?),
+                #tag => ::ferro::codec::decode_into(&mut #var, __r),
             });
         }
         values.push(value);
     }
     let stmts = quote! {
         #(#decls)*
-        __r.fields(|__tag, __r| {
-            match __tag {
-                #(#arms)*
-                _ => {}
-            }
-            ::std::result::Result::Ok(())
+        __r.fields(|__tag, __r| match __tag {
+            #(#arms)*
+            _ => ::std::result::Result::Ok(()),
         })?;
     };
     (stmts, values)
@@ -269,7 +269,7 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
         quote! {
             #tag => {
                 #seen = true;
-                <#ty as ::ferro::Data>::visit(__r)?;
+                <#ty as ::ferro::Data>::visit(__r)
             }
         }
     });
@@ -288,14 +288,14 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
         });
     quote! {
         #(let mut #seen = false;)*
-        __r.fields(|__tag, __r| {
-            match __tag {
-                #(#arms)*
-                _ => {}
-            }
-            ::std::result::Result::Ok(())
+        __r.fields(|__tag, __r| match __tag {
+            #(#arms)*
+            _ => ::std::result::Result::Ok(()),
         })?;
-        #(#required)*
+        (|| -> ::ferro::Result<()> {
+            #(#required)*
+            ::std::result::Result::Ok(())
+        })()?;
     }
 }
 
@@ -520,7 +520,10 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let described = describe_stmts(&fields);
             (
                 quote! { #encode ::std::result::Result::Ok(()) },
-                quote! { #stmts ::std::result::Result::Ok(#build) },
+                quote! {
+                    #stmts
+                    (|| -> ::ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
+                },
                 quote! { #visit ::std::result::Result::Ok(()) },
                 quote! {
                     __d.word("struct");
@@ -615,7 +618,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                 decode_arms.push(quote! {
                     #vtag => {
                         #stmts
-                        ::std::result::Result::Ok(#build)
+                        (|| -> ::ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
                     }
                 });
                 let visit = visit_stmts(&fields);
@@ -767,6 +770,11 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// enum stores a tag hashed from the variant's name, then the variant's fields as a struct's, so
 /// variants can be reordered and added. A variant tag the type does not know fails to decode with
 /// `Error::Decode`, as long as no variant added later has the tag of the removed one.
+///
+/// A type that holds itself does so through a `Box`, an `Arc`, a `Vec`, a `BTreeMap` or a
+/// `BTreeSet`, each of which opens a level of nesting, and a value may nest at most
+/// `ferro::codec::MAX_DEPTH` levels within one object: a deeper one, such as a long chain of
+/// `Option<Box<Node>>`, fails to encode with `Error::TooDeep` and to decode with `Error::Decode`.
 ///
 /// Do not change the encoding or `Ord` of a type used as a key or an indexed value on existing
 /// data.

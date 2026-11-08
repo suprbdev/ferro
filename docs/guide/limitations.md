@@ -49,6 +49,14 @@ This is an experiment, not a production database.
   ancestors could lie in pruned history, as described under [Limits](merging.md#limits).
 - Sync keeps memory for every object it moves and writes a large bundle twice, as described under
   [Limits](sync.md#limits).
+- A value nests at most 128 levels within one object, `codec::MAX_DEPTH`: each `Box`, `Arc`, `Vec`,
+  `BTreeMap` or `BTreeSet` it holds opens one, so a chain of `Option<Box<Node>>` goes 128 deep and a
+  tree of `Vec<Node>` children 127. A commit refuses a deeper value with `Error::TooDeep`, counting
+  on through the maps and tables it writes, two levels for each, and a read or a receive refuses one
+  with `Error::Decode` or `Error::Bundle` rather than run out of stack. At the limit, decoding fits
+  in the 2 MiB stack of a spawned thread in a debug build for types of a few dozen fields; larger
+  values stored inline take more stack a level, as described under [Nesting
+  depth](../internals/storage.md#nesting-depth).
 - No query planning happens. You choose the indexes, and `and` and `or` combine equality lookups by
   key. A range or prefix lookup tests the keys of a side with a quarter of its keys or fewer by
   reading their rows, and joins otherwise only after its keys are read and sorted. Each matching
