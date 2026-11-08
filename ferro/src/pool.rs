@@ -55,6 +55,8 @@ struct State<'p> {
     running: usize,
     idle: usize,
     closed: bool,
+    #[cfg(test)]
+    queued: usize,
 }
 
 impl State<'_> {
@@ -94,6 +96,8 @@ pub(crate) fn scope<'p, R>(f: impl FnOnce(&Pool<'p>) -> R) -> R {
             running: 0,
             idle: 0,
             closed: false,
+            #[cfg(test)]
+            queued: 0,
         }),
         wake: Condvar::new(),
         starter: Condvar::new(),
@@ -121,6 +125,10 @@ impl<'p> Pool<'p> {
     /// [`CHECKS_AT_ONCE`] checks are running and no smaller work waits, first queued first.
     pub(crate) fn check(&self, job: Job<'p>) {
         let mut state = self.state.lock();
+        #[cfg(test)]
+        {
+            state.queued += 1;
+        }
         state.checks.push_back(job);
         self.wake.notify_all();
         self.starter.notify_one();
@@ -130,11 +138,21 @@ impl<'p> Pool<'p> {
     /// waiting in [`help_until`](Pool::help_until) run before any check, first queued first.
     pub(crate) fn queue(&self, job: Job<'p>) {
         let mut state = self.state.lock();
+        #[cfg(test)]
+        {
+            state.queued += 1;
+        }
         state.work.push_back(job);
         self.wake.notify_one();
         if state.waiting() > state.idle {
             self.starter.notify_one();
         }
+    }
+
+    /// How many checks and pieces of smaller work were queued so far.
+    #[cfg(test)]
+    pub(crate) fn jobs(&self) -> usize {
+        self.state.lock().queued
     }
 
     /// Runs queued work until `done` holds, waiting while none is queued: the smaller work alone,

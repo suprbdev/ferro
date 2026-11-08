@@ -408,12 +408,21 @@ impl<'p> Differ<'_, 'p> {
     }
 
     /// Queues on the threads of the pool the check that `index` holds exactly `entries`: the same
-    /// keys, by `Ord`, with values that encode the same.
+    /// keys, by `Ord`, with values that encode the same. With fewer than [`QUEUED_ENTRIES`]
+    /// entries it makes the check here, which costs less than handing it to another thread.
     pub fn verify<K: Data + Ord, V: Data>(
         &self,
         index: &Map<K, V>,
         entries: Vec<(K, V)>,
     ) -> Verifying {
+        if entries.len() < QUEUED_ENTRIES {
+            return Verifying(Arc::new(Told {
+                latch: Latch::new(0),
+                found: parking_lot::Mutex::new(Some(matched(
+                    self.pool, self.store, index, entries,
+                ))),
+            }));
+        }
         let told = Arc::new(Told {
             latch: Latch::new(1),
             found: parking_lot::Mutex::new(None),
@@ -448,6 +457,9 @@ impl<'p> Differ<'_, 'p> {
             .unwrap_or(Err(Error::Detached))
     }
 }
+
+/// The entries past which [`Differ::verify`] hands its check to the threads of the pool.
+const QUEUED_ENTRIES: usize = 1 << 12;
 
 /// A check that an index holds exactly the entries of its rows, which [`Differ::verify`] queued.
 #[doc(hidden)]
@@ -4378,6 +4390,46 @@ mod tests {
     #[derive(crate::Data, Clone, Default)]
     struct Shelf {
         rows: Table<Tagged>,
+    }
+
+    #[derive(crate::Data, Clone, Default)]
+    struct Shelves {
+        many: Map<u64, Table<Tagged>>,
+    }
+
+    #[test]
+    fn many_small_tables_are_checked_in_a_few_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db: Db<Shelves> = Options::new()
+            .durability(Durability::Buffered)
+            .open(dir.path().join("shelves.ferro"))
+            .unwrap();
+        db.update(|shelves| {
+            for at in 0..2_000u64 {
+                let mut table: Table<Tagged> = Table::new();
+                table.insert(Tagged {
+                    id: at,
+                    tags: (0..3).collect(),
+                    group: (at % 7) as u8,
+                    note: 0,
+                });
+                shelves.many.insert(at, table);
+            }
+        })
+        .unwrap();
+        let read = db.read();
+        let found: Vec<FoundTable> = read.many.values().map(|table| found(&table)).collect();
+        let mut plans = crate::codec::Plans::default();
+        for table in &found {
+            plans.build(table);
+        }
+        let view = read.many.store().unwrap().view(0, 1 << 40, u64::MAX);
+        let (failed, jobs) = pool::scope(|pool| {
+            let failed = crate::codec::Checks::default().finish(pool, &view, &plans, &found);
+            (failed.map(|(_, error)| error.to_string()), pool.jobs())
+        });
+        assert_eq!(failed, None);
+        assert!(jobs <= 200, "2,000 small tables took {jobs} jobs to check");
     }
 
     fn found(table: &Table<Tagged>) -> FoundTable {

@@ -39,7 +39,7 @@
 
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -1034,9 +1034,9 @@ pub(crate) struct FoundTable {
     /// reads the file.
     pub(crate) beside: bool,
     /// The table value's bytes, as its parent encodes it.
-    pub(crate) body: Box<[u8]>,
+    pub(crate) body: Arc<[u8]>,
     /// The table value's links.
-    pub(crate) links: Box<[Ptr]>,
+    pub(crate) links: Arc<[Ptr]>,
     /// The hash of the value's bytes and the hashes of its links, which with
     /// [`id`](FoundTable::id) tells this table value from any other.
     pub(crate) hash: Hash,
@@ -1217,33 +1217,57 @@ impl Checks {
         table: &FoundTable,
         base: Option<&FoundTable>,
     ) -> Arc<Verdict> {
+        let (verdict, fresh) = self.verdict(table, base);
+        if let Some(check) = fresh {
+            self.queue_group(pool, store, vec![check]);
+        }
+        verdict
+    }
+
+    /// The verdict of the check of `table` against `base`, and the check to queue for it unless
+    /// one is queued already.
+    fn verdict(
+        &mut self,
+        table: &FoundTable,
+        base: Option<&FoundTable>,
+    ) -> (Arc<Verdict>, Option<Unqueued>) {
         let key = (table.identity(), base.map(FoundTable::identity));
         if let Some(verdict) = self.queued.get(&key) {
-            return verdict.clone();
+            return (verdict.clone(), None);
         }
         let verdict = Arc::new(Verdict::default());
         self.queued.insert(key, verdict.clone());
-        let (table, base, told, strict) =
-            (table.clone(), base.cloned(), verdict.clone(), self.strict);
+        let check = (table.clone(), base.cloned(), verdict.clone());
+        (verdict, Some(check))
+    }
+
+    /// Queues on `pool` one check that makes each of `group` in turn, so that many small tables
+    /// cost a few jobs rather than one each.
+    fn queue_group<'p>(&self, pool: &Pool<'p>, store: &'p Store, group: Vec<Unqueued>) {
+        let strict = self.strict;
         pool.check(pool::job(move |pool| {
-            if !pool.stopped() {
-                let agreed = unwound("checking its indexes", || {
-                    (table.agree)(&table, base.as_ref(), store, pool, strict)
-                });
-                if let Err(error) = agreed.and_then(|agreed| agreed) {
-                    *told.failed.lock() = Some(error);
+            for (table, base, told) in &group {
+                if !pool.stopped() {
+                    let agreed = unwound("checking its indexes", || {
+                        (table.agree)(table, base.as_ref(), store, pool, strict)
+                    });
+                    if let Err(error) = agreed.and_then(|agreed| agreed) {
+                        *told.failed.lock() = Some(error);
+                    }
                 }
+                told.done.store(true, Ordering::Release);
             }
-            told.done.store(true, Ordering::Release);
             pool.wake();
         }));
-        verdict
     }
 
     /// Checks each table among `found` that `plans` does not trust, against the table it plans,
     /// queuing on `pool` those checks not queued yet, waits for them while it helps run what is
     /// queued, and returns the first table, in the order of `found`, whose check failed, with its
     /// error.
+    ///
+    /// The checks not queued yet are queued in groups, up to [`GROUPED`] at a time and fewer
+    /// where there are not many, each group as one job.
     pub(crate) fn finish<'a, 'p>(
         mut self,
         pool: &Pool<'p>,
@@ -1251,23 +1275,48 @@ impl Checks {
         plans: &Plans,
         found: &'a [FoundTable],
     ) -> Option<(&'a FoundTable, Error)> {
+        let mut fresh = Vec::new();
         let waiting: Vec<_> = found
             .iter()
             .filter_map(|table| {
                 let base = plans.base(table)?;
-                Some((table, self.queued(pool, store, table, base)))
+                let (verdict, check) = self.verdict(table, base);
+                fresh.extend(check);
+                Some((table, verdict))
             })
             .collect();
+        let size = (fresh.len() / GROUPS).clamp(1, GROUPED);
+        let mut fresh = fresh.into_iter().peekable();
+        while fresh.peek().is_some() {
+            self.queue_group(pool, store, fresh.by_ref().take(size).collect());
+        }
+        let passed = Cell::new(0);
         pool.help_until(true, || {
-            waiting
-                .iter()
-                .all(|(_, verdict)| verdict.done.load(Ordering::Acquire))
+            let mut at = passed.get();
+            while waiting
+                .get(at)
+                .is_some_and(|(_, verdict)| verdict.done.load(Ordering::Acquire))
+            {
+                at += 1;
+            }
+            passed.set(at);
+            at == waiting.len()
         });
         waiting
             .into_iter()
             .find_map(|(table, verdict)| verdict.failed.lock().take().map(|error| (table, error)))
     }
 }
+
+/// A check that [`Checks`] has a verdict for but has not queued: the table, the table to check it
+/// against, and the verdict.
+type Unqueued = (FoundTable, Option<FoundTable>, Arc<Verdict>);
+
+/// About how many jobs [`Checks::finish`] splits the checks it queues into.
+const GROUPS: usize = 128;
+
+/// The most checks [`Checks::finish`] queues as one job.
+const GROUPED: usize = 64;
 
 fn check_value<D: Data>(_: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
     D::visit(r)?;
