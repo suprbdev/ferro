@@ -4910,9 +4910,9 @@ mod tests {
             let weak = Shared::downgrade(&value);
             let entry = CacheEntry::node(Shared::erase(value.clone()), 64);
             assert!(value.held());
-            if lent {
-                let guard = crate::epoch::pin().unwrap();
-                assert_eq!(weak.lend(&guard), Some(&7));
+            let guard = lent.then(|| crate::epoch::pin().unwrap());
+            if let Some(guard) = &guard {
+                assert_eq!(weak.lend(guard), Some(&7));
             }
             let mut copy = entry.clone();
             assert!(matches!(copy.take(), Entry::Node { owned: false, .. }));
@@ -4923,6 +4923,7 @@ mod tests {
             drop(entry);
             assert!(!value.held());
             assert_eq!(Shared::strong_count(&value), if lent { 2 } else { 1 });
+            drop(guard);
             crate::epoch::flush();
             assert_eq!(Shared::strong_count(&value), 1);
         }
