@@ -88,12 +88,14 @@ db.try_commit_stamped(|shop, stamp| -> Result<_, ShopError> {
 ```
 
 `stamp.version()` is the version this commit will get, so `db.at(version)` later shows the state it
-wrote. `stamp.time_ms()` is its time, fixed by the first call, and the commit keeps that millisecond
-to itself: the next commit on the branch gets a later time, so `db.as_of(time_ms)` returns exactly
-this commit. A branch that makes more than 1,000 such commits a second runs ahead of the clock until
-the rate drops, so read the time only when you need it. A stamp describes the commit that would hold
-the closure's changes. If the closure returns `Err`, panics or changes nothing, no commit holds
-them, and its reading of the time claims nothing.
+wrote. `stamp.time_ms()` is its time, fixed by the first call, and no later commit shares that
+millisecond: the next commit on the branch gets a later time, so `db.as_of(time_ms)` returns exactly
+this commit. An earlier commit can share it, when the clock has not moved on since that commit, and
+`as_of` of that earlier commit's time then returns the stamped one too. A branch that makes more
+than 1,000 such commits a second runs ahead of the clock until the rate drops, so read the time only
+when you need it. A stamp describes the commit that would hold the closure's changes. If the closure
+returns `Err`, panics or changes nothing, no commit holds them, and its reading of the time claims
+nothing.
 
 ## Branches
 

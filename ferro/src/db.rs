@@ -245,11 +245,12 @@ impl Stamp<'_> {
     /// The commit's time, in milliseconds since the Unix epoch.
     ///
     /// The first call reads the clock and fixes the time, no earlier than the commit before it
-    /// allows, and later calls return the same. The commit then keeps that millisecond to itself:
-    /// the next commit on the branch gets a later time, so [`Db::as_of`] of this time returns
-    /// exactly this commit for as long as it is retained. A branch that reads the time in more
-    /// than 1,000 commits a second runs ahead of the clock until the rate drops, so read it only
-    /// when it is needed.
+    /// allows, and later calls return the same. No later commit then shares that millisecond: the
+    /// next commit on the branch gets a later time, so [`Db::as_of`] of this time returns exactly
+    /// this commit for as long as it is retained. An earlier commit can share it, if the clock has
+    /// not moved on since that commit, and `as_of` of that earlier commit's time then returns this
+    /// one. A branch that reads the time in more than 1,000 commits a second runs ahead of the
+    /// clock until the rate drops, so read it only when it is needed.
     ///
     /// With [`Options::coalesce`] the first closure of a group to call it fixes the group's time,
     /// and if that closure fails, the next one to call it fixes it again.
@@ -4429,9 +4430,11 @@ impl<T: Data> Db<T> {
     /// milliseconds since the Unix epoch.
     ///
     /// Before the first commit that is version 0. Times never go back along a branch, so this is
-    /// the state the branch was in at that time. Several commits can share a millisecond after the
-    /// clock steps back, and then this returns the last of them, but a commit whose closure read
-    /// [`Stamp::time_ms`] keeps its millisecond to itself, so `as_of` of that time returns it.
+    /// the state the branch was in at that time. Several commits can share a millisecond, when they
+    /// come faster than the clock ticks or after it steps back, and then this returns the last of
+    /// them. No later commit shares the millisecond of a commit whose closure read
+    /// [`Stamp::time_ms`], so `as_of` of that time returns it, though an earlier commit may share
+    /// it.
     ///
     /// # Errors
     ///
