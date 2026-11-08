@@ -6513,9 +6513,29 @@ fn linked_twice() -> Error {
     Error::Decode("a map links one node from two places".into())
 }
 
-fn expand_bare<K: Data, V: Data, S: Data>(store: &Store, steps: &mut Vec<Bared<K>>) -> Result<()> {
+/// The nodes one side of a diff has opened, by hash, which every run of the diff shares, so that a
+/// side that links one node from two places is refused when it opens it again rather than read
+/// and walked once for each link, as a forged map of a few nodes could make it do without end.
+#[derive(Default)]
+struct Opened(parking_lot::Mutex<HashSet<Hash>>);
+
+impl Opened {
+    /// The steps of the node at `ptr`, as [`bare`] reads them, unless this side opened it before.
+    fn open<K: Data, V: Data, S: Data>(&self, store: &Store, ptr: Ptr) -> Result<Vec<Bared<K>>> {
+        if !self.0.lock().insert(ptr.hash) {
+            return Err(linked_twice());
+        }
+        bare::<K, V, S>(store, ptr)
+    }
+}
+
+fn expand_bare<K: Data, V: Data, S: Data>(
+    store: &Store,
+    steps: &mut Vec<Bared<K>>,
+    opened: &Opened,
+) -> Result<()> {
     if let Some(Bared::Sub(ptr, _)) = steps.pop() {
-        steps.extend(bare::<K, V, S>(store, ptr)?.into_iter().rev());
+        steps.extend(opened.open::<K, V, S>(store, ptr)?.into_iter().rev());
     }
     Ok(())
 }
@@ -6569,6 +6589,7 @@ pub(crate) fn differ<'p, K: Data + Ord, V: Data, S: Summary<K, V>>(
         found: Arc::new(Gathered {
             latch: Latch::new(0),
             parts: parking_lot::Mutex::new(Vec::new()),
+            opened: [Opened::default(), Opened::default()],
         }),
     };
     match (start(old), start(new)) {
@@ -6614,6 +6635,7 @@ pub(crate) struct Differing<K, V> {
 struct Gathered<K, V> {
     latch: Latch,
     parts: parking_lot::Mutex<Vec<FoundRun<K, V>>>,
+    opened: [Opened; 2],
 }
 
 impl<K, V> Differing<K, V> {
@@ -6653,22 +6675,24 @@ fn run<'p, K: Data + Ord, V: Data, S: Data>(
             return;
         }
         let divided = unwound("diffing a map", || {
-            divide::<K, V, S>(store, old, new).and_then(|divided| match divided {
-                Divided::Runs(runs) => {
-                    for (at, (old, new)) in (0u32..).zip(runs) {
-                        let mut path = path.to_vec();
-                        path.push(at);
-                        found.latch.add();
-                        pool.queue(run::<K, V, S>(store, found.clone(), path.into(), old, new));
+            divide::<K, V, S>(pool, store, &found.opened, old, new).and_then(
+                |divided| match divided {
+                    Divided::Runs(runs) => {
+                        for (at, (old, new)) in (0u32..).zip(runs) {
+                            let mut path = path.to_vec();
+                            path.push(at);
+                            found.latch.add();
+                            pool.queue(run::<K, V, S>(store, found.clone(), path.into(), old, new));
+                        }
+                        Ok(None)
                     }
-                    Ok(None)
-                }
-                Divided::Whole(mut old, mut new) => {
-                    old.reverse();
-                    new.reverse();
-                    diffed::<K, V, S>(store, old, new).map(Some)
-                }
-            })
+                    Divided::Whole(mut old, mut new) => {
+                        old.reverse();
+                        new.reverse();
+                        diffed::<K, V, S>(pool, store, &found.opened, old, new).map(Some)
+                    }
+                },
+            )
         });
         match divided.and_then(|divided| divided) {
             Ok(None) => {}
@@ -6695,9 +6719,12 @@ enum Divided<K> {
 
 /// Opens, in rounds from the largest down, the subtrees among `old` and `new`, steps in key order,
 /// of [`SPLIT_ENTRIES`] entries or more whose hash no subtree of the other side has, until the two
-/// sides can be cut into runs, or until none is left to open.
+/// sides can be cut into runs, or until none is left to open. Each side opens its nodes through
+/// its own of `opened`, and it stops with an error once `pool` is told to stop.
 fn divide<K: Data + Ord, V: Data, S: Data>(
+    pool: &Pool<'_>,
     store: &Store,
+    opened: &[Opened; 2],
     mut old: Vec<Bared<K>>,
     mut new: Vec<Bared<K>>,
 ) -> Result<Divided<K>> {
@@ -6720,9 +6747,9 @@ fn divide<K: Data + Ord, V: Data, S: Data>(
             .max()
             .unwrap_or(0)
     };
-    let mut opened = false;
+    let mut cuttable = false;
     loop {
-        if opened {
+        if cuttable {
             let runs = cut(old, new);
             match <[_; 1]>::try_from(runs) {
                 Ok([(one_old, one_new)]) => (old, new) = (one_old, one_new),
@@ -6735,16 +6762,18 @@ fn divide<K: Data + Ord, V: Data, S: Data>(
             return Ok(Divided::Whole(old, new));
         }
         let floor = (top / 8).max(SPLIT_ENTRIES);
-        old = open::<K, V, S>(store, old, &new_subtrees, floor)?;
-        new = open::<K, V, S>(store, new, &old_subtrees, floor)?;
-        opened = true;
+        old = open::<K, V, S>(pool, store, &opened[0], old, &new_subtrees, floor)?;
+        new = open::<K, V, S>(pool, store, &opened[1], new, &old_subtrees, floor)?;
+        cuttable = true;
     }
 }
 
 /// `steps` with each subtree of `floor` entries or more whose hash is not among `other` replaced
-/// by the steps of its node.
+/// by the steps of its node, opened through `opened`.
 fn open<K: Data, V: Data, S: Data>(
+    pool: &Pool<'_>,
     store: &Store,
+    opened: &Opened,
     steps: Vec<Bared<K>>,
     other: &HashSet<Hash>,
     floor: u64,
@@ -6753,7 +6782,10 @@ fn open<K: Data, V: Data, S: Data>(
     for step in steps {
         match step {
             Bared::Sub(ptr, count) if count >= floor && !other.contains(&ptr.hash) => {
-                out.extend(bare::<K, V, S>(store, ptr)?);
+                if pool.stopped() {
+                    return Err(stopped());
+                }
+                out.extend(opened.open::<K, V, S>(store, ptr)?);
             }
             step => out.push(step),
         }
@@ -6836,30 +6868,36 @@ fn apart<K>(steps: Vec<Bared<K>>) -> impl Iterator<Item = Vec<Bared<K>>> {
 }
 
 /// The changes between `old_steps` and `new_steps`, two runs of steps over the same keys, each
-/// reversed so that the step first in key order is last.
+/// reversed so that the step first in key order is last, each side opening its nodes through its
+/// own of `opened`. It stops with an error once `pool` is told to stop.
 fn diffed<K: Data + Ord, V: Data, S: Data>(
+    pool: &Pool<'_>,
     store: &Store,
+    opened: &[Opened; 2],
     mut old_steps: Vec<Bared<K>>,
     mut new_steps: Vec<Bared<K>>,
 ) -> Result<Changed<K, V>> {
     let mut out = Vec::new();
     loop {
+        if pool.stopped() {
+            return Err(stopped());
+        }
         match (old_steps.last(), new_steps.last()) {
             (None, None) => return Ok(out),
             (Some(Bared::Sub(..)), None | Some(Bared::Entry(..))) => {
-                expand_bare::<K, V, S>(store, &mut old_steps)?;
+                expand_bare::<K, V, S>(store, &mut old_steps, &opened[0])?;
             }
             (None | Some(Bared::Entry(..)), Some(Bared::Sub(..))) => {
-                expand_bare::<K, V, S>(store, &mut new_steps)?;
+                expand_bare::<K, V, S>(store, &mut new_steps, &opened[1])?;
             }
             (Some(Bared::Sub(a, a_count)), Some(Bared::Sub(b, b_count))) => {
                 if a.hash == b.hash {
                     old_steps.pop();
                     new_steps.pop();
                 } else if a_count >= b_count {
-                    expand_bare::<K, V, S>(store, &mut old_steps)?;
+                    expand_bare::<K, V, S>(store, &mut old_steps, &opened[0])?;
                 } else {
-                    expand_bare::<K, V, S>(store, &mut new_steps)?;
+                    expand_bare::<K, V, S>(store, &mut new_steps, &opened[1])?;
                 }
             }
             (Some(Bared::Entry(a, _)), Some(Bared::Entry(b, _))) => match a.cmp(b) {
