@@ -155,6 +155,25 @@ pub(crate) fn fatal<T>(result: Result<T>) -> T {
 thread_local! {
     static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static FATAL: Cell<Option<(String, Error)>> = const { Cell::new(None) };
+    static ALONE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the work a map does on many threads at once, such as hashing or applying a large batch,
+/// run on the calling thread alone until the guard it returns is dropped.
+///
+/// A [`Pool`] holds one while it runs a job, so that the threads it starts are all the threads its
+/// work takes.
+pub(crate) fn alone() -> Alone {
+    Alone(ALONE.replace(true))
+}
+
+/// What [`alone`] returns, which puts back what the thread did before when dropped.
+pub(crate) struct Alone(bool);
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        ALONE.set(self.0);
+    }
 }
 
 /// A fold of a map's entries that [`Map<K, V, S>`](Map) keeps for every subtree.
@@ -2952,7 +2971,11 @@ pub(crate) fn workers() -> usize {
 }
 
 fn parallel<T: Send, R: Send>(tasks: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let threads = workers().min(tasks.len());
+    let threads = if ALONE.get() {
+        1
+    } else {
+        workers().min(tasks.len())
+    };
     if threads < 2 {
         return tasks.into_iter().map(work).collect();
     }

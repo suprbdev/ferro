@@ -4,9 +4,11 @@
 //!
 //! [`scope`] runs a closure beside the threads of a pool and returns once the closure has
 //! returned and all the work queued on the pool has run, every thread joined. A thread of its own
-//! starts the others: one whenever more work waits than threads are idle, up to [`workers`] of
-//! them and no more than [`THREADS`], so a small check runs on one thread and a large one on
-//! several, while the closure goes on with work of its own, such as the walk of a bundle. Checks
+//! starts the others: one whenever more work waits than threads are idle, so that the pool has no
+//! more threads than [`workers`] and [`THREADS`] allow, its own included, and a small check runs
+//! on one thread and a large one on several, while the closure goes on with work of its own, such
+//! as the walk of a bundle. A job runs with [`alone`] held, so the work of a map that would spread
+//! over threads of its own runs on the job's thread. Checks
 //! are queued with [`Pool::check`], at most [`CHECKS_AT_ONCE`] of them run at once, which bounds
 //! what they hold, and a check queues the smaller work it splits into, such as the runs of a diff,
 //! with [`Pool::queue`] and waits for it with [`Pool::help_until`], which runs queued work
@@ -20,12 +22,13 @@ use std::thread::Scope;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::map::workers;
+use crate::map::{alone, workers};
 
 /// The most checks that run at once.
 pub(crate) const CHECKS_AT_ONCE: usize = 4;
 
-/// The most threads a pool starts, which leaves cores to the walk that runs beside the checks.
+/// The most threads a pool has, the one that starts the others included, which leaves cores to
+/// the walk that runs beside the checks.
 const THREADS: usize = 8;
 
 /// Work for a [`Pool`], given the pool to queue more on.
@@ -173,7 +176,7 @@ impl<'p> Pool<'p> {
     }
 
     fn start<'s>(&'s self, threads: &'s Scope<'s, '_>) {
-        let most = workers().clamp(1, THREADS);
+        let most = workers().clamp(2, THREADS) - 1;
         let mut started = 0;
         let mut state = self.state.lock();
         loop {
@@ -233,7 +236,10 @@ impl<'p> Pool<'p> {
         state.running += 1;
         state.checking += usize::from(check);
         drop(state);
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| job(self))) {
+        let alone = alone();
+        let ran = catch_unwind(AssertUnwindSafe(|| job(self)));
+        drop(alone);
+        if let Err(panic) = ran {
             self.stop();
             self.panic.lock().get_or_insert(panic);
         }
