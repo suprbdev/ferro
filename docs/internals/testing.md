@@ -461,12 +461,17 @@ Tests are described next to what they test:
   without its indexes, with every kind of index, and pulled with an `each` index over a `Set`, in
   `index_agreement.rs`, and the diff the check makes, against `Map::diff`, on maps small enough to
   diff on one thread and large enough to split among threads, with runs that only one side holds, in
-  `map.rs`. What the check reads of a set an `each` index names, and how many jobs 2,000 small
-  tables take, in `table.rs`; a check beside the walk that must panic on no thread, counted by a
-  panic hook, `index_check_panics.rs`; the bytes a receive allocates for a forged map of rows that
+  `map.rs`. What the check reads of a set an `each` index names, how many jobs 2,000 small tables
+  take, and what it reads of a table of 20,000 rows that shares none with its base, which it builds,
+  and what a pairing pairs: the fields of one object sharing its zero-width items, two roots of
+  200,000 fields of unknown tags, the tables of a `BTreeMap` by key and those of a `Vec` that gained
+  or lost elements, in `table.rs`; a check beside the walk that must panic on no thread, counted by
+  a panic hook, `index_check_panics.rs`; the bytes a receive allocates for a forged map of rows that
   links one node many times, `index_check_cost.rs`; the bytes a pull and `verify_typed` allocate for
-  one-row edits to tables in a map against the same at the root, and for an optional table placed
-  before another against one placed after, `index_check_pairing.rs`; the threads a receive and
+  one-row edits to tables in a map against the same at the root, for an optional table placed before
+  another against one placed after, for tables in maps cloned from one template against maps apart,
+  and for 64 maps cloned from one set to clones of another, `index_check_pairing.rs`; the heap a
+  pull of 50 versions of 20,000 tables in a `Vec` holds, `sync_memory.rs`; the threads a receive and
   `verify_typed` take, `index_check_threads.rs`; and the threads of a pool that run work, in
   `pool.rs`: [Indexes that agree with their
   rows](sync-receive.md#indexes-that-agree-with-their-rows).
