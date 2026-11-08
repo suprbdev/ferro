@@ -1635,6 +1635,7 @@ impl Options {
         let genesis = Arc::new(init());
         let genesis_hash = try_hash_of(&*genesis)?;
         let (refs, depth) = refs::load(&store, head, None).inspect_err(|_| store.close())?;
+        refs::note_unchecked(&store, &refs);
         let settled = store.last_seq();
         let automatic = !read_only && self.history != Keep::All && self.reclaim.every_bytes > 0;
         let signal = Arc::new(Signal {
@@ -1902,6 +1903,9 @@ impl<T: Data> Shared<T> {
     }
 
     fn attached(&self, name: &str) -> Result<Arc<Branch<T>>> {
+        if refs::reserved(name) {
+            return Err(Error::BranchInUse(name.to_string()));
+        }
         loop {
             if self.options.shared {
                 self.catch_up(&mut Vec::new())?;
@@ -2122,6 +2126,7 @@ impl<T: Data> Shared<T> {
     ) -> Result<()> {
         let since = tip.ptr.map(|known| (known, &tip.refs, tip.depth));
         let (refs, depth) = refs::load(store, Some(frame.head), since)?;
+        refs::note_unchecked(store, &refs);
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut followed = Vec::new();
         let mut gone = Vec::new();
@@ -2180,6 +2185,7 @@ impl<T: Data> Shared<T> {
         let (fresh, head) = Store::open(&self.file, self.options.clone())?;
         let rebound = (|| -> Result<_> {
             let (refs, depth) = refs::load(&fresh, head, None)?;
+            refs::note_unchecked(&fresh, &refs);
             let attached: Vec<_> = self.branches.lock().values().cloned().collect();
             let mut states = Vec::new();
             let mut gone = Vec::new();
@@ -2264,6 +2270,7 @@ impl<T: Data> Shared<T> {
                 store.close();
             }
         })?;
+        refs::note_unchecked(&store, &refs);
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         let mut gone = Vec::new();
@@ -3403,6 +3410,7 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
         let (refs, depth) = refs::load(fresh, Some(head), None)?;
+        refs::note_unchecked(fresh, &refs);
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
         for (_, found) in refs.try_entries()? {
             for ptr in found.root.iter().chain(&found.log.tip) {
@@ -5027,7 +5035,8 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoBranch`] if no branch has that name, and read errors.
+    /// [`Error::NoBranch`] if no branch has that name, [`Error::BranchInUse`] for a name that starts
+    /// with a NUL, which the branch table keeps for its own records, and read errors.
     pub fn branch(&self, name: &str) -> Result<Db<T>> {
         let _crossing = self.entering(Needs::Tip)?;
         let branch = self.shared.attached(name)?;
@@ -5049,13 +5058,14 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// - [`Error::BranchInUse`] for `main` and for this handle's own branch.
+    /// - [`Error::BranchInUse`] for `main`, for this handle's own branch, and for a name that
+    ///   starts with a NUL, which the branch table keeps for its own records.
     /// - [`Error::NoBranch`] if no branch has that name.
     /// - [`Error::ReadOnly`] on a read-only handle, [`Error::Reentrant`] where waiting for that
     ///   branch could deadlock, such as from inside a closure on it, and write errors as for
     ///   [`Db::commit`].
     pub fn drop_branch(&self, name: &str) -> Result<()> {
-        if name == MAIN || name == self.branch.name {
+        if name == MAIN || name == self.branch.name || refs::reserved(name) {
             return Err(Error::BranchInUse(name.to_string()));
         }
         let _crossing = self.entering(Needs::Lane(name))?;
@@ -5082,7 +5092,7 @@ impl<T: Data> Db<T> {
             let mut next = tip.refs.clone();
             next.remove(name);
             for (branch, mut head) in next.try_entries()? {
-                if head.merged.try_get(name)?.is_some() {
+                if !refs::reserved(&branch) && head.merged.try_get(name)?.is_some() {
                     head.merged.remove(name);
                     next.insert(branch, head);
                 }
@@ -5109,7 +5119,11 @@ impl<T: Data> Db<T> {
     /// The names of every branch in the file, sorted, `main` included.
     pub fn branches(&self) -> Vec<String> {
         let refs = self.shared.published.lock();
-        let mut names: Vec<String> = refs.refs.keys().collect();
+        let mut names: Vec<String> = refs
+            .refs
+            .keys()
+            .filter(|name| !refs::reserved(name))
+            .collect();
         if !names.iter().any(|name| name == MAIN) {
             names.push(MAIN.to_string());
             names.sort();

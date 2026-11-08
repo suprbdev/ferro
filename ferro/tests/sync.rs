@@ -4583,6 +4583,7 @@ fn a_summarized_table_whose_index_the_receiver_added_lands_and_verifies() {
 struct Person {
     #[key]
     id: u32,
+    #[index]
     email: String,
 }
 
@@ -4876,27 +4877,57 @@ fn a_table_that_stores_no_index_is_refused_when_a_row_sits_under_another_key() {
 }
 
 #[test]
-fn a_table_that_holds_an_index_under_a_fingerprint_the_receiver_does_not_know_is_refused() {
+fn a_table_that_holds_an_index_under_a_fingerprint_the_receiver_does_not_know_is_not_trusted_once_it_does()
+ {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.ferro");
     let peer: Db<shadow::Peer> = fast().open(dir.path().join("peer.ferro")).unwrap();
-    let mine: Db<shadow::MineNarrow> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    let mine: Db<shadow::MineNarrow> = fast().open(&path).unwrap();
     peer.update(|root| {
         root.rows = shadow::Shadow::of(&shadow::honest());
         root.rows.by_email.insert(999, 1);
     })
     .unwrap();
-    match from_peer(&mine, &peer) {
-        Err(Error::Bundle(message)) => assert!(
-            message.contains("fingerprint this type does not know"),
-            "{message}"
-        ),
-        other => panic!("a table with an index the receiver cannot check landed: {other:?}"),
-    }
-    assert_eq!(mine.version(), 0);
-    assert_eq!(mine.branches(), ["main"]);
+    assert_eq!(
+        from_peer(&mine, &peer).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(mine.branches(), ["main", "peer"]);
+    mine.verify_typed().unwrap();
     drop(mine);
-    let mine: Db<shadow::Mine> = fast().open(dir.path().join("mine.ferro")).unwrap();
-    assert_eq!(mine.read().rows.len(), 0);
+
+    let check = |mine: &Db<shadow::Mine>, at: u64, case: &str| {
+        let read = mine.at(at).unwrap();
+        assert_eq!(read.rows.key_by_email(&999), None, "{case}");
+        assert_eq!(read.rows.key_by_email(&100), Some(1), "{case}");
+        assert_eq!(read.rows.by_n(&7).keys().collect::<Vec<_>>(), [3], "{case}");
+    };
+    let mine: Db<shadow::Mine> = fast().open(&path).unwrap();
+    check(&mine, 1, "reopened with the index");
+    mine.verify_typed().unwrap();
+    peer.update(|root| {
+        root.rows.by_email.remove(&999);
+        root.rows.put(shadow::row(4, 8, 800));
+    })
+    .unwrap();
+    assert_eq!(
+        from_peer(&mine, &peer).unwrap().outcome,
+        Outcome::FastForward
+    );
+    check(&mine, 2, "pulled on top");
+    assert_eq!(mine.read().rows.key_by_email(&800), Some(4));
+    mine.update(|root| {
+        root.rows.insert(shadow::row(5, 9, 999));
+    })
+    .unwrap();
+    assert_eq!(mine.read().rows.key_by_email(&999), Some(5));
+    mine.verify_typed().unwrap();
+    mine.compact(ferro::Keep::All).unwrap();
+    drop(mine);
+    let mine: Db<shadow::Mine> = fast().open(&path).unwrap();
+    check(&mine, 1, "after a compaction");
+    assert_eq!(mine.branches(), ["main", "peer"]);
+    mine.verify_typed().unwrap();
 
     let narrow: Db<shadow::MineNarrow> = fast().open(dir.path().join("narrow.ferro")).unwrap();
     narrow
@@ -4910,12 +4941,13 @@ fn a_table_that_holds_an_index_under_a_fingerprint_the_receiver_does_not_know_is
             }
         })
         .unwrap();
+    let wide: Db<shadow::Mine> = fast().open(dir.path().join("wide.ferro")).unwrap();
     assert_eq!(
-        from_peer(&mine, &narrow).unwrap().outcome,
+        from_peer(&wide, &narrow).unwrap().outcome,
         Outcome::FastForward
     );
-    assert_eq!(mine.read().rows.key_by_email(&400), Some(3));
-    mine.verify_typed().unwrap();
+    assert_eq!(wide.read().rows.key_by_email(&400), Some(3));
+    wide.verify_typed().unwrap();
 }
 
 type Drift = (&'static str, fn(&mut shadow::Shadow));

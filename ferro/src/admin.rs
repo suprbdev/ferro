@@ -123,6 +123,9 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     let refs = load_refs(&store, head)?;
     let mut branches = Vec::new();
     for (name, branch) in refs.try_entries()? {
+        if refs::reserved(&name) {
+            continue;
+        }
         let last = branch
             .log
             .tip_entry(&store)?

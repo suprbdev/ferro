@@ -2237,7 +2237,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         (
             quote! {
                 fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                    let (mut __table, __stale, _) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                    let ((mut __table, mut __stale, _), __unchecked) =
+                        ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                    if __unchecked {
+                        __stale = [true; #count];
+                        #(__table.#index_fields = ::std::default::Default::default();)*
+                    }
                     #rebuild
                     ::std::result::Result::Ok(__table)
                 }
@@ -2247,6 +2252,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     ::ferro::table::noted::<#name, _>(__r, |__r| {
                         #visit_fields
                     })
+                    .map(|_| ())
                 }
             },
             quote! {

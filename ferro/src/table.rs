@@ -593,7 +593,9 @@ fn expected<'e, K: Ord, V: Data>(
 /// tables, notes it for the check that its indexes agree with its rows.
 ///
 /// The [`Record`](derive@crate::Record) derive calls it from the `decode` and `visit` of a table
-/// with indexes.
+/// with indexes. It returns, with what `read` returns, whether the file `r` reads from records
+/// this table value as landed with an index nothing checked, in which case `decode` rebuilds
+/// every index rather than trust what the value stores.
 ///
 /// # Errors
 ///
@@ -602,7 +604,7 @@ fn expected<'e, K: Ord, V: Data>(
 pub fn noted<'a, T: Record, R>(
     r: &mut Decoder<'a>,
     read: impl FnOnce(&mut Decoder<'a>) -> Result<R>,
-) -> Result<R> {
+) -> Result<(R, bool)> {
     let start = r.checkpoint();
     let value = read(r)?;
     r.found_table(
@@ -612,47 +614,46 @@ pub fn noted<'a, T: Record, R>(
         agree::<T>,
         !T::Table::indexing_reads(),
     );
-    Ok(value)
+    Ok((value, r.unchecked_since(start)))
 }
 
 /// Checks that each index `table` stores under a fingerprint `T` knows holds exactly the entries
-/// its rows give, and that each row is stored under its own key, reading both through `store`.
-/// With `strict`, a table that holds an index under a fingerprint `T` does not know fails too,
-/// since that index would be trusted unchecked once `T` gains an index with that fingerprint.
+/// its rows give, and that each row is stored under its own key, reading both through `store`,
+/// and returns whether `table` also holds an index under a fingerprint `T` does not know, which
+/// it cannot check. A table value that `store` records as landed with such an index has only its
+/// rows checked, and is never a base: a read rebuilds every index it stores.
 ///
 /// With `base`, a table of the same type whose indexes agree with its rows and which stores every
 /// index `table` does, it diffs the rows of the two and each index of the two on the threads of
 /// `pool`, and checks that each index changed by exactly the entries of the rows that changed,
-/// which costs what changed. Without one it builds the indexes from every row.
+/// which costs what changed. Without one it checks every index against every row.
 fn agree<'p, T: Record>(
     table: &FoundTable,
     base: Option<&FoundTable>,
     store: &'p Store,
     pool: &Pool<'p>,
-    strict: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let read = |found: &FoundTable| {
-        T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))
+        let mut stored =
+            T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))?;
+        if store.is_unchecked(&found.hash) {
+            stored.held.fill(false);
+        }
+        Ok::<_, Error>(stored)
     };
     let Stored {
         table,
         held: slots,
         unknown,
     } = read(table)?;
-    if strict && unknown {
-        return Err(Error::Bundle(format!(
-            "a table it carries ({}) holds an index under a fingerprint this type does not know, \
-             which nothing here can check",
-            type_name::<T::Table>()
-        )));
-    }
     let differ = Differ { pool, store };
     if let Some(base) = base {
         let Stored {
             table: base, held, ..
         } = read(base)?;
         if slots.iter().zip(&held).all(|(slot, held)| !slot || *held) {
-            return faulted(diffed::<T>(&base, &table, &slots, &differ)?);
+            faulted(diffed::<T>(&base, &table, &slots, &differ)?)?;
+            return Ok(unknown);
         }
     }
     let found = table.built_slots(&slots, &differ, &mut |each| {
@@ -661,7 +662,8 @@ fn agree<'p, T: Record>(
             each(&row)
         })
     })?;
-    faulted(found)
+    faulted(found)?;
+    Ok(unknown)
 }
 
 fn diffed<T: Record>(
@@ -4426,7 +4428,10 @@ mod tests {
         let view = read.many.store().unwrap().view(0, 1 << 40, u64::MAX);
         let (failed, jobs) = pool::scope(|pool| {
             let failed = crate::codec::Checks::default().finish(pool, &view, &plans, &found);
-            (failed.map(|(_, error)| error.to_string()), pool.jobs())
+            (
+                failed.failed.map(|(_, error)| error.to_string()),
+                pool.jobs(),
+            )
         });
         assert_eq!(failed, None);
         assert!(jobs <= 200, "2,000 small tables took {jobs} jobs to check");
@@ -4448,7 +4453,7 @@ mod tests {
         }
     }
 
-    fn checked(db: &Db<Shelf>, old: u64, new: u64) -> (Result<()>, u64, u32) {
+    fn checked(db: &Db<Shelf>, old: u64, new: u64) -> (Result<bool>, u64, u32) {
         let allowance = 1 << 40;
         let (old, new) = (db.at(old).unwrap(), db.at(new).unwrap());
         let view = new
@@ -4458,13 +4463,7 @@ mod tests {
             .unwrap()
             .view(0, allowance, u64::MAX);
         let agreed = pool::scope(|pool| {
-            agree::<Tagged>(
-                &found(&new.rows),
-                Some(&found(&old.rows)),
-                &view,
-                pool,
-                true,
-            )
+            agree::<Tagged>(&found(&new.rows), Some(&found(&old.rows)), &view, pool)
         });
         let (left, records) = view.reads_left().unwrap();
         (agreed, allowance - left, records)

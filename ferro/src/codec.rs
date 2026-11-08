@@ -1013,11 +1013,11 @@ pub(crate) type Found = Vec<(usize, Kind)>;
 
 /// What checks that the indexes of a table agree with its rows: given the table, a table of the
 /// same type to work from, whose indexes are known to agree with its rows, the store both read
-/// from, the pool whose threads share the work, and whether an index under a fingerprint the
-/// type does not know fails it, it returns [`Error::Decode`] for an index that does not hold
-/// exactly the entries the rows give.
+/// from and the pool whose threads share the work, it returns [`Error::Decode`] for an index that
+/// does not hold exactly the entries the rows give, and otherwise whether the table holds an index
+/// under a fingerprint the type does not know, which nothing checked.
 pub(crate) type Agree =
-    for<'p> fn(&FoundTable, Option<&FoundTable>, &'p Store, &Pool<'p>, bool) -> Result<()>;
+    for<'p> fn(&FoundTable, Option<&FoundTable>, &'p Store, &Pool<'p>) -> Result<bool>;
 
 /// A table value that a typed check found, kept for the check that its indexes agree with its
 /// rows, which reads the rows and so counts only once every object the check reaches has passed.
@@ -1164,7 +1164,7 @@ impl Plans {
         found: &'a [FoundTable],
         store: &Store,
     ) -> Option<(&'a FoundTable, Error)> {
-        pool::scope(|pool| Checks::default().finish(pool, store, self, found))
+        pool::scope(|pool| Checks::default().finish(pool, store, self, found).failed)
     }
 }
 
@@ -1174,7 +1174,6 @@ impl Plans {
 #[derive(Default)]
 pub(crate) struct Checks {
     queued: HashMap<CheckOf, Arc<Verdict>>,
-    strict: bool,
 }
 
 /// The table a check of [`Checks`] checks and the table it checks it against, by type and hash.
@@ -1184,20 +1183,18 @@ type CheckOf = ((TypeId, Hash), Option<(TypeId, Hash)>);
 #[derive(Default)]
 struct Verdict {
     done: AtomicBool,
+    unchecked: AtomicBool,
     failed: Mutex<Option<Error>>,
 }
 
-impl Checks {
-    /// Checks for a receive, which also fail a table that holds an index under a fingerprint its
-    /// type does not know: nothing checked such an index as it lands, so the file must not hold
-    /// it for a later version of the type that knows the fingerprint to trust.
-    pub(crate) fn strict() -> Checks {
-        Checks {
-            queued: HashMap::new(),
-            strict: true,
-        }
-    }
+/// What [`Checks::finish`] found: the first table whose check failed, with its error, and the
+/// hash of each table that holds an index under a fingerprint its type does not know.
+pub(crate) struct Finished<'a> {
+    pub(crate) failed: Option<(&'a FoundTable, Error)>,
+    pub(crate) unchecked: Vec<Hash>,
+}
 
+impl Checks {
     /// Queues on `pool` the check of `table` against `base`, as [`Plans::base`] gives it, reading
     /// through `store`, unless it is queued already.
     pub(crate) fn start<'p>(
@@ -1244,15 +1241,15 @@ impl Checks {
     /// Queues on `pool` one check that makes each of `group` in turn, so that many small tables
     /// cost a few jobs rather than one each.
     fn queue_group<'p>(&self, pool: &Pool<'p>, store: &'p Store, group: Vec<Unqueued>) {
-        let strict = self.strict;
         pool.check(pool::job(move |pool| {
             for (table, base, told) in &group {
                 if !pool.stopped() {
                     let agreed = unwound("checking its indexes", || {
-                        (table.agree)(table, base.as_ref(), store, pool, strict)
+                        (table.agree)(table, base.as_ref(), store, pool)
                     });
-                    if let Err(error) = agreed.and_then(|agreed| agreed) {
-                        *told.failed.lock() = Some(error);
+                    match agreed.and_then(|agreed| agreed) {
+                        Ok(unchecked) => told.unchecked.store(unchecked, Ordering::Relaxed),
+                        Err(error) => *told.failed.lock() = Some(error),
                     }
                 }
                 told.done.store(true, Ordering::Release);
@@ -1264,7 +1261,8 @@ impl Checks {
     /// Checks each table among `found` that `plans` does not trust, against the table it plans,
     /// queuing on `pool` those checks not queued yet, waits for them while it helps run what is
     /// queued, and returns the first table, in the order of `found`, whose check failed, with its
-    /// error.
+    /// error, and the tables whose checks found an index under a fingerprint their type does not
+    /// know.
     ///
     /// The checks not queued yet are queued in groups, up to [`GROUPED`] at a time and fewer
     /// where there are not many, each group as one job.
@@ -1274,7 +1272,7 @@ impl Checks {
         store: &'p Store,
         plans: &Plans,
         found: &'a [FoundTable],
-    ) -> Option<(&'a FoundTable, Error)> {
+    ) -> Finished<'a> {
         let mut fresh = Vec::new();
         let waiting: Vec<_> = found
             .iter()
@@ -1302,9 +1300,15 @@ impl Checks {
             passed.set(at);
             at == waiting.len()
         });
-        waiting
+        let unchecked = waiting
+            .iter()
+            .filter(|(_, verdict)| verdict.unchecked.load(Ordering::Relaxed))
+            .map(|(table, _)| table.hash)
+            .collect();
+        let failed = waiting
             .into_iter()
-            .find_map(|(table, verdict)| verdict.failed.lock().take().map(|error| (table, error)))
+            .find_map(|(table, verdict)| verdict.failed.lock().take().map(|error| (table, error)));
+        Finished { failed, unchecked }
     }
 }
 
@@ -1649,6 +1653,16 @@ impl<'a> Decoder<'a> {
             &self.buf[checkpoint.pos..self.pos],
             &self.links[checkpoint.cursor..self.cursor],
         )
+    }
+
+    /// Whether the store this decoder reads from records the table value read since `start` as
+    /// landed with an index nothing checked, as [`Store::is_unchecked`] says.
+    pub(crate) fn unchecked_since(&self, start: Checkpoint) -> bool {
+        let Some(store) = self.store.filter(|store| store.has_unchecked()) else {
+            return false;
+        };
+        let (body, links) = self.read_since(start);
+        store.is_unchecked(&hash_parts(body, links.iter().map(|link| &link.hash)))
     }
 
     /// Notes the table value read since `start`, of the table type `id` named `name`, for
