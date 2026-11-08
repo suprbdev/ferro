@@ -1,5 +1,7 @@
 CARGO ?= cargo
 MEM ?= 16G
+JOBS ?= $(patsubst %G,%,$(MEM))
+export CARGO_BUILD_JOBS ?= $(JOBS)
 CAP ?= $(if $(shell command -v systemd-run 2>/dev/null),systemd-run --user --scope -q -p MemoryMax=$(MEM) -p MemorySwapMax=0)
 RUN = $(CAP) $(CARGO)
 WIN_TARGET ?= x86_64-pc-windows-gnu
@@ -25,7 +27,7 @@ LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-	@printf '\nVariables: MEM=%s T=test-filter P=package DB=path ADDR=%s ARGS="..." FUZZ=%s\n' "$(MEM)" "$(ADDR)" "$(FUZZ)"
+	@printf '\nVariables: MEM=%s JOBS=%s T=test-filter P=package DB=path ADDR=%s ARGS="..." FUZZ=%s\n' "$(MEM)" "$(JOBS)" "$(ADDR)" "$(FUZZ)"
 	@printf 'STRESS_ROUNDS=%s STRESS_COPIES=%s STRESS_THREADS=%s size test-stress.\n' "$(STRESS_ROUNDS)" "$(STRESS_COPIES)" "$(STRESS_THREADS)"
 	@printf 'Set CAP= (empty) to run cargo without the systemd memory cap.\n'
 

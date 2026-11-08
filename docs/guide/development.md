@@ -12,7 +12,9 @@ make info DB=target/demo/shop.ferro
 ```
 
 Cargo runs inside a `systemd-run` scope capped at `MEM` (16G by default), so a runaway test cannot
-take the machine down. Set `CAP=` to run without the cap.
+take the machine down. Set `CAP=` to run without the cap. Cargo runs `JOBS` compile jobs at once,
+one for each GiB of `MEM` by default, since linking the test binaries on every core of a large
+machine passes the cap; set `JOBS` when `MEM` is not given in G.
 
 | Target | Does |
 | --- | --- |
