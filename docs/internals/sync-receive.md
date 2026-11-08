@@ -1196,6 +1196,27 @@ follows it:
 A table in the root is paired by reading the two roots, a few hundred bytes, so these move by no
 more than the noise.
 
+After #117 counted a pairing's zero-width items per object, merged fields, kept less of each
+pairing, paired maps that share nodes, aligned the elements of a `Vec` and built a table that
+shares no node with its pair, the same benchmark, with the same bundles, ran with the builds at
+22588a8 and after #117 alternating, medians of ten runs, five for the clone in 100 commits and what
+follows it; the clone in 100 commits and its `verify_typed` ran eight more times each, as other
+work on the machine made the first five vary by a quarter:
+
+| Bundle | Before #117 | After #117 |
+| --- | --- | --- |
+| Clone in ten commits of 20,000 rows | 529 ms | 525 ms |
+| Edit of both plain indexed fields | 53.2 ms | 53.9 ms |
+| Edit of the field no index names | 16.6 ms | 16.6 ms |
+| `verify_typed` of the eleven versions | 766 ms | 744 ms |
+| Clone in 100 commits of 2,000 rows | 2,626 ms | 2,641 ms |
+| Edit of both plain indexed fields after it | 56.9 ms | 56.5 ms |
+| Edit of the field no index names after it | 17.3 ms | 17.2 ms |
+| `verify_typed` of the 101 versions | 2,480 ms | 2,454 ms |
+
+The check of a table against its pair reads the roots of the two maps of rows first, two nodes
+that its diff reads again; the times above do not show it.
+
 The checks take about the processor time they took when they applied the rows: a clone in ten
 commits spent 1.5 s of it against 0.55 s before the check, an edit of both indexed fields 0.12 s
 against 0.06 s, and `verify_typed` of the eleven versions 1.7 s against 0.8 s, process time each,
@@ -1236,8 +1257,9 @@ Left out:
 - Checking only the versions a receiver keeps under its retention. Every version a receive lands
   can be read with `at` until it is pruned, so each is checked.
 - Pairing a table with one at another place in the parent, as when a value moves to another key
-  or a table to another field: such a table is checked against all its rows. The tables of a held
-  parent's root are trusted wherever they move in the root, as before.
+  or a table to another field: such a table is checked against all its rows, unless it moved
+  within a `Vec` that gained or lost elements before it, as above. The tables of a held parent's
+  root are trusted wherever they move in the root, as before.
 - Checking a table in held data of another type, or any table of a bundle whose first root holds
   none, beside the walk: such tables are found by the walk, and are checked once it is done. A
   table checked against all its rows, or with an `each` index over a `Set`, waits for the walk too,
