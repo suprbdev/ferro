@@ -201,7 +201,13 @@ impl Drop for Alone {
 /// [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
 /// recompute every summary they check from the entries below it, with this type's `of` and
 /// `combine`, and refuse one whose encoding differs from what is stored, so two files that sync
-/// need the same `Summary`. `of` may read a collection the value holds, on any thread: such a value
+/// need the same `Summary`. Nothing stored names the summary type, so a map read with another `S`
+/// that encodes like the one that wrote it, or with this type after its `of` or `combine`
+/// changed, returns the old folds from [`Map::summary`] and from range summaries that take a
+/// stored fold, with no error, until `verify_typed` reports them. Give the map's field a new
+/// stored name whenever its summary changes, as
+/// [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// describes. `of` may read a collection the value holds, on any thread: such a value
 /// is summarized once what is checked below it has passed, and reads the collection as a local
 /// read does. The summary may hold a collection too, such as a [`Set`](crate::Set) of the values
 /// seen: a node whose stored summaries hold one is folded once their nodes have passed their

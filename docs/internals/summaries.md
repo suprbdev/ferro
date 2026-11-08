@@ -40,8 +40,14 @@ for the default hasher, and `Map::new` is the same: it is defined for `S = ()` a
 `Map::new()` still infers, and no caller in the workspace changed. A summarized map starts from
 `Map::default()` or `collect`.
 
-Changing `S` changes a map's encoding under the same field tag, as changing `V` does. Rename the
-field to rebuild it.
+Nothing stored says which `S` folded a map, so changing `S` under the same field tag is not always
+caught as changing `V` is. A new `S` that encodes differently fails to decode. One that encodes the
+same way, or the same type after `of` or `combine` changed, reads the old folds as its own, and only
+`verify_typed`, which recomputes them, reports the difference. A fingerprint from `Data::describe`,
+as indexes keep, would not catch that: a description follows the encoding, so two transparent `u64`
+summaries describe alike and a changed `of` describes as before, and it would add bytes to every
+summarized map that the plain encoding does not have. So the field is renamed whenever `S` or what
+it folds changes, which starts the map empty under the new name.
 
 ## Where the summary is stored
 

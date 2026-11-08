@@ -38,8 +38,14 @@ you list.
 A field marked `#[ferro(skip)]` is not stored and reads back as its `Default`. The `Record` derive
 refuses `#[key]` or an index of any kind on one, alone or in a composite, and a `Summary` must not
 depend on one, as described under [Summaries](../internals/summaries.md#how-a-summary-is-kept).
-Changing a summary type `S` changes a map's encoding under the same field tag, as changing `V` does,
-so rename the field to rebuild it.
+
+A map stores the fold of every subtree, and nothing in the file says which summary type `S` made it.
+A new `S` that encodes differently fails to decode, as a changed `V` does. One that encodes the same
+way, such as another transparent `u64`, or the same type with another `of` or `combine`, reads the
+old folds as its own: `summary()`, and a range summary wherever it takes a stored fold, return what
+the old `S` folded, with no error, until `verify_typed` reports them. So whenever `S` or what it
+folds changes, give the field a new stored name, so that the map starts empty, and fill it from the
+old field, which reads as before under its old name with the old `S` until you remove it.
 
 ## Indexes
 
