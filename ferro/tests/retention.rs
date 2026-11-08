@@ -1,6 +1,11 @@
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use common::fast;
+use ferro::db::Clock;
 use ferro::{Db, Error, Keep, Map, Options, Reclaim};
 
 type Root = Map<u64, u64>;
@@ -121,4 +126,32 @@ fn a_branch_forked_before_any_commit_keeps_version_zero_while_another_prunes() {
     db.compact(Keep::Last(2)).unwrap();
     assert_eq!(reachable(&early), vec![0, 1]);
     assert_eq!(reachable(&db), vec![4, 5]);
+}
+
+#[test]
+fn keep_within_measures_its_age_from_the_clock_commits_take_their_times_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = {
+        let now = now.clone();
+        Clock(Arc::new(move || now.load(Ordering::Relaxed)))
+    };
+    let db: Db<Root> = options()
+        .clock(clock)
+        .open(dir.path().join("w.ferro"))
+        .unwrap();
+    for key in 1..=3 {
+        now.store(key * 1_000, Ordering::Relaxed);
+        put(&db, key);
+    }
+    now.store(3_500, Ordering::Relaxed);
+    let report = db
+        .compact(Keep::Within(Duration::from_millis(1_600)))
+        .unwrap();
+    assert_eq!(report.commits_dropped, 1);
+    assert_eq!(reachable(&db), vec![2, 3]);
+    now.store(5_100, Ordering::Relaxed);
+    db.compact(Keep::Within(Duration::from_millis(2_000)))
+        .unwrap();
+    assert_eq!(reachable(&db), vec![3]);
 }

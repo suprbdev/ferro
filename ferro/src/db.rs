@@ -3323,6 +3323,13 @@ impl<T: Data> Shared<T> {
         }
         let store = self.store();
         self.exclusively(notices, |tip, notices| {
+            let keep = match keep {
+                Keep::Within(age) => {
+                    let age = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+                    Keep::Since(self.now().saturating_sub(age))
+                }
+                keep => keep,
+            };
             let mut next = tip.refs.clone();
             let mut dropped = 0;
             for (name, mut head) in tip.refs.try_entries()? {
