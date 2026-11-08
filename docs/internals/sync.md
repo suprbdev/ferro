@@ -42,7 +42,9 @@ recognised tips, and of the commit that set the floor, are anchors: trees the re
 hold. Each new root, oldest first, is compared with the root before it, and the first with the
 anchors, one level at a time. The old side expands a level and records each object it reaches as
 known. Then the new side expands a level, and a new object that is known or already sent is not
-followed. An old object that the new tree still links is common to both and is not expanded.
+followed. An old object that the new tree still links is common to both and is not expanded, unless
+the new tree links it in fewer places than the old one did, as described under [Objects in several
+places](#objects-in-several-places).
 
 The first version compared every new root with the anchors at once, and sent 185 objects and 95 KB
 for two commits that changed one key each in a 5,000 key map. An old node that the first commit kept
@@ -122,6 +124,60 @@ its hash checked, and written in 64 KiB chunks with the LZ4 bytes the file alrea
 the sender compresses nothing. Planning holds about 45 bytes for each object sent, as described
 under [Memory for each object](#memory-for-each-object). `pull` runs the sender on a second thread
 once it sends 256 objects, with eight chunks in flight between the two.
+
+### Objects in several places
+
+An object can sit at several places in one tree, as a table does in two fields that hold clones of
+one map, or in a map under several keys. Linked at one place in the new tree, it used to count as
+common at all of them, so where a commit changed it at another place nothing under it was known and
+the changed copy went whole. A one-row edit to a table of 300,000 rows with two indexes, held in a
+map in the root, sent 2,268 bytes, and with a clone of that map in a second field of the root,
+14,628,636 bytes in 112,608 objects.
+
+The comparison counts places. The new side counts the links to each object from the nodes it sends,
+and the old side the links to it from the nodes it expands, so a node that links an object twice
+counts twice. An old object that the old side has reached more often than the new tree links it has
+lost a place to a new object, which may link what is under it, so it is expanded as one the new
+tree does not link, a level at a time beside the new object that took its place. The edit above
+sends 2,290 bytes, in as many objects as without the clone.
+
+The first new root is compared with every anchor at once, and anchors are mostly versions of one
+tree, which hold the same objects at the same places. Counted across all of them, an object that two
+anchors hold under nodes the new tree changed counts twice against the one link the new tree makes
+and is expanded, and everything under it after it, level by level: a one-row edit of that table,
+pulled into a file that held the table on a second branch as well, took 9.2 ms to bundle that way,
+where it took 0.14 ms without counts. So only the links from nodes reached from one anchor count:
+the root of the commit that set the floor, which the new commits descend from, or the first anchor
+if no commit did. An object reached from that anchor and from another counts as reached from that
+anchor, and that edit takes 0.13 ms to bundle.
+
+An object that lost a place to nothing is expanded too, as when a commit drops one of the two clones
+and changes something else, and what is under it is then walked as deep as the commit's other
+changes reach, as it is when the dropped field held a table of its own. Such a commit to the file
+above, which removes the table from the second map and edits a row of a table of the same size in a
+third, took 0.14 ms to bundle and takes 35 ms, against 39 ms when the removed table was one of its
+own of the same shape.
+
+An object that the new tree links as often as the old one did is still common, so a clone of a held
+map that a commit makes and changes in that same commit is sent whole, as [Limits](#limits) says:
+cloning the map into the second field and editing the clone in one commit sends 14,628,640 bytes.
+Made in two commits and pulled together, the same clone and edit send 2,408 bytes, since the second
+commit's root is compared with the first's, which holds the table in both places.
+
+Where nothing is shared the bundles are the same. The 200,000 scattered edits into the clone of 8
+million keys come out byte for byte as before, planned and written in 6.50 billion instructions
+against 6.45 and with 137.7 MiB of peak heap against 142.2, `notes-scale` sends the same 106,337
+bytes in 139 objects after its edits, and a pull of three one-key commits into that clone runs 3.75
+million instructions, 0.1% more.
+
+`an_edit_to_a_table_two_maps_share_sends_only_what_it_changed`,
+`an_edit_to_a_table_shared_under_many_keys_or_nested_maps_sends_only_what_it_changed` and
+`an_edit_to_a_table_another_branch_shares_sends_only_what_it_changed` in `ferro/tests/sync.rs` edit
+a table of 20,000 rows that two fields share, that 50 keys of a map share, that two keys of an outer
+map share through one inner map, and that another branch shares, and expect each pull to send
+exactly the objects the new head reaches that the receiver's file lacks, and the receiver to pass
+`verify_typed`. Without the counts the first two sent 7,641 and 2,527 objects where 7 and 8 were
+lacking.
 
 ## Applying
 
@@ -416,8 +472,9 @@ place in the order, 4 bytes. A commit adds 80 bytes, and each object the old sid
 incremental pull its hash, its origin as a position and link index, and a slot, about 40. The
 objects it reaches under nodes the next level names count toward 65,536 a bundle, so they add at
 most 2.5 MiB that stay until the plan is done, and about 4 MiB while a step expands them. The
-comparison holds the level it is on
-while the old side has anything left to expand, and walks the rest of the new tree depth first.
+comparison holds the level it is on while the old side has anything left to expand, with the hash
+of each object the new side has linked and a count of 4 bytes, and walks the rest of the new tree
+depth first.
 
 Before, the receiver kept a map from hash to staging offset, 33 bytes a slot, and every check it
 made, by hash and type: an 81-byte slot, the 96-byte kind it was made under and, for a node, a
@@ -520,8 +577,14 @@ Measured and left out:
   receiver's branches plus log n, times the sender's branches, times log n.
 - A subtree that sits two or more levels deeper in the receiver's tree than in the new one is sent
   again. So is an object a new node links that the receiver holds only under a node the new tree
-  links where the old one did, or under a node it moved one level deeper once the old side has
-  reached 65,536 objects there in the bundle.
+  links in as many places as the old one did, such as a held map that a commit clones into a second
+  field and changes there in the same commit, under a node that lost a place only in an anchor
+  other than the one the comparison counts, or under a node it moved one level deeper once the old
+  side has reached 65,536 objects there in the bundle, as described under [Objects in several
+  places](#objects-in-several-places).
+- A node that lost a place in the new tree is expanded, and when nothing took its place, as when a
+  commit drops one of two fields that hold the same map, what is under it is walked as deep as the
+  commit's other changes reach, as under a field that held a map of its own.
 - A value that holds a `Ptr` into pruned history cannot be sent.
 - Each pull that brings a head `remote` does not hold replaces `remote`, including commits made on
   it here. If the remote branch's history no longer contains what was landed before, records under

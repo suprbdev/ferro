@@ -766,6 +766,30 @@ impl Known {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Reached {
+    hash: Hash,
+    offset: u64,
+    times: i32,
+}
+
+impl Reached {
+    fn of(ptr: Ptr, counted: bool) -> Reached {
+        Reached {
+            hash: ptr.hash,
+            offset: ptr.offset,
+            times: i32::from(counted),
+        }
+    }
+
+    fn ptr(&self) -> Ptr {
+        Ptr {
+            hash: self.hash,
+            offset: self.offset,
+        }
+    }
+}
+
 struct Difference {
     known: Known,
     send: Sendable,
@@ -777,6 +801,7 @@ struct Difference {
 fn difference(
     store: &Store,
     old_roots: &[Ptr],
+    counting: usize,
     new_roots: impl IntoIterator<Item = Ptr>,
 ) -> Result<Difference> {
     let mut found = Difference {
@@ -794,10 +819,14 @@ fn difference(
             found.known.insert(root.hash, Origin::Root(slot as u32))?;
         }
     }
-    let mut previous = old_roots.to_vec();
+    let mut previous = old_roots
+        .iter()
+        .enumerate()
+        .map(|(slot, root)| Reached::of(*root, slot == counting))
+        .collect();
     for root in new_roots {
         found.step(store, previous, root)?;
-        previous = vec![root];
+        previous = vec![Reached::of(root, true)];
     }
     Ok(found)
 }
@@ -807,11 +836,12 @@ impl Difference {
         self.known.find(hash).is_some() || self.send.find(hash).is_some()
     }
 
-    fn step(&mut self, store: &Store, mut old: Vec<Ptr>, root: Ptr) -> Result<()> {
-        let mut seen = HashSet::from([root.hash]);
+    fn step(&mut self, store: &Store, mut old: Vec<Reached>, root: Ptr) -> Result<()> {
+        let mut seen = HashMap::from([(root.hash, 1i32)]);
         let mut expanded = HashSet::new();
         let mut fresh = vec![root];
         let mut moved: Vec<Ptr> = Vec::new();
+        let mut children = Vec::new();
         loop {
             fresh.retain(|ptr| !self.classified(&ptr.hash));
             if fresh.is_empty() {
@@ -822,14 +852,20 @@ impl Difference {
                 while self.moved > 0
                     && let Some(ptr) = moved.pop()
                 {
-                    if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
+                    if !seen.contains_key(&ptr.hash) && expanded.insert(ptr.hash) {
                         self.expand(store, ptr, &mut moved, true)?;
                     }
                 }
                 return self.reach(store, fresh);
             }
-            old.sort_unstable_by_key(|ptr| ptr.hash);
-            old.dedup_by_key(|ptr| ptr.hash);
+            old.sort_unstable_by_key(|reached| reached.hash);
+            old.dedup_by(|reached, kept| {
+                let same = reached.hash == kept.hash;
+                if same {
+                    kept.times = kept.times.saturating_add(reached.times);
+                }
+                same
+            });
             let mut linked = vec![false; old.len()];
             let mut starts = Vec::with_capacity(fresh.len() + 1);
             let mut next = Vec::new();
@@ -839,7 +875,7 @@ impl Difference {
                     continue;
                 }
                 for link in store.read_links(*ptr)? {
-                    if let Ok(at) = old.binary_search_by_key(&link.hash, |ptr| ptr.hash) {
+                    if let Ok(at) = old.binary_search_by_key(&link.hash, |reached| reached.hash) {
                         linked[at] = true;
                     }
                     next.push(link);
@@ -847,11 +883,17 @@ impl Difference {
             }
             starts.push(next.len());
             let mut deeper = Vec::new();
-            for (at, ptr) in old.drain(..).enumerate() {
+            for (at, reached) in old.drain(..).enumerate() {
+                let common = seen.get_mut(&reached.hash).is_some_and(|count| {
+                    *count = count.saturating_sub(reached.times);
+                    *count >= 0
+                });
                 if linked[at] {
-                    moved.push(ptr);
-                } else if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
-                    self.expand(store, ptr, &mut deeper, false)?;
+                    moved.push(reached.ptr());
+                } else if !common && expanded.insert(reached.hash) {
+                    self.expand(store, reached.ptr(), &mut children, false)?;
+                    let counted = reached.times > 0;
+                    deeper.extend(children.drain(..).map(|link| Reached::of(link, counted)));
                 }
             }
             let mut below = Vec::new();
@@ -859,7 +901,7 @@ impl Difference {
                 if self.moved == 0 {
                     break;
                 }
-                if !seen.contains(&ptr.hash) && expanded.insert(ptr.hash) {
+                if !seen.contains_key(&ptr.hash) && expanded.insert(ptr.hash) {
                     self.expand(store, ptr, &mut below, true)?;
                 }
             }
@@ -875,10 +917,19 @@ impl Difference {
                 self.send_object(ptr, &next[start..end])?;
                 for index in start..end {
                     let link = next[index];
-                    if !tracking || seen.insert(link.hash) {
-                        next[kept] = link;
-                        kept += 1;
+                    if tracking {
+                        match seen.entry(link.hash) {
+                            hash_map::Entry::Occupied(mut count) => {
+                                *count.get_mut() = count.get().saturating_add(1);
+                                continue;
+                            }
+                            hash_map::Entry::Vacant(count) => {
+                                count.insert(1);
+                            }
+                        }
                     }
+                    next[kept] = link;
+                    kept += 1;
                 }
             }
             next.truncate(kept);
@@ -1107,15 +1158,21 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         })
     };
     let mut old_roots: Vec<Ptr> = Vec::new();
+    let chosen = prefix.map(|(_, chosen)| chosen);
+    let mut counting = 0;
     for (slot, base) in known.iter().enumerate() {
-        if !base.tip && prefix.map(|(_, chosen)| chosen) != Some(slot) {
+        if !base.tip && chosen != Some(slot) {
             continue;
         }
         let entry = Entry::load(store, base.ptr)?;
         let Some(root) = entry.commit.root else {
             continue;
         };
-        if old_roots.iter().any(|old| old.hash == root.hash) {
+        let at = old_roots.iter().position(|old| old.hash == root.hash);
+        if chosen == Some(slot) {
+            counting = at.unwrap_or(old_roots.len());
+        }
+        if at.is_some() {
             continue;
         }
         header.roots.push(base_slot(slot, &mut header.bases));
@@ -1132,7 +1189,7 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         mut send,
         links,
         ..
-    } = difference(store, &old_roots, new_roots)?;
+    } = difference(store, &old_roots, counting, new_roots)?;
     entries.extend(extra);
     for sending in &entries {
         if send.find(&sending.ptr.hash).is_none() {

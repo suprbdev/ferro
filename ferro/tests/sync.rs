@@ -206,6 +206,245 @@ fn a_commit_that_pushes_held_nodes_deeper_sends_only_what_the_receiver_lacks() {
     b.verify().unwrap();
 }
 
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Account {
+    #[key]
+    id: u64,
+    #[index]
+    group: u32,
+    #[unique]
+    email: u64,
+    label: String,
+}
+
+#[derive(Data, Clone, Default)]
+struct Ledgers {
+    a: Map<u64, Table<Account>>,
+    b: Map<u64, Table<Account>>,
+}
+
+#[derive(Data, Clone, Default)]
+struct NestedLedgers {
+    m: Map<u64, Map<u64, Table<Account>>>,
+}
+
+fn accounts(from: u64, rows: u64) -> Table<Account> {
+    let mut table: Table<Account> = Table::new();
+    for id in from..from + rows {
+        table.insert(Account {
+            id,
+            group: (id % 100) as u32,
+            email: id * 7 + 1,
+            label: format!("account {id:>10}"),
+        });
+    }
+    table
+}
+
+fn relabelled(table: &Table<Account>, id: u64, label: &str) -> Table<Account> {
+    let mut table = table.clone();
+    table.update(&id, |row| row.label = label.to_string());
+    table
+}
+
+fn label_of(table: &Table<Account>, id: u64) -> String {
+    table.rows().get(&id).unwrap().label.clone()
+}
+
+fn lacked<T: Data>(dir: &TempDir, sender: &Db<T>, receiver: &Db<T>) -> usize {
+    let sent = object_graph(&sender.path(), &dir.path().join("sender.scratch"));
+    let held = object_graph(&receiver.path(), &dir.path().join("receiver.scratch"));
+    let tree = reached(&sent, sender.head_hash().unwrap());
+    tree.iter().filter(|hash| !held.contains_key(*hash)).count()
+}
+
+fn pull_exactly<T: Data + Clone + Default + Send + Sync + 'static>(
+    dir: &TempDir,
+    receiver: &Db<T>,
+    sender: &Db<T>,
+    remote: &str,
+) -> Pulled<()> {
+    let lacked = lacked(dir, sender, receiver);
+    let pulled = receiver.pull(sender, remote, no_merge).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(pulled.objects as usize, lacked, "{pulled:?}");
+    assert_eq!(receiver.head_hash(), sender.head_hash());
+    receiver.verify_typed().unwrap();
+    pulled
+}
+
+#[test]
+fn an_edit_to_a_table_two_maps_share_sends_only_what_it_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = accounts(0, 20_000);
+    let mut sizes = Vec::new();
+    for shared in [false, true] {
+        let s: Db<Ledgers> = fast()
+            .open(dir.path().join(format!("s{shared}.ferro")))
+            .unwrap();
+        let r: Db<Ledgers> = fast()
+            .open(dir.path().join(format!("r{shared}.ferro")))
+            .unwrap();
+        s.commit("load", |root| {
+            root.a.insert(1, table.clone());
+            if shared {
+                root.b = root.a.clone();
+            }
+        })
+        .unwrap();
+        let clone = r.pull(&s, "s", no_merge).unwrap();
+        s.commit("edit a", |root| {
+            let edited = relabelled(&root.a.get(&1).unwrap(), 5, "edited in a");
+            root.a.insert(1, edited);
+        })
+        .unwrap();
+        let pulled = pull_exactly(&dir, &r, &s, "s");
+        println!("shared {shared}: clone {clone:?}, edit {pulled:?}");
+        assert!(pulled.objects * 100 < clone.objects, "{pulled:?}");
+        assert_eq!(label_of(&r.read().a.get(&1).unwrap(), 5), "edited in a");
+        sizes.push(pulled.received_bytes);
+        if !shared {
+            continue;
+        }
+        assert_eq!(
+            label_of(&r.read().b.get(&1).unwrap(), 5),
+            "account          5"
+        );
+        s.commit("edit b", |root| {
+            let edited = relabelled(&root.b.get(&1).unwrap(), 7, "edited in b");
+            root.b.insert(1, edited);
+        })
+        .unwrap();
+        let pulled = pull_exactly(&dir, &r, &s, "s");
+        assert!(pulled.received_bytes < 2 * sizes[0], "{pulled:?}");
+        s.commit("copy", |root| root.b = root.a.clone()).unwrap();
+        s.commit("edit both", |root| {
+            let edited = relabelled(&root.a.get(&1).unwrap(), 9, "edited in a");
+            root.a.insert(1, edited);
+            let edited = relabelled(&root.b.get(&1).unwrap(), 11, "edited in b");
+            root.b.insert(1, edited);
+        })
+        .unwrap();
+        let pulled = pull_exactly(&dir, &r, &s, "s");
+        assert!(pulled.received_bytes < 4 * sizes[0], "{pulled:?}");
+        let ledgers = r.read();
+        assert_eq!(label_of(&ledgers.a.get(&1).unwrap(), 9), "edited in a");
+        assert_eq!(
+            label_of(&ledgers.b.get(&1).unwrap(), 9),
+            "account          9"
+        );
+        assert_eq!(label_of(&ledgers.b.get(&1).unwrap(), 11), "edited in b");
+        assert_eq!(
+            label_of(&ledgers.a.get(&1).unwrap(), 11),
+            "account         11"
+        );
+    }
+    assert!(sizes[1] < 2 * sizes[0], "{sizes:?}");
+}
+
+#[test]
+fn an_edit_to_a_table_shared_under_many_keys_or_nested_maps_sends_only_what_it_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = accounts(0, 20_000);
+    let s: Db<Ledgers> = fast().open(dir.path().join("keys-s.ferro")).unwrap();
+    let r: Db<Ledgers> = fast().open(dir.path().join("keys-r.ferro")).unwrap();
+    s.commit("load", |root| {
+        for key in 0..50 {
+            root.a.insert(key, table.clone());
+        }
+    })
+    .unwrap();
+    r.pull(&s, "s", no_merge).unwrap();
+    for key in [7, 0, 49] {
+        s.commit(format!("edit {key}"), |root| {
+            let edited = relabelled(&root.a.get(&key).unwrap(), key, "edited");
+            root.a.insert(key, edited);
+        })
+        .unwrap();
+        let pulled = pull_exactly(&dir, &r, &s, "s");
+        assert!(pulled.objects < 20, "key {key}: {pulled:?}");
+        assert_eq!(label_of(&r.read().a.get(&key).unwrap(), key), "edited");
+    }
+
+    let s: Db<NestedLedgers> = fast().open(dir.path().join("nested-s.ferro")).unwrap();
+    let r: Db<NestedLedgers> = fast().open(dir.path().join("nested-r.ferro")).unwrap();
+    s.commit("load", |root| {
+        let mut inner = Map::new();
+        inner.insert(1, table.clone());
+        inner.insert(2, accounts(1_000_000, 10));
+        root.m.insert(1, inner.clone());
+        root.m.insert(2, inner);
+    })
+    .unwrap();
+    r.pull(&s, "s", no_merge).unwrap();
+    for (outer, id) in [(1, 5), (2, 6), (1, 7)] {
+        s.commit(format!("edit {outer}"), |root| {
+            let mut inner = (*root.m.get(&outer).unwrap()).clone();
+            let edited = relabelled(&inner.get(&1).unwrap(), id, "edited");
+            inner.insert(1, edited);
+            root.m.insert(outer, inner);
+        })
+        .unwrap();
+        let pulled = pull_exactly(&dir, &r, &s, "s");
+        assert!(pulled.objects < 20, "m[{outer}]: {pulled:?}");
+        let inner = r.read().m.get(&outer).unwrap();
+        assert_eq!(label_of(&inner.get(&1).unwrap(), id), "edited");
+    }
+}
+
+#[test]
+fn an_edit_to_a_table_another_branch_shares_sends_only_what_it_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let s: Db<Ledgers> = fast().open(dir.path().join("s.ferro")).unwrap();
+    let r: Db<Ledgers> = fast().open(dir.path().join("r.ferro")).unwrap();
+    let table = accounts(0, 20_000);
+    s.commit("load", |root| {
+        root.a.insert(1, table.clone());
+    })
+    .unwrap();
+    let feature = s.fork("feature").unwrap();
+    feature
+        .commit("add", |root| {
+            root.b.insert(9, accounts(1_000_000, 3));
+        })
+        .unwrap();
+    let held = r.fork("feature").unwrap();
+    r.pull(&s, "s", no_merge).unwrap();
+    held.pull(&feature, "s-feature", no_merge).unwrap();
+    s.commit("edit", |root| {
+        let edited = relabelled(&root.a.get(&1).unwrap(), 5, "edited on main");
+        root.a.insert(1, edited);
+    })
+    .unwrap();
+    let pulled = pull_exactly(&dir, &r, &s, "s");
+    assert!(pulled.objects < 20, "{pulled:?}");
+    let copied = (*feature.read().a.get(&1).unwrap()).clone();
+    s.commit("copy and edit", |root| {
+        root.b.insert(1, copied.clone());
+        let edited = relabelled(&root.a.get(&1).unwrap(), 6, "edited on main");
+        root.a.insert(1, edited);
+    })
+    .unwrap();
+    let pulled = pull_exactly(&dir, &r, &s, "s");
+    assert!(pulled.objects < 20, "{pulled:?}");
+    feature
+        .commit("edit", |root| {
+            let edited = relabelled(&root.a.get(&1).unwrap(), 7, "edited on feature");
+            root.a.insert(1, edited);
+        })
+        .unwrap();
+    let pulled = pull_exactly(&dir, &held, &feature, "s-feature");
+    assert!(pulled.objects < 20, "{pulled:?}");
+    assert_eq!(
+        label_of(&held.read().a.get(&1).unwrap(), 7),
+        "edited on feature"
+    );
+    assert_eq!(
+        label_of(&r.read().b.get(&1).unwrap(), 6),
+        "account          6"
+    );
+}
+
 #[test]
 fn diverged_branches_merge_against_the_newest_common_state() {
     let dir = tempfile::tempdir().unwrap();
