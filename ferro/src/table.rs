@@ -2344,13 +2344,14 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
 
     /// The rows that this combination or `other` matches, each once.
     ///
-    /// Both sides must have the same covered fields. Call [`uncovered`](Matches::uncovered), or
-    /// [`IndexIter::uncovered`], on each to combine lookups of differently covered indexes. A key
-    /// both sides hold takes its row and covered fields from this side, and a key only `other`
-    /// holds takes them from `other`. So when `other` is a lookup of another table, or of another
-    /// version of this one, the combination yields every row either holds, each from a table whose
-    /// lookup matched it. If this combination has already yielded rows, what it has left is read
-    /// into a sorted list first.
+    /// Both sides must have the same covered fields, or the call does not compile, since a key only
+    /// `other` holds comes with `other`'s covered fields; [`and`](Matches::and) has no such bound.
+    /// Call [`uncovered`](Matches::uncovered), or [`IndexIter::uncovered`], on each side to combine
+    /// lookups of differently covered indexes. A key both sides hold takes its row and covered
+    /// fields from this side, and a key only `other` holds takes them from `other`. So when `other`
+    /// is a lookup of another table, or of another version of this one, the combination yields
+    /// every row either holds, each from a table whose lookup matched it. If this combination has
+    /// already yielded rows, what it has left is read into a sorted list first.
     ///
     /// # Examples
     ///

@@ -159,6 +159,19 @@ When one has at least four times the keys of the other, only the smaller is walk
 keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where walking both took
 600 µs.
 
+`and` takes any lookup and keeps the covered fields of its left side, but `or` yields a key that
+only its right side holds with that side's covered fields, so it compiles only when both sides cover
+the same fields. Call `.uncovered()` on each side to combine lookups of differently covered indexes:
+
+```rust
+let either: Vec<_> = find
+    .by_customer("wile")
+    .uncovered()
+    .or(find.by_status(&Status::Pending).uncovered())
+    .keys()
+    .collect();
+```
+
 A lookup made on the table itself, such as `by_x_range` or `by_x_prefix` of a unique or a non-unique
 index, can be passed to `and` or `or` too. It is not in key order, so when the other side of an
 `and` has at most a quarter of its keys, only that side is walked, and each of its keys is tested
