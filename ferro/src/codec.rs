@@ -40,7 +40,7 @@
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -1006,6 +1006,145 @@ pub(crate) trait Claim: Any + Send + Sync {
 /// [`Kind`] it must lead to.
 pub(crate) type Found = Vec<(usize, Kind)>;
 
+/// What checks that the indexes of a table agree with its rows: given the table, a table of the
+/// same type to work from, whose indexes are known to agree with its rows, and the store both read
+/// from, it returns [`Error::Decode`] for an index that does not hold exactly the entries the rows
+/// give.
+pub(crate) type Agree = fn(&FoundTable, Option<&FoundTable>, &Store) -> Result<()>;
+
+/// A table value that a typed check found, kept for the check that its indexes agree with its
+/// rows, which reads the rows and so runs once every object the check reaches has passed.
+#[derive(Clone)]
+pub(crate) struct FoundTable {
+    /// The table's type.
+    pub(crate) id: TypeId,
+    /// The table type's name, for error messages.
+    pub(crate) name: &'static str,
+    /// Checks the table's indexes against its rows.
+    pub(crate) agree: Agree,
+    /// The table value's bytes, as its parent encodes it.
+    pub(crate) body: Box<[u8]>,
+    /// The table value's links.
+    pub(crate) links: Box<[Ptr]>,
+    /// The hash of the value's bytes and the hashes of its links, which with
+    /// [`id`](FoundTable::id) tells this table value from any other.
+    pub(crate) hash: Hash,
+}
+
+impl FoundTable {
+    /// The type and hash that tell this table value from any other.
+    pub(crate) fn identity(&self) -> (TypeId, Hash) {
+        (self.id, self.hash)
+    }
+}
+
+/// The table values that typed checks found, each kept once, in the order first found.
+#[derive(Default)]
+pub(crate) struct Tables {
+    seen: HashSet<(TypeId, Hash)>,
+    found: Vec<FoundTable>,
+}
+
+impl Tables {
+    /// Keeps each table in `found` that was not found before.
+    pub(crate) fn note(&mut self, found: Vec<FoundTable>) {
+        for table in found {
+            if self.seen.insert(table.identity()) {
+                self.found.push(table);
+            }
+        }
+    }
+
+    /// Whether a table value with this identity was found.
+    pub(crate) fn holds(&self, table: &FoundTable) -> bool {
+        self.seen.contains(&table.identity())
+    }
+
+    /// Whether no table was found.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.found.is_empty()
+    }
+
+    /// The tables found, in the order first found.
+    pub(crate) fn into_found(self) -> Vec<FoundTable> {
+        self.found
+    }
+}
+
+/// How the check of one table value goes.
+enum Plan {
+    /// The value is known to agree, as part of a version the receiver holds.
+    Trusted,
+    /// It is checked against the rows that changed from this table, whose check does not depend
+    /// on it.
+    From(FoundTable),
+    /// Its indexes are built from its rows.
+    Built,
+}
+
+/// How the check of each table value that a typed check found goes: against the table at the
+/// same place in its version's parent, which costs what changed between the two, or by building
+/// its indexes from its rows.
+///
+/// A table is checked against another only if that one's own check is already planned, so no
+/// chain of checks leads back to where it started and every table that is checked rests on one
+/// whose indexes were built or that was trusted.
+#[derive(Default)]
+pub(crate) struct Plans(HashMap<(TypeId, Hash), Plan>);
+
+impl Plans {
+    /// Takes `table` as agreeing with its rows, unless its check is already planned.
+    pub(crate) fn trust(&mut self, table: &FoundTable) {
+        self.0.entry(table.identity()).or_insert(Plan::Trusted);
+    }
+
+    /// Plans to build the indexes of `table` from its rows, unless its check is already planned.
+    pub(crate) fn build(&mut self, table: &FoundTable) {
+        self.0.entry(table.identity()).or_insert(Plan::Built);
+    }
+
+    /// Plans the check of each table of a version's root, `tables`, whose check is not planned
+    /// yet: against the table of the same type at the same place among `base`, the tables of its
+    /// parent's root, if that one's check is planned and it is another value, and otherwise by
+    /// building its indexes.
+    pub(crate) fn pair(&mut self, tables: &[FoundTable], base: &[FoundTable]) {
+        let mut bases: HashMap<TypeId, Vec<&FoundTable>> = HashMap::new();
+        for table in base {
+            bases.entry(table.id).or_default().push(table);
+        }
+        let mut places: HashMap<TypeId, usize> = HashMap::new();
+        for table in tables {
+            let place = places.entry(table.id).or_default();
+            let at = *place;
+            *place += 1;
+            if self.0.contains_key(&table.identity()) {
+                continue;
+            }
+            let paired = bases.get(&table.id).and_then(|list| list.get(at));
+            let plan = match paired {
+                Some(base)
+                    if base.identity() != table.identity()
+                        && self.0.contains_key(&base.identity()) =>
+                {
+                    Plan::From((*base).clone())
+                }
+                _ => Plan::Built,
+            };
+            self.0.insert(table.identity(), plan);
+        }
+    }
+
+    /// How to check `table`: `None` if it is trusted, and otherwise the table to check it
+    /// against, if any.
+    pub(crate) fn base(&self, table: &FoundTable) -> Option<Option<&FoundTable>> {
+        match self.0.get(&table.identity()) {
+            Some(Plan::Trusted) => None,
+            Some(Plan::From(base)) => Some(Some(base)),
+            Some(Plan::Built) | None => Some(None),
+        }
+    }
+}
+
 fn check_value<D: Data>(_: &Kind, r: &mut Decoder<'_>) -> Result<Shape> {
     D::visit(r)?;
     Ok(Shape::default())
@@ -1093,9 +1232,35 @@ impl Kind {
         links: &[Ptr],
         store: Option<&Store>,
     ) -> Result<(Shape, Found, u64)> {
+        self.checked(body, links, store, None)
+    }
+
+    /// Checks an object without a store, as [`check`](Kind::check) does, and also adds to
+    /// `tables` each table value with indexes that the check reads, in the order it reads them.
+    ///
+    /// # Errors
+    ///
+    /// As for [`check`](Kind::check).
+    pub(crate) fn check_tables(
+        &self,
+        body: &[u8],
+        links: &[Ptr],
+        tables: &RefCell<Vec<FoundTable>>,
+    ) -> Result<(Shape, Found, u64)> {
+        self.checked(body, links, None, Some(tables))
+    }
+
+    fn checked(
+        &self,
+        body: &[u8],
+        links: &[Ptr],
+        store: Option<&Store>,
+        tables: Option<&RefCell<Vec<FoundTable>>>,
+    ) -> Result<(Shape, Found, u64)> {
         let found = RefCell::new(Vec::new());
         let mut decoder = Decoder::new(body, links, store);
         decoder.found = Some(&found);
+        decoder.tables = tables;
         let shape = (self.check)(self, &mut decoder)?;
         let zero_width = decoder.zero_width();
         Ok((shape, found.into_inner(), zero_width))
@@ -1222,6 +1387,7 @@ pub struct Decoder<'a> {
     heap: usize,
     base: usize,
     found: Option<&'a RefCell<Found>>,
+    tables: Option<&'a RefCell<Vec<FoundTable>>>,
     recalled: Option<&'a Recalled>,
 }
 
@@ -1242,6 +1408,7 @@ impl<'a> Decoder<'a> {
             heap: 0,
             base: 0,
             found: None,
+            tables: None,
             recalled: None,
         }
     }
@@ -1270,6 +1437,13 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// How much has been read: the bytes of the body and the links, from the start of this
+    /// decoder's object.
+    #[inline]
+    pub(crate) fn read_so_far(&self) -> (usize, usize) {
+        (self.pos, self.cursor)
+    }
+
     /// Whether a link, typed or not, was read since `checkpoint`.
     #[inline]
     pub(crate) fn linked_since(&self, checkpoint: Checkpoint) -> bool {
@@ -1282,6 +1456,31 @@ impl<'a> Decoder<'a> {
             &self.buf[checkpoint.pos..self.pos],
             &self.links[checkpoint.cursor..self.cursor],
         )
+    }
+
+    /// Notes the table value read since `start`, of the table type `id` named `name`, for
+    /// `agree` to check once the typed check this decoder belongs to has passed, if it collects
+    /// tables.
+    pub(crate) fn found_table(
+        &self,
+        start: Checkpoint,
+        id: TypeId,
+        name: &'static str,
+        agree: Agree,
+    ) {
+        let Some(tables) = self.tables else {
+            return;
+        };
+        let (body, links) = self.read_since(start);
+        let hash = hash_parts(body, links.iter().map(|link| &link.hash));
+        tables.borrow_mut().push(FoundTable {
+            id,
+            name,
+            agree,
+            body: body.into(),
+            links: links.into(),
+            hash,
+        });
     }
 
     /// Where a [`Kind::recheck`] keeps the summaries of the entries it computed, or `None` for
@@ -1533,6 +1732,7 @@ impl<'a> Decoder<'a> {
                 heap: self.heap,
                 base: self.base + self.cursor,
                 found: self.found,
+                tables: self.tables,
                 recalled: self.recalled,
             };
             self.cursor = end;

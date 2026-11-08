@@ -1,4 +1,5 @@
 mod common;
+mod shadow;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -4364,6 +4365,175 @@ fn a_head_the_receiver_cannot_read_stops_no_handle_that_follows_the_remote_in_a_
     let keys: Vec<u32> = b.read().keys().collect();
     assert_eq!(keys, [1, 3, 5, 6]);
     b.verify_typed().unwrap();
+}
+
+fn from_peer<T: Data, U: Data>(mine: &Db<T>, peer: &Db<U>) -> ferro::Result<Pulled<()>> {
+    let bundle = peer.bundle(&mine.have()?)?;
+    mine.receive("peer", &bundle, unmerged)
+}
+
+fn assert_disagrees<T: Data>(received: ferro::Result<Pulled<()>>, mine: &Db<T>, case: &str) {
+    match received {
+        Err(Error::Bundle(message)) => assert!(
+            message.contains("do not agree with its rows"),
+            "{case}: {message}"
+        ),
+        other => panic!("{case}: a table whose indexes disagree with its rows landed: {other:?}"),
+    }
+    mine.verify_typed().unwrap();
+}
+
+#[test]
+fn a_table_whose_indexes_disagree_with_its_rows_is_refused() {
+    assert!(shadow::encodes_as_the_table(&shadow::honest()));
+    for (case, forged) in shadow::forgeries() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer: Db<shadow::Peer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+        let mine: Db<shadow::Mine> = fast().open(dir.path().join("mine.ferro")).unwrap();
+        peer.update(|root| root.rows = forged).unwrap();
+        assert_disagrees(from_peer(&mine, &peer), &mine, case);
+        assert_eq!(mine.version(), 0, "{case}");
+        assert_eq!(mine.branches(), ["main"], "{case}");
+        assert_eq!(mine.read().rows.len(), 0, "{case}");
+    }
+}
+
+type Drift = (&'static str, fn(&mut shadow::Shadow));
+
+#[test]
+fn a_table_that_drifts_from_its_indexes_in_a_pull_is_refused_against_the_version_held() {
+    let rows: Vec<shadow::Row> = (0..300)
+        .map(|id| shadow::row(id, (id % 7) as u32, id * 10))
+        .collect();
+    let drifts: [Drift; 4] = [
+        ("a row moved without its entry", |table| {
+            table.rows.update(&2, |row| row.n = 99);
+        }),
+        ("an entry for no row", |table| {
+            table.by_n.insert((1000, 9999), ());
+        }),
+        ("two rows sharing a unique value", |table| {
+            table.put(shadow::row(500, 1, 30));
+        }),
+        ("a row under another key", |table| {
+            table.put(shadow::row(601, 2, 6010));
+            let moved = table.rows.remove(&601).unwrap();
+            table.rows.insert(600, (*moved).clone());
+        }),
+    ];
+    for (case, drift) in drifts {
+        let dir = tempfile::tempdir().unwrap();
+        let peer: Db<shadow::Peer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+        let mine: Db<shadow::Mine> = fast().open(dir.path().join("mine.ferro")).unwrap();
+        peer.update(|root| root.rows = shadow::Shadow::of(&rows))
+            .unwrap();
+        assert_eq!(
+            from_peer(&mine, &peer).unwrap().outcome,
+            Outcome::FastForward
+        );
+        peer.update(|root| {
+            root.rows.remove(4);
+            root.rows.put(shadow::row(5, 42, 51));
+            root.rows.put(shadow::row(400, 3, 4000));
+        })
+        .unwrap();
+        assert_eq!(
+            from_peer(&mine, &peer).unwrap().outcome,
+            Outcome::FastForward
+        );
+        let landed = mine.head_hash();
+        {
+            let read = mine.read();
+            assert_eq!(read.rows.len(), 300);
+            let fives: Vec<u64> = read.rows.by_n(&42).keys().collect();
+            assert_eq!(fives, [5]);
+            assert_eq!(read.rows.key_by_email(&51), Some(5));
+            assert_eq!(read.rows.key_by_email(&40), None);
+        }
+        peer.update(|root| {
+            root.rows.put(shadow::row(7, 8, 77));
+            drift(&mut root.rows);
+        })
+        .unwrap();
+        assert_disagrees(from_peer(&mine, &peer), &mine, case);
+        assert_eq!(mine.head_hash(), landed, "{case}");
+        let read = mine.read();
+        let twos: Vec<u64> = read.rows.by_n(&2).keys().take(2).collect();
+        assert_eq!(twos, [2, 9], "{case}");
+        assert_eq!(read.rows.key_by_email(&30), Some(3), "{case}");
+    }
+}
+
+#[test]
+fn a_bundle_whose_table_disagrees_in_a_version_before_its_head_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<shadow::Peer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<shadow::Mine> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    peer.update(|root| root.rows = shadow::Shadow::of(&shadow::honest()))
+        .unwrap();
+    peer.update(|root| {
+        root.rows.rows.update(&2, |row| row.n = 60);
+    })
+    .unwrap();
+    peer.update(|root| {
+        root.rows.by_n.remove(&(6, 2));
+        root.rows.by_n.insert((60, 2), ());
+        root.rows.put(shadow::row(4, 8, 800));
+    })
+    .unwrap();
+    assert_disagrees(from_peer(&mine, &peer), &mine, "a clone");
+    assert_eq!(mine.version(), 0);
+    let other: Db<shadow::Peer> = fast().open(dir.path().join("other.ferro")).unwrap();
+    assert_eq!(
+        other.pull(&peer, "peer", unmerged).unwrap().outcome,
+        Outcome::FastForward
+    );
+    let ours: Db<shadow::Mine> = fast().open(dir.path().join("ours.ferro")).unwrap();
+    ours.update(|root| {
+        for row in shadow::honest() {
+            root.rows.insert(row);
+        }
+        root.rows.insert(shadow::row(9, 9, 900));
+    })
+    .unwrap();
+    assert_disagrees(
+        from_peer(&ours, &peer),
+        &ours,
+        "a pull onto commits of our own",
+    );
+    assert_eq!(ours.version(), 1);
+    assert_eq!(ours.branches(), ["main"]);
+}
+
+#[test]
+fn a_table_nested_in_a_map_whose_indexes_disagree_is_refused() {
+    for (case, forged) in shadow::forgeries() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer: Db<Map<u64, shadow::Shadow>> =
+            fast().open(dir.path().join("peer.ferro")).unwrap();
+        let mine: Db<Map<u64, Table<shadow::Row>>> =
+            fast().open(dir.path().join("mine.ferro")).unwrap();
+        peer.update(|root| {
+            for key in 0..40 {
+                let mut rows = shadow::honest();
+                rows.push(shadow::row(key + 10, 1, key + 1000));
+                root.insert(key, shadow::Shadow::of(&rows));
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            from_peer(&mine, &peer).unwrap().outcome,
+            Outcome::FastForward
+        );
+        assert_eq!(mine.read().get(&7).unwrap().key_by_email(&1007), Some(17));
+        let landed = mine.head_hash();
+        peer.update(|root| {
+            root.insert(1000, forged);
+        })
+        .unwrap();
+        assert_disagrees(from_peer(&mine, &peer), &mine, case);
+        assert_eq!(mine.head_hash(), landed, "{case}");
+    }
 }
 
 #[derive(Data, Clone, Copy, Debug, PartialEq)]

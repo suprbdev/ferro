@@ -1435,6 +1435,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let index_fields: Vec<Ident> = indexes.iter().map(Indexed::field).collect();
 
     let mut reindex = Vec::new();
+    let mut entries = Vec::new();
     let mut clashes = Vec::new();
     let mut methods = Vec::new();
     let mut finds = Vec::new();
@@ -1477,6 +1478,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         });
         match ix.kind {
             IndexKind::Value if ix.stores_cover() => {
+                entries.push(quote! {
+                    __out.push(((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of));
+                });
                 reindex.push(quote! {
                     {
                         let (__same, __same_cover) = match (__old, __new) {
@@ -1497,6 +1501,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 });
             }
             IndexKind::Value => {
+                entries.push(quote! {
+                    __out.push(((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
+                });
                 reindex.push(quote! {
                     {
                         let __same = match (__old, __new) {
@@ -1530,6 +1537,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         quote! { #key_ty },
                     )
                 };
+                entries.push(quote! {
+                    if let ::std::option::Option::Some(__value) = #optional {
+                        __out.push((__value, #entry));
+                    }
+                });
                 reindex.push(quote! {
                     {
                         let (__same, __same_cover) = match (__old, __new) {
@@ -1704,6 +1716,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             IndexKind::Each if ix.stores_cover() => {
                 let ident = &ix.fields[0].0;
+                entries.push(quote! {
+                    let __stored = #stored_of;
+                    let __each: ::std::collections::BTreeSet<#vt> =
+                        ::ferro::table::IndexEach::values(&__r.#ident).into_iter().collect();
+                    for __v in __each {
+                        __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
+                    }
+                });
                 reindex.push(quote! {
                     {
                         let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
@@ -1737,6 +1757,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             IndexKind::Each => {
                 let ident = &ix.fields[0].0;
+                entries.push(quote! {
+                    let __each: ::std::collections::BTreeSet<#vt> =
+                        ::ferro::table::IndexEach::values(&__r.#ident).into_iter().collect();
+                    for __v in __each {
+                        __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
+                    }
+                });
                 reindex.push(quote! {
                     {
                         let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
@@ -2044,11 +2071,6 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             },
         }
     };
-    let stale = if count == 0 {
-        quote! {}
-    } else {
-        quote! { let __stale = [#(#vars.is_none()),*]; }
-    };
     let rebuild = if count == 0 {
         quote! {}
     } else {
@@ -2089,6 +2111,143 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     };
+    let read_fields = quote! {
+        #fingerprints_of
+        let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
+        #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
+        __r.fields(|__tag, __r| {
+            match __tag {
+                #rows_tag => __rows = ::std::option::Option::Some(::ferro::Data::decode(__r)?),
+                #decode_arm
+                _ => {}
+            }
+            ::std::result::Result::Ok(())
+        })?;
+    };
+    let visit_fields = quote! {
+        #fingerprints_of
+        __r.fields(|__tag, __r| {
+            match __tag {
+                #rows_tag => <#rows_ty as ::ferro::Data>::visit(__r)?,
+                #visit_arm
+                _ => {}
+            }
+            ::std::result::Result::Ok(())
+        })
+    };
+    let index_names: Vec<&str> = indexes.iter().map(|ix| ix.name.as_str()).collect();
+    let (decode_fn, visit_fn, stored_fn, slot_fns) = if count == 0 {
+        (
+            quote! {
+                fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
+                    #read_fields
+                    ::std::result::Result::Ok(#table {
+                        rows: ::ferro::codec::required(__rows, "rows")?,
+                    })
+                }
+            },
+            quote! {
+                fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+                    #visit_fields
+                }
+            },
+            quote! {},
+            quote! {},
+        )
+    } else {
+        (
+            quote! {
+                fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
+                    let (mut __table, __stale) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                    #rebuild
+                    ::std::result::Result::Ok(__table)
+                }
+            },
+            quote! {
+                fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+                    ::ferro::table::noted::<#name, _>(__r, |__r| {
+                        #visit_fields
+                    })
+                }
+            },
+            quote! {
+                fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count])> {
+                    #read_fields
+                    let __stale = [#(#vars.is_none()),*];
+                    let __table = #table {
+                        rows: ::ferro::codec::required(__rows, "rows")?,
+                        #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
+                    };
+                    ::std::result::Result::Ok((__table, __stale))
+                }
+            },
+            quote! {
+                fn decode_stored(
+                    __r: &mut ::ferro::codec::Decoder<'_>,
+                ) -> ::ferro::Result<(Self, ::std::vec::Vec<bool>)> {
+                    let (__table, __stale) = Self::__stored(__r)?;
+                    ::std::result::Result::Ok((__table, __stale.iter().map(|__stale| !*__stale).collect()))
+                }
+
+                fn apply_slots(
+                    &mut self,
+                    __gone: &[&#name],
+                    __come: &[&#name],
+                    __slots: &[bool],
+                    __wide: bool,
+                ) -> ::std::option::Option<&'static str> {
+                    let mut __tasks: ::std::vec::Vec<::ferro::table::SlotTask<'_>> = ::std::vec::Vec::new();
+                    #(
+                        if __slots.get(#slots) == ::std::option::Option::Some(&true) {
+                            let __index = &mut self.#index_fields;
+                            __tasks.push(::std::boxed::Box::new(move || {
+                                let mut __old = ::std::vec::Vec::new();
+                                for __r in __gone {
+                                    let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (*__r, &mut __old);
+                                    #entries
+                                }
+                                let mut __new = ::std::vec::Vec::new();
+                                for __r in __come {
+                                    let (__r, __out): (&#name, &mut ::std::vec::Vec<_>) = (*__r, &mut __new);
+                                    #entries
+                                }
+                                if ::ferro::table::apply_index(__index, __old, __new) {
+                                    ::std::option::Option::None
+                                } else {
+                                    ::std::option::Option::Some(#index_names)
+                                }
+                            }));
+                        }
+                    )*
+                    ::ferro::table::run_slots(__tasks, __wide)
+                }
+
+                fn differing(
+                    self,
+                    __other: &Self,
+                    __slots: &[bool],
+                    __wide: bool,
+                ) -> ::std::option::Option<&'static str> {
+                    let #table { #(#index_fields,)* .. } = self;
+                    let mut __tasks: ::std::vec::Vec<::ferro::table::SlotTask<'_>> = ::std::vec::Vec::new();
+                    #(
+                        if __slots.get(#slots) == ::std::option::Option::Some(&true) {
+                            let __stored = &__other.#index_fields;
+                            let __built = #index_fields;
+                            __tasks.push(::std::boxed::Box::new(move || {
+                                if ::ferro::table::same_index(&__built, __stored) {
+                                    ::std::option::Option::None
+                                } else {
+                                    ::std::option::Option::Some(#index_names)
+                                }
+                            }));
+                        }
+                    )*
+                    ::ferro::table::run_slots(__tasks, __wide)
+                }
+            },
+        )
+    };
     let table_doc = format!(
         "The rows of [`{name}`] and the indexes its `Record` derive declares. [`ferro::Table<{name}>`](ferro::Table) derefs to it, so its lookups are called on the table."
     );
@@ -2126,40 +2285,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::std::result::Result::Ok(())
             }
 
-            fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                #fingerprints_of
-                let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
-                #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
-                __r.fields(|__tag, __r| {
-                    match __tag {
-                        #rows_tag => __rows = ::std::option::Option::Some(::ferro::Data::decode(__r)?),
-                        #decode_arm
-                        _ => {}
-                    }
-                    ::std::result::Result::Ok(())
-                })?;
-                #stale
-                #[allow(unused_mut)]
-                let mut __table = #table {
-                    rows: ::ferro::codec::required(__rows, "rows")?,
-                    #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
-                };
-                #rebuild
-                ::std::result::Result::Ok(__table)
-            }
+            #decode_fn
 
-            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-                #fingerprints_of
-                __r.fields(|__tag, __r| {
-                    match __tag {
-                        #rows_tag => <#rows_ty as ::ferro::Data>::visit(__r)?,
-                        #visit_arm
-                        _ => {}
-                    }
-                    ::std::result::Result::Ok(())
-                })?;
-                ::std::result::Result::Ok(())
-            }
+            #visit_fn
 
             fn same_encoding(&self, __other: &Self) -> bool {
                 ::ferro::Data::same_encoding(&self.rows, &__other.rows)
@@ -2201,10 +2329,14 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 )*
                 ::std::option::Option::None
             }
+
+            #slot_fns
         }
 
         impl #table {
             #fingerprints_fn
+
+            #stored_fn
 
             #(
                 #[inline]

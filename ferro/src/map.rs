@@ -1103,6 +1103,12 @@ const fn summarized<S>() -> bool {
 }
 
 fn summarize<T>(f: impl FnOnce() -> T) -> Result<T> {
+    unwound("summarizing its entries", f)
+}
+
+/// Runs `f` and returns a panic in it as an error: the error of the read that failed inside it,
+/// or [`Error::Decode`] saying that `doing` panicked.
+pub(crate) fn unwound<T>(doing: &str, f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
         let text = match payload.downcast_ref::<&str>() {
             Some(text) => text,
@@ -1110,7 +1116,7 @@ fn summarize<T>(f: impl FnOnce() -> T) -> Result<T> {
         };
         match FATAL.take() {
             Some((message, error)) if message == text => error,
-            _ => Error::Decode(format!("summarizing its entries panicked: {text}")),
+            _ => Error::Decode(format!("{doing} panicked: {text}")),
         }
     })
 }
@@ -6359,6 +6365,201 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Diff<K, V, S> {
     }
 }
 
+/// Where a value of a node read by [`changed`] is: inline, as a range of the bytes and links of
+/// the node's object, or spilled into an object of its own.
+#[derive(Clone)]
+enum Bare {
+    Inline(Arc<Object>, Range<usize>, Range<usize>),
+    Spilled(Ptr),
+}
+
+impl Bare {
+    fn same(&self, other: &Bare) -> bool {
+        match (self, other) {
+            (Bare::Inline(a, bytes, links), Bare::Inline(b, other_bytes, other_links)) => {
+                a.body[bytes.clone()] == b.body[other_bytes.clone()]
+                    && a.links[links.clone()]
+                        .iter()
+                        .map(|link| link.hash)
+                        .eq(b.links[other_links.clone()].iter().map(|link| link.hash))
+            }
+            (Bare::Spilled(a), Bare::Spilled(b)) => a.hash == b.hash,
+            _ => false,
+        }
+    }
+
+    fn value<V: Data>(&self, store: &Store) -> Result<Val<V>> {
+        let value = match self {
+            Bare::Inline(object, bytes, links) => Arc::new(V::decode(&mut Decoder::new(
+                &object.body[bytes.clone()],
+                &object.links[links.clone()],
+                Some(store),
+            ))?),
+            Bare::Spilled(ptr) => store.load::<V>(*ptr)?,
+        };
+        Ok(Val::of_single(&value))
+    }
+}
+
+/// A step of [`changed`]: a subtree, by its link and the entries it holds, or an entry.
+enum Bared<K> {
+    Sub(Ptr, u64),
+    Entry(K, Bare),
+}
+
+/// The steps of the node at `ptr`, in key order, read through `store` without decoding its values.
+fn bare<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Vec<Bared<K>>> {
+    let (object, charged) = store.read_fresh(ptr)?;
+    let object = Arc::new(object);
+    let mut r = Decoder::new(&object.body, &object.links, Some(store));
+    r.u8()?;
+    let n = r.varint()? as usize;
+    if n > r.remaining() {
+        return Err(Error::Decode(format!("node claims {n} keys")));
+    }
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        keys.push(K::decode(&mut r)?);
+    }
+    let mut slots = Vec::with_capacity(n);
+    for _ in 0..n {
+        match r.u8()? {
+            0 => {
+                let (bytes, links) = r.read_so_far();
+                V::visit(&mut r)?;
+                let (end, last) = r.read_so_far();
+                slots.push(Bare::Inline(object.clone(), bytes..end, links..last));
+            }
+            1 => {
+                slots.push(Bare::Spilled(r.link()?));
+                S::visit(&mut r)?;
+            }
+            other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
+        }
+    }
+    let mut steps = Vec::with_capacity(2 * n + 1);
+    let mut entries = keys.into_iter().zip(slots);
+    for _ in 0..=n {
+        let count = r.varint()?;
+        if count != 0 {
+            S::visit(&mut r)?;
+            steps.push(Bared::Sub(r.link()?, count));
+        }
+        if let Some((key, slot)) = entries.next() {
+            steps.push(Bared::Entry(key, slot));
+        }
+    }
+    if charged {
+        store.count_zero_width(r.zero_width())?;
+    }
+    Ok(steps)
+}
+
+fn expand_bare<K: Data, V: Data, S: Data>(store: &Store, steps: &mut Vec<Bared<K>>) -> Result<()> {
+    if let Some(Bared::Sub(ptr, _)) = steps.pop() {
+        steps.extend(bare::<K, V, S>(store, ptr)?.into_iter().rev());
+    }
+    Ok(())
+}
+
+/// The keys whose values differ between `old` and `new`, two versions of a map that both read
+/// through `store`, in key order, each with its value in `old` and in `new`, `None` where the key
+/// is absent: what [`Map::diff`] gives.
+///
+/// It skips every subtree the two share, as the diff does, and reads the nodes it does not
+/// without decoding their values: it compares each value's bytes and the hashes of its links, and
+/// decodes only the values that differ, so it costs the diff's reads less the decoding of every
+/// value that did not change. A map held in memory has nodes that are not in `store`, and is
+/// diffed as [`Map::diff`] does.
+///
+/// # Errors
+///
+/// Returns the error of a node or value that cannot be read or decoded.
+pub(crate) fn changed<K: Data + Ord, V: Data, S: Summary<K, V>>(
+    old: &Map<K, V, S>,
+    new: &Map<K, V, S>,
+    store: &Store,
+) -> Result<Changed<K, V>> {
+    let start = |map: &Map<K, V, S>| match &map.root {
+        Link::Empty => Some(Vec::new()),
+        Link::Stored { ptr, count, .. } => Some(vec![Bared::Sub(*ptr, *count)]),
+        Link::Mem(..) => None,
+    };
+    let (Some(mut old_steps), Some(mut new_steps)) = (start(old), start(new)) else {
+        return Ok(old
+            .diff(new)
+            .map(|change| match change {
+                Change::Added(key, value) => (key, None, Some(value)),
+                Change::Removed(key, value) => (key, Some(value), None),
+                Change::Changed(key, before, after) => (key, Some(before), Some(after)),
+            })
+            .collect());
+    };
+    let mut out = Vec::new();
+    loop {
+        match (old_steps.last(), new_steps.last()) {
+            (None, None) => return Ok(out),
+            (Some(Bared::Sub(..)), None | Some(Bared::Entry(..))) => {
+                expand_bare::<K, V, S>(store, &mut old_steps)?;
+            }
+            (None | Some(Bared::Entry(..)), Some(Bared::Sub(..))) => {
+                expand_bare::<K, V, S>(store, &mut new_steps)?;
+            }
+            (Some(Bared::Sub(a, a_count)), Some(Bared::Sub(b, b_count))) => {
+                if a.hash == b.hash {
+                    old_steps.pop();
+                    new_steps.pop();
+                } else if a_count >= b_count {
+                    expand_bare::<K, V, S>(store, &mut old_steps)?;
+                } else {
+                    expand_bare::<K, V, S>(store, &mut new_steps)?;
+                }
+            }
+            (Some(Bared::Entry(a, _)), Some(Bared::Entry(b, _))) => match a.cmp(b) {
+                Ordering::Less => removed(store, &mut old_steps, &mut out)?,
+                Ordering::Greater => added(store, &mut new_steps, &mut out)?,
+                Ordering::Equal => {
+                    if let (Some(Bared::Entry(key, before)), Some(Bared::Entry(_, after))) =
+                        (old_steps.pop(), new_steps.pop())
+                        && !before.same(&after)
+                    {
+                        let (before, after) = (before.value::<V>(store)?, after.value::<V>(store)?);
+                        if !V::same_encoding(&before, &after) {
+                            out.push((key, Some(before), Some(after)));
+                        }
+                    }
+                }
+            },
+            (Some(Bared::Entry(..)), None) => removed(store, &mut old_steps, &mut out)?,
+            (None, Some(Bared::Entry(..))) => added(store, &mut new_steps, &mut out)?,
+        }
+    }
+}
+
+pub(crate) type Changed<K, V> = Vec<(K, Option<Val<V>>, Option<Val<V>>)>;
+
+fn removed<K, V: Data>(
+    store: &Store,
+    steps: &mut Vec<Bared<K>>,
+    out: &mut Changed<K, V>,
+) -> Result<()> {
+    if let Some(Bared::Entry(key, before)) = steps.pop() {
+        out.push((key, Some(before.value::<V>(store)?), None));
+    }
+    Ok(())
+}
+
+fn added<K, V: Data>(
+    store: &Store,
+    steps: &mut Vec<Bared<K>>,
+    out: &mut Changed<K, V>,
+) -> Result<()> {
+    if let Some(Bared::Entry(key, after)) = steps.pop() {
+        out.push((key, None, Some(after.value::<V>(store)?)));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;
@@ -7049,5 +7250,61 @@ mod tests {
         assert_eq!(before.get(&7).as_deref(), Some(&7));
         assert_eq!(after.get(&7).as_deref(), Some(&70));
         assert_eq!(db.read().get(&7).as_deref(), Some(&71));
+    }
+
+    #[test]
+    fn changed_finds_what_diff_finds_inline_and_spilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::<Map<u64, String>>::open(dir.path().join("changed.ferro")).unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for version in 0..12u64 {
+            db.update(|map| {
+                for _ in 0..300 {
+                    let key = next() % 2000;
+                    match next() % 5 {
+                        0 => {
+                            map.remove(&key);
+                        }
+                        1 => {
+                            map.insert(key, "x".repeat(1500 + (next() % 3) as usize));
+                        }
+                        _ => {
+                            map.insert(key, format!("{version}-{}", next() % 4));
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        }
+        let versions: Vec<_> = (1..=12).map(|version| db.at(version).unwrap()).collect();
+        let store = versions[0].store.clone().unwrap();
+        for (old, new) in [(0, 1), (3, 4), (0, 11), (11, 2), (5, 5)] {
+            let (old, new) = (&*versions[old], &*versions[new]);
+            let found: Vec<(u64, Option<String>, Option<String>)> = changed(old, new, &store)
+                .unwrap()
+                .into_iter()
+                .map(|(key, before, after)| {
+                    let owned = |value: Option<Val<String>>| value.map(Val::into_owned);
+                    (key, owned(before), owned(after))
+                })
+                .collect();
+            let expected: Vec<(u64, Option<String>, Option<String>)> = old
+                .diff(new)
+                .map(|change| match change {
+                    Change::Added(key, value) => (key, None, Some(value.into_owned())),
+                    Change::Removed(key, value) => (key, Some(value.into_owned()), None),
+                    Change::Changed(key, before, after) => {
+                        (key, Some(before.into_owned()), Some(after.into_owned()))
+                    }
+                })
+                .collect();
+            assert_eq!(found, expected);
+        }
     }
 }

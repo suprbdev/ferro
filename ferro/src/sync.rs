@@ -21,13 +21,14 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use crate::codec::{
-    Claim, Data, Decoder, HASH_BYTES, Hash, Kind, Object, Ptr, Recalled, Shape, push_varint,
+    Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, Plans, Ptr, Recalled, Shape,
+    Tables, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{Column, Hashes, Index};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
-use crate::map::Map;
+use crate::map::{Map, unwound};
 use crate::reentry::{Crossing, Needs};
 use crate::store::{Record, Staging, Store, Txn, compressed, staged};
 
@@ -1667,6 +1668,7 @@ struct Vetting<'a> {
     budget: usize,
     queue: Vec<(Ptr, Kind, Option<Kind>)>,
     deferred: Vec<(u32, Kind)>,
+    tables: Tables,
     confirmed: HashSet<(Hash, TypeId, TypeId, Hash)>,
     carried: usize,
     rerun_budget: usize,
@@ -1688,6 +1690,16 @@ fn retyped(kind: &Kind, error: Error) -> Error {
             "it links as a {} to an object this database holds as another type, which does not \
              check as one: {message}",
             kind.name
+        )),
+        other => other,
+    }
+}
+
+fn disagreeing(table: &FoundTable, error: Error) -> Error {
+    match error {
+        Error::Decode(message) => bad(format!(
+            "a table it carries ({}) has indexes that do not agree with its rows: {message}",
+            table.name
         )),
         other => other,
     }
@@ -1780,9 +1792,11 @@ impl Vetting<'_> {
         };
         let object = self.staging.read_object(ptr)?;
         self.spend(object.body.len())?;
+        let tables = RefCell::new(Vec::new());
         let (shape, found, zero_width) = kind
-            .check(&object.body, &object.links, None)
+            .check_tables(&object.body, &object.links, &tables)
             .map_err(|error| undecodable(kind, error))?;
+        self.tables.note(tables.into_inner());
         self.tally(zero_width)?;
         if shape.deferred {
             self.deferred.push((id, kind.clone()));
@@ -1940,6 +1954,81 @@ impl Vetting<'_> {
         })
     }
 
+    fn tables_of(&self, root: Ptr) -> Result<(Vec<FoundTable>, bool)> {
+        let tables = RefCell::new(Vec::new());
+        let held = match self.staging.id_of(&root.hash) {
+            Some(id) => {
+                let object = self.staging.read_object(Ptr {
+                    hash: root.hash,
+                    offset: self.staging.offset(id),
+                })?;
+                let (_, _, zero_width) = self
+                    .root_kind
+                    .check_tables(&object.body, &object.links, &tables)
+                    .map_err(|error| undecodable(self.root_kind, error))?;
+                self.tally(zero_width)?;
+                false
+            }
+            None => {
+                let object = self.store.read_object(root)?;
+                self.root_kind
+                    .check_tables(&object.body, &object.links, &tables)
+                    .map_err(rejected)?;
+                true
+            }
+        };
+        Ok((tables.into_inner(), held))
+    }
+
+    fn agree(&mut self, lineage: &[Descent]) -> Result<()> {
+        if self.tables.is_empty() {
+            return Ok(());
+        }
+        let mut plans = Plans::default();
+        let mut listed = HashSet::new();
+        for (root, parent) in lineage {
+            if self.staging.id_of(&root.hash).is_none() || !listed.insert(root.hash) {
+                continue;
+            }
+            let (tables, _) = self.tables_of(*root)?;
+            if tables.is_empty() {
+                continue;
+            }
+            let base = match parent {
+                Some((parent, kept)) => {
+                    let (base, held) = self.tables_of(*parent)?;
+                    for table in base.iter().filter(|_| held) {
+                        if *kept || !self.tables.holds(table) {
+                            plans.trust(table);
+                        } else {
+                            plans.build(table);
+                        }
+                    }
+                    base
+                }
+                None => Vec::new(),
+            };
+            plans.pair(&tables, &base);
+        }
+        let found = mem::take(&mut self.tables).into_found();
+        let (view, staging) = (self.view(), self.staging);
+        staging.overlaid(view, || {
+            for table in &found {
+                let Some(base) = plans.base(table) else {
+                    continue;
+                };
+                let agreed = unwound("checking its indexes", || (table.agree)(table, base, view));
+                if let Some(error) = view.overdrawn() {
+                    return Err(error);
+                }
+                agreed
+                    .and_then(|agreed| agreed)
+                    .map_err(|error| disagreeing(table, error))?;
+            }
+            Ok(())
+        })
+    }
+
     fn held(&mut self, hash: Hash, reference: usize, kind: &Kind) -> Result<Option<Shape>> {
         let roots = self.anchors.roots.len();
         let (ptr, known) = if reference <= roots {
@@ -2003,9 +2092,11 @@ impl Vetting<'_> {
             return Ok(Some(shape));
         }
         let (object, charged) = self.view().read_fresh(ptr).map_err(rejected)?;
+        let tables = RefCell::new(Vec::new());
         let (shape, found, zero_width) = kind
-            .check(&object.body, &object.links, None)
+            .check_tables(&object.body, &object.links, &tables)
             .map_err(|error| retyped(kind, error))?;
+        self.tables.note(tables.into_inner());
         if charged {
             self.tally(zero_width)?;
         }
@@ -2449,6 +2540,44 @@ struct Arrival {
     received_bytes: u64,
 }
 
+type Descent = (Ptr, Option<(Ptr, bool)>);
+
+fn lineage(
+    store: &Store,
+    objects: &impl Objects,
+    landing: &Landing<'_>,
+    order: &[(u64, u64, u32)],
+) -> Result<Vec<Descent>> {
+    let mut lineage = Vec::with_capacity(order.len());
+    for (_, _, id) in order {
+        let sent = landing
+            .commits
+            .get(*id)
+            .expect("an ordered commit was walked");
+        let Some(root) = sent.root else {
+            continue;
+        };
+        let entry = read_commit(objects, landing.hashes.hash(*id))?;
+        let parent = match entry.prev {
+            None => None,
+            Some(prev) => match landing.sent(&prev.hash) {
+                Some(parent) => parent.root.map(|root| (root, false)),
+                None => match landing
+                    .find(sent.segment as usize, sent.facts.version.saturating_sub(1))
+                {
+                    Ok(Found::Held(ptr)) if ptr.hash == prev.hash => Entry::load(store, ptr)?
+                        .commit
+                        .root
+                        .map(|root| (root, true)),
+                    _ => None,
+                },
+            },
+        };
+        lineage.push((root, parent));
+    }
+    Ok(lineage)
+}
+
 fn resolve<O: Objects>(
     store: &Store,
     objects: &O,
@@ -2592,6 +2721,7 @@ fn resolve<O: Objects>(
                 .saturating_add(RECHECK_SLACK),
             queue: Vec::new(),
             deferred: Vec::new(),
+            tables: Tables::default(),
             confirmed: HashSet::new(),
             carried: streamed.carried,
             rerun_budget: streamed
@@ -2616,6 +2746,10 @@ fn resolve<O: Objects>(
             }
         }
         vetting.settle()?;
+        if !vetting.tables.is_empty() {
+            let lineage = lineage(store, objects, &landing, &order)?;
+            vetting.agree(&lineage)?;
+        }
         drop(vetting);
         linked = Some(streamed.links);
     }
@@ -2938,7 +3072,9 @@ impl<T: Data> Db<T> {
     ///   is damaged, or if checking it would decode or read more again than its size allows, as
     ///   one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a `Vec<()>`,
-    ///   than its size allows.
+    ///   than its size allows. A table whose index, stored under a fingerprint this side knows,
+    ///   holds other entries than its rows give, a row stored under a key other than its own, or
+    ///   two rows sharing a value of a unique index fail the checks too.
     /// - [`Error::Decode`] if `from` sends a head that `T` cannot read, such as a table whose
     ///   unique index, rebuilt on this side, finds two rows sharing a value. Nothing lands and
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
@@ -3095,10 +3231,12 @@ impl<T: Data> Db<T> {
     ///
     /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
     ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
-    ///   or if checking it would decode or read more again than its size allows, as one large
-    ///   value shared by many keys, or one large node reached under many key ranges, can, or would
-    ///   visit more items that encode to nothing, such as the `()`s of a `Vec<()>`, than its size
-    ///   allows. Nothing reaches the file.
+    ///   and a table whose index, stored under a fingerprint this side knows, does not hold
+    ///   exactly the entries its rows give, as a peer whose schema sets index maps apart from the
+    ///   rows can send, or if checking it would decode or read more again than its size allows,
+    ///   as one large value shared by many keys, or one large node reached under many key ranges,
+    ///   can, or would visit more items that encode to nothing, such as the `()`s of a
+    ///   `Vec<()>`, than its size allows. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.

@@ -125,11 +125,18 @@
 //! As with every collection, a read that cannot load a node from the file, or finds one damaged,
 //! panics. [`Map::try_get`] on [`Table::rows`] returns that failure as an error instead.
 //!
+//! A write trusts that each index holds exactly the entries the rows give. Every write keeps it
+//! so, and [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
+//! check it, so only a damaged file can break it. In such a table, lookups miss rows or return
+//! others, and [`insert`](Table::insert) or [`update`](Table::update) can panic on a value that
+//! no row holds, as they do on a clash, where `try_insert` returns that clash as a [`Taken`].
+//!
 //! [The tables guide](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md) describes
 //! tables and indexes at more length, and
 //! [the schema and unique index internals](https://github.com/archlemon/ferro/blob/main/docs/internals/schema-and-unique-indexes.md)
 //! how they are stored.
 
+use std::any::{TypeId, type_name};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -138,11 +145,14 @@ use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Description, Encoder, Hash};
-use crate::error::Result;
-use crate::map::{Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, same_value};
+use crate::codec::{Data, Decoder, Description, Encoder, FoundTable, Hash};
+use crate::error::{Error, Result};
+use crate::map::{
+    Conflict, Cursor, Diff, Finder, Iter, Keys, Map, Val, Values, changed, fatal, same_value,
+    unwound,
+};
 use crate::prefix::Prefix;
-use crate::store::fresh_reads;
+use crate::store::{Store, fresh_reads};
 
 /// A row type that can be stored in a [`Table`].
 ///
@@ -227,6 +237,296 @@ pub trait TableData<T: Record>: Data + Default {
     fn conflict(&self, _row: &T, _moving: Option<&T::Key>) -> Option<Taken<T::Key>> {
         None
     }
+    /// Reads a table as [`Data::decode`] does, without rebuilding an index it does not store
+    /// under a fingerprint this type knows, and returns it with whether it stores each index, in
+    /// the order the derive declares them. The default, for a table without indexes, reads it
+    /// with [`Data::decode`] and lists none.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Data::decode`].
+    #[doc(hidden)]
+    fn decode_stored(r: &mut Decoder<'_>) -> Result<(Self, Vec<bool>)> {
+        Ok((Self::decode(r)?, Vec::new()))
+    }
+    /// Takes the entries of the rows in `gone` out of each index whose place in `slots` is
+    /// `true`, and puts those of the rows in `come` in, in one batch per index, with
+    /// [`apply_index`], and leaves the other indexes and the rows as they were. With `wide`,
+    /// the indexes are worked on by threads of their own, as [`run_slots`] runs them.
+    ///
+    /// Returns the name of the first index left with fewer entries than it should hold, as a
+    /// unique index is when two rows share a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node of an index cannot be read, as a write to a map does.
+    #[doc(hidden)]
+    fn apply_slots(
+        &mut self,
+        _gone: &[&T],
+        _come: &[&T],
+        _slots: &[bool],
+        _wide: bool,
+    ) -> Option<&'static str> {
+        None
+    }
+    /// The name of the first index whose place in `slots` is `true` that holds other entries
+    /// than the same index of `other`, comparing keys by `Ord` and values by their encoding, as
+    /// [`same_index`] does. With `wide`, the indexes are compared, and dropped, by threads of
+    /// their own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node of either index cannot be read, as a read of a map does.
+    #[doc(hidden)]
+    fn differing(self, _other: &Self, _slots: &[bool], _wide: bool) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Work on one index of a table that [`run_slots`] runs, which answers with the name of the
+/// index when it finds that index wrong.
+#[doc(hidden)]
+pub type SlotTask<'a> = Box<dyn FnOnce() -> Option<&'static str> + Send + 'a>;
+
+/// Runs each of `tasks`, on threads of their own when `wide` and there are several, and returns
+/// the first answer that is `Some`, in the order of `tasks`.
+///
+/// # Panics
+///
+/// A panic in a task carries on in the calling thread, with the error of the read that failed in
+/// it, where one did, for [`Map`]'s reads to report.
+#[doc(hidden)]
+pub fn run_slots(tasks: Vec<SlotTask<'_>>, wide: bool) -> Option<&'static str> {
+    if !wide || tasks.len() < 2 {
+        for task in tasks {
+            if let Some(index) = task() {
+                return Some(index);
+            }
+        }
+        return None;
+    }
+    let answers: Vec<Result<Option<&'static str>>> = std::thread::scope(|scope| {
+        let mut tasks = tasks.into_iter();
+        let first = tasks.next();
+        let helpers: Vec<_> = tasks
+            .map(|task| scope.spawn(move || unwound("checking an index", task)))
+            .collect();
+        let mut answers: Vec<_> = first
+            .map(|task| unwound("checking an index", task))
+            .into_iter()
+            .collect();
+        for helper in helpers {
+            match helper.join() {
+                Ok(answer) => answers.push(answer),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        answers
+    });
+    for answer in answers {
+        if let Some(index) = fatal(answer) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Reads a table value of `T` with `read` and, when `r` belongs to a typed check that collects
+/// tables, notes it for the check that its indexes agree with its rows.
+///
+/// The [`Record`](derive@crate::Record) derive calls it from the `decode` and `visit` of a table
+/// with indexes.
+///
+/// # Errors
+///
+/// Returns the error of `read`.
+#[doc(hidden)]
+pub fn noted<'a, T: Record, R>(
+    r: &mut Decoder<'a>,
+    read: impl FnOnce(&mut Decoder<'a>) -> Result<R>,
+) -> Result<R> {
+    let start = r.checkpoint();
+    let value = read(r)?;
+    r.found_table(
+        start,
+        TypeId::of::<T::Table>(),
+        type_name::<T::Table>(),
+        agree::<T>,
+    );
+    Ok(value)
+}
+
+/// Whether `built`, an index built from rows, and `stored`, the same index as a table stores it,
+/// hold the same entries: keys equal by `Ord` and values that encode the same.
+///
+/// Equal root hashes settle it. Otherwise the two are diffed, which reads only the subtrees whose
+/// hashes differ, so an index whose keys compare equal to the rebuilt ones but are stored as other
+/// bytes, as a type whose `==` ignores case can leave, still agrees.
+///
+/// # Panics
+///
+/// Panics if a node of either index cannot be read, as [`Map::diff`] does.
+#[doc(hidden)]
+pub fn same_index<K: Data + Ord, V: Data>(built: &Map<K, V>, stored: &Map<K, V>) -> bool {
+    built.len() == stored.len()
+        && (built.root_hash() == stored.root_hash() || built.diff(stored).next().is_none())
+}
+
+/// Checks that each index `table` stores under a fingerprint `T` knows holds exactly the entries
+/// its rows give, and that each row is stored under its own key, reading both through `store`.
+///
+/// With `base`, a table of the same type whose indexes agree with its rows and which stores every
+/// index `table` does, it applies the rows that changed from `base` to `table` to `base`'s indexes,
+/// which costs what changed. Without one it builds the indexes from every row.
+fn agree<T: Record>(table: &FoundTable, base: Option<&FoundTable>, store: &Store) -> Result<()> {
+    let read = |found: &FoundTable| {
+        T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))
+    };
+    let (table, slots) = read(table)?;
+    if !slots.contains(&true) {
+        return Ok(());
+    }
+    let base = match base {
+        Some(base) => {
+            let (base, held) = read(base)?;
+            let covers = slots.iter().zip(&held).all(|(slot, held)| !slot || *held);
+            covers.then_some(base)
+        }
+        None => None,
+    };
+    let (indexes, rows) = match base {
+        Some(base) => applied::<T>(base, &table, &slots, store)?,
+        None => built::<T>(&table, &slots)?,
+    };
+    match indexes.differing(&table, &slots, rows >= WIDE_ROWS) {
+        Some(index) => Err(Error::Decode(format!(
+            "index {index} does not hold exactly the entries its rows give"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The rows a rebuild reads before it puts their entries in, so that it holds a batch of rows at
+/// a time rather than the whole table.
+const BUILT_BATCH: usize = 1 << 16;
+
+/// The rows past which the check of a table works on its indexes with a thread each.
+const WIDE_ROWS: usize = 1 << 10;
+
+fn applied<T: Record>(
+    mut indexes: T::Table,
+    table: &T::Table,
+    slots: &[bool],
+    store: &Store,
+) -> Result<(T::Table, usize)> {
+    let (mut gone, mut come) = (Vec::new(), Vec::new());
+    for (key, before, after) in changed(indexes.rows(), table.rows(), store)? {
+        gone.extend(before);
+        if let Some(after) = after {
+            owned::<T>(&key, &after)?;
+            come.push(after);
+        }
+    }
+    let rows = gone.len() + come.len();
+    placed::<T>(&mut indexes, &gone, &come, slots)?;
+    Ok((indexes, rows))
+}
+
+fn built<T: Record>(table: &T::Table, slots: &[bool]) -> Result<(T::Table, usize)> {
+    let mut indexes = T::Table::default();
+    let (mut come, mut rows) = (Vec::new(), 0);
+    for (key, row) in table.rows().iter() {
+        owned::<T>(&key, &row)?;
+        come.push(row);
+        rows += 1;
+        if come.len() == BUILT_BATCH {
+            placed::<T>(&mut indexes, &[], &come, slots)?;
+            come.clear();
+        }
+    }
+    placed::<T>(&mut indexes, &[], &come, slots)?;
+    Ok((indexes, rows))
+}
+
+fn placed<T: Record>(
+    indexes: &mut T::Table,
+    gone: &[Val<T>],
+    come: &[Val<T>],
+    slots: &[bool],
+) -> Result<()> {
+    let wide = gone.len() + come.len() >= WIDE_ROWS;
+    let gone: Vec<&T> = gone.iter().map(|row| &**row).collect();
+    let come: Vec<&T> = come.iter().map(|row| &**row).collect();
+    match indexes.apply_slots(&gone, &come, slots, wide) {
+        Some(index) => Err(Error::Decode(format!(
+            "two rows share a value of unique index {index}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Takes the entries in `old` out of `index` and puts those in `new` in, in one batch, leaving
+/// alone an entry that both hold with the same encoding, and returns whether `index` ends up with
+/// as many entries as that should leave it.
+///
+/// Each entry of `old` must be in `index`. It ends up with fewer when an entry of `new` falls on
+/// a key that another entry of `new`, or one that `old` does not take out, already holds, as two
+/// rows that share a value of a unique index give.
+#[doc(hidden)]
+pub fn apply_index<K: Data + Ord, V: Data>(
+    index: &mut Map<K, V>,
+    mut old: Vec<(K, V)>,
+    mut new: Vec<(K, V)>,
+) -> bool {
+    old.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    new.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut edits = Vec::with_capacity(old.len().max(new.len()));
+    let (mut taken, mut put) = (0usize, 0usize);
+    let (mut old, mut new) = (old.into_iter().peekable(), new.into_iter().peekable());
+    loop {
+        let order = match (old.peek(), new.peek()) {
+            (Some(out), Some(into)) => out.0.cmp(&into.0),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
+        match order {
+            Ordering::Less => {
+                if let Some((key, _)) = old.next() {
+                    edits.push((key, None));
+                    taken += 1;
+                }
+            }
+            Ordering::Greater => {
+                if let Some((key, value)) = new.next() {
+                    edits.push((key, Some(value)));
+                    put += 1;
+                }
+            }
+            Ordering::Equal => {
+                if let (Some((_, out)), Some((key, into))) = (old.next(), new.next())
+                    && !V::same_encoding(&out, &into)
+                {
+                    edits.push((key, Some(into)));
+                }
+            }
+        }
+    }
+    let Some(expected) = index.len().checked_sub(taken).map(|left| left + put) else {
+        return false;
+    };
+    index.apply(edits);
+    index.len() == expected
+}
+
+fn owned<T: Record>(key: &T::Key, row: &T) -> Result<()> {
+    if row.key() != *key {
+        return Err(Error::Decode(
+            "a row is stored under a key other than its own".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn clash<K>(taken: Taken<K>) -> ! {
@@ -439,7 +739,9 @@ impl<T: Record> Table<T> {
     ///
     /// Panics, before changing anything, if a unique index already holds one of `row`'s values
     /// for another key. Inside a commit that discards the transaction. Use
-    /// [`try_insert`](Table::try_insert) to get the clash as a [`Taken`] instead.
+    /// [`try_insert`](Table::try_insert) to get the clash as a [`Taken`] instead. The index is
+    /// trusted, so in a damaged file whose index holds a value that no row does, it panics for
+    /// that value too, as the [module docs](crate::table#panics) describe.
     pub fn insert(&mut self, row: T) -> Option<Val<T>> {
         self.try_insert(row).unwrap_or_else(|taken| clash(taken))
     }
