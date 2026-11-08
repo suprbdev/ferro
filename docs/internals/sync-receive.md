@@ -977,6 +977,18 @@ so two carried roots of 200,000 empty fields of unknown tags, a bundle of 5.1 KB
 differed between the versions, took 24.1 s to receive and as long again in each `verify_typed`;
 they now take 15 ms and 11 ms, against 12 ms and 6 ms at 9e9341e.
 
+Of two versions of a `Vec` whose elements can hold a table, it pairs the elements by position when
+the two have the same length. When one is longer, it takes its extra elements to have come or gone
+in one run, and places the run where the most elements pair with one that encodes alike or shares
+a link with them, such as the root of an index a one-row edit did not touch, the last such place
+if several tie, so that each element keeps its pair when one before it is inserted or removed,
+edited or not. It reads the elements of both to find the place, at most 1,024 of each, and then
+pairs them; within the elements it pairs it pairs by position, so it reads each element at most
+twice. A `Map` value of a `Vec` of two tables of 1.5 million rows that lost its first, whose
+second gained an edit, now lands in under a millisecond, its second checked against what it was,
+where 9e9341e built it in 0.60 s, and so does the same `Vec` at the root, which 9e9341e checked
+against the table that left in 1.04 s.
+
 Before #116 only the tables of each root were paired, the nth table of a type with the nth of that
 type in the parent's root, so an `Option` of a table placed before another shifted the pairs as it
 came and went: nine commits of 2 KB that toggled a table of one row beside one of 1.5 million rows

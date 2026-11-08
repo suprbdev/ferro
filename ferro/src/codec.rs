@@ -491,8 +491,8 @@ pub trait Data: Clone + Send + Sync + 'static {
     /// Reads one value of this type from each of `old` and `new`, the encodings it has at the
     /// same place in two versions, and adds to the [`Pairing`] each table the later one holds with
     /// the table at the same place in the earlier one: the same field of a struct, of the same
-    /// variant of an enum, the same element of a sequence or the value under the same key of a
-    /// map.
+    /// variant of an enum, the same element of a sequence, or the one it most likely was before
+    /// the sequence gained or lost elements, or the value under the same key of a map.
     ///
     /// The default visits both and pairs nothing.
     ///
@@ -1520,6 +1520,7 @@ pub struct Pairing<'s> {
     opened: [HashSet<Hash>; 2],
     again: usize,
     waiting: Vec<Waiting>,
+    aligning: bool,
 }
 
 /// What pairs the tables of two versions of a map, given their roots with the entry counts their
@@ -1554,6 +1555,7 @@ impl<'s> Pairing<'s> {
             opened: [HashSet::new(), HashSet::new()],
             again: 0,
             waiting: Vec::new(),
+            aligning: false,
         }
     }
 
@@ -1728,8 +1730,13 @@ impl<'s> Pairing<'s> {
     }
 }
 
-/// Pairs the tables of the first `olds` items of a sequence of `T` that `old` holds and the first
-/// `news` that `new` holds, item by item, as far as both reach, and visits the rest of the longer.
+/// Pairs the tables of the `olds` items of a sequence of `T` that `old` holds with those of the
+/// `news` items that `new` holds, in order, as if the longer had gained or lost its extra items in
+/// one run, which it visits.
+///
+/// Where the run lies is found by [`split`] when the two differ in length, `T` can hold a table,
+/// neither holds more than [`ALIGNED`] items and the pairing is not already pairing the items of
+/// such a sequence; anywhere else it lies at the end, and the items pair by position.
 ///
 /// # Errors
 ///
@@ -1743,21 +1750,107 @@ fn paired_items<T: Data>(
 ) -> Result<()> {
     let tabled = holds_tables::<T>();
     let both = olds.min(news);
-    for _ in 0..both {
-        if tabled {
-            old.item(|old| new.item(|new| T::pair(old, new, pairing)))?;
-        } else {
-            old.item(T::visit)?;
-            new.item(T::visit)?;
+    let aligning = tabled && olds != news && !pairing.aligning && olds.max(news) <= ALIGNED;
+    let run = if aligning {
+        split::<T>(old, new, olds, news)?
+    } else {
+        both
+    };
+    let outer = pairing.aligning;
+    pairing.aligning = outer || aligning;
+    let paired = (|| {
+        for at in 0..=both {
+            if at == run {
+                for _ in both..olds {
+                    old.item(T::visit)?;
+                }
+                for _ in both..news {
+                    new.item(T::visit)?;
+                }
+            }
+            if at == both {
+                break;
+            }
+            if tabled {
+                old.item(|old| new.item(|new| T::pair(old, new, pairing)))?;
+            } else {
+                old.item(T::visit)?;
+                new.item(T::visit)?;
+            }
+        }
+        Ok(())
+    })();
+    pairing.aligning = outer;
+    paired
+}
+
+/// The most items of a sequence whose items [`paired_items`] aligns rather than pairs by
+/// position.
+const ALIGNED: u64 = 1 << 10;
+
+/// Where the items that the longer of two sequences of `T` holds beyond the shorter's length most
+/// likely came or went, as the position among the shorter's items before which they lie: the one
+/// at which the most items pair with an item they share a link with, or encode alike, the last of
+/// those that tie.
+///
+/// It reads the `olds` items of `old` and the `news` items of `new`, counting their zero-width
+/// items as [`Decoder::item`] does, and leaves both where they started.
+///
+/// # Errors
+///
+/// The error of an item that does not decode.
+fn split<T: Data>(
+    old: &mut Decoder<'_>,
+    new: &mut Decoder<'_>,
+    olds: u64,
+    news: u64,
+) -> Result<u64> {
+    let (from_old, from_new) = (old.checkpoint(), new.checkpoint());
+    let (olds, news) = (traits::<T>(old, olds)?, traits::<T>(new, news)?);
+    old.rewind(from_old);
+    new.rewind(from_new);
+    let (short, long) = if olds.len() <= news.len() {
+        (&olds, &news)
+    } else {
+        (&news, &olds)
+    };
+    let extra = long.len() - short.len();
+    let akin = |(bytes, links): &(&[u8], Vec<Hash>), (other, others): &(&[u8], Vec<Hash>)| {
+        let alike = bytes == other && links == others;
+        u64::from(alike || links.iter().any(|link| others.binary_search(link).is_ok()))
+    };
+    let after: u64 = (0..short.len())
+        .map(|at| akin(&short[at], &long[at + extra]))
+        .sum();
+    let (mut best, mut run) = (after, 0);
+    let (mut before, mut passed) = (0, 0);
+    for at in 0..short.len() {
+        before += akin(&short[at], &long[at]);
+        passed += akin(&short[at], &long[at + extra]);
+        if before + after - passed >= best {
+            (best, run) = (before + after - passed, at + 1);
         }
     }
-    for _ in both..olds {
-        old.item(T::visit)?;
+    Ok(run as u64)
+}
+
+/// The bytes of each of the `count` items of `T` that `r` holds, with the sorted hashes of its
+/// links, which [`split`] compares.
+///
+/// # Errors
+///
+/// The error of an item that does not decode.
+fn traits<'a, T: Data>(r: &mut Decoder<'a>, count: u64) -> Result<Vec<(&'a [u8], Vec<Hash>)>> {
+    let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for _ in 0..count {
+        let start = r.checkpoint();
+        r.item(T::visit)?;
+        let (bytes, links) = r.read_since(start);
+        let mut hashes: Vec<Hash> = links.iter().map(|link| link.hash).collect();
+        hashes.sort_unstable();
+        out.push((bytes, hashes));
     }
-    for _ in both..news {
-        new.item(T::visit)?;
-    }
-    Ok(())
+    Ok(out)
 }
 
 /// What pairs the tables of two versions' roots, given their links: [`pair_roots`] for the type of

@@ -4650,6 +4650,11 @@ mod tests {
         by: BTreeMap<u64, Table<Tagged>>,
     }
 
+    #[derive(crate::Data, Clone, Default)]
+    struct Racks {
+        racks: Vec<Table<Tagged>>,
+    }
+
     fn scratch() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = Store::open(
@@ -4740,6 +4745,62 @@ mod tests {
         );
         let mixed = paired::<Shelf>(&store, &junk(3, rows ^ 1), &junk(2, rows ^ 1)).unwrap();
         assert_eq!(mixed.same.len(), 1);
+    }
+
+    #[test]
+    fn a_sequence_that_gained_or_lost_items_pairs_the_rest_with_the_items_they_came_from() {
+        let (_dir, store) = scratch();
+        let table = |first: u64, note: u64| {
+            let mut table: Table<Tagged> = Table::new();
+            for id in first..first + 3 {
+                table.insert(Tagged {
+                    id,
+                    tags: Set::new(),
+                    group: id as u8,
+                    note,
+                });
+            }
+            table
+        };
+        let (a, b, c) = (table(0, 0), table(10, 0), table(20, 0));
+        let (b2, c2) = (table(10, 1), table(20, 1));
+        let racks = |racks: &[&Table<Tagged>]| {
+            object_of(&Racks {
+                racks: racks.iter().map(|&table| table.clone()).collect(),
+            })
+        };
+        let pairs = |old: &[&Table<Tagged>], new: &[&Table<Tagged>]| {
+            let paired = paired::<Racks>(&store, &racks(old), &racks(new)).unwrap();
+            let pairs: Vec<_> = paired
+                .pairs
+                .iter()
+                .map(|(old, new)| (old.hash, new.hash))
+                .collect();
+            let same: Vec<_> = paired.same.iter().map(|(_, hash)| *hash).collect();
+            (pairs, same)
+        };
+        let hash = |table: &Table<Tagged>| found(table).hash;
+
+        assert_eq!(
+            pairs(&[&a, &b], &[&b2]),
+            (vec![(hash(&b), hash(&b2))], vec![])
+        );
+        assert_eq!(
+            pairs(&[&a, &b, &c], &[&a, &c2]),
+            (vec![(hash(&c), hash(&c2))], vec![hash(&a)])
+        );
+        assert_eq!(
+            pairs(&[&b, &c], &[&a, &b2, &c]),
+            (vec![(hash(&b), hash(&b2))], vec![hash(&c)])
+        );
+        assert_eq!(
+            pairs(&[&a, &b], &[&c2]),
+            (vec![(hash(&a), hash(&c2))], vec![])
+        );
+        assert_eq!(
+            pairs(&[&a, &b], &[&a, &b2]),
+            (vec![(hash(&b), hash(&b2))], vec![hash(&a)])
+        );
     }
 
     #[test]
