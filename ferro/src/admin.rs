@@ -6,16 +6,20 @@
 //! beside a writer. [`Keep`], which says how much history to retain, is here too.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
-use crate::codec::{Checked, Data, Decoder, Encoder, HashSink, Kind, Ptr};
+use crate::codec::{
+    Checked, Data, Decoder, Encoder, FoundTable, Hash, HashSink, Kind, Plans, Ptr, Tables,
+};
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
-use crate::log::Closures;
-use crate::map::Map;
+use crate::log::{Closures, Entry};
+use crate::map::{Map, unwound};
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::refs::{self, Root};
@@ -202,14 +206,16 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
 /// Each object is checked without the store, and one whose summary needs it, because a value it
 /// summarizes or a summary it folds holds a collection, is checked again with the store once every
 /// object below it has passed, so that `of` and `combine` read only collections whose nodes were
-/// checked.
+/// checked. Once every object has passed, each table found is checked against its rows.
 ///
 /// # Errors
 ///
-/// [`Error::Corrupt`] naming the first object that does not decode or does not fit.
+/// [`Error::Corrupt`] naming the first object that does not decode or does not fit, or the first
+/// table whose indexes do not agree with its rows.
 pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> Result<()> {
     let mut roots: Vec<Ptr> = Vec::new();
     let mut commits = HashSet::new();
+    let mut versions: Vec<(u64, Hash, Option<Ptr>, Option<Hash>)> = Vec::new();
     let mut closures = Closures::default();
     for (_, branch) in refs.try_entries()? {
         let chain = branch.log;
@@ -218,6 +224,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
         chain.visit(store, branch.root, |ptr, entry, _, _| {
             if commits.insert(ptr.hash) {
                 roots.extend(entry.commit.root);
+                versions.push(version_of(ptr, entry));
             }
             closures.mark(ptr, chain.first, after);
             closures.seed(entry, after);
@@ -227,6 +234,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     closures.walk(store, |ptr, entry, _, _| {
         if commits.insert(ptr.hash) {
             roots.extend(entry.commit.root);
+            versions.push(version_of(ptr, entry));
         }
         Ok(true)
     })?;
@@ -238,6 +246,7 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
     queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>(), false)));
     let mut checked = Checked::default();
     let mut confirmed = HashSet::new();
+    let mut tables = Tables::default();
     let corrupt = |kind: &Kind, ptr: Ptr, error: Error| {
         Error::Corrupt(format!(
             "the {} at {} does not decode: {error}",
@@ -271,9 +280,11 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
             }
             None => {
                 let object = store.read_object(ptr)?;
+                let found_tables = RefCell::new(Vec::new());
                 let (shape, found, _) = kind
-                    .check(&object.body, &object.links, None)
+                    .check_tables(&object.body, &object.links, &found_tables)
                     .map_err(|error| corrupt(&kind, ptr, error))?;
+                tables.note(found_tables.into_inner());
                 if shape.deferred {
                     queue.push((ptr, kind.clone(), true));
                 }
@@ -292,6 +303,82 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
                 kind.name, ptr.offset, shape.count, shape.level
             )));
         }
+    }
+    if !tables.is_empty() {
+        agreed(store, &root, versions, tables)?;
+    }
+    Ok(())
+}
+
+fn version_of(ptr: Ptr, entry: &Entry) -> (u64, Hash, Option<Ptr>, Option<Hash>) {
+    (
+        entry.commit.version,
+        ptr.hash,
+        entry.commit.root,
+        entry.prev.map(|prev| prev.hash),
+    )
+}
+
+/// Checks that the indexes of each table in `tables` agree with its rows: the tables of each
+/// version's root against those at the same place in its parent's, which costs what changed
+/// between them, and every other table, those of the oldest versions among them, by building its
+/// indexes from its rows.
+fn agreed(
+    store: &Store,
+    root: &Kind,
+    mut versions: Vec<(u64, Hash, Option<Ptr>, Option<Hash>)>,
+    tables: Tables,
+) -> Result<()> {
+    let roots: HashMap<Hash, Ptr> = versions
+        .iter()
+        .filter_map(|(_, commit, root, _)| root.map(|root| (*commit, root)))
+        .collect();
+    versions.sort_unstable_by_key(|(version, commit, _, _)| (*version, *commit));
+    let mut listed: HashMap<Hash, Rc<Vec<FoundTable>>> = HashMap::new();
+    let mut tables_of = |ptr: Ptr| -> Result<Rc<Vec<FoundTable>>> {
+        if let Some(found) = listed.get(&ptr.hash) {
+            return Ok(found.clone());
+        }
+        let object = store.read_object(ptr)?;
+        let found = RefCell::new(Vec::new());
+        root.check_tables(&object.body, &object.links, &found)
+            .map_err(|error| {
+                Error::Corrupt(format!(
+                    "the {} at {} does not decode: {error}",
+                    root.name, ptr.offset
+                ))
+            })?;
+        let found = Rc::new(found.into_inner());
+        listed.insert(ptr.hash, found.clone());
+        Ok(found)
+    };
+    let mut plans = Plans::default();
+    for (_, _, ptr, prev) in &versions {
+        let Some(ptr) = ptr else {
+            continue;
+        };
+        let found = tables_of(*ptr)?;
+        let base = match prev.and_then(|prev| roots.get(&prev)) {
+            Some(prev) => tables_of(*prev)?,
+            None => Rc::default(),
+        };
+        plans.pair(&found, &base);
+    }
+    for table in tables.into_found() {
+        let Some(base) = plans.base(&table) else {
+            continue;
+        };
+        unwound("checking its indexes", || {
+            (table.agree)(&table, base, store)
+        })
+        .and_then(|agreed| agreed)
+        .map_err(|error| match error {
+            Error::Decode(message) => Error::Corrupt(format!(
+                "a table ({}) has indexes that do not agree with its rows: {message}",
+                table.name
+            )),
+            other => other,
+        })?;
     }
     Ok(())
 }

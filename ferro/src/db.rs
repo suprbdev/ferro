@@ -5308,16 +5308,22 @@ impl<T: Data> Db<T> {
     /// Like [`Db::verify`], and also decodes every object reachable from every retained version
     /// as the type that reads it.
     ///
-    /// It checks each map node's count, level and key range against its parent and recomputes
-    /// each summary from the entries below it, as [`Db::receive`] checks what it is sent, so it
-    /// finds a damaged file or a type change that broke stored data before a read panics on it or
-    /// a fold returns a stale total. It costs a full decode of everything retained.
+    /// It checks each map node's count, level and key range against its parent, recomputes
+    /// each summary from the entries below it, and checks that each index a table stores under a
+    /// fingerprint `T` knows holds exactly the entries its rows give, as [`Db::receive`] checks
+    /// what it is sent, so it finds a damaged file or a type change that broke stored data before
+    /// a read panics on it or a fold or lookup returns a stale answer. It costs a full decode of
+    /// everything retained. A table held in a version's root is checked against the table at the
+    /// same place in its parent's root, for what changed between them, and any other table by
+    /// building its indexes from its rows.
     ///
     /// # Errors
     ///
     /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode
     /// or does not fit its parent, which includes a summary that is not the fold of its entries
-    /// and one whose `of` or `combine` panics to recompute.
+    /// and one whose `of` or `combine` panics to recompute, or a table whose index holds other
+    /// entries than its rows give, whose row is stored under a key other than its own, or two of
+    /// whose rows share a value of a unique index.
     pub fn verify_typed(&self) -> Result<Verified> {
         let (head, refs, store) = {
             let published = self.shared.published.lock();
