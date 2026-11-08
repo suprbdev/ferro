@@ -1,7 +1,7 @@
 mod common;
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -9,7 +9,7 @@ use std::path::Path;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ use common::{Rng, quiet_ferro_panics};
 use ferro::db::Hook;
 use ferro::store::{Op, Trace};
 use ferro::{Committed, Db, Durability, Error, Map, Options, Reclaim};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tempfile::TempDir;
 
 type Root = Map<u64, u64>;
@@ -629,6 +629,273 @@ fn coalesced_async_writes_share_versions() {
         }
     }
     assert_eq!(messages, 200);
+}
+
+fn woken_by(flag: &Flag, deadline: Instant) -> bool {
+    while !flag.woken.swap(false, Ordering::SeqCst) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        thread::park_timeout(left);
+    }
+    true
+}
+
+fn within<F: Future>(future: F, patience: Duration) -> Option<F::Output> {
+    let mut future = pin!(future);
+    let (flag, waker) = flag();
+    let mut cx = Context::from_waker(&waker);
+    let deadline = Instant::now() + patience;
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return Some(out);
+        }
+        if !woken_by(&flag, deadline) {
+            return None;
+        }
+    }
+}
+
+type Marks = HashMap<(&'static str, &'static str), (bool, bool)>;
+
+#[derive(Default)]
+struct Steps {
+    held: Mutex<Marks>,
+    moved: Condvar,
+}
+
+impl Steps {
+    fn hook(self: &Arc<Self>) -> Hook {
+        let steps = self.clone();
+        Hook(Arc::new(move |step| {
+            if let Some(name) = thread::current().name() {
+                steps.pass(name, step);
+            }
+        }))
+    }
+
+    fn arm(&self, thread: &'static str, step: &'static str) {
+        self.held.lock().insert((thread, step), (false, false));
+    }
+
+    fn pass(&self, thread: &str, step: &str) {
+        let mut held = self.held.lock();
+        let Some(key) = held
+            .keys()
+            .find(|(name, at)| *name == thread && *at == step)
+            .copied()
+        else {
+            return;
+        };
+        if held[&key].0 {
+            return;
+        }
+        held.insert(key, (true, false));
+        self.moved.notify_all();
+        while !held[&key].1 {
+            self.moved.wait(&mut held);
+        }
+    }
+
+    fn reached(&self, thread: &'static str, step: &'static str) {
+        let deadline = Instant::now() + PATIENCE;
+        let mut held = self.held.lock();
+        while !held[&(thread, step)].0 {
+            let late = self.moved.wait_until(&mut held, deadline).timed_out();
+            assert!(!late, "{thread} never reached {step}");
+        }
+    }
+
+    fn release(&self, thread: &'static str, step: &'static str) {
+        self.held.lock().insert((thread, step), (true, true));
+        self.moved.notify_all();
+    }
+}
+
+fn sync_held(steps: &Steps, db: &Db<Root>, name: &'static str, key: u64) -> thread::JoinHandle<()> {
+    steps.arm(name, "leading");
+    let db = db.clone();
+    let leader = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            db.update(|root| {
+                root.insert(key, key);
+            })
+            .unwrap();
+        })
+        .unwrap();
+    steps.reached(name, "leading");
+    leader
+}
+
+fn lands_promptly(db: &Db<Root>, key: u64, case: &str) {
+    let started = Instant::now();
+    let done = within(
+        db.update_async(move |root| {
+            root.insert(key, key);
+        }),
+        Duration::from_secs(5),
+    );
+    let took = started.elapsed();
+    assert!(
+        done.is_some_and(|done| done.is_ok()) && took < Duration::from_secs(1),
+        "{case}: an awaited write on branch a waited {took:?} for a closure on branch b"
+    );
+}
+
+fn on_branches(steps: &Arc<Steps>) -> (TempDir, Db<Root>, Db<Root>, Db<Root>) {
+    let dir = dir();
+    let main: Db<Root> = buffered()
+        .coalesce(true)
+        .hook(steps.hook())
+        .open(dir.path().join("db.ferro"))
+        .unwrap();
+    let a = main.fork("a").unwrap();
+    let b = main.fork("b").unwrap();
+    (dir, main, a, b)
+}
+
+#[test]
+fn a_long_closure_on_one_branch_holds_up_no_awaited_write_on_another() {
+    let steps = Arc::new(Steps::default());
+    let (_dir, main, a, b) = on_branches(&steps);
+    let leader = sync_held(&steps, &main, "leader", 100);
+    let mut member = Box::pin(b.update_async(|root| {
+        root.insert(1, 1);
+    }));
+    assert!(poll_once(&mut member).is_pending());
+    let (started, running) = mpsc::channel();
+    let long = {
+        let b = b.clone();
+        thread::spawn(move || {
+            b.update(|root| {
+                started.send(()).unwrap();
+                thread::sleep(Duration::from_secs(2));
+                root.insert(2, 2);
+            })
+        })
+    };
+    running.recv().unwrap();
+    steps.release("leader", "leading");
+    leader.join().unwrap();
+    lands_promptly(&a, 3, "a long closure");
+    long.join().unwrap().unwrap();
+    within(member, PATIENCE)
+        .expect("the write on b resolves once its branch's closure ends")
+        .unwrap();
+    assert_eq!(b.read().keys().collect::<Vec<u64>>(), vec![1, 2]);
+    assert_eq!(a.read().keys().collect::<Vec<u64>>(), vec![3]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Holder {
+    Blocking,
+    Awaited,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+    Commits,
+    Fails,
+    Panics,
+}
+
+type Held = thread::Result<std::result::Result<(), Refused>>;
+
+fn hold_lane(
+    b: &Db<Root>,
+    holder: Holder,
+    ends: Ends,
+    started: mpsc::Sender<()>,
+    go: mpsc::Receiver<()>,
+) -> Held {
+    let closure = move |root: &mut Root| -> std::result::Result<(), Refused> {
+        started.send(()).unwrap();
+        let _ = go.recv();
+        root.insert(2, 2);
+        match ends {
+            Ends::Commits => Ok(()),
+            Ends::Fails => Err(Refused(2)),
+            Ends::Panics => panic!("ferro: the closure holding the lane gave up"),
+        }
+    };
+    panic::catch_unwind(AssertUnwindSafe(|| match holder {
+        Holder::Blocking => b.try_update(closure),
+        Holder::Awaited => block_on(b.try_update_async(closure)),
+    }))
+}
+
+fn a_busy_lane_strands_no_group(holder: Holder, ends: Ends) {
+    let case = format!("{holder:?} closure that {ends:?}");
+    let steps = Arc::new(Steps::default());
+    let (_dir, main, a, b) = on_branches(&steps);
+    let first = sync_held(&steps, &main, "first", 100);
+    let mut member = Box::pin(b.update_async(|root| {
+        root.insert(1, 1);
+    }));
+    assert!(poll_once(&mut member).is_pending(), "{case}");
+    steps.arm("holder", "handed");
+    let (started, running) = mpsc::channel();
+    let (go, wait) = mpsc::channel();
+    let holding = {
+        let b = b.clone();
+        thread::Builder::new()
+            .name("holder".to_string())
+            .spawn(move || hold_lane(&b, holder, ends, started, wait))
+            .unwrap()
+    };
+    running.recv().unwrap();
+    steps.release("first", "leading");
+    first.join().unwrap();
+    lands_promptly(&a, 3, &case);
+    let second = sync_held(&steps, &main, "second", 101);
+    go.send(()).unwrap();
+    steps.reached("holder", "handed");
+    steps.release("second", "leading");
+    second.join().unwrap();
+    let (flag, waker) = flag();
+    let mut cx = Context::from_waker(&waker);
+    assert!(member.as_mut().poll(&mut cx).is_pending(), "{case}");
+    lands_promptly(&a, 4, &case);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        if !flag.woken.swap(false, Ordering::SeqCst) {
+            break;
+        }
+        assert!(member.as_mut().poll(&mut cx).is_pending(), "{case}");
+    }
+    steps.release("holder", "handed");
+    let held = holding.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let done = loop {
+        assert!(
+            woken_by(&flag, deadline),
+            "{case}: the group it handed on was never sealed"
+        );
+        if let Poll::Ready(done) = member.as_mut().poll(&mut cx) {
+            break done;
+        }
+    };
+    done.unwrap();
+    let mut keys = vec![1];
+    match (ends, held) {
+        (Ends::Commits, Ok(Ok(()))) => keys.push(2),
+        (Ends::Fails, Ok(Err(Refused(2)))) | (Ends::Panics, Err(_)) => {}
+        (_, held) => panic!("{case}: the holder returned {held:?}"),
+    }
+    assert_eq!(b.read().keys().collect::<Vec<u64>>(), keys, "{case}");
+    b.verify().unwrap();
+}
+
+#[test]
+fn a_group_the_sync_thread_finds_busy_is_finished_by_the_closure_holding_its_lane() {
+    quiet_ferro_panics();
+    for holder in [Holder::Blocking, Holder::Awaited] {
+        for ends in [Ends::Commits, Ends::Fails, Ends::Panics] {
+            a_busy_lane_strands_no_group(holder, ends);
+        }
+    }
 }
 
 #[test]

@@ -2775,7 +2775,10 @@ impl<T: Data> Shared<T> {
     fn close_stranded(&self, stranded: &[Arc<Branch<T>>]) -> bool {
         let mut closed = false;
         for branch in stranded {
-            let mut lane = self.arrive(branch);
+            let Some(guard) = branch.lane.try_lock() else {
+                continue;
+            };
+            let mut lane = branch.hold(guard);
             if self.queue.lock().syncing {
                 return closed;
             }
@@ -4339,10 +4342,20 @@ impl<T: Data> Db<T> {
         let mut others = Vec::new();
         let result = match ran {
             Err(panicked) => {
-                if let Some(group) = shared.pass_on(&mut lane, branch, group, &mut others) {
-                    shared.seal_for_others(branch, group);
+                let handed = match shared.pass_on(&mut lane, branch, group, &mut others) {
+                    Some(group) => {
+                        shared.seal_for_others(branch, group);
+                        false
+                    }
+                    None => lane.is_some(),
+                };
+                if handed {
+                    shared.step("handed");
                 }
                 drop(lane);
+                if handed {
+                    shared.rouse();
+                }
                 panic::resume_unwind(panicked);
             }
             Ok(Err(error)) => Err(error),
@@ -4354,8 +4367,9 @@ impl<T: Data> Db<T> {
             }
         };
         group.members += 1;
-        if let Some(group) = shared.pass_on(&mut lane, branch, group, &mut others) {
-            shared.seal_group(branch, group);
+        match shared.pass_on(&mut lane, branch, group, &mut others) {
+            Some(group) => shared.seal_group(branch, group),
+            None => shared.step("handed"),
         }
         drop(lane);
         if !others.is_empty() {

@@ -19,8 +19,7 @@ returned (#41). These are the cases, each reproduced with a timeout in `ferro/te
   waits for it, the leader of that sync wakes one member of the first open group, the closure's, and
   that member waits for the closure's lane to seal it, so nobody seals the write's group. Waiting on
   a write that was started outside the closure, by awaiting its future, hangs the same way: the
-  group it waits for may be the closure's own, and the sync thread that would close another may be
-  parked on the closure's lane.
+  group it waits for may be the closure's own.
 - Two closures on two threads that write into each other's files, each holding the lane the other
   needs.
 - A write from user code that runs under `tip` rather than a lane. It took its lane and then waited

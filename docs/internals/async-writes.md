@@ -62,9 +62,11 @@ futures whose frames it settled after letting go of the queue's mutex, and if fr
 group are left, rouses the sync thread, since no future will lead them. Under coalescing, the
 blocking path relies on one woken member to close a group that was left open while a sync ran. A
 woken future may be dropped or polled late, so the sync thread also closes any group left open once
-no sync runs and nobody is on the way to the lock, and a writer that closes another's group rouses
-it as well, and so does a future whose group failed, since that group's leader may have been left
-another branch's group to sync, as described under [A group nobody
+no sync runs and nobody is on the way to the lock, taking its lane only if it is free, as described
+under [A sync thread that waited for a
+closure](coalescing.md#a-sync-thread-that-waited-for-a-closure). A writer that closes another's
+group rouses it as well, and so does a future whose group failed, since that group's leader may
+have been left another branch's group to sync, as described under [A group nobody
 led](coalescing.md#a-group-nobody-led). The sync thread uses the same `syncing` flag as everyone
 else, so there is never a second sync at once, and an acknowledgement means what it did: a future
 resolves only once the queue's settled sequence has reached its frame, which under Fsync happens

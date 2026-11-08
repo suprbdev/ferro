@@ -158,6 +158,40 @@ cores, which suggests that handovers there come fast and slow by turns. A runnin
 handovers fell to 79% of plain at 8 writers on 4 busy cores with a weight of an eighth, and to 56%
 with a weight of a sixty-fourth.
 
+## A sync thread that waited for a closure
+
+The sync thread closes a group left open once no sync runs and nobody is on the way to its lane.
+With one writer lock it took that lock to do so, which cost nothing, since every write waited for
+the same lock. Lanes kept the blocking take, so with `coalesce` the sync thread waited for whatever
+closure held a stranded group's lane, and led nothing meanwhile: an awaited write on another branch
+waited for a closure it had nothing to do with, though a long closure holds up its own branch only
+(#123). A bug hunt found it by holding a sync at its `leading` step while an awaited write left a
+group open on one branch and a closure of 4 seconds started there. An awaited write on a second
+branch, made once the sync ended, resolved 3.9 seconds later. Blocking writers lead their own frames
+and seal the groups of other branches only through a free lane, so they never waited.
+
+The sync thread now takes a lane only if it is free, as the other sealers of idle groups do, and
+leads what is waiting either way. A group it passes by is in the hands of the closure holding its
+lane, which took it to join it. That closure seals it, or leaves it open only while a sync runs or
+someone is on the way to the lane. A sync that ends with a group open rouses the sync thread, and
+since the closure may still hold the lane then, it follows up once it lets go: a blocking member
+that finds no sync running and no thread arriving at the lane seals its group itself, and an awaited
+one rouses the sync thread from its poll unless a sync is running, whose leader will. A closure that
+panics is not a member and has nothing to follow up with, so one that leaves the group open now
+rouses the sync thread after it lets go of the lane. Every other holder of a lane seals the group it
+finds there: `fork`, `restore`, merges, `drop_branch`, a cycle and `receive` as they take the lane,
+a member on its way, and a sealer of idle groups. Under `shared` a lane with a group open keeps its
+branch's byte, so no writer holds such a lane while it waits for another process.
+
+`a_long_closure_on_one_branch_holds_up_no_awaited_write_on_another` in `write_async.rs` is the bug
+hunt's test with a closure of 2 seconds, and an awaited write on the other branch waited 2.0
+seconds before the change.
+`a_group_the_sync_thread_finds_busy_is_finished_by_the_closure_holding_its_lane` holds a blocking
+or awaited closure on the lane while a sync ends and the sync thread passes its group by, lets it
+commit, fail or panic once it has handed the group on at the `handed` step, and checks that the
+member polled last before then is woken with its version. With the blocking take every case waited
+for the closure, and without the rouse the group of a closure that panicked was never sealed.
+
 ## Failures
 
 If the group cannot be written, every closure in it gets `Error::GroupFailed`, or `Error::Poisoned`
