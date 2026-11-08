@@ -2029,25 +2029,10 @@ struct Inner {
     freed: Condvar,
     /// The frames that the last catch-up to follow any kept, for reads of their objects.
     followed: ArcSwapOption<Kept>,
-    /// The table values that a receive landed holding an index under a fingerprint the receiving
-    /// type did not know, as the branch table last loaded records them.
-    unchecked: ArcSwapOption<Unchecked>,
     /// How the store was opened.
     options: StoreOptions,
     /// What a [`Store::view`] may still read, or `None` for a store opened on a file.
     view: Option<View>,
-}
-
-/// The table values a file records as landed with an index nothing checked, by the hash of each
-/// value's bytes and links, and the root of the map that records them, which tells whether a
-/// branch table loaded later records others.
-pub(crate) struct Unchecked {
-    /// The root hash of the map the branch table records them in.
-    pub(crate) root: Option<Hash>,
-    /// The values, by hash.
-    pub(crate) tables: HashSet<Hash>,
-    /// Whether the record could not be read, so that every table value counts as recorded.
-    pub(crate) all: bool,
 }
 
 /// What a [`Store::view`] keeps beside the file it reads.
@@ -2441,7 +2426,6 @@ impl Store {
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
                 followed: ArcSwapOption::empty(),
-                unchecked: ArcSwapOption::empty(),
                 options,
                 view: None,
             }),
@@ -2501,7 +2485,6 @@ impl Store {
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
                 followed: ArcSwapOption::empty(),
-                unchecked: ArcSwapOption::new(inner.unchecked.load_full()),
                 options: StoreOptions {
                     read_only: true,
                     shared: false,
@@ -2589,33 +2572,6 @@ impl Store {
             .view
             .as_ref()
             .is_some_and(|view| view.overdrawn.load(Ordering::Relaxed))
-    }
-
-    /// The table values this file records as landed with an index nothing checked, as the branch
-    /// table last loaded records them, if it records any.
-    pub(crate) fn unchecked(&self) -> Option<Arc<Unchecked>> {
-        self.inner.unchecked.load_full()
-    }
-
-    /// Whether this file records the table value whose bytes and links hash to `hash` as landed
-    /// with an index nothing checked, whose stored indexes a read must then not trust.
-    pub(crate) fn is_unchecked(&self, hash: &Hash) -> bool {
-        self.inner
-            .unchecked
-            .load()
-            .as_ref()
-            .is_some_and(|unchecked| unchecked.all || unchecked.tables.contains(hash))
-    }
-
-    /// Whether this file records any table value as landed with an index nothing checked.
-    pub(crate) fn has_unchecked(&self) -> bool {
-        self.inner.unchecked.load().is_some()
-    }
-
-    /// Takes `unchecked` as what the branch table records of the table values that landed with
-    /// an index nothing checked.
-    pub(crate) fn set_unchecked(&self, unchecked: Option<Arc<Unchecked>>) {
-        self.inner.unchecked.store(unchecked);
     }
 
     /// The store's id, which no other store this process opens shares, so that a collection can

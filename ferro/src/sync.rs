@@ -34,7 +34,6 @@ use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
 use crate::map::Map;
 use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
-use crate::refs;
 use crate::store::{Record, Staging, Store, Txn, compressed, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -2100,9 +2099,7 @@ impl Vetting<'_> {
                 let (base, held) = tables_of(*parent)?;
                 for table in base.iter().filter(|_| held) {
                     if *kept || !self.tables.holds(table) {
-                        if !self.store.is_unchecked(&table.hash) {
-                            plans.trust(table);
-                        }
+                        plans.trust(table);
                     } else {
                         plans.build(table);
                     }
@@ -2152,7 +2149,7 @@ impl Vetting<'_> {
         checks: Checks,
         pool: &Pool<'p>,
         view: &'p Store,
-    ) -> Result<Vec<Hash>> {
+    ) -> Result<()> {
         let mut plans = Plans::default();
         let mut listed = HashSet::new();
         for descent in lineage {
@@ -2161,7 +2158,7 @@ impl Vetting<'_> {
             })?;
         }
         let found = mem::take(&mut self.tables).into_found();
-        let finished = checks.finish(pool, view, &plans, &found);
+        let failed = checks.finish(pool, view, &plans, &found);
         if view.out_of_reads() {
             return Err(bad(
                 "checking that the indexes of the tables it carries agree with their rows reads \
@@ -2171,9 +2168,9 @@ impl Vetting<'_> {
         if let Some(error) = view.overdrawn() {
             return Err(error);
         }
-        match finished.failed {
+        match failed {
             Some((table, error)) => Err(disagreeing(table, error)),
-            None => Ok(finished.unchecked),
+            None => Ok(()),
         }
     }
 
@@ -2786,14 +2783,12 @@ struct Vetted<'a> {
 struct Resolved {
     refs: Option<Refs>,
     commits: Vec<u32>,
-    unchecked: Vec<Hash>,
 }
 
 struct Received {
     staging: Staging,
     anchors: Anchors,
     commits: Vec<u32>,
-    unchecked: Vec<Hash>,
 }
 
 struct Arrival {
@@ -2944,7 +2939,6 @@ fn resolve<O: Objects>(
     );
     order.sort_unstable();
     let mut linked = None;
-    let mut unchecked = Vec::new();
     if let Some(Vetted {
         streamed,
         root_kind,
@@ -3029,13 +3023,13 @@ fn resolve<O: Objects>(
         if tabled {
             let descents = lineage(store, objects, &landing, &order);
             let agreeing = vetting.fresh_view();
-            unchecked = staging.overlaid(&agreeing, || {
+            staging.overlaid(&agreeing, || {
                 pool::scope(|pool| {
                     let mut early = Early {
                         on: descents.is_ok(),
                         plans: Plans::default(),
                         listed: HashSet::new(),
-                        checks: Checks::default(),
+                        checks: Checks::strict(),
                     };
                     let walked = vetting.walk(&roots, |vetting, at| {
                         if let Ok(descents) = &descents
@@ -3046,7 +3040,7 @@ fn resolve<O: Objects>(
                     });
                     if walked.is_err() || vetting.tables.is_empty() {
                         pool.stop();
-                        return walked.map(|()| Vec::new());
+                        return walked;
                     }
                     match descents {
                         Ok(lineage) => vetting.agree(&lineage, early.checks, pool, &agreeing),
@@ -3062,8 +3056,8 @@ fn resolve<O: Objects>(
             if !vetting.tables.is_empty() {
                 let lineage = lineage(store, objects, &landing, &order)?;
                 let agreeing = vetting.fresh_view();
-                unchecked = staging.overlaid(&agreeing, || {
-                    pool::scope(|pool| vetting.agree(&lineage, Checks::default(), pool, &agreeing))
+                staging.overlaid(&agreeing, || {
+                    pool::scope(|pool| vetting.agree(&lineage, Checks::strict(), pool, &agreeing))
                 })?;
             }
         }
@@ -3160,7 +3154,6 @@ fn resolve<O: Objects>(
         return Ok(Resolved {
             refs: None,
             commits: landing.commits.ids(),
-            unchecked,
         });
     }
     let mut next = refs.clone();
@@ -3177,7 +3170,7 @@ fn resolve<O: Objects>(
     };
     if !continues {
         for (name, mut head) in next.try_entries()? {
-            if !refs::reserved(&name) && head.merged.try_get(remote)?.is_some() {
+            if head.merged.try_get(remote)?.is_some() {
                 head.merged.remove(remote);
                 next.insert(name, head);
             }
@@ -3187,7 +3180,6 @@ fn resolve<O: Objects>(
     Ok(Resolved {
         refs: Some(next),
         commits: landing.commits.ids(),
-        unchecked,
     })
 }
 
@@ -3248,7 +3240,7 @@ fn fast_forward(ours: Option<&Head>, theirs: &Head) -> Head {
 }
 
 fn check_remote(remote: &str, branch: &str) -> Result<()> {
-    if remote == MAIN || remote == branch || refs::reserved(remote) {
+    if remote == MAIN || remote == branch {
         return Err(Error::BranchInUse(remote.to_string()));
     }
     Ok(())
@@ -3382,8 +3374,7 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// - [`Error::BranchInUse`] if `remote` is `main`, this handle's branch, or a name that starts
-    ///   with a NUL, which the branch table keeps for its own records.
+    /// - [`Error::BranchInUse`] if `remote` is `main` or this handle's branch.
     /// - [`Error::StaleHave`] if this file pruned or dropped what the bundle builds on while it was
     ///   sent, on each of the three attempts. Nothing landed and `merge` did not run.
     /// - [`Error::NoCommonAncestor`] when the merge base could lie in pruned history. The remote
@@ -3393,10 +3384,9 @@ impl<T: Data> Db<T> {
     ///   one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a `Vec<()>`,
     ///   than its size allows. A table whose index, stored under a fingerprint this side knows,
-    ///   holds other entries than its rows give, a row stored under a key other than its own, or
-    ///   two rows sharing a value of a unique index fail the checks too. A table that holds an
-    ///   index under a fingerprint this side does not know lands, and the file records it so that
-    ///   no read trusts that index once `T` knows the fingerprint.
+    ///   holds other entries than its rows give, a table that holds an index under a fingerprint
+    ///   this side does not know, a row stored under a key other than its own, or two rows
+    ///   sharing a value of a unique index fail the checks too.
     /// - [`Error::Decode`] if `from` sends a head that `T` cannot read, such as a table whose
     ///   unique index, rebuilt on this side, finds two rows sharing a value. Nothing lands and
     ///   `merge` does not run: every branch, the remote one and handles on it included, is as it
@@ -3555,11 +3545,12 @@ impl<T: Data> Db<T> {
     ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
     ///   and a table whose index, stored under a fingerprint this side knows, does not hold
     ///   exactly the entries its rows give, as a peer whose schema sets index maps apart from the
-    ///   rows can send, or whose row is stored under a key other than its own, or if checking it
-    ///   would decode or read more again than its size allows, as one large value shared by many
-    ///   keys, or one large node reached under many key ranges, can, or would visit more items
-    ///   that encode to nothing, such as the `()`s of a `Vec<()>`, than its size allows. Nothing
-    ///   reaches the file.
+    ///   rows can send, or that holds an index under a fingerprint this side does not know, as a
+    ///   peer whose type has an index this side's lacks or declares otherwise sends, or if
+    ///   checking it would decode or read more again than its size allows,
+    ///   as one large value shared by many keys, or one large node reached under many key ranges,
+    ///   can, or would visit more items that encode to nothing, such as the `()`s of a
+    ///   `Vec<()>`, than its size allows. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, or this one pruned or dropped that commit after sending
     ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.
@@ -3775,7 +3766,6 @@ impl<T: Data> Db<T> {
             staging,
             anchors,
             commits: sent.commits,
-            unchecked: sent.unchecked,
         })
     }
 
@@ -3784,7 +3774,6 @@ impl<T: Data> Db<T> {
             staging,
             mut anchors,
             commits,
-            unchecked,
         } = received;
         let spilled = staging.spilled();
         if spilled {
@@ -3824,11 +3813,8 @@ impl<T: Data> Db<T> {
                     placed: &placed,
                 },
             };
-            let mut next = resolve(store, &objects, refs, remote, header, &anchors, None)?.refs;
-            if let Some(next) = &mut next {
-                refs::record_unchecked(next, &unchecked)?;
-            }
-            Ok((next, ()))
+            let resolved = resolve(store, &objects, refs, remote, header, &anchors, None)?;
+            Ok((resolved.refs, ()))
         })
     }
 

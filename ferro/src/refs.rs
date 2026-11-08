@@ -8,14 +8,12 @@
 //! describes them.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use crate::codec::{Data, Decoder, Encoder, HASH_BYTES, Hash, Kind, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, Kind, Ptr, Sink};
 use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
-use crate::log::Chain;
 use crate::map::Map;
-use crate::store::{Store, Txn, Unchecked};
+use crate::store::{Store, Txn};
 
 const STEP: u8 = 0x7f;
 /// How many steps a writer stacks on a table before it writes a whole table again.
@@ -203,99 +201,10 @@ pub(crate) fn heads(store: &Store, head: Ptr) -> Result<Heads> {
     Ok(heads)
 }
 
-/// The name under which the branch table records the table values that a receive landed holding
-/// an index under a fingerprint the receiving type did not know, each by the hash of its bytes and
-/// links, as the keys of its head's merged map. No branch a handle opens may start with a NUL.
-pub(crate) const UNCHECKED: &str = "\u{0}unchecked tables";
-
-/// Whether `name` is kept for what the branch table records of its own, which no branch may be
-/// named.
-pub(crate) fn reserved(name: &str) -> bool {
-    name.starts_with('\u{0}')
-}
-
-/// Takes into `store` what `refs` records of the table values that landed with an index nothing
-/// checked, reading the record again only when it changed.
-///
-/// A record that cannot be read, in a damaged branch table, leaves `store` trusting no stored
-/// index, so that every read of a table rebuilds its indexes, rather than fail the open of a
-/// file whose branches may still read.
-pub(crate) fn note_unchecked(store: &Store, refs: &Refs) {
-    let unchecked = (|| -> Result<Option<Arc<Unchecked>>> {
-        let Some(head) = refs.try_get(UNCHECKED)? else {
-            return Ok(None);
-        };
-        let root = head.merged.root_hash();
-        if let Some(known) = store
-            .unchecked()
-            .filter(|known| known.root == root && !known.all)
-        {
-            return Ok(Some(known));
-        }
-        let mut tables = HashSet::new();
-        for (key, _) in head.merged.try_entries()? {
-            tables.insert(unhex(&key).ok_or_else(|| {
-                Error::Corrupt(format!("the branch table records {key:?} as a table"))
-            })?);
-        }
-        Ok(Some(Arc::new(Unchecked {
-            root,
-            tables,
-            all: false,
-        })))
-    })();
-    store.set_unchecked(unchecked.unwrap_or_else(|_| {
-        Some(Arc::new(Unchecked {
-            root: None,
-            tables: HashSet::new(),
-            all: true,
-        }))
-    }));
-}
-
-/// Records in `refs` the table values `tables`, by hash, as landed with an index nothing checked.
-///
-/// # Errors
-///
-/// Read errors of the branch table.
-pub(crate) fn record_unchecked(refs: &mut Refs, tables: &[Hash]) -> Result<()> {
-    if tables.is_empty() {
-        return Ok(());
-    }
-    let mut head = match refs.try_get(UNCHECKED)? {
-        Some(head) => (*head).clone(),
-        None => Head {
-            version: 0,
-            root: None,
-            log: Chain::empty(),
-            merged: Map::new(),
-            born: 0,
-        },
-    };
-    for hash in tables {
-        head.merged.insert(hex(hash), (0, 0));
-    }
-    refs.try_insert(UNCHECKED.to_string(), head)
-}
-
-fn hex(hash: &Hash) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn unhex(text: &str) -> Option<Hash> {
-    let mut hash = [0u8; HASH_BYTES];
-    if text.len() != 2 * HASH_BYTES {
-        return None;
-    }
-    for (at, byte) in hash.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(2 * at..2 * at + 2)?, 16).ok()?;
-    }
-    Some(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::Chain;
     use crate::store::{Closing, Durability, StoreOptions};
 
     fn open(dir: &tempfile::TempDir) -> Closing {
