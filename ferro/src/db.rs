@@ -10,7 +10,7 @@
 //! [`log`](crate::log).
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::mem;
@@ -1764,6 +1764,8 @@ fn rebind<T>(branch: &Branch<T>, state: Arc<State<T>>, notices: &mut Vec<Notice<
     }
 }
 
+type Tracked<R> = std::result::Result<R, Option<u64>>;
+
 fn holds(found: &[Start], ptr: Ptr) -> bool {
     found.iter().any(|start| start.node.ptr.hash == ptr.hash)
 }
@@ -1802,6 +1804,89 @@ fn recorded((refs, store): (&Refs, &Store), starts: &[Start]) -> Result<Vec<Star
         }
     }
     Ok(out)
+}
+
+/// Whether the history of `theirs` holds a commit that is not an ancestor of `ours` and whose
+/// value differs from the value of `ours`, given the merge-base search starts of `ours`.
+///
+/// It walks down from their head through the commits that hold our value, and stops on each path
+/// at a commit of our chain, at the first commit whose value differs, or where history is pruned.
+/// The merge-base search then tells whether each commit it stopped at for its value is an
+/// ancestor of ours; one it cannot place counts as a change.
+fn brings_change<T>(ours: &State<T>, starts: Vec<Start>, theirs: &State<T>) -> Result<bool> {
+    let Some(tip) = theirs.log.tip else {
+        return Ok(false);
+    };
+    let root = ours.snapshot.commit.root.map(|ptr| ptr.hash);
+    let mut walk = vec![Start {
+        store: theirs.store.clone(),
+        node: Node::load(&theirs.store, tip)?,
+        low: theirs.log.first.max(1),
+        after: theirs.log.after(&theirs.store)?,
+        bare: false,
+        under: None,
+    }];
+    let mut seen = HashSet::new();
+    let mut differ = Vec::new();
+    while let Some(step) = walk.pop() {
+        let node = &step.node;
+        if !seen.insert(node.ptr.hash) {
+            continue;
+        }
+        let on_ours = ours.log.node_at(&ours.store, node.version())?;
+        if on_ours.is_some_and(|on| on.ptr.hash == node.ptr.hash) {
+            continue;
+        }
+        if node.entry.commit.root.map(|ptr| ptr.hash) != root {
+            differ.push(step);
+            continue;
+        }
+        let kept = |after: Option<u64>, node: &Node| after.is_none_or(|after| node.time() >= after);
+        let prev = node.entry.prev.filter(|prev| prev.offset != 0);
+        if let Some(prev) = prev.filter(|_| node.version() > step.low) {
+            let below = Node::load(&step.store, prev)?;
+            if kept(step.after, &below) {
+                walk.push(Start {
+                    node: below,
+                    ..step.clone()
+                });
+            }
+        }
+        if let Some(link) = node.entry.merged.filter(|link| link.ptr.offset != 0) {
+            let below = Node::load(&step.store, link.ptr)?;
+            let after = link.after(step.after);
+            if kept(after, &below) {
+                let held = |entry: &Entry| after.is_none_or(|after| entry.commit.time_ms >= after);
+                walk.push(Start {
+                    low: below.lowest_kept(&step.store, link.floor, held)?,
+                    store: step.store.clone(),
+                    node: below,
+                    after,
+                    bare: false,
+                    under: None,
+                });
+            }
+        }
+    }
+    if differ.is_empty() {
+        return Ok(false);
+    }
+    let found = match graph::best(starts.clone(), differ.clone()) {
+        Err(Error::NoCommonAncestor) => return Ok(true),
+        found => found?,
+    };
+    for start in differ {
+        let ptr = start.node.ptr;
+        if holds(&found, ptr) {
+            continue;
+        }
+        match graph::best(starts.clone(), vec![start]) {
+            Ok(alone) if holds(&alone, ptr) => {}
+            Ok(_) | Err(Error::NoCommonAncestor) => return Ok(true),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -4700,14 +4785,19 @@ impl<T: Data> Db<T> {
     ///
     /// When the merge base already holds `other`'s head, `f` does not run, nothing is committed,
     /// and the inner result is `Err` with `other`'s newest version, for the caller to record.
+    ///
+    /// When `other`'s head holds this branch's value and so does every commit of its history that
+    /// this branch lacks, the merge would bring no change in, so `f` does not run, nothing is
+    /// committed and the inner result is `Err(None)`. Nothing is to be recorded either, since
+    /// `other`'s head is not an ancestor of this branch's.
     pub(crate) fn merge_tracking<R, S: Into<String>, E: From<Error>>(
         &self,
         other: &Db<T>,
         mut f: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<std::result::Result<Committed<R>, u64>, E> {
+    ) -> std::result::Result<Tracked<Committed<R>>, E> {
         self.same_file(other)?;
         let from = Some(&*other.branch);
-        let done = self.alone::<std::result::Result<R, u64>, E>(from, |tip, ours, root| {
+        let done = self.alone::<Tracked<R>, E>(from, |tip, ours, root| {
             let (theirs, published) = other.published_view()?;
             let store = self.shared.store();
             let found = Self::merge_base(
@@ -4716,8 +4806,15 @@ impl<T: Data> Db<T> {
                 (&other.branch.name, &theirs, &published),
             )?;
             let Some(ptr) = theirs.log.tip.filter(|ptr| !holds(&found, *ptr)) else {
-                return Ok((String::new(), Err(theirs.log.last), Intent::default()));
+                return Ok((String::new(), Err(Some(theirs.log.last)), Intent::default()));
             };
+            let root_of = |state: &State<T>| state.snapshot.commit.root.map(|ptr| ptr.hash);
+            if root_of(ours) == root_of(&theirs) {
+                let starts = Self::starts(&store, (&self.branch.name, ours, &tip.refs))?;
+                if !brings_change(ours, starts, &theirs)? {
+                    return Ok((String::new(), Err(None), Intent::default()));
+                }
+            }
             let link = Self::link_to(tip, other, &theirs, ptr)?;
             let base = self.base_of((&tip.refs, &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
@@ -4904,40 +5001,41 @@ impl<T: Data> Db<T> {
         if ours.1.log.tip.is_none() || theirs.1.log.tip.is_none() {
             return Ok(Vec::new());
         }
-        let starts = |(name, state, refs): (&str, &State<T>, &Refs)| -> Result<Vec<Start>> {
-            let mut starts = Vec::new();
-            if let Some(tip) = state.log.tip {
+        graph::best(Self::starts(store, ours)?, Self::starts(store, theirs)?)
+    }
+
+    fn starts(store: &Store, (name, state, refs): (&str, &State<T>, &Refs)) -> Result<Vec<Start>> {
+        let mut starts = Vec::new();
+        if let Some(tip) = state.log.tip {
+            starts.push(Start {
+                store: state.store.clone(),
+                node: Node::load(&state.store, tip)?,
+                low: state.log.first,
+                after: state.log.after(&state.store)?,
+                bare: false,
+                under: None,
+            });
+        }
+        let Some(head) = refs.try_get(name)? else {
+            return Err(Error::NoBranch(name.to_string()));
+        };
+        for (other, seen) in head.merged.try_entries()? {
+            let Some(found) = refs.try_get(&other)? else {
+                continue;
+            };
+            if let Some(node) = found.log.node_at(store, seen.0)? {
+                let at = seen.1.max(state.log.first);
                 starts.push(Start {
-                    store: state.store.clone(),
-                    node: Node::load(&state.store, tip)?,
-                    low: state.log.first,
-                    after: state.log.after(&state.store)?,
+                    store: store.clone(),
+                    node,
+                    low: found.log.first,
+                    after: found.log.after(store)?,
                     bare: false,
-                    under: None,
+                    under: state.log.node_at(&state.store, at)?,
                 });
             }
-            let Some(head) = refs.try_get(name)? else {
-                return Err(Error::NoBranch(name.to_string()));
-            };
-            for (other, seen) in head.merged.try_entries()? {
-                let Some(found) = refs.try_get(&other)? else {
-                    continue;
-                };
-                if let Some(node) = found.log.node_at(store, seen.0)? {
-                    let at = seen.1.max(state.log.first);
-                    starts.push(Start {
-                        store: store.clone(),
-                        node,
-                        low: found.log.first,
-                        after: found.log.after(store)?,
-                        bare: false,
-                        under: state.log.node_at(&state.store, at)?,
-                    });
-                }
-            }
-            Ok(starts)
-        };
-        graph::best(starts(ours)?, starts(theirs)?)
+        }
+        Ok(starts)
     }
 
     /// Creates the branch `name` at this branch's newest commit and returns a handle on it.

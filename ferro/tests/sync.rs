@@ -1062,6 +1062,149 @@ fn a_revert_routed_through_a_third_device_survives_the_first_pull() {
     assert_eq!(*a.read().get(&2).unwrap(), "9");
 }
 
+#[test]
+fn a_revert_relayed_by_a_device_that_already_held_its_value_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        open(&dir, "a.ferro"),
+        open(&dir, "b.ferro"),
+        open(&dir, "c.ferro"),
+    );
+    put(&a, 1, "0");
+    put(&a, 2, "1");
+    b.pull(&a, "a", refuse).unwrap();
+    c.pull(&a, "a", refuse).unwrap();
+    put(&c, 2, "5");
+    put(&c, 2, "1");
+    put(&a, 1, "1");
+    assert_eq!(
+        b.pull(&a, "a", refuse).unwrap().outcome,
+        Outcome::FastForward
+    );
+    put(&b, 1, "0");
+    assert_eq!(c.read().root_hash(), b.read().root_hash());
+    let relayed = c.pull(&b, "b", theirs_win).unwrap();
+    assert_eq!(relayed.outcome, Outcome::Merged);
+    assert_eq!(relayed.value, Some(0));
+    assert_eq!(c.read().root_hash(), b.read().root_hash());
+    assert_eq!(
+        a.pull(&c, "c", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(*a.read().get(&1).unwrap(), "0");
+    for _ in 0..3 {
+        c.pull(&a, "a", theirs_win).unwrap();
+        a.pull(&c, "c", theirs_win).unwrap();
+    }
+    for db in [&a, &b, &c] {
+        assert_eq!(*db.read().get(&1).unwrap(), "0");
+        assert_eq!(*db.read().get(&2).unwrap(), "1");
+        db.verify().unwrap();
+        db.verify_typed().unwrap();
+    }
+}
+
+#[test]
+fn a_diverged_history_with_our_value_merges_once_and_then_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
+    put(&a, 1, "one");
+    b.pull(&a, "a", refuse).unwrap();
+    put(&a, 2, "a's draft");
+    a.commit("drop a's draft", |root| {
+        root.remove(&2);
+    })
+    .unwrap();
+    put(&b, 3, "b's draft");
+    b.commit("drop b's draft", |root| {
+        root.remove(&3);
+    })
+    .unwrap();
+    assert_eq!(a.read().root_hash(), b.read().root_hash());
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let mut runs = 0;
+    let first = b
+        .receive("a", &bundle, |root, base, theirs| {
+            runs += 1;
+            theirs_win(root, base, theirs)
+        })
+        .unwrap();
+    assert_eq!(
+        (first.outcome, first.value, runs),
+        (Outcome::Merged, Some(0), 1)
+    );
+    assert_eq!(b.version(), 4);
+    let again = b.receive("a", &bundle, refuse).unwrap();
+    assert_eq!(again.outcome, Outcome::UpToDate);
+    assert_eq!(b.version(), 4);
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::UpToDate);
+    assert_eq!(b.version(), 4);
+    assert_eq!(
+        a.pull(&b, "b", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(a.version(), 4);
+    for _ in 0..3 {
+        for (pulled, from, name) in [(&a, &b, "b"), (&b, &a, "a")] {
+            let outcome = pulled.pull(from, name, refuse).unwrap().outcome;
+            assert_eq!(outcome, Outcome::UpToDate);
+        }
+    }
+    assert_eq!((a.version(), b.version()), (4, 4));
+    assert_eq!(dump(&a.read()), dump(&b.read()));
+    for db in [&a, &b] {
+        db.verify().unwrap();
+        db.verify_typed().unwrap();
+    }
+}
+
+#[test]
+fn a_ring_of_pulls_between_devices_that_hold_one_value_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let devices: Vec<Db<Root>> = (0..3)
+        .map(|device| open(&dir, &format!("d{device}.ferro")))
+        .collect();
+    put(&devices[0], 1, "one");
+    for device in &devices[1..] {
+        device.pull(&devices[0], "d0", refuse).unwrap();
+    }
+    for (key, device) in devices.iter().enumerate() {
+        put(device, 10 + key as u64, "draft");
+        device
+            .commit("drop the draft", |root| {
+                root.remove(&(10 + key as u64));
+            })
+            .unwrap();
+    }
+    let lap = |devices: &[Db<Root>]| -> Vec<Outcome> {
+        (0..3)
+            .map(|to| {
+                let from = (to + 1) % 3;
+                let name = format!("d{from}");
+                devices[to]
+                    .pull(&devices[from], &name, theirs_win)
+                    .unwrap()
+                    .outcome
+            })
+            .collect()
+    };
+    assert!(lap(&devices).contains(&Outcome::Merged));
+    lap(&devices);
+    lap(&devices);
+    let versions: Vec<u64> = devices.iter().map(Db::version).collect();
+    for _ in 0..3 {
+        assert_eq!(lap(&devices), [Outcome::UpToDate; 3]);
+    }
+    assert_eq!(
+        devices.iter().map(Db::version).collect::<Vec<_>>(),
+        versions
+    );
+    for device in &devices {
+        assert_eq!(dump(&device.read()), dump(&devices[0].read()));
+        device.verify_typed().unwrap();
+    }
+}
+
 type Events = Map<u32, i64>;
 
 fn add_deltas(

@@ -302,27 +302,34 @@ the retry to land and the first attempt's copy to be reclaimed.
 
 A second step compares the pulling branch with `remote`:
 
-- The same tip, or the same root: `UpToDate`.
+- The same tip: `UpToDate`.
 - Our tip is the remote chain's entry at our version: `FastForward`. Our head takes the remote chain
   in a frame with no commit. The chains share our entries, so versions carry on from ours, and
   `head_hash` is now the same in both files.
 - Their tip is our entry at their version: `Ahead`.
 - Otherwise the merge-base search of `merge_with` runs under the writer lock against our tip and the
-  landed `remote`. If their tip is the base, we already hold it through a merge: `Ahead`. Otherwise
-  `merge` runs against that base, or against the virtual base after a criss-cross, as a commit on
-  our branch that links their tip as its second parent.
+  landed `remote`. If their tip is the base, we already hold it through a merge: `Ahead`, or
+  `UpToDate` when the two roots are the same.
+- If the roots are the same and their tip is not the base, a walk goes down from their tip through
+  the commits that hold our root, and stops on each path at a commit of our chain, at the first
+  commit with another root, or where history is pruned. If the search finds every commit it stopped
+  at for its root to be an ancestor of ours, every commit of theirs we lack holds our value:
+  `UpToDate`, with nothing written.
+- Otherwise `merge` runs against the base, or against the virtual base after a criss-cross, as a
+  commit on our branch that links their tip as its second parent.
 
 Each outcome that shows their tip is an ancestor of ours records `(their version, our version)`
 under `remote` in our head's `merged` map. The merge link says the same thing, but a record survives
 our side of it being pruned, and the search treats it as a known ancestor of our tip, and of our
 commit at the recorded version, so a branch pruned past its last sync with an idle remote still
-finds itself `Ahead`. Equal roots without that ancestry record nothing, since a record there would
-make the remote's history look like ours. A crash between the landing and this step leaves `remote`
-landed and our branch as it was. The next pull's have names the landed tip, so its bundle is empty
-and the step runs again. `try_pull`, `try_push` and `try_receive` take a merge closure that returns
-a `Result`, and an `Err` from it leaves the file as that crash would, with the error returned in the
-caller's type. Undoing the landing as well would take a frame of its own and make the next pull send
-the same commits again.
+finds itself `Ahead`. A pull that is `UpToDate` because the commits we lack hold our value records
+nothing, since their tip is not an ancestor of ours and a record there would make the remote's
+history look like ours. A crash between the landing and this step leaves `remote` landed and our
+branch as it was. The next pull's have names the landed tip, so its bundle is empty and the step
+runs again. `try_pull`, `try_push` and `try_receive` take a merge closure that returns a `Result`,
+and an `Err` from it leaves the file as that crash would, with the error returned in the caller's
+type. Undoing the landing as well would take a frame of its own and make the next pull send the same
+commits again.
 
 ## Commit identity
 
@@ -377,6 +384,44 @@ A pull is not symmetric: the closure gets `ours` and `theirs`. Devices converge 
 same result whichever side is ours, as last-writer-wins on a Lamport clock does. `examples/notes`
 syncs with a pull each way, and a third pull when the second merged, so that each side has recorded
 the other's last commit. A sync after that sends two empty bundles and writes nothing.
+
+### The same value on both sides
+
+Two branches with the same root used to be `UpToDate` whatever their histories, and that lost a
+revert routed through a device whose value already matched. A sets `x=1`, B fast-forwards to it and
+sets `x=0` again, and C, which never had `x=1`, has the same root as B after changes of its own that
+it undid. C's pull from B wrote nothing, so B's commits never entered C's merge graph, A's next pull
+from C merged against a base older than `x=1`, and A kept `x=1`. Once B stopped syncing, A and C
+settled on `x=1` for good. `merge_with` was not affected: it always commits the merge.
+
+Merging whenever the histories differ is not the answer either, because a merge commit can only
+stand in for a fast-forward. A file cannot adopt another file's chain past a fork, since a commit's
+hash covers its version, so when A merges B and B pulls that merge, B makes a merge of its own that
+holds the same value, which A lacks in turn. With equal roots counted as diverged, the pulls of two
+devices would never stop writing, and three devices pulling round a ring make a new merge on every
+pull. What a merge commit that only links commits holding our value adds is a commit that changes
+nothing, and a base found among such commits gives the same three-way merge as one below them that
+holds the same value. So a pull with equal roots merges only when a commit of theirs that we lack
+holds another value: the walk described under [Bringing the branch up](#bringing-the-branch-up)
+looks for one, down from their tip through the commits that hold our value, which on a settled pair
+of devices are the last merge or two. In the case above, C's walk from B's revert reaches A's `x=1`
+commit, which C lacks, so C merges, its merge links B's revert, and A's next pull from C finds the
+base at `x=1` and applies the revert. Each such merge brings in a commit with another value that we
+lacked, and once syncs stop making new values every device runs out of them, so syncs settle.
+
+`a_revert_relayed_by_a_device_that_already_held_its_value_survives` in `ferro/tests/sync.rs` runs
+the case above and expects C's pull from B to merge and all three files to end with the revert.
+`a_diverged_history_with_our_value_merges_once_and_then_settles` receives the same bundle twice and
+expects one merge, then `UpToDate` with nothing written, and the reverse pull to merge once in turn.
+`a_ring_of_pulls_between_devices_that_hold_one_value_settles` pulls round a ring of three devices
+that each changed a row and changed it back, and expects merges on the first lap and nothing written
+after the third.
+
+Two devices that make the same change on their own, with nothing between, still do not merge: the
+remote commit holds our value and its parent is ours. That commit stays out of our merge graph until
+a later pull brings another value, and that merge finds its base below both changes. A three-way map
+merge takes a change both sides made once, so its result is the same. A merge that adds the two
+sides' changes, as a counter does, sees both only from that later pull.
 
 ## Measurements
 

@@ -19,16 +19,20 @@ println!("{:?}, {} bytes in", pulled.outcome, pulled.received_bytes);
 `pull` copies the other file's branch into this one as the branch `phone`, then brings this branch
 up to it. It returns a `Pulled` with the `outcome`, the merge closure's `value` if it ran, the
 `version` this branch is at afterwards, the number of `objects` the bundle carried, and the
-`sent_bytes` and `received_bytes` of the transfer. The outcome is `UpToDate`, `Ahead` when this
-branch already has all of it, `FastForward` when this branch has nothing it lacks, or `Merged`. Only
-a merge calls your closure. It works as in `merge_with`: the merge commit links the remote commit it
-merged, and the base is a best common ancestor over the merge graph of every file the commits passed
-through, or the virtual base of all of them after a criss-cross, which devices that sync both ways
-make, so a change that reaches you through a third device is merged once, and a revert routed
-through one is not lost. `push` is `pull` from the other side. `try_pull`, `try_push`, `try_receive`
-and `try_receive_from` take a closure that returns a `Result`. An `Err` leaves this branch and its
-merge records as they were and comes back as your error, while the other side's commits stay landed
-on `phone`, so the next pull sends nothing new and merges them again.
+`sent_bytes` and `received_bytes` of the transfer. The outcome is `UpToDate` when the remote brought
+nothing this branch lacks, `Ahead` when this branch already has all of it and more, `FastForward`
+when this branch has nothing it lacks, or `Merged`. The choice goes by history, not by value: two
+branches with the same value still merge when a remote commit this branch lacks holds another value,
+as when the phone changed a row and changed it back, and a pull is `UpToDate` only when every remote
+commit this branch lacks holds its value. Only a merge calls your closure. It works as in
+`merge_with`: the merge commit links the remote commit it merged, and the base is a best common
+ancestor over the merge graph of every file the commits passed through, or the virtual base of all
+of them after a criss-cross, which devices that sync both ways make, so a change that reaches you
+through a third device is merged once, and a revert routed through one is not lost. `push` is `pull`
+from the other side. `try_pull`, `try_push`, `try_receive` and `try_receive_from` take a closure
+that returns a `Result`. An `Err` leaves this branch and its merge records as they were and comes
+back as your error, while the other side's commits stay landed on `phone`, so the next pull sends
+nothing new and merges them again.
 
 ## Over a network
 

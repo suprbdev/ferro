@@ -136,8 +136,9 @@ impl From<Bundle> for Vec<u8> {
 /// How a pull or receive brought this branch up to the remote one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// This branch already had the remote head or a value equal to it, or the remote branch has
-    /// no commits. This branch did not change.
+    /// The remote branch brought nothing this branch lacks: this branch already had the remote
+    /// head, or has the remote head's value and every remote commit it lacks holds that value too,
+    /// or the remote branch has no commits. This branch did not change.
     UpToDate,
     /// This branch already holds everything the remote branch has, and more of its own. This
     /// branch did not change.
@@ -147,6 +148,10 @@ pub enum Outcome {
     FastForward,
     /// Each side had commits the other lacked, so the merge closure ran, and its merge commit is
     /// this branch's new head.
+    ///
+    /// A pull merges even when both sides have the same value, if a remote commit this branch
+    /// lacked holds another one, as when the remote changed a field and changed it back, so that
+    /// the merge commit links those commits and a later merge finds its base among them.
     Merged,
 }
 
@@ -4006,10 +4011,11 @@ impl<T: Data> Db<T> {
             ))
         })?;
         let outcome = match decision {
-            Decision::UpToDate | Decision::Equal => Outcome::UpToDate,
+            Decision::UpToDate => Outcome::UpToDate,
             Decision::Ahead => Outcome::Ahead,
             Decision::FastForward => Outcome::FastForward,
-            Decision::Diverged => return self.merge_remote(remote, merge),
+            Decision::Equal => return self.merge_remote(remote, merge, Outcome::UpToDate),
+            Decision::Diverged => return self.merge_remote(remote, merge, Outcome::Ahead),
         };
         Ok((outcome, None))
     }
@@ -4018,11 +4024,13 @@ impl<T: Data> Db<T> {
         &self,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        held: Outcome,
     ) -> std::result::Result<(Outcome, Option<R>), E> {
         let tracking = self.branch(remote)?;
         let seen = match self.merge_tracking(&tracking, merge)? {
             Ok(committed) => return Ok((Outcome::Merged, Some(committed.value))),
-            Err(seen) => seen,
+            Err(Some(seen)) => seen,
+            Err(None) => return Ok((Outcome::UpToDate, None)),
         };
         let name = self.branch_name().to_string();
         self.rewrite_refs(|_, _, refs| {
@@ -4031,7 +4039,7 @@ impl<T: Data> Db<T> {
             };
             Ok((recorded(refs, &name, (*ours).clone(), remote, seen)?, ()))
         })?;
-        Ok((Outcome::Ahead, None))
+        Ok((held, None))
     }
 }
 

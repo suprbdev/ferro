@@ -441,6 +441,9 @@ Tests are described next to what they test:
 - Writes from inside a closure, `ferro/tests/reentry.rs`, `reentry_sync.rs`, `reentry_shared.rs`
   and `reentry_locks.rs`: [Writes from inside a closure](reentrancy.md#the-cases).
 - Model tests of best common ancestors: [Criss-crosses](merging.md#criss-crosses).
+- Pulls between branches that hold the same value, a revert relayed through such a branch and a
+  ring of pulls that must settle: [The same value on both
+  sides](sync.md#the-same-value-on-both-sides).
 - Power cuts during a receive placed in pieces: [Where checked objects
   wait](sync-receive.md#where-checked-objects-wait).
 - The three-device sync model with small caches: [Commits stored
