@@ -5,14 +5,14 @@
 //! [`scope`] runs a closure beside the threads of a pool and returns once the closure has
 //! returned and all the work queued on the pool has run, every thread joined. A thread of its own
 //! starts the others: one whenever more work waits than threads are idle, so that the pool has no
-//! more threads than [`workers`] and [`THREADS`] allow, its own included, and a small check runs
-//! on one thread and a large one on several, while the closure goes on with work of its own, such
-//! as the walk of a bundle. A job runs with [`alone`] held, so the work of a map that would spread
-//! over threads of its own runs on the job's thread. Checks
-//! are queued with [`Pool::check`], at most [`CHECKS_AT_ONCE`] of them run at once, which bounds
-//! what they hold, and a check queues the smaller work it splits into, such as the runs of a diff,
-//! with [`Pool::queue`] and waits for it with [`Pool::help_until`], which runs queued work
-//! meanwhile, so the work of several checks shares the threads.
+//! more threads than [`workers`] and [`THREADS`] allow, its own included, and once it has started
+//! all it may it works beside them. So a small check runs on one thread and a large one on
+//! several, while the closure goes on with work of its own, such as the walk of a bundle. A job
+//! runs with [`alone`] held, so the work of a map that would spread over threads of its own runs on
+//! the job's thread. Checks are queued with [`Pool::check`], at most [`CHECKS_AT_ONCE`] of them run
+//! at once, which bounds what they hold, and a check queues the smaller work it splits into, such
+//! as the runs of a diff, with [`Pool::queue`] and waits for it with [`Pool::help_until`], which
+//! runs queued work meanwhile, so the work of several checks shares the threads.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -194,14 +194,14 @@ impl<'p> Pool<'p> {
     }
 
     fn start<'s>(&'s self, threads: &'s Scope<'s, '_>) {
-        let most = workers().clamp(2, THREADS) - 1;
+        let most = workers().clamp(1, THREADS) - 1;
         let mut started = 0;
         let mut state = self.state.lock();
-        loop {
+        while started < most {
             if state.closed {
                 return;
             }
-            if started < most && state.waiting() > state.idle {
+            if state.waiting() > state.idle {
                 started += 1;
                 drop(state);
                 threads.spawn(move || self.work());
@@ -210,6 +210,8 @@ impl<'p> Pool<'p> {
             }
             self.starter.wait(&mut state);
         }
+        drop(state);
+        self.work();
     }
 
     fn work(&self) {
@@ -302,5 +304,32 @@ impl Latch {
     /// Whether every piece of work it counts is done.
     pub(crate) fn is_open(&self) -> bool {
         self.0.load(Ordering::Acquire) == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::thread::{self, ThreadId};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn every_thread_of_a_pool_runs_work_and_no_more_than_threads_allows() {
+        let caller = thread::current().id();
+        let ran: Mutex<HashSet<ThreadId>> = Mutex::new(HashSet::new());
+        scope(|pool| {
+            for _ in 0..64 {
+                let ran = &ran;
+                pool.queue(job(move |_| {
+                    ran.lock().insert(thread::current().id());
+                    thread::sleep(Duration::from_millis(20));
+                }));
+            }
+        });
+        let mut ran = ran.into_inner();
+        ran.remove(&caller);
+        assert_eq!(ran.len(), workers().clamp(1, THREADS));
     }
 }
