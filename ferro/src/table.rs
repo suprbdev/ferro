@@ -4438,8 +4438,11 @@ impl<X: Data + Ord> IndexEach for Option<X> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::codec::HashSink;
+    use crate::codec::{HashSink, Object, Paired, Pairing, field_tag};
+    use crate::store::Store;
     use crate::{Db, Durability, Options, Set, pool};
 
     #[derive(crate::Data, crate::Record, Clone, Debug, PartialEq)]
@@ -4583,5 +4586,114 @@ mod tests {
         agreed.unwrap();
         assert_eq!(charged, 0, "an edit of the set read it again");
         assert!(records < 100, "an edit of two tags read {records} records");
+    }
+
+    #[derive(crate::Data, Clone, Default)]
+    struct Wide {
+        t: Vec<[Table<Tagged>; 0]>,
+    }
+
+    #[derive(crate::Data, Clone, Default)]
+    struct Wides {
+        v: Vec<Wide>,
+    }
+
+    #[derive(crate::Data, Clone, Default)]
+    struct Keyed {
+        by: BTreeMap<u64, Table<Tagged>>,
+    }
+
+    fn scratch() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(
+            &dir.path().join("pairing.ferro"),
+            crate::store::StoreOptions::default(),
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    fn object_of<D: Data>(value: &D) -> Object {
+        let mut sink = HashSink;
+        let mut encoder = Encoder::new(&mut sink);
+        value.encode(&mut encoder).unwrap();
+        encoder.into_object()
+    }
+
+    fn paired<D: Data>(store: &Store, old: &Object, new: &Object) -> Result<Paired> {
+        let mut pairing = Pairing::new(store);
+        D::pair(
+            &mut Decoder::new(&old.body, &old.links, Some(store)),
+            &mut Decoder::new(&new.body, &new.links, Some(store)),
+            &mut pairing,
+        )?;
+        Ok(pairing.into_paired())
+    }
+
+    fn wides(each: u64) -> Object {
+        let mut sink = HashSink;
+        let mut w = Encoder::new(&mut sink);
+        w.varint(1);
+        w.field(field_tag("v"), |w| {
+            w.varint(2);
+            for _ in 0..2 {
+                w.varint(1);
+                w.field(field_tag("t"), |w| {
+                    w.varint(each);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        w.into_object()
+    }
+
+    #[test]
+    fn the_fields_of_one_object_share_its_zero_width_items_when_paired() {
+        let (_dir, store) = scratch();
+        let wide = |result: Result<()>| matches!(result, Err(Error::Decode(message)) if message.contains("zero-width"));
+        let (none, half, over) = (wides(0), wides(1 << 23), wides(1 << 24));
+        assert!(wide(Wides::visit(&mut Decoder::new(
+            &over.body,
+            &over.links,
+            None
+        ))));
+        assert!(wide(paired::<Wides>(&store, &none, &over).map(drop)));
+        assert!(wide(paired::<Wides>(&store, &over, &none).map(drop)));
+        Wides::visit(&mut Decoder::new(&half.body, &half.links, None)).unwrap();
+        paired::<Wides>(&store, &none, &half).unwrap();
+    }
+
+    #[test]
+    fn a_btreemap_pairs_the_table_under_each_key_both_versions_hold() {
+        let (_dir, store) = scratch();
+        let table = |rows: u64| {
+            let mut table: Table<Tagged> = Table::new();
+            for id in 0..rows {
+                table.insert(Tagged {
+                    id,
+                    tags: Set::new(),
+                    group: 0,
+                    note: rows,
+                });
+            }
+            table
+        };
+        let old = Keyed {
+            by: BTreeMap::from([(1, table(1)), (2, table(2)), (3, table(3)), (5, table(5))]),
+        };
+        let new = Keyed {
+            by: BTreeMap::from([(2, table(4)), (3, table(3)), (4, table(6)), (6, table(7))]),
+        };
+        let paired = paired::<Keyed>(&store, &object_of(&old), &object_of(&new)).unwrap();
+        let hashes: Vec<_> = paired
+            .pairs
+            .iter()
+            .map(|(old, new)| (old.hash, new.hash))
+            .collect();
+        assert_eq!(hashes, [(found(&table(2)).hash, found(&table(4)).hash)]);
+        let same: Vec<_> = paired.same.iter().map(|table| table.hash).collect();
+        assert_eq!(same, [found(&table(3)).hash]);
     }
 }

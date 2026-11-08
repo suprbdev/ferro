@@ -6517,20 +6517,26 @@ impl Bare {
     }
 
     /// The object the value lies in, with the ranges of its bytes and links there, reading a
-    /// spilled value through `store`.
-    fn object(&self, store: &Store) -> Result<(Arc<Object>, Range<usize>, Range<usize>)> {
+    /// spilled value through `store`, and whether the zero-width items read from it are yet to be
+    /// counted against what `store` may decode: those of a spilled value read at a charge, as
+    /// [`Store::read_fresh`] charges it, since [`bare`] counted those of an inline one.
+    fn object(&self, store: &Store) -> Result<Located> {
         match self {
             Bare::Inline(object, bytes, links) => {
-                Ok((object.clone(), bytes.clone(), links.clone()))
+                Ok((object.clone(), bytes.clone(), links.clone(), false))
             }
             Bare::Spilled(ptr) => {
-                let (object, _) = store.read_fresh(*ptr)?;
+                let (object, charged) = store.read_fresh(*ptr)?;
                 let (bytes, links) = (0..object.body.len(), 0..object.links.len());
-                Ok((Arc::new(object), bytes, links))
+                Ok((Arc::new(object), bytes, links, charged))
             }
         }
     }
 }
+
+/// Where [`Bare::object`] finds a value: the object, the ranges of the value's bytes and links in
+/// it, and whether its zero-width items are yet to be counted.
+type Located = (Arc<Object>, Range<usize>, Range<usize>, bool);
 
 /// A step of [`changed`]: a subtree, by its link and the entries it holds, or an entry.
 enum Bared<K> {
@@ -7160,13 +7166,17 @@ fn paired<K: Data + Ord, V: Data, S: Data>(
 /// [`Data::pair`] does.
 fn pair_values<V: Data>(pairing: &mut Pairing<'_>, before: &Bare, after: &Bare) -> Result<()> {
     let store = pairing.store();
-    let (old, old_bytes, old_links) = before.object(store)?;
-    let (new, new_bytes, new_links) = after.object(store)?;
-    V::pair(
-        &mut Decoder::new(&old.body[old_bytes], &old.links[old_links], Some(store)),
-        &mut Decoder::new(&new.body[new_bytes], &new.links[new_links], Some(store)),
-        pairing,
-    )
+    let (old, old_bytes, old_links, old_charged) = before.object(store)?;
+    let (new, new_bytes, new_links, new_charged) = after.object(store)?;
+    let mut old = Decoder::new(&old.body[old_bytes], &old.links[old_links], Some(store));
+    let mut new = Decoder::new(&new.body[new_bytes], &new.links[new_links], Some(store));
+    V::pair(&mut old, &mut new, pairing)?;
+    for (charged, read) in [(old_charged, &old), (new_charged, &new)] {
+        if charged {
+            store.count_zero_width(read.zero_width())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

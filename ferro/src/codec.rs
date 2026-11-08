@@ -1559,9 +1559,13 @@ impl<'s> Pairing<'s> {
     /// Reads the fields of a struct from `old` and `new`, as [`Decoder::fields`] does, and calls
     /// `f` on each tag both hold, with a decoder over that field on each side.
     ///
+    /// The zero-width items `f` reads count as those of the object each side's field lies in, as
+    /// [`Decoder::item`] counts them, so the fields of one object share the limit.
+    ///
     /// # Errors
     ///
-    /// The error of a field list that does not decode, and the first error of `f`.
+    /// The error of a field list that does not decode, and the first error of `f`, such as
+    /// [`Error::Decode`] once more zero-width items than one object may hold have been read.
     pub fn fields<'a, 'b>(
         &mut self,
         old: &mut Decoder<'a>,
@@ -1570,10 +1574,14 @@ impl<'s> Pairing<'s> {
     ) -> Result<()> {
         let mut olds = old.field_list()?;
         let news = new.field_list()?;
-        for (tag, mut new) in news {
+        for (tag, mut new_field) in news {
             if let Some(at) = olds.iter().position(|(other, _)| *other == tag) {
-                let (_, mut old) = olds.swap_remove(at);
-                f(self, tag, &mut old, &mut new)?;
+                let (_, mut old_field) = olds.swap_remove(at);
+                old_field.empty_items = old.empty_items;
+                new_field.empty_items = new.empty_items;
+                f(self, tag, &mut old_field, &mut new_field)?;
+                old.empty_items = old_field.empty_items;
+                new.empty_items = new_field.empty_items;
             }
         }
         Ok(())
@@ -1689,26 +1697,6 @@ fn paired_items<T: Data>(
     Ok(())
 }
 
-/// The entries of a `BTreeMap<K, V>` that `r` holds, each key with a decoder over its value alone.
-///
-/// # Errors
-///
-/// The error of a key or value that does not decode.
-fn valued<'a, K: Data, V: Data>(r: &mut Decoder<'a>) -> Result<Vec<(K, Decoder<'a>)>> {
-    let len = r.varint()?;
-    let mut entries = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(r.remaining()));
-    for _ in 0..len {
-        let entry = r.item(|r| {
-            let key = K::decode(r)?;
-            let start = r.checkpoint();
-            V::visit(r)?;
-            Ok((key, r.since(start)))
-        })?;
-        entries.push(entry);
-    }
-    Ok(entries)
-}
-
 /// What pairs the tables of two versions' roots, given their links: [`pair_roots`] for the type of
 /// the root.
 pub(crate) type PairRoots = for<'s> fn(&mut Pairing<'s>, Ptr, Ptr) -> Result<()>;
@@ -1716,21 +1704,28 @@ pub(crate) type PairRoots = for<'s> fn(&mut Pairing<'s>, Ptr, Ptr) -> Result<()>
 /// Pairs each table of the root at `new`, a value of `D`, with the table at the same place in the
 /// root at `old`, as [`Data::pair`] pairs them, reading both through the pairing's store.
 ///
+/// The zero-width items it reads from a root that the store, a view, reads at a charge count
+/// against what the view may still decode, as [`Store::count_zero_width`] counts them.
+///
 /// # Errors
 ///
-/// The error of a read, and of a value or node that does not decode.
+/// The error of a read, of a value or node that does not decode, and [`Error::Bundle`] once the
+/// view cannot cover the zero-width items read.
 pub(crate) fn pair_roots<D: Data>(pairing: &mut Pairing<'_>, old: Ptr, new: Ptr) -> Result<()> {
     if old.hash == new.hash || !holds_tables::<D>() {
         return Ok(());
     }
     let store = pairing.store();
-    let (old, _) = store.read_fresh(old)?;
-    let (new, _) = store.read_fresh(new)?;
-    D::pair(
-        &mut Decoder::new(&old.body, &old.links, Some(store)),
-        &mut Decoder::new(&new.body, &new.links, Some(store)),
-        pairing,
-    )?;
+    let (old, old_charged) = store.read_fresh(old)?;
+    let (new, new_charged) = store.read_fresh(new)?;
+    let mut old = Decoder::new(&old.body, &old.links, Some(store));
+    let mut new = Decoder::new(&new.body, &new.links, Some(store));
+    D::pair(&mut old, &mut new, pairing)?;
+    for (charged, read) in [(old_charged, &old), (new_charged, &new)] {
+        if charged {
+            store.count_zero_width(read.zero_width())?;
+        }
+    }
     pairing.settle()
 }
 
@@ -2061,15 +2056,6 @@ impl<'a> Decoder<'a> {
         self.cursor != checkpoint.cursor
     }
 
-    /// A decoder over what was read since `checkpoint` alone.
-    pub(crate) fn since(&self, checkpoint: Checkpoint) -> Decoder<'a> {
-        let (body, links) = self.read_since(checkpoint);
-        let mut part = Decoder::new(body, links, self.store);
-        part.rebuilds = self.rebuilds;
-        part.depth = self.depth;
-        part
-    }
-
     /// The bytes and the links read since `checkpoint`.
     pub(crate) fn read_since(&self, checkpoint: Checkpoint) -> (&'a [u8], &'a [Ptr]) {
         (
@@ -2266,15 +2252,27 @@ impl<'a> Decoder<'a> {
     /// Returns the error of `read`, and [`Error::Decode`] once more than 2^24 zero-width items have
     /// been read from one object.
     pub fn item<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let before = (self.pos, self.cursor);
+        let before = self.read_so_far();
         let value = read(self)?;
-        if (self.pos, self.cursor) == before {
+        self.counted(before)?;
+        Ok(value)
+    }
+
+    /// Counts one item of a sequence that began where the decoder was at `before`, as
+    /// [`item`](Decoder::item) counts the item it reads, for an item read in parts.
+    ///
+    /// # Errors
+    ///
+    /// As for [`item`](Decoder::item).
+    #[inline]
+    fn counted(&mut self, before: (usize, usize)) -> Result<()> {
+        if self.read_so_far() == before {
             self.empty_items += 1;
             if self.empty_items > MAX_EMPTY_ITEMS {
                 return Err(Error::Decode("too many zero-width items".into()));
             }
         }
-        Ok(value)
+        Ok(())
     }
 
     /// Reads with `read` one level deeper, as [`Encoder::nested`] wrote it.
@@ -2412,6 +2410,10 @@ impl<'a> Decoder<'a> {
 
     /// Reads a struct's fields as [`fields`](Decoder::fields) does, and returns each field's tag
     /// with a decoder over that field's bytes and links alone, in the order they are stored.
+    ///
+    /// Each decoder starts its count of zero-width items at nothing: one read as part of this
+    /// decoder's object takes the count from it first and gives it back after, as
+    /// [`fields`](Decoder::fields) does, so that all the fields of one object share it.
     ///
     /// # Errors
     ///
@@ -3111,12 +3113,51 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
         }
         old.nested(|old| {
             new.nested(|new| {
-                let mut olds = valued::<K, V>(old)?.into_iter().peekable();
-                for (key, mut new) in valued::<K, V>(new)? {
-                    while olds.next_if(|(other, _)| *other < key).is_some() {}
-                    if let Some((_, mut old)) = olds.next_if(|(other, _)| *other == key) {
-                        V::pair(&mut old, &mut new, pairing)?;
+                let (mut olds, news) = (old.varint()?, new.varint()?);
+                let mut ahead: Option<(K, (usize, usize))> = None;
+                for _ in 0..news {
+                    let at = new.read_so_far();
+                    let key = K::decode(new)?;
+                    loop {
+                        if ahead.is_none() {
+                            if olds == 0 {
+                                break;
+                            }
+                            olds -= 1;
+                            let at = old.read_so_far();
+                            ahead = Some((K::decode(old)?, at));
+                        }
+                        match &ahead {
+                            Some((other, at)) if *other < key => {
+                                let at = *at;
+                                V::visit(old)?;
+                                old.counted(at)?;
+                                ahead = None;
+                            }
+                            _ => break,
+                        }
                     }
+                    match ahead.take() {
+                        Some((other, at)) if other == key => {
+                            V::pair(old, new, pairing)?;
+                            old.counted(at)?;
+                        }
+                        other => {
+                            ahead = other;
+                            V::visit(new)?;
+                        }
+                    }
+                    new.counted(at)?;
+                }
+                if let Some((_, at)) = ahead {
+                    V::visit(old)?;
+                    old.counted(at)?;
+                }
+                for _ in 0..olds {
+                    old.item(|old| {
+                        K::visit(old)?;
+                        V::visit(old)
+                    })?;
                 }
                 Ok(())
             })

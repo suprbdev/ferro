@@ -946,6 +946,15 @@ depth](storage.md#nesting-depth). A parent the receiver holds is trusted, its ta
 parent the bundle carries is checked in the same receive, and a table of a carried parent that the
 walk did not note, since it lies in data the receiver holds as its own type, is trusted too.
 
+A pairing counts the zero-width items it reads as the walk counts them, as described under
+[Zero-width items in a bundle](#zero-width-items-in-a-bundle): those of one object together, across
+its fields, against the limit of 2^24 for one object, and those of a root or a spilled value it
+reads at a charge against the count of the bundle. It reads the entries of the two versions of a
+`BTreeMap` once each, side by side in key order. Each field of a struct used to start a count of
+its own, so a forged version whose 10,000 values in one `Vec` of the root each held a field that
+claimed 2^24 `()`s, a bundle of 970 bytes, was paired for 32.8 s before the walk refused it, which
+9e9341e did in 7 ms; it is now refused in 8 ms.
+
 Before #116 only the tables of each root were paired, the nth table of a type with the nth of that
 type in the parent's root, so an `Option` of a table placed before another shifted the pairs as it
 came and went: nine commits of 2 KB that toggled a table of one row beside one of 1.5 million rows
