@@ -189,16 +189,19 @@ cycle locks go, so a `Drop` that close runs may write anywhere, `compact` includ
 
 What stays undetected is a wait that ferro does not see. A closure that waits on a channel, a
 condvar or a `Watcher` for another thread's commit can still deadlock: on its own branch, since that
-commit needs the lane; on another branch of its file, while a cycle of the same handle that holds
-that branch's lane waits for this one; and with `coalesce`, for a commit whose closure has already
-run, since that commit may be in this closure's group. A cycle or landing in another handle or
-process takes every branch byte at once or none, so it holds such a commit up only at its gate,
-until the end of an epoch no longer than the gate had been held and at most 1 s, or, when the
-commit goes through the handle that runs it, at that handle's lane, which it lets go to the commit
-once it has waited three epochs of its hold for the range, at most 3 s, as [The
-gate](processes.md#the-gate) describes. The first version of the gate waited there for good, and a
-closure on `a` that joined a thread committing on `b` hung beside another handle's cycle (#136);
-until #142 a commit through the cycling handle waited for its lane for good.
+commit needs the lane, and with `coalesce`, for a commit whose closure has already run, since that
+commit may be in this closure's group. A cycle or landing that waits for this closure holds such a
+commit up only for a while, in any handle or process. One in another process, or another handle,
+takes every branch byte at once or none, so the commit waits only at its gate, until the gate next
+opens. One in the handle the commit goes through may hold the commit's lane, in that handle's lanes
+or while it waits for the closure's, and lets it go at the end of the round of its wait in which the
+commit waits for it. Either way the commit waits no longer than the cycle had already waited, plus
+8 ms, as [The gate](processes.md#the-gate) describes. The first version of the gate waited there for
+good, and a closure on `a` that joined a thread committing on `b` hung beside another handle's cycle
+(#136). Until #142 a commit through the cycling handle waited for its lane for good, and until #145
+so did one on a branch that sorts before the closure's own while the cycle waited for the closure's
+lane, in the closure's handle or, beside a write through the cycling handle waiting for the
+closure's byte, in another.
 
 ## Cost
 

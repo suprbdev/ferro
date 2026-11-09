@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -196,24 +196,23 @@ const SUPER_AT: u64 = LOCKS_AT + 3;
 /// The cycle lock, held exclusive for a reclamation cycle and the pieces of a large receive.
 const CYCLE_AT: u64 = LOCKS_AT + 4;
 /// The gate, held exclusive by a process that wants or holds every branch lock at once, so that
-/// writers in other processes wait a while before they take a new branch lock.
+/// writers in other processes wait before they take a new branch lock, as [`Store::pass_gate`]
+/// describes.
 const GATE_AT: u64 = LOCKS_AT + 5;
-/// The first of the bytes that the gate's holder locks one of, exclusive, to say when it began
-/// to want every branch lock: the byte [`STAMPS`] counts in from here, as [`stamp_of`] gives it.
-const STAMP_AT: u64 = LOCKS_AT + 8;
-/// How many bytes the stamps span, each a [`GATE_EPOCH`] of the shortest length, so that they
-/// count about 17 minutes before they wrap.
-const STAMPS: u64 = 1 << 19;
-/// The shortest and longest epoch, in nanoseconds of `CLOCK_MONOTONIC`, at whose ends a writer
-/// that finds the gate held goes on, as [`gate_epoch`] chooses between them. The longest is a
-/// second and the shortest 1/512 of it, so that every epoch divides every longer one.
-const GATE_EPOCH: (u64, u64) = (1_953_125, 1_000_000_000);
-/// The shortest and longest sleep between two tests of the gate, or of the branch locks, while a
-/// thread waits for them.
-const GATE_POLL: (Duration, Duration) = (Duration::from_micros(50), Duration::from_millis(1));
-/// How long before the end of each shortest epoch a process that wants every branch lock tries
-/// for them again, since the range comes free just before writers go on at an epoch's end.
-const GATE_LEAD: u64 = 150_000;
+/// The first [`Rounds`] length, and the longest that a process holds the gate at a time.
+const ROUND: (Duration, Duration) = (Duration::from_millis(8), Duration::from_secs(1));
+/// How long the gate stays open between two holds, so that every writer waiting at it sees it
+/// open and goes on.
+const GATE_OPEN: Duration = Duration::from_millis(1);
+/// The shortest and longest sleep between two tests of the gate while a writer waits at it, the
+/// longest half of [`GATE_OPEN`], so that a writer tests the gate while it is open.
+const GATE_POLL: (Duration, Duration) = (Duration::from_micros(50), Duration::from_micros(500));
+/// The longest a writer waits at the gate, past the longest hold, for a holder of an earlier build
+/// that holds the gate until it has every branch lock.
+const GATE_WAIT: Duration = Duration::from_secs(2);
+/// The shortest and longest sleep between two tests of the branch locks while a process holds the
+/// gate.
+const RANGE_POLL: (Duration, Duration) = (Duration::from_micros(20), Duration::from_micros(200));
 /// The first byte of the branch locks, each a byte at a 60-bit hash of the branch's name.
 const LANES_AT: u64 = LOCKS_AT + (1 << 20);
 /// How many bytes the branch locks span.
@@ -1898,58 +1897,46 @@ pub(crate) fn lane_of(name: &str) -> u64 {
     LANES_AT + (xxh3_64(name.as_bytes()) & (LANES - 1))
 }
 
-/// The epoch at whose end a writer goes on that finds the gate held `held` nanoseconds after its
-/// holder began to want every branch lock: the longest of the [`GATE_EPOCH`] lengths, each twice
-/// the one before, that is no longer than `held`, or the shortest.
-fn gate_epoch(held: u64) -> u64 {
-    let (mut epoch, longest) = GATE_EPOCH;
-    while epoch < longest && epoch.saturating_mul(2) <= held {
-        epoch *= 2;
+/// The rounds in which a thread that wants every branch lock waits for them, as
+/// [`Store::lock_lanes`] and the caller taking this process's lanes before it do.
+///
+/// The first round lasts [`ROUND`]'s first length and each later one twice as long as the one
+/// before. At the end of each, the thread lets go of everything it holds if another thread of this
+/// process waits for any of it, since that thread may be what the branch locks wait for, through a
+/// closure that waits for it in a way ferro cannot see. Otherwise it lets only the gate go, for
+/// [`GATE_OPEN`], so that writers held at it in other processes go on, and takes it again. It holds
+/// the gate for at most [`ROUND`]'s longest at a time, however long the rounds have grown.
+pub(crate) struct Rounds {
+    length: Duration,
+    ends: Instant,
+}
+
+impl Rounds {
+    /// The first round, beginning now.
+    pub(crate) fn new() -> Rounds {
+        let length = ROUND.0;
+        Rounds {
+            length,
+            ends: Instant::now() + length,
+        }
     }
-    epoch
-}
 
-/// The end of the epoch of length `epoch` that `now` falls in, counted on `CLOCK_MONOTONIC` from
-/// its zero, so that every process of the machine sees the same ends, and an epoch's ends are ends
-/// of every shorter one.
-fn epoch_end(now: u64, epoch: u64) -> u64 {
-    (now / epoch).saturating_add(1).saturating_mul(epoch)
-}
+    /// Whether the round under way has ended, in which case the next one begins, twice as long.
+    pub(crate) fn over(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.ends {
+            return false;
+        }
+        self.length = self.length.saturating_mul(2);
+        self.ends = now.checked_add(self.length).unwrap_or(now);
+        true
+    }
 
-/// How long, in nanoseconds of `CLOCK_MONOTONIC`, a process that has wanted every branch lock
-/// since `began`, or that has not taken the gate yet if that is `None`, and tries for them again
-/// at `now`, waits for them before it lets this process's threads that wait for its lanes go
-/// first: three of the epochs [`gate_epoch`] gives for the hold so far. Once that epoch outlasts
-/// the closures, the range comes free within two of them and a closure's length, so a try that
-/// long fails only before then, and each one after a failed try is longer.
-pub(crate) fn patience(began: Option<u64>, now: u64) -> u64 {
-    let held = began.map_or(0, |at| now.saturating_sub(at));
-    gate_epoch(held).saturating_mul(3)
-}
-
-/// The byte that the gate's holder locks to say it began to want every branch lock at `began`.
-fn stamp_of(began: u64) -> u64 {
-    STAMP_AT + (began / GATE_EPOCH.0) % STAMPS
-}
-
-/// How long before `now` the gate's holder began to want every branch lock, read from the stamp
-/// byte at `at` that [`stamp_of`] gave it, to within a shortest epoch.
-fn stamp_age(at: u64, now: u64) -> u64 {
-    let slot = at.wrapping_sub(STAMP_AT) % STAMPS;
-    let current = (now / GATE_EPOCH.0) % STAMPS;
-    ((current + STAMPS - slot) % STAMPS) * GATE_EPOCH.0
-}
-
-/// Sleeps for `pause`, or until [`GATE_LEAD`] before the end of the shortest epoch that `now`
-/// falls in if that comes first, while a process waits for every branch lock.
-fn nap(now: u64, pause: Duration) {
-    let lead = epoch_end(now, GATE_EPOCH.0).saturating_sub(GATE_LEAD);
-    let pause = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
-    let until = match lead > now {
-        true => lead.min(now.saturating_add(pause)),
-        false => now.saturating_add(pause),
-    };
-    thread::sleep(Duration::from_nanos(until - now));
+    /// Sleeps for [`GATE_OPEN`], while the caller holds nothing, so that the threads and writers
+    /// it let go of take what they waited for before it tries again.
+    pub(crate) fn pause() {
+        thread::sleep(GATE_OPEN);
+    }
 }
 
 /// A byte-range lock that one thread of this process holds, released when dropped.
@@ -1991,7 +1978,6 @@ struct Lanes {
 pub(crate) struct AllLanes {
     store: Store,
     gate: Option<Held>,
-    stamp: Option<u64>,
     range: bool,
 }
 
@@ -2001,9 +1987,6 @@ impl Drop for AllLanes {
         let mut lanes = inner.lanes.lock();
         if self.range {
             let _ = platform::unlock_range(&inner.file, LANES_AT, LANES);
-        }
-        if let Some(at) = self.stamp.take() {
-            let _ = platform::unlock_range(&inner.file, at, 1);
         }
         drop(self.gate.take());
         lanes.whole = false;
@@ -2018,8 +2001,8 @@ pub(crate) enum Every {
     /// Nothing, since the branches the caller listed changed while it waited for this process's
     /// threads.
     Stale,
-    /// Nothing, since a thread of this process waited for the caller's lanes while the range
-    /// stayed busy, so the caller lets them go and tries again.
+    /// Nothing, since a round ended while a thread of this process waited for the caller's lanes
+    /// or for this process's branch locks, so the caller lets its lanes go and tries again.
     Yielded,
 }
 
@@ -3319,23 +3302,21 @@ impl Store {
     /// Takes every branch lock at once, as a cycle's prune and pause and a landing receive do.
     ///
     /// It marks the whole range wanted, so that no thread of this process takes a branch byte,
-    /// waits until none holds one, takes the gate, so that writers in other processes take a
-    /// branch byte they do not hold yet only at the end of an epoch, as [`Store::pass_gate`]
-    /// describes, and then locks the range in the kernel. While it waits for this process's
-    /// threads it calls `stale` every millisecond and gives up with [`Every::Stale`] once that
-    /// returns `true`, since a thread holding a byte for a branch attached after the caller listed
-    /// its lanes may be waiting for one of those lanes.
+    /// waits until none holds one, takes the gate, so that writers in other processes wait before
+    /// they take a branch byte they do not hold yet, as [`Store::pass_gate`] describes, and then
+    /// tests the range without waiting in the kernel, sleeping between tests, until it can lock it.
+    /// While it waits for this process's threads it calls `stale` every millisecond and gives up
+    /// with [`Every::Stale`] once that returns `true`, since a thread holding a byte for a branch
+    /// attached after the caller listed its lanes may be waiting for one of those lanes.
     ///
-    /// It tests the gate and the range without waiting in the kernel, sleeping between tests and
-    /// testing again just before each shortest epoch ends, which is when writers held at the gate
-    /// have let go of their bytes and not yet taken new ones. `began` is when the caller first took
-    /// the gate for what it is doing now, set here the first time; the gate's holder locks a stamp
-    /// byte that says when, so every writer that tests the gate reads how long it has been held.
-    /// Once the range has stayed busy for the [`patience`] of the hold as it was when this try
-    /// began, while a thread of this process waits for `whole` to clear or `waiting` returns
-    /// `true`, it lets everything go and returns [`Every::Yielded`], so that the caller can let go
-    /// of its lanes: such a thread may be what the range waits for, through a closure in another
-    /// process that waits for it in a way ferro cannot see.
+    /// It waits in `rounds`, which the caller began before it took its lanes. At the end of a
+    /// round in which a thread of this process waits for `whole` to clear, or `waiting` returns
+    /// `true`, it lets everything go and returns [`Every::Yielded`], so that the caller lets its
+    /// lanes go too: such a thread may be what the range waits for, through a closure that waits
+    /// for it in a way ferro cannot see. At the end of any other round, and after the longest hold
+    /// of [`ROUND`], it opens the gate for [`GATE_OPEN`], so that writers held at it go on, since one
+    /// of them may be what the range waits for in the same way. It takes the gate after another
+    /// process has let it go only once the gate has been open that long.
     ///
     /// The kernel grants a lock on the range only once every byte of it is free at once, and it
     /// does not hold back a byte another process asks for while the range is wanted, so without
@@ -3343,7 +3324,7 @@ impl Store {
     /// from ever being free.
     pub(crate) fn lock_lanes(
         &self,
-        began: &mut Option<u64>,
+        rounds: &mut Rounds,
         stale: impl Fn() -> bool,
         waiting: impl Fn() -> bool,
     ) -> Result<Every> {
@@ -3357,32 +3338,40 @@ impl Store {
             inner
                 .lanes_moved
                 .wait_for(&mut lanes, Duration::from_millis(1));
+            let others = lanes.waiting > 0;
             drop(lanes);
             let stale = stale();
+            let yielding = !stale && rounds.over() && (others || waiting());
             lanes = inner.lanes.lock();
-            if stale {
+            if stale || yielding {
                 lanes.whole = false;
                 inner.lanes_moved.notify_all();
-                return Ok(Every::Stale);
+                return Ok(match stale {
+                    true => Every::Stale,
+                    false => Every::Yielded,
+                });
             }
         }
         drop(lanes);
         let mut all = AllLanes {
             store: self.clone(),
             gate: None,
-            stamp: None,
             range: false,
         };
-        let started = platform::monotonic_ns();
-        let allowed = patience(*began, started);
-        let mut pause = GATE_POLL.0;
+        let mut taken = None;
+        let mut closed = false;
+        let mut opened = None;
+        let mut pause = RANGE_POLL.0;
         loop {
             if all.gate.is_none() {
-                all.gate = self.hold(GATE_AT, 1, false)?;
-                if all.gate.is_some() {
-                    let at = stamp_of(*began.get_or_insert_with(platform::monotonic_ns));
-                    if platform::lock_range(&inner.file, at, 1, true, false).is_ok() {
-                        all.stamp = Some(at);
+                if platform::range_excluded(&inner.file, GATE_AT, 1)? {
+                    (closed, opened) = (true, None);
+                } else if !closed || opened.get_or_insert_with(Instant::now).elapsed() >= GATE_OPEN
+                {
+                    all.gate = self.hold(GATE_AT, 1, false)?;
+                    match all.gate {
+                        Some(_) => taken = Some(Instant::now()),
+                        None => (closed, opened) = (true, None),
                     }
                 }
             }
@@ -3396,14 +3385,20 @@ impl Store {
                     Err(TryLockError::Error(error)) => return Err(error.into()),
                 }
             }
-            let now = platform::monotonic_ns();
-            if now.saturating_sub(started) >= allowed
-                && (inner.lanes.lock().waiting > 0 || waiting())
-            {
+            let over = rounds.over();
+            if over && (inner.lanes.lock().waiting > 0 || waiting()) {
                 return Ok(Every::Yielded);
             }
-            nap(now, pause);
-            pause = (pause * 2).min(GATE_POLL.1);
+            if over || taken.is_some_and(|at: Instant| at.elapsed() >= ROUND.1) {
+                if all.gate.take().is_some() {
+                    Rounds::pause();
+                    (taken, closed) = (None, false);
+                }
+                pause = RANGE_POLL.0;
+                continue;
+            }
+            thread::sleep(pause);
+            pause = (pause * 2).min(RANGE_POLL.1);
         }
     }
 
@@ -3429,18 +3424,18 @@ impl Store {
         self.take_lane(at, false)
     }
 
-    /// Waits, if `wait` is set, while another process holds the gate, until the end of the epoch
-    /// that [`Store::gate_end`] gives, and returns whether the gate was free or came free.
+    /// Waits, if `wait` is set, while another process holds the gate, for at most [`GATE_WAIT`],
+    /// and returns whether the gate was free or came free.
     ///
     /// A process holds the gate while it wants or holds every branch lock at once, as
     /// [`Store::lock_lanes`] takes them. A thread about to take a branch lock while it holds no
     /// lock of this file passes the gate first, so that once a process wants every branch lock
-    /// other processes take a new one only at the end of an epoch, and the range comes free
-    /// between the closures that end in an epoch and the writers that go on at its end. The wait
-    /// tests the lock without taking it, sleeping between tests, so a thread never holds the gate
-    /// and the process taking it waits for no writer. The wait is bounded because the gate's holder
-    /// may be waiting for a closure that waits for this thread in a way ferro cannot see, such as
-    /// by joining it; at the epoch's end the thread goes on, and that wait comes undone. A thread
+    /// other processes take no new one, and the range comes free as the closures that hold branch
+    /// locks end. The wait tests the lock without taking it, sleeping between tests, so a thread
+    /// never holds the gate and the process taking it waits for no writer. The holder opens the
+    /// gate for [`GATE_OPEN`] at least once a second, as [`Rounds`] describes, and every writer
+    /// waiting then goes on together: the holder may be waiting for a closure that waits for one of
+    /// them in a way ferro cannot see, such as by joining it, and that wait comes undone. A thread
     /// that holds a lock of this file does not wait here at all, since the process holding the gate
     /// may be waiting for that lock.
     ///
@@ -3453,45 +3448,16 @@ impl Store {
         if !wait {
             return Ok(false);
         }
-        let until = self.gate_end()?;
+        let started = Instant::now();
         let (mut pause, longest) = GATE_POLL;
-        loop {
-            let now = platform::monotonic_ns();
-            if now >= until {
-                return Ok(false);
-            }
-            thread::sleep(pause.min(Duration::from_nanos(until - now)));
+        while started.elapsed() < GATE_WAIT {
+            thread::sleep(pause);
             pause = (pause * 2).min(longest);
             if !platform::range_excluded(file, GATE_AT, 1)? {
                 return Ok(true);
             }
         }
-    }
-
-    /// When, on `CLOCK_MONOTONIC`, a writer that finds the gate held now goes on if it is still
-    /// held: the end of the current epoch of the length [`gate_epoch`] gives for how long ago the
-    /// gate's holder began to want every branch lock, as its stamp byte says. A holder whose stamp
-    /// is not there counts as having just begun.
-    ///
-    /// Every writer of the machine that tests the gate at one moment reads the same stamp and the
-    /// same clock, so writers held at the gate go on together at the ends of epochs that grow as
-    /// the hold goes on, from about 2 ms to a second, each no longer than the hold had lasted
-    /// when the writer came, or the shortest. Once the epoch outlasts the closures, every closure
-    /// that began at an epoch's end has ended before the next, and the range is free until then.
-    pub(crate) fn gate_end(&self) -> Result<u64> {
-        let now = platform::monotonic_ns();
-        let stamp = platform::excluded_at(&self.inner.file, STAMP_AT, STAMPS)?;
-        let held = stamp.map_or(0, |at| stamp_age(at, now));
-        Ok(epoch_end(now, gate_epoch(held)))
-    }
-
-    /// [`Store::gate_end`] if another process holds the gate, and `None` if none does or the gate
-    /// cannot be tested.
-    pub(crate) fn gate_until(&self) -> Option<u64> {
-        match platform::range_excluded(&self.inner.file, GATE_AT, 1) {
-            Ok(true) => self.gate_end().ok(),
-            _ => None,
-        }
+        Ok(false)
     }
 
     /// Takes the branch lock at `at`: shares the byte with any lane of this process that holds it,

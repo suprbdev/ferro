@@ -416,6 +416,57 @@ fn a_closure_cannot_write_a_branch_that_sorts_before_its_own() {
 }
 
 #[test]
+fn a_closure_joining_a_commit_on_an_earlier_branch_of_its_handle_finishes_beside_its_cycle() {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let synced = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let synced = synced.clone();
+            move |step: &'static str| {
+                if step == "synced" {
+                    synced.store(true, Ordering::SeqCst);
+                }
+            }
+        };
+        let main: Db<Root> = options()
+            .hook(Hook(Arc::new(hook)))
+            .open(dir.path().join("joined.ferro"))
+            .unwrap();
+        for i in 0..50 {
+            put(&main, i, i);
+        }
+        let b = main.fork("b").unwrap();
+        let c = main.fork("c").unwrap();
+        let inside = Arc::new(AtomicBool::new(false));
+        let nested = {
+            let (b, c, inside, synced) = (b.clone(), c.clone(), inside.clone(), synced.clone());
+            thread::spawn(move || {
+                c.update(|root| {
+                    inside.store(true, Ordering::SeqCst);
+                    wait_until("the copy", || synced.load(Ordering::SeqCst));
+                    thread::sleep(Duration::from_millis(100));
+                    thread::spawn(move || put(&b, 70, 70)).join().unwrap();
+                    root.insert(80, 80);
+                })
+            })
+        };
+        wait_until("the closure", || inside.load(Ordering::SeqCst));
+        let cycle = {
+            let main = main.clone();
+            thread::spawn(move || main.compact(Keep::All))
+        };
+        joined(kind, nested).unwrap();
+        joined(kind, cycle).unwrap();
+        assert_eq!(
+            (value(&b, 70), value(&c, 80)),
+            (Some(70), Some(80)),
+            "{kind}"
+        );
+        main.verify().unwrap();
+    }
+}
+
+#[test]
 fn writing_down_the_lane_order_cannot_deadlock_against_a_cycle() {
     for (kind, options) in kinds() {
         let dir = dir();

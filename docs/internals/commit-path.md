@@ -232,8 +232,10 @@ in five runs the hour before: a lone Fsync writer waits on a disk that other wor
 Left open:
 
 - A cycle, or a `receive` about to land, that waits for a long closure holds the lanes it has
-  already taken, those that sort before that closure's branch, so those branches wait for the rest
-  of that closure, as every branch did before.
+  already taken, those that sort before that closure's branch, so those branches wait for that
+  closure, as every branch did before, until the end of the round of the cycle's wait in which a
+  thread waits for one of them, when it lets them go, as [The gate](processes.md#the-gate)
+  describes.
 - A closure may commit on a branch whose name sorts after its own. One that sorts before it could
   deadlock against a cycle, which takes lanes in name order, so it fails with `Error::Reentrant`, as
   described under [Writes from inside a closure](reentrancy.md).
