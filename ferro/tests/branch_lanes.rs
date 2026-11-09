@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use common::{Rng, cases, text};
+use common::{Rng, cases, frame_shapes, padded_links, text};
 use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Trace};
 use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim};
@@ -1522,7 +1522,9 @@ impl Edits {
             root.0.insert(key, value);
         }
         let shared = 4 * self.row() + 2;
-        root.0.insert(shared, text(self.round, 650));
+        if self.round.is_multiple_of(2) {
+            root.0.insert(shared, text(self.round, 650));
+        }
         for _ in 0..3 {
             let key = 4 * self.row();
             root.0.remove(&key);
@@ -1648,9 +1650,23 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
         );
         moved.verify().unwrap();
         drop((moved, moved_other, placed, placed_other));
+        let (moved_image, placed_image) = (
+            fs::read(&moved_path).unwrap(),
+            fs::read(&placed_path).unwrap(),
+        );
         assert!(
-            fs::read(&moved_path).unwrap() == fs::read(&placed_path).unwrap(),
-            "{kind}: a moved frame left different bytes"
+            frame_shapes(&moved_image) == frame_shapes(&placed_image),
+            "{kind}: a moved frame holds different records or links"
+        );
+        assert!(
+            frame_shapes(&moved_image).len() > 2 * rounds as usize,
+            "{kind}: too few frames read"
+        );
+        assert!(
+            padded_links(&moved_image) > 0 && padded_links(&placed_image) == 0,
+            "{kind}: padded {} links moved and {} placed",
+            padded_links(&moved_image),
+            padded_links(&placed_image)
         );
         let reopened: Db<Mixed> = options().cache_bytes(1).open(&moved_path).unwrap();
         let placed: Db<Mixed> = options().cache_bytes(1).open(&placed_path).unwrap();

@@ -180,9 +180,17 @@ to receive a clone of 220,000 entries and 105,000 rows and 1.39 against 1.36 s f
 ## Records
 
 A record is `varint stored_len`, `varint (link_count << 1 | compressed)`, an optional
-`varint raw_len`, the body, then the links. Each link is its hash followed by a zigzag varint of
-`record offset - target offset`. Children are written before parents, so the deltas are small and
-positive in the common case, and nothing in a record depends on where it sits except that delta.
+`varint raw_len`, the body, then the links. Each link is its hash followed by a varint of twice the
+distance back to its target, `record offset - target offset`. Children are written before parents,
+so the distances are small and positive in the common case, and nothing in a record depends on where
+it sits except those distances. A link's varint may also be padded: an odd value, the varint of
+twice the distance plus one in all its bytes but the last, and a last byte of 1, so that it takes
+more bytes than the distance needs. A commit drafted while other frames are placed pads a link to an
+object before its frame when the distance would need a longer varint once the frame moves as far as
+frames have lately moved, so that a move rewrites each such distance in place, as described under
+[Moving a draft in place](commit-path.md#moving-a-draft-in-place). Records staged for a sync keep a
+zigzag varint of the distance, since a staged record may link an object of the file the staging
+lies beside, past it.
 Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression runs
 after hashing and decompression before the hash check, so the hash covers the canonical body and two
 files with different physical compression still agree on every root hash. The decoder rejects a
@@ -193,7 +201,9 @@ safe module, which forbids unsafe code, because it reads bodies from files and s
 be damaged or hostile.
 
 Every varint in a record takes the fewest bytes its value needs, as `push_varint` writes it, and a
-reader refuses a longer one as damage. A longer form reads as the same number: the last byte with
+reader refuses a longer one as damage. A padded distance is no exception: its value includes the
+last byte of 1, so it is the shortest varint of that value, and a reader refuses an odd value whose
+last byte is anything else. A longer form reads as the same number: the last byte with
 its continuation bit set, then a zero byte. So a flipped high bit in the last byte of a record, the
 end of its last link's offset, read on into the next byte when that byte was zero, as the first byte
 of a frame's table is about once in 256 frames. The record then gave the same object one byte
@@ -269,7 +279,7 @@ either way and thread CPU time by less than the noise between runs. The map and 
 
 Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, records the
 size the file had when this generation began and how much of the previous one survived, and carries
-an anchor, the newest position known to be durable. The superblock's magic, `FERRODB4`, is the
+an anchor, the newest position known to be durable. The superblock's magic, `FERRODB5`, is the
 format's version. The log is a run of frames, one per commit. A frame is a 68-byte header (magic,
 sequence, end offset, head pointer, xxh3-128 check), the records the commit wrote, and a table that
 holds the xxh3-64 of each 4 KiB block of those records, the last block shorter, 8 bytes a block. The

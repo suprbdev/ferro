@@ -224,11 +224,15 @@ fn records(frame: &[u8], start: u64) -> Vec<Record> {
         for _ in 0..flagged >> 1 {
             let hash = frame[pos..pos + HASH_BYTES].try_into().unwrap();
             pos += HASH_BYTES;
-            let zigzag = varint(frame, &mut pos);
-            let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            let begun = pos;
+            let value = varint(frame, &mut pos);
+            let delta = match value & 1 {
+                0 => value >> 1,
+                _ => (value ^ (1 << (7 * (pos - begun - 1)))) >> 1,
+            };
             links.push(Ptr {
                 hash,
-                offset: offset.wrapping_sub(delta as u64),
+                offset: offset.wrapping_sub(delta),
             });
         }
         out.push(Record {

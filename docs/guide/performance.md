@@ -10,7 +10,9 @@ alternating with plain ones. The commits on 16 branches are medians of five runs
 figure on this page but those under [Huge pages](#huge-pages) was measured again that day, and a
 figure that came within the spread of its runs of the one measured on 2026-11-04 is given as it was.
 The copy a reclamation cycle makes, under [Other tools](#other-tools), was measured again on
-2026-11-07, pinned to 16 cores, once it ran on up to 8 threads by default.
+2026-11-07, pinned to 16 cores, once it ran on up to 8 threads by default, and the Buffered commits
+of writers on their own branches on 2026-11-09, once a moved draft rewrote its links in place, as
+described under [Writers and branches](#writers-and-branches).
 
 | Operation | Result |
 | --- | --- |
@@ -22,7 +24,7 @@ The copy a reclamation cycle makes, under [Other tools](#other-tools), was measu
 | Single-key commits, fsync, 8 writers with 8 readers | about 10,100 per second |
 | Reads per second with those writers running | 74M |
 | The same 8 writers with `coalesce` | about 14,900 per second, 9,600 without in the same runs |
-| Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 124,000 per second |
+| Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 135,000 per second |
 | Single-key commit, `Durability::Buffered` | 24 µs |
 | Bytes written per single-key commit | 3.5 KB |
 | `diff` | 3.8 µs per changed key |
@@ -81,10 +83,10 @@ second, median of five runs:
 
 | Writers | Buffered, own branches | Buffered, one branch | One branch, `coalesce` | Fsync, own branches | Fsync, one branch | One branch, `coalesce` |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 49,600 | 49,800 | 49,300 | 2,490 | 2,510 | 2,620 |
-| 4 | 109,100 | 42,800 | 50,200 | 5,400 | 5,300 | 8,600 |
-| 8 | 150,000 | 42,000 | 48,400 | 10,200 | 10,100 | 14,400 |
-| 16 | 123,800 | 39,500 | 53,400 | 18,100 | 18,500 | 23,500 |
+| 1 | 47,800 | 49,800 | 49,300 | 2,490 | 2,510 | 2,620 |
+| 4 | 98,600 | 42,800 | 50,200 | 5,400 | 5,300 | 8,600 |
+| 8 | 153,200 | 42,000 | 48,400 | 10,200 | 10,100 | 14,400 |
+| 16 | 135,100 | 39,500 | 53,400 | 18,100 | 18,500 | 23,500 |
 
 With `coalesce` 16 writers on one branch shared a version 13 at a time Buffered and 16 at a time
 with fsync, and wrote 1,515 and 1,427 bytes a closure against 2,464 and 2,385 without it. A writer
@@ -92,12 +94,18 @@ alone on its branch has nothing to share, and `coalesce` there ran within 5% of 
 apart from 8 Buffered branches at 139,600 a second, 7% fewer.
 
 Past 8 Buffered writers on their own branches, commits queue for `tip`, the one lock that places
-every frame in the file. It is held about 6 µs a commit at 8 writers and 7 to 8 µs at 16, against
+every frame in the file. It was held about 6 µs a commit at 8 writers and 7 to 8 µs at 16, against
 1.2 to 1.5 µs for one, mostly to move drafts that other frames overtook and to insert heads into a
 larger branch table, and a waiter woken from it takes 1 to 2 µs more to run, so from 8 writers on
 it is never free. [Where own-branch writers stop
 scaling](../internals/commit-path.md#where-own-branch-writers-stop-scaling) has the measurements
-and what was tried.
+and what was tried. A moved draft now rewrites only its links' distances, in place, which took the
+instructions a commit runs under `tip` from 24,800 to 17,000 at 8 writers and from 28,000 to 20,200
+at 16, as described under [Moving a draft in
+place](../internals/commit-path.md#moving-a-draft-in-place). The own-branch Buffered column was
+measured again with it on 2026-11-09, medians of six runs alternating with the build before, which
+gave 46,700, 99,000, 144,800 and 112,800 a second in the same runs, with p99 at 16 writers 322 µs
+against 410.
 
 ## Reads from many threads
 

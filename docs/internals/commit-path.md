@@ -269,7 +269,9 @@ from the hook, inside every draft on main, and compares the file byte for byte w
 commits came first, across nested maps, spilled values, a value both branches write and parallel
 flushes. The two can only differ when `dedupe` hands out a different copy of the same object, as it
 can between any two interleavings, so the test keeps each branch's edits apart and the cache large
-enough that reads register nothing.
+enough that reads register nothing. Since a move can pad a link's distance, the test compares the
+files frame by frame and record by record instead, as described under [Moving a draft in
+place](#moving-a-draft-in-place).
 
 `tables`, one Buffered writer, median of five interleaved runs against the tree before, with
 counters around the time `tip` is held:
@@ -780,5 +782,103 @@ alternating with the tree before unless said:
 Left open:
 
 - Taking work out from under `tip` without adding it to the writer's own path. Moving the draft and
-  inserting the head are most of what grows with the branches.
+  inserting the head are most of what grows with the branches. A move now rewrites only the
+  distances that depend on where the frame sits, as described under [Moving a draft in
+  place](#moving-a-draft-in-place).
 - Handing `tip` to a waiter that is already running, without waiting for one that is not.
+
+## Moving a draft in place
+
+Moving an overtaken draft was 9,000 to 12,200 of the 24,600 to 28,000 instructions a commit ran
+under `tip` at 16 writers, as [Where own-branch writers stop
+scaling](#where-own-branch-writers-stop-scaling) found: the move parsed every record, copied it into
+a new buffer, looked each one up again in `dedupe` and wrote every link's distance again. A move now
+rewrites in place only what depends on where the frame sits.
+
+While it drafts, a commit notes the offset and hash of each record and, for each link to an object
+before its frame, where the link's distance sits in the draft and how many bytes it was given. Under
+`tip`, if another frame was placed meanwhile, it writes each of those distances again for the new
+position, in the bytes it was given. Every record moves by the same amount, so a link within the
+frame keeps its distance, and the frame is the one the full move writes but for those bytes. The
+links' bytes leave room to move: the store keeps its drift, the farthest a draft moved lately,
+losing a sixteenth and a byte with each commit placed, and a draft begun while the drift is above
+zero gives each link to an older object the bytes its distance needs once the frame has moved twice
+that far. A distance shorter than that is padded, as described under [Records](storage.md#records):
+its varint holds twice the distance plus one, with a last byte of 1, so it is still the shortest
+varint of its value and a reader still refuses a longer one. A writer alone never moves, so its
+drift stays at zero, its drafts note nothing, and its frames are those it wrote before. A draft
+begun at zero drift that does move, the first after a quiet spell, moves the old way.
+
+The lookups in `dedupe` run before `tip` is taken. A commit looks up its records as the full move
+would, and if a frame placed since the draft began wrote one of them, the draft moves the old way
+under `tip`, dropping that record. A record a frame registers after the lookup is written again, as
+it would be had that frame registered it after the move, which any two interleavings can already
+give. A draft that moves farther than its links leave room for, that holds a received record, or
+that spilled moves as before.
+
+The format moved from 4 to 5, since a build before this one reads a padded distance as a link to a
+later object: no file of format 4 opens in this build, nor one of format 5 in an earlier build, and
+both report `Error::NotFerro`. A file of format 4 holds no odd distance, so its fixtures were
+converted by giving their superblocks the new magic and check. A record staged for a sync keeps a
+zigzag distance, since its links may lead past it into the file beside the staging.
+
+`a_frame_another_branch_moves_is_the_frame_written_in_its_place` compared the moved file with the
+placed one byte for byte. A moved frame may now pad a distance its placed twin does not, so it
+compares the frames, their records and the record each link reaches, with `frame_shapes`, checks
+that the moved file padded some distances and the placed one none, and both files still verify and
+read alike. Both branches wrote the same spilled value every round, which sent every draft down the
+old move, so they now write it every other round, and 44 of the test's 120 moves ran in place.
+Making the move skip rewriting the last distance fails it.
+`a_padded_distance_reads_back_as_the_shortest_varint_of_its_value` and
+`a_link_padded_in_a_record_reads_alike_both_ways` check the encoding against both readers and a
+flipped continuation bit.
+
+With counters around the time `tip` is held, as in the section above, over two runs each, a commit
+ran 24,760 instructions under `tip` before and 17,040 after at 8 writers, and 28,010 and 20,150 to
+20,220 at 16, in 21,000 and 15,800 cycles at 8. The move itself went from 12,020 to 4,420
+instructions at 8 writers and from 12,240 to 4,560 at 16, what is left being the distances written
+again, the offsets the draft registers and the table of where its records went. Of the moves, 99.9%
+at 2 writers, 99.98% at 4, 99.99% at 8 and 99.87% at 16 ran in place.
+
+`group` with `--branches own`, single-key commits into 100,000 keys with no closure, medians of six
+runs alternating with the tree before on the 32-thread machine, each run started with the 1-minute
+load average under 3, commits a second, p99 and bytes per commit:
+
+| Writers | Before | After | p99, before | After | Bytes, before | After |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 46,690 | 47,798 | 37 µs | 35 µs | 2,308 | 2,308 |
+| 4 | 99,030 | 98,642 | 92 µs | 91 µs | 2,352 | 2,354 |
+| 8 | 144,826 | 153,184 (1.06x) | 114 µs | 106 µs | 2,358 | 2,360 |
+| 16 | 112,764 | 135,086 (1.20x) | 410 µs | 322 µs | 2,351 | 2,356 |
+
+Bytes per commit grew by 0.2% at 16 writers, the padded distances. One branch, which never moves a
+draft, ran 46,130, 39,263 and 37,632 a second at 1, 8 and 16 writers against 44,792, 38,972 and
+33,052, and with `coalesce` 48,911, 48,636 and 51,524 against 48,902, 47,714 and 51,474, medians of
+four. Under Fsync, which waits on the disk, 16 own branches ran 17,786 a second against 17,399 over
+six alternating runs, and 1 and 8 writers 2,494 and 9,880 against 2,471 and 9,659 over three. With
+24 busy loops beside the writers, more threads than the machine can run at once, 8 and 16 own
+branches ran 61,540 and 50,584 a second against 58,144 and 49,000, medians of four. A lone writer's
+frames are byte for byte those of the tree before. `tables`, one Buffered writer, medians of four
+alternating runs: outside the closure a hold ran 574,392 instructions against 573,465, a confirm
+742,476 against 740,440 and a cancel 911,779 against 909,502, 0.2% more, in thread CPU time of 74.95
+against 74.85, 95.9 against 95.35 and 123.2 against 122.15 µs, and bytes per write were 13,393
+against 13,392. `ferro-bench`, medians of three alternating runs: a single-key commit at 1M keys ran
+180,420 instructions against 179,888 Buffered, 0.3% more, in 23.3 µs against 23.4, and took 413 µs
+against 421 under Fsync, writing 3,535.6 bytes in both.
+
+Measured and left out:
+
+- Rewriting the distances in place without padding, moving the old way when a distance outgrows its
+  bytes. The first try parsed the draft to find its links and moved in place 41% of the time at 8
+  writers and 27% at 16, its pass costing 2.0 to 2.2 µs, and lost 10%, as the section above
+  describes; padding moves 99.9% in place.
+- Absolute offsets for links to objects before the frame, so that a move rewrites nothing. Counted
+  over `group`'s runs, their varints would have added 52 bytes to a single-key commit of one writer,
+  2.2%, and 31 bytes, 1.3%, at 16 branches, and more as files grow past 256 MiB.
+- Padding with a plain LEB128 varint, its last byte zero, which a reader would have to accept. A
+  flipped continuation bit in a record's last byte, reading on into a following zero byte, then
+  reads as the same number, the damage described under [Records](storage.md#records).
+- Marking a padded distance with a bit of its own, below the zigzagged distance. Every link would
+  carry the bit, a byte more wherever a distance sits near the top of its varint's length, and every
+  file of format 4 would have to be laid out again. Without the bit, an odd value can no longer mean
+  a link forward, which only staged records use, so they keep the zigzag.

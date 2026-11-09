@@ -2,9 +2,10 @@
 
 This is an experiment, not a production database.
 
-- The file format is not stable and may change without migration. It is now format 4, which added
-  a table of checks to every frame: a file of format 3 does not open in this build, nor one of
-  format 4 in an earlier build, and both report `Error::NotFerro`.
+- The file format is not stable and may change without migration. It is now format 5, which lets a
+  link's distance be padded so that a commit can move without laying its records out again: a file
+  of format 4 does not open in this build, nor one of format 5 in an earlier build, and both report
+  `Error::NotFerro`.
 - It runs on Unix and Windows. On Windows the file must be on NTFS: a reclamation cycle renames the
   new file over one that snapshots still hold open, which needs POSIX rename semantics, and Windows
   cannot sync a directory, so the rename is made durable by flushing the renamed file, which relies

@@ -104,7 +104,7 @@ pub fn whole_frame(image: &[u8], start: usize) -> Option<usize> {
 pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
     let mut newest = None;
     for slot in [0, SLOT] {
-        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB4" {
+        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB5" {
             continue;
         }
         if blake3::hash(&image[slot..slot + 112]).as_bytes()[..] != image[slot + 112..slot + 144] {
@@ -124,6 +124,97 @@ pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
         at = end;
     }
     frames
+}
+
+pub const LOG_START: usize = 2 * SLOT;
+pub const HASH_BYTES: usize = 20;
+
+pub fn varint(bytes: &[u8], pos: &mut usize) -> u64 {
+    let mut value = 0;
+    for shift in (0..64).step_by(7) {
+        let byte = bytes[*pos];
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    value
+}
+
+pub fn link_distance(value: u64, len: usize) -> u64 {
+    match value & 1 {
+        0 => value >> 1,
+        _ => {
+            let top = 7 * (len as u32 - 1);
+            assert_eq!(value >> top, 1, "a padded distance ends in a byte of 1");
+            (value ^ (1 << top)) >> 1
+        }
+    }
+}
+
+pub type Link = ([u8; HASH_BYTES], Option<(usize, usize)>);
+
+pub type Shape = (u64, [u8; HASH_BYTES], Vec<(Vec<u8>, Vec<Link>)>);
+
+pub fn frame_shapes(image: &[u8]) -> Vec<Shape> {
+    let mut frames = Vec::new();
+    let mut records = std::collections::HashMap::new();
+    let mut start = LOG_START;
+    while let Some(end) = whole_frame(image, start) {
+        let seq = field(image, start + 8) as u64;
+        let head: [u8; HASH_BYTES] = image[start + 32..start + 52].try_into().unwrap();
+        let body_end = end - table_bytes(end - start);
+        let mut pos = start + FRAME_BYTES;
+        let mut shape = Vec::new();
+        while pos < body_end {
+            let at = pos;
+            let stored = varint(image, &mut pos) as usize;
+            let flagged = varint(image, &mut pos);
+            if flagged & 1 == 1 {
+                varint(image, &mut pos);
+            }
+            pos += stored;
+            let header = image[at..pos].to_vec();
+            let mut links = Vec::new();
+            for _ in 0..flagged >> 1 {
+                let hash = image[pos..pos + HASH_BYTES].try_into().unwrap();
+                pos += HASH_BYTES;
+                let begun = pos;
+                let value = varint(image, &mut pos);
+                let target = (at as u64).wrapping_sub(link_distance(value, pos - begun));
+                links.push((hash, records.get(&target).copied()));
+            }
+            records.insert(at as u64, (frames.len(), shape.len()));
+            shape.push((header, links));
+        }
+        frames.push((seq, head, shape));
+        start = end;
+    }
+    frames
+}
+
+pub fn padded_links(image: &[u8]) -> usize {
+    let mut padded = 0;
+    let mut start = LOG_START;
+    while let Some(end) = whole_frame(image, start) {
+        let body_end = end - table_bytes(end - start);
+        let mut pos = start + FRAME_BYTES;
+        while pos < body_end {
+            let stored = varint(image, &mut pos) as usize;
+            let flagged = varint(image, &mut pos);
+            if flagged & 1 == 1 {
+                varint(image, &mut pos);
+            }
+            pos += stored;
+            for _ in 0..flagged >> 1 {
+                pos += HASH_BYTES;
+                padded += (varint(image, &mut pos) & 1) as usize;
+            }
+        }
+        start = end;
+    }
+    padded
 }
 
 pub fn assert_damaged<T>(result: ferro::Result<T>, frame: usize, byte: usize, context: &str) {

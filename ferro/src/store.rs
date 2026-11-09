@@ -75,7 +75,7 @@ pub(crate) fn fresh_reads() -> u64 {
 }
 
 /// The magic at the start of a superblock, which names the format of the file.
-const MAGIC: &[u8; 8] = b"FERRODB4";
+const MAGIC: &[u8; 8] = b"FERRODB5";
 /// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 /// The magic of the marker a reclamation cycle writes at the end of a log it is replacing.
@@ -1360,6 +1360,9 @@ struct RecordReader<'a> {
     bytes: Cow<'a, [u8]>,
     /// Where the next read starts in `bytes`.
     pos: usize,
+    /// Whether the record is staged, its links' distances zigzagged as [`append_staged`] writes
+    /// them, rather than in the log, where [`distance_of`] reads them.
+    staged: bool,
 }
 
 impl RecordReader<'_> {
@@ -1466,10 +1469,18 @@ impl RecordReader<'_> {
             .take(HASH_BYTES)?
             .try_into()
             .expect("slice length is HASH_BYTES");
-        let delta = unzigzag(self.varint()?);
+        let begun = self.pos;
+        let value = self.varint()?;
+        let distance = match self.staged {
+            true => Some(unzigzag(value) as u64),
+            false => distance_of(value, self.pos - begun),
+        };
+        let distance = distance.ok_or_else(|| {
+            Error::Corrupt(format!("bad link distance in record at {}", self.start))
+        })?;
         Ok(Ptr {
             hash,
-            offset: self.start.wrapping_sub(delta as u64),
+            offset: self.start.wrapping_sub(distance),
         })
     }
 }
@@ -1573,10 +1584,11 @@ pub(crate) fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> O
     for _ in 0..count {
         let hash: Hash = bytes.get(pos..pos + HASH_BYTES)?.try_into().ok()?;
         pos += HASH_BYTES;
-        let delta = unzigzag(varint_within(bytes, &mut pos)?);
+        let begun = pos;
+        let value = varint_within(bytes, &mut pos)?;
         links.push(Ptr {
             hash,
-            offset: start.wrapping_sub(delta as u64),
+            offset: start.wrapping_sub(distance_of(value, pos - begun)?),
         });
     }
     Some(Stored {
@@ -1616,6 +1628,7 @@ fn check_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
         tail: ptr.offset.saturating_add(record.len() as u64),
         bytes: Cow::Borrowed(record),
         pos: 0,
+        staged: false,
     };
     let header = reader.header()?;
     let start = reader.pos;
@@ -2019,6 +2032,10 @@ struct Inner {
     unsynced: AtomicBool,
     /// Set once the store is closed, after which nothing more enters the cache.
     closed: AtomicBool,
+    /// How far drafts have recently moved before their frames were placed: the largest move seen
+    /// lately, losing a sixteenth and a byte with each frame placed, which sizes the room a draft
+    /// leaves in its links to objects before it.
+    drift: AtomicU64,
     /// The branch locks this process holds.
     lanes: Mutex<Lanes>,
     /// Woken when a branch lock is taken or let go.
@@ -2422,6 +2439,7 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                drift: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
@@ -2481,6 +2499,7 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                drift: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
@@ -3396,7 +3415,8 @@ impl Store {
             .as_ref()
             .and_then(|kept| kept.as_deref())
             .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
-        let (object, len, _) = Store::read_within(file, ptr, tail, held, true, false, record)?;
+        let (object, len, _) =
+            Store::read_within(file, ptr, tail, held, true, false, record, false)?;
         Ok((object, len))
     }
 
@@ -3405,7 +3425,8 @@ impl Store {
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
         let tail = self.readable_past(ptr.offset)?;
         let file = Some(&*self.inner.file);
-        let (object, _, packed) = Store::read_within(file, ptr, tail, &[], true, true, None)?;
+        let (object, _, packed) =
+            Store::read_within(file, ptr, tail, &[], true, true, None, false)?;
         Ok((object, packed))
     }
 
@@ -3443,6 +3464,7 @@ impl Store {
             tail,
             bytes: Cow::Owned(mem::take(bytes)),
             pos: 0,
+            staged: false,
         };
         let stored = Self::stored_in(&mut reader, links, claims);
         *bytes = reader.bytes.into_owned();
@@ -3513,6 +3535,7 @@ impl Store {
             tail,
             bytes: Cow::Borrowed(&[]),
             pos: 0,
+            staged: false,
         };
         let stored_len = usize::try_from(reader.varint()?)
             .map_err(|_| Error::Corrupt("body length overflow".into()))?;
@@ -3527,10 +3550,14 @@ impl Store {
                 .take(HASH_BYTES)?
                 .try_into()
                 .expect("slice length is HASH_BYTES");
-            let delta = unzigzag(reader.varint()?);
+            let begun = reader.pos;
+            let value = reader.varint()?;
+            let distance = distance_of(value, reader.pos - begun).ok_or_else(|| {
+                Error::Corrupt(format!("bad link distance in record at {}", ptr.offset))
+            })?;
             links.push(Ptr {
                 hash,
-                offset: ptr.offset.wrapping_sub(delta as u64),
+                offset: ptr.offset.wrapping_sub(distance),
             });
         }
         Ok(links)
@@ -3539,6 +3566,7 @@ impl Store {
     /// Reads the record at `ptr`, never past `tail`, from `held`, bytes that start at the record,
     /// or from `file` when `held` is empty, checking its hash if `verify` is set, keeping its
     /// compressed body if `keep` is, and appending the record's bytes to `record` if given.
+    #[allow(clippy::too_many_arguments)]
     fn read_within(
         file: Option<&File>,
         ptr: Ptr,
@@ -3547,6 +3575,7 @@ impl Store {
         verify: bool,
         keep: bool,
         record: Option<&mut Vec<u8>>,
+        staged: bool,
     ) -> Result<Raw> {
         if ptr.offset < LOG_START || ptr.offset >= tail {
             return Err(Error::Corrupt(format!(
@@ -3569,6 +3598,7 @@ impl Store {
             tail,
             bytes,
             pos: 0,
+            staged,
         };
         let header = reader.header()?;
         let mut packed = None;
@@ -3830,6 +3860,7 @@ impl Store {
             return Err(Error::Poisoned);
         }
         let start = self.inner.placed.load(Ordering::Acquire);
+        let drift = self.inner.drift.load(Ordering::Relaxed);
         Ok(Txn {
             store: self.clone(),
             origin: start,
@@ -3840,6 +3871,11 @@ impl Store {
             unshared: false,
             shared_end: u64::MAX,
             reserve: true,
+            slack: 2 * drift,
+            starts: Vec::new(),
+            outer: Vec::new(),
+            planned: drift > 0,
+            clear: false,
         })
     }
 
@@ -3979,6 +4015,21 @@ pub struct Txn {
     shared_end: u64,
     /// Whether placing the frame grows the [`Durability::Fsync`] preallocation.
     reserve: bool,
+    /// How far the draft can move and still rewrite its links to objects before it in place: twice
+    /// the store's drift when it began.
+    slack: u64,
+    /// The offset and hash of each record the draft wrote, in order.
+    starts: Vec<(u64, Hash)>,
+    /// Each link to an object before the draft: where its distance sits in `buf`, how many bytes
+    /// it was given, and the distance as drafted.
+    outer: Vec<(usize, usize, u64)>,
+    /// Set while `starts` and `outer` describe every record, which they do from the start when
+    /// drafts have moved lately, and cleared once a record is added that they do not describe,
+    /// after which a move lays the draft out again.
+    planned: bool,
+    /// Set by [`Txn::look_ahead`] when no frame placed since the draft began had written any of
+    /// its records, as of when it looked.
+    clear: bool,
 }
 
 /// The offset of every object a transaction wrote or found, by hash.
@@ -4035,6 +4086,41 @@ impl Settling {
             cache.insert(hash, CacheEntry::node(value, entry.weight()));
         }
     }
+}
+
+/// Writes `distance`, a link's distance back to its target, into all of `out`: as the varint of
+/// twice the distance if that takes `out`'s length, or else padded, as the varint of twice the
+/// distance plus one in the bytes but the last and a last byte of 1, which [`distance_of`] reads
+/// back.
+///
+/// The caller makes `out` at least as long as the varint of twice the distance, which leaves room
+/// for the padded form whenever that varint is shorter.
+fn put_distance(out: &mut [u8], distance: u64) {
+    let plain = distance << 1;
+    let last = out.len() - 1;
+    let (mut value, top) = match varint_len(plain) == out.len() {
+        true => (plain, None),
+        false => (plain | 1, Some(1)),
+    };
+    for byte in &mut out[..last] {
+        *byte = (value as u8 & 0x7f) | 0x80;
+        value >>= 7;
+    }
+    out[last] = top.unwrap_or(value as u8);
+}
+
+/// The distance back to its target that a link's varint `value`, `len` bytes long, holds: half an
+/// even value, or for an odd one, padded as [`put_distance`] pads it, half the value below a last
+/// byte of 1. `None` for an odd value whose last byte is anything else.
+fn distance_of(value: u64, len: usize) -> Option<u64> {
+    if value & 1 == 0 {
+        return Some(value >> 1);
+    }
+    let top = 7 * u32::try_from(len.checked_sub(1)?).ok()?;
+    if top == 0 || value.checked_shr(top)? != 1 {
+        return None;
+    }
+    Some((value ^ (1 << top)) >> 1)
 }
 
 /// Reads a varint at `at` in a drafted frame.
@@ -4101,7 +4187,11 @@ fn relayout(
         for _ in 0..flagged >> 1 {
             out.extend_from_slice(old.get(at..at + HASH_BYTES).ok_or_else(missing)?);
             at += HASH_BYTES;
-            let target = was.wrapping_sub(unzigzag(take_varint(old, &mut at)?) as u64);
+            let begun = at;
+            let value = take_varint(old, &mut at)?;
+            let distance = distance_of(value, at - begun)
+                .ok_or_else(|| Error::Corrupt("bad link distance in a drafted record".into()))?;
+            let target = was.wrapping_sub(distance);
             let target = match target >= from {
                 true => news[olds.binary_search(&target).map_err(|_| missing())?],
                 false => target,
@@ -4262,7 +4352,8 @@ impl Txn {
     /// Moves the draft to the end of the log if another frame was placed since it began, and
     /// returns what its placement must settle.
     ///
-    /// The caller holds `tip`, so no frame is placed meanwhile.
+    /// A draft moves in place when it can, as [`Txn::shift`] describes, and is laid out again
+    /// otherwise. The caller holds `tip`, so no frame is placed meanwhile.
     ///
     /// # Errors
     ///
@@ -4274,7 +4365,22 @@ impl Txn {
         if now != self.origin && self.start != self.origin {
             return Err(Error::Corrupt("a draft that spilled cannot move".into()));
         }
+        let drift = &self.store.inner.drift;
+        let was = drift.load(Ordering::Relaxed);
+        let moved = now - self.origin;
+        drift.store(
+            moved.max(was.saturating_sub(was / 16 + 1)),
+            Ordering::Relaxed,
+        );
+        let planned = mem::take(&mut self.planned);
+        let shifted = match now != self.origin && planned {
+            true => self.shift(now),
+            false => None,
+        };
+        self.slack = 0;
+        self.outer.clear();
         let moves = match now == self.origin {
+            _ if shifted.is_some() => shifted,
             true => None,
             false => {
                 let mut hashes: Vec<(u64, Hash)> = self
@@ -4308,12 +4414,99 @@ impl Txn {
         })
     }
 
+    /// Looks up the draft's records in the deduplication table before its commit takes `tip`, so
+    /// that [`Txn::rebase`] need not: a record that a frame placed since the draft began wrote
+    /// lays the draft out again, and one that a frame registers after this looked is written
+    /// again, as it would be had that frame registered it after the rebase.
+    pub(crate) fn look_ahead(&mut self) {
+        let inner = &self.store.inner;
+        let placed = inner.placed.load(Ordering::Acquire);
+        self.clear = self.planned
+            && placed != self.origin
+            && !self.starts.iter().any(|(offset, hash)| {
+                *offset < self.shared_end && inner.dedupe.get(hash).is_some_and(|at| at < placed)
+            });
+    }
+
+    /// Moves the draft to `now` in place, by rewriting the distance of each link to an object
+    /// before it, if no frame placed since it began wrote any of its records and every distance
+    /// still fits the bytes it was given, and returns how its records moved.
+    ///
+    /// Every record moves by the same amount, so a link within the draft keeps its distance, and
+    /// the frame is the one [`relayout`] writes, but for the bytes a distance was given.
+    fn shift(&mut self, now: u64) -> Option<Moves> {
+        let delta = now - self.origin;
+        let dedupe = &self.store.inner.dedupe;
+        let found = match mem::take(&mut self.clear) {
+            true => false,
+            false => self.starts.iter().any(|(offset, hash)| {
+                *offset < self.shared_end && dedupe.get(hash).is_some_and(|at| at < now)
+            }),
+        };
+        let fits = |(_, width, distance): &(usize, usize, u64)| {
+            varint_len(distance.wrapping_add(delta) << 1) <= *width
+        };
+        if found || (delta > self.slack && !self.outer.iter().all(fits)) {
+            return None;
+        }
+        for (at, width, distance) in &self.outer {
+            put_distance(
+                &mut self.buf[*at..*at + *width],
+                distance.wrapping_add(delta),
+            );
+        }
+        for offset in self.seen.values_mut() {
+            if *offset >= self.origin {
+                *offset += delta;
+            }
+        }
+        let olds: Vec<u64> = self.starts.iter().map(|(offset, _)| *offset).collect();
+        let news = olds.iter().map(|offset| offset + delta).collect();
+        let moves = Moves::new(self.origin, olds, news);
+        self.origin = now;
+        self.start = now;
+        Some(moves)
+    }
+
     /// Appends the record of `staged` to the draft and registers its hash.
     fn record(&mut self, hash: Hash, staged: Staged<'_>) -> Ptr {
         let offset = self.start + self.buf.len() as u64;
-        append_staged(&mut self.buf, offset, staged);
+        match self.planned {
+            true => {
+                self.append(offset, staged);
+                self.starts.push((offset, hash));
+            }
+            false => append_staged(&mut self.buf, offset, staged),
+        }
         self.seen.insert(hash, offset);
         Ptr { hash, offset }
+    }
+
+    /// Appends the record of `staged` at `offset`, giving each link to an object before the draft
+    /// the bytes its distance needs once the draft has moved by its slack, and noting where.
+    fn append(&mut self, offset: u64, staged: Staged<'_>) {
+        let buf = &mut self.buf;
+        push_varint(buf, staged.payload.len() as u64);
+        if staged.packed {
+            push_varint(buf, (staged.links.len() as u64) << 1 | 1);
+            push_varint(buf, staged.raw as u64);
+        } else {
+            push_varint(buf, (staged.links.len() as u64) << 1);
+        }
+        buf.extend_from_slice(staged.payload);
+        for link in staged.links {
+            buf.extend_from_slice(&link.hash);
+            let distance = offset.wrapping_sub(link.offset);
+            if link.offset < self.origin {
+                let width = varint_len(distance.wrapping_add(self.slack) << 1);
+                self.outer.push((buf.len(), width, distance));
+                buf.resize(buf.len() + width, 0);
+                let at = buf.len() - width;
+                put_distance(&mut buf[at..], distance);
+            } else {
+                push_varint(buf, zigzag(distance as i64));
+            }
+        }
     }
 
     /// Adds a received record unless its object is already written, and registers where the
@@ -4334,6 +4527,7 @@ impl Txn {
         }
         let offset = self.start + self.buf.len() as u64;
         append_staged(&mut self.buf, offset, staged);
+        self.planned = false;
         Ok(Ptr { hash, offset })
     }
 
@@ -4385,7 +4579,7 @@ impl Txn {
         };
         let verify = ptr.offset < self.origin;
         let file = Some(&*self.store.inner.file);
-        let (object, _, _) = Store::read_within(file, ptr, tail, held, verify, false, None)?;
+        let (object, _, _) = Store::read_within(file, ptr, tail, held, verify, false, None, false)?;
         Ok(object)
     }
 
@@ -4798,8 +4992,16 @@ impl Staging {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
             _ => (&[][..], self.start),
         };
-        let (object, _, _) =
-            Store::read_within(self.file.as_ref(), ptr, tail, held, false, false, None)?;
+        let (object, _, _) = Store::read_within(
+            self.file.as_ref(),
+            ptr,
+            tail,
+            held,
+            false,
+            false,
+            None,
+            true,
+        )?;
         Ok(object)
     }
 
@@ -5004,6 +5206,111 @@ mod tests {
         txn.commit(head.unwrap()).unwrap();
         store.close();
         std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn a_padded_distance_reads_back_as_the_shortest_varint_of_its_value() {
+        let mut distances = vec![
+            1,
+            2,
+            63,
+            64,
+            65,
+            8_191,
+            8_192,
+            1 << 20,
+            (1 << 20) + 7,
+            1 << 40,
+        ];
+        distances.extend((0..200).map(|seed| {
+            noise(seed, 8)
+                .iter()
+                .fold(0u64, |acc, byte| acc << 5 ^ u64::from(*byte))
+                >> 20
+        }));
+        for distance in distances {
+            let plain = varint_len(distance << 1);
+            for width in plain..=MAX_VARINT.min(plain + 3) {
+                let mut out = vec![0u8; width];
+                put_distance(&mut out, distance);
+                let mut pos = 0;
+                let value = varint_within(&out, &mut pos).expect("a canonical varint");
+                assert_eq!(pos, width, "{distance} in {width} bytes");
+                assert_eq!(value & 1 == 1, width > plain, "{distance} in {width} bytes");
+                assert_eq!(
+                    distance_of(value, width),
+                    Some(distance),
+                    "{distance} in {width}"
+                );
+                if width > plain {
+                    assert_eq!(out[width - 1], 1);
+                    let mut stray = out.clone();
+                    stray[width - 1] = 2;
+                    let mut pos = 0;
+                    let value = varint_within(&stray, &mut pos).unwrap();
+                    assert_eq!(distance_of(value, width), None);
+                    stray[width - 1] = 0;
+                    assert!(varint_within(&stray, &mut 0).is_none(), "an overlong pad");
+                }
+            }
+        }
+        assert_eq!(distance_of(1, 1), None);
+        assert_eq!(distance_of(3, 1), None);
+    }
+
+    #[test]
+    fn a_link_padded_in_a_record_reads_alike_both_ways() {
+        let links = [
+            Ptr {
+                hash: [7; HASH_BYTES],
+                offset: LOG_START + 100,
+            },
+            Ptr {
+                hash: [9; HASH_BYTES],
+                offset: LOG_START + 9_000,
+            },
+        ];
+        let at = LOG_START + 10_000;
+        let mut record = Vec::new();
+        push_varint(&mut record, 5);
+        push_varint(&mut record, (links.len() as u64) << 1);
+        record.extend_from_slice(b"body!");
+        for (link, width) in links.iter().zip([3, 4]) {
+            record.extend_from_slice(&link.hash);
+            let begun = record.len();
+            record.resize(begun + width, 0);
+            put_distance(&mut record[begun..], at - link.offset);
+        }
+        let mut found = Vec::new();
+        let stored = stored_within(&record, at, &mut found).expect("the record parses");
+        assert_eq!(stored.len, record.len());
+        assert_eq!(found, links);
+        let object = Object {
+            body: b"body!".to_vec(),
+            links: links.to_vec(),
+        };
+        let ptr = Ptr {
+            hash: object.hash(),
+            offset: at,
+        };
+        let (read, len, _) = Store::read_within(
+            None,
+            ptr,
+            at + record.len() as u64,
+            &record,
+            true,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!((read.links, len as usize), (links.to_vec(), record.len()));
+        let mut scratch = Unpacked::default();
+        verify_stored(&record, ptr, &mut scratch).unwrap();
+        let last = record.len() - 1;
+        record[last] ^= 0x80;
+        assert!(stored_within(&record, at, &mut found).is_none_or(|stored| stored.len != last + 1));
+        assert!(verify_stored(&record, ptr, &mut scratch).is_err());
     }
 
     #[test]

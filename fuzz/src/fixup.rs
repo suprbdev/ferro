@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ferro::codec::{HASH_BYTES, Hash, Object, Ptr};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
-pub const MAGIC: &[u8; 8] = b"FERRODB4";
+pub const MAGIC: &[u8; 8] = b"FERRODB5";
 pub const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 pub const SLOT_BYTES: usize = 4096;
 pub const LOG_START: usize = 2 * SLOT_BYTES;
@@ -66,8 +66,15 @@ fn varint(bytes: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
     None
 }
 
-fn unzigzag(value: u64) -> i64 {
-    ((value >> 1) as i64) ^ -((value & 1) as i64)
+fn link_delta(value: u64, len: usize) -> Option<i64> {
+    if value & 1 == 0 {
+        return i64::try_from(value >> 1).ok();
+    }
+    let top = 7 * u32::try_from(len.checked_sub(1)?).ok()?;
+    if top == 0 || value.checked_shr(top)? != 1 {
+        return None;
+    }
+    i64::try_from((value ^ (1 << top)) >> 1).ok()
 }
 
 fn record(bytes: &[u8], start: usize, end: usize) -> Option<(Record, usize)> {
@@ -98,7 +105,9 @@ fn record(bytes: &[u8], start: usize, end: usize) -> Option<(Record, usize)> {
     for _ in 0..link_count {
         let at = pos;
         pos = pos.checked_add(HASH_BYTES).filter(|next| *next <= end)?;
-        let delta = unzigzag(varint(bytes, &mut pos, end)?);
+        let begun = pos;
+        let value = varint(bytes, &mut pos, end)?;
+        let delta = link_delta(value, pos - begun)?;
         links.push((at, (start as u64).wrapping_sub(delta as u64)));
     }
     Some((

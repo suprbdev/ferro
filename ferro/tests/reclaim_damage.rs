@@ -98,7 +98,7 @@ fn links_to_garbage() -> Vec<u8> {
     let mut fake = vec![8, 2];
     fake.extend_from_slice(b"notabody");
     fake.extend_from_slice(&[0; 20]);
-    fake.push(79);
+    fake.push(80);
     fake.resize(40, 0);
     fake.extend_from_slice(&[0xff; 12]);
     fake

@@ -2464,10 +2464,11 @@ impl<T: Data> Shared<T> {
         &self,
         (branch, state): (&Branch<T>, &Arc<State<T>>),
         change: Change<'_, T>,
-        drafted: Draft<T>,
+        mut drafted: Draft<T>,
         framed: u64,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<(u64, u64)> {
+        drafted.txn.look_ahead();
         let mut tip = self.lock_tip(notices)?;
         let whole = reentry::whole(self.id);
         let committed = self.commit_locked(&mut tip, change, drafted);
