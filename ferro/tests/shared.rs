@@ -1878,3 +1878,187 @@ fn a_read_only_follower_reads_what_it_held_through_another_handles_cycles() {
 fn a_shared_follower_reads_what_it_held_through_another_handles_cycles() {
     held_across_another_handles_cycles(manual());
 }
+
+type Kv = Map<u64, u64>;
+
+fn merge_keeping_ours(
+    kv: &mut Kv,
+    base: &Snapshot<Kv>,
+    theirs: &Snapshot<Kv>,
+) -> (&'static str, ()) {
+    kv.merge(base, theirs, |conflict| conflict.keep_ours());
+    ("pull", ())
+}
+
+#[derive(Clone, Copy)]
+enum Moved {
+    Dropped,
+    PulledAndPruned,
+}
+
+fn pull_after_another_handle_moved_its_tracking_branch(moved: Moved) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pulled.ferro");
+    let remote: Db<Kv> = fast().open(dir.path().join("remote.ferro")).unwrap();
+    let a: Db<Kv> = manual().open(&path).unwrap();
+    let b: Db<Kv> = manual().history(Keep::Last(1)).open(&path).unwrap();
+    a.update(|kv| kv.insert(100, 100)).unwrap();
+    for i in 0..5u64 {
+        remote.update(|kv| kv.insert(i, i)).unwrap();
+    }
+    a.pull(&remote, "origin", merge_keeping_ours).unwrap();
+    b.refresh().unwrap();
+    match moved {
+        Moved::Dropped => b.drop_branch("origin").unwrap(),
+        Moved::PulledAndPruned => {
+            remote.update(|kv| kv.insert(5, 5)).unwrap();
+            b.pull(&remote, "origin", merge_keeping_ours).unwrap();
+        }
+    }
+    remote.update(|kv| kv.insert(10, 10)).unwrap();
+    a.pull(&remote, "origin", merge_keeping_ours).unwrap();
+    assert_eq!(a.read().get(&10).as_deref(), Some(&10));
+    remote.update(|kv| kv.insert(11, 11)).unwrap();
+    let have = a.have().unwrap();
+    let bundle = remote.bundle(&have).unwrap();
+    b.drop_branch("origin").unwrap();
+    assert!(matches!(
+        a.receive("origin", &bundle, merge_keeping_ours),
+        Err(Error::StaleHave(_))
+    ));
+    let bundle = remote.bundle(&a.have().unwrap()).unwrap();
+    a.receive("origin", &bundle, merge_keeping_ours).unwrap();
+    assert_eq!(a.read().get(&11).as_deref(), Some(&11));
+    a.verify_typed().unwrap();
+}
+
+#[test]
+fn a_pull_after_another_handle_dropped_its_tracking_branch_lands() {
+    pull_after_another_handle_moved_its_tracking_branch(Moved::Dropped);
+}
+
+#[test]
+fn a_pull_after_another_handle_pulled_into_its_tracking_branch_and_pruned_it_lands() {
+    pull_after_another_handle_moved_its_tracking_branch(Moved::PulledAndPruned);
+}
+
+fn expected(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NoBranch(_)
+            | Error::BranchExists(_)
+            | Error::BranchInUse(_)
+            | Error::NoCommonAncestor
+            | Error::NoVersion(_)
+    )
+}
+
+fn churn(path: &Path, who: u64, ops: u64, seed: u64) -> Vec<String> {
+    let keep = match who % 3 {
+        0 => Keep::Last(4),
+        1 => Keep::All,
+        _ => Keep::Last(2),
+    };
+    let db: Db<Kv> = manual().history(keep).open(path).unwrap();
+    let remote: Db<Kv> = fast()
+        .open(path.with_extension(format!("remote{who}")))
+        .unwrap();
+    let mut rng = common::Rng::new(seed);
+    let mut odd = Vec::new();
+    let mut note = |what: &str, result: ferro::Result<()>| {
+        if let Err(error) = result
+            && !expected(&error)
+        {
+            odd.push(format!("{who} {what}: {error:?}"));
+        }
+    };
+    for op in 0..ops {
+        let name = match rng.chance(25) {
+            true => format!("r{}", rng.below(3)),
+            false => format!("f{}", rng.below(3)),
+        };
+        let value = who * 1_000_000 + op;
+        match rng.below(12) {
+            0..=2 => {
+                let key = rng.below(64);
+                note("update", db.update(|kv| drop(kv.insert(key, value))));
+            }
+            3 => {
+                let key = rng.below(64);
+                let result = db
+                    .branch(&name)
+                    .and_then(|branch| branch.update(|kv| drop(kv.insert(key, value))));
+                note("branch update", result);
+            }
+            4 => note("fork", db.fork(&name).map(drop)),
+            5 => note("drop", db.drop_branch(&name)),
+            6 => {
+                let result = db.branch(&name).and_then(|branch| {
+                    db.merge_with(&branch, |kv, base, theirs| {
+                        kv.merge(base, theirs, |conflict| conflict.keep_ours());
+                        ("merge", ())
+                    })
+                    .map(drop)
+                });
+                note("merge", result);
+            }
+            7 => {
+                let back = db.version().saturating_sub(1 + rng.below(3));
+                let result = db
+                    .at(back)
+                    .and_then(|snapshot| db.restore(&snapshot).map(drop));
+                note("restore", result);
+            }
+            8 => {
+                let result = db.commit_stamped(|kv, stamp| {
+                    kv.insert(1000 + who, stamp.time_ms());
+                    ("stamped", ())
+                });
+                note("stamped", result.map(drop));
+            }
+            9 => match who == 0 && rng.chance(30) {
+                true => note("compact", db.compact(keep).map(drop)),
+                false => note("refresh", db.refresh().map(drop)),
+            },
+            _ => {
+                let key = 500 + rng.below(16);
+                remote.update(|kv| drop(kv.insert(key, value))).unwrap();
+                let tracking = format!("r{who}");
+                let pulled = db.pull(&remote, &tracking, merge_keeping_ours);
+                note("pull", pulled.map(drop));
+            }
+        }
+    }
+    if let Err(error) = db.verify() {
+        odd.push(format!("{who} verify at the end: {error:?}"));
+    }
+    odd
+}
+
+#[test]
+fn three_handles_that_fork_drop_merge_restore_pull_and_cycle_meet_only_expected_errors() {
+    for round in 0..u64::from(common::cases(4)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("churn.ferro");
+        drop(manual().open::<Kv>(&path).unwrap());
+        let (done, finished) = mpsc::channel();
+        for who in 0..3u64 {
+            let path = path.clone();
+            let done = done.clone();
+            thread::spawn(move || done.send(churn(&path, who, 400, round * 10 + who + 1)));
+        }
+        let mut odd = Vec::new();
+        for _ in 0..3 {
+            let found = finished.recv_timeout(Duration::from_secs(120));
+            odd.extend(found.expect("a handle hung or panicked"));
+        }
+        let db: Db<Kv> = fast()
+            .reclaim(Reclaim { every_bytes: 0 })
+            .open(&path)
+            .unwrap();
+        if let Err(error) = db.verify_typed() {
+            odd.push(format!("verify_typed after a reopen: {error:?}"));
+        }
+        assert!(odd.is_empty(), "round {round}: {odd:#?}");
+    }
+}

@@ -287,6 +287,19 @@ reclamation cycle. After three, the caller gets `StaleHave` and decides, as it w
 only the caller can fetch another. The `Pulled` a pull returns describes the attempt that landed:
 its have, its bundle and their bytes.
 
+A have names what the branch table as last published holds, and a shared writer publishes another
+process's commits only once it catches up. So under `Options::shared` `Db::have` catches up first,
+as `Db::branch` does. Before, a have named a branch or a commit that another process had since
+dropped or pruned for as long as this process did not commit, attach a branch or refresh. The
+landing catches up under the writer locks, found the base gone and returned `StaleHave`, but its
+catch-up was never published, so each retry built the same have, all three attempts failed, and
+so did every `receive` of a bundle built from a fresh have (#129).
+`a_pull_after_another_handle_dropped_its_tracking_branch_lands` and
+`a_pull_after_another_handle_pulled_into_its_tracking_branch_and_pruned_it_lands` in
+`ferro/tests/shared.rs` drop the tracking branch, or pull into it from a handle that keeps one
+commit, before the other handle pulls, and then build a have, drop the branch under it and expect
+`StaleHave` from the `receive` and a landing from the next have.
+
 `a_try_pull_retries_a_stale_have_before_its_error_type_and_returns_its_merge_error_once` and
 `a_push_whose_base_goes_before_it_lands_tries_again_and_merges_once` in `ferro/tests/sync.rs` prune
 the base once, the first before the bundle is read and the second once it is staged, and expect one

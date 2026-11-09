@@ -3371,11 +3371,15 @@ impl<T: Data> Db<T> {
     ///
     /// It names the head of every branch in the file, and commits along this branch at doubling
     /// distances back from its head, so the other side can find the newest commit both hold. It is
-    /// a few hundred bytes.
+    /// a few hundred bytes. With [`Options::shared`](crate::Options::shared) it first catches up
+    /// with commits from other processes, so it names no commit that another process has dropped
+    /// or pruned since this one last caught up, except from a `decode` or a `Drop` that runs while
+    /// this handle holds the whole file, where it names what was last published.
     ///
     /// # Errors
     ///
-    /// Read errors from the branch table or the log.
+    /// Read errors from the branch table or the log, and with
+    /// [`Options::shared`](crate::Options::shared) the errors of [`Db::refresh`].
     ///
     /// # Examples
     ///
@@ -3410,6 +3414,7 @@ impl<T: Data> Db<T> {
     /// # }
     /// ```
     pub fn have(&self) -> Result<Have> {
+        self.caught_up()?;
         let (store, refs) = self.published_refs();
         let mut marks = Vec::new();
         for (_, head) in refs.try_entries()? {

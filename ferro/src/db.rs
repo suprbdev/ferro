@@ -5553,6 +5553,26 @@ impl<T: Data> Db<T> {
         reentry::check(self.shared.id, self.shared.coalesce, needs)
     }
 
+    /// With [`Options::shared`], catches up with the commits of other processes and publishes
+    /// them, as [`Db::branch`] does, so that the branch table as last published is no older than
+    /// the file was when this was called. It does nothing otherwise, nor where this thread holds
+    /// a lock that taking `tip` could wait for, as a decode or a `Drop` run under the whole file
+    /// does, so that the published table stays readable there.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::refresh`], but for [`Error::Reentrant`].
+    pub(crate) fn caught_up(&self) -> Result<()> {
+        if !self.shared.options.shared {
+            return Ok(());
+        }
+        match self.entering(Needs::Tip) {
+            Ok(_crossing) => self.shared.catch_up(&mut Vec::new()).map(drop),
+            Err(Error::Reentrant) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The current store and the branch table as last published.
     pub(crate) fn published_refs(&self) -> (Store, Refs) {
         let published = self.shared.published.lock();

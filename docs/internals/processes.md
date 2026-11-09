@@ -269,7 +269,7 @@ each from inside some 14,000 kept frames, one thread took 166 ms where it takes 
 threads 726 where they take 29.
 
 Catching up happens when a process takes a branch lock, before it places a frame, on each
-`Db::branch`, before each pass of a cycle and on `refresh`, and on a look of a
+`Db::branch` and `Db::have`, before each pass of a cycle and on `refresh`, and on a look of a
 [follower](#followers) that finds a superblock naming a frame past its own. A process that does none
 of these sees nothing new, as a read-only handle that never refreshes sees nothing new.
 
@@ -747,6 +747,9 @@ nothing in the file, and leave the live handle's next commit and a reopen with e
 commit. And it leaves a dead writer's near copy behind a stale marker, which the next writer must
 truncate and sync before it writes. A read-only and a shared follower each hold a snapshot and a
 half-read iterator across three cycles of another handle and read them to the end.
+Three handles with different `Keep`s fork, drop, merge, restore, pull and make stamped commits on
+a few shared names while one of them cycles, and must meet only the errors those calls promise and
+leave a file that passes `verify_typed`.
 Each test added for a finding of the review failed before its fix, as described above.
 A unit test in `ferro/src/store.rs` holds the placement lock while two
 shared writers open a Buffered file whose superblock names a frame past its anchor that reads as
