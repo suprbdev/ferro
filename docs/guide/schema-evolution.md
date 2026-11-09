@@ -10,6 +10,12 @@ the struct:
   `List` and `Table` start empty, a `Box` or `Arc` of one of them does too, and anything else takes
   `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
 - To rename a field, use `#[ferro(rename = "old_name")]`.
+- A field's type can change only to one that encodes the same: a `Box`, an `Arc` or a
+  `#[ferro(transparent)]` newtype of it, or `Bytes` for a `Vec<u8>`. A read decodes each field it
+  knows to its end, so a new type that reads less than old data holds there fails with
+  `Error::Decode` rather than dropping the rest.
+- A variant can be added, renamed with `#[ferro(rename = "old_name")]` or removed, and its fields
+  follow the rules above. Old data that holds a removed variant fails to decode.
 
 A field or variant written as a raw identifier, such as `r#type`, is stored under its name without
 the `r#`, here `type`, and its indexes and lookups are named the same way, as `by_type`. Earlier

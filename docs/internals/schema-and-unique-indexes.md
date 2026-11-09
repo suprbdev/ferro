@@ -10,7 +10,9 @@ types](../guide/schema-evolution.md) and [Tables and indexes](../guide/tables.md
 
 The derive macro writes structs as `(tag, length, payload)` fields, where the tag is a 16-bit FNV-1a
 hash of the field name. Fields are sorted by tag, so reordering a struct does not change its hash.
-Unknown fields are skipped. Missing fields use `Data::missing`, or `#[ferro(default)]`.
+Unknown fields are skipped. Missing fields use `Data::missing`, or `#[ferro(default)]`. Tags must
+strictly ascend, and a field the type knows must decode to its end, as [One encoding for each
+value](storage.md#one-encoding-for-each-value) describes; a table's index fields share one tag.
 `#[ferro(rename = "old")]` keeps the old tag. A table's indexes are not told apart by tag, as
 described under [Index fingerprints](#index-fingerprints).
 

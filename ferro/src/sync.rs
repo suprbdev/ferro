@@ -1419,12 +1419,15 @@ impl Commits {
 }
 
 fn decode_commit(object: &Object) -> Result<Entry> {
-    let entry =
-        Entry::decode(&mut Decoder::new(&object.body, &object.links, None)).map_err(|error| {
-            bad(format!(
-                "an object it links as a commit is not one: {error}"
-            ))
-        })?;
+    let mut decoder = Decoder::new(&object.body, &object.links, None);
+    let entry = Entry::decode(&mut decoder).map_err(|error| {
+        bad(format!(
+            "an object it links as a commit is not one: {error}"
+        ))
+    })?;
+    if decoder.remaining() != 0 {
+        return Err(bad("a commit carries bytes past its end"));
+    }
     let used = usize::from(entry.commit.root.is_some())
         + usize::from(entry.prev.is_some())
         + usize::from(entry.skip.is_some())
@@ -3677,13 +3680,14 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a summary
-    ///   that is not the fold of its entries and one whose `of` or `combine` panics to recompute,
-    ///   and a table whose index, stored under a fingerprint this side knows, does not hold
-    ///   exactly the entries its rows give, as a peer whose schema sets index maps apart from the
-    ///   rows can send, or that holds an index under a fingerprint this side does not know, as a
-    ///   peer whose type has an index this side's lacks or declares otherwise sends, or if
-    ///   checking it would decode or read more again than its size allows,
+    /// - [`Error::Bundle`] if the bundle is malformed, damaged or forged, which includes a value
+    ///   written in a form no encoder writes, such as a varint longer than its value needs or bytes
+    ///   left after it, a summary that is not the fold of its entries and one whose `of` or
+    ///   `combine` panics to recompute, and a table whose index, stored under a fingerprint this
+    ///   side knows, does not hold exactly the entries its rows give, as a peer whose schema sets
+    ///   index maps apart from the rows can send, or that holds an index under a fingerprint this
+    ///   side does not know, as a peer whose type has an index this side's lacks or declares
+    ///   otherwise sends, or if checking it would decode or read more again than its size allows,
     ///   as one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a
     ///   `Vec<()>`, than its size allows. Nothing reaches the file.

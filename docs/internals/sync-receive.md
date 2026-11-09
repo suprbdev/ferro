@@ -275,7 +275,9 @@ written impl, a `Table`, `Set` or `List`, reports where its nodes are. A node ch
 keys, checks that they ascend, that each hashes to the node's level and that they fall inside the
 range the parent gives the node, visits the inline values and summaries, and reports each spilled
 value as a `V` and each child as a node one level down at most, with the separators around it as its
-range. It returns the node's count and level, which must match what the link claimed.
+range. It returns the node's count and level, which must match what the link claimed. Any object
+with bytes or links left after what its type reads is refused, as is a value in a form no encoder
+writes, as [One encoding for each value](storage.md#one-encoding-for-each-value) describes.
 
 The receive check is a worklist that starts at each new commit's root as `T`, oldest commit first,
 and runs each root's tree to the end before the next. A link to a sent object checks that object as

@@ -270,7 +270,7 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
         quote! {
             #tag => {
                 #seen = true;
-                <#ty as ::ferro::Data>::visit(__r)
+                ::ferro::codec::visit_field::<#ty>(__r)
             }
         }
     });
@@ -424,6 +424,15 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
             "transparent needs a struct with one field",
         ));
     };
+    for attr in data.fields.iter().flat_map(|field| &field.attrs) {
+        let attrs = parse_attrs(std::slice::from_ref(attr))?;
+        if attrs.rename.is_some() || !matches!(attrs.fallback, Fallback::Required) {
+            return Err(syn::Error::new(
+                attr.span(),
+                "a transparent struct stores its field as itself, with no name and no default, so the field takes no rename, default or skip",
+            ));
+        }
+    }
     let (access, other) = match &field.ident {
         Some(ident) => (quote! { &self.#ident }, quote! { &__other.#ident }),
         None => (quote! { &self.0 }, quote! { &__other.0 }),
@@ -546,6 +555,12 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
             let mut removed_fields = Vec::new();
             for variant in &data.variants {
                 let attrs = parse_attrs(&variant.attrs)?;
+                if !matches!(attrs.fallback, Fallback::Required) {
+                    return Err(syn::Error::new(
+                        variant.span(),
+                        "default and skip apply to fields; a variant takes rename and removed",
+                    ));
+                }
                 variant_names.push(
                     attrs
                         .rename
@@ -776,6 +791,10 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///   `BTreeMap`, `BTreeSet`, `Bytes`, `Map`, `Set`, `List` and `Table` start empty, and `Box` and
 ///   `Arc` follow what they hold. Any other field needs `#[ferro(default)]`, or the read fails with
 ///   `Error::MissingField`.
+/// - A field the type has must decode whole as its type, so its type can change only to one that
+///   encodes the same, such as a `Box`, an `Arc` or a transparent newtype of it, or `Bytes` for a
+///   `Vec<u8>`. A field whose type reads less than it holds fails to decode with `Error::Decode`,
+///   and so do fields stored out of order of tag, which no encoder writes.
 ///
 /// Tuple fields are named by position, `0`, `1` and so on, and a unit struct stores no fields. An
 /// enum stores a tag hashed from the variant's name, then the variant's fields as a struct's, so
@@ -803,7 +822,19 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// | `#[ferro(default = "path::to::function")]` | Data that lacks the field reads it as `path::to::function()`. |
 /// | `#[ferro(skip)]` | The field is not stored, and every read gives `Default::default()`. |
 ///
-/// On an enum variant, `#[ferro(rename = "name")]` stores the variant under `name`.
+/// On an enum variant, `#[ferro(rename = "name")]` stores the variant under `name`. `default` and
+/// `skip` belong to fields, and a variant marked with either fails to compile:
+///
+/// ```compile_fail
+/// use ferro::Data;
+///
+/// #[derive(Data, Clone)]
+/// enum Mode {
+///     On,
+///     #[ferro(skip)]
+///     Off,
+/// }
+/// ```
 ///
 /// On a struct, an enum or an enum variant, `#[ferro(removed("name", ...))]` lists the stored
 /// names of the fields, or on an enum the variants, that it once had and no longer has. A tag is
@@ -816,7 +847,17 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///
 /// On a struct with exactly one field, `#[ferro(transparent)]` stores the struct as that field
 /// alone, with no tag, and describes it as that field, so a newtype costs nothing over what it
-/// wraps and wrapping a field in one leaves its encoding and its indexes as they were.
+/// wraps and wrapping a field in one leaves its encoding and its indexes as they were. The field
+/// is stored with no name and read whenever the struct is, so `rename`, `default` and `skip` on
+/// it fail to compile:
+///
+/// ```compile_fail
+/// use ferro::Data;
+///
+/// #[derive(Data, Clone)]
+/// #[ferro(transparent)]
+/// struct Cache(#[ferro(skip)] u32);
+/// ```
 ///
 /// Options can share one attribute, as in `#[ferro(rename = "total", default)]`. Any other option
 /// is a compile error, and so are two fields, or two variants, whose stored names hash to the same
@@ -2226,7 +2267,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
-                #(::std::option::Option::Some(#slots) => #vars = ::std::option::Option::Some(::ferro::Data::decode(__r)?),)*
+                #(::std::option::Option::Some(#slots) => ::ferro::codec::decode_into(&mut #vars, __r)?,)*
                 _ => __unknown = true,
             },
         }
@@ -2236,7 +2277,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
-                #(::std::option::Option::Some(#slots) => <#map_tys as ::ferro::Data>::visit(__r)?,)*
+                #(::std::option::Option::Some(#slots) => ::ferro::codec::visit_field::<#map_tys>(__r)?,)*
                 _ => {}
             },
         }
@@ -2290,9 +2331,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut __unknown = false;
         let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
         #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
-        __r.fields(|__tag, __r| {
+        __r.fields_sharing_tags(|__tag, __r| {
             match __tag {
-                #rows_tag => __rows = ::std::option::Option::Some(::ferro::Data::decode(__r)?),
+                #rows_tag => ::ferro::codec::decode_into(&mut __rows, __r)?,
                 #decode_arm
                 _ => {}
             }
@@ -2301,9 +2342,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
     let visit_fields = quote! {
         #fingerprints_of
-        __r.fields(|__tag, __r| {
+        __r.fields_sharing_tags(|__tag, __r| {
             match __tag {
-                #rows_tag => <#rows_ty as ::ferro::Data>::visit(__r)?,
+                #rows_tag => ::ferro::codec::visit_field::<#rows_ty>(__r)?,
                 #visit_arm
                 _ => {}
             }

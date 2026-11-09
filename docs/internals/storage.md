@@ -21,6 +21,48 @@ Everything on disk is an `Object { body, links }`. A link is a `Ptr { hash, offs
 one. `Map::value_hash(&key)` returns the same hash, from the stored pointer without reading a
 spilled value, or by encoding an inline value that is already in memory.
 
+### One encoding for each value
+
+A value's hash is the hash of its encoding, so equal values must reach the file in one form: `==` on
+collections, the skip of a commit that changes nothing, `Map::value_hash`, `diff` and merges compare
+hashes or encodings. Every encoder writes one form, and decoding refuses, with `Error::Decode`, the
+other forms a damaged file or a bundle could hold:
+
+- A varint longer than its value needs, which ends in a zero byte. `Decoder::varint` checks the
+  last byte of a varint of two bytes or more, as the record reader does, and a one-byte varint
+  costs nothing more.
+- Keys of a `BTreeMap` or `BTreeSet` that do not strictly ascend: a key out of order, or one stored
+  twice, of which the map kept the last and dropped the other.
+- Struct fields whose tags do not strictly ascend, so a field stored twice no longer overwrites the
+  first, a field the derive knows that its type does not read to the end, and a field that flags
+  links and holds none.
+- In the checks of a receive and of `verify_typed`, an object with bytes or links left after its
+  value, and in a receive, a commit with bytes left after it.
+
+A bundle that spelled a value in one of these forms used to land and pass `verify_typed`: a map it
+held compared unequal to a map with the same entries, and `value_hash` differed from the `hash_of`
+the value it returned (#134). Such a bundle is now refused with `Error::Bundle`.
+
+What schema evolution needs stays as it was. A field whose tag the type does not know is skipped
+whatever it holds, which is how a removed field and a field from a newer version of the type read. A
+missing field reads as its default, an unknown variant tag fails as before, and a `Box`, an `Arc`,
+a transparent newtype or `Bytes` in place of a `Vec<u8>` read what the field held, since they
+encode alike. A table stores every index under one tag, so it reads its fields with
+`Decoder::fields_sharing_tags`, which lets tags repeat but not descend, and still skips an index
+under a fingerprint its type does not know. A local read of a root, a node or a spilled value does
+not check that the object ends where its value does: bytes left over change no value read from it,
+`verify_typed` reports them, and `admin::space` reads roots as a type that reads nothing. A
+hand-written impl that reads a field through `Decoder::fields` can call `Decoder::end` on it, as
+the derive does.
+
+The varint check is the only one on the paths a read takes all the time. Against the build before
+it, with each binary run alternately, three or four times, decoding a million large `u64`s took
+161.5 instructions a value against 159.0, medium ones 90.0 against 87.8, and `(u32, u32)` pairs
+199.1 against 195.1, with times within the spread of the runs except the pairs, 7.8 ns against 7.5.
+A cold scan of a `Map<u64, u64>` took 1,113 instructions a key against 1,108, and gets,
+warm scans, single-key commits, a bulk load and the table workload of `make bench` moved by under
+0.5%, within the spread of the instruction counts between runs.
+
 Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
 instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage
 resistance, which is what tamper evidence on read needs, is 2^160. Collision resistance is 2^80

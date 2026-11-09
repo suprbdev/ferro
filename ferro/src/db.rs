@@ -5540,11 +5540,11 @@ impl<T: Data> Db<T> {
     ///
     /// # Errors
     ///
-    /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode
-    /// or does not fit its parent, which includes a summary that is not the fold of its entries
-    /// and one whose `of` or `combine` panics to recompute, or a table whose index holds other
-    /// entries than its rows give, whose row is stored under a key other than its own, or two of
-    /// whose rows share a value of a unique index.
+    /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode,
+    /// holds bytes or links its value does not read, or does not fit its parent, which includes a
+    /// summary that is not the fold of its entries and one whose `of` or `combine` panics to
+    /// recompute, or a table whose index holds other entries than its rows give, whose row is
+    /// stored under a key other than its own, or two of whose rows share a value of a unique index.
     pub fn verify_typed(&self) -> Result<Verified> {
         let (head, refs, store) = {
             let published = self.shared.published.lock();

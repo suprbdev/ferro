@@ -581,3 +581,90 @@ fn mutated_bundles_are_refused_or_read_back_whole() {
     );
     assert!(target.refused > 0);
 }
+
+const MARKER: &str = "a value no other object holds";
+
+fn received_after(value: &str, edit: impl Fn(&[u8]) -> Option<Vec<u8>>) -> ferro::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let sender: Db<Map<u64, String>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let receiver: Db<Map<u64, String>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    sender
+        .update(|map| {
+            map.insert(7, value.to_string());
+        })
+        .unwrap();
+    let mut parsed = Parsed::of(&sender.bundle(&receiver.have().unwrap()).unwrap());
+    let old: Vec<Hash> = parsed.objects.iter().map(Wire::hash).collect();
+    let mut edited = 0;
+    for object in &mut parsed.objects {
+        if let Some(body) = edit(&object.body) {
+            object.body = body;
+            edited += 1;
+        }
+    }
+    assert!(edited <= 1);
+    parsed.rehash(old);
+    receiver.receive("a", &parsed.encode(), |_, _, _| -> (String, ()) {
+        panic!("no merge expected")
+    })?;
+    let ours = receiver.read();
+    let theirs = sender.read();
+    assert_eq!(ours.root_hash(), theirs.root_hash());
+    receiver.verify_typed().map(drop)
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[test]
+fn a_bundle_holding_a_value_in_a_form_no_encoder_writes_is_refused() {
+    received_after(MARKER, |_| None).unwrap();
+    let mut length = vec![MARKER.len() as u8];
+    length.extend_from_slice(MARKER.as_bytes());
+    let overlong = received_after(MARKER, |body| {
+        let at = find(body, &length)?;
+        let mut out = body[..at].to_vec();
+        out.extend_from_slice(&[MARKER.len() as u8 | 0x80, 0x00]);
+        out.extend_from_slice(&body[at + 1..]);
+        Some(out)
+    });
+    assert!(matches!(overlong, Err(Error::Bundle(_))), "{overlong:?}");
+    let trailing = received_after(MARKER, |body| {
+        find(body, MARKER.as_bytes())?;
+        let mut out = body.to_vec();
+        out.push(0);
+        Some(out)
+    });
+    assert!(matches!(trailing, Err(Error::Bundle(_))), "{trailing:?}");
+}
+
+#[test]
+fn a_bundle_holding_a_spilled_value_in_a_form_no_encoder_writes_is_refused() {
+    let value = MARKER.repeat(30);
+    let canonical = {
+        let mut sink = ferro::codec::HashSink;
+        let mut encoder = ferro::codec::Encoder::new(&mut sink);
+        value.encode(&mut encoder).unwrap();
+        encoder.into_object().body
+    };
+    received_after(&value, |_| None).unwrap();
+    let overlong = received_after(&value, |body| {
+        (body == canonical.as_slice()).then(|| {
+            let mut out = canonical.clone();
+            out.splice(1..2, [canonical[1] | 0x80, 0x00]);
+            out
+        })
+    });
+    assert!(matches!(overlong, Err(Error::Bundle(_))), "{overlong:?}");
+    let trailing = received_after(&value, |body| {
+        (body == canonical.as_slice()).then(|| {
+            let mut out = canonical.clone();
+            out.push(0);
+            out
+        })
+    });
+    assert!(matches!(trailing, Err(Error::Bundle(_))), "{trailing:?}");
+}

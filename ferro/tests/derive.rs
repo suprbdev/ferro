@@ -667,3 +667,171 @@ fn a_raw_identifier_is_stored_under_its_name_without_the_prefix() {
         PlainVariant::Kind(4)
     );
 }
+
+#[derive(Clone, Debug, PartialEq, Data)]
+struct Point {
+    x: u32,
+    y: u32,
+}
+
+fn field_record(out: &mut Vec<u8>, tag: u16, value: &[u8]) {
+    out.extend_from_slice(&tag.to_le_bytes());
+    out.push((value.len() as u8) << 1);
+    out.extend_from_slice(value);
+}
+
+fn refused_as<T: Data + std::fmt::Debug>(stored: &[u8]) {
+    let decoded = T::decode(&mut Decoder::new(stored, &[], None));
+    assert!(
+        matches!(decoded, Err(ferro::Error::Decode(_))),
+        "{stored:02x?} decoded as {decoded:?}"
+    );
+    let visited = T::visit(&mut Decoder::new(stored, &[], None));
+    assert!(
+        matches!(visited, Err(ferro::Error::Decode(_))),
+        "{stored:02x?} passed a visit"
+    );
+}
+
+#[test]
+fn fields_stored_out_of_order_twice_or_with_bytes_left_over_are_refused() {
+    use ferro::codec::field_tag;
+    let (x, y) = (field_tag("x"), field_tag("y"));
+    assert!(x < y);
+    let mut canonical = vec![2];
+    field_record(&mut canonical, x, &[1]);
+    field_record(&mut canonical, y, &[2]);
+    assert_eq!(canonical, bytes(&Point { x: 1, y: 2 }));
+
+    let mut swapped = vec![2];
+    field_record(&mut swapped, y, &[2]);
+    field_record(&mut swapped, x, &[1]);
+    refused_as::<Point>(&swapped);
+
+    let mut twice = vec![3];
+    field_record(&mut twice, x, &[9]);
+    field_record(&mut twice, x, &[1]);
+    field_record(&mut twice, y, &[2]);
+    refused_as::<Point>(&twice);
+
+    let mut padded = vec![2];
+    field_record(&mut padded, x, &[1, 0xEE]);
+    field_record(&mut padded, y, &[2]);
+    refused_as::<Point>(&padded);
+
+    let mut flagged = vec![2];
+    flagged.extend_from_slice(&x.to_le_bytes());
+    flagged.extend_from_slice(&[(1 << 1) | 1, 0, 1]);
+    field_record(&mut flagged, y, &[2]);
+    refused_as::<Point>(&flagged);
+
+    let mut unknown = vec![3];
+    field_record(&mut unknown, x, &[1]);
+    field_record(&mut unknown, x + 1, &[0xEE, 0xEE]);
+    field_record(&mut unknown, y, &[2]);
+    assert_eq!(
+        Point::decode(&mut Decoder::new(&unknown, &[], None)).unwrap(),
+        Point { x: 1, y: 2 }
+    );
+    Point::visit(&mut Decoder::new(&unknown, &[], None)).unwrap();
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+enum Kind1 {
+    Plain,
+    Dropped(u8),
+    Fancy { level: u8 },
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+struct Post1 {
+    id: u64,
+    title: String,
+    gone: Vec<u32>,
+    blob: Vec<u8>,
+    cents: u32,
+    boxed: (u8, String),
+    kind: Kind1,
+    tag: u16,
+}
+
+#[derive(Data, Clone, Copy, Debug, PartialEq)]
+#[ferro(transparent)]
+struct Cents(u32);
+
+#[derive(Data, Clone, Debug, PartialEq)]
+#[ferro(removed("Dropped"))]
+enum Kind2 {
+    Added(u8),
+    Fancy {
+        #[ferro(default)]
+        extra: u8,
+        level: u8,
+    },
+    Plain,
+}
+
+#[derive(Data, Clone, Debug, PartialEq)]
+#[ferro(removed("gone"))]
+struct Post2 {
+    kind: Kind2,
+    #[ferro(rename = "title")]
+    heading: String,
+    id: u64,
+    blob: Bytes,
+    cents: Cents,
+    boxed: Box<(u8, String)>,
+    tag: std::sync::Arc<u16>,
+    note: Option<String>,
+    tags: Vec<String>,
+    counts: std::collections::BTreeMap<u8, u8>,
+    seen: BTreeSet<u8>,
+    raw: Bytes,
+    index: ferro::Map<u64, u64>,
+    #[ferro(default)]
+    count: u32,
+    #[ferro(default = "seven")]
+    lucky: u32,
+    #[ferro(skip)]
+    cached: u64,
+}
+
+#[test]
+fn every_documented_evolution_step_still_reads_old_data() {
+    let old = Post1 {
+        id: 4,
+        title: "hello".into(),
+        gone: vec![1, 2, 3],
+        blob: vec![9, 8],
+        cents: 250,
+        boxed: (1, "inside".into()),
+        kind: Kind1::Fancy { level: 3 },
+        tag: 300,
+    };
+    let stored = bytes(&old);
+    Post2::visit(&mut Decoder::new(&stored, &[], None)).unwrap();
+    let new: Post2 = reread(&old).unwrap();
+    assert_eq!(new.kind, Kind2::Fancy { extra: 0, level: 3 });
+    assert_eq!(new.heading, "hello");
+    assert_eq!(new.id, 4);
+    assert_eq!(&new.blob[..], [9, 8]);
+    assert_eq!(new.cents, Cents(250));
+    assert_eq!(*new.boxed, (1, "inside".to_string()));
+    assert_eq!(*new.tag, 300);
+    assert_eq!(new.note, None);
+    assert!(new.tags.is_empty() && new.counts.is_empty() && new.seen.is_empty());
+    assert!(new.raw.is_empty() && new.index.is_empty());
+    assert_eq!((new.count, new.lucky, new.cached), (0, 7, 0));
+    for kind in [Kind1::Plain, Kind1::Fancy { level: 1 }] {
+        let stored = bytes(&kind);
+        Kind2::visit(&mut Decoder::new(&stored, &[], None)).unwrap();
+        reread::<_, Kind2>(&kind).unwrap();
+    }
+    assert!(matches!(
+        reread::<_, Kind2>(&Kind1::Dropped(1)),
+        Err(ferro::Error::Decode(_))
+    ));
+    let again = bytes(&new);
+    let back = Post2::decode(&mut Decoder::new(&again, &[], None)).unwrap();
+    assert_eq!(bytes(&back), again);
+}

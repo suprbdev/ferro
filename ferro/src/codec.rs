@@ -330,7 +330,14 @@ impl Sink for HashSink {
 /// - **The encoding is canonical.** It depends only on the value, never on how the value was
 ///   built, its capacity or what it shared. Root hashes, `==` on collections, the skip of a
 ///   commit that changes nothing, [`Map::diff`](crate::Map::diff) and merges all go by
-///   encodings, so a value that encodes two ways looks changed when it is not.
+///   encodings, so a value that encodes two ways looks changed when it is not. Decoding reads a
+///   value only from the one form its encoder writes: the impls ferro provides refuse a varint
+///   longer than its value needs and the keys of a `BTreeMap` or `BTreeSet` that do not strictly
+///   ascend, [`Decoder::fields`] refuses fields out of order of tag, the derive refuses a field
+///   its type does not read to the end, and the checks of [`Db::receive`](crate::Db::receive)
+///   and [`Db::verify_typed`](crate::Db::verify_typed) refuse an object with bytes or links left
+///   after its value. A hand-written impl that reads fields with [`Decoder::fields`] can call
+///   [`Decoder::end`] on each field it knows, as the derive does.
 /// - **A key's encoding agrees with its `Ord`.** A key type's values must compare equal exactly
 ///   when they encode the same. A key's place in a map's tree comes from a hash of its encoding
 ///   and its order from `Ord`, so two equal keys that encode differently can land in different
@@ -720,15 +727,29 @@ pub const fn field_tag(name: &str) -> u16 {
     ((hash >> 16) ^ (hash & 0xffff)) as u16
 }
 
-/// Decodes a value of `T` from `r` into `slot`, as the derive reads each stored field.
+/// Decodes a value of `T` from `r`, the decoder of one field, into `slot`, as the derive reads
+/// each stored field.
 ///
 /// # Errors
 ///
-/// As for [`Data::decode`].
+/// As for [`Data::decode`], and [`Error::Decode`] if the value does not read the field to its
+/// end.
 #[doc(hidden)]
 pub fn decode_into<T: Data>(slot: &mut Option<T>, r: &mut Decoder<'_>) -> Result<()> {
     *slot = Some(T::decode(r)?);
-    Ok(())
+    r.end()
+}
+
+/// Visits a value of `T` in `r`, the decoder of one field, as the derive checks each stored
+/// field.
+///
+/// # Errors
+///
+/// As for [`decode_into`].
+#[doc(hidden)]
+pub fn visit_field<T: Data>(r: &mut Decoder<'_>) -> Result<()> {
+    T::visit(r)?;
+    r.end()
 }
 
 /// The value of the field `name`: `value` if the stored data held the field, and otherwise the
@@ -1023,9 +1044,9 @@ impl<'a> Encoder<'a> {
     /// The field is written as `tag`, then a varint of the length of what `f` writes, with a flag
     /// and a count when `f` writes links, then what `f` writes, so that a reader that does not
     /// know the tag can skip it. A struct writes the number of fields with
-    /// [`varint`](Encoder::varint) and then each field in increasing order of tag, which keeps its
-    /// encoding canonical, and [`Decoder::fields`] reads them back. The derive tags each field
-    /// with the [`field_tag`] of its stored name.
+    /// [`varint`](Encoder::varint) and then each field in strictly increasing order of tag, which
+    /// keeps its encoding canonical, and [`Decoder::fields`] reads them back, refusing them in any
+    /// other order. The derive tags each field with the [`field_tag`] of its stored name.
     ///
     /// # Errors
     ///
@@ -1084,6 +1105,27 @@ const MAX_EMPTY_ITEMS: u64 = 1 << 24;
 #[cold]
 fn too_deep() -> Error {
     Error::Decode(format!("a value nests deeper than {MAX_DEPTH} levels"))
+}
+
+/// The error of a varint that takes more bytes than its value needs.
+#[cold]
+fn overlong() -> Error {
+    Error::Decode("overlong varint".into())
+}
+
+/// The error of a `BTreeMap` or `BTreeSet` whose keys do not strictly ascend.
+#[cold]
+fn unsorted() -> Error {
+    Error::Decode("keys are stored out of order or more than once".into())
+}
+
+/// The error of a value that did not read all of what holds it: `bytes` bytes and `links` links
+/// left over.
+#[cold]
+fn unread(bytes: usize, links: usize) -> Error {
+    Error::Decode(format!(
+        "{bytes} bytes and {links} links are left after the value"
+    ))
 }
 
 /// The most entries each generation of a [`Recalled`] keeps.
@@ -1978,7 +2020,7 @@ impl Kind {
     /// # Errors
     ///
     /// Returns the error of the first part that does not decode, or does not meet what the kind
-    /// asks of it.
+    /// asks of it, and [`Error::Decode`] for an object with bytes or links left after it.
     pub(crate) fn check(
         &self,
         body: &[u8],
@@ -2015,6 +2057,7 @@ impl Kind {
         decoder.found = Some(&found);
         decoder.tables = tables;
         let shape = (self.check)(self, &mut decoder)?;
+        decoder.end()?;
         let zero_width = decoder.zero_width();
         Ok((shape, found.into_inner(), zero_width))
     }
@@ -2038,6 +2081,7 @@ impl Kind {
         let mut decoder = Decoder::new(body, links, Some(store));
         decoder.recalled = recalled;
         let shape = (self.check)(self, &mut decoder)?;
+        decoder.end()?;
         Ok((shape, decoder.zero_width()))
     }
 }
@@ -2299,6 +2343,21 @@ impl<'a> Decoder<'a> {
         self.buf.len() - self.pos
     }
 
+    /// Checks that every byte of the body and every link has been read, as they are once the value
+    /// that fills an object, or a field that [`fields`](Decoder::fields) hands over, has been
+    /// decoded from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Decode`] if bytes or links are left.
+    #[inline]
+    pub fn end(&self) -> Result<()> {
+        if self.pos != self.buf.len() || self.cursor != self.links.len() {
+            return Err(unread(self.remaining(), self.links.len() - self.cursor));
+        }
+        Ok(())
+    }
+
     /// Whether what is left of the body is exactly one varint, as the body of a map without a
     /// summary is, which lets the branch table tell a whole table from a step on top of one.
     pub(crate) fn lone_varint(&self) -> bool {
@@ -2372,7 +2431,9 @@ impl<'a> Decoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Decode`] for a varint that runs past the end of the body or past 64 bits.
+    /// Returns [`Error::Decode`] for a varint that runs past the end of the body or past 64 bits,
+    /// and for one that takes more bytes than its value needs, which ends in a zero byte, so that
+    /// a value is read from the one form an encoder writes for it.
     #[inline]
     pub fn varint(&mut self) -> Result<u64> {
         match self.buf.get(self.pos) {
@@ -2393,6 +2454,9 @@ impl<'a> Decoder<'a> {
             }
             value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
+                if byte == 0 {
+                    return Err(overlong());
+                }
                 self.pos += index + 1;
                 return Ok(value);
             }
@@ -2528,20 +2592,51 @@ impl<'a> Decoder<'a> {
         self.store.map(Store::share)
     }
 
-    /// Reads a struct's fields as [`Encoder::field`] wrote them: a varint count, then each field.
+    /// Reads a struct's fields as [`Encoder::field`] wrote them: a varint count, then each field,
+    /// in strictly increasing order of tag.
     ///
     /// `f` gets each field's tag and a decoder over that field's bytes and links alone. What `f`
     /// leaves unread is skipped, so a field the type no longer has can be ignored, and a missing
-    /// field is one whose tag never comes.
+    /// field is one whose tag never comes. The derive reads each field it knows to its end, and
+    /// refuses one that its type does not read whole, as [`end`](Decoder::end) checks.
     ///
     /// # Errors
     ///
     /// Returns the error of `f`, and [`Error::Decode`] if a field runs past the end of the body or
-    /// the links.
-    pub fn fields(&mut self, mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>) -> Result<()> {
+    /// the links, flags links and holds none, or has a tag no greater than the one before it.
+    pub fn fields(&mut self, f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>) -> Result<()> {
+        self.read_fields(false, f)
+    }
+
+    /// Reads fields as [`fields`](Decoder::fields) does, but lets several fields in a row share
+    /// a tag, as a table stores each of its indexes under one tag.
+    ///
+    /// # Errors
+    ///
+    /// As for [`fields`](Decoder::fields), refusing a tag lower than the one before it.
+    #[doc(hidden)]
+    pub fn fields_sharing_tags(
+        &mut self,
+        f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>,
+    ) -> Result<()> {
+        self.read_fields(true, f)
+    }
+
+    fn read_fields(
+        &mut self,
+        sharing: bool,
+        mut f: impl FnMut(u16, &mut Decoder<'a>) -> Result<()>,
+    ) -> Result<()> {
         let count = self.varint()?;
+        let mut floor = 0u32;
         for _ in 0..count {
             let (tag, body, links) = self.field_parts()?;
+            if u32::from(tag) < floor {
+                return Err(Error::Decode(format!(
+                    "field tag {tag} is stored out of order"
+                )));
+            }
+            floor = u32::from(tag) + u32::from(!sharing);
             let mut sub = Decoder {
                 buf: body,
                 pos: 0,
@@ -2591,7 +2686,10 @@ impl<'a> Decoder<'a> {
         let tag = self.u16()?;
         let prefix = self.varint()?;
         let link_count = if prefix & 1 == 1 {
-            self.varint()? as usize
+            match self.varint()? {
+                0 => return Err(Error::Decode("a field flags links it does not hold".into())),
+                count => count as usize,
+            }
         } else {
             0
         };
@@ -3242,6 +3340,9 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
             let mut out = BTreeMap::new();
             for _ in 0..len {
                 let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
+                if out.last_key_value().is_some_and(|(last, _)| *last >= key) {
+                    return Err(unsorted());
+                }
                 out.insert(key, value);
             }
             r.tree::<K, V>(out.len());
@@ -3252,9 +3353,14 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
         r.nested(|r| {
             let len = r.varint()?;
+            let mut last: Option<K> = None;
             for _ in 0..len {
                 r.item(|r| {
-                    K::visit(r)?;
+                    let key = K::decode(r)?;
+                    if last.as_ref().is_some_and(|last| *last >= key) {
+                        return Err(unsorted());
+                    }
+                    last = Some(key);
                     V::visit(r)
                 })?;
             }
@@ -3359,7 +3465,11 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
             let len = r.varint()?;
             let mut out = BTreeSet::new();
             for _ in 0..len {
-                out.insert(r.item(T::decode)?);
+                let item = r.item(T::decode)?;
+                if out.last().is_some_and(|last| *last >= item) {
+                    return Err(unsorted());
+                }
+                out.insert(item);
             }
             r.tree::<T, ()>(out.len());
             Ok(out)
@@ -3369,8 +3479,13 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
         r.nested(|r| {
             let len = r.varint()?;
+            let mut last: Option<T> = None;
             for _ in 0..len {
-                r.item(T::visit)?;
+                let item = r.item(T::decode)?;
+                if last.as_ref().is_some_and(|last| *last >= item) {
+                    return Err(unsorted());
+                }
+                last = Some(item);
             }
             Ok(())
         })

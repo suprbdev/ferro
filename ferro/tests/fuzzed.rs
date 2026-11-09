@@ -122,7 +122,9 @@ impl Data for Opaque {
         Ok(())
     }
 
-    fn decode(_r: &mut Decoder<'_>) -> ferro::Result<Self> {
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        r.take(r.remaining())?;
+        while r.link().is_ok() {}
         Ok(Opaque)
     }
 }

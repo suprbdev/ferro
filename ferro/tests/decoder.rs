@@ -251,7 +251,7 @@ fn edge_integers_round_trip() {
 
 #[test]
 fn overlong_varints_are_rejected() {
-    let cases: [&[u8]; 5] = [
+    let cases: [&[u8]; 9] = [
         &[0xFF; 10],
         &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02],
         &[
@@ -259,6 +259,10 @@ fn overlong_varints_are_rejected() {
         ],
         &[0xFF; 3],
         &[],
+        &[0x80, 0x00],
+        &[0x85, 0x80, 0x00],
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00],
+        &[0x80, 0x80, 0x00],
     ];
     for bytes in cases {
         let mut decoder = Decoder::new(bytes, &[], None);
@@ -270,6 +274,16 @@ fn overlong_varints_are_rejected() {
         None,
     );
     assert_eq!(decoder.varint().unwrap(), u64::MAX);
+    let mut decoder = Decoder::new(
+        &[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x80, 0x01, 0x00,
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(decoder.varint().unwrap(), 1 << 63);
+    assert_eq!(decoder.varint().unwrap(), 128);
+    assert_eq!(decoder.varint().unwrap(), 0);
 }
 
 #[test]
@@ -369,9 +383,10 @@ fn field_links_stay_within_their_field() {
     let mut sink = HashSink;
     let mut encoder = Encoder::new(&mut sink);
     let links = fake_links(3);
+    assert!(field_tag("b") < field_tag("a"));
     encoder.varint(2);
     encoder
-        .field(field_tag("a"), |w| {
+        .field(field_tag("b"), |w| {
             w.varint(9);
             w.link(links[0]);
             w.link(links[1]);
@@ -379,7 +394,7 @@ fn field_links_stay_within_their_field() {
         })
         .unwrap();
     encoder
-        .field(field_tag("b"), |w| {
+        .field(field_tag("a"), |w| {
             w.link(links[2]);
             Ok(())
         })
@@ -390,7 +405,7 @@ fn field_links_stay_within_their_field() {
     let mut seen = Vec::new();
     decoder
         .fields(|tag, field| {
-            if tag == field_tag("a") {
+            if tag == field_tag("b") {
                 assert_eq!(field.varint()?, 9);
                 seen.push(field.link()?.offset);
                 seen.push(field.link()?.offset);
@@ -428,4 +443,198 @@ fn field_tag_is_stable_and_spreads() {
         .map(|n| field_tag(&format!("field_{n}")))
         .collect();
     assert!(names.len() > 980);
+}
+
+fn body_of<T: Data>(value: &T) -> Vec<u8> {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder).unwrap();
+    encoder.into_object().body
+}
+
+fn refused<T: Data + Debug>(bytes: &[u8]) {
+    let mut decoder = Decoder::new(bytes, &[], None);
+    let decoded = T::decode(&mut decoder);
+    assert!(
+        matches!(decoded, Err(ferro::Error::Decode(_))),
+        "{} decoded {bytes:02x?} as {decoded:?}",
+        std::any::type_name::<T>()
+    );
+    let mut visitor = Decoder::new(bytes, &[], None);
+    assert!(
+        matches!(T::visit(&mut visitor), Err(ferro::Error::Decode(_))),
+        "{} visited {bytes:02x?}",
+        std::any::type_name::<T>()
+    );
+}
+
+#[test]
+fn a_value_is_read_only_from_the_bytes_its_encoder_writes() {
+    refused::<u64>(&[0x80, 0x00]);
+    refused::<u32>(&[0x85, 0x80, 0x00]);
+    refused::<i64>(&[0x81, 0x00]);
+    refused::<char>(&[0xC1, 0x00]);
+    refused::<i128>(&[0x02, 0x80, 0x00]);
+    refused::<String>(&[0x81, 0x00, b'a']);
+    refused::<Vec<u8>>(&[0x81, 0x00, 7]);
+    refused::<ferro::Bytes>(&[0x81, 0x00, 7]);
+    refused::<BTreeMap<u8, u8>>(&[2, 1, 5, 1, 6]);
+    refused::<BTreeMap<u8, u8>>(&[2, 2, 0, 1, 0]);
+    refused::<BTreeSet<u8>>(&[2, 4, 4]);
+    refused::<BTreeSet<u8>>(&[2, 4, 3]);
+    refused::<BTreeSet<String>>(&[2, 1, b'b', 1, b'a']);
+    assert_eq!(
+        body_of(&BTreeMap::from([(1u8, 5u8), (2, 6)])),
+        [2, 1, 5, 2, 6]
+    );
+}
+
+type Mixed = (
+    Vec<Option<u32>>,
+    BTreeMap<u16, String>,
+    BTreeSet<i32>,
+    [u16; 3],
+    char,
+    i128,
+    (bool, u8, i16),
+    ferro::Bytes,
+);
+
+fn mixed(rng: &mut common::Rng) -> Mixed {
+    (
+        (0..rng.below(6))
+            .map(|_| rng.chance(70).then(|| (rng.next() >> rng.below(64)) as u32))
+            .collect(),
+        (0..rng.below(5))
+            .map(|_| (rng.next() as u16, "é".repeat(rng.below(3) as usize)))
+            .collect(),
+        (0..rng.below(5))
+            .map(|_| (rng.next() >> rng.below(64)) as i32)
+            .collect(),
+        [rng.next() as u16, (rng.next() >> 60) as u16, 0],
+        char::from_u32(rng.below(0xD800) as u32).unwrap(),
+        i128::from(rng.next() as i64) << rng.below(64),
+        (rng.chance(50), rng.next() as u8, rng.next() as i16),
+        ferro::Bytes::from(vec![rng.next() as u8; rng.below(4) as usize]),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(4000), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn what_decodes_whole_encodes_back_to_the_same_bytes(seed in any::<u64>()) {
+        let mut rng = common::Rng::new(seed);
+        let mut bytes = body_of(&mixed(&mut rng));
+        for _ in 0..1 + rng.below(3) {
+            if bytes.is_empty() {
+                break;
+            }
+            let at = rng.below(bytes.len() as u64) as usize;
+            match rng.below(4) {
+                0 => bytes[at] ^= 1 << rng.below(8),
+                1 => bytes[at] = rng.next() as u8,
+                2 => bytes.truncate(at),
+                _ => bytes.insert(at, rng.next() as u8),
+            }
+        }
+        let mut decoder = Decoder::new(&bytes, &[], None);
+        let decoded = Mixed::decode(&mut decoder).map(|value| (value, decoder.remaining()));
+        let mut visitor = Decoder::new(&bytes, &[], None);
+        let visited = Mixed::visit(&mut visitor).map(|()| visitor.remaining());
+        prop_assert_eq!(decoded.is_ok(), visited.is_ok());
+        if let (Ok((value, rest)), Ok(left)) = (decoded, visited) {
+            prop_assert_eq!(rest, left);
+            if rest == 0 {
+                prop_assert_eq!(body_of(&value), bytes);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
+struct Forged(Vec<u8>);
+
+impl Data for Forged {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.raw(&self.0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Forged(r.take(r.remaining())?.to_vec()))
+    }
+}
+
+fn forged_file(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forged.ferro");
+    let db = ferro::Db::<Forged>::open(&path).unwrap();
+    db.update(|root| *root = Forged(bytes.to_vec())).unwrap();
+    drop(db);
+    (dir, path)
+}
+
+fn forged_as<T: Data + Default + Debug>(bytes: &[u8]) {
+    let (_dir, path) = forged_file(bytes);
+    match ferro::Db::<T>::open(&path) {
+        Err(ferro::Error::Decode(_)) => {}
+        Err(other) => panic!("opening a forged root failed with {other}"),
+        Ok(db) => {
+            let value = db.read();
+            panic!("a forged root {bytes:02x?} read as {:?}", *value);
+        }
+    }
+}
+
+#[test]
+fn a_root_written_in_a_form_no_encoder_writes_fails_to_open() {
+    forged_as::<u64>(&[0x80, 0x00]);
+    forged_as::<BTreeMap<u8, u8>>(&[2, 1, 5, 1, 6]);
+    forged_as::<BTreeSet<String>>(&[2, 1, b'b', 1, b'a']);
+    forged_as::<Vec<String>>(&[1, 0x81, 0x00, b'a']);
+}
+
+#[test]
+fn a_root_with_bytes_after_its_value_fails_a_typed_verify() {
+    let (_dir, path) = forged_file(&[0x05, 0x07]);
+    let db = ferro::Db::<u64>::open(&path).unwrap();
+    assert_eq!(*db.read(), 5);
+    assert!(matches!(
+        db.verify_typed(),
+        Err(ferro::Error::Corrupt(message)) if message.contains("left after the value")
+    ));
+}
+
+fn forged_map(value: [u8; 2]) -> (tempfile::TempDir, ferro::Db<Map<u64, u64>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forged.ferro");
+    let db = ferro::Db::<Map<u64, [u8; 2]>>::open(&path).unwrap();
+    db.update(|map| {
+        map.insert(3, value);
+    })
+    .unwrap();
+    drop(db);
+    let db = ferro::Db::<Map<u64, u64>>::open(&path).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn a_map_node_holding_a_value_in_a_form_no_encoder_writes_fails_to_read() {
+    let (_dir, db) = forged_map([0x80, 0x00]);
+    assert!(matches!(
+        db.read().try_get(&3),
+        Err(ferro::Error::Decode(_))
+    ));
+    assert!(db.verify_typed().is_err());
+}
+
+#[test]
+fn a_map_node_with_bytes_after_its_entries_fails_a_typed_verify() {
+    let (_dir, db) = forged_map([0x05, 0x00]);
+    assert_eq!(db.read().get(&3).as_deref(), Some(&5));
+    assert!(matches!(
+        db.verify_typed(),
+        Err(ferro::Error::Corrupt(message)) if message.contains("left after the value")
+    ));
 }

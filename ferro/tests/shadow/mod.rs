@@ -153,7 +153,7 @@ impl Data for Shadow {
     fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
         let prints = fingerprints();
         let mut shadow = Shadow::default();
-        r.fields(|tag, r| {
+        r.fields_sharing_tags(|tag, r| {
             if tag == field_tag("rows") {
                 shadow.rows = Map::decode(r)?;
             } else if tag == field_tag("indexes") {
