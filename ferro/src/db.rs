@@ -35,13 +35,13 @@ use crate::graph::{self, Start};
 use crate::history::History;
 use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
-use crate::platform::{canonicalize, monotonic_ns};
+use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
 use crate::refs;
 use crate::store::{
-    Durability, Every, Followed, Frame, Held, Landing, News, Op, Retired, Settling, Store,
-    StoreOptions, Trace, Txn, lane_of, patience,
+    Durability, Followed, Frame, Gate, Held, Landing, News, Op, Retired, Settling, Store,
+    StoreOptions, Trace, Txn, lane_of,
 };
 use crate::watch::{Feed, Filter, Notice, Seats, Watcher};
 
@@ -583,7 +583,6 @@ struct Branch<T> {
 struct Lane<'a, T> {
     guard: Option<MutexGuard<'a, Slot<T>>>,
     branch: &'a Branch<T>,
-    yielding: bool,
 }
 
 impl<T> Lane<'_, T> {
@@ -603,13 +602,6 @@ impl<T> Lane<'_, T> {
         if let Some(store) = self.guard.as_mut().and_then(|slot| slot.crossed.take()) {
             store.unlock_lane(self.branch.lane_at);
         }
-    }
-
-    /// Lets the lane go to the threads and awaited writes waiting for it, handing it to the first
-    /// thread blocked on it and waking every awaited write, which stay counted by
-    /// [`Branch::on_the_way`] until they have taken it or are dropped.
-    fn give_way(mut self) {
-        self.yielding = true;
     }
 }
 
@@ -643,15 +635,9 @@ impl<T> Drop for Lane<'_, T> {
         {
             store.unlock_lane(self.branch.lane_at);
         }
-        match self.guard.take() {
-            Some(guard) if self.yielding => MutexGuard::unlock_fair(guard),
-            guard => drop(guard),
-        }
+        drop(self.guard.take());
         reentry::release(self.branch.db, self.branch.key());
-        match self.yielding {
-            true => self.branch.wake_gate(),
-            false => self.branch.open_gate(),
-        }
+        self.branch.open_gate();
     }
 }
 
@@ -687,18 +673,7 @@ impl<T> Branch<T> {
         Lane {
             guard: Some(guard),
             branch: self,
-            yielding: false,
         }
-    }
-
-    fn wake_gate(&self) {
-        let wakers: Vec<Waker> = self
-            .gate
-            .lock()
-            .iter()
-            .map(|(_, waker)| waker.clone())
-            .collect();
-        wakers.into_iter().for_each(Waker::wake);
     }
 
     fn open_gate(&self) {
@@ -1076,7 +1051,7 @@ impl<T> Shared<T> {
             .name("ferro-lane".to_string())
             .spawn(move || {
                 if gated {
-                    let _ = store.pass_gate(true);
+                    let _ = store.pass_gate(at);
                 }
                 if store.lock_lane(at).is_ok() {
                     store.unlock_lane(at);
@@ -1144,7 +1119,7 @@ struct Writing<'a, T, F, R, E> {
     id: u64,
     start: Option<F>,
     gated: bool,
-    held_up: Option<u64>,
+    held_up: bool,
     wait: Option<Wait<R, E>>,
     crossing: Option<Crossing>,
 }
@@ -1179,16 +1154,14 @@ where
             this.gated = false;
             let mut notices = Vec::new();
             let shared = &db.shared;
-            let gated = this.held_up.is_none_or(|until| monotonic_ns() < until)
+            let gated = !this.held_up
                 && !reentry::holds_besides(shared.id, shared.file_id, &db.branch.name);
             match shared.crossing(&mut lane, false, gated, &mut notices) {
                 Err(error) => return Poll::Ready(Err(error.into())),
                 Ok(Some(busy)) => {
                     let at = lane.branch.lane_at;
                     drop(lane);
-                    if gated && this.held_up.is_none() {
-                        this.held_up = busy.gate_until();
-                    }
+                    this.held_up |= gated;
                     shared.await_lane(busy, at, gated, cx.waker());
                     this.start = Some(f);
                     return Poll::Pending;
@@ -2178,28 +2151,72 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
         f: impl FnOnce(&mut RefState, &mut Vec<Notice<T>>) -> Result<R>,
     ) -> Result<R> {
-        let mut began = None;
+        if self.store().is_shared() {
+            return self.exclusively_shared(notices, f);
+        }
         loop {
             let branches = self.every_lane();
             let mut lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
             lanes.iter_mut().for_each(Lane::uncross);
             let store = self.store();
-            let stale = || !self.covers(&branches);
-            let waiting = || branches.iter().any(|branch| branch.on_the_way());
-            let range = match store.is_shared() {
-                true => match store.lock_lanes(&mut began, stale, waiting)? {
-                    Every::Held(range) => Some(range),
-                    Every::Stale => continue,
-                    Every::Yielded => {
-                        lanes.into_iter().rev().for_each(Lane::give_way);
-                        Self::let_through(&branches, began);
-                        continue;
-                    }
-                },
+            let mut tip = self.tip.lock();
+            let current = self.store().id() == store.id()
+                && self.follow(&mut tip, true, notices)? != Caught::Swapped;
+            if current && self.covers(&branches) {
+                let whole = reentry::whole(self.id, self.file_id);
+                let out = f(&mut tip, notices);
+                drop(whole);
+                drop(tip);
+                lanes.into_iter().rev().for_each(drop);
+                return out;
+            }
+            drop(tip);
+            lanes.into_iter().rev().for_each(drop);
+        }
+    }
+
+    /// [`Shared::exclusively`] for a shared file: holds the gate while it tries for every lane of
+    /// this handle and every branch lock of the file, all at once or none, between the sleeps and
+    /// the ends of phases that [`Gate::wait`] makes.
+    ///
+    /// It holds nothing else while it waits, so no thread waits for it until it has everything: a
+    /// thread or awaited write of this handle that a closure in another handle or process waits
+    /// for, in a way ferro cannot see, never waits for a lane it holds. Before each try it seals
+    /// any coalesced group whose lane is free, since the group keeps its branch's byte.
+    fn exclusively_shared<R>(
+        &self,
+        notices: &mut Vec<Notice<T>>,
+        f: impl FnOnce(&mut RefState, &mut Vec<Notice<T>>) -> Result<R>,
+    ) -> Result<R> {
+        let mut gate: Option<Gate> = None;
+        loop {
+            let store = self.store();
+            if !gate.as_ref().is_some_and(|gate| gate.guards(&store)) {
+                drop(gate.take());
+                gate = Some(store.take_gate()?);
+            }
+            self.seal_open_groups();
+            let branches = self.every_lane();
+            let lanes = match store.lanes_free()? {
+                true => self.every_lane_now(&branches),
                 false => None,
             };
+            let Some(mut lanes) = lanes else {
+                if let Some(gate) = gate.as_mut() {
+                    gate.wait();
+                }
+                continue;
+            };
+            lanes.iter_mut().for_each(Lane::uncross);
+            let Some(range) = store.try_lock_lanes()? else {
+                lanes.into_iter().rev().for_each(drop);
+                if let Some(gate) = gate.as_mut() {
+                    gate.wait();
+                }
+                continue;
+            };
             let mut tip = self.tip.lock();
-            let commit = store.is_shared().then(|| store.lock_commit()).transpose()?;
+            let commit = store.lock_commit()?;
             let current = self.store().id() == store.id()
                 && self.follow(&mut tip, true, notices)? != Caught::Swapped;
             if current && self.covers(&branches) {
@@ -2210,6 +2227,7 @@ impl<T: Data> Shared<T> {
                 drop(tip);
                 drop(range);
                 lanes.into_iter().rev().for_each(drop);
+                drop(gate);
                 return out;
             }
             drop(commit);
@@ -2219,19 +2237,41 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    /// Waits, once [`Shared::exclusively`] has let its lanes go, until no thread or awaited write
-    /// waits for any of `branches`, or for the [`patience`] of a hold that began at `began`, so
-    /// that those that waited for its lanes take them before it does again.
-    fn let_through(branches: &[Arc<Branch<T>>], began: Option<u64>) {
-        let start = monotonic_ns();
-        let (mut pause, longest) = (Duration::from_micros(20), Duration::from_millis(1));
-        while branches.iter().any(|branch| branch.on_the_way()) {
-            let now = monotonic_ns();
-            if now.saturating_sub(start) >= patience(began, now) {
-                return;
+    /// The lane of each of `branches`, if every one is free now, sealing any coalesced group one
+    /// holds, and `None`, holding none of them, if one is not.
+    fn every_lane_now<'a>(&self, branches: &'a [Arc<Branch<T>>]) -> Option<Vec<Lane<'a, T>>> {
+        let mut lanes = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let mut lane = branch.hold(branch.lane.try_lock()?);
+            if let Some(group) = lane.take() {
+                self.seal_for_others(branch, group);
             }
-            thread::sleep(pause);
-            pause = (pause * 2).min(longest);
+            lanes.push(lane);
+        }
+        Some(lanes)
+    }
+
+    /// Seals each coalesced group left open whose lane is free, so that it lets its branch's byte
+    /// go.
+    fn seal_open_groups(&self) {
+        if !self.coalesce {
+            return;
+        }
+        let open: Vec<_> = self
+            .queue
+            .lock()
+            .open
+            .iter()
+            .map(|(_, branch)| branch.clone())
+            .collect();
+        for branch in open {
+            let Some(guard) = branch.lane.try_lock() else {
+                continue;
+            };
+            let mut lane = branch.hold(guard);
+            if let Some(group) = lane.take() {
+                self.seal_for_others(&branch, group);
+            }
         }
     }
 
@@ -2239,17 +2279,17 @@ impl<T: Data> Shared<T> {
         self.crossing(lane, true, false, notices).map(|_| ())
     }
 
-    /// Lets this thread on towards a branch lock of `name` once no other process holds the gate,
-    /// or after the bounded wait that [`Store::pass_gate`] describes, unless this thread holds
-    /// another lock of this file, which that process may be waiting for. It holds no lock of this
-    /// file while it waits, and a write calls it before it takes its branch's lane, so no thread of
-    /// this process waits for it either.
+    /// Lets this thread on towards the branch lock of `name` once no thread of this process or
+    /// another holds the gate, or at the end of the phase it finds, as [`Store::pass_gate`]
+    /// describes, unless this thread holds another lock of this file, which the gate's holder may
+    /// be waiting for. It holds no lock of this file while it waits, and a write calls it before it
+    /// takes its branch's lane, so no thread of this process waits for it either.
     ///
     /// The gate only keeps a process that wants every branch lock from waiting for ever, so a
     /// failure to test it lets the thread on.
     fn admit(&self, name: &str) {
         if self.options.shared && !reentry::holds_besides(self.id, self.file_id, name) {
-            let _ = self.store().pass_gate(true);
+            let _ = self.store().pass_gate(lane_of(name));
         }
     }
 
@@ -4549,7 +4589,7 @@ impl<T: Data> Db<T> {
             id: self.shared.ids.fetch_add(1, Ordering::Relaxed),
             start: Some(f),
             gated: false,
-            held_up: None,
+            held_up: false,
             wait: None,
             crossing: None,
         }

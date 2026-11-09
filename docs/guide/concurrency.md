@@ -96,12 +96,12 @@ including the `Drop` of a value the cache evicts. A `Drop` that runs while a cyc
 while a large `receive` places its pieces, may write too, except `compact`, or a `pull`, `push` or
 `receive` large enough to be placed in pieces, into that file. A closure that waits on a channel or
 a watcher for another thread's commit can still deadlock, because ferro cannot see the wait: on its
-own branch, on a branch that sorts before its own while a cycle or `receive` of the same handle
-waits for this closure, and with `coalesce` also when that commit's closure has already run. One in
-another handle or process holds that commit up for a while: at most a second, or three when the
-commit goes through the handle that runs the cycle. With `shared`, a write through a second open
-of the file is refused as well where it would wait for a lock the closure's own open holds: the
-closure's branch, or every branch for `compact`, `pull`, `push` and `receive`.
+own branch, without `shared` on a branch that sorts before its own while a cycle or `receive` of the
+same handle waits for this closure, and with `coalesce` also when that commit's closure has already
+run. Under `shared` a cycle or landing holds that commit up for a while, through any handle, its own
+included: for at most two rounds of its wait, as below, and 2 s. With `shared`, a write through a
+second open of the file is refused as well where it would wait for a lock the closure's own open
+holds: the closure's branch, or every branch for `compact`, `pull`, `push` and `receive`.
 
 ## Several processes
 
@@ -135,11 +135,13 @@ of their own 4 processes made 87,512 and 4 threads 90,661.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`, or as soon as their follower sees the rename. While a cycle's pause, or a pull
-or receive landing, waits for every branch, writers in other processes hold off new closures until
-the end of an epoch that grows with that wait, from 2 ms up to a second, and ends at the same moment
-in every process of the machine, so it waits only for the closures already running, and gets every
-branch once the epoch outlasts them. Closures that each last over a second, in several threads or
-processes, can still keep it waiting. A process killed in the middle of
+or receive landing, waits for every branch, writers in every process, its own handle's included,
+hold off new closures until the end of a round of that wait, which ends for all of them at once.
+The first round lasts 4 ms and each later one twice as long as the one before, up to a second, so
+the wait is only for the closures already running, and it gets every branch once a round outlasts
+the closures that the end of the last one let begin. Closures that each keep a branch for over a
+second, in several threads or processes, can still keep it waiting, and so can closures in several
+threads that each wait for another thread's write. A process killed in the middle of
 a commit holds up the others only until the operating system releases its locks, and nothing it
 acknowledged is lost. It needs open file description locks, so it runs on 64-bit Linux only, and the
 processes must share one machine and a local file system. Elsewhere, Windows included, the open

@@ -1,8 +1,11 @@
 #![cfg(all(target_os = "linux", target_pointer_width = "64"))]
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, LocalKey};
 use std::time::{Duration, Instant};
 
@@ -398,14 +401,31 @@ enum Nested {
     Hung,
 }
 
-type Call = fn(&Db<Probed>, &Db<Probed>) -> ferro::Result<()>;
+struct Unpark(thread::Thread);
 
-fn nested_through_a_second_open(
-    call: impl FnOnce(&Db<Probed>, &Db<Probed>) -> ferro::Result<()> + Send + 'static,
-) -> Nested {
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        thread::park();
+    }
+}
+
+type Call = fn(&Db<Probed>, &Db<Probed>, &Path) -> ferro::Result<()>;
+
+fn nested_through_a_second_open(options: fn() -> Options, call: Call) -> Nested {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let path = dir.path().join("twice.ferro");
-    let options = kinds()[0].1;
     let first: Db<Probed> = options().open(&path).unwrap();
     put(&first, 1).unwrap();
     for name in ["a", "b"] {
@@ -416,8 +436,9 @@ fn nested_through_a_second_open(
     elsewhere.fork("a").unwrap();
     let held = first.branch("a").unwrap();
     let (done, finished) = std::sync::mpsc::channel();
+    let opened = path.clone();
     thread::spawn(move || {
-        let ran = held.update(|_| call(&second, &elsewhere));
+        let ran = held.update(|_| call(&second, &elsewhere, &opened));
         let _ = done.send(match ran {
             Ok(Ok(())) => Nested::Done,
             Ok(Err(Error::Reentrant)) => Nested::Reentrant,
@@ -433,36 +454,65 @@ fn nested_through_a_second_open(
 
 #[test]
 fn a_write_through_a_second_open_that_would_wait_for_the_closure_holding_the_file_is_refused() {
-    let cases: [(&str, Nested, Call); 7] = [
-        ("an update of `a`", Nested::Reentrant, |second, _| {
+    let cases: [(&str, Nested, Call); 13] = [
+        ("an update of `a`", Nested::Reentrant, |second, _, _| {
             put(&second.branch("a")?, 3)
         }),
-        ("a fork from `a`", Nested::Reentrant, |second, _| {
+        ("a fork from `a`", Nested::Reentrant, |second, _, _| {
             second.branch("a")?.fork("c").map(drop)
         }),
-        ("a drop of `a`", Nested::Reentrant, |second, _| {
+        ("a drop of `a`", Nested::Reentrant, |second, _, _| {
             second.drop_branch("a")
         }),
-        ("a compact", Nested::Reentrant, |second, _| {
+        ("a compact", Nested::Reentrant, |second, _, _| {
             second.compact(Keep::All).map(drop)
         }),
-        ("an update of `b`", Nested::Done, |second, _| {
+        ("an update of `b`", Nested::Done, |second, _, _| {
             put(&second.branch("b")?, 3)
         }),
-        ("an update of `main`", Nested::Done, |second, _| {
+        ("an awaited update of `b`", Nested::Done, |second, _, _| {
+            let b = second.branch("b")?;
+            block_on(b.update_async(|root| {
+                root.rows.insert(3, 3);
+            }))
+            .map(drop)
+        }),
+        ("an update of `main`", Nested::Done, |second, _, _| {
             put(second, 3)
         }),
+        ("a fork from `main`", Nested::Done, |second, _, _| {
+            second.fork("c").map(drop)
+        }),
+        ("a fork from `b`", Nested::Done, |second, _, _| {
+            second.branch("b")?.fork("d").map(drop)
+        }),
+        ("a drop of `b`", Nested::Done, |second, _, _| {
+            second.drop_branch("b")
+        }),
+        ("a refresh", Nested::Done, |second, _, _| {
+            second.refresh().map(drop)
+        }),
+        (
+            "a read-only open and refresh",
+            Nested::Done,
+            |_, _, path| {
+                let read_only: Db<Probed> = Options::new().read_only(true).open(path)?;
+                read_only.refresh().map(drop)
+            },
+        ),
         (
             "an update of `a` in another file",
             Nested::Done,
-            |_, elsewhere| put(&elsewhere.branch("a")?, 3),
+            |_, elsewhere, _| put(&elsewhere.branch("a")?, 3),
         ),
     ];
     let mut failed = Vec::new();
-    for (what, want, call) in cases {
-        let got = nested_through_a_second_open(call);
-        if got != want {
-            failed.push(format!("{what}: {got:?}, wanted {want:?}"));
+    for (kind, options) in kinds() {
+        for (what, want, call) in &cases {
+            let got = nested_through_a_second_open(options, *call);
+            if got != *want {
+                failed.push(format!("{kind}, {what}: {got:?}, wanted {want:?}"));
+            }
         }
     }
     assert!(

@@ -414,6 +414,101 @@ count, without a sanitizer; it failed before the guard. Built with AddressSaniti
 of `fuzzed.rs` then ran clean together and one at a time, and so did the library's 51 unit tests,
 the 84 of `sync.rs`, the 32 of `crash.rs` and the 35 of `reclaim.rs`.
 
+## The gate model
+
+Four designs of the gate that lets a cycle, a landing or a prune take every branch lock under
+`shared`, described under [The gate](processes.md#the-gate), each fixed what a review of the last
+found and brought new hangs or stalls (#128, #136, #142, #145, #146). The fifth was chosen in a
+model first: `ferro/tests/gate_model.rs` runs each design as tasks of a single-threaded executor on
+a simulated clock, which moves only when every task waits, so a run is fixed by its seed.
+
+The model has what the designs differ in, and nothing of the file itself:
+
+- Open file description locks, exclusive, held per open: a lock that conflicts with another open's
+  waits, every waiter is woken when a lock goes and the first to run wins, and other opens test a
+  range as `F_OFD_GETLK` does.
+- Each open's lanes, which behave as `parking_lot` mutexes do: a free lane goes to whoever asks
+  first, an unlock wakes the longest parked thread, which parks again at the back if another took
+  the lane meanwhile, and about once a millisecond an unlock hands the lane over instead. A lane can
+  also be waited for with a timeout, as 51dbfc6 did.
+- Each open's count of the branch bytes its lanes hold, its `whole` mark, its table of the gate
+  bytes its threads hold and the queue of awaited writes at each lane, and the coalesced groups that
+  keep a branch's byte between closures.
+- Writers that pass the gate, take their lane and byte, run a closure and commit; awaited writes
+  that take the lane through the queue, test the gate and the byte without waiting and hand the
+  wait to another thread; closures that sleep, write from inside themselves or join a thread that
+  writes through any open, the cycling one included.
+- The whole-range takers of each design: 6fb68bc's epochs, read from the holder's stamp, with its
+  holder taking its own lanes in order and giving them up after three epochs; 51dbfc6's rounds with
+  their 1 ms openings and lanes taken with a 1 ms timeout; and the phase gate, with no rule for a
+  busy branch, with a rule that waits for as many phases as the branch stays busy, and with the
+  chosen rule that waits for one.
+
+Every wake runs after a delay drawn from one of three profiles, which alternate by seed: calm, a few
+microseconds with 0.2% of wakes preempted for up to 4 ms; busy, up to 300 µs with 4% preempted for
+up to 12 ms, as beside spinning threads; and hostile, 1% preempted for 5 to 50 ms. A sleep
+overshoots by 50 to 80 µs, a commit takes 20 to 60 µs and a pause up to a millisecond. Each scenario also adds
+one of 400 offsets 25 µs apart, chosen by the seed, to when a closure joins its write or a thread
+begins, so that 1,200 seeds cover 10 ms of phase against the rounds in every profile.
+
+A run ends stuck when no task can run and none sleeps, late when its scenario's time runs out, and
+otherwise is checked against the scenario's bounds on how long a taker and a joined write took. The
+scenarios are those of each issue: five cycles beside 4 or 16 other handles on branches of their
+own with closures of 0 to 20 ms, and 50 commits through a handle that cycles over and over (#128);
+a closure joining a commit, blocking or awaited, beside another handle's cycle (#136); a cycle
+beside four threads of one handle with 600 ms closures begun 150 ms apart, eight with 300 ms ones,
+two handles of four, and four with 900 ms ones, and a closure joining a commit through the cycling
+handle (#142); three cycles beside four threads of the cycling handle on one branch and four
+handles with 20 ms closures, a closure on `b` joining a commit on `a` through the cycling handle
+while a blocking or awaited write on `b` there waits for its byte, a closure joining a commit on an
+earlier branch of the cycling handle, and a cycle and pulls in one handle (#145); a cycle beside two
+or three threads of its handle taking one lane in turn, closures joining commits back to back
+beside a handle cycling as fast as it can, through another handle and through the cycling one, a
+coalesced cycle that seals a group holding `a` while a closure on `b` joins a commit on `a`, and
+cycles and pulls in two handles (#146). Four more are adversarial: nested and awaited writes from
+closures beside twenty cycles; two threads taking turns at closures on one branch that each join a
+commit, each queued before the last ends; closures joining commits on a branch three other handles
+keep busy; and four threads each looping closures that join commits on branches of their own.
+
+`the_phase_gate_passes_every_scenario` runs the chosen design over 1,200 seeds of each scenario, in
+about seven seconds, or as many as `FERRO_GATE_SEEDS` says.
+`the_model_finds_what_the_reviews_of_earlier_designs_found` checks that the model finds each failure
+the reviews found, in the design they were found in, within 120 seeds: 6fb68bc's 4 to 6 s cycles
+beside its own threads on one branch, its hangs beside a write waiting for the joining closure's
+byte, beside a closure joining a commit on an earlier branch of its handle and beside the coalesced
+group, and its joined commits through the cycling handle of up to 3 s; 51dbfc6's stalls beside
+threads of its handle taking one lane in turn, its back-to-back livelock, its joined commits of up
+to 16.4 s through the cycling handle, as the review measured, and its hang beside the group. It also
+finds that the phase gate without the rule for a busy branch lets a chain of joining closures on one
+branch keep a cycle waiting for good, and that a rule that waits as long as the branch stays busy
+holds a joined commit for 2 s on a branch other handles keep busy. `compare_designs`, ignored,
+prints each design's failures and the spread of its takers' and joined writes' times.
+
+With 300 seeds of each scenario, the chosen phase gate passed all 30, and the others failed these,
+out of 300, where the phase gates are named by their rule for a busy branch:
+
+| Scenario | 6fb68bc | 51dbfc6 | No rule | Every phase |
+| --- | --- | --- | --- | --- |
+| #136, a closure joining a commit, blocking and awaited | 0, 0 | 14, 21 | 0, 0 | 0, 0 |
+| #145, cycles beside the cycling handle's threads on one branch | 293 | 0 | 0 | 0 |
+| #145, a write waiting for the joining closure's byte, blocking and awaited | 297, 297 | 0, 0 | 0, 0 | 0, 0 |
+| #145, a closure joining a commit on an earlier branch of the cycling handle | 300 | 0 | 0 | 0 |
+| #146, three threads with 5 ms closures and two with 2 ms taking one lane in turn | 0, 0 | 182, 60 | 0, 0 | 0, 0 |
+| #146, joined commits back to back, and 5 ms apart | 0, 0 | 191, 40 | 0, 0 | 0, 0 |
+| #146, joined commits back to back through the cycling handle | 18 | 117 | 0 | 0 |
+| #146, a coalesced group's byte | 300 | 300 | 0 | 0 |
+| Two threads' joining closures on one branch, each queued before the last ends | 139 | 246 | 159 | 0 |
+| Closures joining commits on a branch three other handles keep busy | 0 | 36 | 0 | 204 |
+| Four threads' joining closures on branches of their own, joined commits only | 0 | 224 | 0 | 0 |
+
+The last scenario, four threads looping closures that join commits on branches of their own, is
+beyond what the gate promises a taker, as [The gate](processes.md#the-gate) says. Under every design
+the five cycles often had not finished after 10 s, so it checks only that nothing is stuck and that
+each joined commit waits at most 1.2 s, which 51dbfc6's 2 s waits fail.
+
+The model does not have the kernel's merging of one open's locks on neighbouring bytes, which the
+first build of the phase gate tripped on and `ferro/tests/gate.rs` caught.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:
@@ -496,6 +591,9 @@ Tests are described next to what they test:
   entries](reclamation.md#records-reached-as-entries).
 - Processes that write one file at once, die mid-commit and run cycles, and the frames a catch-up
   checks in memory and keeps: [Tests](processes.md#tests).
+- Cycles, landings and prunes beside writers in other handles and processes, and closures that
+  join writes beside them, `ferro/tests/gate.rs` and `ferro/tests/shared.rs`: [The
+  gate](processes.md#the-gate).
 - The nodes a commit reads from the file to change, which stay out of the cache: [Nodes a commit
   changes](read-path.md#nodes-a-commit-changes).
 - Followers of a read-only handle and a shared writer, across cycles, a removed file and damaged

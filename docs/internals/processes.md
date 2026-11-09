@@ -20,13 +20,14 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | 2^62 + 2, placement | Exclusive, per frame, or shared by a read-only open's scan | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the pieces of a large `receive` |
-| 2^62 + 5, gate | Exclusive, while a process wants or holds every branch lock; only ever tested by writers | Holding off new branch locks in other processes meanwhile |
-| 2^62 + 8 + one of 2^19, stamp | Exclusive, one byte, by the gate's holder while it holds the gate; only ever tested by writers | Saying when the holder began to want every branch lock |
+| 2^62 + 5, gate | Exclusive, while a thread wants or holds every branch lock | Letting one thread of the machine at a time want them |
+| 2^62 + 6 and 2^62 + 7, phase | Exclusive, one at a time, by the gate's holder, changing at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
 
 A cycle's prune and pause, the landing of a `receive` and anything else that replaces every
 branch's head lock the whole range of branch bytes at once, as they take every lane within a
-process, and hold the gate while they wait for it and hold it, as [The gate](#the-gate) describes.
+process, and hold the gate and a phase byte while they try for them and hold them, as [The
+gate](#the-gate) describes.
 Locks are taken in the order lane, branch lock, `tip`, placement lock, and the leader of a sync
 takes the superblock lock holding none of them. A writer passes the gate before its lane, holding
 no lock of the file, and the whole range is taken after every lane and the gate. The cycle lock
@@ -64,14 +65,18 @@ Branch bytes are shared within a process on purpose: two branch names can hash t
 process counts how many of its lanes hold each byte and unlocks it when the last one lets go. That
 costs only parallelism, except that with nested writes across branches two such names could
 deadlock two processes. With 60 bits, a thousand branch names share a byte with odds of about 4 in
-10^13. Taking the whole range is exclusive with them: a thread that wants it marks it wanted, so no
-thread of the process takes a branch byte, and waits until none holds one before it locks the
-range. A thread that holds a byte for a branch attached after the cycle listed its lanes could be
-waiting for one of those lanes, so the wait gives up when the set of attached branches changes and
-the cycle lists them again. In the first version an awaited write's waiting thread was granted a
-branch byte as a no-op inside its own process's cycle, then unlocked it, and another process's
-closure ran during the pause and failed with `the file was replaced while a closure held its
-branch`. `an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause` reproduces it.
+10^13. Taking the whole range is exclusive with them: under `shared` a thread takes it only at a
+moment when no thread of its process holds a byte, under the lock of that count, and marks it held,
+so no thread of the process takes a byte until it lets the range go. Without `shared` there is no
+range, and a cycle takes every lane in name order. An earlier version marked the range wanted and
+waited for the process's threads to let their bytes go while it held every lane, and gave up when
+the set of attached branches changed, since a thread holding a byte for a branch attached after the
+cycle listed its lanes could be waiting for one of them; a thread that wants the range now holds
+nothing while it waits and lists the lanes again at each try. In the first version an awaited
+write's waiting thread was granted a branch byte as a no-op inside its own process's cycle, then
+unlocked it, and another process's closure ran during the pause and failed with `the file was
+replaced while a closure held its branch`.
+`an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause` reproduces it.
 
 So the cycle's lanes must cover every branch byte the process can hold for long, and attached
 branches are not all of them: a coalesced group keeps its branch's byte between closures, and a
@@ -90,197 +95,291 @@ of every branch with a group open, attached or not, which seals the group.
 The kernel grants a lock on the whole range only at a moment when every byte of it is free, and it
 holds back no byte that another process asks for while the range is wanted: a waiting
 `F_OFD_SETLKW` is woken when a lock in its way goes, tries again, and sleeps again if another byte
-is held by then. Within a process the `whole` flag keeps new takers out, but across processes
+is held by then. Within a process the `whole` mark keeps new takers out, but across processes
 nothing did, and a writer holds its branch's byte for nearly all of each commit, 93% of the time
 in the measurements under [Reading back what other processes
 wrote](#reading-back-what-other-processes-wrote). So writers in other processes, each on a branch
 of its own, kept the range from ever being free at once. With four handles of one file committing
 on branches of their own, a cycle reached its pause 0.28 s after it began and then waited 10.7 s,
 until the writers were stopped, and the same with four processes; a pull's landing and a prune
-waited the same way. The cycling process holds every one of its own lanes while it waits, so its
+waited the same way. The cycling process held every one of its own lanes while it waited, so its
 own writers waited as long (#128).
 
-So a process that wants every branch lock takes the gate, a byte of its own, exclusive, once its own
-threads hold no branch byte, and only then the range, and it lets the gate go with the range. A
-writer about to take its branch's lane, holding no lock of the file, tests the gate with
-`F_OFD_GETLK` for a shared lock, which reports only an exclusive lock another open file holds, and
-goes on if there is none. If there is, it waits until the gate is free or until the end of the
-current epoch, testing the gate again after a sleep that doubles from 50 µs to 1 ms, and then goes
-on either way. A writer never holds the gate, so the process taking it waits for no writer, only
-for another process that wants every branch lock. Nothing in it depends on the kernel being fair.
+So a thread that wants every branch lock, for a cycle's prune or pause, a landing or a `Keep::Last`
+prune, holds a gate that keeps writers from taking new branch locks while it waits. Any wait it
+adds has to end, because a closure can wait for another thread's write in a way ferro cannot see:
+by joining a thread that commits, by polling an awaited commit on another thread, or through a
+channel, and that write may go through any handle of the file, the waiting thread's own included.
+The gate promises five things:
 
-Epochs are counted on `CLOCK_MONOTONIC` from its zero, which every process of the machine reads
-alike. While it holds the gate the holder also locks a stamp, one of 2^19 bytes from 2^62 + 8,
-chosen by the time it began to want every branch lock counted in 1/512 s, so the stamps wrap after
-about 17 minutes. A writer that finds the gate held reads the stamp with a second `F_OFD_GETLK`
-over those bytes, which reports where the lock in its way begins, and so knows how long the hold
-has lasted, to within 2 ms. While that is under 4 ms an epoch is 1/512 s, about 2 ms, and after it
-the longest of 1/256, 1/128, and so on up to 1 s, that is no longer than the hold: each twice the
-one before, and each ending where every shorter one ends. So every writer of the machine that the
-gate holds up at one moment goes on at the same end, and none goes on between two ends of the epoch
-then current. Once the epoch outlasts the closures, a closure that begins at one end has ended
-before the next, and from then until that next end no writer holds a byte: the range is free. The
-holder tests the range without waiting in the kernel, after sleeps that double from 50 µs to 1 ms
-and again 150 µs before each end of the shortest epoch, when the writers held up are about to go
-on, and gets it then. The epoch outlasts closures of any length up to a second once the hold is
-twice as long as they are, and the range is free within two epochs and a closure after that.
-Closures that each last over a second, in several threads or processes, can still keep it waiting.
-The shortest epoch keeps the 2 ms floor the first version measured best: a 1 ms floor did no better,
-and 5 ms doubled what a closure waiting for another thread lost.
+1. No cycle of waits that ferro can see lasts.
+2. A write that a closure waits for waits at the gate for at most two rounds of the hold, as below,
+   and never more than 2 s, through any handle.
+3. The thread that wants every branch lock gets them beside writers in other processes and
+   threads, its own handle's included, within about three times C and 4 ms, where C is how long
+   the writers that the end of a phase lets on keep their branches, as long as C is under a
+   second.
+4. Without `shared` none of it runs, and lanes behave and cost what they did.
+5. A writer that finds the gate free pays one relaxed load and one `fcntl`.
 
-The first version bounded each writer's wait by how long the writers of its handle had found the
-gate held, from 2 ms to 1 s, counted from when each writer came. A fixed bound had left the range
-busy again beside closures that outlast it: with 16 handles committing on branches of their own,
-five cycles in a release build finished beside closures that spun 1 ms under a fixed 2 ms bound but
-none had finished after 20 s beside 5 ms closures, nor under a 10 ms bound beside 20 ms closures,
-while a 20 ms bound held up a closure that waited for another thread, as below, for up to 32 ms. A
-bound that grew with the wait did better beside handles of their own, but writers that came first
-waited least, so their closures began further apart with each round until the bound reached a
-second, and from then each waited a second after its own closure and their closures never all ended
-together. A cycle beside four threads of one handle whose 600 ms closures began 150 ms apart had not
-finished after 30 s in three runs of four, nor one beside eight threads with 300 ms closures in two
-of two, nor one beside two processes of four threads each whose 600 ms closures began 75 ms apart
-(#142). The record of when the
-handle's writers first found the gate held also outlived the hold: a writer whose wait ran out left
-it set, and if the handle wrote nothing more until the next hold, that hold began with a 1 s bound,
-so a commit that a closure joined, as below, waited 1.0 s at a gate held for 100 ms. With epochs
-those three cycles took 2.4 s, 1.1 to 1.2 s and 1.8 s, every hold begins with the shortest
-epoch, since its stamp is its own, and that joined commit waits 9 to 14 ms. Beside 4 and 16 handles
-committing on branches of their own, each in a closure that spins, five cycles in a release build,
-pinned to eight cores while other work ran on the rest, took 6.5, 11.5, 15, 46 and 105 ms each at
-the median of three rounds beside 4 handles whose closures spun 0, 1, 5, 20 and 50 ms, where the
-first version took 5.3, 9.8, 14, 43 and 103 ms, and 16, 28, 72, 154 and 137 ms beside 16 handles,
-whose closures took longer than they spun on eight cores, against 13, 34, 82, 106 and 228 ms. An
-epoch has to grow past the closures' length, which costs most where they end just past the end of
-one, as there beside 16 handles' 20 ms, and least where the first version's bound grew slowly.
+The thread that wants every branch lock, the holder, first takes the gate byte, 2^62 + 5, exclusive,
+waiting in the kernel while another process holds it, and through the table of [One owner per lock
+in a process](#one-owner-per-lock-in-a-process) while another of its threads does, so one thread
+of the machine holds the gate of a file at a time. It then holds one of the two phase bytes,
+2^62 + 6 and 2^62 + 7, and counts the same phase in its process, whose writers wait on that count,
+since a process never sees its own locks. It tries for everything at once between sleeps that
+double from 20 µs to 1 ms, and to at most an eighth of the round: it seals any coalesced group whose
+lane is free, since a group keeps its branch's byte, tests without taking anything whether a thread
+of its process or another process holds a branch byte, and only if none does takes every lane of
+its handle with `try_lock`, all or none, and then the range with `F_OFD_SETLK` under the lock of
+its process's count of bytes, so no thread of the process takes one meanwhile. Between tries it
+holds nothing but the gate and the phase byte, and a cycle's lock: no lane, no branch byte and no
+`whole` mark. Its rounds last 4 ms, then twice as long as the one before, up to a second. At the end
+of each it ends the phase: it locks the other phase byte, lets the one it held go and wakes the
+writers of its process. Once it has every lock it catches up, runs its prune, pause or landing, and
+lets the range, its lanes, the phase byte and the gate go.
 
-The wait is bounded because a closure can wait for another thread's commit in a way ferro cannot
-see. The first version waited at the gate until it came free, by taking it shared, and hung: a
-closure on `a` that joins a thread committing on `b`, or a thread that polls an awaited commit on
-`b`, holds the byte of `a`, and the other thread, which holds no lock, waited at the gate of a
-process that was waiting for the byte of `a`. Such a wait on a branch that sorts after the closure's
-own was safe before the gate, since a cycle in another process holds no byte until it has them all,
-and the tests below hung at their first cycle (#136). Bounded, it comes undone at the end of the
-epoch: the other thread goes on to its byte, which the gate's holder does not hold, commits, and
-the closure ends. An epoch is no longer than the hold had lasted when the writer came, or 2 ms, and
-at most 1 s, so every wait at the gate ends within that, whatever else the thread holds, and no
-cycle of waits through the gate lasts. In a release build, 200 such closures beside another handle
-cycling as fast as it could took 239 µs each on average and at most 4.2 ms, where the first
-version's bound, with its 2 ms floor, took 276 µs and at most 2.4 ms.
+A writer whose thread holds no lock of the file tests the gate before it takes its lane: a relaxed
+load of its process's flag for a holder there, and one `F_OFD_GETLK` over both phase bytes. If
+neither is held it goes on. If one is, it waits until the phase it found ends, on a condition
+variable for its own process's count, or testing that phase byte after sleeps that double from
+50 µs to 1 ms until it is let go. If its branch's byte is then held, in its process or another, it
+waits for the next end too, once in each pass, since the closure holding the byte may be waiting
+for a write that the end just let on, and a writer queued behind it would hold the byte again as
+soon as the closure let it go. Whatever the holder does, it goes on after 2 s. It holds no lock of
+the file while it waits, and goes on to its lane and byte as before. The kernel merges the locks one
+open holds on bytes next to each other, so a test over both phase bytes reports the holder's gate
+byte and phase byte as one lock that begins at the gate byte, and the writer finds the phase it
+waits for by testing each phase byte alone. The first try of this design took the start of the lock
+reported, waited for the gate byte, which the holder keeps for its whole hold, and every commit a
+closure joined beside a cycle that the closure held up waited the full 2 s.
 
-The holder also takes every lane of its own handle before it wants the range, so a thread that
-commits through that handle waits for its lane, not at the gate. A closure in another handle that
-joined a thread committing on `b` through the cycling handle, or polling such an awaited commit,
-hung for good beside that handle's cycle (#142), and so would one in another process waiting for
-such a commit in a way ferro cannot see. That is why the holder tests the range rather than waiting
-for it in the kernel, where a wait cannot be called off. Once it has tested it for three epochs of
-the hold as it was when it began this try, while a thread or awaited write of its process waits
-for one of its lanes or for the `whole` mark to clear, it lets everything go: the range it wanted,
-the stamp, the gate and its lanes. It hands each lane to the first thread blocked on it, wakes
-every awaited write that wants one, and waits until none waits any more, or for three epochs again,
-before it starts over. It keeps the time it began, so its next stamp says the same and the epochs
-go on growing. Those threads commit, the closure that waited for one of them ends, and the range
-comes free. Giving way cannot keep the cycle from finishing: a try gives way only after three
-epochs, each try lasts at least as long as the one before, the writers let through run one closure
-each, which the next try waits for as it waits for its lanes, and once the epoch outlasts the
-closures a try sees the range free within two epochs and a closure, wherever it began. 200 such
-closures, each joining a commit through the cycling handle, took 305 µs on average and at most
-8.8 ms beside 31 cycles.
+An awaited write takes its lane first, as it does, and tests the gate and its byte without waiting.
+If either is held it lets the lane go and returns `Pending`, and its waiting thread waits at the
+gate as above and then for the byte. Once held up there it goes to its byte on later polls without
+the gate, as a blocking write that passed the gate does. A write whose thread holds a lock of the
+file, through any handle, goes straight to its byte, as before: a nested write to a branch that
+sorts after the closure's own, or anything under the whole-file record. The holder may be waiting
+for that thread's byte, so a wait there would only hold both up for a round. The reentrancy record
+of each thread, described in [Writes from inside a closure](reentrancy.md), says whether it holds
+such a lock: each entry names its file by an xxh3 of the canonical path as well as its handle.
+Locks on other files do not count, since the holder waits only for this file's bytes. An earlier
+version let a write from a closure on another file go straight on too, and four writers that
+committed in a loop inside closures on files of their own kept five cycles from finishing for 20 s,
+as before the gate (#136). The path is the one the file was opened by, canonical, so a cycle's
+rename of the new file over it keeps the id. Two paths to one file, through a bind mount, give two
+ids, and a thread holding a lock through one then waits at the gate through the other, for at most
+two rounds; two files whose paths hash alike only let a thread skip the gate. The sync thread and
+the seal of a group take no new branch byte and never pass the gate.
 
-A thread that holds any lock of the file, through any handle, goes straight to its byte, as before:
-a nested write to a branch that sorts after the closure's own, or anything under the whole-file
-record. The gate's holder may be waiting for that thread's byte, so a wait there would only hold
-both up for an epoch. The reentrancy record of each thread, described in [Writes from inside a
-closure](reentrancy.md), says whether it holds such a lock: each entry names its file by an xxh3 of
-the canonical path as well as its handle. Locks on other files do not count, since the gate's holder
-waits only for this file's bytes. The first version let a write from a closure on another file go
-straight on too, and four writers that committed in a loop inside closures on files of their own
-kept five cycles from finishing for 20 s, as before the gate (#136). A cycle of waits that also runs
-through locks of another file breaks at the gate like any other. The path is the one the file was
-opened by, canonical, so a cycle's rename of the new file over it keeps the id. Two paths to one
-file, through a bind mount, give two ids, and a thread holding a lock through one then waits at the
-gate through the other, for at most an epoch; two files whose paths hash alike only let a thread
-skip the gate.
+Why each promise holds:
 
-A writer waits at the gate before it takes its lane, never holding one: a writer waiting there with
-the lane of `b` would hold up a closure on `a` that writes to `b`, and the gate's holder would be
-waiting for the byte of `a`. An awaited write that finds the gate held returns `Pending` as when its
-byte is held, and the thread that waits for the byte waits at the gate first, until the epoch ends;
-the write remembers the end of the epoch it found when first held up there, and once that has
-passed it goes to its byte without the gate, as a blocking write would. A write from a thread
-holding a lock of the file gets a waiting thread of its own that does not wait at the gate. The sync
-thread, the seal of a group and a cycle's own lanes take no new branch byte and never pass the gate.
-Within a process the thread that takes the gate goes through the table of [One owner per lock in a
-process](#one-owner-per-lock-in-a-process), and no other thread takes it.
+1. The holder waits for nothing while it holds anything a writer needs. It waits for a cycle's lock
+   and then for the gate byte, held only by another cycle or holder, and holds nothing of the
+   branches while it does; everything after that it tries without waiting. A writer waiting at
+   the gate holds no lock of the file, and the end of its phase comes on the holder's clock
+   whatever the range does, or after 2 s. A lane or a byte is held only by a closure, a nested write within one, a coalesced
+   group, which the holder or the sync thread seals, or a holder in its pause, which waits for
+   nothing but `tip` and the placement lock, which nobody holds while waiting for a lane. So every
+   cycle of waits runs through a wait ferro cannot see, and those listed under [What stays
+   undetected](reentrancy.md#what-stays-undetected) aside, it comes undone at the next end of a
+   phase, when the write the closure waits for goes on.
+2. A write that a closure waits for waits at the gate until the end of its phase, a round at most
+   4 ms longer than the hold had lasted when the write came, and at most a second, and once
+   more if its branch is busy then: at most two rounds and 2 s. It then waits for its lane and byte
+   as any write does, which only the closures ahead of it on its branch and a holder in its pause
+   hold, since the holder takes no lane before it has everything. That holds through the holder's
+   own handle too, where the write waits on the count of phases.
+3. While the gate is held, writers take new branch bytes only at the ends of phases. The exceptions
+   end on their own: a nested write ends with its closure, a writer that passed the gate before the
+   holder took it takes its byte once, and a group is sealed. The writers that one end lets on
+   begin together, and each branch they take is held for at most C after that end: the longest
+   closure times the writers that queue for one branch, which cannot grow, since a writer whose
+   branch is held at the end of its phase waits for the next. Once a round outlasts C and a sleep,
+   every branch is free before the round ends, the holder's next try finds them so, and since no
+   new writer goes on until that end it gets them. The rounds double, so the holder gets them
+   within the first round after the closures already running end when C is under 4 ms, and within
+   about 3C and 4 ms when C is longer, up to a second. Writers of the holder's own handle wait on
+   its count of phases and are let on at the same ends, so they are held to the same bound.
+4. Without `shared`, `Shared::exclusively` takes the lanes in name order, waiting for each, and
+   nothing tests a gate, as before. The lanes themselves are the same `parking_lot` mutexes,
+   waited for without a timeout.
+5. A writer reads its process's flag, and finds no holder there, and makes one `F_OFD_GETLK`.
 
-The gate and the stamp keep nothing in the file, a process that dies holding them lets them go with
-its other locks, and a test of the gate that fails lets the writer on, since it only keeps the range
-from waiting for ever. A shared writer of an earlier build pays the gate no heed, so beside one the
-range can still wait as long as it did, and a holder of an earlier build locks no stamp, so writers
-beside it go on at each end of the shortest epoch. Processes in different time namespaces read
-different `CLOCK_MONOTONIC`s and their epochs end at different moments; each still waits at most an
-epoch, but beside closures near a second the range may not come free.
-`a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own` in
-`ferro/tests/shared.rs` runs five cycles beside four handles committing on branches of their own,
-`a_cycle_finishes_while_writers_in_closures_on_other_files_commit_on_branches_of_their_own`
-does it with each writer's commits inside a closure on a file of its own, and
-`a_handles_own_commits_wait_for_its_cycle_only_while_other_handles_finish_theirs` makes 50 commits
-on a branch of a handle that cycles over and over; the first and third waited past 20 s without the
-gate, and the second with the first version of it.
-`nested_and_awaited_writes_go_on_through_another_handles_cycles` runs twenty cycles beside blocking
-and awaited writes from a closure on `a` into `b`, writers on `b` in the same handle and writers on
-branches of their own in others, and had not finished them after 60 s without the gate.
-`a_closure_joining_a_thread_that_commits_on_a_later_branch_finishes_beside_another_handles_cycle`
-and `a_closure_joining_a_thread_that_awaits_a_commit_finishes_beside_another_handles_cycle` start a
-cycle in another handle while a closure on `a` holds its byte, and then join a thread that commits
-on `b`; both hung with the first version of the gate.
-`a_closure_joining_a_commit_through_the_handle_that_cycles_finishes_beside_its_cycle` and
-`a_closure_joining_an_awaited_commit_through_the_handle_that_cycles_finishes_beside_its_cycle`
-commit on `b` through the cycling handle instead, and hung before it gave way.
-`a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wait_ran_out` lets a
-handle's write run out its wait at a prune and idle until the pause, and its commit then waited
-655 ms at a gate held for about 50 ms with the first version's record.
-`a_cycle_finishes_beside_threads_of_one_handle_whose_600_ms_closures_end_at_staggered_times` runs
-the cycle above beside four threads of one handle, and had not finished after 20 s with that
-version.
-`a_cycle_finishes_while_other_processes_commit_on_branches_of_their_own` in
-`ferro/tests/shared_process.rs` does it with four processes, or as many as `FERRO_SHARED_OWN` says:
-in a release build the five cycles took 4 to 8 ms each beside 4 processes and 6 to 12 ms beside 16,
-where without the gate, in a debug build beside 4, the first two took 589 and 5 ms and the third had
-not finished after 20 s.
-`a_cycle_finishes_beside_processes_whose_threads_hold_600_ms_closures_ending_at_staggered_times`
-runs one cycle beside two processes of four such threads each, and had not finished after 20 s with
-the first version's bound.
+What stays unbounded:
 
-The test costs a writer one `fcntl` a commit. On 2026-11-09, pinned to eight cores of the
-32-thread machine while other work ran on the rest, alternating with the build before, under
-Buffered: `group` with one shared writer made 44,445 single-key commits a second against 45,277,
-median of five rounds, 1.8% fewer, and with eight threads 38,160 against 37,993. In `processes`,
-median of the two of three rounds the other work left alone, 2, 4 and 8 processes on one branch
-made 35,241, 29,757 and 24,646 commits a second against 35,776, 29,829 and 24,644, and on
-branches of their own 66,422, 101,017 and 59,471 against 67,596, 101,061 and 59,540; the same
-writers as threads of one process moved by at most 1.7% either way.
+- Closures that keep their branches longer than a second, C over the longest round, in several
+  threads or processes. Each round lets on writers whose closures outlast it.
+- Closures that each wait for another thread's write that the gate holds up, begun by several
+  threads at different ends of phases. Each such closure that one end lets begin holds its byte
+  until the write it waits for goes on at the next end, by when another has begun, so once two
+  threads are out of step the range need never be free at once. The writes still wait at most two
+  rounds each, so nothing hangs, but the holder waits until such closures stop or fall into step.
+  None of the designs below gets the range there: the writes that end those closures and the
+  writers that begin new ones look alike at the gate, and only telling them apart would let the
+  first go and hold the others. A closure that writes to another branch itself, rather than through
+  another thread, is a nested write and is not held at all.
+- A holder stopped in its process, by a debugger or `SIGSTOP`, keeps writers at the gate for 2 s at
+  a time.
+- Writers of earlier builds. One that tests the gate byte only, as 6fb68bc's did, finds a holder of
+  this build there for its whole hold, reads no stamp and so goes on at the end of each 2 ms epoch.
+  A holder of an earlier build holds the gate byte, and writers of this build, which test the phase
+  bytes, pay it no heed, while a holder of this build waits in the kernel for that gate byte until
+  the earlier holder is done. A shared writer from before the gate pays no heed to either. Beside
+  one, the range can wait as it did before the gate.
 
-Bounding the wait changed nothing on that path, where the gate is free: a writer that found it free
-also cleared its store's record of when the gate was found held, one relaxed load when there was
-none.
-On 2026-11-09, pinned to eight cores while other work ran on the rest, alternating with the build
-before over five rounds under Buffered, `group` with one and eight shared writers made 44,710 and
-38,544 single-key commits a second against 44,927 and 38,462 at the median, and `processes` at 2, 4
-and 8 processes, on one branch and on branches of their own, and the same writers as threads, came
-within 2.5% of the build before at every count, inside the spread between its own rounds.
+The gate and the phase bytes keep nothing in the file, a process that dies holding them lets them go
+with its other locks, and a test of the gate that fails lets the writer on, since it only keeps the
+range from waiting for ever. Within a process the gate byte goes through the table of [One owner per
+lock in a process](#one-owner-per-lock-in-a-process), so a second thread that wants every branch
+lock, a pull beside a cycle in one handle, waits there for the first to finish.
 
-Epochs leave that path shorter still: a writer that finds the gate free returns after its one test,
-reading no clock and keeping no record, and only a writer that finds it held reads the stamp. The
-builds differ there in nothing else a commit runs but a lock of its lane that tries first and
-counts the threads it waits behind only when it has to wait. On 2026-11-09, pinned to eight cores
-while other builds and tests filled the rest, alternating with the build before over five rounds
-under Buffered, the best round of `group` with one and eight shared writers made 46,060 and 40,205
-single-key commits a second against 45,725 and 40,856, and the best of `processes` at 2, 4 and 8
-processes on one branch 35,880, 30,651 and 26,444 against 36,177, 30,218 and 26,212, and on
-branches of their own 70,169, 94,893 and 63,340 against 71,188, 100,075 and 64,592. Medians moved
-from -36% to +22% between the two builds with no pattern, as the other work came and went, and a
-second set of six rounds under more of it moved as far either way.
+#### Earlier versions
+
+Four designs before this one each fixed what a review of the last found, and each review found new
+hangs or stalls:
+
+- The first waited at the gate until it came free, by taking it shared, and hung: a closure on `a`
+  that joins a thread committing on `b`, or a thread that polls an awaited commit on `b`, holds the
+  byte of `a`, and the other thread, which holds no lock, waited at the gate of a process that was
+  waiting for the byte of `a` (#136).
+- The second bounded each writer's wait by how long the writers of its handle had found the gate
+  held, from 2 ms to 1 s, counted from when each writer came. Writers that came first waited least,
+  so their closures began further apart with each round until the bound reached a second, and from
+  then each waited a second after its own closure and their closures never all ended together: a
+  cycle beside four threads of one handle whose 600 ms closures began 150 ms apart had not finished
+  after 30 s. Its record of when the gate was found held also outlived the hold, so a commit that a
+  closure joined waited 1.0 s at a gate held for 100 ms. A holder that took its own lanes and then
+  waited in the kernel for the range hung a commit through its handle that a closure in another
+  handle had joined (#142).
+- The third, 6fb68bc, let writers on together at the ends of epochs of `CLOCK_MONOTONIC` that grew
+  with the hold, read from a stamp byte the holder locked, and had the holder give its lanes to its
+  own waiting threads after three epochs of trying. Its patience was counted from the hold as it
+  grew while it waited, so it gave way only once the epoch reached a second: beside four threads of
+  the cycling handle on one branch and four handles with 20 ms closures, cycles took 7.1 s. It gave
+  way only while it tested the range, and hung holding lane `a` while it waited for lane `b`, when a
+  write on `b` through its handle waited in the kernel for a closure on `b` in another handle that
+  had joined a commit on `a` through it. A writer that read its clock just before a new holder
+  locked its stamp read the hold as 17 minutes old and waited a second (#145). Closures a little
+  longer than an epoch kept the range busy across several.
+- The fourth, 51dbfc6, held the gate in growing rounds and let it go for 1 ms between them, and
+  took the holder's own lanes with a 1 ms timeout in every mode. Without `shared`, a cycle or pull
+  could no longer get a lane that two or more threads of its handle took in turn, since each timeout
+  queued it behind them again: 3 threads with 5 ms closures kept a cycle waiting over 20 s. Each
+  opening let the next closure of a chain through by the lane's hand-over before the holder tried
+  again, so closures that joined commits back to back kept a cycle waiting 18 s, and its rounds grew
+  without a cap, so commits joined through the cycling handle waited up to 16.4 s. Nor did it seal a
+  coalesced group before it waited for the next lane, so the group kept its byte of `a` while a
+  closure on `b` waited for a commit on `a` through another handle, a hang 6fb68bc had too (#146).
+
+This design keeps what worked: writers held up go on together, so the range comes free between the
+closures one end lets on and the next end, as epochs did, but at ends the holder makes, so no
+writer reads a clock or a stamp, and no end lets on a writer that came after it, as an opening of
+the gate did. The holder taking nothing of its own while it waits is what ended the hangs that ran
+through its lanes in #142, #145 and #146, and the wait for one more phase when a branch is busy is
+what keeps a chain of closures on one branch from passing the range between them. The model in
+[The gate model](testing.md#the-gate-model) runs every design above but the first two against each
+scenario of those issues and finds each failure its review found, and none in this one.
+
+#### Tests of the gate
+
+`ferro/tests/shared.rs`, `ferro/tests/gate.rs` and `ferro/tests/shared_process.rs` test the gate,
+and [The gate model](testing.md#the-gate-model) tests the designs:
+
+- Takers beside writers.
+  `a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own` runs five cycles beside
+  four handles committing on branches of their own,
+  `a_cycle_finishes_while_writers_in_closures_on_other_files_commit_on_branches_of_their_own`
+  does it with each writer's commits inside a closure on a file of its own, and
+  `a_handles_own_commits_wait_for_its_cycle_only_while_other_handles_finish_theirs` makes 50
+  commits on a branch of a handle that cycles over and over; the first and third waited past 20 s
+  without the gate, and the second with its first version.
+  `a_cycle_finishes_beside_threads_of_one_handle_whose_600_ms_closures_end_at_staggered_times`, and
+  `a_cycle_finishes_while_other_processes_commit_on_branches_of_their_own` and
+  `a_cycle_finishes_beside_processes_whose_threads_hold_600_ms_closures_ending_at_staggered_times`
+  in `shared_process.rs`, do it beside threads and processes; the staggered ones had not finished
+  after 20 s with the second version.
+  `cycles_beside_threads_of_the_cycling_handle_contending_for_one_branch_take_under_a_second` took
+  7.1 s with 6fb68bc, and
+  `a_shared_cycle_gets_a_lane_that_threads_of_its_handle_take_in_turn_with_5_ms_closures` over
+  20 s with 51dbfc6.
+  `a_cycle_and_a_pull_in_two_handles_both_wanting_every_branch_finish_beside_writers` and
+  `cycles_and_pulls_in_one_handle_all_finish_beside_other_handles_committing` run two takers at
+  once.
+- Writes that closures join.
+  `a_closure_joining_a_thread_that_commits_on_a_later_branch_finishes_beside_another_handles_cycle`
+  and `a_closure_joining_a_thread_that_awaits_a_commit_finishes_beside_another_handles_cycle` hung
+  with the first version,
+  `a_closure_joining_a_commit_through_the_handle_that_cycles_finishes_beside_its_cycle` and its
+  awaited form until #142, and
+  `a_closure_joining_a_commit_on_an_earlier_branch_finishes_beside_a_blocked_write_on_its_own`,
+  its awaited form, and
+  `a_closure_joining_a_commit_on_an_earlier_branch_of_its_handle_finishes_beside_its_cycle`, with
+  and without `coalesce`, with 6fb68bc.
+  `a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wait_ran_out` waited
+  655 ms with the second version's record. The five `a_joined_commit_beside_cycles_stays_short_*`
+  tests join 40 commits from 20 ms closures back to back beside a handle cycling as fast as it can,
+  on an idle machine, 5 ms apart, beside two spinning threads a core and awaited, each under
+  500 ms, where 51dbfc6 kept a cycle waiting 18 s, and
+  `closures_joining_commits_through_the_cycling_handle_back_to_back_wait_a_bounded_time` does it
+  through the cycling handle, where 51dbfc6's commits waited up to 16.4 s.
+  `forks_and_drops_joined_from_closures_finish_beside_cycles` joins forks and drops, and
+  `nested_and_awaited_writes_go_on_through_another_handles_cycles` runs twenty cycles beside writes
+  nested in closures, which had not finished after 60 s without the gate.
+- `a_coalesced_cycle_holding_an_open_groups_byte_lets_a_joined_commit_through_another_handle_land`
+  hung with 6fb68bc and 51dbfc6.
+- The bytes. `a_writer_waits_at_the_gate_until_the_phase_another_open_holds_ends` and
+  `a_writer_goes_on_past_a_phase_that_never_ends_within_a_bounded_time` hold a phase byte from a
+  bare open of the file, and
+  `a_cycle_that_panics_in_its_pause_leaves_neither_the_gate_nor_the_branch_range_locked` and
+  `a_coalesced_cycle_that_panics_in_its_pause_leaves_its_lanes_the_bytes_and_the_gate_free` check
+  that a panic lets everything go.
+- Without `shared`.
+  `a_plain_cycle_gets_a_lane_that_threads_of_its_handle_take_in_turn_with_5_ms_closures`,
+  `a_plain_cycle_gets_a_lane_that_two_threads_of_its_handle_take_in_turn_with_2_ms_closures`,
+  `a_coalesced_plain_cycle_gets_a_lane_that_threads_of_its_handle_take_in_turn` and
+  `a_plain_pull_lands_beside_threads_of_its_handle_taking_one_lane_in_turn` took from 1.7 s to over
+  20 s with 51dbfc6's timeouts, and
+  `plain_cycles_beside_writers_on_branches_of_their_own_report_their_times` prints cycle times
+  beside 8 and 16 writers.
+
+#### What the gate costs
+
+The test costs a writer one `fcntl` a commit. On 2026-11-09, when the gate was first added, pinned
+to eight cores of the 32-thread machine while other work ran on the rest, alternating with the
+build before, under Buffered: `group` with one shared writer made 44,445 single-key commits a
+second against 45,277, median of five rounds, 1.8% fewer, and with eight threads 38,160 against
+37,993. In `processes`, 2, 4 and 8 processes on one branch made 35,241, 29,757 and 24,646 commits a
+second against 35,776, 29,829 and 24,644, and on branches of their own 66,422, 101,017 and 59,471
+against 67,596, 101,061 and 59,540.
+
+The phase gate adds a relaxed load of the process's flag to that path. It was measured on
+2026-11-09 against the build before it, which ran 6fb68bc's epochs, pinned to eight cores while
+other work ran on the rest, the two builds alternating, under Buffered:
+
+- Without `shared`, which runs none of it, `group` with 1, 8 and 16 writers on one branch made
+  49,710, 41,960 and 40,013 single-key commits a second against 49,784, 42,123 and 40,099, and on
+  branches of their own 49,375, 164,240 and 142,921 against 49,767, 164,011 and 143,305, medians of
+  five rounds; the one cell 0.8% apart, one writer on a branch of its own, came out at 49,896
+  against 50,152 over six more rounds, from 49,739 to 50,446 against 49,040 to 50,532. Ten cycles
+  beside 8 and 16 writers on branches of their own whose closures slept 2 and 5 ms took 22.7, 67.3,
+  42.0 and 103.5 ms at the median against 23.3, 65.9, 41.3 and 109.6. `ferro-bench`'s Buffered
+  single-key commit took 23.67 µs against 23.81 µs over three rounds, at 178,591 instructions against
+  178,610, and its Fsync commit 407 µs against 399 µs, from 394 to 439 against 399 to 445.
+- With `shared`, `group` with 1 and 8 writers made 44,751 and 38,630 commits a second against
+  45,008 and 38,627, medians of five rounds, and `processes` at 2, 4 and 8 processes, on one branch
+  and on branches of their own, and the same writers as threads, came within 0.7% of the build
+  before at every count, medians of three.
+- Five cycles, each a prune and a pause, beside handles committing on branches of their own in
+  closures that spun 0, 1, 2 and 5 ms took 5.8, 4.5, 6.4 and 12.8 ms at the median of three rounds
+  beside 4 handles, against 4.7, 6.2, 7.8 and 13.4, and 10.5, 14.2, 17.5 and 32.4 ms beside 16,
+  against 10.8, 19.0, 29.3 and 57.6. Beside processes they took 4.2, 5.4, 6.4 and 12.7 ms beside 4,
+  against 4.3, 7.0, 8.0 and 13.5, and 12.2, 16.3, 20.4 and 58.5 ms beside 16, against 11.4, 19.8,
+  32.8 and 61.3. The spread between rounds was up to 30% either way at 0 ms, where the cycle waits
+  only for closures already running.
+- A commit held up waits for the end of a round rather than of a 2 ms epoch, so beside 4 handles
+  with 1 and 2 ms closures the longest commit took 7.5 and 8.4 ms against 4.2 and 5.0. A first round
+  of 2 ms instead of 4 made neither the longest commit nor the cycles shorter.
 
 ## A commit
 

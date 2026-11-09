@@ -104,10 +104,9 @@ through a second open, from inside a closure on `a`, waited for good for the byt
 held, and so did a `compact` through it.
 
 With `shared`, a write the check lets through also reads the record to decide whether it may wait
-at another process's gate: one whose thread holds anything on that file, through any handle, goes
-straight to its branch's byte, as [The gate](processes.md#the-gate) describes. Each record names the
-file as well as the handle, by an xxh3 of its canonical path, and locks on other files do not
-count.
+at the gate: one whose thread holds anything on that file, through any handle, goes straight to its
+branch's byte, as [The gate](processes.md#the-gate) describes. Each record names the file as well as
+the handle, by an xxh3 of its canonical path, and locks on other files do not count.
 
 `pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
 scratch file, as described under [Where checked objects
@@ -189,16 +188,17 @@ cycle locks go, so a `Drop` that close runs may write anywhere, `compact` includ
 
 What stays undetected is a wait that ferro does not see. A closure that waits on a channel, a
 condvar or a `Watcher` for another thread's commit can still deadlock: on its own branch, since that
-commit needs the lane; on another branch of its file, while a cycle of the same handle that holds
-that branch's lane waits for this one; and with `coalesce`, for a commit whose closure has already
-run, since that commit may be in this closure's group. A cycle or landing in another handle or
-process takes every branch byte at once or none, so it holds such a commit up only at its gate,
-until the end of an epoch no longer than the gate had been held and at most 1 s, or, when the
-commit goes through the handle that runs it, at that handle's lane, which it lets go to the commit
-once it has waited three epochs of its hold for the range, at most 3 s, as [The
+commit needs the lane; without `shared`, on another branch of its file, while a cycle of the same
+handle that holds that branch's lane waits for this one; and with `coalesce`, for a commit whose
+closure has already run, since that commit may be in this closure's group. With `shared` a cycle or
+landing takes every lane of its handle and every branch byte at once or none, so it holds such a
+commit up only at its gate, through any handle, its own included: until the end of the phase the
+commit finds, a round at most 4 ms longer than the hold had lasted when it came, and at most a
+second, and one more round if the commit's branch is busy then, at most 2 s in all, as [The
 gate](processes.md#the-gate) describes. The first version of the gate waited there for good, and a
 closure on `a` that joined a thread committing on `b` hung beside another handle's cycle (#136);
-until #142 a commit through the cycling handle waited for its lane for good.
+until #142 a commit through the cycling handle waited for its lane for good, and until #145 a cycle
+that held some of its lanes while it waited for the rest could hang beside such a commit.
 
 ## Cost
 
