@@ -1,7 +1,9 @@
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use ferro::codec::{Decoder, Encoder, HashSink};
-use ferro::{Bytes, Data, Db, Record, Set, Table};
+use ferro::codec::{Decoder, Description, Encoder, HashSink};
+use ferro::{Bytes, Data, Db, Durability, Keep, Map, Options, Record, Set, Snapshot, Table};
 
 fn bytes<T: Data>(value: &T) -> Vec<u8> {
     let mut sink = HashSink;
@@ -834,4 +836,484 @@ fn every_documented_evolution_step_still_reads_old_data() {
     let again = bytes(&new);
     let back = Post2::decode(&mut Decoder::new(&again, &[], None)).unwrap();
     assert_eq!(bytes(&back), again);
+}
+
+fn buffered() -> Options {
+    Options::new().durability(Durability::Buffered)
+}
+
+fn no_merge<T>(_: &mut T, _: &Snapshot<T>, _: &Snapshot<T>) -> (String, ()) {
+    ("merge".to_string(), ())
+}
+
+fn opened_as<T: Data + Default>(path: &Path, holds: impl Fn(&T) -> bool) {
+    let db: Db<T> = buffered().open(path).unwrap();
+    assert!(holds(&db.read()), "the old data read back wrong");
+    db.verify_typed().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let other: Db<T> = buffered().open(dir.path().join("other.ferro")).unwrap();
+    let bundle = db.bundle(&other.have().unwrap()).unwrap();
+    other.receive("sender", &bundle, no_merge).unwrap();
+    assert!(holds(&other.read()), "the received data read back wrong");
+    other.verify_typed().unwrap();
+    db.compact(Keep::Last(1)).unwrap();
+    db.verify_typed().unwrap();
+    db.commit("rewrite", |_| ()).unwrap();
+    assert!(holds(&db.read()), "the rewritten data read back wrong");
+    db.verify_typed().unwrap();
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Shelf {
+    #[key]
+    id: u32,
+    #[index]
+    name: String,
+}
+
+fn shelves(names: &[&str]) -> Table<Shelf> {
+    let mut table: Table<Shelf> = Table::new();
+    for (id, name) in names.iter().enumerate() {
+        table.insert(Shelf {
+            id: id as u32,
+            name: name.to_string(),
+        });
+    }
+    table
+}
+
+mod keys_v1 {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(ferro::Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Pair {
+        pub a: u32,
+        pub b: u32,
+    }
+
+    #[derive(ferro::Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Level {
+        Low,
+        High,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub pairs: BTreeSet<Pair>,
+        pub counts: BTreeMap<Pair, ferro::Map<u64, u64>>,
+        pub levels: BTreeMap<Level, ferro::Table<super::Shelf>>,
+    }
+}
+
+mod keys_v2 {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(ferro::Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Pair {
+        pub b: u32,
+        pub a: u32,
+    }
+
+    #[derive(ferro::Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Level {
+        High,
+        Low,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub pairs: BTreeSet<Pair>,
+        pub counts: BTreeMap<Pair, ferro::Map<u64, u64>>,
+        pub levels: BTreeMap<Level, ferro::Table<super::Shelf>>,
+    }
+}
+
+#[test]
+fn a_btree_key_whose_fields_or_variants_are_reordered_reads_old_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reordered.ferro");
+    {
+        let db: Db<keys_v1::Root> = buffered().open(&path).unwrap();
+        db.commit("fill", |root| {
+            for (a, b) in [(1, 2), (2, 1), (3, 0), (0, 3)] {
+                let pair = keys_v1::Pair { a, b };
+                root.pairs.insert(pair.clone());
+                let counts = (0..40u64).map(|n| (n, n * u64::from(a))).collect();
+                root.counts.insert(pair, counts);
+            }
+            root.levels
+                .insert(keys_v1::Level::Low, shelves(&["low", "lower"]));
+            root.levels.insert(keys_v1::Level::High, shelves(&["high"]));
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+    opened_as::<keys_v2::Root>(&path, |root| {
+        let pairs: Vec<(u32, u32)> = root.pairs.iter().map(|p| (p.a, p.b)).collect();
+        let counted = root.counts.iter().all(|(pair, counts)| {
+            counts.len() == 40 && counts.get(&39).as_deref() == Some(&(39 * u64::from(pair.a)))
+        });
+        let low = root.levels.get(&keys_v2::Level::Low);
+        pairs == [(3, 0), (2, 1), (1, 2), (0, 3)]
+            && counted
+            && low.is_some_and(|table| table.by_name("lower").count() == 1)
+            && root.levels.get(&keys_v2::Level::High).map(Table::len) == Some(1)
+    });
+}
+
+mod removed_v1 {
+    #[derive(ferro::Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Slot {
+        pub shelf: u32,
+        pub bin: u32,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub slots: std::collections::BTreeSet<Slot>,
+    }
+}
+
+mod removed_v2 {
+    #[derive(ferro::Data, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    #[ferro(removed("shelf"))]
+    pub struct Slot {
+        pub bin: u32,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub slots: std::collections::BTreeSet<Slot>,
+    }
+}
+
+fn slots_file(path: &Path, slots: &[(u32, u32)]) {
+    let db: Db<removed_v1::Root> = buffered().open(path).unwrap();
+    db.commit("slots", |root| {
+        for &(shelf, bin) in slots {
+            root.slots.insert(removed_v1::Slot { shelf, bin });
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_btree_key_that_loses_a_field_reads_old_data_whose_keys_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("removed.ferro");
+    slots_file(&path, &[(1, 5), (2, 3), (3, 4)]);
+    opened_as::<removed_v2::Root>(&path, |root| {
+        root.slots.iter().map(|slot| slot.bin).collect::<Vec<_>>() == [3, 4, 5]
+    });
+}
+
+#[test]
+fn a_btree_key_that_loses_a_field_refuses_old_data_whose_keys_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("collide.ferro");
+    slots_file(&path, &[(1, 5), (2, 5)]);
+    assert!(matches!(
+        buffered().open::<removed_v2::Root>(&path),
+        Err(ferro::Error::Decode(message)) if message.contains("more than once")
+    ));
+    let old: Db<removed_v1::Root> = buffered().open(&path).unwrap();
+    assert_eq!(old.read().slots.len(), 2);
+    old.verify_typed().unwrap();
+}
+
+mod vec_v1 {
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub tags: Vec<String>,
+    }
+}
+
+mod vec_v2 {
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub tags: std::collections::BTreeSet<String>,
+    }
+}
+
+#[test]
+fn a_vec_field_turned_into_a_btree_set_reads_old_data_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vec.ferro");
+    {
+        let db: Db<vec_v1::Root> = buffered().open(&path).unwrap();
+        db.commit("tags", |root| {
+            root.tags = vec!["b".into(), "c".into(), "a".into()];
+        })
+        .unwrap();
+    }
+    opened_as::<vec_v2::Root>(&path, |root| {
+        root.tags.iter().map(String::as_str).collect::<Vec<_>>() == ["a", "b", "c"]
+    });
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Job {
+    #[ferro(skip)]
+    priority: u32,
+    name: String,
+}
+
+fn job(priority: u32, name: &str) -> Job {
+    Job {
+        priority,
+        name: name.to_string(),
+    }
+}
+
+#[derive(Data, Clone, Default)]
+struct Queue {
+    jobs: BTreeSet<Job>,
+    queued: Map<u32, BTreeSet<Job>>,
+}
+
+#[test]
+fn a_key_whose_ord_reads_a_skipped_field_reads_back_and_a_commit_that_collides_fails_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skip.ferro");
+    {
+        let db: Db<Queue> = buffered().open(&path).unwrap();
+        db.commit("jobs", |root| {
+            root.jobs.insert(job(1, "zip"));
+            root.jobs.insert(job(2, "archive"));
+            root.queued
+                .insert(1, BTreeSet::from([job(2, "b"), job(1, "c")]));
+        })
+        .unwrap();
+        let version = db.version();
+        let colliding = [
+            BTreeSet::from([job(1, "same"), job(2, "same")]),
+            BTreeSet::from([job(1, &"x".repeat(600)), job(2, &"x".repeat(600))]),
+        ];
+        assert!(
+            db.commit("collide", |root| {
+                root.jobs.insert(job(3, "zip"));
+            })
+            .is_err()
+        );
+        for (key, jobs) in colliding.into_iter().enumerate() {
+            let collided = db.commit("collide", |root| {
+                root.queued.insert(10 + key as u32, jobs);
+            });
+            assert!(
+                matches!(collided, Err(ferro::Error::Decode(_))),
+                "{collided:?}"
+            );
+        }
+        assert_eq!(db.version(), version);
+        db.verify_typed().unwrap();
+    }
+    opened_as::<Queue>(&path, |root| {
+        let names: Vec<&str> = root.jobs.iter().map(|job| job.name.as_str()).collect();
+        let queued = root.queued.get(&1).is_some_and(|jobs| jobs.len() == 2);
+        names == ["archive", "zip"] && queued && root.queued.len() == 1
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct Rev(u32);
+
+impl Ord for Rev {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.cmp(&self.0)
+    }
+}
+
+impl PartialOrd for Rev {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Data for Rev {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.raw(&self.0.to_be_bytes());
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let bytes = r.take(4)?;
+        Ok(Rev(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))
+    }
+
+    fn describe(d: &mut Description) {
+        d.word("rev");
+    }
+
+    fn same_encoding(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Versioned {
+    a: u32,
+    b: String,
+}
+
+impl Data for Versioned {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        use ferro::codec::field_tag;
+        let mut fields = [(field_tag("a"), true), (field_tag("b"), false)];
+        fields.sort();
+        w.varint(2);
+        for (tag, first) in fields {
+            w.field(tag, |w| match first {
+                true => {
+                    self.a.encode(w)?;
+                    w.varint(99);
+                    Ok(())
+                }
+                false => self.b.encode(w),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        use ferro::codec::field_tag;
+        let mut out = Versioned::default();
+        r.fields(|tag, r| {
+            if tag == field_tag("a") {
+                out.a = u32::decode(r)?;
+            } else if tag == field_tag("b") {
+                out.b = String::decode(r)?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Tags(BTreeMap<String, u32>);
+
+impl Data for Tags {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Tags(BTreeMap::decode(r)?))
+    }
+}
+
+#[derive(Data, Clone, Default)]
+struct Custom {
+    revs: BTreeSet<Rev>,
+    pairs: BTreeMap<(String, Rev), u8>,
+    tree: Map<Rev, u8>,
+    versioned: Versioned,
+    by_key: Map<u32, Versioned>,
+    tags: Tags,
+}
+
+#[test]
+fn keys_ordered_against_their_bytes_and_hand_written_impls_verify_sync_and_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("custom.ferro");
+    {
+        let db: Db<Custom> = buffered().open(&path).unwrap();
+        db.commit("fill", |root| {
+            for n in [0u32, 1, 7, 300, 70_000, u32::MAX] {
+                root.revs.insert(Rev(n));
+                root.pairs.insert((format!("k{}", n % 3), Rev(n)), n as u8);
+                root.tree.insert(Rev(n), n as u8);
+                let b = "x".repeat((n % 600) as usize);
+                root.by_key.insert(n, Versioned { a: n, b });
+                root.tags.0.insert(format!("t{n}"), n);
+            }
+            root.versioned = Versioned {
+                a: 3,
+                b: "three".into(),
+            };
+        })
+        .unwrap();
+    }
+    opened_as::<Custom>(&path, |root| {
+        root.revs.first() == Some(&Rev(u32::MAX))
+            && root.tree.len() == 6
+            && root.versioned.a == 3
+            && root.by_key.get(&300).is_some_and(|v| v.b.len() == 300)
+            && root.tags.0.len() == 6
+    });
+}
+
+mod indexes_v1 {
+    #[derive(ferro::Data, ferro::Record, Clone, Debug, PartialEq)]
+    pub struct Item {
+        #[key]
+        pub id: u32,
+        #[index]
+        pub kind: u8,
+        #[unique]
+        pub name: String,
+        pub note: String,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub items: ferro::Table<Item>,
+    }
+}
+
+mod indexes_v2 {
+    #[derive(ferro::Data, ferro::Record, Clone, Debug, PartialEq)]
+    pub struct Item {
+        #[key]
+        pub id: u32,
+        #[index(cover(memo))]
+        pub kind: u8,
+        #[index]
+        pub name: String,
+        #[ferro(rename = "note")]
+        pub memo: String,
+        #[ferro(default)]
+        #[index]
+        pub extra: u32,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub items: ferro::Table<Item>,
+    }
+}
+
+#[test]
+fn a_table_whose_indexes_change_verifies_compacts_and_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("indexes.ferro");
+    {
+        let db: Db<indexes_v1::Root> = buffered().open(&path).unwrap();
+        db.commit("fill", |root| {
+            for id in 0..300u32 {
+                root.items.insert(indexes_v1::Item {
+                    id,
+                    kind: (id % 5) as u8,
+                    name: format!("n{id}"),
+                    note: "x".repeat((id % 700) as usize),
+                });
+            }
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+    let db: Db<indexes_v2::Root> = buffered().open(&path).unwrap();
+    db.verify_typed().unwrap();
+    db.commit("touch", |root| {
+        root.items.update(&7, |item| item.extra = 3);
+    })
+    .unwrap();
+    db.verify_typed().unwrap();
+    db.compact(Keep::Last(1)).unwrap();
+    drop(db);
+    opened_as::<indexes_v2::Root>(&path, |root| {
+        root.items.len() == 300 && root.items.by_extra(&3).count() == 1
+    });
 }

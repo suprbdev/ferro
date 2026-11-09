@@ -454,3 +454,51 @@ fn every_verifier_reports_a_merge_record_that_names_a_dropped_branch() {
     assert!(refused(main.verify()));
     assert!(refused(main.verify_typed()));
 }
+
+fn theirs_win(
+    root: &mut Root,
+    base: &ferro::Snapshot<Root>,
+    theirs: &ferro::Snapshot<Root>,
+) -> (String, ()) {
+    root.merge(base, theirs, |conflict| conflict.theirs.map(|value| *value));
+    ("merge".to_string(), ())
+}
+
+fn verified(db: &Db<Root>, step: &str) {
+    db.verify()
+        .unwrap_or_else(|error| panic!("{step}: verify: {error}"));
+    db.verify_typed()
+        .unwrap_or_else(|error| panic!("{step}: verify_typed: {error}"));
+}
+
+#[test]
+fn merge_records_verify_through_drops_forks_of_the_same_name_pulls_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = fast().open::<Root>(dir.path().join("a.ferro")).unwrap();
+    let db = open(&dir);
+    put(&remote, 1, 1);
+    put(&db, 2, 2);
+    db.pull(&remote, "a", theirs_win).unwrap();
+    verified(&db, "first pull");
+    let side = db.fork("side").unwrap();
+    put(&side, 3, 3);
+    side.pull(&remote, "a", theirs_win).unwrap();
+    verified(&db, "pull into a fork");
+    db.drop_branch("a").unwrap();
+    verified(&db, "drop the tracking branch");
+    let again = db.fork("a").unwrap();
+    put(&again, 4, 4);
+    verified(&db, "fork the same name");
+    drop(again);
+    db.drop_branch("a").unwrap();
+    put(&remote, 5, 5);
+    db.pull(&remote, "a", theirs_win).unwrap();
+    side.pull(&remote, "a", theirs_win).unwrap();
+    verified(&db, "pull again");
+    db.compact(Keep::Last(1)).unwrap();
+    verified(&db, "compact");
+    let clone = fast().open::<Root>(dir.path().join("c.ferro")).unwrap();
+    clone.pull(&db, "b", theirs_win).unwrap();
+    verified(&clone, "clone");
+    admin::verify(dir.path().join("b.ferro")).unwrap();
+}

@@ -11,9 +11,10 @@ the struct:
   `#[ferro(default)]` or `#[ferro(default = "path::to::fn")]`.
 - To rename a field, use `#[ferro(rename = "old_name")]`.
 - A field's type can change only to one that encodes the same: a `Box`, an `Arc` or a
-  `#[ferro(transparent)]` newtype of it, or `Bytes` for a `Vec<u8>`. A read decodes each field it
-  knows to its end, so a new type that reads less than old data holds there fails with
-  `Error::Decode` rather than dropping the rest.
+  `#[ferro(transparent)]` newtype of it, `Bytes` for a `Vec<u8>`, or a `BTreeSet<T>` for a `Vec<T>`
+  and a `BTreeMap<K, V>` for a `Vec<(K, V)>` whose old data holds no two equal items or keys. A read
+  decodes each field it knows to its end, so a new type that reads less than old data holds there
+  fails with `Error::Decode` rather than dropping the rest.
 - A variant can be added, renamed with `#[ferro(rename = "old_name")]` or removed, and its fields
   follow the rules above. Old data that holds a removed variant fails to decode.
 
@@ -22,7 +23,17 @@ the `r#`, here `type`, and its indexes and lookups are named the same way, as `b
 builds stored it under `r#type` and could not index it, so to read data they wrote, mark the field
 `#[ferro(rename = "r#type")]`.
 
-Do not change the encoding or `Ord` of a key type on existing data. Tree placement depends on both.
+Do not change the encoding or `Ord` of the key type of a `Map`, a `Set`, a table or an index on
+existing data. Tree placement depends on both.
+
+The keys of a `BTreeMap` or `BTreeSet` are read in whatever order they were stored and sorted by
+their type's `Ord` as it is now, so the steps above read old data there too: reordering the fields
+of a key struct that derives `Ord` or the variants of a key enum, and removing a field from a key
+type. One step is not safe for such a key type: a change after which two stored keys compare equal,
+such as removing the only field that told them apart, fails the read with `Error::Decode`, since
+the collection could keep only one of them. To make such a change, give the field a new stored name
+with the new type, and fill it from the old field, read under its old name and type, merging the
+entries that collide as you choose.
 
 A field is stored under a 16-bit hash of its name, so a field you add has a 1 in 65,536 chance of
 hashing to the tag of a field you removed. Old data then still holds bytes under that tag, and the
@@ -49,6 +60,11 @@ you list.
 A field marked `#[ferro(skip)]` is not stored and reads back as its `Default`. The `Record` derive
 refuses `#[key]` or an index of any kind on one, alone or in a composite, and a `Summary` must not
 depend on one, as described under [Summaries](../internals/summaries.md#how-a-summary-is-kept).
+Keep it out of the `Ord` of a type used as a key: the file does not hold it, so it cannot order the
+keys read back. In a `BTreeMap` or `BTreeSet`, keys that differ in a stored field read back sorted
+by what was stored, with the skipped field at its default, and a commit that writes two keys that
+differ only in a skipped field fails with `Error::Decode`, before anything reaches the file. The
+derive cannot see an `Ord` impl, so it does not refuse one that reads a skipped field.
 
 A map stores the fold of every subtree, and nothing in the file says which summary type `S` made it.
 A new `S` that encodes differently fails to decode, as a changed `V` does. One that encodes the same

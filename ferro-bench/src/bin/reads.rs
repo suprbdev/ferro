@@ -12,9 +12,11 @@
 //! `contains_many` over every 2nd, 16th, 256th and 4096th key in key order. It also times a table
 //! of `n / 5` accounts indexed on `tier` and `balance`, scanned whole, through an index in key
 //! order, through scattered index rows, with `for_each` and over index keys; a `Map<String, u64>`
-//! scanned three ways; and decoding vectors of a million small, medium and large `u64`s, `f64`s and
-//! pairs of `u32`s. `--only` takes a comma-separated list of `string`, `u64`, `u32`, `unit`,
-//! `rows`, `text` and `decode` to run some of them.
+//! scanned three ways; decoding vectors of a million small, medium and large `u64`s, `f64`s and
+//! pairs of `u32`s; and decoding and visiting a `BTreeMap<u64, u64>` and a `BTreeSet<String>` of a
+//! million keys, stored in order and shuffled, and a million keys in `BTreeMap`s of four. `--only`
+//! takes a comma-separated list of `string`, `u64`, `u32`, `unit`, `rows`, `text`, `decode` and
+//! `btree` to run some of them.
 //!
 //! Each timed read runs three times and reports its fastest nanoseconds per item, and its fewest
 //! user-space instructions per item as `_ins`, counted through `perf_event_open` on Linux and 0
@@ -27,7 +29,7 @@
 //! ```
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::hint::black_box;
 use std::io::Write;
@@ -594,6 +596,44 @@ fn decode_case(report: &mut Report) {
     );
 }
 
+fn decoded_whole<T: Data>(report: &mut Report, name: &str, count: u64, value: &impl Data) {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    value.encode(&mut encoder).unwrap();
+    let body = encoder.into_object().body;
+    if T::decode(&mut Decoder::new(&body, &[], None)).is_err() {
+        return;
+    }
+    report.timed(&format!("decode_{name}"), count, || {
+        T::decode(&mut Decoder::new(&body, &[], None)).unwrap()
+    });
+    report.timed(&format!("visit_{name}"), count, || {
+        T::visit(&mut Decoder::new(&body, &[], None)).unwrap()
+    });
+}
+
+fn btree_case(report: &mut Report) {
+    let pairs: Vec<(u64, u64)> = (0..1_000_000u64).map(|i| (mix(i), i)).collect();
+    let mut sorted = pairs.clone();
+    sorted.sort_unstable();
+    decoded_whole::<BTreeMap<u64, u64>>(report, "btreemap", 1_000_000, &sorted);
+    decoded_whole::<BTreeMap<u64, u64>>(report, "btreemap_shuffled", 1_000_000, &pairs);
+    let texts: Vec<String> = (0..1_000_000u64)
+        .map(|i| format!("user-{:016x}", mix(i)))
+        .collect();
+    let mut sorted = texts.clone();
+    sorted.sort_unstable();
+    decoded_whole::<BTreeSet<String>>(report, "btreeset_text", 1_000_000, &sorted);
+    decoded_whole::<BTreeSet<String>>(report, "btreeset_text_shuffled", 1_000_000, &texts);
+    let small: Vec<BTreeMap<u16, u32>> = (0..250_000u64)
+        .map(|i| {
+            let base = (mix(i) as u16) & !3;
+            (0..4).map(|j| (base + j as u16, j)).collect()
+        })
+        .collect();
+    decoded_whole::<Vec<BTreeMap<u16, u32>>>(report, "btreemap_small", 1_000_000, &small);
+}
+
 fn argument(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -637,6 +677,9 @@ fn main() {
     }
     if wanted("decode") {
         decode_case(&mut report);
+    }
+    if wanted("btree") {
+        btree_case(&mut report);
     }
     let body: Vec<String> = report
         .0

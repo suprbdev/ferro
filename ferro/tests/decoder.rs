@@ -9,7 +9,7 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
 
-use common::{cases, quiet_ferro_panics};
+use common::{cases, fast, quiet_ferro_panics};
 use ferro::codec::{Decoder, Encoder, HashSink, field_tag};
 use ferro::{Data, List, Map, Ptr, Set};
 use proptest::prelude::*;
@@ -479,13 +479,52 @@ fn a_value_is_read_only_from_the_bytes_its_encoder_writes() {
     refused::<Vec<u8>>(&[0x81, 0x00, 7]);
     refused::<ferro::Bytes>(&[0x81, 0x00, 7]);
     refused::<BTreeMap<u8, u8>>(&[2, 1, 5, 1, 6]);
-    refused::<BTreeMap<u8, u8>>(&[2, 2, 0, 1, 0]);
+    refused::<BTreeMap<u8, u8>>(&[3, 1, 5, 2, 6, 1, 7]);
     refused::<BTreeSet<u8>>(&[2, 4, 4]);
-    refused::<BTreeSet<u8>>(&[2, 4, 3]);
-    refused::<BTreeSet<String>>(&[2, 1, b'b', 1, b'a']);
+    refused::<BTreeSet<u8>>(&[3, 4, 3, 4]);
+    refused::<BTreeSet<String>>(&[2, 1, b'a', 1, b'a']);
+    let repeated: Vec<u32> = (0..40).chain([17]).collect();
+    refused::<BTreeSet<u32>>(&body_of(&repeated));
     assert_eq!(
         body_of(&BTreeMap::from([(1u8, 5u8), (2, 6)])),
         [2, 1, 5, 2, 6]
+    );
+}
+
+fn reads_sorted<T: Data + Debug + PartialEq>(bytes: &[u8], expected: T) {
+    let mut decoder = Decoder::new(bytes, &[], None);
+    assert_eq!(T::decode(&mut decoder).unwrap(), expected);
+    assert_eq!(decoder.remaining(), 0);
+    let mut visitor = Decoder::new(bytes, &[], None);
+    T::visit(&mut visitor).unwrap();
+    assert_eq!(visitor.remaining(), 0);
+    let canonical = body_of(&expected);
+    assert_ne!(canonical, bytes);
+    assert_eq!(
+        T::decode(&mut Decoder::new(&canonical, &[], None)).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn btree_keys_stored_in_any_order_read_sorted() {
+    reads_sorted(&[2, 2, 0, 1, 0], BTreeMap::from([(1u8, 0u8), (2, 0)]));
+    reads_sorted(&[2, 4, 3], BTreeSet::from([3u8, 4]));
+    reads_sorted(
+        &[2, 1, b'b', 1, b'a'],
+        BTreeSet::from(["a".to_string(), "b".to_string()]),
+    );
+    let shuffled: Vec<(u32, String)> = (0..300u32)
+        .map(|n| (n * 7 % 300, format!("v{n}")))
+        .collect();
+    reads_sorted(
+        &body_of(&shuffled),
+        shuffled.iter().cloned().collect::<BTreeMap<_, _>>(),
+    );
+    let late: Vec<u32> = (1..60).chain([0]).collect();
+    reads_sorted(
+        &body_of(&late),
+        late.iter().copied().collect::<BTreeSet<_>>(),
     );
 }
 
@@ -493,6 +532,17 @@ type Mixed = (
     Vec<Option<u32>>,
     BTreeMap<u16, String>,
     BTreeSet<i32>,
+    [u16; 3],
+    char,
+    i128,
+    (bool, u8, i16),
+    ferro::Bytes,
+);
+
+type Stored = (
+    Vec<Option<u32>>,
+    Vec<(u16, String)>,
+    Vec<i32>,
     [u16; 3],
     char,
     i128,
@@ -523,7 +573,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(4000), failure_persistence: None, ..ProptestConfig::default() })]
 
     #[test]
-    fn what_decodes_whole_encodes_back_to_the_same_bytes(seed in any::<u64>()) {
+    fn what_decodes_whole_encodes_back_to_the_same_bytes_with_its_keys_sorted(seed in any::<u64>()) {
         let mut rng = common::Rng::new(seed);
         let mut bytes = body_of(&mixed(&mut rng));
         for _ in 0..1 + rng.below(3) {
@@ -546,7 +596,10 @@ proptest! {
         if let (Ok((value, rest)), Ok(left)) = (decoded, visited) {
             prop_assert_eq!(rest, left);
             if rest == 0 {
-                prop_assert_eq!(body_of(&value), bytes);
+                let mut stored = Stored::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+                stored.1.sort_by_key(|(key, _)| *key);
+                stored.2.sort_unstable();
+                prop_assert_eq!(body_of(&value), body_of(&stored));
             }
         }
     }
@@ -591,7 +644,7 @@ fn forged_as<T: Data + Default + Debug>(bytes: &[u8]) {
 fn a_root_written_in_a_form_no_encoder_writes_fails_to_open() {
     forged_as::<u64>(&[0x80, 0x00]);
     forged_as::<BTreeMap<u8, u8>>(&[2, 1, 5, 1, 6]);
-    forged_as::<BTreeSet<String>>(&[2, 1, b'b', 1, b'a']);
+    forged_as::<BTreeSet<String>>(&[2, 1, b'a', 1, b'a']);
     forged_as::<Vec<String>>(&[1, 0x81, 0x00, b'a']);
 }
 
@@ -1108,4 +1161,163 @@ fn a_map_node_with_bytes_after_its_entries_fails_a_typed_verify() {
         db.verify_typed(),
         Err(ferro::Error::Corrupt(message)) if message.contains("left after the value")
     ));
+}
+
+fn verified_whole<T: Data + Default>(db: &ferro::Db<T>) {
+    db.verify_typed().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let other: ferro::Db<T> = fast().open(dir.path().join("other.ferro")).unwrap();
+    let bundle = db.bundle(&other.have().unwrap()).unwrap();
+    other
+        .receive("sender", &bundle, |_, _, _| ("merge".to_string(), ()))
+        .unwrap();
+    other.verify_typed().unwrap();
+    db.compact(ferro::Keep::Last(1)).unwrap();
+    db.verify_typed().unwrap();
+}
+
+mod spill_v1 {
+    #[derive(ferro::Data, Clone, Debug, Default)]
+    pub struct Blob {
+        pub data: Vec<u8>,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub blobs: ferro::Map<u32, Blob>,
+    }
+}
+
+mod spill_v2 {
+    #[derive(ferro::Data, Clone, Debug, Default)]
+    pub struct Blob {
+        pub data: Vec<u8>,
+        #[ferro(default)]
+        pub extra: u64,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub blobs: ferro::Map<u32, Blob>,
+    }
+}
+
+mod spill_v3 {
+    #[derive(ferro::Data, Clone, Debug, Default)]
+    #[ferro(removed("extra"))]
+    pub struct Blob {
+        pub data: Vec<u8>,
+    }
+
+    #[derive(ferro::Data, Clone, Default)]
+    pub struct Root {
+        pub blobs: ferro::Map<u32, Blob>,
+    }
+}
+
+#[test]
+fn values_near_the_spill_size_hold_their_placement_across_schema_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spill.ferro");
+    {
+        let db: ferro::Db<spill_v1::Root> = fast().open(&path).unwrap();
+        db.commit("fill", |root| {
+            for key in 0..400u32 {
+                let data = vec![key as u8; 490 + (key % 30) as usize];
+                root.blobs.insert(key, spill_v1::Blob { data });
+            }
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+    {
+        let db: ferro::Db<spill_v2::Root> = fast().open(&path).unwrap();
+        db.verify_typed().unwrap();
+        db.commit("touch", |root| {
+            for key in (0..400u32).step_by(7) {
+                let data = vec![1; 500 + (key % 20) as usize];
+                let extra = u64::from(key) * 1_000_000;
+                root.blobs
+                    .insert(key + 1000, spill_v2::Blob { data, extra });
+            }
+            for key in (3..400u32).step_by(11) {
+                if let Some(blob) = root.blobs.get_mut(&key) {
+                    blob.extra = 1 << 40;
+                }
+            }
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+    let db: ferro::Db<spill_v3::Root> = fast().open(&path).unwrap();
+    assert_eq!(db.read().blobs.len(), 458);
+    verified_whole(&db);
+    db.commit("rewrite", |root| root.blobs.rewrite()).unwrap();
+    verified_whole(&db);
+}
+
+#[derive(Data, Clone, Default)]
+struct Lists {
+    list: List<String>,
+    lists: Map<u32, List<u64>>,
+    sets: Set<String>,
+}
+
+#[test]
+fn lists_hold_their_positions_after_every_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db: ferro::Db<Lists> = fast().open(dir.path().join("lists.ferro")).unwrap();
+    db.commit("extend", |root| {
+        root.list.extend((0..600).map(|n| format!("item {n}")));
+        for key in 0..20u32 {
+            let list = (0..u64::from(key) * 40).collect::<List<u64>>();
+            root.lists.insert(key, list);
+        }
+        root.sets.extend((0..300).map(|n| format!("s{n}")));
+    })
+    .unwrap();
+    db.commit("pop", |root| {
+        root.list.pop();
+        root.list.pop();
+    })
+    .unwrap();
+    db.commit("set", |root| {
+        root.list.set(5, "five".into());
+        root.list.set(root.list.len() - 1, "last".into());
+    })
+    .unwrap();
+    db.commit("truncate", |root| root.list.truncate(333))
+        .unwrap();
+    db.commit("push", |root| {
+        for n in 0..50 {
+            root.list.push(format!("again {n}"));
+        }
+    })
+    .unwrap();
+    db.commit("inner", |root| {
+        for key in 0..20u32 {
+            let Some(list) = root.lists.get_mut(&key) else {
+                continue;
+            };
+            match key % 4 {
+                0 => list.clear(),
+                1 => list.truncate(key as usize),
+                2 => {
+                    list.pop();
+                    list.push(9);
+                }
+                _ => list.rewrite(),
+            }
+        }
+        root.sets.remove("s7");
+    })
+    .unwrap();
+    verified_whole(&db);
+    db.commit("empty", |root| {
+        root.list.truncate(0);
+        root.list.push("one".into());
+    })
+    .unwrap();
+    verified_whole(&db);
+    assert_eq!(db.read().list.len(), 1);
 }

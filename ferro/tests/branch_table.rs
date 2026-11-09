@@ -347,3 +347,50 @@ fn every_verifier_reports_a_branch_table_whose_names_are_out_of_order() {
     assert!(refused(db.verify()));
     assert!(refused(db.verify_typed()));
 }
+
+#[test]
+fn a_table_of_many_branches_with_names_in_any_script_verifies_and_compacts() {
+    let dir = dir();
+    let path = dir.path().join("names.ferro");
+    let prefixes = [
+        "a",
+        "Z",
+        "ветка",
+        "枝",
+        "🌿",
+        "é",
+        "e\u{301}",
+        "ß",
+        "\u{10FFFF}",
+        " ",
+    ];
+    let mut kept = vec!["main".to_string()];
+    {
+        let db: Db<Root> = options().open(&path).unwrap();
+        put(&db, 0, 0);
+        for n in 0..260u64 {
+            let name = format!("{}-{n}", prefixes[n as usize % prefixes.len()]);
+            let branch = db.fork(&name).unwrap();
+            put(&branch, n, n);
+            drop(branch);
+            match n % 9 {
+                0 => db.drop_branch(&name).unwrap(),
+                _ => kept.push(name),
+            }
+        }
+        db.verify().unwrap();
+        db.verify_typed().unwrap();
+        db.compact(Keep::Last(1)).unwrap();
+        db.verify().unwrap();
+    }
+    kept.sort();
+    let db: Db<Root> = options().open(&path).unwrap();
+    assert_eq!(db.branches(), kept);
+    db.verify().unwrap();
+    db.verify_typed().unwrap();
+    ferro::admin::verify(&path).unwrap();
+    for name in kept.iter().filter(|name| *name != "main") {
+        let n: u64 = name.rsplit('-').next().unwrap().parse().unwrap();
+        assert_eq!(db.branch(name).unwrap().read().get(&n).as_deref(), Some(&n));
+    }
+}

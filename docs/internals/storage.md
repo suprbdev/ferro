@@ -31,8 +31,8 @@ other forms a damaged file or a bundle could hold:
 - A varint longer than its value needs, which ends in a zero byte. `Decoder::varint` checks the
   last byte of a varint of two bytes or more, as the record reader does, and a one-byte varint
   costs nothing more.
-- Keys of a `BTreeMap` or `BTreeSet` that do not strictly ascend: a key out of order, or one stored
-  twice, of which the map kept the last and dropped the other.
+- Two keys of a `BTreeMap` or `BTreeSet` that its key type's `Ord` holds equal, of which the map
+  kept the last and dropped the other.
 - Struct fields whose tags do not strictly ascend, so a field stored twice no longer overwrites the
   first, a field the derive knows that its type does not read to the end, and a field that flags
   links and holds none.
@@ -59,6 +59,30 @@ overwrote the last (#135). Both are refused now. A spilled value is checked unde
 own, one for each map type, so that an object the check passed as a `V` elsewhere, as the root of a
 commit whose type holds maps of itself, does not vouch for its size as a spilled value.
 
+Keys of a `BTreeMap` or `BTreeSet` stored out of order are the one form no encoder writes that a
+read accepts. An encoder writes them in the order of their type's `Ord`, and that order changes
+under steps the schema guide allows: reordering the fields of a struct that derives `Ord`, or the
+variants of an enum, or removing a field. A file written before such a step holds its keys in the
+old order, and refusing them, as the build after #134 did, made the whole root of such a file fail
+to open (#141). So decoding reads the entries in the order stored, checks that they ascend, sorts
+them under the reading type's `Ord` only when they do not, and refuses two that compare equal: no
+encoder writes those, and a map would keep one and drop the other. A step that makes two stored
+keys equal, such as removing the only field that told them apart, fails the read with
+`Error::Decode` rather than drop an entry.
+
+The value read is the same whatever order its keys were stored in. What the stored order costs is a
+second hash for an equal value: the object that holds it keeps its hash until the value is written
+again, so a map that holds it compares unequal to one that holds the sorted form, `value_hash`
+differs from the `hash_of` the value read, and the first commit that writes the value again writes
+the sorted form and changes the hash, once. A bundle can carry keys out of order too, and lands
+with the same cost, and nothing more: no entry is lost or changed, as a key stored twice would
+change it. `verify_typed` reports neither. An evolved file holds that form honestly, nothing in the
+bytes tells it from a forged one, and a warning on every such file would teach users to ignore it.
+
+A type whose `Ord` compares a field the derive skips can hold two keys that compare unequal and
+encode alike. The commit that writes them fails with `Error::Decode` before anything lands, since a
+commit decodes what it drafted, so no file holds a value that cannot be read back.
+
 What schema evolution needs stays as it was. A field whose tag the type does not know is skipped
 whatever it holds, which is how a removed field and a field from a newer version of the type read. A
 missing field reads as its default, an unknown variant tag fails as before, and a `Box`, an `Arc`,
@@ -78,6 +102,21 @@ it, with each binary run alternately, three or four times, decoding a million la
 A cold scan of a `Map<u64, u64>` took 1,113 instructions a key against 1,108, and gets,
 warm scans, single-key commits, a bulk load and the table workload of `make bench` moved by under
 0.5%, within the spread of the instruction counts between runs.
+
+A `BTreeMap` or `BTreeSet` decodes by collecting its entries, checking that each key sorts after the
+one before, sorting only when one does not, and building the tree from the sorted entries at once,
+rather than inserting each entry as it is read. Measured with `make bench-reads ARGS='--only btree'`
+against the build that checked and inserted each key, each binary run alternately three times, a
+`BTreeMap<u64, u64>` of a million keys stored in order decodes in 12.0 ns a key against 57.7, 342
+instructions against 1,000, and a `BTreeSet<String>` of a million keys in 36 ns against 156, 789
+instructions against 2,909. A `Vec` of maps of four keys decodes in 17.5 ns a key against 17.1, 372
+instructions against 355, the cost of the vector each map collects into. Stored out of order, the
+large map decodes in 30 ns a key and the set in 212. A visit, as `verify_typed` and a receive make,
+keeps only the last key while the keys ascend, and at the first key out of order goes back to the
+start of the collection, forgetting the typed links and tables it noted there, and reads it again
+keeping every key to sort: the large map visits in 7.4 ns a key against 8.2 at 240 instructions
+both, maps of four in 6.1 ns against 5.7, 141 instructions against 132, and out of order the large
+map takes 21 ns a key.
 
 Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
 instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage

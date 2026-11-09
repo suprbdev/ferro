@@ -1,7 +1,7 @@
 mod common;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -667,4 +667,67 @@ fn a_bundle_holding_a_spilled_value_in_a_form_no_encoder_writes_is_refused() {
         })
     });
     assert!(matches!(trailing, Err(Error::Bundle(_))), "{trailing:?}");
+}
+
+type Tagged = Map<u64, BTreeSet<String>>;
+
+fn set_of(items: [&str; 2]) -> Vec<u8> {
+    let mut out = vec![2];
+    for item in items {
+        out.push(item.len() as u8);
+        out.extend_from_slice(item.as_bytes());
+    }
+    out
+}
+
+fn tags_landed(stored: &[u8]) -> (TempDir, Db<Tagged>, Db<Tagged>, ferro::Result<()>) {
+    let dir = tempfile::tempdir().unwrap();
+    let sender: Db<Tagged> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let receiver: Db<Tagged> = fast().open(dir.path().join("b.ferro")).unwrap();
+    sender
+        .update(|map| {
+            map.insert(7, BTreeSet::from(["tag-a".into(), "tag-b".into()]));
+        })
+        .unwrap();
+    let canonical = set_of(["tag-a", "tag-b"]);
+    let mut parsed = Parsed::of(&sender.bundle(&receiver.have().unwrap()).unwrap());
+    let old: Vec<Hash> = parsed.objects.iter().map(Wire::hash).collect();
+    let mut edited = 0;
+    for object in &mut parsed.objects {
+        if let Some(at) = find(&object.body, &canonical) {
+            object
+                .body
+                .splice(at..at + canonical.len(), stored.iter().copied());
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 1);
+    parsed.rehash(old);
+    let landed = receiver
+        .receive("a", &parsed.encode(), |_, _, _| -> (String, ()) {
+            panic!("no merge expected")
+        })
+        .map(drop);
+    (dir, sender, receiver, landed)
+}
+
+#[test]
+fn a_bundle_holding_btree_keys_out_of_order_lands_and_one_holding_a_key_twice_is_refused() {
+    let (_dir, sender, receiver, landed) = tags_landed(&set_of(["tag-b", "tag-a"]));
+    landed.unwrap();
+    receiver.verify_typed().unwrap();
+    let (ours, theirs) = (receiver.read(), sender.read());
+    assert_eq!(ours.get(&7).as_deref(), theirs.get(&7).as_deref());
+    assert_ne!(ours.root_hash(), theirs.root_hash());
+    receiver
+        .update(|map| {
+            let tags = (*map.get(&7).unwrap()).clone();
+            map.insert(7, tags);
+        })
+        .unwrap();
+    assert_eq!(receiver.read().root_hash(), sender.read().root_hash());
+    receiver.verify_typed().unwrap();
+    let (_dir, _, receiver, landed) = tags_landed(&set_of(["tag-a", "tag-a"]));
+    assert!(matches!(landed, Err(Error::Bundle(_))), "{landed:?}");
+    assert!(receiver.read().is_empty());
 }

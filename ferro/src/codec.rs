@@ -332,17 +332,23 @@ impl Sink for HashSink {
 ///   commit that changes nothing, [`Map::diff`](crate::Map::diff) and merges all go by
 ///   encodings, so a value that encodes two ways looks changed when it is not. Decoding reads a
 ///   value only from the one form its encoder writes: the impls ferro provides refuse a varint
-///   longer than its value needs and the keys of a `BTreeMap` or `BTreeSet` that do not strictly
-///   ascend, [`Decoder::fields`] refuses fields out of order of tag, the derive refuses a field
-///   its type does not read to the end, and the checks of [`Db::receive`](crate::Db::receive)
-///   and [`Db::verify_typed`](crate::Db::verify_typed) refuse an object with bytes or links left
+///   longer than its value needs and a `BTreeMap` or `BTreeSet` that holds two equal keys,
+///   [`Decoder::fields`] refuses fields out of order of tag, the derive refuses a field its type
+///   does not read to the end, and the checks of [`Db::receive`](crate::Db::receive) and
+///   [`Db::verify_typed`](crate::Db::verify_typed) refuse an object with bytes or links left
 ///   after its value. A hand-written impl that reads fields with [`Decoder::fields`] can call
-///   [`Decoder::end`] on each field it knows, as the derive does.
+///   [`Decoder::end`] on each field it knows, as the derive does. The one other form read is the
+///   keys of a `BTreeMap` or `BTreeSet` out of order, which a file written before their type's
+///   `Ord` changed holds: they are sorted as they are read, and the object that holds them keeps
+///   its hash until the value is written again.
 /// - **A key's encoding agrees with its `Ord`.** A key type's values must compare equal exactly
 ///   when they encode the same. A key's place in a map's tree comes from a hash of its encoding
 ///   and its order from `Ord`, so two equal keys that encode differently can land in different
-///   nodes and be missed by lookups. Neither the encoding nor the `Ord` of a key type may change
-///   on existing data.
+///   nodes and be missed by lookups. Neither the encoding nor the `Ord` of the key type of a map,
+///   a set or a table index may change on existing data. A `BTreeMap` or `BTreeSet` sorts its keys
+///   as it reads them, so its key type's `Ord` may change, but a commit that writes two of its
+///   keys that compare unequal and encode the same, as a type whose `Ord` reads a
+///   `#[ferro(skip)]` field can hold, fails with [`Error::Decode`].
 /// - **The encoding evolves by name.** Old data must keep decoding as the type changes. The
 ///   derive gets this by storing each field under a tag hashed from its name, which
 ///   [`Encoder::field`] and [`Decoder::fields`] offer a hand-written impl too; one that writes
@@ -1113,10 +1119,109 @@ fn overlong() -> Error {
     Error::Decode("overlong varint".into())
 }
 
-/// The error of a `BTreeMap` or `BTreeSet` whose keys do not strictly ascend.
+/// The error of a `BTreeMap` or `BTreeSet` that stores two keys its key type's `Ord` holds equal.
 #[cold]
-fn unsorted() -> Error {
-    Error::Decode("keys are stored out of order or more than once".into())
+fn repeated() -> Error {
+    Error::Decode("a key is stored more than once".into())
+}
+
+/// Room for the entries of a `BTreeMap` or `BTreeSet` of `len` entries in what is left of `r`,
+/// reserving no more than the remaining bytes could hold, as [`Data::decode_vec`] does, so that a
+/// damaged length cannot make it allocate far ahead of what it decodes.
+fn entries_for<T>(r: &Decoder<'_>, len: u64) -> Vec<T> {
+    let room = r.remaining() / size_of::<T>().max(1);
+    Vec::with_capacity(usize::try_from(len).unwrap_or(usize::MAX).min(room))
+}
+
+/// Whether `key` sorts after the key `key_of` gives for the last of `entries`, as each key does
+/// when a `BTreeMap` or `BTreeSet` is stored in the order it encodes its keys.
+#[inline]
+fn after<T, K: Ord>(entries: &[T], key: &K, key_of: impl Fn(&T) -> &K) -> bool {
+    entries.last().is_none_or(|last| key_of(last) < key)
+}
+
+/// Sorts `entries`, read in the order they were stored, by the key `key_of` gives, unless they
+/// were stored `ascending`, and refuses two whose keys are equal.
+///
+/// A `BTreeMap` or `BTreeSet` reads its keys in any order, since the `Ord` of a key type can change
+/// as the type evolves, but never two equal keys, which no encoder writes and of which a map would
+/// keep one.
+///
+/// # Errors
+///
+/// [`Error::Decode`] if two keys are equal.
+fn sort_distinct<T, K: Ord>(
+    entries: &mut [T],
+    ascending: bool,
+    key_of: impl Fn(&T) -> &K,
+) -> Result<()> {
+    if ascending {
+        return Ok(());
+    }
+    entries.sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+    match entries
+        .windows(2)
+        .any(|pair| key_of(&pair[0]).cmp(key_of(&pair[1])).is_eq())
+    {
+        true => Err(repeated()),
+        false => Ok(()),
+    }
+}
+
+/// Reads the `len` entries of a `BTreeMap` or `BTreeSet` with `entry`, in the order they were
+/// stored, and sorts them by the key `key_of` gives, refusing two equal keys.
+///
+/// # Errors
+///
+/// The error of an entry that does not decode, and [`Error::Decode`] for two equal keys.
+fn sorted_entries<E, K: Ord>(
+    r: &mut Decoder<'_>,
+    len: u64,
+    mut entry: impl FnMut(&mut Decoder<'_>) -> Result<E>,
+    key_of: impl Fn(&E) -> &K,
+) -> Result<Vec<E>> {
+    let mut entries: Vec<E> = entries_for(r, len);
+    let mut ascending = true;
+    for _ in 0..len {
+        let read = r.item(&mut entry)?;
+        ascending = ascending && after(&entries, key_of(&read), &key_of);
+        entries.push(read);
+    }
+    sort_distinct(&mut entries, ascending, key_of)?;
+    Ok(entries)
+}
+
+/// Visits the entries of a `BTreeMap` or `BTreeSet` after its opening level, reading each with
+/// `entry`, which returns its key, and refuses two equal keys in whatever order they are stored.
+///
+/// Keys stored in order, as every encoder writes them, cost a comparison each and are not kept. At
+/// the first key out of order it goes back to the start, forgetting the typed links and tables the
+/// entries noted, and reads them again, keeping the keys to sort them.
+///
+/// # Errors
+///
+/// The error of an entry that does not decode, and [`Error::Decode`] for two equal keys.
+fn visit_entries<K: Ord>(
+    r: &mut Decoder<'_>,
+    mut entry: impl FnMut(&mut Decoder<'_>) -> Result<K>,
+) -> Result<()> {
+    let start = r.checkpoint();
+    let noted = r.tables.map_or(0, |tables| tables.borrow().len());
+    let len = r.varint()?;
+    let mut last: Option<K> = None;
+    for _ in 0..len {
+        let key = r.item(&mut entry)?;
+        if last.as_ref().is_some_and(|last| *last >= key) {
+            r.rewind(start);
+            if let Some(tables) = r.tables {
+                tables.borrow_mut().truncate(noted);
+            }
+            r.varint()?;
+            return sorted_entries(r, len, &mut entry, |key| key).map(drop);
+        }
+        last = Some(key);
+    }
+    Ok(())
 }
 
 /// The error of a value that did not read all of what holds it: `bytes` bytes and `links` links
@@ -3337,34 +3442,20 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         r.nested(|r| {
             let len = r.varint()?;
-            let mut out = BTreeMap::new();
-            for _ in 0..len {
-                let (key, value) = r.item(|r| Ok((K::decode(r)?, V::decode(r)?)))?;
-                if out.last_key_value().is_some_and(|(last, _)| *last >= key) {
-                    return Err(unsorted());
-                }
-                out.insert(key, value);
-            }
-            r.tree::<K, V>(out.len());
-            Ok(out)
+            let entry = |r: &mut Decoder<'_>| Ok((K::decode(r)?, V::decode(r)?));
+            let entries = sorted_entries(r, len, entry, |(key, _)| key)?;
+            r.tree::<K, V>(entries.len());
+            Ok(BTreeMap::from_iter(entries))
         })
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
         r.nested(|r| {
-            let len = r.varint()?;
-            let mut last: Option<K> = None;
-            for _ in 0..len {
-                r.item(|r| {
-                    let key = K::decode(r)?;
-                    if last.as_ref().is_some_and(|last| *last >= key) {
-                        return Err(unsorted());
-                    }
-                    last = Some(key);
-                    V::visit(r)
-                })?;
-            }
-            Ok(())
+            visit_entries(r, |r| {
+                let key = K::decode(r)?;
+                V::visit(r)?;
+                Ok(key)
+            })
         })
     }
 
@@ -3463,32 +3554,14 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         r.nested(|r| {
             let len = r.varint()?;
-            let mut out = BTreeSet::new();
-            for _ in 0..len {
-                let item = r.item(T::decode)?;
-                if out.last().is_some_and(|last| *last >= item) {
-                    return Err(unsorted());
-                }
-                out.insert(item);
-            }
-            r.tree::<T, ()>(out.len());
-            Ok(out)
+            let items = sorted_entries(r, len, T::decode, |item| item)?;
+            r.tree::<T, ()>(items.len());
+            Ok(BTreeSet::from_iter(items))
         })
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        r.nested(|r| {
-            let len = r.varint()?;
-            let mut last: Option<T> = None;
-            for _ in 0..len {
-                let item = r.item(T::decode)?;
-                if last.as_ref().is_some_and(|last| *last >= item) {
-                    return Err(unsorted());
-                }
-                last = Some(item);
-            }
-            Ok(())
-        })
+        r.nested(|r| visit_entries(r, T::decode))
     }
 
     fn missing() -> Option<Self> {
