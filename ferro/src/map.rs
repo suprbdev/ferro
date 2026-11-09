@@ -1898,7 +1898,121 @@ fn tail<T>(items: &mut Vec<T>, at: usize) -> Vec<T> {
     tail
 }
 
+/// Cuts the tree under `link` where `side` turns from [`Ordering::Less`] to
+/// [`Ordering::Greater`], leaving `link` empty, and returns the two halves.
+///
+/// Every node on the cut is loaded into `link` before any of them is taken apart, so a load that
+/// fails or panics leaves `link` holding what it held.
 fn split<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    side: &impl Fn(&K) -> Ordering,
+) -> Result<Parts<K, V, S>> {
+    ready_cut(store, link, side)?;
+    sever(store, link.take(), side)
+}
+
+/// Loads in place, as [`node_mut`] does, each node on the path [`split`] cuts along, and checks
+/// that no key on it is where the cut falls.
+///
+/// A path held in memory throughout, as a map's own new nodes are, is only walked.
+fn ready_cut<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    side: &impl Fn(&K) -> Ordering,
+) -> Result<()> {
+    let mut at = &*link;
+    loop {
+        let node = match at {
+            Link::Empty => return Ok(()),
+            Link::Stored { .. } => return load_cut(store, link, side),
+            Link::Mem(node, _) => node,
+        };
+        match node.children.get(cut_at(node, side)?) {
+            Some(child) => at = child,
+            None => return Ok(()),
+        }
+    }
+}
+
+fn load_cut<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    side: &impl Fn(&K) -> Ordering,
+) -> Result<()> {
+    if matches!(link, Link::Empty) {
+        return Ok(());
+    }
+    let node = node_mut(store, link)?;
+    let position = cut_at(node, side)?;
+    match node.children.get_mut(position) {
+        Some(child) => load_cut(store, child, side),
+        None => Ok(()),
+    }
+}
+
+fn cut_at<K, V, S>(node: &Node<K, V, S>, side: &impl Fn(&K) -> Ordering) -> Result<usize> {
+    node.keys
+        .binary_search_by(side)
+        .err()
+        .ok_or_else(|| Error::Corrupt("key found at a level it does not hash to".into()))
+}
+
+/// Loads in place, as [`node_mut`] does, each node that [`merge`] of `a` and `b` takes apart: the
+/// last children down from `a` and the first children down from `b`, as far as their levels lead
+/// the join.
+///
+/// Edges held in memory throughout are only walked.
+fn ready_join<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    a: &mut Link<K, V, S>,
+    b: &mut Link<K, V, S>,
+) -> Result<()> {
+    let (mut left, mut right) = (&*a, &*b);
+    loop {
+        let (x, y) = match (left, right) {
+            (Link::Empty, _) | (_, Link::Empty) => return Ok(()),
+            (Link::Mem(x, _), Link::Mem(y, _)) => (x, y),
+            _ => return load_join(store, a, b),
+        };
+        let (last, first) = (x.child(x.keys.len()), y.child(0));
+        (left, right) = match x.level.cmp(&y.level) {
+            Ordering::Greater => (last, right),
+            Ordering::Less => (left, first),
+            Ordering::Equal => (last, first),
+        };
+    }
+}
+
+fn load_join<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    a: &mut Link<K, V, S>,
+    b: &mut Link<K, V, S>,
+) -> Result<()> {
+    if matches!(a, Link::Empty) || matches!(b, Link::Empty) {
+        return Ok(());
+    }
+    let x = node_mut(store, a)?;
+    let y = node_mut(store, b)?;
+    match x.level.cmp(&y.level) {
+        Ordering::Greater => match x.children.last_mut() {
+            Some(last) => ready_join(store, last, b),
+            None => Ok(()),
+        },
+        Ordering::Less => match y.children.first_mut() {
+            Some(first) => ready_join(store, a, first),
+            None => Ok(()),
+        },
+        Ordering::Equal => match (x.children.last_mut(), y.children.first_mut()) {
+            (Some(last), Some(first)) => ready_join(store, last, first),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The cut [`split`] makes, which takes `link` apart as it loads it, so it runs only on a tree
+/// [`ready_cut`] has loaded, or inside [`absorb`], which runs on a copy or after [`ready`].
+fn sever<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
@@ -1930,7 +2044,7 @@ fn split<K: Data + Ord, V: Data, S: Data>(
     }
     let mut right_children = children.split_off(position + 1);
     let middle = children.pop().ok_or(Error::Detached)?;
-    let (left_part, right_part) = split(store, middle, side)?;
+    let (left_part, right_part) = sever(store, middle, side)?;
     children.push(left_part);
     right_children.insert(0, right_part);
     Ok((
@@ -1939,13 +2053,23 @@ fn split<K: Data + Ord, V: Data, S: Data>(
     ))
 }
 
+/// Joins `a` and `b`, every key of `a` sorting before every key of `b`.
+///
+/// It loads what it takes apart, so a caller that holds the two links in its map calls
+/// [`ready_join`] on them first, which makes the join itself unable to fail.
 fn merge<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     a: Link<K, V, S>,
     b: Link<K, V, S>,
 ) -> Result<Link<K, V, S>> {
+    if matches!(a, Link::Empty) {
+        return Ok(b);
+    }
+    if matches!(b, Link::Empty) {
+        return Ok(a);
+    }
     let (Some(x), Some(y)) = (load(store, &a)?, load(store, &b)?) else {
-        return Ok(if a.count() == 0 { b } else { a });
+        return Err(Error::Detached);
     };
     match x.level.cmp(&y.level) {
         Ordering::Greater => {
@@ -1982,6 +2106,11 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
     }
 }
 
+/// Stores `value` under `key`, whose level is `level`, in the tree under `link`, returning the slot
+/// it replaced.
+///
+/// A replaced value stored on its own is read before the slot is replaced, so that the caller can
+/// read the slot it gets back without failing.
 fn insert_at<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
@@ -2003,7 +2132,11 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
     match node.search(&key) {
         Ok(index) => {
             let before = node.buffers();
-            let replaced = std::mem::replace(&mut node.cells.slots()[index], Slot::Fresh(value));
+            let slot = &mut node.cells.slots()[index];
+            if let Slot::Spilled(_) = slot {
+                unspill(store, slot)?;
+            }
+            let replaced = std::mem::replace(slot, Slot::Fresh(value));
             hint.renew(node, before);
             Ok(Some(replaced))
         }
@@ -2038,6 +2171,15 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
     }
 }
 
+#[cold]
+#[inline(never)]
+fn unspill<V: Data, S>(store: Option<&Store>, slot: &mut Slot<V, S>) -> Result<()> {
+    if let Slot::Spilled(spill) = slot {
+        *slot = Slot::Fresh(store.ok_or(Error::Detached)?.load::<V>(spill.0)?);
+    }
+    Ok(())
+}
+
 #[inline(never)]
 fn insert_outside<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
@@ -2067,7 +2209,7 @@ fn insert_above<K: Data + Ord, V: Data, S: Data>(
     level: u8,
     value: Arc<V>,
 ) -> Result<Option<Slot<V, S>>> {
-    let (left, right) = split(store, link.take(), &|probe: &K| probe.cmp(&key))?;
+    let (left, right) = split(store, link, &|probe: &K| probe.cmp(&key))?;
     *link = link_from(
         level,
         vec![key],
@@ -2088,7 +2230,7 @@ fn insert_between<K: Data + Ord, V: Data, S: Data>(
     value: Arc<V>,
 ) -> Result<()> {
     let before = node.buffers();
-    let (left, right) = split(store, node.children[position].take(), &|probe: &K| {
+    let (left, right) = split(store, &mut node.children[position], &|probe: &K| {
         probe.cmp(&key)
     })?;
     node.children[position] = left;
@@ -2117,13 +2259,17 @@ where
     let node = node_mut(store, link)?;
     match node.search(key) {
         Ok(index) => {
-            node.keys.remove(index);
-            let slot = node.cells.slots().remove(index);
-            if !node.children.is_empty() {
-                let right = node.children.remove(index + 1);
-                let left = node.children[index].take();
-                node.children[index] = merge(store, left, right)?;
+            if let Cells::Slots(slots) = &mut node.cells
+                && let slot @ Slot::Spilled(_) = &mut slots[index]
+            {
+                unspill(store, slot)?;
             }
+            let slot = if node.children.is_empty() {
+                node.keys.remove(index);
+                node.cells.slots().remove(index)
+            } else {
+                remove_between(store, node, index)?
+            };
             node.count -= 1;
             if node.keys.is_empty() {
                 *link = node.children.first_mut().map_or(Link::Empty, Link::take);
@@ -2138,6 +2284,23 @@ where
             Ok(removed)
         }
     }
+}
+
+#[inline(never)]
+fn remove_between<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    node: &mut Node<K, V, S>,
+    index: usize,
+) -> Result<Slot<V, S>> {
+    if let [.., left, right] = node.children.get_mut(..index + 2).unwrap_or_default() {
+        ready_join(store, left, right)?;
+    }
+    node.keys.remove(index);
+    let slot = node.cells.slots().remove(index);
+    let right = node.children.remove(index + 1);
+    let left = node.children[index].take();
+    node.children[index] = merge(store, left, right)?;
+    Ok(slot)
 }
 
 fn find_mut<'a, K, V, S, Q>(
@@ -2420,6 +2583,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     let rewritten = dirty(node).count();
     let mut stored: Vec<Link<K, V, S>> = Vec::with_capacity(if branching { width + 1 } else { 0 });
     let mut total = None;
+    let mut held = width as u64;
     for position in 0..=width {
         let child = node.child(position);
         let flushed = flush_with(
@@ -2442,6 +2606,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
                 summary.encode(&mut encoder)?;
                 encoder.link(*ptr);
                 total = fold(total, summary);
+                held = held.saturating_add(*count);
             }
             Link::Mem(..) => return Err(Error::Detached),
         }
@@ -2452,6 +2617,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
             total = fold(total, &node.entry_summary(position));
         }
     }
+    miscounted(node, held)?;
     let total = total.ok_or(Error::Detached)?;
     let unsettled = encoder.is_unsettled();
     let object = encoder.into_object();
@@ -2492,6 +2658,18 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
         total,
         origin: node.origin,
     })
+}
+
+/// Refuses to write `node` when the count it keeps for its subtree is not the `held` entries its
+/// keys and children's links add up to, which a parent's link would otherwise record.
+fn miscounted<K, V, S>(node: &Node<K, V, S>, held: u64) -> Result<()> {
+    if node.count == held {
+        return Ok(());
+    }
+    Err(Error::Corrupt(format!(
+        "a map node counts {} entries but holds {held}",
+        node.count
+    )))
 }
 
 type Entries<V, S> = (Vec<(usize, Slot<V, S>)>, Vec<(usize, V)>);
@@ -2783,7 +2961,9 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
     }
     let mut linked = Vec::with_capacity(children.len());
     let mut total = None;
+    let mut held = width as u64;
     for position in 0..=width {
+        held = held.saturating_add(node.child(position).count());
         match node.child(position) {
             Link::Empty => encoder.varint(0),
             Link::Stored {
@@ -2811,6 +2991,7 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
             total = fold(total, &node.entry_summary(position));
         }
     }
+    miscounted(node, held)?;
     if encoder.is_unsettled() {
         return Err(Error::Detached);
     }
@@ -3035,6 +3216,69 @@ struct Edit<K, V> {
     value: Option<Arc<V>>,
 }
 
+/// Loads in place, as [`node_mut`] does, every node that [`absorb`] of `edits`, sorted by key,
+/// would load or take apart, so that the absorb that follows has nothing left to load.
+///
+/// That is each node on the path of each key, and for a key removed from a node with children,
+/// every node down the edges of the two children beside it, since removing neighbouring keys
+/// joins what earlier joins made.
+fn ready<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    mut edits: &[Edit<K, V>],
+) -> Result<()> {
+    if edits.is_empty() || matches!(link, Link::Empty) {
+        return Ok(());
+    }
+    let node = node_mut(store, link)?;
+    let mut position = 0;
+    while let Some(first) = edits.first() {
+        position += node.keys[position..].partition_point(|key| *key < first.key);
+        if node.keys.get(position) == Some(&first.key) {
+            if first.value.is_none()
+                && let [.., left, right] = node.children.get_mut(..position + 2).unwrap_or_default()
+            {
+                ready_edge(store, left, true)?;
+                ready_edge(store, right, false)?;
+            }
+            edits = &edits[1..];
+            position += 1;
+            continue;
+        }
+        let group = match node.keys.get(position) {
+            Some(limit) => edits.partition_point(|edit| edit.key < *limit),
+            None => edits.len(),
+        };
+        if let Some(child) = node.children.get_mut(position) {
+            ready(store, child, &edits[..group])?;
+        }
+        edits = &edits[group..];
+    }
+    Ok(())
+}
+
+/// Loads in place, as [`node_mut`] does, every node down the last children of `link`, or down the
+/// first children unless `last`.
+fn ready_edge<K: Data, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    last: bool,
+) -> Result<()> {
+    if matches!(link, Link::Empty) {
+        return Ok(());
+    }
+    let node = node_mut(store, link)?;
+    let child = if last {
+        node.children.last_mut()
+    } else {
+        node.children.first_mut()
+    };
+    match child {
+        Some(child) => ready_edge(store, child, last),
+        None => Ok(()),
+    }
+}
+
 struct Open<K, V, S> {
     level: u8,
     keys: Vec<K>,
@@ -3080,7 +3324,8 @@ fn rise<K: Data + Ord, V: Data, S: Data>(
     level: u8,
     edits: &mut vec::IntoIter<Edit<K, V>>,
     count: usize,
-) -> Result<()> {
+    rewriting: bool,
+) -> Result<bool> {
     let mut left = count;
     let mut keys = Vec::new();
     let mut slots = Vec::new();
@@ -3091,8 +3336,8 @@ fn rise<K: Data + Ord, V: Data, S: Data>(
         .position(|edit| edit.level == level && edit.value.is_some())
     {
         let key = &edits.as_slice()[before].key;
-        let (mut low, high) = split(store, piece, &|probe: &K| probe.cmp(key))?;
-        absorb(store, &mut low, edits, before)?;
+        let (mut low, high) = sever(store, piece.take(), &|probe: &K| probe.cmp(key))?;
+        absorb(store, &mut low, edits, before, rewriting)?;
         children.push(low);
         let edit = edits.next().ok_or(Error::Detached)?;
         keys.push(edit.key);
@@ -3100,24 +3345,33 @@ fn rise<K: Data + Ord, V: Data, S: Data>(
         piece = high;
         left -= before + 1;
     }
-    absorb(store, &mut piece, edits, left)?;
+    absorb(store, &mut piece, edits, left, rewriting)?;
     children.push(piece);
     *link = link_from(level, keys, slots, children, None);
-    Ok(())
+    Ok(true)
 }
 
+/// Applies the next `count` of `edits`, sorted by key, to the tree under `link` in one descent,
+/// and returns whether any of them changed it.
+///
+/// A removal of an absent key changes nothing, and neither does storing a value of a zero-sized
+/// type under a key the tree holds, unless `rewriting`. It takes nodes apart as it loads them, so
+/// a load that fails leaves the tree half changed. [`Map::apply`] therefore runs it on a copy of
+/// a stored root, which it keeps only once the whole batch has gone in, and on a root in memory
+/// only after [`ready`] has loaded what it reaches.
 fn absorb<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
     edits: &mut vec::IntoIter<Edit<K, V>>,
     mut count: usize,
-) -> Result<()> {
+    rewriting: bool,
+) -> Result<bool> {
     if count == 0 {
-        return Ok(());
+        return Ok(false);
     }
     if matches!(link, Link::Empty) {
         *link = build_sorted(edits.by_ref().take(count));
-        return Ok(());
+        return Ok(!matches!(link, Link::Empty));
     }
     if let Link::Stored { .. } = link {
         *link = Link::Mem(
@@ -3133,10 +3387,11 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
     if let (Link::Mem(current, _), Some(level)) = (&*link, top)
         && level > current.level
     {
-        return rise(store, link, level, edits, count);
+        return rise(store, link, level, edits, count, rewriting);
     }
     let node = node_mut(store, link)?;
     let level = node.level;
+    let mut changed = false;
     let mut position = 0;
     while count > 0 {
         let pending = &edits.as_slice()[..count];
@@ -3144,11 +3399,14 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
         if node.keys.get(position) == Some(&pending[0].key) {
             count -= 1;
             match edits.next().and_then(|edit| edit.value) {
+                Some(_) if size_of::<V>() == 0 && !rewriting => position += 1,
                 Some(value) => {
                     node.cells.slots()[position] = Slot::Fresh(value);
                     position += 1;
+                    changed = true;
                 }
                 None => {
+                    changed = true;
                     node.keys.remove(position);
                     node.cells.slots().remove(position);
                     if !node.children.is_empty() {
@@ -3169,10 +3427,12 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
             .position(|edit| edit.level == level && edit.value.is_some());
         match found {
             None => {
-                absorb(store, &mut node.children_mut()[position], edits, group)?;
+                let child = &mut node.children_mut()[position];
+                changed |= absorb(store, child, edits, group, rewriting)?;
                 count -= group;
             }
             Some(before) => {
+                changed = true;
                 if node.children.is_empty() && before == 0 {
                     let edit = edits.next().ok_or(Error::Detached)?;
                     node.keys.insert(position, edit.key);
@@ -3182,8 +3442,8 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
                 } else {
                     let key = &pending[before].key;
                     let piece = node.children_mut()[position].take();
-                    let (mut low, high) = split(store, piece, &|probe: &K| probe.cmp(key))?;
-                    absorb(store, &mut low, edits, before)?;
+                    let (mut low, high) = sever(store, piece, &|probe: &K| probe.cmp(key))?;
+                    absorb(store, &mut low, edits, before, rewriting)?;
                     let edit = edits.next().ok_or(Error::Detached)?;
                     node.keys.insert(position, edit.key);
                     node.cells
@@ -3201,7 +3461,7 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
     if node.keys.is_empty() {
         *link = node.children.first_mut().map_or(Link::Empty, Link::take);
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn build_sorted<K: Data + Ord, V: Data, S: Data>(
@@ -3446,8 +3706,9 @@ fn left_if(left: bool) -> Ordering {
 /// # Panics
 ///
 /// A read that cannot load a node from the file, or finds one damaged, panics, as with every
-/// collection, and so does a write that has to load one. [`Map::try_get`] returns that failure as
-/// an error instead.
+/// collection, and so does a write that has to load one, which leaves the map with the entries it
+/// had, as a `Data` impl whose decode panics does. [`Map::try_get`] returns that failure as an
+/// error instead.
 pub struct Map<K, V, S = ()> {
     root: Link<K, V, S>,
     store: Option<Store>,
@@ -3496,8 +3757,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///
     /// A map read from a database is clean, and so is an empty one. An insert, a removal or a
     /// [`get_mut`](Map::get_mut) makes it dirty, while one that finds nothing to change, such as
-    /// removing an absent key, leaves it clean. A commit writes the nodes a dirty map changed, and
-    /// the version it commits reads back clean.
+    /// removing an absent key, leaves it clean, and so does a batch of such edits, which for a
+    /// zero-sized `V`, as in a [`Set`](crate::Set), includes storing under a key the map holds. A
+    /// commit writes the nodes a dirty map changed, and the version it commits reads back clean.
     pub fn is_dirty(&self) -> bool {
         matches!(self.root, Link::Mem(..))
     }
@@ -3705,7 +3967,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     /// [`insert`](Map::insert) that returns a failure to encode the key or to load a node instead
-    /// of panicking, and drops the value it replaced unread.
+    /// of panicking, and drops the value it replaced.
     pub(crate) fn try_insert(&mut self, key: K, value: V) -> Result<()> {
         let level = level_of(&key)?;
         insert_at(
@@ -3747,14 +4009,14 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// Removes and returns the entry with the smallest key, in O(log n).
     pub fn pop_first(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.first()?;
-        self.remove(&key);
+        fatal(remove_at(self.store.as_ref(), &mut self.root, &key));
         Some((key, value))
     }
 
     /// Removes and returns the entry with the largest key, in O(log n).
     pub fn pop_last(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.last()?;
-        self.remove(&key);
+        fatal(remove_at(self.store.as_ref(), &mut self.root, &key));
         Some((key, value))
     }
 
@@ -4300,10 +4562,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             return taken;
         }
         let store = self.store.as_ref();
-        let (kept, rest) = fatal(split(store, self.root.take(), &|key| {
-            left_if(below(key, start))
-        }));
-        let (middle, tail) = fatal(split(store, rest, &|key| left_if(within(key, end))));
+        let low = |key: &K| left_if(below(key, start));
+        let high = |key: &K| left_if(within(key, end));
+        fatal(ready_cut(store, &mut self.root, &low));
+        fatal(ready_cut(store, &mut self.root, &high));
+        let (kept, mut rest) = fatal(split(store, &mut self.root, &low));
+        let (middle, tail) = fatal(split(store, &mut rest, &high));
         self.root = fatal(merge(store, kept, tail));
         taken.root = middle;
         taken
@@ -4332,7 +4596,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     {
         let start = Bound::Included(key);
         let store = self.store.as_ref();
-        let (kept, tail) = fatal(split(store, self.root.take(), &|probe| {
+        let (kept, tail) = fatal(split(store, &mut self.root, &|probe| {
             left_if(below(probe, start))
         }));
         self.root = kept;
@@ -4367,10 +4631,12 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         if joinable && (ascending || descending) {
             let store = self.store.clone().or_else(|| other.store.clone());
             let (low, high) = if ascending {
-                (self.root.take(), other.root.take())
+                (&mut self.root, &mut other.root)
             } else {
-                (other.root.take(), self.root.take())
+                (&mut other.root, &mut self.root)
             };
+            fatal(ready_join(store.as_ref(), low, high));
+            let (low, high) = (low.take(), high.take());
             self.root = fatal(merge(store.as_ref(), low, high));
             self.store = store;
             return;
@@ -4400,8 +4666,9 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// and `(key, None)` removes the key.
     ///
     /// The edits need not be sorted, and when a key appears more than once its last edit wins. A
-    /// node is walked once however many edits fall in it, and a subtree that none falls in is left
-    /// shared, which makes a large batch cheaper than the same edits one at a time.
+    /// node is walked once however many edits fall in it, or twice in a map read from a database
+    /// and changed since, and a subtree that none falls in is left shared, which makes a large
+    /// batch cheaper than the same edits one at a time.
     ///
     /// # Examples
     ///
@@ -4477,13 +4744,17 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             .iter()
             .map(|(key, value)| (key, Some(value.into_arc())))
             .collect();
-        self.batch(every);
+        self.write_batch(every, true);
     }
 
     fn batch(&mut self, items: Vec<(K, Option<Arc<V>>)>) {
+        self.write_batch(items, false);
+    }
+
+    fn write_batch(&mut self, items: Vec<(K, Option<Arc<V>>)>, rewriting: bool) {
         let items = sorted_unique(items);
-        let count = items.len();
         let levels = levels(&items);
+        let count = items.len();
         let mut edits: vec::IntoIter<Edit<K, V>> = items
             .into_iter()
             .zip(levels)
@@ -4491,7 +4762,19 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             .collect::<Vec<_>>()
             .into_iter();
         let store = self.store.as_ref();
-        fatal(absorb(store, &mut self.root, &mut edits, count));
+        if store.is_none() {
+            fatal(absorb(store, &mut self.root, &mut edits, count, rewriting));
+            return;
+        }
+        if let Link::Mem(..) = self.root {
+            fatal(ready(store, &mut self.root, edits.as_slice()));
+            fatal(absorb(store, &mut self.root, &mut edits, count, rewriting));
+            return;
+        }
+        let mut root = self.root.clone();
+        if fatal(absorb(store, &mut root, &mut edits, count, rewriting)) {
+            self.root = root;
+        }
     }
 
     /// The changes that turn this map into `newer`, in key order, as a lazy iterator of

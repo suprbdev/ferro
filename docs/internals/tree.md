@@ -35,6 +35,41 @@ to update every index for every row, so it is O(rows) and returns them. `append`
 or with overlapping keys, copies `other` entry by entry, since links only mean something inside
 their own store.
 
+## Edits that fail halfway
+
+A cut, a join or a batch takes nodes apart as it reaches them, and a node it reaches may first have
+to be read from the file, which can fail, or decoded by a `Data` impl that panics. Each edit is
+arranged so that a failure leaves the map with the entries, length, summary and root hash it had:
+
+- `split` walks its cut path first. A path held in memory throughout, as a map's new nodes are, is
+  only walked. A stored node on it is loaded into its link in place, which changes no entry, and
+  only then is the path cut. `remove` and a joining `append` do the same for the two edges a
+  `merge` takes apart, as far as their levels lead it, and `take_range` loads both of its paths
+  before the first cut.
+- A batch on a stored root runs on a copy of the root, which the map keeps only once the whole
+  batch has gone in. The copy costs nothing, since the nodes the batch loads are new either way and
+  a failure drops them with the copy. It is dropped as well when no edit changed anything, a removal
+  of an absent key or a zero-sized value stored under a key the map holds, so such a batch leaves a
+  clean map clean. A copy of a root changed earlier in the transaction would make the batch copy
+  each changed node it reaches rather than edit it in place, so such a batch first walks the path
+  of each of its keys, and both edges beside each key it removes, loading the stored nodes there in
+  place, and then edits in place with nothing left to load. The edges go all the way down, since
+  removing neighbouring keys joins what earlier joins made.
+- `insert` and `remove` read a value stored on its own that they replace or remove before they
+  change its slot, so neither fails once the tree has changed.
+- `flush` refuses, with `Error::Corrupt`, a node whose count is not its keys plus its children's
+  counts, so a tree damaged some other way is not committed with links that claim more entries than
+  their nodes hold.
+
+Measured against the code before in alternating runs at 1M keys: per-key inserts in `bulk` ran 2,752
+instructions a key against 2,740 in the same time, single-key commits 0.05 to 0.07% more
+instructions, most of them the count check in `flush`, and reads, `remove_range`, `split_off`,
+`append` and batches onto a committed map did not move beyond noise. Removing keys one at a time ran
+1.4 to 1.9% more instructions, for what it checks and loads before it changes a node. A batch onto a
+root changed earlier in the transaction ran 11 to 20% more instructions and took 5 to 33% more time
+for the walk before it. Running it on a copy of such a root, tried first, ran 37 to 168% more
+instructions, from copying each changed node it reached.
+
 ## Copy-on-write and flush
 
 Mutation is copy-on-write through `Shared::make_mut`, so a node is copied once per transaction and
@@ -247,16 +282,18 @@ edit per key. Batches of 16,384 keys or more hash their key levels on the scoped
 above. An empty map is assembled bottom-up in one pass, which gives the same tree as inserting key
 by key. A non-empty map takes the batch in one descent: each node sorts the edits into its gaps,
 applies the ones at its own level in place, and passes each group to one child, so a subtree no edit
-falls in stays shared and a node is walked once however many edits it receives. Editing the node in
-place, not rebuilding its vectors from the old and new entries, is what makes this pay: the
-rebuilding form was up to 28% slower than per-key inserts. The gain is modest, because a touched
-node has to be read and copied either way and `flush` costs three to four times the tree work. At 1M
-keys the closure takes 5 to 25% less time than sorted per-key inserts from 1,000 to 100,000 edits
-and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less, and batches under 1,000 edits
-show no difference. A 50,000 page wiki import, 20M posting entries, gained 4% in its posting phase.
-The metrics load test gained nothing measurable, since chunk merging dominates there, so its ingest
-keeps plain inserts. `retain` collects its deletes and applies them the same way. A disjoint batch
-needs no special case, since the same descent walks one edge of the tree.
+falls in stays shared and a node is walked once however many edits it receives, or twice on a root
+changed earlier in the transaction, as [Edits that fail halfway](#edits-that-fail-halfway)
+describes. Editing the node in place, not rebuilding its vectors from the old and new entries, is
+what makes this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is
+modest, because a touched node has to be read and copied either way and `flush` costs three to four
+times the tree work. At 1M keys the closure takes 5 to 25% less time than sorted per-key inserts
+from 1,000 to 100,000 edits and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less,
+and batches under 1,000 edits show no difference. A 50,000 page wiki import, 20M posting entries,
+gained 4% in its posting phase. The metrics load test gained nothing measurable, since chunk merging
+dominates there, so its ingest keeps plain inserts. `retain` collects its deletes and applies them
+the same way. A disjoint batch needs no special case, since the same descent walks one edge of the
+tree.
 
 ## Spilled values
 

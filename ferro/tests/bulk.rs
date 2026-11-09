@@ -304,6 +304,36 @@ fn a_batch_of_absent_deletes_changes_nothing() {
 }
 
 #[test]
+fn a_batch_that_changes_nothing_leaves_the_map_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast()
+        .open::<(Map<u32, u32>, Map<u32, ()>)>(dir.path().join("clean.ferro"))
+        .unwrap();
+    db.update(|(map, members)| {
+        map.extend((0..1000).map(|key| (key * 2, key)));
+        members.extend((0..1000).map(|key| (key * 2, ())));
+    })
+    .unwrap();
+    let (mut map, mut members) = (*db.read()).clone();
+    map.remove(&1);
+    map.retain(|_, _| true);
+    map.apply([(1, None), (3, None), (1999, None)]);
+    assert!(!map.is_dirty());
+    members.apply([(1, None), (2, Some(())), (4, Some(())), (3, None)]);
+    members.extend([(6, ()), (8, ())]);
+    assert!(!members.is_dirty());
+    let mut rewritten = members.clone();
+    rewritten.rewrite();
+    assert!(rewritten.is_dirty());
+    map.apply([(1, None), (5, Some(5))]);
+    assert!(map.is_dirty());
+    assert_eq!(map.get(&5).as_deref(), Some(&5));
+    members.apply([(1, Some(()))]);
+    assert!(members.is_dirty() && members.contains_key(&1));
+    assert_eq!(members.len(), 1001);
+}
+
+#[test]
 fn a_batch_keeps_the_last_edit_of_each_key() {
     let mut map: Map<u32, u32> = (0..100).map(|key| (key, key)).collect();
     map.apply([
