@@ -410,6 +410,58 @@ fn a_changes_watcher_follows_another_handles_cycle_to_the_new_file() {
 }
 
 #[test]
+fn a_changes_watcher_stays_in_the_new_file_after_a_cycle_that_caught_up_with_another_handles_cycle()
+{
+    let dir = dir();
+    let path = path_in(&dir);
+    let shared = || options().shared(true).open::<Root>(&path).unwrap();
+    let (one, other) = (shared(), shared());
+    fill(&one, 200, 40);
+    assert!(other.refresh().unwrap());
+    let watcher = on_key_zero(&other);
+    put_one(&one, 1, 500);
+    one.compact(Keep::Last(3)).unwrap();
+    other.compact(Keep::Last(3)).unwrap();
+    assert_eq!(watcher.seen().unwrap().version(), 200);
+    assert_eq!(other.space().unwrap().retired_bytes, 0);
+    put_one(&other, 0, 501);
+    assert_eq!(watcher.try_recv().unwrap().version(), 202);
+}
+
+#[test]
+fn a_changes_watcher_stays_in_the_newest_file_when_one_call_catches_up_with_two_cycles() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let one = options().shared(true).open::<Root>(&path).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (one, armed) = (one.clone(), armed.clone());
+        Hook(Arc::new(move |step| {
+            if step == "published" && armed.swap(false, Ordering::SeqCst) {
+                put_one(&one, 2, 600);
+                one.compact(Keep::Last(4)).unwrap();
+            }
+        }))
+    };
+    let other = options()
+        .shared(true)
+        .hook(hook)
+        .open::<Root>(&path)
+        .unwrap();
+    fill(&one, 200, 40);
+    assert!(other.refresh().unwrap());
+    let watcher = on_key_zero(&other);
+    put_one(&one, 1, 500);
+    one.compact(Keep::Last(4)).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    other.fork("side").unwrap();
+    assert!(!armed.load(Ordering::SeqCst));
+    assert_eq!(other.read().version(), 202);
+    assert_eq!(watcher.seen().unwrap().version(), 200);
+    assert_eq!(other.space().unwrap().retired_bytes, 0);
+}
+
+#[test]
 fn branches_merges_and_records_survive() {
     let dir = dir();
     let main: Db<Root> = options().open(path_in(&dir)).unwrap();

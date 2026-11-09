@@ -705,6 +705,18 @@ an older retained and the newest version across a cycle and a read-only `refresh
 `a_changes_watcher_follows_another_handles_cycle_to_the_new_file` across a shared writer's
 catch-up; `a_read_only_handle_counts_the_file_a_held_snapshot_keeps_after_refresh` checks the count.
 
+A move waits in its notice, and a later swap's move can run first: a cycle that began by catching up
+with another process's cycle moved the watchers into its own new file, and the catch-up's notice,
+dropped when the cycle returned, then moved them back into the file the cycle had just replaced,
+which they kept on disk; a `fork` that caught up with one cycle and, on attaching the new branch,
+with a second did the same. So a move puts a snapshot in place only while the branch still reads
+the file it was found in, asking under each watcher's lock: a later swap changes the file the
+branch reads before it reads the watchers, so it either stops the earlier move or moves on what
+that move put in place (#137).
+`a_changes_watcher_stays_in_the_new_file_after_a_cycle_that_caught_up_with_another_handles_cycle`
+and `a_changes_watcher_stays_in_the_newest_file_when_one_call_catches_up_with_two_cycles` check
+`retired_bytes` after each.
+
 Moving them costs the cycle, not the writers. With 10,000 `watch_changes` watchers on a 100,000-key
 map, measured with a probe kept out of the tree on 2026-11-08 on a machine shared with other work,
 the pause stayed at 24 to 36 µs with or without them, as in the build before. The cycle around it

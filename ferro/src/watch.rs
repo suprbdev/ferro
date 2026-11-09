@@ -143,8 +143,13 @@ pub(crate) struct Seats<T> {
 
 impl<T> Seats<T> {
     /// Puts each found snapshot in place of the one its watcher compares against, unless the
-    /// watcher has returned a newer snapshot since [`Feed::seats`] read it.
-    pub(crate) fn seat(mut self) -> Notice<T> {
+    /// watcher has returned a newer snapshot since [`Feed::seats`] read it, or `current` says the
+    /// found snapshots no longer come from the file the branch reads.
+    ///
+    /// `current` is asked under each watcher's lock, so a later swap, which changes the file the
+    /// branch reads before it reads the watchers, either stops this from putting an older file's
+    /// snapshot in place or reads the snapshot this put there and moves it on.
+    pub(crate) fn seat(mut self, current: impl Fn() -> bool) -> Notice<T> {
         for (gate, count, at) in &self.gates {
             let (seen, Some(found)) = &self.commits[*at] else {
                 continue;
@@ -153,6 +158,7 @@ impl<T> Seats<T> {
             if let Some((was, held)) = held.as_mut()
                 && *was == *count
                 && ptr::eq(held.commit(), seen.commit())
+                && current()
             {
                 self.replaced.push(mem::replace(held, found.clone()));
             }

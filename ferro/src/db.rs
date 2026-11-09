@@ -1975,11 +1975,18 @@ impl<T: Data> Shared<T> {
         })
     }
 
-    /// A notice that, once dropped, moves the [`Db::watch_changes`] watchers of `branch` onto
-    /// `state`'s file as [`Shared::seats`] finds them, so that the reads it takes wait for no
-    /// lock the caller holds.
+    /// Moves the [`Db::watch_changes`] watchers of `branch` onto `state`'s file as
+    /// [`Shared::seats`] finds them, while the branch still reads that file.
+    fn reseat(branch: &Branch<T>, state: &State<T>) -> Option<Notice<T>> {
+        let current = || branch.state.load().store.id() == state.store.id();
+        current().then(|| Self::seats(branch, state).seat(current))
+    }
+
+    /// A notice that, once dropped, does [`Shared::reseat`], so that the reads it takes wait for
+    /// no lock the caller holds. A swap that came after it, whose notice may have run first,
+    /// leaves the watchers where that one put them.
     fn reseating(branch: Arc<Branch<T>>, state: Arc<State<T>>) -> Notice<T> {
-        Notice::later(move || drop(Self::seats(&branch, &state).seat()))
+        Notice::later(move || drop(Self::reseat(&branch, &state)))
     }
 
     /// Records `old`, a store that a cycle or a refresh replaced, so that [`Db::space`] counts its
@@ -3555,7 +3562,7 @@ impl<T: Data> Shared<T> {
         )?;
         report.pause = paused.elapsed();
         for (branch, state) in &rebound {
-            notices.push(Self::seats(branch, state).seat());
+            notices.extend(Self::reseat(branch, state));
         }
         self.step("swapped");
         report.after_bytes = fresh.size();

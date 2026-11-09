@@ -133,8 +133,9 @@ return by one moves it for all, only ever forward by count. It holds its snapsho
 return, like the snapshot a consumer keeps to diff against, but not the file a cycle replaced: the
 feed lists every such gate by a `Weak`, and after a swap each moves to the new file's snapshot of
 the same commit while the new file retains that version, keeping its count, unless it has returned
-a newer snapshot meanwhile. One whose version was pruned keeps the old file until it next returns,
-as described under [Generations](reclamation.md#generations), which gives the cost. A closed
+a newer snapshot meanwhile or a later swap has moved the branch on to another file. One whose
+version was pruned keeps the old file until it next returns, as described under
+[Generations](reclamation.md#generations), which gives the cost. A closed
 feed holds no snapshot, so a watcher made on a dropped branch's handle takes the one that handle
 reads, which is the last its branch had there and never changes. It ends at once, but `seen` still
 answers as its documentation promises; the first version left it `None`, and the `Watcher::changed`
