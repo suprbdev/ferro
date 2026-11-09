@@ -126,8 +126,9 @@ pub struct Space {
     /// the share of the growth since then that the last cycle found survives, or the whole file if
     /// no cycle has run on it.
     pub live_bytes: u64,
-    /// The bytes of files that cycles replaced but that held snapshots, maps, logs or histories
-    /// keep open.
+    /// The bytes of files that cycles replaced but that held snapshots, maps, logs, histories or
+    /// [`Db::watch_changes`](crate::Db::watch_changes) watchers keep open. On a read-only handle it
+    /// counts the files that [`Db::refresh`](crate::Db::refresh) followed past.
     pub retired_bytes: u64,
     /// The number of cycles started since the database was opened, background ones and
     /// [`Db::compact`](crate::Db::compact) alike, whether they succeeded or not.

@@ -486,7 +486,9 @@ as above, the fastest of three on 2026-11-07:
 
 `Compacted::handed_out` counts the trees a cycle handed out, and `reclaim_threads.rs` checks that
 copies at 2, 4 and 8 threads, keeping everything and the last 20 versions, hand out trees and make
-the same bytes as one thread, both in the first copy and in the copy of the file a cycle wrote.
+the same bytes as one thread, both in the first copy and in the copy of the file a cycle wrote. It
+does the same at 1, 2, 3 and 8 threads for a file of eight branches with merges, restores, nested
+maps and 20 KB values, keeping everything, the last 15 versions and the last 300 ms by its clock.
 
 ### The walk past eight threads
 
@@ -679,11 +681,38 @@ all take both from one state. Commits compare root hashes, not offsets, so the s
 generations is equal.
 
 Whatever holds a `Store` keeps reading the file it came from: a `Snapshot`, a `Map` cloned from one,
-a `Log`, a `History`, or a handle on a dropped branch. Nothing old ever fails, because nothing old
-changes. A cycle frees no disk space while such a handle lives, and it holds the whole old file, not
-only its version. `Space::retired_bytes` shows that. A branch's watcher feed would hold the file
-too, so a swap rebinds its latest snapshot without firing it. Old generations read uncached, because
-a cached node can hold a `Map` that holds the `Store`, which would keep the file open forever.
+a `Log`, a `History`, a handle on a dropped branch, or a `watch_changes` watcher whose last return
+the new file no longer retains. Nothing old ever fails, because nothing old changes. A cycle frees
+no disk space while such a handle lives, and it holds the whole old file, not only its version.
+`Space::retired_bytes` shows that, on a writer and, once `refresh` has followed the new file, on a
+read-only handle too. A branch's watcher feed would hold the file too, so a swap rebinds its latest
+snapshot without firing it. Old generations read uncached, because a cached node can hold a `Map`
+that holds the `Store`, which would keep the file open forever.
+
+A `watch_changes` watcher holds the snapshot it returned last, to compare new ones with, and an
+idle one on a branch that other branches' commits outgrow would hold every file it had seen. So the
+feed lists those watchers by a `Weak`, and after each swap, whether a cycle's, a catch-up's or a
+read-only `refresh`'s, each moves to the new file's snapshot of the same commit, read once for each
+commit the watchers saw, while the new file retains that version. One whose version was pruned
+keeps the old file until it next returns, like any snapshot a program holds. A cycle does this once
+writers are let go, so the pause is unchanged, and a catch-up or a `refresh` once it has released
+`tip`, in the notice that frees what it replaced. A watcher that returns meanwhile keeps what it
+returned. Before, a watcher that never returned again kept the file of its last return on disk for
+as long as it lived (#127), and a read-only handle reported `retired_bytes` of 0 while a snapshot
+held from before its `refresh` kept the replaced file open. In `ferro/tests/reclaim.rs`,
+`a_changes_watcher_moves_to_the_new_file_while_it_retains_what_was_seen` holds watchers at a pruned,
+an older retained and the newest version across a cycle and a read-only `refresh`, and
+`a_changes_watcher_follows_another_handles_cycle_to_the_new_file` across a shared writer's
+catch-up; `a_read_only_handle_counts_the_file_a_held_snapshot_keeps_after_refresh` checks the count.
+
+Moving them costs the cycle, not the writers. With 10,000 `watch_changes` watchers on a 100,000-key
+map, measured with a probe kept out of the tree on 2026-11-08 on a machine shared with other work,
+the pause stayed at 24 to 36 µs with or without them, as in the build before. The cycle around it
+took about 0.5 ms more with all of them at one version, and about 5.5 ms more with them spread over
+1,000 versions, 9.6 to 10.2 ms against 3.7 to 4.6 ms before, a lookup down the chain and a root read
+for each version. A read-only `refresh` that followed a cycle took 0.7 ms with them at one version
+and 4.3 ms spread over 1,000 versions, against 0.05 ms with none; the moving in it runs once `tip`
+is let go.
 
 Writing is where a generation can go wrong. A `Map` from an older generation put into a commit must
 not write its old offsets into the new file. `Map::encode` already compares store ids for maps from

@@ -43,7 +43,7 @@ use crate::store::{
     Durability, Followed, Frame, Held, Landing, News, Op, Retired, Settling, Store, StoreOptions,
     Trace, Txn, lane_of,
 };
-use crate::watch::{Feed, Filter, Notice, Watcher};
+use crate::watch::{Feed, Filter, Notice, Seats, Watcher};
 
 const MAIN: &str = "main";
 const MAX_PASSES: u32 = 6;
@@ -1937,6 +1937,41 @@ impl<T: Data> Shared<T> {
         })
     }
 
+    /// For each [`Db::watch_changes`] watcher of `branch`, the snapshot of the commit it compares
+    /// against as `state` reads it from another file, while `state` retains that commit.
+    ///
+    /// A commit `state` no longer retains, or one that does not read, leaves the watcher on the
+    /// snapshot it holds.
+    fn seats(branch: &Branch<T>, state: &State<T>) -> Seats<T> {
+        branch.feed.seats(|seen| {
+            let version = seen.commit.version;
+            let found = match version {
+                0 => return None,
+                _ if state.snapshot.commit.version == version => state.snapshot.clone(),
+                _ => {
+                    let entry = state.log.get(&state.store, version).ok()??;
+                    Db::snapshot_of(&state.store, &entry.commit).ok()?
+                }
+            };
+            (found.commit == seen.commit).then_some(found)
+        })
+    }
+
+    /// A notice that, once dropped, moves the [`Db::watch_changes`] watchers of `branch` onto
+    /// `state`'s file as [`Shared::seats`] finds them, so that the reads it takes wait for no
+    /// lock the caller holds.
+    fn reseating(branch: Arc<Branch<T>>, state: Arc<State<T>>) -> Notice<T> {
+        Notice::later(move || drop(Self::seats(&branch, &state).seat()))
+    }
+
+    /// Records `old`, a store that a cycle or a refresh replaced, so that [`Db::space`] counts its
+    /// file for as long as something holds it.
+    fn retire(&self, old: &Store) {
+        let mut retired = self.retired.lock();
+        retired.retain(|old| old.bytes().is_some());
+        retired.push(old.retired());
+    }
+
     fn moved_states(&self, store: &Store, before: &Refs, after: &Refs) -> Result<Vec<Moved<T>>> {
         for (name, head) in after.try_entries()? {
             if let Some(root) = head.root
@@ -2299,6 +2334,7 @@ impl<T: Data> Shared<T> {
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
+            notices.push(Self::reseating(branch.clone(), state.clone()));
             rebind(&branch, state, notices);
         }
         let mut branches = self.branches.lock();
@@ -2313,10 +2349,7 @@ impl<T: Data> Shared<T> {
             free(notices, &branch.state.load());
             branch.retire();
         }
-        let mut retired = self.retired.lock();
-        retired.retain(|old| old.bytes().is_some());
-        retired.push(old.retired());
-        drop(retired);
+        self.retire(old);
         old.close();
         self.signal.base.store(fresh.size(), Ordering::Relaxed);
         self.step("followed");
@@ -2383,6 +2416,9 @@ impl<T: Data> Shared<T> {
         }
         let previous = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
+            if replaced {
+                notices.push(Self::reseating(branch.clone(), state.clone()));
+            }
             rebind(&branch, state, &mut notices);
         }
         let mut branches = self.branches.lock();
@@ -2398,6 +2434,7 @@ impl<T: Data> Shared<T> {
             branch.retire();
         }
         if replaced {
+            self.retire(&current);
             current.close();
         }
         Ok(true)
@@ -3463,8 +3500,9 @@ impl<T: Data> Shared<T> {
         copier.sync()?;
         self.step("synced");
         let paused = Instant::now();
-        let (fresh, objects) =
-            self.exclusively(notices, |tip, notices| -> Result<(Store, u64)> {
+        let (fresh, objects, rebound) = self.exclusively(
+            notices,
+            |tip, notices| -> Result<(Store, u64, Vec<Moved<T>>)> {
                 self.step("paused");
                 self.settle(store.last_seq(), notices)?;
                 store.check_healthy()?;
@@ -3477,18 +3515,19 @@ impl<T: Data> Shared<T> {
                 report.handed_out = copier.handed_out();
                 let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
                 let swapped = self.swap_in(tip, store, &fresh, &temp, head, notices);
-                swapped.inspect_err(|_| fresh.close())?;
+                let rebound = swapped.inspect_err(|_| fresh.close())?;
                 self.signal.base.store(fresh.size(), Ordering::Relaxed);
-                Ok((fresh, objects))
-            })?;
+                Ok((fresh, objects, rebound))
+            },
+        )?;
         report.pause = paused.elapsed();
+        for (branch, state) in &rebound {
+            notices.push(Self::seats(branch, state).seat());
+        }
         self.step("swapped");
         report.after_bytes = fresh.size();
         report.objects = objects;
-        let mut retired = self.retired.lock();
-        retired.retain(|old| old.bytes().is_some());
-        retired.push(store.retired());
-        drop(retired);
+        self.retire(store);
         Ok(report)
     }
 
@@ -3509,7 +3548,7 @@ impl<T: Data> Shared<T> {
         temp: &Path,
         head: Ptr,
         notices: &mut Vec<Notice<T>>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Moved<T>>> {
         let (refs, depth) = refs::load(fresh, Some(head), None)?;
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
         for (_, found) in refs.try_entries()? {
@@ -3540,14 +3579,14 @@ impl<T: Data> Shared<T> {
         tip.depth = depth;
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
-        for (branch, state) in states {
+        for (branch, state) in &states {
             notices.push(branch.feed.rebind(state.snapshot.clone()));
             free(notices, &branch.tip.swap(state.clone()));
-            free(notices, &branch.state.swap(state));
+            free(notices, &branch.state.swap(state.clone()));
         }
         drop(published);
         drop(replaced);
-        Ok(())
+        Ok(states)
     }
 }
 
@@ -5328,7 +5367,9 @@ impl<T: Data> Db<T> {
     /// `test(seen, now)` decides, so "wake me when this changed since I looked" needs no state of
     /// its own. Until the first receive, `seen` is the snapshot current when the watcher was made,
     /// which [`Watcher::seen`] returns, so a consumer that starts from it misses nothing that lands
-    /// meanwhile. Clones share what was seen: a receive by one moves it for all.
+    /// meanwhile. Clones share what was seen: a receive by one moves it for all. A reclamation
+    /// cycle moves what was seen into the new file while that file retains its version; one the
+    /// cycle pruned keeps the old file on disk until the next receive.
     pub fn watch_changes(
         &self,
         test: impl Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync + 'static,

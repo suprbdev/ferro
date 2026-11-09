@@ -59,7 +59,9 @@ while let Ok(now) = watcher.changed().await {
 "wake me when this changed since I looked" needs no state of its own. Until the first return it
 compares against the snapshot that was current when the watcher was made, which `seen` returns, so a
 consumer that starts from `seen` misses nothing that lands meanwhile. Clones share what was seen: a
-return by one moves it for all.
+return by one moves it for all. A reclamation cycle moves what was seen into the new file, unless
+the cycle pruned its version, and then it keeps the old file on disk until the watcher next returns,
+as a snapshot you hold would.
 
 ## Where tests run
 

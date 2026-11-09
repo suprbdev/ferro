@@ -129,8 +129,12 @@ one. The first reference is the feed's snapshot, taken in the same mutex hold as
 cannot disagree with the place, and `Watcher::seen` returns it. The chat example used to keep its
 marks in a mutex shared with its test and hold that mutex across `db.read()` for the same guarantee,
 and to refresh them before each `recv`. The reference lives in the gate, so clones share it and a
-return by one moves it for all, only ever forward by count. It holds its snapshot, and so its file
-across a cycle, until the next return, like the snapshot a consumer keeps to diff against. A closed
+return by one moves it for all, only ever forward by count. It holds its snapshot until the next
+return, like the snapshot a consumer keeps to diff against, but not the file a cycle replaced: the
+feed lists every such gate by a `Weak`, and after a swap each moves to the new file's snapshot of
+the same commit while the new file retains that version, keeping its count, unless it has returned
+a newer snapshot meanwhile. One whose version was pruned keeps the old file until it next returns,
+as described under [Generations](reclamation.md#generations), which gives the cost. A closed
 feed holds no snapshot, so a watcher made on a dropped branch's handle takes the one that handle
 reads, which is the last its branch had there and never changes. It ends at once, but `seen` still
 answers as its documentation promises; the first version left it `None`, and the `Watcher::changed`

@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use common::{Rng, fast, text, uncached};
 use ferro::db::Hook;
 use ferro::{
-    Commit, Data, Db, Durability, Error, Keep, Map, Options, Ptr, Reclaim, Snapshot, admin,
+    Bundle, Commit, Data, Db, Durability, Error, Have, Keep, Map, Options, Ptr, Reclaim, Snapshot,
+    Watcher, admin,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -307,6 +308,107 @@ fn history_log_and_watchers_work_across_cycles() {
     assert_eq!(db.log().len(), 2);
 }
 
+fn put_one(db: &Db<Root>, key: u64, value: u64) {
+    db.update(|root| {
+        root.insert(key, text(value, 40));
+    })
+    .unwrap();
+}
+
+fn on_key_zero(db: &Db<Root>) -> Watcher<Root> {
+    db.watch_changes(|seen, now| seen.get(&0) != now.get(&0))
+}
+
+#[test]
+fn a_read_only_handle_counts_the_file_a_held_snapshot_keeps_after_refresh() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Root> = options().open(&path).unwrap();
+    fill(&db, 500, 100);
+    let reader: Db<Root> = Options::new()
+        .read_only(true)
+        .cache_bytes(1)
+        .open(&path)
+        .unwrap();
+    let held = reader.read();
+    let want = dump(&held);
+    db.compact(Keep::Last(1)).unwrap();
+    assert!(reader.refresh().unwrap());
+    assert_eq!(dump(&held), want);
+    let space = reader.space().unwrap();
+    assert!(space.retired_bytes > 0, "{space:?}");
+    drop(held);
+    assert_eq!(reader.space().unwrap().retired_bytes, 0);
+}
+
+#[test]
+fn a_changes_watcher_moves_to_the_new_file_while_it_retains_what_was_seen() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let db: Db<Root> = options().open(&path).unwrap();
+    fill(&db, 300, 50);
+    let pruned = on_key_zero(&db);
+    for value in 0..20 {
+        put_one(&db, 1, 1000 + value);
+    }
+    let behind = on_key_zero(&db);
+    for value in 20..30 {
+        put_one(&db, 1, 1000 + value);
+    }
+    let head = on_key_zero(&db);
+    db.compact(Keep::Last(20)).unwrap();
+    assert_eq!(db.log().first().unwrap().0, 311);
+    assert_eq!(pruned.seen().unwrap().version(), 300);
+    assert!(db.space().unwrap().retired_bytes > 0);
+    for (watcher, version) in [(&behind, 320), (&head, 330)] {
+        let seen = watcher.seen().unwrap();
+        assert_eq!(seen.version(), version);
+        assert_eq!(dump(&seen), dump(&db.at(version).unwrap()));
+    }
+    put_one(&db, 0, 2000);
+    let now = pruned.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(now.version(), 331);
+    assert_eq!(db.space().unwrap().retired_bytes, 0);
+    for watcher in [&behind, &head] {
+        let now = watcher.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(now.version(), 331);
+        assert_eq!(watcher.seen().unwrap().version(), 331);
+    }
+
+    let reader: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
+    let watching = on_key_zero(&reader);
+    let held = reader.read();
+    put_one(&db, 1, 3000);
+    db.compact(Keep::Last(5)).unwrap();
+    assert!(reader.refresh().unwrap());
+    assert_eq!(watching.seen().unwrap().version(), 331);
+    assert!(reader.space().unwrap().retired_bytes > 0);
+    drop(held);
+    assert_eq!(reader.space().unwrap().retired_bytes, 0);
+    put_one(&db, 0, 3001);
+    assert!(reader.refresh().unwrap());
+    assert_eq!(watching.try_recv().unwrap().version(), 333);
+}
+
+#[test]
+fn a_changes_watcher_follows_another_handles_cycle_to_the_new_file() {
+    let dir = dir();
+    let path = path_in(&dir);
+    let shared = || options().shared(true).open::<Root>(&path).unwrap();
+    let (one, other) = (shared(), shared());
+    fill(&one, 200, 40);
+    assert!(other.refresh().unwrap());
+    let watcher = on_key_zero(&other);
+    put_one(&one, 1, 500);
+    one.compact(Keep::Last(3)).unwrap();
+    assert!(other.refresh().unwrap());
+    assert_eq!(watcher.seen().unwrap().version(), 200);
+    assert_eq!(other.space().unwrap().retired_bytes, 0);
+    put_one(&one, 0, 501);
+    assert!(other.refresh().unwrap());
+    assert_eq!(watcher.try_recv().unwrap().version(), 202);
+}
+
 #[test]
 fn branches_merges_and_records_survive() {
     let dir = dir();
@@ -588,6 +690,102 @@ fn commits_forks_and_drops_during_every_stage_of_a_cycle_are_kept() {
         db.compact(Keep::Last(1)).unwrap();
         assert_eq!(dump(&db.read()), want, "{stage}");
         db.verify().unwrap();
+    }
+}
+
+fn fill_from(db: &Db<Root>, from: u64, commits: u64, keys: u64) {
+    for i in from..from + commits {
+        db.commit(format!("c{i}"), |root| {
+            root.insert(i % keys, text(i, 40));
+        })
+        .unwrap();
+    }
+}
+
+type Heads = Vec<(String, u64, Vec<(u64, String)>)>;
+
+fn every_branch(db: &Db<Root>) -> Heads {
+    db.branches()
+        .into_iter()
+        .map(|name| {
+            let snapshot = db.branch(&name).unwrap().read();
+            (name, snapshot.version(), dump(&snapshot))
+        })
+        .collect()
+}
+
+fn keep_ours(ours: &mut Root, base: &Snapshot<Root>, theirs: &Snapshot<Root>) -> (String, usize) {
+    let applied = ours.merge(base, theirs, |conflict| conflict.keep_ours());
+    ("merge".to_string(), applied)
+}
+
+#[test]
+fn merges_restores_stamped_commits_drops_and_receives_during_every_stage_of_a_cycle_are_kept() {
+    for stage in ["created", "copied", "synced", "swapped", "retired"] {
+        let dir = dir();
+        let path = path_in(&dir);
+        let remote: Db<Root> = options().open(dir.path().join("remote.ferro")).unwrap();
+        let slot: Arc<Mutex<Option<Db<Root>>>> = Arc::new(Mutex::new(None));
+        let old: Arc<Mutex<Option<Snapshot<Root>>>> = Arc::new(Mutex::new(None));
+        let hook = {
+            let (slot, old, remote) = (slot.clone(), old.clone(), remote.clone());
+            move |name: &'static str| {
+                if name != stage {
+                    return;
+                }
+                let Some(db) = slot.lock().unwrap().clone() else {
+                    return;
+                };
+                let side = db.branch("side").unwrap();
+                fill_from(&side, 3000, 5, 7);
+                db.merge_with(&side, keep_ours).unwrap();
+                db.restore(&old.lock().unwrap().take().unwrap()).unwrap();
+                db.commit_stamped(|root, stamp| {
+                    root.insert(900, format!("{}-{}", stamp.version(), stamp.time_ms()));
+                    ("stamped", ())
+                })
+                .unwrap();
+                db.drop_branch("gone").unwrap();
+                let again = db.fork("gone").unwrap();
+                again
+                    .update(|root| {
+                        root.insert(901, "again".into());
+                    })
+                    .unwrap();
+                fill_from(&remote, 7000, 5, 3);
+                let have: Vec<u8> = db.have().unwrap().into();
+                let bundle: Vec<u8> = remote.bundle(&Have::from(have)).unwrap().into();
+                match db.receive("remote", &Bundle::from(bundle), keep_ours) {
+                    Ok(_) | Err(Error::NoCommonAncestor) => {}
+                    Err(error) => panic!("{stage}: {error}"),
+                }
+            }
+        };
+        let db = hooked(&path, 1 << 20, hook);
+        *slot.lock().unwrap() = Some(db.clone());
+        fill_from(&db, 0, 300, 9);
+        *old.lock().unwrap() = Some(db.at(150).unwrap());
+        let side = db.fork("side").unwrap();
+        fill_from(&side, 1000, 40, 9);
+        db.fork("gone").unwrap();
+        fill_from(&remote, 5000, 20, 3);
+        db.compact(Keep::Last(60)).unwrap();
+        *slot.lock().unwrap() = None;
+        let want = every_branch(&db);
+        db.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        let gone = db.branch("gone").unwrap();
+        assert_eq!(gone.read().get(&901).as_deref(), Some(&"again".to_string()));
+        db.compact(Keep::Last(2)).unwrap();
+        db.verify_typed()
+            .unwrap_or_else(|error| panic!("{stage}: {error}"));
+        assert_eq!(every_branch(&db), want, "{stage}");
+        drop((db, side, gone));
+        admin::compact(&path, Keep::Last(1)).unwrap();
+        admin::verify(&path).unwrap();
+        let db: Db<Root> = options().open(&path).unwrap();
+        assert_eq!(every_branch(&db), want, "{stage}");
+        db.verify_typed().unwrap();
     }
 }
 

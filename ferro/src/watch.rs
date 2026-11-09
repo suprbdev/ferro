@@ -9,11 +9,13 @@
 //! [Watchers](https://github.com/archlemon/ferro/blob/main/docs/internals/watchers.md) in the
 //! internals describes the feed and the watch thread.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, OnceLock, Weak};
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use crate::db::Snapshot;
+use crate::db::{Commit, Snapshot};
 
 type Each<T> = Box<dyn Fn(&Snapshot<T>) -> bool + Send + Sync>;
 type Pair<T> = Box<dyn Fn(&Snapshot<T>, &Snapshot<T>) -> bool + Send + Sync>;
@@ -122,14 +124,58 @@ struct Plan<T> {
     closed: bool,
 }
 
-/// What publishing or replacing a snapshot leaves to do: wake the branch's watch thread after a
-/// publish, and free the snapshot replaced.
+struct Tracked<T> {
+    gates: Vec<Weak<Gate<T>>>,
+    prune: usize,
+}
+
+/// The snapshots that a feed's [`Db::watch_changes`](crate::Db::watch_changes) watchers compare
+/// against, from [`Feed::seats`]: each watcher with the place it had seen, and each commit seen
+/// with the snapshot of it to put in place, if one was found.
 ///
-/// Both happen when it is dropped, so a caller keeps it until it has released its locks.
+/// [`Seats::seat`] puts them in place, and the notice it returns holds the gates and every
+/// snapshot read or replaced, so that none of them is dropped under the caller's locks.
+pub(crate) struct Seats<T> {
+    gates: Vec<(Arc<Gate<T>>, u64, usize)>,
+    commits: Vec<(Snapshot<T>, Option<Snapshot<T>>)>,
+    replaced: Vec<Snapshot<T>>,
+}
+
+impl<T> Seats<T> {
+    /// Puts each found snapshot in place of the one its watcher compares against, unless the
+    /// watcher has returned a newer snapshot since [`Feed::seats`] read it.
+    pub(crate) fn seat(mut self) -> Notice<T> {
+        for (gate, count, at) in &self.gates {
+            let (seen, Some(found)) = &self.commits[*at] else {
+                continue;
+            };
+            let mut held = gate.seen.lock();
+            if let Some((was, held)) = held.as_mut()
+                && *was == *count
+                && ptr::eq(held.commit(), seen.commit())
+            {
+                self.replaced.push(mem::replace(held, found.clone()));
+            }
+        }
+        Notice {
+            feed: None,
+            replaced: None,
+            seats: Some(self),
+            later: None,
+        }
+    }
+}
+
+/// What publishing or replacing a snapshot leaves to do: wake the branch's watch thread after a
+/// publish, free the snapshot replaced, or run work that must wait for the caller's locks.
+///
+/// All of it happens when it is dropped, so a caller keeps it until it has released its locks.
 #[must_use]
 pub(crate) struct Notice<T> {
     feed: Option<Arc<Feed<T>>>,
     replaced: Option<Snapshot<T>>,
+    seats: Option<Seats<T>>,
+    later: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl<T> Notice<T> {
@@ -139,6 +185,18 @@ impl<T> Notice<T> {
         Notice {
             feed: None,
             replaced: Some(snapshot),
+            seats: None,
+            later: None,
+        }
+    }
+
+    /// A notice that runs `work` when it is dropped, once the caller has released its locks.
+    pub(crate) fn later(work: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Notice {
+            feed: None,
+            replaced: None,
+            seats: None,
+            later: Some(Box::new(work)),
         }
     }
 }
@@ -149,6 +207,10 @@ impl<T> Drop for Notice<T> {
             feed.kick();
         }
         self.replaced.take();
+        self.seats.take();
+        if let Some(work) = self.later.take() {
+            work();
+        }
     }
 }
 
@@ -157,6 +219,7 @@ pub(crate) struct Feed<T> {
     slot: Mutex<Slot<T>>,
     fresh: Condvar,
     plan: Mutex<Plan<T>>,
+    tracked: Mutex<Tracked<T>>,
     waiting: AtomicUsize,
     due: AtomicBool,
     notifier: OnceLock<Thread>,
@@ -176,6 +239,10 @@ impl<T> Feed<T> {
                 gates: Vec::new(),
                 prune: 64,
                 closed: false,
+            }),
+            tracked: Mutex::new(Tracked {
+                gates: Vec::new(),
+                prune: 64,
             }),
             waiting: AtomicUsize::new(0),
             due: AtomicBool::new(false),
@@ -199,6 +266,8 @@ impl<T> Feed<T> {
             return Notice {
                 feed: None,
                 replaced: Some(previous.clone()),
+                seats: None,
+                later: None,
             };
         }
         let replaced = slot.latest.replace(snapshot);
@@ -208,6 +277,8 @@ impl<T> Feed<T> {
         Notice {
             feed: Some(self.clone()),
             replaced,
+            seats: None,
+            later: None,
         }
     }
 
@@ -234,6 +305,69 @@ impl<T> Feed<T> {
         Notice {
             feed: None,
             replaced,
+            seats: None,
+            later: None,
+        }
+    }
+
+    /// Lists the gate of a [`Db::watch_changes`](crate::Db::watch_changes) watcher by a `Weak`, so
+    /// that [`Feed::seats`] can reach the snapshot it compares against.
+    fn track(&self, gate: &Arc<Gate<T>>) {
+        let mut tracked = self.tracked.lock();
+        if tracked.gates.len() >= tracked.prune {
+            tracked.gates.retain(|gate| gate.strong_count() > 0);
+            tracked.prune = (tracked.gates.len() * 2).max(64);
+        }
+        tracked.gates.push(Arc::downgrade(gate));
+    }
+
+    /// Reads the snapshot each [`Db::watch_changes`](crate::Db::watch_changes) watcher of the feed
+    /// compares against, and asks `find` for one of the same commit to put in its place, as a
+    /// cycle's swap puts the feed's own snapshot in place with [`Feed::rebind`].
+    ///
+    /// `find` runs once for each commit the watchers saw, whichever snapshot of it they hold.
+    /// Nothing changes until [`Seats::seat`], and a gate's lock is held only to read what it saw,
+    /// never while `find` runs.
+    pub(crate) fn seats(
+        &self,
+        mut find: impl FnMut(&Snapshot<T>) -> Option<Snapshot<T>>,
+    ) -> Seats<T> {
+        let live: Vec<Arc<Gate<T>>> = {
+            let mut tracked = self.tracked.lock();
+            tracked.gates.retain(|gate| gate.strong_count() > 0);
+            tracked.prune = (tracked.gates.len() * 2).max(64);
+            tracked.gates.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut gates = Vec::with_capacity(live.len());
+        let mut commits = Vec::new();
+        let mut places: HashMap<*const Commit, usize> = HashMap::new();
+        for gate in live {
+            let read = {
+                let seen = gate.seen.lock();
+                seen.as_ref().map(|(count, seen)| {
+                    let commit = ptr::from_ref(seen.commit());
+                    let first = (!places.contains_key(&commit)).then(|| seen.clone());
+                    (*count, commit, first)
+                })
+            };
+            let Some((count, commit, first)) = read else {
+                continue;
+            };
+            let at = match first {
+                Some(seen) => {
+                    let found = find(&seen);
+                    commits.push((seen, found));
+                    places.insert(commit, commits.len() - 1);
+                    commits.len() - 1
+                }
+                None => places[&commit],
+            };
+            gates.push((gate, count, at));
+        }
+        Seats {
+            gates,
+            commits,
+            replaced: Vec::new(),
         }
     }
 
@@ -622,8 +756,12 @@ impl<T> Watcher<T> {
             _ => None,
         };
         drop(slot);
+        let gate = Gate::new(filter, seen);
+        if matches!(gate.filter, Filter::Changes(_)) {
+            feed.track(&gate);
+        }
         Watcher {
-            gate: Gate::new(filter, seen),
+            gate,
             feed,
             place: AtomicU64::new(place),
         }
