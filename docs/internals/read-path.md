@@ -408,12 +408,152 @@ reach of the TLB, take several DRAM misses where a `Vec` takes two. Neither the 
 decoding goes away without a different structure. What a `Vec` cannot do at any price is take a
 commit or keep an old version.
 
+## Reading a node from the file
+
+A read that misses the cache reads the node's record from the file, checks its hash, decodes it and
+caches it. `ferro-bench`'s cold `get` does that 2.74 times a get on its 1M-key `Map<u64, String>`
+with a 1 MiB cache: 0.87 times for a leaf of 15 keys and 1.87 times for an interior node of 13, the
+levels below the pinned ones that the cache cannot hold. The cold scans of `reads`, over maps loaded
+with `extend`, miss once for each leaf of about 8 keys. Where those misses spent their time before
+the changes below, timed with the time stamp counter in a build that recorded each step, as a share
+of the time spent fetching nodes. The counter reads are not serialized, so a step's cache misses
+can land in the step after it, and the shares are approximate:
+
+| Step | Cold `get` | Cold scan |
+| --- | ---: | ---: |
+| BLAKE3 of the body and link hashes | 30% | 26% |
+| Decoding the node | 25% | 25% |
+| of which values, a `String` each | 12% | 10% |
+| of which child links | 6% | 3% |
+| of which keys | 4% | 6% |
+| `pread` of 1 KiB, and its buffer | 16% | 16% |
+| Inserting into the cache | 11% | 13% |
+| of which dropping the nodes it evicts | 7% | 5% |
+| Parsing the record's header and links | 8% | 2% |
+| LZ4 | 5% | 7% |
+| Looking the node up in the cache | 1% | 3% |
+
+A get spends about 2.1 µs a miss, so hashing a node's body and link hashes, about 500 bytes on
+average, takes about 630 ns. BLAKE3 hashes a chunk of 1 KiB one 64-byte block after another, each
+block a chain of dependent operations: on this machine it took 58 ns for 64 bytes, 301 for 220 and
+1,143 for 1 KiB, and 1,260 for 4 KiB, which it hashes as four chunks side by side. A random `pread`
+from the page cache costs about 390 ns before the 70 ns a KiB it copies: 451 ns for 1 KiB, 669 for
+4 KiB and 987 for 8 KiB at random places in the 98 MB file. In a scan, which reads the file in
+order, it costs about half that.
+
+Three changes came out of it. `Store::read_lent` reads a record for decoding without making an
+`Object`: it parses the record in one pass over the bytes it read, with `stored_within`, which
+`read_stored` already used, where `read_within` read each byte of each link through a reader that
+could extend its buffer, and it lends the decoder the body and links from buffers the thread keeps,
+a compressed body decompressed into one and an uncompressed one borrowed from the read. A miss
+allocates no read buffer, body or link list of its own, and copies no uncompressed body. A view,
+which charges what it reads, and the reads that keep an `Object` still go through `read_fresh`.
+
+The bytes `read_lent` reads stay in a `Window` on the thread, and the next record that lies whole
+within them is taken from there, its hash checked like any other. A record from the window that
+fails its check is read from the file again, and fails there if the file holds it damaged, so the
+window can only spare a read, never vouch for bytes. Once a record has come from the window, the
+next read of the same file within 64 KiB of the window is wider: 4 KiB behind the record, where the
+leaves of a node written just after them sit, and 4 KiB past the usual 1 KiB. A scan reads a node,
+then the leaves written just before it one after another, so most of its reads come from the
+window, and gets, whose reads land far apart, read 1 KiB as before. A wider read that fails is made
+again at 1 KiB, so a read still fails only where the bytes it always read cannot be read. The window
+is keyed by the store's id, which a file swapped in by a refresh or a cycle does not share.
+`a_read_through_the_window_lends_only_records_that_check` reads records of every kind through it in
+both directions, through a window of other bytes, and past damage in the file with and without the
+damaged bytes already in the window.
+`a_scan_reads_past_bytes_beside_its_records_that_cannot_be_read`
+makes reads fail inside overwritten values that sit between the leaves a scan reads, and the faults
+of `refresh_fault` now fail any read that covers their offset, since the record they target may
+come in a wider read that starts before it.
+
+`Decoder::varint` read a varint of nine or ten bytes, which a random `u64` takes, with a branch on
+whether the ninth byte ends it, wrong half the time. It now reads the first eight bytes as before
+and the last one or two without a branch, and falls back to the loop for anything but the shortest
+form, so it refuses an overlong varint, one past 64 bits, and one that runs off the end as it did.
+`varints_of_nine_and_ten_bytes_read_only_their_shortest_form` holds it to a plain reading of the
+format, value, length and refusal, for every ninth and tenth byte after four prefixes of eight
+continued bytes, and for 200,000 random strings.
+
+Each step, measured with a harness that runs `ferro-bench`'s cold gets and `reads`' cold scans on
+the same files, medians of five alternating runs against the build before it, seven for the varint,
+in nanoseconds a get and a key:
+
+| Change | Cold `get` | Cold scan, strings | Cold scan, `u64` | Warm `get` |
+| --- | ---: | ---: | ---: | ---: |
+| Parsing in one pass, a read buffer kept | 5,740 to 5,454 | 144.2 to 139.1 | 110.5 to 107.5 | 297.9 to 298.4 |
+| Body and links lent | 5,547 to 5,446 | 138.9 to 137.3 | 106.4 to 103.7 | 306.6 to 300.7 |
+| The window | 5,200 to 5,210 | 132.1 to 115.7 | 99.6 to 85.2 | 288.6 to 290.2 |
+| The varint's last bytes | 5,280 to 5,267 | 117.9 to 118.2 | 87.1 to 86.0 | 291.5 to 290.4 |
+
+Against the build before all of them, seven alternating runs of each tool, pinned to the second
+CCD, with other work running: the 1-minute load average was 4.4 to 6.9 during `ferro-bench`'s runs
+and 1.3 to 2.9 during those of `reads`:
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| `ferro-bench` cold `get`, 1 MiB cache | 5,757 ns, 57,370 instructions | 5,473 ns, 52,522 |
+| `ferro-bench` cold `get`, 5 MiB cache | 4,109 ns, 38,723 instructions | 3,903 ns, 35,857 |
+| `ferro-bench` cold `get` on a writer, 1 MiB cache | 5,743 ns | 5,440 ns |
+| `ferro-bench` warm `get` | 316 ns, 1,038 instructions | 315 ns, 1,038 |
+| `ferro-bench` Buffered single-key commit | 23.8 µs, 180,572 instructions | 23.6 µs, 178,570 |
+| `ferro-bench` bulk load, per key | 666 ns | 666 ns |
+| `reads` cold scan, `u64` values | 105.7 ns, 1,113 instructions | 85.0 ns, 1,011 |
+| `reads` cold scan, short strings | 140.2 ns, 1,385 instructions | 118.9 ns, 1,295 |
+| `reads` random `get`, `u64` and strings | 250 and 324 ns | 245 and 327 ns |
+| `reads` single-key commit, `u64` and strings | 21.7 and 26.0 µs | 21.6 and 26.0 µs |
+| `reads` decode of a random `u64` | 9.0 ns, 161.5 instructions | 5.0 ns, 148.9 |
+| `reads` decode of a `u64` of three bytes | 3.3 ns | 3.1 ns |
+
+The fsync commits of `ferro-bench` came out at 412 µs against 401 before for the map and 435
+against 419 for the table, at 0.4% and 0.2% fewer instructions, inside the spread of fsync times
+on a busy machine, 391 to 434 µs and 399 to 464 µs across the runs of either build. `diff` ran
+0.45% more instructions a change, 20,676 against 20,583, at times that split between about 3.3 and
+4.2 µs in both builds. Folds over a warm `Map<u64, u64>` in `reads` ran 8 to 11% faster at the same
+instruction counts, `sum` 6.7 ns a key against 7.5, which points at where the decoded nodes landed
+in the heap, no longer between the buffers each read allocated and freed. In two passes of
+`scaling` with the 16 MiB cache and no writer, three rounds each, at load averages of 3.3 to 6.1,
+gets went from 335,000 and 333,000 a second to 345,000 and 344,000 on one thread and from 1.99M and
+2.02M to 2.03M and 2.06M on 16, `for_each` scans from 7.29M and 7.26M keys a second to 8.73M and
+8.63M on one thread and from 49.9M and 50.2M to 57.2M and 56.6M on 16, and index lookups from
+73,700 and 77,700 a second to 79,300 and 80,500 on 16.
+
+Timed the same way after the first two changes, a cold get's misses spent 25% on the hash, 27% on
+the decode, which allocates a key vector, a column, a child vector and a string a value, 16% on the
+`pread`, 12% on the insert, 7 of them dropping what it evicts, 3% on LZ4 and 2.5% on the parse.
+Hashing and decompressing into buffers the thread had just used took less time than into new
+ones, 1,437 against 1,889 and 180 against 307 time stamp ticks a miss.
+
+Measured and left out:
+
+- Wider reads whenever a read lands within 64 KiB of the window, whether or not the window served a
+  record. Cold scans gained as much, but gets lost: in a file that took 21,000 single-key commits
+  after its load, a node of level 1 sits far from most of its leaves, so the wider read rarely
+  served the next one. Over three alternating runs, reading 1 KiB and keeping it, without widening,
+  made cold gets 1.1% slower and scans of strings and of `u64`s 8.4 and 12.2% faster; 4 KiB behind,
+  2.7% slower and 10.4 and 14.8% faster; 4 KiB behind and ahead, 3.7% slower and 11.4 and 15.5%
+  faster; 8 KiB behind, 4.2% slower and 10.1 and 14.8% faster.
+- Other sizes for the streaming window, over five alternating runs, with cold gets within 0.2% for
+  each: 2 KiB behind and ahead took 10.9 and 14.2% off the scans, 4 KiB behind and 8 KiB ahead 12.4
+  and 15.0%, and 8 KiB each 12.1 and 14.9%, against 12.4 and 14.5% for 4 KiB each.
+- Reading eight bytes at a time for every varint of two bytes or more. A random `u64` decoded in
+  4.4 ns against 9.6, but one of three bytes in 4.2 against 3.4 and a pair of `u32`s in 8.8 against
+  8.2: the length now came from the bytes, where the loop's predicted exit let the next varint start
+  early. Taking the eight bytes only for varints of nine or ten, behind a test of the first eight,
+  also gave 4.4 ns for a random `u64`, but 3.8 against 3.2 for three bytes and 9.9 against 8.3 for
+  a pair, for the test on every call.
+- A faster hash. The SSE4.1 build of BLAKE3 took 92 ns for 64 bytes, 359 for 220 and 1,395 for 1
+  KiB, slower than the AVX-512 one it picks here. Records hashed several at once, a lane each, would
+  be faster, but that needs a BLAKE3 of ferro's own or the `blake3` crate's hidden `platform`
+  module, whose API it does not promise.
+
 ## Measured and left out
 
 A node miss is dominated by BLAKE3, at roughly 500 to 900 ns on an interior node against 130 to 190
-ns for `pread`, and the hash check is not negotiable. Reads fetch 1 KiB at a time, which fits most
-records. `Decoder::varint` takes a one byte varint inline, which took `Vec<u64>` of small numbers
-from 6.1 to 1.5 ns an item and cold scans down about 7%.
+ns for `pread`, and the hash check is not negotiable. A read fetches 1 KiB, which fits most records,
+or a wider window while a scan streams through the file, as [Reading a node from the
+file](#reading-a-node-from-the-file) describes. `Decoder::varint` takes a one byte varint inline,
+which took `Vec<u64>` of small numbers from 6.1 to 1.5 ns an item and cold scans down about 7%.
 
 - Bulk decode hooks for keys. `Vec<f64>`, eight raw bytes an item, decodes at 1.4 ns, and a random
   `u64` varint at 8.8 ns, so raw keys would save at most 7 ns in a cold scan of about 100 ns a key.

@@ -63,6 +63,16 @@ use crate::shared::{Erased, Shared, Weak};
 thread_local! {
     static FRESH: Cell<u64> = const { Cell::new(0) };
     static EVICTED: Cell<Vec<CacheEntry>> = const { Cell::new(Vec::new()) };
+    static WINDOW: Cell<Window> = const {
+        Cell::new(Window {
+            store: 0,
+            start: 0,
+            bytes: Vec::new(),
+            streaming: Cell::new(false),
+        })
+    };
+    static LENT_BODY: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+    static LENT_LINKS: Cell<Vec<Ptr>> = const { Cell::new(Vec::new()) };
 }
 
 /// How many objects this thread has read from a file to decode them, past the cache, so far.
@@ -129,6 +139,14 @@ const MAX_RESERVE: u64 = 4 << 20;
 const LOCK_RETRIES: u32 = 5;
 /// How many bytes a read of a record takes at once, enough for most records whole.
 const READ_AHEAD: usize = 1024;
+/// How many bytes before a record a streaming [`Window`] also reads, where a map node's children
+/// sit when they were written just before it.
+const WINDOW_BEHIND: u64 = 4 << 10;
+/// How many bytes past [`READ_AHEAD`] a streaming [`Window`] also reads, where the records a scan
+/// reads next sit.
+const WINDOW_AHEAD: u64 = 4 << 10;
+/// How close to the start of a streaming [`Window`] a read must land for it to read wider.
+const WINDOW_NEAR: u64 = 64 << 10;
 /// The most bytes of frames another process placed that a catch-up keeps in memory for reads of
 /// the objects in them, and so the largest frame it keeps.
 const FOLLOWED_BYTES: usize = 4 << 20;
@@ -160,6 +178,9 @@ const READ_WORDS: usize = 64;
 const REPLAY_CHUNK: usize = 256 << 10;
 /// The most capacity a check's scratch body keeps between records.
 const SCRATCH_KEEP: usize = 1 << 20;
+/// The most bytes of capacity each of the buffers that [`Store::read_lent`] reuses keeps between
+/// reads.
+const LENT_KEEP: usize = 64 << 10;
 /// The most entries the list of evicted cache entries that a thread lends to its inserts keeps room
 /// for between them.
 const EVICTED_KEEP: usize = 1 << 10;
@@ -1566,6 +1587,96 @@ fn varint_within(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 
+/// The body of the record at `ptr`, which [`stored_within`] found whole in `bytes` with its
+/// `links`, decompressed into `unpacked` if it is compressed, once its hash checks.
+fn checked_body<'a>(
+    bytes: &'a [u8],
+    stored: &Stored,
+    links: &[Ptr],
+    unpacked: &'a mut Vec<u8>,
+    ptr: Ptr,
+) -> Result<&'a [u8]> {
+    let payload = &bytes[stored.payload.clone()];
+    let body = match stored.packed {
+        true => {
+            unpack_into(payload, stored.raw, ptr.offset, unpacked)?;
+            &unpacked[..]
+        }
+        false => payload,
+    };
+    if hash_parts(body, links.iter().map(|link| &link.hash)) != ptr.hash {
+        return Err(Error::Corrupt(format!(
+            "hash mismatch for object at {}",
+            ptr.offset
+        )));
+    }
+    Ok(body)
+}
+
+/// The bytes of a store's file that a thread last read to decode a record, which serve the
+/// records it reads next from within them.
+#[derive(Default)]
+struct Window {
+    /// The id of the store whose file the bytes are from, or 0 for none.
+    store: u64,
+    /// Where the bytes start in the file.
+    start: u64,
+    /// The bytes.
+    bytes: Vec<u8>,
+    /// Whether a record besides the one they were read for was read from these bytes, which makes
+    /// the next read of the same file nearby a wider one.
+    streaming: Cell<bool>,
+}
+
+impl Window {
+    /// The bytes from `offset` up to `tail` if they are from `store` and begin within the window.
+    fn holding(&self, store: u64, offset: u64, tail: u64) -> Option<&[u8]> {
+        if self.store != store || offset < self.start {
+            return None;
+        }
+        let from = usize::try_from(offset - self.start).ok()?;
+        let end = usize::try_from(tail.saturating_sub(self.start))
+            .unwrap_or(usize::MAX)
+            .min(self.bytes.len());
+        self.bytes.get(from..end).filter(|bytes| !bytes.is_empty())
+    }
+
+    /// Reads the window for a record at `offset` in `store`'s `file`, never past `tail`, and
+    /// returns its bytes from `offset`.
+    ///
+    /// It reads [`READ_AHEAD`] bytes from `offset`, and when it was streaming bytes of the same
+    /// file that start within [`WINDOW_NEAR`] of it, [`WINDOW_BEHIND`] bytes before `offset` and
+    /// [`WINDOW_AHEAD`] more after. A wider read that fails is made again at its usual width, so
+    /// a read fails only where one of those [`READ_AHEAD`] bytes cannot be read.
+    fn fill(&mut self, file: &File, store: u64, offset: u64, tail: u64) -> Result<&[u8]> {
+        let streaming = self.streaming.replace(false);
+        let near = streaming && self.store == store && self.start.abs_diff(offset) <= WINDOW_NEAR;
+        let end = tail.min(offset.saturating_add(READ_AHEAD as u64));
+        self.store = 0;
+        let mut start = offset;
+        if near {
+            start = offset.saturating_sub(WINDOW_BEHIND).max(LOG_START);
+            let wide = tail.min(end.saturating_add(WINDOW_AHEAD));
+            if self.read(file, start, wide).is_err() {
+                start = offset;
+                self.read(file, offset, end)?;
+            }
+        } else {
+            self.read(file, offset, end)?;
+        }
+        self.store = store;
+        self.start = start;
+        Ok(&self.bytes[(offset - start) as usize..])
+    }
+
+    /// Reads the bytes of `file` from `start` to `end` into the window.
+    fn read(&mut self, file: &File, start: u64, end: u64) -> std::io::Result<()> {
+        self.bytes.clear();
+        self.bytes.resize((end - start) as usize, 0);
+        file.read_exact_at(&mut self.bytes, start)
+    }
+}
+
 /// Reads a whole record from `bytes`, which start at `start` in the log, filling `links`, or
 /// `None` if it runs past them or does not parse, for the caller to read it the slow way.
 pub(crate) fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> Option<Stored> {
@@ -1589,6 +1700,7 @@ pub(crate) fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> O
     }
     pos = payload.end;
     links.clear();
+    links.reserve(count);
     for _ in 0..count {
         let hash: Hash = bytes.get(pos..pos + HASH_BYTES)?.try_into().ok()?;
         pos += HASH_BYTES;
@@ -3529,6 +3641,78 @@ impl Store {
         Ok((object, len))
     }
 
+    /// Reads the record at `ptr` as [`Store::read_object`] does and lends its body and links to
+    /// `f`, from buffers this thread keeps for the next read rather than in a new [`Object`].
+    ///
+    /// The record's bytes come from the frames a catch-up kept, from the [`Window`] this thread
+    /// last read from the file if it holds the record whole and the record checks, or from a new
+    /// read, which [`Window::fill`] widens while the reads stream through the file.
+    fn read_lent<R>(&self, ptr: Ptr, f: impl FnOnce(&[u8], &[Ptr]) -> Result<R>) -> Result<R> {
+        let tail = self.readable_past(ptr.offset)?;
+        if ptr.offset < LOG_START || ptr.offset >= tail {
+            return Err(Error::Corrupt(format!(
+                "pointer {} outside log of {tail} bytes",
+                ptr.offset
+            )));
+        }
+        let kept = self
+            .inner
+            .options
+            .shared
+            .then(|| self.inner.followed.load());
+        let held = kept
+            .as_ref()
+            .and_then(|kept| kept.as_deref())
+            .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
+        let mut window = WINDOW.try_with(Cell::take).unwrap_or_default();
+        let mut links = LENT_LINKS.try_with(Cell::take).unwrap_or_default();
+        let mut unpacked = LENT_BODY.try_with(Cell::take).unwrap_or_default();
+        let lent = self.lend_record(held, &mut window, &mut links, &mut unpacked, ptr, tail, f);
+        let _ = WINDOW.try_with(|kept| kept.set(window));
+        if links.capacity() <= LENT_KEEP / size_of::<Ptr>() {
+            let _ = LENT_LINKS.try_with(|kept| kept.set(links));
+        }
+        if unpacked.capacity() <= LENT_KEEP {
+            let _ = LENT_BODY.try_with(|kept| kept.set(unpacked));
+        }
+        lent
+    }
+
+    /// [`Store::read_lent`] with its bytes and buffers in hand.
+    #[allow(clippy::too_many_arguments)]
+    fn lend_record<R>(
+        &self,
+        held: &[u8],
+        window: &mut Window,
+        links: &mut Vec<Ptr>,
+        unpacked: &mut Vec<u8>,
+        ptr: Ptr,
+        tail: u64,
+        f: impl FnOnce(&[u8], &[Ptr]) -> Result<R>,
+    ) -> Result<R> {
+        let id = self.inner.id;
+        if held.is_empty()
+            && let Some(bytes) = window.holding(id, ptr.offset, tail)
+            && let Some(stored) = stored_within(bytes, ptr.offset, links)
+            && let Ok(body) = checked_body(bytes, &stored, links, unpacked, ptr)
+        {
+            window.streaming.set(true);
+            return f(body, links);
+        }
+        let bytes = match held.is_empty() {
+            true => window.fill(&self.inner.file, id, ptr.offset, tail)?,
+            false => held,
+        };
+        match stored_within(bytes, ptr.offset, links) {
+            Some(stored) => f(checked_body(bytes, &stored, links, unpacked, ptr)?, links),
+            None => {
+                let file = Some(&*self.inner.file);
+                Store::read_within(file, ptr, tail, bytes, true, false, None, false)
+                    .and_then(|(object, _, _)| f(&object.body, &object.links))
+            }
+        }
+    }
+
     /// [`Store::read_object`], with the record's compressed body if it has one, for a sync to send
     /// as it is.
     pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
@@ -3816,17 +4000,24 @@ impl Store {
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
         weigh: impl FnOnce(&T, usize, usize) -> u32,
     ) -> Result<(T, u32)> {
+        let decoded = |body: &[u8], links: &[Ptr], charged: bool| {
+            if body.len() >= SPILL_BYTES && !self.inner.options.read_only {
+                self.inner.dedupe.insert(ptr.hash, ptr.offset);
+            }
+            let mut decoder = Decoder::new(body, links, Some(self));
+            let value = decode(&mut decoder)?;
+            if charged {
+                self.count_zero_width(decoder.zero_width())?;
+            }
+            let weight = weigh(&value, body.len(), decoder.heap());
+            Ok((value, weight))
+        };
+        if self.inner.view.is_none() {
+            FRESH.with(|fresh| fresh.set(fresh.get().wrapping_add(1)));
+            return self.read_lent(ptr, |body, links| decoded(body, links, false));
+        }
         let (object, charged) = self.read_fresh(ptr)?;
-        if object.body.len() >= SPILL_BYTES && !self.inner.options.read_only {
-            self.inner.dedupe.insert(ptr.hash, ptr.offset);
-        }
-        let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
-        let value = decode(&mut decoder)?;
-        if charged {
-            self.count_zero_width(decoder.zero_width())?;
-        }
-        let weight = weigh(&value, object.body.len(), decoder.heap());
-        Ok((value, weight))
+        decoded(&object.body, &object.links, charged)
     }
 
     /// Reads the object at `ptr` for decoding: for a [`Store::view`], the one staged with its hash
@@ -3946,13 +4137,20 @@ impl Store {
         ptr: Ptr,
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
-        let (object, charged) = self.read_fresh(ptr)?;
-        let mut decoder = Decoder::new(&object.body, &object.links, Some(self));
-        let value = decode(&mut decoder)?;
-        if charged {
-            self.count_zero_width(decoder.zero_width())?;
+        let decoded = |body: &[u8], links: &[Ptr], charged: bool| {
+            let mut decoder = Decoder::new(body, links, Some(self));
+            let value = decode(&mut decoder)?;
+            if charged {
+                self.count_zero_width(decoder.zero_width())?;
+            }
+            Ok(value)
+        };
+        if self.inner.view.is_none() {
+            FRESH.with(|fresh| fresh.set(fresh.get().wrapping_add(1)));
+            return self.read_lent(ptr, |body, links| decoded(body, links, false));
         }
-        Ok(value)
+        let (object, charged) = self.read_fresh(ptr)?;
+        decoded(&object.body, &object.links, charged)
     }
 
     /// Starts a transaction that appends to the end of the log.
@@ -6066,5 +6264,78 @@ mod tests {
         assert_eq!(follower.read_object(second).unwrap().body, noise(2, 600));
         writer.close();
         follower.close();
+    }
+
+    #[test]
+    fn a_read_through_the_window_lends_only_records_that_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("window.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            ..StoreOptions::default()
+        };
+        let (store, _) = Store::open(&path, options).unwrap();
+        let mut txn = store.begin().unwrap();
+        let mut objects = Vec::new();
+        let mut ptrs: Vec<Ptr> = Vec::new();
+        for index in 0..60u64 {
+            let body = match index % 4 {
+                0 => vec![index as u8; 300],
+                1 => noise(index, 40 + index as usize * 7),
+                2 => noise(index, 3 * READ_AHEAD),
+                _ => Vec::new(),
+            };
+            let links = ptrs
+                .iter()
+                .rev()
+                .take(index as usize % 5)
+                .copied()
+                .collect();
+            let object = Object { body, links };
+            ptrs.push(txn.put_ref(&object, object.hash()).unwrap());
+            objects.push(object);
+        }
+        txn.commit(*ptrs.last().unwrap()).unwrap();
+        let lent =
+            |ptr: Ptr| store.read_lent(ptr, |body, links| Ok((body.to_vec(), links.to_vec())));
+        let wanted = |index: usize| (objects[index].body.clone(), objects[index].links.clone());
+        drop(WINDOW.take());
+        for (index, ptr) in ptrs.iter().enumerate() {
+            assert_eq!(lent(*ptr).unwrap(), wanted(index));
+        }
+        let window = WINDOW.take();
+        assert_eq!(window.store, store.id());
+        assert!(window.bytes.len() > READ_AHEAD);
+        WINDOW.set(window);
+        for (index, ptr) in ptrs.iter().enumerate().rev() {
+            assert_eq!(lent(*ptr).unwrap(), wanted(index));
+        }
+        for index in [5, 6, 13] {
+            WINDOW.set(Window {
+                store: store.id(),
+                start: ptrs[index].offset - 3,
+                bytes: noise(index as u64, 2 * READ_AHEAD),
+                streaming: Cell::new(true),
+            });
+            assert_eq!(lent(ptrs[index]).unwrap(), wanted(index));
+        }
+        let damage = OpenOptions::new().write(true).open(&path).unwrap();
+        for index in [9, 10] {
+            let flipped = ptrs[index].offset + 6;
+            let mut byte = [0u8];
+            store.read_exact(flipped, &mut byte).unwrap();
+            damage.write_all_at(&[byte[0] ^ 0x10], flipped).unwrap();
+        }
+        for before in [None, Some(8), Some(11)] {
+            drop(WINDOW.take());
+            if let Some(before) = before {
+                assert_eq!(lent(ptrs[before]).unwrap(), wanted(before));
+            }
+            for index in [9, 10] {
+                assert!(matches!(lent(ptrs[index]), Err(Error::Corrupt(_))));
+            }
+        }
+        assert_eq!(lent(ptrs[12]).unwrap(), wanted(12));
+        store.close();
     }
 }

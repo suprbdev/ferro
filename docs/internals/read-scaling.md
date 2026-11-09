@@ -402,7 +402,9 @@ instead, as described under [Iterators under hazards](#iterators-under-hazards).
 - Moving `cached` and `lent` ahead of `keys`, so that they share a line with the header a walk reads
   anyway: no faster.
 - A per-thread read buffer in place of the 1 KiB vector each disk read allocates: within 3% either
-  way, with the 16 MiB cache and the 1 GiB one.
+  way, with the 16 MiB cache and the 1 GiB one. Reads now keep such a buffer as a window that later
+  records are taken from, which scans gain from, as [Reading a node from the
+  file](read-path.md#reading-a-node-from-the-file) describes.
 - 512 cache shards sized for four times the items, against the default of 128: gets and index
   lookups with the 16 MiB cache 11 to 18% slower.
 - Aligning the store's shared state to 128 bytes, so that the `Store` clone every iterator takes
@@ -509,7 +511,10 @@ gets, the heap of `heap`'s cases and peak RSS did not move.
   probe that could not fail and assumed no spills was 1 to 3% faster with the 16 MiB cache, within
   noise, and the real thing needs `unsafe` to drop a half-built column on a decode error.
 - Decoding from the read buffer instead of copying the body out of it: the copy and its allocation
-  were under 1% of the profile below, so it was not built.
+  were under 1% of the profile below, so it was not built. Built later, with the record parsed in
+  one pass and its links and a compressed body in buffers the thread keeps, it took 1 to 2.5% off
+  cold gets and scans on one thread, as [Reading a node from the
+  file](read-path.md#reading-a-node-from-the-file) describes.
 
 ### The allocator
 

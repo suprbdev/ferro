@@ -286,6 +286,83 @@ fn overlong_varints_are_rejected() {
     assert_eq!(decoder.varint().unwrap(), 0);
 }
 
+fn varint_as_written(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (index, &byte) in bytes.iter().enumerate().take(10) {
+        if index == 9 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return (byte != 0 || index == 0).then_some((value, index + 1));
+        }
+    }
+    None
+}
+
+fn agrees_with_written_form(bytes: &[u8]) {
+    let mut decoder = Decoder::new(bytes, &[], None);
+    match (decoder.varint(), varint_as_written(bytes)) {
+        (Ok(value), Some((wanted, len))) => {
+            assert_eq!(value, wanted, "{bytes:02x?}");
+            assert_eq!(decoder.remaining(), bytes.len() - len, "{bytes:02x?}");
+        }
+        (Err(_), None) => {}
+        (read, wanted) => panic!("{bytes:02x?}: read {read:?}, wanted {wanted:?}"),
+    }
+}
+
+#[test]
+fn varints_of_nine_and_ten_bytes_read_only_their_shortest_form() {
+    let prefixes: [[u8; 8]; 4] = [
+        [0x80; 8],
+        [0xff; 8],
+        [0x81, 0xfe, 0x80, 0xc3, 0x9a, 0xff, 0x80, 0xb7],
+        [0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80],
+    ];
+    for prefix in prefixes {
+        agrees_with_written_form(&prefix);
+        for ninth in 0..=255u8 {
+            let mut bytes = prefix.to_vec();
+            bytes.push(ninth);
+            agrees_with_written_form(&bytes);
+            for tenth in 0..=255u8 {
+                bytes.truncate(9);
+                bytes.push(tenth);
+                agrees_with_written_form(&bytes);
+                bytes.extend_from_slice(&[0x01, 0x80]);
+                agrees_with_written_form(&bytes);
+            }
+        }
+    }
+    let mut rng = common::Rng::new(19);
+    for _ in 0..cases(200_000) {
+        let len = rng.below(13) as usize;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| match rng.below(4) {
+                0 => rng.below(256) as u8,
+                1 => 0x80 | rng.below(128) as u8,
+                2 => [0x00, 0x01, 0x7f, 0x80, 0x81, 0xff][rng.below(6) as usize],
+                _ => 0x80,
+            })
+            .collect();
+        agrees_with_written_form(&bytes);
+    }
+    for value in [
+        1 << 56,
+        (1 << 63) - 1,
+        1 << 63,
+        u64::MAX,
+        0x0123_4567_89ab_cdef,
+    ] {
+        let bytes = varint_bytes(value);
+        assert!(bytes.len() >= 9);
+        let mut decoder = Decoder::new(&bytes, &[], None);
+        assert_eq!(decoder.varint().unwrap(), value);
+        assert_eq!(decoder.remaining(), 0);
+    }
+}
+
 #[test]
 fn out_of_range_narrow_integers_are_rejected() {
     let mut sink = HashSink;

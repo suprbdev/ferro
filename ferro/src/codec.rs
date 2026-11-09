@@ -2551,9 +2551,22 @@ impl<'a> Decoder<'a> {
     }
 
     fn long_varint(&mut self) -> Result<u64> {
+        let rest = &self.buf[self.pos..];
         let mut value = 0u64;
         let mut shift = 0u32;
-        for (index, &byte) in self.buf[self.pos..].iter().enumerate() {
+        for (index, &byte) in rest.iter().enumerate() {
+            if index == 8
+                && let Some(&tenth) = rest.get(9)
+            {
+                let more = byte >> 7;
+                let last = if more == 0 { byte } else { tenth };
+                if (last != 0) & ((more == 0) | (last == 1)) {
+                    self.pos += 9 + usize::from(more);
+                    return Ok(value
+                        | u64::from(byte & 0x7f) << 56
+                        | u64::from(tenth & more) << 63);
+                }
+            }
             if shift == 63 && byte > 1 {
                 return Err(Error::Decode("varint overflow".into()));
             }

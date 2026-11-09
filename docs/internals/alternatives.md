@@ -44,6 +44,8 @@ numbers. This index lists them by subsystem.
   cursors](read-path.md#sorted-lookups-and-cursors).
 - A wider varint decoder: [What is left, on
   `examples/graph`](read-path.md#what-is-left-on-examplesgraph).
+- Wider reads near every window, other window sizes, eight-byte varint reads, and another BLAKE3
+  build: [Reading a node from the file](read-path.md#reading-a-node-from-the-file).
 - Bulk decode hooks, lazy value decoding, `mmap`, cheaper cache keys, a chunked or trie `List`,
   scan admission control, other loop shapes for folds, a node's headers beside its flags, and a
   node in one allocation with its keys inline: [Measured and left

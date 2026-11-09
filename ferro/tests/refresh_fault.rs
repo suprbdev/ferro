@@ -2,10 +2,11 @@
 
 mod common;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use common::fast;
+use common::{Rng, fast};
 use ferro::{Db, Error, Keep, Map};
 
 type Root = Map<u64, u64>;
@@ -19,12 +20,15 @@ unsafe extern "C" {
 }
 
 thread_local! {
-    static FAIL_READ_AT: Cell<i64> = const { Cell::new(-1) };
+    static FAIL_READS_AT: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static FAILED_READS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pread64(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize {
-    if FAIL_READ_AT.with(Cell::get) == offset {
+    let end = offset.saturating_add(count as i64);
+    if FAIL_READS_AT.with_borrow(|at| at.iter().any(|at| (offset..end).contains(at))) {
+        FAILED_READS.with(|failed| failed.set(failed.get() + 1));
         // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
         // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = EIO };
@@ -53,9 +57,9 @@ fn root_offset(db: &Db<Root>) -> i64 {
 }
 
 fn refresh_failing_at(reader: &Db<Root>, offset: i64) -> ferro::Result<bool> {
-    FAIL_READ_AT.with(|at| at.set(offset));
+    FAIL_READS_AT.with_borrow_mut(|at| *at = vec![offset]);
     let refreshed = reader.refresh();
-    FAIL_READ_AT.with(|at| at.set(-1));
+    FAIL_READS_AT.with_borrow_mut(Vec::clear);
     refreshed
 }
 
@@ -100,4 +104,54 @@ fn a_refresh_that_fails_partway_is_finished_by_the_next() {
 #[test]
 fn a_refresh_that_fails_partway_through_a_replaced_file_is_finished_by_the_next() {
     followed(true);
+}
+
+#[test]
+fn a_scan_reads_past_bytes_beside_its_records_that_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scan.ferro");
+    let db = fast().open::<Map<u64, String>>(&path).unwrap();
+    let mut rng = Rng::new(7);
+    let mut model = BTreeMap::new();
+    let mut overwritten = Vec::new();
+    for round in 0..40u64 {
+        let text: String = (0..4096)
+            .map(|_| char::from(b'0' + rng.below(64) as u8))
+            .collect();
+        db.update(|root| {
+            root.insert(round * 1_000, text.clone());
+        })
+        .unwrap();
+        let batch: Vec<(u64, String)> = (0..120)
+            .map(|i| (round * 1_000 + i, format!("value-{round}-{i}")))
+            .collect();
+        db.update(|root| root.extend(batch.clone())).unwrap();
+        model.extend(batch);
+        overwritten.push(text);
+    }
+    drop(db);
+    let bytes = std::fs::read(&path).unwrap();
+    let failing: Vec<i64> = overwritten
+        .iter()
+        .map(|text| {
+            let head = &text.as_bytes()[..64];
+            let at = bytes.windows(64).position(|window| window == head).unwrap();
+            at as i64 + 2048
+        })
+        .collect();
+    let reader = fast()
+        .cache_bytes(1)
+        .read_only(true)
+        .open::<Map<u64, String>>(&path)
+        .unwrap();
+    let snapshot = reader.read();
+    FAILED_READS.with(|failed| failed.set(0));
+    FAIL_READS_AT.with_borrow_mut(|at| *at = failing);
+    let seen: Vec<(u64, String)> = snapshot
+        .iter()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect();
+    FAIL_READS_AT.with_borrow_mut(Vec::clear);
+    assert_eq!(seen, model.into_iter().collect::<Vec<_>>());
+    assert!(FAILED_READS.with(Cell::get) > 0);
 }

@@ -12,7 +12,8 @@ figure that came within the spread of its runs of the one measured on 2026-11-04
 The copy a reclamation cycle makes, under [Other tools](#other-tools), was measured again on
 2026-11-07, pinned to 16 cores, once it ran on up to 8 threads by default, and the Buffered commits
 of writers on their own branches on 2026-11-09, once a moved draft rewrote its links in place, as
-described under [Writers and branches](#writers-and-branches).
+described under [Writers and branches](#writers-and-branches). The figures under [Reads past the
+cache](#reads-past-the-cache) were measured on 2026-11-09 beside other work, as that section says.
 
 | Operation | Result |
 | --- | --- |
@@ -174,6 +175,29 @@ did 2.9M gets a second with the default glibc, 4.6M with
 4.0M with mimalloc, and index lookups went from 108,000 a second to between 176,000 and 189,000. One
 thread gains 2 to 7%. ferro does not choose an allocator, so an application with that workload
 should set one, or the tunable, itself.
+
+## Reads past the cache
+
+A read whose nodes are not in the cache reads each from the file, checks its hash and decodes it.
+With a 1 MiB cache over the 1M keys, `ferro-bench`'s cold `get` reads 2.7 nodes a get, and the
+cold scans of `reads` read a leaf for about every 8 keys. Measured on 2026-11-09, seven runs
+alternating with the build before, pinned to one CCD while other work ran:
+
+| Read | Before | After |
+| --- | ---: | ---: |
+| Cold `get`, 1 MiB cache | 5.76 µs | 5.47 µs |
+| Cold `get`, 5 MiB cache | 4.11 µs | 3.90 µs |
+| Cold scan, `u64` values | 106 ns per key | 85 ns |
+| Cold scan, short strings | 140 ns per key | 119 ns |
+| Decode of a random `u64` | 9.0 ns | 5.0 ns |
+
+A miss now decodes the record from buffers its thread keeps rather than from copies of its own, and
+a later record that lies within the bytes it read is taken from them, so a scan, which reads leaves
+in the order they were written, takes most of them from bytes it already read. Warm gets, commits
+and bulk loads moved by less than the spread of their runs. A miss in a get is still about a
+quarter BLAKE3, which hashes a node of a few hundred bytes one block after another, a quarter
+decoding, a sixth the `pread` and a ninth the cache's insert, as [Reading a node from the
+file](../internals/read-path.md#reading-a-node-from-the-file) describes.
 
 ## Huge pages
 
