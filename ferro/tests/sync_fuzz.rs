@@ -1,13 +1,13 @@
 mod common;
 
-use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
 use common::{cases, fast, panic_text, quiet_ferro_panics, text};
-use ferro::codec::Object;
+use ferro::codec::{Decoder, Encoder, Object, Pairing, Tabled};
 use ferro::{
     Bundle, Bytes, Data, Db, Error, Hash, List, Map, Outcome, Ptr, Record, Set, Snapshot, Summary,
     Table,
@@ -730,4 +730,210 @@ fn a_bundle_holding_btree_keys_out_of_order_lands_and_one_holding_a_key_twice_is
     let (_dir, _, receiver, landed) = tags_landed(&set_of(["tag-a", "tag-a"]));
     assert!(matches!(landed, Err(Error::Bundle(_))), "{landed:?}");
     assert!(receiver.read().is_empty());
+}
+
+thread_local! {
+    static KEY_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CountedKey(u8);
+
+impl Data for CountedKey {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        KEY_READS.set(KEY_READS.get() + 1);
+        Ok(CountedKey(u8::decode(r)?))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Nest<const DESCENDING: bool>(BTreeMap<CountedKey, Nest<DESCENDING>>);
+
+impl<const DESCENDING: bool> Data for Nest<DESCENDING> {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.nested(|w| {
+            w.varint(self.0.len() as u64);
+            let entries: Vec<_> = match DESCENDING {
+                true => self.0.iter().rev().collect(),
+                false => self.0.iter().collect(),
+            };
+            for (key, value) in entries {
+                w.item(|w| {
+                    key.encode(w)?;
+                    value.encode(w)
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Nest(BTreeMap::decode(r)?))
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> ferro::Result<()> {
+        BTreeMap::<CountedKey, Nest<DESCENDING>>::visit(r)
+    }
+}
+
+fn nest<const DESCENDING: bool>(depth: u32) -> Nest<DESCENDING> {
+    if depth == 0 {
+        return Nest::default();
+    }
+    Nest(BTreeMap::from([
+        (CountedKey(0), nest(depth - 1)),
+        (CountedKey(1), nest(depth - 1)),
+    ]))
+}
+
+fn keys_read_landing<const DESCENDING: bool>(depth: u32) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let sender: Db<Nest<DESCENDING>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let receiver: Db<Nest<DESCENDING>> = fast().open(dir.path().join("b.ferro")).unwrap();
+    sender.update(|root| *root = nest(depth)).unwrap();
+    let bundle = sender.bundle(&receiver.have().unwrap()).unwrap();
+    KEY_READS.set(0);
+    receiver
+        .receive("a", &bundle, |_, _, _| -> (String, ()) {
+            panic!("no merge expected")
+        })
+        .unwrap();
+    let read = KEY_READS.get();
+    assert_eq!(*receiver.read(), nest::<DESCENDING>(depth));
+    read
+}
+
+#[test]
+fn a_bundle_of_maps_out_of_order_at_every_level_lands_reading_each_key_a_bounded_number_of_times() {
+    let ascending = keys_read_landing::<false>(10);
+    let descending = keys_read_landing::<true>(10);
+    assert!(
+        descending <= 2 * ascending,
+        "landing read {descending} keys out of order against {ascending} in order"
+    );
+}
+
+#[derive(Clone, Debug, Default)]
+struct Reversed<V>(BTreeMap<u8, V>);
+
+impl<V: Data> Data for Reversed<V> {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.nested(|w| {
+            w.varint(self.0.len() as u64);
+            for (key, value) in self.0.iter().rev() {
+                w.item(|w| {
+                    key.encode(w)?;
+                    value.encode(w)
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Reversed(BTreeMap::decode(r)?))
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> ferro::Result<()> {
+        BTreeMap::<u8, V>::visit(r)
+    }
+
+    fn tables(t: &mut Tabled) {
+        BTreeMap::<u8, V>::tables(t)
+    }
+
+    fn pair(
+        old: &mut Decoder<'_>,
+        new: &mut Decoder<'_>,
+        pairing: &mut Pairing<'_>,
+    ) -> ferro::Result<()> {
+        BTreeMap::<u8, V>::pair(old, new, pairing)
+    }
+}
+
+fn reversed_rows(rng: &mut common::Rng, slot: u8, count: u64) -> Table<Row> {
+    let mut table: Table<Row> = Table::new();
+    for id in 0..count {
+        table.insert(Row {
+            id,
+            email: format!("{slot}-{id}@x"),
+            city: format!("c{}", rng.below(4)),
+            tags: vec![text(rng.next(), 1 + rng.below(700) as usize)],
+        });
+    }
+    table
+}
+
+fn landed_whole<T: Data>(sender: &Db<T>, receiver: &Db<T>) {
+    let bundle = sender.bundle(&receiver.have().unwrap()).unwrap();
+    receiver
+        .receive("a", &bundle, |_, _, _| -> (String, ()) {
+            panic!("no merge expected")
+        })
+        .unwrap();
+    receiver.verify_typed().unwrap();
+}
+
+#[test]
+fn btrees_out_of_order_holding_tables_and_maps_land_and_verify_through_many_commits() {
+    type Shelves = Map<u64, Reversed<(Table<Row>, Map<u32, String>, Reversed<Table<Row>>)>>;
+    let dir = tempfile::tempdir().unwrap();
+    let sender: Db<Shelves> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let receiver: Db<Shelves> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let rooted: Db<Reversed<Table<Row>>> = fast().open(dir.path().join("c.ferro")).unwrap();
+    let rooted_receiver: Db<Reversed<Table<Row>>> =
+        fast().open(dir.path().join("d.ferro")).unwrap();
+    let mut rng = common::Rng::new(5);
+    for round in 0..6u64 {
+        sender
+            .update(|shelves| {
+                for shelf in 0..4u64 {
+                    let mut held = shelves
+                        .get(&shelf)
+                        .map(|held| (*held).clone())
+                        .unwrap_or_default();
+                    let slot = rng.below(5) as u8 * 3;
+                    let (table, map, inner) = held.0.entry(slot).or_default();
+                    let count = rng.below(30);
+                    *table = reversed_rows(&mut rng, slot, count);
+                    table.retain(|row| row.id % 5 != round % 5);
+                    map.insert(rng.below(50) as u32, text(rng.next(), 600));
+                    let at = rng.below(3) as u8;
+                    let count = rng.below(8);
+                    inner.0.insert(at, reversed_rows(&mut rng, at, count));
+                    shelves.insert(shelf, held);
+                }
+            })
+            .unwrap();
+        rooted
+            .update(|root| {
+                let slot = rng.below(10) as u8;
+                match rng.below(3) {
+                    0 => {
+                        root.0.remove(&slot);
+                    }
+                    _ => {
+                        let count = rng.below(30);
+                        root.0.insert(slot, reversed_rows(&mut rng, slot, count));
+                    }
+                }
+            })
+            .unwrap();
+        sender.verify_typed().unwrap();
+        landed_whole(&sender, &receiver);
+        landed_whole(&rooted, &rooted_receiver);
+        for (sent, got) in sender.read().iter().zip(receiver.read().iter()) {
+            assert_eq!(sent.0, got.0, "round {round}");
+            for ((a, x), (b, y)) in sent.1.0.iter().zip(got.1.0.iter()) {
+                assert_eq!(a, b, "round {round}");
+                assert_eq!((&x.0, &x.1), (&y.0, &y.1), "round {round}");
+            }
+        }
+        let (sent, got) = (rooted.read(), rooted_receiver.read());
+        assert!(sent.0.iter().eq(got.0.iter()), "round {round}");
+    }
 }

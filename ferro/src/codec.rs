@@ -1191,37 +1191,147 @@ fn sorted_entries<E, K: Ord>(
     Ok(entries)
 }
 
-/// Visits the entries of a `BTreeMap` or `BTreeSet` after its opening level, reading each with
-/// `entry`, which returns its key, and refuses two equal keys in whatever order they are stored.
+/// Visits the entries of a `BTreeMap` or `BTreeSet` after its opening level, reading each key with
+/// `key` and the value after it with `value`, and refuses two equal keys in whatever order they are
+/// stored.
 ///
-/// Keys stored in order, as every encoder writes them, cost a comparison each and are not kept. At
-/// the first key out of order it goes back to the start, forgetting the typed links and tables the
-/// entries noted, and reads them again, keeping the keys to sort them.
+/// Each value is visited once. Keys stored in order, as every encoder writes them, cost a
+/// comparison each and are not kept: only where each entry begins is. At the first key out of
+/// order it reads the keys before it again from there, apart from this decoder, so that nothing
+/// they hold is noted or counted twice, keeps them and the keys that follow, and sorts them.
 ///
 /// # Errors
 ///
 /// The error of an entry that does not decode, and [`Error::Decode`] for two equal keys.
 fn visit_entries<K: Ord>(
     r: &mut Decoder<'_>,
-    mut entry: impl FnMut(&mut Decoder<'_>) -> Result<K>,
+    mut key: impl FnMut(&mut Decoder<'_>) -> Result<K>,
+    mut value: impl FnMut(&mut Decoder<'_>) -> Result<()>,
 ) -> Result<()> {
-    let start = r.checkpoint();
-    let noted = r.tables.map_or(0, |tables| tables.borrow().len());
     let len = r.varint()?;
+    let mut starts = Starts::for_entries(len);
     let mut last: Option<K> = None;
-    for _ in 0..len {
-        let key = r.item(&mut entry)?;
-        if last.as_ref().is_some_and(|last| *last >= key) {
-            r.rewind(start);
-            if let Some(tables) = r.tables {
-                tables.borrow_mut().truncate(noted);
+    let mut outcome = Ok(());
+    for index in 0..len {
+        let before = r.read_so_far();
+        let read = match key(r).and_then(|read| value(r).map(|()| read)) {
+            Ok(read) => read,
+            Err(error) => {
+                outcome = Err(error);
+                break;
             }
-            r.varint()?;
-            return sorted_entries(r, len, &mut entry, |key| key).map(drop);
+        };
+        if let Err(error) = r.counted(before) {
+            outcome = Err(error);
+            break;
         }
-        last = Some(key);
+        if last.as_ref().is_some_and(|last| *last >= read) {
+            outcome = visit_unordered(r, len - index - 1, &starts, read, &mut key, &mut value);
+            break;
+        }
+        starts.push(before);
+        last = Some(read);
     }
-    Ok(())
+    starts.release();
+    outcome
+}
+
+/// Visits the `rest` entries of a `BTreeMap` or `BTreeSet` that follow `read`, the first key out
+/// of order, as [`visit_entries`] does, keeping every key: those before it, read again from
+/// `starts`, `read` and those after it. Then sorts them and refuses two equal keys.
+///
+/// # Errors
+///
+/// As for [`visit_entries`].
+#[cold]
+#[inline(never)]
+fn visit_unordered<K: Ord>(
+    r: &mut Decoder<'_>,
+    rest: u64,
+    starts: &Starts,
+    read: K,
+    mut key: impl FnMut(&mut Decoder<'_>) -> Result<K>,
+    mut value: impl FnMut(&mut Decoder<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut keys: Vec<K> = entries_for(r, rest);
+    keys.reserve(starts.len() + 1);
+    for &at in starts.iter() {
+        keys.push(r.reread(at, &mut key)?);
+    }
+    keys.push(read);
+    for _ in 0..rest {
+        let before = r.read_so_far();
+        let read = key(r)?;
+        value(r)?;
+        r.counted(before)?;
+        keys.push(read);
+    }
+    sort_distinct(&mut keys, false, |key| key)
+}
+
+/// The number of entry starts a [`Starts`] holds in place before it takes a vector.
+const STARTS_NEAR: usize = 8;
+
+/// The most entry starts whose room a thread keeps for the next large collection it visits.
+const STARTS_KEPT: usize = 1 << 16;
+
+thread_local! {
+    static STARTS: Cell<Vec<(usize, usize)>> = const { Cell::new(Vec::new()) };
+}
+
+/// Where each entry of a `BTreeMap` or `BTreeSet` that a visit read begins, as
+/// [`Decoder::read_so_far`] gives it: the first [`STARTS_NEAR`] in place, so that a small
+/// collection allocates nothing, and the rest in a vector that the thread keeps between visits.
+struct Starts {
+    near: [(usize, usize); STARTS_NEAR],
+    held: usize,
+    far: Vec<(usize, usize)>,
+}
+
+impl Starts {
+    /// Room for the starts of a collection of `len` entries, which takes the vector the thread
+    /// kept if they do not all fit in place.
+    #[inline]
+    fn for_entries(len: u64) -> Starts {
+        let far = match len > STARTS_NEAR as u64 {
+            true => STARTS.take(),
+            false => Vec::new(),
+        };
+        Starts {
+            near: [(0, 0); STARTS_NEAR],
+            held: 0,
+            far,
+        }
+    }
+
+    /// Notes where the next entry begins.
+    #[inline]
+    fn push(&mut self, at: (usize, usize)) {
+        match self.near.get_mut(self.held) {
+            Some(slot) => {
+                *slot = at;
+                self.held += 1;
+            }
+            None => self.far.push(at),
+        }
+    }
+
+    /// Gives the vector back for the thread to keep, unless it has grown past [`STARTS_KEPT`].
+    #[inline]
+    fn release(mut self) {
+        if self.far.capacity() > 0 && self.far.capacity() <= STARTS_KEPT {
+            self.far.clear();
+            STARTS.set(std::mem::take(&mut self.far));
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.held + self.far.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(usize, usize)> {
+        self.near[..self.held].iter().chain(&self.far)
+    }
 }
 
 /// The error of a value that did not read all of what holds it: `bytes` bytes and `links` links
@@ -2361,6 +2471,36 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// Reads with `read` from `at`, a place [`read_so_far`](Decoder::read_so_far) gave, apart from
+    /// this decoder, which stays where it is: the typed links, tables and zero-width items `read`
+    /// meets are not noted or counted.
+    ///
+    /// # Errors
+    ///
+    /// The error of `read`.
+    fn reread<T>(
+        &self,
+        at: (usize, usize),
+        read: impl FnOnce(&mut Decoder<'a>) -> Result<T>,
+    ) -> Result<T> {
+        let mut apart = Decoder {
+            buf: self.buf,
+            pos: at.0,
+            links: self.links,
+            cursor: at.1,
+            store: self.store,
+            empty_items: 0,
+            heap: 0,
+            base: self.base,
+            found: None,
+            tables: None,
+            recalled: None,
+            rebuilds: self.rebuilds,
+            depth: self.depth,
+        };
+        read(&mut apart)
+    }
+
     /// How much has been read: the bytes of the body and the links, from the start of this
     /// decoder's object.
     #[inline]
@@ -3463,13 +3603,7 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        r.nested(|r| {
-            visit_entries(r, |r| {
-                let key = K::decode(r)?;
-                V::visit(r)?;
-                Ok(key)
-            })
-        })
+        r.nested(|r| visit_entries(r, K::decode, V::visit))
     }
 
     fn missing() -> Option<Self> {
@@ -3574,7 +3708,7 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     }
 
     fn visit(r: &mut Decoder<'_>) -> Result<()> {
-        r.nested(|r| visit_entries(r, T::decode))
+        r.nested(|r| visit_entries(r, T::decode, |_| Ok(())))
     }
 
     fn missing() -> Option<Self> {

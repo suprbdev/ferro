@@ -111,12 +111,23 @@ against the build that checked and inserted each key, each binary run alternatel
 instructions against 1,000, and a `BTreeSet<String>` of a million keys in 36 ns against 156, 789
 instructions against 2,909. A `Vec` of maps of four keys decodes in 17.5 ns a key against 17.1, 372
 instructions against 355, the cost of the vector each map collects into. Stored out of order, the
-large map decodes in 30 ns a key and the set in 212. A visit, as `verify_typed` and a receive make,
-keeps only the last key while the keys ascend, and at the first key out of order goes back to the
-start of the collection, forgetting the typed links and tables it noted there, and reads it again
-keeping every key to sort: the large map visits in 7.4 ns a key against 8.2 at 240 instructions
-both, maps of four in 6.1 ns against 5.7, 141 instructions against 132, and out of order the large
-map takes 21 ns a key.
+large map decodes in 30 ns a key and the set in 212.
+
+A visit, as `verify_typed` and a receive make, reads each entry once. While the keys ascend it keeps
+only the last key and where each entry begins. At the first key out of order it reads the keys
+before it again from those places, apart from the decoder, so that the links, tables and zero-width
+items they hold are not noted or counted twice, and keeps every key from there on to sort. The build
+of #141 went back to the start of the collection instead and visited its values again, and since
+the maps inside each value did the same, maps nested out of order at every level cost four times
+the key reads for each level: an object of 64 KB holding 32,766 entries took 358 million key reads
+and 2.5 s to visit, one of 1 MB would have taken about ten minutes, and a receive charged the
+bundle for its size alone (#144). That object now takes 49,149 key reads and 0.44 ms, and receiving
+such a bundle costs about 100 µs a KB from 15 KB to 1 MB, as one stored in order does. The places
+take 16 bytes an entry past the first eight, in a vector each thread keeps for the next collection
+while it holds no more than 65,536 of them. Against the build of #141, each binary run alternately
+three times, the large map visits in 7.7 ns a key against 7.2, 235 instructions against 226, maps
+of four in 6.3 ns against 6.1, 146 instructions against 140, and out of order the large map in 17.2
+ns a key, as before.
 
 Hashes are 160 bits, not 256. A link costs 20 hash bytes plus a varint offset, about 23 bytes
 instead of 40, which cut the bytes written per single-key commit by about 19%. Second-preimage

@@ -1398,3 +1398,226 @@ fn lists_hold_their_positions_after_every_operation() {
     verified_whole(&db);
     assert_eq!(db.read().list.len(), 1);
 }
+
+thread_local! {
+    static KEY_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CountedKey(u8);
+
+impl Data for CountedKey {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        KEY_READS.set(KEY_READS.get() + 1);
+        Ok(CountedKey(u8::decode(r)?))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Descending(BTreeMap<CountedKey, Descending>);
+
+impl Data for Descending {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.nested(|w| {
+            w.varint(self.0.len() as u64);
+            for (key, value) in self.0.iter().rev() {
+                w.item(|w| {
+                    key.encode(w)?;
+                    value.encode(w)
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Descending(BTreeMap::decode(r)?))
+    }
+
+    fn visit(r: &mut Decoder<'_>) -> ferro::Result<()> {
+        BTreeMap::<CountedKey, Descending>::visit(r)
+    }
+}
+
+fn descending(depth: u32) -> Descending {
+    if depth == 0 {
+        return Descending::default();
+    }
+    Descending(BTreeMap::from([
+        (CountedKey(0), descending(depth - 1)),
+        (CountedKey(1), descending(depth - 1)),
+    ]))
+}
+
+fn key_reads(read: impl FnOnce(&mut Decoder<'_>), bytes: &[u8]) -> u64 {
+    KEY_READS.set(0);
+    let mut decoder = Decoder::new(bytes, &[], None);
+    read(&mut decoder);
+    decoder.end().unwrap();
+    KEY_READS.get()
+}
+
+#[test]
+fn a_visit_reads_each_key_at_most_twice_however_deep_the_keys_are_out_of_order() {
+    for depth in [1u32, 2, 6, 12] {
+        let entries = (1u64 << (depth + 1)) - 2;
+        let bytes = body_of(&descending(depth));
+        let decoded = key_reads(
+            |r| assert_eq!(Descending::decode(r).unwrap(), descending(depth)),
+            &bytes,
+        );
+        let visited = key_reads(|r| Descending::visit(r).unwrap(), &bytes);
+        assert_eq!(decoded, entries, "depth {depth}");
+        assert!(
+            visited <= 2 * entries,
+            "depth {depth}: a visit read {visited} keys of {entries} entries"
+        );
+    }
+}
+
+fn leb(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn scrambled<K: Data, V>(
+    rng: &mut common::Rng,
+    mut entries: Vec<(K, V)>,
+    value: impl Fn(&mut common::Rng, &V, &mut Vec<u8>),
+) -> Vec<u8> {
+    if rng.chance(60) {
+        rng.shuffle(&mut entries);
+    }
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    if rng.chance(10) && !entries.is_empty() {
+        let at = rng.below(order.len() as u64 + 1) as usize;
+        order.insert(at, rng.below(entries.len() as u64) as usize);
+    }
+    let mut out = Vec::new();
+    leb(&mut out, order.len() as u64);
+    for at in order {
+        let (key, held) = &entries[at];
+        out.extend(body_of(key));
+        value(rng, held, &mut out);
+    }
+    out
+}
+
+type Inner = BTreeMap<u16, BTreeSet<u8>>;
+type Outer = BTreeMap<u8, Inner>;
+
+fn scrambled_set(rng: &mut common::Rng, set: &BTreeSet<u8>, out: &mut Vec<u8>) {
+    let entries = set.iter().map(|&item| (item, ())).collect();
+    out.extend(scrambled(rng, entries, |_, _, _| {}));
+}
+
+fn scrambled_inner(rng: &mut common::Rng, inner: &Inner, out: &mut Vec<u8>) {
+    out.extend(scrambled(
+        rng,
+        inner.clone().into_iter().collect(),
+        scrambled_set,
+    ));
+}
+
+fn scrambled_outer(rng: &mut common::Rng, outer: &Outer) -> Vec<u8> {
+    scrambled(rng, outer.clone().into_iter().collect(), scrambled_inner)
+}
+
+fn random_outer(rng: &mut common::Rng) -> Outer {
+    (0..rng.below(5))
+        .map(|_| {
+            let inner = (0..rng.below(4))
+                .map(|_| {
+                    let set = (0..rng.below(4)).map(|_| rng.below(6) as u8).collect();
+                    (rng.below(300) as u16, set)
+                })
+                .collect();
+            (rng.below(8) as u8, inner)
+        })
+        .collect()
+}
+
+fn read_both_ways<T: Data>(bytes: &[u8]) -> Result<Option<T>, String> {
+    let mut decoder = Decoder::new(bytes, &[], None);
+    let decoded = T::decode(&mut decoder);
+    let mut visitor = Decoder::new(bytes, &[], None);
+    let visited = T::visit(&mut visitor);
+    match (decoded, visited) {
+        (Ok(value), Ok(())) if decoder.remaining() == visitor.remaining() => Ok(Some(value)),
+        (Err(_), Err(_)) => Ok(None),
+        (decoded, visited) => Err(format!(
+            "decode {:?} with {} left, visit {visited:?} with {} left, of {bytes:02x?}",
+            decoded.map(drop),
+            decoder.remaining(),
+            visitor.remaining()
+        )),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(2000), failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn decode_and_visit_agree_on_nested_btrees_stored_in_any_order(seed in any::<u64>(), damage in 0u32..4) {
+        let mut rng = common::Rng::new(seed);
+        let outer = random_outer(&mut rng);
+        let mut bytes = scrambled_outer(&mut rng, &outer);
+        for _ in 0..damage {
+            if bytes.is_empty() {
+                break;
+            }
+            let at = rng.below(bytes.len() as u64) as usize;
+            match rng.below(4) {
+                0 => bytes[at] ^= 1 << rng.below(8),
+                1 => bytes.truncate(at),
+                2 => bytes.insert(at, rng.next() as u8),
+                _ => {
+                    bytes.remove(at);
+                }
+            }
+        }
+        let read = read_both_ways::<Outer>(&bytes);
+        prop_assert!(read.is_ok(), "{}", read.unwrap_err());
+        if damage == 0 && let Ok(Some(read)) = &read {
+            prop_assert_eq!(read, &outer);
+        }
+        let mut twice = Vec::new();
+        leb(&mut twice, 2);
+        twice.extend(&bytes);
+        twice.extend(&bytes);
+        let read = read_both_ways::<Vec<Outer>>(&twice);
+        prop_assert!(read.is_ok(), "{}", read.unwrap_err());
+    }
+}
+
+#[test]
+fn zero_width_items_of_btrees_out_of_order_count_once() {
+    const LIMIT: u64 = 1 << 24;
+    for spare in [0u64, 1] {
+        let mut bytes = Vec::new();
+        leb(&mut bytes, LIMIT - 7000 + spare);
+        leb(&mut bytes, 2);
+        for (key, units) in [(5u8, 1000u64), (3, 1000)] {
+            bytes.push(key);
+            leb(&mut bytes, units);
+        }
+        leb(&mut bytes, 2);
+        for units in [3000u64, 2000] {
+            leb(&mut bytes, units);
+        }
+        type Units = (Vec<()>, BTreeMap<u8, Vec<()>>, BTreeSet<Vec<()>>);
+        let read = read_both_ways::<Units>(&bytes).unwrap();
+        assert_eq!(read.is_some(), spare == 0, "spare {spare}");
+    }
+}
