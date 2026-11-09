@@ -1941,29 +1941,37 @@ fn split<K: Data + Ord, V: Data, S: Data>(
     link: &mut Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
 ) -> Result<Parts<K, V, S>> {
-    ready_cut(store, link, side)?;
+    if ready_cut(store, link, side)?.is_some() {
+        return Err(Error::Corrupt(
+            "key found at a level it does not hash to".into(),
+        ));
+    }
     sever(store, link.take(), side)
 }
 
-/// Loads in place, as [`node_mut`] does, each node on the path [`split`] cuts along, and checks
-/// that no key on it is where the cut falls.
+/// Loads in place, as [`node_mut`] does, each node on the path [`split`] cuts along, and returns
+/// the level of the key on it where the cut falls, if there is one, refusing such a key as corrupt
+/// unless it sits at the level it hashes to.
 ///
 /// A path held in memory throughout, as a map's own new nodes are, is only walked.
 fn ready_cut<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
-) -> Result<()> {
+) -> Result<Option<u8>> {
     let mut at = &*link;
     loop {
         let node = match at {
-            Link::Empty => return Ok(()),
+            Link::Empty => return Ok(None),
             Link::Stored { .. } => return load_cut(store, link, side),
             Link::Mem(node, _) => node,
         };
-        match node.children.get(cut_at(node, side)?) {
+        let Some(position) = cut_at(node, side)? else {
+            return Ok(Some(node.level));
+        };
+        match node.children.get(position) {
             Some(child) => at = child,
-            None => return Ok(()),
+            None => return Ok(None),
         }
     }
 }
@@ -1972,23 +1980,31 @@ fn load_cut<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
     side: &impl Fn(&K) -> Ordering,
-) -> Result<()> {
+) -> Result<Option<u8>> {
     if matches!(link, Link::Empty) {
-        return Ok(());
+        return Ok(None);
     }
     let node = node_mut(store, link)?;
-    let position = cut_at(node, side)?;
+    let Some(position) = cut_at(node, side)? else {
+        return Ok(Some(node.level));
+    };
     match node.children.get_mut(position) {
         Some(child) => load_cut(store, child, side),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
-fn cut_at<K, V, S>(node: &Node<K, V, S>, side: &impl Fn(&K) -> Ordering) -> Result<usize> {
-    node.keys
-        .binary_search_by(side)
-        .err()
-        .ok_or_else(|| Error::Corrupt("key found at a level it does not hash to".into()))
+fn cut_at<K: Data, V, S>(
+    node: &Node<K, V, S>,
+    side: &impl Fn(&K) -> Ordering,
+) -> Result<Option<usize>> {
+    match node.keys.binary_search_by(side) {
+        Err(position) => Ok(Some(position)),
+        Ok(index) if level_of(&node.keys[index])? == node.level => Ok(None),
+        Ok(_) => Err(Error::Corrupt(
+            "key found at a level it does not hash to".into(),
+        )),
+    }
 }
 
 /// Loads in place, as [`node_mut`] does, each node that [`merge`] of `a` and `b` takes apart: the
@@ -2191,8 +2207,7 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             Ok(None)
         }
         Err(position) if level == node.level => {
-            insert_between(store, node, hint, position, key, value)?;
-            Ok(None)
+            insert_between(store, node, hint, position, key, value)
         }
         Err(position) => {
             if node.children.is_empty() {
@@ -2251,7 +2266,11 @@ fn insert_above<K: Data + Ord, V: Data, S: Data>(
     level: u8,
     value: Arc<V>,
 ) -> Result<Option<Slot<V, S>>> {
-    let (left, right) = split(store, link, &|probe: &K| probe.cmp(&key))?;
+    let side = |probe: &K| probe.cmp(&key);
+    if let Some(stored) = ready_cut(store, link, &side)? {
+        return insert_at(store, link, key, stored, value);
+    }
+    let (left, right) = sever(store, link.take(), &side)?;
     *link = link_from(
         level,
         vec![key],
@@ -2270,18 +2289,20 @@ fn insert_between<K: Data + Ord, V: Data, S: Data>(
     position: usize,
     key: K,
     value: Arc<V>,
-) -> Result<()> {
+) -> Result<Option<Slot<V, S>>> {
+    let side = |probe: &K| probe.cmp(&key);
+    if let Some(stored) = ready_cut(store, &mut node.children[position], &side)? {
+        return insert_at(store, &mut node.children[position], key, stored, value);
+    }
     let before = node.buffers();
-    let (left, right) = split(store, &mut node.children[position], &|probe: &K| {
-        probe.cmp(&key)
-    })?;
+    let (left, right) = sever(store, node.children[position].take(), &side)?;
     node.children[position] = left;
     node.children.insert(position + 1, right);
     node.keys.insert(position, key);
     node.cells.slots().insert(position, Slot::Fresh(value));
     node.count += 1;
     hint.renew(node, before);
-    Ok(())
+    Ok(None)
 }
 
 fn remove_at<K, V, S, Q>(
@@ -3720,7 +3741,12 @@ fn rise<K: Data + Ord, V: Data, S: Data>(
         .position(|edit| edit.level == level && edit.value.is_some())
     {
         let key = &edits.as_slice()[before].key;
-        let (mut low, high) = sever(store, piece.take(), &|probe: &K| probe.cmp(key))?;
+        let side = |probe: &K| probe.cmp(key);
+        if let Some(stored) = ready_cut(store, &mut piece, &side)? {
+            edits.as_mut_slice()[before].level = stored;
+            continue;
+        }
+        let (mut low, high) = sever(store, piece.take(), &side)?;
         absorb(store, &mut low, edits, before, rewriting)?;
         children.push(low);
         let edit = edits.next().ok_or(Error::Detached)?;
@@ -3816,6 +3842,14 @@ fn absorb<K: Data + Ord, V: Data, S: Data>(
                 count -= group;
             }
             Some(before) => {
+                if !node.children.is_empty() {
+                    let key = &pending[before].key;
+                    let side = |probe: &K| probe.cmp(key);
+                    if let Some(stored) = ready_cut(store, &mut node.children[position], &side)? {
+                        edits.as_mut_slice()[before].level = stored;
+                        continue;
+                    }
+                }
                 changed = true;
                 if node.children.is_empty() && before == 0 {
                     let edit = edits.next().ok_or(Error::Detached)?;

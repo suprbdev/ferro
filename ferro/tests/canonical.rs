@@ -756,3 +756,157 @@ fn commits_along_cached_paths_hash_as_a_fresh_build() {
         assert_eq!(db.read().root_hash(), build(&model).root_hash());
     }
 }
+
+#[derive(Clone, Debug)]
+struct Loose(u32, u32);
+
+impl PartialEq for Loose {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Loose {}
+
+impl PartialOrd for Loose {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Loose {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl Data for Loose {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)?;
+        self.1.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        Ok(Loose(u32::decode(r)?, u32::decode(r)?))
+    }
+}
+
+fn loose_pairs(count: usize) -> Vec<(Loose, Loose)> {
+    (1..u32::MAX)
+        .filter_map(|id| {
+            let low = (0..64)
+                .map(|tag| Loose(id, tag))
+                .find(|key| level_of(key) == 0)?;
+            let high = (0..4096)
+                .map(|tag| Loose(id, tag))
+                .find(|key| level_of(key) >= 2)?;
+            Some((low, high))
+        })
+        .take(count)
+        .collect()
+}
+
+fn loose_base(skip: &[u32], size: u32) -> Map<Loose, u32> {
+    (0..size)
+        .filter(|id| !skip.contains(id))
+        .map(|id| (Loose(id, 0), id))
+        .collect()
+}
+
+fn assert_loose_canonical(map: &Map<Loose, u32>, expect: &[(u32, u32)]) {
+    for (id, value) in expect {
+        assert_eq!(map.get(&Loose(*id, 0)).as_deref(), Some(value));
+    }
+    let entries: Vec<(Loose, u32)> = map.iter().map(|(key, value)| (key, *value)).collect();
+    let mut fresh = Map::new();
+    for (key, value) in &entries {
+        fresh.insert(key.clone(), *value);
+    }
+    assert_eq!(map.len(), fresh.len());
+    assert_eq!(map.root_hash(), fresh.root_hash());
+    let built: Map<Loose, u32> = entries.into_iter().collect();
+    assert_eq!(map.root_hash(), built.root_hash());
+}
+
+#[test]
+fn a_key_equal_to_a_stored_one_that_hashes_elsewhere_keeps_the_tree_canonical() {
+    let pairs = loose_pairs(8);
+    let ids: Vec<u32> = pairs.iter().map(|(low, _)| low.0).collect();
+    let sized = [12, 3000]
+        .into_iter()
+        .flat_map(|size| pairs.iter().map(move |pair| (size, pair)));
+    for (size, (low, high)) in sized {
+        for (first, second) in [(low, high), (high, low)] {
+            let mut map = loose_base(&ids, size);
+            map.insert(first.clone(), 1);
+            assert_eq!(map.insert(second.clone(), 2).as_deref(), Some(&1));
+            assert_loose_canonical(&map, &[(low.0, 2)]);
+            assert_eq!(map.remove(second).as_deref(), Some(&2));
+            assert_loose_canonical(&map, &[]);
+            assert_eq!(map.root_hash(), loose_base(&ids, size).root_hash());
+
+            let mut map = loose_base(&ids, size);
+            map.insert(first.clone(), 1);
+            map.apply([(second.clone(), Some(2))]);
+            assert_loose_canonical(&map, &[(low.0, 2)]);
+
+            let mut map = loose_base(&ids, size);
+            map.insert(first.clone(), 1);
+            map.extend([(second.clone(), 2)]);
+            assert_loose_canonical(&map, &[(low.0, 2)]);
+
+            let mut map = loose_base(&ids, size);
+            map.insert(first.clone(), 1);
+            *map.get_or_insert_with(second.clone(), || 3) += 1;
+            assert_loose_canonical(&map, &[(low.0, 2)]);
+
+            let mut map = loose_base(&ids, size);
+            map.insert(first.clone(), 1);
+            let mut other = Map::new();
+            other.insert(second.clone(), 2);
+            map.append(&mut other);
+            assert_loose_canonical(&map, &[(low.0, 2)]);
+
+            let base = loose_base(&ids, size);
+            let mut ours = base.clone();
+            ours.insert(first.clone(), 1);
+            let mut theirs = base.clone();
+            theirs.insert(second.clone(), 2);
+            ours.merge(&base, &theirs, |conflict| conflict.keep_theirs());
+            assert_loose_canonical(&ours, &[(low.0, 2)]);
+        }
+    }
+}
+
+#[test]
+fn a_key_equal_to_a_stored_one_that_hashes_elsewhere_keeps_a_committed_tree_canonical() {
+    let pairs = loose_pairs(8);
+    let ids: Vec<u32> = pairs.iter().map(|(low, _)| low.0).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let sized = [12, 3000]
+        .into_iter()
+        .flat_map(|size| pairs.iter().enumerate().map(move |pair| (size, pair)));
+    for (size, (n, (low, high))) in sized {
+        for (m, (first, second)) in [(low, high), (high, low)].into_iter().enumerate() {
+            let db = fast()
+                .open::<Map<Loose, u32>>(dir.path().join(format!("l{size}-{n}-{m}.ferro")))
+                .unwrap();
+            db.update(|root| {
+                *root = loose_base(&ids, size);
+                root.insert(first.clone(), 1);
+            })
+            .unwrap();
+            db.update(|root| {
+                root.insert(second.clone(), 2);
+            })
+            .unwrap();
+            assert_loose_canonical(&db.read(), &[(low.0, 2)]);
+            db.update(|root| {
+                root.apply([(second.clone(), Some(3))]);
+            })
+            .unwrap();
+            assert_loose_canonical(&db.read(), &[(low.0, 3)]);
+            db.verify().unwrap();
+        }
+    }
+}

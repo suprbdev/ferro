@@ -35,6 +35,14 @@ to update every index for every row, so it is O(rows) and returns them. `append`
 or with overlapping keys, copies `other` entry by entry, since links only mean something inside
 their own store.
 
+A key that compares equal to one the map holds but encodes otherwise can hash to a higher level than
+the stored key, so an insert or a batch would cut the tree under it, across the stored key. The cut
+path is walked before it is cut, and a stored key found on it turns the edit into a change of that
+key's value at that key's level, unless the stored key does not sit at the level it hashes to, which
+is refused as corrupt. The map keeps the key it was first given, as it does when the new
+key hashes to the stored key's level or below, and the tree stays the one a fresh build of its
+entries gives.
+
 ## Edits that fail halfway
 
 A cut, a join or a batch takes nodes apart as it reaches them, and a node it reaches may first have
