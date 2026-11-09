@@ -89,6 +89,20 @@ whose bundle spilled while its pieces are placed. A write is refused when its th
   bundle spilled, which take it;
 - a lane of that file whose name sorts at or after the one the write takes.
 
+Two shared opens of one file lock it separately, so a lock that one holds is one the other waits for
+in the kernel, and a write through one is refused as well when its thread holds, through another
+open of the same file:
+
+- the lane of the branch the write takes, or of one whose name hashes to the same byte;
+- any lane, for `compact`, `pull`, `push` and `receive`, which take every byte;
+- the cycle lock, for `compact`, and for `pull`, `push` and `receive` when their bundle spilled.
+
+Its other locks through that open count only as a crossing, as locks in other files do, so a write
+to another branch through it, or into another file, goes on as before. The record names each lock's
+file by an xxh3 of its canonical path, the same for every open of it. Until #142 a write to `a`
+through a second open, from inside a closure on `a`, waited for good for the byte its own thread
+held, and so did a `compact` through it.
+
 With `shared`, a write the check lets through also reads the record to decide whether it may wait
 at another process's gate: one whose thread holds anything on that file, through any handle, goes
 straight to its branch's byte, as [The gate](processes.md#the-gate) describes. Each record names the
@@ -178,10 +192,13 @@ condvar or a `Watcher` for another thread's commit can still deadlock: on its ow
 commit needs the lane; on another branch of its file, while a cycle of the same handle that holds
 that branch's lane waits for this one; and with `coalesce`, for a commit whose closure has already
 run, since that commit may be in this closure's group. A cycle or landing in another handle or
-process holds no lane of this one and takes every branch byte at once or none, so it holds such a
-commit up only at its gate, for no longer than the gate had been held and at most 1 s, as [The
-gate](processes.md#the-gate) describes; the first version of the gate waited there for good, and a
-closure on `a` that joined a thread committing on `b` hung beside another handle's cycle (#136).
+process takes every branch byte at once or none, so it holds such a commit up only at its gate,
+until the end of an epoch no longer than the gate had been held and at most 1 s, or, when the
+commit goes through the handle that runs it, at that handle's lane, which it lets go to the commit
+once it has waited three epochs of its hold for the range, at most 3 s, as [The
+gate](processes.md#the-gate) describes. The first version of the gate waited there for good, and a
+closure on `a` that joined a thread committing on `b` hung beside another handle's cycle (#136);
+until #142 a commit through the cycling handle waited for its lane for good.
 
 ## Cost
 

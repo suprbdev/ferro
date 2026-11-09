@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result};
+use crate::store::lane_of;
 
 /// The locks a call will wait on, for [`check`].
 #[derive(Clone, Copy)]
@@ -195,11 +196,23 @@ impl Drop for Crossing {
 /// [`Needs::Ack`], since a group may be waiting for this thread. [`Needs::Tip`] is safe under any
 /// branch lock. The cycle lock refuses only [`Needs::Cycle`].
 ///
+/// `file` is the [`file_id`] of `db` when it locks its file against other opens, as a shared
+/// one does. Another open of that file locks it separately, so a lock this thread holds through
+/// that open is one the call would wait for in the kernel: a branch lock refuses a
+/// [`Needs::Lane`] on the same byte, [`Needs::Every`] and [`Needs::Cycle`], and the cycle lock
+/// refuses [`Needs::Cycle`]. Its other locks count only as a crossing, as those of other files
+/// do.
+///
 /// # Errors
 ///
 /// [`Error::Reentrant`] where the call could deadlock, including when `db` already reaches back,
 /// through crossings other threads hold, to a database this thread holds locks in.
-pub(crate) fn check(db: u64, coalesce: bool, needs: Needs<'_>) -> Result<Option<Crossing>> {
+pub(crate) fn check(
+    db: u64,
+    file: Option<u64>,
+    coalesce: bool,
+    needs: Needs<'_>,
+) -> Result<Option<Crossing>> {
     let checked = HOLDS.try_with(|holds| {
         let holds = holds.borrow();
         if holds.live == 0 {
@@ -208,6 +221,9 @@ pub(crate) fn check(db: u64, coalesce: bool, needs: Needs<'_>) -> Result<Option<
         let mut from = Vec::new();
         for hold in &holds.list[..holds.live] {
             if hold.db != db {
+                if file == Some(hold.file) && waits_across(hold, needs) {
+                    return Err(Error::Reentrant);
+                }
                 if !from.contains(&hold.db) {
                     from.push(hold.db);
                 }
@@ -230,6 +246,20 @@ pub(crate) fn check(db: u64, coalesce: bool, needs: Needs<'_>) -> Result<Option<
         cross(from, db)
     });
     checked.unwrap_or(Ok(None))
+}
+
+/// Whether a call that waits on `needs` through one open of a file would wait in the kernel for
+/// `hold`, a lock this thread holds through another open of it.
+fn waits_across(hold: &Hold, needs: Needs<'_>) -> bool {
+    match hold.lane {
+        0 => false,
+        CYCLE => matches!(needs, Needs::Cycle),
+        _ => match needs {
+            Needs::Lane(name) => lane_of(name) == lane_of(&hold.name),
+            Needs::Every | Needs::Cycle => true,
+            Needs::Tip | Needs::Ack => false,
+        },
+    }
 }
 
 fn cross(from: Vec<u64>, to: u64) -> Result<Option<Crossing>> {

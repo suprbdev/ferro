@@ -1901,6 +1901,236 @@ fn a_closure_joining_a_thread_that_awaits_a_commit_finishes_beside_another_handl
     a_closure_waits_for_another_thread_beside_another_handles_cycle(true);
 }
 
+fn a_closure_waits_for_a_commit_through_the_handle_that_cycles(awaited: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("through.ferro");
+    let y: Db<Root> = manual().open(&path).unwrap();
+    y.fork("a").unwrap();
+    y.fork("b").unwrap();
+    bump(&y, 0, 1);
+    bump(&y, 0, 2);
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    let b = cycler.branch("b").unwrap();
+    let a = y.branch("a").unwrap();
+    let (go, started) = mpsc::channel::<()>();
+    let (done, finished) = mpsc::channel();
+    let cycled = done.clone();
+    thread::spawn(move || {
+        started.recv().unwrap();
+        cycler.compact(Keep::Last(1)).unwrap();
+        let _ = cycled.send(None);
+    });
+    thread::spawn(move || {
+        a.update(|root| {
+            go.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            let joined = Instant::now();
+            thread::spawn(move || match awaited {
+                true => block_on(b.update_async(|inner| inner.n += 1)).unwrap(),
+                false => drop(bump(&b, 1, 1)),
+            })
+            .join()
+            .unwrap();
+            let _ = done.send(Some(joined.elapsed()));
+            root.n += 1;
+        })
+        .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ended = Vec::new();
+    while ended.len() < 2 {
+        match finished.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(what) => ended.push(what),
+            Err(_) => break,
+        }
+    }
+    let joined = ended.iter().flatten().next().copied();
+    assert_eq!(
+        ended.len(),
+        2,
+        "a closure on `a` in one handle that joined a thread committing on `b` through another \
+         handle, awaited: {awaited}, while that handle's cycle waited for `a`, had not finished \
+         with the cycle after 20 s; the commit took {joined:?}"
+    );
+    assert!(
+        joined.is_some_and(|took| took < Duration::from_secs(1)),
+        "a commit through the cycling handle, awaited: {awaited}, that a closure on `a` joined \
+         took {joined:?} beside that handle's cycle"
+    );
+}
+
+#[test]
+fn a_closure_joining_a_commit_through_the_handle_that_cycles_finishes_beside_its_cycle() {
+    a_closure_waits_for_a_commit_through_the_handle_that_cycles(false);
+}
+
+#[test]
+fn a_closure_joining_an_awaited_commit_through_the_handle_that_cycles_finishes_beside_its_cycle() {
+    a_closure_waits_for_a_commit_through_the_handle_that_cycles(true);
+}
+
+fn stopping_at(stop: &'static str) -> (Hook, mpsc::Receiver<&'static str>, Arc<Barrier>) {
+    let (sender, receiver) = mpsc::channel();
+    let sender = parking_lot::Mutex::new(sender);
+    let resume = Arc::new(Barrier::new(2));
+    let held = resume.clone();
+    let hook = Hook(Arc::new(move |step| {
+        let _ = sender.lock().send(step);
+        if step == stop {
+            held.wait();
+        }
+    }));
+    (hook, receiver, resume)
+}
+
+fn wait_for_step(steps: &mpsc::Receiver<&'static str>, step: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match steps.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(seen) if seen == step => return,
+            Ok(_) => {}
+            Err(_) => panic!("the cycle never reached {step}"),
+        }
+    }
+}
+
+#[test]
+fn a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wait_ran_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.ferro");
+    let (hook, steps, resume) = stopping_at("copied");
+    let cycler: Db<Root> = manual().hook(hook).open(&path).unwrap();
+    let idle: Db<Root> = manual().open(&path).unwrap();
+    for name in ["a", "b", "c", "d"] {
+        idle.fork(name).unwrap();
+    }
+    for i in 1..=3 {
+        bump(&idle, 0, i);
+    }
+    let other: Db<Root> = manual().open(&path).unwrap();
+    let a = other.branch("a").unwrap();
+    let (b, c, d) = (
+        idle.branch("b").unwrap(),
+        idle.branch("c").unwrap(),
+        idle.branch("d").unwrap(),
+    );
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let holder = {
+        let (entered, release) = (entered.clone(), release.clone());
+        thread::spawn(move || {
+            c.update(|root| {
+                entered.wait();
+                release.wait();
+                root.n += 1;
+            })
+            .unwrap();
+        })
+    };
+    entered.wait();
+    let cycle = thread::spawn(move || cycler.compact(Keep::Last(1)));
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    bump(&d, 1, 1);
+    let first = started.elapsed();
+    release.wait();
+    holder.join().unwrap();
+    wait_for_step(&steps, "copied");
+    thread::sleep(Duration::from_millis(600));
+    let (in_a, go) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let (sent, took) = mpsc::channel();
+    let closure = {
+        let (in_a, go) = (in_a.clone(), go.clone());
+        thread::spawn(move || {
+            a.update(|root| {
+                in_a.wait();
+                go.wait();
+                let joined = Instant::now();
+                thread::spawn(move || bump(&b, 2, 1)).join().unwrap();
+                let _ = sent.send(joined.elapsed());
+                root.n += 1;
+            })
+            .unwrap();
+        })
+    };
+    in_a.wait();
+    resume.wait();
+    wait_for_step(&steps, "synced");
+    thread::sleep(Duration::from_millis(50));
+    go.wait();
+    let waited = took
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the joined commit never finished");
+    closure.join().unwrap();
+    cycle.join().unwrap().unwrap();
+    assert!(
+        waited < Duration::from_millis(300),
+        "a commit that a closure on `a` joined waited {waited:?} at a gate held for about 50 ms, \
+         after the same handle's last write had waited {first:?} at an earlier hold"
+    );
+}
+
+fn a_cycle_beside_threads_of_one_handle_with_long_staggered_closures(
+    writers: u64,
+    closure: Duration,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.ferro");
+    let db: Db<Root> = manual().open(&path).unwrap();
+    for writer in 0..writers {
+        db.fork(&format!("own-{writer}")).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads: Vec<_> = (0..writers)
+        .map(|writer| {
+            let db = db.branch(&format!("own-{writer}")).unwrap();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(closure * writer as u32 / writers as u32);
+                let mut commits = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    db.update(|root| {
+                        thread::sleep(closure);
+                        root.n += 1;
+                    })
+                    .unwrap();
+                    commits += 1;
+                }
+                commits
+            })
+        })
+        .collect();
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    bump(&cycler, 99, 1);
+    thread::sleep(closure * 2);
+    let (done, finished) = mpsc::channel();
+    let started = Instant::now();
+    let cycle = thread::spawn(move || {
+        let out = cycler.compact(Keep::All);
+        let _ = done.send(started.elapsed());
+        out
+    });
+    let waited = finished.recv_timeout(Duration::from_secs(20));
+    stop.store(true, Ordering::Relaxed);
+    let commits: Vec<u64> = threads.into_iter().map(|w| w.join().unwrap()).collect();
+    let after = started.elapsed();
+    cycle.join().unwrap().unwrap();
+    assert!(
+        waited.is_ok(),
+        "a cycle had not finished after 20 s beside {writers} threads of one handle whose \
+         closures last {closure:?}, started {:?} apart, which committed {commits:?} times; it \
+         finished {after:?} after it began, once they stopped",
+        closure / writers as u32
+    );
+}
+
+#[test]
+fn a_cycle_finishes_beside_threads_of_one_handle_whose_600_ms_closures_end_at_staggered_times() {
+    a_cycle_beside_threads_of_one_handle_with_long_staggered_closures(
+        4,
+        Duration::from_millis(600),
+    );
+}
+
 fn held_across_another_handles_cycles(follower: Options) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("held.ferro");

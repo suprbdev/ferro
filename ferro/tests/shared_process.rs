@@ -89,6 +89,9 @@ fn shared_child() {
         mixed(Path::new(&path), count);
         return;
     }
+    if role == "slow" {
+        slow(Path::new(&path), writer, count)
+    }
     let mut options = options();
     if let Ok(step) = std::env::var("FERRO_SHARED_ABORT") {
         options = options.hook(abort_at(step, number("FERRO_SHARED_NTH")));
@@ -113,6 +116,29 @@ fn shared_child() {
         }
     }
     println!("DONE {writer}");
+}
+
+fn slow(path: &Path, process: u64, threads: u64) -> ! {
+    let closure = Duration::from_millis(number("FERRO_SHARED_CLOSURE_MS"));
+    let spacing = Duration::from_millis(number("FERRO_SHARED_SPACING_MS"));
+    let db: Db<Root> = options().open(path).unwrap();
+    for thread in 0..threads {
+        let db = db.branch(&format!("own-{process}-{thread}")).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(spacing * (process * threads + thread) as u32);
+            loop {
+                db.update(|root| {
+                    std::thread::sleep(closure);
+                    root.n += 1;
+                })
+                .unwrap();
+            }
+        });
+    }
+    println!("READY {process}");
+    loop {
+        std::thread::park();
+    }
 }
 
 fn follow(path: &str, until: u64) {
@@ -859,6 +885,67 @@ fn a_cycle_finishes_while_other_processes_commit_on_branches_of_their_own() {
         5,
         "a cycle had not finished after 20 s while {processes} processes committed on branches \
          of their own; those before it took {took:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cycle_finishes_beside_processes_whose_threads_hold_600_ms_closures_ending_at_staggered_times()
+{
+    let (processes, threads, closure) = (2u64, 4u64, 600u64);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("slow.ferro");
+    let cycler: Db<Root> = options()
+        .durability(Durability::Buffered)
+        .open(&path)
+        .unwrap();
+    for process in 0..processes {
+        for thread in 0..threads {
+            cycler.fork(&format!("own-{process}-{thread}")).unwrap();
+        }
+    }
+    commit(&cycler, 99, 1);
+    let spacing = closure / (processes * threads);
+    let extra = [
+        ("FERRO_SHARED_DURABILITY", "buffered".to_string()),
+        ("FERRO_SHARED_CLOSURE_MS", closure.to_string()),
+        ("FERRO_SHARED_SPACING_MS", spacing.to_string()),
+    ];
+    let mut children = Vec::new();
+    for process in 0..processes {
+        let mut spawned = spawn(&path, "slow", process, 0, threads, &extra);
+        let stdout = spawned.child.stdout.take().unwrap();
+        std::thread::spawn(move || BufReader::new(stdout).lines().map_while(Result::ok).count());
+        children.push(spawned);
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let busy = |process: u64, thread: u64| {
+        let branch = cycler.branch(&format!("own-{process}-{thread}")).unwrap();
+        branch.read().n >= 3
+    };
+    while (0..processes).any(|process| (0..threads).any(|thread| !busy(process, thread))) {
+        assert!(Instant::now() < deadline, "the writers never got going");
+        cycler.refresh().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let cycle = std::thread::spawn(move || {
+        let out = cycler.compact(Keep::All);
+        let _ = done.send(started.elapsed());
+        out
+    });
+    let took = finished.recv_timeout(Duration::from_secs(20));
+    for mut spawned in children {
+        spawned.child.kill().unwrap();
+        spawned.child.wait().unwrap();
+    }
+    cycle.join().unwrap().unwrap();
+    println!("SLOW CYCLE {took:?}");
+    assert!(
+        took.is_ok(),
+        "a cycle had not finished after 20 s beside {processes} processes of {threads} threads \
+         each, whose {closure} ms closures began {spacing} ms apart"
     );
 }
 

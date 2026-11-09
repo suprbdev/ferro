@@ -389,3 +389,85 @@ fn a_branch_another_process_dropped_is_dropped_after_the_locks() {
     let writers: Vec<Outer> = writers.collect();
     matrix(Host::Drop, Trigger::DropBranch, &writers);
 }
+
+#[derive(Debug, PartialEq)]
+enum Nested {
+    Done,
+    Reentrant,
+    Failed(String),
+    Hung,
+}
+
+type Call = fn(&Db<Probed>, &Db<Probed>) -> ferro::Result<()>;
+
+fn nested_through_a_second_open(
+    call: impl FnOnce(&Db<Probed>, &Db<Probed>) -> ferro::Result<()> + Send + 'static,
+) -> Nested {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("twice.ferro");
+    let options = kinds()[0].1;
+    let first: Db<Probed> = options().open(&path).unwrap();
+    put(&first, 1).unwrap();
+    for name in ["a", "b"] {
+        put(&first.fork(name).unwrap(), 2).unwrap();
+    }
+    let second: Db<Probed> = options().open(&path).unwrap();
+    let elsewhere: Db<Probed> = options().open(dir.path().join("other.ferro")).unwrap();
+    elsewhere.fork("a").unwrap();
+    let held = first.branch("a").unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let ran = held.update(|_| call(&second, &elsewhere));
+        let _ = done.send(match ran {
+            Ok(Ok(())) => Nested::Done,
+            Ok(Err(Error::Reentrant)) => Nested::Reentrant,
+            Ok(Err(error)) | Err(error) => Nested::Failed(error.to_string()),
+        });
+    });
+    let got = finished
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or(Nested::Hung);
+    drop(dir);
+    got
+}
+
+#[test]
+fn a_write_through_a_second_open_that_would_wait_for_the_closure_holding_the_file_is_refused() {
+    let cases: [(&str, Nested, Call); 7] = [
+        ("an update of `a`", Nested::Reentrant, |second, _| {
+            put(&second.branch("a")?, 3)
+        }),
+        ("a fork from `a`", Nested::Reentrant, |second, _| {
+            second.branch("a")?.fork("c").map(drop)
+        }),
+        ("a drop of `a`", Nested::Reentrant, |second, _| {
+            second.drop_branch("a")
+        }),
+        ("a compact", Nested::Reentrant, |second, _| {
+            second.compact(Keep::All).map(drop)
+        }),
+        ("an update of `b`", Nested::Done, |second, _| {
+            put(&second.branch("b")?, 3)
+        }),
+        ("an update of `main`", Nested::Done, |second, _| {
+            put(second, 3)
+        }),
+        (
+            "an update of `a` in another file",
+            Nested::Done,
+            |_, elsewhere| put(&elsewhere.branch("a")?, 3),
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (what, want, call) in cases {
+        let got = nested_through_a_second_open(call);
+        if got != want {
+            failed.push(format!("{what}: {got:?}, wanted {want:?}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "from inside a closure on `a`, through a second open of its file:\n{}",
+        failed.join("\n")
+    );
+}

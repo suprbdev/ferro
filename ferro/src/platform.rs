@@ -512,6 +512,30 @@ mod ranges {
         Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
     }
 
+    /// The first byte of an exclusive lock that another open file holds on any of the `len` bytes
+    /// of `file` from `at`, or `None` if there is none. Where several are held it names one of
+    /// them.
+    pub(crate) fn excluded_at(file: &File, at: u64, len: u64) -> io::Result<Option<u64>> {
+        let lock = ofd(file, libc::F_OFD_GETLK, libc::F_RDLCK, at, len)?;
+        if lock.l_type == libc::F_UNLCK as libc::c_short {
+            return Ok(None);
+        }
+        Ok(u64::try_from(lock.l_start).ok())
+    }
+
+    /// The nanoseconds of `CLOCK_MONOTONIC`, which every process of the machine reads alike.
+    pub(crate) fn monotonic_ns() -> u64 {
+        // SAFETY: `timespec` is a C struct of plain integers, for which all zero bytes are a valid
+        // value.
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: `now` is a live, writable `timespec` for the call, and `CLOCK_MONOTONIC` is
+        // always available on Linux, so the call only writes it.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+        let secs = u64::try_from(now.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(now.tv_nsec).unwrap_or(0);
+        secs.saturating_mul(1_000_000_000).saturating_add(nanos)
+    }
+
     /// Asks the kernel to start writing the `len` bytes of `file` from `at` to disk, without
     /// waiting for them and without making them durable. A failure is ignored, since the later
     /// sync covers the range either way.
@@ -567,6 +591,23 @@ mod ranges {
     /// Returns `false`, since no range can be locked on this target.
     pub(crate) fn range_excluded(_file: &File, _at: u64, _len: u64) -> io::Result<bool> {
         Ok(false)
+    }
+
+    /// Returns `None`, since no range can be locked on this target.
+    pub(crate) fn excluded_at(_file: &File, _at: u64, _len: u64) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// The nanoseconds since this process first read this clock, which is monotonic but, unlike
+    /// on Linux, not shared with other processes. Nothing here locks across processes, so nothing
+    /// needs it to be.
+    pub(crate) fn monotonic_ns() -> u64 {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = BASE
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos();
+        u64::try_from(elapsed).unwrap_or(u64::MAX)
     }
 }
 
