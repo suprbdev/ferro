@@ -364,13 +364,15 @@ Each of these runs inside `systemd-run --user --scope -q -p MemoryMax=16G -p Mem
 the `Makefile`'s targets do, and `FERRO_STRESS_SEED` and `FERRO_STRESS_MS` change the stress test's
 seed and its four seconds. `STRESS_ROUNDS` and `STRESS_COPIES` size `make test-stress`, and the
 unit test binary that a sanitizer build leaves under its target directory runs the same way, a dozen
-copies at a time with `--test-threads 16`:
+copies at a time with `--test-threads 16`. The Miri runs skip the store's `shared_writers` tests,
+which open files that Miri's isolation refuses:
 
 ```
 make test-stress STRESS_ROUNDS=250
-MIRIFLAGS="-Zmiri-many-seeds=0..32" cargo +nightly miri test -p ferro --lib -- epoch_ shared_
+MIRIFLAGS="-Zmiri-many-seeds=0..32" \
+    cargo +nightly miri test -p ferro --lib -- epoch_ shared_ --skip shared_writers
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-many-seeds=0..32" \
-    cargo +nightly miri test -p ferro --lib -- epoch_ shared_
+    cargo +nightly miri test -p ferro --lib -- epoch_ shared_ --skip shared_writers
 RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR=target/asan cargo +nightly test -Zbuild-std \
     --target x86_64-unknown-linux-gnu --release -p ferro --lib --test epoch_stress --test reads
 RUSTFLAGS="-Zsanitizer=thread" CARGO_TARGET_DIR=target/tsan cargo +nightly test -Zbuild-std \
