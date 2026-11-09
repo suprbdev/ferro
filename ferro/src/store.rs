@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -175,8 +175,13 @@ const SUPER_AT: u64 = LOCKS_AT + 3;
 /// The cycle lock, held exclusive for a reclamation cycle and the pieces of a large receive.
 const CYCLE_AT: u64 = LOCKS_AT + 4;
 /// The gate, held exclusive by a process that wants or holds every branch lock at once, so that
-/// other processes take no new branch lock until it is done.
+/// writers in other processes wait a while before they take a new branch lock.
 const GATE_AT: u64 = LOCKS_AT + 5;
+/// The shortest and longest that [`Store::pass_gate`] waits for another process to let the gate
+/// go, as [`Store::gate_bound`] chooses between them.
+const GATE_WAIT: (Duration, Duration) = (Duration::from_millis(2), Duration::from_secs(1));
+/// The shortest and longest sleep between two tests of the gate while a writer waits at it.
+const GATE_POLL: (Duration, Duration) = (Duration::from_micros(50), Duration::from_millis(1));
 /// The first byte of the branch locks, each a byte at a 60-bit hash of the branch's name.
 const LANES_AT: u64 = LOCKS_AT + (1 << 20);
 /// How many bytes the branch locks span.
@@ -1770,6 +1775,14 @@ pub(crate) fn lane_of(name: &str) -> u64 {
     LANES_AT + (xxh3_64(name.as_bytes()) & (LANES - 1))
 }
 
+/// The nanoseconds since this process first read this clock, plus one, so that 0 stands for
+/// none.
+fn gate_clock() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let elapsed = BASE.get_or_init(Instant::now).elapsed().as_nanos();
+    u64::try_from(elapsed).unwrap_or(u64::MAX - 1) + 1
+}
+
 /// A byte-range lock that one thread of this process holds, released when dropped.
 ///
 /// Every thread of a process locks through one open file description, which grants a range it
@@ -2042,6 +2055,9 @@ struct Inner {
     /// lately, losing a sixteenth and a byte with each frame placed, which sizes the room a draft
     /// leaves in its links to objects before it.
     drift: AtomicU64,
+    /// When a writer of this store first found the gate held by another process since one last
+    /// found it free, as [`gate_clock`] read it then, or 0.
+    gate_held: AtomicU64,
     /// The branch locks this process holds.
     lanes: Mutex<Lanes>,
     /// Woken when a branch lock is taken or let go.
@@ -2446,6 +2462,7 @@ impl Store {
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
+                gate_held: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
@@ -2506,6 +2523,7 @@ impl Store {
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
+                gate_held: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
@@ -3070,12 +3088,6 @@ impl Store {
     ///
     /// It returns `None` if `wait` is not set and the range is held, here or in another process.
     fn hold(&self, at: u64, len: u64, wait: bool) -> Result<Option<Held>> {
-        self.hold_as(at, len, true, wait)
-    }
-
-    /// [`Store::hold`], locking the range in the kernel shared rather than exclusive unless
-    /// `exclusive` is set. Within this process the range is this thread's alone either way.
-    fn hold_as(&self, at: u64, len: u64, exclusive: bool, wait: bool) -> Result<Option<Held>> {
         let inner = &self.inner;
         let mut taken = inner.taken.lock();
         while taken.contains(&at) {
@@ -3086,7 +3098,7 @@ impl Store {
         }
         taken.push(at);
         drop(taken);
-        let locked = platform::lock_range(&inner.file, at, len, exclusive, wait);
+        let locked = platform::lock_range(&inner.file, at, len, true, wait);
         if locked.is_ok() {
             return Ok(Some(Held {
                 store: self.clone(),
@@ -3111,11 +3123,12 @@ impl Store {
     /// Takes every branch lock at once, as a cycle's prune and pause and a landing receive do.
     ///
     /// It marks the whole range wanted, so that no thread of this process takes a branch byte,
-    /// waits until none holds one, takes the gate, so that no other process takes a branch byte
-    /// it does not hold yet, and then locks the range in the kernel. While it waits for this
-    /// process's threads it calls `stale` every millisecond and gives up with `None` once that
-    /// returns `true`, since a thread holding a byte for a branch attached after the caller listed
-    /// its lanes may be waiting for one of those lanes.
+    /// waits until none holds one, takes the gate, so that other processes take a branch byte
+    /// they do not hold yet only after [`Store::pass_gate`] has waited, and then locks the range
+    /// in the kernel. While it waits for this process's threads it calls `stale` every
+    /// millisecond and gives up with `None` once that returns `true`, since a thread holding a
+    /// byte for a branch attached after the caller listed its lanes may be waiting for one of
+    /// those lanes.
     ///
     /// The kernel grants a lock on the range only once every byte of it is free at once, and it
     /// does not hold back a byte another process asks for while the range is wanted, so without
@@ -3178,26 +3191,63 @@ impl Store {
         self.take_lane(at, false)
     }
 
-    /// Waits, if `wait` is set, while another process holds the gate, and returns whether the
-    /// gate was free or came free.
+    /// Waits, if `wait` is set, while another process holds the gate, for at most
+    /// [`Store::gate_bound`], and returns whether the gate was free or came free.
     ///
     /// A process holds the gate while it wants or holds every branch lock at once, as
     /// [`Store::lock_lanes`] takes them. A thread about to take a branch lock while it holds no
-    /// lock of any file passes the gate first, so that once a process wants every branch lock no
-    /// other process takes a new one, and the range comes free as the closures that hold branch
-    /// locks end. The test reads the lock without taking it, so a thread that finds the gate free
-    /// never holds it, and a process taking the gate waits only for the threads that found it
-    /// held, each of which takes it shared and lets it go at once. A thread that holds a lock must
-    /// not wait here, since the process holding the gate may be waiting for that lock.
+    /// lock of this file passes the gate first, so that once a process wants every branch lock
+    /// other processes take a new one only after this wait, and the range comes free as the
+    /// closures that hold branch locks end. The wait tests the lock without taking it, sleeping
+    /// between tests, so a thread never holds the gate and the process taking it waits for no
+    /// writer. The wait is bounded because the gate's holder may be waiting for a closure that
+    /// waits for this thread in a way ferro cannot see, such as by joining it; past the bound the
+    /// thread goes on, and that wait comes undone. A thread that holds a lock of this file does not
+    /// wait here at all, since the process holding the gate may be waiting for that lock.
     pub(crate) fn pass_gate(&self, wait: bool) -> Result<bool> {
-        if !platform::range_excluded(&self.inner.file, GATE_AT, 1)? {
-            return Ok(true);
+        let inner = &self.inner;
+        let started = Instant::now();
+        let mut bound = None;
+        let (mut pause, longest) = GATE_POLL;
+        loop {
+            if !platform::range_excluded(&inner.file, GATE_AT, 1)? {
+                if inner.gate_held.load(Ordering::Relaxed) != 0 {
+                    inner.gate_held.store(0, Ordering::Relaxed);
+                }
+                return Ok(true);
+            }
+            let _ = inner.gate_held.compare_exchange(
+                0,
+                gate_clock(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            if !wait {
+                return Ok(false);
+            }
+            let bound = *bound.get_or_insert_with(|| self.gate_bound());
+            let left = bound.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            thread::sleep(pause.min(left));
+            pause = (pause * 2).min(longest);
         }
-        if !wait {
-            return Ok(false);
-        }
-        drop(self.hold_as(GATE_AT, 1, false, true)?);
-        Ok(true)
+    }
+
+    /// How long a writer that finds the gate held now waits at it at most: as long as this
+    /// store's writers have found it held without finding it free, at least 2 ms and at most 1 s.
+    ///
+    /// A wait that grows with the hold lets closures of any length up to the longest end before
+    /// writers that waited take new branch locks, so the range comes free even beside writers
+    /// whose closures outlast a fixed wait, and it undoes a wait that ferro cannot see in no more
+    /// time than the gate's holder had already waited.
+    pub(crate) fn gate_bound(&self) -> Duration {
+        let held = match self.inner.gate_held.load(Ordering::Relaxed) {
+            0 => Duration::ZERO,
+            since => Duration::from_nanos(gate_clock().saturating_sub(since)),
+        };
+        held.clamp(GATE_WAIT.0, GATE_WAIT.1)
     }
 
     /// Takes the branch lock at `at`: shares the byte with any lane of this process that holds it,

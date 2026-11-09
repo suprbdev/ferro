@@ -567,6 +567,7 @@ struct Branch<T> {
     name: String,
     born: u64,
     db: u64,
+    file: u64,
     lane_at: u64,
     state: ArcSwap<State<T>>,
     tip: ArcSwap<State<T>>,
@@ -641,11 +642,12 @@ impl<T> Drop for Lane<'_, T> {
 }
 
 impl<T> Branch<T> {
-    fn new(name: &str, born: u64, db: u64, state: Arc<State<T>>) -> Branch<T> {
+    fn new(name: &str, born: u64, db: u64, file: u64, state: Arc<State<T>>) -> Branch<T> {
         Branch {
             name: name.to_string(),
             born,
             db,
+            file,
             lane_at: lane_of(name),
             feed: Arc::new(Feed::new(state.snapshot.clone())),
             state: ArcSwap::new(state.clone()),
@@ -667,7 +669,7 @@ impl<T> Branch<T> {
     }
 
     fn hold<'a>(&'a self, guard: MutexGuard<'a, Slot<T>>) -> Lane<'a, T> {
-        reentry::hold(self.db, self.key(), &self.name);
+        reentry::hold(self.db, self.file, self.key(), &self.name);
         Lane {
             guard: Some(guard),
             branch: self,
@@ -975,6 +977,7 @@ impl Drop for Keeper {
 
 struct Shared<T> {
     id: u64,
+    file_id: u64,
     store: ArcSwap<Store>,
     path: PathBuf,
     file: PathBuf,
@@ -1116,6 +1119,7 @@ struct Writing<'a, T, F, R, E> {
     id: u64,
     start: Option<F>,
     gated: bool,
+    held_up: Option<(Instant, Duration)>,
     wait: Option<Wait<R, E>>,
     crossing: Option<Crossing>,
 }
@@ -1149,13 +1153,18 @@ where
             };
             this.gated = false;
             let mut notices = Vec::new();
-            let gated = !reentry::holds_besides(db.shared.id, &db.branch.name);
-            match db.shared.crossing(&mut lane, false, gated, &mut notices) {
+            let shared = &db.shared;
+            let gated = this.held_up.is_none_or(|(at, bound)| at.elapsed() < bound)
+                && !reentry::holds_besides(shared.id, shared.file_id, &db.branch.name);
+            match shared.crossing(&mut lane, false, gated, &mut notices) {
                 Err(error) => return Poll::Ready(Err(error.into())),
                 Ok(Some(busy)) => {
                     let at = lane.branch.lane_at;
                     drop(lane);
-                    db.shared.await_lane(busy, at, gated, cx.waker());
+                    if gated && this.held_up.is_none() {
+                        this.held_up = Some((Instant::now(), busy.gate_bound()));
+                    }
+                    shared.await_lane(busy, at, gated, cx.waker());
                     this.start = Some(f);
                     return Poll::Pending;
                 }
@@ -1654,6 +1663,7 @@ impl Options {
         let mut options = options;
         let shared = Arc::new(Shared {
             id: reentry::next_db(),
+            file_id: reentry::file_id(&file),
             store: ArcSwap::from_pointee(store),
             path: path.as_ref().to_path_buf(),
             file,
@@ -2049,7 +2059,7 @@ impl<T: Data> Shared<T> {
         }
         let state = Arc::new(self.state_of(&self.store(), head.as_deref())?);
         let born = head.as_ref().map_or(0, |head| head.born);
-        let branch = Arc::new(Branch::new(name, born, self.id, state));
+        let branch = Arc::new(Branch::new(name, born, self.id, self.file_id, state));
         let attached = self
             .branches
             .lock()
@@ -2068,7 +2078,7 @@ impl<T: Data> Shared<T> {
                 return Ok(branch.clone());
             }
             let tip = self.tip.lock();
-            let _whole = reentry::whole(self.id);
+            let _whole = reentry::whole(self.id, self.file_id);
             let published = self.published.lock().refs.clone();
             if self.options.shared {
                 let newest = tip.refs.try_get(name)?;
@@ -2155,7 +2165,7 @@ impl<T: Data> Shared<T> {
             let current = self.store().id() == store.id()
                 && self.follow(&mut tip, true, notices)? != Caught::Swapped;
             if current && self.covers(&branches) {
-                let whole = reentry::whole(self.id);
+                let whole = reentry::whole(self.id, self.file_id);
                 let out = f(&mut tip, notices);
                 drop(whole);
                 drop(commit);
@@ -2176,14 +2186,15 @@ impl<T: Data> Shared<T> {
     }
 
     /// Lets this thread on towards a branch lock of `name` once no other process holds the gate,
-    /// as [`Store::pass_gate`] describes, unless this thread holds another lock, which that
-    /// process may be waiting for. It holds no lock while it waits, and a write calls it before
-    /// it takes its branch's lane, so no thread of this process waits for it either.
+    /// or after the bounded wait that [`Store::pass_gate`] describes, unless this thread holds
+    /// another lock of this file, which that process may be waiting for. It holds no lock of this
+    /// file while it waits, and a write calls it before it takes its branch's lane, so no thread of
+    /// this process waits for it either.
     ///
     /// The gate only keeps a process that wants every branch lock from waiting for ever, so a
     /// failure to test it lets the thread on.
     fn admit(&self, name: &str) {
-        if self.options.shared && !reentry::holds_besides(self.id, name) {
+        if self.options.shared && !reentry::holds_besides(self.id, self.file_id, name) {
             let _ = self.store().pass_gate(true);
         }
     }
@@ -2273,12 +2284,12 @@ impl<T: Data> Shared<T> {
         match store.follow(holds, upto)? {
             Followed::Still => Ok(Caught::Still),
             Followed::Moved(frame) => {
-                let _whole = reentry::whole(self.id);
+                let _whole = reentry::whole(self.id, self.file_id);
                 self.adopt(tip, &store, frame, notices)?;
                 Ok(Caught::Moved)
             }
             Followed::Retired => {
-                let _whole = reentry::whole(self.id);
+                let _whole = reentry::whole(self.id, self.file_id);
                 self.follow_swap(tip, &store, notices)?;
                 Ok(Caught::Swapped)
             }
@@ -2412,7 +2423,7 @@ impl<T: Data> Shared<T> {
     fn refresh(&self) -> Result<bool> {
         let mut notices = Vec::new();
         let mut tip = self.tip.lock();
-        let _whole = reentry::whole(self.id);
+        let _whole = reentry::whole(self.id, self.file_id);
         let current = self.store();
         let (store, head) = match current.refresh() {
             Err(Error::Replaced) => Store::open(&self.file, self.options.clone())?,
@@ -2508,7 +2519,7 @@ impl<T: Data> Shared<T> {
     ) -> Result<(u64, u64)> {
         drafted.txn.look_ahead();
         let mut tip = self.lock_tip(notices)?;
-        let whole = reentry::whole(self.id);
+        let whole = reentry::whole(self.id, self.file_id);
         let committed = self.commit_locked(&mut tip, change, drafted);
         drop(whole);
         let (version, time_ms, settling) = committed?;
@@ -3451,7 +3462,7 @@ impl<T: Data> Shared<T> {
         }
         let mut notices = Vec::new();
         let only = self.cycle.lock();
-        let cycle = reentry::cycle(self.id);
+        let cycle = reentry::cycle(self.id, self.file_id);
         let across = self.hold_cycle(stop.is_none(), &mut notices)?;
         if stop.is_some() && self.options.shared && !self.due() {
             return Err(Error::Interrupted);
@@ -4478,6 +4489,7 @@ impl<T: Data> Db<T> {
             id: self.shared.ids.fetch_add(1, Ordering::Relaxed),
             start: Some(f),
             gated: false,
+            held_up: None,
             wait: None,
             crossing: None,
         }
@@ -5210,7 +5222,7 @@ impl<T: Data> Db<T> {
         self.shared.cross(&mut lane, &mut notices)?;
         self.branch.check_live()?;
         let mut tip = self.shared.lock_tip(&mut notices)?;
-        let whole = reentry::whole(self.shared.id);
+        let whole = reentry::whole(self.shared.id, self.shared.file_id);
         if name == MAIN || tip.refs.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
@@ -5291,7 +5303,7 @@ impl<T: Data> Db<T> {
             let lane = doomed.as_ref().map(|branch| self.shared.lane(branch));
             let byte = self.shared.byte_of(name)?;
             let mut tip = self.shared.lock_tip(&mut notices)?;
-            let _whole = reentry::whole(self.shared.id);
+            let _whole = reentry::whole(self.shared.id, self.shared.file_id);
             let attached = self.shared.branches.lock().get(name).cloned();
             let moved_file = byte
                 .as_ref()
@@ -5661,7 +5673,7 @@ impl<T: Data> Db<T> {
     pub(crate) fn hold_cycles(&self) -> Result<Cycles<'_, T>> {
         let mut freed = Vec::new();
         let local = self.shared.cycle.lock();
-        let held = reentry::cycle(self.shared.id);
+        let held = reentry::cycle(self.shared.id, self.shared.file_id);
         let across = self.shared.hold_cycle(true, &mut freed)?;
         Ok(Cycles {
             _across: across,
@@ -5683,7 +5695,7 @@ impl<T: Data> Db<T> {
         let shared = &self.shared;
         let mut notices = Vec::new();
         let mut tip = shared.lock_tip(&mut notices)?;
-        let _whole = reentry::whole(shared.id);
+        let _whole = reentry::whole(shared.id, shared.file_id);
         let store = shared.store();
         let mut txn = store.begin()?;
         let out = fill(&store, &mut txn)?;

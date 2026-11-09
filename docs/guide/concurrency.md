@@ -96,8 +96,9 @@ including the `Drop` of a value the cache evicts. A `Drop` that runs while a cyc
 while a large `receive` places its pieces, may write too, except `compact`, or a `pull`, `push` or
 `receive` large enough to be placed in pieces, into that file. A closure that waits on a channel or
 a watcher for another thread's commit can still deadlock, because ferro cannot see the wait: on its
-own branch, on a branch that sorts before its own while a cycle or `receive` waits for this
-closure, and with `coalesce` also when that commit's closure has already run.
+own branch, on a branch that sorts before its own while a cycle or `receive` of the same handle
+waits for this closure, and with `coalesce` also when that commit's closure has already run. One in
+another handle or process holds that commit up for a while, at most a second.
 
 ## Several processes
 
@@ -131,8 +132,9 @@ of their own 4 processes made 87,512 and 4 threads 90,661.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
 commit or `refresh`, or as soon as their follower sees the rename. While a cycle's pause, or a pull
-or receive landing, waits for every branch, writers in other processes start no new closure, so it
-waits only for the closures already running. A process killed in the middle of
+or receive landing, waits for every branch, writers in other processes hold off new closures for a
+time that grows with that wait, from 2 ms up to a second, so it waits only for the closures already
+running. A process killed in the middle of
 a commit holds up the others only until the operating system releases its locks, and nothing it
 acknowledged is lost. It needs open file description locks, so it runs on 64-bit Linux only, and the
 processes must share one machine and a local file system. Elsewhere, Windows included, the open

@@ -10,9 +10,11 @@
 //! describes the rules.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result};
 
@@ -34,6 +36,7 @@ pub(crate) enum Needs<'a> {
 
 struct Hold {
     db: u64,
+    file: u64,
     lane: usize,
     name: String,
 }
@@ -63,23 +66,26 @@ pub(crate) fn next_db() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Records that this thread holds lock `lane`, of the branch `name`, in database `db`.
+/// Records that this thread holds lock `lane`, of the branch `name`, in database `db`, whose
+/// file [`file_id`] names `file`.
 ///
 /// Lane 0 stands for the whole file, which [`whole`] records, and [`CYCLE`] for the reclamation
 /// cycle lock, which [`cycle`] records.
-pub(crate) fn hold(db: u64, lane: usize, name: &str) {
+pub(crate) fn hold(db: u64, file: u64, lane: usize, name: &str) {
     let _ = HOLDS.try_with(|holds| {
         let mut holds = holds.borrow_mut();
         let live = holds.live;
         match holds.list.get_mut(live) {
             Some(hold) => {
                 hold.db = db;
+                hold.file = file;
                 hold.lane = lane;
                 hold.name.clear();
                 hold.name.push_str(name);
             }
             None => holds.list.push(Hold {
                 db,
+                file,
                 lane,
                 name: name.to_string(),
             }),
@@ -104,18 +110,26 @@ pub(crate) fn release(db: u64, lane: usize) {
     });
 }
 
-/// Whether this thread holds any lock it records, in any database, other than the branch lock of
-/// `name` in database `db`.
+/// The id that [`hold`] records for the database file at the canonical path `path`, the same for
+/// every handle on that file.
+pub(crate) fn file_id(path: &Path) -> u64 {
+    xxh3_64(path.as_os_str().as_encoded_bytes())
+}
+
+/// Whether this thread holds any lock it records on the file `file`, through any handle, other
+/// than the branch lock of `name` in database `db`.
 ///
-/// A thread that does may be what another process waiting for every branch lock waits for, so it
-/// must not wait at that process's gate. A thread whose record cannot be read counts as holding
+/// A thread that does may hold what another process waiting for every branch lock of that file
+/// waits for, so it does not wait at that process's gate. Locks on other files do not count, since
+/// that process waits only for this file's. A thread whose record cannot be read counts as holding
 /// one.
-pub(crate) fn holds_besides(db: u64, name: &str) -> bool {
+pub(crate) fn holds_besides(db: u64, file: u64, name: &str) -> bool {
     HOLDS
         .try_with(|holds| {
             let holds = holds.borrow();
             holds.list[..holds.live].iter().any(|hold| {
-                hold.db != db || hold.lane == 0 || hold.lane == CYCLE || hold.name != name
+                hold.file == file
+                    && (hold.db != db || hold.lane == 0 || hold.lane == CYCLE || hold.name != name)
             })
         })
         .unwrap_or(true)
@@ -124,9 +138,10 @@ pub(crate) fn holds_besides(db: u64, name: &str) -> bool {
 /// A record that this thread holds a lock on all of a database, removed when dropped.
 pub(crate) struct Whole(u64);
 
-/// Records that this thread holds a lock on all of database `db` until the guard is dropped.
-pub(crate) fn whole(db: u64) -> Whole {
-    hold(db, 0, "");
+/// Records that this thread holds a lock on all of database `db`, of the file `file`, until the
+/// guard is dropped.
+pub(crate) fn whole(db: u64, file: u64) -> Whole {
+    hold(db, file, 0, "");
     Whole(db)
 }
 
@@ -139,14 +154,14 @@ impl Drop for Whole {
 /// A record that this thread holds the reclamation cycle lock of a database, removed when dropped.
 pub(crate) struct Cycle(u64);
 
-/// Records that this thread holds the reclamation cycle lock of database `db` until the guard is
-/// dropped.
+/// Records that this thread holds the reclamation cycle lock of database `db`, of the file `file`,
+/// until the guard is dropped.
 ///
 /// A cycle holds it without any branch lock while it copies the file and once it has swapped it
 /// in, and a landing bundle that spilled while it places its pieces, so the record refuses only
 /// [`Needs::Cycle`].
-pub(crate) fn cycle(db: u64) -> Cycle {
-    hold(db, CYCLE, "");
+pub(crate) fn cycle(db: u64, file: u64) -> Cycle {
+    hold(db, file, CYCLE, "");
     Cycle(db)
 }
 

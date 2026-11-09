@@ -90,8 +90,10 @@ whose bundle spilled while its pieces are placed. A write is refused when its th
 - a lane of that file whose name sorts at or after the one the write takes.
 
 With `shared`, a write the check lets through also reads the record to decide whether it may wait
-at another process's gate: one whose thread holds anything goes straight to its branch's byte, as
-[The gate](processes.md#the-gate) describes.
+at another process's gate: one whose thread holds anything on that file, through any handle, goes
+straight to its branch's byte, as [The gate](processes.md#the-gate) describes. Each record names the
+file as well as the handle, by an xxh3 of its canonical path, and locks on other files do not
+count.
 
 `pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
 scratch file, as described under [Where checked objects
@@ -173,9 +175,13 @@ cycle locks go, so a `Drop` that close runs may write anywhere, `compact` includ
 
 What stays undetected is a wait that ferro does not see. A closure that waits on a channel, a
 condvar or a `Watcher` for another thread's commit can still deadlock: on its own branch, since that
-commit needs the lane; on another branch of its file, while a cycle that holds that branch's lane
-waits for this one; and with `coalesce`, for a commit whose closure has already run, since that
-commit may be in this closure's group.
+commit needs the lane; on another branch of its file, while a cycle of the same handle that holds
+that branch's lane waits for this one; and with `coalesce`, for a commit whose closure has already
+run, since that commit may be in this closure's group. A cycle or landing in another handle or
+process holds no lane of this one and takes every branch byte at once or none, so it holds such a
+commit up only at its gate, for no longer than the gate had been held and at most 1 s, as [The
+gate](processes.md#the-gate) describes; the first version of the gate waited there for good, and a
+closure on `a` that joined a thread committing on `b` hung beside another handle's cycle (#136).
 
 ## Cost
 

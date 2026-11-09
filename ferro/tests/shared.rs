@@ -1665,6 +1665,7 @@ fn writers_on_branches_of_their_own(
     path: &Path,
     writers: u64,
     stop: &Arc<AtomicBool>,
+    nested: bool,
 ) -> Vec<thread::JoinHandle<u64>> {
     let first: Db<Root> = manual().open(path).unwrap();
     for writer in 0..writers {
@@ -1680,11 +1681,19 @@ fn writers_on_branches_of_their_own(
             thread::spawn(move || {
                 let db: Db<Root> = manual().open(&path).unwrap();
                 let db = db.branch(&format!("own-{writer}")).unwrap();
+                let outer = path.with_file_name(format!("outer-{writer}.ferro"));
+                let outer: Option<Db<Root>> = nested.then(|| fast().open(&outer).unwrap());
                 ready.wait();
+                let commit = |i: &mut u64| {
+                    while !stop.load(Ordering::Relaxed) {
+                        *i += 1;
+                        bump(&db, writer, *i);
+                    }
+                };
                 let mut i = 0;
-                while !stop.load(Ordering::Relaxed) {
-                    i += 1;
-                    bump(&db, writer, i);
+                match &outer {
+                    Some(outer) => outer.update(|_| commit(&mut i)).unwrap(),
+                    None => commit(&mut i),
                 }
                 i
             })
@@ -1694,12 +1703,11 @@ fn writers_on_branches_of_their_own(
     threads
 }
 
-#[test]
-fn a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own() {
+fn five_cycles_beside_writers_on_branches_of_their_own(nested: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gate.ferro");
     let stop = Arc::new(AtomicBool::new(false));
-    let writers = writers_on_branches_of_their_own(&path, 4, &stop);
+    let writers = writers_on_branches_of_their_own(&path, 4, &stop, nested);
     let cycler: Db<Root> = manual().open(&path).unwrap();
     bump(&cycler, 99, 1);
     thread::sleep(Duration::from_millis(100));
@@ -1718,9 +1726,20 @@ fn a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own() {
     assert!(
         waited.is_ok(),
         "five cycles had not finished after 20 s while four handles committed {commits:?} times \
-         on branches of their own; they finished {:?} after they began, once those stopped",
+         on branches of their own, nested in closures on other files: {nested}; they finished \
+         {:?} after they began, once those stopped",
         started.elapsed()
     );
+}
+
+#[test]
+fn a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own() {
+    five_cycles_beside_writers_on_branches_of_their_own(false);
+}
+
+#[test]
+fn a_cycle_finishes_while_writers_in_closures_on_other_files_commit_on_branches_of_their_own() {
+    five_cycles_beside_writers_on_branches_of_their_own(true);
 }
 
 #[test]
@@ -1728,7 +1747,7 @@ fn a_handles_own_commits_wait_for_its_cycle_only_while_other_handles_finish_thei
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("own.ferro");
     let stop = Arc::new(AtomicBool::new(false));
-    let writers = writers_on_branches_of_their_own(&path, 4, &stop);
+    let writers = writers_on_branches_of_their_own(&path, 4, &stop, false);
     let cycler: Db<Root> = manual().open(&path).unwrap();
     let own = cycler.fork("mine").unwrap();
     thread::sleep(Duration::from_millis(100));
@@ -1766,7 +1785,7 @@ fn nested_and_awaited_writes_go_on_through_another_handles_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested.ferro");
     let stop = Arc::new(AtomicBool::new(false));
-    let writers = writers_on_branches_of_their_own(&path, 2, &stop);
+    let writers = writers_on_branches_of_their_own(&path, 2, &stop, false);
     let db: Db<Root> = manual().open(&path).unwrap();
     db.fork("a").unwrap();
     db.fork("b").unwrap();
@@ -1818,6 +1837,68 @@ fn nested_and_awaited_writes_go_on_through_another_handles_cycles() {
     assert!(commits.iter().all(|n| *n > 0), "{commits:?}");
     db.refresh().unwrap();
     db.verify_typed().unwrap();
+}
+
+fn a_closure_waits_for_another_thread_beside_another_handles_cycle(awaited: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("joined.ferro");
+    let db: Db<Root> = manual().open(&path).unwrap();
+    db.fork("a").unwrap();
+    db.fork("b").unwrap();
+    bump(&db, 0, 1);
+    bump(&db, 0, 2);
+    let (a, b) = (db.branch("a").unwrap(), db.branch("b").unwrap());
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    let (go, started) = mpsc::channel::<()>();
+    let (done, finished) = mpsc::channel();
+    let cycled = done.clone();
+    thread::spawn(move || {
+        started.recv().unwrap();
+        cycler.compact(Keep::Last(1)).unwrap();
+        cycled.send("the cycle").unwrap();
+    });
+    thread::spawn(move || {
+        a.update(|root| {
+            go.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let b = b.clone();
+            thread::spawn(move || match awaited {
+                true => block_on(b.update_async(|inner| inner.n += 1)).unwrap(),
+                false => drop(bump(&b, 1, 1)),
+            })
+            .join()
+            .unwrap();
+            root.n += 1;
+        })
+        .unwrap();
+        drop(db);
+        done.send("the closure").unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ended = Vec::new();
+    while ended.len() < 2 {
+        match finished.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(what) => ended.push(what),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        ended.len(),
+        2,
+        "a closure on `a` joining a thread that commits on `b`, awaited: {awaited}, and another \
+         handle's cycle had not both finished after 20 s, only {ended:?}"
+    );
+}
+
+#[test]
+fn a_closure_joining_a_thread_that_commits_on_a_later_branch_finishes_beside_another_handles_cycle()
+{
+    a_closure_waits_for_another_thread_beside_another_handles_cycle(false);
+}
+
+#[test]
+fn a_closure_joining_a_thread_that_awaits_a_commit_finishes_beside_another_handles_cycle() {
+    a_closure_waits_for_another_thread_beside_another_handles_cycle(true);
 }
 
 fn held_across_another_handles_cycles(follower: Options) {
