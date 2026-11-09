@@ -1421,8 +1421,9 @@ impl Options {
 
     /// How much history each branch retains, [`Keep::All`] by default.
     ///
-    /// [`Keep::Last`] prunes as part of each commit, while [`Keep::Since`] and [`Keep::Within`]
-    /// take effect at each reclamation cycle. A writer that keeps less than everything also runs
+    /// [`Keep::Last`] prunes as part of each commit and of each pull or receive that brings a
+    /// branch up to the branch it landed, while [`Keep::Since`] and [`Keep::Within`] take effect
+    /// at each reclamation cycle. A writer that keeps less than everything also runs
     /// cycles on a background thread, as [`Options::reclaim`] sets, to give the space back. A
     /// pruned version is gone, whether or not a cycle has reclaimed its bytes yet. See
     /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
@@ -5637,6 +5638,54 @@ impl<T: Data> Db<T> {
             landed?;
             shared.settle(store.last_seq(), notices)?;
             Ok(out)
+        })
+    }
+
+    /// Raises the oldest retained version of each branch in `names` that `refs` holds, as
+    /// [`Keep::Last`] in [`Options::history`] does at each commit, and returns whether any of
+    /// them moved.
+    ///
+    /// The other forms of [`Options::history`] take effect at each cycle, so under them `refs`
+    /// is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Read errors from walking a branch's log.
+    pub(crate) fn keep_last(&self, store: &Store, refs: &mut Refs, names: &[&str]) -> Result<bool> {
+        let keep = self.shared.history;
+        if !matches!(keep, Keep::Last(_)) {
+            return Ok(false);
+        }
+        let mut moved = false;
+        for name in names {
+            let Some(head) = refs.try_get(*name)? else {
+                continue;
+            };
+            let log = head.log.pruned(store, keep)?;
+            if log != head.log {
+                let mut head = (*head).clone();
+                head.log = log;
+                refs.try_insert(name.to_string(), head)?;
+                moved = true;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Prunes the branches in `names` as [`Db::keep_last`] does, landing the branch table in a
+    /// frame of its own if any of them moved.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Db::rewrite_refs`].
+    pub(crate) fn keep_last_now(&self, names: &[&str]) -> Result<()> {
+        if !matches!(self.shared.history, Keep::Last(_)) {
+            return Ok(());
+        }
+        self.rewrite_refs(|store, _, refs| {
+            let mut next = refs.clone();
+            let moved = self.keep_last(store, &mut next, names)?;
+            Ok((moved.then_some(next), ()))
         })
     }
 }

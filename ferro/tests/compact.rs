@@ -114,8 +114,13 @@ fn compaction_refuses_a_live_writer_and_empty_is_a_noop() {
         Err(Error::Locked)
     ));
     drop(db);
+    let before = std::fs::read(&path).unwrap();
     let report = admin::compact(&path, Keep::All).unwrap();
     assert_eq!(report.objects, 0);
+    assert_eq!(report.passes, 0);
+    assert_eq!(report.pause, std::time::Duration::ZERO);
+    assert_eq!(report.before_bytes, report.after_bytes);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

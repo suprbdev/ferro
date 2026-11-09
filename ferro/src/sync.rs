@@ -3672,9 +3672,11 @@ impl<T: Data> Db<T> {
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a
     ///   `Vec<()>`, than its size allows. Nothing reaches the file.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
-    ///   it was built for another file, or this one pruned or dropped that commit after sending
-    ///   its have. Nothing lands and `merge` does not run; build a new bundle from a fresh have.
-    ///   Only the caller can fetch one, so this is not retried as [`Db::pull`] retries it.
+    ///   it was built for another file, this one pruned or dropped that commit after sending its
+    ///   have, or the part of the bundle that names that commit was damaged on the way. Nothing
+    ///   lands and `merge` does not run; build a new bundle from a fresh have, which is the way on
+    ///   from a damaged one too. Only the caller can fetch one, so this is not retried as
+    ///   [`Db::pull`] retries it.
     /// - The other errors of [`Db::pull`].
     ///
     /// # Panics
@@ -4005,10 +4007,10 @@ impl<T: Data> Db<T> {
                     None => return Ok((None, decision)),
                 },
             };
-            Ok((
-                recorded(refs, &name, head, remote, theirs.version)?,
-                decision,
-            ))
+            let changed = recorded(refs, &name, head, remote, theirs.version)?;
+            let mut next = changed.clone().unwrap_or_else(|| refs.clone());
+            let pruned = self.keep_last(store, &mut next, &[&name, remote])?;
+            Ok(((changed.is_some() || pruned).then_some(next), decision))
         })?;
         let outcome = match decision {
             Decision::UpToDate => Outcome::UpToDate,
@@ -4028,16 +4030,22 @@ impl<T: Data> Db<T> {
     ) -> std::result::Result<(Outcome, Option<R>), E> {
         let tracking = self.branch(remote)?;
         let seen = match self.merge_tracking(&tracking, merge)? {
-            Ok(committed) => return Ok((Outcome::Merged, Some(committed.value))),
+            Ok(committed) => {
+                self.keep_last_now(&[remote])?;
+                return Ok((Outcome::Merged, Some(committed.value)));
+            }
             Err(Some(seen)) => seen,
             Err(None) => return Ok((Outcome::UpToDate, None)),
         };
         let name = self.branch_name().to_string();
-        self.rewrite_refs(|_, _, refs| {
+        self.rewrite_refs(|store, _, refs| {
             let Some(ours) = refs.try_get(&name)? else {
                 return Ok((None, ()));
             };
-            Ok((recorded(refs, &name, (*ours).clone(), remote, seen)?, ()))
+            let changed = recorded(refs, &name, (*ours).clone(), remote, seen)?;
+            let mut next = changed.clone().unwrap_or_else(|| refs.clone());
+            let pruned = self.keep_last(store, &mut next, &[remote])?;
+            Ok(((changed.is_some() || pruned).then_some(next), ()))
         })?;
         Ok((held, None))
     }

@@ -41,7 +41,11 @@ pub enum Keep {
     All,
     /// The given number of newest commits of each branch, with 0 counting as 1.
     ///
-    /// As [`Options::history`](crate::Options::history) it prunes as part of each commit.
+    /// As [`Options::history`](crate::Options::history) it prunes a branch as part of each commit
+    /// on it, and as part of each pull or receive that brings a branch up to the branch it
+    /// landed and records it, which it prunes too. A landed branch that a pull did not record,
+    /// as when its merge failed or every commit it brought already held this branch's value,
+    /// keeps what landed until a later pull records it or a cycle runs.
     Last(usize),
     /// The commits made at or after this time, in milliseconds since the Unix epoch.
     ///
@@ -480,17 +484,18 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 /// It takes the writer lock, copies what is reachable to a new file beside this one, renames it
 /// over the old one atomically and syncs the directory, so a crash leaves one file or the other.
 /// It needs free disk for everything retained. No writer waits, so the report's `pause` is zero
-/// and its `passes` 1. A program with the file open calls [`Db::compact`](crate::Db::compact)
-/// instead, which runs while its writers do.
+/// and its `passes` 1. A file with no commit yet has nothing to copy: it is left as it is, and the
+/// report's `passes` and `objects` are 0. A program with the file open calls
+/// [`Db::compact`](crate::Db::compact) instead, which runs while its writers do.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] with [`NotFound`](std::io::ErrorKind::NotFound) if there is no file at `path`,
 /// [`Error::Locked`] while a writer has the file open, [`Error::NotFerro`] if the file is not a
-/// database, which includes an empty file, as for [`info`], since a compaction does not make a
-/// database of one as a writable [`Db::open`](crate::Db::open) does, and [`Error::Corrupt`] or
-/// [`Error::Io`] if the file cannot be read or the copy written. A copy that fails is removed, and
-/// the file is left as it was.
+/// database, which includes an empty file and one of only zeroes, as for [`info`], since a
+/// compaction does not make a database of one as a writable [`Db::open`](crate::Db::open) does,
+/// and [`Error::Corrupt`] or [`Error::Io`] if the file cannot be read or the copy written. A copy
+/// that fails is removed, and the file is left as it was.
 ///
 /// # Examples
 ///

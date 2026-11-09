@@ -2254,7 +2254,9 @@ impl Store {
     ///
     /// - [`Error::Locked`] if another writer has the file open.
     /// - [`Error::NoDatabase`] if a read-only open finds no file.
-    /// - [`Error::NotFerro`] if the file holds something else, or is empty and opened read-only.
+    /// - [`Error::NotFerro`] if the file holds something else, or, opened read-only, is empty or
+    ///   holds only zeroes, as a creation cut short leaves it. A writable open creates a database
+    ///   in such a file of at most 8 KiB.
     /// - [`Error::Corrupt`] if both superblocks are invalid, the newest names a log the file does
     ///   not hold, or a frame past its anchor reached the disk whole and was damaged since, or,
     ///   for a shared writer that opens beside another, any frame the newest superblock names
@@ -2266,8 +2268,8 @@ impl Store {
     }
 
     /// Opens the database file at `path` as [`Store::open`] does, but never creates one: an empty
-    /// file, which a writable open would make a database of, is [`Error::NotFerro`] as it is to a
-    /// read-only open.
+    /// file, or one of only zeroes, which a writable open would make a database of, is
+    /// [`Error::NotFerro`] as it is to a read-only open.
     ///
     /// # Errors
     ///
@@ -2358,15 +2360,14 @@ impl Store {
                 }
             }
             None => {
-                if options.read_only {
-                    return Err(Error::NotFerro(path.display().to_string()));
-                }
                 let mut probe = vec![0u8; len.min(LOG_START) as usize];
                 file.read_exact_at(&mut probe, 0)?;
-                if probe.starts_with(MAGIC) {
+                let second = probe.get(SLOT_BYTES as usize..).unwrap_or_default();
+                if probe.starts_with(MAGIC) || second.starts_with(MAGIC) {
                     return Err(Error::Corrupt("both superblocks are invalid".into()));
                 }
-                if !create || len > LOG_START || probe.iter().any(|b| *b != 0) {
+                if options.read_only || !create || len > LOG_START || probe.iter().any(|b| *b != 0)
+                {
                     return Err(Error::NotFerro(path.display().to_string()));
                 }
                 let empty = Mark {

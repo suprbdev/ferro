@@ -22,8 +22,9 @@ Pruning only raises `first`. Walks stop there, and lookups below it return `NoVe
 entries are not rewritten, so the entry at `first` still links `prev` and perhaps `skip` entries
 that are gone. Those links are hashes nothing follows, and a copy into a new file writes them with
 offset 0. `Options::history(Keep::Last(n))` raises `first` as part of each commit, which costs no
-extra bytes. `Keep::Since` and `Keep::Within` need a lookup by time, so they apply at each
-reclamation cycle.
+extra bytes, and as a pull brings a branch up to the branch it landed, as [Bringing the branch
+up](sync.md#bringing-the-branch-up) describes. `Keep::Since` and `Keep::Within` need a lookup by
+time, so they apply at each reclamation cycle.
 
 Readers take a head and its chain as they find them, and the walks of whole chains check what they
 rely on, as [What readers rely on](#what-readers-rely-on) lists.

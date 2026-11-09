@@ -21,7 +21,11 @@ println!("down to {}, writers waited {:?}", report.after_bytes, report.pause);
 ```
 
 `history` prunes as part of each commit and reclaims on a background thread whenever the file has
-grown by `every_bytes` or by its size after the last cycle, whichever is larger.
+grown by `every_bytes` or by its size after the last cycle, whichever is larger. A pull or receive
+prunes too, both the branch it brings up and the branch it landed, once it has brought the one up
+to the other and recorded it. A landed branch that a pull did not record, as when the merge failed
+or every commit it brought already held this branch's value, keeps what landed until a later pull
+records it or a cycle runs.
 `Keep::Since(unix_ms)` and `Keep::Within(duration)` retain by time instead, and take effect at each
 cycle. `compact` runs one cycle now, with writers still running, and can prune harder than `history`
 does. A cycle copies what is retained to a new file and swaps it in. Writers wait a few milliseconds

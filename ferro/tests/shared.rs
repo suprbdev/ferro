@@ -545,6 +545,46 @@ fn a_pull_into_a_shared_file_lands_beside_another_handles_commits() {
 }
 
 #[test]
+fn keep_last_prunes_a_pull_into_a_shared_file_for_every_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let source: Db<Root> = fast().open(dir.path().join("source.ferro")).unwrap();
+    for i in 1..=20 {
+        bump(&source, 9, i);
+    }
+    let path = dir.path().join("pulled.ferro");
+    let options = || {
+        shared()
+            .history(Keep::Last(2))
+            .reclaim(Reclaim { every_bytes: 0 })
+    };
+    let a: Db<Root> = options().open(&path).unwrap();
+    let b: Db<Root> = options().open(&path).unwrap();
+    let lens = |db: &Db<Root>| (db.log().len(), db.branch("origin").unwrap().log().len());
+    let pulled = a.pull(&source, "origin", |_, _, _| ("merge", ())).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    assert_eq!(lens(&a), (2, 2));
+    b.refresh().unwrap();
+    assert_eq!(b.read().n, 20);
+    assert_eq!(lens(&b), (2, 2));
+
+    bump(&b, 1, 1);
+    for i in 21..=25 {
+        bump(&source, 9, i);
+    }
+    let pulled = a.pull(&source, "origin", |_, _, _| ("merge", ())).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::Merged);
+    assert_eq!(lens(&a), (2, 2));
+    b.refresh().unwrap();
+    assert_eq!(lens(&b), (2, 2));
+    a.compact(Keep::Last(2)).unwrap();
+    b.refresh().unwrap();
+    for db in [&a, &b] {
+        db.verify().unwrap();
+        db.verify_typed().unwrap();
+    }
+}
+
+#[test]
 fn background_cycles_in_several_handles_run_one_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("background.ferro");

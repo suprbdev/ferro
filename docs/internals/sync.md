@@ -331,6 +331,19 @@ and an `Err` from it leaves the file as that crash would, with the error returne
 type. Undoing the landing as well would take a frame of its own and make the next pull send the same
 commits again.
 
+Under `Options::history(Keep::Last(n))` this step also raises `first` on our branch and on `remote`
+to their newest `n` commits, as a commit does on its branch, wherever it records `remote`. The
+landing cannot: until the decision, `remote` needs its commits down to our tip, since a fast-forward
+is told by finding our tip in the remote chain at our version, and a merge needs them down to the
+base. A fast-forward, `Ahead` or `UpToDate` with a record prunes both in the frame that moves or
+records our head. After a merge, whose commit prunes our branch, `remote` is pruned in a frame of
+its own, written only when that raises its `first`. A pull that is `UpToDate` because the commits we
+lack hold our value records nothing, and the next pull answers that again from `remote`'s commits,
+so it leaves `remote` as it landed: pruned there, the next pull refused with `NoCommonAncestor` or
+merged again in a randomized mesh of pruned devices, right after a sync. A refused or failed merge
+also leaves `remote` as it landed, so that the next pull merges against the same base. A cycle
+prunes `remote` as it prunes every branch.
+
 ## Commit identity
 
 An entry's hash covers its version, time, message and root, and its parent's hash, so a pulled

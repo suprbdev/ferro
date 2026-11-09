@@ -37,9 +37,11 @@ pub enum Error {
     NoDatabase(String),
     /// The file at the path, which the error holds, is not a ferro database.
     ///
-    /// A writable open returns it for a file with other contents and creates a database only in an
-    /// empty file. A read-only open, and [`admin::compact`](crate::admin::compact), also return it
-    /// for an empty file.
+    /// A writable open returns it for a file with other contents, and creates a database in an
+    /// empty file or in one of at most 8 KiB that holds only zeroes, which is what a creation cut
+    /// short by a crash leaves. A read-only open, and [`admin::compact`](crate::admin::compact),
+    /// also return it for such a file. A file whose superblocks are both invalid but that still
+    /// starts either one with ferro's magic is [`Error::Corrupt`] instead.
     #[error("not a ferro database: {0}")]
     NotFerro(String),
     /// The file is damaged, or holds something no file ferro wrote can hold.
@@ -191,13 +193,16 @@ pub enum Error {
     /// A sync [`Have`](crate::Have) or [`Bundle`](crate::Bundle) is malformed, damaged or forged.
     ///
     /// [`Db::receive`](crate::Db::receive) checks every object before any of it reaches the file,
-    /// so a rejected bundle changes nothing.
+    /// so a rejected bundle changes nothing. Damage to the part of a bundle that names the commit
+    /// it builds on is reported as [`Error::StaleHave`] instead, and fetching a fresh bundle is
+    /// the way on from both.
     #[error("sync bundle rejected: {0}")]
     Bundle(String),
     /// A bundle builds on a commit this file does not hold, so it cannot land.
     ///
-    /// The bundle was built for another file, or this file pruned or dropped that commit after it
-    /// sent its [`Have`](crate::Have). Nothing lands; build a new bundle from a fresh have.
+    /// The bundle was built for another file, this file pruned or dropped that commit after it
+    /// sent its [`Have`](crate::Have), or the part of the bundle that names the commit was
+    /// damaged on the way. Nothing lands; build a new bundle from a fresh have.
     /// [`Db::pull`](crate::Db::pull) and [`Db::push`](crate::Db::push) do that themselves, and
     /// return this only after three attempts.
     #[error("sync bundle is stale: {0}; build a new one from a fresh have")]

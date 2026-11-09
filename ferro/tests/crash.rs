@@ -15,7 +15,7 @@ use common::{
 use ferro::codec::{HASH_BYTES, Object, Sink};
 use ferro::db::Clock;
 use ferro::store::{Store, StoreOptions, record_len};
-use ferro::{Db, Error, Map, Options, Ptr};
+use ferro::{Db, Error, Keep, Map, Options, Ptr, admin};
 use tempfile::TempDir;
 
 type Root = Map<u64, String>;
@@ -23,6 +23,7 @@ type Model = BTreeMap<u64, String>;
 
 const LOG_START: usize = 8192;
 const SUPER: usize = 144;
+const MAGIC: usize = 8;
 
 struct Built {
     dir: TempDir,
@@ -182,6 +183,32 @@ fn assert_clear_error<T>(result: Result<T, Error>, context: &str) {
         Err(Error::Corrupt(_) | Error::NotFerro(_)) => {}
         Err(other) => panic!("{context}: unexpected error {other}"),
         Ok(_) => panic!("{context}: opened a damaged file"),
+    }
+}
+
+fn assert_both_slots_damaged(path: &Path, magic_kept: bool, context: &str) {
+    let opens = [
+        ("writable", fast().open::<Root>(path).map(drop)),
+        (
+            "read-only",
+            fast().read_only(true).open::<Root>(path).map(drop),
+        ),
+        ("info", admin::info(path).map(drop)),
+        ("verify", admin::verify(path).map(drop)),
+        ("space", admin::space(path).map(drop)),
+        ("compact", admin::compact(path, Keep::All).map(drop)),
+    ];
+    for (open, result) in opens {
+        match result {
+            Err(Error::Corrupt(message)) if magic_kept => {
+                assert!(
+                    message.contains("both superblocks are invalid"),
+                    "{message}"
+                );
+            }
+            Err(Error::NotFerro(_)) if !magic_kept => {}
+            other => panic!("both slots damaged, {context}, {open}: {other:?}"),
+        }
     }
 }
 
@@ -715,9 +742,17 @@ fn corrupt_superblocks_fall_back_or_report() {
             image[newest + byte] ^= bit;
             image[older + byte] ^= bit;
             fs::write(&path, &image).unwrap();
-            assert_clear_error(fast().open::<Root>(&path), "both slots damaged");
+            assert_both_slots_damaged(&path, byte >= MAGIC, &format!("byte {byte}"));
             assert_eq!(fs::read(&path).unwrap(), image);
         }
+    }
+    for (magic, check) in [(0, SLOT + SUPER - 1), (SLOT, SUPER - 1)] {
+        let mut image = built.bytes.clone();
+        image[magic] ^= 0x01;
+        image[check] ^= 0x01;
+        fs::write(&path, &image).unwrap();
+        assert_both_slots_damaged(&path, true, &format!("magic at {magic}"));
+        assert_eq!(fs::read(&path).unwrap(), image);
     }
     for byte in [SUPER, SUPER + 1, SLOT - 1, SLOT + SUPER, 2 * SLOT - 1] {
         let mut image = built.bytes.clone();

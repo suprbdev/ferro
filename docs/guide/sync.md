@@ -96,23 +96,25 @@ every branch go on however slowly the bundle comes. Only once the whole bundle h
 objects copied into the file, beside those commits, where nothing can find them until one frame
 points the remote branch at them, so a crash leaves the previous head. Only that frame takes the
 writer locks, and it checks again that the commits the bundle builds on are still here. A damaged or
-forged bundle is rejected with `Error::Bundle` and never reaches the file. `receive` uses a fixed
-buffer, the object it is reading and about 40 bytes for each object the bundle carries, not memory
-for its bytes or for what it claims, and refuses commits dated more than a day past this machine's
-clock.
+forged bundle is rejected with `Error::Bundle` and never reaches the file, except that damage to the
+part that names the commit it builds on reads as `Error::StaleHave`, described below. Either way,
+fetch a fresh bundle. `receive` uses a fixed buffer, the object it is reading and about 40 bytes for
+each object the bundle carries, not memory for its bytes or for what it claims, and refuses commits
+dated more than a day past this machine's clock.
 
 ## When the other side has moved
 
 If this file does not hold the commit a bundle builds on, because the bundle was built for another
 file, or this one pruned or dropped that commit after sending its have, even while the bundle was
 arriving, `receive` returns `Error::StaleHave` and lands nothing: build a new bundle from a fresh
-have and try again. Only you can fetch that bundle, so `receive` and `receive_from` leave the retry
-to you. `pull` and `push` hold both files, so they send a fresh have and try again themselves, up
-to three attempts in all, and return `StaleHave` only if this file moved under all three. A stale
-have is found before your merge closure can run, so the closure never runs for an attempt that is
-tried again, only for the one that landed, as often as a merge runs it (more than once after a
-criss-cross, as [Merging](merging.md#limits) describes), and `try_pull` and `try_push` retry before
-any error reaches your error type.
+have and try again. A bundle damaged where it names that commit gets the same error, and the same
+retry fetches an undamaged one. Only you can fetch that bundle, so `receive` and `receive_from`
+leave the retry to you. `pull` and `push` hold both files, so they send a fresh have and try again
+themselves, up to three attempts in all, and return `StaleHave` only if this file moved under all
+three. A stale have is found before your merge closure can run, so the closure never runs for an
+attempt that is tried again, only for the one that landed, as often as a merge runs it (more than
+once after a criss-cross, as [Merging](merging.md#limits) describes), and `try_pull` and `try_push`
+retry before any error reaches your error type.
 
 ## Versions and hashes across files
 

@@ -859,6 +859,41 @@ fn a_bundle_built_for_another_database_is_rejected() {
 }
 
 #[test]
+fn a_bundle_damaged_where_it_names_its_base_reads_as_stale_and_a_fresh_one_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
+    put(&a, 1, "one");
+    b.pull(&a, "a", refuse).unwrap();
+    put(&a, 2, "two");
+    let base = b.head_hash().unwrap();
+    let bytes: Vec<u8> = a.bundle(&b.have().unwrap()).unwrap().into();
+    let at = bytes
+        .windows(base.len())
+        .position(|window| window == base.as_slice())
+        .expect("the bundle names the commit it builds on");
+    let state = |b: &Db<Root>| {
+        let landed = b.branch("a").unwrap().head_hash();
+        (b.head_hash(), landed, b.size_on_disk())
+    };
+    let before = state(&b);
+    for offset in [0, base.len() / 2, base.len() - 1] {
+        let mut damaged = bytes.clone();
+        damaged[at + offset] ^= 0x01;
+        match b.receive("a", &Bundle::from(damaged), refuse) {
+            Err(Error::StaleHave(message)) => {
+                assert!(message.contains("does not have"), "{message}")
+            }
+            other => panic!("a damaged base at {offset} was not stale: {other:?}"),
+        }
+        assert_eq!(state(&b), before);
+    }
+    let pulled = b.receive("a", &Bundle::from(bytes), refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.head_hash(), a.head_hash());
+    b.verify().unwrap();
+}
+
+#[test]
 fn a_bundle_survives_local_commits_made_after_its_have() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (open(&dir, "a.ferro"), open(&dir, "b.ferro"));
@@ -2178,6 +2213,83 @@ fn a_fast_forward_keeps_history_that_another_branch_pruned() {
     assert_eq!(b.log().len(), 12);
     assert_eq!(dump(&b.at(3).unwrap()).len(), 3);
     b.verify().unwrap();
+}
+
+#[test]
+fn keep_last_prunes_a_branch_a_pull_brings_up_and_the_branch_it_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open(&dir, "a.ferro");
+    let b: Db<Root> = fast()
+        .history(Keep::Last(2))
+        .reclaim(Reclaim { every_bytes: 0 })
+        .open(dir.path().join("b.ferro"))
+        .unwrap();
+    let lens = |b: &Db<Root>| (b.log().len(), b.branch("a").unwrap().log().len());
+    for key in 1..=20 {
+        put(&a, key, "a");
+    }
+    let pulled = b.pull(&a, "a", refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(lens(&b), (2, 2));
+    assert!(matches!(b.at(5), Err(Error::NoVersion(5))));
+    assert_eq!(b.head_hash(), a.head_hash());
+
+    for key in 21..=25 {
+        put(&a, key, "a");
+    }
+    let pulled = b.pull(&a, "a", refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!((lens(&b), b.version()), ((2, 2), 25));
+
+    put(&b, 100, "b");
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::Ahead);
+    assert_eq!(lens(&b), (2, 2));
+
+    for key in 26..=30 {
+        put(&a, key, "a");
+    }
+    let refused = b.try_pull(&a, "a", |_, _, _| {
+        Err::<(String, ()), Error>(Error::Decode("refused".into()))
+    });
+    assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
+    assert_eq!(b.branch("a").unwrap().version(), 30);
+    let pulled = b.pull(&a, "a", theirs_win).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    assert_eq!(lens(&b), (2, 2));
+    let landed = b.branch("a").unwrap();
+    assert_eq!(b.common_ancestor(&landed).unwrap().version(), 30);
+    let mut expected: BTreeMap<u64, String> = (1..=30).map(|key| (key, "a".to_string())).collect();
+    expected.insert(100, "b".to_string());
+    assert_eq!(dump(&b.read()), expected);
+
+    b.compact(Keep::Last(2)).unwrap();
+    b.verify().unwrap();
+    b.verify_typed().unwrap();
+
+    put(&a, 31, "a");
+    put(&b, 105, "b");
+    assert_eq!(
+        b.pull(&a, "a", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(lens(&b), (2, 2));
+    expected.insert(31, "a".to_string());
+    expected.insert(105, "b".to_string());
+    assert_eq!(dump(&b.read()), expected);
+    assert_eq!(
+        a.pull(&b, "b", theirs_win).unwrap().outcome,
+        Outcome::Merged
+    );
+    assert_eq!(dump(&a.read()), expected);
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::UpToDate);
+    assert_eq!(lens(&b), (2, 3));
+    assert_eq!(b.pull(&a, "a", refuse).unwrap().outcome, Outcome::UpToDate);
+    b.compact(Keep::Last(2)).unwrap();
+    assert_eq!(lens(&b), (2, 2));
+    for db in [&a, &b] {
+        db.verify().unwrap();
+        db.verify_typed().unwrap();
+    }
 }
 
 #[test]
@@ -6113,7 +6225,7 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     }
     let landed = b.branch("a").unwrap();
     assert_eq!(landed.head_hash(), a.head_hash());
-    assert_eq!(landed.log().first().unwrap().0, 1);
+    assert_eq!(landed.log().first().unwrap().0, 2);
     assert_eq!(
         b.common_ancestor(&landed).unwrap().commit().message,
         "put 3"
