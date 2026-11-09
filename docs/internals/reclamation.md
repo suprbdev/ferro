@@ -865,7 +865,8 @@ pause longer. That did not happen in any run here, at up to 19,000 commits a sec
 bounds it.
 
 `Space::live_bytes` is an estimate: the size of this generation when it began, plus the bytes since
-then scaled by the share that survived the last cycle. Before the first cycle it is the file size.
+then scaled by the share that survived the last cycle, all measured on the log, which ends before
+any zeroes a writer preallocated. Before the first cycle it is the log's size, `Space::log_bytes`.
 `verify` still gives the exact number.
 
 ## Offline compaction

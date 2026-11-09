@@ -37,9 +37,14 @@ thread and copies the trees it reaches, checking every object's hash, on up to s
 `Options::copy_threads` sets the total, which defaults to the number of cores up to 8, and
 `copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads,
 as [The copy on several threads](../internals/reclamation.md#the-copy-on-several-threads) describes.
-`space` also reports `cycles` run, the `longest_pause` and the `last_error` of a background cycle.
-`compact` returns a `Compacted` with `before_bytes`, `after_bytes`, `objects` copied,
-`commits_dropped`, `passes`, `pause` and `handed_out`, the trees it copied as units.
+`space` reports the file's length as `file_bytes`, the bytes its log takes as `log_bytes`, and the
+`live_bytes` estimate, which is at most `log_bytes`, itself at most `file_bytes`. The difference
+between the last two is zeroes that a writer under `Durability::Fsync` preallocates past the log,
+up to 4 MiB, which an exclusive writer truncates when it closes and the next writer to open
+truncates otherwise. `space` also reports `cycles` run, the `longest_pause` and the `last_error` of
+a background cycle. `compact` returns a `Compacted` with `before_bytes` and `after_bytes`, the
+lengths of the old and the new file, `objects` copied, `commits_dropped`, `passes`, `pause` and
+`handed_out`, the trees it copied as units.
 
 ## What pruning means
 

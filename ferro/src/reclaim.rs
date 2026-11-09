@@ -96,9 +96,10 @@ impl Default for Reclaim {
 /// [`admin::compact`](crate::admin::compact).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Compacted {
-    /// The size of the file before the cycle, in bytes.
+    /// The length of the file before the cycle, in bytes, zeroes a writer preallocated past its
+    /// log included.
     pub before_bytes: u64,
-    /// The size of the new file, in bytes.
+    /// The length of the new file, in bytes, once the cycle has swapped it in.
     pub after_bytes: u64,
     /// The number of objects copied into the new file.
     pub objects: u64,
@@ -120,11 +121,17 @@ pub struct Compacted {
 /// or [`admin::space`](crate::admin::space).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Space {
-    /// The size of the file, in bytes.
+    /// The length of the file, in bytes. It includes the zeroes that a writer under
+    /// [`Durability::Fsync`](crate::Durability::Fsync) preallocates past the log, up to 4 MiB,
+    /// which an exclusive writer truncates when it closes and the next writer to open truncates
+    /// otherwise, so it is never less than [`Space::log_bytes`].
     pub file_bytes: u64,
-    /// An estimate of the bytes that retained versions take: the size after the last cycle, plus
-    /// the share of the growth since then that the last cycle found survives, or the whole file if
-    /// no cycle has run on it.
+    /// The bytes the file's log takes, from the start of the file to the end of its newest
+    /// commit, as [`Db::size_on_disk`](crate::Db::size_on_disk) reports them.
+    pub log_bytes: u64,
+    /// An estimate of the bytes that retained versions take: the log's size after the last cycle,
+    /// plus the share of the log's growth since then that the last cycle found survives, or the
+    /// whole log if no cycle has run on it. It is never more than [`Space::log_bytes`].
     pub live_bytes: u64,
     /// The bytes of files that cycles replaced but that held snapshots, maps, logs, histories or
     /// [`Db::watch_changes`](crate::Db::watch_changes) watchers keep open. On a read-only handle it

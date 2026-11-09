@@ -73,7 +73,7 @@ pub struct BranchInfo {
 /// What [`info`] reports of a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Info {
-    /// The size of the file in bytes.
+    /// The length of the file in bytes, zeroes a writer preallocated past its log included.
     pub file_bytes: u64,
     /// Every branch in the file, sorted by name. `main` is listed once it has a commit.
     pub branches: Vec<BranchInfo>,
@@ -94,8 +94,8 @@ fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
     Ok(refs::load(store, head, None)?.0)
 }
 
-/// The size of the file at `path`, and each branch with its version, commit count and last commit
-/// time.
+/// The length of the file at `path`, and each branch with its version, commit count and last
+/// commit time.
 ///
 /// # Errors
 ///
@@ -124,6 +124,7 @@ fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
 /// ```
 pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     let (store, head) = read_only(path.as_ref())?;
+    let file_bytes = store.file_len()?;
     let refs = load_refs(&store, head)?;
     let mut branches = Vec::new();
     for (name, branch) in refs.try_entries()? {
@@ -140,7 +141,7 @@ pub fn info(path: impl AsRef<Path>) -> Result<Info> {
     }
     store.close();
     Ok(Info {
-        file_bytes: store.size(),
+        file_bytes,
         branches,
     })
 }
@@ -189,7 +190,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
 /// values of a branch, and that each branch's merge records name a branch the table holds.
 pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {
     let mut report = crate::Verified {
-        file_bytes: store.size(),
+        file_bytes: store.file_len()?,
         ..crate::Verified::default()
     };
     if let Some(ptr) = head {
@@ -521,7 +522,9 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 /// over the old one atomically and syncs the directory, so a crash leaves one file or the other.
 /// It needs free disk for everything retained. No writer waits, so the report's `pause` is zero
 /// and its `passes` 1. A file with no commit yet has nothing to copy: it is left as it is, and the
-/// report's `passes` and `objects` are 0. A program with the file open calls
+/// report's `passes` and `objects` are 0. The report's `before_bytes` is the file's length as the
+/// call found it, zeroes that a writer preallocated past the log and opening trims included, and
+/// its `after_bytes` the length of the file it leaves. A program with the file open calls
 /// [`Db::compact`](crate::Db::compact) instead, which runs while its writers do.
 ///
 /// # Errors
@@ -556,22 +559,24 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     let real = fs::canonicalize(path.as_ref())?;
     let path = real.as_path();
+    let before_bytes = fs::metadata(path)?.len();
     let (store, head) = Store::open_existing(path, StoreOptions::default())?;
-    let before_bytes = store.size();
     let Some(head) = head else {
+        let after_bytes = store.file_len();
         store.close();
         return Ok(Compacted {
             before_bytes,
-            after_bytes: before_bytes,
+            after_bytes: after_bytes?,
             ..Compacted::default()
         });
     };
     let refs = load_refs(&store, Some(head)).inspect_err(|_| store.close())?;
     let temp = sibling(path);
-    let result = write_copy(&store, &refs, keep, &temp, before_bytes).and_then(|mut report| {
+    let result = write_copy(&store, &refs, keep, &temp).and_then(|mut report| {
+        report.before_bytes = before_bytes;
+        report.after_bytes = fs::metadata(&temp)?.len();
         rename(&temp, path)?;
         sync_parent(path)?;
-        report.before_bytes = before_bytes;
         Ok(report)
     });
     if result.is_err() {
@@ -581,21 +586,14 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     result
 }
 
-fn write_copy(
-    store: &Store,
-    refs: &Refs,
-    keep: Keep,
-    temp: &Path,
-    before: u64,
-) -> Result<Compacted> {
+fn write_copy(store: &Store, refs: &Refs, keep: Keep, temp: &Path) -> Result<Compacted> {
     let (pruned, commits_dropped) = pruned(store, refs, keep)?;
     let mut copier = Copier::create(store, temp, &StoreOptions::default(), None)?;
     copier.pass(&pruned)?;
     let after = copier.end();
-    let survival = after as f64 / before.max(1) as f64;
+    let survival = after as f64 / store.size().max(1) as f64;
     let (_, objects) = copier.finish(&pruned, store.last_seq(), survival)?;
     Ok(Compacted {
-        after_bytes: copier.end(),
         objects,
         commits_dropped,
         passes: 1,

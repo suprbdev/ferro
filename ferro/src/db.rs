@@ -3527,7 +3527,7 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Compacted> {
         let mut report = Compacted {
-            before_bytes: store.size(),
+            before_bytes: store.file_len()?,
             commits_dropped: self.prune(keep, notices)?,
             ..Compacted::default()
         };
@@ -3576,7 +3576,7 @@ impl<T: Data> Shared<T> {
             notices.extend(Self::reseat(branch, state));
         }
         self.step("swapped");
-        report.after_bytes = fresh.size();
+        report.after_bytes = fresh.file_len().unwrap_or_else(|_| fresh.size());
         report.objects = objects;
         self.retire(store);
         Ok(report)
@@ -3676,7 +3676,10 @@ impl<T: Data> Db<T> {
         self.shared.path.clone()
     }
 
-    /// The size of the file in bytes.
+    /// The bytes the file's log takes, from the start of the file to the end of its newest commit.
+    ///
+    /// The file itself can be up to 4 MiB longer, by zeroes a writer preallocated past the log;
+    /// [`Space::file_bytes`] from [`Db::space`] is its length.
     pub fn size_on_disk(&self) -> u64 {
         self.shared.store().size()
     }
@@ -3684,21 +3687,23 @@ impl<T: Data> Db<T> {
     /// How the file's size compares with what it holds, and how reclamation has gone.
     ///
     /// [`Space::live_bytes`] is an estimate from the share of bytes the last reclamation cycle
-    /// kept, or the whole file before any cycle has run.
+    /// kept, or the whole log before any cycle has run, and is at most [`Space::log_bytes`], which
+    /// is at most [`Space::file_bytes`].
     ///
     /// # Errors
     ///
-    /// This call does not fail at present.
+    /// [`Error::Io`] if the file's length cannot be read.
     pub fn space(&self) -> Result<Space> {
         let store = self.shared.store();
-        let file_bytes = store.size();
+        let log_bytes = store.size();
+        let file_bytes = store.file_len()?;
         let basis = store.basis();
         let live_bytes = if basis.bytes == 0 {
-            file_bytes
+            log_bytes
         } else {
-            let grown = file_bytes.saturating_sub(basis.bytes) as f64;
+            let grown = log_bytes.saturating_sub(basis.bytes) as f64;
             let survived = (grown * basis.survival()) as u64;
-            basis.bytes.saturating_add(survived).min(file_bytes)
+            basis.bytes.saturating_add(survived).min(log_bytes)
         };
         let retired = self.shared.retired.lock();
         let retired_bytes = retired.iter().filter_map(Retired::bytes).sum();
@@ -3706,6 +3711,7 @@ impl<T: Data> Db<T> {
         let log = self.shared.log.lock();
         Ok(Space {
             file_bytes,
+            log_bytes,
             live_bytes,
             retired_bytes,
             cycles: log.cycles,
@@ -5593,7 +5599,7 @@ pub struct Verified {
     pub objects: u64,
     /// The bytes those objects take in the file.
     pub bytes: u64,
-    /// The size of the file in bytes.
+    /// The length of the file in bytes, zeroes a writer preallocated past its log included.
     pub file_bytes: u64,
 }
 

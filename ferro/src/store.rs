@@ -2661,6 +2661,17 @@ impl Store {
         Ok(self.inner.file.metadata()?)
     }
 
+    /// The length of the file in bytes, zeroes preallocated past the log included, and never less
+    /// than [`Store::size`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file's metadata cannot be read.
+    pub(crate) fn file_len(&self) -> Result<u64> {
+        let log = self.size();
+        Ok(self.metadata()?.len().max(log))
+    }
+
     /// A clone that waits out a count passing through zero, for a handle that may hold no count of
     /// its own.
     ///
