@@ -109,10 +109,12 @@ file, or this one pruned or dropped that commit after sending its have, even whi
 arriving, `receive` returns `Error::StaleHave` and lands nothing: build a new bundle from a fresh
 have and try again. A bundle damaged where it names that commit gets the same error, and the same
 retry fetches an undamaged one. With `Options::shared`, `have` first catches up with what other
-processes committed, so a fresh have names nothing another process has dropped or pruned. Only you
-can fetch that bundle, so `receive` and `receive_from` leave the retry to you. `pull` and `push`
-hold both files, so they send a fresh have and try again themselves, up to three attempts in all,
-and return `StaleHave` only if this file moved under all three.
+processes committed, so a fresh have names nothing another process has dropped or pruned, and
+`receive` and `bundle` catch up too, so a bundle lands in a process other than the one that sent
+the have, and a bundle carries the newest head another process committed. Only you can fetch that
+bundle, so `receive` and `receive_from` leave the retry to you. `pull` and `push` hold both files,
+so they send a fresh have and try again themselves, up to three attempts in all, and return
+`StaleHave` only if this file moved under all three.
 A stale have is found before your merge closure can run, so the closure never runs for an
 attempt that is tried again, only for the one that landed, as often as a merge runs it (more than
 once after a criss-cross, as [Merging](merging.md#limits) describes), and `try_pull` and `try_push`

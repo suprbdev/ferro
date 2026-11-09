@@ -269,9 +269,10 @@ each from inside some 14,000 kept frames, one thread took 166 ms where it takes 
 threads 726 where they take 29.
 
 Catching up happens when a process takes a branch lock, before it places a frame, on each
-`Db::branch` and `Db::have`, before each pass of a cycle and on `refresh`, and on a look of a
-[follower](#followers) that finds a superblock naming a frame past its own. A process that does none
-of these sees nothing new, as a read-only handle that never refreshes sees nothing new.
+`Db::branch`, `Db::have`, `Db::bundle` and `Db::receive`, before each pass of a cycle and on
+`refresh`, and on a look of a [follower](#followers) that finds a superblock naming a frame past its
+own. A process that does none of these sees nothing new, as a read-only handle that never refreshes
+sees nothing new.
 
 Catching up only rebuilds branches that are attached. A branch attached later takes its state from
 the published refs, so attaching first catches up and syncs what is queued, and then attaches only

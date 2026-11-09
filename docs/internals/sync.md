@@ -300,6 +300,19 @@ so did every `receive` of a bundle built from a fresh have (#129).
 commit, before the other handle pulls, and then build a have, drop the branch under it and expect
 `StaleHave` from the `receive` and a landing from the next have.
 
+Staging finds the commits a bundle builds on in the branch table as last published too, so
+`receive` and `receive_from` catch up first under `Options::shared` as well. Before, a bundle built
+from a have that another handle or process on the file sent, as when one server process answers
+the have and another applies the bundle, named commits the receiving process had not caught up
+with: `StaleHave` said the file did not hold them, and every fresh have from the other process got
+the same answer until the receiving one committed, attached a branch or refreshed (#131). The
+sending side had the same gap: `bundle`, `bundle_to` and the sending half of `pull` and `push` read
+the branch as last published, so a process that had not caught up sent an older head than its file
+held. They catch up first now too. `a_bundle_built_from_another_handles_have_lands` and
+`a_bundle_over_a_mebibyte_built_from_another_handles_have_lands` in `ferro/tests/shared.rs` receive
+through a handle that never caught up, a bundle staged in memory and one staged in a scratch file,
+and `a_pull_from_a_handle_behind_another_sends_the_newest_head` pulls, bundles and pushes from one.
+
 `a_try_pull_retries_a_stale_have_before_its_error_type_and_returns_its_merge_error_once` and
 `a_push_whose_base_goes_before_it_lands_tries_again_and_merges_once` in `ferro/tests/sync.rs` prune
 the base once, the first before the bundle is read and the second once it is staged, and expect one

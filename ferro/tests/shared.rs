@@ -1942,6 +1942,83 @@ fn a_pull_after_another_handle_pulled_into_its_tracking_branch_and_pruned_it_lan
     pull_after_another_handle_moved_its_tracking_branch(Moved::PulledAndPruned);
 }
 
+fn merge_spread(
+    spread: &mut Spread,
+    base: &Snapshot<Spread>,
+    theirs: &Snapshot<Spread>,
+) -> (&'static str, ()) {
+    spread.merge(base, theirs, |conflict| conflict.keep_theirs());
+    ("pull", ())
+}
+
+fn receive_through_a_handle_behind_the_one_that_sent_the_have(count: u64, len: usize) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.ferro");
+    let answers: Db<Spread> = manual().open(&path).unwrap();
+    let applies: Db<Spread> = manual().open(&path).unwrap();
+    let phone: Db<Spread> = fast().open(dir.path().join("phone.ferro")).unwrap();
+    answers
+        .update(|spread| spread.insert(0, "zero".to_string()))
+        .unwrap();
+    let pulled = phone.pull(&answers, "server", merge_spread).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    phone
+        .update(|spread| {
+            for key in 1..=count {
+                spread.insert(key, common::text(key, len));
+            }
+        })
+        .unwrap();
+    let bundle = phone.bundle(&answers.have().unwrap()).unwrap();
+    let pulled = applies.receive("phone", &bundle, merge_spread).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    let again = phone.bundle(&answers.have().unwrap()).unwrap();
+    let pulled = applies.receive("phone", &again, merge_spread).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::UpToDate);
+    answers.refresh().unwrap();
+    assert_eq!(answers.head_hash(), phone.head_hash());
+    assert_eq!(spread_of(&answers), spread_of(&phone));
+    answers.verify_typed().unwrap();
+    bundle.as_bytes().len()
+}
+
+#[test]
+fn a_bundle_built_from_another_handles_have_lands() {
+    let sent = receive_through_a_handle_behind_the_one_that_sent_the_have(20, 16);
+    assert!(sent < 1 << 20);
+}
+
+#[test]
+fn a_bundle_over_a_mebibyte_built_from_another_handles_have_lands() {
+    let sent = receive_through_a_handle_behind_the_one_that_sent_the_have(1_500, 1_000);
+    assert!(sent > 1 << 20, "{sent}");
+}
+
+#[test]
+fn a_pull_from_a_handle_behind_another_sends_the_newest_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.ferro");
+    let writes: Db<Kv> = manual().open(&path).unwrap();
+    let serves: Db<Kv> = manual().open(&path).unwrap();
+    let phone: Db<Kv> = fast().open(dir.path().join("phone.ferro")).unwrap();
+    writes.update(|kv| kv.insert(1, 1)).unwrap();
+    let pulled = phone.pull(&serves, "server", merge_keeping_ours).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    assert_eq!(phone.head_hash(), writes.head_hash());
+    writes.update(|kv| kv.insert(2, 2)).unwrap();
+    let bundle = serves.bundle(&phone.have().unwrap()).unwrap();
+    let pulled = phone
+        .receive("server", &bundle, merge_keeping_ours)
+        .unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    assert_eq!(phone.head_hash(), writes.head_hash());
+    writes.update(|kv| kv.insert(3, 3)).unwrap();
+    let pulled = serves.push(&phone, "server", merge_keeping_ours).unwrap();
+    assert_eq!(pulled.outcome, ferro::Outcome::FastForward);
+    assert_eq!(phone.read().get(&3).as_deref(), Some(&3));
+    phone.verify_typed().unwrap();
+}
+
 fn expected(error: &Error) -> bool {
     matches!(
         error,

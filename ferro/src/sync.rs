@@ -3449,12 +3449,15 @@ impl<T: Data> Db<T> {
     /// reach that it does not hold.
     ///
     /// It costs what changed since the newest commit both files hold, and the first bundle for a
-    /// file that shares no commit with this one carries everything. It reads the branch as last
-    /// published and holds no writer lock.
+    /// file that shares no commit with this one carries everything. With
+    /// [`Options::shared`](crate::Options::shared) it first catches up with commits from other
+    /// processes, as [`Db::have`] does, so it sends the newest head this file holds. It then reads
+    /// the branch as last published and holds no writer lock while it builds the bundle.
     ///
     /// # Errors
     ///
-    /// [`Error::Bundle`] if `have` is not a have, and read errors.
+    /// [`Error::Bundle`] if `have` is not a have, read errors, and with
+    /// [`Options::shared`](crate::Options::shared) the errors of [`Db::refresh`].
     pub fn bundle(&self, have: &Have) -> Result<Bundle> {
         let mut out = Vec::new();
         self.bundle_to(have, &mut out)?;
@@ -3470,6 +3473,7 @@ impl<T: Data> Db<T> {
     ///
     /// As for [`Db::bundle`], and [`Error::Io`] if writing to `out` fails.
     pub fn bundle_to(&self, have: &Have, mut out: impl Write) -> Result<u64> {
+        self.caught_up()?;
         self.emitter(have)?.write_to(&mut out)
     }
 
@@ -3489,7 +3493,9 @@ impl<T: Data> Db<T> {
     /// commits passed through, so a change that reaches this file through a third device is
     /// merged once. A pulled commit keeps the version, time, message and hash it had, while a merge
     /// commits at this branch's next version, so compare commits across files by hash. A pull that
-    /// brings new commits replaces the branch `remote`, so do not commit to it.
+    /// brings new commits replaces the branch `remote`, so do not commit to it. Under
+    /// [`Options::shared`](crate::Options::shared) each file first catches up with commits from
+    /// other processes, so the pull sends the newest head the file of `from` holds.
     ///
     /// If this file prunes or drops what the bundle builds on while it is sent, nothing lands, and
     /// the pull sends a fresh have and tries again, up to three attempts in all. That is found
@@ -3504,6 +3510,9 @@ impl<T: Data> Db<T> {
     ///   sent, on each of the three attempts. Nothing landed and `merge` did not run.
     /// - [`Error::NoCommonAncestor`] when the merge base could lie in pruned history. The remote
     ///   branch has landed, and this branch is as it was.
+    /// - [`Error::NoBranch`] if this handle's branch is dropped while the pull runs, or the branch
+    ///   `remote` is dropped between its landing and bringing this branch up to it, as another
+    ///   handle or process can do. This branch is as it was.
     /// - [`Error::Bundle`] if what `from` sends fails the checks, which for an open file means it
     ///   is damaged, or if checking it would decode or read more again than its size allows, as
     ///   one large value shared by many keys, or one large node reached under many key ranges,
@@ -3662,7 +3671,9 @@ impl<T: Data> Db<T> {
     /// file beside the database, under no writer lock, so commits on every branch go on meanwhile.
     /// Once the whole bundle has passed, its objects are copied into the file, and one frame
     /// points the branch `remote` at them, so a crash leaves the previous head. A bundle that
-    /// arrives late or twice changes nothing.
+    /// arrives late or twice changes nothing. With [`Options::shared`](crate::Options::shared) it
+    /// first catches up with commits from other processes, as [`Db::have`] does, so a bundle
+    /// built from a have that another handle or process on this file sent finds what it builds on.
     ///
     /// # Errors
     ///
@@ -3682,7 +3693,8 @@ impl<T: Data> Db<T> {
     ///   lands and `merge` does not run; build a new bundle from a fresh have, which is the way on
     ///   from a damaged one too. Only the caller can fetch one, so this is not retried as
     ///   [`Db::pull`] retries it.
-    /// - The other errors of [`Db::pull`].
+    /// - The other errors of [`Db::pull`], and with [`Options::shared`](crate::Options::shared)
+    ///   those of [`Db::refresh`].
     ///
     /// # Panics
     ///
@@ -3776,6 +3788,7 @@ impl<T: Data> Db<T> {
         input: impl Read,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
+        self.caught_up()?;
         let arrival = self.land_from(remote, input)?;
         self.bring_up(remote, arrival, merge)
     }
@@ -3783,6 +3796,7 @@ impl<T: Data> Db<T> {
     fn fetch(&self, from: &Db<T>, remote: &str) -> Result<(Arrival, u64)> {
         drop(self.entering(Needs::Every)?);
         let have = self.have()?;
+        from.caught_up()?;
         let emitter = {
             let _theirs = from.entering(Needs::Tip)?;
             from.emitter(&have)?
