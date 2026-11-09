@@ -629,6 +629,477 @@ fn a_map_node_holding_a_value_in_a_form_no_encoder_writes_fails_to_read() {
     assert!(db.verify_typed().is_err());
 }
 
+#[derive(Clone, Default)]
+struct Obj {
+    body: Vec<u8>,
+    links: Vec<usize>,
+}
+
+#[derive(Clone, Default)]
+struct Objects(Arc<Vec<Obj>>);
+
+fn write_obj(w: &mut Encoder<'_>, obj: &Obj, ptrs: &[Ptr]) {
+    w.raw(&obj.body);
+    for &link in &obj.links {
+        w.link(ptrs[link]);
+    }
+}
+
+impl Data for Objects {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        let Some((root, children)) = self.0.split_last() else {
+            return Ok(());
+        };
+        let mut ptrs = Vec::new();
+        for obj in children {
+            let ptr = w.child(|inner| {
+                write_obj(inner, obj, &ptrs);
+                Ok(())
+            })?;
+            ptrs.push(ptr);
+        }
+        write_obj(w, root, &ptrs);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        r.take(r.remaining())?;
+        while r.link().is_ok() {}
+        Ok(Objects::default())
+    }
+}
+
+#[derive(Default)]
+struct Forge(Vec<Obj>);
+
+impl Forge {
+    fn add(&mut self, obj: Obj) -> usize {
+        self.0.push(obj);
+        self.0.len() - 1
+    }
+
+    fn file(mut self, root: Obj) -> (tempfile::TempDir, std::path::PathBuf) {
+        self.0.push(root);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forged.ferro");
+        let db = ferro::Db::<Objects>::open(&path).unwrap();
+        let objects = Objects(Arc::new(self.0));
+        db.update(|root| *root = objects).unwrap();
+        drop(db);
+        (dir, path)
+    }
+}
+
+fn varint_bytes(value: u64) -> Vec<u8> {
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    encoder.varint(value);
+    encoder.bytes().to_vec()
+}
+
+enum Slot {
+    Inline(Vec<u8>),
+    Apart(usize, Vec<u8>),
+}
+
+struct Child {
+    at: usize,
+    count: u64,
+    summary: Vec<u8>,
+    obj: usize,
+}
+
+fn forged_node<K: Data>(level: u8, keys: &[K], slots: Vec<Slot>, children: Vec<Child>) -> Obj {
+    let mut body = vec![level];
+    body.extend(varint_bytes(keys.len() as u64));
+    for key in keys {
+        body.extend(body_of(key));
+    }
+    let mut links = Vec::new();
+    for slot in slots {
+        match slot {
+            Slot::Inline(value) => {
+                body.push(0);
+                body.extend(value);
+            }
+            Slot::Apart(obj, summary) => {
+                body.push(1);
+                body.extend(summary);
+                links.push(obj);
+            }
+        }
+    }
+    for position in 0..=keys.len() {
+        match children.iter().find(|child| child.at == position) {
+            Some(child) => {
+                body.extend(varint_bytes(child.count));
+                body.extend(child.summary.iter().copied());
+                links.push(child.obj);
+            }
+            None => body.push(0),
+        }
+    }
+    Obj { body, links }
+}
+
+fn forged_root(count: u64, summary: Vec<u8>, top: usize) -> Obj {
+    let mut body = varint_bytes(count);
+    body.extend(summary);
+    Obj {
+        body,
+        links: vec![top],
+    }
+}
+
+fn keys_at(level: u32, count: usize, from: u64) -> Vec<u64> {
+    (from..)
+        .filter(|key| common::level_of(key) == level)
+        .take(count)
+        .collect()
+}
+
+fn inline<D: Data>(value: &D) -> Slot {
+    Slot::Inline(body_of(value))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Data)]
+struct Total(u64);
+
+impl ferro::Summary<u64, u64> for Total {
+    fn of(_key: &u64, value: &u64) -> Self {
+        Total(*value)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Total(self.0 + other.0)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Data)]
+struct Len(u64);
+
+impl ferro::Summary<u64, ferro::Bytes> for Len {
+    fn of(_key: &u64, value: &ferro::Bytes) -> Self {
+        Len(value.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Len(self.0 + other.0)
+    }
+}
+
+fn one_entry(
+    slot: impl FnOnce(&mut Forge) -> Slot,
+    summary: Vec<u8>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let key = keys_at(0, 1, 1)[0];
+    let mut forge = Forge::default();
+    let slot = slot(&mut forge);
+    let top = forge.add(forged_node(0, &[key], vec![slot], vec![]));
+    forge.file(forged_root(1, summary, top))
+}
+
+fn apart(body: Vec<u8>, summary: Vec<u8>) -> impl FnOnce(&mut Forge) -> Slot {
+    move |forge| {
+        let obj = forge.add(Obj {
+            body,
+            links: Vec::new(),
+        });
+        Slot::Apart(obj, summary)
+    }
+}
+
+fn typed_verdict<T: Data + Default>(path: &std::path::Path) -> ferro::Result<ferro::Verified> {
+    ferro::admin::verify(path).unwrap();
+    ferro::Db::<T>::open(path).unwrap().verify_typed()
+}
+
+fn received<T: Data + Default>(path: &std::path::Path) -> ferro::Result<()> {
+    let sender = ferro::Db::<T>::open(path).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let receiver = ferro::Db::<T>::open(dir.path().join("receiver.ferro")).unwrap();
+    let bundle = sender.bundle(&receiver.have().unwrap()).unwrap();
+    let received = receiver.receive("peer", &bundle, |_, _, _| ("merge", ()));
+    assert_eq!(receiver.version(), 0);
+    received.map(drop)
+}
+
+fn refused_as(outcome: ferro::Result<ferro::Verified>, ending: &str) {
+    assert!(
+        matches!(&outcome, Err(ferro::Error::Corrupt(message)) if message.ends_with(ending)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn verify_typed_and_receive_refuse_a_small_value_stored_apart_from_its_node() {
+    let small = |len: usize| {
+        format!(
+            "a value of {len} bytes is stored apart from its node, where one under 512 stays in it"
+        )
+    };
+    let (_dir, path) = one_entry(apart(body_of(&5u64), Vec::new()), Vec::new());
+    refused_as(typed_verdict::<Map<u64, u64>>(&path), &small(1));
+    assert!(matches!(
+        received::<Map<u64, u64>>(&path),
+        Err(ferro::Error::Bundle(_))
+    ));
+
+    let total = body_of(&Total(5));
+    let (_dir, path) = one_entry(apart(body_of(&5u64), total.clone()), total);
+    refused_as(typed_verdict::<Summed>(&path), &small(1));
+    assert!(matches!(
+        received::<Summed>(&path),
+        Err(ferro::Error::Bundle(_))
+    ));
+
+    let value = ferro::Bytes::from(vec![7; 509]);
+    let (_dir, path) = one_entry(apart(body_of(&value), Vec::new()), Vec::new());
+    refused_as(typed_verdict::<Map<u64, ferro::Bytes>>(&path), &small(511));
+}
+
+#[test]
+fn verify_typed_and_receive_refuse_a_large_value_stored_in_its_node() {
+    let large = "a value of 512 bytes sits in its node, where one of 512 or more is stored apart";
+    let value = ferro::Bytes::from(vec![7; 510]);
+    let (_dir, path) = one_entry(|_| inline(&value), Vec::new());
+    refused_as(typed_verdict::<Map<u64, ferro::Bytes>>(&path), large);
+    assert!(matches!(
+        received::<Map<u64, ferro::Bytes>>(&path),
+        Err(ferro::Error::Bundle(_))
+    ));
+
+    let (_dir, path) = one_entry(|_| inline(&value), body_of(&Len(510)));
+    refused_as(typed_verdict::<Map<u64, ferro::Bytes, Len>>(&path), large);
+    assert!(matches!(
+        received::<Map<u64, ferro::Bytes, Len>>(&path),
+        Err(ferro::Error::Bundle(_))
+    ));
+}
+
+type Summed = Map<u64, u64, Total>;
+
+fn two_level(
+    parent_key: u64,
+    child_keys: &[u64],
+    child_count: u64,
+    child_summary: u64,
+    root_count: u64,
+    root_summary: u64,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let mut forge = Forge::default();
+    let parent_level = common::level_of(&parent_key) as u8;
+    let child_level = child_keys
+        .first()
+        .map_or(0, |key| common::level_of(key) as u8);
+    let child = forge.add(forged_node(
+        child_level,
+        child_keys,
+        child_keys.iter().map(inline).collect(),
+        vec![],
+    ));
+    let top = forge.add(forged_node(
+        parent_level,
+        &[parent_key],
+        vec![inline(&parent_key)],
+        vec![Child {
+            at: 0,
+            count: child_count,
+            summary: body_of(&Total(child_summary)),
+            obj: child,
+        }],
+    ));
+    forge.file(forged_root(root_count, body_of(&Total(root_summary)), top))
+}
+
+#[test]
+fn verify_typed_reports_each_way_a_forged_map_node_disagrees_with_its_parent() {
+    let high = keys_at(1, 1, 1000)[0];
+    let low: Vec<u64> = keys_at(0, 3, 1)
+        .into_iter()
+        .filter(|key| *key < high)
+        .collect();
+    assert_eq!(low.len(), 3);
+    let sum = |keys: &[u64]| keys.iter().sum::<u64>();
+    let all = sum(&low) + high;
+
+    let (_dir, good) = two_level(high, &low, 3, sum(&low), 4, all);
+    let db = ferro::Db::<Summed>::open(&good).unwrap();
+    db.verify_typed().unwrap();
+    assert_eq!(db.read().summary(), Some(Total(all)));
+    drop(db);
+
+    let fits = "not what its parent records";
+    let fold = "a map node's link records a summary that is not the fold of its entries";
+    let level = "a key sits at a level it does not hash to";
+    let swapped = [low[1], low[0], low[2]];
+    let escaped = keys_at(0, 1, high + 1)[0];
+    let outside = [low[0], low[1], escaped];
+    let twice = [low[0], low[1], high];
+    let level_ones: Vec<u64> = keys_at(1, 2, 1)
+        .into_iter()
+        .filter(|key| *key < high)
+        .collect();
+    assert_eq!(level_ones.len(), 2);
+    let cases = [
+        (two_level(high, &low, 2, sum(&low), 3, all), fits),
+        (two_level(high, &low, 3, sum(&low) + 1, 4, all + 1), fold),
+        (two_level(high, &low, 3, sum(&low), 4, all + 1), fold),
+        (two_level(high, &low, 3, sum(&low), 5, all), fits),
+        (
+            two_level(high, &swapped, 3, sum(&low), 4, all),
+            "node keys are out of order",
+        ),
+        (
+            two_level(high, &outside, 3, sum(&outside), 4, sum(&outside) + high),
+            "node keys fall outside the range their parent gives them",
+        ),
+        (
+            two_level(high, &twice, 3, sum(&twice), 4, sum(&twice) + high),
+            level,
+        ),
+        (
+            two_level(
+                high,
+                &level_ones,
+                2,
+                sum(&level_ones),
+                3,
+                sum(&level_ones) + high,
+            ),
+            fits,
+        ),
+        (
+            one_entry(
+                apart(body_of(&5u64), body_of(&Total(6))),
+                body_of(&Total(6)),
+            ),
+            "stays in it",
+        ),
+        (
+            one_entry(
+                apart([body_of(&5u64), vec![0; 600]].concat(), body_of(&Total(6))),
+                body_of(&Total(6)),
+            ),
+            "a spilled value's entry records a summary that is not the fold of its entries",
+        ),
+        (
+            one_entry(
+                apart([body_of(&5u64), vec![0; 600]].concat(), body_of(&Total(5))),
+                body_of(&Total(5)),
+            ),
+            "600 bytes and 0 links are left after the value",
+        ),
+    ];
+    for ((_dir, path), ending) in cases {
+        refused_as(typed_verdict::<Summed>(&path), ending);
+    }
+}
+
+#[derive(ferro::Record, Data, Clone, Debug, PartialEq)]
+struct Blob {
+    #[key]
+    id: u64,
+    #[index]
+    tag: u32,
+    body: ferro::Bytes,
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Sized {
+    plain: Map<u64, ferro::Bytes>,
+    summed: Map<u64, ferro::Bytes, Len>,
+    nested: Map<u64, (ferro::Bytes, Map<u64, ferro::Bytes>)>,
+    rows: ferro::Table<Blob>,
+}
+
+fn sized(len: u64) -> ferro::Bytes {
+    ferro::Bytes::from(vec![len as u8; len as usize])
+}
+
+fn nested_value(len: u64) -> (ferro::Bytes, Map<u64, ferro::Bytes>) {
+    let inner = (500..=520).map(|inner| (inner, sized(inner))).collect();
+    (sized(len), inner)
+}
+
+fn blob(id: u64, len: u64) -> Blob {
+    Blob {
+        id,
+        tag: (id % 7) as u32,
+        body: sized(len),
+    }
+}
+
+#[test]
+fn values_at_either_side_of_the_spill_size_pass_verify_typed_and_receive() {
+    let lens = 480..=530;
+    let sizes = |encoded: Vec<usize>| encoded.contains(&511) && encoded.contains(&512);
+    assert!(sizes(
+        lens.clone().map(|len| body_of(&sized(len)).len()).collect()
+    ));
+    assert!(sizes(
+        lens.clone()
+            .map(|len| body_of(&nested_value(len)).len())
+            .collect()
+    ));
+    assert!(sizes(
+        lens.clone()
+            .map(|len| body_of(&blob(len, len)).len())
+            .collect()
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sized.ferro");
+    let db = ferro::Db::<Sized>::open(&path).unwrap();
+    let edits: [&dyn Fn(&mut Sized); 4] = [
+        &|root| {
+            for len in lens.clone() {
+                root.plain.insert(len, sized(len));
+                root.summed.insert(len, sized(len));
+                root.nested.insert(len, nested_value(len));
+                root.rows.insert(blob(len, len));
+            }
+        },
+        &|root| {
+            for len in lens.clone() {
+                root.plain.insert(len * 1000, sized(3));
+                root.summed.insert(len * 1000, sized(3));
+                root.rows.insert(blob(len * 1000, 3));
+            }
+        },
+        &|root| {
+            root.plain.rewrite();
+            root.nested.rewrite();
+            root.rows.rewrite();
+        },
+        &|root| {
+            for len in lens.clone().step_by(3) {
+                root.plain.remove(&len);
+                root.summed.remove(&len);
+                root.nested.remove(&len);
+                root.rows.remove(&len);
+            }
+        },
+    ];
+    for edit in edits {
+        db.update(edit).unwrap();
+        db.verify_typed().unwrap();
+    }
+    let receiver = ferro::Db::<Sized>::open(dir.path().join("receiver.ferro")).unwrap();
+    let bundle = db.bundle(&receiver.have().unwrap()).unwrap();
+    receiver
+        .receive("peer", &bundle, |root, _, theirs| {
+            *root = (**theirs).clone();
+            ("take", ())
+        })
+        .unwrap();
+    assert!(*receiver.read() == *db.read());
+    receiver.verify_typed().unwrap();
+    drop(db);
+    let db = ferro::Db::<Sized>::open(&path).unwrap();
+    db.verify_typed().unwrap();
+}
+
 #[test]
 fn a_map_node_with_bytes_after_its_entries_fails_a_typed_verify() {
     let (_dir, db) = forged_map([0x05, 0x00]);

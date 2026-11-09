@@ -346,3 +346,109 @@ fn db_snapshot_and_watcher_format_without_a_debug_bound() {
     assert_eq!(watcher.try_recv().unwrap_err(), TryRecvError::Empty);
     assert!(format!("{watcher:?}").contains("Watcher"));
 }
+
+fn list_missing_a_position(path: &std::path::Path) {
+    let db = fast().open::<Map<u64, String>>(path).unwrap();
+    db.update(|map| {
+        for (position, text) in [(0, "a"), (2, "b"), (3, "c")] {
+            map.insert(position, text.to_string());
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn verify_typed_reports_a_list_with_a_position_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.ferro");
+    list_missing_a_position(&path);
+    admin::verify(&path).unwrap();
+    let db = fast().open::<List<String>>(&path).unwrap();
+    assert_eq!(db.read().len(), 3);
+    assert!(db.read().get(1).is_none());
+    assert!(matches!(
+        db.verify_typed(),
+        Err(Error::Corrupt(message)) if message.ends_with("node keys fall outside the range their parent gives them")
+    ));
+}
+
+#[test]
+fn a_bundle_holding_a_list_with_a_position_missing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.ferro");
+    list_missing_a_position(&path);
+    let sender = fast().open::<List<String>>(&path).unwrap();
+    let receiver = fast()
+        .open::<List<String>>(dir.path().join("receiver.ferro"))
+        .unwrap();
+    let bundle = sender.bundle(&receiver.have().unwrap()).unwrap();
+    let received = receiver.receive("peer", &bundle, |_, _, _| ("merge", ()));
+    assert!(matches!(received, Err(Error::Bundle(_))), "{received:?}");
+    assert_eq!(receiver.branches(), ["main"]);
+    assert_eq!(receiver.version(), 0);
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Lists {
+    log: List<String>,
+    nested: Map<u64, List<u64>>,
+}
+
+#[test]
+fn lists_pushed_popped_set_and_truncated_pass_verify_typed_and_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lists.ferro");
+    let db = fast().open::<Lists>(&path).unwrap();
+    let steps: [fn(&mut Lists); 8] = [
+        |lists| lists.log.extend((0..300).map(|n| text(n, 8))),
+        |lists| {
+            lists.log.pop();
+            lists.log.pop();
+        },
+        |lists| {
+            lists.log.set(7, text(99, 600));
+            lists.log.push(text(98, 40));
+        },
+        |lists| lists.log.truncate(120),
+        |lists| {
+            for key in 0..20 {
+                lists.nested.insert(key, (0..key * 10).collect());
+            }
+        },
+        |lists| {
+            for key in 0..20 {
+                let mut list = (*lists.nested.get(&key).unwrap()).clone();
+                list.truncate(key as usize * 3);
+                list.push(key);
+                lists.nested.insert(key, list);
+            }
+        },
+        |lists| {
+            *lists.log.get_mut(0).unwrap() = text(1, 2000);
+            lists.log.clear();
+            lists.log.push(text(2, 3));
+        },
+        |lists| {
+            lists.nested.remove(&4);
+        },
+    ];
+    for step in steps {
+        db.update(step).unwrap();
+        db.verify_typed().unwrap();
+    }
+    let receiver = fast()
+        .open::<Lists>(dir.path().join("receiver.ferro"))
+        .unwrap();
+    let bundle = db.bundle(&receiver.have().unwrap()).unwrap();
+    receiver
+        .receive("peer", &bundle, |lists, _, theirs| {
+            *lists = (**theirs).clone();
+            ("take", ())
+        })
+        .unwrap();
+    assert_eq!(*receiver.read(), *db.read());
+    receiver.verify_typed().unwrap();
+    drop(db);
+    let db = fast().open::<Lists>(&path).unwrap();
+    db.verify_typed().unwrap();
+}

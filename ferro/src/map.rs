@@ -104,8 +104,10 @@ use crate::shared::{Erased, Shared, Weak};
 use crate::store::{Lent, MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
-/// The most encoded bytes a value can take and still be stored inside its node; a larger value is
-/// written as an object of its own, which its node links to.
+/// The most bytes a value can take in its node, its encoding and the tag byte before it; a larger
+/// value is written as an object of its own, which its node links to. So a value stored in its
+/// node encodes to fewer than this many bytes, and one stored apart to this many or more, which
+/// the typed checks hold every node to.
 pub(crate) const SPILL_BYTES: usize = 512;
 /// The levels of nesting, as [`MAX_DEPTH`] counts them, that a map opens when an encoding writes
 /// its nodes, below the value that holds it: writing a node takes about the stack of two levels of
@@ -1295,17 +1297,32 @@ fn node_kind<K: Data + Ord, V: Data, S: Summary<K, V>>(
     }
 }
 
-fn spill_kind<K: Data + Ord, V: Data, S: Summary<K, V>>(key: K, summary: S) -> Kind {
-    let claim = EntryClaim::<K, V, S> {
-        key,
-        summary,
-        value: PhantomData,
-    };
+struct Spilled<K, V, S>(PhantomData<(K, V, S)>);
+
+fn spill_kind<K: Data + Ord, V: Data, S: Summary<K, V>>(entry: Option<(K, S)>) -> Kind {
+    let claim = entry.map(|(key, summary)| {
+        Arc::new(EntryClaim::<K, V, S> {
+            key,
+            summary,
+            value: PhantomData,
+        }) as Arc<dyn Claim>
+    });
     Kind {
+        id: TypeId::of::<Spilled<K, V, S>>(),
         check: check_spill::<K, V, S>,
         held: held_spill::<K, V, S>,
-        claim: Some(Arc::new(claim)),
+        claim,
         ..Kind::value::<V>()
+    }
+}
+
+fn inline_fits(len: usize) -> Result<()> {
+    match len < SPILL_BYTES {
+        true => Ok(()),
+        false => Err(Error::Decode(format!(
+            "a value of {len} bytes sits in its node, where one of {SPILL_BYTES} or more is \
+             stored apart"
+        ))),
     }
 }
 
@@ -1313,6 +1330,13 @@ fn check_spill<K: Data + Ord, V: Data, S: Summary<K, V>>(
     kind: &Kind,
     r: &mut Decoder<'_>,
 ) -> Result<Shape> {
+    if r.remaining() < SPILL_BYTES {
+        return Err(Error::Decode(format!(
+            "a value of {} bytes is stored apart from its node, where one under {SPILL_BYTES} \
+             stays in it",
+            r.remaining()
+        )));
+    }
     let Some(claim) = claim_of::<EntryClaim<K, V, S>>(kind) else {
         V::visit(r)?;
         return Ok(Shape::default());
@@ -1468,9 +1492,13 @@ fn check_plain<K: Data + Ord, V: Data, S: Summary<K, V>>(
     }
     for _ in 0..n {
         match r.u8()? {
-            0 => V::visit(r)?,
+            0 => {
+                let before = r.remaining();
+                V::visit(r)?;
+                inline_fits(before - r.remaining())?;
+            }
             1 => {
-                r.typed_link(Kind::value::<V>)?;
+                r.typed_link(|| spill_kind::<K, V, S>(None))?;
                 S::visit(r)?;
             }
             other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
@@ -1530,7 +1558,9 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
     let start = r.checkpoint();
     'slots: loop {
         for key in keys {
-            match r.u8()? {
+            let tag = r.u8()?;
+            let before = r.remaining();
+            match tag {
                 0 if claim.is_some() && stored => {
                     parts.push(Part::Summary(entry_summary::<K, V, S>(key, r)?))
                 }
@@ -1556,7 +1586,7 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
                             linked = r.links_read() != links;
                             Ok(summary)
                         },
-                        |summary| spill_kind::<K, V, S>(key.clone(), summary.clone()),
+                        |summary| spill_kind::<K, V, S>(Some((key.clone(), summary.clone()))),
                     )?;
                     deferred |= claim.is_some() && !stored && linked;
                     if claim.is_some() {
@@ -1564,6 +1594,9 @@ fn check_summaries<K: Data + Ord, V: Data, S: Summary<K, V>>(
                     }
                 }
                 other => return Err(Error::Decode(format!("invalid slot tag {other}"))),
+            }
+            if tag == 0 {
+                inline_fits(before - r.remaining())?;
             }
         }
         break;
@@ -4974,6 +5007,28 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             .map(|(key, value)| (key, (*value).clone()))
             .collect()
     }
+
+    /// Decodes a map as [`Data::decode`] does, and with `high`, has the typed checks hold every
+    /// key it stores below the key `high` gives for its count.
+    pub(crate) fn decode_below(r: &mut Decoder<'_>, high: Option<fn(u64) -> K>) -> Result<Self> {
+        let count = r.varint()?;
+        let root = if count == 0 {
+            Link::Empty
+        } else {
+            let summary = S::decode(r)?;
+            let claim = || const { summarized::<S>() }.then(|| summary.clone());
+            let span = high.map(|high| (None, Some(high(count))));
+            Link::stored(
+                r.typed_link(|| node_kind::<K, V, S>(count, None, span, claim()))?,
+                count,
+                summary,
+            )
+        };
+        Ok(Map {
+            root,
+            store: r.store(),
+        })
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
@@ -5013,22 +5068,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Data for Map<K, V, S> {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        let count = r.varint()?;
-        let root = if count == 0 {
-            Link::Empty
-        } else {
-            let summary = S::decode(r)?;
-            let claim = || const { summarized::<S>() }.then(|| summary.clone());
-            Link::stored(
-                r.typed_link(|| node_kind::<K, V, S>(count, None, None, claim()))?,
-                count,
-                summary,
-            )
-        };
-        Ok(Map {
-            root,
-            store: r.store(),
-        })
+        Self::decode_below(r, None)
     }
 
     fn missing() -> Option<Self> {

@@ -14,7 +14,7 @@ cargo run --release -p ferro-cli -- compact shop.ferro --keep-last 1000
 | --- | --- |
 | `info <path>` | File size, and each branch with its version, commit count and last commit time. |
 | `log <path> [--branch main] [--limit 20]` | A branch's commits, newest first. |
-| `verify <path>` | Re-hashes every reachable object. |
+| `verify <path>` | Re-hashes every reachable object, checks the branch table's map, and checks that each branch's merge records name a branch the file holds, as `Db::verify` does. It cannot decode your types, which `Db::verify_typed` does. |
 | `space <path>` | File size against estimated live bytes. |
 | `compact <path> [--keep-last N \| --since-ms T]` | Rewrites the file, keeping the `N` newest commits per branch, or those at or after unix time `T` in milliseconds. |
 

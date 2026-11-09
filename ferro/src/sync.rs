@@ -4065,6 +4065,9 @@ impl<T: Data> Db<T> {
             let Some(ours) = refs.try_get(&name)? else {
                 return Ok((None, ()));
             };
+            if !tracking.held_in(refs)? {
+                return Ok((None, ()));
+            }
             let changed = recorded(refs, &name, (*ours).clone(), remote, seen)?;
             let mut next = changed.clone().unwrap_or_else(|| refs.clone());
             let pruned = self.keep_last(store, &mut next, &[remote])?;

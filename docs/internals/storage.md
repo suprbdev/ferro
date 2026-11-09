@@ -38,10 +38,26 @@ other forms a damaged file or a bundle could hold:
   links and holds none.
 - In the checks of a receive and of `verify_typed`, an object with bytes or links left after its
   value, and in a receive, a commit with bytes left after it.
+- In the same checks, a map value stored against its size. A node keeps a value whose encoding,
+  with the tag byte before it, takes at most `SPILL_BYTES`, 512, and writes a larger one as an
+  object of its own, so a value inside its node takes under 512 bytes and one stored apart 512 or
+  more. The check reads the sizes as stored, not as the value's type encodes it now: a spilled
+  object keeps its bytes until its value is written again, and a value written again is placed by
+  its new size, so a file written under an older schema passes too. It costs a compare a slot.
+- In the same checks, a `List` whose map holds a key at or past its length. A list's keys are its
+  positions, so `n` distinct keys below `n` are exactly `0..n`. `List::decode` gives its root link
+  that range, and the node check holds every node to it as it holds a child to the separators
+  around it, which costs nothing more.
 
 A bundle that spelled a value in one of these forms used to land and pass `verify_typed`: a map it
 held compared unequal to a map with the same entries, and `value_hash` differed from the `hash_of`
-the value it returned (#134). Such a bundle is now refused with `Error::Bundle`.
+the value it returned (#134). Such a bundle is now refused with `Error::Bundle`. A map that held a
+one-byte value apart from its node, or a 512-byte value inside it, passed both the same way, and
+compared unequal to a map of the same entries; a list whose positions skipped one passed too, its
+`get` returned `None` below its length, its `last` returned the value before the last, and a `push`
+overwrote the last (#135). Both are refused now. A spilled value is checked under a type of its
+own, one for each map type, so that an object the check passed as a `V` elsewhere, as the root of a
+commit whose type holds maps of itself, does not vouch for its size as a spilled value.
 
 What schema evolution needs stays as it was. A field whose tag the type does not know is skipped
 whatever it holds, which is how a removed field and a field from a newer version of the type read. A

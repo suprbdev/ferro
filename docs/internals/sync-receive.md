@@ -273,9 +273,10 @@ carry a list of typed links. `Map::decode` adds its root link to that list as a 
 and `S` with the count it claims, so any value that holds a map, through a derived struct, a hand
 written impl, a `Table`, `Set` or `List`, reports where its nodes are. A node check decodes the
 keys, checks that they ascend, that each hashes to the node's level and that they fall inside the
-range the parent gives the node, visits the inline values and summaries, and reports each spilled
-value as a `V` and each child as a node one level down at most, with the separators around it as its
-range. It returns the node's count and level, which must match what the link claimed. Any object
+range the parent gives the node, visits the inline values and summaries, checking that each inline
+value takes under 512 bytes, and reports each spilled value as a value of its map that must take 512
+bytes or more and each child as a node one level down at most, with the separators around it as its
+range. A `List` gives its root the range below its length, so that its keys are its positions. It returns the node's count and level, which must match what the link claimed. Any object
 with bytes or links left after what its type reads is refused, as is a value in a form no encoder
 writes, as [One encoding for each value](storage.md#one-encoding-for-each-value) describes.
 
@@ -375,7 +376,8 @@ with their rows](#indexes-that-agree-with-their-rows).
 
 `Db::verify_typed` runs the same check over the whole file: the refs, and the roots of every
 retained commit, as `T`, each object checked once per type. It costs a decode of everything
-reachable, so it is a separate call from `verify`, which knows no types and only re-hashes.
+reachable, so it is a separate call from `verify`, which knows no user types: it re-hashes, and
+checks only the branch table and its steps this way, with the merge records they hold.
 
 A fuzz test parses an honest bundle with hints, applies one or two mutations to its tree objects,
 flipping, setting, cutting or inserting a byte, or dropping, swapping or retargeting a link,
@@ -805,6 +807,11 @@ copy of a `counts` map of 200,000 keys, each 200,000, and sent it in 173 bytes. 
 4×10^10 zero-width items, against a count of 2.7×10^8 its size allows; with one value of 2^24 + 1 it
 was refused 7.9 s in, for that object, on every resend. Both are now refused 0.06 s in. A copy into
 a type with no zero-width items counts none, and one of 16,384 keys of 4 such items each lands.
+
+A value of four bytes stored apart from its node is now refused before any of its items are
+counted, as a value of under 512 bytes stored apart (#135), so the tests of these budgets spill
+values that pad the same count of items to 606 bytes, which counts the same, and grow the node
+linked under many ranges with 2,100 entries of 500 bytes instead of one value of 1 MiB.
 
 The bundle of 1.27 MB above visited 2^24 items in 3.28 ms an object, about 0.2 ns an item, and the
 clone of a `Map<u64, String>` of 400,000 keys of 80 bytes, 35.8 MB, was received in 0.153 s,

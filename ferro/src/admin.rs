@@ -170,12 +170,13 @@ pub fn log(path: impl AsRef<Path>, branch: &str, limit: usize) -> Result<Vec<Com
 }
 
 /// Re-hashes every object reachable from every retained version of every branch in the file at
-/// `path`, as [`Db::verify`](crate::Db::verify) does.
+/// `path`, and checks the branch table, as [`Db::verify`](crate::Db::verify) does.
 ///
 /// # Errors
 ///
-/// [`Error::Corrupt`] for the first object whose bytes do not match its hash, and the errors of
-/// [`info`].
+/// [`Error::Corrupt`] for the first object whose bytes do not match its hash, for a branch table
+/// that does not decode or whose map does not hold together, and for a branch that records a
+/// merge of a branch the table does not hold, and the errors of [`info`].
 pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
     let (store, head) = read_only(path.as_ref())?;
     let report = verified(&store, head);
@@ -183,7 +184,9 @@ pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
     report
 }
 
-/// Re-hashes every object reachable from the branch table at `head`, counting each once.
+/// Re-hashes every object reachable from the branch table at `head`, counting each once, then
+/// checks the branch table and its steps as the types that read them, as [`typed`] checks the
+/// values of a branch, and that each branch's merge records name a branch the table holds.
 pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {
     let mut report = crate::Verified {
         file_bytes: store.size(),
@@ -200,12 +203,35 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
                 report.bytes += u64::from(len);
             },
         )?;
+        checked(
+            store,
+            vec![(ptr, Kind::value::<Root>(), false)],
+            &mut Tables::default(),
+        )?;
+        named_merges(&load_refs(store, head)?)?;
     }
     Ok(report)
 }
 
-/// Decodes every object reachable from every retained version in `refs`, and the branch table at
-/// `head`, as the type that reads it, checking each map node against what its parent records.
+/// Checks that every merge record in `refs` names a branch `refs` holds, as dropping a branch
+/// removes the records that name it, so that a later branch of that name is not taken for one
+/// already merged.
+fn named_merges(refs: &Refs) -> Result<()> {
+    for (name, head) in refs.try_entries()? {
+        for (other, _) in head.merged.try_entries()? {
+            if refs.try_get(&other)?.is_none() {
+                return Err(Error::Corrupt(format!(
+                    "branch {name} records a merge of branch {other}, which the file does not hold"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes every object reachable from every retained version in `refs` as the type that reads
+/// it, checking each map node against what its parent records. The branch table is left to
+/// [`verified`].
 ///
 /// Each object is checked without the store, and one whose summary needs it, because a value it
 /// summarizes or a summary it folds holds a collection, is checked again with the store once every
@@ -216,7 +242,7 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
 ///
 /// [`Error::Corrupt`] naming the first object that does not decode or does not fit, or the first
 /// table whose indexes do not agree with its rows.
-pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> Result<()> {
+pub(crate) fn typed<T: Data>(store: &Store, refs: &Refs) -> Result<()> {
     let mut roots: Vec<Ptr> = Vec::new();
     let mut commits = HashSet::new();
     let mut versions: Vec<(u64, Hash, Option<Ptr>, Option<Hash>)> = Vec::new();
@@ -243,14 +269,27 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
         Ok(true)
     })?;
     let root = Kind::value::<T>();
-    let mut queue: Vec<(Ptr, Kind, bool)> = roots
+    let queue: Vec<(Ptr, Kind, bool)> = roots
         .into_iter()
         .map(|ptr| (ptr, root.clone(), false))
         .collect();
-    queue.extend(head.map(|ptr| (ptr, Kind::value::<Root>(), false)));
+    let mut tables = Tables::default();
+    checked(store, queue, &mut tables)?;
+    if !tables.is_empty() {
+        agreed(store, &root, pair_roots::<T>, versions, tables)?;
+    }
+    Ok(())
+}
+
+/// Checks each object in `queue` as its kind, and every object those reach through typed links,
+/// adding each table found to `tables`.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] naming the first object that does not decode or does not fit.
+fn checked(store: &Store, mut queue: Vec<(Ptr, Kind, bool)>, tables: &mut Tables) -> Result<()> {
     let mut checked = Checked::default();
     let mut confirmed = HashSet::new();
-    let mut tables = Tables::default();
     let corrupt = |kind: &Kind, ptr: Ptr, error: Error| {
         Error::Corrupt(format!(
             "the {} at {} does not decode: {error}",
@@ -307,9 +346,6 @@ pub(crate) fn typed<T: Data>(store: &Store, head: Option<Ptr>, refs: &Refs) -> R
                 kind.name, ptr.offset, shape.count, shape.level
             )));
         }
-    }
-    if !tables.is_empty() {
-        agreed(store, &root, pair_roots::<T>, versions, tables)?;
     }
     Ok(())
 }

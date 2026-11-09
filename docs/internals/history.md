@@ -80,9 +80,22 @@ and otherwise reads on, without walking, until they have met the entries they na
 every time made `verify` 29% slower on a file of 202,000 commits and 2,000 merges, and the
 recorded hashes bring that to 1%, as [Fuzzing](testing.md#fuzzing) records.
 
-Some things are left unchecked because no reader is misled by them. The old `merged` records are
-claims a structure cannot confirm, and readers already ignore one whose version is past the commit
-a search starts from or outside the named branch's retained versions. A merge's time bound past
+`verify` and `verify_typed` also check the branch table itself, which `verify` once only re-hashed:
+they decode it and the steps on top of it and hold the nodes of their maps to the checks of
+`verify_typed`, since a table whose names were out of order hid `main` from every lookup while the
+re-hash passed (#135). And each merge record must name a branch the table holds. Dropping a branch
+removes the records that name it, and landing a new tracking branch removes those that name it
+there, but a record that outlived its branch made a branch forked later under that name look merged
+up to the recorded version, so merging it dropped what it had added by then (#135). A pull that
+finds its tracking branch's head already below ours writes its record in a step of its own after
+the merge search, and if the tracking branch was dropped meanwhile, or replaced by another of its
+name, it now writes none. Bundles carry no records: a landed branch starts with none. On a file of 10,000 branches the table checks added 2 ms to the 43 ms `Db::verify`
+took, and on one of two branches and a million keys nothing measurable.
+
+Some things are left unchecked because no reader is misled by them. Beyond naming a branch the
+table holds, the old `merged` records are claims a structure cannot confirm, and readers already
+ignore one whose version is past the commit a search starts from or outside the named branch's
+retained versions. A merge's time bound past
 the merged commit's time makes that commit bare, which the search and the copy treat alike. A
 missing skip link only makes lookups slower. An entry with no root reads as `NoVersion`. A commit
 after a stamped one may share its millisecond in a file another peer sent, since a receive does not

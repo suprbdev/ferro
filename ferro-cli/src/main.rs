@@ -7,7 +7,8 @@
 //!   time.
 //! - `log` lists a branch's commits newest first, `--branch` naming the branch and `--limit` the
 //!   number shown.
-//! - `verify` re-hashes every object reachable from the file's current head.
+//! - `verify` re-hashes every object reachable from the file's current head, checks the branch
+//!   table's map, and checks that each branch's merge records name a branch the file holds.
 //! - `space` prints the file's size against an estimate of its live bytes.
 //! - `compact` copies what is reachable to a new file and swaps it in atomically, keeping every
 //!   commit, the `--keep-last` newest commits per branch, or those at or after `--since-ms`. It

@@ -3,10 +3,12 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::Once;
 
-use ferro::codec::{Encoder, HashSink};
-use ferro::{Data, Db, Durability, Map, Options};
+use ferro::codec::{Decoder, Encoder, HashSink};
+use ferro::store::{Store, StoreOptions, Txn};
+use ferro::{Data, Db, Durability, Map, Options, Ptr};
 
 pub struct Rng(pub u64);
 
@@ -380,6 +382,72 @@ pub fn quiet_ferro_panics() {
             }
         }));
     });
+}
+
+#[derive(Clone)]
+pub struct RawHead {
+    pub version: u64,
+    pub first: u64,
+    pub flags: u8,
+    pub root: Option<Ptr>,
+    pub tip: Option<Ptr>,
+    pub merged: Map<String, (u64, u64)>,
+    pub born: Option<u64>,
+}
+
+impl Data for RawHead {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.version.encode(w)?;
+        self.first.encode(w)?;
+        w.u8(self.flags);
+        if let Some(root) = self.root {
+            w.link(root);
+        }
+        self.tip.encode(w)?;
+        self.merged.encode(w)?;
+        if let Some(born) = self.born {
+            born.encode(w)?;
+        }
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let version = u64::decode(r)?;
+        let first = u64::decode(r)?;
+        let flags = r.u8()?;
+        let root = match flags & 1 {
+            0 => None,
+            _ => Some(r.link()?),
+        };
+        let tip = Option::<Ptr>::decode(r)?;
+        let merged = Map::decode(r)?;
+        let born = match flags & 2 {
+            0 => None,
+            _ => Some(u64::decode(r)?),
+        };
+        Ok(RawHead {
+            version,
+            first,
+            flags,
+            root,
+            tip,
+            merged,
+            born,
+        })
+    }
+}
+
+pub fn rewrite_branch_table(
+    path: &Path,
+    write: impl FnOnce(Map<String, RawHead>, &mut Txn) -> Ptr,
+) {
+    ferro::admin::compact(path, ferro::Keep::All).unwrap();
+    let (store, head) = Store::open(path, StoreOptions::default()).unwrap();
+    let refs = (*store.load::<Map<String, RawHead>>(head.unwrap()).unwrap()).clone();
+    let mut txn = store.begin().unwrap();
+    let table = write(refs, &mut txn);
+    txn.commit(table).unwrap();
+    store.close();
 }
 
 pub enum Outcome<T> {

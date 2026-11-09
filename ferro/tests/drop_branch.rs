@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use common::fast;
 use ferro::admin::{self, Keep};
-use ferro::{Db, Error, Map};
+use ferro::codec::Encoder;
+use ferro::{Data, Db, Error, Map};
 
 type Root = Map<u64, u64>;
 
@@ -374,4 +375,82 @@ fn a_writer_racing_the_drop_fails_cleanly() {
     drop(db);
     let db = fast().open::<Root>(&path).unwrap();
     assert_eq!(db.branches(), vec!["main".to_string()]);
+}
+
+fn synced_from_x(path: &std::path::Path) -> Db<Root> {
+    let remote = fast().open::<Root>(path.with_extension("remote")).unwrap();
+    for key in 2..=7 {
+        put(&remote, key, key);
+    }
+    let main = fast().open::<Root>(path).unwrap();
+    put(&main, 1, 1);
+    put(&main, 50, 50);
+    let bundle = remote.bundle(&main.have().unwrap()).unwrap();
+    main.receive("x", &bundle, |root, base, theirs| {
+        root.merge(base, theirs, |conflict| conflict.keep_theirs());
+        ("sync x", ())
+    })
+    .unwrap();
+    assert_eq!(main.version(), 3);
+    main
+}
+
+fn fork_x_again_and_merge(main: &Db<Root>) -> Vec<u64> {
+    let x = main.fork("x").unwrap();
+    for key in 100..=104 {
+        put(&x, key, key);
+    }
+    assert_eq!(x.version(), 8);
+    main.merge_with(&x, |root, base, theirs| {
+        root.merge(base, theirs, |conflict| conflict.keep_theirs());
+        ("merge the new x", ())
+    })
+    .unwrap();
+    (100..=104)
+        .filter(|key| main.read().contains_key(key))
+        .collect()
+}
+
+#[test]
+fn a_branch_dropped_after_a_sync_recorded_it_and_forked_again_merges_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synced.ferro");
+    let main = synced_from_x(&path);
+    main.verify().unwrap();
+    main.drop_branch("x").unwrap();
+    main.verify().unwrap();
+    assert_eq!(fork_x_again_and_merge(&main), [100, 101, 102, 103, 104]);
+    main.verify_typed().unwrap();
+    drop(main);
+    admin::verify(&path).unwrap();
+}
+
+#[test]
+fn every_verifier_reports_a_merge_record_that_names_a_dropped_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.ferro");
+    drop(synced_from_x(&path));
+    common::rewrite_branch_table(&path, |mut refs, txn| {
+        refs.remove("x");
+        let records: Vec<(String, (u64, u64))> = refs
+            .get("main")
+            .unwrap()
+            .merged
+            .iter()
+            .map(|(name, seen)| (name, *seen))
+            .collect();
+        assert_eq!(records, [("x".to_string(), (6, 3))]);
+        let mut w = Encoder::new(txn);
+        refs.encode(&mut w).unwrap();
+        w.finish().unwrap()
+    });
+    let refused = |outcome: ferro::Result<ferro::Verified>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message == "branch main records a merge of branch x, which the file does not hold")
+    };
+    assert!(refused(admin::verify(&path)));
+    let main = fast().open::<Root>(&path).unwrap();
+    assert_eq!(main.branches(), ["main"]);
+    assert!(refused(main.verify()));
+    assert!(refused(main.verify_typed()));
 }

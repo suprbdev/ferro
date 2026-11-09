@@ -2,8 +2,9 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{Rng, cases};
-use ferro::{Db, Durability, Keep, Map, Options, Reclaim};
+use common::{RawHead, Rng, cases, level_of, rewrite_branch_table};
+use ferro::codec::Encoder;
+use ferro::{Data, Db, Durability, Keep, Map, Options, Reclaim};
 use tempfile::TempDir;
 
 type Root = Map<u64, u64>;
@@ -293,4 +294,56 @@ fn many_branches_reopen_whole() {
     db.verify_typed().unwrap();
     let info = ferro::admin::info(&path).unwrap();
     assert_eq!(info.branches.len(), 141);
+}
+
+#[test]
+fn every_verifier_reports_a_branch_table_whose_names_are_out_of_order() {
+    let level = level_of(&"main".to_string());
+    let other = (0..)
+        .map(name)
+        .find(|name| level_of(name) == level && name.as_str() < "main")
+        .unwrap();
+    let dir = dir();
+    let path = dir.path().join("order.ferro");
+    let db: Db<Root> = options().open(&path).unwrap();
+    put(&db, 1, 1);
+    db.fork(&other).unwrap();
+    drop(db);
+    ferro::admin::verify(&path).unwrap();
+
+    rewrite_branch_table(&path, |refs, txn| {
+        let mut entries: Vec<(String, RawHead)> = refs
+            .iter()
+            .map(|(name, head)| (name, (*head).clone()))
+            .collect();
+        assert_eq!(entries.len(), 2);
+        entries.reverse();
+        let mut w = Encoder::new(txn);
+        w.u8(level as u8);
+        w.varint(2);
+        for (name, _) in &entries {
+            name.encode(&mut w).unwrap();
+        }
+        for (_, head) in &entries {
+            w.u8(0);
+            head.encode(&mut w).unwrap();
+        }
+        for _ in 0..3 {
+            w.varint(0);
+        }
+        let top = w.finish().unwrap();
+        let mut w = Encoder::new(txn);
+        w.varint(2);
+        w.link(top);
+        w.finish().unwrap()
+    });
+    assert!(matches!(
+        ferro::admin::log(&path, "main", 10),
+        Err(ferro::Error::NoBranch(_))
+    ));
+    let refused = |outcome: ferro::Result<ferro::Verified>| matches!(outcome, Err(ferro::Error::Corrupt(message)) if message.ends_with("node keys are out of order"));
+    assert!(refused(ferro::admin::verify(&path)));
+    let db: Db<Root> = options().read_only(true).open(&path).unwrap();
+    assert!(refused(db.verify()));
+    assert!(refused(db.verify_typed()));
 }

@@ -5508,16 +5508,22 @@ impl<T: Data> Db<T> {
         self.keeper.follower.as_ref().map(Follower::status)
     }
 
-    /// Re-hashes every object reachable from every retained version of every branch.
+    /// Re-hashes every object reachable from every retained version of every branch, and checks
+    /// the branch table.
     ///
     /// A match shows that each object is the one its link names, so together with
     /// [`Db::head_hash`] it shows history is unchanged. It reads everything retained once, without
-    /// decoding it as `T`, as [`Db::verify_typed`] does.
+    /// decoding it as `T`, as [`Db::verify_typed`] does. It does decode the branch table and the
+    /// steps written on top of it, and checks the nodes of their maps as `verify_typed` checks a
+    /// map's, so that a lookup by name finds every branch the table lists, and it checks that
+    /// each branch's merge records name a branch the table holds, as dropping a branch removes the
+    /// records that name it.
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] for the first object whose bytes do not match its hash, and other read
-    /// errors.
+    /// [`Error::Corrupt`] for the first object whose bytes do not match its hash, for a branch
+    /// table that does not decode or whose map does not hold together, and for a merge record
+    /// that names a branch the table does not hold, and other read errors.
     pub fn verify(&self) -> Result<Verified> {
         let (head, store) = {
             let published = self.shared.published.lock();
@@ -5529,29 +5535,34 @@ impl<T: Data> Db<T> {
     /// Like [`Db::verify`], and also decodes every object reachable from every retained version
     /// as the type that reads it.
     ///
-    /// It checks each map node's count, level and key range against its parent, recomputes
-    /// each summary from the entries below it, and checks that each index a table stores under a
-    /// fingerprint `T` knows holds exactly the entries its rows give, as [`Db::receive`] checks
-    /// what it is sent, so it finds a damaged file or a type change that broke stored data before
-    /// a read panics on it or a fold or lookup returns a stale answer. It costs a full decode of
-    /// everything retained. A table held in a version's root is checked against the table at the
-    /// same place in its parent's root, for what changed between them, and any other table by
-    /// building its indexes from its rows.
+    /// It checks each map node's count, level and key range against its parent, that each value
+    /// is stored in its node or apart from it as its encoded size says, that a [`List`] holds
+    /// exactly the positions below its length, recomputes each summary from the entries below
+    /// it, and checks that each index a table stores under a fingerprint `T` knows holds exactly
+    /// the entries its rows give, as [`Db::receive`] checks what it is sent, so it finds a damaged
+    /// file or a type change that broke stored data before a read panics on it or a fold or
+    /// lookup returns a stale answer. It costs a full decode of everything retained. A table held
+    /// in a version's root is checked against the table at the same place in its parent's root,
+    /// for what changed between them, and any other table by building its indexes from its rows.
     ///
     /// # Errors
     ///
     /// As for [`Db::verify`], and [`Error::Corrupt`] naming the first object that does not decode,
-    /// holds bytes or links its value does not read, or does not fit its parent, which includes a
-    /// summary that is not the fold of its entries and one whose `of` or `combine` panics to
-    /// recompute, or a table whose index holds other entries than its rows give, whose row is
-    /// stored under a key other than its own, or two of whose rows share a value of a unique index.
+    /// holds bytes or links its value does not read, is in a form no encoder writes, or does not
+    /// fit its parent, which includes a value stored in its node or apart from it against its
+    /// size, a list with a position missing, a summary that is not the fold of its entries and one
+    /// whose `of` or `combine` panics to recompute, or a table whose index holds other entries
+    /// than its rows give, whose row is stored under a key other than its own, or two of whose
+    /// rows share a value of a unique index.
+    ///
+    /// [`List`]: crate::List
     pub fn verify_typed(&self) -> Result<Verified> {
         let (head, refs, store) = {
             let published = self.shared.published.lock();
             (published.ptr, published.refs.clone(), self.shared.store())
         };
         let report = crate::admin::verified(&store, head)?;
-        crate::admin::typed::<T>(&store, head, &refs)?;
+        crate::admin::typed::<T>(&store, &refs)?;
         Ok(report)
     }
 }
@@ -5596,6 +5607,17 @@ impl<T: Data> Db<T> {
             Err(Error::Reentrant) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether `refs` holds this handle's branch, and not one of the same name made after it was
+    /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// The read errors of looking the branch up.
+    pub(crate) fn held_in(&self, refs: &Refs) -> Result<bool> {
+        let head = refs.try_get(&self.branch.name)?;
+        Ok(!self.branch.dropped_in(head.as_deref()))
     }
 
     /// The current store and the branch table as last published.

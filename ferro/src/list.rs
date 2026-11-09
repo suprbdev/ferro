@@ -151,7 +151,7 @@ impl<T: Data> Data for List<T> {
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
-        Ok(List(Map::decode(r)?))
+        Ok(List(Map::decode_below(r, Some(|len| len))?))
     }
 
     fn missing() -> Option<Self> {

@@ -1400,6 +1400,35 @@ fn a_superblock_whose_log_ends_inside_the_header_is_corrupt() {
 }
 
 #[test]
+fn both_superblocks_naming_an_older_frame_open_at_the_newest_commit_and_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("older.ferro");
+    let db = Db::<Root>::open(&path).unwrap();
+    for key in 1..=4 {
+        db.update(|root| {
+            root.insert(key, key.to_string());
+        })
+        .unwrap();
+    }
+    drop(db);
+    let mut bytes = fs::read(&path).unwrap();
+    let newest = newest_slot(&bytes);
+    let older = SLOT - newest;
+    assert!(field(&bytes, older + 8) < field(&bytes, newest + 8));
+    bytes.copy_within(older..older + SLOT, newest);
+    fs::write(&path, &bytes).unwrap();
+
+    admin::verify(&path).unwrap();
+    let reader = read_only().open::<Root>(&path).unwrap();
+    assert_eq!((reader.read().version(), reader.read().len()), (4, 4));
+    reader.verify_typed().unwrap();
+    drop(reader);
+    let db = Db::<Root>::open(&path).unwrap();
+    assert_eq!((db.read().version(), db.read().len()), (4, 4));
+    db.verify_typed().unwrap();
+}
+
+#[test]
 fn a_commit_after_the_last_version_is_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("last.ferro");

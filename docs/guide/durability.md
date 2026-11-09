@@ -11,10 +11,14 @@ commits, back to the last checkpoint at worst, and never the whole file: a check
 every `Options::checkpoint_bytes` of log, 64 MiB by default, and on clean close.
 
 Every read re-hashes the object against the pointer it came from, so corruption surfaces as an
-error, not wrong data. The whole database is a Merkle tree, and `verify` re-hashes all of it.
-`verify_typed` also decodes every object reachable from every retained version as your type, and
-checks each map node's count, level and key range and recomputes each summary, at the cost of a
-full decode.
+error, not wrong data. The whole database is a Merkle tree, and `verify` re-hashes all of it. It
+also decodes the branch table, holding its map to the checks `verify_typed` holds yours to, so that
+every branch it lists is found by name, and checks that each branch's merge records name a branch
+the file holds. `verify_typed` also decodes every object reachable from every retained version as
+your type: it checks each map node's count, level and key range, that each value is stored in its
+node or apart from it as its encoded size says, and that each `List` holds exactly the positions
+below its length, recomputes each summary, and checks each table's indexes against its rows, at the
+cost of a full decode. `admin::verify` and `ferro verify` check what `verify` does.
 
 ## Errors on read
 

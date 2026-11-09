@@ -3488,20 +3488,23 @@ fn a_large_node_reached_under_narrower_key_ranges_lands() {
 
 #[test]
 fn a_bundle_that_reuses_one_node_under_many_key_ranges_lands_up_to_a_budget() {
-    let low = key_at_level(0);
-    let separators: Vec<u64> = (low + 1..)
+    let keys = keys_at(0, 2_100);
+    let values: Vec<String> = keys.iter().map(|key| text(*key, 500)).collect();
+    let slots: Vec<Vec<u8>> = values.iter().map(|value| inline_string(value)).collect();
+    let leaf = leaf_of(&keys, &slots, Vec::new());
+    assert!(leaf.body.len() > 1 << 20);
+    let separators: Vec<u64> = (keys[keys.len() - 1] + 1..)
         .filter(|key| common::level_of(key) == 1)
         .take(64)
         .collect();
-    let big = text(1, 1 << 20);
-    let leaf = node_of(low, &inline_string(&big), Vec::new());
     for (parents, lands) in [(12, true), (64, false)] {
         let mut nodes = Vec::new();
         for separator in &separators[..parents] {
             let mut body = vec![1, 1];
             varint(&mut body, *separator);
             body.extend_from_slice(&inline_string("p"));
-            body.extend_from_slice(&[1, 0]);
+            varint(&mut body, keys.len() as u64);
+            body.push(0);
             nodes.push(Object {
                 body,
                 links: vec![link_to(&leaf)],
@@ -3509,7 +3512,9 @@ fn a_bundle_that_reuses_one_node_under_many_key_ranges_lands_up_to_a_budget() {
         }
         let mut body = Vec::new();
         varint(&mut body, parents as u64);
-        body.extend(std::iter::repeat_n(2, parents));
+        for _ in 0..parents {
+            varint(&mut body, keys.len() as u64 + 1);
+        }
         let root = Object {
             body,
             links: nodes.iter().map(link_to).collect(),
@@ -3523,7 +3528,8 @@ fn a_bundle_that_reuses_one_node_under_many_key_ranges_lands_up_to_a_budget() {
             let maps = b.read();
             assert_eq!(maps.len(), parents);
             for (map, separator) in maps.iter().zip(&separators) {
-                assert_eq!(*map.get(&low).unwrap(), big);
+                assert_eq!(map.len(), keys.len() + 1);
+                assert_eq!(*map.get(&keys[0]).unwrap(), values[0]);
                 assert_eq!(*map.get(separator).unwrap(), "p");
             }
             b.verify_typed().unwrap();
@@ -3567,20 +3573,34 @@ impl Summary<u64, Units> for Width {
     }
 }
 
+type Padded = (Vec<()>, String);
+
+impl Summary<u64, Padded> for Width {
+    fn of(_key: &u64, value: &Padded) -> Self {
+        Width(value.0.len() as u64)
+    }
+
+    fn combine(&self, other: &Self) -> Self {
+        Width(self.0.wrapping_add(other.0))
+    }
+}
+
+fn padded_object(count: u64) -> Object {
+    let mut body = Vec::new();
+    varint(&mut body, count);
+    varint(&mut body, 600);
+    body.extend(std::iter::repeat_n(b'x', 600));
+    Object {
+        body,
+        links: Vec::new(),
+    }
+}
+
 fn keys_at(level: u32, count: usize) -> Vec<u64> {
     (0..)
         .filter(|key| common::level_of(key) == level)
         .take(count)
         .collect()
-}
-
-fn units_object(count: u64) -> Object {
-    let mut body = Vec::new();
-    varint(&mut body, count);
-    Object {
-        body,
-        links: Vec::new(),
-    }
 }
 
 fn units_slot(tag: u8, count: u64) -> Vec<u8> {
@@ -3652,7 +3672,7 @@ fn a_bundle_of_values_that_claim_many_zero_width_items_is_refused_while_honest_o
 
     let keys = keys_at(0, 40_000);
     let values: Vec<Object> = (0..keys.len() as u64)
-        .map(|at| units_object(ZERO_WIDTH - at))
+        .map(|at| padded_object(ZERO_WIDTH - at))
         .collect();
     let node = leaf_of(
         &keys,
@@ -3663,7 +3683,7 @@ fn a_bundle_of_values_that_claim_many_zero_width_items_is_refused_while_honest_o
     let mut objects: Vec<&Object> = values.iter().collect();
     objects.extend([&node, &root]);
     let started = Instant::now();
-    let (b, result, _dir) = receive_tree::<Units>(&objects);
+    let (b, result, _dir) = receive_tree::<Map<u64, Padded>>(&objects);
     refused_for_zero_width(&result, started);
     assert_refused(&b, result);
 }
@@ -3708,7 +3728,8 @@ fn a_node_rechecked_under_narrower_key_ranges_counts_its_zero_width_items_each_t
 
 #[test]
 fn a_value_spilled_under_many_keys_counts_its_zero_width_items_for_each_summary_it_confirms() {
-    let value = units_object(ZERO_WIDTH);
+    let value = padded_object(ZERO_WIDTH);
+    assert!(value.body.len() >= 512);
     for (count, lands) in [(8, true), (400, false)] {
         let keys = keys_at(0, count);
         let node = leaf_of(
@@ -3718,13 +3739,13 @@ fn a_value_spilled_under_many_keys_counts_its_zero_width_items_for_each_summary_
         );
         let root = summed_root(count as u64, ZERO_WIDTH * count as u64, &node);
         let started = Instant::now();
-        let (b, result, _dir) = receive_tree::<Map<u64, Vec<()>, Width>>(&[&value, &node, &root]);
+        let (b, result, _dir) = receive_tree::<Map<u64, Padded, Width>>(&[&value, &node, &root]);
         if lands {
             assert_eq!(result.unwrap().outcome, Outcome::FastForward);
             let map = b.read();
             assert_eq!(map.summary(), Some(Width(ZERO_WIDTH * count as u64)));
             for key in &keys {
-                assert_eq!(map.get(key).unwrap().len(), ZERO_WIDTH as usize);
+                assert_eq!(map.get(key).unwrap().0.len(), ZERO_WIDTH as usize);
             }
             b.verify_typed().unwrap();
         } else {
