@@ -35,13 +35,13 @@ use crate::graph::{self, Start};
 use crate::history::History;
 use crate::log::{Chain, Entry, Log, Merged, Node};
 use crate::map::Map;
-use crate::platform::canonicalize;
+use crate::platform::{canonicalize, monotonic_ns};
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
 use crate::refs;
 use crate::store::{
-    Durability, Every, Followed, Frame, Held, Landing, News, Op, Retired, Rounds, Settling, Store,
-    StoreOptions, Trace, Txn, lane_of,
+    Durability, Every, Followed, Frame, Held, Landing, News, Op, Retired, Settling, Store,
+    StoreOptions, Trace, Txn, lane_of, patience,
 };
 use crate::watch::{Feed, Filter, Notice, Seats, Watcher};
 
@@ -578,23 +578,6 @@ struct Branch<T> {
     gate: Mutex<VecDeque<(u64, Waker)>>,
     gated: AtomicUsize,
     framed: AtomicU64,
-}
-
-/// One more thread counted as on its way to a branch's lane, as [`Branch::on_the_way`] reports,
-/// until dropped.
-struct Arriving<'a>(&'a AtomicUsize);
-
-impl<'a> Arriving<'a> {
-    fn new(count: &'a AtomicUsize) -> Arriving<'a> {
-        count.fetch_add(1, Ordering::AcqRel);
-        Arriving(count)
-    }
-}
-
-impl Drop for Arriving<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 struct Lane<'a, T> {
@@ -1161,7 +1144,7 @@ struct Writing<'a, T, F, R, E> {
     id: u64,
     start: Option<F>,
     gated: bool,
-    held_up: bool,
+    held_up: Option<u64>,
     wait: Option<Wait<R, E>>,
     crossing: Option<Crossing>,
 }
@@ -1196,14 +1179,16 @@ where
             this.gated = false;
             let mut notices = Vec::new();
             let shared = &db.shared;
-            let gated = !this.held_up
+            let gated = this.held_up.is_none_or(|until| monotonic_ns() < until)
                 && !reentry::holds_besides(shared.id, shared.file_id, &db.branch.name);
             match shared.crossing(&mut lane, false, gated, &mut notices) {
                 Err(error) => return Poll::Ready(Err(error.into())),
                 Ok(Some(busy)) => {
                     let at = lane.branch.lane_at;
                     drop(lane);
-                    this.held_up |= gated;
+                    if gated && this.held_up.is_none() {
+                        this.held_up = busy.gate_until();
+                    }
                     shared.await_lane(busy, at, gated, cx.waker());
                     this.start = Some(f);
                     return Poll::Pending;
@@ -2193,22 +2178,21 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
         f: impl FnOnce(&mut RefState, &mut Vec<Notice<T>>) -> Result<R>,
     ) -> Result<R> {
-        let mut rounds = Rounds::new();
+        let mut began = None;
         loop {
             let branches = self.every_lane();
-            let Some(mut lanes) = self.every_lane_within(&branches, &mut rounds) else {
-                continue;
-            };
+            let mut lanes: Vec<_> = branches.iter().map(|branch| self.lane(branch)).collect();
             lanes.iter_mut().for_each(Lane::uncross);
             let store = self.store();
             let stale = || !self.covers(&branches);
             let waiting = || branches.iter().any(|branch| branch.on_the_way());
             let range = match store.is_shared() {
-                true => match store.lock_lanes(&mut rounds, stale, waiting)? {
+                true => match store.lock_lanes(&mut began, stale, waiting)? {
                     Every::Held(range) => Some(range),
                     Every::Stale => continue,
                     Every::Yielded => {
-                        Self::give_way(lanes);
+                        lanes.into_iter().rev().for_each(Lane::give_way);
+                        Self::let_through(&branches, began);
                         continue;
                     }
                 },
@@ -2235,70 +2219,20 @@ impl<T: Data> Shared<T> {
         }
     }
 
-    /// The lanes of `branches`, taken in order for [`Shared::exclusively`] in `rounds`, or `None`
-    /// once a round ended while a thread or awaited write waited for one already taken, in which
-    /// case those taken have been given way.
-    fn every_lane_within<'a>(
-        &self,
-        branches: &'a [Arc<Branch<T>>],
-        rounds: &mut Rounds,
-    ) -> Option<Vec<Lane<'a, T>>> {
-        let mut lanes: Vec<Lane<'a, T>> = Vec::with_capacity(branches.len());
-        for branch in branches {
-            let waited = |lanes: &[Lane<'a, T>]| lanes.iter().any(|lane| lane.branch.on_the_way());
-            match self.lane_within(branch, || rounds.over() && waited(&lanes)) {
-                Some(lane) => lanes.push(lane),
-                None => {
-                    Self::give_way(lanes);
-                    return None;
-                }
+    /// Waits, once [`Shared::exclusively`] has let its lanes go, until no thread or awaited write
+    /// waits for any of `branches`, or for the [`patience`] of a hold that began at `began`, so
+    /// that those that waited for its lanes take them before it does again.
+    fn let_through(branches: &[Arc<Branch<T>>], began: Option<u64>) {
+        let start = monotonic_ns();
+        let (mut pause, longest) = (Duration::from_micros(20), Duration::from_millis(1));
+        while branches.iter().any(|branch| branch.on_the_way()) {
+            let now = monotonic_ns();
+            if now.saturating_sub(start) >= patience(began, now) {
+                return;
             }
+            thread::sleep(pause);
+            pause = (pause * 2).min(longest);
         }
-        Some(lanes)
-    }
-
-    /// The lane of `branch`, as [`Shared::lane`] takes it, or `None` if `give_up` returns `true`
-    /// while another holds the lane, which it calls every millisecond until then.
-    fn lane_within<'a>(
-        &self,
-        branch: &'a Arc<Branch<T>>,
-        mut give_up: impl FnMut() -> bool,
-    ) -> Option<Lane<'a, T>> {
-        let free = match self.coalesce {
-            true => None,
-            false => branch.lane.try_lock(),
-        };
-        let guard = match free {
-            Some(guard) => guard,
-            None => {
-                let arriving = Arriving::new(&branch.arriving);
-                if self.coalesce {
-                    self.step("arriving");
-                }
-                let guard = loop {
-                    if let Some(guard) = branch.lane.try_lock_for(Duration::from_millis(1)) {
-                        break guard;
-                    }
-                    if give_up() {
-                        return None;
-                    }
-                };
-                drop(arriving);
-                guard
-            }
-        };
-        let mut lane = branch.hold(guard);
-        if let Some(group) = lane.take() {
-            self.seal_for_others(branch, group);
-        }
-        Some(lane)
-    }
-
-    /// Lets `lanes` go, as [`Shared::exclusively`] does at the end of a round in which a thread or
-    /// awaited write waited for one of them, and pauses so that those take them first.
-    fn give_way(lanes: Vec<Lane<'_, T>>) {
-        lanes.into_iter().rev().for_each(Lane::give_way);
-        Rounds::pause();
     }
 
     fn cross(&self, lane: &mut Lane<'_, T>, notices: &mut Vec<Notice<T>>) -> Result<()> {
@@ -2665,7 +2599,14 @@ impl<T: Data> Shared<T> {
     }
 
     fn arrive<'a>(&self, branch: &'a Branch<T>) -> Lane<'a, T> {
-        let arriving = Arriving::new(&branch.arriving);
+        struct Arriving<'b>(&'b AtomicUsize);
+        impl Drop for Arriving<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        branch.arriving.fetch_add(1, Ordering::AcqRel);
+        let arriving = Arriving(&branch.arriving);
         self.step("arriving");
         let guard = branch.lane.lock();
         drop(arriving);
@@ -4608,7 +4549,7 @@ impl<T: Data> Db<T> {
             id: self.shared.ids.fetch_add(1, Ordering::Relaxed),
             start: Some(f),
             gated: false,
-            held_up: false,
+            held_up: None,
             wait: None,
             crossing: None,
         }
