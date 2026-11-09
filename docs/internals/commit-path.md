@@ -813,8 +813,9 @@ The lookups in `dedupe` run before `tip` is taken. A commit looks up its records
 would, and if a frame placed since the draft began wrote one of them, the draft moves the old way
 under `tip`, dropping that record. A record a frame registers after the lookup is written again, as
 it would be had that frame registered it after the move, which any two interleavings can already
-give. A draft that moves farther than its links leave room for, that holds a received record, or
-that spilled moves as before.
+give. A draft that moves farther than its links leave room for moves as before. A draft never holds
+a received record and never spills: received records and spilled frames go only into transactions
+begun under `tip`, which no other frame can overtake, so they never move.
 
 The format moved from 4 to 5, since a build before this one reads a padded distance as a link to a
 later object: no file of format 4 opens in this build, nor one of format 5 in an earlier build, and

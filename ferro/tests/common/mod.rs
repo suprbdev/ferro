@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
 use ferro::codec::{Encoder, HashSink};
-use ferro::{Data, Durability, Options};
+use ferro::{Data, Db, Durability, Map, Options};
 
 pub struct Rng(pub u64);
 
@@ -153,6 +154,61 @@ pub fn link_distance(value: u64, len: usize) -> u64 {
     }
 }
 
+pub struct LinkSlot {
+    pub hash_at: usize,
+    pub at: usize,
+    pub len: usize,
+    pub target: u64,
+}
+
+pub fn link_slots(bytes: &[u8], start: usize) -> (Vec<LinkSlot>, usize) {
+    let mut pos = start;
+    let stored = varint(bytes, &mut pos) as usize;
+    let flagged = varint(bytes, &mut pos);
+    if flagged & 1 == 1 {
+        varint(bytes, &mut pos);
+    }
+    pos += stored;
+    let mut slots = Vec::new();
+    for _ in 0..flagged >> 1 {
+        let hash_at = pos;
+        pos += HASH_BYTES;
+        let at = pos;
+        let value = varint(bytes, &mut pos);
+        slots.push(LinkSlot {
+            hash_at,
+            at,
+            len: pos - at,
+            target: (start as u64).wrapping_sub(link_distance(value, pos - at)),
+        });
+    }
+    (slots, pos)
+}
+
+pub fn distance_bytes(offset: u64, target: u64, len: usize) -> Option<Vec<u8>> {
+    let plain = offset.checked_sub(target)?.checked_mul(2)?;
+    let mut need = 1;
+    let mut rest = plain;
+    while rest >= 0x80 {
+        rest >>= 7;
+        need += 1;
+    }
+    if need > len || len > 10 {
+        return None;
+    }
+    let (mut value, last) = match need == len {
+        true => (plain, None),
+        false => (plain | 1, Some(1)),
+    };
+    let mut out = Vec::with_capacity(len);
+    for _ in 1..len {
+        out.push(value as u8 & 0x7f | 0x80);
+        value >>= 7;
+    }
+    out.push(last.unwrap_or(value as u8));
+    Some(out)
+}
+
 pub type Link = ([u8; HASH_BYTES], Option<(usize, usize)>);
 
 pub type Shape = (u64, [u8; HASH_BYTES], Vec<(Vec<u8>, Vec<Link>)>);
@@ -233,6 +289,41 @@ pub fn text(seed: u64, len: usize) -> String {
     let mut rng = Rng::new(seed.wrapping_add(1));
     (0..len)
         .map(|_| char::from(b'a' + rng.below(26) as u8))
+        .collect()
+}
+
+pub type Spread = Map<u64, String>;
+
+pub fn spread_into(db: &Db<Spread>, model: &mut BTreeMap<u64, String>, rng: &mut Rng, lane: u64) {
+    let count = match rng.below(10) {
+        0 => 2_000,
+        1 | 2 => 200,
+        _ => 1 + rng.below(30),
+    };
+    let writes: Vec<(u64, String)> = (0..count)
+        .map(|_| {
+            let key = lane << 32 | rng.below(5_000);
+            let value = match rng.below(8) {
+                0 => text(rng.next(), 2_000),
+                1 => text(key % 3, 1_500),
+                _ => format!("{lane}-{}", rng.next()),
+            };
+            (key, value)
+        })
+        .collect();
+    model.extend(writes.iter().cloned());
+    db.update(|root| {
+        for (key, value) in writes {
+            root.insert(key, value);
+        }
+    })
+    .unwrap();
+}
+
+pub fn spread_of(db: &Db<Spread>) -> BTreeMap<u64, String> {
+    db.read()
+        .iter()
+        .map(|(key, value)| (key, (*value).clone()))
         .collect()
 }
 

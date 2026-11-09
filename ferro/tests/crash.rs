@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{
-    BLOCK, FRAME_BYTES, Outcome, Rng, SECTOR, SLOT, assert_damaged, cases, fast, field, guarded,
-    judged, quiet_ferro_panics, seal_frame, table_bytes, text, uncached,
+    BLOCK, FRAME_BYTES, Outcome, Rng, SECTOR, SLOT, assert_damaged, cases, distance_bytes, fast,
+    field, guarded, judged, link_slots, quiet_ferro_panics, seal_frame, table_bytes, text,
+    uncached,
 };
 use ferro::codec::{HASH_BYTES, Object, Sink};
 use ferro::db::Clock;
-use ferro::store::{Store, StoreOptions, record_len};
+use ferro::store::{Store, StoreOptions};
 use ferro::{Db, Error, Keep, Map, Options, Ptr, admin};
 use tempfile::TempDir;
 
@@ -814,6 +815,32 @@ fn foreign_files_are_rejected_and_left_alone() {
 }
 
 #[test]
+fn a_file_of_the_format_before_padded_links_is_not_ferro_and_left_alone() {
+    let built = build(3, 3);
+    let path = built.target();
+    let sealed = |magic: &[u8; MAGIC]| {
+        let mut image = built.bytes.clone();
+        for slot in [0, SLOT] {
+            image[slot..slot + MAGIC].copy_from_slice(magic);
+            let check = blake3::hash(&image[slot..slot + SUPER - 32]);
+            image[slot + SUPER - 32..slot + SUPER].copy_from_slice(check.as_bytes());
+        }
+        image
+    };
+    fs::write(&path, sealed(b"FERRODB5")).unwrap();
+    fast().open::<Root>(&path).unwrap().verify().unwrap();
+    let old = sealed(b"FERRODB4");
+    fs::write(&path, &old).unwrap();
+    for options in [fast(), fast().read_only(true)] {
+        let opened = options.open::<Root>(&path).map(|_| ());
+        assert!(matches!(opened, Err(Error::NotFerro(_))), "{opened:?}");
+    }
+    let verified = admin::verify(&path).map(|_| ());
+    assert!(matches!(verified, Err(Error::NotFerro(_))), "{verified:?}");
+    assert_eq!(fs::read(&path).unwrap(), old);
+}
+
+#[test]
 fn truncated_database_is_never_reinitialised() {
     let built = build(3, 3);
     let path = built.target();
@@ -835,11 +862,12 @@ fn reachable(path: &Path) -> Vec<(usize, usize, Vec<Ptr>)> {
         ..StoreOptions::default()
     };
     let (store, head) = Store::open(path, options).unwrap();
+    let bytes = fs::read(path).unwrap();
     let mut out = Vec::new();
     store
         .walk(head.unwrap(), |ptr, object| {
             let start = ptr.offset as usize;
-            let end = start + record_len(ptr.offset, object);
+            let (_, end) = link_slots(&bytes, start);
             out.push((start, end, object.links.clone()));
         })
         .unwrap();
@@ -1079,59 +1107,24 @@ fn wide_database() -> (TempDir, PathBuf, u64) {
     (dir, path, 20_000)
 }
 
-fn zigzag_len(offset: u64, target: u64) -> usize {
-    let delta = offset.wrapping_sub(target) as i64;
-    let mut value = ((delta << 1) ^ (delta >> 63)) as u64;
-    let mut len = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
-}
-
-fn zigzag_of_len(offset: u64, target: u64, len: usize) -> Option<Vec<u8>> {
-    if zigzag_len(offset, target) != len {
-        return None;
-    }
-    let delta = offset.wrapping_sub(target) as i64;
-    let mut value = ((delta << 1) ^ (delta >> 63)) as u64;
-    let mut out = Vec::new();
-    for position in 0..len {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if position + 1 < len {
-            byte |= 0x80;
-        }
-        out.push(byte);
-    }
-    Some(out)
-}
-
 fn redirect_sibling_link(path: &Path) -> usize {
     let ranges = reachable(path);
-    let (start, end, links) = ranges
+    let (start, _, links) = ranges
         .iter()
         .max_by_key(|entry| entry.2.len())
         .expect("database has objects");
     assert!(links.len() > 3);
-    let lens: Vec<usize> = links
-        .iter()
-        .map(|link| HASH_BYTES + zigzag_len(*start as u64, link.offset))
-        .collect();
     let mut image = fs::read(path).unwrap();
-    let mut position = end - lens.iter().sum::<usize>();
+    let (slots, _) = link_slots(&image, *start);
     for index in 0..links.len() - 1 {
-        let delta_len = lens[index] - HASH_BYTES;
-        if let Some(patch) = zigzag_of_len(*start as u64, links[index + 1].offset, delta_len)
+        let slot = &slots[index];
+        if let Some(patch) = distance_bytes(*start as u64, links[index + 1].offset, slot.len)
             && links[index + 1].offset != links[index].offset
         {
-            let delta_at = position + HASH_BYTES;
-            image[delta_at..delta_at + delta_len].copy_from_slice(&patch);
+            image[slot.at..slot.at + slot.len].copy_from_slice(&patch);
             fs::write(path, image).unwrap();
             return index;
         }
-        position += lens[index];
     }
     panic!("no link could be redirected in place");
 }
@@ -1188,21 +1181,14 @@ fn a_link_redirected_to_a_sibling_is_reported_by_verify() {
     let ranges = reachable(&path);
     let mut redirected = 0;
     for (start, end, links) in &ranges {
-        let lens: Vec<usize> = links
-            .iter()
-            .map(|link| HASH_BYTES + zigzag_len(*start as u64, link.offset))
-            .collect();
-        let mut at = end - lens.iter().sum::<usize>();
-        for (index, link) in links.iter().enumerate() {
-            let delta_len = lens[index] - HASH_BYTES;
-            let delta_at = at + HASH_BYTES;
-            at += lens[index];
+        let (slots, _) = link_slots(&built.bytes, *start);
+        for (index, (link, slot)) in links.iter().zip(&slots).enumerate() {
             for other in links.iter().filter(|other| other.hash != link.hash) {
-                let Some(patch) = zigzag_of_len(*start as u64, other.offset, delta_len) else {
+                let Some(patch) = distance_bytes(*start as u64, other.offset, slot.len) else {
                     continue;
                 };
                 let mut image = built.bytes.clone();
-                image[delta_at..delta_at + delta_len].copy_from_slice(&patch);
+                image[slot.at..slot.at + slot.len].copy_from_slice(&patch);
                 fs::write(&path, &image).unwrap();
                 let report = fast()
                     .open::<Root>(&path)

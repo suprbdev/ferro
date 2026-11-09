@@ -2,14 +2,15 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::task::{Context, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::fast;
+use common::{Rng, Spread, cases, fast, padded_links, spread_into, spread_of};
 use ferro::db::{Clock, Hook};
 use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim, Snapshot};
 
@@ -112,6 +113,57 @@ fn threads_on_several_handles_lose_nothing() {
         assert_eq!(db.version(), handles * each);
         db.verify().unwrap();
     }
+}
+
+type Other = Arc<Mutex<Option<(Db<Spread>, BTreeMap<u64, String>, Rng)>>>;
+
+#[test]
+fn a_draft_moves_over_the_frames_another_handle_placed_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("moves.ferro");
+    let armed = Arc::new(AtomicBool::new(false));
+    let other: Other = Arc::default();
+    let hook = {
+        let (armed, other) = (armed.clone(), other.clone());
+        move |step: &'static str| {
+            if step != "drafted" || !armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let mut other = other.lock().unwrap();
+            let (db, model, rng) = other.as_mut().expect("the other handle is ready");
+            let frames = 1 + rng.below(3);
+            thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        for _ in 0..frames {
+                            spread_into(db, model, rng, 1);
+                        }
+                    })
+                    .join()
+                    .unwrap();
+            });
+        }
+    };
+    let a: Db<Spread> = shared().hook(Hook(Arc::new(hook))).open(&path).unwrap();
+    a.fork("other").unwrap();
+    let b: Db<Spread> = shared().open(&path).unwrap();
+    *other.lock().unwrap() = Some((b.branch("other").unwrap(), BTreeMap::new(), Rng::new(31)));
+    let (mut model, mut rng) = (BTreeMap::new(), Rng::new(8));
+    for round in 0..cases(40) {
+        armed.store(true, Ordering::SeqCst);
+        spread_into(&a, &mut model, &mut rng, 0);
+        assert!(!armed.load(Ordering::SeqCst), "round {round} moved nothing");
+    }
+    let (b_other, other_model, _) = other.lock().unwrap().take().unwrap();
+    assert_eq!(spread_of(&a), model);
+    assert_eq!(spread_of(&b_other), other_model);
+    a.verify().unwrap();
+    drop((a, b_other, b));
+    assert!(padded_links(&std::fs::read(&path).unwrap()) > 0);
+    let db: Db<Spread> = Options::new().open(&path).unwrap();
+    db.verify().unwrap();
+    assert_eq!(spread_of(&db), model);
+    assert_eq!(spread_of(&db.branch("other").unwrap()), other_model);
 }
 
 #[test]

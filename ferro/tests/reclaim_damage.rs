@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::Rng;
+use common::{LinkSlot, Rng, distance_bytes, link_slots};
 use ferro::store::{Store, StoreOptions};
 use ferro::{Bytes, Db, Durability, Error, Keep, Map, Options, Reclaim};
 
@@ -144,20 +144,6 @@ fn build(path: &Path) {
     .unwrap();
 }
 
-fn varint(bytes: &[u8], at: &mut usize) -> u64 {
-    let mut value = 0;
-    let mut shift = 0;
-    loop {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        shift += 7;
-        if byte & 0x80 == 0 {
-            return value;
-        }
-    }
-}
-
 fn find(bytes: &[u8], marker: &[u8]) -> u64 {
     let at = bytes
         .windows(marker.len())
@@ -166,51 +152,10 @@ fn find(bytes: &[u8], marker: &[u8]) -> u64 {
     (at + marker.len()) as u64
 }
 
-struct Link {
-    hash_at: usize,
-    delta_at: usize,
-    delta_len: usize,
-    target: u64,
-}
-
-fn links_of(bytes: &[u8], offset: u64) -> Vec<Link> {
-    let mut at = offset as usize;
-    let stored = varint(bytes, &mut at) as usize;
-    let flagged = varint(bytes, &mut at);
-    if flagged & 1 == 1 {
-        varint(bytes, &mut at);
-    }
-    at += stored;
-    let mut links = Vec::new();
-    for _ in 0..flagged >> 1 {
-        let hash_at = at;
-        at += 20;
-        let delta_at = at;
-        let delta = varint(bytes, &mut at);
-        let delta = ((delta >> 1) as i64) ^ -((delta & 1) as i64);
-        links.push(Link {
-            hash_at,
-            delta_at,
-            delta_len: at - delta_at,
-            target: offset.wrapping_sub(delta as u64),
-        });
-    }
-    links
-}
-
-fn retarget(bytes: &mut [u8], offset: u64, link: &Link, target: u64) {
-    let delta = offset as i64 - target as i64;
-    let mut value = ((delta << 1) ^ (delta >> 63)) as u64;
-    for index in 0..link.delta_len {
-        let more = if index + 1 < link.delta_len { 0x80 } else { 0 };
-        bytes[link.delta_at + index] = (value & 0x7f) as u8 | more;
-        value >>= 7;
-    }
-    assert_eq!(
-        value, 0,
-        "the link at {} cannot reach {target}",
-        link.delta_at
-    );
+fn retarget(bytes: &mut [u8], offset: u64, link: &LinkSlot, target: u64) {
+    let patch = distance_bytes(offset, target, link.len)
+        .unwrap_or_else(|| panic!("the link at {} cannot reach {target}", link.at));
+    bytes[link.at..link.at + link.len].copy_from_slice(&patch);
 }
 
 struct Hosts {
@@ -270,7 +215,7 @@ enum Damage {
 fn damaged(source: &[u8], layout: &Hosts, damage: &Damage) -> (Vec<u8>, String) {
     let mut bytes = source.to_vec();
     let parent = layout.parent;
-    let links = links_of(&bytes, parent);
+    let (links, _) = link_slots(&bytes, parent as usize);
     let (link, key) = links
         .iter()
         .find_map(|link| {

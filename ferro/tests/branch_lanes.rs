@@ -1677,3 +1677,146 @@ fn a_frame_another_branch_moves_is_the_frame_written_in_its_place() {
         reopened.verify().unwrap();
     }
 }
+
+#[test]
+fn drafts_moved_over_several_frames_of_any_size_read_verify_and_compact_alike() {
+    let rounds = cases(20) as u64;
+    for cache in [1 << 30, 1] {
+        let dir = dir();
+        let moved_path = dir.path().join("moved.ferro");
+        let placed_path = dir.path().join("placed.ferro");
+        let armed = Arc::new(AtomicBool::new(false));
+        let other: Other = Arc::default();
+        let frames = Arc::new(Mutex::new((Rng::new(cache + 3), Vec::new())));
+        let hook = {
+            let (armed, other, frames) = (armed.clone(), other.clone(), frames.clone());
+            move |step: &'static str| {
+                if step != "drafted" || !armed.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let mut frames = frames.lock();
+                let count = 1 + frames.0.below(3);
+                frames.1.push(count);
+                let mut other = other.lock();
+                let (db, edits) = other.as_mut().expect("the other branch is ready");
+                thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            for _ in 0..count {
+                                db.update(|root| edits.apply(root)).unwrap();
+                            }
+                        })
+                        .join()
+                        .unwrap();
+                });
+            }
+        };
+        let moved: Db<Mixed> = mixed_options(buffered)
+            .cache_bytes(cache)
+            .hook(Hook(Arc::new(hook)))
+            .open(&moved_path)
+            .unwrap();
+        *other.lock() = Some((mixed_seed(&moved), Edits::new(1, "other")));
+        let mut main = Edits::new(0, "main");
+        for round in 0..rounds {
+            armed.store(true, Ordering::SeqCst);
+            moved.update(|root| main.apply(root)).unwrap();
+            assert!(
+                !armed.load(Ordering::SeqCst),
+                "cache {cache}: round {round} moved nothing"
+            );
+        }
+        let placed: Db<Mixed> = mixed_options(buffered).open(&placed_path).unwrap();
+        let placed_other = mixed_seed(&placed);
+        let (mut main, mut second) = (Edits::new(0, "main"), Edits::new(1, "other"));
+        for count in std::mem::take(&mut frames.lock().1) {
+            for _ in 0..count {
+                placed_other.update(|root| second.apply(root)).unwrap();
+            }
+            placed.update(|root| main.apply(root)).unwrap();
+        }
+        let moved_other = other.lock().take().expect("the other branch is held").0;
+        assert!(
+            entries(&moved) == entries(&placed),
+            "cache {cache}: main reads differently"
+        );
+        assert!(
+            entries(&moved_other) == entries(&placed_other),
+            "cache {cache}: other reads differently"
+        );
+        moved.verify().unwrap();
+        drop((moved, moved_other));
+        assert!(
+            padded_links(&fs::read(&moved_path).unwrap()) > 0,
+            "cache {cache}: no draft moved in place"
+        );
+        let reopened: Db<Mixed> = buffered().cache_bytes(1).open(&moved_path).unwrap();
+        reopened.verify().unwrap();
+        reopened.compact(Keep::All).unwrap();
+        reopened.verify().unwrap();
+        assert!(
+            entries(&reopened) == entries(&placed),
+            "cache {cache}: main reads differently once compacted"
+        );
+        assert!(
+            entries(&reopened.branch("other").unwrap()) == entries(&placed_other),
+            "cache {cache}: other reads differently once compacted"
+        );
+    }
+}
+
+#[test]
+fn own_branches_drafting_at_once_read_as_if_written_in_turn() {
+    let lanes = 8;
+    let rounds = cases(12) as u64;
+    let dir = dir();
+    let path = dir.path().join("lanes.ferro");
+    let db: Db<Mixed> = mixed_options(buffered)
+        .cache_bytes(1 << 16)
+        .open(&path)
+        .unwrap();
+    let placed: Db<Mixed> = mixed_options(buffered)
+        .open(dir.path().join("placed.ferro"))
+        .unwrap();
+    let forks = |db: &Db<Mixed>| -> Vec<Db<Mixed>> {
+        mixed_seed(db);
+        (0..lanes)
+            .map(|lane| db.fork(&format!("lane-{lane}")).unwrap())
+            .collect()
+    };
+    let branches = forks(&db);
+    thread::scope(|scope| {
+        for (lane, branch) in branches.iter().enumerate() {
+            scope.spawn(move || {
+                let mut edits = Edits::new(lane as u64, "lane");
+                for _ in 0..rounds {
+                    branch.update(|root| edits.apply(root)).unwrap();
+                }
+            });
+        }
+    });
+    for (lane, branch) in forks(&placed).iter().enumerate() {
+        let mut edits = Edits::new(lane as u64, "lane");
+        for _ in 0..rounds {
+            branch.update(|root| edits.apply(root)).unwrap();
+        }
+    }
+    db.verify().unwrap();
+    let alike = |db: &Db<Mixed>, context: &str| {
+        for lane in 0..lanes {
+            let name = format!("lane-{lane}");
+            assert!(
+                entries(&db.branch(&name).unwrap()) == entries(&placed.branch(&name).unwrap()),
+                "{context}: {name} reads differently"
+            );
+        }
+    };
+    alike(&db, "open");
+    drop((branches, db));
+    let reopened: Db<Mixed> = buffered().cache_bytes(1).open(&path).unwrap();
+    reopened.verify().unwrap();
+    alike(&reopened, "reopened");
+    reopened.compact(Keep::All).unwrap();
+    reopened.verify().unwrap();
+    alike(&reopened, "compacted");
+}

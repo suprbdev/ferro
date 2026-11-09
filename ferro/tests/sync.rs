@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Rng, cases, fast, text};
+use common::{Rng, cases, fast, padded_links, spread_into, spread_of, text};
 use ferro::codec::{Encoder, HashSink, Object};
 use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Store, StoreOptions, Trace};
@@ -477,6 +477,73 @@ fn diverged_branches_merge_against_the_newest_common_state() {
     assert_eq!(again.outcome, Outcome::UpToDate);
     a.verify().unwrap();
     b.verify().unwrap();
+}
+
+type Other = Arc<Mutex<Option<(Db<Root>, BTreeMap<u64, String>, Rng)>>>;
+
+#[test]
+fn a_file_whose_drafts_moved_in_place_pulls_out_and_in_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("moved.ferro");
+    let armed = Arc::new(AtomicBool::new(false));
+    let other: Other = Arc::default();
+    let hook = {
+        let (armed, other) = (armed.clone(), other.clone());
+        move |step: &'static str| {
+            if step != "drafted" || !armed.load(Ordering::SeqCst) {
+                return;
+            }
+            let Some(mut other) = other.try_lock() else {
+                return;
+            };
+            let Some((db, model, rng)) = other.as_mut() else {
+                return;
+            };
+            thread::scope(|scope| {
+                scope
+                    .spawn(|| spread_into(db, model, rng, 1))
+                    .join()
+                    .unwrap();
+            });
+        }
+    };
+    let main: Db<Root> = fast()
+        .cache_bytes(1 << 30)
+        .hook(Hook(Arc::new(hook)))
+        .open(&path)
+        .unwrap();
+    *other.lock() = Some((main.fork("other").unwrap(), BTreeMap::new(), Rng::new(41)));
+    let (mut ours, mut theirs, mut rng) = (BTreeMap::new(), BTreeMap::new(), Rng::new(12));
+    armed.store(true, Ordering::SeqCst);
+    for _ in 0..cases(30) {
+        spread_into(&main, &mut ours, &mut rng, 0);
+    }
+    let fresh = open(&dir, "fresh.ferro");
+    fresh.pull(&main, "moved", refuse).unwrap();
+    fresh.verify().unwrap();
+    assert_eq!(spread_of(&fresh), ours);
+    for _ in 0..10 {
+        spread_into(&fresh, &mut theirs, &mut rng, 5);
+        spread_into(&main, &mut ours, &mut rng, 0);
+    }
+    let pulled = main.pull(&fresh, "fresh", theirs_win).unwrap();
+    assert_eq!(pulled.outcome, Outcome::Merged);
+    for _ in 0..10 {
+        spread_into(&main, &mut ours, &mut rng, 0);
+    }
+    armed.store(false, Ordering::SeqCst);
+    let (other_db, other_model, _) = other.lock().take().unwrap();
+    let mut both = ours.clone();
+    both.extend(theirs);
+    assert_eq!(spread_of(&main), both);
+    assert_eq!(spread_of(&other_db), other_model);
+    main.verify().unwrap();
+    drop((main, other_db, fresh));
+    assert!(padded_links(&file_bytes(&path)) > 0);
+    let reopened: Db<Root> = fast().cache_bytes(1).open(&path).unwrap();
+    reopened.verify().unwrap();
+    assert_eq!(spread_of(&reopened), both);
+    assert_eq!(spread_of(&reopened.branch("other").unwrap()), other_model);
 }
 
 #[test]
