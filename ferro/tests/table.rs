@@ -666,10 +666,11 @@ mod failed_loads {
     use std::cmp::Ordering;
 
     use ferro::codec::{Decoder, Encoder};
-    use ferro::{Data, Options, Record, Set, Table, hash_of};
+    use ferro::{Data, Map, Options, Record, Set, Table, hash_of};
 
     use crate::common::{
-        Brittle, Rng, cases, defuse, fuse, interrupted, quiet_ferro_panics, roomy, text, uncached,
+        Brittle, Fragile, Rng, cases, count_decodes, decodes, defuse, fuse, interrupted,
+        quiet_ferro_panics, roomy, text, uncached,
     };
 
     #[derive(Clone, Debug)]
@@ -1147,5 +1148,281 @@ mod failed_loads {
             }
         })
         .unwrap();
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Stamped {
+        #[key]
+        id: u64,
+        #[index(cover(label, body))]
+        label: Loose,
+        body: Fragile,
+    }
+
+    fn rebuilt<T: Record + Clone>(table: &Table<T>) -> Table<T> {
+        let mut fresh: Table<T> = Table::new();
+        for row in table.iter() {
+            fresh.insert((*row).clone());
+        }
+        fresh
+    }
+
+    #[test]
+    fn a_relabel_whose_covered_value_is_stored_apart_is_whole_through_failed_loads() {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamped.ferro");
+        let db = uncached().open::<Table<Stamped>>(&path).unwrap();
+        db.update(|table| {
+            for id in 0..40 {
+                table.insert(Stamped {
+                    id,
+                    label: Loose(id * 2),
+                    body: Fragile(id, text(id, 2000)),
+                });
+            }
+        })
+        .unwrap();
+        drop(db);
+        let db = uncached().open::<Table<Stamped>>(&path).unwrap();
+        db.update(|table| {
+            let hash = hash_of(table);
+            let mut at = 0;
+            loop {
+                let mut trial = table.clone();
+                fuse(at, at % 2 == 1);
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    trial.update(&17, |row| row.label = Loose(35));
+                }));
+                defuse();
+                if outcome.is_ok() {
+                    assert_eq!(trial.get(&17).unwrap().label.0, 35);
+                    assert_eq!(hash_of(&trial), hash_of(&rebuilt(&trial)));
+                    break;
+                }
+                assert_eq!(hash_of(&trial), hash, "relabel failed at decode {at}");
+                at += 1;
+            }
+            assert!(at > 4, "the relabel loaded too little to test");
+        })
+        .unwrap();
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Big {
+        #[key]
+        id: u64,
+        #[index]
+        group: u64,
+        body: Fragile,
+    }
+
+    fn big(id: u64) -> Big {
+        Big {
+            id,
+            group: id % 7,
+            body: Fragile(id, text(id, 4000)),
+        }
+    }
+
+    #[test]
+    fn writes_read_a_row_stored_apart_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.ferro");
+        let db = uncached().open::<Table<Big>>(&path).unwrap();
+        db.update(|table| {
+            for id in 0..200 {
+                table.insert(big(id));
+            }
+        })
+        .unwrap();
+        drop(db);
+        let db = uncached().open::<Table<Big>>(&path).unwrap();
+        db.update(|table| {
+            let mut counted = |what: &str, write: &mut dyn FnMut(&mut Table<Big>)| {
+                count_decodes();
+                write(table);
+                assert_eq!(decodes(), 1, "{what}");
+            };
+            counted("remove", &mut |table| {
+                table.remove(&50);
+            });
+            counted("update", &mut |table| {
+                table.update(&60, |row| row.group = 99);
+            });
+            counted("get_mut", &mut |table| {
+                table.get_mut(&61).unwrap().group = 98;
+            });
+            counted("insert over", &mut |table| {
+                table.insert(big(70));
+            });
+        })
+        .unwrap();
+        let map_path = dir.path().join("map.ferro");
+        let maps = uncached().open::<Map<u64, Fragile>>(&map_path).unwrap();
+        maps.update(|map| {
+            for id in 0..200 {
+                map.insert(id, big(id).body);
+            }
+        })
+        .unwrap();
+        drop(maps);
+        let maps = uncached().open::<Map<u64, Fragile>>(&map_path).unwrap();
+        maps.update(|map| {
+            count_decodes();
+            map.pop_first();
+            assert_eq!(decodes(), 1, "pop_first");
+            count_decodes();
+            map.pop_last();
+            assert_eq!(decodes(), 1, "pop_last");
+        })
+        .unwrap();
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Leaf {
+        #[key]
+        id: u64,
+        #[index]
+        group: Brittle,
+        #[unique]
+        slug: Option<Brittle>,
+        #[index(each)]
+        tags: Vec<Brittle>,
+        note: String,
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Shelf {
+        #[key]
+        id: Brittle,
+        #[index]
+        kind: Brittle,
+        #[unique]
+        name: Option<Brittle>,
+        #[index(each)]
+        labels: Set<Brittle>,
+        leaves: Table<Leaf>,
+        note: String,
+    }
+
+    fn leaf(rng: &mut Rng, id: u64) -> Leaf {
+        Leaf {
+            id,
+            group: Brittle(rng.below(5)),
+            slug: rng.chance(50).then(|| Brittle(id + 1000)),
+            tags: (0..rng.below(3)).map(|_| Brittle(rng.below(6))).collect(),
+            note: text(rng.next(), if rng.chance(10) { 700 } else { 5 }),
+        }
+    }
+
+    fn shelf(rng: &mut Rng, id: u64) -> Shelf {
+        let mut leaves: Table<Leaf> = Table::new();
+        for at in 0..rng.below(30) {
+            leaves.insert(leaf(rng, at));
+        }
+        let mut labels = Set::new();
+        for _ in 0..rng.below(4) {
+            labels.insert(Brittle(rng.below(8)));
+        }
+        Shelf {
+            id: Brittle(id),
+            kind: Brittle(rng.below(4)),
+            name: rng.chance(60).then(|| Brittle(id + 500)),
+            labels,
+            leaves,
+            note: text(rng.next(), if rng.chance(20) { 900 } else { 8 }),
+        }
+    }
+
+    fn whole(table: &Table<Shelf>, what: &str) {
+        assert_eq!(hash_of(table), hash_of(&rebuilt(table)), "{what}: outer");
+        for shelf in table.iter() {
+            assert_eq!(
+                hash_of(&shelf.leaves),
+                hash_of(&rebuilt(&shelf.leaves)),
+                "{what}: the leaves of {:?}",
+                shelf.id
+            );
+        }
+    }
+
+    fn swept(table: &Table<Shelf>, what: &str, op: impl Fn(&mut Table<Shelf>)) -> Table<Shelf> {
+        let hash = hash_of(table);
+        let mut at = 0;
+        loop {
+            let mut trial = table.clone();
+            fuse(at, at % 2 == 1);
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| op(&mut trial)));
+            defuse();
+            if outcome.is_ok() {
+                whole(&trial, &format!("{what} done"));
+                return trial;
+            }
+            assert_eq!(hash_of(&trial), hash, "{what} failed at decode {at}");
+            if at % 8 == 0 {
+                whole(&trial, &format!("{what} failed at decode {at}"));
+            }
+            at += 1;
+        }
+    }
+
+    #[test]
+    fn nested_tables_and_brittle_keys_survive_every_load_point() {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shelves.ferro");
+        let mut rng = Rng::new(11);
+        let db = uncached().open::<Table<Shelf>>(&path).unwrap();
+        db.update(|table| {
+            for id in 0..60 {
+                table.insert(shelf(&mut rng, id));
+            }
+        })
+        .unwrap();
+        drop(db);
+        let db = uncached().open::<Table<Shelf>>(&path).unwrap();
+        db.update(|table| {
+            let replacement = shelf(&mut Rng::new(12), 7);
+            *table = swept(table, "insert over", |table| {
+                table.insert(replacement.clone());
+            });
+            *table = swept(table, "insert", |table| {
+                table.insert(shelf(&mut Rng::new(5), 900));
+            });
+            *table = swept(table, "remove", |table| {
+                table.remove(&Brittle(13));
+            });
+            *table = swept(table, "inner write", |table| {
+                table.update(&Brittle(21), |shelf| {
+                    shelf.leaves.insert(leaf(&mut Rng::new(3), 2));
+                    shelf.leaves.remove(&4);
+                    shelf.leaves.update(&6, |leaf| leaf.group = Brittle(9));
+                });
+            });
+            *table = swept(table, "relabel", |table| {
+                table.update(&Brittle(22), |shelf| {
+                    shelf.labels.insert(Brittle(7));
+                    shelf.labels.remove(&Brittle(0));
+                    shelf.name = None;
+                    shelf.kind = Brittle(3);
+                });
+            });
+            *table = swept(table, "key change", |table| {
+                table.update(&Brittle(30), |shelf| {
+                    shelf.id = Brittle(31);
+                    shelf.name = Some(Brittle(531));
+                });
+            });
+            *table = swept(table, "retain", |table| {
+                table.retain(|shelf| shelf.kind.0 != 2)
+            });
+            *table = swept(table, "drain_range", |table| {
+                table.drain_range(Brittle(40)..Brittle(50));
+            });
+            *table = swept(table, "rewrite", |table| table.rewrite());
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
     }
 }

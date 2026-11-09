@@ -142,7 +142,7 @@
 
 use std::any::{TypeId, type_name};
 use std::borrow::Borrow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
@@ -227,6 +227,11 @@ impl<K: fmt::Debug> std::error::Error for Taken<K> {}
 #[doc(hidden)]
 pub type Rows<T> = Map<<T as Record>::Key, T>;
 
+/// What [`TableData::write`] hands each changed row to, as the `old` and `new` that
+/// [`reindex`](TableData::reindex) takes.
+#[doc(hidden)]
+pub type Stage<'a, T> = dyn FnMut(Option<&T>, Option<&T>) + 'a;
+
 /// The storage behind a [`Table`]: its rows and the indexes kept beside them.
 ///
 /// [`Record`](derive@crate::Record) implements this for the `{Name}Table` type it generates, which
@@ -246,20 +251,24 @@ pub trait TableData<T: Record>: Data + Default {
     /// before it changed. The writes of [`Table`] leave the rows and every index as they were.
     fn reindex(&mut self, old: Option<&T>, new: Option<&T>);
     /// Changes the rows with `rows`, and every index for each row that changes from `old` to
-    /// `new` in `changes`, as [`reindex`](TableData::reindex) does for one.
+    /// `new` as `changes` hands the pair to the [`Stage`] it is given, as
+    /// [`reindex`](TableData::reindex) does for one.
     ///
-    /// The derive stages every index entry in an [`Edits`] and loads what the removals and batches
-    /// of entries will load. Then it adds each lone entry and calls `rows`, either of which can
-    /// fail, taking the entries it added back if one does, and last makes the removals and
-    /// batches, which have nothing left to load. So a load that fails leaves the rows and every
-    /// index as they were, as long as `rows` changes nothing when it fails. The default calls
-    /// `rows` and then [`reindex`](TableData::reindex) for each change.
+    /// `changes` is called once, before `rows`, so a row read for it can be dropped as soon as it
+    /// is handed over. The derive stages every index entry in an [`Edits`] and loads what the
+    /// removals and batches of entries will load. Then it adds each lone entry and calls `rows`,
+    /// either of which can fail, taking the entries it added back if one does, and last makes the
+    /// removals and batches, which have nothing left to load. So a load that fails leaves the rows
+    /// and every index as they were, as long as `rows` changes nothing when it fails. The default
+    /// calls [`reindex`](TableData::reindex) for each change and then `rows`.
     #[doc(hidden)]
-    fn write(&mut self, changes: &[(Option<&T>, Option<&T>)], rows: &mut dyn FnMut(&mut Rows<T>)) {
+    fn write(
+        &mut self,
+        changes: &mut dyn FnMut(&mut Stage<'_, T>),
+        rows: &mut dyn FnMut(&mut Rows<T>),
+    ) {
+        changes(&mut |old, new| self.reindex(old, new));
         rows(self.rows_mut());
-        for &(old, new) in changes {
-            self.reindex(old, new);
-        }
     }
     /// Returns the clash `row` would cause in a unique index, if any.
     ///
@@ -1038,7 +1047,8 @@ impl<T: Record> Table<T> {
         let row = Arc::new(row);
         let (old, undo) = self.0.rows_mut().insert_undoable(row.key(), row.clone());
         let indexed = panic::catch_unwind(AssertUnwindSafe(|| {
-            self.0.write(&[(old.as_deref(), Some(&row))], &mut |_| {});
+            self.0
+                .write(&mut |stage| stage(old.as_deref(), Some(&row)), &mut |_| {});
         }));
         if let Err(payload) = indexed {
             self.0.rows_mut().undo_insert(&row.key(), undo);
@@ -1070,16 +1080,20 @@ impl<T: Record> Table<T> {
         let row = Arc::new(row);
         if old_key == new_key {
             let mut entry = Some((new_key, row.clone()));
-            self.0.write(&[(Some(old), Some(&row))], &mut |rows| {
-                if let Some((key, row)) = entry.take() {
-                    rows.put_shared(key, row);
-                }
-            });
+            self.0
+                .write(&mut |stage| stage(Some(old), Some(&row)), &mut |rows| {
+                    if let Some((key, row)) = entry.take() {
+                        rows.put_shared(key, row);
+                    }
+                });
         } else {
             let displaced = self.0.rows().get(&new_key);
             let mut moved = Some(vec![(old_key, None), (new_key, Some(row.clone()))]);
             self.0.write(
-                &[(Some(old), None), (displaced.as_deref(), Some(&row))],
+                &mut |stage| {
+                    stage(Some(old), None);
+                    stage(displaced.as_deref(), Some(&row));
+                },
                 &mut |rows| {
                     if let Some(moved) = moved.take() {
                         rows.apply_shared(moved);
@@ -1097,7 +1111,9 @@ impl<T: Record> Table<T> {
     {
         let old = self.0.rows().get(key)?;
         self.0
-            .write(&[(Some(&old), None)], &mut |rows| rows.discard(key));
+            .write(&mut |stage| stage(Some(&old), None), &mut |rows| {
+                rows.discard(key)
+            });
         Some(old)
     }
 
@@ -1200,21 +1216,30 @@ impl<T: Record> Table<T> {
     /// Removes every row for which `keep` returns `false`, with its index entries.
     ///
     /// Reads every row once, in key order, then removes the rows as one batch, and their entries
-    /// as one batch for each index.
+    /// as one batch for each index. Until then it holds the keys and index entries of the rows it
+    /// removes, not the rows.
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
-        let doomed: Vec<(T::Key, Val<T>)> =
-            self.0.rows().iter().filter(|(_, row)| !keep(row)).collect();
-        if doomed.is_empty() {
-            return;
-        }
-        let changes: Vec<(Option<&T>, Option<&T>)> =
-            doomed.iter().map(|(_, row)| (Some(&**row), None)).collect();
-        let mut gone = Some(doomed.iter().map(|(key, _)| (key.clone(), None)).collect());
-        self.0.write(&changes, &mut |rows| {
-            if let Some(gone) = gone.take() {
-                rows.apply_shared(gone);
-            }
-        });
+        let mut read = Some(self.0.rows().clone());
+        let gone = RefCell::new(Vec::new());
+        self.0.write(
+            &mut |stage| {
+                let Some(read) = read.take() else {
+                    return;
+                };
+                for (key, row) in read.iter() {
+                    if !keep(&row) {
+                        stage(Some(&row), None);
+                        gone.borrow_mut().push((key, None));
+                    }
+                }
+            },
+            &mut |rows| {
+                let gone = gone.take();
+                if !gone.is_empty() {
+                    rows.apply_shared(gone);
+                }
+            },
+        );
     }
 
     /// Removes the rows whose key lies in `range` and returns them in key order.
@@ -1237,11 +1262,16 @@ impl<T: Record> Table<T> {
         if drained.is_empty() {
             return drained;
         }
-        let changes: Vec<(Option<&T>, Option<&T>)> =
-            drained.iter().map(|row| (Some(&**row), None)).collect();
-        self.0.write(&changes, &mut |rows| {
-            rows.remove_range::<Q, _>(span);
-        });
+        self.0.write(
+            &mut |stage| {
+                for row in &drained {
+                    stage(Some(row), None);
+                }
+            },
+            &mut |rows| {
+                rows.remove_range::<Q, _>(span);
+            },
+        );
         drained
     }
 

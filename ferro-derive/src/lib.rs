@@ -2578,13 +2578,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn write(
                 &mut self,
-                __changes: &[(::std::option::Option<&#name>, ::std::option::Option<&#name>)],
+                __changes: &mut dyn ::std::ops::FnMut(&mut ::ferro::table::Stage<'_, #name>),
                 __rows: &mut dyn ::std::ops::FnMut(&mut ::ferro::table::Rows<#name>),
             ) {
                 #(let mut #edits_vars = ::ferro::table::Edits::<#index_key_tys, #index_value_tys>::new();)*
-                for &(__old, __new) in __changes {
+                __changes(&mut |__old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>| {
                     #(Self::#reindex_fns(&mut #edits_vars, __old, __new);)*
-                }
+                });
                 #(#edits_vars.ready(&mut self.#index_fields);)*
                 let __wrote = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     #(#edits_vars.insert_now(&mut self.#index_fields);)*

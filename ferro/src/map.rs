@@ -2167,20 +2167,22 @@ fn merge<K: Data + Ord, V: Data, S: Data>(
 /// Stores `value` under `key`, whose level is `level`, in the tree under `link`, returning the slot
 /// it replaced.
 ///
-/// A replaced value stored on its own is read before the slot is replaced, so that the caller can
-/// read the slot it gets back without failing.
+/// When `read` is set, a replaced value stored on its own is read before the slot is replaced, so
+/// that the caller can read the slot it gets back without failing. Otherwise the slot comes back
+/// as it was, for a caller that drops it or puts it back.
 fn insert_at<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
     key: K,
     level: u8,
     value: Arc<V>,
+    read: bool,
 ) -> Result<Option<Slot<V, S>>> {
     let Link::Mem(current, hint) = link else {
-        return insert_outside(store, link, key, level, value);
+        return insert_outside(store, link, key, level, value, read);
     };
     if level > current.level {
-        return insert_above(store, link, key, level, value);
+        return insert_above(store, link, key, level, value, read);
     }
     let shared = Shared::as_ptr(current);
     let node = Shared::make_mut(current);
@@ -2191,7 +2193,7 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
         Ok(index) => {
             let before = node.buffers();
             let slot = &mut node.cells.slots()[index];
-            if let Slot::Spilled(_) = slot {
+            if read && let Slot::Spilled(_) = slot {
                 unspill(store, slot)?;
             }
             let replaced = std::mem::replace(slot, Slot::Fresh(value));
@@ -2207,7 +2209,7 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             Ok(None)
         }
         Err(position) if level == node.level => {
-            insert_between(store, node, hint, position, key, value)
+            insert_between(store, node, hint, position, key, value, read)
         }
         Err(position) => {
             if node.children.is_empty() {
@@ -2219,7 +2221,7 @@ fn insert_at<K: Data + Ord, V: Data, S: Data>(
             {
                 hint.prefetch_at(Shared::as_ptr(child).addr());
             }
-            let replaced = insert_at(store, &mut node.children[position], key, level, value)?;
+            let replaced = insert_at(store, &mut node.children[position], key, level, value, read)?;
             if replaced.is_none() {
                 node.count += 1;
             }
@@ -2244,11 +2246,12 @@ fn insert_outside<K: Data + Ord, V: Data, S: Data>(
     key: K,
     level: u8,
     value: Arc<V>,
+    read: bool,
 ) -> Result<Option<Slot<V, S>>> {
     if let Link::Stored { .. } = link {
         let node = load_to_change(store, link)?.ok_or(Error::Detached)?;
         *link = Link::Mem(node, Hint::NONE);
-        return insert_at(store, link, key, level, value);
+        return insert_at(store, link, key, level, value, read);
     }
     let mut keys = Vec::with_capacity(LEAF_CAPACITY);
     keys.push(key);
@@ -2265,10 +2268,11 @@ fn insert_above<K: Data + Ord, V: Data, S: Data>(
     key: K,
     level: u8,
     value: Arc<V>,
+    read: bool,
 ) -> Result<Option<Slot<V, S>>> {
     let side = |probe: &K| probe.cmp(&key);
     if let Some(stored) = ready_cut(store, link, &side)? {
-        return insert_at(store, link, key, stored, value);
+        return insert_at(store, link, key, stored, value, read);
     }
     let (left, right) = sever(store, link.take(), &side)?;
     *link = link_from(
@@ -2289,10 +2293,18 @@ fn insert_between<K: Data + Ord, V: Data, S: Data>(
     position: usize,
     key: K,
     value: Arc<V>,
+    read: bool,
 ) -> Result<Option<Slot<V, S>>> {
     let side = |probe: &K| probe.cmp(&key);
     if let Some(stored) = ready_cut(store, &mut node.children[position], &side)? {
-        return insert_at(store, &mut node.children[position], key, stored, value);
+        return insert_at(
+            store,
+            &mut node.children[position],
+            key,
+            stored,
+            value,
+            read,
+        );
     }
     let before = node.buffers();
     let (left, right) = sever(store, node.children[position].take(), &side)?;
@@ -2305,10 +2317,16 @@ fn insert_between<K: Data + Ord, V: Data, S: Data>(
     Ok(None)
 }
 
+/// Removes `key` from the tree under `link`, returning the slot it held.
+///
+/// When `read` is set, a value stored on its own is read before the key is removed, so that the
+/// caller can read the slot it gets back without failing. Otherwise the slot comes back as it was,
+/// for a caller that drops it.
 fn remove_at<K, V, S, Q>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
     key: &Q,
+    read: bool,
 ) -> Result<Option<Slot<V, S>>>
 where
     K: Data + Ord + Borrow<Q>,
@@ -2322,7 +2340,8 @@ where
     let node = node_mut(store, link)?;
     match node.search(key) {
         Ok(index) => {
-            if let Cells::Slots(slots) = &mut node.cells
+            if read
+                && let Cells::Slots(slots) = &mut node.cells
                 && let slot @ Slot::Spilled(_) = &mut slots[index]
             {
                 unspill(store, slot)?;
@@ -2340,7 +2359,7 @@ where
             Ok(Some(slot))
         }
         Err(position) => {
-            let removed = remove_at(store, &mut node.children_mut()[position], key)?;
+            let removed = remove_at(store, &mut node.children_mut()[position], key, read)?;
             if removed.is_some() {
                 node.count -= 1;
             }
@@ -2366,18 +2385,11 @@ fn remove_between<K: Data + Ord, V: Data, S: Data>(
     Ok(slot)
 }
 
-/// Whether the slot at `index` holds a value stored on its own, which an edit that replaces or
-/// removes it reads first.
-fn spilled_at<K, V, S>(node: &Node<K, V, S>, index: usize) -> bool {
-    matches!(&node.cells, Cells::Slots(slots) if matches!(slots[index], Slot::Spilled(_)))
-}
-
-/// Loads in place, as [`node_mut`] does, every node and value that [`remove_at`] of `key` would
-/// load, so that the removal that follows has nothing left to load.
+/// Loads in place, as [`node_mut`] does, every node that [`remove_at`] of `key`, not reading the
+/// value it removes, would load, so that the removal that follows has nothing left to load.
 ///
-/// That is each node on the path of `key`, the value stored on its own under it, and what
-/// [`ready_join`] loads of the two children beside it. A path held in memory throughout is only
-/// walked.
+/// That is each node on the path of `key` and what [`ready_join`] loads of the two children beside
+/// it. A path held in memory throughout is only walked.
 fn ready_remove<K: Data + Ord, V: Data, S: Data>(
     store: Option<&Store>,
     link: &mut Link<K, V, S>,
@@ -2392,7 +2404,7 @@ fn ready_remove<K: Data + Ord, V: Data, S: Data>(
         };
         match node.search(key) {
             Ok(index) => {
-                if spilled_at(node, index) || !joined(node.child(index), node.child(index + 1)) {
+                if !joined(node.child(index), node.child(index + 1)) {
                     return load_remove(store, link, key);
                 }
                 return Ok(());
@@ -2416,9 +2428,6 @@ fn load_remove<K: Data + Ord, V: Data, S: Data>(
     let node = node_mut(store, link)?;
     match node.search(key) {
         Ok(index) => {
-            if let Cells::Slots(slots) = &mut node.cells {
-                unspill(store, &mut slots[index])?;
-            }
             if let [.., left, right] = node.children.get_mut(..index + 2).unwrap_or_default() {
                 ready_join(store, left, right)?;
             }
@@ -3591,6 +3600,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Edits<K, V, S> {
             key.clone(),
             level,
             Arc::new(value),
+            false,
         ));
         self.staged = Pending::Inserted(gone, key, Undo(replaced));
         if let Pending::Inserted(Some(gone), ..) = &self.staged
@@ -3628,11 +3638,11 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Edits<K, V, S> {
         let store = map.store.as_ref();
         match std::mem::replace(&mut self.staged, Pending::Empty) {
             Pending::Remove(key) | Pending::Inserted(Some(key), ..) => {
-                fatal(remove_at(store, &mut map.root, &key));
+                fatal(remove_at(store, &mut map.root, &key, false));
             }
             Pending::Swapped(gone, come, level, value) => {
-                fatal(remove_at(store, &mut map.root, &gone));
-                fatal(insert_at(store, &mut map.root, come, level, value));
+                fatal(remove_at(store, &mut map.root, &gone, false));
+                fatal(insert_at(store, &mut map.root, come, level, value, false));
             }
             Pending::Batch(first, rest) => {
                 for edits in [first, rest] {
@@ -4380,7 +4390,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     pub(crate) fn insert_shared(&mut self, key: K, value: Arc<V>) -> Option<Val<V>> {
         let level = fatal(level_of(&key));
         let store = self.store.as_ref();
-        let replaced = fatal(insert_at(store, &mut self.root, key, level, value));
+        let replaced = fatal(insert_at(store, &mut self.root, key, level, value, true));
         replaced.map(|slot| fatal(read_slot(store, &slot)))
     }
 
@@ -4394,6 +4404,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             key,
             level,
             Arc::new(value),
+            true,
         )?;
         Ok(())
     }
@@ -4407,7 +4418,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ) -> (Option<Val<V>>, Undo<V, S>) {
         let level = fatal(level_of(&key));
         let store = self.store.as_ref();
-        let replaced = fatal(insert_at(store, &mut self.root, key, level, value));
+        let replaced = fatal(insert_at(store, &mut self.root, key, level, value, true));
         let old = replaced.as_ref().map(|slot| fatal(read_slot(store, slot)));
         (old, Undo(replaced))
     }
@@ -4415,14 +4426,14 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// Takes back the insert of `key` that [`insert_undoable`](Map::insert_undoable) made, while
     /// nothing else has changed the map since: removes the key, or puts back the slot it replaced.
     ///
-    /// Neither loads anything. The insert left the path to `key` in memory and read a value it
-    /// replaced, and a new key's two children are the halves it cut, whose facing edges, which a
-    /// removal joins, are new nodes.
+    /// Neither loads anything. The insert left the path to `key` in memory, a slot it replaced goes
+    /// back as it was, and a new key's two children are the halves it cut, whose facing edges,
+    /// which a removal joins, are new nodes.
     pub(crate) fn undo_insert(&mut self, key: &K, undo: Undo<V, S>) {
         let store = self.store.as_ref();
         match undo.0 {
             None => {
-                fatal(remove_at(store, &mut self.root, key));
+                fatal(remove_at(store, &mut self.root, key, false));
             }
             Some(slot) => {
                 if let Some(held) = fatal(find_slot(store, &mut self.root, key)) {
@@ -4433,7 +4444,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     /// [`insert_shared`](Map::insert_shared) for a caller that has read the value it replaces
-    /// already, which it drops.
+    /// already, which it drops without reading it again.
     pub(crate) fn put_shared(&mut self, key: K, value: Arc<V>) {
         let level = fatal(level_of(&key));
         fatal(insert_at(
@@ -4442,17 +4453,18 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             key,
             level,
             value,
+            false,
         ));
     }
 
     /// [`remove`](Map::remove) for a caller that knows `key` is present and has read its value
-    /// already, which it drops.
+    /// already, which it drops without reading it again.
     pub(crate) fn discard<Q>(&mut self, key: &Q)
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        fatal(remove_at(self.store.as_ref(), &mut self.root, key));
+        fatal(remove_at(self.store.as_ref(), &mut self.root, key, false));
     }
 
     /// Applies `items` as one batch, as [`apply`](Map::apply) does, for values already in an
@@ -4473,7 +4485,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             return None;
         }
         let store = self.store.as_ref();
-        let removed = fatal(remove_at(store, &mut self.root, key));
+        let removed = fatal(remove_at(store, &mut self.root, key, true));
         removed.map(|slot| fatal(read_slot(store, &slot)))
     }
 
@@ -4490,14 +4502,14 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// Removes and returns the entry with the smallest key, in O(log n).
     pub fn pop_first(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.first()?;
-        fatal(remove_at(self.store.as_ref(), &mut self.root, &key));
+        fatal(remove_at(self.store.as_ref(), &mut self.root, &key, false));
         Some((key, value))
     }
 
     /// Removes and returns the entry with the largest key, in O(log n).
     pub fn pop_last(&mut self) -> Option<(K, Val<V>)> {
         let (key, value) = self.last()?;
-        fatal(remove_at(self.store.as_ref(), &mut self.root, &key));
+        fatal(remove_at(self.store.as_ref(), &mut self.root, &key, false));
         Some((key, value))
     }
 

@@ -64,14 +64,16 @@ arranged so that a failure leaves the map with the entries, length, summary and 
   place, and then edits in place with nothing left to load. The edges go all the way down, since
   removing neighbouring keys joins what earlier joins made.
 - `insert` and `remove` read a value stored on its own that they replace or remove before they
-  change its slot, so neither fails once the tree has changed.
+  change its slot, so neither fails once the tree has changed. An edit that drops such a value
+  unread, as each index edit of a table write does, and as a table does with a row it has read
+  already, loads nothing for it.
 - `merge` reads the three maps and resolves the whole diff before it writes anything, then writes
   as one batch, so a load that fails, like an `Err` from `resolve`, leaves ours as it was. It
   reads ours through a finder, which keeps the leaf and parent of the key it found last, since
   the diff hands it keys in order.
 - A table write changes its rows and several index maps, each edit whole on its own, and stages the
   entries of each index in `Edits`. An index that loses a lone entry is loaded for first, as far as
-  `remove` would load, and one with more edits than a removal and an insert as a batch on a changed
+  a removal that drops the value unread would load, and one with more edits than a removal and an insert as a batch on a changed
   root is. An index that gains a lone entry gets it as the write goes, and if a later step fails the
   entry is taken back, which loads nothing: the insert left the path to its key in memory, and the
   two children it cut beside a new key are new nodes down the edges that a removal joins. The write
