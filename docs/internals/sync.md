@@ -462,6 +462,28 @@ a later pull brings another value, and that merge finds its base below both chan
 merge takes a change both sides made once, so its result is the same. A merge that adds the two
 sides' changes, as a counter does, sees both only from that later pull.
 
+### The sync model
+
+`ferro/tests/sync_model.rs` syncs three to five files in random orders and checks every step
+against a model of the merge graph. Each commit's message names its node, and a node's value is the
+sum of the deltas of every node below it, which is what a merge that adds deltas against the best
+common ancestors gives, so every file must hold its node's value after every step. The steps are
+edits, reverts of a file's own edits, the same edit on two files, pulls and two-way syncs, a have
+sent at one step and its bundle received at a later one or received twice, pulls into a forked
+branch that is then merged, local forks and merges, cycles, reopens, and dropping a pull's tracking
+branch, sometimes forking a branch of the same name. Some files are `Options::shared` with two
+handles, and each step picks one. Each outcome must agree with the graph: a fast-forward to a node
+holding ours, `Ahead` of one ours holds, `UpToDate` with one ours holds or one of our value, and a
+merge of one ours lacks. Where every file keeps all history, a pull never refuses, `UpToDate` with
+a node ours lacks needs every node it lacks to hold our value, as [The same value on both
+sides](#the-same-value-on-both-sides) describes, and a merge needs one that does not. After the
+steps, rounds of pulls between every pair must stop writing within eight, at one value when every
+file keeps all history. Other runs prune some or all files, and compact harder than they keep. Two
+more tests write and pull at once from threads on two handles of each shared file, and from three
+processes, while dropping tracking branches, and then require every change once. A failure prints
+the seed, and `FERRO_SYNC_SHRINK=plan:seed` runs `shrink_a_failing_sync_model_case`, which cuts the
+steps down to the fewest that still fail. `FERRO_TEST_SCALE` multiplies the seeds.
+
 ## Measurements
 
 On one NVMe SSD with ext4, in release:

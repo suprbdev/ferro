@@ -444,6 +444,8 @@ Tests are described next to what they test:
 - Pulls between branches that hold the same value, a revert relayed through such a branch and a
   ring of pulls that must settle: [The same value on both
   sides](sync.md#the-same-value-on-both-sides).
+- Files syncing in random orders against a model of the merge graph, with shared handles, threads
+  and processes, `sync_model.rs`: [The sync model](sync.md#the-sync-model).
 - Power cuts during a receive placed in pieces: [Where checked objects
   wait](sync-receive.md#where-checked-objects-wait).
 - The three-device sync model with small caches: [Commits stored
