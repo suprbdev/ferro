@@ -130,7 +130,9 @@ processes made 35,759 and 8 made 24,742, against 43,581 and 38,806 for 2 and 8 t
 of their own 4 processes made 87,512 and 4 threads 90,661.
 
 A reclamation cycle runs in one process at a time, and the others move to the new file at their next
-commit or `refresh`, or as soon as their follower sees the rename. A process killed in the middle of
+commit or `refresh`, or as soon as their follower sees the rename. While a cycle's pause, or a pull
+or receive landing, waits for every branch, writers in other processes start no new closure, so it
+waits only for the closures already running. A process killed in the middle of
 a commit holds up the others only until the operating system releases its locks, and nothing it
 acknowledged is lost. It needs open file description locks, so it runs on 64-bit Linux only, and the
 processes must share one machine and a local file system. Elsewhere, Windows included, the open

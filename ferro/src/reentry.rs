@@ -104,6 +104,23 @@ pub(crate) fn release(db: u64, lane: usize) {
     });
 }
 
+/// Whether this thread holds any lock it records, in any database, other than the branch lock of
+/// `name` in database `db`.
+///
+/// A thread that does may be what another process waiting for every branch lock waits for, so it
+/// must not wait at that process's gate. A thread whose record cannot be read counts as holding
+/// one.
+pub(crate) fn holds_besides(db: u64, name: &str) -> bool {
+    HOLDS
+        .try_with(|holds| {
+            let holds = holds.borrow();
+            holds.list[..holds.live].iter().any(|hold| {
+                hold.db != db || hold.lane == 0 || hold.lane == CYCLE || hold.name != name
+            })
+        })
+        .unwrap_or(true)
+}
+
 /// A record that this thread holds a lock on all of a database, removed when dropped.
 pub(crate) struct Whole(u64);
 

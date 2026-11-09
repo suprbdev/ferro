@@ -758,6 +758,8 @@ impl<T> Drop for Branch<T> {
 
 type Moved<T> = (Arc<Branch<T>>, Arc<State<T>>);
 
+type LaneWaits = Mutex<HashMap<(u64, bool), Vec<Waker>>>;
+
 type Update<T> = Option<Moved<T>>;
 
 struct Pending<T> {
@@ -997,7 +999,7 @@ struct Shared<T> {
     signal: Arc<Signal>,
     syncer: OnceLock<Arc<Signal>>,
     ids: AtomicU64,
-    lane_waits: Arc<Mutex<HashMap<u64, Vec<Waker>>>>,
+    lane_waits: Arc<LaneWaits>,
     flush: fn(&Shared<T>),
 }
 
@@ -1029,29 +1031,33 @@ impl<T> Shared<T> {
         self.queue.lock().tasks.retain(|task| task.id != id);
     }
 
-    fn await_lane(&self, store: Store, at: u64, waker: &Waker) {
+    fn await_lane(&self, store: Store, at: u64, gated: bool, waker: &Waker) {
+        let key = (at, gated);
         let mut waits = self.lane_waits.lock();
-        if let Some(wakers) = waits.get_mut(&at) {
+        if let Some(wakers) = waits.get_mut(&key) {
             if !wakers.iter().any(|held| held.will_wake(waker)) {
                 wakers.push(waker.clone());
             }
             return;
         }
-        waits.insert(at, vec![waker.clone()]);
+        waits.insert(key, vec![waker.clone()]);
         drop(waits);
         let waits = self.lane_waits.clone();
         let waiting = waits.clone();
         let spawned = thread::Builder::new()
             .name("ferro-lane".to_string())
             .spawn(move || {
+                if gated {
+                    let _ = store.pass_gate(true);
+                }
                 if store.lock_lane(at).is_ok() {
                     store.unlock_lane(at);
                 }
-                let woken = waiting.lock().remove(&at).unwrap_or_default();
+                let woken = waiting.lock().remove(&key).unwrap_or_default();
                 woken.into_iter().for_each(Waker::wake);
             });
         if spawned.is_err() {
-            let woken = waits.lock().remove(&at).unwrap_or_default();
+            let woken = waits.lock().remove(&key).unwrap_or_default();
             woken.into_iter().for_each(Waker::wake);
         }
     }
@@ -1143,12 +1149,13 @@ where
             };
             this.gated = false;
             let mut notices = Vec::new();
-            match db.shared.crossing(&mut lane, false, &mut notices) {
+            let gated = !reentry::holds_besides(db.shared.id, &db.branch.name);
+            match db.shared.crossing(&mut lane, false, gated, &mut notices) {
                 Err(error) => return Poll::Ready(Err(error.into())),
                 Ok(Some(busy)) => {
                     let at = lane.branch.lane_at;
                     drop(lane);
-                    db.shared.await_lane(busy, at, cx.waker());
+                    db.shared.await_lane(busy, at, gated, cx.waker());
                     this.start = Some(f);
                     return Poll::Pending;
                 }
@@ -2148,13 +2155,27 @@ impl<T: Data> Shared<T> {
     }
 
     fn cross(&self, lane: &mut Lane<'_, T>, notices: &mut Vec<Notice<T>>) -> Result<()> {
-        self.crossing(lane, true, notices).map(|_| ())
+        self.crossing(lane, true, false, notices).map(|_| ())
+    }
+
+    /// Lets this thread on towards a branch lock of `name` once no other process holds the gate,
+    /// as [`Store::pass_gate`] describes, unless this thread holds another lock, which that
+    /// process may be waiting for. It holds no lock while it waits, and a write calls it before
+    /// it takes its branch's lane, so no thread of this process waits for it either.
+    ///
+    /// The gate only keeps a process that wants every branch lock from waiting for ever, so a
+    /// failure to test it lets the thread on.
+    fn admit(&self, name: &str) {
+        if self.options.shared && !reentry::holds_besides(self.id, name) {
+            let _ = self.store().pass_gate(true);
+        }
     }
 
     fn crossing(
         &self,
         lane: &mut Lane<'_, T>,
         wait: bool,
+        gated: bool,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Option<Store>> {
         if !self.options.shared || lane.crossed() {
@@ -2168,7 +2189,7 @@ impl<T: Data> Shared<T> {
             let at = lane.branch.lane_at;
             match wait {
                 true => store.lock_lane(at)?,
-                false if store.try_lock_lane(at)? => {}
+                false if store.try_lock_lane(at, gated)? => {}
                 false => return Ok(Some(store)),
             }
             let mut tip = self.tip.lock();
@@ -4236,6 +4257,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
+        self.shared.admit(&self.branch.name);
         let lane = match self.shared.coalesce {
             true => self.shared.arrive(&self.branch),
             false => self.shared.lane(&self.branch),
@@ -4269,6 +4291,7 @@ impl<T: Data> Db<T> {
         f: impl FnOnce(&RefState, &State<T>, &mut T) -> std::result::Result<(String, R, Intent), E>,
     ) -> std::result::Result<Committed<R>, E> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
+        self.shared.admit(&self.branch.name);
         let lane = self.shared.lane(&self.branch);
         let staged = self.stage_alone(lane, from, |state, root, _| {
             let tip = self.shared.tip.lock().clone();
@@ -5150,6 +5173,7 @@ impl<T: Data> Db<T> {
     pub fn fork(&self, name: &str) -> Result<Db<T>> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         let mut notices = Vec::new();
+        self.shared.admit(&self.branch.name);
         let mut lane = self.shared.lane(&self.branch);
         self.shared.cross(&mut lane, &mut notices)?;
         self.branch.check_live()?;
@@ -5229,6 +5253,7 @@ impl<T: Data> Db<T> {
         }
         let _crossing = self.entering(Needs::Lane(name))?;
         let mut notices = Vec::new();
+        self.shared.admit(name);
         loop {
             let doomed = self.shared.branches.lock().get(name).cloned();
             let lane = doomed.as_ref().map(|branch| self.shared.lane(branch));

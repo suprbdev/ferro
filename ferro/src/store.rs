@@ -174,6 +174,9 @@ const COMMIT_AT: u64 = LOCKS_AT + 2;
 const SUPER_AT: u64 = LOCKS_AT + 3;
 /// The cycle lock, held exclusive for a reclamation cycle and the pieces of a large receive.
 const CYCLE_AT: u64 = LOCKS_AT + 4;
+/// The gate, held exclusive by a process that wants or holds every branch lock at once, so that
+/// other processes take no new branch lock until it is done.
+const GATE_AT: u64 = LOCKS_AT + 5;
 /// The first byte of the branch locks, each a byte at a 60-bit hash of the branch's name.
 const LANES_AT: u64 = LOCKS_AT + (1 << 20);
 /// How many bytes the branch locks span.
@@ -1799,9 +1802,11 @@ struct Lanes {
     whole: bool,
 }
 
-/// Every branch lock at once, held by one thread of this process and released when dropped.
+/// Every branch lock at once, and the gate, held by one thread of this process and released when
+/// dropped.
 pub(crate) struct AllLanes {
     store: Store,
+    gate: Option<Held>,
 }
 
 impl Drop for AllLanes {
@@ -1809,6 +1814,7 @@ impl Drop for AllLanes {
         let inner = &self.store.inner;
         let mut lanes = inner.lanes.lock();
         let _ = platform::unlock_range(&inner.file, LANES_AT, LANES);
+        drop(self.gate.take());
         lanes.whole = false;
         inner.lanes_moved.notify_all();
     }
@@ -3064,6 +3070,12 @@ impl Store {
     ///
     /// It returns `None` if `wait` is not set and the range is held, here or in another process.
     fn hold(&self, at: u64, len: u64, wait: bool) -> Result<Option<Held>> {
+        self.hold_as(at, len, true, wait)
+    }
+
+    /// [`Store::hold`], locking the range in the kernel shared rather than exclusive unless
+    /// `exclusive` is set. Within this process the range is this thread's alone either way.
+    fn hold_as(&self, at: u64, len: u64, exclusive: bool, wait: bool) -> Result<Option<Held>> {
         let inner = &self.inner;
         let mut taken = inner.taken.lock();
         while taken.contains(&at) {
@@ -3074,7 +3086,7 @@ impl Store {
         }
         taken.push(at);
         drop(taken);
-        let locked = platform::lock_range(&inner.file, at, len, true, wait);
+        let locked = platform::lock_range(&inner.file, at, len, exclusive, wait);
         if locked.is_ok() {
             return Ok(Some(Held {
                 store: self.clone(),
@@ -3099,10 +3111,16 @@ impl Store {
     /// Takes every branch lock at once, as a cycle's prune and pause and a landing receive do.
     ///
     /// It marks the whole range wanted, so that no thread of this process takes a branch byte,
-    /// waits until none holds one, and then locks the range in the kernel. While it waits it calls
-    /// `stale` every millisecond and gives up with `None` once that returns `true`, since a thread
-    /// holding a byte for a branch attached after the caller listed its lanes may be waiting for
-    /// one of those lanes.
+    /// waits until none holds one, takes the gate, so that no other process takes a branch byte
+    /// it does not hold yet, and then locks the range in the kernel. While it waits for this
+    /// process's threads it calls `stale` every millisecond and gives up with `None` once that
+    /// returns `true`, since a thread holding a byte for a branch attached after the caller listed
+    /// its lanes may be waiting for one of those lanes.
+    ///
+    /// The kernel grants a lock on the range only once every byte of it is free at once, and it
+    /// does not hold back a byte another process asks for while the range is wanted, so without
+    /// the gate writers in other processes, each on a branch of its own, could keep the range
+    /// from ever being free.
     pub(crate) fn lock_lanes(&self, stale: impl Fn() -> bool) -> Result<Option<AllLanes>> {
         let inner = &self.inner;
         let mut lanes = inner.lanes.lock();
@@ -3124,9 +3142,11 @@ impl Store {
             }
         }
         drop(lanes);
-        let all = AllLanes {
+        let mut all = AllLanes {
             store: self.clone(),
+            gate: None,
         };
+        all.gate = self.hold(GATE_AT, 1, true)?;
         platform::lock_range(&inner.file, LANES_AT, LANES, true, true).map_err(
             |error| match error {
                 TryLockError::Error(error) => Error::Io(error),
@@ -3148,8 +3168,36 @@ impl Store {
     }
 
     /// Takes the branch lock at `at` if it can without waiting, and returns whether it did.
-    pub(crate) fn try_lock_lane(&self, at: u64) -> Result<bool> {
+    ///
+    /// If `gated` is set, it does not while another process holds the gate, as
+    /// [`Store::pass_gate`] describes. A gate that cannot be tested counts as free.
+    pub(crate) fn try_lock_lane(&self, at: u64, gated: bool) -> Result<bool> {
+        if gated && !self.pass_gate(false).unwrap_or(true) {
+            return Ok(false);
+        }
         self.take_lane(at, false)
+    }
+
+    /// Waits, if `wait` is set, while another process holds the gate, and returns whether the
+    /// gate was free or came free.
+    ///
+    /// A process holds the gate while it wants or holds every branch lock at once, as
+    /// [`Store::lock_lanes`] takes them. A thread about to take a branch lock while it holds no
+    /// lock of any file passes the gate first, so that once a process wants every branch lock no
+    /// other process takes a new one, and the range comes free as the closures that hold branch
+    /// locks end. The test reads the lock without taking it, so a thread that finds the gate free
+    /// never holds it, and a process taking the gate waits only for the threads that found it
+    /// held, each of which takes it shared and lets it go at once. A thread that holds a lock must
+    /// not wait here, since the process holding the gate may be waiting for that lock.
+    pub(crate) fn pass_gate(&self, wait: bool) -> Result<bool> {
+        if !platform::range_excluded(&self.inner.file, GATE_AT, 1)? {
+            return Ok(true);
+        }
+        if !wait {
+            return Ok(false);
+        }
+        drop(self.hold_as(GATE_AT, 1, false, true)?);
+        Ok(true)
     }
 
     /// Takes the branch lock at `at`: shares the byte with any lane of this process that holds it,

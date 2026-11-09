@@ -1656,3 +1656,225 @@ fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
         thread::sleep(Duration::from_millis(5));
     }
 }
+
+fn manual() -> Options {
+    shared().reclaim(Reclaim { every_bytes: 0 })
+}
+
+fn writers_on_branches_of_their_own(
+    path: &Path,
+    writers: u64,
+    stop: &Arc<AtomicBool>,
+) -> Vec<thread::JoinHandle<u64>> {
+    let first: Db<Root> = manual().open(path).unwrap();
+    for writer in 0..writers {
+        first.fork(&format!("own-{writer}")).unwrap();
+    }
+    drop(first);
+    let ready = Arc::new(Barrier::new(writers as usize + 1));
+    let threads = (0..writers)
+        .map(|writer| {
+            let path = path.to_path_buf();
+            let stop = stop.clone();
+            let ready = ready.clone();
+            thread::spawn(move || {
+                let db: Db<Root> = manual().open(&path).unwrap();
+                let db = db.branch(&format!("own-{writer}")).unwrap();
+                ready.wait();
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    bump(&db, writer, i);
+                }
+                i
+            })
+        })
+        .collect();
+    ready.wait();
+    threads
+}
+
+#[test]
+fn a_cycle_finishes_while_other_handles_commit_on_branches_of_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gate.ferro");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers = writers_on_branches_of_their_own(&path, 4, &stop);
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    bump(&cycler, 99, 1);
+    thread::sleep(Duration::from_millis(100));
+    let (done, finished) = mpsc::channel();
+    let started = Instant::now();
+    let cycle = thread::spawn(move || {
+        for _ in 0..5 {
+            cycler.compact(Keep::Last(2)).unwrap();
+        }
+        done.send(()).unwrap();
+    });
+    let waited = finished.recv_timeout(Duration::from_secs(20));
+    stop.store(true, Ordering::Relaxed);
+    let commits: Vec<u64> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    cycle.join().unwrap();
+    assert!(
+        waited.is_ok(),
+        "five cycles had not finished after 20 s while four handles committed {commits:?} times \
+         on branches of their own; they finished {:?} after they began, once those stopped",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_handles_own_commits_wait_for_its_cycle_only_while_other_handles_finish_theirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("own.ferro");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers = writers_on_branches_of_their_own(&path, 4, &stop);
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    let own = cycler.fork("mine").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let cycling = Arc::new(AtomicBool::new(true));
+    let cycle = thread::spawn({
+        let cycling = cycling.clone();
+        move || {
+            while cycling.load(Ordering::Relaxed) {
+                cycler.compact(Keep::All).unwrap();
+            }
+        }
+    });
+    let (done, finished) = mpsc::channel();
+    let committer = thread::spawn(move || {
+        for i in 1..=50 {
+            bump(&own, 77, i);
+        }
+        done.send(()).unwrap();
+    });
+    let waited = finished.recv_timeout(Duration::from_secs(20));
+    stop.store(true, Ordering::Relaxed);
+    cycling.store(false, Ordering::Relaxed);
+    let commits: Vec<u64> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    committer.join().unwrap();
+    cycle.join().unwrap();
+    assert!(
+        waited.is_ok(),
+        "50 commits on a branch of the cycling handle took over 20 s while four other handles \
+         committed {commits:?} times"
+    );
+}
+
+#[test]
+fn nested_and_awaited_writes_go_on_through_another_handles_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested.ferro");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers = writers_on_branches_of_their_own(&path, 2, &stop);
+    let db: Db<Root> = manual().open(&path).unwrap();
+    db.fork("a").unwrap();
+    db.fork("b").unwrap();
+    let a = db.branch("a").unwrap();
+    let b = db.branch("b").unwrap();
+    let mut threads = Vec::new();
+    for kind in 0..3 {
+        let (a, b, stop) = (a.clone(), b.clone(), stop.clone());
+        threads.push(thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                i += 1;
+                match kind {
+                    0 => a
+                        .update(|root| {
+                            bump(&b, 10, i);
+                            root.n += 1;
+                        })
+                        .unwrap(),
+                    1 => a
+                        .update(|root| {
+                            block_on(b.update_async(|inner| inner.n += 1)).unwrap();
+                            root.n += 1;
+                        })
+                        .unwrap(),
+                    _ => {
+                        bump(&b, 11, i);
+                    }
+                }
+            }
+        }));
+    }
+    let cycler: Db<Root> = manual().open(&path).unwrap();
+    let (done, finished) = mpsc::channel();
+    let cycle = thread::spawn(move || {
+        for _ in 0..20 {
+            cycler.compact(Keep::Last(3)).unwrap();
+        }
+        done.send(()).unwrap();
+    });
+    let waited = finished.recv_timeout(Duration::from_secs(60));
+    stop.store(true, Ordering::Relaxed);
+    assert!(waited.is_ok(), "twenty cycles did not finish in 60 s");
+    cycle.join().unwrap();
+    threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    let commits: Vec<u64> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert!(commits.iter().all(|n| *n > 0), "{commits:?}");
+    db.refresh().unwrap();
+    db.verify_typed().unwrap();
+}
+
+fn held_across_another_handles_cycles(follower: Options) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.ferro");
+    let writer: Db<Root> = manual().history(Keep::Last(2)).open(&path).unwrap();
+    for chunk in 0..30u64 {
+        writer
+            .update(|root| {
+                for k in 0..100 {
+                    root.n += 1;
+                    root.order.insert(chunk * 100 + k, (chunk, k));
+                }
+            })
+            .unwrap();
+    }
+    let follower: Db<Root> = follower.follow(true).open(&path).unwrap();
+    let caught_up = |version: u64| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while follower.version() < version {
+            assert!(Instant::now() < deadline, "{:?}", follower.following());
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    caught_up(writer.version());
+    let snapshot = follower.read();
+    let mut iter = snapshot.order.iter();
+    let mut seen: Vec<_> = iter.by_ref().take(100).map(|(k, v)| (k, *v)).collect();
+    for round in 0..3u64 {
+        writer
+            .update(|root| {
+                for k in 0..3000 {
+                    root.order.insert(k, (round + 100, k));
+                }
+            })
+            .unwrap();
+        writer.update(|root| root.n += 1).unwrap();
+        writer.compact(Keep::Last(1)).unwrap();
+    }
+    writer.update(|root| root.n += 1).unwrap();
+    caught_up(writer.version());
+    seen.extend(iter.map(|(k, v)| (k, *v)));
+    let expected: Vec<_> = (0..3000u64).map(|k| (k, (k / 100, k % 100))).collect();
+    assert_eq!(seen, expected);
+    let again: Vec<_> = snapshot.order.iter().map(|(k, v)| (k, *v)).collect();
+    assert_eq!(again, expected);
+    assert_eq!(follower.read().order.get(&5).as_deref(), Some(&(102, 5)));
+    follower.verify_typed().unwrap();
+    assert!(follower.following().unwrap().last_error.is_none());
+}
+
+#[test]
+fn a_read_only_follower_reads_what_it_held_through_another_handles_cycles() {
+    held_across_another_handles_cycles(fast().read_only(true));
+}
+
+#[test]
+fn a_shared_follower_reads_what_it_held_through_another_handles_cycles() {
+    held_across_another_handles_cycles(manual());
+}

@@ -97,11 +97,17 @@ fn shared_child() {
     if cycles {
         options = options.history(Keep::Last(4));
     }
+    let every =
+        std::env::var("FERRO_SHARED_CYCLE_EVERY").map_or(25, |every| every.parse().unwrap());
     let db: Db<Root> = options.open(&path).unwrap();
+    let db = match role.as_str() {
+        "own" => db.branch(&format!("own-{writer}")).unwrap(),
+        _ => db,
+    };
     for i in first..first + count {
         let n = commit(&db, writer, i);
         println!("ACK {writer} {i} {n}");
-        if cycles && i % 25 == 0 {
+        if cycles && i % every == 0 {
             db.compact(Keep::Last(4)).unwrap();
             println!("CYCLE {i}");
         }
@@ -795,4 +801,90 @@ fn a_cycle_killed_at_every_stage_keeps_the_other_processes_writing() {
             .count() as u64;
         assert!(root.n >= 600 + cycled, "{stage}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cycle_finishes_while_other_processes_commit_on_branches_of_their_own() {
+    let processes: u64 = std::env::var("FERRO_SHARED_OWN").map_or(4, |n| n.parse().unwrap());
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("gate.ferro");
+    let cycler: Db<Root> = options()
+        .durability(Durability::Buffered)
+        .open(&path)
+        .unwrap();
+    for writer in 0..processes {
+        cycler.fork(&format!("own-{writer}")).unwrap();
+    }
+    commit(&cycler, 99, 1);
+    let extra = [("FERRO_SHARED_DURABILITY", "buffered".to_string())];
+    let mut children = Vec::new();
+    for writer in 0..processes {
+        let mut spawned = spawn(&path, "own", writer, 1, 100_000_000, &extra);
+        let stdout = spawned.child.stdout.take().unwrap();
+        std::thread::spawn(move || BufReader::new(stdout).lines().map_while(Result::ok).count());
+        children.push(spawned);
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while (0..processes).any(|writer| {
+        cycler.refresh().unwrap();
+        cycler.branch(&format!("own-{writer}")).unwrap().read().n < 10
+    }) {
+        assert!(Instant::now() < deadline, "the writers never got going");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let cycle = std::thread::spawn(move || {
+        for _ in 0..5 {
+            let started = Instant::now();
+            cycler.compact(Keep::Last(2)).unwrap();
+            done.send(started.elapsed()).unwrap();
+        }
+    });
+    let mut took = Vec::new();
+    for _ in 0..5 {
+        match finished.recv_timeout(Duration::from_secs(20)) {
+            Ok(elapsed) => took.push(elapsed),
+            Err(_) => break,
+        }
+    }
+    for mut spawned in children {
+        spawned.child.kill().unwrap();
+        spawned.child.wait().unwrap();
+    }
+    cycle.join().unwrap();
+    println!("CYCLES {processes} {took:?}");
+    assert_eq!(
+        took.len(),
+        5,
+        "a cycle had not finished after 20 s while {processes} processes committed on branches \
+         of their own; those before it took {took:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cycler_killed_at_random_beside_writers_loses_no_acknowledged_commit() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("cycler-killed.ferro");
+    let mut rng = common::Rng::new(0xC1C1E);
+    let extra = [
+        ("FERRO_SHARED_DURABILITY", "buffered".to_string()),
+        ("FERRO_SHARED_CYCLE_EVERY", "3".to_string()),
+    ];
+    let writers: Vec<_> = (0..2)
+        .map(|writer| spawn(&path, "writer", writer, 1, 3000, &extra))
+        .collect();
+    let mut acks = Acks::default();
+    for round in 0..u64::from(common::cases(8)) {
+        let first = round * 1_000_000 + 1;
+        let mut cycler = spawn(&path, "cycler", 2, first, 100_000, &extra);
+        std::thread::sleep(Duration::from_millis(60 + rng.below(200)));
+        cycler.child.kill().unwrap();
+        cycler.finish(&mut acks, Duration::from_secs(60));
+    }
+    for writer in writers {
+        assert!(writer.finish(&mut acks, Duration::from_secs(120)));
+    }
+    check(&path, &acks, &[(0, 3000), (1, 3000)]);
 }

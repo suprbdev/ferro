@@ -89,6 +89,10 @@ whose bundle spilled while its pieces are placed. A write is refused when its th
   bundle spilled, which take it;
 - a lane of that file whose name sorts at or after the one the write takes.
 
+With `shared`, a write the check lets through also reads the record to decide whether it may wait
+at another process's gate: one whose thread holds anything goes straight to its branch's byte, as
+[The gate](processes.md#the-gate) describes.
+
 `pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
 scratch file, as described under [Where checked objects
 wait](sync-receive.md#where-checked-objects-wait). They make the check before they read anything, so
