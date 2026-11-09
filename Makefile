@@ -161,7 +161,7 @@ booking-stress: ## Race threads for rooms and check every version
 queue-bench: ## Benchmark the durable job queue
 	$(RUN) run --release -p queue --bin queue-bench -- $(ARGS)
 
-info: ## Show a database file's size and branches, DB=path
+info: ## Show a database file's length and branches, DB=path
 	$(RUN) run --release -q -p ferro-cli -- info $(DB)
 
 log: ## List a database's newest commits, DB=path
@@ -170,7 +170,7 @@ log: ## List a database's newest commits, DB=path
 verify: ## Re-hash every reachable object in DB
 	$(RUN) run --release -q -p ferro-cli -- verify $(DB)
 
-space: ## Show DB's size against its live bytes
+space: ## Show DB's file length, log bytes and live bytes
 	$(RUN) run --release -q -p ferro-cli -- space $(DB)
 
 compact: ## Rewrite DB, keeping KEEP newest commits per branch if set

@@ -63,8 +63,9 @@ reading the file it came from, even past pruning, and a read-only process does t
 calls `refresh`, or until its follower sees the cycle if it was opened with `follow`. The price is
 that the old file stays on disk until the last such handle is dropped, which `space.retired_bytes`
 shows. A `watch_changes` watcher moves what it last returned into the new file, unless the cycle
-pruned that version, and then holds the old file until it next returns. Committing a `Map` held from before a cycle writes it again by value, under the writer lock,
-so `restore` of a snapshot held across a cycle costs time proportional to its size.
+pruned that version, and then holds the old file until it next returns. Committing a `Map` held
+from before a cycle writes it again by value, under the writer lock, so `restore` of a snapshot held
+across a cycle costs time proportional to its size.
 
 ## Limits
 

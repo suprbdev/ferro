@@ -13,14 +13,14 @@ This is an experiment, not a production database.
   rather than fdatasync. Performance on Windows was never measured, and CI skips the tests that
   intercept libc calls or kill processes there, so failed syncs and process death are tested on Unix
   only.
-- A single-key commit writes about 3.5 KB at this size, so batch related changes into one commit.
+- A single-key commit writes about 3.5 KB at 1M keys, so batch related changes into one commit.
   Secondary indexes add to that. Without retention the file only grows.
 
 - Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
   your current `Default`, or the `init` passed to `open_with`.
 
-- One writer closure runs at a time on each branch, and placing commits and writing their frames
-  take one lock for the whole file, as described under [Branches and the writer
+- One writer closure runs at a time on each branch, and placing commits and writing the refs take
+  one lock for the whole file, as described under [Branches and the writer
   lock](concurrency.md#branches-and-the-writer-lock).
 - A write from inside a closure fails with `Error::Reentrant` wherever it could deadlock, and a
   closure that waits for another thread's commit in a way ferro cannot see can still deadlock, as

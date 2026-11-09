@@ -5,8 +5,8 @@ threads and 124 GB of RAM, on one NVMe SSD with ext4, under Linux 7.2.14 with ru
 else was running: the 1-minute load average was under 2 before each set of runs, and other processes
 kept well under one core busy during them. The workload is 1M `u64` keys with short string values,
 using `ferro-bench`. Its figures are medians of seven runs, and the coalesced writers of nine runs
-alternating with plain ones. The commits on 16 branches are medians of five runs of `ferro-bench`'s
-`group` tool, and the booking commits of seven runs of its `tables` tool, pinned to one CCD. Every
+alternating with plain ones. The commits on 16 branches are medians of six runs of `ferro-bench`'s
+`group` tool, and the booking commits of seven runs of its `tables` tool pinned to one CCD. Every
 figure on this page but those under [Huge pages](#huge-pages) was measured again that day, and a
 figure that came within the spread of its runs of the one measured on 2026-11-04 is given as it was.
 The copy a reclamation cycle makes, under [Other tools](#other-tools), was measured again on
@@ -80,7 +80,7 @@ by less than the spread of their runs.
 
 `group` runs single-key commits into a map of 100,000 keys from each writer thread for three
 seconds, either one writer on each of its own branches or all of them on one branch. Commits a
-second, median of five runs:
+second, median of five runs, or of six in the first column:
 
 | Writers | Buffered, own branches | Buffered, one branch | One branch, `coalesce` | Fsync, own branches | Fsync, one branch | One branch, `coalesce` |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -91,8 +91,9 @@ second, median of five runs:
 
 With `coalesce` 16 writers on one branch shared a version 13 at a time Buffered and 16 at a time
 with fsync, and wrote 1,515 and 1,427 bytes a closure against 2,464 and 2,385 without it. A writer
-alone on its branch has nothing to share, and `coalesce` there ran within 5% of the plain figures,
-apart from 8 Buffered branches at 139,600 a second, 7% fewer.
+alone on its branch has nothing to share, and `coalesce` there ran within 5% of the plain figures
+of the same runs, before the first column was measured again, apart from 8 Buffered branches at
+139,600 a second, 7% fewer.
 
 Past 8 Buffered writers on their own branches, commits queue for `tip`, the one lock that places
 every frame in the file. It was held about 6 µs a commit at 8 writers and 7 to 8 µs at 16, against
