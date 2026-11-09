@@ -64,7 +64,8 @@ A merge that finds it cannot go ahead uses `try_merge_with`, whose closure retur
 `try_commit_with`'s does. `Err` discards the merge, including an `Err` while the virtual base is
 built: nothing is written or recorded, the next merge finds the same base, and the error comes back
 in your own type. `Map::try_merge` and `Table::try_merge` take a `resolve` that returns a `Result`,
-stop at its first `Err` and leave the collection as it was.
+stop at its first `Err` and leave the collection as it was, as they and `merge` do when a node
+cannot be loaded.
 
 ## Limits
 

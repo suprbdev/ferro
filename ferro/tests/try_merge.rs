@@ -1,8 +1,9 @@
 mod common;
 
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
-use common::fast;
+use common::{Fragile, defuse, fast, fuse, quiet_ferro_panics, text, uncached};
 use ferro::{Bundle, Data, Db, Error, Have, Map, Options, Outcome, Record, Table};
 
 #[derive(Debug)]
@@ -329,4 +330,63 @@ fn a_refused_receive_or_push_merges_nothing() {
         .unwrap();
     assert_eq!(received.outcome, Outcome::Merged);
     assert_eq!(phone.version(), version + 1);
+}
+
+#[test]
+fn a_merge_whose_load_fails_at_any_point_leaves_ours_as_it_was() {
+    quiet_ferro_panics();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fragile.ferro");
+    let db = uncached().open::<Map<u64, Fragile>>(&path).unwrap();
+    db.update(|root| {
+        root.extend((0..3000).map(|key| (key, Fragile(key, text(key, (key % 7) as usize)))));
+    })
+    .unwrap();
+    drop(db);
+    let db = uncached().open::<Map<u64, Fragile>>(&path).unwrap();
+    db.update(|ours| {
+        let base = ours.clone();
+        let mut theirs = base.clone();
+        theirs.apply((0..3000).step_by(7).map(|key| {
+            let value = (key % 3 != 0).then(|| Fragile(key + 1, "theirs".into()));
+            (key, value)
+        }));
+        ours.apply(
+            (0..3000)
+                .step_by(11)
+                .map(|key| (key, Some(Fragile(key + 2, "ours".into())))),
+        );
+        let before = ours.root_hash();
+        let mut merged = ours.clone();
+        let written = merged.merge(&base, &theirs, |conflict| conflict.keep_theirs());
+        let mut failures = 0;
+        for after in (0..).step_by(23) {
+            let mut trial = ours.clone();
+            fuse(after, after % 2 == 1);
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                if after % 3 == 0 {
+                    trial.try_merge(&base, &theirs, |conflict| {
+                        Ok::<_, ()>(conflict.keep_theirs())
+                    })
+                } else {
+                    Ok(trial.merge(&base, &theirs, |conflict| conflict.keep_theirs()))
+                }
+            }));
+            defuse();
+            match outcome {
+                Ok(done) => {
+                    assert_eq!(done, Ok(written));
+                    assert_eq!(trial.root_hash(), merged.root_hash());
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    assert_eq!(trial.len(), ours.len(), "failed at decode {after}");
+                    assert_eq!(trial.root_hash(), before, "failed at decode {after}");
+                }
+            }
+        }
+        assert!(failures > 10, "the merge loaded too little to test");
+    })
+    .unwrap();
 }

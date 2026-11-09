@@ -658,3 +658,494 @@ fn a_table_written_before_an_index_existed_gets_the_index_rebuilt() {
         39
     );
 }
+
+mod failed_loads {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::panic::{self, AssertUnwindSafe};
+
+    use std::cmp::Ordering;
+
+    use ferro::codec::{Decoder, Encoder};
+    use ferro::{Data, Options, Record, Set, Table, hash_of};
+
+    use crate::common::{
+        Brittle, Rng, cases, defuse, fuse, interrupted, quiet_ferro_panics, roomy, text, uncached,
+    };
+
+    #[derive(Clone, Debug)]
+    struct Loose(u64);
+
+    impl PartialEq for Loose {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 / 2 == other.0 / 2
+        }
+    }
+
+    impl Eq for Loose {}
+
+    impl PartialOrd for Loose {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for Loose {
+        fn cmp(&self, other: &Self) -> Ordering {
+            (self.0 / 2).cmp(&(other.0 / 2))
+        }
+    }
+
+    impl Data for Loose {
+        fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+            self.0.encode(w)
+        }
+
+        fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+            let Brittle(value) = Brittle::decode(r)?;
+            Ok(Loose(value))
+        }
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    #[index(group, rank)]
+    struct Frail {
+        #[key]
+        id: u64,
+        #[index(cover(note))]
+        group: Brittle,
+        #[unique(cover(rank))]
+        slug: Option<Brittle>,
+        #[index(each)]
+        tags: Vec<Brittle>,
+        #[index(each, cover(rank))]
+        marks: Set<Brittle>,
+        rank: u64,
+        note: String,
+        #[index(cover(label))]
+        label: Loose,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Plain {
+        group: u64,
+        slug: Option<u64>,
+        tags: Vec<u64>,
+        marks: BTreeSet<u64>,
+        rank: u64,
+        note: String,
+        label: u64,
+    }
+
+    type Frails = Table<Frail>;
+    type Model = BTreeMap<u64, Plain>;
+
+    const IDS: u64 = 400;
+
+    fn row(id: u64, plain: &Plain) -> Frail {
+        Frail {
+            id,
+            group: Brittle(plain.group),
+            slug: plain.slug.map(Brittle),
+            tags: plain.tags.iter().copied().map(Brittle).collect(),
+            marks: plain.marks.iter().copied().map(Brittle).collect(),
+            rank: plain.rank,
+            note: plain.note.clone(),
+            label: Loose(plain.label),
+        }
+    }
+
+    fn plain(row: &Frail) -> Plain {
+        Plain {
+            group: row.group.0,
+            slug: row.slug.as_ref().map(|slug| slug.0),
+            tags: row.tags.iter().map(|tag| tag.0).collect(),
+            marks: row.marks.iter().map(|mark| mark.0).collect(),
+            rank: row.rank,
+            note: row.note.clone(),
+            label: row.label.0,
+        }
+    }
+
+    fn made(rng: &mut Rng) -> Plain {
+        let len = if rng.chance(10) { 600 } else { rng.below(12) };
+        Plain {
+            group: rng.below(20),
+            slug: rng.chance(70).then(|| rng.below(300)),
+            tags: (0..rng.below(4)).map(|_| rng.below(40)).collect(),
+            marks: (0..rng.below(5)).map(|_| rng.below(30)).collect(),
+            rank: rng.below(5),
+            note: text(rng.next(), len as usize),
+            label: rng.below(8),
+        }
+    }
+
+    fn changed(rng: &mut Rng, plain: &mut Plain) {
+        let fresh = made(rng);
+        match rng.below(7) {
+            6 => plain.label ^= 1,
+            0 => plain.group = fresh.group,
+            1 => plain.slug = fresh.slug,
+            2 => plain.tags = fresh.tags,
+            3 => plain.marks = fresh.marks,
+            4 => plain.rank = fresh.rank,
+            _ => plain.note = fresh.note,
+        }
+    }
+
+    fn fresh(model: &Model) -> Frails {
+        let mut table = Frails::new();
+        for (id, plain) in model {
+            table.insert(row(*id, plain));
+        }
+        table
+    }
+
+    fn read_back(table: &Frails) -> Model {
+        table.iter().map(|row| (row.id, plain(&row))).collect()
+    }
+
+    fn same(table: &Frails, model: &Model, what: &str) {
+        assert_eq!(table.len(), model.len(), "{what}: rows");
+        assert!(read_back(table) == *model, "{what}: rows differ");
+        assert_eq!(
+            hash_of(table),
+            hash_of(&fresh(model)),
+            "{what}: the indexes are not those of the rows"
+        );
+    }
+
+    fn clashes(model: &Model, id: u64, slug: Option<u64>, moving: Option<u64>) -> bool {
+        slug.is_some()
+            && model
+                .iter()
+                .any(|(held, plain)| plain.slug == slug && *held != id && Some(*held) != moving)
+    }
+
+    fn moved(model: &mut Model, old: u64, id: u64, plain: Plain) {
+        model.remove(&old);
+        model.insert(id, plain);
+    }
+
+    fn held(model: &Model, rng: &mut Rng) -> u64 {
+        match model.keys().nth(rng.below(model.len() as u64 + 1) as usize) {
+            Some(id) if rng.chance(85) => *id,
+            _ => rng.below(IDS),
+        }
+    }
+
+    fn step(table: &mut Frails, model: &mut Model, base: &Frails, rng: &mut Rng) -> &'static str {
+        let before = model.clone();
+        let (name, done) = match rng.below(15) {
+            0..=2 => {
+                let (id, plain) = (held(model, rng), made(rng));
+                let done = interrupted(rng, || table.try_insert(row(id, &plain)).is_ok());
+                if done == Some(true) {
+                    model.insert(id, plain);
+                }
+                ("insert", done.is_some())
+            }
+            3 | 4 => {
+                let id = held(model, rng);
+                let done = interrupted(rng, || table.remove(&id)).is_some();
+                if done {
+                    model.remove(&id);
+                }
+                ("remove", done)
+            }
+            5..=7 => {
+                let old = held(model, rng);
+                let Some(mut plain) = model.get(&old).cloned() else {
+                    return "update of an absent row";
+                };
+                changed(rng, &mut plain);
+                let id = if rng.chance(20) { rng.below(IDS) } else { old };
+                let how = rng.below(3);
+                let clash = clashes(model, id, plain.slug, Some(old));
+                let next = row(id, &plain);
+                let done = interrupted(rng, || match how {
+                    0 => table.try_update(&old, |row| *row = next.clone()).is_ok(),
+                    1 => {
+                        table.update(&old, |row| *row = next.clone());
+                        true
+                    }
+                    _ => {
+                        let mut held = table.get_mut(&old).expect("the row is held");
+                        *held = next.clone();
+                        drop(held);
+                        true
+                    }
+                });
+                if done == Some(true) {
+                    assert!(!clash, "a clashing update went in");
+                    moved(model, old, id, plain);
+                }
+                ("update", done == Some(true))
+            }
+            8 => {
+                let (group, rank) = (rng.below(20), rng.below(5));
+                let doomed = move |plain: &Plain| plain.group == group || plain.rank == rank;
+                let done = interrupted(rng, || {
+                    table.retain(|row| !doomed(&plain(row)));
+                })
+                .is_some();
+                if done {
+                    model.retain(|_, plain| !doomed(plain));
+                }
+                ("retain", done)
+            }
+            9 => {
+                let low = rng.below(IDS);
+                let high = low + rng.below(40);
+                let drained = interrupted(rng, || table.drain_range(low..high));
+                let done = drained.is_some();
+                if let Some(drained) = drained {
+                    let wanted: Vec<u64> = model.range(low..high).map(|(id, _)| *id).collect();
+                    let got: Vec<u64> = drained.iter().map(|row| row.id).collect();
+                    assert_eq!(got, wanted, "drain_range");
+                    model.retain(|id, _| !(low..high).contains(id));
+                }
+                ("drain_range", done)
+            }
+            10 | 11 => {
+                let mut theirs = base.clone();
+                for _ in 0..rng.below(30) {
+                    let id = rng.below(IDS);
+                    if rng.chance(30) {
+                        theirs.remove(&id);
+                    } else {
+                        let _ = theirs.try_insert(row(id, &made(rng)));
+                    }
+                }
+                let refuse = rng.chance(30);
+                let done = interrupted(rng, || {
+                    table
+                        .try_merge(base, &theirs, |conflict| {
+                            if refuse {
+                                Err(conflict.key)
+                            } else {
+                                Ok(conflict.keep_theirs())
+                            }
+                        })
+                        .is_ok()
+                });
+                if done == Some(true) {
+                    *model = read_back(table);
+                }
+                ("merge", done == Some(true))
+            }
+            12 => {
+                let done = interrupted(rng, || table.rewrite()).is_some();
+                ("rewrite", done)
+            }
+            _ => {
+                let (id, plain) = (rng.below(IDS), made(rng));
+                let clash = clashes(model, id, plain.slug, None);
+                let done = interrupted(rng, || {
+                    table.insert(row(id, &plain));
+                })
+                .is_some();
+                if done {
+                    assert!(!clash, "a clashing insert went in");
+                    model.insert(id, plain);
+                }
+                ("insert or clash", done)
+            }
+        };
+        if done {
+            same(table, model, &format!("{name} done"));
+        } else {
+            same(
+                table,
+                &before,
+                &format!("a failed {name} changed the table"),
+            );
+        }
+        name
+    }
+
+    fn run(seed: u64, options: fn() -> Options) {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frail.ferro");
+        let open = || options().open::<Frails>(&path).unwrap();
+        let mut db = open();
+        let mut rng = Rng::new(seed);
+        let mut model = Model::new();
+        db.update(|table| {
+            for _ in 0..300 {
+                let (id, plain) = (rng.below(IDS), made(&mut rng));
+                if table.try_insert(row(id, &plain)).is_ok() {
+                    model.insert(id, plain);
+                }
+            }
+        })
+        .unwrap();
+        for commit in 0..8 {
+            let mut working = model.clone();
+            let mut trail = Vec::new();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                db.update(|table| {
+                    let base = table.clone();
+                    for _ in 0..25 {
+                        trail.push(step(table, &mut working, &base, &mut rng));
+                    }
+                })
+                .unwrap();
+            }));
+            if let Err(payload) = outcome {
+                eprintln!("seed {seed} commit {commit} after {trail:?}");
+                panic::resume_unwind(payload);
+            }
+            model = working;
+            same(&db.read(), &model, "the commit");
+            if commit % 3 == 2 {
+                db.verify_typed().unwrap();
+                drop(db);
+                db = open();
+                same(&db.read(), &model, "the reopened file");
+            }
+        }
+        db.verify_typed().unwrap();
+    }
+
+    #[test]
+    fn every_table_write_keeps_rows_and_indexes_together_through_failed_loads_uncached() {
+        for seed in 0..u64::from(cases(3)) {
+            run(seed, uncached);
+        }
+    }
+
+    #[test]
+    fn every_table_write_keeps_rows_and_indexes_together_through_failed_loads_roomy() {
+        for seed in 50..50 + u64::from(cases(3)) {
+            run(seed, roomy);
+        }
+    }
+
+    fn sweep(table: &Frails, before: &Model, after: &Model, what: &str, op: impl Fn(&mut Frails)) {
+        let hash = hash_of(table);
+        let mut at = 0;
+        loop {
+            let mut trial = table.clone();
+            fuse(at, at % 2 == 1);
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| op(&mut trial)));
+            defuse();
+            if outcome.is_ok() {
+                same(&trial, after, &format!("{what} done"));
+                return;
+            }
+            assert_eq!(hash_of(&trial), hash, "{what} failed at decode {at}");
+            if at % 16 == 0 {
+                same(&trial, before, &format!("{what} failed at decode {at}"));
+            }
+            at += 1;
+        }
+    }
+
+    #[test]
+    fn every_load_point_of_every_table_write_leaves_the_table_as_it_was() {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sweep.ferro");
+        let mut rng = Rng::new(7);
+        let mut model = Model::new();
+        let db = uncached().open::<Frails>(&path).unwrap();
+        db.update(|table| {
+            for id in 0..IDS {
+                let plain = Plain {
+                    slug: Some(id),
+                    ..made(&mut rng)
+                };
+                table.insert(row(id, &plain));
+                model.insert(id, plain);
+            }
+        })
+        .unwrap();
+        drop(db);
+        let db = uncached().open::<Frails>(&path).unwrap();
+        db.update(|table| {
+            for round in 0..2 {
+                let id = IDS + round;
+                let plain = Plain {
+                    slug: Some(IDS + round),
+                    ..made(&mut rng)
+                };
+                let mut after = model.clone();
+                after.insert(id, plain.clone());
+                sweep(table, &model, &after, "insert", |table| {
+                    table.insert(row(id, &plain));
+                });
+
+                let id = 17 + round * 101;
+                let mut plain = Plain {
+                    slug: Some(IDS + 10 + round),
+                    ..made(&mut rng)
+                };
+                plain.marks.insert(29);
+                let mut after = model.clone();
+                after.insert(id, plain.clone());
+                sweep(table, &model, &after, "replace", |table| {
+                    table.insert(row(id, &plain));
+                });
+
+                let id = 33 + round * 97;
+                let mut after = model.clone();
+                after.remove(&id);
+                sweep(table, &model, &after, "remove", |table| {
+                    table.remove(&id);
+                });
+
+                let id = 51 + round * 89;
+                let mut plain = model[&id].clone();
+                changed(&mut rng, &mut plain);
+                plain.group = (plain.group + 1) % 20;
+                let mut after = model.clone();
+                after.insert(id, plain.clone());
+                sweep(table, &model, &after, "update", |table| {
+                    table.update(&id, |held| *held = row(id, &plain));
+                });
+
+                let (old, id) = (77 + round * 83, 140 + round * 61);
+                let plain = model[&old].clone();
+                let mut after = model.clone();
+                moved(&mut after, old, id, plain.clone());
+                sweep(table, &model, &after, "key change", |table| {
+                    table.update(&old, |held| *held = row(id, &plain));
+                });
+
+                let id = 23 + round * 71;
+                let mut plain = model[&id].clone();
+                plain.label ^= 1;
+                let mut after = model.clone();
+                after.insert(id, plain.clone());
+                sweep(table, &model, &after, "relabel", |table| {
+                    table.update(&id, |held| *held = row(id, &plain));
+                });
+
+                let (old, id) = (91 + round * 67, 160 + round * 53);
+                let mut plain = model[&old].clone();
+                plain.label = model[&id].label ^ 1;
+                let mut after = model.clone();
+                moved(&mut after, old, id, plain.clone());
+                sweep(table, &model, &after, "key change and relabel", |table| {
+                    table.update(&old, |held| *held = row(id, &plain));
+                });
+
+                let rank = round;
+                let mut after = model.clone();
+                after.retain(|_, plain| plain.rank != rank);
+                sweep(table, &model, &after, "retain", |table| {
+                    table.retain(|row| row.rank != rank);
+                });
+
+                let low = 200 + round * 50;
+                let mut after = model.clone();
+                after.retain(|id, _| !(low..low + 30).contains(id));
+                sweep(table, &model, &after, "drain_range", |table| {
+                    table.drain_range(low..low + 30);
+                });
+            }
+        })
+        .unwrap();
+    }
+}

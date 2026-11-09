@@ -57,6 +57,24 @@ arranged so that a failure leaves the map with the entries, length, summary and 
   removing neighbouring keys joins what earlier joins made.
 - `insert` and `remove` read a value stored on its own that they replace or remove before they
   change its slot, so neither fails once the tree has changed.
+- `merge` reads the three maps and resolves the whole diff before it writes anything, then writes
+  as one batch, so a load that fails, like an `Err` from `resolve`, leaves ours as it was. It
+  reads ours through a finder, which keeps the leaf and parent of the key it found last, since
+  the diff hands it keys in order.
+- A table write changes its rows and several index maps, each edit whole on its own, and stages the
+  entries of each index in `Edits`. An index that loses a lone entry is loaded for first, as far as
+  `remove` would load, and one with more edits than a removal and an insert as a batch on a changed
+  root is. An index that gains a lone entry gets it as the write goes, and if a later step fails the
+  entry is taken back, which loads nothing: the insert left the path to its key in memory, and the
+  two children it cut beside a new key are new nodes down the edges that a removal joins. The write
+  the derive generates loads, then makes the lone inserts and writes the rows, taking the inserts
+  back if either fails, and last makes the removals and batches, which have nothing left to load. A
+  lone removal beside a lone insert in one index, as a changed value gives, is loaded for just after
+  the insert, so that it loads what the tree it applies to needs, with no allocation for a batch. A
+  removal and an insert of keys that compare equal but encode otherwise, as a covered field whose
+  encoding changes while `==` holds gives, cannot be one edit, since the new key hashes to its own
+  level; the removal is loaded for down both edges beside its key, and both are made last, the
+  removal first, so that the insert cuts along the seam the removal joined, which is loaded.
 - `flush` refuses, with `Error::Corrupt`, a node whose count is not its keys plus its children's
   counts, so a tree damaged some other way is not committed with links that claim more entries than
   their nodes hold.
@@ -69,6 +87,16 @@ instructions, most of them the count check in `flush`, and reads, `remove_range`
 root changed earlier in the transaction ran 11 to 20% more instructions and took 5 to 33% more time
 for the walk before it. Running it on a copy of such a root, tried first, ran 37 to 168% more
 instructions, from copying each changed node it reached.
+
+The table writes and `merge` were measured the same way. The hold, confirm and cancel commits of
+`bench-tables` ran within 0.3% of the instructions and the time they took before, and the main
+benchmark's table updates within 0.05% of the instructions. Loading a table 10,000 rows a commit ran
+4% more instructions and 2% more time, for staging each index entry. Two designs tried first cost
+more: loading every node an index edit reaches before any write, which walks each path twice, and
+reading the old row before an insert to stage its entries, ran 1.0 to 1.9% more instructions in
+those commits and 13% more in the load. `Map::merge` of 1M keys with 110,000 written took 1 to 5%
+less time than writing each key as the diff reached it, which putting back a copy on a panic kept
+to; reading ours without the finder had made it up to 10% slower.
 
 ## Copy-on-write and flush
 

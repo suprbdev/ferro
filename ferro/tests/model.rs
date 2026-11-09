@@ -2775,3 +2775,1061 @@ mod summarized {
         }
     }
 }
+
+mod failed_loads {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ops::Bound;
+    use std::panic::{self, AssertUnwindSafe};
+
+    use ferro::{Data, Map, Options, Set, Summary};
+
+    use crate::common::{
+        Brittle, Fragile, Rng, cases, count_decodes, decodes, defuse, fuse, interrupted, level_of,
+        quiet_ferro_panics, roomy, text, uncached,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Data)]
+    #[ferro(transparent)]
+    struct Weight(u64);
+
+    impl Summary<u64, Fragile> for Weight {
+        fn of(key: &u64, value: &Fragile) -> Self {
+            Weight(key.wrapping_mul(31) ^ value.0 ^ value.1.len() as u64)
+        }
+
+        fn combine(&self, other: &Self) -> Self {
+            Weight(self.0.wrapping_add(other.0))
+        }
+    }
+
+    type Fragiles = Map<u64, Fragile, Weight>;
+    type Model = BTreeMap<u64, Fragile>;
+    type Span = (Bound<u64>, Bound<u64>);
+
+    const SPREAD: u64 = 5000;
+
+    fn pool() -> Vec<u64> {
+        let mut keys: Vec<u64> = (0..SPREAD).collect();
+        for level in 2..=5 {
+            keys.extend((SPREAD..).filter(|key| level_of(key) >= level).take(6));
+        }
+        keys
+    }
+
+    fn pick(pool: &[u64], rng: &mut Rng) -> u64 {
+        pool[rng.below(pool.len() as u64) as usize]
+    }
+
+    fn value(rng: &mut Rng) -> Fragile {
+        let len = if rng.chance(12) { 600 } else { rng.below(16) };
+        Fragile(rng.next(), text(rng.next(), len as usize))
+    }
+
+    fn span(pool: &[u64], rng: &mut Rng) -> Span {
+        let low = pick(pool, rng);
+        let width = if rng.chance(20) { 3000 } else { 120 };
+        let high = low.saturating_add(rng.below(width));
+        let low = match rng.below(8) {
+            0 => Bound::Unbounded,
+            1..=3 => Bound::Included(low),
+            _ => Bound::Excluded(low),
+        };
+        let high = match rng.below(8) {
+            0 => Bound::Unbounded,
+            1..=3 => Bound::Included(high),
+            _ => Bound::Excluded(high),
+        };
+        if rng.chance(5) {
+            return (high, low);
+        }
+        (low, high)
+    }
+
+    fn inside(key: u64, span: &Span) -> bool {
+        let above = match span.0 {
+            Bound::Included(low) => key >= low,
+            Bound::Excluded(low) => key > low,
+            Bound::Unbounded => true,
+        };
+        let below = match span.1 {
+            Bound::Included(high) => key <= high,
+            Bound::Excluded(high) => key < high,
+            Bound::Unbounded => true,
+        };
+        above && below
+    }
+
+    fn fresh(model: &Model) -> Fragiles {
+        model
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    }
+
+    fn same(map: &Fragiles, model: &Model, what: &str) {
+        assert_eq!(map.len(), model.len(), "{what}: len");
+        let got: Vec<(u64, Fragile)> = map.iter().map(|(k, v)| (k, (*v).clone())).collect();
+        let wanted: Vec<(u64, Fragile)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
+        assert!(got == wanted, "{what}: entries differ");
+        let built = fresh(model);
+        assert_eq!(map.root_hash(), built.root_hash(), "{what}: root hash");
+        assert_eq!(map.summary(), built.summary(), "{what}: summary");
+    }
+
+    fn three_way(ours: &Model, base: &Model, theirs: &Model) -> Model {
+        let mut merged = ours.clone();
+        let keys: BTreeSet<u64> = base.keys().chain(theirs.keys()).copied().collect();
+        for key in keys {
+            let (before, after) = (base.get(&key), theirs.get(&key));
+            if before == after {
+                continue;
+            }
+            match after {
+                Some(value) => merged.insert(key, value.clone()),
+                None => merged.remove(&key),
+            };
+        }
+        merged
+    }
+
+    fn edits(pool: &[u64], rng: &mut Rng, model: &Model) -> Vec<(u64, Option<Fragile>)> {
+        let mut edits = Vec::new();
+        let held: Vec<u64> = model.keys().copied().collect();
+        for _ in 0..rng.below(48) {
+            let key = match rng.below(4) {
+                0 if !held.is_empty() => held[rng.below(held.len() as u64) as usize],
+                1 if !held.is_empty() => {
+                    let at = rng.below(held.len() as u64) as usize;
+                    let run = rng.below(6) as usize;
+                    for near in held.iter().skip(at).take(run) {
+                        edits.push((*near, None));
+                    }
+                    held[at]
+                }
+                _ => pick(pool, rng),
+            };
+            edits.push((key, rng.chance(50).then(|| value(rng))));
+            if rng.chance(10) {
+                edits.push((key, rng.chance(50).then(|| value(rng))));
+            }
+        }
+        edits
+    }
+
+    fn applied(model: &mut Model, edits: &[(u64, Option<Fragile>)]) {
+        for (key, edit) in edits {
+            match edit {
+                Some(value) => model.insert(*key, value.clone()),
+                None => model.remove(key),
+            };
+        }
+    }
+
+    fn step(
+        root: &mut Fragiles,
+        model: &mut Model,
+        base: &(Fragiles, Model),
+        pool: &[u64],
+        rng: &mut Rng,
+    ) -> &'static str {
+        let before = model.clone();
+        let (name, done) = match rng.below(22) {
+            0 | 1 => {
+                let (key, value) = (pick(pool, rng), value(rng));
+                let done = interrupted(rng, || root.insert(key, value.clone())).is_some();
+                if done {
+                    model.insert(key, value);
+                }
+                ("insert", done)
+            }
+            2 | 3 => {
+                let key = match model.keys().nth(rng.below(model.len() as u64 + 1) as usize) {
+                    Some(key) if rng.chance(70) => *key,
+                    _ => pick(pool, rng),
+                };
+                let done = interrupted(rng, || root.remove(&key)).is_some();
+                if done {
+                    model.remove(&key);
+                }
+                ("remove", done)
+            }
+            4..=6 => {
+                let batch = edits(pool, rng, model);
+                let done = interrupted(rng, || root.apply(batch.clone())).is_some();
+                if done {
+                    applied(model, &batch);
+                }
+                ("apply", done)
+            }
+            7 => {
+                let many = if model.len() < 3000 { 600 } else { 40 };
+                let items: Vec<(u64, Fragile)> = (0..rng.below(many))
+                    .map(|_| (pick(pool, rng), value(rng)))
+                    .collect();
+                let done = interrupted(rng, || root.extend(items.clone())).is_some();
+                if done {
+                    model.extend(items);
+                }
+                ("extend", done)
+            }
+            8 => {
+                let salt = rng.next() | 1;
+                let share = rng.below(40) + 8;
+                let doomed = move |key: &u64| (key ^ salt).is_multiple_of(share);
+                let done = interrupted(rng, || root.retain(|key, _| !doomed(key))).is_some();
+                if done {
+                    model.retain(|key, _| !doomed(key));
+                }
+                ("retain", done)
+            }
+            9 | 10 => {
+                let span = span(pool, rng);
+                let taken = interrupted(rng, || root.take_range::<u64, _>(span));
+                let done = taken.is_some();
+                if let Some(mut taken) = taken {
+                    let wanted: Model = model
+                        .iter()
+                        .filter(|(key, _)| inside(**key, &span))
+                        .map(|(key, value)| (*key, value.clone()))
+                        .collect();
+                    model.retain(|key, _| !inside(*key, &span));
+                    same(&taken, &wanted, "take_range taken");
+                    same(root, model, "take_range kept");
+                    if rng.chance(85) {
+                        let back = interrupted(rng, || root.append(&mut taken)).is_some();
+                        if back {
+                            model.extend(wanted);
+                        } else {
+                            same(
+                                &taken,
+                                &wanted,
+                                "a failed append changed the range appended",
+                            );
+                            same(root, model, "a failed append back changed the map");
+                        }
+                    }
+                }
+                ("take_range", done)
+            }
+            11 => {
+                let key = pick(pool, rng);
+                let tail = interrupted(rng, || root.split_off(&key));
+                let done = tail.is_some();
+                if let Some(mut tail) = tail {
+                    let wanted = model.split_off(&key);
+                    same(&tail, &wanted, "split_off tail");
+                    if rng.chance(95) {
+                        let upward = rng.chance(50);
+                        let joined = interrupted(rng, || {
+                            if upward {
+                                root.append(&mut tail);
+                            } else {
+                                tail.append(root);
+                                std::mem::swap(root, &mut tail);
+                            }
+                        });
+                        if joined.is_some() {
+                            model.extend(wanted);
+                        } else {
+                            same(root, model, "a failed join changed the lower map");
+                            same(&tail, &wanted, "a failed join changed the upper map");
+                        }
+                    }
+                }
+                ("split_off", done)
+            }
+            12 => {
+                let mut other = Fragiles::default();
+                let mut wanted = Model::new();
+                for _ in 0..rng.below(30) {
+                    let (key, value) = (pick(pool, rng), value(rng));
+                    other.insert(key, value.clone());
+                    wanted.insert(key, value);
+                }
+                let done = interrupted(rng, || root.append(&mut other)).is_some();
+                if done {
+                    model.extend(wanted);
+                } else {
+                    same(&other, &wanted, "a failed append changed the map appended");
+                }
+                ("append", done)
+            }
+            13 => {
+                let done = interrupted(rng, || root.rewrite()).is_some();
+                ("rewrite", done)
+            }
+            14 => {
+                let first = rng.chance(50);
+                let popped = interrupted(rng, || {
+                    if first {
+                        root.pop_first()
+                    } else {
+                        root.pop_last()
+                    }
+                });
+                let done = popped.is_some();
+                if done {
+                    let _ = if first {
+                        model.pop_first()
+                    } else {
+                        model.pop_last()
+                    };
+                }
+                ("pop", done)
+            }
+            15 => {
+                let key = pick(pool, rng);
+                let grown = text(rng.next(), rng.below(700) as usize);
+                let done = interrupted(rng, || root.update(&key, |value| value.1 = grown.clone()))
+                    .is_some();
+                if done && let Some(value) = model.get_mut(&key) {
+                    value.1 = grown;
+                }
+                ("update", done)
+            }
+            16 => {
+                let key = pick(pool, rng);
+                let grown = text(rng.next(), rng.below(700) as usize);
+                let done = interrupted(rng, || {
+                    if let Some(value) = root.get_mut(&key) {
+                        value.1 = grown.clone();
+                    }
+                })
+                .is_some();
+                if done && let Some(value) = model.get_mut(&key) {
+                    value.1 = grown;
+                }
+                ("get_mut", done)
+            }
+            17 => {
+                let (key, made) = (pick(pool, rng), value(rng));
+                let tag = rng.next();
+                let done = interrupted(rng, || {
+                    root.get_or_insert_with(key, || made.clone()).0 = tag
+                })
+                .is_some();
+                if done {
+                    model.entry(key).or_insert(made).0 = tag;
+                }
+                ("get_or_insert_with", done)
+            }
+            18 | 19 => {
+                let (base_map, base_model) = base;
+                let mut theirs = base_map.clone();
+                let mut theirs_model = base_model.clone();
+                let batch = edits(pool, rng, &theirs_model);
+                theirs.apply(batch.clone());
+                applied(&mut theirs_model, &batch);
+                let done = interrupted(rng, || {
+                    root.merge(base_map, &theirs, |conflict| conflict.keep_theirs())
+                })
+                .is_some();
+                if done {
+                    *model = three_way(model, base_model, &theirs_model);
+                }
+                ("merge", done)
+            }
+            20 => {
+                let (base_map, _) = base;
+                let mut theirs = base_map.clone();
+                let mut theirs_model = base.1.clone();
+                let batch = edits(pool, rng, &theirs_model);
+                theirs.apply(batch.clone());
+                applied(&mut theirs_model, &batch);
+                let refused = interrupted(rng, || {
+                    root.try_merge(base_map, &theirs, |conflict| {
+                        Err::<Option<Fragile>, _>(conflict.key)
+                    })
+                });
+                let done = matches!(refused, Some(Ok(_)));
+                if done {
+                    *model = three_way(model, &base.1, &theirs_model);
+                }
+                ("try_merge", done)
+            }
+            _ => {
+                let span = span(pool, rng);
+                let removed = interrupted(rng, || root.remove_range::<u64, _>(span));
+                let done = removed.is_some();
+                if done {
+                    model.retain(|key, _| !inside(*key, &span));
+                }
+                ("remove_range", done)
+            }
+        };
+        if done {
+            same(root, model, &format!("{name} done"));
+        } else {
+            same(root, &before, &format!("a failed {name} changed the map"));
+        }
+        name
+    }
+
+    fn run(seed: u64, options: fn() -> Options, steps: usize) {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed_loads.ferro");
+        let open = || options().open::<Fragiles>(&path).unwrap();
+        let mut db = open();
+        let pool = pool();
+        let mut rng = Rng::new(seed);
+        let mut model = Model::new();
+        db.update(|root| {
+            for _ in 0..4500 {
+                let (key, value) = (pick(&pool, &mut rng), value(&mut rng));
+                root.insert(key, value.clone());
+                model.insert(key, value);
+            }
+        })
+        .unwrap();
+        for commit in 0..10 {
+            let mut working = model.clone();
+            let mut trail = Vec::new();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                db.update(|root| {
+                    let base = (root.clone(), working.clone());
+                    for _ in 0..steps {
+                        trail.push(step(root, &mut working, &base, &pool, &mut rng));
+                    }
+                })
+                .unwrap();
+            }));
+            if let Err(payload) = outcome {
+                eprintln!("seed {seed} commit {commit} after {trail:?}");
+                panic::resume_unwind(payload);
+            }
+            model = working;
+            same(&db.read(), &model, "the commit");
+            if commit % 3 == 2 {
+                db.verify_typed().unwrap();
+                drop(db);
+                db = open();
+                same(&db.read(), &model, "the reopened file");
+            }
+        }
+        db.verify_typed().unwrap();
+    }
+
+    #[test]
+    fn every_edit_keeps_a_canonical_tree_and_its_entries_through_failed_loads_uncached() {
+        for seed in 0..u64::from(cases(3)) {
+            run(seed, uncached, 30);
+        }
+    }
+
+    #[test]
+    fn every_edit_keeps_a_canonical_tree_and_its_entries_through_failed_loads_roomy() {
+        for seed in 100..100 + u64::from(cases(3)) {
+            run(seed, roomy, 30);
+        }
+    }
+
+    type Brittles = Set<Brittle>;
+    type SetModel = BTreeSet<u64>;
+
+    fn same_set(set: &Brittles, model: &SetModel, what: &str) {
+        assert_eq!(set.len(), model.len(), "{what}: len");
+        let got: Vec<u64> = set.iter().map(|key| key.0).collect();
+        let wanted: Vec<u64> = model.iter().copied().collect();
+        assert!(got == wanted, "{what}: values differ");
+        let built: Brittles = model.iter().map(|key| Brittle(*key)).collect();
+        assert!(*set == built, "{what}: root hash");
+    }
+
+    fn set_step(
+        set: &mut Brittles,
+        model: &mut SetModel,
+        pool: &[u64],
+        rng: &mut Rng,
+    ) -> &'static str {
+        let before = model.clone();
+        let (name, done) = match rng.below(10) {
+            0 => {
+                let key = pick(pool, rng);
+                let done = interrupted(rng, || set.insert(Brittle(key))).is_some();
+                if done {
+                    model.insert(key);
+                }
+                ("insert", done)
+            }
+            1 => {
+                let key = match model.iter().nth(rng.below(model.len() as u64 + 1) as usize) {
+                    Some(key) => *key,
+                    None => pick(pool, rng),
+                };
+                let done = interrupted(rng, || set.remove(&Brittle(key))).is_some();
+                if done {
+                    model.remove(&key);
+                }
+                ("remove", done)
+            }
+            2 | 3 => {
+                let held: Vec<u64> = model.iter().copied().collect();
+                let mut batch = Vec::new();
+                for _ in 0..rng.below(60) {
+                    let key = if !held.is_empty() && rng.chance(50) {
+                        held[rng.below(held.len() as u64) as usize]
+                    } else {
+                        pick(pool, rng)
+                    };
+                    batch.push((key, rng.chance(50)));
+                }
+                let edits: Vec<(Brittle, bool)> = batch
+                    .iter()
+                    .map(|(key, keep)| (Brittle(*key), *keep))
+                    .collect();
+                let done = interrupted(rng, || set.apply(edits.clone())).is_some();
+                if done {
+                    for (key, keep) in batch {
+                        if keep {
+                            model.insert(key);
+                        } else {
+                            model.remove(&key);
+                        }
+                    }
+                }
+                ("apply", done)
+            }
+            4 => {
+                let items: Vec<u64> = (0..rng.below(300)).map(|_| pick(pool, rng)).collect();
+                let done = interrupted(rng, || set.extend(items.iter().map(|key| Brittle(*key))))
+                    .is_some();
+                if done {
+                    model.extend(items);
+                }
+                ("extend", done)
+            }
+            5 => {
+                let salt = rng.next() | 1;
+                let doomed = move |key: u64| (key ^ salt).is_multiple_of(23);
+                let done = interrupted(rng, || set.retain(|key| !doomed(key.0))).is_some();
+                if done {
+                    model.retain(|key| !doomed(*key));
+                }
+                ("retain", done)
+            }
+            6 | 7 => {
+                let low = pick(pool, rng);
+                let high = low + rng.below(200);
+                let taken = interrupted(rng, || set.take_range(Brittle(low)..Brittle(high)));
+                let done = taken.is_some();
+                if let Some(mut taken) = taken {
+                    let wanted: SetModel = model.range(low..high).copied().collect();
+                    model.retain(|key| !(low..high).contains(key));
+                    same_set(&taken, &wanted, "take_range");
+                    let back = interrupted(rng, || set.append(&mut taken)).is_some();
+                    if back {
+                        model.extend(wanted);
+                    } else {
+                        same_set(&taken, &wanted, "a failed append changed the range");
+                        same_set(set, model, "a failed append changed the set");
+                    }
+                }
+                ("take_range", done)
+            }
+            8 => {
+                let key = pick(pool, rng);
+                let tail = interrupted(rng, || set.split_off(&Brittle(key)));
+                let done = tail.is_some();
+                if let Some(mut tail) = tail {
+                    let wanted = model.split_off(&key);
+                    same_set(&tail, &wanted, "split_off");
+                    let back = interrupted(rng, || set.append(&mut tail)).is_some();
+                    if back {
+                        model.extend(wanted);
+                    } else {
+                        same_set(&tail, &wanted, "a failed join changed the tail");
+                        same_set(set, model, "a failed join changed the set");
+                    }
+                }
+                ("split_off", done)
+            }
+            _ => {
+                let first = rng.chance(50);
+                let popped = interrupted(rng, || {
+                    if first {
+                        set.pop_first()
+                    } else {
+                        set.pop_last()
+                    }
+                });
+                let done = popped.is_some();
+                if done {
+                    if first {
+                        model.pop_first();
+                    } else {
+                        model.pop_last();
+                    }
+                }
+                ("pop", done)
+            }
+        };
+        if done {
+            same_set(set, model, &format!("{name} done"));
+        } else {
+            same_set(set, &before, &format!("a failed {name} changed the set"));
+        }
+        name
+    }
+
+    #[test]
+    fn set_edits_keep_the_set_through_failed_loads() {
+        quiet_ferro_panics();
+        for seed in 300..300 + u64::from(cases(3)) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("set.ferro");
+            let open = || uncached().open::<Brittles>(&path).unwrap();
+            let mut db = open();
+            let pool = pool();
+            let mut rng = Rng::new(seed);
+            let mut model = SetModel::new();
+            db.update(|set| {
+                for _ in 0..4000 {
+                    let key = pick(&pool, &mut rng);
+                    set.insert(Brittle(key));
+                    model.insert(key);
+                }
+            })
+            .unwrap();
+            for commit in 0..8 {
+                let mut working = model.clone();
+                let mut trail = Vec::new();
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    db.update(|set| {
+                        for _ in 0..30 {
+                            trail.push(set_step(set, &mut working, &pool, &mut rng));
+                        }
+                    })
+                    .unwrap();
+                }));
+                if let Err(payload) = outcome {
+                    eprintln!("seed {seed} commit {commit} after {trail:?}");
+                    panic::resume_unwind(payload);
+                }
+                model = working;
+                same_set(&db.read(), &model, "the commit");
+                if commit % 3 == 2 {
+                    db.verify_typed().unwrap();
+                    drop(db);
+                    db = open();
+                }
+            }
+        }
+    }
+
+    type Nested = Map<u64, Fragiles>;
+    type NestedModel = BTreeMap<u64, Model>;
+
+    fn same_nested(outer: &Nested, model: &NestedModel, what: &str) {
+        assert_eq!(outer.len(), model.len(), "{what}: outer len");
+        for ((key, inner), (want_key, want)) in outer.iter().zip(model.iter()) {
+            assert_eq!(key, *want_key, "{what}: outer keys");
+            same(&inner, want, what);
+        }
+        let built: Nested = model
+            .iter()
+            .map(|(key, inner)| (*key, fresh(inner)))
+            .collect();
+        assert_eq!(
+            outer.root_hash(),
+            built.root_hash(),
+            "{what}: outer root hash"
+        );
+    }
+
+    fn inner_op(inner: &mut Fragiles, model: &mut Model, pool: &[u64], rng: &mut Rng) {
+        match rng.below(6) {
+            0 => {
+                let (key, value) = (pick(pool, rng), value(rng));
+                inner.insert(key, value.clone());
+                model.insert(key, value);
+            }
+            1 => {
+                let held: Vec<u64> = model.keys().copied().collect();
+                let key = held
+                    .get(rng.below(held.len() as u64 + 1) as usize)
+                    .copied()
+                    .unwrap_or(0);
+                inner.remove(&key);
+                model.remove(&key);
+            }
+            2 | 3 => {
+                let batch = edits(pool, rng, model);
+                inner.apply(batch.clone());
+                applied(model, &batch);
+            }
+            4 => {
+                let salt = rng.next() | 1;
+                let doomed = move |key: &u64| (key ^ salt).is_multiple_of(17);
+                inner.retain(|key, _| !doomed(key));
+                model.retain(|key, _| !doomed(key));
+            }
+            _ => {
+                let low = pick(pool, rng);
+                let taken = inner.take_range(low..low + 90);
+                model.retain(|key, _| !(low..low + 90).contains(key));
+                drop(taken);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_maps_keep_their_entries_through_failed_loads() {
+        quiet_ferro_panics();
+        for seed in 400..400 + u64::from(cases(3)) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nested.ferro");
+            let open = || uncached().open::<Nested>(&path).unwrap();
+            let mut db = open();
+            let pool: Vec<u64> = pool().into_iter().filter(|key| *key % 3 == 0).collect();
+            let mut rng = Rng::new(seed);
+            let mut model = NestedModel::new();
+            db.update(|outer| {
+                for slot in 0..6u64 {
+                    let mut inner = Fragiles::default();
+                    let mut want = Model::new();
+                    for _ in 0..600 {
+                        let (key, value) = (pick(&pool, &mut rng), value(&mut rng));
+                        inner.insert(key, value.clone());
+                        want.insert(key, value);
+                    }
+                    outer.insert(slot, inner);
+                    model.insert(slot, want);
+                }
+            })
+            .unwrap();
+            for commit in 0..8 {
+                let mut working = model.clone();
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    db.update(|outer| {
+                        for _ in 0..20 {
+                            let slot = rng.below(7);
+                            let how = rng.below(3);
+                            if how == 2 && !working.contains_key(&slot) {
+                                outer.insert(slot, Fragiles::default());
+                                working.insert(slot, Model::new());
+                            }
+                            let before = working.clone();
+                            let mut want = working.get(&slot).cloned().unwrap_or_default();
+                            let mut op_rng = Rng::new(rng.next());
+                            let done = interrupted(&mut rng, || match how {
+                                0 => {
+                                    outer.update(&slot, |inner| {
+                                        inner_op(inner, &mut want, &pool, &mut op_rng)
+                                    });
+                                }
+                                1 => {
+                                    if let Some(inner) = outer.get_mut(&slot) {
+                                        inner_op(inner, &mut want, &pool, &mut op_rng);
+                                    }
+                                }
+                                _ => {
+                                    let inner = outer.get_or_insert_with(slot, Fragiles::default);
+                                    inner_op(inner, &mut want, &pool, &mut op_rng);
+                                }
+                            })
+                            .is_some();
+                            if done {
+                                if working.contains_key(&slot) {
+                                    working.insert(slot, want);
+                                }
+                                same_nested(outer, &working, "nested edit done");
+                            } else {
+                                same_nested(outer, &before, "a failed nested edit changed the map");
+                            }
+                        }
+                    })
+                    .unwrap();
+                }));
+                if let Err(payload) = outcome {
+                    eprintln!("seed {seed} commit {commit}");
+                    panic::resume_unwind(payload);
+                }
+                model = working;
+                same_nested(&db.read(), &model, "the commit");
+                if commit % 3 == 2 {
+                    db.verify_typed().unwrap();
+                    drop(db);
+                    db = open();
+                }
+            }
+        }
+    }
+
+    fn sweep(
+        root: &Fragiles,
+        before: &Model,
+        after: &Model,
+        extra: &Model,
+        what: &str,
+        op: impl Fn(&mut Fragiles) -> Fragiles,
+    ) -> u32 {
+        let hash = root.root_hash();
+        let mut at = 0;
+        loop {
+            let mut trial = root.clone();
+            fuse(at, at % 2 == 1);
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| op(&mut trial)));
+            defuse();
+            match outcome {
+                Ok(other) => {
+                    same(&trial, after, &format!("{what} done"));
+                    same(&other, extra, &format!("{what} done, the other map"));
+                    return at;
+                }
+                Err(_) => {
+                    let label = format!("{what} failed at decode {at}");
+                    assert_eq!(trial.len(), before.len(), "{label}: len");
+                    assert_eq!(trial.root_hash(), hash, "{label}: root hash");
+                    if at % 32 == 0 {
+                        same(&trial, before, &label);
+                    }
+                }
+            }
+            at += 1;
+        }
+    }
+
+    fn sweep_all(root: &Fragiles, model: &Model, pool: &[u64], rng: &mut Rng, changed: &str) {
+        let none = Model::new();
+        for round in 0..3 {
+            let batch = edits(pool, rng, model);
+            let mut after = model.clone();
+            applied(&mut after, &batch);
+            let what = format!("{changed} apply {round}");
+            sweep(root, model, &after, &none, &what, |map| {
+                map.apply(batch.clone());
+                Fragiles::default()
+            });
+
+            let held: Vec<u64> = model.keys().copied().collect();
+            let key = held[rng.below(held.len() as u64) as usize];
+            let mut after = model.clone();
+            after.remove(&key);
+            sweep(
+                root,
+                model,
+                &after,
+                &none,
+                &format!("{changed} remove"),
+                |map| {
+                    map.remove(&key);
+                    Fragiles::default()
+                },
+            );
+
+            let key = pick(pool, rng);
+            let fill = value(rng);
+            let mut after = model.clone();
+            after.insert(key, fill.clone());
+            sweep(
+                root,
+                model,
+                &after,
+                &none,
+                &format!("{changed} insert"),
+                |map| {
+                    map.insert(key, fill.clone());
+                    Fragiles::default()
+                },
+            );
+
+            let span = span(pool, rng);
+            let (mut after, mut taken) = (model.clone(), Model::new());
+            after.retain(|key, value| {
+                let inner = inside(*key, &span);
+                if inner {
+                    taken.insert(*key, value.clone());
+                }
+                !inner
+            });
+            sweep(
+                root,
+                model,
+                &after,
+                &taken,
+                &format!("{changed} take_range"),
+                |map| map.take_range::<u64, _>(span),
+            );
+
+            let key = pick(pool, rng);
+            let mut after = model.clone();
+            let tail = after.split_off(&key);
+            sweep(
+                root,
+                model,
+                &after,
+                &tail,
+                &format!("{changed} split_off"),
+                |map| map.split_off(&key),
+            );
+
+            let mut low = root.clone();
+            let high = low.split_off(&key);
+            let (low_model, high_model) = (after.clone(), tail.clone());
+            sweep(
+                &low,
+                &low_model,
+                model,
+                &none,
+                &format!("{changed} append up"),
+                |map| {
+                    let mut other = high.clone();
+                    map.append(&mut other);
+                    other
+                },
+            );
+            sweep(
+                &high,
+                &high_model,
+                model,
+                &none,
+                &format!("{changed} append down"),
+                |map| {
+                    let mut other = low.clone();
+                    map.append(&mut other);
+                    other
+                },
+            );
+
+            let first = rng.chance(50);
+            let mut after = model.clone();
+            if first {
+                after.pop_first();
+            } else {
+                after.pop_last();
+            }
+            sweep(
+                root,
+                model,
+                &after,
+                &none,
+                &format!("{changed} pop"),
+                |map| {
+                    if first {
+                        map.pop_first();
+                    } else {
+                        map.pop_last();
+                    }
+                    Fragiles::default()
+                },
+            );
+
+            let salt = rng.next() | 1;
+            let doomed = move |key: &u64| (key ^ salt).is_multiple_of(11);
+            let mut after = model.clone();
+            after.retain(|key, _| !doomed(key));
+            sweep(
+                root,
+                model,
+                &after,
+                &none,
+                &format!("{changed} retain"),
+                |map| {
+                    map.retain(|key, _| !doomed(key));
+                    Fragiles::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn every_load_point_of_every_edit_leaves_the_map_as_it_was() {
+        quiet_ferro_panics();
+        for seed in 500..500 + u64::from(cases(2)) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sweep.ferro");
+            let db = uncached().open::<Fragiles>(&path).unwrap();
+            let pool = pool();
+            let mut rng = Rng::new(seed);
+            let mut model = Model::new();
+            db.update(|root| {
+                for _ in 0..3000 {
+                    let (key, value) = (pick(&pool, &mut rng), value(&mut rng));
+                    root.insert(key, value.clone());
+                    model.insert(key, value);
+                }
+            })
+            .unwrap();
+            drop(db);
+            let db = uncached().open::<Fragiles>(&path).unwrap();
+            db.update(|root| {
+                sweep_all(root, &model, &pool, &mut rng, "stored");
+                for _ in 0..12 {
+                    let (key, value) = (pick(&pool, &mut rng), value(&mut rng));
+                    root.insert(key, value.clone());
+                    model.insert(key, value);
+                }
+                let held: Vec<u64> = model.keys().copied().collect();
+                for _ in 0..6 {
+                    let key = held[rng.below(held.len() as u64) as usize];
+                    root.remove(&key);
+                    model.remove(&key);
+                }
+                sweep_all(root, &model, &pool, &mut rng, "changed");
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_unchanging_batch_keeps_the_nodes_it_reads_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idle.ferro");
+        let db = roomy().open::<Brittles>(&path).unwrap();
+        db.update(|set| set.extend((0..20_000).map(Brittle)))
+            .unwrap();
+        drop(db);
+        let db = roomy().open::<Brittles>(&path).unwrap();
+        let counted = |f: &mut dyn FnMut()| {
+            count_decodes();
+            f();
+            decodes()
+        };
+        db.update(|set| {
+            assert_eq!(set.iter().count(), 20_000);
+            set.extend((0..20_000).step_by(3).map(Brittle));
+            let second = counted(&mut || set.extend((0..20_000).step_by(3).map(Brittle)));
+            let read = counted(&mut || assert_eq!(set.iter().count(), 20_000));
+            assert_eq!(
+                second + read,
+                0,
+                "an unchanging batch dropped the nodes it read"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_small_batch_on_a_large_changed_root_loads_only_its_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paths.ferro");
+        let db = uncached().open::<Brittles>(&path).unwrap();
+        db.update(|set| set.extend((0..100_000).map(|key| Brittle(key * 2))))
+            .unwrap();
+        drop(db);
+        let db = uncached().open::<Brittles>(&path).unwrap();
+        let counted = |f: &mut dyn FnMut()| {
+            count_decodes();
+            f();
+            decodes()
+        };
+        db.update(|set| {
+            let held: Vec<u64> = (0..100_000).step_by(9_973).map(|key| key * 2).collect();
+            let batch = || {
+                held.iter()
+                    .flat_map(|key| [(Brittle(*key), false), (Brittle(key + 1), true)])
+                    .collect::<Vec<_>>()
+            };
+            let mut copy = set.clone();
+            let stored = counted(&mut || copy.apply(batch()));
+            set.insert(Brittle(1_000_001));
+            let changed = counted(&mut || set.apply(batch()));
+            assert!(
+                changed < 4 * stored.max(1),
+                "a batch on a changed root read far more"
+            );
+        })
+        .unwrap();
+    }
+}

@@ -1565,6 +1565,24 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         })
         .collect();
+    let (index_key_tys, index_value_tys): (Vec<TokenStream2>, Vec<TokenStream2>) = indexes
+        .iter()
+        .map(|ix| {
+            let vt = ix.value_ty();
+            let st = ix.stored_ty();
+            match ix.kind {
+                IndexKind::Unique if ix.stores_cover() => {
+                    (quote! { #vt }, quote! { (#key_ty, #st) })
+                }
+                IndexKind::Unique => (quote! { #vt }, quote! { #key_ty }),
+                _ => (quote! { (#vt, #key_ty) }, quote! { #st }),
+            }
+        })
+        .unzip();
+    let edits_vars: Vec<Ident> = index_fields
+        .iter()
+        .map(|field| format_ident!("__edits_{}", field))
+        .collect();
     let entries_fns: Vec<Ident> = index_fields
         .iter()
         .map(|field| format_ident!("__entries_{}", field))
@@ -1674,12 +1692,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__r) = __old {
-                                self.#field.remove(&(#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
+                                ::ferro::table::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
                         }
                         if !__same || !__same_cover {
                             if let ::std::option::Option::Some(__r) = __new {
-                                self.#field.insert((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of);
+                                ::ferro::table::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of);
                             }
                         }
                     }
@@ -1697,10 +1715,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__r) = __old {
-                                self.#field.remove(&(#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
+                                ::ferro::table::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
                             if let ::std::option::Option::Some(__r) = __new {
-                                self.#field.insert((#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ());
+                                ::ferro::table::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ());
                             }
                         }
                     }
@@ -1735,13 +1753,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__value) = __old.and_then(|__r| #optional) {
-                                self.#field.remove(&__value);
+                                ::ferro::table::IndexSink::remove(__sink, __value);
                             }
                         }
                         if !__same || !__same_cover {
                             if let ::std::option::Option::Some(__r) = __new {
                                 if let ::std::option::Option::Some(__value) = #optional {
-                                    self.#field.insert(__value, #entry);
+                                    ::ferro::table::IndexSink::insert(__sink, __value, #entry);
                                 }
                             }
                         }
@@ -1945,13 +1963,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         let __before = __collect(__old);
                         let __after = __collect(__new);
                         for __entry in __before.difference(&__after) {
-                            self.#field.remove(__entry);
+                            ::ferro::table::IndexSink::remove_ref(__sink, __entry);
                         }
                         if let ::std::option::Option::Some(__r) = __new {
                             let __stored = #stored_of;
                             for __entry in &__after {
                                 if !__same_cover || !__before.contains(__entry) {
-                                    self.#field.insert(::std::clone::Clone::clone(__entry), ::std::clone::Clone::clone(&__stored));
+                                    ::ferro::table::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ::std::clone::Clone::clone(&__stored));
                                 }
                             }
                         }
@@ -1979,10 +1997,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         let __old = __collect(__old);
                         let __new = __collect(__new);
                         for __entry in __old.difference(&__new) {
-                            self.#field.remove(__entry);
+                            ::ferro::table::IndexSink::remove_ref(__sink, __entry);
                         }
                         for __entry in __new.difference(&__old) {
-                            self.#field.insert(::std::clone::Clone::clone(__entry), ());
+                            ::ferro::table::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ());
                         }
                     }
                 });
@@ -2555,7 +2573,28 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             fn reindex(&mut self, __old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>) {
-                #(self.#reindex_fns(__old, __new);)*
+                #(Self::#reindex_fns(&mut self.#index_fields, __old, __new);)*
+            }
+
+            fn write(
+                &mut self,
+                __changes: &[(::std::option::Option<&#name>, ::std::option::Option<&#name>)],
+                __rows: &mut dyn ::std::ops::FnMut(&mut ::ferro::table::Rows<#name>),
+            ) {
+                #(let mut #edits_vars = ::ferro::table::Edits::<#index_key_tys, #index_value_tys>::new();)*
+                for &(__old, __new) in __changes {
+                    #(Self::#reindex_fns(&mut #edits_vars, __old, __new);)*
+                }
+                #(#edits_vars.ready(&mut self.#index_fields);)*
+                let __wrote = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    #(#edits_vars.insert_now(&mut self.#index_fields);)*
+                    __rows(&mut self.rows);
+                }));
+                if let ::std::result::Result::Err(__payload) = __wrote {
+                    #(#edits_vars.take_back(&mut self.#index_fields);)*
+                    ::std::panic::resume_unwind(__payload);
+                }
+                #(#edits_vars.apply(&mut self.#index_fields);)*
             }
 
             fn conflict(
@@ -2581,7 +2620,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             #(
                 #[inline]
-                fn #reindex_fns(&mut self, __old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>) {
+                fn #reindex_fns(
+                    __sink: &mut impl ::ferro::table::IndexSink<#index_key_tys, #index_value_tys>,
+                    __old: ::std::option::Option<&#name>,
+                    __new: ::std::option::Option<&#name>,
+                ) {
                     #reindex
                 }
             )*

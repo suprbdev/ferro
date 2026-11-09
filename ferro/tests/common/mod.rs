@@ -468,3 +468,81 @@ pub fn guarded<T>(f: impl FnOnce() -> T) -> Outcome<T> {
         }
     }
 }
+
+thread_local! {
+    static FUSE: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+    static DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub fn fuse(after: u32, fails: bool) {
+    FUSE.set(Some((after, fails)));
+}
+
+pub fn defuse() {
+    FUSE.set(None);
+}
+
+pub fn decodes() -> u64 {
+    DECODES.get()
+}
+
+pub fn count_decodes() {
+    DECODES.set(0);
+}
+
+fn tick() -> ferro::Result<()> {
+    DECODES.set(DECODES.get() + 1);
+    match FUSE.get() {
+        Some((0, fails)) => {
+            FUSE.set(None);
+            if fails {
+                return Err(ferro::Error::Decode("the fuse blew".into()));
+            }
+            panic!("the fuse blew");
+        }
+        Some((left, fails)) => FUSE.set(Some((left - 1, fails))),
+        None => {}
+    }
+    Ok(())
+}
+
+pub fn interrupted<R>(rng: &mut Rng, op: impl FnOnce() -> R) -> Option<R> {
+    if rng.chance(80) {
+        let decodes = if rng.chance(50) { 40 } else { 2500 };
+        fuse(rng.below(decodes) as u32, rng.chance(50));
+    }
+    let outcome = panic::catch_unwind(AssertUnwindSafe(op));
+    defuse();
+    outcome.ok()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fragile(pub u64, pub String);
+
+impl Data for Fragile {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)?;
+        self.1.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let value = Fragile(u64::decode(r)?, String::decode(r)?);
+        tick()?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Brittle(pub u64);
+
+impl Data for Brittle {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        let key = Brittle(u64::decode(r)?);
+        tick()?;
+        Ok(key)
+    }
+}

@@ -123,7 +123,11 @@
 //! # Panics
 //!
 //! As with every collection, a read that cannot load a node from the file, or finds one damaged,
-//! panics. [`Map::try_get`] on [`Table::rows`] returns that failure as an error instead.
+//! panics. [`Map::try_get`] on [`Table::rows`] returns that failure as an error instead. A write
+//! that cannot load a node, or reads a row or an entry whose `Data` impl panics, panics too, and
+//! leaves the rows and every index as they were: it works out every index entry it changes and
+//! loads what it will take apart before it changes anything, and takes back the entries it added
+//! if a load after them fails.
 //!
 //! A write trusts that each index holds exactly the entries the rows give. Every write keeps it
 //! so, and [`Db::receive`](crate::Db::receive) and [`Db::verify_typed`](crate::Db::verify_typed)
@@ -144,6 +148,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::codec::{
@@ -218,6 +223,10 @@ impl<K: fmt::Debug> fmt::Display for Taken<K> {
 
 impl<K: fmt::Debug> std::error::Error for Taken<K> {}
 
+/// The map of a table's rows by primary key, which [`TableData::rows`] returns.
+#[doc(hidden)]
+pub type Rows<T> = Map<<T as Record>::Key, T>;
+
 /// The storage behind a [`Table`]: its rows and the indexes kept beside them.
 ///
 /// [`Record`](derive@crate::Record) implements this for the `{Name}Table` type it generates, which
@@ -232,7 +241,26 @@ pub trait TableData<T: Record>: Data + Default {
     fn rows_mut(&mut self) -> &mut Map<T::Key, T>;
     /// Updates every index for a row that changes from `old` to `new`, where `None` means the row
     /// is absent on that side: `(None, Some(row))` adds a row, `(Some(row), None)` removes one.
+    ///
+    /// Each index is written in turn, so a load that fails partway leaves the indexes that came
+    /// before it changed. The writes of [`Table`] leave the rows and every index as they were.
     fn reindex(&mut self, old: Option<&T>, new: Option<&T>);
+    /// Changes the rows with `rows`, and every index for each row that changes from `old` to
+    /// `new` in `changes`, as [`reindex`](TableData::reindex) does for one.
+    ///
+    /// The derive stages every index entry in an [`Edits`] and loads what the removals and batches
+    /// of entries will load. Then it adds each lone entry and calls `rows`, either of which can
+    /// fail, taking the entries it added back if one does, and last makes the removals and
+    /// batches, which have nothing left to load. So a load that fails leaves the rows and every
+    /// index as they were, as long as `rows` changes nothing when it fails. The default calls
+    /// `rows` and then [`reindex`](TableData::reindex) for each change.
+    #[doc(hidden)]
+    fn write(&mut self, changes: &[(Option<&T>, Option<&T>)], rows: &mut dyn FnMut(&mut Rows<T>)) {
+        rows(self.rows_mut());
+        for &(old, new) in changes {
+            self.reindex(old, new);
+        }
+    }
     /// Returns the clash `row` would cause in a unique index, if any.
     ///
     /// A value held by `row`'s own key does not clash, and neither does one held by `moving`, the
@@ -774,7 +802,8 @@ fn clash<K>(taken: Taken<K>) -> ! {
 /// # Panics
 ///
 /// A read that cannot load a node from the file, or finds one damaged, panics, as with every
-/// collection. Writes that would break a unique index panic too, as described on
+/// collection, and so does a write that has to load one, which leaves the rows and every index as
+/// they were. Writes that would break a unique index panic too, as described on
 /// [`insert`](Table::insert).
 pub struct Table<T: Record>(T::Table);
 
@@ -1006,23 +1035,57 @@ impl<T: Record> Table<T> {
     }
 
     fn put(&mut self, row: T) -> Option<Val<T>> {
+        let row = Arc::new(row);
+        let (old, undo) = self.0.rows_mut().insert_undoable(row.key(), row.clone());
+        let indexed = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.0.write(&[(old.as_deref(), Some(&row))], &mut |_| {});
+        }));
+        if let Err(payload) = indexed {
+            self.0.rows_mut().undo_insert(&row.key(), undo);
+            panic::resume_unwind(payload);
+        }
+        old
+    }
+
+    /// [`put`](Table::put) for a caller that puts the whole table back if it fails, which writes
+    /// each index in turn.
+    fn put_guarded(&mut self, row: T) {
         let key = row.key();
         let row = Arc::new(row);
         let old = self.0.rows_mut().insert_shared(key, row.clone());
         self.0.reindex(old.as_deref(), Some(&row));
-        old
+    }
+
+    /// [`remove`](Table::remove) for a caller that puts the whole table back if it fails, which
+    /// writes each index in turn.
+    fn remove_guarded(&mut self, key: &T::Key) {
+        if let Some(old) = self.0.rows_mut().remove(key) {
+            self.0.reindex(Some(&old), None);
+        }
     }
 
     fn replace(&mut self, old: &T, row: T) {
         let old_key = old.key();
         let new_key = row.key();
+        let row = Arc::new(row);
         if old_key == new_key {
-            self.0.reindex(Some(old), Some(&row));
-            self.0.rows_mut().insert(new_key, row);
+            let mut entry = Some((new_key, row.clone()));
+            self.0.write(&[(Some(old), Some(&row))], &mut |rows| {
+                if let Some((key, row)) = entry.take() {
+                    rows.put_shared(key, row);
+                }
+            });
         } else {
-            self.0.rows_mut().remove(&old_key);
-            self.0.reindex(Some(old), None);
-            self.put(row);
+            let displaced = self.0.rows().get(&new_key);
+            let mut moved = Some(vec![(old_key, None), (new_key, Some(row.clone()))]);
+            self.0.write(
+                &[(Some(old), None), (displaced.as_deref(), Some(&row))],
+                &mut |rows| {
+                    if let Some(moved) = moved.take() {
+                        rows.apply_shared(moved);
+                    }
+                },
+            );
         }
     }
 
@@ -1032,8 +1095,9 @@ impl<T: Record> Table<T> {
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let old = self.0.rows_mut().remove(key)?;
-        self.0.reindex(Some(&old), None);
+        let old = self.0.rows().get(key)?;
+        self.0
+            .write(&[(Some(&old), None)], &mut |rows| rows.discard(key));
         Some(old)
     }
 
@@ -1135,39 +1199,49 @@ impl<T: Record> Table<T> {
 
     /// Removes every row for which `keep` returns `false`, with its index entries.
     ///
-    /// Reads every row once, in key order.
+    /// Reads every row once, in key order, then removes the rows as one batch, and their entries
+    /// as one batch for each index.
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
-        let doomed: Vec<T::Key> = self
-            .0
-            .rows()
-            .iter()
-            .filter(|(_, row)| !keep(row))
-            .map(|(key, _)| key)
-            .collect();
-        for key in doomed {
-            self.remove(&key);
+        let doomed: Vec<(T::Key, Val<T>)> =
+            self.0.rows().iter().filter(|(_, row)| !keep(row)).collect();
+        if doomed.is_empty() {
+            return;
         }
+        let changes: Vec<(Option<&T>, Option<&T>)> =
+            doomed.iter().map(|(_, row)| (Some(&**row), None)).collect();
+        let mut gone = Some(doomed.iter().map(|(key, _)| (key.clone(), None)).collect());
+        self.0.write(&changes, &mut |rows| {
+            if let Some(gone) = gone.take() {
+                rows.apply_shared(gone);
+            }
+        });
     }
 
     /// Removes the rows whose key lies in `range` and returns them in key order.
     ///
-    /// Cutting the rows out takes O(log n) nodes, but every removed row's index entries are
-    /// removed one by one, so the whole costs O(rows removed).
+    /// Cutting the rows out takes O(log n) nodes, but every removed row is read and its index
+    /// entries removed, as one batch for each index, so the whole costs O(rows removed).
     pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Val<T>>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
+        let span = (range.start_bound(), range.end_bound());
         let drained: Vec<Val<T>> = self
             .0
-            .rows_mut()
-            .take_range::<Q, R>(range)
-            .values()
+            .rows()
+            .range::<Q, _>(span)
+            .map(|(_, row)| row)
             .collect();
-        for row in &drained {
-            self.0.reindex(Some(row), None);
+        if drained.is_empty() {
+            return drained;
         }
+        let changes: Vec<(Option<&T>, Option<&T>)> =
+            drained.iter().map(|row| (Some(&**row), None)).collect();
+        self.0.write(&changes, &mut |rows| {
+            rows.remove_range::<Q, _>(span);
+        });
         drained
     }
 
@@ -1193,6 +1267,11 @@ impl<T: Record> Table<T> {
     /// `resolve` with `ours` set to the row holding the value. `resolve` is called at most once
     /// for each key, and a row that still clashes after that keeps our row for its key, so a merge
     /// never panics on a clash and the indexes always match the rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics, as a write does, if a node or row cannot be loaded, and leaves the table as it was
+    /// before the merge.
     ///
     /// # Examples
     ///
@@ -1239,16 +1318,24 @@ impl<T: Record> Table<T> {
     ///
     /// Returns the first error `resolve` returns, and leaves the table as it was before the
     /// merge.
+    ///
+    /// # Panics
+    ///
+    /// Panics, as a write does, if a node or row cannot be loaded, and leaves the table as it was
+    /// before the merge.
     pub fn try_merge<E>(
         &mut self,
         base: &Table<T>,
         theirs: &Table<T>,
         resolve: impl FnMut(Conflict<T::Key, T>) -> std::result::Result<Option<T>, E>,
     ) -> std::result::Result<usize, E> {
-        let kept = self.clone();
-        let merged = self.merge_rows(base, theirs, resolve);
-        if merged.is_err() {
-            *self = kept;
+        let mut guard = Restore {
+            kept: Some(self.clone()),
+            table: self,
+        };
+        let merged = guard.table.merge_rows(base, theirs, resolve);
+        if merged.is_ok() {
+            guard.kept = None;
         }
         merged
     }
@@ -1283,11 +1370,11 @@ impl<T: Record> Table<T> {
             };
             match row {
                 None => {
-                    self.remove(&key);
+                    self.remove_guarded(&key);
                 }
                 Some(row) if row.key() != key => {}
                 Some(row) if self.0.conflict(&row, None).is_none() => {
-                    self.put(row);
+                    self.put_guarded(row);
                 }
                 Some(row) => held.hold(key, row, asked),
             }
@@ -1310,7 +1397,7 @@ impl<T: Record> Table<T> {
             })?;
             match resolved {
                 None => {
-                    self.remove(&key);
+                    self.remove_guarded(&key);
                     held.freed(&key);
                 }
                 Some(row) if row.key() == key => {
@@ -1332,11 +1419,26 @@ impl<T: Record> Table<T> {
                 Some(taken) => held.waiting.entry(taken.holder).or_default().push(key),
                 None => {
                     if let Some((row, _)) = held.rows.remove(&key) {
-                        self.put(row);
+                        self.put_guarded(row);
                     }
                     held.freed(&key);
                 }
             }
+        }
+    }
+}
+
+/// Puts back the table it holds when it drops, on an error or a panic, unless the work it guards
+/// went through and took `kept`.
+struct Restore<'a, T: Record> {
+    table: &'a mut Table<T>,
+    kept: Option<Table<T>>,
+}
+
+impl<T: Record> Drop for Restore<'_, T> {
+    fn drop(&mut self) {
+        if let Some(kept) = self.kept.take() {
+            *self.table = kept;
         }
     }
 }
@@ -1554,6 +1656,56 @@ pub type Indexed<T, I> = fn(&T, &mut dyn FnMut(&I) -> bool) -> bool;
 /// a float that turns from `0.0` to `-0.0` is rewritten.
 pub fn same_stored<D: Data + PartialEq>(old: &D, new: &D) -> bool {
     old == new && old.same_encoding(new)
+}
+
+#[doc(hidden)]
+pub use crate::map::Edits;
+
+/// Where the code the [`Record`](derive@crate::Record) derive generates writes the entries of one
+/// index for a changed row: the index's map itself, for
+/// [`reindex`](TableData::reindex), or the [`Edits`] that [`write`](TableData::write) stages.
+#[doc(hidden)]
+pub trait IndexSink<K, V> {
+    /// Removes the entry under `key`.
+    fn remove(&mut self, key: K);
+    /// Removes the entry under `key`, borrowed.
+    fn remove_ref(&mut self, key: &K);
+    /// Stores `value` under `key`.
+    fn insert(&mut self, key: K, value: V);
+}
+
+impl<K: Data + Ord, V: Data> IndexSink<K, V> for Map<K, V> {
+    #[inline]
+    fn remove(&mut self, key: K) {
+        Map::remove(self, &key);
+    }
+
+    #[inline]
+    fn remove_ref(&mut self, key: &K) {
+        Map::remove(self, key);
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, value: V) {
+        Map::insert(self, key, value);
+    }
+}
+
+impl<K: Data + Ord, V: Data> IndexSink<K, V> for Edits<K, V> {
+    #[inline]
+    fn remove(&mut self, key: K) {
+        Edits::remove(self, key);
+    }
+
+    #[inline]
+    fn remove_ref(&mut self, key: &K) {
+        Edits::remove(self, key.clone());
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, value: V) {
+        Edits::insert(self, key, value);
+    }
 }
 
 struct Entries<I, K, S, C> {

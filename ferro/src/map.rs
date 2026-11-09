@@ -2001,12 +2001,21 @@ fn ready_join<K: Data, V: Data, S: Data>(
     a: &mut Link<K, V, S>,
     b: &mut Link<K, V, S>,
 ) -> Result<()> {
-    let (mut left, mut right) = (&*a, &*b);
+    if joined(a, b) {
+        return Ok(());
+    }
+    load_join(store, a, b)
+}
+
+/// Whether every node that [`merge`] of `a` and `b` takes apart is held in memory, so that the
+/// join has nothing to load.
+fn joined<K, V, S>(a: &Link<K, V, S>, b: &Link<K, V, S>) -> bool {
+    let (mut left, mut right) = (a, b);
     loop {
         let (x, y) = match (left, right) {
-            (Link::Empty, _) | (_, Link::Empty) => return Ok(()),
+            (Link::Empty, _) | (_, Link::Empty) => return true,
             (Link::Mem(x, _), Link::Mem(y, _)) => (x, y),
-            _ => return load_join(store, a, b),
+            _ => return false,
         };
         let (last, first) = (x.child(x.keys.len()), y.child(0));
         (left, right) = match x.level.cmp(&y.level) {
@@ -2334,6 +2343,71 @@ fn remove_between<K: Data + Ord, V: Data, S: Data>(
     let left = node.children[index].take();
     node.children[index] = merge(store, left, right)?;
     Ok(slot)
+}
+
+/// Whether the slot at `index` holds a value stored on its own, which an edit that replaces or
+/// removes it reads first.
+fn spilled_at<K, V, S>(node: &Node<K, V, S>, index: usize) -> bool {
+    matches!(&node.cells, Cells::Slots(slots) if matches!(slots[index], Slot::Spilled(_)))
+}
+
+/// Loads in place, as [`node_mut`] does, every node and value that [`remove_at`] of `key` would
+/// load, so that the removal that follows has nothing left to load.
+///
+/// That is each node on the path of `key`, the value stored on its own under it, and what
+/// [`ready_join`] loads of the two children beside it. A path held in memory throughout is only
+/// walked.
+fn ready_remove<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    key: &K,
+) -> Result<()> {
+    let mut at = &*link;
+    loop {
+        let node = match at {
+            Link::Empty => return Ok(()),
+            Link::Stored { .. } => return load_remove(store, link, key),
+            Link::Mem(node, _) => node,
+        };
+        match node.search(key) {
+            Ok(index) => {
+                if spilled_at(node, index) || !joined(node.child(index), node.child(index + 1)) {
+                    return load_remove(store, link, key);
+                }
+                return Ok(());
+            }
+            Err(position) => match node.children.get(position) {
+                Some(child) => at = child,
+                None => return Ok(()),
+            },
+        }
+    }
+}
+
+fn load_remove<K: Data + Ord, V: Data, S: Data>(
+    store: Option<&Store>,
+    link: &mut Link<K, V, S>,
+    key: &K,
+) -> Result<()> {
+    if matches!(link, Link::Empty) {
+        return Ok(());
+    }
+    let node = node_mut(store, link)?;
+    match node.search(key) {
+        Ok(index) => {
+            if let Cells::Slots(slots) = &mut node.cells {
+                unspill(store, &mut slots[index])?;
+            }
+            if let [.., left, right] = node.children.get_mut(..index + 2).unwrap_or_default() {
+                ready_join(store, left, right)?;
+            }
+            Ok(())
+        }
+        Err(position) => match node.children.get_mut(position) {
+            Some(child) => load_remove(store, child, key),
+            None => Ok(()),
+        },
+    }
 }
 
 fn find_mut<'a, K, V, S, Q>(
@@ -3312,6 +3386,283 @@ fn ready_edge<K: Data, V: Data, S: Data>(
     }
 }
 
+/// What [`Map::undo_insert`] takes back: the slot an insert replaced, or `None` for a new key.
+pub(crate) struct Undo<V, S>(Option<Slot<V, S>>);
+
+/// Edits to one map that a write changing several maps stages, so that a load that fails or
+/// panics partway leaves every map with the entries it had.
+///
+/// [`ready`](Edits::ready) loads in place what the edits will load, changing no entry, except for
+/// a lone insert, alone or beside a lone removal. [`insert_now`](Edits::insert_now) then makes
+/// that insert, which loads what it needs and fails as a whole, and loads what the removal beside
+/// it will load. [`take_back`](Edits::take_back) undoes the insert while nothing else has changed
+/// the map, which loads nothing, and [`apply`](Edits::apply) makes the rest, which has nothing
+/// left to load. A removal and an insert of keys that compare equal but encode otherwise are
+/// made in that order by `apply`, the removal loaded for down both edges beside its key, along
+/// which the insert then cuts. A [`Table`](crate::Table) writes its indexes this way.
+#[doc(hidden)]
+pub struct Edits<K, V, S = ()> {
+    staged: Pending<K, V, S>,
+}
+
+enum Pending<K, V, S> {
+    Empty,
+    One(K, Option<V>),
+    Pair(K, K, V),
+    Swap(K, K, V),
+    Many(Writes<K, V>),
+    Remove(K),
+    Inserted(Option<K>, K, Undo<V, S>),
+    Swapped(K, K, u8, Arc<V>),
+    Batch(Vec<Edit<K, V>>, Vec<Edit<K, V>>),
+}
+
+impl<K, V, S> Pending<K, V, S> {
+    fn into_items(self) -> Writes<K, V> {
+        match self {
+            Pending::Empty | Pending::Inserted(..) => Vec::new(),
+            Pending::One(key, value) => vec![(key, value.map(Arc::new))],
+            Pending::Pair(gone, come, value) | Pending::Swap(gone, come, value) => {
+                vec![(gone, None), (come, Some(Arc::new(value)))]
+            }
+            Pending::Swapped(gone, come, _, value) => vec![(gone, None), (come, Some(value))],
+            Pending::Many(items) => items,
+            Pending::Remove(key) => vec![(key, None)],
+            Pending::Batch(first, rest) => first
+                .into_iter()
+                .chain(rest)
+                .map(|edit| (edit.key, edit.value))
+                .collect(),
+        }
+    }
+}
+
+impl<K, V, S> Default for Edits<K, V, S> {
+    fn default() -> Self {
+        Edits {
+            staged: Pending::Empty,
+        }
+    }
+}
+
+impl<K: Data + Ord, V: Data, S: Summary<K, V>> Edits<K, V, S> {
+    /// No edits.
+    pub fn new() -> Self {
+        Edits::default()
+    }
+
+    /// Stages the removal of `key`.
+    pub fn remove(&mut self, key: K) {
+        self.push(key, None);
+    }
+
+    /// Stages storing `value` under `key`.
+    ///
+    /// After the removal of a key equal to `key` that encodes otherwise, it stores `key` itself
+    /// rather than the value alone, as the removal and an insert would.
+    pub fn insert(&mut self, key: K, value: V) {
+        self.push(key, Some(value));
+    }
+
+    #[inline]
+    fn push(&mut self, key: K, value: Option<V>) {
+        if let Pending::Empty = self.staged {
+            self.staged = Pending::One(key, value);
+            return;
+        }
+        self.staged = match (std::mem::replace(&mut self.staged, Pending::Empty), value) {
+            (Pending::One(gone, None), Some(value)) if gone == key => {
+                if gone.same_encoding(&key) {
+                    Pending::One(key, Some(value))
+                } else {
+                    Pending::Swap(gone, key, value)
+                }
+            }
+            (Pending::One(first, _), value) if first == key => Pending::One(key, value),
+            (Pending::One(gone, None), Some(value)) => Pending::Pair(gone, key, value),
+            (Pending::One(come, Some(value)), None) => Pending::Pair(key, come, value),
+            (staged, value) => {
+                let mut items = staged.into_items();
+                items.push((key, value.map(Arc::new)));
+                Pending::Many(items)
+            }
+        };
+    }
+
+    /// Loads in place every node and value of `map` that the edits will load, changing no entry,
+    /// except for a lone insert, which [`insert_now`](Edits::insert_now) makes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be loaded, as a write does, leaving `map` with the
+    /// entries it had.
+    #[inline]
+    pub fn ready(&mut self, map: &mut Map<K, V, S>) {
+        if let Pending::One(_, None) | Pending::Swap(..) | Pending::Many(_) = self.staged {
+            fatal(self.try_ready(map));
+        }
+    }
+
+    fn try_ready(&mut self, map: &mut Map<K, V, S>) -> Result<()> {
+        let store = map.store.as_ref();
+        self.staged = match std::mem::replace(&mut self.staged, Pending::Empty) {
+            Pending::One(key, None) => {
+                if store.is_some() {
+                    ready_remove(store, &mut map.root, &key)?;
+                }
+                Pending::Remove(key)
+            }
+            Pending::Swap(gone, come, value) => {
+                let level = level_of(&come)?;
+                let gone = Edit {
+                    key: gone,
+                    level: 0,
+                    value: None,
+                };
+                if store.is_some() {
+                    ready(store, &mut map.root, std::slice::from_ref(&gone))?;
+                }
+                Pending::Swapped(gone.key, come, level, Arc::new(value))
+            }
+            Pending::Many(items) => {
+                let (first, rest) = rekeyed(items);
+                let edit = |(key, value): (K, Option<Arc<V>>)| -> Result<Edit<K, V>> {
+                    let level = level_of(&key)?;
+                    Ok(Edit { key, level, value })
+                };
+                let first = first.into_iter().map(edit).collect::<Result<Vec<_>>>()?;
+                let rest = rest.into_iter().map(edit).collect::<Result<Vec<_>>>()?;
+                if store.is_some() {
+                    ready(store, &mut map.root, &first)?;
+                    ready(store, &mut map.root, &rest)?;
+                }
+                Pending::Batch(first, rest)
+            }
+            staged => staged,
+        };
+        Ok(())
+    }
+
+    /// Makes a lone insert, which loads what it needs and fails, or panics, as a whole, leaving
+    /// `map` with the entries it had, and then loads in place what a lone removal staged beside it
+    /// will load.
+    #[inline]
+    pub fn insert_now(&mut self, map: &mut Map<K, V, S>) {
+        if let Pending::One(_, Some(_)) | Pending::Pair(..) = self.staged {
+            self.insert_lone(map);
+        }
+    }
+
+    fn insert_lone(&mut self, map: &mut Map<K, V, S>) {
+        let (gone, key, value) = match std::mem::replace(&mut self.staged, Pending::Empty) {
+            Pending::One(key, Some(value)) => (None, key, value),
+            Pending::Pair(gone, key, value) => (Some(gone), key, value),
+            staged => {
+                self.staged = staged;
+                return;
+            }
+        };
+        let store = map.store.as_ref();
+        let level = fatal(level_of(&key));
+        let replaced = fatal(insert_at(
+            store,
+            &mut map.root,
+            key.clone(),
+            level,
+            Arc::new(value),
+        ));
+        self.staged = Pending::Inserted(gone, key, Undo(replaced));
+        if let Pending::Inserted(Some(gone), ..) = &self.staged
+            && store.is_some()
+        {
+            fatal(ready_remove(store, &mut map.root, gone));
+        }
+    }
+
+    /// Takes back the insert [`insert_now`](Edits::insert_now) made, while nothing but its own
+    /// loads has changed `map` since, which loads nothing.
+    #[inline]
+    pub fn take_back(&mut self, map: &mut Map<K, V, S>) {
+        if let Pending::Inserted(..) = self.staged
+            && let Pending::Inserted(_, key, undo) =
+                std::mem::replace(&mut self.staged, Pending::Empty)
+        {
+            map.undo_insert(&key, undo);
+        }
+    }
+
+    /// Makes the edits that [`ready`](Edits::ready) and [`insert_now`](Edits::insert_now) loaded
+    /// for, which load nothing and cannot fail, and any that they have not been given.
+    #[inline]
+    pub fn apply(&mut self, map: &mut Map<K, V, S>) {
+        if let Pending::Empty | Pending::Inserted(None, ..) = self.staged {
+            return;
+        }
+        self.finish(map);
+    }
+
+    fn finish(&mut self, map: &mut Map<K, V, S>) {
+        self.ready(map);
+        self.insert_now(map);
+        let store = map.store.as_ref();
+        match std::mem::replace(&mut self.staged, Pending::Empty) {
+            Pending::Remove(key) | Pending::Inserted(Some(key), ..) => {
+                fatal(remove_at(store, &mut map.root, &key));
+            }
+            Pending::Swapped(gone, come, level, value) => {
+                fatal(remove_at(store, &mut map.root, &gone));
+                fatal(insert_at(store, &mut map.root, come, level, value));
+            }
+            Pending::Batch(first, rest) => {
+                for edits in [first, rest] {
+                    let count = edits.len();
+                    fatal(absorb(
+                        store,
+                        &mut map.root,
+                        &mut edits.into_iter(),
+                        count,
+                        false,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Splits edits into the removals to make first and the rest, sorted, with the last edit to each
+/// key.
+///
+/// A removal comes first when the last edit to its key stores a key equal to it that encodes
+/// otherwise, which belongs where its own encoding hashes in the tree, so the old key has to be
+/// gone before it goes in.
+fn rekeyed<K: Data + Ord, V>(mut items: Writes<K, V>) -> (Writes<K, V>, Writes<K, V>) {
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut first = Vec::new();
+    let mut rest: Writes<K, V> = Vec::with_capacity(items.len());
+    let mut items = items.into_iter().peekable();
+    while let Some((mut key, mut value)) = items.next() {
+        let mut removed = None;
+        while let Some((next, _)) = items.peek()
+            && *next == key
+            && let Some((next, later)) = items.next()
+        {
+            let earlier = std::mem::replace(&mut key, next);
+            if value.is_none() && removed.is_none() {
+                removed = Some(earlier);
+            }
+            value = later;
+        }
+        if let (Some(old), Some(_)) = (removed, &value)
+            && !old.same_encoding(&key)
+        {
+            first.push((old, None));
+        }
+        rest.push((key, value));
+    }
+    (first, rest)
+}
+
 struct Open<K, V, S> {
     level: u8,
     keys: Vec<K>,
@@ -4011,6 +4362,69 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
             Arc::new(value),
         )?;
         Ok(())
+    }
+
+    /// [`insert_shared`](Map::insert_shared) that also returns what
+    /// [`undo_insert`](Map::undo_insert) takes to take the insert back.
+    pub(crate) fn insert_undoable(
+        &mut self,
+        key: K,
+        value: Arc<V>,
+    ) -> (Option<Val<V>>, Undo<V, S>) {
+        let level = fatal(level_of(&key));
+        let store = self.store.as_ref();
+        let replaced = fatal(insert_at(store, &mut self.root, key, level, value));
+        let old = replaced.as_ref().map(|slot| fatal(read_slot(store, slot)));
+        (old, Undo(replaced))
+    }
+
+    /// Takes back the insert of `key` that [`insert_undoable`](Map::insert_undoable) made, while
+    /// nothing else has changed the map since: removes the key, or puts back the slot it replaced.
+    ///
+    /// Neither loads anything. The insert left the path to `key` in memory and read a value it
+    /// replaced, and a new key's two children are the halves it cut, whose facing edges, which a
+    /// removal joins, are new nodes.
+    pub(crate) fn undo_insert(&mut self, key: &K, undo: Undo<V, S>) {
+        let store = self.store.as_ref();
+        match undo.0 {
+            None => {
+                fatal(remove_at(store, &mut self.root, key));
+            }
+            Some(slot) => {
+                if let Some(held) = fatal(find_slot(store, &mut self.root, key)) {
+                    *held = slot;
+                }
+            }
+        }
+    }
+
+    /// [`insert_shared`](Map::insert_shared) for a caller that has read the value it replaces
+    /// already, which it drops.
+    pub(crate) fn put_shared(&mut self, key: K, value: Arc<V>) {
+        let level = fatal(level_of(&key));
+        fatal(insert_at(
+            self.store.as_ref(),
+            &mut self.root,
+            key,
+            level,
+            value,
+        ));
+    }
+
+    /// [`remove`](Map::remove) for a caller that knows `key` is present and has read its value
+    /// already, which it drops.
+    pub(crate) fn discard<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        fatal(remove_at(self.store.as_ref(), &mut self.root, key));
+    }
+
+    /// Applies `items` as one batch, as [`apply`](Map::apply) does, for values already in an
+    /// [`Arc`].
+    pub(crate) fn apply_shared(&mut self, items: Writes<K, V>) {
+        self.batch(items);
     }
 
     /// Removes `key`, in O(log n), returning the value it held.
@@ -4863,8 +5277,14 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///   [`Conflict::keep_theirs`] are ready-made resolutions.
     ///
     /// Values are compared as stored, by [`Data::same_encoding`]. A key only our side changed is
-    /// left as it is. [`Db::merge_with`](crate::Db::merge_with) finds the base of two branches and
-    /// commits the merge.
+    /// left as it is. The writes go in as one batch once the whole diff is resolved, as
+    /// [`apply`](Map::apply) takes it. [`Db::merge_with`](crate::Db::merge_with) finds the base of
+    /// two branches and commits the merge.
+    ///
+    /// # Panics
+    ///
+    /// Panics, as a write does, if a node or value of any of the three maps cannot be loaded, and
+    /// leaves this map as it was before the merge.
     ///
     /// # Examples
     ///
@@ -4937,26 +5357,10 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         theirs: &Map<K, V, S>,
         resolve: impl FnMut(Conflict<K, V>) -> std::result::Result<Option<V>, E>,
     ) -> std::result::Result<usize, E> {
-        let kept = self.clone();
-        let merged = three_way(
-            self,
-            base,
-            theirs,
-            |map, key| map.get(key),
-            |map, key, value| match value {
-                Some(value) => {
-                    map.insert(key, value);
-                }
-                None => {
-                    map.remove(&key);
-                }
-            },
-            resolve,
-        );
-        if merged.is_err() {
-            *self = kept;
-        }
-        merged
+        let writes = three_way(self, base, theirs, resolve)?;
+        let written = writes.len();
+        self.batch(writes);
+        Ok(written)
     }
 
     /// The hash of the map's tree, or `None` for an empty map.
@@ -6638,48 +7042,49 @@ impl<K, V: Clone> Conflict<K, V> {
     }
 }
 
-/// Merges into `target` what changed from `base` to `theirs`, as [`Map::merge`] describes, and
-/// returns how many keys it wrote.
+/// Values to store under keys, or `None` to remove them, as a batch takes them.
+type Writes<K, V> = Vec<(K, Option<Arc<V>>)>;
+
+/// The writes that merge into `ours` what changed from `base` to `theirs`, as [`Map::merge`]
+/// describes, in key order: a value to store, or `None` to remove the key.
 ///
-/// `read` gets ours for a key and `write` stores a value, or removes the key for `None`, so that
-/// a table can merge its rows and keep its indexes in step. The first error `resolve` returns
-/// stops the merge and is returned, with the keys written before it left in `target`.
-pub(crate) fn three_way<T, K, V, S, E>(
-    target: &mut T,
+/// It reads the three maps and calls `resolve`, but writes nothing, so the first error `resolve`
+/// returns, or a load that fails, leaves `ours` as it was.
+fn three_way<K, V, S, E>(
+    ours: &Map<K, V, S>,
     base: &Map<K, V, S>,
     theirs: &Map<K, V, S>,
-    read: impl Fn(&T, &K) -> Option<Val<V>>,
-    mut write: impl FnMut(&mut T, K, Option<V>),
     mut resolve: impl FnMut(Conflict<K, V>) -> std::result::Result<Option<V>, E>,
-) -> std::result::Result<usize, E>
+) -> std::result::Result<Writes<K, V>, E>
 where
     K: Data + Ord,
     V: Data,
     S: Summary<K, V>,
 {
-    let mut written = 0;
+    let mut writes = Vec::new();
+    let mut finder = ours.finder();
     for change in base.diff(theirs) {
         let key = change.key().clone();
         let before = change.before().cloned();
         let after = change.after().cloned();
-        let ours = read(target, &key);
-        if same_value(ours.as_ref(), after.as_ref()) {
+        let held = finder.get(&key);
+        if same_value(held.as_ref(), after.as_ref()) {
             continue;
         }
-        let value = if same_value(ours.as_ref(), before.as_ref()) {
-            after.map(|value| (*value).clone())
+        let value = if same_value(held.as_ref(), before.as_ref()) {
+            after.map(Val::into_arc)
         } else {
             resolve(Conflict {
                 key: key.clone(),
                 base: before,
-                ours,
+                ours: held,
                 theirs: after,
             })?
+            .map(Arc::new)
         };
-        write(target, key, value);
-        written += 1;
+        writes.push((key, value));
     }
-    Ok(written)
+    Ok(writes)
 }
 
 enum Step<K, V, S> {
