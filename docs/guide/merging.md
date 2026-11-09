@@ -69,10 +69,11 @@ stop at its first `Err` and leave the collection as it was.
 ## Limits
 
 After a criss-cross, a merge closure runs more than once: once for each extra best common ancestor,
-to build the virtual base, then for the merge. A closure with effects outside its return value, such
-as logging each conflict, has them for the ancestors too. When the base of those ancestors could lie
-in pruned history, the merge refuses with `NoCommonAncestor`, even though `common_ancestors`
-answers.
+and for each extra ancestor of those on the way down, to build the virtual base, then for the
+merge. Each virtual base is built once per merge, however many paths lead back to it. A closure
+with effects outside its return value, such as logging each conflict, has them for the ancestors
+too. When the base of those ancestors could lie in pruned history, the merge refuses with
+`NoCommonAncestor`, even though `common_ancestors` answers.
 
 ## How it works
 

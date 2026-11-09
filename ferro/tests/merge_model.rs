@@ -1674,6 +1674,48 @@ fn a_criss_cross_of_criss_crosses_builds_its_virtual_base_recursively() {
     assert_eq!(counts(&side), ones(&[0, 1, 2, 3, 4]));
 }
 
+#[test]
+fn a_merge_after_rounds_of_three_branches_merging_each_other_builds_each_virtual_base_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let main: Db<Events> = fast().open(dir.path().join("w.ferro")).unwrap();
+    event(&main, "x0", 0);
+    let branches = [
+        main.clone(),
+        main.fork("b").unwrap(),
+        main.fork("c").unwrap(),
+    ];
+    let rounds = 10u32;
+    let mut events = vec![0];
+    for round in 0..rounds {
+        for (at, branch) in branches.iter().enumerate() {
+            let key = 1 + round * 3 + at as u32;
+            event(branch, &format!("e{key}"), key);
+            events.push(key);
+        }
+        let copies: Vec<Db<Events>> = branches
+            .iter()
+            .enumerate()
+            .map(|(at, branch)| branch.fork(&format!("r{round}-{at}")).unwrap())
+            .collect();
+        for (at, branch) in branches.iter().enumerate() {
+            for (other, copy) in copies.iter().enumerate() {
+                if other != at {
+                    merge_named(branch, copy, &format!("r{round}: {at} <- {other}"));
+                }
+            }
+        }
+        for (at, copy) in copies.into_iter().enumerate() {
+            drop(copy);
+            main.drop_branch(&format!("r{round}-{at}")).unwrap();
+        }
+    }
+    assert_eq!(main.common_ancestors(&branches[1]).unwrap().len(), 3);
+    let (_, calls) = traced_merge(&main, &branches[1], "last");
+    assert_eq!(calls.len(), 2 * rounds as usize + 1);
+    assert_eq!(counts(&main), ones(&events));
+    main.verify_typed().unwrap();
+}
+
 fn pull_named(db: &Db<Events>, from: &Db<Events>, remote: &str, name: &str) -> (Outcome, usize) {
     let mut calls = 0;
     let pulled = db

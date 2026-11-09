@@ -1779,11 +1779,21 @@ fn holds(found: &[Start], ptr: Ptr) -> bool {
     found.iter().any(|start| start.node.ptr.hash == ptr.hash)
 }
 
+type StartKey = (Hash, Option<Hash>, u64, Option<u64>, bool);
+
+fn start_key(start: &Start) -> StartKey {
+    let under = start.under.as_ref().map(|node| node.ptr.hash);
+    (
+        start.node.ptr.hash,
+        under,
+        start.low,
+        start.after,
+        start.bare,
+    )
+}
+
 fn same_start(a: &Start, b: &Start) -> bool {
-    let under = |start: &Start| start.under.as_ref().map(|node| node.ptr.hash);
-    a.node.ptr.hash == b.node.ptr.hash
-        && under(a) == under(b)
-        && (a.low, a.after, a.bare) == (b.low, b.after, b.bare)
+    start_key(a) == start_key(b)
 }
 
 fn recorded((tables, store): (&[&Refs], &Store), starts: &[Start]) -> Result<Vec<Start>> {
@@ -4790,10 +4800,10 @@ impl<T: Data> Db<T> {
     ///
     /// The base is a best common ancestor over the whole merge graph, as git finds it, so a change
     /// is merged once however it arrived. After a criss-cross, where there are several, `f` first
-    /// merges them into a virtual base, once for each after the first, and what it returns from
-    /// those runs is dropped; that is why it is [`FnMut`]. Branches that share no commit merge
-    /// against version 0. See
-    /// [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
+    /// merges them into a virtual base, once for each after the first and likewise for their own
+    /// bases where those are several, each built once, and what it returns from those runs is
+    /// dropped; that is why it is [`FnMut`]. Branches that share no commit merge against version
+    /// 0. See [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
     ///
     /// # Errors
     ///
@@ -4948,6 +4958,20 @@ impl<T: Data> Db<T> {
         found: Vec<Start>,
         f: &mut impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Snapshot<T>, E> {
+        self.virtual_base(file, found, f, &mut HashMap::new())
+    }
+
+    fn virtual_base<R, S: Into<String>, E: From<Error>>(
+        &self,
+        file: (&[&Refs], &Store),
+        found: Vec<Start>,
+        f: &mut impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        built: &mut HashMap<Vec<StartKey>, Snapshot<T>>,
+    ) -> std::result::Result<Snapshot<T>, E> {
+        let key: Vec<StartKey> = found.iter().map(start_key).collect();
+        if let Some(base) = built.get(&key) {
+            return Ok(base.clone());
+        }
         let mut found = found.into_iter();
         let Some(first) = found.next() else {
             return Ok(self.genesis());
@@ -4960,7 +4984,7 @@ impl<T: Data> Db<T> {
             if holds(&below, next.node.ptr) {
                 continue;
             }
-            let under = self.base_of(file, below, f)?;
+            let under = self.virtual_base(file, below, f, built)?;
             let theirs = Self::snapshot_of(&next.store, &next.node.entry.commit)?;
             let mut working = (*base.value).clone();
             let (message, _) = f(&mut working, &under, &theirs)?;
@@ -4979,6 +5003,7 @@ impl<T: Data> Db<T> {
             };
             merged.push(next);
         }
+        built.insert(key, base.clone());
         Ok(base)
     }
 

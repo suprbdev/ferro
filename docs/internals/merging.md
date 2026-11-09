@@ -319,6 +319,22 @@ commit:
 The merge costs one more search, from the two ancestors to their fork point, and one more call of
 the closure.
 
+A step's own base can be virtual in turn, so building the base recurses down the criss-crosses
+below the tips, and where three or more branches keep merging each other the same set of ancestors
+comes up on many paths. At a level with three best ancestors, both later steps recursed into the
+same set below, so a merge after n rounds of three branches merging each other ran the closure
+2^(n+1) - 1 times, 2,047 after ten rounds. Devices that pull from each other while two handles of
+one shared file pull into it make that shape on most pulls: one merge searched 2,000 to 4,800 times
+and took seconds while it held its branch's lock, so the other handle's landings and merges waited
+behind it, and a pull took up to 57 s in a debug build (#132). A merge now builds each virtual base
+once, keyed by the commits it merges and the limits the search reached them with, and reuses it
+wherever the recursion meets that set again, so the closure runs once for each set of ancestors.
+`a_merge_after_rounds_of_three_branches_merging_each_other_builds_each_virtual_base_once` in
+`ferro/tests/merge_model.rs` expects 21 calls after ten rounds. In a debug build, four shared files
+each with a writer and two pulling handles, 1,200 pulls a run over three runs, went from a mean of
+85 ms to 1.25 s and a slowest pull of 4.9 to 57 s, to a mean of 51 to 133 ms and a slowest of 0.7
+to 1.8 s, measured on 2026-11-09. With one pulling handle a file the mean stayed at 5 to 10 ms.
+
 ## Merges and pruning
 
 A branch keeps its retained versions and, through every merge entry among them, the commits that
