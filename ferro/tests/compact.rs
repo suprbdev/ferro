@@ -164,6 +164,83 @@ fn read_only_handle_follows_a_replaced_file_on_refresh() {
     assert!(!reader.refresh().unwrap());
 }
 
+type Heads = Vec<(String, u64, Vec<(u64, String)>)>;
+
+fn branches_of(db: &Db<Root>) -> Heads {
+    db.branches()
+        .into_iter()
+        .map(|name| {
+            let snapshot = db.branch(&name).unwrap().read();
+            let values = snapshot.iter().map(|(k, v)| (k, (*v).clone())).collect();
+            (name, snapshot.version(), values)
+        })
+        .collect()
+}
+
+fn merge_ours(db: &Db<Root>, other: &Db<Root>) {
+    db.merge_with(other, |ours, base, theirs| {
+        let applied = ours.merge(base, theirs, |conflict| conflict.keep_ours());
+        ("merge", applied)
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_compacted_file_opens_for_shared_writers_and_read_only_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.ferro");
+    build(&path, 200);
+    let want = {
+        let db = Db::<Root>::open(&path).unwrap();
+        let side = db.fork("side").unwrap();
+        for i in 0..50 {
+            side.update(|root| {
+                root.insert(i, format!("side {i}"));
+            })
+            .unwrap();
+        }
+        merge_ours(&db, &side);
+        merge_ours(&side, &db);
+        branches_of(&db)
+    };
+    admin::compact(&path, Keep::Last(3)).unwrap();
+    admin::verify(&path).unwrap();
+    let reader = ferro::Options::new()
+        .read_only(true)
+        .open::<Root>(&path)
+        .unwrap();
+    assert_eq!(branches_of(&reader), want);
+    reader.verify_typed().unwrap();
+    let shared = || {
+        ferro::Options::new()
+            .shared(true)
+            .open::<Root>(&path)
+            .unwrap()
+    };
+    let one = shared();
+    assert_eq!(branches_of(&one), want);
+    one.verify_typed().unwrap();
+    one.update(|root| {
+        root.insert(1000, "shared".into());
+    })
+    .unwrap();
+    merge_ours(&one.branch("side").unwrap(), &one);
+    let want = branches_of(&one);
+    one.compact(Keep::Last(2)).unwrap();
+    one.verify_typed().unwrap();
+    let other = shared();
+    assert_eq!(branches_of(&other), want);
+    assert!(reader.refresh().unwrap());
+    assert_eq!(branches_of(&reader), want);
+    drop((one, other));
+    let again = ferro::Options::new()
+        .read_only(true)
+        .open::<Root>(&path)
+        .unwrap();
+    assert_eq!(branches_of(&again), want);
+    again.verify_typed().unwrap();
+}
+
 #[test]
 fn nested_collections_copy_with_their_values() {
     let dir = tempfile::tempdir().unwrap();

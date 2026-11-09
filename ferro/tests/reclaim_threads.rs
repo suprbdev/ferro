@@ -3,9 +3,11 @@ mod common;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use common::{Rng, text};
+use ferro::db::Clock;
 use ferro::store::{Store, StoreOptions, record_len};
 use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim, admin};
 use tempfile::TempDir;
@@ -124,6 +126,93 @@ fn several_threads_copy_the_same_bytes_as_one() {
             "{keep:?}: the first copies"
         );
         assert!(copies.windows(2).all(|pair| pair[0] == pair[1]), "{keep:?}");
+    }
+}
+
+type Nested = Map<u64, Map<u64, String>>;
+
+fn build_branched(path: &Path, seed: u64) -> u64 {
+    let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let clock = {
+        let ticks = ticks.clone();
+        Clock(Arc::new(move || ticks.fetch_add(1, Ordering::SeqCst)))
+    };
+    let main: Db<Nested> = options(1)
+        .cache_bytes(1 << 20)
+        .clock(clock)
+        .open(path)
+        .unwrap();
+    let mut rng = Rng::new(seed);
+    let mut branches = vec![main.clone()];
+    for step in 0..2500u64 {
+        let db = branches[rng.below(branches.len() as u64) as usize].clone();
+        match rng.below(20) {
+            0 if branches.len() < 8 => branches.push(db.fork(&format!("b{step}")).unwrap()),
+            1 => {
+                let other = branches[rng.below(branches.len() as u64) as usize].clone();
+                if other.branch_name() != db.branch_name() {
+                    let _ = db.merge_with(&other, |ours, base, theirs| {
+                        let applied = ours.merge(base, theirs, |conflict| conflict.keep_ours());
+                        ("merge", applied)
+                    });
+                }
+            }
+            2 if db.version() > 3 => {
+                let back = db.at(db.version() - 1 - rng.below(3)).unwrap();
+                db.restore(&back).unwrap();
+            }
+            _ => {
+                let (outer, inner) = (rng.below(40), rng.below(200));
+                let len = match rng.below(100) {
+                    0..3 => 20_000,
+                    _ => 30 + rng.below(200) as usize,
+                };
+                let value = text(rng.next(), len);
+                db.update(|root| {
+                    let mut map = root.get(&outer).map(|m| (*m).clone()).unwrap_or_default();
+                    map.insert(inner, value.clone());
+                    root.insert(outer, map);
+                })
+                .unwrap();
+            }
+        }
+    }
+    ticks.load(Ordering::SeqCst)
+}
+
+#[test]
+fn several_threads_copy_branched_merged_nested_history_into_the_same_bytes() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    let end = build_branched(&source, 7);
+    assert!(fs::metadata(&source).unwrap().len() > 2 << 20);
+    for keep in [Keep::All, Keep::Last(15), Keep::Since(end - 300)] {
+        let mut copies = Vec::new();
+        for threads in [1, 2, 3, 8] {
+            let path = dir.path().join(format!("copy-{threads}.ferro"));
+            fs::copy(&source, &path).unwrap();
+            let db: Db<Nested> = options(threads).open(&path).unwrap();
+            db.compact(keep).unwrap();
+            db.verify_typed()
+                .unwrap_or_else(|error| panic!("{keep:?} at {threads} threads: {error}"));
+            let first = fs::read(&path).unwrap();
+            db.compact(keep).unwrap();
+            db.verify_typed().unwrap();
+            drop(db);
+            copies.push((threads, first, fs::read(&path).unwrap()));
+        }
+        for pair in copies.windows(2) {
+            let (one, other) = (pair[0].0, pair[1].0);
+            assert!(
+                pair[0].1 == pair[1].1,
+                "{keep:?}: first copies at {one} and {other}"
+            );
+            assert!(
+                pair[0].2 == pair[1].2,
+                "{keep:?}: second copies at {one} and {other}"
+            );
+        }
     }
 }
 

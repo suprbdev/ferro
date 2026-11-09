@@ -155,3 +155,237 @@ fn keep_within_measures_its_age_from_the_clock_commits_take_their_times_from() {
         .unwrap();
     assert_eq!(reachable(&db), vec![3]);
 }
+
+type Versions = Vec<(u64, u64, Vec<(u64, u64)>)>;
+
+struct Modeled {
+    name: String,
+    db: Db<Root>,
+    versions: Versions,
+    first: u64,
+}
+
+impl Modeled {
+    fn record(&mut self) {
+        let snapshot = self.db.read();
+        let version = snapshot.version();
+        if version == 0 || self.versions.last().is_some_and(|(v, _, _)| *v == version) {
+            return;
+        }
+        let values = snapshot.iter().map(|(k, v)| (k, *v)).collect();
+        self.versions
+            .push((version, snapshot.commit().time_ms, values));
+    }
+
+    fn first_after(&self, keep: Keep, now: u64) -> u64 {
+        let Some((last, _, _)) = self.versions.last() else {
+            return self.first;
+        };
+        let since = |cut: u64| {
+            self.versions
+                .iter()
+                .filter(|(version, time, _)| *version >= self.first && *time < cut)
+                .map(|(version, _, _)| version + 1)
+                .max()
+                .unwrap_or(self.first)
+        };
+        let first = match keep {
+            Keep::All => self.first,
+            Keep::Last(count) => (last + 1).saturating_sub(count.max(1) as u64),
+            Keep::Since(cut) => since(cut),
+            Keep::Within(age) => since(now.saturating_sub(age.as_millis() as u64)),
+        };
+        first.max(self.first).min(*last)
+    }
+
+    fn check(&self, context: &str) {
+        let name = &self.name;
+        let logged: Vec<u64> = self.db.log().iter().map(|(v, _)| v).collect();
+        let last = self.versions.last().map_or(0, |(v, _, _)| *v);
+        let want: Vec<u64> = match last {
+            0 => Vec::new(),
+            last => (self.first..=last).collect(),
+        };
+        assert_eq!(logged, want, "{context}: the log of {name}");
+        for (version, time, values) in &self.versions {
+            if *version < self.first {
+                assert!(
+                    matches!(self.db.at(*version), Err(Error::NoVersion(_))),
+                    "{context}: {name} v{version}"
+                );
+                continue;
+            }
+            let snapshot = self.db.at(*version).unwrap();
+            let read: Vec<(u64, u64)> = snapshot.iter().map(|(k, v)| (k, *v)).collect();
+            assert_eq!(&read, values, "{context}: {name} v{version}");
+            let newest = self
+                .versions
+                .iter()
+                .filter(|(_, at, _)| at <= time)
+                .map(|(v, _, _)| *v)
+                .max();
+            let as_of = self.db.as_of(*time).unwrap();
+            assert_eq!(
+                Some(as_of.version()),
+                newest,
+                "{context}: {name} as of {time}"
+            );
+        }
+    }
+}
+
+fn retention_model(seed: u64) {
+    let mut rng = common::Rng::new(seed);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.ferro");
+    let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let clock = {
+        let ticks = ticks.clone();
+        Clock(Arc::new(move || ticks.load(Ordering::SeqCst)))
+    };
+    let threads = [1, 2, 4][(seed % 3) as usize];
+    let main: Db<Root> = options()
+        .copy_threads(threads)
+        .clock(clock)
+        .open(&path)
+        .unwrap();
+    let mut models = vec![Modeled {
+        name: "main".into(),
+        db: main.clone(),
+        versions: Vec::new(),
+        first: 1,
+    }];
+    let mut counter = 0;
+    for step in 0..300 {
+        let pick = rng.below(models.len() as u64) as usize;
+        match rng.below(100) {
+            0..4 => {
+                ticks.fetch_sub(rng.below(5), Ordering::SeqCst);
+            }
+            4..41 => {
+                ticks.fetch_add(rng.below(4), Ordering::SeqCst);
+                counter += 1;
+                let key = rng.below(20);
+                let model = &mut models[pick];
+                if rng.chance(20) {
+                    model
+                        .db
+                        .commit_stamped(|root, stamp| {
+                            root.insert(key, stamp.time_ms());
+                            ("stamped", ())
+                        })
+                        .unwrap();
+                } else {
+                    put_value(&model.db, key, counter);
+                }
+                model.record();
+            }
+            41..49 if models.len() < 6 => {
+                let name = format!("b{step}");
+                let parent = &models[pick];
+                let fork = Modeled {
+                    db: parent.db.fork(&name).unwrap(),
+                    name,
+                    versions: parent.versions.clone(),
+                    first: parent.first,
+                };
+                models.push(fork);
+            }
+            49..63 if models.len() > 1 => {
+                ticks.fetch_add(rng.below(3), Ordering::SeqCst);
+                let from = rng.below(models.len() as u64) as usize;
+                if from == pick {
+                    continue;
+                }
+                let other = models[from].db.clone();
+                let merged = models[pick].db.merge_with(&other, |ours, base, theirs| {
+                    let applied = ours.merge(base, theirs, |conflict| conflict.keep_theirs());
+                    ("merge", applied)
+                });
+                match merged {
+                    Ok(_) => models[pick].record(),
+                    Err(Error::NoCommonAncestor) => {}
+                    Err(error) => panic!("seed {seed} step {step}: {error}"),
+                }
+            }
+            63..67 if models.len() > 1 => {
+                let index = 1 + rng.below(models.len() as u64 - 1) as usize;
+                main.drop_branch(&models[index].name).unwrap();
+                models.remove(index);
+            }
+            67..73 => {
+                let model = &mut models[pick];
+                let retained: Vec<u64> = model
+                    .versions
+                    .iter()
+                    .map(|(v, _, _)| *v)
+                    .filter(|v| *v >= model.first)
+                    .collect();
+                if retained.is_empty() {
+                    continue;
+                }
+                let version = retained[rng.below(retained.len() as u64) as usize];
+                let snapshot = model.db.at(version).unwrap();
+                model.db.restore(&snapshot).unwrap();
+                model.record();
+            }
+            73..81 => {
+                let now = ticks.load(Ordering::SeqCst);
+                let keep = match rng.below(4) {
+                    0 => Keep::All,
+                    1 => Keep::Last(1 + rng.below(8) as usize),
+                    2 => Keep::Since(now.saturating_sub(rng.below(30))),
+                    _ => Keep::Within(Duration::from_millis(rng.below(30))),
+                };
+                let context = format!("seed {seed} step {step} {keep:?} at {threads} threads");
+                let heads: Vec<_> = models.iter().map(|m| m.db.head_hash()).collect();
+                let firsts: Vec<u64> = models.iter().map(|m| m.first_after(keep, now)).collect();
+                main.compact(keep)
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
+                for (model, first) in models.iter_mut().zip(firsts) {
+                    model.first = first;
+                }
+                let after: Vec<_> = models.iter().map(|m| m.db.head_hash()).collect();
+                assert_eq!(heads, after, "{context}");
+                main.verify_typed()
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
+                for model in &models {
+                    model.check(&context);
+                }
+            }
+            _ => {}
+        }
+    }
+    for model in &models {
+        model.check(&format!("seed {seed} at the end"));
+    }
+    let heads: Vec<_> = models
+        .iter()
+        .map(|m| (m.name.clone(), m.db.head_hash()))
+        .collect();
+    drop(models);
+    drop(main);
+    let db: Db<Root> = options().open(&path).unwrap();
+    db.verify_typed().unwrap();
+    for (name, head) in heads {
+        assert_eq!(
+            db.branch(&name).unwrap().head_hash(),
+            head,
+            "seed {seed} {name}"
+        );
+    }
+}
+
+fn put_value(db: &Db<Root>, key: u64, value: u64) {
+    db.update(|root| {
+        root.insert(key, value);
+    })
+    .unwrap();
+}
+
+#[test]
+fn every_kind_of_retention_keeps_exactly_its_versions_across_merges_and_a_clock_that_steps_back() {
+    for seed in 0..u64::from(common::cases(12)) {
+        retention_model(seed);
+    }
+}
