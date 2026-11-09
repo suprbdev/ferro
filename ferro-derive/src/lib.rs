@@ -2244,6 +2244,26 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         .iter()
         .map(|field| format_ident!("__reindex_{}", field))
         .collect();
+    let add_fn = if indexes.iter().any(|ix| matches!(ix.kind, IndexKind::Each)) {
+        quote! {}
+    } else {
+        let fresh_vars: Vec<Ident> = index_fields
+            .iter()
+            .map(|field| format_ident!("__fresh_{}", field))
+            .collect();
+        quote! {
+            fn add(&mut self, __row: &#name) {
+                #(let mut #fresh_vars = ::ferro::table::Fresh::new(&mut self.#index_fields);)*
+                let __wrote = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    #(Self::#reindex_fns(&mut #fresh_vars, ::std::option::Option::None, ::std::option::Option::Some(__row));)*
+                }));
+                if let ::std::result::Result::Err(__payload) = __wrote {
+                    #(#fresh_vars.take_back(|__sink| Self::#reindex_fns(__sink, ::std::option::Option::None, ::std::option::Option::Some(__row)));)*
+                    ::std::panic::resume_unwind(__payload);
+                }
+            }
+        }
+    };
     let clash_slots: Vec<usize> = clashes.iter().map(|(slot, _)| *slot).collect();
     let clash_fns: Vec<Ident> = clash_slots
         .iter()
@@ -2596,6 +2616,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
                 #(#edits_vars.apply(&mut self.#index_fields);)*
             }
+
+            #add_fn
 
             fn conflict(
                 &self,

@@ -72,7 +72,10 @@ removes beside it, and writes the rows, each in one edit or batch that a failure
 If one fails it takes back the entries it added: an entry just added has its path in memory and two
 new halves beside it, so removing it loads nothing. Last it makes the removals and batches, which
 have nothing left to load. An insert writes its row first,
-since it learns the row it replaces from that, and takes it back the same way. `retain` and
+since it learns the row it replaces from that, and takes it back the same way. A row under a new
+key, in a table without an `each` index, gives each index at most one entry and removes none, so
+the insert puts each entry in as it goes and takes back those before one that fails, working their
+keys out again from the row. `retain` and
 `drain_range` remove their rows as one batch and each index's entries as another.
 `Table::try_merge`, which writes as it goes, puts back the copy of the table it keeps for an `Err`
 from `resolve` on a panic too. [Edits that fail halfway](tree.md#edits-that-fail-halfway) describes

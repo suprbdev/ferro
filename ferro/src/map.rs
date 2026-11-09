@@ -4423,6 +4423,20 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
         (old, Undo(replaced))
     }
 
+    /// [`insert_undoable`](Map::insert_undoable) for a caller that drops the value it replaces,
+    /// which it leaves unread.
+    pub(crate) fn put_undoable(&mut self, key: K, value: Arc<V>) -> Undo<V, S> {
+        let level = fatal(level_of(&key));
+        Undo(fatal(insert_at(
+            self.store.as_ref(),
+            &mut self.root,
+            key,
+            level,
+            value,
+            false,
+        )))
+    }
+
     /// Takes back the insert of `key` that [`insert_undoable`](Map::insert_undoable) made, while
     /// nothing else has changed the map since: removes the key, or puts back the slot it replaced.
     ///

@@ -156,8 +156,8 @@ use crate::codec::{
 };
 use crate::error::{Error, Result};
 use crate::map::{
-    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Val, Values, differ, kin,
-    same_value, unwound, walked, walked_until,
+    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Undo, Val, Values, differ,
+    kin, same_value, unwound, walked, walked_until,
 };
 use crate::pool::{Latch, Pool};
 use crate::prefix::Prefix;
@@ -269,6 +269,17 @@ pub trait TableData<T: Record>: Data + Default {
     ) {
         changes(&mut |old, new| self.reindex(old, new));
         rows(self.rows_mut());
+    }
+    /// Adds the index entries of `row`, which no row's key equals, as
+    /// [`write`](TableData::write) does for a row that changes from `None`, leaving every index
+    /// as it was if a load fails or a `Data` impl panics.
+    ///
+    /// The derive, for a table whose every index gives a row at most one entry, puts each entry
+    /// straight into its index through a [`Fresh`], and if a later one fails, takes back those it
+    /// put in, which loads nothing. The default calls [`write`](TableData::write).
+    #[doc(hidden)]
+    fn add(&mut self, row: &T) {
+        self.write(&mut |stage| stage(None, Some(row)), &mut |_| {});
     }
     /// Returns the clash `row` would cause in a unique index, if any.
     ///
@@ -1046,9 +1057,11 @@ impl<T: Record> Table<T> {
     fn put(&mut self, row: T) -> Option<Val<T>> {
         let row = Arc::new(row);
         let (old, undo) = self.0.rows_mut().insert_undoable(row.key(), row.clone());
-        let indexed = panic::catch_unwind(AssertUnwindSafe(|| {
-            self.0
-                .write(&mut |stage| stage(old.as_deref(), Some(&row)), &mut |_| {});
+        let indexed = panic::catch_unwind(AssertUnwindSafe(|| match old.as_deref() {
+            None => self.0.add(&row),
+            Some(old) => self
+                .0
+                .write(&mut |stage| stage(Some(old), Some(&row)), &mut |_| {}),
         }));
         if let Err(payload) = indexed {
             self.0.rows_mut().undo_insert(&row.key(), undo);
@@ -1693,7 +1706,8 @@ pub use crate::map::Edits;
 
 /// Where the code the [`Record`](derive@crate::Record) derive generates writes the entries of one
 /// index for a changed row: the index's map itself, for
-/// [`reindex`](TableData::reindex), or the [`Edits`] that [`write`](TableData::write) stages.
+/// [`reindex`](TableData::reindex), the [`Edits`] that [`write`](TableData::write) stages, or
+/// the [`Fresh`] that [`add`](TableData::add) puts them in through.
 #[doc(hidden)]
 pub trait IndexSink<K, V> {
     /// Removes the entry under `key`.
@@ -1735,6 +1749,60 @@ impl<K: Data + Ord, V: Data> IndexSink<K, V> for Edits<K, V> {
     #[inline]
     fn insert(&mut self, key: K, value: V) {
         Edits::insert(self, key, value);
+    }
+}
+
+/// Where the code the [`Record`](derive@crate::Record) derive generates for
+/// [`add`](TableData::add) puts the entry of one index for a row new to the table: straight into
+/// the index, keeping what [`take_back`](Fresh::take_back) needs to take it out again.
+///
+/// It takes one entry, and no removals, as an index that gives a row at most one entry hands it
+/// for a row that changes from `None`.
+#[doc(hidden)]
+pub struct Fresh<'a, K, V> {
+    map: &'a mut Map<K, V>,
+    undo: Option<Undo<V, ()>>,
+    back: bool,
+}
+
+impl<'a, K: Data + Ord, V: Data> Fresh<'a, K, V> {
+    /// Puts the entry it is handed into `map`.
+    #[inline]
+    pub fn new(map: &'a mut Map<K, V>) -> Self {
+        Fresh {
+            map,
+            undo: None,
+            back: false,
+        }
+    }
+
+    /// Takes back the entry put in, if any, while nothing else has changed the index since,
+    /// which loads nothing. `entries` hands the same entry again, as it did to put it in.
+    pub fn take_back(&mut self, entries: impl FnOnce(&mut Self)) {
+        if self.undo.is_some() {
+            self.back = true;
+            entries(self);
+        }
+    }
+}
+
+impl<K: Data + Ord, V: Data> IndexSink<K, V> for Fresh<'_, K, V> {
+    fn remove(&mut self, _: K) {
+        unreachable!("a row new to the table removes no index entry");
+    }
+
+    fn remove_ref(&mut self, _: &K) {
+        unreachable!("a row new to the table removes no index entry");
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, value: V) {
+        if !self.back {
+            debug_assert!(self.undo.is_none(), "a Fresh takes one entry");
+            self.undo = Some(self.map.put_undoable(key, Arc::new(value)));
+        } else if let Some(undo) = self.undo.take() {
+            self.map.undo_insert(&key, undo);
+        }
     }
 }
 

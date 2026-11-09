@@ -85,6 +85,12 @@ arranged so that a failure leaves the map with the entries, length, summary and 
   encoding changes while `==` holds gives, cannot be one edit, since the new key hashes to its own
   level; the removal is loaded for down both edges beside its key, and both are made last, the
   removal first, so that the insert cuts along the seam the removal joined, which is loaded.
+- An insert of a row under a key the table does not hold, into a table whose every index gives a
+  row at most one entry, has only lone inserts to make, so it stages nothing. It puts each entry
+  straight into its index, keeping only the slot it replaced, if any, and if a later entry or a
+  `Data` or `Clone` impl fails, takes back those it put in, working their keys out again from the
+  row, which loads nothing for the same reason. So it clones no key to take back by. A table with
+  an `each` index, whose rows can give an index several entries, writes them through `Edits`.
 - `flush` refuses, with `Error::Corrupt`, a node whose count is not its keys plus its children's
   counts, so a tree damaged some other way is not committed with links that claim more entries than
   their nodes hold.
@@ -107,6 +113,18 @@ reading the old row before an insert to stage its entries, ran 1.0 to 1.9% more 
 those commits and 13% more in the load. `Map::merge` of 1M keys with 110,000 written took 1 to 5%
 less time than writing each key as the diff reached it, which putting back a copy on a panic kept
 to; reading ours without the finder had made it up to 10% slower.
+
+The load's extra instructions were all in the insert loop: a third of them cloning each key to take
+it back by, the rest the staging around it. Putting a new row's entries straight into their indexes
+won them back. Against the code before staging and the code with it, in alternating runs pinned to
+16 cores, medians of eight, the main benchmark's table load ran 14,494 instructions a row against
+14,389 and 15,010, in 1,645 ns against 1,645 and 1,692. Loading the same 200,000 rows into a table
+in memory ran 7,556 instructions a row against 7,476 before staging, 8,057 when staging came in and
+8,123 just before the change, so what is left over the code before staging came with later map
+changes. The hold commits of `bench-tables` ran 1.4% fewer instructions in their closure, and its
+confirms and cancels, the main benchmark's table updates and `bulk` the same instructions as with
+staging, all within the noise in time. Returning the panic from the derive's insert of the entries,
+rather than catching it again around it, ran 4 instructions a row more and was left out.
 
 ## Copy-on-write and flush
 

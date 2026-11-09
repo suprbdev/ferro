@@ -660,6 +660,7 @@ fn a_table_written_before_an_index_existed_gets_the_index_rebuilt() {
 }
 
 mod failed_loads {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::panic::{self, AssertUnwindSafe};
 
@@ -1424,5 +1425,254 @@ mod failed_loads {
         })
         .unwrap();
         db.verify_typed().unwrap();
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    #[index(group, rank)]
+    struct Slim {
+        #[key]
+        id: u64,
+        #[index(cover(note))]
+        group: Brittle,
+        #[unique(cover(rank))]
+        slug: Option<Brittle>,
+        #[index]
+        label: Brittle,
+        rank: u64,
+        note: String,
+    }
+
+    fn slim(rng: &mut Rng, id: u64) -> Slim {
+        Slim {
+            id,
+            group: Brittle(rng.below(20)),
+            slug: rng.chance(70).then(|| Brittle(id + 1000)),
+            label: Brittle(rng.below(8)),
+            rank: rng.below(5),
+            note: text(rng.next(), if rng.chance(10) { 600 } else { 8 }),
+        }
+    }
+
+    fn slims(table: &Table<Slim>) -> BTreeMap<u64, Slim> {
+        table.iter().map(|row| (row.id, (*row).clone())).collect()
+    }
+
+    fn agrees(table: &Table<Slim>, model: &BTreeMap<u64, Slim>, what: &str) {
+        assert!(slims(table) == *model, "{what}: rows differ");
+        assert_eq!(
+            hash_of(table),
+            hash_of(&rebuilt(table)),
+            "{what}: the indexes are not those of the rows"
+        );
+    }
+
+    fn every_point<T: Record + Clone>(
+        table: &Table<T>,
+        what: &str,
+        op: impl Fn(&mut Table<T>),
+    ) -> (Table<T>, u32) {
+        let hash = hash_of(table);
+        let mut at = 0;
+        loop {
+            let mut trial = table.clone();
+            fuse(at, at % 2 == 1);
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| op(&mut trial)));
+            defuse();
+            if outcome.is_ok() {
+                return (trial, at);
+            }
+            assert_eq!(hash_of(&trial), hash, "{what} failed at decode {at}");
+            at += 1;
+        }
+    }
+
+    #[test]
+    fn a_new_row_goes_into_every_index_or_none_at_every_load_point() {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slim.ferro");
+        let mut rng = Rng::new(17);
+        let db = uncached().open::<Table<Slim>>(&path).unwrap();
+        db.update(|table| {
+            for id in 0..300 {
+                table.insert(slim(&mut rng, id * 2));
+            }
+        })
+        .unwrap();
+        drop(db);
+        let db = uncached().open::<Table<Slim>>(&path).unwrap();
+        db.update(|table| {
+            let mut model = slims(table);
+            for (round, id) in [1, 301, 599, 701].into_iter().enumerate() {
+                let mut row = slim(&mut rng, id);
+                if round % 2 == 1 {
+                    row.slug = None;
+                }
+                let (after, points) = every_point(table, "insert", |table| {
+                    table.insert(row.clone());
+                });
+                assert!(points >= 4, "the insert of {id} loaded too little to test");
+                model.insert(id, row);
+                *table = after;
+                agrees(table, &model, "insert");
+            }
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+
+    fn slim_run(seed: u64, options: fn() -> Options) {
+        quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slim.ferro");
+        let open = || options().open::<Table<Slim>>(&path).unwrap();
+        let mut db = open();
+        let mut rng = Rng::new(seed);
+        let mut model = BTreeMap::new();
+        db.update(|table| {
+            for _ in 0..200 {
+                let id = rng.below(IDS);
+                let row = slim(&mut rng, id);
+                model.insert(id, row.clone());
+                table.insert(row);
+            }
+        })
+        .unwrap();
+        for commit in 0..6 {
+            let mut working = model.clone();
+            db.update(|table| {
+                for _ in 0..30 {
+                    let before = working.clone();
+                    let id = rng.below(IDS);
+                    let row = slim(&mut rng, id);
+                    let (what, done) = match rng.below(4) {
+                        0 | 1 => {
+                            let done = interrupted(&mut rng, || {
+                                table.insert(row.clone());
+                            });
+                            if done.is_some() {
+                                working.insert(id, row);
+                            }
+                            ("insert", done.is_some())
+                        }
+                        2 => {
+                            let done = interrupted(&mut rng, || {
+                                table.remove(&id);
+                            });
+                            if done.is_some() {
+                                working.remove(&id);
+                            }
+                            ("remove", done.is_some())
+                        }
+                        _ => {
+                            let label = row.label.clone();
+                            let done = interrupted(&mut rng, || {
+                                table.update(&id, |held| held.label = label.clone());
+                            });
+                            if done.is_some()
+                                && let Some(held) = working.get_mut(&id)
+                            {
+                                held.label = label;
+                            }
+                            ("update", done.is_some())
+                        }
+                    };
+                    if done {
+                        agrees(table, &working, &format!("{what} done"));
+                    } else {
+                        agrees(
+                            table,
+                            &before,
+                            &format!("a failed {what} changed the table"),
+                        );
+                    }
+                }
+            })
+            .unwrap();
+            model = working;
+            agrees(&db.read(), &model, "the commit");
+            if commit % 2 == 1 {
+                db.verify_typed().unwrap();
+                drop(db);
+                db = open();
+                agrees(&db.read(), &model, "the reopened file");
+            }
+        }
+    }
+
+    #[test]
+    fn new_rows_keep_rows_and_indexes_together_through_failed_loads() {
+        for seed in 0..u64::from(cases(2)) {
+            slim_run(seed, uncached);
+        }
+        for seed in 50..50 + u64::from(cases(2)) {
+            slim_run(seed, roomy);
+        }
+    }
+
+    thread_local! {
+        static TOUCHY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Touchy(u64);
+
+    impl Clone for Touchy {
+        fn clone(&self) -> Self {
+            assert!(!TOUCHY.get(), "touched");
+            Touchy(self.0)
+        }
+    }
+
+    impl Data for Touchy {
+        fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+            self.0.encode(w)
+        }
+
+        fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+            Ok(Touchy(u64::decode(r)?))
+        }
+    }
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Prickly {
+        #[key]
+        id: u64,
+        #[index]
+        group: u64,
+        #[unique]
+        slug: Option<u64>,
+        #[index]
+        touchy: Touchy,
+    }
+
+    #[test]
+    fn a_new_row_whose_last_index_value_panics_leaves_no_entry_behind() {
+        let mut table: Table<Prickly> = Table::new();
+        for id in 0..100 {
+            table.insert(Prickly {
+                id,
+                group: id % 3,
+                slug: Some(id),
+                touchy: Touchy(id),
+            });
+        }
+        let hash = hash_of(&table);
+        TOUCHY.set(true);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            table.insert(Prickly {
+                id: 500,
+                group: 1,
+                slug: Some(500),
+                touchy: Touchy(5),
+            })
+        }));
+        TOUCHY.set(false);
+        assert!(outcome.is_err(), "the index value did not panic");
+        assert_eq!(hash_of(&table), hash);
+        assert!(table.get(&500).is_none());
+        assert_eq!(table.by_group(&1).len(), 33);
+        assert!(table.by_slug(&500).is_none());
+        assert_eq!(hash_of(&table), hash_of(&rebuilt(&table)));
     }
 }
