@@ -89,6 +89,10 @@ fn shared_child() {
         mixed(Path::new(&path), count);
         return;
     }
+    if role == "gate holder" {
+        hold_the_gate(Path::new(&path));
+        return;
+    }
     if role == "slow" {
         slow(Path::new(&path), writer, count)
     }
@@ -116,6 +120,67 @@ fn shared_child() {
         }
     }
     println!("DONE {writer}");
+}
+
+fn hold_the_gate(path: &Path) {
+    let db: Db<Root> = options().open(path).unwrap();
+    let hold = db.branch("hold").unwrap();
+    std::thread::spawn(move || {
+        hold.update(|root| {
+            std::thread::sleep(Duration::from_secs(60));
+            root.n += 1;
+        })
+        .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    println!("CYCLING");
+    let _ = db.compact(Keep::All);
+}
+
+#[test]
+fn a_writer_held_at_the_gate_of_another_process_goes_on_when_that_process_dies() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("dies.ferro");
+    let db: Db<Root> = options().open(&path).unwrap();
+    db.fork("hold").unwrap();
+    let own = db.fork("own").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "shared_child", "--nocapture", "--test-threads=1"])
+        .env("FERRO_SHARED_ROLE", "gate holder")
+        .env("FERRO_SHARED_PATH", &path)
+        .env("FERRO_SHARED_WRITER", "0")
+        .env("FERRO_SHARED_FIRST", "1")
+        .env("FERRO_SHARED_COUNT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let cycling = lines
+        .map_while(std::result::Result::ok)
+        .any(|line| line.contains("CYCLING"));
+    assert!(cycling, "the other process never began its cycle");
+    std::thread::sleep(Duration::from_millis(2500));
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        commit(&own, 1, 1);
+        let _ = done.send(Instant::now());
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let early = finished.try_recv().ok();
+    let killed = Instant::now();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let ended = finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the writer never finished after the other process died");
+    let after = ended.saturating_duration_since(killed);
+    assert!(
+        early.is_none() && after < Duration::from_millis(200),
+        "a writer held at the gate of a process that was then killed finished before the kill: \
+         {}, and {after:?} after it",
+        early.is_some()
+    );
 }
 
 fn slow(path: &Path, process: u64, threads: u64) -> ! {

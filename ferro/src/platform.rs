@@ -512,6 +512,18 @@ mod ranges {
         Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
     }
 
+    /// The first byte of an exclusive lock that another open file holds on any of the `len` bytes
+    /// of `file` from `at`, or `None` if there is none. The kernel reports the first such lock it
+    /// finds, and of the locks one open holds, the one that starts first; it merges one open's
+    /// locks on neighbouring bytes into one, so the first byte can lie before `at`.
+    pub(crate) fn excluded_at(file: &File, at: u64, len: u64) -> io::Result<Option<u64>> {
+        let lock = ofd(file, libc::F_OFD_GETLK, libc::F_RDLCK, at, len)?;
+        if lock.l_type == libc::F_UNLCK as libc::c_short {
+            return Ok(None);
+        }
+        Ok(u64::try_from(lock.l_start).ok())
+    }
+
     /// Asks the kernel to start writing the `len` bytes of `file` from `at` to disk, without
     /// waiting for them and without making them durable. A failure is ignored, since the later
     /// sync covers the range either way.
@@ -567,6 +579,11 @@ mod ranges {
     /// Returns `false`, since no range can be locked on this target.
     pub(crate) fn range_excluded(_file: &File, _at: u64, _len: u64) -> io::Result<bool> {
         Ok(false)
+    }
+
+    /// Returns `None`, since no range can be locked on this target.
+    pub(crate) fn excluded_at(_file: &File, _at: u64, _len: u64) -> io::Result<Option<u64>> {
+        Ok(None)
     }
 }
 

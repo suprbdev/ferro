@@ -21,7 +21,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the pieces of a large `receive` |
 | 2^62 + 5, gate | Exclusive, while a thread wants or holds every branch lock | Letting one thread of the machine at a time want them |
-| 2^62 + 6 and 2^62 + 7, phase | Exclusive, one at a time, by the gate's holder, changing at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
+| 2^62 + 3 · 2^18 and every other byte of the 2,048 from there, phase | Exclusive, one at a time, by the gate's holder, from one drawn at random to the next at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
 
 A cycle's prune and pause, the landing of a `receive` and anything else that replaces every
@@ -125,9 +125,12 @@ The gate promises five things:
 The thread that wants every branch lock, the holder, first takes the gate byte, 2^62 + 5, exclusive,
 waiting in the kernel while another process holds it, and through the table of [One owner per lock
 in a process](#one-owner-per-lock-in-a-process) while another of its threads does, so one thread
-of the machine holds the gate of a file at a time. It then holds one of the two phase bytes,
-2^62 + 6 and 2^62 + 7, and counts the same phase in its process, whose writers wait on that count,
-since a process never sees its own locks. It tries for everything at once between sleeps that
+of the machine holds the gate of a file at a time. If it had to wait for the gate it waits 1 ms
+more, the longest sleep of a writer between tests of its phase byte, so that the writers the last
+hold let on take their branch bytes before this hold tries for them. It then holds one of 1,024
+phase bytes, every other byte from 2^62 + 3 · 2^18, starting at one drawn at random, and gives
+the phase a number in its process that no phase there had before, which its process's writers
+wait on, since a process never sees its own locks. It tries for everything at once between sleeps that
 double from 20 µs to 1 ms, and to at most an eighth of the round: it seals any coalesced group whose
 lane is free, since a group keeps its branch's byte, tests without taking anything whether a thread
 of its process or another process holds a branch byte, and only if none does takes every lane of
@@ -135,24 +138,43 @@ its handle with `try_lock`, all or none, and then the range with `F_OFD_SETLK` u
 its process's count of bytes, so no thread of the process takes one meanwhile. Between tries it
 holds nothing but the gate and the phase byte, and a cycle's lock: no lane, no branch byte and no
 `whole` mark. Its rounds last 4 ms, then twice as long as the one before, up to a second. At the end
-of each it ends the phase: it locks the other phase byte, lets the one it held go and wakes the
-writers of its process. Once it has every lock it catches up, runs its prune, pause or landing, and
-lets the range, its lanes, the phase byte and the gate go.
+of each it ends the phase: it locks the next phase byte, lets the one it held go and wakes the
+writers of its process with the next number. Once it has every lock it catches up, runs its prune,
+pause or landing, and lets the range, its lanes, the phase byte and the gate go.
 
 A writer whose thread holds no lock of the file tests the gate before it takes its lane: a relaxed
-load of its process's flag for a holder there, and one `F_OFD_GETLK` over both phase bytes. If
-neither is held it goes on. If one is, it waits until the phase it found ends, on a condition
-variable for its own process's count, or testing that phase byte after sleeps that double from
-50 µs to 1 ms until it is let go. If its branch's byte is then held, in its process or another, it
+load of its process's flag for a holder there, and one `F_OFD_GETLK` over every phase byte. If
+none is held it goes on. If one is, it waits until the phase it found ends, on a condition
+variable for its own process's phase number, or testing that phase byte after sleeps that double
+from 50 µs to 1 ms until it is let go. If its branch's byte is then held, in its process or another, it
 waits for the next end too, once in each pass, since the closure holding the byte may be waiting
 for a write that the end just let on, and a writer queued behind it would hold the byte again as
 soon as the closure let it go. Whatever the holder does, it goes on after 2 s. It holds no lock of
-the file while it waits, and goes on to its lane and byte as before. The kernel merges the locks one
-open holds on bytes next to each other, so a test over both phase bytes reports the holder's gate
-byte and phase byte as one lock that begins at the gate byte, and the writer finds the phase it
-waits for by testing each phase byte alone. The first try of this design took the start of the lock
-reported, waited for the gate byte, which the holder keeps for its whole hold, and every commit a
-closure joined beside a cycle that the closure held up waited the full 2 s.
+the file while it waits, and goes on to its lane and byte as before.
+
+The test reports the start of the lock it finds, and that is the phase byte held. The kernel merges
+the locks one open holds on bytes next to each other into one, so the phase bytes lie every other
+byte, far from the gate byte and from every other lock: the first build of the two-byte design
+read a test over both phase bytes as the start of the holder's gate byte and phase byte merged,
+waited for the gate byte, which the holder keeps for its whole hold, and every commit a closure
+joined beside a cycle that the closure held up waited the full 2 s. While the holder moves to the
+next byte it holds both for a moment, and of the locks one open holds the kernel reports the one
+that starts first, the old one, but at the wrap from the last byte to the first, where a writer
+that tests in that moment waits for one phase more, once in 1,024 ends.
+
+Phases have to be told apart across holds as well as within one. A writer waits for the byte it
+found to be let go, testing it at most a millisecond apart, and a hold that gets every branch in
+its first round lasts well under that; with every hold starting on the same byte, as the two-byte
+design did, the next hold, by the same taker or by another that was waiting in the kernel for the
+gate, took that byte again within microseconds, and the writer slept through the end it waited for
+and on through later holds until it happened to test in a gap, or for 2 s (#147). Starting each
+hold on a byte drawn at random makes that one hold in 1,024, which costs the writer that hold,
+and the numbers in the holder's process never repeat. The 1 ms a holder waits after a gate it had
+to wait for keeps holds that queue for the gate from following one another with no gap at all, in
+which the writers each end lets on would take their bytes just as the next hold tried for every
+one, and that hold would wait out its first round for them: with four handles pulling over and
+over, a writer in a fifth committed fewer than 4,000 times in 3 s without it, at the same rate
+as before the change to the starting byte.
 
 An awaited write takes its lane first, as it does, and tests the gate and its byte without waiting.
 If either is held it lets the lane go and returns `Pending`, and its waiting thread waits at the
@@ -175,8 +197,9 @@ the seal of a group take no new branch byte and never pass the gate.
 Why each promise holds:
 
 1. The holder waits for nothing while it holds anything a writer needs. It waits for a cycle's lock
-   and then for the gate byte, held only by another cycle or holder, and holds nothing of the
-   branches while it does; everything after that it tries without waiting. A writer waiting at
+   and then for the gate byte, held only by another cycle or holder, and then sleeps a millisecond,
+   and holds nothing of the branches while it does; everything after that it tries without
+   waiting. A writer waiting at
    the gate holds no lock of the file, and the end of its phase comes on the holder's clock
    whatever the range does, or after 2 s. A lane or a byte is held only by a closure, a nested write within one, a coalesced
    group, which the holder or the sync thread seals, or a holder in its pause, which waits for
@@ -225,8 +248,9 @@ What stays unbounded:
   this build there for its whole hold, reads no stamp and so goes on at the end of each 2 ms epoch.
   A holder of an earlier build holds the gate byte, and writers of this build, which test the phase
   bytes, pay it no heed, while a holder of this build waits in the kernel for that gate byte until
-  the earlier holder is done. A shared writer from before the gate pays no heed to either. Beside
-  one, the range can wait as it did before the gate.
+  the earlier holder is done. Writers of b2741a3 test only its two phase bytes, which a holder of
+  this build never takes, and writers of this build pay no heed to them. A shared writer from
+  before the gate pays no heed to either. Beside one, the range can wait as it did before the gate.
 
 The gate and the phase bytes keep nothing in the file, a process that dies holding them lets them go
 with its other locks, and a test of the gate that fails lets the writer on, since it only keeps the
@@ -236,7 +260,7 @@ lock, a pull beside a cycle in one handle, waits there for the first to finish.
 
 #### Earlier versions
 
-Four designs before this one each fixed what a review of the last found, and each review found new
+Five designs before this one each fixed what a review of the last found, and each review found new
 hangs or stalls:
 
 - The first waited at the gate until it came free, by taking it shared, and hung: a closure on `a`
@@ -272,14 +296,26 @@ hangs or stalls:
   coalesced group before it waited for the next lane, so the group kept its byte of `a` while a
   closure on `b` waited for a commit on `a` through another handle, a hang 6fb68bc had too (#146).
 
+- The fifth, b2741a3, held one of two phase bytes, starting every hold on the first, and numbered
+  the phases in its process from that byte at each hold. A hold that got every branch in its first
+  round ended within a millisecond, and the next, whether the same taker's or one waiting in the
+  kernel for the gate, took the same byte again within microseconds, so a writer that tested its
+  byte a millisecond apart missed the end it waited for and waited out later holds. Beside four
+  handles pulling over and over, each pull two holds back to back, a writer in a fifth committed
+  900 to 2,300 times in 3 s, against 52,000 to 72,000 with 6fb68bc. A writer also found its phase
+  with a test over both bytes and then a test of the first alone, and one that the holder moved
+  between the two waited for the next phase as well (#147).
+
 This design keeps what worked: writers held up go on together, so the range comes free between the
 closures one end lets on and the next end, as epochs did, but at ends the holder makes, so no
 writer reads a clock or a stamp, and no end lets on a writer that came after it, as an opening of
 the gate did. The holder taking nothing of its own while it waits is what ended the hangs that ran
 through its lanes in #142, #145 and #146, and the wait for one more phase when a branch is busy is
-what keeps a chain of closures on one branch from passing the range between them. The model in
-[The gate model](testing.md#the-gate-model) runs every design above but the first two against each
-scenario of those issues and finds each failure its review found, and none in this one.
+what keeps a chain of closures on one branch from passing the range between them. Phase bytes drawn
+at random, and phase numbers that never repeat, tell a writer that the hold it found ended however
+soon the next begins. The model in [The gate model](testing.md#the-gate-model) runs every design
+above but the first two against each scenario of those issues and finds each failure its review
+found, and none in this one.
 
 #### Tests of the gate
 
@@ -328,12 +364,20 @@ and [The gate model](testing.md#the-gate-model) tests the designs:
   nested in closures, which had not finished after 60 s without the gate.
 - `a_coalesced_cycle_holding_an_open_groups_byte_lets_a_joined_commit_through_another_handle_land`
   hung with 6fb68bc and 51dbfc6.
-- The bytes. `a_writer_waits_at_the_gate_until_the_phase_another_open_holds_ends` and
-  `a_writer_goes_on_past_a_phase_that_never_ends_within_a_bounded_time` hold a phase byte from a
+- Holds back to back. `a_writer_beside_four_handles_pulling_back_to_back_waits_only_for_the_hold_it_finds`
+  and `a_writer_in_a_handle_pulling_back_to_back_in_four_threads_waits_only_for_the_hold_it_finds`
+  commit beside four threads pulling over and over, in handles of their own or the writer's; with
+  b2741a3 the first made 900 to 2,300 commits in 3 s with a p99 of 18 to 33 ms (#147).
+- The bytes. `a_writer_waits_at_the_gate_until_the_phase_another_open_holds_ends`,
+  `a_writer_waits_for_the_phase_byte_it_finds_until_the_holder_moves_to_the_next` and
+  `a_writer_goes_on_past_a_phase_that_never_ends_within_a_bounded_time` hold phase bytes from a
   bare open of the file, and
   `a_cycle_that_panics_in_its_pause_leaves_neither_the_gate_nor_the_branch_range_locked` and
   `a_coalesced_cycle_that_panics_in_its_pause_leaves_its_lanes_the_bytes_and_the_gate_free` check
-  that a panic lets everything go.
+  that a panic lets everything go, and `writers_held_at_a_pause_that_panics_go_on_as_it_unwinds`
+  that the writers it held up go on. In `shared_process.rs`,
+  `a_writer_held_at_the_gate_of_another_process_goes_on_when_that_process_dies` kills a process
+  whose cycle holds the gate.
 - Without `shared`.
   `a_plain_cycle_gets_a_lane_that_threads_of_its_handle_take_in_turn_with_5_ms_closures`,
   `a_plain_cycle_gets_a_lane_that_two_threads_of_its_handle_take_in_turn_with_2_ms_closures`,
@@ -380,6 +424,37 @@ other work ran on the rest, the two builds alternating, under Buffered:
 - A commit held up waits for the end of a round rather than of a 2 ms epoch, so beside 4 handles
   with 1 and 2 ms closures the longest commit took 7.5 and 8.4 ms against 4.2 and 5.0. A first round
   of 2 ms instead of 4 made neither the longest commit nor the cycles shorter.
+
+The phase bytes drawn at random and the 1 ms after a gate the holder waited for (#147) were measured
+on 2026-11-09 against b2741a3 and against the build that ran 6fb68bc's epochs, pinned to eight
+cores, the three builds alternating, medians of three rounds, under Buffered:
+
+- Beside four handles pulling over and over, a writer in a fifth committed 156,208 times in 3 s,
+  with a p99 of 19 µs, against 561 with 22.6 ms and 32,638 with 2.0 ms; with the four pulls and the
+  writer in one handle, 190,194 times against 2,004 and 2,410. The pulls themselves ran 884 times
+  in all against 1,123 and 2,728, and in one handle 759 against 1,045 and 761. With no wait after a
+  contested gate they ran about as often, from 946 to 1,213 in four runs, and the writer committed
+  1,044 to 2,552 times; with 250 µs it committed 23,324 to 28,120 times and with 500 µs 80,289 to
+  86,377.
+- Beside two handles pulling, the writer committed 191,034 times against 1,933 and 133,822, b2741a3
+  making 108,604 in one round of three; the pulls ran 1,251 times against 1,433 and 3,596. A pull
+  that waits for the other's hold now waits 1 ms more each time, so two takers that keep taking in
+  turn run about as often as with b2741a3 and a third as often as with 6fb68bc, which let writers
+  on every 2 ms whatever its takers did.
+- Five cycles beside 4 handles with closures that spun 0, 1, 2 and 5 ms took 0.2, 1.7, 2.3 and
+  5.5 ms against 0.1, 1.3, 2.3 and 5.7 and 0.1, 1.7, 0.2 and 0.2, and beside 16 handles 1.0, 4.0,
+  10.3 and 13.8 against 0.9, 3.7, 9.2 and 25.5 and 1.1, 7.7, 14.4 and 30.8. Beside processes they
+  took 4.5, 4.5, 6.6 and 10.4 ms beside 4, against 5.2, 4.4, 6.6 and 11.0 and 4.7, 5.0, 8.2 and
+  13.4, and 11.4, 12.6, 12.7 and 46.7 beside 16, against 9.0, 11.4, 14.4 and 56.2 and 10.2, 20.4,
+  29.9 and 62.6.
+- `group` with 1 and 8 shared writers made 47,165 and 39,987 commits a second against 45,595 and
+  40,539 and 46,510 and 40,640, and `processes` at 2, 4 and 8 came within 1.8% of both at every
+  count, on one branch and on branches of their own. Without `shared`, `group` with 1, 8 and 16
+  writers made 51,825, 44,088 and 42,890 on one branch, against 50,807, 43,405 and 42,511 and
+  51,747, 44,513 and 43,273, and 52,247, 164,678 and 142,592 on branches of their own, against
+  51,548, 153,962 and 139,728 and 51,574, 162,451 and 140,895; ten plain cycles beside 8 and 16
+  writers whose closures slept 2 and 5 ms took 20.2, 50.6, 39.0 and 95.9 ms against 20.6, 55.7,
+  37.1 and 91.2 and 20.4, 55.4, 38.8 and 95.8.
 
 ## A commit
 

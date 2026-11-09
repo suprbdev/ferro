@@ -2340,7 +2340,8 @@ fn cycles_and_pulls_in_one_handle_all_finish_beside_other_handles_committing() {
 }
 
 const GATE_AT: u64 = (1 << 62) + 5;
-const PHASE_AT: u64 = (1 << 62) + 6;
+const PHASE_AT: u64 = (1 << 62) + (3 << 18);
+const PHASE_BYTES: u64 = 2 << 10;
 const LANES_AT: u64 = (1 << 62) + (1 << 20);
 const LANES: u64 = 1 << 60;
 
@@ -2389,7 +2390,8 @@ fn a_cycle_that_panics_in_its_pause_leaves_neither_the_gate_nor_the_branch_range
     let ran = thread::spawn(move || held.compact(Keep::Last(1))).join();
     assert!(ran.is_err(), "the hook did not panic: {ran:?}");
     let probe = raw_open(&path);
-    let gate = locked_elsewhere(&probe, GATE_AT, 3);
+    let gate =
+        locked_elsewhere(&probe, GATE_AT, 1) || locked_elsewhere(&probe, PHASE_AT, PHASE_BYTES);
     let range = locked_elsewhere(&probe, LANES_AT, LANES);
     drop(cycler);
     assert!(
@@ -2423,6 +2425,33 @@ fn a_writer_waits_at_the_gate_until_the_phase_another_open_holds_ends() {
     assert!(
         took >= Duration::from_millis(200) && took < Duration::from_millis(400),
         "a commit beside a phase byte that another open held for 200 ms took {took:?}"
+    );
+}
+
+#[test]
+fn a_writer_waits_for_the_phase_byte_it_finds_until_the_holder_moves_to_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("moves.ferro");
+    let db: Db<Root> = manual().open(&path).unwrap();
+    let own = db.fork("own").unwrap();
+    tick(&own);
+    let holder = raw_open(&path);
+    let at = PHASE_AT + 2 * 500;
+    ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, GATE_AT, 1);
+    ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, at, 1);
+    let started = Instant::now();
+    let writer = thread::spawn(move || {
+        tick(&own);
+        started.elapsed()
+    });
+    thread::sleep(Duration::from_millis(200));
+    ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, at + 2, 1);
+    ofd(&holder, libc::F_OFD_SETLK, libc::F_UNLCK, at, 1);
+    let took = writer.join().unwrap();
+    drop(holder);
+    assert!(
+        took >= Duration::from_millis(200) && took < Duration::from_millis(400),
+        "a writer beside a phase byte in the middle of them that another open held, and moved          from to the next at 200 ms, took {took:?}"
     );
 }
 

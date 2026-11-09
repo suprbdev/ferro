@@ -32,6 +32,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
+use std::hash::{BuildHasher, RandomState};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::ErrorKind;
 use std::mem;
@@ -198,10 +199,16 @@ const CYCLE_AT: u64 = LOCKS_AT + 4;
 /// The gate, held exclusive by the one process at a time that wants every branch lock at once, for
 /// as long as it wants them, as [`Gate`] describes.
 const GATE_AT: u64 = LOCKS_AT + 5;
-/// The first of the two phase bytes, of which the gate's holder holds one exclusive at a time,
-/// changing to the other at the end of each round, so that a writer held up by one goes on when
-/// it is let go.
-const PHASE_AT: u64 = LOCKS_AT + 6;
+/// The first of the [`PHASES`] phase bytes, every other byte from here, of which the gate's
+/// holder holds one exclusive at a time, starting each hold on one drawn at random and moving to
+/// the next at the end of each round, so that a writer held up by one goes on when it is let go,
+/// even when the next hold begins at once. They lie clear of every other lock and of each other,
+/// so the kernel never merges the lock on one with another lock of the holder's open, and a test
+/// over all of them reports the byte held.
+const PHASE_AT: u64 = LOCKS_AT + (3 << 18);
+/// How many phase bytes there are, so that a hold starts on the byte the last one ended on, which
+/// a writer may still be waiting for, once in this many holds.
+const PHASES: u64 = 1 << 10;
 /// The first round of a hold of the gate, and the longest: each later round is twice as long as
 /// the one before, up to the longest.
 const ROUNDS: (Duration, Duration) = (Duration::from_millis(4), Duration::from_secs(1));
@@ -211,6 +218,11 @@ const GATE_POLL: (Duration, Duration) = (Duration::from_micros(50), Duration::fr
 /// The shortest and longest sleep between two tries for every branch lock while the gate is held;
 /// the longest is also at most an eighth of the round.
 const RANGE_POLL: (Duration, Duration) = (Duration::from_micros(20), Duration::from_millis(1));
+/// How long a thread that had to wait for the gate waits again before it holds its first phase:
+/// the longest sleep of [`GATE_POLL`], so that writers in other processes that the end of the
+/// last hold let on see it ended, and take their branch locks, before this hold tries for every
+/// one.
+const GATE_GAP: Duration = GATE_POLL.1;
 /// The longest a writer waits at the gate, past the longest round, in case its holder stopped
 /// without letting the phase byte go.
 const GATE_WAIT: Duration = Duration::from_secs(2);
@@ -1928,9 +1940,33 @@ struct Lanes {
     held: HashMap<u64, Option<usize>>,
     /// Set while a thread holds every byte at once, so that no thread takes one.
     whole: bool,
-    /// The phase of the gate while a thread of this process holds it, which writers of this
-    /// process wait to end as writers in other processes wait for the phase byte.
+    /// The number of the phase of the gate while a thread of this process holds it, which
+    /// writers of this process wait to end as writers in other processes wait for the phase byte.
     phase: Option<u64>,
+    /// How many phases the threads of this process have begun, from which each new phase takes
+    /// its number, so that no two phases share one, even across holds.
+    numbered: u64,
+}
+
+impl Lanes {
+    /// Begins a new phase of the gate this process holds, under a number no phase had before.
+    fn begin_phase(&mut self) {
+        self.numbered += 1;
+        self.phase = Some(self.numbered);
+    }
+}
+
+/// The phase byte `index` phases from the first, wrapping around.
+fn phase_byte(index: u64) -> u64 {
+    PHASE_AT + 2 * (index % PHASES)
+}
+
+/// Locks the first phase byte from the `index`th on that no other open holds, trying a few, and
+/// returns it.
+fn lock_phase(file: &File, index: u64) -> Option<u64> {
+    (index..index + 4)
+        .map(phase_byte)
+        .find(|at| platform::lock_range(file, *at, 1, true, false).is_ok())
 }
 
 /// Every branch lock at once, held by one thread of this process and released when dropped.
@@ -1951,14 +1987,18 @@ impl Drop for AllLanes {
 /// The gate, held by the one thread of the machine that wants every branch lock of the file at
 /// once, released when dropped.
 ///
-/// Its holder holds [`GATE_AT`], so that one thread at a time holds the gate, and one of the two
-/// [`PHASE_AT`] bytes, and counts the same phase within its process, where writers wait on the
-/// count in place of the byte, since a process never sees its own locks. A writer about to take
-/// its branch lock that finds a phase held waits until it ends, as [`Store::pass_gate`]
-/// describes, so while the gate is held writers take new branch locks only at the ends of phases.
-/// The holder tries for every branch lock between sleeps and holds nothing else of its own while
-/// it waits, and [`Gate::wait`] ends the phase at the end of each round: it locks the other phase
-/// byte, lets this one go and wakes the writers of its process. The first round lasts
+/// Its holder holds [`GATE_AT`], so that one thread at a time holds the gate, and one of the
+/// [`PHASES`] phase bytes from [`PHASE_AT`], and numbers the same phase within its process, where
+/// writers wait on the number in place of the byte, since a process never sees its own locks. A
+/// writer about to take its branch lock that finds a phase held waits until it ends, as
+/// [`Store::pass_gate`] describes, so while the gate is held writers take new branch locks only
+/// at the ends of phases. Each hold starts on a phase byte drawn at random and a phase number no
+/// phase had before, so a writer still waiting for the end of the last hold sees it even when
+/// this one begins at once, and a holder that had to wait for the gate waits [`GATE_GAP`] more
+/// before it holds a phase, so that the writers the last hold let on go first. The holder tries for every branch lock between sleeps and holds
+/// nothing else of its own while it waits, and [`Gate::wait`] ends the phase at the end of each
+/// round: it locks the next phase byte, lets this one go and wakes the writers of its process
+/// with the next number. The first round lasts
 /// [`ROUNDS`]'s first length and each later one twice as long as the one before, up to a second,
 /// so a writer held up goes on within a round at most the first round's length longer than the
 /// hold had lasted when it came, and the writers that a phase's end lets on together have let go
@@ -1989,14 +2029,13 @@ impl Gate {
             return;
         }
         let inner = &self.store.inner;
-        if let Some(phase) = self.phase {
-            let next = phase + 1;
-            if platform::lock_range(&inner.file, PHASE_AT + next % 2, 1, true, false).is_ok() {
-                let _ = platform::unlock_range(&inner.file, PHASE_AT + phase % 2, 1);
-                self.phase = Some(next);
-                inner.lanes.lock().phase = Some(next);
-                inner.phased.notify_all();
-            }
+        if let Some(at) = self.phase
+            && let Some(next) = lock_phase(&inner.file, (at - PHASE_AT) / 2 + 1)
+        {
+            let _ = platform::unlock_range(&inner.file, at, 1);
+            self.phase = Some(next);
+            inner.lanes.lock().begin_phase();
+            inner.phased.notify_all();
         }
         self.round = (self.round * 2).min(ROUNDS.1);
         self.ends = Instant::now() + self.round;
@@ -2007,8 +2046,8 @@ impl Gate {
 impl Drop for Gate {
     fn drop(&mut self) {
         let inner = &self.store.inner;
-        if let Some(phase) = self.phase.take() {
-            let _ = platform::unlock_range(&inner.file, PHASE_AT + phase % 2, 1);
+        if let Some(at) = self.phase.take() {
+            let _ = platform::unlock_range(&inner.file, at, 1);
             inner.gated.store(false, Ordering::Relaxed);
             inner.lanes.lock().phase = None;
             inner.phased.notify_all();
@@ -3319,15 +3358,21 @@ impl Store {
     }
 
     /// Takes the gate, waiting for another thread of this process or another process that holds
-    /// it, and holds its first phase, as [`Gate`] describes.
+    /// it and then for [`GATE_GAP`], and holds its first phase, on a phase byte drawn at random,
+    /// as [`Gate`] describes.
     pub(crate) fn take_gate(&self) -> Result<Gate> {
-        let held = self.hold(GATE_AT, 1, true)?.ok_or(Error::Locked)?;
+        let held = match self.hold(GATE_AT, 1, false)? {
+            Some(held) => held,
+            None => {
+                let held = self.hold(GATE_AT, 1, true)?.ok_or(Error::Locked)?;
+                thread::sleep(GATE_GAP);
+                held
+            }
+        };
         let inner = &self.inner;
-        let phase = (0..2).find(|phase| {
-            platform::lock_range(&inner.file, PHASE_AT + phase, 1, true, false).is_ok()
-        });
+        let phase = lock_phase(&inner.file, RandomState::new().hash_one(GATE_AT) % PHASES);
         if phase.is_some() {
-            inner.lanes.lock().phase = phase;
+            inner.lanes.lock().begin_phase();
             inner.gated.store(true, Ordering::Relaxed);
         }
         Ok(Gate {
@@ -3407,7 +3452,7 @@ impl Store {
         if inner.gated.load(Ordering::Relaxed) && inner.lanes.lock().phase.is_some() {
             return Ok(true);
         }
-        Ok(platform::range_excluded(&inner.file, PHASE_AT, 2)?)
+        Ok(platform::range_excluded(&inner.file, PHASE_AT, 2 * PHASES)?)
     }
 
     /// Waits, while the gate is held, until the end of the phase in which this writer found it
@@ -3444,9 +3489,11 @@ impl Store {
     /// Waits until the end of the phase of the gate held now, or until [`GATE_WAIT`] after
     /// `started`, and returns whether the gate was held and its phase ended.
     ///
-    /// The kernel merges the locks one open holds on bytes next to each other, so a test over both
-    /// phase bytes reports the holder's [`GATE_AT`] and phase byte as one lock that starts at the
-    /// gate. The phase held is the one a test of each byte alone finds.
+    /// One test over every phase byte finds whether a phase is held and which: the phase bytes lie
+    /// clear of each other and of every other lock, so the kernel reports the byte itself. While
+    /// the holder moves to the next byte it holds both for a moment, and the kernel reports the
+    /// one that starts first, the old one, but at the wrap from the last byte to the first, where
+    /// a writer that tests just then waits for one phase more.
     fn await_phase(&self, started: Instant) -> Result<bool> {
         let inner = &self.inner;
         if inner.gated.load(Ordering::Relaxed) {
@@ -3462,12 +3509,8 @@ impl Store {
                 return Ok(true);
             }
         }
-        if !platform::range_excluded(&inner.file, PHASE_AT, 2)? {
+        let Some(held) = platform::excluded_at(&inner.file, PHASE_AT, 2 * PHASES)? else {
             return Ok(false);
-        }
-        let held = match platform::range_excluded(&inner.file, PHASE_AT, 1)? {
-            true => PHASE_AT,
-            false => PHASE_AT + 1,
         };
         let (mut pause, longest) = GATE_POLL;
         loop {

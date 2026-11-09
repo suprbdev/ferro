@@ -330,6 +330,169 @@ fn sleepy_writers(
         .collect()
 }
 
+struct Waits {
+    count: usize,
+    median: Duration,
+    p99: Duration,
+    longest: Duration,
+}
+
+fn waits(mut took: Vec<Duration>) -> Waits {
+    took.sort();
+    let at = |share: usize| {
+        took.get(took.len().saturating_sub(1) * share / 100)
+            .copied()
+            .unwrap_or_default()
+    };
+    Waits {
+        count: took.len(),
+        median: at(50),
+        p99: at(99),
+        longest: at(100),
+    }
+}
+
+fn commits_until(db: Db<Root>, stop: Arc<AtomicBool>) -> thread::JoinHandle<Vec<Duration>> {
+    thread::spawn(move || {
+        let mut took = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            tick(&db);
+            took.push(started.elapsed());
+        }
+        took
+    })
+}
+
+fn pulls_until(
+    pulled: Db<Root>,
+    source: Db<Root>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<Vec<Duration>> {
+    thread::spawn(move || {
+        let mut took = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            tick(&source);
+            let started = Instant::now();
+            pulled.pull(&source, "source", keeping_ours).unwrap();
+            took.push(started.elapsed());
+        }
+        took
+    })
+}
+
+fn commits_beside_back_to_back_pulls(pullers: usize, one_handle: bool) -> (Waits, Waits) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pulls.ferro");
+    let first: Db<Root> = manual().open(&path).unwrap();
+    tick(&first.fork("own").unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let pulls: Vec<_> = (0..pullers)
+        .map(|at| {
+            let puller: Db<Root> = match one_handle {
+                true => first.clone(),
+                false => manual().open(&path).unwrap(),
+            };
+            let pulled = puller.fork(&format!("pulled-{at}")).unwrap();
+            let source: Db<Root> = fast()
+                .open(dir.path().join(format!("source-{at}.ferro")))
+                .unwrap();
+            tick(&source);
+            pulls_until(pulled, source, stop.clone())
+        })
+        .collect();
+    let writer = match one_handle {
+        true => first.branch("own").unwrap(),
+        false => {
+            let other: Db<Root> = manual().open(&path).unwrap();
+            other.branch("own").unwrap()
+        }
+    };
+    thread::sleep(Duration::from_millis(100));
+    let writes = commits_until(writer, stop.clone());
+    thread::sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::Relaxed);
+    let commits = writes.join().unwrap();
+    let pulled: Vec<Duration> = pulls.into_iter().flat_map(|p| p.join().unwrap()).collect();
+    (waits(commits), waits(pulled))
+}
+
+fn assert_commits_wait_no_longer_than_holds(pullers: usize, one_handle: bool) {
+    let (commits, pulls) = commits_beside_back_to_back_pulls(pullers, one_handle);
+    let seen = format!(
+        "{} commits, median {:?}, p99 {:?}, longest {:?}; {} pulls, median {:?}, longest {:?}",
+        commits.count,
+        commits.median,
+        commits.p99,
+        commits.longest,
+        pulls.count,
+        pulls.median,
+        pulls.longest
+    );
+    println!("{pullers} pullers, one handle: {one_handle}: {seen}");
+    assert!(
+        commits.count >= 8_000,
+        "a writer beside {pullers} threads pulling back to back, in one handle: {one_handle}, \
+         waited out holds that began after the one it found: {seen}"
+    );
+}
+
+#[test]
+fn a_writer_beside_four_handles_pulling_back_to_back_waits_only_for_the_hold_it_finds() {
+    assert_commits_wait_no_longer_than_holds(4, false);
+}
+
+#[test]
+fn a_writer_in_a_handle_pulling_back_to_back_in_four_threads_waits_only_for_the_hold_it_finds() {
+    assert_commits_wait_no_longer_than_holds(4, true);
+}
+
+#[test]
+fn writers_held_at_a_pause_that_panics_go_on_as_it_unwinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unwinds.ferro");
+    let (paused, at_pause) = mpsc::channel::<()>();
+    let armed = Arc::new(AtomicBool::new(true));
+    let hook = {
+        let armed = armed.clone();
+        let paused = parking_lot::Mutex::new(paused);
+        Hook(Arc::new(move |step| {
+            if step == "paused" && armed.swap(false, Ordering::AcqRel) {
+                let _ = paused.lock().send(());
+                thread::sleep(Duration::from_millis(300));
+                panic!("a pause that panics");
+            }
+        }))
+    };
+    let cycler: Db<Root> = manual().hook(hook).open(&path).unwrap();
+    tick(&cycler.fork("own").unwrap());
+    tick(&cycler.fork("mine").unwrap());
+    let other: Db<Root> = manual().open(&path).unwrap();
+    let own_elsewhere = other.branch("own").unwrap();
+    let mine = cycler.branch("mine").unwrap();
+    let cycling = thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cycler.compact(Keep::All)))
+            .is_err()
+    });
+    at_pause.recv_timeout(Duration::from_secs(10)).unwrap();
+    let started = Instant::now();
+    let elsewhere = thread::spawn(move || {
+        tick(&own_elsewhere);
+        started.elapsed()
+    });
+    let within = thread::spawn(move || {
+        tick(&mine);
+        started.elapsed()
+    });
+    let (elsewhere, within) = (elsewhere.join().unwrap(), within.join().unwrap());
+    assert!(cycling.join().unwrap(), "the pause did not panic");
+    assert!(
+        elsewhere < Duration::from_millis(600) && within < Duration::from_millis(600),
+        "writers that came during a 300 ms pause that then panicked took {elsewhere:?} in another \
+         handle and {within:?} in the cycling handle"
+    );
+}
+
 #[test]
 fn a_cycle_and_a_pull_in_two_handles_both_wanting_every_branch_finish_beside_writers() {
     let dir = tempfile::tempdir().unwrap();
@@ -495,7 +658,8 @@ fn a_joined_awaited_commit_beside_cycles_stays_short_beside_spinning_threads() {
 }
 
 const GATE_AT: u64 = (1 << 62) + 5;
-const GATES: u64 = 3;
+const PHASE_AT: u64 = (1 << 62) + (3 << 18);
+const PHASE_BYTES: u64 = 2 << 10;
 const LANES_AT: u64 = (1 << 62) + (1 << 20);
 const LANES: u64 = 1 << 60;
 
@@ -546,7 +710,8 @@ fn a_coalesced_cycle_that_panics_in_its_pause_leaves_its_lanes_the_bytes_and_the
         .write(true)
         .open(&path)
         .unwrap();
-    let gate = locked_elsewhere(&probe, GATE_AT, GATES);
+    let gate =
+        locked_elsewhere(&probe, GATE_AT, 1) || locked_elsewhere(&probe, PHASE_AT, PHASE_BYTES);
     let range = locked_elsewhere(&probe, LANES_AT, LANES);
     let (done, finished) = mpsc::channel();
     let other: Db<Root> = manual().open(&path).unwrap();
