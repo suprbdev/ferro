@@ -1846,13 +1846,20 @@ fn recorded((tables, store): (&[&Refs], &Store), starts: &[Start]) -> Result<Vec
 }
 
 /// Whether the history of `theirs` holds a commit that is not an ancestor of `ours` and whose
-/// value differs from the value of `ours`, given the merge-base search starts of `ours`.
+/// value differs from the value of `ours`, given the merge-base search starts of `ours` and
+/// `base`, the best common ancestors that search found with `theirs`.
 ///
 /// It walks down from their head through the commits that hold our value, and stops on each path
-/// at a commit of our chain, at the first commit whose value differs, or where history is pruned.
-/// The merge-base search then tells whether each commit it stopped at for its value is an
-/// ancestor of ours; one it cannot place counts as a change.
-fn brings_change<T>(ours: &State<T>, starts: Vec<Start>, theirs: &State<T>) -> Result<bool> {
+/// at a commit of our chain or of a base's chain, which are ancestors of ours, at the first commit
+/// whose value differs, or where history is pruned. The merge-base search then tells whether each
+/// commit it stopped at for its value is an ancestor of ours; one it cannot place counts as a
+/// change.
+fn brings_change<T>(
+    ours: &State<T>,
+    starts: Vec<Start>,
+    base: &[Start],
+    theirs: &State<T>,
+) -> Result<bool> {
     let Some(tip) = theirs.log.tip else {
         return Ok(false);
     };
@@ -1873,7 +1880,7 @@ fn brings_change<T>(ours: &State<T>, starts: Vec<Start>, theirs: &State<T>) -> R
             continue;
         }
         let on_ours = ours.log.node_at(&ours.store, node.version())?;
-        if on_ours.is_some_and(|on| on.ptr.hash == node.ptr.hash) {
+        if on_ours.is_some_and(|on| on.ptr.hash == node.ptr.hash) || on_base(base, node)? {
             continue;
         }
         if node.entry.commit.root.map(|ptr| ptr.hash) != root {
@@ -1923,6 +1930,24 @@ fn brings_change<T>(ours: &State<T>, starts: Vec<Start>, theirs: &State<T>) -> R
             Ok(alone) if holds(&alone, ptr) => {}
             Ok(_) | Err(Error::NoCommonAncestor) => return Ok(true),
             Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn on_base(base: &[Start], node: &Node) -> Result<bool> {
+    let at = node.version();
+    for start in base {
+        let low = if start.bare {
+            start.node.version()
+        } else {
+            start.low
+        };
+        if low <= at
+            && at <= start.node.version()
+            && start.node.down_to(&start.store, at)?.ptr.hash == node.ptr.hash
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -5048,7 +5073,7 @@ impl<T: Data> Db<T> {
             let root_of = |state: &State<T>| state.snapshot.commit.root.map(|ptr| ptr.hash);
             if root_of(ours) == root_of(&theirs) {
                 let starts = Self::starts(&store, (&self.branch.name, ours, &tip.refs))?;
-                if !brings_change(ours, starts, &theirs)? {
+                if !brings_change(ours, starts, &found, &theirs)? {
                     return Ok((String::new(), Err(None), Intent::default()));
                 }
             }

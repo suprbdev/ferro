@@ -358,10 +358,10 @@ A second step compares the pulling branch with `remote`:
   landed `remote`. If their tip is the base, we already hold it through a merge: `Ahead`, or
   `UpToDate` when the two roots are the same.
 - If the roots are the same and their tip is not the base, a walk goes down from their tip through
-  the commits that hold our root, and stops on each path at a commit of our chain, at the first
-  commit with another root, or where history is pruned. If the search finds every commit it stopped
-  at for its root to be an ancestor of ours, every commit of theirs we lack holds our value:
-  `UpToDate`, with nothing written.
+  the commits that hold our root, and stops on each path at a commit of our chain or of a base's
+  chain, at the first commit with another root, or where history is pruned. If the search finds
+  every commit it stopped at for its root to be an ancestor of ours, every commit of theirs we lack
+  holds our value: `UpToDate`, with nothing written.
 - Otherwise `merge` runs against the base, or against the virtual base after a criss-cross, as a
   commit on our branch that links their tip as its second parent.
 
@@ -482,6 +482,67 @@ remote commit holds our value and its parent is ours. That commit stays out of o
 a later pull brings another value, and that merge finds its base below both changes. A three-way map
 merge takes a change both sides made once, so its result is the same. A merge that adds the two
 sides' changes, as a counter does, sees both only from that later pull.
+
+### What the walk costs
+
+Where devices pull from each other and have settled on one value, most pulls land a remote that
+holds our value, so the walk runs on nearly every pull. With two `Options::shared` handles pulling
+into one file, each pull also waits for the other handle: its landing takes every branch lock, and
+the other handle's merge step holds this branch's while it searches. After each virtual base came
+to be built once per merge (#132), four shared files, each with a writer and two handles pulling
+from the other three, 1,200 pulls a seed, still took a mean of 47 to 98 ms a pull in a debug build
+and 8.9 to 9.8 ms in release, against 1.6 ms in release with one pulling handle (#133). Timed per
+phase in release, 37% of a pull went to the searches that placed the commits the walk stopped at,
+one over all of them and one more for each that it did not place, about 2.7 a pull and each opening
+3,000 to 6,000 log entries. The merge-base search before them took 8%, virtual bases under 1%, and
+the landing's wait for every branch lock 41%.
+
+Most of those commits lie below the merge base that the merge step has just found: of 15,000 in one
+run, 12% were one of its commits and 60% lay on the chain of one, and every such commit is an
+ancestor of ours, since every base is. So the walk also stops at a commit on a base's chain, within
+what that base retains, as it stops at one of our chain, for one descent of the skip links per base,
+and the searches run only for the commits left. Everything below such a commit is an ancestor of
+ours too, so the walk still reaches every commit that is not, and the answer changes only where a
+search over the commits it no longer places would have refused for pruned history. Run beside the
+old walk over 6,000 pulls of the case above, it agreed on every one. Measured in release on
+2026-11-09, ten seeds a run and two runs a case:
+
+| Case | Before | After |
+| --- | --- | --- |
+| Two pulling handles a file, 12,000 pulls, mean | 8.9 and 9.8 ms | 3.7 and 3.5 ms |
+| The same, 99th percentile | 30 and 32 ms | 20 and 17 ms |
+| One pulling handle a file, 12,000 pulls, mean | 1.61 ms | 1.20 ms |
+| Peers that do not pull from each other, two handles, mean | 3.61 ms | 3.42 ms |
+| The same, one handle | 0.49 ms | 0.50 ms |
+
+In a debug build the three runs of the first case went from a mean of 47, 98 and 52 ms to 69, 21
+and 22 ms, the first with a slowest pull of 2.4 s. `cargo run --release -p ferro-bench --bin merge`
+did not change, since `merge_with` does not walk. Timed per phase again, the walk's searches now
+take 18% of a pull, 0.7 a pull, the merge-base search 17%, the landing's wait for every branch lock
+35%, and the slowest pulls in release, 30 to 40 ms, are merges that build a virtual base of 6 to 25
+steps.
+
+Measured and left out:
+
+- Remembering, for each branch, the commits found to be ancestors of its search starts, keyed by
+  every start and the history it retains, so that the next pull over the same starts searches only
+  for commits it has not placed. On top of the change above it took the first case to 2.5 and 2.4
+  ms and one pulling handle to 1.00 ms, and on its own to 2.8 and 2.7 ms. A remembered ancestor
+  goes stale only when the starts lose ancestry, through a dropped tracking branch whose record was
+  the only way to it or a prune that raises a start's oldest version. Where every file keeps all
+  history that never happens, and where files prune either answer is allowed, so no test showed it
+  wrong: keyed by our tip alone, it passed 1,800 seeds of a sync model sweep in which every file
+  was shared and pruned and a fresh handle repeated every `UpToDate`. Left out until something can
+  test what clears it.
+- Keeping virtual bases across merges. They took under 1% of a pull, and a virtual base is what the
+  closure returned, which another merge's closure, or one that captures another policy, need not
+  return again, and nothing ferro sees says when that changes.
+- Reusing the landing's search in the merge step. The landing runs none: it decides from the
+  entries at our version and at theirs. The merge step's own search is the one the walk now uses.
+- The landing's wait for every branch lock. Beside peers that do not pull from each other, two
+  handles take 3.4 to 3.6 ms a pull against 0.5 ms for one, with a median of 4.07 ms, about the
+  first round of [the gate](processes.md#the-gate), for which a merge or commit of the other
+  handle that arrives during a landing waits.
 
 ### The sync model
 
