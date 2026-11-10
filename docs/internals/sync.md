@@ -99,8 +99,8 @@ Following the links in order again made all but one the same, and cost a tenth m
 A sent merge commit links the commit it merged, and the receiver needs that commit to find later
 merge bases. If the receiver named it in its have, its mark goes into the bundle's list of commits
 the receiver holds, and the link resolves to it there. Otherwise the merged commit is sent, with its
-chain down to the newest entry a recognised commit's chain shares with it, and the same for the
-merges inside it, so far as the sender keeps them under the retention rule for merges, described
+chain down to the newest entry a recognised commit's chain shares with it, whose mark goes into the
+list too, and the same for the merges inside it, so far as the sender keeps them under the retention rule for merges, described
 under [Merges and pruning](merging.md#merges-and-pruning). A merged commit the sender has let go is
 not sent, and the receiver writes the link with offset 0, which the merge-base search treats as
 pruned history. The receiver may keep more of its history than the sender did, so a merge can claim
@@ -312,6 +312,27 @@ held. They catch up first now too. `a_bundle_built_from_another_handles_have_lan
 `a_bundle_over_a_mebibyte_built_from_another_handles_have_lands` in `ferro/tests/shared.rs` receive
 through a handle that never caught up, a bundle staged in memory and one staged in a scratch file,
 and `a_pull_from_a_handle_behind_another_sends_the_newest_head` pulls, bundles and pushes from one.
+
+The landing checks only the commits the bundle lists, and the list used to leave out the one the
+new entries build on whenever its root was already there as another recognised tip's, as it is
+when a remote holds the value of a branch the receiver keeps, which devices that have settled on
+one value do on most pulls. If another handle or process dropped the tracking branch between the
+staging and the landing, the check passed, the commit below the new entries was on no branch any
+more, and the branch landed with only the new entries retained, in a file that keeps all history.
+A merged chain sent with a merge had the same gap below it. A later merge then met what looked like
+pruned history and was refused with `NoCommonAncestor`: two handles of each of three shared files
+pulling from the others and dropping tracking branches, the run of
+`threads_on_two_handles_of_each_shared_file_syncing_at_once_apply_every_change_once` at
+`FERRO_TEST_SCALE=50`, refused within its 100 seeds in two runs of three (#148). The commit the new
+entries build on, and the recognised commit each sent merged chain builds on, are listed now, so
+such a landing returns `StaleHave` and the pull tries again from a fresh have, which lands the whole
+chain, while a branch that still holds that commit at its version lands the bundle against it as
+before. `a_tracking_branch_dropped_before_landing_is_fetched_again_and_landed_whole` and
+`a_merged_chain_whose_tracking_branch_is_dropped_before_landing_is_fetched_again` in
+`ferro/tests/shared.rs` drop the tracking branch from the hook at `received`, between the staging
+and the landing, and expect a second staging and every commit retained, and
+`a_tracking_branch_dropped_before_landing_lands_on_a_branch_that_still_holds_its_base` expects one
+staging when a fork holds the base. The threads test at that scale then passed five runs of five.
 
 `a_try_pull_retries_a_stale_have_before_its_error_type_and_returns_its_merge_error_once` and
 `a_push_whose_base_goes_before_it_lands_tries_again_and_merges_once` in `ferro/tests/sync.rs` prune

@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::task::{Context, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2584,6 +2584,135 @@ fn a_pull_after_another_handle_dropped_its_tracking_branch_lands() {
 #[test]
 fn a_pull_after_another_handle_pulled_into_its_tracking_branch_and_pruned_it_lands() {
     pull_after_another_handle_moved_its_tracking_branch(Moved::PulledAndPruned);
+}
+
+fn tracking_branch_dropped_between_staging_and_landing(kept_elsewhere: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pulled.ferro");
+    let remote: Db<Kv> = fast().open(dir.path().join("remote.ferro")).unwrap();
+    let other: Arc<OnceLock<Db<Kv>>> = Arc::new(OnceLock::new());
+    let armed = Arc::new(AtomicBool::new(false));
+    let staged = Arc::new(AtomicU64::new(0));
+    let hook = {
+        let (other, armed, staged) = (other.clone(), armed.clone(), staged.clone());
+        Hook(Arc::new(move |step| {
+            if step != "received" {
+                return;
+            }
+            staged.fetch_add(1, Ordering::SeqCst);
+            if armed.swap(false, Ordering::SeqCst) {
+                other.get().unwrap().drop_branch("zz").unwrap();
+            }
+        }))
+    };
+    let a: Db<Kv> = manual().hook(hook).open(&path).unwrap();
+    let b: Db<Kv> = manual().open(&path).unwrap();
+    other.set(b.clone()).ok();
+    a.update(|kv| kv.insert(100, 100)).unwrap();
+    remote.update(|kv| kv.insert(1, 1)).unwrap();
+    remote.update(|kv| kv.insert(2, 2)).unwrap();
+    a.pull(&remote, "zz", merge_keeping_ours).unwrap();
+    if !kept_elsewhere {
+        a.branch("zz").unwrap().fork("b").unwrap();
+    }
+    remote.update(|kv| kv.insert(3, 3)).unwrap();
+    remote
+        .update(|kv| {
+            kv.remove(&3);
+        })
+        .unwrap();
+    a.pull(&remote, "zz", merge_keeping_ours).unwrap();
+    if kept_elsewhere {
+        a.branch("zz").unwrap().fork("b").unwrap();
+    }
+    remote.update(|kv| kv.insert(5, 5)).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    staged.store(0, Ordering::SeqCst);
+    let pulled = a.pull(&remote, "zz", merge_keeping_ours).unwrap();
+    assert!(!armed.load(Ordering::SeqCst));
+    assert_eq!(pulled.outcome, ferro::Outcome::Merged);
+    assert_eq!(
+        staged.load(Ordering::SeqCst),
+        if kept_elsewhere { 1 } else { 2 }
+    );
+    let zz = a.branch("zz").unwrap();
+    assert_eq!(zz.version(), 5);
+    assert_eq!(zz.log().first().map(|(version, _)| version), Some(1));
+    assert_eq!(a.read().get(&5).as_deref(), Some(&5));
+    remote.update(|kv| kv.insert(6, 6)).unwrap();
+    b.refresh().unwrap();
+    assert_eq!(
+        b.pull(&remote, "zz", merge_keeping_ours).unwrap().outcome,
+        ferro::Outcome::Merged
+    );
+    a.verify_typed().unwrap();
+}
+
+#[test]
+fn a_tracking_branch_dropped_before_landing_is_fetched_again_and_landed_whole() {
+    tracking_branch_dropped_between_staging_and_landing(false);
+}
+
+#[test]
+fn a_tracking_branch_dropped_before_landing_lands_on_a_branch_that_still_holds_its_base() {
+    tracking_branch_dropped_between_staging_and_landing(true);
+}
+
+#[test]
+fn a_merged_chain_whose_tracking_branch_is_dropped_before_landing_is_fetched_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pulled.ferro");
+    let x: Db<Kv> = fast().open(dir.path().join("x.ferro")).unwrap();
+    let r: Db<Kv> = fast().open(dir.path().join("r.ferro")).unwrap();
+    let other: Arc<OnceLock<Db<Kv>>> = Arc::new(OnceLock::new());
+    let armed = Arc::new(AtomicBool::new(false));
+    let staged = Arc::new(AtomicU64::new(0));
+    let hook = {
+        let (other, armed, staged) = (other.clone(), armed.clone(), staged.clone());
+        Hook(Arc::new(move |step| {
+            if step != "received" {
+                return;
+            }
+            staged.fetch_add(1, Ordering::SeqCst);
+            if armed.swap(false, Ordering::SeqCst) {
+                other.get().unwrap().drop_branch("x").unwrap();
+            }
+        }))
+    };
+    let a: Db<Kv> = manual().hook(hook).open(&path).unwrap();
+    let b: Db<Kv> = manual().open(&path).unwrap();
+    other.set(b.clone()).ok();
+    a.update(|kv| kv.insert(100, 100)).unwrap();
+    r.update(|kv| kv.insert(50, 50)).unwrap();
+    x.update(|kv| kv.insert(1, 1)).unwrap();
+    x.update(|kv| kv.insert(2, 2)).unwrap();
+    a.pull(&x, "x", merge_keeping_ours).unwrap();
+    r.pull(&x, "x", merge_keeping_ours).unwrap();
+    a.branch("x").unwrap().fork("b").unwrap();
+    x.update(|kv| kv.insert(3, 3)).unwrap();
+    x.update(|kv| {
+        kv.remove(&3);
+    })
+    .unwrap();
+    a.pull(&x, "x", merge_keeping_ours).unwrap();
+    x.update(|kv| kv.insert(5, 5)).unwrap();
+    x.update(|kv| kv.insert(6, 6)).unwrap();
+    r.pull(&x, "x", merge_keeping_ours).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    staged.store(0, Ordering::SeqCst);
+    let pulled = a.pull(&r, "r", merge_keeping_ours).unwrap();
+    assert!(!armed.load(Ordering::SeqCst));
+    assert_eq!(staged.load(Ordering::SeqCst), 2);
+    assert_eq!(pulled.outcome, ferro::Outcome::Merged);
+    assert_eq!(a.read().get(&6).as_deref(), Some(&6));
+    x.update(|kv| kv.insert(7, 7)).unwrap();
+    r.pull(&x, "x", merge_keeping_ours).unwrap();
+    assert_eq!(
+        a.pull(&r, "r", merge_keeping_ours).unwrap().outcome,
+        ferro::Outcome::Merged
+    );
+    assert_eq!(a.read().get(&7).as_deref(), Some(&7));
+    a.verify_typed().unwrap();
 }
 
 fn merge_spread(

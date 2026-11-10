@@ -1183,6 +1183,9 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         header.roots.push(base_slot(slot, &mut header.bases));
         old_roots.push(root);
     }
+    if let Some(chosen) = chosen {
+        base_slot(chosen, &mut header.bases);
+    }
     let extra = closures(store, &chain, &entries, merges, &known, &mut header.bases)?;
     let new_roots = entries
         .iter()
@@ -1268,11 +1271,21 @@ fn closures(
             first: low,
             last: version,
         };
-        let mut held = None;
-        for base in known {
-            held = held.max(shared_prefix(store, &reach, &base.chain)?);
+        let mut held: Option<(u64, usize)> = None;
+        for (slot, base) in known.iter().enumerate() {
+            if let Some(shared) = shared_prefix(store, &reach, &base.chain)?
+                && held.is_none_or(|(best, _)| shared > best)
+            {
+                held = Some((shared, slot));
+            }
         }
-        let stop = held.map_or(low, |held| low.max(held + 1)).min(version);
+        if let Some((shared, slot)) = held
+            && shared + 1 >= low
+            && !marked(&known[slot].mark.hash)
+        {
+            bases.push(known[slot].mark);
+        }
+        let stop = held.map_or(low, |(held, _)| low.max(held + 1)).min(version);
         let mut next = Some(ptr);
         while let Some(at) = next.take() {
             if at.offset == 0 || sending.contains(&at.hash) {
