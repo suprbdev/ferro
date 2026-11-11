@@ -62,7 +62,9 @@ This is an experiment, not a production database.
   read or a receive refuses one with `Error::Decode` or `Error::Bundle`. Reads, writes, checks and
   commits move to stack that ferro maps for the thread when the thread's own runs short, so they
   reach the limit on any thread, on Linux, Android, macOS and iOS; on Windows a value reads and
-  writes only as deep as the thread's stack holds, and a deeper one fails with those errors.
+  writes only as deep as the thread's stack holds, and a deeper one fails with those errors. Where
+  ferro can neither learn a thread's stack bounds nor switch stacks, as on the BSDs, the limit stays
+  128.
   Dropping and cloning a value recurse in code that Rust generates, which ferro does not grow: at
   the limit a drop takes up to 590 KB of stack in a release build and 3.3 MB in a debug one, and a
   clone up to 3.3 MB in a release build, so a type meant to hold long chains should drop them in a

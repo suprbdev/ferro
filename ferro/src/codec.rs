@@ -70,7 +70,11 @@ pub const HASH_BYTES: usize = 20;
 /// [`Error::TooDeep`]. An encoding counts on through the nodes of the collections it writes: the
 /// values in the nodes of a map, set, list or table that it writes nest two levels below the
 /// value that holds the collection.
-pub const MAX_DEPTH: usize = 4096;
+///
+/// It is 4,096 where ferro checks the stack for room: on Linux, Android, macOS, iOS and Windows.
+/// Elsewhere, as on the BSDs and under Miri, ferro neither learns a thread's stack bounds nor
+/// switches stacks, and it is 128, which a decode fits within on a spawned thread's 2 MiB.
+pub const MAX_DEPTH: usize = if stack::CHECKED { 4096 } else { 128 };
 
 /// The hash of an [`Object`]: the first [`HASH_BYTES`] bytes of a BLAKE3 hash over its body
 /// length, link count, body and the hashes of its links.
@@ -379,12 +383,13 @@ impl Sink for HashSink {
 /// thread, on Linux, Android, macOS and iOS, so a value at the limit reads and writes on any
 /// thread, in any build, and takes up to a few KB of stack a level, about 12 MB for a decode at
 /// the limit in a release build. On Windows ferro does not switch stacks, and such a level fails
-/// with [`Error::Decode`] or [`Error::TooDeep`] rather than overflow the stack.
+/// with [`Error::Decode`] or [`Error::TooDeep`] rather than overflow the stack. Where ferro can
+/// neither learn a thread's stack bounds nor switch stacks, [`MAX_DEPTH`] is 128.
 ///
 /// Dropping, cloning and comparing a value recurse through it too, in code that Rust generates,
-/// which checks for nothing. Commits and merges, which clone the root, run with at least 12 MiB of
-/// stack, enough to clone a value at the limit, but ferro does not grow the stack for the drops of
-/// the values it read and the roots it replaced, nor for clones of your own. A drop takes at most
+/// which checks for nothing. Commits and merges clone the root with at least 12 MiB of stack,
+/// enough to clone a value at the limit, but ferro does not grow the stack for the drops of the
+/// values it read and the roots it replaced, nor for clones of your own. A drop takes at most
 /// a few hundred bytes a level in a release build, so a value at the limit drops on a spawned
 /// thread's 2 MiB stack, but a debug build can take more, and so can a derived `Clone` of a large
 /// struct. A type meant to hold long chains can drop them in a loop, and a deep value can be

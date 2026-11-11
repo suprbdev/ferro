@@ -2688,7 +2688,7 @@ impl<T: Data> Shared<T> {
         }
         let state = branch.tip.load_full();
         Group {
-            working: (*state.snapshot.value).clone(),
+            working: stack::roomy(|| (*state.snapshot.value).clone()),
             state,
             messages: Vec::new(),
             members: 0,
@@ -4434,15 +4434,13 @@ impl<T: Data> Db<T> {
         lane: Lane<'_, T>,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Wait<R, E>, E> {
-        stack::roomy(|| {
-            if self.shared.coalesce {
-                return self.stage_group(lane, f).map(Wait::Group);
-            }
-            let staged = self.stage_alone(lane, None, |_, root, stamp| {
-                f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
-            });
-            staged.map(Wait::Ticket)
-        })
+        if self.shared.coalesce {
+            return self.stage_group(lane, f).map(Wait::Group);
+        }
+        let staged = self.stage_alone(lane, None, |_, root, stamp| {
+            f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
+        });
+        staged.map(Wait::Ticket)
     }
 
     fn alone<R, E: From<Error>>(
@@ -4453,11 +4451,9 @@ impl<T: Data> Db<T> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         self.shared.admit(&self.branch.name);
         let lane = self.shared.lane(&self.branch);
-        let staged = stack::roomy(|| {
-            self.stage_alone(lane, from, |state, root, _| {
-                let tip = self.shared.tip.lock().clone();
-                f(&tip, state, root)
-            })
+        let staged = self.stage_alone(lane, from, |state, root, _| {
+            let tip = self.shared.tip.lock().clone();
+            f(&tip, state, root)
         })?;
         self.settle(staged)
     }
@@ -4484,7 +4480,7 @@ impl<T: Data> Db<T> {
         self.branch.check_live()?;
         let state = self.branch.tip.load_full();
         let framed = self.branch.framed.load(Ordering::Acquire);
-        let mut working = (*state.snapshot.value).clone();
+        let mut working = stack::roomy(|| (*state.snapshot.value).clone());
         let before = state.snapshot.commit.version;
         let time = OnceCell::new();
         let stamp = Stamp {
@@ -4557,12 +4553,12 @@ impl<T: Data> Db<T> {
         let base = &group.state.snapshot.value;
         let working = &mut group.working;
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
-            let checkpoint = (members > 0).then(|| working.clone());
+            let checkpoint = (members > 0).then(|| stack::roomy(|| working.clone()));
             let ran = panic::catch_unwind(AssertUnwindSafe(|| f(working, &stamp)));
             if !matches!(ran, Ok(Ok(_))) {
                 *working = match checkpoint {
                     Some(checkpoint) => checkpoint,
-                    None => (**base).clone(),
+                    None => stack::roomy(|| (**base).clone()),
                 };
             }
             ran
@@ -5139,7 +5135,7 @@ impl<T: Data> Db<T> {
             }
             let under = self.virtual_base(file, below, f, built)?;
             let theirs = Self::snapshot_of(&next.store, &next.node.entry.commit)?;
-            let mut working = (*base.value).clone();
+            let mut working = stack::roomy(|| (*base.value).clone());
             let (message, _) = f(&mut working, &under, &theirs)?;
             let commit = Commit {
                 version: 0,

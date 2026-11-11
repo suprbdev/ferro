@@ -228,22 +228,43 @@ tree that a commit writes.
 
 A thread learns its stack's bounds from the system the first time it runs short:
 `pthread_getattr_np` on Linux and Android, `pthread_get_stackaddr_np` on macOS and iOS, and
-`GetCurrentThreadStackLimits` on Windows. A stack outside those bounds, such as a coroutine's or one
-another library switched to, never counts as having room, so a recursion there moves to a segment
-at its first level. Windows has no segments: `psm` switches stacks there only through fibers, and
-building it for Windows needs a C compiler for the target, which `make lint-windows` has none of. A
-level there that finds less than `RED_ZONE` left fails instead, with `Error::Decode` or
-`Error::TooDeep`, so a Windows thread reads values only as deep as its own stack holds, a few
-hundred levels in a debug build on the 1 MiB of a main thread. Where the bounds cannot be learned,
-as on the BSDs and under Miri, nothing is checked.
+`GetCurrentThreadStackLimits` on Windows. A stack outside those bounds and the thread's busy
+segments, such as a coroutine's or one another library switched to, never counts as having room,
+so a recursion there moves to a segment at its first level. Windows has no segments: `psm` switches
+stacks there only through fibers, and building it for Windows needs a C compiler for the target,
+which `make lint-windows` has none of. A level there that finds less than `RED_ZONE` left fails
+instead, with `Error::Decode` or `Error::TooDeep`, so a Windows thread reads values only as deep as
+its own stack holds, a few hundred levels in a debug build on the 1 MiB of a main thread. Where the
+bounds cannot be learned and there are no segments, as on the BSDs and under Miri, nothing is
+checked, so `MAX_DEPTH` stays 128 there, which a decode fits within on a spawned thread's 2 MiB.
 
-A thread keeps the segments it is running on, and the first one once its recursion returns to the
-thread's own stack; the others are unmapped. Mapping a segment and unmapping it after each use is
-what `stacker::maybe_grow` does, and costs 2.9 µs each time, where switching to a kept segment costs
-14 ns. A value whose many small branches end just past the edge of a stack crosses that edge once
-for each branch, which a forged value of a few bytes a branch can arrange, so keeping the segment
-is what keeps the time a forged value costs in proportion to its bytes. The kept segment
-holds the pages that the thread's deepest use touched, as a thread's own stack does, at most 16 MiB.
+A segment is busy from before the switch to it until after the switch back, and no other work
+takes or unmaps a busy segment: work takes the first idle one, or maps another. Stackful coroutines
+on one thread can leave work suspended on several segments at once and finish it in any order, so
+nothing may assume that the work last switched to returns first, as an earlier version did when it
+counted segments in use and unmapped those past the count on each return: a coroutine that
+returned before one it had interleaved with unmapped the other's segment under its frames. The
+thread-local that says which stack the thread is on can name another stack after such a switch, so
+a check that fails asks again where it is, the thread's own stack or a busy segment, before it
+moves. A thread that exits leaves a segment still busy mapped.
+
+A thread keeps one idle segment and unmaps the others. Mapping a segment and unmapping it after
+each use is what `stacker::maybe_grow` does, and costs 2.9 µs each time, where switching to a kept
+segment costs 14 ns. A value whose many small branches end just past the edge of a stack crosses
+that edge once for each branch, which a forged value of a few bytes a branch can arrange, so keeping
+the segment is what keeps the time a forged value costs in proportion to its bytes.
+
+Segments are mapped with `MAP_STACK` and advised `MADV_NOHUGEPAGE`, since with transparent huge
+pages a shallow use of a fresh segment took a 2 MiB page: 32 threads that each made one small
+commit on a 2 MiB stack kept 220 kB each, 192 of them in huge pages, where they keep 26 kB now, as
+on a 64 MiB stack. The checks on a segment first stop 256 KiB below its top: one that goes past
+there marks the segment deep and goes on to its bottom, and a clone, which checks nothing, marks it
+deep if `mincore` finds the page below those 256 KiB in memory, as it is once frames went past it.
+When a deep segment falls idle, the pages below its top 256 KiB are given back with
+`MADV_DONTNEED`, so a thread keeps at most that much of the deepest work it did on segments. 32
+threads that each read a chain at the limit of a struct of 16 `u64`s, a `String` and the next link,
+which takes 7 MB of stack, kept 8.6 MB each, 4.3 MB of it in huge pages, and keep 2.7 MB now, most
+of it their own 2 MiB stacks; on stacks of 64 MiB they keep 7 MB.
 
 Two other ways were weighed. A deep decode could run on a thread with a large stack of its own, but
 a recursion cannot move there half way, so the whole read would start over there, the closures a
@@ -285,11 +306,14 @@ already open, so no input reaches them.
 
 Cloning, dropping and comparing a value with `==` recurse through it as well, in code that Rust
 generates for its type, which checks nothing. A commit clones the root value to give its closure a
-copy to change, and a merge clones its base, so commits, merges, `restore` and the merges of a
-receive run through `stack::roomy`, which moves them to a segment unless 12 MiB, `DEEP_ROOM`, are
-left. That costs a switch to the kept segment on each commit made on a thread with a smaller stack.
-Drops are not grown: ferro drops the values it decoded and the roots it replaced where the last
-reference to them goes, which can be any thread that read them.
+copy to change, a group of coalesced commits keeps a clone to roll back to, and a merge clones its
+base, so those clones run through `stack::roomy`, which moves them to a segment unless 12 MiB,
+`DEEP_ROOM`, are left. That costs a switch to the kept segment and a `mincore` on each commit made
+on a thread with a smaller stack. The closures of commits and merges run where they are called, not
+on a segment: a stack overflow there is reported as one, where on a segment, whose guard page the
+runtime does not know, it would end the process with a bare `SIGSEGV`. Drops are not grown: ferro
+drops the values it decoded and the roots it replaced where the last reference to them goes, which
+can be any thread that read them.
 
 #### The stack each level takes
 
@@ -335,22 +359,26 @@ twice with the bundle's pairing and passes `verify_typed` on a 2 MiB stack, and 
 encodes on a thread of 64 KiB. A tree of 4,095 levels with 40 leaves at each commits, reopens, reads
 and verifies on a 2 MiB stack. A chain of a million levels, a byte each, is refused eight times over
 in half a millisecond on a 64 KiB stack, and a bundle that carries it is refused before anything
-lands.
+lands. Two stackful coroutines on one thread that each leave a level suspended on a segment keep
+their frames whichever finishes first, `tests/stack.rs` drives them with `corosensei`, and
+`tests/depth.rs` passes under AddressSanitizer, which ferro tells of each switch, and
+ThreadSanitizer.
 
 The check costs nothing measurable on the paths that run it most. Over three alternating runs of
 each build on a machine that other work shared, the fastest run of each against the build before:
-23.5 against 23.3 µs to commit one entry under `Durability::Buffered`, in 0.5% more instructions,
-for the switch of `roomy` and the checks, and 401 against 403 µs under `Fsync`; 5.22 against 5.34
-µs for a cold get and 311 against 309 ns for a warm one; 19.8 against 19.6 ns a key to scan and 675
-against 671 a key to bulk load; 4.9 against 5.1 ns an item to decode a `Vec<u64>` of large values,
-and 14.5 against 14.6 ns to decode and 8.0 against 8.0 to visit an entry of a `BTreeMap<u64, u64>`,
-each within 0.6% of the instructions it took before. A `Box<u64>` decodes in 6.7 ns where the stack
-has room and in 21 ns on a thread so short of it that each decode switches to the kept segment. The
-one outlier is a `BTreeSet<String>` of a million keys, which decodes in 4% more instructions and
-visits in 45% more time on 1% more instructions, though no check runs for its keys. It follows
-where the compiler places code rather than the work per key: `visit_entries` is kept out of line
-because inlining it slowed the visit of the `BTreeMap` by 12%, and the same `#[inline(never)]` on
-the old build slows its visit of the set by 22% and of the map by 23%.
+23.3 against 23.1 µs to commit one entry under `Durability::Buffered`, in 0.5% more instructions,
+for the switch and the `mincore` of `roomy` and the checks, and 409 against 412 µs under `Fsync`;
+5.23 against 5.31 µs for a cold get and 308.5 ns for a warm one in both; 19.6 against 20.0 ns a
+key to scan and 672 against 668 a key to bulk load; 5.0 ns an item to decode a `Vec<u64>` of large
+values in both, and 14.3 against 14.1 ns to decode and 7.9 against 8.2 to visit an entry of a
+`BTreeMap<u64, u64>`, each within 0.6% of the instructions it took before. A `Box<u64>` decodes
+in 6.7 ns where the stack has room and in 21 ns on a thread so short of it that each decode
+switches to the kept segment. The one outlier is a `BTreeSet<String>` of a million keys, which
+decodes in 4% more instructions and visits in 46% more time on 1% more instructions, though no
+check runs for its keys. It follows where the compiler places code rather than the work per key:
+`visit_entries` is kept out of line because inlining it slowed the visit of the `BTreeMap` by
+12%, and the same `#[inline(never)]` on the old build slows its visit of the set by 22% and of the
+map by 23%.
 
 ## Records
 
