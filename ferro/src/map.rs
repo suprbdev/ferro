@@ -101,6 +101,7 @@ use crate::error::{Error, Result};
 use crate::pool::{Job, Latch, Pool};
 use crate::prefix::Prefix as KeyPrefix;
 use crate::shared::{Erased, Shared, Weak};
+use crate::stack;
 use crate::store::{Lent, MAX_RATIO, Store, compressed, heap_weight};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -2578,6 +2579,10 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
     let Link::Mem(node, _) = link else {
         return Ok(link.clone());
     };
+    if !stack::room() {
+        return stack::elsewhere(|| flush_with(link, sink, depth, dense, fan, nesting))
+            .unwrap_or(Err(Error::TooDeep));
+    }
     if fan && fans_out(node) {
         let stager = Stager {
             id: sink.store_id(),

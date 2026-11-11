@@ -51,6 +51,7 @@ use crate::error::{Error, Result};
 use crate::map::unwound;
 use crate::pool::{self, Pool};
 use crate::shared::Erased;
+use crate::stack;
 use crate::store::Store;
 
 /// The length of a [`Hash`](type@Hash) in bytes.
@@ -61,12 +62,15 @@ pub const HASH_BYTES: usize = 20;
 /// Each `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` a value holds opens a level for what it
 /// holds, and so does each [`Encoder::nested`] and [`Decoder::nested`] call of a hand-written impl.
 /// A type can hold itself only behind a pointer or in a collection, so the count bounds how deep
-/// decoding, checking, pairing and encoding any value recurse: a [`Decoder`] refuses a value that
-/// nests deeper with [`Error::Decode`], so that a forged object cannot run the thread out of
-/// stack, and an [`Encoder`] refuses to write one with [`Error::TooDeep`]. An encoding counts on
-/// through the nodes of the collections it writes: the values in the nodes of a map, set, list or
-/// table that it writes nest two levels below the value that holds the collection.
-pub const MAX_DEPTH: usize = 128;
+/// decoding, checking, pairing and encoding any value recurse. Each level runs on the thread's
+/// stack while it has room, and on a segment of stack mapped for the thread once it does not, so a
+/// value at the limit reads and writes on any thread, and the count bounds the stack a recursion
+/// takes. A [`Decoder`] refuses a value that nests deeper with [`Error::Decode`], so that a forged
+/// object cannot make it take more, and an [`Encoder`] refuses to write one with
+/// [`Error::TooDeep`]. An encoding counts on through the nodes of the collections it writes: the
+/// values in the nodes of a map, set, list or table that it writes nest two levels below the
+/// value that holds the collection.
+pub const MAX_DEPTH: usize = 4096;
 
 /// The hash of an [`Object`]: the first [`HASH_BYTES`] bytes of a BLAKE3 hash over its body
 /// length, link count, body and the hashes of its links.
@@ -325,8 +329,8 @@ impl Sink for HashSink {
 ///   counted at each `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet`. An impl for a pointer or a
 ///   collection of its own, or for a type that reads a value of its own type without going through
 ///   one of those, such as one that boxes what it decodes itself, writes and reads it through
-///   [`Encoder::nested`] and [`Decoder::nested`], so that a forged object cannot make it recurse
-///   until the thread runs out of stack.
+///   [`Encoder::nested`] and [`Decoder::nested`], which count the level and make room on the stack
+///   for it, so that neither a deep value nor a forged object can run the thread out of stack.
 /// - **The encoding is canonical.** It depends only on the value, never on how the value was
 ///   built, its capacity or what it shared. Root hashes, `==` on collections, the skip of a
 ///   commit that changes nothing, [`Map::diff`](crate::Map::diff) and merges all go by
@@ -360,21 +364,33 @@ impl Sink for HashSink {
 /// # Nesting depth
 ///
 /// A value nests at most [`MAX_DEPTH`] levels within one object, one for each `Box`, `Arc`, `Vec`,
-/// `BTreeMap` and `BTreeSet` on the way down to its deepest part: a chain of 128
-/// `Option<Box<Node>>`, or a tree of 127 levels of `Vec<Node>` children. A decoder refuses a value
-/// that nests deeper with [`Error::Decode`], whether it comes from the file or from a sync bundle,
-/// which [`Db::receive`](crate::Db::receive) then refuses whole, so that no input can make a
-/// decode, a check or a pairing recurse until the thread runs out of stack, which would abort the
-/// process. Writing such a value fails with [`Error::TooDeep`] instead, so that no commit stores
-/// what cannot be read back. A commit counts on through the collections it writes as it encodes:
-/// the values in the nodes of a map, set, list or table whose nodes the commit writes nest two
-/// levels below the value that holds it. A collection read from the file encodes as its root link
-/// alone, and its nodes count apart, as they decode apart.
+/// `BTreeMap` and `BTreeSet` on the way down to its deepest part: a chain of 4,096
+/// `Option<Box<Node>>`, or a tree of 4,095 levels of `Vec<Node>` children. A decoder refuses a
+/// value that nests deeper with [`Error::Decode`], whether it comes from the file or from a sync
+/// bundle, which [`Db::receive`](crate::Db::receive) then refuses whole, and writing such a value
+/// fails with [`Error::TooDeep`], so that no commit stores what cannot be read back. A commit
+/// counts on through the collections it writes as it encodes: the values in the nodes of a map,
+/// set, list or table whose nodes the commit writes nest two levels below the value that holds
+/// it. A collection read from the file encodes as its root link alone, and its nodes count apart,
+/// as they decode apart.
 ///
-/// At the limit, decoding fits within the 2 MiB stack that Rust gives the threads it spawns, in a
-/// debug build, with room to spare for types of ordinary size, such as structs of a few dozen
-/// fields. A type that stores large values inline, such as big arrays, uses more stack for each
-/// level.
+/// Encoding, decoding, visiting and pairing recurse once for each level. A level that finds less
+/// than 128 KiB of the thread's stack left runs on a segment of stack that ferro maps for the
+/// thread, on Linux, Android, macOS and iOS, so a value at the limit reads and writes on any
+/// thread, in any build, and takes up to a few KB of stack a level, about 12 MB for a decode at
+/// the limit in a release build. On Windows ferro does not switch stacks, and such a level fails
+/// with [`Error::Decode`] or [`Error::TooDeep`] rather than overflow the stack.
+///
+/// Dropping, cloning and comparing a value recurse through it too, in code that Rust generates,
+/// which checks for nothing. Commits and merges, which clone the root, run with at least 12 MiB of
+/// stack, enough to clone a value at the limit, but ferro does not grow the stack for the drops of
+/// the values it read and the roots it replaced, nor for clones of your own. A drop takes at most
+/// a few hundred bytes a level in a release build, so a value at the limit drops on a spawned
+/// thread's 2 MiB stack, but a debug build can take more, and so can a derived `Clone` of a large
+/// struct. A type meant to hold long chains can drop them in a loop, and a deep value can be
+/// cloned on a thread with a larger stack.
+/// [Nesting depth](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md#nesting-depth)
+/// gives the stack each shape takes.
 ///
 /// # Examples
 ///
@@ -701,6 +717,13 @@ fn scratch(buf: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// What `same` answers to whether two values encode alike, asked with room on the stack for it to
+/// recurse into what they hold, or `false` where no room can be had, as on Windows.
+#[inline(always)]
+fn alike(same: impl FnOnce() -> bool) -> bool {
+    stack::with_room(same).unwrap_or(false)
+}
+
 fn encodings_match<D: Data>(a: &D, b: &D) -> bool {
     let [left, right] = SCRATCH.take();
     let (mut left_sink, mut right_sink) = (HashSink, HashSink);
@@ -956,16 +979,20 @@ impl<'a> Encoder<'a> {
     ///
     /// The impls of `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` each write what they hold
     /// through it, so a hand-written impl needs it only where it holds a value of its own type
-    /// without going through one of them, as [`MAX_DEPTH`] describes.
+    /// without going through one of them, as [`MAX_DEPTH`] describes. `write` runs on a segment
+    /// of stack mapped for the thread if the thread's stack has less than 128 KiB left.
     ///
     /// # Errors
     ///
     /// Returns the error of `write`, and [`Error::TooDeep`] if the value would nest deeper than
-    /// [`MAX_DEPTH`] levels.
+    /// [`MAX_DEPTH`] levels, or the stack is short and cannot grow, as on Windows.
     #[inline(always)]
     pub fn nested<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.deeper()?;
-        let written = write(self);
+        let written = match stack::room() {
+            true => write(self),
+            false => stack::elsewhere(|| write(self)).unwrap_or(Err(Error::TooDeep)),
+        };
         self.depth -= 1;
         written
     }
@@ -1113,6 +1140,15 @@ fn too_deep() -> Error {
     Error::Decode(format!("a value nests deeper than {MAX_DEPTH} levels"))
 }
 
+/// The error of a decoder that reads `depth` levels deep on a stack that has no room left for
+/// them and cannot grow, as on Windows.
+#[cold]
+fn no_room(depth: usize) -> Error {
+    Error::Decode(format!(
+        "the stack has no room to read a value nested {depth} levels deep"
+    ))
+}
+
 /// The error of a varint that takes more bytes than its value needs.
 #[cold]
 fn overlong() -> Error {
@@ -1203,6 +1239,7 @@ fn sorted_entries<E, K: Ord>(
 /// # Errors
 ///
 /// The error of an entry that does not decode, and [`Error::Decode`] for two equal keys.
+#[inline(never)]
 fn visit_entries<K: Ord>(
     r: &mut Decoder<'_>,
     mut key: impl FnMut(&mut Decoder<'_>) -> Result<K>,
@@ -2770,16 +2807,20 @@ impl<'a> Decoder<'a> {
     ///
     /// The impls of `Box`, `Arc`, `Vec`, `BTreeMap` and `BTreeSet` each read what they hold
     /// through it, so a hand-written impl needs it only where it holds a value of its own type
-    /// without going through one of them, as [`MAX_DEPTH`] describes.
+    /// without going through one of them, as [`MAX_DEPTH`] describes. `read` runs on a segment of
+    /// stack mapped for the thread if the thread's stack has less than 128 KiB left.
     ///
     /// # Errors
     ///
     /// Returns the error of `read`, and [`Error::Decode`] if the value nests deeper than
-    /// [`MAX_DEPTH`] levels.
+    /// [`MAX_DEPTH`] levels, or the stack is short and cannot grow, as on Windows.
     #[inline(always)]
     pub fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.depth = self.deeper()?;
-        let value = read(self);
+        let value = match stack::room() {
+            true => read(self),
+            false => stack::elsewhere(|| read(self)).unwrap_or_else(|| Err(no_room(self.depth))),
+        };
         self.depth -= 1;
         value
     }
@@ -3346,7 +3387,8 @@ impl<T: Data> Data for Vec<T> {
     }
 
     fn same_encoding(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
+        self.len() == other.len()
+            && alike(|| self.iter().zip(other).all(|(a, b)| a.same_encoding(b)))
     }
 
     fn tables(t: &mut Tabled) {
@@ -3524,7 +3566,7 @@ impl<T: Data> Data for Box<T> {
     }
 
     fn same_encoding(&self, other: &Self) -> bool {
-        (**self).same_encoding(other)
+        alike(|| (**self).same_encoding(other))
     }
 
     fn tables(t: &mut Tabled) {
@@ -3566,7 +3608,7 @@ impl<T: Data> Data for Arc<T> {
     }
 
     fn same_encoding(&self, other: &Self) -> bool {
-        Arc::ptr_eq(self, other) || (**self).same_encoding(other)
+        Arc::ptr_eq(self, other) || alike(|| (**self).same_encoding(other))
     }
 
     fn tables(t: &mut Tabled) {
@@ -3618,10 +3660,11 @@ impl<K: Data + Ord, V: Data> Data for BTreeMap<K, V> {
 
     fn same_encoding(&self, other: &Self) -> bool {
         self.len() == other.len()
-            && self
-                .iter()
-                .zip(other)
-                .all(|(a, b)| a.0.same_encoding(b.0) && a.1.same_encoding(b.1))
+            && alike(|| {
+                self.iter()
+                    .zip(other)
+                    .all(|(a, b)| a.0.same_encoding(b.0) && a.1.same_encoding(b.1))
+            })
     }
 
     fn tables(t: &mut Tabled) {
@@ -3721,7 +3764,8 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     }
 
     fn same_encoding(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.same_encoding(b))
+        self.len() == other.len()
+            && alike(|| self.iter().zip(other).all(|(a, b)| a.same_encoding(b)))
     }
 }
 

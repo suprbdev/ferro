@@ -97,6 +97,7 @@ mod reentry;
 mod refs;
 pub mod set;
 mod shared;
+mod stack;
 pub mod store;
 pub mod sync;
 pub mod table;

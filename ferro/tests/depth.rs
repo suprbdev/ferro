@@ -1,15 +1,19 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use common::fast;
 use ferro::codec::{Decoder, Encoder, HashSink, MAX_DEPTH, field_tag};
 use ferro::{Bytes, Data, Db, Error, Map, Record, Result, Table};
 
 const SMALL_STACK: usize = 2 << 20;
+const TINY_STACK: usize = 64 << 10;
 const HOSTILE: usize = 20_000;
+const EXTREME: usize = 1 << 20;
 const CHAINED: usize = 3_000;
 const CHILD: &str = "FERRO_DEPTH_CHILD";
 
@@ -118,7 +122,9 @@ trait Shape: Data + Default {
 
     fn chain(depth: usize, bottom: Option<Table<Row>>) -> Self;
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>>;
+    fn bottom(&self) -> &Option<Table<Row>>;
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>>;
 
     fn level() -> Level;
 }
@@ -184,7 +190,15 @@ impl Shape for Opt {
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        while let Some(next) = &at.next {
+            at = next;
+        }
+        &at.t
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         while at.next.is_some() {
             at = at.next.as_mut().unwrap();
@@ -206,6 +220,15 @@ struct Seq {
     kids: Vec<Seq>,
 }
 
+impl Drop for Seq {
+    fn drop(&mut self) {
+        let mut below = std::mem::take(&mut self.kids);
+        while let Some(mut node) = below.pop() {
+            below.append(&mut node.kids);
+        }
+    }
+}
+
 impl Shape for Seq {
     const NAME: &'static str = "vec";
 
@@ -223,7 +246,15 @@ impl Shape for Seq {
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        while let Some(kid) = at.kids.first() {
+            at = kid;
+        }
+        &at.t
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         while !at.kids.is_empty() {
             at = &mut at.kids[0];
@@ -245,6 +276,15 @@ struct Branches {
     kids: BTreeMap<u8, Branches>,
 }
 
+impl Drop for Branches {
+    fn drop(&mut self) {
+        let mut below: Vec<Branches> = std::mem::take(&mut self.kids).into_values().collect();
+        while let Some(mut node) = below.pop() {
+            below.extend(std::mem::take(&mut node.kids).into_values());
+        }
+    }
+}
+
 impl Shape for Branches {
     const NAME: &'static str = "btreemap";
 
@@ -262,7 +302,15 @@ impl Shape for Branches {
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        while let Some(kid) = at.kids.get(&7) {
+            at = kid;
+        }
+        &at.t
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         while !at.kids.is_empty() {
             at = at.kids.get_mut(&7).unwrap();
@@ -293,6 +341,19 @@ impl Default for Chain {
     }
 }
 
+impl Drop for Chain {
+    fn drop(&mut self) {
+        let Chain::More(next) = self else {
+            return;
+        };
+        let mut next = std::mem::take(&mut **next);
+        while let Chain::More(below) = &mut next {
+            let below = std::mem::take(&mut **below);
+            next = below;
+        }
+    }
+}
+
 impl Shape for Chain {
     const NAME: &'static str = "enum";
 
@@ -304,7 +365,17 @@ impl Shape for Chain {
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        loop {
+            match at {
+                Chain::More(next) => at = next,
+                Chain::Leaf { t } => return t,
+            }
+        }
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         loop {
             match at {
@@ -328,6 +399,15 @@ struct Pairs {
     next: Option<Box<(u8, Pairs)>>,
 }
 
+impl Drop for Pairs {
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(mut pair) = next {
+            next = pair.1.next.take();
+        }
+    }
+}
+
 impl Shape for Pairs {
     const NAME: &'static str = "tuple";
 
@@ -345,7 +425,15 @@ impl Shape for Pairs {
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        while let Some(next) = &at.next {
+            at = &next.1;
+        }
+        &at.t
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         while at.next.is_some() {
             at = &mut at.next.as_mut().unwrap().1;
@@ -395,24 +483,38 @@ struct Wide {
     next: Option<Box<Wide>>,
 }
 
+impl Drop for Wide {
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(mut node) = next {
+            next = node.next.take();
+        }
+    }
+}
+
 impl Shape for Wide {
     const NAME: &'static str = "wide";
 
     fn chain(depth: usize, bottom: Option<Table<Row>>) -> Self {
-        let mut node = Wide {
-            t: bottom,
-            ..Wide::default()
-        };
+        let mut node = Wide::default();
+        node.t = bottom;
         for _ in 0..depth {
-            node = Wide {
-                next: Some(Box::new(node)),
-                ..Wide::default()
-            };
+            let mut above = Wide::default();
+            above.next = Some(Box::new(node));
+            node = above;
         }
         node
     }
 
-    fn bottom(&mut self) -> &mut Option<Table<Row>> {
+    fn bottom(&self) -> &Option<Table<Row>> {
+        let mut at = self;
+        while let Some(next) = &at.next {
+            at = next;
+        }
+        &at.t
+    }
+
+    fn bottom_mut(&mut self) -> &mut Option<Table<Row>> {
         let mut at = self;
         while at.next.is_some() {
             at = at.next.as_mut().unwrap();
@@ -529,12 +631,15 @@ fn over_and_at_the_limit<S: Shape>() {
     on_small_stack(move || {
         writer
             .update(|root| {
-                root.bottom().as_mut().unwrap().insert(Row { id: 9, n: 9 });
+                root.bottom_mut()
+                    .as_mut()
+                    .unwrap()
+                    .insert(Row { id: 9, n: 9 });
             })
             .unwrap();
     });
     received(&receiver, sender.bundle(&receiver.have().unwrap()).unwrap()).unwrap();
-    let mut landed: S = (*receiver.read()).clone();
+    let landed = receiver.read();
     let table = landed.bottom().as_ref().unwrap();
     assert_eq!(table.len(), 4);
     assert_eq!(table.by_n(&9).len(), 1);
@@ -578,13 +683,16 @@ fn file_at_the_limit<S: Shape>() {
             .unwrap();
         writer
             .update(|root| {
-                root.bottom().as_mut().unwrap().insert(Row { id: 9, n: 9 });
+                root.bottom_mut()
+                    .as_mut()
+                    .unwrap()
+                    .insert(Row { id: 9, n: 9 });
             })
             .unwrap();
     });
     on_small_stack(move || {
         let db: Db<S> = fast().open(&path).unwrap();
-        let mut root: S = (*db.read()).clone();
+        let root = db.read();
         let table = root.bottom().as_ref().unwrap();
         assert_eq!(table.len(), 4);
         assert_eq!(table.by_n(&5).len(), 1);
@@ -835,8 +943,17 @@ fn stale_tables() {
     });
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Hand(Option<Box<Hand>>);
+
+impl Drop for Hand {
+    fn drop(&mut self) {
+        let mut next = self.0.take();
+        while let Some(mut node) = next {
+            next = node.0.take();
+        }
+    }
+}
 
 impl Data for Hand {
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
@@ -885,6 +1002,178 @@ fn hand_written() {
             Through::visit(&mut Decoder::new(&bytes, &[], None)),
             Err(Error::Decode(_))
         ));
+    });
+}
+
+fn at_the_limit_on_a_tiny_stack<S: Shape>() {
+    let most = deepest::<S>(false);
+    on_stack(TINY_STACK, move || {
+        let value = S::chain(most, None);
+        let bytes = encoded(&value);
+        assert_eq!(bytes, forged::<S>(most), "{}", S::NAME);
+        let decoded = S::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+        assert!(decoded.same_encoding(&value), "{}", S::NAME);
+        assert_eq!(encoded(&decoded), bytes, "{}", S::NAME);
+        S::visit(&mut Decoder::new(&bytes, &[], None)).unwrap();
+        let over = forged::<S>(most + 1);
+        assert!(matches!(
+            S::decode(&mut Decoder::new(&over, &[], None)),
+            Err(Error::Decode(_))
+        ));
+    });
+}
+
+fn tiny_stacks() {
+    at_the_limit_on_a_tiny_stack::<Opt>();
+    at_the_limit_on_a_tiny_stack::<Seq>();
+    at_the_limit_on_a_tiny_stack::<Branches>();
+    at_the_limit_on_a_tiny_stack::<Chain>();
+    at_the_limit_on_a_tiny_stack::<Pairs>();
+    at_the_limit_on_a_tiny_stack::<Wide>();
+    let at = hand_chain(MAX_DEPTH);
+    on_stack(TINY_STACK, move || {
+        let value = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        assert_eq!(encoded(&value), at);
+        let again = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        assert!(value.same_encoding(&again));
+    });
+}
+
+#[derive(Data, Clone, Default)]
+struct Tree {
+    kids: Vec<Tree>,
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let mut below = std::mem::take(&mut self.kids);
+        while let Some(mut node) = below.pop() {
+            below.append(&mut node.kids);
+        }
+    }
+}
+
+fn bushy(depth: usize, leaves: usize) -> Tree {
+    let mut node = Tree::default();
+    for _ in 0..depth {
+        let mut kids: Vec<Tree> = (0..leaves).map(|_| Tree::default()).collect();
+        kids.push(node);
+        node = Tree { kids };
+    }
+    node
+}
+
+fn bushy_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bushy.ferro");
+    let writer: Db<Tree> = fast().open(&path).unwrap();
+    on_small_stack(move || {
+        let start = Instant::now();
+        writer
+            .update(|root| *root = bushy(MAX_DEPTH - 1, 40))
+            .unwrap();
+        let read = writer.read();
+        let bytes = encoded(&*read);
+        for _ in 0..4 {
+            let decoded = Tree::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+            assert!(decoded.same_encoding(&read));
+            Tree::visit(&mut Decoder::new(&bytes, &[], None)).unwrap();
+        }
+        writer.verify_typed().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
+    });
+    on_small_stack(move || {
+        let db: Db<Tree> = fast().open(&path).unwrap();
+        assert_eq!(encoded(&*db.read()), encoded(&bushy(MAX_DEPTH - 1, 40)));
+        db.verify_typed().unwrap();
+    });
+}
+
+fn extreme_hostile() {
+    let bytes = hand_chain(EXTREME);
+    let chain = bytes.clone();
+    on_stack(TINY_STACK, move || {
+        let start = Instant::now();
+        for _ in 0..8 {
+            let decoded = Hand::decode(&mut Decoder::new(&chain, &[], None)).map(drop);
+            match decoded {
+                Err(Error::Decode(message)) => {
+                    assert!(message.contains("nests deeper"), "{message}")
+                }
+                other => panic!("expected the chain to be refused, got {other:?}"),
+            }
+            assert!(Hand::visit(&mut Decoder::new(&chain, &[], None)).is_err());
+            assert!(Through::visit(&mut Decoder::new(&chain, &[], None)).is_err());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let receiver: Db<Hand> = fast().open(dir.path().join("receiver.ferro")).unwrap();
+    let forger: Db<Raw> = fast().open(dir.path().join("forger.ferro")).unwrap();
+    forger.update(|root| *root = Raw(bytes)).unwrap();
+    let bundle = forger.bundle(&receiver.have().unwrap()).unwrap();
+    let start = Instant::now();
+    refused_as_too_deep(received(&receiver, bundle));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(receiver.version(), 0);
+}
+
+#[derive(Clone, Default)]
+struct Fuse(Option<Box<Fuse>>);
+
+impl Data for Fuse {
+    fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
+        match &self.0 {
+            None => {
+                w.u8(0);
+                Ok(())
+            }
+            Some(next) => {
+                w.u8(1);
+                w.nested(|w| Fuse::encode(next, w))
+            }
+        }
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> Result<Self> {
+        match r.u8()? {
+            0 => Ok(Fuse(None)),
+            1 => Ok(Fuse(Some(Box::new(r.nested(Fuse::decode)?)))),
+            _ => panic!("the fuse at the bottom blew"),
+        }
+    }
+}
+
+fn deep_panics() {
+    let mut fused = vec![1; MAX_DEPTH];
+    fused.push(2);
+    on_stack(TINY_STACK, move || {
+        for _ in 0..3 {
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                Fuse::decode(&mut Decoder::new(&fused, &[], None)).map(drop)
+            }));
+            let payload = caught.expect_err("the decode should have panicked");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"the fuse at the bottom blew")
+            );
+        }
+        let at = hand_chain(MAX_DEPTH);
+        let value = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        assert_eq!(encoded(&value), at);
     });
 }
 
@@ -955,6 +1244,10 @@ fn child() {
         "nested-tables" => nested_tables(),
         "stale-tables" => stale_tables(),
         "hand-written" => hand_written(),
+        "tiny-stacks" => tiny_stacks(),
+        "bushy-trees" => bushy_trees(),
+        "extreme-hostile" => extreme_hostile(),
+        "deep-panics" => deep_panics(),
         other => panic!("unknown case {other}"),
     }
     println!("case {case} passed");
@@ -1004,4 +1297,24 @@ fn stale_indexes_of_nested_tables_rebuild_one_level_at_a_time() {
 #[test]
 fn hand_written_and_transparent_types_refuse_deep_input() {
     in_child("hand-written");
+}
+
+#[test]
+fn values_at_the_limit_read_and_write_on_a_tiny_stack() {
+    in_child("tiny-stacks");
+}
+
+#[test]
+fn a_bushy_tree_at_the_limit_commits_reads_and_verifies() {
+    in_child("bushy-trees");
+}
+
+#[test]
+fn a_chain_of_a_million_levels_is_refused_quickly_on_a_tiny_stack() {
+    in_child("extreme-hostile");
+}
+
+#[test]
+fn a_panic_deep_in_a_value_unwinds_back_through_the_stack_segments() {
+    in_child("deep-panics");
 }

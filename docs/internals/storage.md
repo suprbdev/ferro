@@ -183,11 +183,14 @@ items that take no room between them, which no realistic value holds.
 
 ### Nesting depth
 
-Decoding, visiting, encoding and pairing a value recurse once for each level it nests, so a value
-nested deeply enough runs its thread out of stack, and Rust aborts the process on a stack overflow
-rather than unwinding. A chain of 5,200 `Option<Box<Node>>` in a bundle of about 25 KB aborted the
-receiver on an 8 MiB stack, and `Vec` and `BTreeMap` chains did so below 4,000 levels (#118). So a
-value nests at most `MAX_DEPTH`, 128, levels within one object.
+Decoding, visiting, encoding and pairing a value recurse once for each level it nests, and Rust
+aborts the process on a stack overflow rather than unwinding. A chain of 5,200 `Option<Box<Node>>`
+in a bundle of about 25 KB aborted the receiver on an 8 MiB stack, and `Vec` and `BTreeMap` chains
+did so below 4,000 levels (#118). Two things keep that from happening. Each level makes sure the
+stack has room for it, and moves to a segment of stack that ferro maps for the thread when it does
+not, so a value reads and writes on any thread however deep it nests. And a value nests at most
+`MAX_DEPTH`, 4,096, levels within one object, which bounds the stack, and so the memory, that a
+value can make a thread take, and the stack taken by the clones and drops that ferro does not grow.
 
 A type can hold itself only behind a pointer or in a collection, since a type that holds itself
 inline has no size, and of the types ferro implements `Data` for, that means a `Box`, an `Arc`, a
@@ -197,7 +200,7 @@ deeper, through `Decoder::nested` and `Encoder::nested`, and every recursion ove
 mix of structs, enums, `Option`s, tuples and arrays lies between, passes one of them at each turn. A
 `Vec` or a map counts once, not once for each item, so a long `Vec<u64>` costs one check, and a
 derived struct, a transparent one and an `Option` cost none. A decoder past the limit fails with
-`Error::Decode`, "a value nests deeper than 128 levels", which a receive turns into `Error::Bundle`
+`Error::Decode`, "a value nests deeper than 4096 levels", which a receive turns into `Error::Bundle`
 and `verify_typed` reports, and an encoder fails with `Error::TooDeep`, so a commit refuses what a
 read would refuse. A hand-written impl for a pointer or a collection of its own, or one that boxes a
 value of its own type that it decodes itself, has to call `nested` too, which the `Data` docs ask
@@ -209,17 +212,54 @@ It put a compare and two stores around every item of every sequence and a check 
 and together with reading each field's header in a function of its own, to shrink the debug frame of
 `fields`, it cost a release build 20 to 30% on decoding a struct of eight fields that holds three
 collections, 70 to 90% on visiting it, and about a nanosecond on each `u64` of a `Vec`. Counting at
-the five indirections, with `nested` always inlined, costs nothing measurable there, as the
-benchmarks at the end of this section show.
+the five indirections, with `nested` always inlined, costs nothing measurable there.
+
+#### Growing the stack
+
+`nested` runs what it reads or writes through `stack::with_room`, which compares the address of a
+local with the bounds of the stack the thread is on, kept in a thread-local: a load, a subtraction
+and a compare. While at least 128 KiB, `RED_ZONE`, are left below, the level runs where it is.
+Otherwise it runs on a segment: 16 MiB mapped above a guard page, whose pages the system provides
+as they are first touched, switched to with `psm::on_stack`. The levels below check against the
+segment's bounds in turn and move to the next segment when it runs short. A panic on a segment is
+caught there and resumed once back on the stack that switched, so nothing unwinds across a switch.
+The `same_encoding` of the same five impls runs through it too, and so does each level of a map's
+tree that a commit writes.
+
+A thread learns its stack's bounds from the system the first time it runs short:
+`pthread_getattr_np` on Linux and Android, `pthread_get_stackaddr_np` on macOS and iOS, and
+`GetCurrentThreadStackLimits` on Windows. A stack outside those bounds, such as a coroutine's or one
+another library switched to, never counts as having room, so a recursion there moves to a segment
+at its first level. Windows has no segments: `psm` switches stacks there only through fibers, and
+building it for Windows needs a C compiler for the target, which `make lint-windows` has none of. A
+level there that finds less than `RED_ZONE` left fails instead, with `Error::Decode` or
+`Error::TooDeep`, so a Windows thread reads values only as deep as its own stack holds, a few
+hundred levels in a debug build on the 1 MiB of a main thread. Where the bounds cannot be learned,
+as on the BSDs and under Miri, nothing is checked.
+
+A thread keeps the segments it is running on, and the first one once its recursion returns to the
+thread's own stack; the others are unmapped. Mapping a segment and unmapping it after each use is
+what `stacker::maybe_grow` does, and costs 2.9 µs each time, where switching to a kept segment costs
+14 ns. A value whose many small branches end just past the edge of a stack crosses that edge once
+for each branch, which a forged value of a few bytes a branch can arrange, so keeping the segment
+is what keeps the time a forged value costs in proportion to its bytes. The kept segment
+holds the pages that the thread's deepest use touched, as a thread's own stack does, at most 16 MiB.
+
+Two other ways were weighed. A deep decode could run on a thread with a large stack of its own, but
+a recursion cannot move there half way, so the whole read would start over there, the closures a
+hand-written impl passes to `nested` need not be `Send`, and the thread-locals of a decode, such as
+the one that keeps an index rebuild from recursing, would not follow it. And an explicit stack of
+work for `Box`, `Vec` and the B-trees would take only their part of the recursion: a type that
+holds itself recurses through its own `decode`, derived or hand-written, at every level.
 
 Collections link their nodes, and a node decodes in a decoder of its own, starting from zero, as
 the values a node holds are read only when asked for. The paths that cross from a value into the
-nodes of a collection it holds within one call each keep the stack bounded:
+nodes of a collection it holds within one call each keep the count bounded:
 
 - Encoding: a map whose nodes a commit writes encodes them with encoders that start two levels
   below the value holding the map, since writing a node takes about the stack of two levels of a
   value, and `Encoder::child` starts as deep as its parent, so the levels of a value, of the maps it
-  holds and of the values in their nodes add up, and a commit that writes 64 maps nested in each
+  holds and of the values in their nodes add up, and a commit that writes 2,048 maps nested in each
   other's values refuses the next. Each map or table read from the file encodes as its root link
   alone and adds nothing, so a commit can stack maps deeper one commit at a time, which reads and
   pairs as below.
@@ -241,49 +281,76 @@ nodes of a collection it holds within one call each keep the stack bounded:
 `Data::tables` and `Data::describe` recurse over types rather than values, and stop at a type
 already open, so no input reaches them.
 
-128 was measured against the stack each level takes, by filling a thread's stack with a pattern,
-running the operation, and finding the deepest byte it changed, for chains of 300 and 900 levels.
-Each level of the shapes below took, in bytes:
+#### Clones and drops
 
-| Shape | Levels | Debug decode | Debug visit | Debug encode | Release decode | Release encode |
-| --- | --- | --- | --- | --- | --- | --- |
-| `Option<Box<Node>>` field | 1 | 3,360 | 2,240 | 1,248 | 1,392 | 176 |
-| `Vec<Node>` field | 1 | 4,560 | 2,448 | 1,712 | 2,000 | 208 |
-| `BTreeMap<u8, Node>` field | 1 | 5,840 | 2,576 | 1,904 | 2,192 | 240 |
-| enum variant `More(Box<Node>)` | 1 | 3,232 | 2,368 | 1,104 | 1,104 | 208 |
-| `Option<Box<(u8, Node)>>` field | 1 | 4,272 | 2,480 | 1,504 | 1,376 | 240 |
-| struct of 34 fields | 1 | 6,512 | 2,784 | 4,352 | 3,232 | 208 |
-| enum variant of 17 fields | 1 | 4,176 | 2,656 | 2,912 | 2,032 | 224 |
-| `Map<u8, Node>` field, nodes written | 2 | | | 12,672 | | 4,688 |
-| `Table<Row>` in a row, nodes written | 2 | | | 13,280 | | 4,656 |
+Cloning, dropping and comparing a value with `==` recurse through it as well, in code that Rust
+generates for its type, which checks nothing. A commit clones the root value to give its closure a
+copy to change, and a merge clones its base, so commits, merges, `restore` and the merges of a
+receive run through `stack::roomy`, which moves them to a segment unless 12 MiB, `DEEP_ROOM`, are
+left. That costs a switch to the kept segment on each commit made on a thread with a smaller stack.
+Drops are not grown: ferro drops the values it decoded and the roots it replaced where the last
+reference to them goes, which can be any thread that read them.
 
-The derive's debug frames were larger before: a decode kept a slot for each field's `Result` in the
-closure that reads the fields, and the temporaries of building the value in the frame that recurses,
-so the struct of 34 fields took 16,928 bytes a level and `Option<Box<Node>>` 4,768. A field now
-decodes through `codec::decode_into`, whose frame holds one field's temporaries and only while that
-field decodes, the value is built in a closure called once the fields are read, and a visit checks
-its required fields the same way. Release builds inline all of these, and changed little.
+#### The stack each level takes
 
-At 128 levels, each of these shapes, with a table at the bottom, committed, opened, received twice
-with the bundle's pairing, and passed `verify_typed` on a debug build using at most 879 KB of stack,
-for tables nested in rows that one commit writes, 863 KB for the struct of 34 fields, and under 780
-KB for the rest; a release build used at most 423 KB. That leaves more than half of the 2 MiB that
-Rust gives a spawned thread, so the pool threads of the checks, reclamation's threads, the follower,
-the watch threads and the thread that writes asynchronous commits, which all run with that default,
-need no larger stack of their own, and neither does a caller's thread a few hundred KB deep. A type
-that stores larger values inline, such as a struct of hundreds of fields or one holding big arrays,
-takes more for each level. A depth of 256 would have needed up to 1.8 MB in a debug build, too close
-to 2 MiB, and 1,000 levels, as first suggested, would need several MiB even in release builds.
+The stack each level took was measured by filling a thread's stack with a pattern, running the
+operation, and finding the deepest byte it changed, for chains of 40 and 120 levels, and of 1,000
+and 5,000 levels for the clones and drops, which need not be encodable. In bytes:
 
-Over seven alternating runs of a release benchmark against the build before the limit, on a machine
-that other builds shared, the fastest run of each was within 4% of the old: 437 against 423 ns to
-hash a struct of eight fields that holds three collections, 433 against 428 to decode it and 170
-against 167 to visit it, 3.5 ns an item to decode a `Vec<u64>` either way, 21.0 against 20.6 ns an
-entry of a `BTreeMap<u32, u32>`, 36 µs to commit one entry and 16 µs to commit one table row either
-way, 55.1 against 54.2 µs for a cold get and 230 against 228 ns for a warm one, 1.20 against 1.18 s
-to receive a clone of 220,000 entries and 105,000 rows and 1.39 against 1.36 s for its
-`verify_typed`. The medians of those last two were 6.5% and 5.5% slower, 1.29 against 1.21 s and
-1.52 against 1.44 s, within the spread of each build's runs.
+| Shape | Build | Decode | Visit | Encode | `same_encoding` | Clone | Drop |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `Option<Box<Node>>` field | debug | 2,656 | 2,368 | 1,440 | 352 | 256 | 96 |
+| | release | 592 | 448 | 272 | 16 | 48 | 32 |
+| `Vec<Node>` field | debug | 3,248 | 2,624 | 1,904 | 608 | 752 | 160 |
+| | release | 880 | 464 | 224 | 64 | 144 | 64 |
+| `BTreeMap<u8, Node>` field | debug | 3,952 | 3,296 | 2,112 | 896 | 1,440 | 784 |
+| | release | 800 | 720 | 256 | 80 | 208 | 128 |
+| enum variant `More(Arc<Node>)` | debug | 2,480 | 2,464 | 1,216 | 320 | 0 | 192 |
+| | release | 528 | 480 | 192 | 48 | 0 | 32 |
+| struct of 26 fields | debug | 5,088 | 2,768 | 3,776 | 352 | 1,072 | 128 |
+| | release | 2,880 | 1,024 | 336 | 80 | 768 | 48 |
+
+A node that also holds an `Option<Table<_>>` clones in 528 to 800 bytes a level in a release build
+and 608 to 2,080 in a debug one, the most for `BTreeMap` children, and drops in 32 to 144 and 128
+to 816. The derive's debug frames were larger before: a decode kept a slot for each field's `Result`
+in the closure that reads the fields, and the temporaries of building the value in the frame that
+recurses, so a struct of 34 fields took 16,928 bytes a level and `Option<Box<Node>>` 4,768. A field
+now decodes through `codec::decode_into`, whose frame holds one field's temporaries and only while
+that field decodes, the value is built in a closure called once the fields are read, and a visit
+checks its required fields the same way.
+
+So at the limit a decode takes up to 12 MB of stack in a release build and 21 MB in a debug one,
+for a struct of a few dozen fields at every level, and that is the most a value, forged or not, can
+make each thread that reads it take. A clone of the root at the limit takes at most 3.3 MB in a
+release build and 8.5 MB in a debug one, within the segment a commit runs on. A drop at the limit
+takes at most 590 KB in a release build, within the 2 MiB of a spawned thread, but up to 3.3 MB in
+a debug build, for a tree of `BTreeMap` children that each hold a table: such a value, dropped on a
+thread of 2 MiB in a debug build, overflows its stack. A type meant to hold long chains can drop
+them in a loop, as the shapes of the tests do, which costs no stack for their depth. 4,096 keeps
+the drops of a release build within a spawned thread's stack; 65,536 levels would let a drop in a
+release build take 9 MB and a clone 52 MB, and let a value make each reader take 190 MB.
+
+Each shape of the tests, at the limit with a table at the bottom, is committed, reopened, received
+twice with the bundle's pairing and passes `verify_typed` on a 2 MiB stack, and decodes, visits and
+encodes on a thread of 64 KiB. A tree of 4,095 levels with 40 leaves at each commits, reopens, reads
+and verifies on a 2 MiB stack. A chain of a million levels, a byte each, is refused eight times over
+in half a millisecond on a 64 KiB stack, and a bundle that carries it is refused before anything
+lands.
+
+The check costs nothing measurable on the paths that run it most. Over three alternating runs of
+each build on a machine that other work shared, the fastest run of each against the build before:
+23.5 against 23.3 µs to commit one entry under `Durability::Buffered`, in 0.5% more instructions,
+for the switch of `roomy` and the checks, and 401 against 403 µs under `Fsync`; 5.22 against 5.34
+µs for a cold get and 311 against 309 ns for a warm one; 19.8 against 19.6 ns a key to scan and 675
+against 671 a key to bulk load; 4.9 against 5.1 ns an item to decode a `Vec<u64>` of large values,
+and 14.5 against 14.6 ns to decode and 8.0 against 8.0 to visit an entry of a `BTreeMap<u64, u64>`,
+each within 0.6% of the instructions it took before. A `Box<u64>` decodes in 6.7 ns where the stack
+has room and in 21 ns on a thread so short of it that each decode switches to the kept segment. The
+one outlier is a `BTreeSet<String>` of a million keys, which decodes in 4% more instructions and
+visits in 45% more time on 1% more instructions, though no check runs for its keys. It follows
+where the compiler places code rather than the work per key: `visit_entries` is kept out of line
+because inlining it slowed the visit of the `BTreeMap` by 12%, and the same `#[inline(never)]` on
+the old build slows its visit of the set by 22% and of the map by 23%.
 
 ## Records
 

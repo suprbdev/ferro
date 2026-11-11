@@ -39,6 +39,7 @@ use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
 use crate::refs;
+use crate::stack;
 use crate::store::{
     Durability, Followed, Frame, Gate, Held, Landing, News, Op, Retired, Settling, Store,
     StoreOptions, Trace, Txn, lane_of,
@@ -4433,13 +4434,15 @@ impl<T: Data> Db<T> {
         lane: Lane<'_, T>,
         f: impl FnOnce(&mut T, &Stamp<'_>) -> std::result::Result<(String, R), E>,
     ) -> std::result::Result<Wait<R, E>, E> {
-        if self.shared.coalesce {
-            return self.stage_group(lane, f).map(Wait::Group);
-        }
-        let staged = self.stage_alone(lane, None, |_, root, stamp| {
-            f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
-        });
-        staged.map(Wait::Ticket)
+        stack::roomy(|| {
+            if self.shared.coalesce {
+                return self.stage_group(lane, f).map(Wait::Group);
+            }
+            let staged = self.stage_alone(lane, None, |_, root, stamp| {
+                f(root, stamp).map(|(message, value)| (message, value, Intent::default()))
+            });
+            staged.map(Wait::Ticket)
+        })
     }
 
     fn alone<R, E: From<Error>>(
@@ -4450,9 +4453,11 @@ impl<T: Data> Db<T> {
         let _crossing = self.entering(Needs::Lane(&self.branch.name))?;
         self.shared.admit(&self.branch.name);
         let lane = self.shared.lane(&self.branch);
-        let staged = self.stage_alone(lane, from, |state, root, _| {
-            let tip = self.shared.tip.lock().clone();
-            f(&tip, state, root)
+        let staged = stack::roomy(|| {
+            self.stage_alone(lane, from, |state, root, _| {
+                let tip = self.shared.tip.lock().clone();
+                f(&tip, state, root)
+            })
         })?;
         self.settle(staged)
     }
@@ -4738,7 +4743,7 @@ impl<T: Data> Db<T> {
         snapshot: &Snapshot<T>,
         message: impl Into<String>,
     ) -> Result<Committed<()>> {
-        let value = (*snapshot.value).clone();
+        let value = stack::roomy(|| (*snapshot.value).clone());
         let message = message.into();
         let intent = Intent {
             restored: Some(snapshot.commit.version),

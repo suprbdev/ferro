@@ -55,14 +55,18 @@ This is an experiment, not a production database.
   a first pull and more for each commit, and a large bundle refused after it began to arrive leaves
   its frames in the file, without the disk its objects took on Linux, until the writer closes or the
   next reclamation cycle, as described under [Limits](sync.md#limits).
-- A value nests at most 128 levels within one object, `codec::MAX_DEPTH`: each `Box`, `Arc`, `Vec`,
-  `BTreeMap` or `BTreeSet` it holds opens one, so a chain of `Option<Box<Node>>` goes 128 deep and a
-  tree of `Vec<Node>` children 127. A commit refuses a deeper value with `Error::TooDeep`, counting
-  on through the maps and tables it writes, two levels for each, and a read or a receive refuses one
-  with `Error::Decode` or `Error::Bundle` rather than run out of stack. At the limit, decoding fits
-  in the 2 MiB stack of a spawned thread in a debug build for types of a few dozen fields; larger
-  values stored inline take more stack a level, as described under [Nesting
-  depth](../internals/storage.md#nesting-depth).
+- A value nests at most 4,096 levels within one object, `codec::MAX_DEPTH`: each `Box`, `Arc`,
+  `Vec`, `BTreeMap` or `BTreeSet` it holds opens one, so a chain of `Option<Box<Node>>` goes 4,096
+  deep and a tree of `Vec<Node>` children 4,095. A commit refuses a deeper value with
+  `Error::TooDeep`, counting on through the maps and tables it writes, two levels for each, and a
+  read or a receive refuses one with `Error::Decode` or `Error::Bundle`. Reads, writes, checks and
+  commits move to stack that ferro maps for the thread when the thread's own runs short, so they
+  reach the limit on any thread, on Linux, Android, macOS and iOS; on Windows a value reads and
+  writes only as deep as the thread's stack holds, and a deeper one fails with those errors.
+  Dropping and cloning a value recurse in code that Rust generates, which ferro does not grow: at
+  the limit a drop takes up to 590 KB of stack in a release build and 3.3 MB in a debug one, and a
+  clone up to 3.3 MB in a release build, so a type meant to hold long chains should drop them in a
+  loop, as described under [Nesting depth](../internals/storage.md#nesting-depth).
 - Query planning goes by counts alone. You choose the indexes, and `and` and `or` combine lookups
   by key. A chain of `and` is led by the lookup with the fewest keys, counted from its index, and
   looks the others up fewest first, but it holds at most eight lookups, and `a.and(b.and(c))` plans
