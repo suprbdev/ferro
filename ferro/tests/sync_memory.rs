@@ -86,7 +86,7 @@ fn varint(out: &mut Vec<u8>, mut value: u64) {
 
 fn header(out: &mut Vec<u8>, hints: u64) {
     out.extend_from_slice(b"FERROBDL");
-    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&[2, 1]);
     out.extend_from_slice(&[7; 20]);
     varint(out, 1);
     varint(out, 0);
@@ -130,7 +130,7 @@ fn carries_many_objects() -> Bundle {
     header(&mut out, 0);
     let count = 2 * MIB;
     varint(&mut out, count as u64);
-    out.resize(out.len() + 2 * count, 0);
+    out.resize(out.len() + 3 * count, 0);
     Bundle::from(out)
 }
 
@@ -154,6 +154,7 @@ fn expands_far() -> Bundle {
         varint(&mut out, body.len() as u64);
         out.extend_from_slice(&packed);
         varint(&mut out, 0);
+        varint(&mut out, 0);
     }
     Bundle::from(out)
 }
@@ -168,6 +169,7 @@ fn carries_large_objects(count: u64) -> Bundle {
         varint(&mut out, (body.len() as u64) << 1);
         out.extend_from_slice(&body);
         varint(&mut out, 0);
+        varint(&mut out, 0);
     }
     Bundle::from(out)
 }
@@ -180,6 +182,7 @@ fn with_huge_claimed_size() -> Bundle {
     varint(&mut out, (packed.len() as u64) << 1 | 1);
     varint(&mut out, packed.len() as u64 * 255);
     out.extend_from_slice(&packed);
+    varint(&mut out, 0);
     varint(&mut out, 0);
     Bundle::from(out)
 }
@@ -239,7 +242,7 @@ fn hints_on_held(db: &Db<Root>, hints: &[(u64, u64)]) -> Bundle {
     let mut mark = db.head_hash().unwrap().to_vec();
     varint(&mut mark, db.version());
     let mut out = b"FERROBDL".to_vec();
-    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&[2, 1]);
     out.extend_from_slice(&mark);
     varint(&mut out, 1);
     out.extend_from_slice(&mark);
@@ -397,7 +400,7 @@ fn clone_heap(a: &Db<Root>, dir: &std::path::Path) -> (usize, usize, usize) {
 }
 
 #[test]
-fn a_clone_of_a_large_tree_holds_a_few_dozen_bytes_for_each_object() {
+fn a_clone_of_a_large_tree_holds_a_few_bytes_for_each_object() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
     for round in 0..8u64 {
@@ -411,11 +414,11 @@ fn a_clone_of_a_large_tree_holds_a_few_dozen_bytes_for_each_object() {
     let (objects, sent, received) = clone_heap(&a, dir.path());
     assert!(objects > 480_000, "{objects}");
     assert!(
-        sent < 8 * MIB + 44 * objects,
+        sent < 2 * MIB + 8 * objects,
         "sending {objects} objects took {sent} bytes of heap"
     );
     assert!(
-        received < 4 * MIB + 48 * objects,
+        received < 4 * MIB + 8 * objects,
         "receiving {objects} objects took {received} bytes of heap"
     );
 }
@@ -498,7 +501,7 @@ fn verifying_one_value_spilled_under_many_keys_holds_little() {
 }
 
 #[test]
-fn a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object() {
+fn a_clone_of_a_long_history_holds_a_few_bytes_for_each_object_and_more_for_each_commit() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
     for round in 0..50_000u64 {
@@ -512,11 +515,11 @@ fn a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object() {
     let (objects, sent, received) = clone_heap(&a, dir.path());
     assert!(objects > 380_000, "{objects}");
     assert!(
-        sent < 8 * MIB + 64 * objects,
+        sent < 4 * MIB + 8 * objects + 200 * 50_000,
         "sending {objects} objects in 50,000 commits took {sent} bytes of heap"
     );
     assert!(
-        received < 4 * MIB + 64 * objects,
+        received < 4 * MIB + 8 * objects + 250 * 50_000,
         "receiving {objects} objects in 50,000 commits took {received} bytes of heap"
     );
 }

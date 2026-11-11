@@ -110,20 +110,44 @@ merge's limits, and a chain cut short reads as pruned there.
 A sent object that links a known one names it with a hint: the anchor or earlier hint it hangs from,
 and the index of the link there. The receiver follows the path in its own file and checks that it
 ends at the same hash, which costs one read of each parent on a changed path. A link to a sent
-object needs nothing, because objects go children first. Bodies are LZ4 compressed when that is
-smaller, as in the file.
+object names it by how far back in the bundle it is, with no hash, because objects go children
+first and the receiver hashed it as it arrived. A link to anything else, which only a commit makes
+to one the receiver holds, carries its hash. Each object also says how many links later objects in
+the bundle make to it, so the receiver can let it go after the last, as described under [Memory for
+each object](#memory-for-each-object). Bodies are LZ4 compressed when that is smaller, as in the
+file.
 
-The sender plans without bodies. The tree comparison reads only the links of each record, and keeps
-the hash and offset of each object it will send and whether it links anything, with the links of the
-first 64K or so objects and links so that a small bundle reads nothing twice. An object that links
+A bundle for a file that shares no anchor with the sender, a first pull, is sent in the order of the
+sender's file. Every link in a ferro file leads back, to an earlier offset, so that order puts every
+object after what it links. The sender finds what to send with one pass from the end of the file
+toward its start: a heap holds the offsets that what it has reached links to, it takes the largest,
+reads that record's links and adds them, and an offset it takes twice in a row is one object linked
+twice, which also counts the links to it. The commits sent start the heap, and of a commit only its
+root and the commits sent that it links are followed. The pass reads the file 1 MiB at a time
+toward its start and takes each record's links from those bytes, since the kernel reads ahead only
+toward the end of a file, as measured under [Naming sent objects by their
+place](#naming-sent-objects-by-their-place). Each offset reached goes into a list, 64 to a
+run, each run its first offset and then the distance down to each next one as a varint, with the
+first four bytes of the hash the link named and the count of links, so the list takes about seven
+bytes an object. Then the list is read back from its end, and each object read from the file in
+order, its hash checked against those four bytes, and written; a link to a sent object finds that
+object's place in the list by galloping from the run being written and halving one run. Objects the
+file holds twice, at two offsets, are sent twice, since the pass knows objects by their offsets.
+
+An incremental bundle is planned as before. The tree comparison reads only the links of each record,
+and keeps each object it will send in a table of 16-byte slots: its offset, its place in the bundle,
+its state in the walks below, and the first four bytes of its hash. An object is found by its hash,
+through those four bytes and the offset it was added at; one looked up at another offset, where the
+file holds it twice, is read back to tell, and is then found by that offset too. The links of the
+first 64K or so objects are kept, so a small bundle reads nothing twice, and an object that links
 nothing is not read for its links again. The sent commits are then visited in generation order, each
-depth first through what it links that is to be sent, so a commit's trees and parents are out before
-it and the stack is as deep as a tree, not as a history. That walk names the hints, so the header,
-with the anchors, the hints and the object count, goes first. Then each object is read once more,
-its hash checked, and written in 64 KiB chunks with the LZ4 bytes the file already holds for it, so
-the sender compresses nothing. Planning holds about 45 bytes for each object sent, as described
-under [Memory for each object](#memory-for-each-object). `pull` runs the sender on a second thread
-once it sends 256 objects, with eight chunks in flight between the two.
+depth first through what it links that is to be sent, counting the links to each, so a commit's
+trees and parents are out before it and the stack is as deep as a tree, not as a history. That walk
+names the hints, so the header, with the anchors, the hints and the object count, goes first. Then
+the same walk runs again, reading each object once more, its hash checked, and writing it. Either
+way each object goes out in 64 KiB chunks with the LZ4 bytes the file already holds for it, so the
+sender compresses nothing. `pull` runs the sender on a second thread once it sends 256 objects, with
+eight chunks in flight between the two.
 
 ### Objects in several places
 
@@ -220,7 +244,9 @@ written into the file while it streams:
   hash, or to offset 0 below the landed branch's `first`, which nothing follows. A sent commit's
   `prev` or `skip` that lands on a sent commit must name the one at that version, so a lookup
   through skip links cannot reach a commit the `prev` chain does not hold. Anything else rejects the
-  bundle, and so does an object nothing links to.
+  bundle, and so does an object nothing links to. Each object is linked by later objects exactly as
+  often as it says: a link past that count, or a count the rest of the bundle leaves short, rejects
+  it.
 - A sent commit's merge link resolves to a commit in the bundle, which must decode as a commit, to a
   commit the bundle says the receiver holds, or to offset 0. Each merged chain in the bundle is
   checked like the landed branch: versions descend one at a time, and every `prev` and `skip` names
@@ -599,7 +625,8 @@ the in-memory version on a machine other work was sharing, and these are the med
 | The same with `Durability::Buffered` | median 0.98 ms, fastest 0.65 ms | median 0.93 ms, fastest 0.60 ms |
 
 The heap that was left was the receiver's bookkeeping, 467 bytes an object, and the sender's, 113,
-since cut to about 38 and 43, as described under [Memory for each object](#memory-for-each-object).
+since cut to about 38 and 43, and then to about 5 and 7, as described under [Memory for each
+object](#memory-for-each-object).
 It got faster mostly because neither side compresses a body the file already holds compressed, and
 `pull` runs the two sides on two threads. A small pull costs what it did: its bundle is below 1 MiB,
 so the frame is written in one piece, and the planning reads that streaming added are served from
@@ -626,48 +653,150 @@ measured](sync-receive.md#staging-in-the-log-measured).
 
 ## Memory for each object
 
-What a sync holds grows with the objects it moves, not with their bytes, so a large first pull is
-bounded by a few columns an object. The receiver keeps, for each object in the bundle:
+What a sync holds grows with the objects it moves, not with their bytes, and by a few bytes an
+object. The receiver keeps, for each object in the bundle:
 
-- its hash, 20 bytes, and its offset in the staging, 8, in columns of 4,096 entries that grow
-  without copying;
-- a count of the links other sent objects make to it, a byte that stops at 255, which also finds
-  the objects nothing links to;
-- its position in a hashbrown table from hash to position, 4 bytes and a control byte a slot at
-  between 44 and 88% full, so 6 to 11 bytes an object, split into 16 tables so that growing one
-  copies a sixteenth.
+- its offset in the staging, as its distance from the first offset of its run of 4,096, 4 bytes,
+  with the first offset of each run, 8 bytes, and the few distances past 4 GiB whole beside them,
+  so that an offset finds its object's place by halving;
+- the count of links later objects make to it, as the bundle states it, a byte that stops at 255,
+  which also finds the objects nothing links to.
 
-That is 35 to 40 bytes. Placing drops the staging offsets and keeps each object's offset in the log
-in their place. A check is kept only while a later link of its type may need it, as described under
+That is about 5 bytes. An object's hash is held only from its arrival to the last link the bundle
+says later objects make to it, in a table from its place in the bundle to its hash and the links
+still to come, 32 bytes and a slot. A first pull comes in the order of the sender's file, where a
+commit writes each node just after its children, so that table holds a few hundred objects at a
+time, and in a history also the nodes a later commit links again: in 100,000 commits of ten keys,
+121 at most. Beside them the receiver keeps the hashes of the last 131,072 objects, 2.5 MiB, for the
+deduplication table to learn once the bundle has landed, and of every object while the staging is in
+memory, under 1 MiB of records. Placing a bundle under 1 MiB, or one that a cycle moved, keeps each
+object's offset in the log beside the others, 8 bytes, and the moved one each hash as it is read
+back, 20 more. A check is kept only while a later link of its type may need it, as described under
 [Checking trees](sync-receive.md#checking-trees). The walk below held data linked as another type
 keeps at most 229,376 checks of 24 bytes, in a table of 6.25 MiB that peaks at 9.4 MiB while it
 grows, however much of the file it reads and however long its keys, as described under [Held data
-linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent
-commit adds its graph facts, root and segment, 88 bytes, and 40 to 60 more in indexes and the
-order it is checked in. Each hint an
-incremental bundle names adds the object it resolves to, the kind it holds with its parent's key
-range, and its place in the header, about 140 bytes. Hints are resolved grouped by parent, so one
-parent's links and kinds are held at a time, where every parent read used to be kept, about 2.3 KB
-each, until the last hint. They are resolved a level of the paths at a time, and within a level
-grouped by the object their parent resolves to and the kind it holds, not by the parent's place in
-the header, so a held object is read once however many hints lead to it. Grouped by place, a
-1.18 MB header naming the first link of an anchor root 200,000 times, and then the first link of
-each of those hints, read that object 200,000 times. On a map of 100,000 keys that took 111 ms,
-against 36 ms before hints were grouped and 18 ms now.
-`hints_that_name_one_held_object_many_ways_read_it_once` in `ferro/tests/sync_memory.rs` sends that
-header to a map of 20,000 keys and expects it to allocate no more than 400,000 hints on the root's
-link do: 63 MB each now, where it allocated 381 MB in 175 ms. Each hint's depth in its path, 4
-bytes, is held while they resolve.
+linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent commit adds its
+graph facts, root, hash and segment, 112 bytes, and about 130 more in indexes, the order it is
+checked in, and the list by hash the landing finds it by. Each hint an incremental bundle names adds
+the object it resolves to, the kind it holds with its parent's key range, and its place in the
+header, about 140 bytes. Hints are resolved grouped by parent, so one parent's links and kinds are
+held at a time, where every parent read used to be kept, about 2.3 KB each, until the last hint.
+They are resolved a level of the paths at a time, and within a level grouped by the object their
+parent resolves to and the kind it holds, not by the parent's place in the header, so a held object
+is read once however many hints lead to it. Grouped by place, a 1.18 MB header naming the first link
+of an anchor root 200,000 times, and then the first link of each of those hints, read that object
+200,000 times. On a map of 100,000 keys that took 111 ms, against 36 ms before hints were grouped
+and 18 ms now. `hints_that_name_one_held_object_many_ways_read_it_once` in
+`ferro/tests/sync_memory.rs` sends that header to a map of 20,000 keys and expects it to allocate no
+more than 400,000 hints on the root's link do: 63 MB each now, where it allocated 381 MB in 175 ms.
+Each hint's depth in its path, 4 bytes, is held while they resolve.
 
-The sender keeps, for each object it will send, its hash and offset, whether it links anything and
-its state in the post-order walk, 30 bytes in columns, a slot in the same kind of table, and its
-place in the order, 4 bytes. A commit adds 80 bytes, and each object the old side reaches in an
-incremental pull its hash, its origin as a position and link index, and a slot, about 40. The
+The sender of a first pull keeps, for each object it will send, an entry in the list described
+under [What is sent](#what-is-sent): the distance to the offset before it, 2 bytes for records of a
+few hundred bytes, the first four bytes of its hash and the count of links to it, about 7 bytes,
+with the first offset of each run of 64 and where its bytes start, 12 bytes a run. The heap holds 16
+bytes for each link the pass has yet to follow: a few hundred in a tree written in commits, since
+each node follows its children closely, and 388,454 at most for the 895,489 objects of 100,000
+commits of ten keys, since each commit links nodes written by the ones before. It reads the file
+through a window of 1 MiB, and each commit adds about 100 bytes. The sender of an incremental pull
+keeps, for each object it will send, a 16-byte slot and a control byte in a table split into 16
+that runs between 44 and 88% full, 19 to 39 bytes, a commit adds 80 bytes, and each object the old
+side reaches its hash, its origin as a position and link index, and a slot, about 40. The
 objects it reaches under nodes the next level names count toward 65,536 a bundle, so they add at
 most 2.5 MiB that stay until the plan is done, and about 4 MiB while a step expands them. The
 comparison holds the level it is on while the old side has anything left to expand, with the hash
 of each object the new side has linked and a count of 4 bytes, and walks the rest of the new tree
 depth first.
+
+### Naming sent objects by their place
+
+Until 2026-11 both sides found every object of a bundle by its hash, so each kept every hash. The
+receiver kept each object's hash, its offset in the staging, a count of links and a slot in a table
+from hash to place, 35 to 40 bytes; the sender the hash, offset, a flag for links, its state in the
+walk, a slot in the same kind of table and its place in the order, about 43. A first pull of 50
+million objects took 1.7 GiB to receive and 2.0 GiB to send.
+
+Three changes took most of that away. A link to a sent object names how far back in the bundle the
+object came, without its hash, and each object states how many links later objects make to it, so
+the receiver needs no table to find it and keeps its hash only until its last link. A first pull is
+sent in the order of the sender's file, found by one pass from the end of the file, so the sender
+keeps a list of a few bytes an object and no table. And the receiver keeps its offsets as four-byte
+distances. Bundles are smaller as well, by the 20 bytes each such link no longer carries, a tenth of
+a tree of small values and two fifths of a long history.
+
+Measured as before with `cargo run --release -p ferro-bench --bin clone`, each step in a process of
+its own, Buffered, on `Map<u64, String>` files of 16-byte values loaded in ten commits unless named,
+with the peak heap from the counting allocator and times the medians of three runs alternating with
+the build before, two for 50 million objects, with the file in the page cache, on a machine other
+work was sharing:
+
+| Case | Sent before | Sent after | Received before | Received after | Bundle |
+| --- | --- | --- | --- | --- | --- |
+| 8M keys, 999,734 objects | 45.2 MiB, 1.44 s | 7.7 MiB, 0.64 s | 39.9 MiB, 1.44 s | 9.4 MiB, 1.35 s | 208.2 MB, now 189.2 |
+| 80M keys, 10,003,303 objects | 453.6 MiB, 12.90 s | 68.6 MiB, 6.42 s | 358.4 MiB, 17.18 s | 51.8 MiB, 13.79 s | 2,101.0 MB, now 1,911.2 |
+| 400M keys, 50,004,566 objects | 2,064.6 MiB, 66.7 and 74.7 s | 334.4 MiB, 34.7 and 37.1 s | 1,705.7 MiB, 95.4 and 98.2 s | 243.4 MiB, 69.1 and 73.5 s | 10,570.1 MB, now 9,621.4 |
+| 1M keys in 100,000 commits, 895,489 objects | 47.6 MiB, 2.75 s | 21.6 MiB, 1.69 s | 50.8 MiB, 2.05 s | 31.2 MiB, 2.02 s | 214.7 MB, now 131.8 |
+| 200,000 of the 8M keys edited, into the clone: 236,262 objects | 137.7 MiB, 1.51 s | 136.9 MiB, 1.71 s | 126.6 MiB, 1.17 s | 122.3 MiB, 1.13 s | 89.2 MB, now 85.2 |
+
+At ten million objects that is 7 bytes an object sent and 5 received, against 48 and 38, and at
+fifty million 7 and 5 against 43 and 36. The history's sender holds its heap and an entry for each
+commit, and its receiver about 240 bytes a commit. The edit's sender holds what its old side
+reached and its table of what it sends, as much as before, and took 1.21 to 1.80 s against 1.25 to
+1.82 over five alternating runs. With the file dropped from the page cache by `posix_fadvise`
+before each run, sending the ten million objects took 8.0 and 9.4 s against 27.2 and 25.7, and the
+fifty million 39.9 s against 118.8, since the pass reads the file a window at a time and the
+objects go out in the order the file holds them.
+
+`a_clone_of_a_large_tree_holds_a_few_bytes_for_each_object` and
+`a_clone_of_a_long_history_holds_a_few_bytes_for_each_object_and_more_for_each_commit` in
+`ferro/tests/sync_memory.rs` clone 499,886 objects loaded in eight commits and 407,377 in 50,000,
+counting the heap of each side on its thread. They bound the tree's sender to 2 MiB plus 8 bytes an
+object and its receiver to 4 MiB plus 8, and the history's to 4 MiB plus 8 bytes an object and 200
+or 250 a commit. They measure 4.5 and 15.7 MB sent and 6.7 and 18.0 MB received, where the build
+before took 25.1 MB for each to send and 21.5 and 24.0 to receive. A bundle of 2,097,152 empty
+objects, 6.3 MB, took 20.0 MB of heap and was refused, since nothing links them: an object is no
+longer refused as a repeat when it arrives, as nothing finds one by its hash, and costs what any
+other does.
+
+Small pulls cost what they did. A pull of three one-key commits into the clone of the eight million
+keys, 200 times, ran 3.78 million instructions at the median against 3.73 million, 1.4% more, in
+0.36 to 0.37 ms against 0.35 to 0.36 Buffered and in 1.16 to 1.31 ms against 1.14 to 1.40 with
+fsync, the medians of three runs alternating with the build before, and its bundle took 11,691
+bytes where it took 12,288. Its receive ran as many instructions as before once the staging held in
+memory began where the log ends: from 2^62, where the first build put it, each link from a staged
+record to one of the file took a varint of ten bytes, read again at each check and placing, and the
+receive ran 4% more.
+
+Measured and left out:
+
+- Keeping objects to send in a table by their offset alone, 12 bytes a slot. The tree comparison
+  knows objects by their hashes, so where a file holds one twice it followed one copy and the walk
+  after it the other, and the sync model sweeps found objects the plan had not reached. The table
+  now finds an object by its hash through four bytes of it and the offset it was added at, and
+  reads back a copy at another offset to tell.
+- That table and the walk for a first pull too: 42.5 MiB to send the million objects, against 45.2
+  before and 7.7 now, since 16 tables of 62,500 slots were 48% full, and 1.7 to 1.9 s against 1.4
+  to 1.5 before.
+- Every hash kept by the receiver, with links named by place: 29.9 MiB to receive the million
+  objects and 49.0 for the history, against 39.9 and 50.8 before.
+- Staging offsets kept whole, 8 bytes: 13.3 MiB to receive the million objects against 9.4.
+- Finding sent commits through a table by hash in each pass over them, as the first build did:
+  33.3 MiB to receive the history against 31.2.
+- Reading the pass's records one at a time: on a file not in the page cache it took 25.7 s of a
+  33 s send of ten million objects, against 3.6 s with the file cached, since the kernel reads
+  ahead only toward the end of a file, and `posix_fadvise` with `POSIX_FADV_WILLNEED`, which the
+  kernel caps at its readahead, changed nothing.
+
+Not built: a receiver that keeps no offset or count for an object past its last link. Checking the
+trees and placing find a staged object by its offset, and checking holds a check for an object
+linked twice until its last link, so they would need those facts for the objects linked twice
+only. The pass that counts links found 372 of the million objects linked twice in the tree, and
+104,394 of the 895,489 in the history, so such a receiver would hold a few MiB for either.
+
+### Columns for each object
+
+Before that, the receiver kept its hashes and offsets in columns of 4,096 entries and a table of
+positions by hash, and the sender the same.
 
 Before, the receiver kept a map from hash to staging offset, 33 bytes a slot, and every check it
 made, by hash and type: an 81-byte slot, the 96-byte kind it was made under and, for a node, a
@@ -696,12 +825,9 @@ piece, and the sender its cache of links, a few MiB at most. The edit's sender a
 old side reached, 857,288 objects of the old tree with their origins, and while it compares the
 widest level, the set of what its new side has linked.
 
-`a_clone_of_a_large_tree_holds_a_few_dozen_bytes_for_each_object` and
-`a_clone_of_a_long_history_holds_a_few_dozen_bytes_for_each_object` in `ferro/tests/sync_memory.rs`
-clone 499,886 objects loaded in eight commits and 407,377 in 50,000, counting the heap of each side
-on its thread, and bound the sender to 8 MiB plus 44 or 64 bytes an object and the receiver to 4 MiB
-plus 48 or 64. They measure 25.1 MB sent for each and 21.5 and 24.0 MB received, where the build
-before took 47.6 and 38.0 MB to send and 229.7 and 140.7 MB to receive.
+The two clones in `ferro/tests/sync_memory.rs`, 499,886 objects loaded in eight commits and 407,377
+in 50,000, measured 25.1 MB sent for each and 21.5 and 24.0 MB received, where the build before
+took 47.6 and 38.0 MB to send and 229.7 and 140.7 MB to receive.
 
 Small syncs got no slower. A pull of three one-key commits into the clone of the 330 MB file, 200
 times, ran 4.19 million instructions at the median against 5.14 million, 18% fewer, in 1.79 ms
@@ -749,13 +875,18 @@ Measured and left out:
 
 ## Limits
 
-- A bundle streams, but the receiver keeps about 38 bytes for each object and the sender about 43,
-  so the first pull of a file of 50 million objects needs about 2 GB on each side. Each commit adds
-  about 140 bytes on the receiver and 80 on the sender, and each hint about 140 on the receiver, so
-  a pull of scattered edits, which names about three held nodes for each one it sends, costs a few
-  hundred bytes an object there. Each object is held whole, so one huge value needs a few times its
-  size. A hostile stream costs the same, for what it carries and not for what it claims, and so
-  does checking it, as the limits on checks below describe.
+- A bundle streams, but a first pull keeps about 5 bytes for each object on the receiver and 7 on
+  the sender, so one of 50 million objects needs about 250 MiB to receive and 340 MiB to send.
+  Each commit adds about 240 bytes on the receiver and 100 on the sender, and the sender's heap 16
+  bytes for each link that leads further back than the pass has reached, which in a long history
+  is a large part of its links. An incremental pull keeps 19 to 39 bytes for each object sent on
+  the sender, and each hint costs about 140 bytes on the receiver, so a pull of scattered edits,
+  which names about three held nodes for each one it sends, costs a few hundred bytes an object
+  there. Each object is held whole, so one huge value needs a few times its size. A hostile stream
+  costs the same, for what it carries and not for what it claims, and so does checking it, as the
+  limits on checks below describe.
+- A first pull sends an object the sending file holds twice, at two offsets, twice, and the
+  receiving file then holds it twice as well.
 - `receive` writes a bundle over 1 MiB once, into staging frames as it arrives, but a reclamation
   cycle that swaps the file while the bundle streams, or before it lands, leaves those frames in
   the old file, and `receive` then copies the bundle into the new one before it lands, writing it

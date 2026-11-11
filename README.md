@@ -72,8 +72,8 @@ explained or undone from the history, and corruption surfaces as an error rather
   each matching row is read separately unless the index covers the fields it needs.
 - **Very large files.** A reclamation cycle copies everything retained at 1.1 to 3.0 GB/s on eight
   threads, the default on eight cores or more, and 650 MB/s to 2.2 GB/s on four, and needs that much
-  free disk, and a first sync keeps about 40 bytes per object in memory on each side, about 2 GB
-  for 50 million objects.
+  free disk, and a first sync keeps about 5 bytes per object in memory to receive and 7 to send,
+  about 250 and 340 MiB for 50 million objects.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
   measured, and failed syncs and process death are tested on Unix only.
 - **Adversaries.** Hashes are 160-bit and unkeyed, so collision resistance is 2^80, and `head_hash`

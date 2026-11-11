@@ -21,9 +21,14 @@ log's record format, with its links resolved to offsets: to an object sent earli
 the staging, to an anchor or hint, by its offset in the file, or, where a link names something not
 sent, to offset 0 for now. Each record keeps the body it arrived with, its LZ4 bytes or those a body
 that arrived uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing
-is compressed again when it lands. In memory the records sit at offsets of their own, from where a
-log would start, so a link may lead past its record into the file, and every distance is
-zigzagged.
+is compressed again when it lands. In memory the records sit at offsets of their own, from where
+the log ended when the bundle began to arrive, past every object of the file the bundle can name,
+so an offset tells a staged object from one it links in the file and a link leads back from its
+record into the file, and every distance is zigzagged. The offsets grow with
+the order the objects came in, so an offset finds its object's place by halving them, and no table
+from hash to object is kept: a link to a sent object names its place in the bundle, as described
+under [What is sent](sync.md#what-is-sent), and its hash is kept only until the last link the
+bundle says later objects make to it.
 
 Before a record would take the buffer past 1 MiB, the staging moves into the log. It asks for a
 staging frame: under the `tip` mutex, and in a shared file the placement lock, it places a frame
@@ -83,23 +88,25 @@ learns of the swap when it next asks for a frame, and writes the rest of the bun
 the old file, 1 MiB at a time as into staging frames, so that it holds no more of the bundle in
 memory. It first makes the old file as long as where they begin, a block boundary past its end, so
 that the checks, reading a record staged near that end, never read past the end of the file. No
-writer touches the old file again, and its close leaves its length alone: the cycle
-marks the old generation replaced as soon as it has renamed the new one over it, before the receive
-can learn of the swap, so the close truncates nothing whenever it runs, before the receive writes
-past the end, between its writes or after them. Truncating there would gain nothing, since no open
-can reach the old file again and its blocks go back with its last handle. Its landing then finds its
-records outside the current file: it resolves the anchors again in the generation now current, each
-base by hash and version, and each hint by following its path again from the anchors' roots, one
-read per parent object as when it was first resolved, which must end at the same hash, and places
-the records in the new file in pieces of 256 KiB under the cycle mutex, each a frame of its own that
-keeps the refs as they were and whose objects the deduplication table learns, but for the commits,
-before it lands as above. Each record it reads back from the old file is hashed again before it is
-placed, and one that reads as zeroes, as where a write never landed, is named as such, so that no
-object lands whose bytes do not match its hash. Such a bundle is written twice, as every large
-bundle used to be. The staging frames of a receive in flight are
-left out of the growth that makes a background cycle due, so that a receive does not set off the
-cycle that would make it write twice; a cycle due from what other commits wrote runs as before, and
-in a shared file another process counts the frames as growth.
+writer touches the old file again, and its close leaves its length alone: the cycle marks the old
+generation replaced as soon as it has renamed the new one over it, before the receive can learn of
+the swap, so the close truncates nothing whenever it runs, before the receive writes past the end,
+between its writes or after them. Truncating there would gain nothing, since no open can reach the
+old file again and its blocks go back with its last handle. Its landing then finds its records
+outside the current file: it resolves the anchors again in the generation now current, each base by
+hash and version, and each hint by following its path again from the anchors' roots, one read per
+parent object as when it was first resolved, which must end at the same hash, and places the records
+in the new file in pieces of 256 KiB under the cycle mutex, each a frame of its own that keeps the
+refs as they were and whose objects the deduplication table learns, but for the commits, before it
+lands as above. Each record it reads back from the old file is hashed again before it is placed,
+every link it makes to an earlier record must name the hash that record was read back as, and the
+last must hash as the head the bundle names, and a record that reads as zeroes, as where a write
+never landed, is named as such, so that no object lands whose bytes do not match its hash. The
+receive keeps those hashes while it places, 20 bytes an object. Such a bundle is written twice, as
+every large bundle used to be. The staging frames of a receive in flight are left out of the growth
+that makes a background cycle due, so that a receive does not set off the cycle that would make it
+write twice; a cycle due from what other commits wrote runs as before, and in a shared file another
+process counts the frames as growth.
 
 Until the landing frame is durable, nothing names the staged objects. Readers bound every offset by
 the published end of the log, and the staging frames keep the previous refs, so a crash anywhere
@@ -150,17 +157,17 @@ the disk stored as zeroes was refused in place and after a cycle, and one with a
 the end of a replaced file was refused before anything landed.
 
 The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written, the object being
-read, and for each object its hash, its offset in the staging and a count of the links to it, about
-38 bytes an object, as described under [Memory for each object](sync.md#memory-for-each-object). A
-bundle that lands where it is needs nothing more, since the offsets in the staging are those in the
-log; one that a cycle moved holds each object's offset in the new file beside them, 8 bytes an
-object more. When the staging moves into the log, the buffer it leaves and the frame it fills are
-both held for a moment, 1 MiB more. An object is held whole, about four times over while it is
-read, compressed again if it arrived uncompressed, as described under [Applying](sync.md#applying),
-hashed and copied, so the largest value sent bounds memory too. A hostile stream gets no more: 48
-distinct objects of 1 MiB took 2.1 MiB of heap and never landed. A 33 MB stream of 4,549 objects
-took 1.66 MB, where the frame it used to fill took 2.80 MB, and 256 commits with 64 KiB messages,
-17 MB, took 2.2 MB.
+read, and for each object its offset in the staging and the count of links to it, about 5 bytes an
+object, with the hash of each object that a link still to arrive names, as described under [Memory
+for each object](sync.md#memory-for-each-object). A bundle that lands where it is needs nothing
+more, since the offsets in the staging are those in the log; one that a cycle moved holds each
+object's offset in the new file and its hash beside them, 28 bytes an object more. When the staging
+moves into the log, the buffer it leaves and the frame it fills are both held for a moment, 1 MiB
+more. An object is held whole, about four times over while it is read, compressed again if it
+arrived uncompressed, as described under [Applying](sync.md#applying), hashed and copied, so the
+largest value sent bounds memory too. A hostile stream gets no more: 48 distinct objects of 1 MiB
+took 2.4 MiB of heap and never landed. A 33 MB stream of 4,549 objects took 2.7 MB, and 256 commits
+with 64 KiB messages, 17 MB, took 3.3 MB.
 
 ### Staging in the log, measured
 

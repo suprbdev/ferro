@@ -113,7 +113,7 @@ pub struct Parsed {
 impl Parsed {
     pub fn of(bytes: &[u8]) -> Option<Parsed> {
         let mut r = Reader { bytes, pos: 0 };
-        if r.take(8)? != MAGIC || r.take(1)? != [1] {
+        if r.take(8)? != MAGIC || r.take(1)? != [2] {
             return None;
         }
         let tip = match r.take(1)?[0] {
@@ -133,7 +133,8 @@ impl Parsed {
         for _ in 0..r.varint()? {
             hints.push((r.varint()?, r.varint()?));
         }
-        let mut objects = Vec::new();
+        let held = (roots.len() + hints.len()) as u64;
+        let mut objects: Vec<Wire> = Vec::new();
         for _ in 0..r.varint()? {
             let flagged = r.varint()?;
             let stored = usize::try_from(flagged >> 1).ok()?;
@@ -145,8 +146,16 @@ impl Parsed {
             };
             let mut links = Vec::new();
             for _ in 0..r.varint()? {
-                links.push((r.hash()?, r.varint()?));
+                let reference = r.varint()?;
+                links.push(match reference.checked_sub(held + 1) {
+                    Some(back) => {
+                        let at = objects.len().checked_sub(1 + usize::try_from(back).ok()?)?;
+                        (objects[at].hash(), 0)
+                    }
+                    None => (r.hash()?, reference),
+                });
             }
+            r.varint()?;
             objects.push(Wire { body, links });
         }
         if r.pos != bytes.len() {
@@ -164,7 +173,7 @@ impl Parsed {
 
     pub fn encode(&self, pack: u8) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
-        out.push(1);
+        out.push(2);
         match self.tip {
             Some((hash, version)) => {
                 out.push(1);
@@ -188,7 +197,18 @@ impl Parsed {
             varint(&mut out, *index);
         }
         varint(&mut out, self.count.unwrap_or(self.objects.len() as u64));
-        for object in &self.objects {
+        let held = (self.roots.len() + self.hints.len()) as u64;
+        let hashes: Vec<Hash> = self.objects.iter().map(Wire::hash).collect();
+        let earlier = |at: usize, hash: &Hash| hashes[..at].iter().rposition(|seen| seen == hash);
+        let mut uses = vec![0u64; hashes.len()];
+        for (at, object) in self.objects.iter().enumerate() {
+            for (hash, reference) in &object.links {
+                if let (0, Some(target)) = (*reference, earlier(at, hash)) {
+                    uses[target] += 1;
+                }
+            }
+        }
+        for (at, object) in self.objects.iter().enumerate() {
             let raw = object.body.len();
             let packed = (pack & (PACK_SMART | PACK_ALWAYS) != 0 && raw >= COMPRESS_MIN)
                 .then(|| lz4_flex::block::compress(&object.body))
@@ -208,9 +228,15 @@ impl Parsed {
             }
             varint(&mut out, object.links.len() as u64);
             for (hash, reference) in &object.links {
-                out.extend_from_slice(hash);
-                varint(&mut out, *reference);
+                match (*reference, earlier(at, hash)) {
+                    (0, Some(target)) => varint(&mut out, held + (at - target) as u64),
+                    _ => {
+                        varint(&mut out, *reference);
+                        out.extend_from_slice(hash);
+                    }
+                }
             }
+            varint(&mut out, uses[at]);
         }
         out
     }

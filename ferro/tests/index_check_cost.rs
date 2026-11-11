@@ -238,7 +238,7 @@ fn entry(root: &Object, version: u64, prev: Ptr) -> Object {
 
 fn bundle(tip: &Object, base: [u8; 20], objects: &[(&Object, &[u64])]) -> Bundle {
     let mut out = b"FERROBDL".to_vec();
-    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&[2, 1]);
     out.extend_from_slice(&tip.hash());
     varint(&mut out, 2);
     varint(&mut out, 1);
@@ -247,14 +247,33 @@ fn bundle(tip: &Object, base: [u8; 20], objects: &[(&Object, &[u64])]) -> Bundle
     varint(&mut out, 0);
     varint(&mut out, 0);
     varint(&mut out, objects.len() as u64);
-    for (object, references) in objects {
+    let mut sent: Vec<[u8; 20]> = Vec::new();
+    let mut uses = vec![0u64; objects.len()];
+    for (at, (object, references)) in objects.iter().enumerate() {
+        for (linked, reference) in object.links.iter().zip(references.iter()) {
+            let earlier = objects[..at]
+                .iter()
+                .rposition(|(earlier, _)| earlier.hash() == linked.hash);
+            if let (Some(target), 0) = (earlier, *reference) {
+                uses[target] += 1;
+            }
+        }
+    }
+    for (at, (object, references)) in objects.iter().enumerate() {
         varint(&mut out, (object.body.len() as u64) << 1);
         out.extend_from_slice(&object.body);
         varint(&mut out, object.links.len() as u64);
         for (linked, reference) in object.links.iter().zip(references.iter()) {
-            out.extend_from_slice(&linked.hash);
-            varint(&mut out, *reference);
+            match sent.iter().rposition(|earlier| *earlier == linked.hash) {
+                Some(at) if *reference == 0 => varint(&mut out, (sent.len() - at) as u64),
+                _ => {
+                    varint(&mut out, *reference);
+                    out.extend_from_slice(&linked.hash);
+                }
+            }
         }
+        varint(&mut out, uses[at]);
+        sent.push(object.hash());
     }
     Bundle::from(out)
 }

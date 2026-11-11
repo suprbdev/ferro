@@ -243,9 +243,9 @@ impl Parsed {
         assert_eq!(r.take(1), [1]);
         let tip = (r.hash(), r.varint());
         let bases = (0..r.varint()).map(|_| (r.hash(), r.varint())).collect();
-        let roots = (0..r.varint()).map(|_| r.varint()).collect();
-        let hints = (0..r.varint()).map(|_| (r.varint(), r.varint())).collect();
-        let mut objects = Vec::new();
+        let roots: Vec<u64> = (0..r.varint()).map(|_| r.varint()).collect();
+        let hints: Vec<(u64, u64)> = (0..r.varint()).map(|_| (r.varint(), r.varint())).collect();
+        let mut objects: Vec<Wire> = Vec::new();
         for _ in 0..r.varint() {
             let flagged = r.varint();
             let stored = (flagged >> 1) as usize;
@@ -255,7 +255,16 @@ impl Parsed {
             } else {
                 r.take(stored).to_vec()
             };
-            let links = (0..r.varint()).map(|_| (r.hash(), r.varint())).collect();
+            let held = (roots.len() + hints.len()) as u64;
+            let mut links = Vec::new();
+            for _ in 0..r.varint() {
+                let reference = r.varint();
+                links.push(match reference.checked_sub(held + 1) {
+                    Some(back) => (objects[objects.len() - 1 - back as usize].hash(), 0),
+                    None => (r.hash(), reference),
+                });
+            }
+            r.varint();
             objects.push(Wire { body, links });
         }
         assert_eq!(r.pos, r.bytes.len());
@@ -270,7 +279,7 @@ impl Parsed {
 
     fn encode(&self) -> Bundle {
         let mut out = b"FERROBDL".to_vec();
-        out.extend_from_slice(&[1, 1]);
+        out.extend_from_slice(&[2, 1]);
         out.extend_from_slice(&self.tip.0);
         varint(&mut out, self.tip.1);
         varint(&mut out, self.bases.len() as u64);
@@ -288,14 +297,36 @@ impl Parsed {
             varint(&mut out, *index);
         }
         varint(&mut out, self.objects.len() as u64);
-        for object in &self.objects {
+        let held = (self.roots.len() + self.hints.len()) as u64;
+        let hashes: Vec<Hash> = self.objects.iter().map(Wire::hash).collect();
+        let mut uses = vec![0u64; hashes.len()];
+        for (at, object) in self.objects.iter().enumerate() {
+            for (hash, reference) in &object.links {
+                if *reference == 0
+                    && let Some(target) = hashes[..at].iter().rposition(|earlier| earlier == hash)
+                {
+                    uses[target] += 1;
+                }
+            }
+        }
+        let mut sent: Vec<Hash> = Vec::new();
+        for (at, object) in self.objects.iter().enumerate() {
             varint(&mut out, (object.body.len() as u64) << 1);
             out.extend_from_slice(&object.body);
             varint(&mut out, object.links.len() as u64);
             for (hash, reference) in &object.links {
-                out.extend_from_slice(hash);
-                varint(&mut out, *reference);
+                match sent.iter().rposition(|earlier| earlier == hash) {
+                    Some(at) if *reference == 0 => {
+                        varint(&mut out, held + (sent.len() - at) as u64)
+                    }
+                    _ => {
+                        varint(&mut out, *reference);
+                        out.extend_from_slice(hash);
+                    }
+                }
             }
+            varint(&mut out, uses[at]);
+            sent.push(hashes[at]);
         }
         Bundle::from(out)
     }

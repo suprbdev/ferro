@@ -54,7 +54,7 @@ use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
     Staged, hash_parts, push_varint,
 };
-use crate::dense::{Column, Hashes};
+use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
 use crate::map::SPILL_BYTES;
 use crate::platform::{self, FileExt};
@@ -2533,8 +2533,8 @@ impl View {
         Ok(())
     }
 
-    /// The object with `ptr`'s hash in the staging lent to the view, or `None` if none is lent or
-    /// it holds no such object.
+    /// The object `ptr` leads to in the staging lent to the view, or `None` if none is lent or
+    /// `ptr` leads to none of its objects.
     fn staged(&self, ptr: Ptr) -> Option<Result<Object>> {
         let lent = self.lent.read();
         let staging = lent.load(Ordering::Relaxed);
@@ -2548,11 +2548,8 @@ impl View {
         // and nothing writes through the pointer. `Staging` is `Sync`, which `overlaid` requires,
         // so the shared borrow may be used on any thread.
         let staging = unsafe { &*staging };
-        let at = staging.id_of(&ptr.hash)?;
-        Some(staging.read_object(Ptr {
-            hash: ptr.hash,
-            offset: staging.offset(at),
-        }))
+        staging.find(ptr)?;
+        Some(staging.read_object(ptr))
     }
 }
 
@@ -4223,16 +4220,6 @@ impl Store {
         }
     }
 
-    /// [`Store::read_object`], with the record's compressed body if it has one, for a sync to send
-    /// as it is.
-    pub(crate) fn read_packed(&self, ptr: Ptr) -> Result<(Object, Option<Vec<u8>>)> {
-        let tail = self.readable_past(ptr.offset)?;
-        let file = Some(&*self.inner.file);
-        let (object, _, packed) =
-            Store::read_within(file, ptr, tail, &[], true, true, None, false)?;
-        Ok((object, packed))
-    }
-
     /// Reads the record at `ptr` into `bytes` as it is stored, without decompressing it or checking
     /// its hash, fills `links`, and returns the record's bytes and where its parts sit.
     ///
@@ -4321,6 +4308,44 @@ impl Store {
             payload,
             len: reader.pos,
         })
+    }
+
+    /// The object at `offset`, with the record's compressed body if it has one, for a sync to send
+    /// as it is. Its hash is not checked, since the caller does not know it.
+    pub(crate) fn read_packed_at(&self, offset: u64) -> Result<(Object, Option<Vec<u8>>)> {
+        let tail = self.readable_past(offset)?;
+        let file = Some(&*self.inner.file);
+        let ptr = Ptr {
+            hash: [0; HASH_BYTES],
+            offset,
+        };
+        let (object, _, packed) =
+            Store::read_within(file, ptr, tail, &[], false, true, None, false)?;
+        Ok((object, packed))
+    }
+
+    /// Reads the log from `at` to `end`, or to where it can be read if that is sooner, into `out`,
+    /// for a pass that parses the records there with [`stored_within`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] where the log cannot be read, and the I/O error of a failed read.
+    pub(crate) fn read_span(&self, at: u64, end: u64, out: &mut Vec<u8>) -> Result<()> {
+        let end = end.min(self.readable_past(at)?);
+        let len = end.saturating_sub(at) as usize;
+        out.clear();
+        out.reserve_exact(len);
+        out.resize(len, 0);
+        self.inner.file.read_exact_at(out, at)?;
+        Ok(())
+    }
+
+    /// Whether the record at `ptr`'s offset holds the object `ptr`'s hash names.
+    pub(crate) fn holds(&self, ptr: Ptr) -> Result<bool> {
+        let tail = self.readable_past(ptr.offset)?;
+        let file = Some(&*self.inner.file);
+        let (object, _, _) = Store::read_within(file, ptr, tail, &[], false, false, None, false)?;
+        Ok(object.hash() == ptr.hash)
     }
 
     /// The links of the record at `ptr`, read without decompressing its body or checking its hash.
@@ -5607,13 +5632,15 @@ pub(crate) type Room<'a> = dyn FnMut(u64) -> Result<Option<(u64, u64)>> + 'a;
 ///
 /// Each record is in the log's record format, with its links resolved to offsets, within the
 /// staging for objects sent earlier in the bundle. Each object gets a `u32` id in the order it was
-/// put, with its offset beside it. In memory, offsets start at [`LOG_START`], as in a log of their
-/// own, so a link may lead past its record into the file, and every distance is zigzagged. Once
-/// the records outgrow `limit` they move into staging frames, placed at the end of the log as
-/// they fill by a [`Room`], where offsets are the log's and every link leads back, so the zigzag
-/// of each distance is the varint a log record holds. If a cycle replaces the file meanwhile, the
-/// rest go past the end of the replaced file, which no other writer touches again, written out
-/// whenever [`STAGED_ROOM`] of them wait in memory.
+/// put, with its offset beside it, and its offsets grow with its ids, so an offset finds its id by
+/// halving. Hashes are kept only while the records are all in memory, and for the last
+/// [`STAGED_LEARNED`] objects, so no table from hash to id is kept. In memory, offsets start where
+/// the log ended when the staging began, past every object of the file a bundle can name, so a
+/// link leads back from its record into the file, and every distance is zigzagged. Once the records outgrow `limit` they move into staging
+/// frames, placed at the end of the log as they fill by a [`Room`], where offsets are the log's
+/// and every link leads back, so the zigzag of each distance is the varint a log record holds. If a
+/// cycle replaces the file meanwhile, the rest go past the end of the replaced file, which no other
+/// writer touches again, written out whenever [`STAGED_ROOM`] of them wait in memory.
 pub(crate) struct Staging {
     store: Store,
     limit: usize,
@@ -5621,8 +5648,11 @@ pub(crate) struct Staging {
     /// Where the records still in `buf` begin, past those already written.
     start: u64,
     buf: Vec<u8>,
-    hashes: Hashes,
-    offsets: Column<u64>,
+    /// The hash of every object, while the records are all in memory.
+    hashes: Option<Column<Hash>>,
+    /// The hashes of the last [`STAGED_LEARNED`] objects, once the records are in the log.
+    recent: VecDeque<Hash>,
+    offsets: Ascending,
 }
 
 /// Where a staging that outgrew memory writes its records.
@@ -5670,6 +5700,26 @@ impl Record {
     /// [`Error::Corrupt`] for a body that does not decompress or an object whose hash differs,
     /// saying so when the record reads as zeroes, as where a write never landed.
     fn check(&self, at: u64, body: &mut Vec<u8>) -> Result<()> {
+        if self.hash_of(at, body)? == self.hash {
+            return Ok(());
+        }
+        if !self.packed && self.payload.is_empty() && self.links.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "the staged record at {at} reads as zeroes"
+            )));
+        }
+        Err(Error::Corrupt(format!(
+            "hash mismatch for the staged object at {at}"
+        )))
+    }
+
+    /// The hash of the object the record holds, decompressing its body into `body` if it is
+    /// compressed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] for a body that does not decompress.
+    fn hash_of(&self, at: u64, body: &mut Vec<u8>) -> Result<Hash> {
         let held = match self.packed {
             true => {
                 let most = self.payload.len().saturating_mul(MAX_RATIO);
@@ -5683,18 +5733,17 @@ impl Record {
             }
             false => &self.payload[..],
         };
-        if hash_parts(held, self.links.iter().map(|link| &link.hash)) == self.hash {
-            return Ok(());
-        }
-        if !self.packed && self.payload.is_empty() && self.links.is_empty() {
-            return Err(Error::Corrupt(format!(
-                "the staged record at {at} reads as zeroes"
-            )));
-        }
-        Err(Error::Corrupt(format!(
-            "hash mismatch for the staged object at {at}"
-        )))
+        Ok(hash_parts(held, self.links.iter().map(|link| &link.hash)))
     }
+}
+
+/// The error for the staged record at `at`, read back as the object with `hash`, where a link or
+/// the bundle's head names another.
+fn unlike(at: u64, hash: Hash) -> Error {
+    if hash == hash_parts(&[], std::iter::empty()) {
+        return Error::Corrupt(format!("the staged record at {at} reads as zeroes"));
+    }
+    Error::Corrupt(format!("hash mismatch for the staged object at {at}"))
 }
 
 /// Reads a varint at `pos` in `bytes`, or `None` if it runs past them, failing with
@@ -5784,18 +5833,17 @@ impl Staging {
             store: store.clone(),
             limit,
             log: None,
-            start: LOG_START,
+            start: store.inner.placed.load(Ordering::Acquire),
             buf: Vec::new(),
-            hashes: Hashes::new(),
-            offsets: Column::new(),
+            hashes: Some(Column::new()),
+            recent: VecDeque::new(),
+            offsets: Ascending::new(),
         }
     }
 
     /// Adds the record of `staged` behind `hash` and returns the object's id, moving the records
     /// into the log first if this one could take them past the limit, and asking `room` for a
     /// staging frame whenever the one being filled cannot hold it.
-    ///
-    /// The caller must know that `hash` is not staged yet, as [`Hashes::insert`] requires.
     ///
     /// # Errors
     ///
@@ -5823,21 +5871,37 @@ impl Staging {
         if self.log.is_some() {
             self.make_room(most, room)?;
         }
-        let id = self.hashes.insert(hash).ok_or_else(|| {
-            Error::Bundle("it carries more objects than one receive can hold".into())
-        })?;
+        let id = u32::try_from(self.offsets.len())
+            .ok()
+            .filter(|id| *id < u32::MAX)
+            .ok_or_else(|| {
+                Error::Bundle("it carries more objects than one receive can hold".into())
+            })?;
         let offset = self.start + self.buf.len() as u64;
         append_staged(&mut self.buf, offset, staged);
+        match &mut self.hashes {
+            Some(hashes) => hashes.push(hash),
+            None => {
+                if self.recent.len() == STAGED_LEARNED {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(hash);
+            }
+        }
         self.offsets.push(offset);
         Ok(id)
     }
 
     /// Moves the records held in memory into staging frames, linking each record to the new
     /// offsets of those before it, and returns the offsets they had.
-    fn spill(&mut self, room: &mut Room<'_>) -> Result<Column<u64>> {
+    fn spill(&mut self, room: &mut Room<'_>) -> Result<Ascending> {
         let held = mem::take(&mut self.buf);
-        let was = mem::replace(&mut self.offsets, Column::new());
-        let base = self.start;
+        let was = mem::replace(&mut self.offsets, Ascending::new());
+        let base = mem::replace(&mut self.start, LOG_START);
+        let hashes = self.hashes.take().unwrap_or_else(Column::new);
+        let kept = hashes.len().saturating_sub(STAGED_LEARNED)..hashes.len();
+        self.recent.reserve_exact(STAGED_LEARNED);
+        self.recent.extend(kept.map(|id| hashes.get(id as u32)));
         self.log = Some(Logged {
             room: 0,
             frames: Vec::new(),
@@ -5845,7 +5909,7 @@ impl Staging {
         });
         for id in 0..was.len() as u32 {
             let at = was.get(id);
-            let hash = self.hashes.hash(id);
+            let hash = hashes.get(id);
             let (record, _) = parse_record(&held[(at - base) as usize..], at, hash)?
                 .ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
             let links = self.moved_links(&record.links, &was, id);
@@ -5860,11 +5924,11 @@ impl Staging {
 
     /// `links`, with each link to an object put before the id `before`, at the offset `was` gave
     /// it, moved to the offset it has now.
-    fn moved_links(&self, links: &[Ptr], was: &Column<u64>, before: u32) -> Vec<Ptr> {
+    fn moved_links(&self, links: &[Ptr], was: &Ascending, before: u32) -> Vec<Ptr> {
         links
             .iter()
-            .map(|link| match self.hashes.find(&link.hash) {
-                Some(target) if target < before && was.get(target) == link.offset => Ptr {
+            .map(|link| match was.position(link.offset) {
+                Some(target) if target < before => Ptr {
                     hash: link.hash,
                     offset: self.offsets.get(target),
                 },
@@ -5928,33 +5992,35 @@ impl Staging {
         Ok(())
     }
 
-    /// The id of the object with `hash`.
-    pub(crate) fn id_of(&self, hash: &Hash) -> Option<u32> {
-        self.hashes.find(hash)
+    /// The number of objects put.
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len()
     }
 
-    /// The offset in the staging of the object with the id `id`.
+    /// The id of the object `ptr` leads to, if it leads to one in the staging.
+    pub(crate) fn find(&self, ptr: Ptr) -> Option<u32> {
+        self.offsets.position(ptr.offset)
+    }
+
+    /// The hash of the last object put, if any was.
+    pub(crate) fn last(&self) -> Option<Hash> {
+        match &self.hashes {
+            Some(hashes) => hashes
+                .len()
+                .checked_sub(1)
+                .map(|last| hashes.get(last as u32)),
+            None => self.recent.back().copied(),
+        }
+    }
+
+    /// The offset in the staging of the object with the id `id`: in the log, once the staging is
+    /// in staging frames.
     ///
     /// # Panics
     ///
     /// If no object has that id.
     pub(crate) fn offset(&self, id: u32) -> u64 {
         self.offsets.get(id)
-    }
-
-    /// The offset in the staging of the object with `hash`.
-    pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
-        self.id_of(hash).map(|id| self.offset(id))
-    }
-
-    /// The offset of every object, by id: in the log, once the staging is in staging frames.
-    pub(crate) fn offsets(&self) -> &Column<u64> {
-        &self.offsets
-    }
-
-    /// The table of every object's hash and id.
-    pub(crate) fn hashes(&self) -> &Hashes {
-        &self.hashes
     }
 
     /// Whether the records went into the log.
@@ -5992,10 +6058,10 @@ impl Staging {
         Ok(object)
     }
 
-    /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`], by hash.
+    /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`].
     ///
-    /// While `f` runs, a read through `view` takes an object staged here with the hash it asks
-    /// for, wherever its pointer leads, and reads anything else from the file, on whatever thread
+    /// While `f` runs, a read through `view` of a pointer that leads to an object staged here,
+    /// with its hash, takes that object, and reads anything else from the file, on whatever thread
     /// it reads. The links of a staged object lead into the staging, and the view caches nothing,
     /// so what it decodes from one stays with whatever read it. No other store sees the staging,
     /// and no read through `view` once `f` returns or unwinds, which waits for the reads of the
@@ -6054,14 +6120,11 @@ impl Staging {
     /// [`STAGED_LEARNED`] of them, but for the ids in `commits`, sorted, which may still link a
     /// parent at offset 0. Once it has, the staging must never be discarded.
     pub(crate) fn learn(&self, commits: &[u32]) {
-        let count = self.offsets.len();
-        for id in count.saturating_sub(STAGED_LEARNED)..count {
-            let id = id as u32;
+        let first = self.offsets.len() - self.recent.len();
+        for (at, hash) in self.recent.iter().enumerate() {
+            let id = (first + at) as u32;
             if commits.binary_search(&id).is_err() {
-                self.store
-                    .inner
-                    .dedupe
-                    .insert(self.hashes.hash(id), self.offsets.get(id));
+                self.store.inner.dedupe.insert(*hash, self.offsets.get(id));
             }
         }
     }
@@ -6091,6 +6154,7 @@ impl Staging {
             window: Vec::new(),
             window_at: LOG_START,
             body: Vec::new(),
+            hashes: Column::new(),
         }
     }
 }
@@ -6115,6 +6179,8 @@ pub(crate) struct Replay<'a> {
     window_at: u64,
     /// The scratch body a compressed record read from the file decompresses into for its check.
     body: Vec<u8>,
+    /// The hash of each record replayed, where the staging no longer holds them.
+    hashes: Column<Hash>,
 }
 
 impl Replay<'_> {
@@ -6135,7 +6201,8 @@ impl Replay<'_> {
             return Ok(None);
         }
         let at = staging.offsets.get(self.next);
-        let hash = staging.hashes.hash(self.next);
+        let known = staging.hashes.as_ref().map(|hashes| hashes.get(self.next));
+        let hash = known.unwrap_or([0; HASH_BYTES]);
         let (parsed, written) = match at.checked_sub(staging.start) {
             Some(from) => (
                 parse_record(&staging.buf[from as usize..], at, hash)?,
@@ -6143,9 +6210,27 @@ impl Replay<'_> {
             ),
             None => (self.written_record(at, hash)?, true),
         };
-        let (record, _) =
+        let (mut record, _) =
             parsed.ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
-        if written {
+        if known.is_none() {
+            let hashed = record.hash_of(at, &mut self.body);
+            self.body.clear();
+            self.body.shrink_to(SCRATCH_KEEP);
+            record.hash = hashed?;
+            for link in &record.links {
+                if let Some(target) = staging.offsets.position(link.offset)
+                    && target < self.next
+                    && self.hashes.get(target) != link.hash
+                {
+                    return Err(unlike(staging.offsets.get(target), self.hashes.get(target)));
+                }
+            }
+            let last = self.next as usize + 1 == staging.offsets.len();
+            if last && staging.last() != Some(record.hash) {
+                return Err(unlike(at, record.hash));
+            }
+            self.hashes.push(record.hash);
+        } else if written {
             let checked = record.check(at, &mut self.body);
             self.body.clear();
             self.body.shrink_to(SCRATCH_KEEP);

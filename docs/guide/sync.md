@@ -101,9 +101,9 @@ the bundle takes the writer locks, and it checks again that the commits the bund
 still here. A damaged or forged bundle is rejected with `Error::Bundle` and nothing it carries is
 ever linked, except that damage to the part that names the commit it builds on reads as
 `Error::StaleHave`, described below. Either way, fetch a fresh bundle. `receive` uses a fixed
-buffer, the object it is reading and about 40 bytes for each object the bundle carries, not memory
-for its bytes or for what it claims, and refuses commits dated more than a day past this machine's
-clock.
+buffer, the object it is reading and about 5 bytes for each object the bundle carries, with the
+hash of each object a later one still links, not memory for its bytes or for what it claims, and
+refuses commits dated more than a day past this machine's clock.
 
 ## When the other side has moved
 
@@ -149,21 +149,23 @@ cargo run --release -p notes --bin notes-scale
 
 ## Limits
 
-Sync streams, but keeps about 40 bytes per object received and 45 per object sent, so a clone of 50
-million objects needs about 2 GB on each side. A pull that changes many scattered keys costs about
-140 bytes more on the receiver for each unchanged node next to a changed one, which the bundle names
-so that the new tree can link it. Each object is held whole, so one huge value needs a few times its
-size. A bundle over 1 MiB is written into the file once, as it arrives, in frames that nothing
-links until it lands. One refused after that, for any reason, gives back on Linux the disk its
-objects took at once, but its frames stay in the log, with the file's length, until the writer
-closes, if nothing was written after them, or until the next reclamation cycle, one for each
-attempt; elsewhere its objects stay too. So does a bundle that a crash interrupts, unless its frames
-end the log, which the next open drops. A reclamation cycle that replaces the file while a bundle
-arrives makes `receive` copy what arrived into the new file before it lands, writing it twice. A
-large `receive` syncs once before it lands, even under `Durability::Buffered`, and a commit beside
-it under `Durability::Fsync` waits for the bundle's writeback in its own sync: 0.68 ms at the
-median beside a 1 GB receive, against 0.41 when bundles were staged in a scratch file. Files that
-share no commit send everything on their first pull.
+Sync streams, and a first pull keeps about 5 bytes per object received and 7 per object sent, so a
+clone of 50 million objects needs about 250 MiB to receive and 340 MiB to send, and about 240 and
+100 bytes more for each commit. A pull into a file that shares history with the sender keeps 20 to
+40 bytes per object sent, and one that changes many scattered keys costs about 140 bytes more on the
+receiver for each unchanged node next to a changed one, which the bundle names so that the new tree
+can link it. An object the sending file holds twice is sent twice in a first pull. Each object is
+held whole, so one huge value needs a few times its size. A bundle over 1 MiB is written into the
+file once, as it arrives, in frames that nothing links until it lands. One refused after that, for
+any reason, gives back on Linux the disk its objects took at once, but its frames stay in the log,
+with the file's length, until the writer closes, if nothing was written after them, or until the
+next reclamation cycle, one for each attempt; elsewhere its objects stay too. So does a bundle that
+a crash interrupts, unless its frames end the log, which the next open drops. A reclamation cycle
+that replaces the file while a bundle arrives makes `receive` copy what arrived into the new file
+before it lands, writing it twice. A large `receive` syncs once before it lands, even under
+`Durability::Buffered`, and a commit beside it under `Durability::Fsync` waits for the bundle's
+writeback in its own sync: 0.68 ms at the median beside a 1 GB receive, against 0.41 when bundles
+were staged in a scratch file. Files that share no commit send everything on their first pull.
 
 Peers need the same `Summary` of each map, and the receiving side must declare every index of a
 table that the sending side's tables hold. When a table gains an index, or an index changes kind or
