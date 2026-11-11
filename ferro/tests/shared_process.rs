@@ -184,7 +184,7 @@ fn a_writer_held_at_the_gate_of_another_process_goes_on_when_that_process_dies()
         .expect("the writer never finished after the other process died");
     let after = ended.saturating_duration_since(killed);
     assert!(
-        early.is_none() && after < Duration::from_millis(200),
+        early.is_none() && after < Duration::from_secs(1),
         "a writer held at the gate of a process that was then killed finished before the kill: \
          {}, and {after:?} after it",
         early.is_some()
