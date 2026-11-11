@@ -34,7 +34,7 @@ use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
 use crate::map::Map;
 use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
-use crate::store::{Record, Room, Staging, Store, Txn, compressed, staged};
+use crate::store::{Record, Room, Staging, Store, Together, Txn, compressed, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
 const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
@@ -2916,6 +2916,7 @@ struct Received {
 
 struct Arrival {
     landed: Option<Option<Crossing>>,
+    together: Option<Together>,
     objects: u64,
     received_bytes: u64,
 }
@@ -3854,6 +3855,7 @@ impl<T: Data> Db<T> {
         };
         let received_bytes = input.read;
         drop(input);
+        let mut bound = None;
         let landed = match received {
             Some(received) => {
                 let ours = match self.entering(Needs::Every) {
@@ -3863,6 +3865,7 @@ impl<T: Data> Db<T> {
                         return Err(error);
                     }
                 };
+                bound = self.published_refs().0.together();
                 self.land_staged(remote, &header, received)?;
                 Some(ours)
             }
@@ -3870,6 +3873,7 @@ impl<T: Data> Db<T> {
         };
         Ok(Arrival {
             landed,
+            together: bound,
             objects: header.count,
             received_bytes,
         })
@@ -3882,7 +3886,7 @@ impl<T: Data> Db<T> {
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
     ) -> std::result::Result<Pulled<R>, E> {
         let (outcome, value) = match arrival.landed {
-            Some(_ours) => self.integrate(remote, merge)?,
+            Some(_ours) => self.integrate(remote, merge, arrival.together)?,
             None => (Outcome::UpToDate, None),
         };
         Ok(Pulled {
@@ -4083,10 +4087,15 @@ impl<T: Data> Db<T> {
         }
     }
 
+    /// Brings this branch up to the landed `remote`, as [`Db::pull`] describes.
+    ///
+    /// `together` binds the landing's hold of the gate to the decision's, and is let go once the
+    /// decision is made, before `merge` runs.
     fn integrate<R, S: Into<String>, E: From<Error>>(
         &self,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
+        together: Option<Together>,
     ) -> std::result::Result<(Outcome, Option<R>), E> {
         let name = self.branch_name().to_string();
         let decision = self.rewrite_refs(|store, _, refs| {
@@ -4108,6 +4117,7 @@ impl<T: Data> Db<T> {
             let pruned = self.keep_last(store, &mut next, &[&name, remote])?;
             Ok(((changed.is_some() || pruned).then_some(next), decision))
         })?;
+        drop(together);
         let outcome = match decision {
             Decision::UpToDate => Outcome::UpToDate,
             Decision::Ahead => Outcome::Ahead,

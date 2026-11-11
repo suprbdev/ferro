@@ -21,6 +21,8 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the landing of a large `receive` |
 | 2^62 + 5, gate | Exclusive, while a thread wants or holds every branch lock | Letting one thread of the machine at a time want them |
+| 2^62 + 7, door | Exclusive, while a thread that wants the gate draws a turn | Handing out turns one at a time |
+| 2^62 + 2^19 and every other byte of the 2,048 from there, turn | Exclusive, one per open queued for the gate, from its draw until its hold ends | Letting opens take the gate in the order they drew |
 | 2^62 + 3 · 2^18 and every other byte of the 2,048 from there, phase | Exclusive, one at a time, by the gate's holder, from one drawn at random to the next at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
 
@@ -30,8 +32,8 @@ process, and hold the gate and a phase byte while they try for them and hold the
 gate](#the-gate) describes.
 Locks are taken in the order lane, branch lock, `tip`, placement lock, and the leader of a sync
 takes the superblock lock holding none of them. A writer passes the gate before its lane, holding
-no lock of the file, and the whole range is taken after every lane and the gate. The cycle lock
-comes before all of them.
+no lock of the file, and the whole range is taken after every lane and the gate, and the gate
+after a place in its handle's line and a turn. The cycle lock comes before all of them.
 
 The byte-range locks are open file description locks, `fcntl` with `F_OFD_SETLK` and
 `F_OFD_SETLKW`, which only Linux has, on 64-bit targets where `off_t` holds the offsets. Classic
@@ -110,7 +112,7 @@ prune, holds a gate that keeps writers from taking new branch locks while it wai
 adds has to end, because a closure can wait for another thread's write in a way ferro cannot see:
 by joining a thread that commits, by polling an awaited commit on another thread, or through a
 channel, and that write may go through any handle of the file, the waiting thread's own included.
-The gate promises five things:
+The gate promises six things:
 
 1. No cycle of waits that ferro can see lasts.
 2. A write that a closure waits for waits at the gate for at most two rounds of the hold, as below,
@@ -121,13 +123,18 @@ The gate promises five things:
    second.
 4. Without `shared` none of it runs, and lanes behave and cost what they did.
 5. A writer that finds the gate free pays one relaxed load and one `fcntl`.
+6. Threads that want every branch lock get the gate in the order they asked for it, so none waits
+   for more than the holds of those ahead of it, and a pull's landing and integration hold it one
+   after the other.
 
 The thread that wants every branch lock, the holder, first takes the gate byte, 2^62 + 5, exclusive,
-waiting in the kernel while another process holds it, and through the table of [One owner per lock
-in a process](#one-owner-per-lock-in-a-process) while another of its threads does, so one thread
-of the machine holds the gate of a file at a time. If it had to wait for the gate it waits 1 ms
-more, the longest sleep of a writer between tests of its phase byte, so that the writers the last
-hold let on take their branch bytes before this hold tries for them. It then holds one of 1,024
+through the table of [One owner per lock in a process](#one-owner-per-lock-in-a-process), so one
+thread of the machine holds the gate of a file at a time. It queues for it in the order it came,
+as [Takers in turn](#takers-in-turn) describes: in a line of the threads of its handle that want
+it, and then by a turn among the opens of the file that want it. If it had to wait, in its line,
+for a turn or for the gate byte, it waits 1 ms more, the longest sleep of a writer between tests
+of its phase byte, so that the writers the last hold let on take their branch bytes before this
+hold tries for them. It then holds one of 1,024
 phase bytes, every other byte from 2^62 + 3 · 2^18, starting at one drawn at random, and gives
 the phase a number in its process that no phase there had before, which its process's writers
 wait on, since a process never sees its own locks. It tries for everything at once between sleeps that
@@ -196,10 +203,11 @@ the seal of a group take no new branch byte and never pass the gate.
 
 Why each promise holds:
 
-1. The holder waits for nothing while it holds anything a writer needs. It waits for a cycle's lock
-   and then for the gate byte, held only by another cycle or holder, and then sleeps a millisecond,
-   and holds nothing of the branches while it does; everything after that it tries without
-   waiting. A writer waiting at
+1. The holder waits for nothing while it holds anything a writer needs. It waits for a cycle's lock,
+   in its line, for a turn and for the gate byte, each held only by another cycle or taker, and then
+   sleeps a millisecond, and holds nothing of the branches while it does; everything after that it
+   tries without waiting. A pull that keeps its place and turn between its landing and its
+   integration runs only ferro's own code between them. A writer waiting at
    the gate holds no lock of the file, and the end of its phase comes on the holder's clock
    whatever the range does, or after 2 s. A lane or a byte is held only by a closure, a nested write within one, a coalesced
    group, which the holder or the sync thread seals, or a holder in its pause, which waits for
@@ -228,6 +236,11 @@ Why each promise holds:
    nothing tests a gate, as before. The lanes themselves are the same `parking_lot` mutexes,
    waited for without a timeout.
 5. A writer reads its process's flag, and finds no holder there, and makes one `F_OFD_GETLK`.
+6. The threads of a handle are served in the order of their tickets, and each turn byte has one
+   waiter at most, the open that drew the turn after it, so no taker that asks later gets the gate
+   first, as [Takers in turn](#takers-in-turn) describes. With n takers queued each waits for at
+   most the n holds ahead of it, each bounded as in 3. A pull's landing keeps its place and turn,
+   and its integration goes straight to the gate byte.
 
 What stays unbounded:
 
@@ -243,7 +256,7 @@ What stays unbounded:
   first go and hold the others. A closure that writes to another branch itself, rather than through
   another thread, is a nested write and is not held at all.
 - A holder stopped in its process, by a debugger or `SIGSTOP`, keeps writers at the gate for 2 s at
-  a time.
+  a time, and the takers queued behind it for as long as it stays stopped.
 - Writers of earlier builds. One that tests the gate byte only, as 6fb68bc's did, finds a holder of
   this build there for its whole hold, reads no stamp and so goes on at the end of each 2 ms epoch.
   A holder of an earlier build holds the gate byte, and writers of this build, which test the phase
@@ -254,9 +267,57 @@ What stays unbounded:
 
 The gate and the phase bytes keep nothing in the file, a process that dies holding them lets them go
 with its other locks, and a test of the gate that fails lets the writer on, since it only keeps the
-range from waiting for ever. Within a process the gate byte goes through the table of [One owner per
-lock in a process](#one-owner-per-lock-in-a-process), so a second thread that wants every branch
-lock, a pull beside a cycle in one handle, waits there for the first to finish.
+range from waiting for ever. Within a handle a second thread that wants every branch lock, a pull
+beside a cycle, waits in the handle's line for the first to finish.
+
+#### Takers in turn
+
+The gate byte alone left the order of takers to the kernel and to the table of [One owner per lock
+in a process](#one-owner-per-lock-in-a-process), and neither keeps one. The kernel links a blocked
+`F_OFD_SETLKW` below the lock in its way, and below the first waiter already linked there that it
+conflicts with, so the waiters for the gate byte form a chain. An unlock wakes only the first, and
+each waiter woken tries again when it runs, wakes the one linked below it and is linked again under
+whatever is then in its way. A thread that runs meanwhile, such as the taker that just let the gate
+go and comes back for it, takes the byte before the waiter it was handed to, and a newcomer that
+blocks is linked ahead of the waiters not yet relinked. A pull takes the gate for its landing and
+again for its integration, and came back each time. The table's condition variable wakes its
+waiters the same way, one at a time through its mutex, and the thread that let the byte go took it
+again first. Beside four processes committing in 5 ms closures, sixteen processes pulling over and
+over made from 10 to 156 pulls each in 5 s, and some waited about a second for one; sixteen threads
+of one handle waited up to 911 ms (#149).
+
+So a taker now queues twice before the gate byte. The threads of a handle take tickets in a line, a
+count of tickets handed out and of the one served, under a mutex, and wait on a condition variable
+until theirs is served, so one thread of a handle at a time goes on. That thread draws a turn among
+the opens of the file: holding the door, 2^62 + 7, it locks the turn byte after the last one
+another open holds, of 1,024 turn bytes every other byte from 2^62 + 2^19, lets the door go, and
+then waits in the kernel for the turn byte before its own, takes it once it is let go and lets it
+go at once. Each turn byte has one waiter at most, the open that drew the turn after it, so each
+open hands the gate on to the next in the order they drew, and no chain of waiters is woken and
+relinked. The last turn held is found by halving: a test over every turn byte reports one held, and
+tests over the turn bytes past it find the furthest held within half of them, about ten tests while
+others are queued and none more when no turn is held. The thread lets its turn and its place in
+line go after the gate byte, at the end of its hold.
+
+A pull would then queue for its integration behind every taker that came during its landing, and
+wait 1 ms more after it: beside one writer, two processes pulling made fewer than half as many
+pulls as before in one run. So the landing keeps its place in line and its turn for the integration, which
+goes straight to the gate byte, through a guard that the pulling thread holds from the landing
+until the integration's decision is made, before the merge closure runs. A `receive` keeps them
+the same way. A large one streams its staging frames, and syncs them or places them anew, before
+its landing queues for the gate, so it holds no turn while it does; between the landing and the
+decision it only gives back the disk of staging frames it placed anew.
+
+Turns only order the takers; the gate byte still lets one hold at a time. A draw that fails, from
+an error, or because the byte after the last turn held is held too, which takes more than 512 opens
+queued at once, lets the thread on to the gate byte without a turn. A process that dies holding a
+turn lets it go with its other locks, and the open behind it goes on to the gate byte. A taker of
+an earlier build draws no turn and may take the gate byte ahead of those queued, as before.
+
+The model in [The gate model](testing.md#the-gate-model), with the kernel's chains of waiters in
+it, finds b919d64's order unfair in all three of #149's runs, a line in each handle fair only among
+the threads of one handle, and turns fair in all three, and turns with a pull's two holds bound
+together pull about as often as b919d64 did.
 
 #### Earlier versions
 
@@ -378,6 +439,17 @@ and [The gate model](testing.md#the-gate-model) tests the designs:
   that the writers it held up go on. In `shared_process.rs`,
   `a_writer_held_at_the_gate_of_another_process_goes_on_when_that_process_dies` kills a process
   whose cycle holds the gate.
+- Takers in turn. The unit tests
+  `opens_that_want_the_gate_get_it_in_the_order_they_asked_before_one_that_just_let_it_go` and
+  `threads_of_one_open_that_want_the_gate_get_it_in_the_order_they_asked` in `store.rs` queue three
+  takers, through opens of their own or through one, behind one that holds the gate, which lets it
+  go and asks for it again at once and must come last; with b919d64's order the open took it back
+  first. `holds_bound_together_take_the_gate_again_before_those_queued_and_then_let_them_on` checks
+  that a landing's place and turn carry over to the integration and go with the guard. The ignored
+  `puller_processes_beside_writer_processes_report_how_often_each_pulls`, in `shared_process.rs`,
+  and `threads_pulling_beside_writers_report_how_often_each_pulls` print how often each of many
+  pullers pulls and its longest pull, and `cycles_beside_writer_processes_report_their_times` the
+  cycles beside writer processes, as [What the gate costs](#what-the-gate-costs) gives them.
 - Without `shared`.
   `a_plain_cycle_gets_a_lane_that_threads_of_its_handle_take_in_turn_with_5_ms_closures`,
   `a_plain_cycle_gets_a_lane_that_two_threads_of_its_handle_take_in_turn_with_2_ms_closures`,
@@ -455,6 +527,48 @@ cores, the three builds alternating, medians of three rounds, under Buffered:
   51,548, 153,962 and 139,728 and 51,574, 162,451 and 140,895; ten plain cycles beside 8 and 16
   writers whose closures slept 2 and 5 ms took 20.2, 50.6, 39.0 and 95.9 ms against 20.6, 55.7,
   37.1 and 91.2 and 20.4, 55.4, 38.8 and 95.8.
+
+The line and the turns (#149) were measured on 2026-11-11 against b919d64, the two builds
+alternating, beside a stress run of the fault tests that kept the load average between about 4 and
+27 on the 32-thread machine, under Buffered, three rounds unless said, with the ignored tests
+`puller_processes_beside_writer_processes_report_how_often_each_pulls`,
+`threads_pulling_beside_writers_report_how_often_each_pulls` and
+`cycles_beside_writer_processes_report_their_times`:
+
+- Sixteen processes pulling over and over beside four writer processes whose closures slept 5 ms
+  made from 39 to 41 pulls each in 5 s, 632 to 651 in all, the longest taking 156 to 159 ms,
+  against from 22 to 45, 15 to 132 and 22 to 47 each, 490 to 715 in all, the longest 449 ms to
+  1.29 s. Beside sixteen they made 34 to 36 each, 546 to 564 in all, the longest 172 to 193 ms,
+  against 18 to 38, 16 to 57 and 21 to 35, 388 to 455 in all, the longest 624 to 862 ms. The
+  writers committed 3% to 7% less, 2,818 to 2,830 times against 2,924 to 3,032, and 9,548 to
+  9,637 against 9,739 to 10,489.
+- Sixteen threads of one handle pulling beside four handles whose closures slept 5 ms made 80 to 86
+  pulls each in 10 s, 1,283 to 1,352 in all, the longest 146 to 169 ms, against 29 to 52 each, 595
+  to 692 in all, the longest 1.13 to 1.27 s; sixteen handles made 81 to 85 each, 1,299 to 1,340 in
+  all, the longest 162 to 170 ms, against 40 to 146 each, 818 to 1,144, the longest 670 to 926 ms.
+- Beside one process committing with no closure, four processes pulling made 1,926 to 2,246 pulls
+  in 3 s, from 471 to 648 each, against 967 to 1,203, from 207 to 455, and the writer committed
+  223,000 to 308,000 times against 184,000 to 213,000. Two processes pulling made 2,228 to 2,289
+  pulls, 1,114 to 1,166 each, against 2,487 to 2,911, from 568 to 2,343 each, a sixth fewer, and
+  the writer committed 238,000 to 334,000 times against 214,000 to 325,000. Two pullers take the
+  gate in turn, each waiting for the other's pull and 1 ms more, where b919d64's often took it back
+  ahead of the other; the writer gets the time.
+- Five cycles beside 4 and 16 processes committing in closures that spun 0, 1, 2 and 5 ms took 4.4,
+  4.5, 6.9 and 9.3 ms and 13.0, 7.1, 7.2 and 15.2 ms at the median, against 3.5, 4.7, 6.5 and 9.3
+  and 5.2, 6.8, 7.5 and 19.7. The cell 13.0 against 5.2, beside 16 at 0 ms, came out at 11.7
+  against 11.3 over five more rounds, and beside 4 at 4.2 against 4.7, with the load near 17 then.
+- Writers run nothing new, nor does anything without `shared`. Alternating each round, `group` with
+  1 and 8 shared writers made 40,109 and 34,730 commits a second against 37,981 and 35,561, and
+  without `shared` 1, 8 and 16 writers on one branch made 46,403, 37,256 and 37,633 against 44,909,
+  38,486 and 37,341, medians of five rounds. `processes` at 2, 4 and 8 on one branch made 30,490,
+  25,948 and 21,829 against 32,754, 25,470 and 22,466, and on branches of their own 62,626, 92,961
+  and 55,724 against 60,692, 89,163 and 54,392, medians of three.
+- Measured again on top of the staging frames of 344e36d, against c44151a, two rounds with the
+  load average near 7: sixteen processes pulling beside four writers made 38 to 42 pulls each,
+  the longest 157 ms, against 14 to 117, the longest 1.08 s; sixteen threads of one handle 77 to
+  81 each, the longest 166 ms, against 30 to 51, the longest 1.49 s; four processes pulling beside
+  a writer made 1,825 and 2,042 pulls against 835 and 966, and two 2,236 and 2,326 against 1,149,
+  one of them pulling 300 times and the other 849, and 3,296.
 
 ## A commit
 

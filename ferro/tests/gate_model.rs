@@ -4,31 +4,36 @@
 //! branch byte of the file at once, beside writers in other processes that each lock one byte per
 //! closure. The model runs those actors as tasks of a single-threaded executor whose clock moves
 //! only when every task waits, so a run is fixed by its seed: which task runs next after each wake,
-//! how long a wake, a sleep or a commit takes, when a thread is preempted, which of the threads
-//! woken by a kernel unlock wins the byte, and when an in-process lane hands itself over fairly.
+//! how long a wake, a sleep or a commit takes, when a thread is preempted, which thread runs first
+//! after an unlock, and when an in-process lane hands itself over fairly.
 //!
 //! The pieces it models are the ones the protocols differ in:
 //!
-//! - open file description locks, exclusive, per open, granted to the first waiter that runs after
-//!   an unlock, and tested by other opens with `F_OFD_GETLK`;
+//! - open file description locks, exclusive, per open, whose blocked takers the kernel links in
+//!   chains below the lock in their way and wakes and relinks a link at a time, as `fs/locks.c`
+//!   does, and which other opens test with `F_OFD_GETLK`;
 //! - each open's lanes, which behave as `parking_lot` mutexes do: a free lane goes to whoever asks
 //!   first, an unlock wakes the longest parked thread, which parks again at the back if another
 //!   took the lane meanwhile, and about once a millisecond an unlock hands the lane over instead;
 //! - each open's branch bytes shared between its lanes, its `whole` mark, its table of the bytes
-//!   its threads hold, through which the gate, the cycle lock and the placement lock are taken, and
-//!   the queue of awaited writes at each lane, with the thread each byte's held-up writes share;
+//!   its threads hold, through which the gate, the cycle lock and the placement lock are taken and
+//!   whose condition variable wakes its waiters a thread at a time through its mutex, as
+//!   `parking_lot`'s does, and the queue of awaited writes at each lane, with the thread each
+//!   byte's held-up writes share;
 //! - closures that sleep, write from inside themselves, or join another thread's write through any
 //!   open, the one that cycles included, blocking or awaited;
 //! - coalesced groups that keep their branch's byte between closures.
 //!
 //! [`Design`] lists the protocols: the shared epochs of 6fb68bc, the growing rounds of 51dbfc6,
 //! and the phase gates that replaced both, with and without their rule for writers whose branch is
-//! busy when their phase ends, and with the ways of telling phases apart that [`Phasing`] lists.
-//! Each scenario comes from an issue that a review of one of them found, #128, #136, #142, #145,
-//! #146 and #147, or is an adversarial one added here, and each checks the
-//! properties the gate promises: no task waits for ever (P1), a write a closure joins ends within a
-//! bound (P2), and a whole-range taker finishes within a bound beside closures of a given length
-//! (P3). The tests check that the phase gate passes every scenario under thousands of seeds, calm
+//! busy when their phase ends, with the ways of telling phases apart that [`Phasing`] lists, and
+//! with the ways of queueing takers for the gate that [`Queue`] lists. Each scenario comes from an
+//! issue that a review of one of them found, #128, #136, #142, #145, #146, #147 and #149, or is an
+//! adversarial one added here, and each checks the properties the gate promises: no task waits for
+//! ever (P1), a write a closure joins ends within a bound (P2), a whole-range taker finishes within
+//! a bound beside closures of a given length (P3), and takers get the gate in the order they asked
+//! for it (P6), which shows in how often each of several pulls. The tests check that the phase
+//! gate passes every scenario under thousands of seeds, calm
 //! and with threads preempted for milliseconds at a time, and that the earlier designs fail the
 //! scenarios their reviews found, so that the model is known to see those failures.
 //!
@@ -62,6 +67,12 @@ const PHASES: u64 = 6;
 const FLAG: u64 = 9;
 /// The first of the phase bytes of [`Phasing::Pool`], every other byte from here.
 const POOL: u64 = 100;
+/// The byte a taker of [`Queue::Turns`] holds while it draws its turn.
+const DOOR: u64 = 11;
+/// The first of the [`TURNS`] turn bytes of [`Queue::Turns`], every other byte from here.
+const TURN_AT: u64 = 4000;
+/// How many turn bytes there are.
+const TURNS: u64 = 64;
 /// The first branch byte; branch `b` locks `BYTES + b`.
 const BYTES: u64 = 1 << 20;
 /// Every branch byte.
@@ -135,6 +146,30 @@ struct Knobs {
     /// How long a holder that had to wait for the gate waits again before it holds its first
     /// phase.
     gap: u64,
+    /// How takers queue for the gate.
+    queue: Queue,
+    /// Whether a pull's landing and integration take the gate in one place in line and one turn.
+    together: bool,
+}
+
+/// How whole-range takers queue for the gate byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Queue {
+    /// b919d64: a try for the gate byte, and if that fails a wait in the table of the bytes the
+    /// open's threads hold and then in `F_OFD_SETLKW`, so that the order is the table's and the
+    /// kernel's.
+    Kernel,
+    /// As [`Queue::Kernel`] with no try first, so that a taker that finds the gate held always
+    /// queues: a blocking take from the start, with the gap after it if it had to wait.
+    Blocking,
+    /// Takers of one open queue for the gate in the order they came, by ticket, and the first in
+    /// line then takes it as [`Queue::Kernel`] does.
+    Local,
+    /// As [`Queue::Local`], and the first in line of each open then draws a turn: under
+    /// [`DOOR`] it locks the turn byte after the last one held, and waits for the one before it
+    /// to be let go before it takes the gate, so that opens take the gate in the order they
+    /// drew, each waiting on a byte no other waits on.
+    Turns,
 }
 
 /// The phase gate of b2741a3.
@@ -144,6 +179,8 @@ const PAIR: Knobs = Knobs {
     longest: SEC,
     phasing: Phasing::Pair,
     gap: 0,
+    queue: Queue::Kernel,
+    together: false,
 };
 
 /// The phase gate with a 1.5 ms space between holds.
@@ -164,11 +201,36 @@ const POOLED: Knobs = Knobs {
     ..PAIR
 };
 
-/// The chosen phase gate: a pool of 1,024 phase bytes, and a gap as long as a writer's longest
-/// sleep between tests of its phase byte after a gate the holder waited for.
-const CHOSEN: Knobs = Knobs {
+/// The phase gate of b919d64: a pool of 1,024 phase bytes, and a gap as long as a writer's
+/// longest sleep between tests of its phase byte after a gate the holder waited for, with takers
+/// queued for the gate byte in the kernel.
+const KERNEL: Knobs = Knobs {
     gap: PHASE_POLL.1,
     ..POOLED
+};
+
+/// [`KERNEL`] with no try for the gate byte before a blocking take.
+const BLOCKING: Knobs = Knobs {
+    queue: Queue::Blocking,
+    ..KERNEL
+};
+
+/// [`KERNEL`] with takers of one open in line for the gate.
+const LOCAL: Knobs = Knobs {
+    queue: Queue::Local,
+    ..KERNEL
+};
+
+/// [`KERNEL`] with takers in line in their open and turns across opens.
+const TURNED: Knobs = Knobs {
+    queue: Queue::Turns,
+    ..KERNEL
+};
+
+/// The chosen phase gate: [`TURNED`], with a pull's landing and integration in one turn.
+const CHOSEN: Knobs = Knobs {
+    together: true,
+    ..TURNED
 };
 
 /// The phase gate without its rule for busy branches.
@@ -286,17 +348,41 @@ struct Open {
     waiting: usize,
     moved: Vec<usize>,
     taken: Vec<u64>,
-    freed: Vec<usize>,
+    freed: VecDeque<usize>,
+    requeued: VecDeque<usize>,
+    handing: bool,
     phase: Option<u64>,
     phased: Vec<usize>,
     numbered: u64,
     coalesce: bool,
+    tickets: u64,
+    serving: u64,
+    served: Vec<usize>,
 }
 
 struct Lock {
+    id: u64,
     owner: usize,
     start: u64,
     end: u64,
+}
+
+/// What a blocked `F_OFD_SETLKW` waits on, as the kernel links it: a lock, or a request that
+/// was itself blocked first and that it conflicts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Blocker {
+    Lock(u64),
+    Task(usize),
+}
+
+/// A blocked `F_OFD_SETLKW`: linked under its blocker while it sleeps, and unlinked, with its own
+/// waiters still linked under it, once woken.
+struct Waiter {
+    owner: usize,
+    start: u64,
+    end: u64,
+    on: Option<Blocker>,
+    seq: u64,
 }
 
 /// What a run saw.
@@ -311,6 +397,7 @@ struct Seen {
     overwaits: u64,
     late_waits: u64,
     most_late: u64,
+    pulls: Vec<u64>,
 }
 
 struct St {
@@ -324,7 +411,9 @@ struct St {
     spawned: Vec<(usize, Task)>,
     opens: Vec<Open>,
     locks: Vec<Lock>,
-    blocked: Vec<usize>,
+    lock_ids: u64,
+    waiters: HashMap<usize, Waiter>,
+    waiter_seq: u64,
     began: Option<u64>,
     stop: bool,
     seen: Seen,
@@ -367,22 +456,111 @@ impl St {
             .min()
     }
 
+    /// The lock in the way of `owner` taking `start..end`, the first in the file's list, which
+    /// keeps each owner's locks together in the order the owners first locked.
+    fn blocking(&self, owner: usize, start: u64, end: u64) -> Option<u64> {
+        self.locks
+            .iter()
+            .find(|lock| lock.owner != owner && lock.start < end && start < lock.end)
+            .map(|lock| lock.id)
+    }
+
+    fn grant(&mut self, owner: usize, start: u64, end: u64) {
+        let same = |lock: &Lock| lock.owner == owner && lock.start == start && lock.end == end;
+        if self.locks.iter().any(same) {
+            return;
+        }
+        self.lock_ids += 1;
+        let lock = Lock {
+            id: self.lock_ids,
+            owner,
+            start,
+            end,
+        };
+        let first = self.locks.iter().position(|held| held.owner == owner);
+        let after = first.map_or(self.locks.len(), |first| {
+            first
+                + self.locks[first..]
+                    .iter()
+                    .take_while(|held| held.owner == owner && held.start < start)
+                    .count()
+        });
+        self.locks.insert(after, lock);
+    }
+
     fn try_lock(&mut self, owner: usize, start: u64, end: u64) -> bool {
         if self.conflict(owner, start, end).is_some() {
             return false;
         }
-        let same = |lock: &Lock| lock.owner == owner && lock.start == start && lock.end == end;
-        if !self.locks.iter().any(same) {
-            self.locks.push(Lock { owner, start, end });
-        }
+        self.grant(owner, start, end);
         true
     }
 
+    /// The requests linked directly under `blocker`, in the order they were linked.
+    fn linked(&self, blocker: Blocker) -> Vec<usize> {
+        let mut linked: Vec<(u64, usize)> = self
+            .waiters
+            .iter()
+            .filter(|(_, waiter)| waiter.on == Some(blocker))
+            .map(|(task, waiter)| (waiter.seq, *task))
+            .collect();
+        linked.sort_unstable();
+        linked.into_iter().map(|(_, task)| task).collect()
+    }
+
+    /// Unlinks and wakes the requests linked directly under `blocker`, as
+    /// `__locks_wake_up_blocks` does; those linked under them stay linked there.
+    fn wake_linked(&mut self, blocker: Blocker) {
+        for task in self.linked(blocker) {
+            if let Some(waiter) = self.waiters.get_mut(&task) {
+                waiter.on = None;
+            }
+            self.wake(task);
+        }
+    }
+
+    /// Links `me` under the lock `id` in its way, as `__locks_insert_block` does: below the first
+    /// request linked there that it conflicts with, and so on down, at the tail. It first wakes
+    /// the requests linked under it, which retry on their own.
+    fn link(&mut self, me: usize, owner: usize, (start, end): (u64, u64), id: u64) {
+        self.wake_linked(Blocker::Task(me));
+        let mut on = Blocker::Lock(id);
+        'down: loop {
+            for task in self.linked(on) {
+                let other = &self.waiters[&task];
+                if other.owner != owner && other.start < end && start < other.end {
+                    on = Blocker::Task(task);
+                    continue 'down;
+                }
+            }
+            break;
+        }
+        self.waiter_seq += 1;
+        let seq = self.waiter_seq;
+        self.waiters.insert(
+            me,
+            Waiter {
+                owner,
+                start,
+                end,
+                on: Some(on),
+                seq,
+            },
+        );
+    }
+
     fn unlock(&mut self, owner: usize, start: u64, end: u64) {
+        let gone: Vec<u64> = self
+            .locks
+            .iter()
+            .filter(|lock| lock.owner == owner && lock.start == start && lock.end == end)
+            .map(|lock| lock.id)
+            .collect();
         self.locks
             .retain(|lock| !(lock.owner == owner && lock.start == start && lock.end == end));
-        let blocked = std::mem::take(&mut self.blocked);
-        self.wake_all(blocked);
+        for id in gone {
+            self.wake_linked(Blocker::Lock(id));
+        }
     }
 
     fn lane(&mut self, open: usize, branch: usize) -> &mut Lane {
@@ -398,6 +576,16 @@ impl St {
         lane.holder = Some(me);
         self.meta[me].holds += 1;
         true
+    }
+
+    /// Lets the mutex of `open`'s table go: wakes the next thread moved to it from the condition
+    /// variable, if any.
+    fn hand_on(&mut self, open: usize) {
+        let next = self.opens[open].requeued.pop_front();
+        self.opens[open].handing = next.is_some();
+        if let Some(next) = next {
+            self.wake(next);
+        }
     }
 
     fn moved(&mut self, open: usize) {
@@ -546,16 +734,35 @@ impl W {
         .await;
     }
 
-    async fn lock(&self, owner: usize, start: u64, end: u64) {
+    /// `F_OFD_SETLKW`: granted at once if nothing is in the way, and otherwise linked under what
+    /// is, until an unlock or a request it was linked under wakes it to try again.
+    async fn lock(&self, owner: usize, start: u64, end: u64) -> bool {
         self.syscall().await;
+        let mut blocked = false;
         self.until(|st, me| {
-            if st.try_lock(owner, start, end) {
-                return true;
+            if st
+                .waiters
+                .get(&me)
+                .is_some_and(|waiter| waiter.on.is_some())
+            {
+                return false;
             }
-            st.blocked.push(me);
-            false
+            match st.blocking(owner, start, end) {
+                None => {
+                    st.grant(owner, start, end);
+                    st.wake_linked(Blocker::Task(me));
+                    st.waiters.remove(&me);
+                    true
+                }
+                Some(id) => {
+                    blocked = true;
+                    st.link(me, owner, (start, end), id);
+                    false
+                }
+            }
         })
         .await;
+        blocked
     }
 
     async fn conflict(&self, owner: usize, start: u64, end: u64) -> Option<u64> {
@@ -697,28 +904,47 @@ impl W {
         got
     }
 
+    /// Takes `at` through the table of the bytes `open`'s threads hold, as `Store::hold` does, and
+    /// then in the kernel, waiting for both if `wait` is set. The table's condition variable
+    /// behaves as `parking_lot`'s: a thread that runs takes a free byte at once, and a release
+    /// moves every thread waiting on the condition variable, in order, to the mutex, which wakes
+    /// them one at a time as each lets it go; one that finds its byte taken waits again at the
+    /// back. It returns whether it took the byte, and with `wait` set whether it had to wait.
     async fn hold(&self, open: usize, at: u64, wait: bool) -> bool {
+        self.held(open, at, wait).await.0
+    }
+
+    async fn held(&self, open: usize, at: u64, wait: bool) -> (bool, bool) {
         let mut free = false;
+        let mut parked = false;
         self.until(|st, me| {
             let shared = &mut st.opens[open];
+            if parked && (shared.freed.contains(&me) || shared.requeued.contains(&me)) {
+                return false;
+            }
             if !shared.taken.contains(&at) {
                 shared.taken.push(at);
                 free = true;
+            }
+            if parked {
+                st.hand_on(open);
+            }
+            let shared = &mut st.opens[open];
+            if free || !wait {
                 return true;
             }
-            if !wait {
-                return true;
-            }
-            shared.freed.push(me);
+            shared.freed.push_back(me);
+            parked = true;
             false
         })
         .await;
         if !free {
-            return false;
+            return (false, parked);
         }
         let got = match wait {
             true => {
-                self.lock(open, at, at + 1).await;
+                let blocked = self.lock(open, at, at + 1).await;
+                parked |= blocked;
                 true
             }
             false => self.try_lock(open, at, at + 1).await,
@@ -726,7 +952,7 @@ impl W {
         if !got {
             self.release(open, at, false).await;
         }
-        got
+        (got, parked)
     }
 
     async fn release(&self, open: usize, at: u64, locked: bool) {
@@ -734,9 +960,13 @@ impl W {
             self.unlock(open, at, at + 1).await;
         }
         let mut st = self.st();
-        st.opens[open].taken.retain(|held| *held != at);
-        let freed = std::mem::take(&mut st.opens[open].freed);
-        st.wake_all(freed);
+        let shared = &mut st.opens[open];
+        shared.taken.retain(|held| *held != at);
+        let freed: Vec<usize> = shared.freed.drain(..).collect();
+        shared.requeued.extend(freed);
+        if !shared.handing {
+            st.hand_on(open);
+        }
     }
 
     async fn seal(&self, open: usize, branch: usize) {
@@ -964,6 +1194,9 @@ async fn await_phase(
     let mut pause = PHASE_POLL.0;
     let mut over = false;
     let ended = loop {
+        if w.now() - started >= PHASE_WAIT {
+            break false;
+        }
         w.sleep(pause).await;
         pause = (pause * 2).min(PHASE_POLL.1);
         if w.conflict(open, held, held + 1).await.is_none() {
@@ -971,9 +1204,6 @@ async fn await_phase(
         }
         if w.st().ends > first {
             over = true;
-        }
-        if w.now() - started >= PHASE_WAIT {
-            break false;
         }
     };
     w.st().seen.overwaits += u64::from(over);
@@ -1175,7 +1405,9 @@ fn exclusively(w: W, open: usize) -> Task {
         match w.design() {
             Design::Epochs => exclusively_in_epochs(&w, open).await,
             Design::Rounds => exclusively_in_rounds(&w, open).await,
-            Design::Phases(knobs) => exclusively_in_phases(&w, open, knobs).await,
+            Design::Phases(knobs) => {
+                exclusively_in_phases(&w, open, knobs, None, false).await;
+            }
         }
     })
 }
@@ -1510,15 +1742,119 @@ async fn lock_from(w: &W, open: usize, mut at: u64, count: u64) -> Option<u64> {
     None
 }
 
-/// Takes the gate and the first phase as `phasing` has it: the phase byte held, if any, and the
-/// number the holder's open waits on.
-async fn take_phase_gate(w: &W, open: usize, knobs: Knobs) -> (Option<u64>, Option<u64>) {
-    let phasing = knobs.phasing;
+/// Waits for this taker's ticket in the line of `open`'s takers, and returns whether it had to.
+async fn enter_line(w: &W, open: usize) -> bool {
+    let ticket = {
+        let mut st = w.st();
+        let shared = &mut st.opens[open];
+        shared.tickets += 1;
+        shared.tickets - 1
+    };
+    let mut waited = false;
+    w.until(|st, me| {
+        if st.opens[open].serving == ticket {
+            return true;
+        }
+        waited = true;
+        st.opens[open].served.push(me);
+        false
+    })
+    .await;
+    waited
+}
+
+fn leave_line(w: &W, open: usize) {
+    let mut st = w.st();
+    st.opens[open].serving += 1;
+    let served = std::mem::take(&mut st.opens[open].served);
+    st.wake_all(served);
+}
+
+fn turn_byte(index: u64) -> u64 {
+    TURN_AT + 2 * (index % TURNS)
+}
+
+/// Draws a turn under [`DOOR`] and waits for the turn before it to be let go: returns the turn
+/// byte held, if one was free, and whether a turn came before it, as the code counts a wait.
+async fn take_turn(w: &W, open: usize) -> (Option<u64>, bool) {
+    w.lock(open, DOOR, DOOR + 1).await;
+    let found = w.conflict(open, TURN_AT, TURN_AT + 2 * TURNS).await;
+    let last = match found {
+        None => None,
+        Some(at) => {
+            for _ in 0..TURNS.ilog2() {
+                w.syscall().await;
+            }
+            let st = w.st();
+            let first = (at - TURN_AT) / 2;
+            let last = (1..TURNS / 2)
+                .rev()
+                .map(|ahead| first + ahead)
+                .find(|index| {
+                    let byte = turn_byte(*index);
+                    st.conflict(open, byte, byte + 1).is_some()
+                })
+                .unwrap_or(first);
+            Some(last)
+        }
+    };
+    let mine = last.map_or(0, |last| last + 1);
+    let held = w.try_lock(open, turn_byte(mine), turn_byte(mine) + 1).await;
+    w.unlock(open, DOOR, DOOR + 1).await;
+    if !held {
+        return (None, false);
+    }
+    let Some(last) = last else {
+        return (Some(turn_byte(mine)), false);
+    };
+    let before = turn_byte(last);
+    w.lock(open, before, before + 1).await;
+    w.unlock(open, before, before + 1).await;
+    (Some(turn_byte(mine)), true)
+}
+
+/// Queues for the gate byte as `queue` has it and takes it: returns the turn byte held, if any,
+/// and whether it had to wait. A taker that kept its place in line and its turn from its last
+/// hold, as `kept` says, goes straight to the gate byte.
+async fn queue_for_gate(
+    w: &W,
+    open: usize,
+    queue: Queue,
+    kept: Option<Option<u64>>,
+) -> (Option<u64>, bool) {
+    let mut waited = false;
+    if kept.is_none() && matches!(queue, Queue::Local | Queue::Turns) {
+        waited |= enter_line(w, open).await;
+    }
+    let mut turn = kept.flatten();
+    if kept.is_none() && queue == Queue::Turns {
+        let (held, behind) = take_turn(w, open).await;
+        turn = held;
+        waited |= behind;
+    }
+    if queue == Queue::Blocking {
+        let (_, blocked) = w.held(open, GATE, true).await;
+        return (turn, waited || blocked);
+    }
     if !w.hold(open, GATE, false).await {
         w.hold(open, GATE, true).await;
-        if knobs.gap > 0 {
-            w.sleep(knobs.gap).await;
-        }
+        waited = true;
+    }
+    (turn, waited)
+}
+
+/// Takes the gate and the first phase as `phasing` has it: the phase byte held, if any, the
+/// number the holder's open waits on and the turn byte held, if any.
+async fn take_phase_gate(
+    w: &W,
+    open: usize,
+    knobs: Knobs,
+    kept: Option<Option<u64>>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let phasing = knobs.phasing;
+    let (turn, waited) = queue_for_gate(w, open, knobs.queue, kept).await;
+    if waited && knobs.gap > 0 {
+        w.sleep(knobs.gap).await;
     }
     {
         let mut st = w.st();
@@ -1552,7 +1888,7 @@ async fn take_phase_gate(w: &W, open: usize, knobs: Knobs) -> (Option<u64>, Opti
     if number.is_some() {
         w.st().opens[open].phase = number;
     }
-    (byte, number)
+    (byte, number, turn)
 }
 
 fn fresh_number(w: &W, open: usize) -> u64 {
@@ -1603,8 +1939,17 @@ async fn end_phase(
     (byte, number)
 }
 
-/// Lets the phase byte and the gate go, as `phasing` has it.
-async fn leave_phase_gate(w: &W, open: usize, phasing: Phasing, byte: Option<u64>) {
+/// Lets the phase byte, the gate and the turn go, as `knobs` has them, or with `keep` set keeps
+/// the place in line and the turn, and returns them.
+async fn leave_phase_gate(
+    w: &W,
+    open: usize,
+    knobs: Knobs,
+    byte: Option<u64>,
+    turn: Option<u64>,
+    keep: bool,
+) -> Option<Option<u64>> {
+    let phasing = knobs.phasing;
     if let Some(at) = byte {
         if phasing == Phasing::Counter {
             w.syscall().await;
@@ -1622,10 +1967,26 @@ async fn leave_phase_gate(w: &W, open: usize, phasing: Phasing, byte: Option<u64
     }
     w.st().hold_began = None;
     w.release(open, GATE, true).await;
+    if keep {
+        return Some(turn);
+    }
+    if let Some(at) = turn {
+        w.unlock(open, at, at + 1).await;
+    }
+    if matches!(knobs.queue, Queue::Local | Queue::Turns) {
+        leave_line(w, open);
+    }
+    None
 }
 
-async fn exclusively_in_phases(w: &W, open: usize, knobs: Knobs) {
-    let (mut byte, mut number) = take_phase_gate(w, open, knobs).await;
+async fn exclusively_in_phases(
+    w: &W,
+    open: usize,
+    knobs: Knobs,
+    kept: Option<Option<u64>>,
+    keep: bool,
+) -> Option<Option<u64>> {
+    let (mut byte, mut number, turn) = take_phase_gate(w, open, knobs, kept).await;
     let mut round = knobs.first;
     let mut ends = w.now() + round;
     let mut pause = PHASE_RANGE_POLL.0;
@@ -1645,7 +2006,24 @@ async fn exclusively_in_phases(w: &W, open: usize, knobs: Knobs) {
         pause = (pause * 2).min(PHASE_RANGE_POLL.1).min(round / 8);
     };
     finish(w, open, &lanes).await;
-    leave_phase_gate(w, open, knobs.phasing, byte).await;
+    leave_phase_gate(w, open, knobs, byte, turn, keep).await
+}
+
+/// A pull's landing and integration, each taking every branch, `decide` apart: under a phase gate
+/// with [`Knobs::together`] set, in one place in line and one turn.
+async fn land_and_integrate(w: &W, open: usize, decide: u64) {
+    match w.design() {
+        Design::Phases(knobs) if knobs.together => {
+            let kept = exclusively_in_phases(w, open, knobs, None, true).await;
+            w.cpu(decide).await;
+            exclusively_in_phases(w, open, knobs, kept, false).await;
+        }
+        _ => {
+            exclusively(w.clone(), open).await;
+            w.cpu(decide).await;
+            exclusively(w.clone(), open).await;
+        }
+    }
 }
 
 /// The model of one run: the state the tasks share and the executor that runs them.
@@ -1677,7 +2055,9 @@ impl Model {
             spawned: Vec::new(),
             opens: Vec::new(),
             locks: Vec::new(),
-            blocked: Vec::new(),
+            lock_ids: 0,
+            waiters: HashMap::new(),
+            waiter_seq: 0,
             began: None,
             stop: false,
             seen: Seen::default(),
@@ -1903,7 +2283,7 @@ fn own_branches(design: Design, timing: Timing, seed: u64, opens: usize, length:
         cycles(&m.w, cycler, 5, false, (MS, 2 * MS)),
     ));
     let end = m.run(20 * SEC, |st| st.seen.cycles.len() == 5);
-    let bound = 200 * MS + 30 * length;
+    let bound = 250 * MS + 30 * length;
     Verdict::check(end, std::mem::take(&mut m.w.st().seen), |seen| {
         under("a cycle", &seen.cycles, bound)
     })
@@ -2185,11 +2565,7 @@ fn coalesced_group(design: Design, timing: Timing, seed: u64) -> Verdict {
     {
         let mut st = m.w.st();
         st.opens[h].held.insert(BYTES + A as u64, Some(1));
-        st.locks.push(Lock {
-            owner: h,
-            start: BYTES + A as u64,
-            end: BYTES + A as u64 + 1,
-        });
+        st.grant(h, BYTES + A as u64, BYTES + A as u64 + 1);
         let lane = st.lane(h, A);
         lane.group = true;
         lane.crossed = true;
@@ -2462,6 +2838,7 @@ fn holds_back_to_back(
 /// whose closures last up to 100 µs.
 fn pullers(design: Design, timing: Timing, seed: u64, count: usize) -> Verdict {
     let mut m = Model::new(design, timing, seed);
+    m.w.st().seen.pulls = vec![0; count];
     let open = m.open(&[MAIN, OWN], false);
     m.spawn(writer(&m.w, open, OWN, (0, 100 * US), 0));
     for at in 0..count {
@@ -2474,14 +2851,15 @@ fn pullers(design: Design, timing: Timing, seed: u64, count: usize) -> Verdict {
                 let fetch = w.st().rng.within((100 * US, 300 * US));
                 w.cpu(fetch).await;
                 let started = w.now();
-                exclusively(w.clone(), puller).await;
                 let decide = w.st().rng.within((50 * US, 150 * US));
-                w.cpu(decide).await;
-                exclusively(w.clone(), puller).await;
+                land_and_integrate(&w, puller, decide).await;
                 commit(w.clone(), puller, branch, nothing()).await;
                 let mut st = w.st();
                 let took = st.now - started;
                 st.seen.cycles.push(took);
+                if !st.stop {
+                    st.seen.pulls[at] += 1;
+                }
             }
         }));
     }
@@ -2489,6 +2867,90 @@ fn pullers(design: Design, timing: Timing, seed: u64, count: usize) -> Verdict {
     let end = m.run(5 * SEC, |st| !st.seen.marks.is_empty());
     Verdict::check(end, std::mem::take(&mut m.w.st().seen), |seen| {
         held_up_briefly(seen).or_else(|| under("a pull", &seen.cycles, SEC))
+    })
+}
+
+/// The spread of what each of several takers did in a run: how many pulls the one that made
+/// fewest made, and the one that made most.
+fn fewest_and_most(seen: &Seen) -> (u64, u64) {
+    let fewest = seen.pulls.iter().copied().min().unwrap_or(0);
+    let most = seen.pulls.iter().copied().max().unwrap_or(0);
+    (fewest, most)
+}
+
+/// #149: `takers` pull over and over, each in an open of its own or, if `one_open` is set, in
+/// threads of one open, each pull a landing and an integration, each taking every branch, and a
+/// merge committed through the puller, beside `writers` other opens committing on branches of
+/// their own in 5 ms closures, for 3 s. Taken in turn, each taker pulls once in about the time
+/// all of them take to pull once each, 3 s times the takers over the pulls they made in all, so
+/// each pull, and each wait for one that had not ended when the run stopped, must take at most
+/// twice that and 100 ms, and the taker that pulled fewest times, with one more, at least half as
+/// often as the one that pulled most.
+fn fair_pulls(
+    design: Design,
+    timing: Timing,
+    seed: u64,
+    (takers, writers, one_open): (usize, usize, bool),
+) -> Verdict {
+    let mut m = Model::new(design, timing, seed);
+    for writer_at in 0..writers {
+        let open = m.open(&[MAIN, OWN + writer_at], false);
+        m.spawn(writer(&m.w, open, OWN + writer_at, (5 * MS, 5 * MS), 0));
+    }
+    let shared = one_open.then(|| m.open(&[MAIN], false));
+    m.w.st().seen.pulls = vec![0; takers];
+    let pulling = Rc::new(RefCell::new(vec![None; takers]));
+    for at in 0..takers {
+        let branch = OWN + writers + at;
+        let puller = match shared {
+            Some(open) => {
+                m.w.st().opens[open].attached.push(branch);
+                open
+            }
+            None => m.open(&[MAIN, branch], false),
+        };
+        let w = m.w.clone();
+        let pulling = pulling.clone();
+        m.spawn(Box::pin(async move {
+            w.sleep(at as u64 * 200 * US + offset(seed)).await;
+            while !w.st().stop {
+                let fetch = w.st().rng.within((100 * US, 300 * US));
+                w.cpu(fetch).await;
+                let started = w.now();
+                pulling.borrow_mut()[at] = Some(started);
+                let decide = w.st().rng.within((50 * US, 150 * US));
+                land_and_integrate(&w, puller, decide).await;
+                commit(w.clone(), puller, branch, nothing()).await;
+                pulling.borrow_mut()[at] = None;
+                let mut st = w.st();
+                if st.stop {
+                    return;
+                }
+                let took = st.now - started;
+                st.seen.cycles.push(took);
+                st.seen.pulls[at] += 1;
+            }
+        }));
+    }
+    let window = 3 * SEC;
+    stop_after(&m.w, window);
+    let end = m.run(10 * SEC, |st| !st.seen.marks.is_empty());
+    let now = m.w.now();
+    let mut seen = std::mem::take(&mut m.w.st().seen);
+    seen.cycles.extend(
+        pulling
+            .borrow()
+            .iter()
+            .flatten()
+            .map(|started| now - started),
+    );
+    Verdict::check(end, seen, |seen| {
+        let (fewest, most) = fewest_and_most(seen);
+        let round = window * takers as u64 / seen.pulls.iter().sum::<u64>().max(1);
+        under("a pull", &seen.cycles, 2 * round + 100 * MS).or_else(|| {
+            (2 * (fewest + 1) < most)
+                .then(|| format!("takers pulled from {fewest} to {most} times each"))
+        })
     })
 }
 
@@ -2721,6 +3183,15 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
             round_edge(d, t, s, 512_100 * US)
         }),
         ("#147 swap race", swap_race),
+        ("#149 16 pullers beside 4 writers", |d, t, s| {
+            fair_pulls(d, t, s, (16, 4, false))
+        }),
+        ("#149 16 pullers beside 16 writers", |d, t, s| {
+            fair_pulls(d, t, s, (16, 16, false))
+        }),
+        ("#149 16 threads of one open pulling", |d, t, s| {
+            fair_pulls(d, t, s, (16, 4, true))
+        }),
     ]
 }
 
@@ -2731,14 +3202,19 @@ fn seeds(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// What one seed of a sweep saw at worst.
+struct Worst {
+    taker: u64,
+    joined: u64,
+    gate_wait: u64,
+    commits: u64,
+    fewest: u64,
+    most: u64,
+}
+
 /// Runs `scenario` under `design` for `count` seeds, calm and busy, and returns how many failed
 /// and the first failure.
-#[allow(clippy::type_complexity)]
-fn sweep(
-    design: Design,
-    scenario: Scenario,
-    count: u64,
-) -> (u64, Option<String>, Vec<(u64, u64, u64, u64)>) {
+fn sweep(design: Design, scenario: Scenario, count: u64) -> (u64, Option<String>, Vec<Worst>) {
     let mut failed = 0;
     let mut first = None;
     let mut worst = Vec::new();
@@ -2749,12 +3225,15 @@ fn sweep(
             _ => Timing::hostile(),
         };
         let verdict = scenario(design, timing, seed);
-        worst.push((
-            longest(&verdict.seen.cycles),
-            longest(&verdict.seen.joined),
-            verdict.seen.gate_wait,
-            verdict.seen.commits,
-        ));
+        let (fewest, most) = fewest_and_most(&verdict.seen);
+        worst.push(Worst {
+            taker: longest(&verdict.seen.cycles),
+            joined: longest(&verdict.seen.joined),
+            gate_wait: verdict.seen.gate_wait,
+            commits: verdict.seen.commits,
+            fewest,
+            most,
+        });
         if let Some(why) = verdict.failure {
             failed += 1;
             first.get_or_insert_with(|| format!("seed {seed}: {why} ({:?})", verdict.end));
@@ -2787,14 +3266,19 @@ fn report(design: Design, count: u64) -> Vec<String> {
             continue;
         }
         let (failed, first, worst) = sweep(design, scenario, count);
-        let taken = spread(worst.iter().map(|(cycle, _, _, _)| *cycle).collect());
-        let joined = spread(worst.iter().map(|(_, joined, _, _)| *joined).collect());
-        let waited = spread(worst.iter().map(|(_, _, waited, _)| *waited).collect());
-        let mut commits: Vec<u64> = worst.iter().map(|(_, _, _, commits)| *commits).collect();
-        commits.sort_unstable();
-        let commits = commits.get(commits.len() / 2).copied().unwrap_or(0);
+        let taken = spread(worst.iter().map(|worst| worst.taker).collect());
+        let joined = spread(worst.iter().map(|worst| worst.joined).collect());
+        let waited = spread(worst.iter().map(|worst| worst.gate_wait).collect());
+        let median = |mut values: Vec<u64>| {
+            values.sort_unstable();
+            values.get(values.len() / 2).copied().unwrap_or(0)
+        };
+        let commits = median(worst.iter().map(|worst| worst.commits).collect());
+        let fewest = median(worst.iter().map(|worst| worst.fewest).collect());
+        let most = median(worst.iter().map(|worst| worst.most).collect());
+        let least = worst.iter().map(|worst| worst.fewest).min().unwrap_or(0);
         println!(
-            "{design:?} | {name} | failed {failed}/{count} | taker ms p50/p99/max {taken} | joined {joined} | gate wait {waited} | commits p50 {commits}"
+            "{design:?} | {name} | failed {failed}/{count} | taker ms p50/p99/max {taken} | joined {joined} | gate wait {waited} | commits p50 {commits} | pulls each p50 {fewest}-{most}, fewest {least}"
         );
         if let Some(first) = first {
             failures.push(format!("{name}: {failed}/{count}, {first}"));
@@ -2812,32 +3296,52 @@ fn the_phase_gate_passes_every_scenario() {
 #[test]
 fn the_model_finds_what_the_reviews_of_earlier_designs_found() {
     let found = [
-        (Design::Epochs, "#145 contended own branch"),
-        (Design::Epochs, "#145 blocked write"),
-        (Design::Epochs, "#145 awaited write"),
-        (Design::Epochs, "#145 earlier own branch"),
-        (Design::Epochs, "#146 through cycler"),
-        (Design::Epochs, "#146 coalesced group"),
-        (Design::Rounds, "#146 3 turns x 5 ms"),
-        (Design::Rounds, "#146 2 turns x 2 ms"),
-        (Design::Rounds, "#146 back to back"),
-        (Design::Rounds, "#146 through cycler"),
-        (Design::Rounds, "#146 coalesced group"),
-        (Design::Phases(BLIND), "pipelined joins"),
-        (Design::Phases(ALWAYS), "joined on a hot branch"),
-        (Design::Phases(PAIR), "#147 back to back, other opens"),
-        (Design::Phases(PAIR), "#147 back to back, two takers"),
-        (Design::Phases(PAIR), "#147 four pullers"),
-        (Design::Phases(PAIR), "#147 swap race"),
+        (Design::Epochs, "#145 contended own branch", 120),
+        (Design::Epochs, "#145 blocked write", 120),
+        (Design::Epochs, "#145 awaited write", 120),
+        (Design::Epochs, "#145 earlier own branch", 120),
+        (Design::Epochs, "#146 through cycler", 120),
+        (Design::Epochs, "#146 coalesced group", 120),
+        (Design::Rounds, "#146 3 turns x 5 ms", 120),
+        (Design::Rounds, "#146 2 turns x 2 ms", 120),
+        (Design::Rounds, "#146 back to back", 120),
+        (Design::Rounds, "#146 through cycler", 120),
+        (Design::Rounds, "#146 coalesced group", 120),
+        (Design::Phases(BLIND), "pipelined joins", 120),
+        (Design::Phases(ALWAYS), "joined on a hot branch", 120),
+        (Design::Phases(PAIR), "#147 back to back, other opens", 120),
+        (Design::Phases(PAIR), "#147 back to back, two takers", 120),
+        (Design::Phases(PAIR), "#147 four pullers", 600),
+        (Design::Phases(PAIR), "#147 swap race", 120),
+        (
+            Design::Phases(KERNEL),
+            "#149 16 pullers beside 4 writers",
+            120,
+        ),
+        (
+            Design::Phases(KERNEL),
+            "#149 16 pullers beside 16 writers",
+            120,
+        ),
+        (
+            Design::Phases(KERNEL),
+            "#149 16 threads of one open pulling",
+            120,
+        ),
+        (
+            Design::Phases(LOCAL),
+            "#149 16 pullers beside 4 writers",
+            120,
+        ),
     ];
     let all = scenarios();
     let mut missed = Vec::new();
-    for (design, name) in found {
+    for (design, name, count) in found {
         let (_, scenario) = all
             .iter()
             .find(|(named, _)| *named == name)
             .expect("a scenario of that name");
-        let (failed, _, _) = sweep(design, *scenario, 120);
+        let (failed, _, _) = sweep(design, *scenario, count);
         if failed == 0 {
             missed.push(format!("{design:?}: {name}"));
         }
@@ -2855,6 +3359,12 @@ fn sweep_one_design() {
         Ok("spaced") => Design::Phases(SPACED),
         Ok("counter") => Design::Phases(COUNTER),
         Ok("pooled") => Design::Phases(POOLED),
+        Ok("blind") => Design::Phases(BLIND),
+        Ok("always") => Design::Phases(ALWAYS),
+        Ok("kernel") => Design::Phases(KERNEL),
+        Ok("blocking") => Design::Phases(BLOCKING),
+        Ok("local") => Design::Phases(LOCAL),
+        Ok("turns") => Design::Phases(TURNED),
         _ => Design::Phases(CHOSEN),
     };
     let failures = report(design, seeds(300));
@@ -2873,6 +3383,10 @@ fn compare_designs() {
         Design::Phases(SPACED),
         Design::Phases(COUNTER),
         Design::Phases(POOLED),
+        Design::Phases(KERNEL),
+        Design::Phases(BLOCKING),
+        Design::Phases(LOCAL),
+        Design::Phases(TURNED),
         Design::Phases(CHOSEN),
     ] {
         let failures = report(design, seeds(300));

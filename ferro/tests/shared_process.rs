@@ -8,10 +8,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferro::db::Hook;
-use ferro::{Data, Db, Durability, Keep, Map, Options, Reclaim};
+use ferro::{Data, Db, Durability, Keep, Map, Options, Reclaim, Snapshot};
 
 #[derive(Data, Clone, Debug, Default, PartialEq)]
 struct Root {
@@ -95,6 +95,14 @@ fn shared_child() {
     }
     if role == "slow" {
         slow(Path::new(&path), writer, count)
+    }
+    if role == "busy" {
+        busy(Path::new(&path), writer);
+        return;
+    }
+    if role == "puller" {
+        puller(Path::new(&path), writer);
+        return;
     }
     let mut options = options();
     if let Ok(step) = std::env::var("FERRO_SHARED_ABORT") {
@@ -204,6 +212,74 @@ fn slow(path: &Path, process: u64, threads: u64) -> ! {
     loop {
         std::thread::park();
     }
+}
+
+fn epoch_ms() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_millis()).unwrap()
+}
+
+fn sleep_until(at: u64) {
+    let now = epoch_ms();
+    if at > now {
+        std::thread::sleep(Duration::from_millis(at - now));
+    }
+}
+
+fn busy(path: &Path, writer: u64) {
+    let closure = Duration::from_micros(number("FERRO_SHARED_CLOSURE_US"));
+    let spin = std::env::var("FERRO_SHARED_SPIN").is_ok();
+    let until = number("FERRO_SHARED_UNTIL");
+    let db: Db<Root> = options().open(path).unwrap();
+    let db = db.branch(&format!("own-{writer}")).unwrap();
+    while epoch_ms() < until {
+        db.update(|root| {
+            if spin {
+                let started = Instant::now();
+                while started.elapsed() < closure {}
+            } else if !closure.is_zero() {
+                std::thread::sleep(closure);
+            }
+            root.n += 1;
+        })
+        .unwrap();
+    }
+}
+
+fn keeping_ours(_: &mut Root, _: &Snapshot<Root>, _: &Snapshot<Root>) -> (&'static str, ()) {
+    ("merge", ())
+}
+
+fn puller(path: &Path, writer: u64) {
+    let at = number("FERRO_SHARED_AT");
+    let length = Duration::from_millis(number("FERRO_SHARED_LENGTH_MS"));
+    let db: Db<Root> = options().open(path).unwrap();
+    let pulled = db.branch(&format!("pulled-{writer}")).unwrap();
+    let source_path = path.with_file_name(format!("source-{writer}.ferro"));
+    let source: Db<Root> = Options::new()
+        .durability(Durability::Buffered)
+        .open(source_path)
+        .unwrap();
+    sleep_until(at);
+    let end = Instant::now() + length;
+    let mut took = Vec::new();
+    let mut i = 0;
+    while Instant::now() < end {
+        i += 1;
+        commit(&source, writer, i);
+        let started = Instant::now();
+        pulled.pull(&source, "source", keeping_ours).unwrap();
+        took.push(started.elapsed());
+    }
+    took.sort();
+    let at = |share: usize| took[(took.len() - 1) * share / 100].as_micros();
+    println!(
+        "PULLS {writer} {} {} {} {}",
+        took.len(),
+        at(50),
+        at(99),
+        at(100)
+    );
 }
 
 fn follow(path: &str, until: u64) {
@@ -1039,4 +1115,164 @@ fn a_cycler_killed_at_random_beside_writers_loses_no_acknowledged_commit() {
         assert!(writer.finish(&mut acks, Duration::from_secs(120)));
     }
     check(&path, &acks, &[(0, 3000), (1, 3000)]);
+}
+
+struct Killed(Vec<Child>);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn setting(name: &str, default: u64) -> u64 {
+    std::env::var(name).map_or(default, |value| value.parse().unwrap())
+}
+
+fn spawn_busy(path: &Path, writers: u64, until: u64, killed: &mut Killed) {
+    let mut extra = vec![
+        ("FERRO_SHARED_DURABILITY", "buffered".to_string()),
+        (
+            "FERRO_SHARED_CLOSURE_US",
+            setting("FERRO_CLOSURE_US", 5_000).to_string(),
+        ),
+        ("FERRO_SHARED_UNTIL", until.to_string()),
+    ];
+    if std::env::var("FERRO_SPIN").is_ok() {
+        extra.push(("FERRO_SHARED_SPIN", "1".to_string()));
+    }
+    for writer in 0..writers {
+        let mut spawned = spawn(path, "busy", writer, 0, 0, &extra);
+        let stdout = spawned.child.stdout.take().unwrap();
+        std::thread::spawn(move || BufReader::new(stdout).lines().map_while(Result::ok).count());
+        killed.0.push(spawned.child);
+    }
+}
+
+fn commits_on_own_branches(db: &Db<Root>, writers: u64) -> u64 {
+    db.refresh().unwrap();
+    (0..writers)
+        .map(|writer| db.branch(&format!("own-{writer}")).unwrap().read().n)
+        .sum()
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "prints how often each of FERRO_PULLERS puller processes pulls beside FERRO_WRITERS \
+            writer processes whose closures last FERRO_CLOSURE_US, over FERRO_SECS"]
+fn puller_processes_beside_writer_processes_report_how_often_each_pulls() {
+    let pullers = setting("FERRO_PULLERS", 16);
+    let writers = setting("FERRO_WRITERS", 4);
+    let secs = setting("FERRO_SECS", 5);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("pulls.ferro");
+    let db: Db<Root> = options()
+        .durability(Durability::Buffered)
+        .open(&path)
+        .unwrap();
+    for writer in 0..writers {
+        db.fork(&format!("own-{writer}")).unwrap();
+    }
+    for puller in 0..pullers {
+        db.fork(&format!("pulled-{puller}")).unwrap();
+    }
+    commit(&db, 99, 1);
+    let at = epoch_ms() + 2_000;
+    let until = at + secs * 1_000 + 3_000;
+    let mut killed = Killed(Vec::new());
+    spawn_busy(&path, writers, until, &mut killed);
+    let extra = [
+        ("FERRO_SHARED_DURABILITY", "buffered".to_string()),
+        ("FERRO_SHARED_AT", at.to_string()),
+        ("FERRO_SHARED_LENGTH_MS", (secs * 1_000).to_string()),
+    ];
+    let readers: Vec<_> = (0..pullers)
+        .map(|puller| {
+            let mut spawned = spawn(&path, "puller", puller, 0, 0, &extra);
+            let stdout = spawned.child.stdout.take().unwrap();
+            killed.0.push(spawned.child);
+            std::thread::spawn(move || {
+                BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                    .find_map(|line| {
+                        let rest = line.split_once("PULLS ")?.1.to_string();
+                        let fields: Vec<u64> = rest
+                            .split(' ')
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        Some(fields)
+                    })
+            })
+        })
+        .collect();
+    sleep_until(at);
+    let before = commits_on_own_branches(&db, writers);
+    std::thread::sleep(Duration::from_secs(secs));
+    let after = commits_on_own_branches(&db, writers);
+    let mut each: Vec<Vec<u64>> = readers
+        .into_iter()
+        .map(|reader| reader.join().unwrap().expect("a puller's counts"))
+        .collect();
+    drop(killed);
+    each.sort_by_key(|fields| fields[1]);
+    let counts: Vec<u64> = each.iter().map(|fields| fields[1]).collect();
+    let mut medians: Vec<u64> = each.iter().map(|fields| fields[2]).collect();
+    medians.sort_unstable();
+    let longest = each.iter().map(|fields| fields[4]).max().unwrap_or(0);
+    println!(
+        "PULLERS {pullers} beside {writers} writers, {secs} s: pulls each {counts:?}, {} in all; \
+         median pull per puller {} to {} us; longest pull {longest} us; writer commits {}",
+        counts.iter().sum::<u64>(),
+        medians.first().unwrap_or(&0),
+        medians.last().unwrap_or(&0),
+        after - before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "prints how long five cycles take beside FERRO_WRITERS writer processes whose \
+            closures last FERRO_CLOSURE_US"]
+fn cycles_beside_writer_processes_report_their_times() {
+    let writers = setting("FERRO_WRITERS", 4);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("cycles.ferro");
+    let cycler: Db<Root> = options()
+        .durability(Durability::Buffered)
+        .open(&path)
+        .unwrap();
+    for writer in 0..writers {
+        cycler.fork(&format!("own-{writer}")).unwrap();
+    }
+    commit(&cycler, 99, 1);
+    let mut killed = Killed(Vec::new());
+    spawn_busy(&path, writers, epoch_ms() + 60_000, &mut killed);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while (0..writers).any(|writer| {
+        cycler.refresh().unwrap();
+        cycler.branch(&format!("own-{writer}")).unwrap().read().n < 10
+    }) {
+        assert!(Instant::now() < deadline, "the writers never got going");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut took = Vec::new();
+    let mut pauses = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        let report = cycler.compact(Keep::Last(2)).unwrap();
+        took.push(started.elapsed());
+        pauses.push((report.pause, report.passes));
+    }
+    drop(killed);
+    took.sort();
+    println!(
+        "CYCLES beside {writers} writers, closures {} us: median {:?}, all {took:?}; pauses and \
+         passes {pauses:?}",
+        setting("FERRO_CLOSURE_US", 5_000),
+        took[2]
+    );
 }
