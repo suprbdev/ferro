@@ -74,10 +74,11 @@ across a cycle costs time proportional to its size.
 
 - A reclamation cycle copies everything retained, so it needs that much free disk, and reads that
   miss the node cache are slower for a moment after each swap. On 8 threads, the default on a
-  machine with 8 cores or more, it ran at 1,000 MB/s on a file of small table rows and 2,960 MB/s on
-  one of 320 byte values, measured on 2026-11-07, against 640 and 2,140 MB/s on 4 threads and 237
-  and 806 MB/s on one, so a 10 GB database takes about 10 seconds. Past 8 threads it gets no faster
-  on table rows, because one thread walks the log.
+  machine with 8 cores or more, it ran at 1,078 MB/s on a file of small table rows and 2,958 MB/s on
+  one of 320 byte values, measured on 2026-11-11, against 652 and 2,180 MB/s on 4 threads and 239
+  and 794 MB/s on one, so a 10 GB database takes about 9 seconds. On 16 threads it gains about a
+  tenth more on table rows at best, and on 32 it is slower than on 8, because one thread walks the
+  log and writes its entries.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.

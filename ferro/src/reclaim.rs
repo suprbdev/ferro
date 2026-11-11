@@ -32,8 +32,10 @@ use crate::store::{
     Basis, LOG_START, Prehashed, Store, StoreOptions, Traced, Unpacked, append_staged, body_of,
     compressed, seal, staged, stored_within, verify_stored,
 };
+use ahead::Ahead;
 use units::{Key, PENDING, Reserved, Settled, Units};
 
+mod ahead;
 mod units;
 
 const FLUSH_BYTES: usize = 1 << 20;
@@ -486,8 +488,14 @@ struct EntryCache {
 }
 
 impl EntryCache {
-    fn read(&mut self, source: &Store, ptr: Ptr) -> Result<(Object, u32)> {
+    fn read(&mut self, source: &Store, ahead: Option<&Ahead>, ptr: Ptr) -> Result<(Object, u32)> {
         self.skip();
+        if let Some(fetched) = ahead.and_then(|ahead| ahead.take(ptr))
+            && let Some(object) = object_of(&fetched.record, ptr.offset)
+        {
+            self.hold(&fetched.record);
+            return Ok((object, fetched.len));
+        }
         if self.full || self.held() >= KEEP_BYTES {
             self.full = true;
             return source.read_record(ptr);
@@ -505,6 +513,21 @@ impl EntryCache {
 
     fn held(&self) -> usize {
         self.bytes.capacity() + self.at.capacity() * (size_of::<(u64, Spot)>() + 1)
+    }
+
+    fn hold(&mut self, record: &[u8]) {
+        if self.full || self.held() >= KEEP_BYTES {
+            self.full = true;
+            return;
+        }
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(record);
+        if self.held() > KEEP_BYTES {
+            self.bytes.truncate(start);
+            self.full = true;
+        } else {
+            self.last = Some(start);
+        }
     }
 
     fn keep(&mut self, ptr: Ptr, entry: &Entry) {
@@ -540,6 +563,19 @@ impl EntryCache {
     fn clear(&mut self) {
         *self = EntryCache::default();
     }
+}
+
+/// The object the record `record`, read at `offset`, holds, or `None` if it does not parse whole.
+fn object_of(record: &[u8], offset: u64) -> Option<Object> {
+    let mut links = Vec::new();
+    let stored = stored_within(record, offset, &mut links)?;
+    let mut out = Vec::new();
+    let body = body_of(record, &stored, offset, &mut out).ok()?;
+    let body = match stored.packed {
+        true => out,
+        false => body.to_vec(),
+    };
+    Some(Object { body, links })
 }
 
 impl CopySink<'_> {
@@ -891,20 +927,24 @@ impl CopySink<'_> {
             self.drain()?;
         }
         let end = self.end;
-        if let Some(units) = &mut self.units {
-            units.dispatch(link, end);
-        }
+        let offset = match &mut self.units {
+            Some(units) => units.dispatch(link, end),
+            None => PENDING,
+        };
         Ok(Ptr {
             hash: link.hash,
-            offset: PENDING,
+            offset,
         })
     }
 
     fn resolve(&self, links: &mut [Ptr]) -> Result<()> {
-        for link in links.iter_mut().filter(|link| link.offset == PENDING) {
-            link.offset = self
-                .placed(link.hash)
-                .map(|placed| placed.offset)
+        for link in links.iter_mut().filter(|link| link.offset >= PENDING) {
+            let pending = self
+                .units
+                .as_ref()
+                .and_then(|units| units.pending(link.offset));
+            link.offset = pending
+                .or_else(|| self.placed(link.hash).map(|placed| placed.offset))
                 .ok_or_else(|| {
                     Error::Corrupt(format!("the copy lost the tree at {}", link.offset))
                 })?;
@@ -1114,12 +1154,20 @@ impl<'a> Copier<'a> {
         let mut again = Vec::new();
         let mut closures = Closures::exact();
         let cache = RefCell::new(mem::take(&mut sink.cache));
-        let read = |ptr| cache.borrow_mut().read(&source, ptr);
+        let ahead = sink.units.as_ref().map(Units::ahead);
+        let read = |ptr| cache.borrow_mut().read(&source, ahead.as_deref(), ptr);
         for (_, branch) in refs.try_entries()? {
             let (first, after) = (branch.log.first, branch.log.after(&source)?);
             let root = branch.root;
             closures.chain(&branch.log);
-            branch.log.visit_with(root, read, |ptr, entry, _, _| {
+            let walked = branch
+                .log
+                .tip
+                .is_some_and(|tip| sink.walked.get(&tip.offset) == Some(&tip.hash));
+            if let Some(units) = sink.units.as_mut().filter(|_| !walked) {
+                units.read_ahead(&branch.log);
+            }
+            let visited = branch.log.visit_with(root, read, |ptr, entry, _, _| {
                 if !sink.wanted(ptr, Need::new(first, after), &mut again) {
                     return Ok(false);
                 }
@@ -1133,7 +1181,11 @@ impl<'a> Copier<'a> {
                 closures.mark(ptr, first, after);
                 closures.seed(entry, after);
                 Ok(true)
-            })?;
+            });
+            if let Some(units) = &mut sink.units {
+                units.end_ahead();
+            }
+            visited?;
         }
         loop {
             for (ptr, need) in again.drain(..) {

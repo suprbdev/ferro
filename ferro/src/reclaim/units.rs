@@ -21,7 +21,13 @@
 //! entry to [`Units::check_ahead`], and workers with nothing else to do check the hashes of the
 //! records below, claiming nothing. Each slot records the offset of the record checked under its
 //! hash, so discovery takes a record checked at the offset it reaches as checked, and only reads
-//! and parses it.
+//! and parses it. Before that walk goes down a chain, [`Units::read_ahead`] has threads read the
+//! chain's entries ahead of it, as [`Ahead`] describes.
+//!
+//! Each thread remembers the slots of the hashes it met lately, so a claim of one of them takes
+//! no lock, and a claim compares and lowers the slot's key without one. The offsets placed records
+//! take are kept apart from the slots that the claims and checks write, and the root of each unit
+//! the walk dispatched is found by its number rather than its hash.
 
 use std::any::Any;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -36,8 +42,10 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex};
 
 use super::ByHash;
+use super::ahead::{Ahead, Read};
 use crate::codec::{HASH_BYTES, Hash, Ptr, Staged};
 use crate::error::{Error, Result};
+use crate::log::Chain;
 use crate::platform::start_writeback;
 use crate::store::{
     Store, Traced, Unpacked, append_staged, stored_within, varint_len, verify_stored, zigzag,
@@ -48,8 +56,9 @@ use crate::store::{
 /// index, with 255 below the last.
 pub(super) type Key = u64;
 
-/// The offset a link to a dispatched unit holds until the unit is placed.
-pub(super) const PENDING: u64 = u64::MAX;
+/// The least offset a link to a dispatched unit holds until the unit is placed: the unit's
+/// number in dispatch order taken from `u64::MAX`.
+pub(super) const PENDING: u64 = u64::MAX - u32::MAX as u64;
 /// How many levels below a dispatched unit's root a unit may be split at.
 const LEVELS: u32 = 3;
 /// The most links a node split into units may have, so that each child's index fits its byte.
@@ -84,7 +93,6 @@ fn child_key(key: Key, depth: u32, index: usize) -> Key {
 
 struct Slot {
     claim: AtomicU64,
-    offset: AtomicU64,
     checked: AtomicU64,
 }
 
@@ -92,18 +100,40 @@ impl Default for Slot {
     fn default() -> Slot {
         Slot {
             claim: AtomicU64::new(u64::MAX),
-            offset: AtomicU64::new(0),
             checked: AtomicU64::new(0),
         }
     }
 }
 
+/// An array indexed by `u32` that allocates its chunks as they are first touched.
+struct Chunked<T> {
+    chunks: Box<[OnceLock<Box<[T]>>]>,
+}
+
+impl<T: Default> Chunked<T> {
+    fn new() -> Chunked<T> {
+        Chunked {
+            chunks: (0..CHUNKS).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    fn get(&self, id: u32) -> &T {
+        let id = id as usize;
+        let chunk =
+            self.chunks[id / CHUNK].get_or_init(|| (0..CHUNK).map(|_| T::default()).collect());
+        &chunk[id % CHUNK]
+    }
+}
+
 /// Which unit holds each object, by hash, and where each placed object sits in the copy.
 ///
-/// A slot is found by hash under one of 256 locks, and read by its number without one.
+/// A slot is found by hash under one of 256 locks, and read by its number without one. The
+/// offsets placed objects take are kept apart from the slots, so that the thread placing them
+/// reads the offsets of the objects they link from lines the other threads do not write.
 struct Claims {
     shards: Box<[Mutex<HashMap<Hash, u32, ByHash>>]>,
-    chunks: Box<[OnceLock<Box<[Slot]>>]>,
+    slots: Chunked<Slot>,
+    offsets: Chunked<AtomicU64>,
     next: AtomicU32,
 }
 
@@ -111,7 +141,8 @@ impl Claims {
     fn new() -> Claims {
         Claims {
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
-            chunks: (0..CHUNKS).map(|_| OnceLock::new()).collect(),
+            slots: Chunked::new(),
+            offsets: Chunked::new(),
             next: AtomicU32::new(0),
         }
     }
@@ -121,10 +152,11 @@ impl Claims {
     }
 
     fn slot(&self, id: u32) -> &Slot {
-        let id = id as usize;
-        let chunk =
-            self.chunks[id / CHUNK].get_or_init(|| (0..CHUNK).map(|_| Slot::default()).collect());
-        &chunk[id % CHUNK]
+        self.slots.get(id)
+    }
+
+    fn offset(&self, id: u32) -> &AtomicU64 {
+        self.offsets.get(id)
     }
 
     fn insert(&self, map: &mut HashMap<Hash, u32, ByHash>, hash: &Hash) -> u32 {
@@ -134,37 +166,44 @@ impl Claims {
         id
     }
 
-    fn claim(&self, hash: &Hash, key: Key) -> (u32, bool) {
-        let mut map = self.shard(hash).lock();
-        let id = match map.get(hash) {
-            Some(id) => *id,
-            None => self.insert(&mut map, hash),
-        };
+    fn claim(&self, hash: &Hash, key: Key, seen: &mut Seen) -> (u32, bool) {
+        let id = self.id(hash, seen);
         let slot = self.slot(id);
-        let won = key < slot.claim.load(Ordering::Relaxed);
-        if won {
-            slot.claim.store(key, Ordering::Relaxed);
-        }
+        let won = key < slot.claim.load(Ordering::Acquire)
+            && key < slot.claim.fetch_min(key, Ordering::AcqRel);
         (id, won)
     }
 
-    fn id(&self, hash: &Hash) -> u32 {
-        let mut map = self.shard(hash).lock();
-        match map.get(hash) {
-            Some(id) => *id,
-            None => self.insert(&mut map, hash),
+    fn id(&self, hash: &Hash, seen: &mut Seen) -> u32 {
+        let at = seen.at(hash);
+        if let Some((known, id)) = seen.slots.get(at)
+            && *id != u32::MAX
+            && known == hash
+        {
+            return *id;
         }
+        if seen.ids.is_empty() {
+            let first = self.next.fetch_add(IDS, Ordering::Relaxed);
+            assert!(first < u32::MAX - IDS, "a copy of more than 2^32 objects");
+            seen.ids = first..first + IDS;
+        }
+        let mut map = self.shard(hash).lock();
+        let id = *map.entry(*hash).or_insert(seen.ids.start);
+        drop(map);
+        if id == seen.ids.start {
+            seen.ids.start += 1;
+        }
+        seen.put(at, hash, id);
+        id
     }
 
-    fn held(&self, hash: &Hash) -> Key {
-        let map = self.shard(hash).lock();
-        map.get(hash)
-            .map_or(u64::MAX, |id| self.slot(*id).claim.load(Ordering::Relaxed))
+    fn held(&self, hash: &Hash, seen: &mut Seen) -> Key {
+        self.slot(self.id(hash, seen)).claim.load(Ordering::Acquire)
     }
 
     fn placed(&self, hash: &Hash) -> Option<u64> {
         let id = *self.shard(hash).lock().get(hash)?;
-        let offset = self.slot(id).offset.load(Ordering::Acquire);
+        let offset = self.offset(id).load(Ordering::Acquire);
         (offset != 0).then_some(offset)
     }
 
@@ -174,15 +213,45 @@ impl Claims {
             Some(id) => *id,
             None => self.insert(&mut map, hash),
         };
-        let slot = self.slot(id);
-        slot.claim.store(key, Ordering::Relaxed);
-        slot.offset.store(offset, Ordering::Release);
+        self.slot(id).claim.store(key, Ordering::Release);
+        self.offset(id).store(offset, Ordering::Release);
+    }
+}
+
+/// How many hashes each thread remembers the slot of, so that claiming one it met lately takes no
+/// lock.
+const SEEN: usize = 1 << 12;
+/// How many slot numbers a thread takes at once for the hashes it meets first.
+const IDS: u32 = 1 << 10;
+
+/// The slots of hashes a thread met lately, in a table indexed by the hash's first bytes, each
+/// entry replacing the one before at its index, and the block of slot numbers the thread gives the
+/// hashes it meets first.
+///
+/// An entry whose slot is `u32::MAX`, which no hash is given, is empty.
+#[derive(Default)]
+struct Seen {
+    slots: Vec<(Hash, u32)>,
+    ids: Range<u32>,
+}
+
+impl Seen {
+    fn at(&self, hash: &Hash) -> usize {
+        usize::from(u16::from_le_bytes([hash[0], hash[1]])) % SEEN
+    }
+
+    fn put(&mut self, at: usize, hash: &Hash, id: u32) {
+        if self.slots.is_empty() {
+            self.slots = vec![([0xff; HASH_BYTES], u32::MAX); SEEN];
+        }
+        self.slots[at] = (*hash, id);
     }
 }
 
 /// A tree to copy: a root and what its discovery found.
 pub(super) struct Unit {
     key: Key,
+    index: u32,
     root: Ptr,
     depth: u32,
     taint: Arc<HashSet<Hash, ByHash>>,
@@ -252,11 +321,17 @@ struct Node {
     links: Vec<Ptr>,
 }
 
-struct Queued(Arc<Unit>);
+struct Queued(Key, Arc<Unit>);
+
+impl Queued {
+    fn of(unit: Arc<Unit>) -> Queued {
+        Queued(unit.key, unit)
+    }
+}
 
 impl PartialEq for Queued {
     fn eq(&self, other: &Queued) -> bool {
-        self.0.key == other.0.key
+        self.0 == other.0
     }
 }
 
@@ -270,7 +345,7 @@ impl PartialOrd for Queued {
 
 impl Ord for Queued {
     fn cmp(&self, other: &Queued) -> std::cmp::Ordering {
-        other.0.key.cmp(&self.0.key)
+        other.0.cmp(&self.0)
     }
 }
 
@@ -299,6 +374,7 @@ enum Item {
     Unit(Arc<Unit>),
     Job(Job),
     Check(Ptr),
+    Read(Read),
 }
 
 #[derive(Default)]
@@ -306,8 +382,8 @@ struct Queue {
     units: BinaryHeap<Queued>,
     jobs: VecDeque<Job>,
     checks: VecDeque<Ptr>,
+    reads: VecDeque<Read>,
     writing: usize,
-    events: u64,
 }
 
 impl Queue {
@@ -315,10 +391,13 @@ impl Queue {
         if let Some(job) = self.jobs.pop_front() {
             return Some(Item::Job(job));
         }
-        self.units.pop().map(|queued| Item::Unit(queued.0))
+        self.units.pop().map(|queued| Item::Unit(queued.1))
     }
 
     fn take(&mut self) -> Option<Item> {
+        if let Some(read) = self.reads.pop_front() {
+            return Some(Item::Read(read));
+        }
         self.work()
             .or_else(|| self.checks.pop_front().map(Item::Check))
     }
@@ -360,6 +439,7 @@ struct Scratch {
     spare: Vec<Vec<Ptr>>,
     ids: Vec<Vec<u32>>,
     checks: Vec<Ptr>,
+    seen: Seen,
 }
 
 impl Scratch {
@@ -472,13 +552,19 @@ struct Shared {
     writing: Mutex<()>,
     queue: Mutex<Queue>,
     ready: Condvar,
+    moving: Mutex<()>,
     moved: Condvar,
+    events: AtomicU64,
+    watching: AtomicU64,
     placer: Mutex<Placer>,
     again: AtomicBool,
     failure: Mutex<Option<Failure>>,
     cancel: AtomicBool,
     checking: AtomicBool,
     clean: HashSet<Hash, ByHash>,
+    threads: usize,
+    ahead: Arc<Ahead>,
+    roots: Chunked<AtomicU32>,
 }
 
 impl Shared {
@@ -568,14 +654,15 @@ impl Shared {
             count += 1;
             if stack.len() >= 2 * SHARE || count % SHARE == 0 {
                 let mut queue = self.queue.lock();
-                let busy = !queue.jobs.is_empty() || !queue.units.is_empty();
+                let busy =
+                    !queue.jobs.is_empty() || !queue.units.is_empty() || !queue.reads.is_empty();
                 let share = match busy {
                     true => stack.len(),
                     false => stack.len() / 2,
                 };
                 if queue.checks.len() + share <= CHECKS {
                     queue.checks.extend(stack.drain(..share));
-                    self.ready.notify_all();
+                    self.wake(share);
                 }
                 if busy {
                     stack.clear();
@@ -590,7 +677,7 @@ impl Shared {
         if ptr.offset == 0 {
             return;
         }
-        let slot = self.claims.slot(self.claims.id(&ptr.hash));
+        let slot = self.claims.slot(self.claims.id(&ptr.hash, &mut s.seen));
         let started =
             slot.checked
                 .compare_exchange(0, CHECKING, Ordering::AcqRel, Ordering::Relaxed);
@@ -610,7 +697,7 @@ impl Shared {
         }
     }
 
-    fn split(&self, unit: &Unit, node: &Node) -> Option<Vec<Arc<Unit>>> {
+    fn split(&self, unit: &Unit, node: &Node, seen: &mut Seen) -> Option<Vec<Arc<Unit>>> {
         if unit.depth >= LEVELS || node.links.len() < 2 || node.links.len() > MAX_CHILDREN {
             return None;
         }
@@ -619,7 +706,7 @@ impl Shared {
             .iter()
             .enumerate()
             .map(|(index, link)| (child_key(unit.key, unit.depth, index), *link))
-            .filter(|(key, link)| self.claims.held(&link.hash) > *key)
+            .filter(|(key, link)| self.claims.held(&link.hash, seen) > *key)
             .collect();
         if open.len() < 2 {
             return None;
@@ -627,6 +714,7 @@ impl Shared {
         let units = open.into_iter().map(|(key, root)| {
             Arc::new(Unit {
                 key,
+                index: 0,
                 root,
                 depth: unit.depth + 1,
                 taint: unit.taint.clone(),
@@ -638,7 +726,10 @@ impl Shared {
 
     fn discover(&self, unit: &Unit, s: &mut Scratch) -> Option<Found> {
         let mut records = Records::default();
-        let (mut id, won) = self.claims.claim(&unit.root.hash, unit.key);
+        let (mut id, won) = self.claims.claim(&unit.root.hash, unit.key, &mut s.seen);
+        if unit.depth == 0 {
+            self.roots.get(unit.index).store(id + 1, Ordering::Release);
+        }
         if !won {
             return Some(Found::Copied {
                 children: Vec::new(),
@@ -648,7 +739,7 @@ impl Shared {
         let mut node = self.read(unit.root, id, &unit.taint, s)?;
         let mut chain = Vec::new();
         while let [link] = node.links[..] {
-            let (child, won) = self.claims.claim(&link.hash, unit.key);
+            let (child, won) = self.claims.claim(&link.hash, unit.key, &mut s.seen);
             if !won {
                 break;
             }
@@ -656,12 +747,12 @@ impl Shared {
             chain.push((id, mem::replace(&mut node, next), child));
             id = child;
         }
-        let children = match self.split(unit, &node) {
+        let children = match self.split(unit, &node, &mut s.seen) {
             Some(children) => {
                 let ids: Vec<u32> = node
                     .links
                     .iter()
-                    .map(|link| self.claims.id(&link.hash))
+                    .map(|link| self.claims.id(&link.hash, &mut s.seen))
                     .collect();
                 records.push(id, &node, &ids)?;
                 children
@@ -692,7 +783,7 @@ impl Shared {
                 if self.cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                let (child, won) = self.claims.claim(&link.hash, unit.key);
+                let (child, won) = self.claims.claim(&link.hash, unit.key, &mut s.seen);
                 ids.push(child);
                 if won {
                     let node = self.read(link, child, &unit.taint, s)?;
@@ -762,7 +853,7 @@ impl Shared {
             let at = placer.end;
             let mut size = u64::from(rec.fixed);
             for id in records.links(index) {
-                let target = self.claims.slot(*id).offset.load(Ordering::Acquire);
+                let target = self.claims.offset(*id).load(Ordering::Acquire);
                 if target == 0 {
                     return Err(Error::Corrupt(format!(
                         "the copy reached the record at {} before a record it links",
@@ -771,7 +862,7 @@ impl Shared {
                 }
                 size += varint_len(zigzag(at.wrapping_sub(target) as i64)) as u64;
             }
-            slot.offset.store(at, Ordering::Release);
+            self.claims.offset(rec.slot).store(at, Ordering::Release);
             placer.job.add(unit, index, at, size);
             placer.end += size;
             placer.objects += 1;
@@ -837,7 +928,7 @@ impl Shared {
                 if slot.claim.load(Ordering::Relaxed) != unit.key {
                     continue;
                 }
-                let at = slot.offset.load(Ordering::Acquire);
+                let at = self.claims.offset(rec.slot).load(Ordering::Acquire);
                 if at != job.start + s.out.len() as u64 {
                     return Err(misplaced(rec.src));
                 }
@@ -862,7 +953,7 @@ impl Shared {
                 }
                 s.new.clear();
                 for (link, id) in s.links.iter().zip(ids) {
-                    let offset = self.claims.slot(*id).offset.load(Ordering::Acquire);
+                    let offset = self.claims.offset(*id).load(Ordering::Acquire);
                     s.new.push(Ptr {
                         hash: link.hash,
                         offset,
@@ -916,6 +1007,14 @@ impl Shared {
         }
     }
 
+    fn wake(&self, items: usize) {
+        for _ in 0..items.min(self.threads) {
+            if !self.ready.notify_one() {
+                break;
+            }
+        }
+    }
+
     fn run(&self, item: Item, s: &mut Scratch) {
         match item {
             Item::Unit(unit) => {
@@ -925,8 +1024,8 @@ impl Shared {
                     && !children.is_empty()
                 {
                     let mut queue = self.queue.lock();
-                    queue.units.extend(children.iter().cloned().map(Queued));
-                    self.ready.notify_all();
+                    queue.units.extend(children.iter().cloned().map(Queued::of));
+                    self.wake(children.len());
                 }
                 let _ = unit.found.set(found);
                 self.try_place();
@@ -942,10 +1041,21 @@ impl Shared {
             Item::Check(ptr) => {
                 let _ = panic::catch_unwind(AssertUnwindSafe(|| self.check_ahead(ptr, s)));
             }
+            Item::Read(read) => {
+                let source = &self.source;
+                let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.ahead.read(source, &read, &self.cancel);
+                }));
+                if ran.is_err() {
+                    self.ahead.finish(&read);
+                }
+            }
         }
-        let mut queue = self.queue.lock();
-        queue.events += 1;
-        self.moved.notify_all();
+        self.events.fetch_add(1, Ordering::SeqCst);
+        if self.watching.load(Ordering::SeqCst) > 0 {
+            let _moving = self.moving.lock();
+            self.moved.notify_all();
+        }
     }
 
     fn wait(&self, seen: u64, scratch: &mut Scratch, jobs_only: bool) {
@@ -959,9 +1069,13 @@ impl Shared {
             self.run(item, scratch);
             return;
         }
-        if queue.events == seen {
-            self.moved.wait_for(&mut queue, WAIT);
+        drop(queue);
+        let mut moving = self.moving.lock();
+        self.watching.fetch_add(1, Ordering::SeqCst);
+        if self.events.load(Ordering::SeqCst) == seen {
+            self.moved.wait_for(&mut moving, WAIT);
         }
+        self.watching.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1009,13 +1123,19 @@ impl Units {
                 writing: Mutex::new(()),
                 queue: Mutex::default(),
                 ready: Condvar::new(),
+                moving: Mutex::new(()),
                 moved: Condvar::new(),
+                events: AtomicU64::new(0),
+                watching: AtomicU64::new(0),
                 placer: Mutex::default(),
                 again: AtomicBool::new(false),
                 failure: Mutex::default(),
                 cancel: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
                 clean: HashSet::default(),
+                threads,
+                ahead: Arc::default(),
+                roots: Chunked::new(),
             }),
             threads,
             handles: Vec::new(),
@@ -1069,9 +1189,10 @@ impl Units {
             .dispatched
             .lock()
             .extend(self.batch.iter().cloned());
+        let count = self.batch.len();
         let mut queue = self.shared.queue.lock();
-        queue.units.extend(self.batch.drain(..).map(Queued));
-        self.shared.ready.notify_all();
+        queue.units.extend(self.batch.drain(..).map(Queued::of));
+        self.shared.wake(count);
     }
 
     /// Queues the tree at `root` to have its records' hashes checked by threads with nothing else
@@ -1090,6 +1211,35 @@ impl Units {
         }
     }
 
+    /// Has the copy's other threads read the entries of `chain` ahead of the walk, which takes them
+    /// through [`Units::ahead`], until [`Units::end_ahead`].
+    pub(super) fn read_ahead(&mut self, chain: &Chain) {
+        if self.threads <= 1 {
+            return;
+        }
+        if !self.started {
+            self.start();
+        }
+        let reads = self.shared.ahead.begin(chain, self.handles.len());
+        if reads.is_empty() {
+            return;
+        }
+        let count = reads.len();
+        let mut queue = self.shared.queue.lock();
+        queue.reads.extend(reads);
+        self.shared.wake(count);
+    }
+
+    /// Stops the reading [`Units::read_ahead`] began and drops what it read.
+    pub(super) fn end_ahead(&mut self) {
+        self.shared.ahead.end();
+    }
+
+    /// The chain entries the copy's other threads read ahead of the walk.
+    pub(super) fn ahead(&self) -> Arc<Ahead> {
+        self.shared.ahead.clone()
+    }
+
     /// Hands the trees queued by [`Units::check_ahead`] to the threads.
     pub(super) fn publish_checks(&mut self) {
         if self.checks.is_empty() {
@@ -1098,8 +1248,9 @@ impl Units {
         self.shared.checking.store(true, Ordering::Relaxed);
         let mut queue = self.shared.queue.lock();
         if queue.checks.len() < CHECKS {
+            let count = self.checks.len();
             queue.checks.extend(self.checks.drain(..));
-            self.shared.ready.notify_all();
+            self.shared.wake(count);
         }
         self.checks.clear();
     }
@@ -1138,9 +1289,24 @@ impl Units {
         }
     }
 
+    /// Where the root of the unit that [`Units::dispatch`] returned `pending` for was placed, if
+    /// its discovery found it and it is placed.
+    pub(super) fn pending(&self, pending: u64) -> Option<u64> {
+        let index = u32::try_from(u64::MAX - pending).ok()?;
+        let id = self
+            .shared
+            .roots
+            .get(index)
+            .load(Ordering::Acquire)
+            .checked_sub(1)?;
+        let offset = self.shared.claims.offset(id).load(Ordering::Acquire);
+        (offset != 0).then_some(offset)
+    }
+
     /// Hands the tree at `root` to the threads as the next unit, with the copy ending at `end`
-    /// when no unit is outstanding.
-    pub(super) fn dispatch(&mut self, root: Ptr, end: u64) {
+    /// when no unit is outstanding, and returns the offset a link to it holds until it is placed,
+    /// for [`Units::pending`].
+    pub(super) fn dispatch(&mut self, root: Ptr, end: u64) -> u64 {
         if !self.started {
             self.start();
         }
@@ -1149,6 +1315,7 @@ impl Units {
         self.outstanding += 1;
         let unit = Arc::new(Unit {
             key: root_key(self.index),
+            index: self.index,
             root,
             depth: 0,
             taint: self.taint.clone(),
@@ -1162,6 +1329,7 @@ impl Units {
         if self.batch.len() >= BATCH {
             self.publish();
         }
+        u64::MAX - u64::from(self.index)
     }
 
     /// Places units in order, discovering and writing them on this thread too while it waits,
@@ -1177,7 +1345,7 @@ impl Units {
         loop {
             interrupted(stop)?;
             shared.check()?;
-            let seen = shared.queue.lock().events;
+            let seen = shared.events.load(Ordering::SeqCst);
             {
                 let mut placer = shared.placer.lock();
                 match shared.place(&mut placer)? {
@@ -1224,13 +1392,10 @@ impl Units {
         loop {
             interrupted(stop)?;
             shared.check()?;
-            let seen = {
-                let queue = shared.queue.lock();
-                if queue.writing == 0 {
-                    break;
-                }
-                queue.events
-            };
+            let seen = shared.events.load(Ordering::SeqCst);
+            if shared.queue.lock().writing == 0 {
+                break;
+            }
             shared.wait(seen, &mut self.scratch, true);
         }
         shared.checking.store(false, Ordering::Relaxed);

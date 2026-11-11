@@ -16,12 +16,13 @@ copying stays proportional to what was written.
    `at` stops serving a version before its objects are left behind.
 2. Copy, with no lock. Walk the published refs and write each reachable object to
    `<file>.compacting`, re-emitting links with new offsets behind each body as it is stored. The
-   walk copies log entries itself and hands each tree it reaches to up to seven other threads, which
-   check every object's hash and write the tree where one thread would have, as described under [The
-   copy on several threads](#the-copy-on-several-threads). Chain entries are copied like anything
-   else, but a link to an entry that is past `first` and was not brought in by a retained merge, as
-   described under [Merges and pruning](merging.md#merges-and-pruning), is written with offset 0
-   instead of being followed, and so is a skip link below where the entry's `prev` links reach.
+   walk copies log entries itself, which up to four other threads read ahead of it, and hands each
+   tree it reaches to up to seven other threads, which check every object's hash and write the
+   tree where one thread would have, as described under [The copy on several
+   threads](#the-copy-on-several-threads). Chain entries are copied like anything else, but a link
+   to an entry that is past `first` and was not brought in by a retained merge, as described under
+   [Merges and pruning](merging.md#merges-and-pruning), is written with offset 0 instead of being
+   followed, and so is a skip link below where the entry's `prev` links reach.
    Copies are keyed by hash, and entries by the offset they were read from, as described under
    [Commits stored twice](sync-receive.md#commits-stored-twice), so a later pass from newer refs
    visits only what is new. An entry's copy also records how much history it was made for, and a
@@ -363,15 +364,17 @@ a log entry, pruned history or offset 0; otherwise it copies the tree itself and
 the same way. A node of the branch table links each branch's tip, so it stays with the walk, and the
 current tree it links goes out. A thread discovers a unit: it reads each record, checks its hash
 before following its links, and lists the records the unit copies in the order one thread writes
-them, children first. Every object a unit reaches is claimed for it by hash, under one of 256 locks,
-with the unit's key, which orders units as one thread reaches them: the order the walk handed them
-out in, then the index of each link a unit was split at. The smaller key keeps the claim, so of two
-units that reach one object, the one that comes first copies it, whichever thread got there first,
-and a thread that finds an object claimed by a later unit takes it over and copies what it reaches
-below it again. A tree whose root has two or more children no earlier unit holds is split into a
-unit for each such child and one for the root, down to three levels below the tree's root, and a
-chain of nodes with one link each counts as one level, so the current tree of a file becomes
-hundreds of units while each version's path in history stays one.
+them, children first. Every object a unit reaches is claimed for it by hash, its slot found under
+one of 256 locks or in a table of the hashes the thread met lately, as described under [Past eight
+threads again](#past-eight-threads-again), with the unit's key, which orders units as one thread
+reaches them: the order the walk handed them out in, then the index of each link a unit was split
+at. The smaller key keeps the claim, so of two units that reach one object, the one that comes
+first copies it, whichever thread got there first, and a thread that finds an object claimed by a
+later unit takes it over and copies what it reaches below it again. A tree whose root has two or
+more children no earlier unit holds is split into a unit for each such child and one for the root,
+down to three levels below the tree's root, and a chain of nodes with one link each counts as one
+level, so the current tree of a file becomes hundreds of units while each version's path in history
+stays one.
 
 Units are placed in key order, by whichever thread finds the next one discovered. Each record its
 unit still holds takes the next offset, and its length follows from that offset and its links', all
@@ -619,6 +622,123 @@ against 0.54 s.
 checking against 46 beside 7, and handing out units cost the walk 22 ms at 16 threads against 4 at
 8, on the lock of the queue the threads take units from.
 
+### Past eight threads again
+
+On 2026-11-11 the copy of the table rows took 0.191 s at 8 threads, 0.200 s at 16 and 0.319 s at
+32, medians of five runs pinned as above, cores 0-15 up to 16 threads and all 32 at 32. Stamps
+along the first pass, the copy's CPU time and stacks of every thread, taken by attaching `gdb`
+200 times during repeated copies at 16 threads, put the time in three places, the first and last
+on one thread. The stamps slow the copy by a few percent.
+
+- The walk down the chains ended at 46 to 49 ms at 4 and 8 threads, 64 to 70 ms at 16 and 134 ms
+  at 32, against 50 ms on one thread, of which reading and checking the 40,001 entries took 27. It
+  reads each entry from the one above it, so it waits for each `pread` in turn, 37% of its samples
+  at 16 threads, and it slows as more threads check ahead beside it, most at 32, where one of them
+  shares its core. The other threads only check ahead meanwhile, and two fifths of the samples at
+  16 threads fell in this part.
+- Units were placed at about 5,000 every 14 ms at 8 threads and at 16 alike. Placing them kept
+  its thread busy 21 to 33 ms at 4 and 8 threads, 60 to 64 ms at 16 and 85 ms at 32, most of it
+  reading the offsets of the records each record links from slots that the threads claiming and
+  checking were writing. With the first change below in place, the copy used 1.89 s of CPU in
+  0.226 s at 16 threads, 8.4 of 16 cores, against 1.25 s in 0.225 s at 8, and discovering units
+  took 1,050 to 1,430 ms of the threads' time at 16 threads against 650 to 680 ms of their CPU,
+  where at 8 it took 709 ms against 690: the threads waited on the locks of the claims and of the
+  queue, whose waiters spin, yield and park, and on whatever else ran on their cores.
+- Once every unit was placed, the walk wrote the 40,001 entries, from 29 ms at 8 threads to 38 and
+  40 ms at 16 and 32.
+
+Three changes went in. In one set of alternating runs on the table rows, medians of five, in
+seconds, each of the middle rows leaves one of them out, the third by turning the reading ahead
+off in the build of the last:
+
+| Build | 1 thread | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before | 0.809 | 0.309 | 0.196 | 0.202 | 0.312 |
+| Fewer locks, chains read ahead | 0.803 | 0.303 | 0.184 | 0.204 | 0.235 |
+| Fewer locks, offsets apart | 0.804 | 0.292 | 0.190 | 0.198 | 0.264 |
+| All three | 0.807 | 0.290 | 0.178 | 0.203 | 0.223 |
+
+- Claims take fewer locks. Each thread keeps a table of 4,096 hashes it met lately with their
+  slots, indexed by the hash's first bytes, so a claim of one of them finds its slot without the
+  lock of its shard, and a claim lowers the slot's key with a compare-and-swap, and only when its
+  key is lower than the one it reads, so a claim that loses writes nothing. A thread numbers the
+  slots of hashes it meets first from a block of 1,024 it takes at once, rather than one at a time
+  from a counter every thread shares. Of 3.9 million lookups at 16 threads, 1.5 million found
+  their slot in the thread's table. The end of each item is counted with an atomic add rather than
+  under the queue's lock, the walk waits for it on a lock of its own, a thread is woken for each
+  item queued rather than every thread for any, and the queue orders units by a key held beside
+  each rather than read through its pointer.
+- The offsets placed records take are kept apart from the slots, so the thread placing them reads
+  them from lines the others do not write, and the root of each unit the walk dispatched is found
+  by the unit's number rather than looked up by hash: a link to a unit holds that number, taken
+  from `u64::MAX`, until it is placed. Placing kept its thread busy 25 to 29 ms at 8 threads, 28 to
+  40 ms at 16 and 43 to 59 ms at 32.
+- The chains are read ahead. Before the walk goes down a branch's chain of 2,048 entries or more,
+  it splits the chain's versions into up to four stretches, one for each of up to four of the
+  copy's other threads. A thread reads its stretch down the `prev` links, from the tip or from the
+  entry the skip links lead to from the tip, checks each record's hash and decodes it to find the
+  next, and hands the records to the walk in batches of 32. The walk takes each entry it reads from
+  the stretch that holds it next, waiting for that stretch's thread if it is on its way, and reads
+  it itself otherwise: an entry no thread has reached, one a damaged link sent elsewhere, one
+  reached through a merge, or one past where a stretch's share of 16 MiB filled. So the walk sees
+  the same records in the same order, and meets any error on its own read with the error one
+  thread gives. A chain whose tip an earlier pass walked is not read ahead, so neither is a later
+  pass's nor the pause's. All 40,001 entries of the table rows came from the stretches, and the
+  walk waited 3 ms for them in all. The walk down the chains now ends at 22 to 29 ms at 8 threads,
+  36 to 50 ms at 16 and 72 to 94 ms at 32: its bookkeeping, six maps and the closures' marks for
+  each entry, is what is left, and it slows as the other threads run.
+
+Against the build before, on 2026-11-11, pinned as above, medians of five alternating runs:
+
+| File | Threads | Before | After |
+| --- | ---: | ---: | ---: |
+| 189 MB of table rows, 383,364 objects | 1 | 0.809 s | 0.793 s |
+| | 4 | 0.295 s | 0.291 s |
+| | 8 | 0.191 s | 0.176 s |
+| | 16 | 0.200 s | 0.191 s |
+| | 32 | 0.319 s | 0.229 s |
+| 331 MB of 320 byte values, 124,939 objects | 1 | 0.418 s | 0.417 s |
+| | 4 | 0.150 s | 0.152 s |
+| | 8 | 0.112 s | 0.112 s |
+| | 16 | 0.114 s | 0.109 s |
+| | 32 | 0.102 s | 0.107 s |
+
+The values have ten commits, so their chain is not read ahead, and they move within the spread
+of the runs. On cores 0-15, 16 threads lose time to something else that runs on cores 8-15 on this
+machine: 12 threads on cores 0-11 and 16 on 0-15 made 16,000 to 45,000 involuntary context
+switches a copy, where 8 on cores 0-7, 16 on the eight cores 0-7 and their siblings 16-23, or 16
+on all 32 made a few hundred. On all 32, 16 threads copied the table rows in 0.167 s against 0.199
+before, and 8 in 0.186 against 0.194; on cores 0-7 and 16-23, 16 threads took 0.166 against 0.189.
+So 16 threads now copy faster than 8, by about a tenth, where before they did not, and 32 no longer
+lose a third to 8. The default stays at 8.
+
+The 255 MB file of 6,000 commits of 8 updates, as above, medians of three:
+
+| Copy of the 255 MB file | Threads | Before | After |
+| --- | ---: | ---: | ---: |
+| `Keep::All` | 1 | 1.065 s | 1.060 s |
+| | 8 | 0.308 s | 0.221 s |
+| | 16 | 0.252 s | 0.227 s |
+| `Keep::Last(3000)` | 1 | 0.685 s | 0.706 s |
+| | 8 | 0.175 s | 0.155 s |
+| | 16 | 0.167 s | 0.155 s |
+| `Keep::All`, of a file a cycle wrote | 8 | 0.226 s | 0.215 s |
+| | 16 | 0.229 s | 0.224 s |
+| `Keep::Last(3000)`, of a file a cycle wrote | 8 | 0.151 s | 0.149 s |
+| | 16 | 0.155 s | 0.146 s |
+
+The fastest of the three took 0.239 against 0.220 s at 8 threads keeping everything, and 0.685
+against 0.683 s on one thread keeping the last 3,000, whose code does not change. The copy is the
+same bytes at any number of threads: `cmp` found the copies of the table rows and of the values
+made at 3, 8, 16 and 32 threads identical to the one made on one, and the reclamation tests pass
+unchanged. Peak RSS copying the table rows went from 160 to 162 MiB on one thread, 88 to 92 MiB at
+8 and 90 to 98 MiB at 16, and copying the values from 24 to 28 MiB at 8 threads and 28 to 33 MiB at
+16: the stretches read ahead, up to 16 MiB while the walk goes down a chain, the threads' tables of
+hashes, 96 KiB each, and the number of each unit's root, 4 bytes a unit. The longest pause of
+`ferro-bench --bin reclaim live table`, as under [Measurements](#measurements), medians of three
+alternating runs, was 2.75 ms against 2.69 ms before, within the runs' spread of 2.59 to 2.87 ms,
+at 5,160 and 5,159 commits a second, and a cycle took 0.58 s against 0.58 to 0.61 s.
+
 ### Measured and left out
 
 - Reading a node's children in one read. When the children still to copy lay within 256 KiB and
@@ -662,10 +782,34 @@ checking against 46 beside 7, and handing out units cost the walk 22 ms at 16 th
 - Checking ahead without units recording what they checked. At 16 threads 91,000 records were
   checked after their unit had checked them, and the table rows took 0.293, 0.192 and 0.203 s at 4,
   8 and 16 threads against 0.288, 0.186 and 0.192.
-- Reading the chains on another thread, ahead of the walk's bookkeeping. Not built. Reading and
-  checking entries is about half of the walk down the chains, at most 22 ms of a 0.19 s copy at 16
-  threads, and the walk would have to take the other thread's records in the order it asks for
-  them, with any error at the record that gave it.
+- Reading wider around each record. A thread whose next read lay within 64 KiB of its last read
+  12 KiB before the record and 4 KiB after, and 32 KiB ahead for a write job, since a commit writes
+  a version's path together, children first. Reading then took 39% of the threads' running samples
+  against 29%, copying 16 KiB where it had copied 1, and the table rows took 0.183 and 0.191 s at 8
+  and 16 threads against 0.179 and 0.192.
+- Taking up to eight units from the queue at once while many waited. Each thread then discovered
+  units further out of order, so later units claimed what earlier ones took over, and the threads
+  discovered 500,000 to 580,000 records where 351,000 are copied.
+- 4,096 shards of claims instead of 256. The table rows took 0.184, 0.193 and 0.225 s at 8, 16 and
+  32 threads against 0.179, 0.193 and 0.227, and discovery still spent half its time off the CPU at
+  16 threads.
+- Making room in the walk's maps for every entry of a chain before going down it. The walk down
+  the chains took 22 to 24 ms against 27 to 29 at 8 threads, but 48 to 54 against 37 to 40 at 16
+  and 88 to 98 against 78 to 88 at 32.
+- Letting only half or a quarter of the threads check ahead, so that the walk had cores to itself.
+  At 32 threads copies took 0.200 to 0.220 s against 0.223 to 0.232, and at 16 0.197 to 0.207
+  against 0.177 to 0.198, single runs within the spread of either.
+- Writing each job's buffer from whichever thread holds the file, so that the others queue it and
+  go on rather than wait for the lock. Waiting for the file fell from 313 ms of the threads' time
+  at 16 threads to none, but the table rows took 0.182, 0.194 and 0.218 s at 8, 16 and 32 threads
+  against 0.180, 0.194 and 0.223.
+- Handing out the units the walk dispatched without the queue's lock, each taken by a
+  compare-and-swap on a count: 0.179, 0.193 and 0.227 s at 8, 16 and 32 threads against 0.182,
+  0.194 and 0.218.
+- A format that lists each frame's objects in its header, or copying a frame whole when nothing in
+  it is garbage. Not built. A file a cycle wrote has no frames, so the background cycles that
+  follow the first would gain nothing, and with the chains read ahead the walk no longer waits to
+  find entries but on its own bookkeeping.
 
 ## Generations
 
@@ -840,23 +984,26 @@ comparison was made on one base, before value columns landed:
 
 ## Limits
 
-A cycle walks the log on one thread and copies the trees it reaches on up to seven others, checking
-every object's hash as it goes, as described under [The copy on several
-threads](#the-copy-on-several-threads). On 2026-11-07 the copy of a file in the page cache, keeping
-everything, ran at 1,000 MB/s on 189 MB of table rows, 200,000 rows and 40,000 updates in 383,364
-objects, and at 2,960 MB/s on 331 MB of a million 320 byte values in 124,939 objects, with 8
-threads, where it ran at 870 and 2,780 MB/s at best before. With 4 threads it now runs at 640 and
-2,140 MB/s, with 16 at 980 and 3,130, and on one thread at 237 and 806 MB/s as before. So a 10 GB
-database of table rows takes about 10 seconds and needs 10 GB free. The trigger keeps that to one
-extra byte copied per byte written, at worst. Past 8 threads the copy of table rows gains nothing
-more, since the walk down the chains slows as more cores run and handing out units costs it more,
-as described under [The walk past eight threads](#the-walk-past-eight-threads). `Keep::All` copies
-all of history, so `history` is what makes background cycles worthwhile. The copy holds its claims,
-about 68 bytes per object, about 80 bytes per commit for where each entry was read and copied and
-what its copy keeps, up to 16 MiB of the entries the walk down the chains read, counted at what
-their buffer and map allocate, until the pass ends, the lists of the trees waiting to be placed,
-24 bytes a record and 4 a link, and 16 MiB of records and decompressed bodies the threads and the
-walk hold at once, or one larger record alone, besides a buffer of up to 1 MiB on each thread and
+A cycle walks the log on one thread, with up to four others reading the chains ahead of it, and
+copies the trees it reaches on up to seven others, checking every object's hash as it goes, as
+described under [The copy on several threads](#the-copy-on-several-threads). On 2026-11-11 the
+copy of a file in the page cache, keeping everything, ran at 1,078 MB/s on 189 MB of table rows,
+200,000 rows and 40,000 updates in 383,364 objects, and at 2,958 MB/s on 331 MB of a million 320
+byte values in 124,939 objects, with 8 threads, medians of five runs, against 993 MB/s on the table
+rows before and as before on the values. With 4 threads it runs at 652 and 2,180 MB/s, with 16 at 993 and 3,040, and on one thread
+at 239 and 794 MB/s, as before. So a 10 GB database of table rows takes about 9 seconds and needs
+10 GB free. The trigger keeps that to one extra byte copied per byte written, at worst. Past 8
+threads the copy of table rows gains about a tenth at 16 threads, 1,136 MB/s with them spread over
+all 32 CPUs, and runs at 828 MB/s at 32, since the walk down the chains and the writing of the
+entries after every tree stay on one thread, and the walk's bookkeeping slows as more cores run,
+as described under [Past eight threads again](#past-eight-threads-again). `Keep::All` copies all of
+history, so `history` is what makes background cycles worthwhile. The copy holds its claims, about
+68 bytes per object, about 80 bytes per commit for where each entry was read and copied and what
+its copy keeps, up to 16 MiB of the entries the walk down the chains read, counted at what their
+buffer and map allocate, until the pass ends, and up to 16 MiB more of entries read ahead of it
+while it goes down a chain, the lists of the trees waiting to be placed, 24 bytes a record and 4 a
+link, and 16 MiB of records and decompressed bodies the threads and the walk hold at once, or one
+larger record alone, besides a buffer of up to 1 MiB and a table of 4,096 hashes on each thread and
 the one record the walk is copying.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
