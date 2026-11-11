@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use common::quiet_ferro_panics;
+use common::{Tripwire, quiet_ferro_panics};
 use ferro::db::Hook;
 use ferro::{Db, Durability, Error, Map, Options, Reclaim};
 use tempfile::TempDir;
@@ -47,8 +47,15 @@ static SUPERS_FAIL: AtomicBool = AtomicBool::new(false);
 static ZEROS_FAIL: AtomicBool = AtomicBool::new(false);
 static ZEROS_FAILED: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy)]
+enum Garble {
+    Zeroes,
+    Flip,
+}
+
 thread_local! {
     static STAGED_FAIL: Cell<u32> = const { Cell::new(0) };
+    static STAGED_GARBLE: Cell<(u32, Garble)> = const { Cell::new((0, Garble::Zeroes)) };
     static FRAMES_FAIL: Cell<bool> = const { Cell::new(false) };
     static FRAMES_HELD: Cell<bool> = const { Cell::new(false) };
 }
@@ -108,6 +115,7 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
         unsafe { *__errno_location() = ENOSPC };
         return -1;
     }
+    let mut garbled = None;
     if offset >= 8192 && count >= 256 << 10 && !is_frame(buf, count) {
         let left = STAGED_FAIL.with(|fail| fail.replace(fail.get().saturating_sub(1)));
         if left == 1 {
@@ -116,7 +124,25 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
             unsafe { *__errno_location() = ENOSPC };
             return -1;
         }
+        let (left, how) = STAGED_GARBLE.with(|garble| {
+            let (left, how) = garble.get();
+            garble.set((left.saturating_sub(1), how));
+            (left, how)
+        });
+        if left == 1 {
+            // SAFETY: a caller of `pwrite64` guarantees that `buf` is readable for `count` bytes,
+            // which is the length read here.
+            let mut bytes = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), count) }.to_vec();
+            match how {
+                Garble::Zeroes => bytes.fill(0),
+                Garble::Flip => bytes[count / 2] ^= 0x10,
+            }
+            garbled = Some(bytes);
+        }
     }
+    let buf = garbled
+        .as_ref()
+        .map_or(buf, |bytes| bytes.as_ptr().cast::<c_void>());
     if is_frame(buf, count) {
         if FRAMES_FAIL.with(Cell::get) {
             // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's
@@ -807,6 +833,73 @@ fn a_staging_frame_whose_records_fail_to_write_fails_the_receive_and_nothing_els
             Some(&"side".to_string())
         );
     }
+}
+
+fn garbled_receive(how: Garble, swapped: bool, wanted: &str) {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let sender: Db<Text> = buffered().open(dir.path().join("sender.ferro")).unwrap();
+        sender
+            .update(|root| {
+                for key in 0..3_000 {
+                    root.insert(key, common::text(key, 1_000));
+                }
+            })
+            .unwrap();
+        let path = dir.path().join("receiver.ferro");
+        let db: Db<Text> = options().open(&path).unwrap();
+        db.update(|root| {
+            root.insert(0, "base".to_string());
+        })
+        .unwrap();
+        let bundle = sender.bundle(&db.have().unwrap()).unwrap();
+        assert!(bundle.as_bytes().len() > 2 << 20, "{kind}");
+        let input = Tripwire::new(bundle.as_bytes(), 256 << 10, || {
+            if swapped {
+                let db = db.clone();
+                thread::spawn(move || db.compact(ferro::Keep::All))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        STAGED_GARBLE.with(|garble| garble.set((1, how)));
+        let received = db.receive_from("peer", input, merge_theirs);
+        let (left, _) = STAGED_GARBLE.with(|garble| garble.replace((0, Garble::Zeroes)));
+        assert_eq!(left, 0, "{kind}: no staged write was garbled");
+        match received {
+            Err(Error::Corrupt(message)) => {
+                assert!(message.contains(wanted), "{kind}: {message}")
+            }
+            other => panic!("{kind}: a receive whose records were garbled: {other:?}"),
+        }
+        assert!(db.branch("peer").is_err(), "{kind}");
+        db.verify().unwrap();
+        let pulled = db.receive("peer", &bundle, merge_theirs).unwrap();
+        assert_eq!(pulled.outcome, ferro::Outcome::Merged, "{kind}");
+        drop(db);
+        let db: Db<Text> = options().open(&path).unwrap();
+        db.verify_typed().unwrap();
+        assert_eq!(db.branch("peer").unwrap().head_hash(), sender.head_hash());
+    }
+}
+
+#[test]
+fn a_receive_whose_staged_records_were_written_as_zeroes_refuses_them_in_place() {
+    let _turn = serial();
+    garbled_receive(Garble::Zeroes, false, "reads as zeroes");
+}
+
+#[test]
+fn a_receive_that_a_cycle_moved_refuses_records_written_past_the_old_file_as_zeroes() {
+    let _turn = serial();
+    garbled_receive(Garble::Zeroes, true, "reads as zeroes");
+}
+
+#[test]
+fn a_receive_that_a_cycle_moved_refuses_a_record_whose_bytes_changed_past_the_old_file() {
+    let _turn = serial();
+    garbled_receive(Garble::Flip, true, "hash mismatch for the staged object");
 }
 
 #[test]

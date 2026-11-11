@@ -39,7 +39,8 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   sparse instead, one or two to a commit, each zeroes with a few bits set, under 96 bytes so that
   it stays raw, up to 64 KiB so that it compresses to runs of ones, or 400 KB of noise that
   compression does not shrink around a KiB of zeroes with one bit set; or it can start the file
-  with a pull of three values of such noise from another file, which arrives in staging frames.
+  with a pull of three values of such noise from another file, which arrives in staging frames
+  that the mode walks over, damaging only frames with a table, those after them among them.
   The mode then compares the damaged frame with the whole one: if each block and the header and
   table together differ in at most one bit, at most 8 blocks differ, the entry of no block differs
   along with its block, and every bit that differs sits in a sector that holds at least 8 of the
@@ -47,8 +48,10 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   read-only open and a writer's open must fail with `Corrupt` naming the frame and its first wrong
   byte and leave the file as it was. Otherwise both must open at the version the frames before it
   hold, which a pull's staging frames leave where it was, the writer truncating the file at the
-  frame,
-  `verify` must pass, and a commit must survive a reopen.
+  end of the frame before it, with any staging frames between them, `verify` must pass, and a
+  commit must survive a reopen. The seeds of the `open` corpus include small files with staging
+  frames written beside a shared writer, ending the log, followed by commits, with zeroed
+  records, cut in the header and with a bit flipped in it.
 - `reclaim` takes the input `admin` takes, opens the file as the type that decodes nothing and
   compacts it with `copy_threads(1)` and again, from the same image, with `copy_threads(4)`, keeping
   every version, the newest one or three, or those since time 0, and for some modes compacts the

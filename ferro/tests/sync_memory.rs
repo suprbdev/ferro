@@ -7,8 +7,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::Instant;
 
-use common::{fast, text};
-use ferro::{Bundle, Data, Db, Error, Map, Outcome, Record, Snapshot, Summary, Table};
+use common::{Tripwire, fast, text};
+use ferro::{
+    Bundle, Data, Db, Error, Keep, Map, Outcome, Reclaim, Record, Snapshot, Summary, Table,
+};
 
 struct Peak;
 
@@ -574,6 +576,69 @@ fn checking_held_data_linked_as_another_type_holds_no_more_for_long_keys() {
     assert!(
         long < short + 8 * MIB,
         "checking a copy of 40,000 keys of 2 KiB took {long} bytes of heap, of 20 bytes {short}"
+    );
+}
+
+#[test]
+fn a_receive_whose_file_a_cycle_replaced_before_it_spilled_holds_a_buffer_not_the_bundle() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let a: Db<Root> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let b: Db<Root> = fast().open(dir.path().join("b.ferro")).unwrap();
+    a.update(|root| {
+        for key in 0..10 {
+            root.insert(key, text(key, 1_500));
+        }
+    })
+    .unwrap();
+    b.pull(&a, "a", refuse).unwrap();
+    a.update(|root| {
+        for key in 10..12_000 {
+            root.insert(key, text(key, 1_500));
+        }
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    drop(b);
+    let source = std::fs::read(dir.path().join("b.ferro")).unwrap();
+    let mut peaks = Vec::new();
+    for swap in [false, true] {
+        let path = dir.path().join(format!("swap-{swap}.ferro"));
+        std::fs::write(&path, &source).unwrap();
+        let b: Db<Root> = fast()
+            .reclaim(Reclaim { every_bytes: 0 })
+            .open(&path)
+            .unwrap();
+        let base = Cell::new(0);
+        let input = Tripwire::new(bundle.as_bytes(), 256 << 10, || {
+            if swap {
+                let db = b.clone();
+                std::thread::spawn(move || db.compact(Keep::All))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            }
+            let live = LIVE.with(Cell::get);
+            HIGH.with(|high| high.set(live));
+            base.set(live);
+        });
+        let pulled = b.receive_from("a", input, refuse).unwrap();
+        peaks.push(HIGH.with(Cell::get) - base.get());
+        assert_eq!(pulled.outcome, Outcome::FastForward);
+        assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
+        b.verify_typed().unwrap();
+    }
+    let len = bundle.as_bytes().len();
+    println!(
+        "{len} bytes received with {} bytes of heap in place, {} once a cycle replaced the file",
+        peaks[0], peaks[1]
+    );
+    assert!(len > 16 * MIB, "{len}");
+    assert!(
+        peaks[1] < 8 * MIB,
+        "a receive whose file a cycle replaced took {} bytes of heap for {len} bytes, against {} \
+         in place",
+        peaks[1],
+        peaks[0]
     );
 }
 

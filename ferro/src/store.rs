@@ -2444,6 +2444,9 @@ struct Inner {
     unsynced: AtomicBool,
     /// Set once the store is closed, after which nothing more enters the cache.
     closed: AtomicBool,
+    /// Set once a cycle has renamed another generation over the file, which no open can reach
+    /// again, so that a close leaves its length as it is.
+    replaced: AtomicBool,
     /// How far drafts have recently moved before their frames were placed: the largest move seen
     /// lately, losing a sixteenth and a byte with each frame placed, which sizes the room a draft
     /// leaves in its links to objects before it.
@@ -2865,6 +2868,7 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                replaced: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
                 staging: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
@@ -2931,6 +2935,7 @@ impl Store {
                 lost_at: AtomicU64::new(u64::MAX),
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                replaced: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
                 staging: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
@@ -4097,6 +4102,13 @@ impl Store {
         Ok(())
     }
 
+    /// Notes that a cycle has renamed another generation over the file, once the rename is done,
+    /// so that [`Store::close`] leaves the file's length as it is: no open can reach it again,
+    /// and a receive that staged in it may still be writing records past its end.
+    pub(crate) fn mark_replaced(&self) {
+        self.inner.replaced.store(true, Ordering::Release);
+    }
+
     /// Reads the object at `ptr` and checks its hash.
     ///
     /// An object in a frame that is placed but still being written is waited for.
@@ -4565,9 +4577,10 @@ impl Store {
     /// Staging frames that end the log hold records of a receive that never landed, so a writer
     /// truncates them too, durably, so that none can line up with frames a later writer places
     /// there. A shared writer truncates nothing, since other writers may be placing frames in the
-    /// preallocation or have followed its staging frames, and neither does a poisoned store or
-    /// one a receive is still staging in, as it may be after a cycle replaced it. A second close
-    /// does nothing to the file, so it never truncates under a new writer.
+    /// preallocation or have followed its staging frames, and neither does a poisoned store, one
+    /// a receive is still staging in, or one whose file a cycle replaced, which no open can reach
+    /// again and past whose end a receive may still be writing. A second close does nothing to
+    /// the file, so it never truncates under a new writer.
     pub fn close(&self) {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
@@ -4589,7 +4602,8 @@ impl Store {
             .staged_from
             .filter(|_| inner.placed.load(Ordering::Acquire) == end);
         let staging = inner.staging.load(Ordering::Acquire) > 0;
-        if !inner.poisoned.load(Ordering::Acquire) && !staging {
+        let replaced = inner.replaced.load(Ordering::Acquire);
+        if !inner.poisoned.load(Ordering::Acquire) && !staging && !replaced {
             match staged {
                 Some(at) => {
                     let _ = inner.file.set_len(at).and_then(|()| inner.file.sync_all());
@@ -5598,7 +5612,8 @@ pub(crate) type Room<'a> = dyn FnMut(u64) -> Result<Option<(u64, u64)>> + 'a;
 /// the records outgrow `limit` they move into staging frames, placed at the end of the log as
 /// they fill by a [`Room`], where offsets are the log's and every link leads back, so the zigzag
 /// of each distance is the varint a log record holds. If a cycle replaces the file meanwhile, the
-/// rest go past the end of the replaced file, which no other writer touches again.
+/// rest go past the end of the replaced file, which no other writer touches again, written out
+/// whenever [`STAGED_ROOM`] of them wait in memory.
 pub(crate) struct Staging {
     store: Store,
     limit: usize,
@@ -5612,8 +5627,9 @@ pub(crate) struct Staging {
 
 /// Where a staging that outgrew memory writes its records.
 struct Logged {
-    /// Where the room for records ends: the end of the staging frame being filled, or `u64::MAX`
-    /// once records go past the end of a replaced file.
+    /// Where the room for records ends: the end of the staging frame being filled, or, once
+    /// records go past the end of a replaced file, where those held in memory are next written
+    /// out.
     room: u64,
     /// Where each staging frame placed for the records starts and ends.
     frames: Vec<(u64, u64)>,
@@ -5644,6 +5660,40 @@ impl Record {
             packed: self.packed,
             links,
         }
+    }
+
+    /// Fails unless the record, read back from `at` in the file, holds the object its hash names,
+    /// decompressing its body into `body` if it is compressed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] for a body that does not decompress or an object whose hash differs,
+    /// saying so when the record reads as zeroes, as where a write never landed.
+    fn check(&self, at: u64, body: &mut Vec<u8>) -> Result<()> {
+        let held = match self.packed {
+            true => {
+                let most = self.payload.len().saturating_mul(MAX_RATIO);
+                if self.raw > most.saturating_add(MAX_RATIO) {
+                    return Err(Error::Corrupt(format!(
+                        "implausible compression in the staged record at {at}"
+                    )));
+                }
+                unpack_into(&self.payload, self.raw, at, body)?;
+                &body[..]
+            }
+            false => &self.payload[..],
+        };
+        if hash_parts(held, self.links.iter().map(|link| &link.hash)) == self.hash {
+            return Ok(());
+        }
+        if !self.packed && self.payload.is_empty() && self.links.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "the staged record at {at} reads as zeroes"
+            )));
+        }
+        Err(Error::Corrupt(format!(
+            "hash mismatch for the staged object at {at}"
+        )))
     }
 }
 
@@ -5824,15 +5874,25 @@ impl Staging {
     }
 
     /// Makes sure the staging frame being filled has room for `most` more bytes, writing the
-    /// records it holds and asking `room` for another if it has not.
+    /// records it holds and asking `room` for another if it has not. Past the end of a replaced
+    /// file, it writes the records it holds once they would take more than [`STAGED_ROOM`]. It
+    /// makes the replaced file as long as where those records begin, so that the file never ends
+    /// before the records a read may reach.
     fn make_room(&mut self, most: u64, room: &mut Room<'_>) -> Result<()> {
         let end = self.start + self.buf.len() as u64;
         let log = self.log.as_ref().expect("a staging in the log");
         if end.checked_add(most).is_some_and(|need| need <= log.room) {
             return Ok(());
         }
+        let past = log.past.is_some();
         self.write_out()?;
-        let found = room(most.max(STAGED_ROOM))?;
+        let wanted = most.max(STAGED_ROOM);
+        if past {
+            let log = self.log.as_mut().expect("a staging in the log");
+            log.room = self.start.saturating_add(wanted);
+            return Ok(());
+        }
+        let found = room(wanted)?;
         let log = self.log.as_mut().expect("a staging in the log");
         match found {
             Some((at, end)) => {
@@ -5841,10 +5901,14 @@ impl Staging {
                 self.start = at + FRAME_BYTES as u64;
             }
             None => {
-                let len = self.store.inner.file.metadata()?.len();
+                let file = &self.store.inner.file;
+                let len = file.metadata()?.len();
                 let past = len.max(self.start).next_multiple_of(BLOCK_BYTES as u64);
+                if past > len {
+                    file.set_len(past)?;
+                }
                 log.past = Some(past);
-                log.room = u64::MAX;
+                log.room = past.saturating_add(wanted);
                 self.start = past;
             }
         }
@@ -5905,7 +5969,8 @@ impl Staging {
     }
 
     /// Reads the object at `ptr`, an offset in the staging, without checking its hash, which was
-    /// checked as it arrived.
+    /// checked as it arrived, but refusing a record read from the file that reads as zeroes, as
+    /// where a write never landed, unless its object is the empty one.
     pub(crate) fn read_object(&self, ptr: Ptr) -> Result<Object> {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
@@ -5914,6 +5979,16 @@ impl Staging {
         };
         let file = self.log.as_ref().map(|_| &*self.store.inner.file);
         let (object, _, _) = Store::read_within(file, ptr, tail, held, false, false, None, true)?;
+        if held.is_empty()
+            && object.body.is_empty()
+            && object.links.is_empty()
+            && object.hash() != ptr.hash
+        {
+            return Err(Error::Corrupt(format!(
+                "the staged record at {} reads as zeroes",
+                ptr.offset
+            )));
+        }
         Ok(object)
     }
 
@@ -6015,6 +6090,7 @@ impl Staging {
             next: 0,
             window: Vec::new(),
             window_at: LOG_START,
+            body: Vec::new(),
         }
     }
 }
@@ -6037,15 +6113,22 @@ pub(crate) struct Replay<'a> {
     window: Vec<u8>,
     /// Where `window` starts.
     window_at: u64,
+    /// The scratch body a compressed record read from the file decompresses into for its check.
+    body: Vec<u8>,
 }
 
 impl Replay<'_> {
     /// The next record, or `None` after the last.
     ///
+    /// A record read back from the file is checked against its hash, since nothing else checks
+    /// the bytes a write left there before they are placed elsewhere. One held in memory was
+    /// hashed as it arrived.
+    ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if a record runs past the end of the staging or does not parse, and the
-    /// I/O error of a failed read of the file.
+    /// [`Error::Corrupt`] if a record runs past the end of the staging or does not parse, or one
+    /// read from the file does not hold the object its hash names, and the I/O error of a failed
+    /// read of the file.
     pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
         let staging = self.staging;
         if self.next as usize == staging.offsets.len() {
@@ -6053,12 +6136,21 @@ impl Replay<'_> {
         }
         let at = staging.offsets.get(self.next);
         let hash = staging.hashes.hash(self.next);
-        let parsed = match at.checked_sub(staging.start) {
-            Some(from) => parse_record(&staging.buf[from as usize..], at, hash)?,
-            None => self.written_record(at, hash)?,
+        let (parsed, written) = match at.checked_sub(staging.start) {
+            Some(from) => (
+                parse_record(&staging.buf[from as usize..], at, hash)?,
+                false,
+            ),
+            None => (self.written_record(at, hash)?, true),
         };
         let (record, _) =
             parsed.ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
+        if written {
+            let checked = record.check(at, &mut self.body);
+            self.body.clear();
+            self.body.shrink_to(SCRATCH_KEEP);
+            checked?;
+        }
         self.next += 1;
         Ok(Some(record))
     }

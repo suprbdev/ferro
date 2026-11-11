@@ -24,8 +24,9 @@ in a message are escaped as Rust escapes them, `\n` for a newline and `\\` for a
 a message cannot break a line or forge one.
 
 The file length that `info`, `space` and `verify` print includes the zeroes a writer preallocates
-past the log, up to 4 MiB, while it has the file open, or after shared writers closed it, until the
-next writer opens it. `space` prints the log's bytes beside it. `compact` prints the file's length
+past the log, up to 4 MiB, and the staging frames of a receive of more than 1 MiB that end the log,
+while it has the file open, or after shared writers closed it, until the next writer opens it.
+`space` prints the log's bytes beside it. `compact` prints the file's length
 before and after.
 
 Output goes to standard output and errors to standard error, as `ferro: <error>` with exit status 1.

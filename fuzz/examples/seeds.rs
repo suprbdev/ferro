@@ -14,6 +14,7 @@ use ferro::{Bytes, Data, Db, Durability, Error, Keep, Map, Options, Reclaim};
 use ferro_fuzz::catalog::{
     Catalog, CatalogV1, CatalogV3, Pairs, World, item, item_v1, item_v3, word,
 };
+use ferro_fuzz::fixup::{FRAME_BYTES, FRAME_CHECKED, LOG_START, STAGING_MAGIC, seal_staging};
 use ferro_fuzz::sync::{self as fuzz_sync, BOTH, DIRECT, EDITS, PACK_SMART, REHASH, REOPEN};
 use ferro_fuzz::types::{Docs, Nested, Order, Probe, Root, Shop, Status, Summed};
 use ferro_fuzz::{
@@ -900,6 +901,64 @@ fn pieces(corpus: &mut Corpus, dir: &Path) {
     corpus.emit(ROOT, &torn);
 }
 
+fn word_at(bytes: &[u8], at: usize) -> usize {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+}
+
+fn append_staging(path: &Path, records: impl FnOnce(&[u8]) -> Vec<u8>) -> usize {
+    let bytes = fs::read(path).unwrap();
+    let (mut at, mut last, mut before) = (LOG_START, None, None);
+    while at + FRAME_BYTES <= bytes.len() {
+        if bytes[at..].starts_with(FRAME_MAGIC) {
+            last = Some(at);
+        } else if !bytes[at..].starts_with(STAGING_MAGIC) {
+            break;
+        }
+        before = Some(at);
+        at = word_at(&bytes, at + 16);
+    }
+    assert_eq!(at, bytes.len(), "the log ends the file");
+    let (last, before) = last.zip(before).expect("a frame before the staging frame");
+    let body = &bytes[last + FRAME_BYTES..word_at(&bytes, last + 16)];
+    let records = records(body);
+    let mut frame = vec![0u8; FRAME_BYTES];
+    frame[..8].copy_from_slice(STAGING_MAGIC);
+    let seq = word_at(&bytes, before + 8) as u64 + 1;
+    frame[8..16].copy_from_slice(&seq.to_le_bytes());
+    let end = (at + FRAME_BYTES + records.len()) as u64;
+    frame[16..24].copy_from_slice(&end.to_le_bytes());
+    frame[24..FRAME_CHECKED].copy_from_slice(&bytes[before + 24..before + FRAME_CHECKED]);
+    seal_staging(&mut frame, 0);
+    frame.extend_from_slice(&records);
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, &frame, at as u64).unwrap();
+    at
+}
+
+fn staging_frames(corpus: &mut Corpus, dir: &Path) {
+    let path = dir.join("staging.ferro");
+    let db = options().shared(true).open::<Root>(&path).unwrap();
+    small(&db, 0, 0);
+    small(&db, 1, 1);
+    let first = append_staging(&path, |body| body.to_vec());
+    let ending = fs::read(&path).unwrap();
+    corpus.emit(ROOT, &ending);
+    corpus.emit(ROOT, &ending[..first + FRAME_BYTES / 2]);
+    small(&db, 2, 2);
+    let side = db.fork("side").unwrap();
+    small(&side, 3, 3);
+    corpus.emit(ROOT, &fs::read(&path).unwrap());
+    let second = append_staging(&path, |body| vec![0; body.len().min(512)]);
+    let refused = fs::read(&path).unwrap();
+    corpus.emit(ROOT, &refused);
+    let mut flipped = refused.clone();
+    flipped[second + 20] ^= 0x04;
+    corpus.emit(ROOT, &flipped);
+    small(&db, 4, 4);
+    drop((side, db));
+    corpus.emit_file(ROOT, &path);
+}
+
 fn mid_receive(corpus: &mut Corpus, dir: &Path) {
     let scenario = fuzz_sync::scenarios()
         .iter()
@@ -1060,6 +1119,7 @@ fn main() {
     crashes(&mut corpus, dir.path());
     out_of_order(&mut corpus, dir.path());
     mid_receive(&mut corpus, dir.path());
+    staging_frames(&mut corpus, dir.path());
     sync_seeds(&mut corpus, dir.path());
     refs_seeds(&mut corpus);
     damage_seeds(&mut corpus);

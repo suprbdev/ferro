@@ -80,14 +80,23 @@ now current.
 A cycle copies only what the refs reach, so one that swaps the file while a bundle streams leaves
 its staging frames behind in the old file, which the receive's `Store` keeps open. The receive
 learns of the swap when it next asks for a frame, and writes the rest of the bundle past the end of
-the old file, which no writer touches again and which the old file's close leaves alone while a
-receive stages in it. Its landing then finds its records outside the current file: it resolves the
-anchors again in the generation now current, each base by hash and version, and each hint by
-following its path again from the anchors' roots, one read per parent object as when it was first
-resolved, which must end at the same hash, and places the records in the new file in pieces of 256
-KiB under the cycle mutex, each a frame of its own that keeps the refs as they were and whose
-objects the deduplication table learns, but for the commits, before it lands as above. Such a bundle
-is written twice, as every large bundle used to be. The staging frames of a receive in flight are
+the old file, 1 MiB at a time as into staging frames, so that it holds no more of the bundle in
+memory. It first makes the old file as long as where they begin, a block boundary past its end, so
+that the checks, reading a record staged near that end, never read past the end of the file. No
+writer touches the old file again, and its close leaves its length alone: the cycle
+marks the old generation replaced as soon as it has renamed the new one over it, before the receive
+can learn of the swap, so the close truncates nothing whenever it runs, before the receive writes
+past the end, between its writes or after them. Truncating there would gain nothing, since no open
+can reach the old file again and its blocks go back with its last handle. Its landing then finds its
+records outside the current file: it resolves the anchors again in the generation now current, each
+base by hash and version, and each hint by following its path again from the anchors' roots, one
+read per parent object as when it was first resolved, which must end at the same hash, and places
+the records in the new file in pieces of 256 KiB under the cycle mutex, each a frame of its own that
+keeps the refs as they were and whose objects the deduplication table learns, but for the commits,
+before it lands as above. Each record it reads back from the old file is hashed again before it is
+placed, and one that reads as zeroes, as where a write never landed, is named as such, so that no
+object lands whose bytes do not match its hash. Such a bundle is written twice, as every large
+bundle used to be. The staging frames of a receive in flight are
 left out of the growth that makes a background cycle due, so that a receive does not set off the
 cycle that would make it write twice; a cycle due from what other commits wrote runs as before, and
 in a shared file another process counts the frames as growth.
@@ -107,14 +116,38 @@ punches holes over them, and the frames stay as headers until the writer closes,
 followed them, or until the next cycle. A refusal at the landing, because a base went while the
 bundle streamed or its head does not read as `T`, keeps the records, since a commit may have linked
 them by then, until the next cycle. A staging frame whose records fail to write, as when the disk
-fills, fails the receive without poisoning the store. A power cut at every write of a receive that
+fills, fails the receive without poisoning the store.
+
+A bundle that lands where it is is not hashed again: its bytes in the file are those encoded from
+the objects hashed as they arrived. Each record is encoded in memory from the body or LZ4 bytes the
+hash was checked against, and written once into the room of its own staging frame, which nothing
+else writes before the landing. The frame is placed at the end of the log under `tip`, so no other
+frame overlaps it. A commit adds Fsync zeroes only past the end of the log as it is placed, and a
+draft spills records past that end only under `tip`, both before the frame exists. Only a refused
+receive punches holes, over its own records, and it never lands. No close truncates while a receive
+stages, a catch-up of another process truncates only past the last whole frame, which a staging
+frame is from the moment its header is written, and only a writer that opens with no writer alive
+drops staging frames. The checks read the records back through the same page cache, refusing one
+that reads as zeroes, as where a write never landed, and the records are synced before the landing
+frame is written. What is left is storage changing bytes after they were written, which the hash
+check of every read finds, as in any frame. Hashing every record again before the landing, measured
+with `ferro-bench`'s `clone` of 1,000-byte values under Fsync, took a 103 MB receive from 0.26 to
+0.39 s and a 1.03 GB one from 2.62 to 3.96 s, medians of five and three runs alternating. The
+records that a cycle made the receive place in the new file are read back from the old one and are
+hashed again as they are placed, where the copy already reads and writes every byte. A power cut at every write of a receive that
 staged a 3 MB bundle, with a commit on the pulling branch while the stream was stalled and another
 on a second branch between the sync and the landing, keeping or dropping each write not yet synced,
 always opened at the previous head, that first commit, the landed remote or the merge, never lost a
 commit acknowledged before the cut, and had nothing past the end of the log. A process killed in a
 hook after its third staging frame, once the bundle was checked, and after the sync, left a file
 that opened at the previous head with the bytes it had before the receive, and one killed after the
-landing opened at the landed head.
+landing opened at the landed head. A shared receiving process killed at its first and third staging
+frame, once the bundle was checked and after the sync, beside a live writer that went on committing
+past its frames, left every one of those commits through reopens with and without a writer alive,
+under either durability. A cycle held between its swap and its close of the old file until the
+receive had written past that file's end left the bundle to land. A write of staged records that
+the disk stored as zeroes was refused in place and after a cycle, and one with a byte flipped past
+the end of a replaced file was refused before anything landed.
 
 The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written, the object being
 read, and for each object its hash, its offset in the staging and a count of the links to it, about

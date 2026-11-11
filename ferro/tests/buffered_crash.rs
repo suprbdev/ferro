@@ -352,11 +352,17 @@ fn replay(recording: &Recording, stride: usize, seed: u64) -> usize {
     images
 }
 
-fn damage(recording: &Recording, losses: &[Loss], seed: u64, name: &str) -> (usize, usize) {
+struct Damaged {
+    reported: usize,
+    acknowledged: usize,
+    past_staging: usize,
+}
+
+fn damage(recording: &Recording, losses: &[Loss], seed: u64, name: &str) -> Damaged {
     let dir = dir();
     let path = dir.path().join("image.ferro");
     let mut rng = Rng::new(seed);
-    let (mut reported, mut acknowledged) = (0, 0);
+    let (mut reported, mut acknowledged, mut past_staging) = (0, 0, 0);
     for cut in 0..=recording.ops.len() {
         for &loss in losses {
             let state = crash(recording, cut, loss, &mut rng);
@@ -390,9 +396,19 @@ fn damage(recording: &Recording, losses: &[Loss], seed: u64, name: &str) -> (usi
             if kept as i64 - (frames.len() - 1 - index) as i64 <= state.newest as i64 {
                 acknowledged += 1;
             }
+            if state.image[..start]
+                .windows(8)
+                .any(|magic| magic == b"FERROSTG")
+            {
+                past_staging += 1;
+            }
         }
     }
-    (reported, acknowledged)
+    Damaged {
+        reported,
+        acknowledged,
+        past_staging,
+    }
 }
 
 #[test]
@@ -400,7 +416,11 @@ fn a_flipped_bit_in_a_whole_frame_past_the_anchor_is_reported_after_any_cut() {
     let dir = dir();
     let recording = record(&dir.path().join("trace.ferro"), 2, 12, buffered);
     let losses = [Loss::Nothing, Loss::Some, Loss::Torn, Loss::FramesOnly];
-    let (reported, acknowledged) = damage(&recording, &losses, 45, "buffered");
+    let Damaged {
+        reported,
+        acknowledged,
+        ..
+    } = damage(&recording, &losses, 45, "buffered");
     assert!(reported > 100, "only {reported} frames damaged");
     assert!(
         acknowledged > 50,
@@ -413,12 +433,39 @@ fn a_flipped_bit_in_an_acknowledged_frame_whose_superblock_was_lost_is_reported(
     let dir = dir();
     let fsync = || Options::new().reclaim(MANUAL);
     let recording = record(&dir.path().join("trace.ferro"), 2, 8, fsync);
-    let (reported, acknowledged) = damage(&recording, &[Loss::FramesOnly], 46, "fsync");
+    let Damaged {
+        reported,
+        acknowledged,
+        ..
+    } = damage(&recording, &[Loss::FramesOnly], 46, "fsync");
     assert!(reported > 20, "only {reported} frames damaged");
     assert!(
         acknowledged > 10,
         "only {acknowledged} acknowledged frames damaged"
     );
+}
+
+#[test]
+fn a_flipped_bit_in_a_frame_past_the_staging_frames_of_a_pull_is_reported_after_any_cut() {
+    let fsync = || Options::new().reclaim(MANUAL);
+    for (name, options, seed) in [
+        ("buffered", buffered as fn() -> Options, 49),
+        ("fsync", fsync, 50),
+    ] {
+        let dir = dir();
+        let recording = record_sparse(dir.path(), options);
+        let losses = [Loss::Nothing, Loss::Some, Loss::Torn, Loss::FramesOnly];
+        let Damaged {
+            reported,
+            past_staging,
+            ..
+        } = damage(&recording, &losses, seed, name);
+        assert!(reported > 20, "{name}: only {reported} frames damaged");
+        assert!(
+            past_staging > 10,
+            "{name}: only {past_staging} of {reported} damaged frames lay past a staging frame"
+        );
+    }
 }
 
 fn sweep(recording: &Recording, name: &str) -> usize {

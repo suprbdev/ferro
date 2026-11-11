@@ -123,11 +123,15 @@ pub struct Compacted {
 pub struct Space {
     /// The length of the file, in bytes. It includes the zeroes that a writer under
     /// [`Durability::Fsync`](crate::Durability::Fsync) preallocates past the log, up to 4 MiB,
-    /// which an exclusive writer truncates when it closes and the next writer to open truncates
-    /// otherwise, so it is never less than [`Space::log_bytes`].
+    /// and the staging frames that a receive of more than 1 MiB placed past the newest commit,
+    /// while it streams, or once it was refused, as headers over holes on Linux. An exclusive
+    /// writer truncates both when it closes and the next writer to open truncates them otherwise,
+    /// so it is never less than [`Space::log_bytes`].
     pub file_bytes: u64,
     /// The bytes the file's log takes, from the start of the file to the end of its newest
-    /// commit, as [`Db::size_on_disk`](crate::Db::size_on_disk) reports them.
+    /// commit, as [`Db::size_on_disk`](crate::Db::size_on_disk) reports them. The staging frames
+    /// of a refused receive that a commit followed count here until the next cycle, though on
+    /// Linux their records take no disk.
     pub log_bytes: u64,
     /// An estimate of the bytes that retained versions take: the log's size after the last cycle,
     /// plus the share of the log's growth since then that the last cycle found survives, or the

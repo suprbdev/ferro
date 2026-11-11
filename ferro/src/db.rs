@@ -3740,6 +3740,7 @@ impl<T: Data> Shared<T> {
             old.mark_retired()?;
         }
         rename(temp, &self.file)?;
+        old.mark_replaced();
         fresh.trace_rename();
         if let Err(error) = sync_parent(&self.file) {
             old.poison();
@@ -3799,8 +3800,9 @@ impl<T: Data> Db<T> {
 
     /// The bytes the file's log takes, from the start of the file to the end of its newest commit.
     ///
-    /// The file itself can be up to 4 MiB longer, by zeroes a writer preallocated past the log;
-    /// [`Space::file_bytes`] from [`Db::space`] is its length.
+    /// The file itself can be up to 4 MiB longer, by zeroes a writer preallocated past the log,
+    /// and longer still by the staging frames of a large receive past the newest commit, as
+    /// [`Space::file_bytes`] from [`Db::space`], its length, describes.
     pub fn size_on_disk(&self) -> u64 {
         self.shared.store().size()
     }

@@ -3,7 +3,9 @@ use std::path::Path;
 
 use ferro::{Db, Durability, Error, Map, Options, Reclaim, Snapshot};
 
-use crate::fixup::{BLOCK_BYTES, BLOCK_CHECK, FRAME_BYTES, FRAME_MAGIC, LOG_START, SLOT_BYTES};
+use crate::fixup::{
+    BLOCK_BYTES, BLOCK_CHECK, FRAME_BYTES, FRAME_MAGIC, LOG_START, SLOT_BYTES, STAGING_MAGIC,
+};
 use crate::input::Input;
 use crate::{fresh, scratch};
 
@@ -103,17 +105,25 @@ fn refuse(_: &mut Root, _: &Snapshot<Root>, _: &Snapshot<Root>) -> (String, ()) 
 
 struct Built {
     bytes: Vec<u8>,
+    starts: Vec<usize>,
     ends: Vec<usize>,
     steps: Vec<(Vec<u8>, usize)>,
     versions: Vec<usize>,
 }
 
-fn frames(bytes: &[u8]) -> Option<Vec<usize>> {
-    let mut ends = vec![LOG_START];
-    while let Some(end) = whole_frame(bytes, *ends.last()?) {
-        ends.push(end);
+fn frames(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let mut frames = vec![(LOG_START, LOG_START)];
+    let mut at = frames.last()?.1;
+    loop {
+        if let Some(end) = whole_frame(bytes, at) {
+            frames.push((at, end));
+            at = end;
+        } else if let Some(end) = staging_frame(bytes, at) {
+            at = end;
+        } else {
+            return Some(frames);
+        }
     }
-    Some(ends)
 }
 
 fn build(input: &mut Input, path: &Path, fsync: bool, recipe: Recipe) -> Option<Built> {
@@ -168,7 +178,7 @@ fn build(input: &mut Input, path: &Path, fsync: bool, recipe: Recipe) -> Option<
     }
     drop(db);
     let bytes = fs::read(path).ok()?;
-    let ends = frames(&bytes)?;
+    let (starts, ends): (Vec<usize>, Vec<usize>) = frames(&bytes)?.into_iter().unzip();
     let counts: Vec<usize> = steps.iter().map(|(_, count)| *count).collect();
     if counts.windows(2).any(|pair| pair[0] >= pair[1]) || counts.last() != Some(&(ends.len() - 1))
     {
@@ -185,6 +195,7 @@ fn build(input: &mut Input, path: &Path, fsync: bool, recipe: Recipe) -> Option<
     }
     Some(Built {
         bytes,
+        starts,
         ends,
         steps,
         versions,
@@ -202,6 +213,19 @@ fn whole_frame(bytes: &[u8], start: usize) -> Option<usize> {
     let mut sealed = bytes[..end].to_vec();
     crate::fixup::seal_frame(&mut sealed, start, end);
     (sealed[start..end] == bytes[start..end]).then_some(end)
+}
+
+fn staging_frame(bytes: &[u8], start: usize) -> Option<usize> {
+    if start + FRAME_BYTES > bytes.len() || &bytes[start..start + 8] != STAGING_MAGIC {
+        return None;
+    }
+    let end = field(bytes, start + 16);
+    if end < start + FRAME_BYTES || end > bytes.len() {
+        return None;
+    }
+    let mut header = bytes[start..start + FRAME_BYTES].to_vec();
+    crate::fixup::seal_staging(&mut header, 0);
+    (header[..] == bytes[start..start + FRAME_BYTES]).then_some(end)
 }
 
 fn anchor(image: &[u8]) -> Option<usize> {
@@ -396,14 +420,14 @@ pub fn run(data: &[u8]) {
     };
     let last = named + 1 + input.pick(frames - named);
     let past: Vec<usize> = (1..=last)
-        .filter(|commit| built.ends[commit - 1] >= anchor)
+        .filter(|commit| built.starts[*commit] >= anchor)
         .collect();
     image.extend_from_slice(&built.bytes[LOG_START..built.ends[last]]);
     let whole = image.clone();
     let target = (!past.is_empty()).then(|| past[input.pick(past.len())]);
     let chosen = match target {
         Some(commit) => {
-            let frame = Frame::new(built.ends[commit - 1], built.ends[commit]);
+            let frame = Frame::new(built.starts[commit], built.ends[commit]);
             damage(&mut image, &frame, &mut input);
             Some((commit, frame))
         }
@@ -419,7 +443,7 @@ pub fn run(data: &[u8]) {
     let (version, start) = match &chosen {
         Some((commit, frame)) => match verdict(&whole, &image, frame) {
             Verdict::Whole => (built.versions[last], None),
-            Verdict::Torn => (built.versions[commit - 1], Some(frame.start)),
+            Verdict::Torn => (built.versions[commit - 1], Some(built.ends[commit - 1])),
             Verdict::Damaged(byte) => {
                 expect_damaged(read_only(), frame, byte, "read-only");
                 assert_eq!(fs::read(&path).unwrap(), image, "a read-only open wrote");

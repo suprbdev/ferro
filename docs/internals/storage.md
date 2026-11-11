@@ -563,7 +563,9 @@ lost, the frames of acknowledged commits among them. It also records a Buffered 
 values of 300 and 400 KB that compression does not shrink, each with a KiB of zeroes holding one set
 bit, three of them pulled from another file into staging frames, and every crash image of every
 cut opens, under every loss, as does every image that lost one sector of a frame's write, for
-each sector where that write's bytes hold at most 8 set bits and for its first and last.
+each sector where that write's bytes hold at most 8 set bits and for its first and last. A bit
+flipped in a whole frame past the anchor of those images, walking over the staging frames, is
+reported after any cut, in frames past the staging frames among them.
 `group_commit.rs` flips one in the last frame past the superblock of each image its intercepted
 fdatasync takes, frames that sync then made durable, of acknowledged commits among them. `shared.rs`
 leaves a dead writer's frame cut at each of its first page boundaries, over zeroes and at the end of
@@ -777,7 +779,10 @@ shared writer's staging frame makes the file 4 MiB longer than itself, which oth
 as reserved. Commits beside a receive then extend the file, as the receive's records do anyway.
 The reservation is only an optimization. A failed reservation stops further attempts without failing the commit, open discards
 it, and a clean close truncates it, so the file can be up to 4 MiB longer than `size_on_disk` while
-open.
+open, and longer still by staging frames that end the log, which hold a receive's records while it
+streams and stay, once it is refused, until the writer closes. Truncating those at the refusal would
+take the log's end and sequence numbers back while other threads place frames, and a shared writer
+cannot, since another process may have followed them.
 
 ### Failed writes and `refresh`
 

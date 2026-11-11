@@ -40,8 +40,11 @@ as [The copy on several threads](../internals/reclamation.md#the-copy-on-several
 `space` reports the file's length as `file_bytes`, the bytes its log takes as `log_bytes`, and the
 `live_bytes` estimate, which is at most `log_bytes`, itself at most `file_bytes`. The difference
 between the last two is zeroes that a writer under `Durability::Fsync` preallocates past the log,
-up to 4 MiB, which an exclusive writer truncates when it closes and the next writer to open
-truncates otherwise. `space` also reports `cycles` run, the `longest_pause` and the `last_error` of
+up to 4 MiB, and the staging frames that a receive of more than 1 MiB placed past the newest
+commit, while it streams, or once it was refused, as headers over holes on Linux. An exclusive
+writer truncates both when it closes and the next writer to open truncates them otherwise. The
+staging frames of a refused receive that a commit followed count in `log_bytes` until the next
+cycle, though on Linux their records take no disk. `space` also reports `cycles` run, the `longest_pause` and the `last_error` of
 a background cycle. `compact` returns a `Compacted` with `before_bytes` and `after_bytes`, the
 lengths of the old and the new file, `objects` copied, `commits_dropped`, `passes`, `pause` and
 `handed_out`, the trees it copied as units.

@@ -130,7 +130,10 @@ fn record(bytes: &[u8], start: usize, end: usize) -> Option<(Record, usize)> {
 fn run(bytes: &[u8], start: usize, end: usize, bare: bool, out: &mut Vec<Record>) -> usize {
     let mut pos = start;
     while pos < end && out.len() < MAX_RECORDS {
-        if bare && (bytes[pos..].starts_with(FRAME_MAGIC) || bytes[pos..end.min(pos + 4)] == [0; 4])
+        if bare
+            && (bytes[pos..].starts_with(FRAME_MAGIC)
+                || bytes[pos..].starts_with(STAGING_MAGIC)
+                || bytes[pos..end.min(pos + 4)] == [0; 4])
         {
             break;
         }

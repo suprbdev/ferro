@@ -10,6 +10,41 @@ use ferro::codec::{Decoder, Encoder, HashSink};
 use ferro::store::{Store, StoreOptions, Txn};
 use ferro::{Data, Db, Durability, Map, Options, Ptr};
 
+pub struct Tripwire<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    at: usize,
+    trip: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl<'a> Tripwire<'a> {
+    pub fn new(bytes: &'a [u8], at: usize, trip: impl FnOnce() + 'a) -> Tripwire<'a> {
+        Tripwire {
+            bytes,
+            pos: 0,
+            at,
+            trip: Some(Box::new(trip)),
+        }
+    }
+}
+
+impl std::io::Read for Tripwire<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.at
+            && let Some(trip) = self.trip.take()
+        {
+            trip();
+        }
+        let mut n = out.len().min(self.bytes.len() - self.pos).min(64 << 10);
+        if self.trip.is_some() {
+            n = n.min(self.at - self.pos);
+        }
+        out[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 pub struct Rng(pub u64);
 
 impl Rng {
@@ -104,6 +139,18 @@ pub fn whole_frame(image: &[u8], start: usize) -> Option<usize> {
     whole.then_some(end)
 }
 
+pub fn staging_frame(image: &[u8], start: usize) -> Option<usize> {
+    if start + FRAME_BYTES > image.len() || &image[start..start + 8] != b"FERROSTG" {
+        return None;
+    }
+    let end = field(image, start + 16);
+    if end < start + FRAME_BYTES || end > image.len() {
+        return None;
+    }
+    let check = frame_check(&image[start..], &[]);
+    (check == image[start + FRAME_CHECKED..start + FRAME_BYTES]).then_some(end)
+}
+
 pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
     let mut newest = None;
     for slot in [0, SLOT] {
@@ -122,11 +169,16 @@ pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
     let Some((_, mut at)) = newest else {
         return frames;
     };
-    while let Some(end) = whole_frame(image, at) {
-        frames.push((at, end));
-        at = end;
+    loop {
+        if let Some(end) = whole_frame(image, at) {
+            frames.push((at, end));
+            at = end;
+        } else if let Some(end) = staging_frame(image, at) {
+            at = end;
+        } else {
+            return frames;
+        }
     }
-    frames
 }
 
 pub const LOG_START: usize = 2 * SLOT;
