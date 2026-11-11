@@ -159,8 +159,8 @@ pub(crate) struct Cycle(u64);
 /// until the guard is dropped.
 ///
 /// A cycle holds it without any branch lock while it copies the file and once it has swapped it
-/// in, and a landing bundle that spilled while it places its pieces, so the record refuses only
-/// [`Needs::Cycle`].
+/// in, and a bundle that spilled from the end of its stream until it lands, so the record refuses
+/// only [`Needs::Cycle`].
 pub(crate) fn cycle(db: u64, file: u64) -> Cycle {
     hold(db, file, CYCLE, "");
     Cycle(db)

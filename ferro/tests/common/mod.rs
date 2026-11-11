@@ -107,7 +107,7 @@ pub fn whole_frame(image: &[u8], start: usize) -> Option<usize> {
 pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
     let mut newest = None;
     for slot in [0, SLOT] {
-        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB5" {
+        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB6" {
             continue;
         }
         if blake3::hash(&image[slot..slot + 112]).as_bytes()[..] != image[slot + 112..slot + 144] {

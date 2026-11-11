@@ -181,7 +181,8 @@ lacking.
 
 ## Applying
 
-`receive` checks everything before anything it writes can be found:
+`receive` checks everything before anything it writes can be found, as a bundle over 1 MiB is
+written into the file while it streams:
 
 - Every object is hashed as the bundle is read. Nothing is reserved from a count the bundle claims:
   lists grow as entries are read, and a body is read into memory as it arrives. The bodies, after
@@ -252,19 +253,21 @@ head's root is then read as `T`, so a table whose unique index finds two rows sh
 refused here, as described under [Limits](#limits), and only then does a `Refs` that points `remote`
 at the new head go into the next frame. Both are synced like a commit, so a crash leaves the
 previous head: a torn frame is not replayed, and a whole first frame without the second holds
-records nothing links. Branch handles on `remote` are rebound to the root that was read and its
-watchers fire. Their notices drop once the pull has released `tip`, so a `watch_when` test may
-commit or pull. A bad bundle is `Error::Bundle` and leaves the file as it
-was. Flipping every byte of a 3,358 byte bundle with three masks gave 10,073 rejections and one flip
-inside an LZ4 body that decoded to the same bytes, and so landed the same commit.
-
+records nothing links, as do the staging frames of a larger bundle without the landing. Branch
+handles on `remote` are rebound to the root that was read and its watchers fire. Their notices drop
+once the pull has released `tip`, so a `watch_when` test may commit or pull. A bad bundle is
+`Error::Bundle` and leaves the branches as they were, and the file as it was but for the staging
+frames of one over 1 MiB, whose records are given back. Flipping every byte of a 3,358 byte bundle
+with three masks gave 10,073 rejections and one flip inside an LZ4 body that decoded to the same
+bytes, and so landed the same commit.
 ## A stale have in a pull
 
 A receive is two steps: the landing, which stages the bundle, checks it and writes the frame that
 points `remote` at its head, and [bringing the branch up](#bringing-the-branch-up), which runs the
 merge closure. Every check that can return `StaleHave` is in the landing: the bases and hints are
-resolved before the first object is read, again before a bundle over 1 MiB is placed, and again
-under the writer locks for the frame that lands it. Once that frame is written nothing the bundle
+resolved before the first object is read, again before a bundle over 1 MiB that a cycle moved
+away from its staging frames is placed in the new file, and again under the writer locks for the
+frame that lands it. Once that frame is written nothing the bundle
 builds on is looked up again, so no stale have can be found after the closure has run.
 
 `pull` runs the landing on its own, and the landing returns ferro's own `Error`, so a `StaleHave`
@@ -310,7 +313,7 @@ sending side had the same gap: `bundle`, `bundle_to` and the sending half of `pu
 the branch as last published, so a process that had not caught up sent an older head than its file
 held. They catch up first now too. `a_bundle_built_from_another_handles_have_lands` and
 `a_bundle_over_a_mebibyte_built_from_another_handles_have_lands` in `ferro/tests/shared.rs` receive
-through a handle that never caught up, a bundle staged in memory and one staged in a scratch file,
+through a handle that never caught up, a bundle staged in memory and one staged in the log,
 and `a_pull_from_a_handle_behind_another_sends_the_newest_head` pulls, bundles and pushes from one.
 
 The landing checks only the commits the bundle lists, and the list used to leave out the one the
@@ -617,7 +620,9 @@ for the stream, on a faster machine that other work was sharing, and these are t
 
 A clone costs about a seventh more, the second write and read of its bytes, and no more memory. A
 small pull still lands in one frame, but copies its bundle once more and checks its chains twice,
-about 25 µs.
+about 25 µs. Staging a large bundle in the log instead, where it lands, took the second write and
+read back out, as described under [Staging in the log,
+measured](sync-receive.md#staging-in-the-log-measured).
 
 ## Memory for each object
 
@@ -751,14 +756,32 @@ Measured and left out:
   hundred bytes an object there. Each object is held whole, so one huge value needs a few times its
   size. A hostile stream costs the same, for what it carries and not for what it claims, and so
   does checking it, as the limits on checks below describe.
-- `receive` writes a bundle over 1 MiB twice, to the scratch file as it arrives and then into the
-  log, so it needs free disk for both until it lands and costs a second write and read of the
-  bundle. A crash while it places the bundle, or a landing refused because a base went while the
-  bundle streamed, leaves what was placed in the log until the next reclamation cycle, once for
-  each attempt of a pull that tried again.
-- Placing a large bundle holds the cycle mutex, so a cycle that is running when the bundle has been
-  checked delays the landing until it ends, and one that comes due waits for the copy. The landing
-  waits for the closure running on each branch, as a cycle's pause does.
+- `receive` writes a bundle over 1 MiB once, into staging frames as it arrives, but a reclamation
+  cycle that swaps the file while the bundle streams, or before it lands, leaves those frames in
+  the old file, and `receive` then copies the bundle into the new one before it lands, writing it
+  twice, as every large bundle used to be written. Staging frames in flight do not count towards
+  a background cycle of the same process, so a receive does not set one off by itself, but they
+  count towards one of another process sharing the file.
+- A bundle refused after it began to stage, by a check, a broken stream, a base that went while it
+  streamed or a head that does not read as `T`, leaves its staging frames in the log. On Linux
+  their records become holes at once, so the disk comes back but the file's length does not, until
+  the writer closes, if nothing was written after them, or the next cycle; on other targets the
+  records stay too. A peer whose bundles are refused can so grow the file's length with every
+  attempt until then, though not its disk on Linux. A bundle refused once its objects were synced
+  and the deduplication table learned them, when a base went or the head does not read as `T`,
+  keeps its records, since a commit may have linked them since. A crash while a bundle streams
+  leaves its staging frames the same way, unless they end the log, which a writer opening with no
+  writer alive drops.
+- Each staging frame has room for 1 MiB of records, and the room the last record of a frame leaves
+  unused stays in the file, a part of a record on average.
+- Every fdatasync of the file flushes the staging frames written since the last, so under
+  `Durability::Fsync` a commit beside a large receive waits for that writeback too, and adds no
+  zeroes ahead of the log meanwhile, as described under [Preallocating the
+  log](storage.md#preallocating-the-log). Under `Durability::Buffered` a large receive syncs its
+  staging frames before it lands, which a Buffered commit never does.
+- Landing a large bundle holds the cycle mutex, so a cycle that is running when the bundle has been
+  checked delays the landing until it ends, and one that comes due waits for the landing's sync.
+  The landing waits for the closure running on each branch, as a cycle's pause does.
 - Files that share no commit share no anchors, so their first pull sends everything, even trees both
   happen to hold.
 - Each commit in a have is looked up in every branch of the sender, so recognising them costs the
@@ -855,13 +878,13 @@ Measured and left out:
   our branch, a merge opens `remote` to merge it, and a handle on `remote` is rebound to it. The
   store's cache keeps the decoded root for that, so it costs nothing more unless the cache drops it
   or the pull ends `UpToDate` or `Ahead` with no handle open on `remote`. A bundle under 1 MiB is
-  written in a frame of its own ahead of the branch table, as the pieces of a larger one are, so
-  that the read finds its objects. That costs a frame header and a write more per pull, synced with
+  written in a frame of its own ahead of the branch table, as the staging frames of a larger one
+  are, so that the read finds its objects. That costs a frame header and a write more per pull, synced with
   the landing: five incremental pulls that each merged one row grew the file by 76 to 80 bytes more
   than before, and 400 fast-forward pulls of one row into a table of 1,000 rows under
   `Durability::Buffered` took a median of 40.4 µs against 39.4 µs, middle of three runs each. A
   landing refused for a head that does not read leaves those objects in the log until the next
-  reclamation cycle, as a refused landing of a larger bundle leaves its pieces.
+  reclamation cycle, as a refused landing of a larger bundle leaves its staging frames.
   `sync.rs` sends such a table to an empty file, to one with commits of its own, to one with a
   handle open on `remote`, and to a shared file that a second open follows `remote` in, and checks
   that each refuses it with `remote` where it was, commits on every branch, reopens at its own head,

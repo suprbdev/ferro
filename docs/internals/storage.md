@@ -296,9 +296,10 @@ twice the distance plus one in all its bytes but the last, and a last byte of 1,
 more bytes than the distance needs. A commit drafted while other frames are placed pads a link to an
 object before its frame when the distance would need a longer varint once the frame moves as far as
 frames have lately moved, so that a move rewrites each such distance in place, as described under
-[Moving a draft in place](commit-path.md#moving-a-draft-in-place). Records staged for a sync keep a
-zigzag varint of the distance, since a staged record may link an object of the file the staging
-lies beside, past it.
+[Moving a draft in place](commit-path.md#moving-a-draft-in-place). Records a sync stages in memory
+keep a zigzag varint of the distance, since a record there may link an object of the file past it.
+In a staging frame every link leads back, and the zigzag of a distance back is the even varint a
+record in a frame holds.
 Bodies of 96 bytes or more are LZ4 block compressed when that makes them smaller. Compression runs
 after hashing and decompression before the hash check, so the hash covers the canonical body and two
 files with different physical compression still agree on every root hash. The decoder rejects a
@@ -387,7 +388,7 @@ either way and thread CPU time by less than the noise between runs. The map and 
 
 Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, records the
 size the file had when this generation began and how much of the previous one survived, and carries
-an anchor, the newest position known to be durable. The superblock's magic, `FERRODB5`, is the
+an anchor, the newest position known to be durable. The superblock's magic, `FERRODB6`, is the
 format's version. The log is a run of frames, one per commit. A frame is a 68-byte header (magic,
 sequence, end offset, head pointer, xxh3-128 check), the records the commit wrote, and a table that
 holds the xxh3-64 of each 4 KiB block of those records, the last block shorter, 8 bytes a block. The
@@ -402,7 +403,23 @@ the version, the first version kept, the root and the log's tip each as a flag b
 link, the map of merge records, and, when bit 2 of the root's flag byte is set, the sequence number
 taken when the branch was created, as [A branch of the same
 name](history.md#a-branch-of-the-same-name) describes. Its first link is the table or step before
-it, followed by the head's links. A commit does this:
+it, followed by the head's links.
+
+A staging frame, magic `FERROSTG`, holds the records of a large `receive` until a later frame links
+them, as described under [Where checked objects wait](sync-receive.md#where-checked-objects-wait).
+Its header has the same fields, the head pointer naming what the frame before named, but its check
+covers the header alone and it has no table: the receive places it with room for 1 MiB of records,
+or for one larger record, writes its header and makes the file at least as long, lets the locks go,
+and writes the records afterwards. A scan, and a writer of another process catching up, check the
+header and go on at the frame's end without reading the records, so they never wait for them. The
+receive syncs its staging frames before any frame that links them is written, under either
+durability, and a reader checks each record's hash as it reads it, as everywhere else. Format 6
+added these frames: a build of format 5 would read one as the end of the log and truncate it and
+every frame after it, so no file of format 5 opens in this build, nor one of format 6 in an earlier
+one, and both report `Error::NotFerro`. A file of format 5 holds no staging frame, so its fixtures
+were converted by giving their superblocks the new magic and check.
+
+A commit does this:
 
 1. Write the frame at the log tail.
 2. fdatasync. This is the durability point.
@@ -428,7 +445,9 @@ the frames it accepted, truncates the rest, and rewrites the superblock, in that
 truncation is durable before any new frame is written, so a frame stranded past a torn one can
 never line up with the log later. Nothing at or below the newest superblock is truncated but what
 lies past its anchor, which under `Durability::Buffered` a crash may have lost, as described under
-[What a superblock names](#what-a-superblock-names).
+[What a superblock names](#what-a-superblock-names), and staging frames that end the log, which a
+writer opening with no writer alive drops: a landing is written after the frames it links, so
+nothing can have linked them.
 
 ### Torn and damaged frames
 
@@ -542,8 +561,8 @@ older frame's bytes, and leaves a hole of zeroes, whole or every other sector, b
 recording, under every loss, and of an Fsync recording whose superblocks since the last sync were
 lost, the frames of acknowledged commits among them. It also records a Buffered and an Fsync file of
 values of 300 and 400 KB that compression does not shrink, each with a KiB of zeroes holding one set
-bit, three of them pulled from another file in pieces that spill, and every crash image of every
-other cut opens, under every loss, as does every image that lost one sector of a frame's write, for
+bit, three of them pulled from another file into staging frames, and every crash image of every
+cut opens, under every loss, as does every image that lost one sector of a frame's write, for
 each sector where that write's bytes hold at most 8 set bits and for its first and last.
 `group_commit.rs` flips one in the last frame past the superblock of each image its intercepted
 fdatasync takes, frames that sync then made durable, of acknowledged commits among them. `shared.rs`
@@ -751,8 +770,12 @@ for overwriting allocated blocks on the test NVMe. So in `Durability::Fsync` the
 zero-filled chunks, doubling from 64 KiB to 4 MiB, and frames overwrite blocks that are already
 written, which needs only the device flush. The zeroes must be real: `posix_fallocate` leaves
 unwritten extents, and converting those commits the journal just the same (640 µs). The first commit
-of a process reserves nothing, so a short run pays for no zeroes. The reservation is only an
-optimization. A failed reservation stops further attempts without failing the commit, open discards
+of a process reserves nothing, so a short run pays for no zeroes. While a receive of the same writer stages records in the log, as described under [Where checked
+objects wait](sync-receive.md#where-checked-objects-wait), commits add no zeroes, since the next
+staging frame would be placed over them and its records would write the bytes a second time; a
+shared writer's staging frame makes the file 4 MiB longer than itself, which other processes take
+as reserved. Commits beside a receive then extend the file, as the receive's records do anyway.
+The reservation is only an optimization. A failed reservation stops further attempts without failing the commit, open discards
 it, and a clean close truncates it, so the file can be up to 4 MiB longer than `size_on_disk` while
 open.
 

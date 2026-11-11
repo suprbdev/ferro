@@ -62,7 +62,9 @@ files. Cloning a 330 MB file of a million keys took 0.82 s and 17 MiB at peak on
 pull of three small commits into it 1.3 ms with fsync. The in-memory version that streaming
 replaced took 1.1 GB, and 2.6 s where streaming took 2.3 s in the same runs, with small pulls as
 fast. Staging the bundle in a scratch file, so that commits go on while it arrives, added about a
-seventh to a clone and nothing to its memory.
+seventh to a clone and nothing to its memory, and staging it in the file instead, where it
+lands, took a sixth off a 1 GB receive and wrote it once, as described under [Staging in the log,
+measured](../internals/sync-receive.md#staging-in-the-log-measured).
 
 A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
 it lacks and the objects their trees reach that it does not hold, so it costs what changed: three
@@ -90,17 +92,18 @@ and the bundle links as another is checked as the new type: after a commit copie
 next pull reads the copied map once, however many commits it brings, a million keys in about
 0.11 s, and counts the zero-width items of the new type as it goes. A `Summary` whose `of` or
 `combine` panics on what a bundle carries, such as an overflowing sum, makes `receive` refuse the
-bundle rather than unwind. Objects are staged as they arrive, in memory up to 1 MiB and past that in
-a scratch file beside the database, and `receive` holds no writer lock while it reads, so commits on
-every branch go on however slowly the bundle comes. Only once the whole bundle has passed are its
-objects copied into the file, beside those commits, where nothing can find them until one frame
-points the remote branch at them, so a crash leaves the previous head. Only that frame takes the
-writer locks, and it checks again that the commits the bundle builds on are still here. A damaged or
-forged bundle is rejected with `Error::Bundle` and never reaches the file, except that damage to the
-part that names the commit it builds on reads as `Error::StaleHave`, described below. Either way,
-fetch a fresh bundle. `receive` uses a fixed buffer, the object it is reading and about 40 bytes for
-each object the bundle carries, not memory for its bytes or for what it claims, and refuses commits
-dated more than a day past this machine's clock.
+bundle rather than unwind. Objects are staged as they arrive, in memory up to 1 MiB and past that
+in frames of their own at the end of the file, beside the commits made meanwhile, where nothing can
+find them until one frame points the remote branch at them, so a crash leaves the previous head.
+`receive` holds no writer lock while it reads, but for the moment each of those frames takes to be
+placed, so commits on every branch go on however slowly the bundle comes. Only the frame that lands
+the bundle takes the writer locks, and it checks again that the commits the bundle builds on are
+still here. A damaged or forged bundle is rejected with `Error::Bundle` and nothing it carries is
+ever linked, except that damage to the part that names the commit it builds on reads as
+`Error::StaleHave`, described below. Either way, fetch a fresh bundle. `receive` uses a fixed
+buffer, the object it is reading and about 40 bytes for each object the bundle carries, not memory
+for its bytes or for what it claims, and refuses commits dated more than a day past this machine's
+clock.
 
 ## When the other side has moved
 
@@ -150,11 +153,17 @@ Sync streams, but keeps about 40 bytes per object received and 45 per object sen
 million objects needs about 2 GB on each side. A pull that changes many scattered keys costs about
 140 bytes more on the receiver for each unchanged node next to a changed one, which the bundle names
 so that the new tree can link it. Each object is held whole, so one huge value needs a few times its
-size. A bundle over 1 MiB is written twice, to a scratch file beside the database while it arrives
-and then into the file, so it needs disk for both until it lands. A crash while it is copied in, or
-a bundle refused because this file pruned what it builds on while it arrived, leaves the copy in the
-file until the next reclamation cycle, one for each attempt a pull refused. Files that share no
-commit send everything on their first pull.
+size. A bundle over 1 MiB is written into the file once, as it arrives, in frames that nothing
+links until it lands. One refused after that, for any reason, gives back on Linux the disk its
+objects took at once, but its frames stay in the log, with the file's length, until the writer
+closes, if nothing was written after them, or until the next reclamation cycle, one for each
+attempt; elsewhere its objects stay too. So does a bundle that a crash interrupts, unless its frames
+end the log, which the next open drops. A reclamation cycle that replaces the file while a bundle
+arrives makes `receive` copy what arrived into the new file before it lands, writing it twice. A
+large `receive` syncs once before it lands, even under `Durability::Buffered`, and a commit beside
+it under `Durability::Fsync` waits for the bundle's writeback in its own sync: 0.68 ms at the
+median beside a 1 GB receive, against 0.41 when bundles were staged in a scratch file. Files that
+share no commit send everything on their first pull.
 
 Peers need the same `Summary` of each map, and the receiving side must declare every index of a
 table that the sending side's tables hold. When a table gains an index, or an index changes kind or

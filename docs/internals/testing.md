@@ -39,14 +39,15 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   sparse instead, one or two to a commit, each zeroes with a few bits set, under 96 bytes so that
   it stays raw, up to 64 KiB so that it compresses to runs of ones, or 400 KB of noise that
   compression does not shrink around a KiB of zeroes with one bit set; or it can start the file
-  with a pull of three values of such noise from another file, which arrives in pieces that spill.
+  with a pull of three values of such noise from another file, which arrives in staging frames.
   The mode then compares the damaged frame with the whole one: if each block and the header and
   table together differ in at most one bit, at most 8 blocks differ, the entry of no block differs
   along with its block, and every bit that differs sits in a sector that holds at least 8 of the
   frame's bytes and has something other than all zeroes or all ones on either side of it, both a
   read-only open and a writer's open must fail with `Corrupt` naming the frame and its first wrong
   byte and leave the file as it was. Otherwise both must open at the version the frames before it
-  hold, which a pull's pieces leave where it was, the writer truncating the file at the frame,
+  hold, which a pull's staging frames leave where it was, the writer truncating the file at the
+  frame,
   `verify` must pass, and a commit must survive a reopen.
 - `reclaim` takes the input `admin` takes, opens the file as the type that decodes nothing and
   compacts it with `copy_threads(1)` and again, from the same image, with `copy_threads(4)`, keeping
@@ -75,7 +76,7 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
 - `sync` receives a bundle into a copy of a database through `receive_from`. Nine honest pairs of a
   database and a bundle are built once per binary and cached beside the scratch files: hints into
   held trees, a clone into an empty file, merges on both sides, edited covered indexes, a 1.2 MB
-  bundle that spills to the scratch file and is placed in pieces, and four taken from devices that
+  bundle that spills into staging frames, and four taken from devices that
   pull from each other's branches with pruned history and cycles, so that a bundle can carry
   commits the receiver already holds. Three of its maps keep a summary: a wrapping sum over small
   values, one over spilled blobs, some of them one value under several keys, whose `of` reads the
@@ -85,9 +86,9 @@ cargo +nightly fuzz run open corpus/seeds/open -- -max_len=70000 -timeout=10 -ma
   cancel so that the node's own fold still holds, and rehashes them up to the head, or edits the
   encoded bytes, or replaces the bundle outright. It can feed the stream in small reads, interrupt
   it, break it, or commit, fork or run a cycle while the checked bundle waits to be placed, or
-  commit or fork between placing a spilled bundle's pieces and landing it. A refused bundle must
-  leave both branches where they were and the receiving branch readable whole. An accepted one must
-  read back whole on both branches, with every map's length equal to its iteration, every key
+  commit or fork between syncing a spilled bundle's staging frames and landing it. A refused bundle
+  must leave both branches where they were and the receiving branch readable whole. An accepted one
+  must read back whole on both branches, with every map's length equal to its iteration, every key
   found, every index lookup answered, each unique index's range over the whole index as long as its
   map from either end, and each summarized map's `summary`, and the two halves of it that
   `range_summary` folds, equal to the fold of its entries,
@@ -101,7 +102,7 @@ without coalescing, devices that relay through pulls and cycles, branch tables o
 200 branches, step chains just below and past multiples of 64, twenty branches whose commits rewrite
 covered index entries across two full tables, crash images cut from the recorded writes of
 concurrent commits with every kind of loss, a frame of objects nothing names, and a file caught
-between placing a bundle's pieces and landing it. Frames that land out of order come from a hook
+between staging a bundle and landing it. Frames that land out of order come from a hook
 that holds one commit's frame before its write until three later frames have landed: the images
 leave a hole where a held frame belongs with every later frame written, or stop just after a later
 frame landed ahead of the held one. Each `refs` seed pairs one of its bases with a forgery and a
@@ -599,8 +600,9 @@ Tests are described next to what they test:
   sides](sync.md#the-same-value-on-both-sides).
 - Files syncing in random orders against a model of the merge graph, with shared handles, threads
   and processes, `sync_model.rs`: [The sync model](sync.md#the-sync-model).
-- Power cuts during a receive placed in pieces: [Where checked objects
-  wait](sync-receive.md#where-checked-objects-wait).
+- Power cuts, killed processes, cycles, refusals and failed writes during a receive staged in the
+  log, `sync_stream.rs`, `sync_unlocked.rs`, `sync_staging.rs` and `landing_fault.rs`: [Where
+  checked objects wait](sync-receive.md#where-checked-objects-wait).
 - The three-device sync model with small caches: [Commits stored
   twice](sync-receive.md#commits-stored-twice).
 - Mutated bundles: [Checking trees](sync-receive.md#checking-trees).

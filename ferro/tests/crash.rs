@@ -815,7 +815,7 @@ fn foreign_files_are_rejected_and_left_alone() {
 }
 
 #[test]
-fn a_file_of_the_format_before_padded_links_is_not_ferro_and_left_alone() {
+fn a_file_of_a_format_before_staging_frames_is_not_ferro_and_left_alone() {
     let built = build(3, 3);
     let path = built.target();
     let sealed = |magic: &[u8; MAGIC]| {
@@ -827,17 +827,19 @@ fn a_file_of_the_format_before_padded_links_is_not_ferro_and_left_alone() {
         }
         image
     };
-    fs::write(&path, sealed(b"FERRODB5")).unwrap();
+    fs::write(&path, sealed(b"FERRODB6")).unwrap();
     fast().open::<Root>(&path).unwrap().verify().unwrap();
-    let old = sealed(b"FERRODB4");
-    fs::write(&path, &old).unwrap();
-    for options in [fast(), fast().read_only(true)] {
-        let opened = options.open::<Root>(&path).map(|_| ());
-        assert!(matches!(opened, Err(Error::NotFerro(_))), "{opened:?}");
+    for magic in [b"FERRODB4", b"FERRODB5"] {
+        let old = sealed(magic);
+        fs::write(&path, &old).unwrap();
+        for options in [fast(), fast().read_only(true)] {
+            let opened = options.open::<Root>(&path).map(|_| ());
+            assert!(matches!(opened, Err(Error::NotFerro(_))), "{opened:?}");
+        }
+        let verified = admin::verify(&path).map(|_| ());
+        assert!(matches!(verified, Err(Error::NotFerro(_))), "{verified:?}");
+        assert_eq!(fs::read(&path).unwrap(), old);
     }
-    let verified = admin::verify(&path).map(|_| ());
-    assert!(matches!(verified, Err(Error::NotFerro(_))), "{verified:?}");
-    assert_eq!(fs::read(&path).unwrap(), old);
 }
 
 #[test]

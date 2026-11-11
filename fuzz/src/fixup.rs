@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use ferro::codec::{HASH_BYTES, Hash, Object, Ptr};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
-pub const MAGIC: &[u8; 8] = b"FERRODB5";
+pub const MAGIC: &[u8; 8] = b"FERRODB6";
 pub const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+pub const STAGING_MAGIC: &[u8; 8] = b"FERROSTG";
 pub const SLOT_BYTES: usize = 4096;
 pub const LOG_START: usize = 2 * SLOT_BYTES;
 pub const MARK_BYTES: usize = 24 + HASH_BYTES;
@@ -39,6 +40,12 @@ pub fn seal_frame(bytes: &mut [u8], at: usize, end: usize) {
     hasher.update(&table);
     bytes[at + FRAME_CHECKED..at + FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
 }
+pub fn seal_staging(bytes: &mut [u8], at: usize) {
+    let mut hasher = Xxh3::new();
+    hasher.update(&bytes[at..at + FRAME_CHECKED]);
+    bytes[at + FRAME_CHECKED..at + FRAME_BYTES].copy_from_slice(&hasher.digest128().to_le_bytes());
+}
+
 const MAX_BODY: usize = 1 << 22;
 
 struct Record {
@@ -153,6 +160,7 @@ pub fn fixup(bytes: &mut [u8]) {
     let len = bytes.len();
     let mut records = Vec::new();
     let mut frames = Vec::new();
+    let mut staged = Vec::new();
     let mut at = LOG_START;
     while at < len && records.len() < MAX_RECORDS {
         if bytes[at..].starts_with(FRAME_MAGIC) {
@@ -173,6 +181,18 @@ pub fn fixup(bytes: &mut [u8]) {
                 &mut records,
             );
             frames.push((at, end));
+            at = end;
+        } else if bytes[at..].starts_with(STAGING_MAGIC) {
+            if at + FRAME_BYTES > len {
+                break;
+            }
+            let end = read_u64(bytes, at + 16);
+            if end < (at + FRAME_BYTES) as u64 || end > len as u64 {
+                break;
+            }
+            let end = end as usize;
+            run(bytes, at + FRAME_BYTES, end, true, &mut records);
+            staged.push(at);
             at = end;
         } else {
             let next = run(bytes, at, len, true, &mut records);
@@ -239,6 +259,10 @@ pub fn fixup(bytes: &mut [u8]) {
     for &(at, end) in &frames {
         fix_mark(bytes, at + 8, &by_offset);
         seal_frame(bytes, at, end);
+    }
+    for &at in &staged {
+        fix_mark(bytes, at + 8, &by_offset);
+        seal_staging(bytes, at);
     }
     for slot in 0..2 {
         let start = slot * SLOT_BYTES;

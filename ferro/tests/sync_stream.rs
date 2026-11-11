@@ -103,6 +103,12 @@ fn a_bundle_written_to_a_stream_matches_the_one_in_memory_and_lands_the_same() {
     reopened.verify_typed().unwrap();
 }
 
+#[cfg(target_os = "linux")]
+fn allocated(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().blocks() * 512
+}
+
 #[test]
 fn a_stream_refused_after_it_spilled_leaves_the_file_as_it_was() {
     let case = Case::new();
@@ -110,6 +116,8 @@ fn a_stream_refused_after_it_spilled_leaves_the_file_as_it_was() {
     let before = file_bytes(&path);
     let b = case.b();
     let (head, size) = (b.head_hash(), b.size_on_disk());
+    #[cfg(target_os = "linux")]
+    let taken = allocated(&path);
     let mut damaged = case.bundle.clone();
     let at = damaged.len() - 40;
     damaged[at] ^= 0x20;
@@ -121,8 +129,14 @@ fn a_stream_refused_after_it_spilled_leaves_the_file_as_it_was() {
         }
         assert_eq!(b.head_hash(), head);
         assert_eq!(b.size_on_disk(), size);
-        assert_eq!(fs::metadata(&path).unwrap().len(), before.len() as u64);
+        #[cfg(target_os = "linux")]
+        assert!(
+            allocated(&path) < taken + (64 << 10),
+            "a refused bundle kept {} bytes of disk",
+            allocated(&path) - taken
+        );
     }
+    b.verify().unwrap();
     drop(b);
     assert_eq!(file_bytes(&path), before);
     let b = case.b();

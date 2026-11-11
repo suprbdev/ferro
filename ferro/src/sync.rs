@@ -34,7 +34,7 @@ use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
 use crate::map::Map;
 use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
-use crate::store::{Record, Staging, Store, Txn, compressed, staged};
+use crate::store::{Record, Room, Staging, Store, Txn, compressed, staged};
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
 const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
@@ -2800,6 +2800,7 @@ fn stream<R: Read>(
     header: &Header,
     anchors: &Anchors,
     input: &mut Input<R>,
+    room: &mut Room<'_>,
 ) -> Result<Streamed> {
     let (roots, hinted) = (&anchors.roots, &anchors.hinted);
     let references = 1 + roots.len() + hinted.len();
@@ -2844,7 +2845,8 @@ fn stream<R: Read>(
             return Err(bad("it repeats an object"));
         }
         found.carried = found.carried.saturating_add(object.body.len());
-        let id = staging.put(hash, staged(&object.body, packed.as_deref(), &object.links))?;
+        let staged = staged(&object.body, packed.as_deref(), &object.links);
+        let id = staging.put(hash, staged, room)?;
         found.links.push(0);
         if open {
             found.loose.push(id);
@@ -3543,7 +3545,7 @@ impl<T: Data> Db<T> {
     ///   was. A merge whose base `T` cannot read returns it too, with the remote branch landed and
     ///   this branch as it was.
     /// - [`Error::Reentrant`] from inside a closure on this file, for a bundle large enough to be
-    ///   placed in pieces also from code that runs while this thread holds the file's cycle lock,
+    ///   staged in the log also from code that runs while this thread holds the file's cycle lock,
     ///   or where waiting on `from`'s file could otherwise deadlock, [`Error::ReadOnly`] on a
     ///   read-only handle, and the errors of [`Db::commit`].
     ///
@@ -3683,13 +3685,14 @@ impl<T: Data> Db<T> {
     /// It hashes every object and checks every link as it reads, and checks every object as the
     /// type that will read it, recomputing each map summary from the entries below it with this
     /// side's [`Summary`](crate::Summary), and it refuses commits dated more than a day past this
-    /// machine's clock. Objects are staged as they arrive, in memory up to 1 MiB and past that in a scratch
-    /// file beside the database, under no writer lock, so commits on every branch go on meanwhile.
-    /// Once the whole bundle has passed, its objects are copied into the file, and one frame
-    /// points the branch `remote` at them, so a crash leaves the previous head. A bundle that
-    /// arrives late or twice changes nothing. With [`Options::shared`](crate::Options::shared) it
-    /// first catches up with commits from other processes, as [`Db::have`] does, so a bundle
-    /// built from a have that another handle or process on this file sent finds what it builds on.
+    /// machine's clock. Objects are staged as they arrive, in memory up to 1 MiB and past that in
+    /// staging frames at the end of the file that nothing links, under no writer lock but for the
+    /// moment each frame takes to be placed, so commits on every branch go on meanwhile. Once the
+    /// whole bundle has passed, one frame points the branch `remote` at them, so a crash leaves the
+    /// previous head. A bundle that arrives late or twice changes nothing. With
+    /// [`Options::shared`](crate::Options::shared) it first catches up with commits from other
+    /// processes, as [`Db::have`] does, so a bundle built from a have that another handle or
+    /// process on this file sent finds what it builds on.
     ///
     /// # Errors
     ///
@@ -3703,7 +3706,8 @@ impl<T: Data> Db<T> {
     ///   otherwise sends, or if checking it would decode or read more again than its size allows,
     ///   as one large value shared by many keys, or one large node reached under many key ranges,
     ///   can, or would visit more items that encode to nothing, such as the `()`s of a
-    ///   `Vec<()>`, than its size allows. Nothing reaches the file.
+    ///   `Vec<()>`, than its size allows. Nothing it carries is linked, and on Linux the disk its
+    ///   staging frames took is given back.
     /// - [`Error::StaleHave`] if this file does not hold the commit the bundle builds on, because
     ///   it was built for another file, this one pruned or dropped that commit after sending its
     ///   have, or the part of the bundle that names that commit was damaged on the way. Nothing
@@ -3852,7 +3856,13 @@ impl<T: Data> Db<T> {
         drop(input);
         let landed = match received {
             Some(received) => {
-                let ours = self.entering(Needs::Every)?;
+                let ours = match self.entering(Needs::Every) {
+                    Ok(ours) => ours,
+                    Err(error) => {
+                        received.staging.discard();
+                        return Err(error);
+                    }
+                };
                 self.land_staged(remote, &header, received)?;
                 Some(ours)
             }
@@ -3902,24 +3912,35 @@ impl<T: Data> Db<T> {
         let (store, refs) = self.published_refs();
         let root_kind = Kind::value::<T>();
         let mut anchors = anchors(&store, &refs, header, &root_kind)?;
-        let mut staging = Staging::new(store.path(), SPILL_AT);
-        let streamed = stream(&mut staging, header, &anchors, input)?;
-        let vetted = Vetted {
-            streamed,
-            root_kind: &root_kind,
-            pair_roots: pair_roots::<T>,
+        let mut staging = Staging::new(&store, SPILL_AT);
+        let generation = store.id();
+        let mut room = |bytes| self.stage_room(generation, bytes);
+        let checked = stream(&mut staging, header, &anchors, input, &mut room)
+            .and_then(|streamed| {
+                let vetted = Vetted {
+                    streamed,
+                    root_kind: &root_kind,
+                    pair_roots: pair_roots::<T>,
+                };
+                resolve(
+                    &store,
+                    &staging,
+                    &refs,
+                    remote,
+                    header,
+                    &anchors,
+                    Some(vetted),
+                )
+            })
+            .and_then(|sent| staging.finish().map(|()| sent));
+        let sent = match checked {
+            Ok(sent) => sent,
+            Err(error) => {
+                staging.discard();
+                return Err(error);
+            }
         };
-        let sent = resolve(
-            &store,
-            &staging,
-            &refs,
-            remote,
-            header,
-            &anchors,
-            Some(vetted),
-        )?;
         anchors.hint_kinds = Kinds::default();
-        staging.seal()?;
         self.step("received");
         Ok(Received {
             staging,
@@ -3928,48 +3949,87 @@ impl<T: Data> Db<T> {
         })
     }
 
+    fn stage_room(&self, generation: u64, bytes: u64) -> Result<Option<(u64, u64)>> {
+        let room = self.place_staging(generation, bytes)?;
+        if room.is_some() {
+            self.step("staging");
+        }
+        Ok(room)
+    }
+
     fn land_staged(&self, remote: &str, header: &Header, received: Received) -> Result<()> {
         let Received {
             staging,
-            mut anchors,
+            anchors,
             commits,
         } = received;
+        let mut learned = false;
+        let landed = self.land_records(remote, header, &staging, anchors, &commits, &mut learned);
+        let failed = landed.is_err() && self.published_refs().0.check_healthy().is_err();
+        if !learned && !failed {
+            staging.discard();
+        }
+        landed
+    }
+
+    fn land_records(
+        &self,
+        remote: &str,
+        header: &Header,
+        staging: &Staging,
+        mut anchors: Anchors,
+        commits: &[u32],
+        learned: &mut bool,
+    ) -> Result<()> {
         let spilled = staging.spilled();
         if spilled {
             drop(self.entering(Needs::Cycle)?);
         }
         let _cycles = spilled.then(|| self.hold_cycles()).transpose()?;
-        let mut placed = Column::new();
+        let mut moved = None;
         if spilled {
             let (store, refs) = self.published_refs();
-            anchors = reanchor(&store, &refs, header, &anchors)?;
-            drop((store, refs));
-            placed = self.place_staged(&staging, &anchors, &commits)?;
-            self.published_refs().0.flush()?;
+            if staging.in_place(&store) {
+                drop((store, refs));
+                staging.sync()?;
+                staging.learn(commits);
+                *learned = true;
+            } else {
+                anchors = reanchor(&store, &refs, header, &anchors)?;
+                drop((store, refs));
+                moved = Some(self.place_staged(staging, &anchors, commits)?);
+                self.published_refs().0.flush()?;
+            }
             self.step("placed");
         }
+        let mut held_here = Column::new();
         self.rewrite_refs(|store, txn, refs| {
             let anchors = reanchor(store, refs, header, &anchors)?;
-            if !spilled {
-                let held = anchors.held();
-                let mut replay = staging.replay();
-                while let Some(record) = replay.next_record()? {
-                    place(
-                        txn,
-                        &record,
-                        staging.hashes(),
-                        &mut placed,
-                        &anchors,
-                        &held,
-                        false,
-                    )?;
+            let placed = match (&moved, spilled) {
+                (Some(placed), _) => placed,
+                (None, true) => staging.offsets(),
+                (None, false) => {
+                    let held = anchors.held();
+                    let mut replay = staging.replay();
+                    while let Some(record) = replay.next_record()? {
+                        place(
+                            txn,
+                            &record,
+                            staging.hashes(),
+                            &mut held_here,
+                            &anchors,
+                            &held,
+                            false,
+                        )?;
+                    }
+                    &held_here
                 }
-            }
+            };
             let objects = Placed {
                 txn: RefCell::new(txn),
                 earlier: Earlier {
                     hashes: staging.hashes(),
-                    placed: &placed,
+                    placed,
                 },
             };
             let resolved = resolve(store, &objects, refs, remote, header, &anchors, None)?;

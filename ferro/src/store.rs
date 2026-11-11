@@ -86,9 +86,11 @@ pub(crate) fn fresh_reads() -> u64 {
 }
 
 /// The magic at the start of a superblock, which names the format of the file.
-const MAGIC: &[u8; 8] = b"FERRODB5";
+const MAGIC: &[u8; 8] = b"FERRODB6";
 /// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
+/// The magic at the start of a staging frame's header, whose records no check covers.
+const STAGING_MAGIC: &[u8; 8] = b"FERROSTG";
 /// The magic of the marker a reclamation cycle writes at the end of a log it is replacing.
 const RETIRED_MAGIC: &[u8; 8] = b"FERROGEN";
 /// The size of each of the two superblock slots at the front of the file.
@@ -175,8 +177,13 @@ const READ_GRAIN: u64 = 8;
 /// The words of bits in each chunk of that record, which is allocated when a read first lands in
 /// it.
 const READ_WORDS: usize = 64;
-/// The smallest window a replay reads from a staging's scratch file.
+/// The smallest window a replay reads from the records a staging wrote to the file.
 const REPLAY_CHUNK: usize = 256 << 10;
+/// The room for records each staging frame of a large receive leaves, unless one record needs more.
+const STAGED_ROOM: u64 = 1 << 20;
+/// How many of the objects a receive staged in the log, the last it staged, the deduplication
+/// table learns once they have passed every check.
+const STAGED_LEARNED: usize = 1 << 17;
 /// The most capacity a check's scratch body keeps between records.
 const SCRATCH_KEEP: usize = 1 << 20;
 /// The most bytes of capacity each of the buffers that [`Store::read_lent`] reuses keeps between
@@ -194,7 +201,7 @@ const MULTI_AT: u64 = LOCKS_AT + 1;
 const COMMIT_AT: u64 = LOCKS_AT + 2;
 /// The superblock lock, held exclusive to sync and write a superblock.
 const SUPER_AT: u64 = LOCKS_AT + 3;
-/// The cycle lock, held exclusive for a reclamation cycle and the pieces of a large receive.
+/// The cycle lock, held exclusive for a reclamation cycle and the landing of a large receive.
 const CYCLE_AT: u64 = LOCKS_AT + 4;
 /// The gate, held exclusive by the one process at a time that wants every branch lock at once, for
 /// as long as it wants them, as [`Gate`] describes.
@@ -889,8 +896,12 @@ fn frame_check(header: &[u8], table: &[u8]) -> [u8; 16] {
 /// The frame `header` names if it has a frame's magic and could follow `tip` in a file `len`
 /// bytes long, with the bytes of records it holds: its sequence number is the next after `tip`'s,
 /// and its end lies within `len` at a length a frame can have.
+///
+/// A staging frame holds no records a check covers, so it gives none and may end anywhere past
+/// its header.
 fn shape(tip: &Super, header: &[u8; FRAME_BYTES], len: u64) -> Option<(Super, u64)> {
-    if &header[0..8] != FRAME_MAGIC {
+    let staged = staging_header(header);
+    if &header[0..8] != FRAME_MAGIC && !staged {
         return None;
     }
     let body_start = tip.log_end.checked_add(FRAME_BYTES as u64)?;
@@ -900,8 +911,16 @@ fn shape(tip: &Super, header: &[u8; FRAME_BYTES], len: u64) -> Option<(Super, u6
     if !follows || frame.log_end < body_start || frame.log_end > len {
         return None;
     }
-    let records = records_in(frame.log_end - body_start)?;
+    let records = match staged {
+        true => 0,
+        false => records_in(frame.log_end - body_start)?,
+    };
     Some((frame, records))
+}
+
+/// Whether `header` starts with a staging frame's magic.
+fn staging_header(header: &[u8]) -> bool {
+    header.starts_with(STAGING_MAGIC)
 }
 
 /// Reads the table that a frame whose records start at `at` and run for `records` bytes holds,
@@ -935,23 +954,28 @@ fn read_tables(file: &File, at: u64, records: u64) -> Result<Option<(Vec<u8>, Ve
     Ok(Some((stored, computed)))
 }
 
-/// What follows `tip` in a file `len` bytes long, as [`examine`] judges the header there.
-fn read_frame(file: &File, tip: &Super, len: u64, judge: bool) -> Result<Found> {
+/// What follows `tip` in a file `len` bytes long, as [`examine`] judges the header there, and
+/// whether that header is a staging frame's.
+fn read_frame(file: &File, tip: &Super, len: u64, judge: bool) -> Result<(Found, bool)> {
     let start = tip.log_end;
     if start.saturating_add(FRAME_BYTES as u64) > len {
-        return Ok(Found::Torn);
+        return Ok((Found::Torn, false));
     }
     let mut header = [0u8; FRAME_BYTES];
     if !read_or_end(file, &mut header, start)? {
-        return Ok(Found::Torn);
+        return Ok((Found::Torn, false));
     }
-    examine(file, tip, &header, len, judge)
+    let found = examine(file, tip, &header, len, judge)?;
+    Ok((found, staging_header(&header)))
 }
 
-/// Whether `header` starts with a frame's magic, or with one that differs from it in one bit.
+/// Whether `header` starts with a frame's or a staging frame's magic, or with one that differs
+/// from either in one bit.
 fn frame_like(header: &[u8]) -> bool {
     let magic = u64::from_le_bytes(header[0..8].try_into().unwrap_or_default());
-    (magic ^ u64::from_le_bytes(*FRAME_MAGIC)).count_ones() <= 1
+    [FRAME_MAGIC, STAGING_MAGIC]
+        .iter()
+        .any(|kind| (magic ^ u64::from_le_bytes(**kind)).count_ones() <= 1)
 }
 
 /// What the frame whose header, read from where `tip`'s log ends, is `header` turns out to be, in
@@ -1204,18 +1228,25 @@ fn reaches(tip: &Super, named: &Super) -> Result<()> {
     )))
 }
 
-/// Follows frames from `sb` while each follows the one before and is whole, and returns the last.
+/// Follows frames from `sb` while each follows the one before and is whole, and returns the last
+/// and the last before the staging frames that end the log, if any do.
 ///
 /// With `judge`, a frame that reached the disk whole and was damaged since fails the scan with
 /// [`Error::Corrupt`], naming its offset, where it would otherwise end the log. Only a scan that
 /// no write can race may judge, as [`examine`] says.
-fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<Super> {
+fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<(Super, Super)> {
     let mut tip = sb;
+    let mut settled = sb;
     loop {
         match read_frame(file, &tip, len, judge)? {
-            Found::Whole(next) => tip = next,
-            Found::Torn => return Ok(tip),
-            Found::Damaged(at) => return Err(damaged(&tip, at)),
+            (Found::Whole(next), staged) => {
+                tip = next;
+                if !staged {
+                    settled = next;
+                }
+            }
+            (Found::Torn, _) => return Ok((tip, settled)),
+            (Found::Damaged(at), _) => return Err(damaged(&tip, at)),
         }
     }
 }
@@ -1236,11 +1267,13 @@ fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<Super> {
 /// back a frame `sb` names since that writer recovered the file, and the scan ending before the
 /// end of the log `sb` names fails it with [`Error::Corrupt`] too, before it writes anything.
 /// Without it, only frames past the anchor can be truncated, which under
-/// [`Durability::Buffered`] a crash may have lost.
+/// [`Durability::Buffered`] a crash may have lost, and the staging frames that end the log: no
+/// writer is alive to land them, and a landing is written after them.
 fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(Super, u64)> {
-    let mut tip = scan(file, sb.at_anchor(), len, true)?;
-    if live {
-        reaches(&tip, &sb)?;
+    let (mut tip, settled) = scan(file, sb.at_anchor(), len, true)?;
+    match live {
+        true => reaches(&tip, &sb)?,
+        false => tip = settled,
     }
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
@@ -1274,12 +1307,14 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
 /// placement lock shared too, and if it gets them and no shared writer holds [`MULTI_AT`], no
 /// writer is alive: it scans from the anchor under the locks, judging damage as a writer's open
 /// does, and syncs the frames it kept, since a dead writer's frames may be only in the page cache.
-/// A shared writer that opens meanwhile waits for the placement lock before it recovers or writes,
-/// so nothing it writes races the scan. With a writer alive, `sb` is current. A placement lock
-/// held elsewhere means a writer is placing a frame, so `sb` is used as it is, but a test of the
-/// lock that fails with an error says nothing about writers, and the open goes on to test
-/// [`MULTI_AT`] and scans without the placement lock, as it would where there are no byte-range
-/// locks, so a shared writer that opens meanwhile can write during that scan.
+/// It keeps none of the staging frames that end the log, which a writer opening drops, and which
+/// keep the head the frame before them names. A shared writer that opens meanwhile waits for the
+/// placement lock before it recovers or writes, so nothing it writes races the scan. With a writer
+/// alive, `sb` is current. A placement lock held elsewhere means a writer is placing a frame, so
+/// `sb` is used as it is, but a test of the lock that fails with an error says nothing about
+/// writers, and the open goes on to test [`MULTI_AT`] and scans without the placement lock, as it
+/// would where there are no byte-range locks, so a shared writer that opens meanwhile can write
+/// during that scan.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
@@ -1312,6 +1347,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
         .metadata()
         .map_err(Error::from)
         .and_then(|meta| scan(file, sb.at_anchor(), meta.len(), true))
+        .map(|(_, settled)| settled)
         .and_then(|tip| {
             if tip.seq != before {
                 platform::sync_reader(file, path)?;
@@ -2101,6 +2137,16 @@ impl Frame {
         self.mark().fill(&mut header[8..]);
         header
     }
+
+    /// The header of a staging frame, whose check covers the header alone.
+    fn staging_header(&self) -> [u8; FRAME_BYTES] {
+        let mut header = [0u8; FRAME_BYTES];
+        header[0..8].copy_from_slice(STAGING_MAGIC);
+        self.mark().fill(&mut header[8..]);
+        let check = frame_check(&header, &[]);
+        header[FRAME_CHECKED..FRAME_BYTES].copy_from_slice(&check);
+        header
+    }
 }
 
 /// What placing frames keeps under its lock.
@@ -2112,6 +2158,8 @@ struct Cursor {
     reserved: u64,
     /// The next chunk of zeroes to add.
     reserve: u64,
+    /// Where the staging frames this writer placed last begin, while no other frame follows them.
+    staged_from: Option<u64>,
 }
 
 /// The newest frame a superblock names, and the anchor, the newest frame known to be durable.
@@ -2277,6 +2325,9 @@ struct Inner {
     /// lately, losing a sixteenth and a byte with each frame placed, which sizes the room a draft
     /// leaves in its links to objects before it.
     drift: AtomicU64,
+    /// The bytes of the staging frames this process placed for receives that have neither landed
+    /// nor been given up.
+    staging: AtomicU64,
     /// The branch locks this process holds.
     lanes: Mutex<Lanes>,
     /// Woken when a branch lock is taken or let go.
@@ -2669,6 +2720,7 @@ impl Store {
                     seq: sb.seq,
                     reserved: sb.log_end,
                     reserve: 0,
+                    staged_from: None,
                 }),
                 slot: AtomicU64::new(slot),
                 marks: Mutex::new(Marks {
@@ -2686,6 +2738,7 @@ impl Store {
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
+                staging: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 gated: AtomicBool::new(false),
@@ -2734,6 +2787,7 @@ impl Store {
                     seq: cursor,
                     reserved: placed,
                     reserve: 0,
+                    staged_from: None,
                 }),
                 slot: AtomicU64::new(inner.slot.load(Ordering::Acquire)),
                 marks: Mutex::new(marks),
@@ -2748,6 +2802,7 @@ impl Store {
                 unsynced: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 drift: AtomicU64::new(0),
+                staging: AtomicU64::new(0),
                 lanes: Mutex::new(Lanes::default()),
                 lanes_moved: Condvar::new(),
                 gated: AtomicBool::new(false),
@@ -3180,8 +3235,10 @@ impl Store {
     /// needs nothing written either, so it is published without the lock, since superblocks
     /// only ever grow while this process is alive. Otherwise it reads on past `frame`
     /// to the newest whole frame of any process, syncs, and names that frame, so that the
-    /// processes that queued frames meanwhile find them covered. The superblock goes to the slot
-    /// that does not hold the newest, unless the newest is already as new.
+    /// processes that queued frames meanwhile find them covered, or the newest before the staging
+    /// frames that end the log, so that no superblock names a frame a writer opening later may
+    /// drop. The superblock goes to the slot that does not hold the newest, unless the newest is
+    /// already as new.
     fn sync_shared(&self, frame: Frame, durable: bool) -> Result<()> {
         let inner = &self.inner;
         let mark = frame.mark();
@@ -3204,7 +3261,9 @@ impl Store {
         let last = match durable {
             true => {
                 let len = inner.file.metadata()?.len();
-                scan(&inner.file, Super::new(mark, mark, inner.basis), len, false)?.mark()
+                scan(&inner.file, Super::new(mark, mark, inner.basis), len, false)?
+                    .1
+                    .mark()
             }
             false => mark,
         };
@@ -3233,8 +3292,8 @@ impl Store {
     }
 
     /// Syncs the file under [`Durability::Fsync`], poisoning the store if that fails, as a large
-    /// receive does once it has placed its pieces and before it lands them. It does nothing under
-    /// `Buffered`.
+    /// receive does once it has placed its records in a file a cycle replaced and before it lands
+    /// them. It does nothing under `Buffered`.
     pub(crate) fn flush(&self) -> Result<()> {
         if self.inner.options.durability != Durability::Fsync {
             return Ok(());
@@ -3654,7 +3713,9 @@ impl Store {
             if Super::fields(header).is_some_and(|next| next.seq > upto) {
                 break false;
             }
-            if let Some((frame, records)) = shape(&at, header, u64::MAX) {
+            if !staging_header(header)
+                && let Some((frame, records)) = shape(&at, header, u64::MAX)
+            {
                 let whole = frame.log_end - at.log_end;
                 if whole <= FOLLOWED_BYTES as u64 {
                     let whole = whole as usize;
@@ -3745,8 +3806,61 @@ impl Store {
             return;
         }
         cursor.seq = frame.seq;
+        cursor.staged_from = None;
         inner.placed.fetch_max(frame.end, Ordering::AcqRel);
         inner.written.fetch_max(frame.end, Ordering::AcqRel);
+    }
+
+    /// Places a staging frame at the end of the log, with `room` bytes for records past its header
+    /// and naming `head` as the frame before it does, writes its header, and returns where the
+    /// frame starts and ends.
+    ///
+    /// No check covers the records, which the receive that asked for the room writes once this
+    /// returns, holding no lock: the frame is whole once its header is written, and the file is
+    /// made at least as long as the frame, so that a writer of another process catching up finds
+    /// it whole while its records are still being written. Under [`Durability::Fsync`] a shared
+    /// writer makes it [`MAX_RESERVE`] longer still, which another process takes as reserved, so
+    /// that its commits beside the receive add no zeroes the records would be written over. The
+    /// caller holds `tip`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poisoned`] once a write has failed, [`Error::Corrupt`] if the log has used its last
+    /// sequence number, and the I/O error of a failed write, after which nothing is placed.
+    pub(crate) fn place_staging(&self, head: Ptr, room: u64) -> Result<(u64, u64)> {
+        let inner = &self.inner;
+        let mut cursor = inner.cursor.lock();
+        if inner.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        let at = inner.placed.load(Ordering::Acquire);
+        let seq = cursor
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("the log has used its last sequence number".into()))?;
+        let end = at + FRAME_BYTES as u64 + room;
+        let header = Frame { seq, end, head }.staging_header();
+        inner.file.write_all_at(&header, at)?;
+        let ahead = match inner.options.shared && inner.options.durability == Durability::Fsync {
+            true => MAX_RESERVE,
+            false => 0,
+        };
+        if inner.file.metadata()?.len() < end + ahead {
+            inner.file.set_len(end + ahead)?;
+        }
+        cursor.seq = seq;
+        cursor.staged_from.get_or_insert(at);
+        inner.placed.store(end, Ordering::Release);
+        inner.staging.fetch_add(end - at, Ordering::AcqRel);
+        drop(cursor);
+        self.arrived(at, end);
+        Ok((at, end))
+    }
+
+    /// The bytes of the staging frames this process placed for receives that have neither landed
+    /// nor been given up, which a cycle due by how far the file has grown leaves out.
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.inner.staging.load(Ordering::Acquire)
     }
 
     /// Writes a cycle's marker at the end of the placed log, so that a process catching up learns
@@ -4224,9 +4338,12 @@ impl Store {
     /// Clones of the store go on reading what they read before, and a new writer may open the
     /// file meanwhile. Cached and retired nodes that hold nested maps hold the store too, so
     /// dropping the cache and flushing the epoch is what lets the file close with the last clone.
-    /// A shared writer truncates nothing, since other writers may be placing frames in the
-    /// preallocation, and neither does a poisoned store. A second close does nothing to the file,
-    /// so it never truncates under a new writer.
+    /// Staging frames that end the log hold records of a receive that never landed, so a writer
+    /// truncates them too, durably, so that none can line up with frames a later writer places
+    /// there. A shared writer truncates nothing, since other writers may be placing frames in the
+    /// preallocation or have followed its staging frames, and neither does a poisoned store or
+    /// one a receive is still staging in, as it may be after a cycle replaced it. A second close
+    /// does nothing to the file, so it never truncates under a new writer.
     pub fn close(&self) {
         let inner = &self.inner;
         let closed = inner.closed.swap(true, Ordering::SeqCst);
@@ -4242,10 +4359,22 @@ impl Store {
             return;
         }
         let end = inner.written.load(Ordering::Acquire);
-        if !inner.poisoned.load(Ordering::Acquire)
-            && inner.file.metadata().is_ok_and(|meta| meta.len() > end)
-        {
-            let _ = inner.file.set_len(end);
+        let staged = inner
+            .cursor
+            .lock()
+            .staged_from
+            .filter(|_| inner.placed.load(Ordering::Acquire) == end);
+        let staging = inner.staging.load(Ordering::Acquire) > 0;
+        if !inner.poisoned.load(Ordering::Acquire) && !staging {
+            match staged {
+                Some(at) => {
+                    let _ = inner.file.set_len(at).and_then(|()| inner.file.sync_all());
+                }
+                None if inner.file.metadata().is_ok_and(|meta| meta.len() > end) => {
+                    let _ = inner.file.set_len(end);
+                }
+                None => {}
+            }
         }
         let _ = platform::unlock(&inner.file);
     }
@@ -4744,9 +4873,13 @@ impl Sink for Txn {
 ///
 /// The first call reserves nothing, and each chunk after it doubles the last, from
 /// [`FIRST_RESERVE`] to [`MAX_RESERVE`]. A shared writer takes another's longer file as reserved,
-/// and a failed write stops further tries. It does nothing under [`Durability::Buffered`].
+/// and a failed write stops further tries. It does nothing under [`Durability::Buffered`], nor
+/// while a receive of this process stages records in the log, which would write over the zeroes.
 fn reserve(inner: &Inner, cursor: &mut Cursor, end: u64) {
-    if inner.options.durability != Durability::Fsync || end <= cursor.reserved {
+    if inner.options.durability != Durability::Fsync
+        || end <= cursor.reserved
+        || inner.staging.load(Ordering::Acquire) > 0
+    {
         return;
     }
     if inner.options.shared
@@ -5136,6 +5269,7 @@ impl Txn {
             self.origin = self.start;
         }
         cursor.seq = frame.seq;
+        cursor.staged_from = None;
         inner.placed.store(end, Ordering::Release);
         drop(cursor);
         if !landing.pending {
@@ -5225,39 +5359,42 @@ impl Drop for Landing {
     }
 }
 
-/// The counter that names scratch files.
-static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
-
-/// Opens a new scratch file beside `near`, named for this process and a counter, that deletes
-/// itself.
-fn scratch(near: &Path) -> Result<File> {
-    loop {
-        let mut name = near.as_os_str().to_os_string();
-        let id = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
-        name.push(format!(".receiving.{}.{id}", std::process::id()));
-        match platform::scratch(Path::new(&name)) {
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            opened => return Ok(opened?),
-        }
-    }
-}
+/// Finds room for a staging's records in the log: places a staging frame with room for at least
+/// the bytes it is given and returns where the frame starts and ends, or `None` once a cycle has
+/// replaced the file the staging writes to.
+pub(crate) type Room<'a> = dyn FnMut(u64) -> Result<Option<(u64, u64)>> + 'a;
 
 /// The records of a received bundle, held until it lands: in memory up to `limit` bytes, and past
-/// that in a scratch file beside the database that deletes itself.
+/// that in staging frames at the end of the log.
 ///
-/// Each record sits behind its hash, in the log's record format, with its links resolved to
-/// offsets, within the staging for objects sent earlier in the bundle. Each object gets a `u32`
-/// id in the order it was put, with its offset in the staging beside it. Offsets start at
-/// [`LOG_START`], as in a log.
+/// Each record is in the log's record format, with its links resolved to offsets, within the
+/// staging for objects sent earlier in the bundle. Each object gets a `u32` id in the order it was
+/// put, with its offset beside it. In memory, offsets start at [`LOG_START`], as in a log of their
+/// own, so a link may lead past its record into the file, and every distance is zigzagged. Once
+/// the records outgrow `limit` they move into staging frames, placed at the end of the log as
+/// they fill by a [`Room`], where offsets are the log's and every link leads back, so the zigzag
+/// of each distance is the varint a log record holds. If a cycle replaces the file meanwhile, the
+/// rest go past the end of the replaced file, which no other writer touches again.
 pub(crate) struct Staging {
-    near: PathBuf,
+    store: Store,
     limit: usize,
-    file: Option<File>,
-    /// Where the records still in `buf` begin, past those already spilled.
+    log: Option<Logged>,
+    /// Where the records still in `buf` begin, past those already written.
     start: u64,
     buf: Vec<u8>,
     hashes: Hashes,
     offsets: Column<u64>,
+}
+
+/// Where a staging that outgrew memory writes its records.
+struct Logged {
+    /// Where the room for records ends: the end of the staging frame being filled, or `u64::MAX`
+    /// once records go past the end of a replaced file.
+    room: u64,
+    /// Where each staging frame placed for the records starts and ends.
+    frames: Vec<(u64, u64)>,
+    /// Where records began to go past the end of a replaced file, if they did.
+    past: Option<u64>,
 }
 
 /// A record of a staging, read back for placing.
@@ -5306,15 +5443,10 @@ fn parse_varint(bytes: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     Err(Error::Corrupt("varint overflow in a staged record".into()))
 }
 
-/// Reads the staged record at the front of `bytes`, which start at `at` in the staging, and its
-/// length, or `None` if it runs past them.
-fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
-    let Some(hash) = bytes.get(..HASH_BYTES) else {
-        return Ok(None);
-    };
-    let hash: Hash = hash.try_into().expect("slice length is HASH_BYTES");
-    let offset = at + HASH_BYTES as u64;
-    let mut pos = HASH_BYTES;
+/// Reads the staged record of the object with `hash` at the front of `bytes`, which start at `at`
+/// in the staging, and its length, or `None` if it runs past them.
+fn parse_record(bytes: &[u8], at: u64, hash: Hash) -> Result<Option<(Record, usize)>> {
+    let mut pos = 0;
     let size = |value: u64| {
         usize::try_from(value).map_err(|_| Error::Corrupt("staged record overflow".into()))
     };
@@ -5351,7 +5483,7 @@ fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
         };
         links.push(Ptr {
             hash: link,
-            offset: offset.wrapping_sub(unzigzag(delta) as u64),
+            offset: at.wrapping_sub(unzigzag(delta) as u64),
         });
     }
     let record = Record {
@@ -5364,13 +5496,20 @@ fn parse_record(bytes: &[u8], at: u64) -> Result<Option<(Record, usize)>> {
     Ok(Some((record, pos)))
 }
 
+/// The most bytes the record of `staged` can take.
+fn most_bytes(staged: &Staged<'_>) -> u64 {
+    let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
+    (staged.payload.len() + 3 * MAX_VARINT + links) as u64
+}
+
 impl Staging {
-    /// An empty staging, which spills to a scratch file beside `near` once it holds `limit` bytes.
-    pub(crate) fn new(near: &Path, limit: usize) -> Staging {
+    /// An empty staging for a receive into `store`, which moves into staging frames in its log
+    /// once it holds `limit` bytes.
+    pub(crate) fn new(store: &Store, limit: usize) -> Staging {
         Staging {
-            near: near.to_path_buf(),
+            store: store.clone(),
             limit,
-            file: None,
+            log: None,
             start: LOG_START,
             buf: Vec::new(),
             hashes: Hashes::new(),
@@ -5378,29 +5517,127 @@ impl Staging {
         }
     }
 
-    /// Adds the record of `staged` behind `hash`, spilling what is in memory first if the record
-    /// could take it past the limit, and returns the object's id.
+    /// Adds the record of `staged` behind `hash` and returns the object's id, moving the records
+    /// into the log first if this one could take them past the limit, and asking `room` for a
+    /// staging frame whenever the one being filled cannot hold it.
     ///
     /// The caller must know that `hash` is not staged yet, as [`Hashes::insert`] requires.
     ///
     /// # Errors
     ///
-    /// [`Error::Bundle`] once the staging holds as many objects as it has ids, and the I/O error
-    /// of a failed spill.
-    pub(crate) fn put(&mut self, hash: Hash, staged: Staged<'_>) -> Result<u32> {
-        let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
-        let most = HASH_BYTES + staged.payload.len() + 3 * MAX_VARINT + links;
-        if !self.buf.is_empty() && self.buf.len() + most > self.limit {
-            self.spill()?;
+    /// [`Error::Bundle`] once the staging holds as many objects as it has ids, the error of
+    /// `room`, and the I/O error of a failed write.
+    pub(crate) fn put(
+        &mut self,
+        hash: Hash,
+        staged: Staged<'_>,
+        room: &mut Room<'_>,
+    ) -> Result<u32> {
+        let most = most_bytes(&staged);
+        let mut moved = None;
+        if self.log.is_none()
+            && !self.buf.is_empty()
+            && self.buf.len() as u64 + most > self.limit as u64
+        {
+            let was = self.spill(room)?;
+            moved = Some(self.moved_links(staged.links, &was, self.offsets.len() as u32));
+        }
+        let staged = Staged {
+            links: moved.as_deref().unwrap_or(staged.links),
+            ..staged
+        };
+        if self.log.is_some() {
+            self.make_room(most, room)?;
         }
         let id = self.hashes.insert(hash).ok_or_else(|| {
             Error::Bundle("it carries more objects than one receive can hold".into())
         })?;
-        self.buf.extend_from_slice(&hash);
         let offset = self.start + self.buf.len() as u64;
         append_staged(&mut self.buf, offset, staged);
         self.offsets.push(offset);
         Ok(id)
+    }
+
+    /// Moves the records held in memory into staging frames, linking each record to the new
+    /// offsets of those before it, and returns the offsets they had.
+    fn spill(&mut self, room: &mut Room<'_>) -> Result<Column<u64>> {
+        let held = mem::take(&mut self.buf);
+        let was = mem::replace(&mut self.offsets, Column::new());
+        let base = self.start;
+        self.log = Some(Logged {
+            room: 0,
+            frames: Vec::new(),
+            past: None,
+        });
+        for id in 0..was.len() as u32 {
+            let at = was.get(id);
+            let hash = self.hashes.hash(id);
+            let (record, _) = parse_record(&held[(at - base) as usize..], at, hash)?
+                .ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
+            let links = self.moved_links(&record.links, &was, id);
+            let staged = record.staged(&links);
+            self.make_room(most_bytes(&staged), room)?;
+            let offset = self.start + self.buf.len() as u64;
+            append_staged(&mut self.buf, offset, staged);
+            self.offsets.push(offset);
+        }
+        Ok(was)
+    }
+
+    /// `links`, with each link to an object put before the id `before`, at the offset `was` gave
+    /// it, moved to the offset it has now.
+    fn moved_links(&self, links: &[Ptr], was: &Column<u64>, before: u32) -> Vec<Ptr> {
+        links
+            .iter()
+            .map(|link| match self.hashes.find(&link.hash) {
+                Some(target) if target < before && was.get(target) == link.offset => Ptr {
+                    hash: link.hash,
+                    offset: self.offsets.get(target),
+                },
+                _ => *link,
+            })
+            .collect()
+    }
+
+    /// Makes sure the staging frame being filled has room for `most` more bytes, writing the
+    /// records it holds and asking `room` for another if it has not.
+    fn make_room(&mut self, most: u64, room: &mut Room<'_>) -> Result<()> {
+        let end = self.start + self.buf.len() as u64;
+        let log = self.log.as_ref().expect("a staging in the log");
+        if end.checked_add(most).is_some_and(|need| need <= log.room) {
+            return Ok(());
+        }
+        self.write_out()?;
+        let found = room(most.max(STAGED_ROOM))?;
+        let log = self.log.as_mut().expect("a staging in the log");
+        match found {
+            Some((at, end)) => {
+                log.frames.push((at, end));
+                log.room = end;
+                self.start = at + FRAME_BYTES as u64;
+            }
+            None => {
+                let len = self.store.inner.file.metadata()?.len();
+                let past = len.max(self.start).next_multiple_of(BLOCK_BYTES as u64);
+                log.past = Some(past);
+                log.room = u64::MAX;
+                self.start = past;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the records held in memory to the file, once the staging is in the log.
+    fn write_out(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let file = &self.store.inner.file;
+        file.write_all_at(&self.buf, self.start)?;
+        platform::start_writeback(file, self.start, self.buf.len() as u64);
+        self.start += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
     }
 
     /// The id of the object with `hash`.
@@ -5412,18 +5649,19 @@ impl Staging {
     ///
     /// # Panics
     ///
-    /// If no object has that id, or the staging is sealed.
+    /// If no object has that id.
     pub(crate) fn offset(&self, id: u32) -> u64 {
         self.offsets.get(id)
     }
 
     /// The offset in the staging of the object with `hash`.
-    ///
-    /// # Panics
-    ///
-    /// If the staging is sealed and holds the object.
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
         self.id_of(hash).map(|id| self.offset(id))
+    }
+
+    /// The offset of every object, by id: in the log, once the staging is in staging frames.
+    pub(crate) fn offsets(&self) -> &Column<u64> {
+        &self.offsets
     }
 
     /// The table of every object's hash and id.
@@ -5431,24 +5669,15 @@ impl Staging {
         &self.hashes
     }
 
-    /// Whether any records went to the scratch file.
+    /// Whether the records went into the log.
     pub(crate) fn spilled(&self) -> bool {
-        self.file.is_some()
+        self.log.is_some()
     }
 
-    /// Writes the records in memory to the scratch file, creating it on the first spill.
-    pub(crate) fn spill(&mut self) -> Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let file = match &self.file {
-            Some(file) => file,
-            None => self.file.insert(scratch(&self.near)?),
-        };
-        file.write_all_at(&self.buf, self.start)?;
-        self.start += self.buf.len() as u64;
-        self.buf.clear();
-        Ok(())
+    /// Whether the records lie in staging frames of `store`, so that a landing there can link
+    /// them where they are: none went past the end of a file a cycle replaced.
+    pub(crate) fn in_place(&self, store: &Store) -> bool {
+        self.store.id() == store.id() && self.log.as_ref().is_some_and(|log| log.past.is_none())
     }
 
     /// Reads the object at `ptr`, an offset in the staging, without checking its hash, which was
@@ -5459,16 +5688,8 @@ impl Staging {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
             _ => (&[][..], self.start),
         };
-        let (object, _, _) = Store::read_within(
-            self.file.as_ref(),
-            ptr,
-            tail,
-            held,
-            false,
-            false,
-            None,
-            true,
-        )?;
+        let file = self.log.as_ref().map(|_| &*self.store.inner.file);
+        let (object, _, _) = Store::read_within(file, ptr, tail, held, false, false, None, true)?;
         Ok(object)
     }
 
@@ -5510,24 +5731,75 @@ impl Staging {
         f()
     }
 
-    /// Drops the offsets, which placing does not need, and if the staging spilled, writes the rest
-    /// to the scratch file and frees the buffer, so that a replay reads only the file.
-    pub(crate) fn seal(&mut self) -> Result<()> {
-        self.offsets = Column::new();
-        if self.spilled() {
-            self.spill()?;
-            self.buf = Vec::new();
+    /// Writes what is left in memory of a staging in the log, so that every record is in the
+    /// file.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        match self.log {
+            Some(_) => self.write_out(),
+            None => Ok(()),
+        }
+    }
+
+    /// Makes the records the staging wrote to the log durable, as they must be before a frame
+    /// that links them is written. A failed sync poisons the store.
+    pub(crate) fn sync(&self) -> Result<()> {
+        if let Err(error) = self.store.inner.file.sync_data() {
+            self.store.poison_unsynced();
+            return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Lets the deduplication table find the objects staged in the log, once they have passed
+    /// every check and are durable, so that a commit may link them where they are: the last
+    /// [`STAGED_LEARNED`] of them, but for the ids in `commits`, sorted, which may still link a
+    /// parent at offset 0. Once it has, the staging must never be discarded.
+    pub(crate) fn learn(&self, commits: &[u32]) {
+        let count = self.offsets.len();
+        for id in count.saturating_sub(STAGED_LEARNED)..count {
+            let id = id as u32;
+            if commits.binary_search(&id).is_err() {
+                self.store
+                    .inner
+                    .dedupe
+                    .insert(self.hashes.hash(id), self.offsets.get(id));
+            }
+        }
+    }
+
+    /// Gives back the disk the records took, for a staging that will never land where it is:
+    /// nothing links its staging frames, so their records become holes, and the staging frames
+    /// that end the log go when the writer closes or a writer next opens the file.
+    pub(crate) fn discard(&self) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let file = &self.store.inner.file;
+        for (at, end) in &log.frames {
+            let from = at + FRAME_BYTES as u64;
+            platform::punch(file, from, end - from);
+        }
+        if let Some(past) = log.past {
+            platform::punch(file, past, self.start.saturating_sub(past));
+        }
     }
 
     /// A reader of the records in the order they were put.
     pub(crate) fn replay(&self) -> Replay<'_> {
         Replay {
             staging: self,
-            at: LOG_START,
+            next: 0,
             window: Vec::new(),
             window_at: LOG_START,
+        }
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Some(log) = &self.log {
+            let bytes = log.frames.iter().map(|(at, end)| end - at).sum();
+            self.store.inner.staging.fetch_sub(bytes, Ordering::AcqRel);
         }
     }
 }
@@ -5535,9 +5807,9 @@ impl Staging {
 /// A reader of a staging's records in the order they were put.
 pub(crate) struct Replay<'a> {
     staging: &'a Staging,
-    /// The offset of the next record.
-    at: u64,
-    /// The bytes read of the scratch file.
+    /// The id of the next record.
+    next: u32,
+    /// The bytes read of the file.
     window: Vec<u8>,
     /// Where `window` starts.
     window_at: u64,
@@ -5549,47 +5821,52 @@ impl Replay<'_> {
     /// # Errors
     ///
     /// [`Error::Corrupt`] if a record runs past the end of the staging or does not parse, and the
-    /// I/O error of a failed read of the scratch file.
+    /// I/O error of a failed read of the file.
     pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
         let staging = self.staging;
-        if self.at == staging.start + staging.buf.len() as u64 {
+        if self.next as usize == staging.offsets.len() {
             return Ok(None);
         }
-        let parsed = match self.at.checked_sub(staging.start) {
-            Some(at) => parse_record(&staging.buf[at as usize..], self.at)?,
-            None => self.spilled_record()?,
+        let at = staging.offsets.get(self.next);
+        let hash = staging.hashes.hash(self.next);
+        let parsed = match at.checked_sub(staging.start) {
+            Some(from) => parse_record(&staging.buf[from as usize..], at, hash)?,
+            None => self.written_record(at, hash)?,
         };
-        let (record, len) =
+        let (record, _) =
             parsed.ok_or_else(|| Error::Corrupt("a staged record runs past its end".into()))?;
-        self.at += len as u64;
+        self.next += 1;
         Ok(Some(record))
     }
 
-    /// Reads the record at `at` from the scratch file, reading a window at least [`REPLAY_CHUNK`]
-    /// long and doubling it until the record fits.
-    fn spilled_record(&mut self) -> Result<Option<(Record, usize)>> {
-        let file = self
-            .staging
-            .file
-            .as_ref()
-            .ok_or_else(|| Error::Corrupt("a staged record was never written".into()))?;
+    /// Reads the record at `at` from the file, reading a window at least [`REPLAY_CHUNK`] long
+    /// and doubling it until the record fits.
+    fn written_record(&mut self, at: u64, hash: Hash) -> Result<Option<(Record, usize)>> {
+        if self.staging.log.is_none() {
+            return Err(Error::Corrupt("a staged record was never written".into()));
+        }
+        let file = &self.staging.store.inner.file;
         loop {
-            let from = usize::try_from(self.at - self.window_at).unwrap_or(usize::MAX);
-            let have = self.window.len().saturating_sub(from);
-            if have > 0
-                && let Some(found) = parse_record(&self.window[from..], self.at)?
-            {
-                return Ok(Some(found));
+            let held = self.window_at + self.window.len() as u64;
+            let have = match at >= self.window_at && at < held {
+                true => (held - at) as usize,
+                false => 0,
+            };
+            if have > 0 {
+                let from = (at - self.window_at) as usize;
+                if let Some(found) = parse_record(&self.window[from..], at, hash)? {
+                    return Ok(Some(found));
+                }
             }
-            let left = usize::try_from(self.staging.start - self.at).unwrap_or(usize::MAX);
+            let left = usize::try_from(self.staging.start - at).unwrap_or(usize::MAX);
             let want = have.saturating_mul(2).max(REPLAY_CHUNK).min(left);
             if want <= have {
                 return Ok(None);
             }
             self.window.clear();
             self.window.resize(want, 0);
-            file.read_exact_at(&mut self.window, self.at)?;
-            self.window_at = self.at;
+            file.read_exact_at(&mut self.window, at)?;
+            self.window_at = at;
         }
     }
 }
@@ -5826,14 +6103,14 @@ mod tests {
             image[at as usize] ^= 0x20;
             std::fs::write(&path, &image).unwrap();
             let file = File::open(&path).unwrap();
-            let lenient = read_frame(&file, &tip, end, false).unwrap();
+            let lenient = read_frame(&file, &tip, end, false).unwrap().0;
             assert!(matches!(lenient, Found::Torn), "byte {at} without judging");
-            read_frame(&file, &tip, end, true).unwrap()
+            read_frame(&file, &tip, end, true).unwrap().0
         };
         std::fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
         assert!(matches!(
-            read_frame(&file, &tip, end, true).unwrap(),
+            read_frame(&file, &tip, end, true).unwrap().0,
             Found::Whole(_)
         ));
         let table = end - BLOCK_CHECK as u64;
@@ -5963,6 +6240,7 @@ mod tests {
             image.len() as u64,
             true,
         )
+        .map(|(tip, _)| tip)
     }
 
     /// Checks that no image of `frames` torn by a power cut reads as damaged: with each sector
@@ -6497,5 +6775,77 @@ mod tests {
         }
         assert_eq!(lent(ptrs[12]).unwrap(), wanted(12));
         store.close();
+    }
+
+    #[test]
+    fn a_scan_passes_a_staging_frame_unread_and_judges_its_header_and_an_open_drops_one_at_the_end()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            ..StoreOptions::default()
+        };
+        let (store, _) = Store::open(&path, options.clone()).unwrap();
+        let commit = |body: &[u8]| {
+            let object = Object {
+                body: body.to_vec(),
+                links: Vec::new(),
+            };
+            let mut txn = store.begin().unwrap();
+            let ptr = txn.put_ref(&object, object.hash()).unwrap();
+            txn.commit(ptr).unwrap();
+            ptr
+        };
+        let first = commit(b"before the staging frame");
+        let settled = store.inner.placed.load(Ordering::Acquire);
+        let (at, end) = store.place_staging(first, 8192).unwrap();
+        assert_eq!(at, settled);
+        let body = at + FRAME_BYTES as u64;
+        store
+            .inner
+            .file
+            .write_all_at(&noise(3, 5_000), body)
+            .unwrap();
+        let last = commit(b"after the staging frame");
+        let (trailing, _) = store.place_staging(last, 4096).unwrap();
+        store
+            .inner
+            .file
+            .write_all_at(&noise(4, 3_000), trailing + FRAME_BYTES as u64)
+            .unwrap();
+        let image = std::fs::read(&path).unwrap();
+        drop(store);
+        let copy = dir.path().join("copy.ferro");
+        let tip = scanned(&copy, &image).unwrap();
+        assert_eq!(tip.head, Some(last));
+        assert_eq!(tip.log_end, image.len() as u64);
+        for at in [body, body + 100, end - 1] {
+            let mut changed = image.clone();
+            changed[at as usize] ^= 0xff;
+            let tip = scanned(&copy, &changed).unwrap();
+            assert_eq!(tip.log_end, image.len() as u64, "byte {at} of the records");
+        }
+        for byte in [0, 9, 20, 30, 60] {
+            let mut flipped = image.clone();
+            flipped[(at + byte) as usize] ^= 0x04;
+            match scanned(&copy, &flipped) {
+                Err(Error::Corrupt(message)) => assert!(message.contains("damaged"), "{message}"),
+                other => panic!(
+                    "byte {byte} of the header: {:?}",
+                    other.map(|tip| tip.log_end)
+                ),
+            }
+        }
+        std::fs::write(&copy, &image).unwrap();
+        let (reopened, head) = Store::open(&copy, options).unwrap();
+        assert_eq!(head, Some(last));
+        assert_eq!(reopened.inner.placed.load(Ordering::Acquire), trailing);
+        assert_eq!(std::fs::metadata(&copy).unwrap().len(), trailing);
+        assert_eq!(
+            reopened.read_object(first).unwrap().body,
+            b"before the staging frame"
+        );
+        reopened.close();
     }
 }

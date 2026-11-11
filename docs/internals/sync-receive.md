@@ -7,23 +7,41 @@ this is in [Sync](sync.md).
 ## Where checked objects wait
 
 A bundle is read once and not kept, so its objects have to be somewhere between being hashed and
-being published. They wait in a scratch file beside the database while the bundle streams and is
-checked, and go into the log only once every check has passed. No writer lock is held while the
-bundle is read, so a slow or stalled peer holds up no commit on the receiving file (#42).
+being published. A bundle under 1 MiB waits in memory. A larger one waits in the file itself, in
+staging frames at the end of the log that nothing links, and is checked there, so its objects are
+written once; one frame links them once every check has passed. No writer lock is held while the
+bundle is read, but for the moment each staging frame takes to be placed, so a slow or stalled peer
+holds up no commit on the receiving file (#42).
 
 `receive` reads the bundle's header, then resolves the anchors and hints against the published refs,
 so a stale have fails before any object is read. It keeps the `Store` of that generation for the
 rest of the transfer, so a reclamation cycle that swaps the file meanwhile leaves every object it
-resolved readable. Each object is hashed as it arrives and appended to a staging buffer, behind its
-hash, in the log's record format, with its links resolved to offsets: to an object sent earlier, by
-its offset in the staging, to an anchor or hint, by its offset in the file, or, where a link names
-something not sent, to offset 0 for now. Before a record would take the buffer past 1 MiB, the
-buffer goes to the scratch file. The first spill creates it in the database's directory as
-`<file>.receiving.<pid>.<n>` and unlinks it at once, or on Windows opens it to be deleted on close,
-so neither a crash nor a failed receive leaves it behind, and a bundle under 1 MiB never creates
-one. The checks above read the sent objects back from the staging without hashing them again, and
-what the receiver holds from the generation `receive` started in. A bundle that fails any of them,
-or a stream that errors or ends early, has written nothing to the database.
+resolved readable. Each object is hashed as it arrives and appended to a staging buffer, in the
+log's record format, with its links resolved to offsets: to an object sent earlier, by its offset in
+the staging, to an anchor or hint, by its offset in the file, or, where a link names something not
+sent, to offset 0 for now. Each record keeps the body it arrived with, its LZ4 bytes or those a body
+that arrived uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing
+is compressed again when it lands. In memory the records sit at offsets of their own, from where a
+log would start, so a link may lead past its record into the file, and every distance is
+zigzagged.
+
+Before a record would take the buffer past 1 MiB, the staging moves into the log. It asks for a
+staging frame: under the `tip` mutex, and in a shared file the placement lock, it places a frame
+with room for 1 MiB of records, or for one record that needs more, at the end of the log, writes its
+68-byte header, makes the file at least as long as the frame, and lets the locks go. The header
+carries the next sequence number, the frame's end and the head the frame before named, so the frame
+keeps the refs as they were, and its check covers the header alone, as described under [File format
+and durability](storage.md#file-format-and-durability). The records held in memory are encoded again
+where they land, and every later one at its offset in the frame, so every link leads back and its
+zigzagged distance is the even varint a record in the log holds. Once a frame is full its records
+go to the file in one write, with no lock held, writeback starts on them, and the next frame is
+placed. Commits on every branch go on between and beside them: a staging frame placed while a
+commit drafts moves the draft as any frame does, and a writer of another process catching up checks
+the header and goes on at the frame's end without reading the records. A bundle under 1 MiB places
+no frame. The checks above read the sent objects back from the staging without hashing them again,
+from the buffer and through the page cache, and what the receiver holds from the generation
+`receive` started in. A bundle that fails any of them, or a stream that errors or ends early, lands
+nothing.
 
 Only a commit may link to something not sent, and an object that does and is not one of the new
 commits rejects the bundle. Which commit such a link names is only known once the chains are walked,
@@ -31,82 +49,150 @@ so each sent commit whose links differ from what the walk resolved is appended a
 ones, in generation order so that its parents' final copies come first. A clone into an empty file
 rewrites none, and an incremental pull rewrites its few commits.
 
-Placing copies the staged records into the log. Each is encoded again at its offset there, keeping
-the body it was staged with, the LZ4 bytes it arrived with or those a body that arrived
-uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing is
-compressed at placing. A link to a sent object takes
-the offset it was placed at, and a link to an anchor or hint the offset of that object in the
-generation now current. A bundle that never spilled is placed under the writer locks, in a frame of
-its own that keeps the refs as they were and is written in one piece like a commit's, just before the
-frame that lands it, so the landing can read the new head as `T` first, as described under
-[Limits](sync.md#limits). A larger one is placed first, in pieces
-of 256 KiB, each a frame of its own that keeps the refs as they were, so nothing can find its
-objects yet. A piece takes only the `tip` mutex, for about as long as a commit's encode, and commits
-on every branch go on between pieces. The dedupe cache learns a piece's objects when the piece is
-written, except its commits: until the landing, a sent commit may still link its parent at offset 0,
-and a local commit that hashed the same would have reused that copy.
+Once the bundle has passed every check, `receive` writes what is left of the buffer and takes the
+cycle mutex, so that no swap can move the staging frames from under the frame that links them: a
+cycle already running finishes first, and one that comes due waits. If the file is still the
+generation the frames were placed in, the bundle lands where it is. The frames are synced, under
+either durability, so that no frame that links them can reach the disk before they do, and the
+deduplication table learns the last 131,072 objects staged, but for the commits: until the landing,
+a sent commit may still link its parent at offset 0, and a local commit that hashed the same would
+reuse that copy. The landing then takes every branch's lane and `tip`, as before, and checks again
+against the heads it finds there what depends on this file: every base must still be in one of its
+chains, or `receive` returns `StaleHave`, the commit below the oldest one sent is looked up again,
+and every sent commit's links, generation and merge numbers are worked out and checked against the
+commits this file holds now. A check that passed against the old heads passes against newer ones
+unless a commit it relied on has been pruned, which only leaves less to check. A `StaleHave` from
+these checks or from the first ones comes before the merge closure, so a pull tries again from a
+fresh have, as described under [A stale have in a pull](sync.md#a-stale-have-in-a-pull). The copies
+of the commits whose links changed go into one more frame that keeps the refs, 1 MiB at a time as
+the old frame did, with a header written last whose hash reads back the part already written. The
+head's root is read as `T`, and the landing frame then holds only the refs that point `remote` at
+the head. Type checks and hashes are not repeated: they depend only on the bundle and on objects
+whose hashes do not change.
 
-Under `Durability::Fsync` the pieces are synced before the landing, with no lock held, so the
-landing's own sync has only its frame left to flush. The landing then takes every branch's lane and
-`tip`, as before, and checks again against the heads it finds there what depends on this file: every
-base must still be in one of its chains, or `receive` returns `StaleHave`, the commit below the
-oldest one sent is looked up again, and every sent commit's links, generation and merge numbers are
-worked out and checked against the commits this file holds now. A check that passed against the old
-heads passes against newer ones unless a commit it relied on has been pruned, which only leaves less
-to check. A `StaleHave` from these checks or from the first ones comes before the merge closure, so
-a pull tries again from a fresh have, as described under [A stale have in a
-pull](sync.md#a-stale-have-in-a-pull). The copies of the commits whose links changed go into one
-more frame that keeps the refs, 1 MiB at a time as the old frame did, with a header written last
-whose hash reads back the part already written. The head's root is read as `T`, and the landing
-frame then holds only the refs that point `remote` at the head. Type checks and hashes are not
-repeated: they depend only on the bundle and on objects whose hashes do not change.
+A bundle that never spilled is placed under the writer locks, in a frame of its own that keeps the
+refs as they were and is written in one piece like a commit's, just before the frame that lands it,
+so the landing can read the new head as `T` first, as described under [Limits](sync.md#limits).
+Each record is encoded again at its offset there: a link to a sent object takes the offset its
+object was placed at, and a link to an anchor or hint the offset of that object in the generation
+now current.
 
-A reclamation cycle can prune, swap the file and retire the old one while the bundle streams. Before
-placing, `receive` resolves the anchors again in the generation now current: each base by hash and
-version, and each hint by following its path again from the anchors' roots, one read per parent
-object as when it was first resolved, which must end at the same hash. Placing holds the cycle mutex
-from the first piece to the landing, so no swap can move the pieces from under the frame that links
-them. A cycle that comes due meanwhile waits for the copy, which runs at the speed of the disk and
-not of the peer, and a cycle already running when the bundle has been checked finishes before
-placing starts. A bundle that never spilled needs no such hold, because it is placed under the locks
-a swap takes.
+A cycle copies only what the refs reach, so one that swaps the file while a bundle streams leaves
+its staging frames behind in the old file, which the receive's `Store` keeps open. The receive
+learns of the swap when it next asks for a frame, and writes the rest of the bundle past the end of
+the old file, which no writer touches again and which the old file's close leaves alone while a
+receive stages in it. Its landing then finds its records outside the current file: it resolves the
+anchors again in the generation now current, each base by hash and version, and each hint by
+following its path again from the anchors' roots, one read per parent object as when it was first
+resolved, which must end at the same hash, and places the records in the new file in pieces of 256
+KiB under the cycle mutex, each a frame of its own that keeps the refs as they were and whose
+objects the deduplication table learns, but for the commits, before it lands as above. Such a bundle
+is written twice, as every large bundle used to be. The staging frames of a receive in flight are
+left out of the growth that makes a background cycle due, so that a receive does not set off the
+cycle that would make it write twice; a cycle due from what other commits wrote runs as before, and
+in a shared file another process counts the frames as growth.
 
-Until the landing frame is durable, nothing names the placed objects. Readers bound every offset by
-the published end of the log, and the pieces are whole frames that keep the previous refs, so a
-crash anywhere leaves the previous head, and pieces that reached the disk stay in the log until the
-next cycle drops them. A landing refused under the locks, because a base was pruned or dropped while
-the bundle streamed, leaves its pieces the same way and writes nothing else: a 3 MB bundle refused
-there left the file 3 MB larger until the next cycle. One refused because its head does not read as
-`T` has written its objects, or the relinked copies of its commits, in the frame before the landing
-by then, and leaves that frame the same way. A piece whose write fails, as when the disk
-fills, fails the receive without poisoning the store, and the next frame is written over what
-reached the file. A power cut at every write of a receive that placed a 3 MB bundle in pieces, with
-a commit on the pulling branch while the stream was stalled and another on a second branch between
-placing and landing, keeping or dropping each write not yet synced, always opened at the previous
-head, that first commit, the landed remote or the merge, never lost a commit acknowledged before the
-cut, and had nothing past the end of the log.
+Until the landing frame is durable, nothing names the staged objects. Readers bound every offset by
+the published end of the log, and the staging frames keep the previous refs, so a crash anywhere
+leaves the previous head, with the staging frames in the log, unlinked, until the next cycle. If
+they end the log, a writer that opens the file with no writer alive drops them, since a landing is
+written after the frames it links, a read-only open that scans leaves them out, and a superblock
+never names them, so neither can come to rely on them. A writer without `Options::shared` drops
+those it placed itself as it closes, if nothing followed them. Both truncations are synced before
+anything else is written, so that a staging frame left past the end of the log, which names an
+older head, can never line up with frames written later. A receive refused before its objects were
+synced and learned, by a check, an error of its stream or its write, gives back the disk its
+records took: nothing links its staging frames and no check covers their records, so on Linux it
+punches holes over them, and the frames stay as headers until the writer closes, if nothing
+followed them, or until the next cycle. A refusal at the landing, because a base went while the
+bundle streamed or its head does not read as `T`, keeps the records, since a commit may have linked
+them by then, until the next cycle. A staging frame whose records fail to write, as when the disk
+fills, fails the receive without poisoning the store. A power cut at every write of a receive that
+staged a 3 MB bundle, with a commit on the pulling branch while the stream was stalled and another
+on a second branch between the sync and the landing, keeping or dropping each write not yet synced,
+always opened at the previous head, that first commit, the landed remote or the merge, never lost a
+commit acknowledged before the cut, and had nothing past the end of the log. A process killed in a
+hook after its third staging frame, once the bundle was checked, and after the sync, left a file
+that opened at the previous head with the bytes it had before the receive, and one killed after the
+landing opened at the landed head.
 
 The receiver holds a 64 KiB read buffer, up to 1 MiB of staging not yet written, the object being
 read, and for each object its hash, its offset in the staging and a count of the links to it, about
-38 bytes an object, as described under [Memory for each object](sync.md#memory-for-each-object).
-Placing drops the offsets in the staging first and holds each object's offset in the log in their
-place, one piece and a window on the scratch file. An object is held whole, about four times over
-while it is read, compressed again if it arrived uncompressed, as described under
-[Applying](sync.md#applying), hashed and copied, so the largest value sent bounds memory too. A
-hostile stream gets no more: 48 distinct objects of 1 MiB took 2.1 MiB of heap and never reached the
-database. A 33 MB stream of 4,549 objects took 1.66 MB, where the frame it used to fill took 2.80
-MB, and 256 commits with 64 KiB messages, 17 MB, took 2.2 MB.
+38 bytes an object, as described under [Memory for each object](sync.md#memory-for-each-object). A
+bundle that lands where it is needs nothing more, since the offsets in the staging are those in the
+log; one that a cycle moved holds each object's offset in the new file beside them, 8 bytes an
+object more. When the staging moves into the log, the buffer it leaves and the frame it fills are
+both held for a moment, 1 MiB more. An object is held whole, about four times over while it is
+read, compressed again if it arrived uncompressed, as described under [Applying](sync.md#applying),
+hashed and copied, so the largest value sent bounds memory too. A hostile stream gets no more: 48
+distinct objects of 1 MiB took 2.1 MiB of heap and never landed. A 33 MB stream of 4,549 objects
+took 1.66 MB, where the frame it used to fill took 2.80 MB, and 256 commits with 64 KiB messages,
+17 MB, took 2.2 MB.
 
-Three other places were weighed. Writing the staged objects into the log as frames of their own
-while the bundle streams writes each byte once, but a cycle that swaps the file meanwhile copies
-only what the refs reach, so it would drop them, and holding the swap off until the stream ends lets
-a slow peer stall reclamation instead of commits. It would also leave a refused bundle's bytes in
-the file until the next cycle, so a hostile peer could grow the file with every attempt, where a
-refusal by these checks now costs the database nothing. A head that passes them and does not read
-as `T` is refused only after its objects are written, but such a head used to land, so it grew the
-file by as much. Copying from the scratch file inside the landing frame keeps
-the crash story as it was, with no pieces, but holds every writer for a copy as large as the bundle.
-Holding the checked objects in memory loses the bound above.
+### Staging in the log, measured
+
+Until 2026-11, a bundle over 1 MiB waited in a scratch file beside the database, created on the
+first spill and unlinked at once, and was copied into the log once checked, in frames of 256 KiB
+under `tip`. It needed free disk for both copies, wrote and read the bundle a second time, and left
+what it had placed in the log until the next cycle when a crash cut the copy short or a base went
+before the landing. `ferro-bench`'s `clone` received bundles of 1,000-byte values, 10.3 MB, 103 MB
+and 1.03 GB, into an empty file, printing the bytes the process dirtied for the disk as
+`/proc/self/io` counts them and the most disk its open files took; `receive-busy` committed one key
+on another branch every millisecond meanwhile. Medians of three runs alternating with the scratch
+file build, on the 32-thread machine with ext4 on NVMe, while other work shared it:
+
+| Bundle | Scratch file | Staging frames |
+| --- | --- | --- |
+| 10.3 MB, `Durability::Fsync` | 0.036 s, 20.1 MiB dirtied, 20 MiB at peak | 0.029 s, 10.0 MiB, 10 MiB |
+| 103 MB | 0.322 s, 200 MiB, 200 MiB | 0.252 s, 99 MiB, 99 MiB |
+| 1.03 GB | 3.42 s, 1,999 MiB, 1,999 MiB | 2.90 s, 992 MiB, 988 MiB |
+| 1.03 GB, `Durability::Buffered` | 3.47 s | 2.79 s |
+| Commits beside the 1.03 GB receive, Fsync | median 0.41 ms, p99 3.34 ms, slowest 15.7 ms | 0.68 ms, 1.20 ms, 15.9 ms |
+| The same, Buffered | median 0.02 ms, p99 0.12 ms, slowest 30.6 ms | 0.02 ms, 0.11 ms, 1.0 ms |
+
+With 124 GB of memory, the scratch file's half of what was dirtied, 1,009 MiB of the 1.03 GB
+bundle's, was deleted before writeback, so the device wrote about as much either way there; what
+staging in the log saves on such a machine is the copy through the page cache, the second read and
+the disk for a second copy, and on one with less memory the scratch file's writeback too. A commit
+beside the receive under Fsync waits longer at the median, since its fdatasync now flushes the
+staging frames written since the one before, where the scratch file's pages were another file's,
+and shorter at p99, since no piece holds `tip` for its encode and write. Pulls of three one-key
+commits into a clone of 100,000 keys, 60 at a time, ran in 1.12 to 1.16 ms against 1.13 to 1.19
+under Fsync and in 0.36 to 0.37 ms both under Buffered, at 3,924,000 to 3,930,000 user-space
+instructions both, three runs each: a bundle under 1 MiB takes the same path as before. One of
+2.07 MB took 7 ms against 6 under Buffered, five runs each, for the sync it now takes before it
+lands, and 8 ms against 9 under Fsync.
+
+The first build let commits add zeroes ahead of the log while a receive staged, as they do after
+any frame: each zero-filled the 4 MiB past its frame, and the next staging frames were placed over
+them, so the 1.03 GB receive beside commits dirtied 5,851 MiB, against 2,629 for the scratch file.
+Commits of the receiving writer now add no zeroes while it stages, and a shared writer's staging
+frame makes the file 4 MiB longer than itself, which other processes take as reserved, as described
+under [Preallocating the log](storage.md#preallocating-the-log): 1,009 MiB.
+
+Measured and left out:
+
+- Writing the staged records into the log as ordinary frames while the bundle streams. It writes
+  each byte once too, but each frame's check covers its records, so a refused bundle's frames could
+  not be given back: they would stay on disk until the next cycle, which under `Keep::All` never
+  comes on its own, and a peer whose bundles are refused could grow the disk with each attempt. Each
+  frame would also be encoded and written under `tip`, as the old pieces were, which is where the
+  scratch file build's commits beside a receive took their p99 of 3.34 ms and their slowest 15.7.
+- Staging in a scratch file and cloning its blocks into the log with `FICLONERANGE`, or copying
+  them in the kernel with `copy_file_range`. ext4 refuses `FICLONERANGE` with `EOPNOTSUPP`, and
+  `copy_file_range` of the 1.03 GB bundle there dirtied 986 MiB in 0.34 s, as a read and write
+  through user space did in 0.32 s. A cloned record would also have to be laid out for where it
+  lands, since its links to the file's objects are distances back from it, so the range would have
+  to be reserved in the log before the bundle arrives, which is what a staging frame is.
+- Holding the cycle mutex while the bundle streams, so that no cycle can move the staging frames:
+  a slow peer would stall reclamation instead of commits.
+- Encoding each staging frame's records under `tip`, so that frames hold exactly their records and
+  no room is left unused at their ends: it puts the encode back under `tip` for what the room left
+  unused costs. That is a part of a record at the end of each frame, and the rest of the last
+  frame, under 1 MiB a bundle, which is never written and so takes length but no disk. The files
+  received were 10,495,140, 103,824,456 and 1,037,117,618 bytes, against 10,392,449, 103,799,631
+  and 1,037,882,126 from the scratch file, whose pieces each carried a table of block checks that
+  a staging frame does not.
 
 ## Commits stored twice
 

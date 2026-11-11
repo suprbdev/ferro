@@ -15,10 +15,13 @@
 //! `send` before `receive` and `receive-busy`, `pull` before `incremental`, and `pull` and `edit`
 //! before `send-edit`, which comes before `receive-edit`. A pull or receive prints its outcome,
 //! the bytes and objects it took in and its seconds, and a bundle its bytes and seconds, each with
-//! the peak RSS and the peak live heap counted by the global allocator. `incremental` prints the
-//! median, fastest and slowest of its pulls and the peak RSS. Steps open files with
-//! `Durability::Fsync`, or `Durability::Buffered` when `CLONE_BUFFERED` is set, and `build` always
-//! writes Buffered.
+//! the peak RSS and the peak live heap counted by the global allocator. On Linux a receive also
+//! prints the bytes the process dirtied for the disk, as `write_bytes` in `/proc/self/io` counts
+//! them, the part of those a deleted file dropped before writeback, and the most disk that the
+//! files it held open for writing took at once beyond what they took when it began, sampled every
+//! 2 ms. `incremental` prints the median, fastest and slowest of its pulls and the peak RSS. Steps
+//! open files with `Durability::Fsync`, or `Durability::Buffered` when `CLONE_BUFFERED` is set, and
+//! `build` always writes Buffered.
 //!
 //! ```sh
 //! cargo run --release -p ferro-bench --bin clone -- build target/clone --keys 1000000 --value 320
@@ -134,6 +137,101 @@ impl Counter {
         // write land in it, and `fd` came from a successful `perf_event_open` and is never closed.
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
         value
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Io {
+    written: u64,
+    cancelled: u64,
+}
+
+fn io() -> Io {
+    let text = fs::read_to_string("/proc/self/io").unwrap_or_default();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    Io {
+        written: field("write_bytes:"),
+        cancelled: field("cancelled_write_bytes:"),
+    }
+}
+
+#[cfg(unix)]
+fn open_blocks() -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+        return 0;
+    };
+    let writable = |fd: &std::ffi::OsStr| {
+        let info = fs::read_to_string(Path::new("/proc/self/fdinfo").join(fd)).unwrap_or_default();
+        info.lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok())
+            .is_some_and(|flags| flags & 3 != 0)
+    };
+    entries
+        .flatten()
+        .filter(|entry| writable(&entry.file_name()))
+        .filter_map(|entry| fs::metadata(entry.path()).ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.blocks() * 512)
+        .sum()
+}
+
+#[cfg(not(unix))]
+fn open_blocks() -> u64 {
+    0
+}
+
+struct Disk {
+    io: Io,
+    base: u64,
+    peak: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    sampler: Option<thread::JoinHandle<()>>,
+}
+
+impl Disk {
+    fn watch() -> Disk {
+        let base = open_blocks();
+        let peak = Arc::new(AtomicUsize::new(base as usize));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak, stop) = (peak.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    peak.fetch_max(open_blocks() as usize, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        Disk {
+            io: io(),
+            base,
+            peak,
+            stop,
+            sampler: Some(sampler),
+        }
+    }
+
+    fn report(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(sampler) = self.sampler.take() {
+            sampler.join().unwrap();
+        }
+        let now = io();
+        let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+        let peak = (self.peak.load(Ordering::Relaxed) as u64).saturating_sub(self.base);
+        println!(
+            "disk: {:.1} MiB dirtied, {:.1} MiB of it dropped unwritten, peak {:.1} MiB more on disk",
+            mib(now.written - self.io.written),
+            mib(now.cancelled - self.io.cancelled),
+            mib(peak)
+        );
     }
 }
 
@@ -323,13 +421,13 @@ fn receive_edit(dir: &Path) {
 
 fn receive(dir: &Path) {
     let clone: Db<Root> = options().open(fresh(dir, "received.ferro")).unwrap();
+    let input = bundle_file(&dir.join("bundle.bin"));
+    let disk = Disk::watch();
     let started = Instant::now();
-    let pulled = read_bundle(&clone, &dir.join("bundle.bin"));
-    report(
-        "receive into an empty file",
-        &pulled,
-        started.elapsed().as_secs_f64(),
-    );
+    let pulled = receive_bundle(&clone, input);
+    let seconds = started.elapsed().as_secs_f64();
+    disk.report();
+    report("receive into an empty file", &pulled, seconds);
 }
 
 fn receive_busy(dir: &Path) {
@@ -352,9 +450,12 @@ fn receive_busy(dir: &Path) {
         }
         latencies
     });
+    let input = bundle_file(&dir.join("bundle.bin"));
+    let disk = Disk::watch();
     let started = Instant::now();
-    let pulled = read_bundle(&clone, &dir.join("bundle.bin"));
+    let pulled = receive_bundle(&clone, input);
     let seconds = started.elapsed().as_secs_f64();
+    disk.report();
     done.store(true, Ordering::Release);
     let mut latencies = writer.join().unwrap();
     latencies.sort_by(f64::total_cmp);
@@ -375,7 +476,14 @@ fn write_bundle(source: &Db<Root>, have: &Have, path: &Path) -> u64 {
 }
 
 fn read_bundle(clone: &Db<Root>, path: &Path) -> Pulled<()> {
-    let input = BufReader::new(File::open(path).unwrap());
+    receive_bundle(clone, bundle_file(path))
+}
+
+fn bundle_file(path: &Path) -> BufReader<File> {
+    BufReader::new(File::open(path).unwrap())
+}
+
+fn receive_bundle(clone: &Db<Root>, input: BufReader<File>) -> Pulled<()> {
     clone.receive_from("source", input, refuse).unwrap()
 }
 

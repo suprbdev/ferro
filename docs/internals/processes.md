@@ -19,7 +19,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | 2^62 + 1 | Shared, from the end of the writer's open for its life | Telling a read-only open, and a writer that opens, that a writer has opened and is alive |
 | 2^62 + 2, placement | Exclusive, per frame, or shared by a read-only open's scan | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
-| 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the pieces of a large `receive` |
+| 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the landing of a large `receive` |
 | 2^62 + 5, gate | Exclusive, while a thread wants or holds every branch lock | Letting one thread of the machine at a time want them |
 | 2^62 + 3 · 2^18 and every other byte of the 2,048 from there, phase | Exclusive, one at a time, by the gate's holder, from one drawn at random to the next at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
@@ -730,8 +730,14 @@ was.
   queued behind another process's closure took the process from 3 threads to 36, and now take it
   to 5, the waiting thread and the sync thread
   (`awaited_writes_waiting_on_another_process_share_one_waiting_thread`).
-- `receive` places a large bundle's pieces under the cycle lock and lands it under every branch
-  lock, so its checks run against the newest heads of every process.
+- `receive` places a large bundle's staging frames as it arrives, each under the placement lock
+  only while it writes the frame's header, so other processes commit between them, and a catch-up
+  checks a staging frame's header and goes on at its end without reading its records, keeping none
+  of them for later reads. It lands the bundle under the cycle lock and every branch lock, so its
+  checks run against the newest heads of every process. Only a writer that opens with no writer
+  alive drops the staging frames that end the log, since a live process may still be filling them,
+  and a shared writer leaves its own in place as it closes, since another process may have
+  followed them.
 
 ## Followers
 
@@ -994,7 +1000,9 @@ Killed while it holds a branch lock, its closure is lost. Killed between placing
 frame, it wrote nothing, and the next frame goes where it would have. Killed while writing it, the
 frame stops at a page boundary, fails its check and is written over. Killed after writing it and
 before syncing, the frame is whole and stays in the log, so its commit may appear though it was
-never acknowledged, as after a crash in one process. Power cuts are unchanged: frames that follow
+never acknowledged, as after a crash in one process. Killed while a large `receive` streams, its
+staging frames stay in the log, unlinked, until the next cycle, or until a writer opens with no
+writer alive, if they end the log. Power cuts are unchanged: frames that follow
 each other from the anchor survive, and every process's acknowledged commits were synced before
 they were acknowledged.
 

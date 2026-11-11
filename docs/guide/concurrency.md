@@ -93,8 +93,8 @@ Everything else on its own file is refused, and so is a write into another file 
 there is writing back into this one. Reads such as `branches`, `verify` and `have` take no lock
 that the caller's own thread could be holding, so they work from any closure, `decode` or `Drop`,
 including the `Drop` of a value the cache evicts. A `Drop` that runs while a cycle copies a file, or
-while a large `receive` places its pieces, may write too, except `compact`, or a `pull`, `push` or
-`receive` large enough to be placed in pieces, into that file. A closure that waits on a channel or
+while a large `receive` lands, may write too, except `compact`, or a `pull`, `push` or `receive`
+large enough to be staged in the log, into that file. A closure that waits on a channel or
 a watcher for another thread's commit can still deadlock, because ferro cannot see the wait: on its
 own branch, without `shared` on a branch that sorts before its own while a cycle or `receive` of the
 same handle waits for this closure, and with `coalesce` also when that commit's closure has already

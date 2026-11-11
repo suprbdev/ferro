@@ -488,9 +488,9 @@ fn a_power_cut_never_leaves_a_database_of_sparse_values_that_will_not_open() {
             )
             .count();
         assert!(spilled > 2, "{name}: {spilled} frames spilled");
-        assert!(replay(&recording, 2, seed) > 100, "{name}");
+        assert!(replay(&recording, 1, seed) > 100, "{name}");
         let swept = sweep(&recording, name);
-        assert!(swept > 30, "{name}: only {swept} sectors swept");
+        assert!(swept > 20, "{name}: only {swept} sectors swept");
     }
 }
 

@@ -48,8 +48,9 @@ This is an experiment, not a production database.
   commits of the last sync, as described under [What was tested](durability.md#what-was-tested).
 - After a criss-cross, a merge closure runs more than once, and it refuses when the base of the
   ancestors could lie in pruned history, as described under [Limits](merging.md#limits).
-- Sync keeps memory for every object it moves and writes a large bundle twice, as described under
-  [Limits](sync.md#limits).
+- Sync keeps memory for every object it moves, and a large bundle refused after it began to
+  arrive leaves its frames in the file, without the disk its objects took on Linux, until the
+  writer closes or the next reclamation cycle, as described under [Limits](sync.md#limits).
 - A value nests at most 128 levels within one object, `codec::MAX_DEPTH`: each `Box`, `Arc`, `Vec`,
   `BTreeMap` or `BTreeSet` it holds opens one, so a chain of `Option<Box<Node>>` goes 128 deep and a
   tree of `Vec<Node>` children 127. A commit refuses a deeper value with `Error::TooDeep`, counting

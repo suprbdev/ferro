@@ -52,7 +52,7 @@ returned (#41). These are the cases, each reproduced with a timeout in `ferro/te
   entries, and all it held when its store closed, while it held a shard's lock, which every read of
   the shard takes, so a `decode` or a `Drop` that made such a read waited for itself. A cycle holds the cycle lock without any lane
   while it copies, and closed the file it replaced under it, and a `receive` whose bundle spilled
-  holds it while its pieces are placed, so a `Drop` run there that called `compact`, or a `pull`,
+  holds it from the end of the stream until it lands, so a `Drop` run there that called `compact`, or a `pull`,
   `push` or `receive` whose bundle spilled, waited for it too. `reentry_locks.rs` makes those
   reads, reads through the cache, `pull`, `push`, a small and a spilled `receive` and `compact`
   from a `decode` and from a `Drop` that the cache runs as it evicts a value or closes, during a
@@ -80,7 +80,7 @@ when it returns early. The catch-up's is taken in `follow_to` only once the log 
 new, so a commit in a process alone, which finds nothing, records nothing more. `fork` decodes
 nothing, but the cache of decoded objects may drop a value it evicts at any read under `tip`. A
 cycle records the cycle lock from when it takes it until it lets it go, and so does a `receive`
-whose bundle spilled while its pieces are placed. A write is refused when its thread holds:
+whose bundle spilled, from the end of the stream until it lands. A write is refused when its thread holds:
 
 - the whole file it writes to;
 - with `coalesce`, any lane of that file;
@@ -108,8 +108,8 @@ at the gate: one whose thread holds anything on that file, through any handle, g
 branch's byte, as [The gate](processes.md#the-gate) describes. Each record names the file as well as
 the handle, by an xxh3 of its canonical path, and locks on other files do not count.
 
-`pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into a
-scratch file, as described under [Where checked objects
+`pull`, `push` and `receive` take the lanes only to land a bundle, after it has streamed into
+staging frames, as described under [Where checked objects
 wait](sync-receive.md#where-checked-objects-wait). They make the check before they read anything, so
 a call that will be refused reads no stream, but the edge into the receiving file described below is
 listed only from the end of the stream to the merge, and a pull's edge into the sending file only

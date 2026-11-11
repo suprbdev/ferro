@@ -3635,7 +3635,9 @@ impl<T: Data> Shared<T> {
     fn due(&self) -> bool {
         let base = self.signal.base.load(Ordering::Relaxed);
         let goal = base.max(self.reclaim.every_bytes);
-        self.store().size().saturating_sub(base) >= goal
+        let store = self.store();
+        let size = store.size().saturating_sub(store.staging_bytes());
+        size.saturating_sub(base) >= goal
     }
 
     fn run_cycle(
@@ -5828,6 +5830,29 @@ impl<T: Data> Db<T> {
         let out = fill(&store, &mut txn)?;
         shared.write_records(&mut tip, txn)?;
         Ok(out)
+    }
+
+    /// Places a staging frame with room for `bytes` of records at the end of the log, as
+    /// [`Store::place_staging`] does, and returns where it starts and ends, or `None` once the
+    /// file is no longer the generation with the id `generation`, since a cycle replaced it.
+    ///
+    /// It takes the file's tip lock only to place the frame and write its header, so commits on
+    /// every branch go on while a receive fills the frame.
+    pub(crate) fn place_staging(&self, generation: u64, bytes: u64) -> Result<Option<(u64, u64)>> {
+        let _crossing = self.entering(Needs::Tip)?;
+        let shared = &self.shared;
+        let mut notices = Vec::new();
+        let mut tip = shared.lock_tip(&mut notices)?;
+        let _whole = reentry::whole(shared.id, shared.file_id);
+        let store = shared.store();
+        if store.id() != generation {
+            return Ok(None);
+        }
+        if tip.ptr.is_none() {
+            shared.write_records(&mut tip, store.begin()?)?;
+        }
+        let head = tip.ptr.expect("a frame names the branch table");
+        store.place_staging(head, bytes).map(Some)
     }
 
     /// Replaces the branch table with what `edit` returns, under every writer lock of the file.

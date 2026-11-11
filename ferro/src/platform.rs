@@ -1,11 +1,12 @@
 //! What the store asks of the operating system where Unix and Windows differ.
 //!
 //! Positioned reads and writes, the writer lock, the identity of a file, a read-only open's sync,
-//! the directory sync after a create or rename, renaming over an open file, the owner of a new
-//! generation and self-deleting scratch files each have one function here, with the same contract
-//! on every target. The byte-range locks behind `Options::shared` and the early writeback of a copy
-//! exist only on 64-bit Linux, and [`RANGES`] says whether they do. So does the inotify [`Watch`]
-//! that a follower waits on, whose [`Watch::new`] fails with `Unsupported` elsewhere.
+//! the directory sync after a create or rename, renaming over an open file and the owner of a new
+//! generation each have one function here, with the same contract on every target. The byte-range
+//! locks behind `Options::shared`, the early writeback of a copy and the holes punched where a
+//! refused receive staged its records exist only on 64-bit Linux, and [`RANGES`] says whether the
+//! locks do. So does the inotify [`Watch`] that a follower waits on, whose [`Watch::new`] fails
+//! with `Unsupported` elsewhere.
 //! [Windows](https://github.com/archlemon/ferro/blob/main/docs/internals/windows.md) and
 //! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
 //! describe both sides.
@@ -14,7 +15,7 @@
 mod imp {
     use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, fchown};
+    use std::os::unix::fs::{MetadataExt, fchown};
     use std::path::{Path, PathBuf};
 
     pub(crate) use std::os::unix::fs::FileExt;
@@ -88,21 +89,6 @@ mod imp {
     pub(crate) fn copy_owner(file: &File, source: &Metadata) {
         let _ = fchown(file, Some(source.uid()), Some(source.gid()));
     }
-
-    /// Creates a new file at `path`, readable and writable by the owner alone, whose space comes
-    /// back when the returned handle closes, even if the process dies.
-    ///
-    /// The name is removed at once, so nothing else can open the file. Fails if `path` exists.
-    pub(crate) fn scratch(path: &Path) -> io::Result<File> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        std::fs::remove_file(path)?;
-        Ok(file)
-    }
 }
 
 #[cfg(windows)]
@@ -122,9 +108,8 @@ mod imp {
         ERROR_NOT_LOCKED, ERROR_NOT_SUPPORTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FileRenameInfoEx,
-        GetFileInformationByHandle, LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        FileRenameInfoEx, GetFileInformationByHandle, LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK,
         LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, SYNCHRONIZE, SetFileInformationByHandle,
         UnlockFileEx,
     };
@@ -405,18 +390,6 @@ mod imp {
     /// Does nothing: a new file takes its access control list from its directory, and its owner
     /// is not copied.
     pub(crate) fn copy_owner(_file: &File, _source: &Metadata) {}
-
-    /// Creates a new file at `path`, shared with no other handle, which Windows deletes when the
-    /// returned handle closes, even if the process dies. Fails if `path` exists.
-    pub(crate) fn scratch(path: &Path) -> io::Result<File> {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE)
-            .open(path)
-    }
 }
 
 pub(crate) use imp::*;
@@ -540,6 +513,26 @@ mod ranges {
             )
         };
     }
+
+    /// Asks the file system to free the blocks under the `len` bytes of `file` from `at`, which
+    /// then read as zeroes, keeping the file's length. A failure is ignored, as from a file system
+    /// that cannot punch holes, since the bytes are only given back sooner.
+    pub(crate) fn punch(file: &File, at: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: the descriptor belongs to `file`, which is borrowed for the call, and
+        // `fallocate` takes no pointers. With `FALLOC_FL_KEEP_SIZE` it changes only the blocks of
+        // the range, which nothing reads once the caller gives them back.
+        unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                at as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
@@ -554,6 +547,9 @@ mod ranges {
     /// Does nothing: this target has no call that starts writeback early, so the later sync
     /// writes the range.
     pub(crate) fn start_writeback(_file: &File, _at: u64, _len: u64) {}
+
+    /// Does nothing: the bytes keep their blocks until a reclamation cycle copies the file.
+    pub(crate) fn punch(_file: &File, _at: u64, _len: u64) {}
 
     /// Fails with an `Unsupported` error, since this target has no open file description locks.
     pub(crate) fn lock_range(

@@ -48,6 +48,7 @@ static ZEROS_FAIL: AtomicBool = AtomicBool::new(false);
 static ZEROS_FAILED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
+    static STAGED_FAIL: Cell<u32> = const { Cell::new(0) };
     static FRAMES_FAIL: Cell<bool> = const { Cell::new(false) };
     static FRAMES_HELD: Cell<bool> = const { Cell::new(false) };
 }
@@ -106,6 +107,15 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
         // valid for writes for as long as the thread runs.
         unsafe { *__errno_location() = ENOSPC };
         return -1;
+    }
+    if offset >= 8192 && count >= 256 << 10 && !is_frame(buf, count) {
+        let left = STAGED_FAIL.with(|fail| fail.replace(fail.get().saturating_sub(1)));
+        if left == 1 {
+            // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's
+            // `errno`, valid for writes for as long as the thread runs.
+            unsafe { *__errno_location() = ENOSPC };
+            return -1;
+        }
     }
     if is_frame(buf, count) {
         if FRAMES_FAIL.with(Cell::get) {
@@ -728,6 +738,74 @@ fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
         db.verify().unwrap();
         WRITE_RELEASED.store(false, Ordering::SeqCst);
         WRITE_ENTERED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn merge_theirs(
+    root: &mut Text,
+    base: &ferro::Snapshot<Text>,
+    theirs: &ferro::Snapshot<Text>,
+) -> (&'static str, ()) {
+    root.merge(base, theirs, |conflict| {
+        conflict.theirs.map(|value| (*value).clone())
+    });
+    ("merge", ())
+}
+
+#[test]
+fn a_staging_frame_whose_records_fail_to_write_fails_the_receive_and_nothing_else() {
+    let _turn = serial();
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let sender: Db<Text> = buffered().open(dir.path().join("sender.ferro")).unwrap();
+        sender
+            .update(|root| {
+                for key in 0..3_000 {
+                    root.insert(key, common::text(key, 1_000));
+                }
+            })
+            .unwrap();
+        let path = dir.path().join("receiver.ferro");
+        let db: Db<Text> = options().open(&path).unwrap();
+        db.update(|root| {
+            root.insert(0, "base".to_string());
+        })
+        .unwrap();
+        let side = db.fork("side").unwrap();
+        let bundle = sender.bundle(&db.have().unwrap()).unwrap();
+        assert!(bundle.as_bytes().len() > 2 << 20, "{kind}");
+        STAGED_FAIL.with(|fail| fail.set(2));
+        let received = db.receive("peer", &bundle, merge_theirs);
+        let unfailed = STAGED_FAIL.with(|fail| fail.replace(0));
+        assert_eq!(
+            unfailed, 0,
+            "{kind}: a second staging frame's records were never written"
+        );
+        match received {
+            Err(Error::Io(error)) => assert_eq!(error.raw_os_error(), Some(ENOSPC), "{kind}"),
+            other => panic!("{kind}: a receive whose records failed to write: {other:?}"),
+        }
+        assert!(db.branch("peer").is_err(), "{kind}");
+        side.update(|root| {
+            root.insert(1, "side".to_string());
+        })
+        .unwrap();
+        db.update(|root| {
+            root.insert(2, "main".to_string());
+        })
+        .unwrap();
+        db.verify().unwrap();
+        let pulled = db.receive("peer", &bundle, merge_theirs).unwrap();
+        assert_eq!(pulled.outcome, ferro::Outcome::Merged, "{kind}");
+        assert_eq!(db.branch("peer").unwrap().head_hash(), sender.head_hash());
+        drop((db, side));
+        let db: Db<Text> = options().open(&path).unwrap();
+        db.verify_typed().unwrap();
+        assert_eq!(db.branch("peer").unwrap().head_hash(), sender.head_hash());
+        assert_eq!(
+            db.branch("side").unwrap().read().get(&1).as_deref(),
+            Some(&"side".to_string())
+        );
     }
 }
 
