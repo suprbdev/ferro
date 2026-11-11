@@ -307,7 +307,8 @@ claimed expansion beyond LZ4's 255:1 limit before allocating. `lz4_flex` is buil
 and without `safe-encode`: the compressor is its unsafe implementation, unsafe code from a
 dependency on the write path that only ever reads bytes ferro produced, and the decompressor is its
 safe module, which forbids unsafe code, because it reads bodies from files and sync bundles that may
-be damaged or hostile.
+be damaged or hostile. [Bytes of a small commit](commit-bytes.md) splits a commit's records into
+their parts and measures other encodings of records and nodes.
 
 Every varint in a record takes the fewest bytes its value needs, as `push_varint` writes it, and a
 reader refuses a longer one as damage. A padded distance is no exception: its value includes the

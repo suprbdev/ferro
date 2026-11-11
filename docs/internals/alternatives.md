@@ -13,6 +13,10 @@ numbers. This index lists them by subsystem.
 - `posix_fallocate` for the log's reservation: [Preallocating the
   log](storage.md#preallocating-the-log).
 - Frames written with `O_DIRECT|O_DSYNC`: [Direct I/O, rejected](commit-path.md#direct-io-rejected).
+- Keys written after the key before, untagged values and no counts in leaves, built and measured,
+  and bit-packed integer keys, no hash on a link into the same frame, LZ4 over a whole frame,
+  distances from the link before, interior nodes stored as chunks, and a shorter log entry, step
+  and frame header: [Bytes of a small commit](commit-bytes.md).
 
 ## The tree
 

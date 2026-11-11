@@ -429,6 +429,7 @@ dependencies = [
  "ferro",
  "ledger",
  "libc",
+ "lz4_flex",
  "metrics",
  "mimalloc",
  "tempfile",

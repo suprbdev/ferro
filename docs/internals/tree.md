@@ -15,9 +15,10 @@ strings and tuples match the ideal geometric distribution. Fanout 8 was chosen b
 re-checked after links shrank, bodies were compressed and reads gained child memos, at 1M keys:
 against fanout 16 it writes 27% fewer bytes per commit for 31% slower warm gets and 29% faster cold
 gets, and against fanout 4 it writes 30% more bytes per commit for 12% faster warm gets and 17%
-smaller bulk loads. A node holds all keys of exactly its level within its range, and children hold
-the gaps. Tree shape depends only on the key set, never on insertion order. Consequences that the
-rest of the system relies on:
+smaller bulk loads. The largest part of a single-key commit's bytes is the child hashes of the
+large nodes on its path, as [Bytes of a small commit](commit-bytes.md) measures. A node holds all
+keys of exactly its level within its range, and children hold the gaps. Tree shape depends only on
+the key set, never on insertion order. Consequences that the rest of the system relies on:
 
 - `a == b` for two maps compares root hashes in O(1).
 - A commit that changes nothing has the same root hash and is skipped.

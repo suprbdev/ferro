@@ -37,9 +37,9 @@ machine passes the cap; set `JOBS` when `MEM` is not given in G.
 | `make fuzz-lint` | rustfmt and clippy on the fuzz crate, which is its own workspace, on stable. |
 | `make clean`, `make clean-tmp` | Remove build output, or ferro test directories in `/tmp` untouched for an hour. |
 
-`ferro-bench` has more tools than the `Makefile` names: `collections`, `clone`, `delta`, `follow`,
-`group`, `processes`, `reclaim`, `summary` and `watchers` run with `cargo run --release -p
-ferro-bench --bin <tool>`.
+`ferro-bench` has more tools than the `Makefile` names: `bytes`, `collections`, `clone`, `delta`,
+`follow`, `group`, `processes`, `reclaim`, `summary` and `watchers` run with `cargo run --release
+-p ferro-bench --bin <tool>`.
 `make ARGS='...'` passes arguments through to any of them.
 
 CI runs clippy and every test on Linux, and clippy and the library's tests on `windows-latest`.

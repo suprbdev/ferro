@@ -32,6 +32,10 @@ cache](#reads-past-the-cache) were measured on 2026-11-09 beside other work, as 
 | Booking hold commit, `Durability::Buffered` | 86 µs of CPU, 14 µs of it in the closure |
 | Booking confirm commit, `Durability::Buffered` | 106 µs of CPU, 14 µs of it in the closure |
 
+Of the 3.5 KB a single-key commit writes, 38% is the hashes of the children of the nodes on the
+changed path and 21% those nodes' keys, as [Bytes of a small commit](../internals/commit-bytes.md)
+measures, with the encodings tried to make it smaller.
+
 The booking commits cost 4 and 14% more than the 82 and 93 µs this page gave before, measured on
 2026-11-03. Since then the example's customer index covers six fields of each booking, which
 [Covering indexes](../internals/schema-and-unique-indexes.md#covering-indexes) found adds 5% to the

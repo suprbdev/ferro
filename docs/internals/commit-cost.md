@@ -1,7 +1,8 @@
 # Commits of a few rows
 
 Where the CPU time of a small multi-table commit goes, and what was done about it. The lock
-structure around it is in [Writers and the commit path](commit-path.md).
+structure around it is in [Writers and the commit path](commit-path.md), and where its bytes go in
+[Bytes of a small commit](commit-bytes.md).
 
 A booking write in `examples/booking` changes about ten small trees, the rows and their indexes, and
 spent six to ten times as long outside its closure as in it, all under the writer lock.

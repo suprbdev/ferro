@@ -14,7 +14,10 @@ This is an experiment, not a production database.
   intercept libc calls or kill processes there, so failed syncs and process death are tested on Unix
   only.
 - A single-key commit writes about 3.5 KB at 1M keys, so batch related changes into one commit.
-  Secondary indexes add to that. Without retention the file only grows.
+  Secondary indexes add to that: a row inserted into a table of 200,000 rows with two indexes writes
+  8.2 KB. The largest part is the hashes of the children of every node on the changed path, which
+  reads check, as described under [Bytes of a small commit](../internals/commit-bytes.md). Without
+  retention the file only grows.
 
 - Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
   your current `Default`, or the `init` passed to `open_with`.

@@ -40,6 +40,7 @@ machine, most of them on 2026-11-05. Start with [Getting started](guide/getting-
 | [Writers and the commit path](internals/commit-path.md) | Lanes, `tip`, group commit, a lock per branch and drafting |
 | [Writers in several processes](internals/processes.md) | `Options::shared`, the locks, catching up, superblocks and cycles across processes, and followers |
 | [Commits of a few rows](internals/commit-cost.md) | Where a small multi-table commit's CPU time goes |
+| [Bytes of a small commit](internals/commit-bytes.md) | Where a single-key commit's bytes go, and the encodings measured to cut them |
 | [Coalescing](internals/coalescing.md) | Groups of closures sharing a version |
 | [Awaited writes](internals/async-writes.md) | Futures, the gate and the sync thread |
 | [Writes from inside a closure](internals/reentrancy.md) | Deadlocks refused with `Error::Reentrant` |
