@@ -163,6 +163,39 @@ When one has at least four times the keys of the other, only the smaller is walk
 keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where walking both took
 600 µs.
 
+Every lookup knows how many keys it holds as soon as it is built, counted from the counts the
+index's nodes keep, without reading its entries, and a combination picks how to read its lookups
+from those counts the first time it is read, not from the order you wrote them in. A chain of `and`,
+such as `a.and(b).and(c)`, is one `and` of up to eight lookups: the one with the fewest keys leads,
+those with less than four times its keys are walked beside it, and the rest are looked up, fewest
+keys first, each only for a key every lookup before it holds. Written in another order, a chain
+yields the rows and covered fields of its leftmost lookup, and costs the same. On 200,000 rows,
+measured on 2026-11-11, a lookup of 100,000 keys, then one of 1,000, then one of 1,000 took 12 µs
+where they took 47 µs before chains were planned, as long as written smallest first. `explain()`
+shows the plan without reading anything, one line a lookup, each side indented below its `and` or
+`or`:
+
+```rust
+let find = shop.orders.find();
+let plan = find
+    .by_status(&Status::Pending)
+    .and(find.by_customer("wile"))
+    .and(shop.orders.by_day_range(first..=last))
+    .explain();
+assert_eq!(plan.sides[1].read, Read::Walked);
+println!("{plan}");
+```
+
+```text
+and, at most 12 keys, walked
+  value, 48210 keys, searched
+  value, 12 keys, walked
+  range, 9124 keys, tested
+```
+
+A lookup made with `and` on a combination already read from, or nested on the right as in
+`a.and(b.and(c))`, is planned on its own, as one side.
+
 `and` takes any lookup and keeps the covered fields of its left side, but `or` yields a key that
 only its right side holds with that side's covered fields, so it compiles only when both sides cover
 the same fields. Call `.uncovered()` on each side to combine lookups of differently covered indexes:
@@ -177,9 +210,9 @@ let either: Vec<_> = find
 ```
 
 A lookup made on the table itself, such as `by_x_range` or `by_x_prefix` of a unique or a non-unique
-index, can be passed to `and` or `or` too. It is not in key order, so when the other side of an
-`and` has at most a quarter of its keys, only that side is walked, and each of its keys is tested
-against the range by reading its row. With `day` indexed:
+index, can be passed to `and` or `or` too. It is not in key order, so when the keys the rest of the
+`and` leads to it are at most a quarter of its own, it is never walked, and each of those keys is
+tested against the range by reading its row. With `day` indexed:
 
 ```rust
 let find = snapshot.orders.find();
@@ -194,12 +227,22 @@ reading and sorting the range took 2.4 ms, and 1,000 keys took 106 µs against 2
 tested costs a row read, about 100 ns with the rows cached, so `.keys()` and `.covered()` read
 those rows too, though they yield none. A row read from the file costs dozens of times as much,
 so once such reads come to about what reading the range would cost, the combination reads the
-range's keys for the rest instead. When the range has less than four times the keys of the other
-side, leads the combination through `into_matches()`, or gives the combination its covered fields,
-its keys are read in full and sorted first, at 18 to 30 ns a key. Pass the range through
-`.uncovered()` to have it read that way from the start, reading no rows for it. A combination
-reads the indexes and rows as they were when you built it, like any lookup. [Combining
-lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the measurements.
+range's keys for the rest instead. When the range has less than four times the keys led to it, or
+gives the combination its covered fields, its keys are read in full and sorted first, at 18 to 30
+ns a key. Pass the range through `.uncovered()` to have it read that way from the start, reading no
+rows for it. A combination reads the indexes and rows as they were when you built it, like any
+lookup. [Combining lookups](../internals/schema-and-unique-indexes.md#combining-lookups) has the
+measurements.
+
+A range written first, as `orders.by_day_range(first..=last).into_matches().and(...)`, is tested
+too when another side of the `and` reads the same table at the same version, since the combination
+reads its rows through the range's own finder and the range borrows that side's: 10 keys against
+a range of 100,000 written that way took 1.4 µs, where it had taken 2.4 ms. Of two ranges, the one
+with fewer keys leads and the other is tested. In a chain, the keys led to a range are estimated
+from the lookups walked before it, as if they matched independently, so two lookups of 50,000 keys
+that share 12,500 and a range of 100,000 took 3.0 ms where they took 4.6 ms with the range read in
+full. The tests stop once they number a quarter of the range's keys, so when the estimate was too
+low they cost about what reading the range would, as rows read from the file do.
 
 Lookups of two tables of the same row type, or of two versions of one table, such as a snapshot's
 and the one inside a commit, combine as well. Each answers for the table and version it was made
@@ -262,10 +305,11 @@ place](../internals/read-scaling.md#rows-lent-in-place) has the measurements.
 
 ## Lookups
 
-A `Table` lookup through an index reads each row separately unless you read it through `.covered()`,
-and no query planning happens. You choose the indexes, and combine them as described under
-[Combining lookups](#combining-lookups). `IndexIter::keys` gives the primary keys without reading
-any row.
+A `Table` lookup through an index reads each row separately unless you read it through `.covered()`.
+You choose the indexes. A combination of them picks which lookup leads and how the others are read
+from the keys each counts in its index, as described under [Combining lookups](#combining-lookups),
+but it has no statistics of the values and no cost model of your data. `IndexIter::keys` gives the
+primary keys without reading any row.
 
 ## How it works
 

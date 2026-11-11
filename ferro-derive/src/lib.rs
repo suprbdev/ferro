@@ -2794,10 +2794,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// every non-unique index: `by_x(&value)`, `by_x_after(&value, &key)` and, for an `Option` field,
 /// `by_x_some` and `by_x_some_after`. They return `Matches<Name, C>`, which `and` and `or` combine
 /// by primary key, reading a row only for a key that matches. `and` and `or` also take any
-/// `IndexIter`. A range or prefix lookup of a unique or non-unique index is tested key by key when
-/// the other side of an `and` has at most a quarter of its keys, by reading each such key's row,
-/// and its keys are read in full and sorted first otherwise. `.keys()` reads no rows but those,
-/// and `.covered()` gives the covered fields of the leftmost lookup.
+/// `IndexIter`. A chain of `and` is led by its smallest lookup, whatever the order it was written
+/// in, and a range or prefix lookup of a unique or non-unique index is tested key by key, by
+/// reading each such key's row, when the keys led to it are at most a quarter of its own, and read
+/// in full and sorted first otherwise. `.keys()` reads no rows but those, `.covered()` gives the
+/// covered fields of the leftmost lookup, and `.explain()` tells how the combination will be read.
 ///
 /// # Covering indexes
 ///

@@ -16,19 +16,27 @@
 //! of the unique `rank` index, or the prefix of a band of the composite `(band, score)` index,
 //! whose bands hold 1,000, 10,000 and 100,000 rows. Each field is a random permutation of the
 //! rows, so a range's keys are scattered across the table. Their strategies are the `and` read as
-//! keys from either end or as rows, collecting the range's keys and sorting them as `and` once
-//! did, filtering the group's rows or covered fields, and checking the covered fields and then
-//! seeking the range's index at each `(value, key)`.
+//! keys from either end or as rows, the `and` with the range passed through `uncovered()` so that
+//! it is read in full, collecting the range's keys and sorting them as `and` once did, filtering
+//! the group's rows or covered fields, and checking the covered fields and then seeking the range's
+//! index at each `(value, key)`.
+//!
+//! The order cases write the same combination in two orders, one that the plan of a two-sided
+//! `and` once suited and one it did not, and read each as keys and as rows: a score range of
+//! 100,000 or 2,000 written before a group, a score range of 100,000 before a rank range of 1,000,
+//! 10,000 or 50,000, a chain of the 100,000 and 1,000 rows of one `xs` and `ys` case with a group,
+//! and the two lookups of 50,000 sharing 12,500 keys before a score range of 30,000, 100,000 or
+//! 150,000, against filtering their rows by score by hand.
 //!
 //! Each strategy named in `--strategies`, by default all of `merge`, `after`, `cursor`, `cursor2`,
 //! `cursor4`, `cursor8`, `after8`, `after32`, `set`, `and`, `and-back`, `rows`, `gets`, `or`,
 //! `or-rows`, `or-versions` and `or-versions-rows` for the equality cases and `and`, `and-back`,
-//! `rows`, `collect`, `filter`, `covered` and `seek` for the range cases, is checked against the
-//! merge, the union or the filter and then run over and over for `--ms` milliseconds (default 40)
-//! in each of `--rounds` rounds (default 5). `--cases` picks `equal`, `range` or both, the
-//! default, `crossover`, which runs groups of 100, 1,000 and 10,000 rows against score ranges from
-//! as many keys to 128 times as many, or `cold`, and `--only` runs just the cases whose title holds
-//! the text it gives.
+//! `rows`, `collected`, `collect`, `listed`, `filter`, `covered` and `seek` for the range cases, is
+//! checked against the merge, the union or the filter and then run over and over for `--ms`
+//! milliseconds (default 40) in each of `--rounds` rounds (default 5). `--cases` picks `equal`,
+//! `range` or both, the default, `crossover`, which runs groups of 100, 1,000 and 10,000 rows
+//! against score ranges from as many keys to 128 times as many, `order` or `cold`, and `--only`
+//! runs just the cases whose title holds the text it gives.
 //!
 //! The cold cases build a second file of `--wide-rows` rows (default 60,000) whose 4 KiB notes are
 //! stored apart from their leaves, and combine groups of 10, 100 and 1,000 of them with score
@@ -42,6 +50,7 @@
 //! ```sh
 //! make bench-combine ARGS='--strategies merge,and,set'
 //! make bench-combine ARGS='--cases range --strategies and,collect,filter'
+//! make bench-combine ARGS='--cases order'
 //! cargo run --release -p ferro-bench --bin combine -- --rows 200000 --rounds 5 --ms 40
 //! ```
 
@@ -401,6 +410,7 @@ enum Joined {
     And,
     AndBack,
     Rows,
+    Collected,
     Collect,
     Listed,
     Filter,
@@ -414,6 +424,7 @@ impl Joined {
             Joined::And => "and",
             Joined::AndBack => "and, from the back",
             Joined::Rows => "and, rows",
+            Joined::Collected => "and, range collected",
             Joined::Collect => "collect and sort",
             Joined::Listed => "into_matches, alone",
             Joined::Filter => "lead rows, filtered",
@@ -436,6 +447,12 @@ impl Joined {
                     .by_group(&group)
                     .and(span.lookup(t))
                     .map(|row| row.id),
+            ),
+            Joined::Collected => out.extend(
+                t.find()
+                    .by_group(&group)
+                    .and(span.lookup(t).uncovered())
+                    .keys(),
             ),
             Joined::Collect => {
                 let mut keys: Vec<u64> = span.lookup(t).keys().collect();
@@ -479,6 +496,197 @@ impl Joined {
 }
 
 type Snapshot = Table<Item>;
+
+#[derive(Clone, Copy)]
+enum Order {
+    RangeFirst(u8, u32),
+    Ranges(u32, u32),
+    Three(u8),
+    Nested(u32),
+}
+
+const ORDER_CASES: [Order; 13] = [
+    Order::RangeFirst(1, 100_000),
+    Order::RangeFirst(2, 100_000),
+    Order::RangeFirst(3, 100_000),
+    Order::RangeFirst(4, 100_000),
+    Order::RangeFirst(3, 2_000),
+    Order::Ranges(1_000, 100_000),
+    Order::Ranges(10_000, 100_000),
+    Order::Ranges(50_000, 100_000),
+    Order::Three(2),
+    Order::Three(3),
+    Order::Nested(100_000),
+    Order::Nested(30_000),
+    Order::Nested(150_000),
+];
+
+const THREE: u32 = 7;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Ordered {
+    Written,
+    WrittenRows,
+    Better,
+    BetterRows,
+}
+
+impl Ordered {
+    fn name(self) -> &'static str {
+        match self {
+            Ordered::Written => "bad order, keys",
+            Ordered::WrittenRows => "bad order, rows",
+            Ordered::Better => "good order, keys",
+            Ordered::BetterRows => "good order, rows",
+        }
+    }
+}
+
+impl Order {
+    fn name(&self) -> String {
+        match *self {
+            Order::RangeFirst(group, size) => {
+                let lead = GROUPS[usize::from(group) - 1];
+                format!("a score range of {size}, then {lead} keys")
+            }
+            Order::Ranges(small, large) => {
+                format!("a score range of {large}, then a rank range of {small}")
+            }
+            Order::Three(group) => {
+                let lead = GROUPS[usize::from(group) - 1];
+                format!("100k keys, then 1k, then {lead}")
+            }
+            Order::Nested(size) => {
+                format!("50k and 50k sharing 12k, then a score range of {size}")
+            }
+        }
+    }
+
+    fn holds(&self, item: &Item) -> bool {
+        match *self {
+            Order::RangeFirst(group, size) => item.group == group && item.score < size,
+            Order::Ranges(small, large) => item.rank < small && item.score < large,
+            Order::Three(group) => {
+                item.group == group && item.xs.contains(&THREE) && item.ys.contains(&THREE)
+            }
+            Order::Nested(size) => {
+                item.xs.contains(&0) && item.ys.contains(&0) && item.score < size
+            }
+        }
+    }
+
+    fn run(&self, t: &Snapshot, how: Ordered, out: &mut Vec<u64>) {
+        let rows = matches!(how, Ordered::WrittenRows | Ordered::BetterRows);
+        let written = matches!(how, Ordered::Written | Ordered::WrittenRows);
+        let find = t.find();
+        let matches = match (*self, written) {
+            (Order::RangeFirst(group, size), true) => t
+                .by_score_range(0..size)
+                .into_matches()
+                .and(find.by_group(&group)),
+            (Order::RangeFirst(group, size), false) => find
+                .by_group(&group)
+                .and(t.by_score_range(0..size))
+                .uncovered(),
+            (Order::Ranges(small, large), true) => t
+                .by_score_range(0..large)
+                .into_matches()
+                .and(t.by_rank_range(0..small)),
+            (Order::Ranges(small, large), false) => t
+                .by_rank_range(0..small)
+                .into_matches()
+                .and(t.by_score_range(0..large)),
+            (Order::Three(group), true) => find
+                .by_ys(&THREE)
+                .and(find.by_xs(&THREE))
+                .and(find.by_group(&group)),
+            (Order::Three(group), false) => find
+                .by_group(&group)
+                .uncovered()
+                .and(find.by_xs(&THREE))
+                .and(find.by_ys(&THREE)),
+            (Order::Nested(size), true) => find
+                .by_xs(&0)
+                .and(find.by_ys(&0))
+                .and(t.by_score_range(0..size)),
+            (Order::Nested(size), false) => {
+                let both = find.by_xs(&0).and(find.by_ys(&0));
+                if rows {
+                    both.visit(|item| {
+                        if item.score < size {
+                            out.push(item.id);
+                        }
+                    });
+                } else {
+                    out.extend(
+                        both.keys()
+                            .filter(|key| t.get(key).is_some_and(|item| item.score < size)),
+                    );
+                }
+                return;
+            }
+        };
+        if rows {
+            matches.visit(|item| out.push(item.id));
+        } else {
+            out.extend(matches.keys());
+        }
+    }
+}
+
+fn order(t: &Snapshot, rounds: usize, budget_ms: f64, only: &str) {
+    let counter = Counter::instructions();
+    let ways = [
+        Ordered::Written,
+        Ordered::Better,
+        Ordered::WrittenRows,
+        Ordered::BetterRows,
+    ];
+    let mut out = Vec::new();
+    for case in ORDER_CASES {
+        let title = case.name();
+        if !title.contains(only) {
+            continue;
+        }
+        let mut wanted: Vec<u64> = Vec::new();
+        t.iter().visit(|item| {
+            if case.holds(item) {
+                wanted.push(item.id);
+            }
+        });
+        let mut samples = vec![(Vec::new(), Vec::new()); ways.len()];
+        for _ in 0..rounds {
+            for (slot, how) in ways.iter().enumerate() {
+                out.clear();
+                case.run(t, *how, &mut out);
+                assert_eq!(out, wanted, "{} on {title}", how.name());
+                let began = Instant::now();
+                let mut runs = 0u64;
+                let before = counter.read();
+                while began.elapsed().as_secs_f64() * 1000.0 < budget_ms {
+                    out.clear();
+                    case.run(t, *how, &mut out);
+                    black_box(&out);
+                    runs += 1;
+                }
+                let instructions = counter.read() - before;
+                let ns = began.elapsed().as_nanos() as f64 / runs as f64;
+                samples[slot].0.push(ns);
+                samples[slot].1.push(instructions as f64 / runs as f64);
+            }
+        }
+        println!("{title} ({} shared)", wanted.len());
+        for (slot, how) in ways.iter().enumerate() {
+            let (ns, instructions) = samples[slot].clone();
+            println!(
+                "  {:<22} {:>11.1} us {:>13.0} instructions",
+                how.name(),
+                median(ns) / 1000.0,
+                median(instructions)
+            );
+        }
+    }
+}
 
 fn merge(t: &Snapshot, value: u32, out: &mut Vec<u64>) {
     let mut a = t.by_xs(&value).keys();
@@ -1071,6 +1279,7 @@ fn main() {
         ("and", Joined::And),
         ("and-back", Joined::AndBack),
         ("rows", Joined::Rows),
+        ("collected", Joined::Collected),
         ("collect", Joined::Collect),
         ("listed", Joined::Listed),
         ("filter", Joined::Filter),
@@ -1156,6 +1365,9 @@ fn main() {
                 median(instructions)
             );
         }
+    }
+    if kinds.contains(&"order") {
+        order(table, rounds, budget_ms, &only);
     }
     let crossover = kinds.contains(&"crossover");
     let ranged = crossover || kinds.contains(&"range");

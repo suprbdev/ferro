@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Range, RangeBounds};
 
 use common::{Rng, fast, uncached};
-use ferro::table::{IndexEach, IndexIter, IntoMatches, Matches};
+use ferro::table::{IndexEach, IndexIter, IntoMatches, Matches, Read};
 use ferro::{Data, Db, Record, Table};
 use proptest::prelude::*;
 
@@ -354,6 +354,17 @@ impl Query {
         self.rows(&[(table, model)], 0).into_keys().collect()
     }
 
+    fn links(&self) -> Vec<&Query> {
+        match self {
+            Query::And(left, right) => {
+                let mut links = left.links();
+                links.push(right);
+                links
+            }
+            other => vec![other],
+        }
+    }
+
     fn lookup_in(&self, tables: &[&Table<Row>], on: usize) -> Matches<Row> {
         match self {
             Query::Leaf(leaf) => leaf.lookup(tables[on]),
@@ -510,6 +521,28 @@ fn led(rng: &mut Rng, ids: u32, shape: Shape, versions: usize) -> Query {
     }
 }
 
+fn chain(rng: &mut Rng, ids: u32, shape: Shape, versions: usize) -> Query {
+    let sides = 3 + rng.below(8);
+    let leaf = |rng: &mut Rng| {
+        let leaf = if rng.chance(50) {
+            Query::Leaf(ranged(rng, ids, shape))
+        } else {
+            Query::Leaf(small(rng, ids, shape))
+        };
+        on(rng, versions, leaf)
+    };
+    let mut query = leaf(rng);
+    for _ in 1..sides {
+        let side = if rng.chance(15) {
+            Query::Or(Box::new(leaf(rng)), Box::new(leaf(rng)))
+        } else {
+            leaf(rng)
+        };
+        query = Query::And(Box::new(query), Box::new(side));
+    }
+    query
+}
+
 fn zigzag<T, I: DoubleEndedIterator<Item = T>>(mut iter: I, rng: &mut Rng) -> Vec<T> {
     let (mut front, mut back) = (Vec::new(), Vec::new());
     loop {
@@ -631,6 +664,21 @@ fn covered_agree(versions: &[Version<'_>], group: u8, rest: &Query, rng: &mut Rn
         .covered()
         .collect();
     assert_eq!(listed, wanted, "covered and listed {what}");
+    let chained = || {
+        rest.links()
+            .into_iter()
+            .fold(find.by_group(&group), |all, link| {
+                all.and(link.lookup_in(&tables, at))
+            })
+    };
+    let covered: Vec<(u32, (u16, u8))> = chained().covered().collect();
+    assert_eq!(covered, wanted, "covered chain {what}");
+    let rows: Vec<(u32, (u16, u8))> = chained()
+        .rev()
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let reversed: Vec<(u32, (u16, u8))> = wanted.iter().rev().copied().collect();
+    assert_eq!(rows, reversed, "rows of the chain from the back {what}");
 
     let high = group + 1 + rng.below(2) as u8;
     let other = rng.below(versions.len() as u64) as usize;
@@ -814,19 +862,21 @@ fn check_in(versions: &[Version<'_>], seed: u64, queries: usize, shape: Shape) {
     let (count, ids) = (versions.len(), ids_in(versions));
     let mut rng = Rng::new(seed);
     for _ in 0..queries {
-        let query = if rng.chance(50) {
-            led(&mut rng, ids, shape, count)
-        } else {
-            query(&mut rng, ids, shape, 3, count)
+        let query = match rng.below(5) {
+            0 | 1 => led(&mut rng, ids, shape, count),
+            2 => chain(&mut rng, ids, shape, count),
+            _ => query(&mut rng, ids, shape, 3, count),
         };
         agree_in(versions, &query, &mut rng);
     }
     for group in 0..3 {
-        let rest = if rng.chance(50) {
-            let leaf = Query::Leaf(ranged(&mut rng, ids, shape));
-            on(&mut rng, count, leaf)
-        } else {
-            query(&mut rng, ids, shape, 2, count)
+        let rest = match rng.below(3) {
+            0 => {
+                let leaf = Query::Leaf(ranged(&mut rng, ids, shape));
+                on(&mut rng, count, leaf)
+            }
+            1 => chain(&mut rng, ids, shape, count),
+            _ => query(&mut rng, ids, shape, 2, count),
         };
         covered_agree(versions, group, &rest, &mut rng);
     }
@@ -1271,15 +1321,55 @@ fn a_range_against_few_keys_tests_each_once_and_reads_in_full_when_the_rows_are_
             .collect::<Vec<_>>()
     });
     assert_eq!((keys, tested), (wanted.clone(), 0));
-    let (keys, tested) = counted(|| {
+    let first = || {
         table
             .by_tags_range(0..60)
             .into_matches()
             .and(find.by_group(&0))
+    };
+    assert_eq!(
+        (
+            first().explain().sides[0].read,
+            first().explain().sides[1].read
+        ),
+        (Read::Tested, Read::Walked)
+    );
+    let (keys, tested) = counted(|| first().keys().collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), lead.len() as u64));
+    let (back, tested) = counted(|| first().rev().map(|row| row.id).collect::<Vec<_>>());
+    assert_eq!(back, wanted.iter().rev().copied().collect::<Vec<_>>());
+    assert_eq!(tested, lead.len() as u64);
+    let (keys, tested) = counted(|| {
+        table
+            .by_tags_range(0..60)
+            .into_matches()
+            .and(table.by_tags_range(0..10))
+            .and(find.by_group(&0))
             .keys()
             .collect::<Vec<_>>()
     });
-    assert_eq!((keys, tested), (wanted.clone(), 0));
+    let narrow: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0 && row.tags.0.iter().any(|tag| *tag < 10))
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(keys, narrow);
+    assert!(
+        tested > 0 && tested <= 2 * lead.len() as u64,
+        "{tested} tests"
+    );
+    let mut moved = table.clone();
+    moved.remove(&lead[0]);
+    let (keys, tested) = counted(|| {
+        table
+            .by_tags_range(0..60)
+            .into_matches()
+            .and(moved.find().by_group(&0))
+            .keys()
+            .collect::<Vec<_>>()
+    });
+    let kept: Vec<u32> = wanted.iter().copied().filter(|id| *id != lead[0]).collect();
+    assert_eq!((keys, tested), (kept, 0));
     let many: Vec<u32> = rows
         .iter()
         .filter(|row| row.group != 0 && row.tags.0.iter().any(|tag| *tag < 60))
@@ -1342,4 +1432,88 @@ fn a_range_against_few_keys_tests_each_once_and_reads_in_full_when_the_rows_are_
             lead.len()
         );
     }
+}
+
+#[derive(Data, Record, Clone, Debug, PartialEq)]
+struct Spread {
+    #[key]
+    id: u32,
+    #[index]
+    wide: u8,
+    #[index]
+    mid: u8,
+    #[index]
+    narrow: u8,
+    #[index(each)]
+    tags: Counted,
+}
+
+#[test]
+fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
+    let mut rng = Rng::new(83);
+    let mut table: Table<Spread> = Table::new();
+    let mut rows = Vec::new();
+    for id in 0..6_000 {
+        let row = Spread {
+            id,
+            wide: (id % 2) as u8,
+            mid: (id % 10) as u8,
+            narrow: (id % 97) as u8,
+            tags: Counted(vec![rng.below(100) as u16]),
+        };
+        table.insert(row.clone());
+        rows.push(row);
+    }
+    let wanted: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.wide == 0 && row.mid == 4 && row.narrow == 5 && row.tags.0[0] < 70)
+        .map(|row| row.id)
+        .collect();
+    let narrow = table.by_narrow(&5).len() as u64;
+    let find = table.find();
+    let lookup = |side: usize| match side {
+        0 => find.by_wide(&0),
+        1 => find.by_mid(&4),
+        2 => find.by_narrow(&5),
+        _ => table.by_tags_range(..70).into_matches(),
+    };
+    let mut orders = vec![vec![0, 1, 2, 3]];
+    for _ in 0..23 {
+        let mut order = orders.last().unwrap().clone();
+        let (a, b) = (rng.below(4) as usize, rng.below(4) as usize);
+        order.swap(a, b);
+        orders.push(order);
+    }
+    let mut costs = BTreeSet::new();
+    for order in &orders {
+        let combined = || {
+            order[1..]
+                .iter()
+                .fold(lookup(order[0]), |all, side| all.and(lookup(*side)))
+        };
+        let plan = combined().explain();
+        assert_eq!(plan.sides.len(), 4, "{order:?}: {plan}");
+        let walked: Vec<usize> = plan
+            .sides
+            .iter()
+            .enumerate()
+            .filter(|(_, side)| side.read == Read::Walked)
+            .map(|(at, _)| order[at])
+            .collect();
+        assert_eq!(walked, [2], "{order:?}: {plan}");
+        let range = order.iter().position(|side| *side == 3).unwrap();
+        assert_eq!(plan.sides[range].read, Read::Tested, "{order:?}: {plan}");
+        let (keys, tested) = counted(|| combined().keys().collect::<Vec<_>>());
+        assert_eq!(keys, wanted, "{order:?}");
+        assert!(tested <= narrow, "{order:?}: {tested} tests");
+        let (ids, again) = counted(|| combined().rev().map(|row| row.id).collect::<Vec<_>>());
+        assert_eq!(
+            ids,
+            wanted.iter().rev().copied().collect::<Vec<_>>(),
+            "{order:?}"
+        );
+        assert_eq!(again, tested, "{order:?}");
+        costs.insert(tested);
+    }
+    assert_eq!(costs.len(), 1, "tests by order: {costs:?}");
 }

@@ -6319,6 +6319,14 @@ where
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Finder<K, V, S> {
+    /// The number of entries in the version of the map this finder reads, in O(1).
+    pub(crate) fn len(&self) -> usize {
+        match &self.root {
+            Top::Lent(root) => root.count as usize,
+            Top::Link(link) => link.count() as usize,
+        }
+    }
+
     /// Whether this finder and `other` read the same version of a map: both from one root node,
     /// both from stored roots of one hash, or both from an empty map.
     ///

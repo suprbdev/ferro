@@ -627,8 +627,10 @@ pass when the lookup was of one value and is sorted already.
 ### Two plans
 
 `and` builds a node over its two sides and picks how to run it the first time it is read, from their
-lengths. A view lookup knows its length exactly from `range_by`, a collected lookup the count of its
-entries, an `and` the smaller of its sides' and an `or` their sum.
+lengths. A view lookup knows its length exactly from `range_by`, which counts the entries between
+the two ends it finds from the counts every link holds, a range or prefix lookup the same way, a
+collected lookup the count of its entries, an `and` the smallest of its sides' and an `or` their
+sum.
 
 - Within a factor of four, both sides are walked. Each seeks to the other's key by stepping, and
   after 16 steps it builds its range again from the root, starting at the target, so a long gap
@@ -653,6 +655,55 @@ vector, since a side that is looked up answers for its whole range.
 looked up, where its cursor stopped. A key it read before `covered()` was called is looked up in the
 index again, and a collected lookup keeps the fields of every entry.
 
+When an `and` is looked up rather than walked, it asks its sides in order of their lengths, fewest
+first, and stops at the first that does not hold the key. A side that holds a later key answers
+with it, and the `and` passes that on as its own answer, though the other sides were not asked about
+it: the lead seeks to it and asks again, and a key is yielded only once every side answered with
+that key itself. Asking every side until they agreed on a key, as `and` did before, ran 100 keys
+against an `and` of 100,000 and 1,000 keys in 388,000 instructions, where stopping at the first side
+that lacks the key ran 95,000.
+
+### A chain of `and`
+
+`a.and(b).and(c)` built a node over `a.and(b)` and `c`, so the order it was written in decided the
+plan: with `b` the smallest, `a.and(b)` was planned alone, and `c` met it through the smaller of
+their lengths, an upper bound. Now `and` called on a combination that is itself an `and` not yet
+read adds the new side to that node, up to eight sides, past which it builds a node over the eight
+and the new one. The node keeps the left side, whose rows and covered fields it yields, apart from
+the others, which it only asks about keys, and finds a side by its number through a `match`.
+
+Its plan comes from the sides' lengths when it is first read. They are sorted, fewest first; the
+first leads, and a side with less than four times the lead's keys is walked beside it, as two sides
+within the factor of four are. The others are looked up, in that order, each only for a key that
+every walked side and every side before it holds, and when one answers with a later key, the lead
+seeks to it. Two walked sides run the merge of two sides and one walked side with the first looked
+up runs the lead of two, so the hot loop is the code of the two-sided node; three or more walked
+sides leapfrog, each seeking to the key the one before it found. With two sides the node plans as it
+did, through the same functions.
+
+A range or prefix lookup in a chain is weighed against the keys that reach it rather than against
+the lead's. Each walked side after the lead scales the keys left by its share of the table's rows,
+as if the sides matched independently, and a range with at least four times the estimate is tested
+against what the walked sides agree on, the rest of its test settled by the count of what the tests
+cost, below. An equality lookup is weighed against the lead's keys alone, since looking one up for
+more keys than estimated has no such bound.
+
+### Who reads a range's rows
+
+A tested range reads rows through a finder of its own. The one its `IndexIter` came with reads the
+combination's rows when the range leads it through `into_matches`, so such a range was collected
+whatever the other side held. `and` now hands the finder of the side it is given, when no stream on
+that side took it and both sides read one version of one table, to a range on the left that has
+none, and a plan whose lead is a range hands the lead's finder, which a walked range no longer
+needs, to a range it looks keys up in. The finder travels as a `Spare`, which a stream takes without
+asking its source number, so `and` offers it only between sides it compared with `Finder::same_map`
+when it was built. Since that comparison costs a few dozen instructions, `and` makes it only when a
+side holds a range not yet read.
+
+`Matches::explain` walks the streams without changing them and reports, for each, its length and how
+it will be read: walked, looked up, tested or collected first. A node not yet planned reports the
+plan it would choose and the finders it would hand over, from the same lengths and functions.
+
 ### Ranges and prefixes in a combination
 
 A range or prefix lookup is not in key order, so it cannot be walked beside another side, but
@@ -666,10 +717,11 @@ collect its entries. The equality lookups made on the table, and a lookup passed
 `IndexIter::uncovered`, keep the plain cursor and are collected as before.
 
 The stream chooses when the combination is first read. When `and` picks the plan in which one side
-leads, it tells the other side how many keys the lead holds at most, and an `and` or `or` that is
-itself looked up passes that on to each of its sides. A range with at least four times as many
-entries left as the lead has keys is tested. One with fewer is collected, and so is one that is
-walked, which happens within the factor of four and when it leads. To test, the stream reads the
+leads, it tells the other side how many keys the lead holds at most, or in a chain how many the
+walked sides are estimated to agree on, and an `and` or `or` that is itself looked up passes that on
+to each of its sides. A range with at least four times as many entries left as that is tested. One
+with fewer is collected, and so is one that is walked, which happens within the factor of four and
+when it leads. To test, the stream reads the
 first and last entries the range has left without stepping past them: `Iter::front_key_with` and
 `back_key_with` take a step and set the frame back. A key is in the range when its row holds a
 value whose entry lies between those two. A non-unique entry is `(value, key)`, so the key is
@@ -685,8 +737,9 @@ given to that side's streams, since it reads no rows through them, and `or` hand
 read a version it already has a finder for, and each range that came without a finder takes the one
 of its own version. A tested range so reads the table it was made on as it was when the range was
 built, whatever table or version the other side reads. A range that leads a combination through
-`into_matches` has no finder of its own, since the combination reads its rows through it, and is
-collected.
+`into_matches` has no finder of its own, since the combination reads its rows through it, and
+borrows one from the other side, as [Who reads a range's rows](#who-reads-a-ranges-rows)
+describes, or is collected.
 
 A probe of a tested range answers with the key when the range holds it, and otherwise with a new
 answer, `Past(key)`, meaning that it holds nothing from the target up to that key. The lead then
@@ -712,7 +765,12 @@ matches is read for the yield anyway, and found in the cache after the test. Onc
 counted, weighted at 64 entries each, pass the number of entries the range had when testing began,
 the stream stops testing and collects the entries it has left, which is the rent-or-buy rule: the
 tests can cost about as much as the collection would, and no more, before the collection is paid
-for. Cached rows count nothing, so testing goes on as before.
+for. The keys tested count as well, against a quarter of those entries, since a cached test costs
+about what four collected entries do. A lead counted exactly, or bounded, never reaches that, as a
+range is tested only against a quarter of its entries or fewer, so cached rows stop the testing only
+when a chain estimated too few keys. A first build counted both in one sum, four entries a test and
+64 a read: a lead of exactly a quarter then left no room for reads, and 1,000 keys against a range
+of 4,000 with every row cached ran 47% more instructions, collecting after a stray read.
 
 The test relies on the index agreeing with the rows, as every lookup does: an entry for exactly
 the values the rows hold. The derive refuses an index on a `#[ferro(skip)]` field, which rows read
@@ -972,6 +1030,47 @@ one version, read the row through a call that asked for the finder's number when
 and found the side to record in `or` by counting the sides it went through: `or` ran 2.2% more
 instructions, `and` as rows 5 more a row, and setting up a combination 220 to 260 more.
 
+### What planning measured
+
+The order cases of `ferro-bench --bin combine`, which `make bench-combine ARGS='--cases order'`
+runs, write a combination in an order the earlier plans suited and in one they did not, on the
+200,000 rows of the other cases, with a group's covered fields left out. The figures are means of
+two runs of each build, alternated, of the medians of three rounds each, pinned to eight cores of a
+machine shared with other work. In microseconds, before and after, as keys and as rows, written in
+the order the earlier plans did not suit:
+
+| Combination | Keys | Rows |
+| --- | --- | --- |
+| Score range of 100,000, then 10 keys | 2,433 → 1.4 | 2,461 → 1.8 |
+| Score range of 100,000, then 1,000 keys | 2,591 → 107 | 2,726 → 138 |
+| Score range of 100,000, then 10,000 keys | 2,991 → 933 | 3,747 → 1,251 |
+| Score range of 100,000, then rank range of 1,000 | 2,470 → 115 | 2,565 → 140 |
+| Score range of 100,000, then rank range of 10,000 | 3,132 → 1,130 | 3,652 → 1,395 |
+| 100,000 keys, then 1,000, then a group of 100 | 17.9 → 4.1 | 18.0 → 4.0 |
+| 100,000 keys, then 1,000, then a group of 1,000 | 47.2 → 12.2 | 47.5 → 12.4 |
+| 50,000 and 50,000 sharing 12,500, then score range of 100,000 | 4,600 → 2,960 | 5,875 → 3,366 |
+| 50,000 and 50,000 sharing 12,500, then score range of 150,000 | 6,121 → 2,715 | 8,382 → 3,295 |
+
+Each of the first seven now runs within 1% of the instructions of the order the earlier plans
+suited: 41.7 million instructions became 24,000 for the range written before 10 keys, and 1.03
+million became 0.35 million for the second chain. The order the earlier plans suited ran 0.1 to
+1.1% more instructions. The last two have no better order: the two lookups merged first and the
+range was read in full. Testing the range against the estimate of 12,500 keys ran 30.0 and 30.8
+million instructions where reading it had run 65.6 and 89.0, close to the 30.2 million of filtering
+the merged keys' rows by hand. Against a score range of 30,000, within four times the estimate,
+all three are walked, and the leapfrog ran 2.0% more instructions than the merges nested as
+written; a score range of 2,000 before 1,000 keys and two ranges of 50,000 and 100,000, read in
+full either way, ran 1.0% and 1.2% more.
+
+The equality and range cases of the benchmark plan as they did. Built with one codegen unit, to
+keep functions moving between units out of the count, setting up a combination of two equality
+lookups ran 130 to 170 instructions more, 1.2% of two lookups of 20 keys, and one with a tested
+range about 260 more and about 5 more a tested key, 0.3 to 0.4% for 1,000 keys or more. Built as
+`make` builds them, collecting a range ran up to 1% more instructions in every build that changed
+the stream types, though its code did not change. The cold cases came within 1% of their
+instructions, and the warm ones within 1.8%, the most for 10 keys, once tests and reads from the
+file kept apart counts, as above.
+
 ### Left out
 
 - The index map in every equality `IndexIter`, so that `by_x` itself could combine. A clone of the
@@ -1003,10 +1102,11 @@ instructions, `and` as rows 5 more a row, and setting up a combination 220 to 26
 - Testing below the factor of four. For a lead of 10,000 keys testing broke even at 2.1 times its
   keys, but for leads of 100 and 1,000 at 4.5 to 4.7, and within the factor walking both sides
   beats testing for small leads.
-- A finder of its own for a range that leads a combination through `into_matches`, so that it could
-  be tested too. A finder lends the store and root through hazard slots of its own, and making a
-  second from the first means lending both again; the combination reads its rows through the one
-  it has. A range that leads is collected, as one whose covered fields are wanted must be.
+- A finder of its own for a range that leads a combination through `into_matches`, made from the
+  one the combination reads its rows through. A finder lends the store and root through hazard
+  slots of its own, and making a second from the first means lending both again. Such a range
+  borrows the finder of another side of the same table and version instead, which every lookup
+  comes with, and is collected when there is none.
 - Testing a lookup passed through `IndexIter::uncovered`. The cursor it wraps has covered fields
   that the method does not require to be `Send`, which a stream holding them would need, and
   requiring it broke callers generic over the covered type. It is collected.
@@ -1043,18 +1143,48 @@ instructions, `and` as rows 5 more a row, and setting up a combination 220 to 26
   versions could test while the combination reads that version's rows through the first. Making
   one means lending the store and root through new hazard slots, for a case that collects the
   range as it did before ranges were tested.
+- A cost model in place of the factor of four, with constants fitted to the crossover
+  measurements. Fitted to those above, it would test a range from about twice the lead's keys for a
+  lead of 10,000. With other work running on the machine, the crossover for that lead moved to about
+  five times: at four times, testing took 1,879 µs where collecting took 1,589, and at eight times
+  1,627 µs where collecting took 3,117, while leads of 100 and 1,000 crossed where they had. A
+  test costs what the caches hold, which no count tells, so the factor stays.
+- Estimating the keys that reach an equality lookup in a chain, as for a range. Looking an equality
+  lookup up costs about four steps of walking it, so an estimate too low by more than four times, as
+  for two lookups that hold the same keys, would cost more than walking it, with no count to stop
+  it as a range's tests have.
+- Merging the two walked sides with the fewest keys first and seeking the others to the key they
+  agree on, as nested `and`s did. For two lookups of 50,000 and a range of 30,000, all three
+  walked, that merged the range with one lookup first and ran 11.6% more instructions than the
+  `and`s nested as written, where the leapfrog of all three runs 1.5% more.
+- Leaving out `or`'s comparisons when its sides' keys lie apart. A key costs a comparison with the
+  next key of each later side, a few instructions of the 390 or so a key of two lookups of 50,000
+  costs, and a count tells how many keys a side holds, not where they lie.
+- Testing a range first for a read that stops early, such as `take(20)`, and collecting it once the
+  tests cost as much. An iterator does not tell how many keys it will be asked for, and a
+  combination read to the end would take up to twice as long wherever collecting is the better
+  plan, which the factor of four decides.
+- Planning `a.and(b.and(c))` as one chain. `b.and(c)` has handed its finders to its own streams and
+  numbers its sources from its own left side, so joining its sides to `a`'s would mean taking both
+  back.
 
 ### What is left
 
 - Even sizes run 1.3 times as long as a merge written for them. A seek inside the range iterator,
   climbing its frames as a cursor does, would let a walked side skip without building its range
   again, and both that and a cursor that steps backwards would live in `map.rs`.
-- A range or prefix lookup is read in full and sorted before it combines when the other side has
-  more than a quarter of its keys, when it leads, when the combination yields its covered fields,
-  and after `IndexIter::uncovered`. A unique index has no lookup in the view, since `key_by_x`
-  gives its one key.
+- A range or prefix lookup is read in full and sorted before it combines when the keys led to it
+  are more than a quarter of its own, when it leads its `and`, when the combination yields its
+  covered fields, after `IndexIter::uncovered`, and on the left of an `and` none of whose other
+  sides reads its table at its version with a finder to spare. A unique index has no lookup in the
+  view, since `key_by_x` gives its one key.
 - The factor of four suits leads of up to a few thousand keys. Against larger ones testing would
-  win from about twice the lead's keys, but the plan within the factor walks both sides.
+  win from about twice the lead's keys on a quiet machine, but the plan within the factor walks
+  both sides, and where the plans cross moves with what the caches hold.
+- A chain plans once, from counts and from an estimate that its lookups match independently. When
+  two walked lookups share most of their keys, a range tested against what they agree on stops at
+  about what collecting it costs, so it takes up to about twice as long as collecting it would
+  have. A chain holds eight lookups, past which `and` builds a node over the eight and the next.
 - A tested key costs a row read, so `keys()` and `covered()` read rows they did not before. Rows
   read from the file stop the testing once they cost about what collecting would, but a range
   whose entries are cached while its rows are not still takes up to 3.5 times as long as
@@ -1062,7 +1192,8 @@ instructions, `and` as rows 5 more a row, and setting up a combination 220 to 26
   cached ones and 30 read from the file.
 - `Matches` knows only an upper bound on its length, through `size_hint`.
 - Setting up a combination costs about 4,000 instructions, so two lookups of 20 keys took 0.7 µs
-  against 0.5 for the merge.
+  against 0.5 for the merge. Planning chains added about 150 to that, and when a range is tested
+  about 260, and 5 a tested key.
 - A range on the right side of an `or` whose finder reads another version than any lookup to its
   left is read in full when the `or` is the left side of an `and` that looks keys up in it and
   yields rows, since the combination reads that version's rows through the range's finder.

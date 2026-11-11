@@ -59,11 +59,15 @@ This is an experiment, not a production database.
   in the 2 MiB stack of a spawned thread in a debug build for types of a few dozen fields; larger
   values stored inline take more stack a level, as described under [Nesting
   depth](../internals/storage.md#nesting-depth).
-- No query planning happens. You choose the indexes, and `and` and `or` combine equality lookups by
-  key. A range or prefix lookup tests the keys of a side with a quarter of its keys or fewer by
-  reading their rows, and joins otherwise only after its keys are read and sorted. Each matching
-  row is read separately unless the index covers the fields it needs, as described under
-  [Combining lookups](tables.md#combining-lookups) and [Lookups](tables.md#lookups).
+- Query planning goes by counts alone. You choose the indexes, and `and` and `or` combine lookups
+  by key. A chain of `and` is led by the lookup with the fewest keys, counted from its index, and
+  looks the others up fewest first, but it holds at most eight lookups, and `a.and(b.and(c))` plans
+  `b.and(c)` on its own. The keys several walked lookups share are estimated as if they matched
+  independently. A range or prefix lookup tests the keys led to it by reading their rows when they
+  are a quarter of its keys or fewer, and joins otherwise only after its keys are read and sorted,
+  and a factor of four decides both, whatever the rows cost to read. Each matching row is read
+  separately unless the index covers the fields it needs, as described under [Combining
+  lookups](tables.md#combining-lookups) and [Lookups](tables.md#lookups).
 
 Each subsystem's own limits are in the internals: [sync](../internals/sync.md#limits),
 [reclamation](../internals/reclamation.md#limits) and [Windows](../internals/windows.md).

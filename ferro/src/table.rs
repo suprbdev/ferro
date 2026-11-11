@@ -64,18 +64,21 @@
 //! [`IndexIter::keys`] reads no rows at all, and on an index with `cover(...)`
 //! [`IndexIter::covered`] returns the fields the index stores beside each entry, also without
 //! reading a row. `by_x_counts()` counts the rows of each value with one seek per distinct value.
-//! No query planning happens: you choose the index. The [`Record`](derive@crate::Record) derive
-//! lists every lookup it generates, for each kind of index.
+//! You choose the index: only a combination of lookups plans, picking how to read the lookups you
+//! gave it. The [`Record`](derive@crate::Record) derive lists every lookup it generates, for each
+//! kind of index.
 //!
 //! # Combining lookups
 //!
 //! `find()` returns a view with the equality lookups of each non-unique index, which return
 //! [`Matches`] instead of an [`IndexIter`]. [`Matches::and`] and [`Matches::or`] combine them by
 //! primary key and read a row only for a key that matches, as described on [`Matches`]. They also
-//! take a range or prefix lookup made on the table, against which a side with at most a quarter
-//! of its keys tests each of its keys by reading that key's row, as [`IntoMatches`] describes.
-//! Lookups of different tables, or of different versions of one, combine too, each row read from
-//! a lookup that holds its key.
+//! take a range or prefix lookup made on the table, against which the keys of the other sides are
+//! tested one by one by reading each key's row when they are at most a quarter of its keys, as
+//! [`IntoMatches`] describes. A chain of `and` counts the keys of each lookup from its index and
+//! is led by the smallest, whatever the order it was written in, and [`Matches::explain`] shows
+//! what it will do. Lookups of different tables, or of different versions of one, combine too,
+//! each row read from a lookup that holds its key.
 //!
 //! # Unique indexes
 //!
@@ -2043,10 +2046,11 @@ where
             covering: false,
             lead: None,
             landed: None,
-            cold: false,
+            quit: false,
             rowless: false,
             budget: 0,
             spent: 0,
+            tests: 0,
             source: 0,
         })
     }
@@ -2365,23 +2369,26 @@ impl<T: Record> ExactSizeIterator for IndexKeys<T> {}
 /// [`IndexIter`].
 ///
 /// An [`IndexIter`] from a lookup on the table, such as `by_x_range` or `by_x_prefix`, is not in
-/// key order. A range or prefix lookup passed to `and` or `or` is tested rather than read when
-/// the combination only looks keys up in it, because the other side of an `and` has at most a
-/// quarter of its keys: each key that side offers is tested by reading its row from the table the
+/// key order. A range or prefix lookup passed to `and` or `or`, or leading a chain of `and`
+/// through [`into_matches`](IntoMatches::into_matches), is tested rather than read when the
+/// combination only looks keys up in it, because the keys the other sides of the `and` lead to it
+/// are at most a quarter of its own: each such key is tested by reading its row from the table the
 /// lookup was made on and checking the indexed value against the span of entries the lookup has
 /// left. Otherwise the first time the combination is read the lookup's keys and covered fields are
-/// read in full and sorted, as they are for one that leads the combination through
-/// [`into_matches`](IntoMatches::into_matches), one whose covered fields the combination yields,
-/// one passed through [`IndexIter::uncovered`], and every other [`IndexIter`]. A lookup of one
-/// value is in key order already and sorts in one pass.
+/// read in full and sorted, as they are for one that leads its `and`, one whose covered fields the
+/// combination yields, one passed through [`IndexIter::uncovered`], and every other
+/// [`IndexIter`]. A lookup of one value is in key order already and sorts in one pass. A range on
+/// the left side of an `and` is tested through the finder of a lookup on the other side of the
+/// same table at the same version, since its own reads the combination's rows.
 ///
-/// A row found in the cache costs about as much to test as a few entries do to read, but one read
+/// A row found in the cache costs about as much to test as four entries do to read, but one read
 /// from the file costs as much as dozens. So tests count the rows they had to read from the file:
 /// those of every key under [`Matches::keys`] and [`Matches::covered`], which yield no rows, and
 /// otherwise those of keys the lookup does not hold, since a row that matches is read anyway. Once
-/// they come to more than about a 64th of the entries the lookup has, the lookup is read in full
-/// for the keys left, so a combination whose rows are not cached costs at most about twice what
-/// reading the lookup would.
+/// they come to more than about a 64th of the entries the lookup has, or the keys tested to more
+/// than a quarter of them, which only a chain of `and` that estimated too few keys can reach, the
+/// lookup is read in full for the keys left. So a combination whose rows are not cached costs at
+/// most about twice what reading the lookup would.
 ///
 /// # Examples
 ///
@@ -2451,11 +2458,19 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 /// An index entry is `(value, key)`, so the keys of one value come in key order and two lookups
 /// of similar size are walked side by side. When one side of an `and` has at least four times the
 /// keys of the other, only the smaller is walked and each of its keys is looked up in the larger,
-/// so a few keys against many cost a few searches. A range or prefix lookup on the table is not
-/// in key order, so it is looked up by reading the row of each key and testing it against the
-/// range, and when it has less than four times the keys of the other side it is read in full and
-/// sorted instead, as [`IntoMatches`] describes. The choice is made when the combination is first
-/// read. A combination reads the indexes and rows as they were when its lookups were built.
+/// so a few keys against many cost a few searches. A chain such as `a.and(b).and(c)` is one `and`
+/// of up to eight sides: the side with the fewest keys leads, those within four times its keys are
+/// walked beside it, and the rest are searched, fewest keys first, each only for a key every
+/// side before it holds. The order the chain was written in decides only which side's rows and
+/// covered fields it yields, and which of two sides with as many keys leads. A range or prefix
+/// lookup on the table is not in key order,
+/// so it is searched by reading the row of each key and testing it against the range, and when it
+/// has less than four times the keys led to it it is read in full and sorted instead, as
+/// [`IntoMatches`] describes. In a chain, the keys led to a range are estimated from the counts of
+/// the sides walked before it, as if they matched independently. The choices are made when the
+/// combination is first read, from the number of keys each lookup counts in its index, and
+/// [`explain`](Matches::explain) shows them. A combination reads the indexes and rows as they were
+/// when its lookups were built.
 ///
 /// [`keys`](Matches::keys) gives the keys alone and [`covered`](Matches::covered) the covered
 /// fields of the leftmost lookup, so a combination whose first index covers what you show reads
@@ -2524,6 +2539,11 @@ pub struct Matches<T: Record, C = ()> {
 
 type More<T> = Option<Box<Vec<Finder<<T as Record>::Key, T>>>>;
 
+type Adopted<T, C> = (
+    Box<dyn Stream<<T as Record>::Key, C>>,
+    Option<Finder<<T as Record>::Key, T>>,
+);
+
 struct Finders<T: Record> {
     first: Option<Finder<T::Key, T>>,
     more: Vec<Option<Finder<T::Key, T>>>,
@@ -2549,12 +2569,14 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// The rows that both this combination and `other` match.
     ///
     /// `other` can be any [`IntoMatches`], so a range or prefix lookup on the table joins too,
-    /// tested key by key when this side has at most a quarter of its keys and read in full and
-    /// sorted otherwise. The result keeps this side's covered fields, and reads each row from this
-    /// side. `other` may be a lookup of another table, or of another version of this one: it
-    /// matches the keys its own table holds, and decides only which of this side's rows are
-    /// yielded. If this combination has already yielded rows, what it has left is read into a
-    /// sorted list first.
+    /// tested key by key when the keys led to it are at most a quarter of its own and read in full
+    /// and sorted otherwise. When this combination is itself an `and` not yet read, `other` joins
+    /// it as one more side, up to eight, so a chain of `and` is led by its smallest side whatever
+    /// the order, as [`Matches`] describes. The result keeps this side's covered fields, and reads
+    /// each row from this side. `other` may be a lookup of another table, or of another version of
+    /// this one: it matches the keys its own table holds, and decides only which of this side's
+    /// rows are yielded. If this combination has already yielded rows, what it has left is read
+    /// into a sorted list first.
     ///
     /// # Examples
     ///
@@ -2582,12 +2604,31 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// assert_eq!(late, [100, 200, 400]);
     /// ```
     pub fn and<M: IntoMatches<T>>(self, other: M) -> Matches<T, C> {
-        let left = self.unstarted();
-        let right = other.into_matches().unstarted().adopted();
+        let mut left = self.unstarted();
+        let right = other.into_matches().unstarted();
+        let alone = left.more.is_none();
+        let same = alone
+            && right.more.is_none()
+            && (left.stream.ranges() || right.stream.ranges())
+            && left.rows.same_map(&right.rows);
+        let (right, spare) = right.adopted();
+        if same
+            && let Some(rows) = spare
+            && left.stream.wants()
+        {
+            left.stream.adopt(&mut Spare(Some(Box::new(rows))));
+        }
+        let stream = match left
+            .stream
+            .join(Box::new(Blind(right)), same, left.rows.len())
+        {
+            None => left.stream,
+            Some(right) => Box::new(All::new(left.stream, right, alone, same)),
+        };
         Matches {
             rows: left.rows,
             more: left.more,
-            stream: Box::new(All::new(left.stream, Box::new(Blind(right)))),
+            stream,
             started: false,
         }
     }
@@ -2705,13 +2746,19 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
         }
     }
 
-    fn adopted(self) -> Box<dyn Stream<T::Key, C>> {
+    fn adopted(self) -> Adopted<T, C> {
         let mut stream = self.stream;
         match self.more {
-            None => stream.adopt(&mut Some(self.rows)),
-            Some(more) => stream.adopt(&mut Finders::<T>::of(Some(self.rows), *more)),
+            None => {
+                let mut rows = Some(self.rows);
+                stream.adopt(&mut rows);
+                (stream, rows)
+            }
+            Some(more) => {
+                stream.adopt(&mut Finders::<T>::of(Some(self.rows), *more));
+                (stream, None)
+            }
         }
-        stream
     }
 
     fn lend_more(&mut self) {
@@ -2765,6 +2812,52 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
 }
 
 impl<T: Record, C> Matches<T, C> {
+    /// How the combination reads its lookups: which side of each `and` leads, which is searched,
+    /// which range or prefix lookup is tested key by key and which is read in full first.
+    ///
+    /// It reads no entry and changes nothing. The choices come from the number of keys of each
+    /// lookup, which an index counts from its nodes without reading its entries, and are the ones
+    /// the combination makes when it is first read, as rows or as [`keys`](Matches::keys).
+    /// [`covered`](Matches::covered) reads every range or prefix lookup in full instead, and a
+    /// combination already read from reports what it is doing. A tested range whose rows turn out
+    /// to be read from the file can still be read in full partway, as [`IntoMatches`] describes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::table::{IntoMatches, Read, Step};
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     #[index]
+    ///     customer: String,
+    ///     #[index]
+    ///     day: u32,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=400 {
+    ///     let customer = if id % 100 == 0 { "wile" } else { "road" };
+    ///     orders.insert(Order { id, customer: customer.into(), day: id as u32 % 30 });
+    /// }
+    ///
+    /// let late = orders.by_day_range(5..).into_matches().and(orders.find().by_customer("wile"));
+    /// let plan = late.explain();
+    /// assert_eq!((plan.step, plan.sides[0].step), (Step::And, Step::Range));
+    /// assert_eq!((plan.sides[0].read, plan.sides[1].read), (Read::Tested, Read::Walked));
+    /// assert_eq!(
+    ///     plan.to_string(),
+    ///     "and, at most 4 keys, walked\n  range, 331 keys, tested\n  value, 4 keys, walked"
+    /// );
+    /// assert_eq!(late.keys().collect::<Vec<_>>(), [100, 200, 400]);
+    /// ```
+    pub fn explain(&self) -> Explain {
+        self.stream.explain(Role::Walked, false)
+    }
+
     /// Steps to the next matching row and lends it, where `next` hands out a [`Val`], as
     /// [`IndexIter::next_ref`] does.
     ///
@@ -2937,6 +3030,103 @@ impl<T: Record, C> DoubleEndedIterator for MatchCovered<T, C> {
     }
 }
 
+/// How [`Matches`] reads one of its lookups, or one `and` or `or` of them, from
+/// [`Matches::explain`].
+///
+/// A lookup has no [`sides`](Explain::sides), and an `and` or an `or` has one for each lookup or
+/// combination it was given, left first. `Display` prints the tree one step a line, each side
+/// indented below the step it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Explain {
+    /// What the step is.
+    pub step: Step,
+    /// How the step is read.
+    pub read: Read,
+    /// The keys the step holds: exactly for a lookup, counted from the index without reading its
+    /// entries, and at most for an `and` or an `or`.
+    pub keys: usize,
+    /// The sides of an `and` or an `or`, left first, and none for a lookup.
+    pub sides: Vec<Explain>,
+}
+
+impl Explain {
+    fn of(step: Step, keys: usize, read: Read) -> Self {
+        Explain {
+            step,
+            read,
+            keys,
+            sides: Vec::new(),
+        }
+    }
+
+    fn write(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        let step = match self.step {
+            Step::Value => "value",
+            Step::Range => "range",
+            Step::List => "list",
+            Step::And => "and",
+            Step::Or => "or",
+        };
+        let read = match self.read {
+            Read::Walked => "walked",
+            Read::Searched => "searched",
+            Read::Tested => "tested",
+            Read::Collected => "collected",
+        };
+        let most = match self.step {
+            Step::And | Step::Or => "at most ",
+            Step::Value | Step::Range | Step::List => "",
+        };
+        let indent = 2 * depth;
+        write!(f, "{:indent$}{step}, {most}{} keys, {read}", "", self.keys)?;
+        for side in &self.sides {
+            writeln!(f)?;
+            side.write(f, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Explain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(f, 0)
+    }
+}
+
+/// What one step of an [`Explain`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A lookup of one value of a non-unique index from the `find()` view, in key order.
+    Value,
+    /// A range or prefix lookup made on the table, which is not in key order.
+    Range,
+    /// A list of keys sorted in memory: any other [`IndexIter`], a range or prefix lookup passed
+    /// through [`IndexIter::uncovered`], or what a combination had left when it was combined
+    /// again.
+    List,
+    /// The rows both sides match.
+    And,
+    /// The rows either side matches.
+    Or,
+}
+
+/// How one step of an [`Explain`] is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// Stepped through in key order. The walked sides of an `and` lead it, and when both are
+    /// walked they leapfrog.
+    Walked,
+    /// Searched for each key that the walked side of the `and` it belongs to offers, which skips
+    /// the keys in between.
+    Searched,
+    /// A range or prefix tested against each key that the walked side of its `and` offers, by
+    /// reading that key's row and checking the indexed value against the range.
+    Tested,
+    /// Read in full and sorted the first time the combination is read, then walked or searched as
+    /// a list.
+    Collected,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum End {
     Front,
@@ -3001,6 +3191,47 @@ trait Stream<K, C>: Send {
     fn follow(&mut self, _lead: usize) {}
     fn adopt(&mut self, _rows: &mut dyn std::any::Any) {}
     fn rowless(&mut self) {}
+    fn spare(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+    fn spares(&self) -> bool {
+        false
+    }
+    fn wants(&self) -> bool {
+        false
+    }
+    fn testable(&self) -> bool {
+        false
+    }
+    fn ranges(&self) -> bool {
+        false
+    }
+    fn join(
+        &mut self,
+        right: Box<dyn Stream<K, ()>>,
+        _same: bool,
+        _total: usize,
+    ) -> Option<Box<dyn Stream<K, ()>>> {
+        Some(right)
+    }
+    fn explain(&self, role: Role, offered: bool) -> Explain;
+}
+
+struct Spare(Option<Box<dyn std::any::Any + Send>>);
+
+#[derive(Clone, Copy)]
+enum Role {
+    Walked,
+    Probed(usize),
+}
+
+impl Role {
+    fn read(self) -> Read {
+        match self {
+            Role::Walked => Read::Walked,
+            Role::Probed(_) => Read::Searched,
+        }
+    }
 }
 
 const STEPS: usize = 16;
@@ -3264,6 +3495,10 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> Stream<K, C> for EqualStrea
     fn renumber(&mut self, sources: &[usize]) {
         self.source = sources[self.source];
     }
+
+    fn explain(&self, role: Role, _offered: bool) -> Explain {
+        Explain::of(Step::Value, self.len(), role.read())
+    }
 }
 
 type Collect<K, C> = Box<dyn FnOnce() -> Vec<(K, Option<C>)> + Send>;
@@ -3411,6 +3646,14 @@ impl<K: Ord + Send, C: Send> Stream<K, C> for Listed<K, C> {
     fn renumber(&mut self, sources: &[usize]) {
         self.source = sources[self.source];
     }
+
+    fn explain(&self, role: Role, _offered: bool) -> Explain {
+        let read = match self.pending {
+            Some(_) => Read::Collected,
+            None => role.read(),
+        };
+        Explain::of(Step::List, self.len(), read)
+    }
 }
 
 struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
@@ -3421,10 +3664,11 @@ struct Ranged<T: Record, I, X: Span<I, T::Key>, C> {
     covering: bool,
     lead: Option<usize>,
     landed: Option<(T::Key, bool)>,
-    cold: bool,
+    quit: bool,
     rowless: bool,
     budget: u64,
     spent: u64,
+    tests: u64,
     source: usize,
 }
 
@@ -3456,7 +3700,7 @@ where
     }
 
     fn testing(&mut self) -> bool {
-        if self.cold {
+        if self.quit {
             return false;
         }
         if self.edges.is_some() {
@@ -3472,6 +3716,7 @@ where
             return false;
         }
         self.budget = spanned.cursor.left() as u64;
+        self.tests = self.budget / RATIO as u64;
         self.edges = spanned.cursor.edges();
         self.edges.is_some()
     }
@@ -3539,9 +3784,14 @@ where
             if !holds || self.rowless {
                 self.spent += fresh_reads().wrapping_sub(before);
             }
-            if self.spent.saturating_mul(FRESH) > self.budget {
-                self.cold = true;
-                self.edges = None;
+            match self.tests.checked_sub(1) {
+                Some(tests) if self.spent.saturating_mul(FRESH) <= self.budget => {
+                    self.tests = tests
+                }
+                _ => {
+                    self.quit = true;
+                    self.edges = None;
+                }
             }
         }
         match &self.landed {
@@ -3588,7 +3838,51 @@ where
             }
         } else if let Some(rows) = rows.downcast_mut::<Finders<T>>() {
             self.rows = rows.take(self.source);
+        } else if let Some(Spare(rows)) = rows.downcast_mut::<Spare>()
+            && self.spanned.is_some()
+            && let Some(rows) = rows.take_if(|rows| rows.is::<Finder<T::Key, T>>())
+        {
+            self.rows = rows.downcast().ok().map(|rows| *rows);
         }
+    }
+
+    fn spare(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        let rows = self.rows.take()?;
+        Some(Box::new(rows))
+    }
+
+    fn spares(&self) -> bool {
+        self.rows.is_some()
+    }
+
+    fn wants(&self) -> bool {
+        self.rows.is_none() && self.spanned.is_some()
+    }
+
+    fn testable(&self) -> bool {
+        self.spanned.is_some() && !self.covering && !self.quit
+    }
+
+    fn ranges(&self) -> bool {
+        self.spanned.is_some()
+    }
+
+    fn explain(&self, role: Role, offered: bool) -> Explain {
+        let read = match (&self.spanned, role) {
+            (None, role) => role.read(),
+            (Some(_), Role::Walked) => Read::Collected,
+            (Some(spanned), Role::Probed(lead)) => {
+                let left = spanned.cursor.left();
+                let tests = !self.quit
+                    && (self.edges.is_some()
+                        || !self.covering
+                            && left > 0
+                            && (self.rows.is_some() || offered)
+                            && self.lead.unwrap_or(lead).saturating_mul(RATIO) <= left);
+                if tests { Read::Tested } else { Read::Collected }
+            }
+        };
+        Explain::of(Step::Range, self.len(), read)
     }
 }
 
@@ -3652,6 +3946,30 @@ impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
     fn rowless(&mut self) {
         self.0.rowless();
     }
+
+    fn spare(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.0.spare()
+    }
+
+    fn spares(&self) -> bool {
+        self.0.spares()
+    }
+
+    fn wants(&self) -> bool {
+        self.0.wants()
+    }
+
+    fn testable(&self) -> bool {
+        self.0.testable()
+    }
+
+    fn ranges(&self) -> bool {
+        self.0.ranges()
+    }
+
+    fn explain(&self, role: Role, offered: bool) -> Explain {
+        self.0.explain(role, offered)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3659,19 +3977,110 @@ enum Plan {
     Merge,
     Left,
     Right,
+    Many,
 }
 
 const RATIO: usize = 4;
 
 const FRESH: u64 = 64;
 
+const SIDES: usize = 8;
+
 struct All<K, C> {
     left: Box<dyn Stream<K, C>>,
     right: Box<dyn Stream<K, ()>>,
+    more: Vec<Box<dyn Stream<K, ()>>>,
     plan: Option<Plan>,
     settled: [bool; 2],
     covering: bool,
     landed: Option<K>,
+    shared: u8,
+    ordered: bool,
+    order: [u8; SIDES],
+    walks: usize,
+    total: usize,
+}
+
+macro_rules! side {
+    ($all:expr, $at:expr, |$side:ident| $body:expr) => {
+        match $at {
+            0 => {
+                let $side = &mut *$all.left;
+                $body
+            }
+            1 => {
+                let $side = &mut *$all.right;
+                $body
+            }
+            at => {
+                let $side = &mut *$all.more[at - 2];
+                $body
+            }
+        }
+    };
+}
+
+macro_rules! seen {
+    ($all:expr, $at:expr, |$side:ident| $body:expr) => {
+        match $at {
+            0 => {
+                let $side = &*$all.left;
+                $body
+            }
+            1 => {
+                let $side = &*$all.right;
+                $body
+            }
+            at => {
+                let $side = &*$all.more[at - 2];
+                $body
+            }
+        }
+    };
+}
+
+fn estimate(candidates: usize, len: usize, total: usize) -> usize {
+    let estimate = match total {
+        0 => candidates,
+        total => (candidates as u128 * len as u128).div_ceil(total as u128) as usize,
+    };
+    estimate.min(candidates).min(len)
+}
+
+fn choose(left: usize, right: usize) -> Plan {
+    if left.max(right) < left.min(right).saturating_mul(RATIO) {
+        Plan::Merge
+    } else if left <= right {
+        Plan::Left
+    } else {
+        Plan::Right
+    }
+}
+
+enum Met<K> {
+    At(K),
+    Past(K),
+    Gone,
+}
+
+fn met<K: Clone>(probe: Probe<'_, K>) -> Met<K> {
+    match probe {
+        Probe::At(key) => Met::At(key.clone()),
+        Probe::Past(key) => Met::Past(key.clone()),
+        Probe::Gone => Met::Gone,
+    }
+}
+
+fn joined<K: Ord + Clone, X, Y>(
+    a: &mut dyn Stream<K, X>,
+    b: &mut dyn Stream<K, Y>,
+    end: End,
+    leads: bool,
+) -> bool {
+    match leads {
+        true => led(a, b, end),
+        false => merged(a, b, end),
+    }
 }
 
 fn merged<K: Ord + Clone, X, Y>(
@@ -3731,33 +4140,232 @@ fn led<K: Ord + Clone, X, Y>(
 }
 
 impl<K: Data + Ord, C> All<K, C> {
-    fn new(left: Box<dyn Stream<K, C>>, right: Box<dyn Stream<K, ()>>) -> Self {
+    fn new(
+        left: Box<dyn Stream<K, C>>,
+        right: Box<dyn Stream<K, ()>>,
+        alone: bool,
+        same: bool,
+    ) -> Self {
         All {
             left,
             right,
+            more: Vec::new(),
             plan: None,
             settled: [false, false],
             covering: false,
             landed: None,
+            shared: u8::from(alone) | u8::from(same) << 1,
+            ordered: false,
+            order: [0; SIDES],
+            walks: 0,
+            total: 0,
         }
     }
 
-    fn plan(&mut self) -> Plan {
-        if let Some(plan) = self.plan {
-            return plan;
+    fn sides(&self) -> usize {
+        2 + self.more.len()
+    }
+
+    fn len_at(&self, at: usize) -> usize {
+        seen!(self, at, |side| side.len())
+    }
+
+    fn right_at(&mut self, at: usize) -> &mut dyn Stream<K, ()> {
+        match at {
+            1 => &mut *self.right,
+            at => &mut *self.more[at - 2],
         }
-        let (left, right) = (self.left.len(), self.right.len());
-        let plan = if left.max(right) < left.min(right).saturating_mul(RATIO) {
-            Plan::Merge
-        } else if left <= right {
-            self.right.follow(left);
-            Plan::Left
+    }
+
+    fn shares(&self, at: usize) -> bool {
+        self.shared & 1 << at != 0
+    }
+
+    fn by_length(&self) -> [u8; SIDES] {
+        let sides = self.sides();
+        let mut lens = [0; SIDES];
+        let mut order = [0; SIDES];
+        for at in 0..sides {
+            lens[at] = self.len_at(at);
+            order[at] = at as u8;
+        }
+        order[..sides].sort_by_key(|at| lens[usize::from(*at)]);
+        order
+    }
+
+    fn ordered(&mut self) {
+        if !self.ordered {
+            self.order = self.by_length();
+            self.ordered = true;
+        }
+    }
+
+    fn walked(&self) -> ([u8; SIDES], usize, usize) {
+        let sides = self.sides();
+        let by_length = self.by_length();
+        let lead = self.len_at(usize::from(by_length[0]));
+        let (mut order, mut walks, mut candidates) = ([0; SIDES], 0, lead);
+        let (mut probed, mut probes) = ([0; SIDES], 0);
+        for &at in &by_length[..sides] {
+            let side = usize::from(at);
+            let len = self.len_at(side);
+            let bound = match seen!(self, side, |side| side.testable()) {
+                true => candidates,
+                false => lead,
+            };
+            if walks == 0 || len < bound.saturating_mul(RATIO) {
+                if walks > 0 {
+                    candidates = estimate(candidates, len, self.total);
+                }
+                order[walks] = at;
+                walks += 1;
+            } else {
+                probed[probes] = at;
+                probes += 1;
+            }
+        }
+        order[walks..sides].copy_from_slice(&probed[..probes]);
+        (order, walks, candidates)
+    }
+
+    fn lend(&mut self, from: usize, to: usize) {
+        if !self.shares(from) || !self.shares(to) || !seen!(self, to, |side| side.wants()) {
+            return;
+        }
+        if let Some(rows) = side!(self, from, |side| side.spare()) {
+            side!(self, to, |side| side.adopt(&mut Spare(Some(rows))));
+        }
+    }
+
+    #[inline]
+    fn plan(&mut self) -> Plan {
+        match self.plan {
+            Some(plan) => plan,
+            None => self.planned(),
+        }
+    }
+
+    #[inline(never)]
+    fn planned(&mut self) -> Plan {
+        let plan = if self.more.is_empty() {
+            let (left, right) = (self.left.len(), self.right.len());
+            let plan = choose(left, right);
+            match plan {
+                Plan::Left => {
+                    self.right.follow(left);
+                    self.lend(0, 1);
+                }
+                Plan::Right => {
+                    self.left.follow(right);
+                    self.lend(1, 0);
+                }
+                Plan::Merge | Plan::Many => {}
+            }
+            plan
         } else {
-            self.left.follow(right);
-            Plan::Right
+            let (order, walks, candidates) = self.walked();
+            (self.order, self.walks) = (order, walks);
+            for &probed in &order[walks..self.sides()] {
+                let probed = usize::from(probed);
+                side!(self, probed, |side| side.follow(candidates));
+                for &walked in &order[..walks] {
+                    self.lend(usize::from(walked), probed);
+                }
+            }
+            Plan::Many
         };
         self.plan = Some(plan);
         plan
+    }
+
+    fn pair(&mut self, a: usize, b: usize, end: End, leads: bool) -> bool {
+        let All {
+            left, right, more, ..
+        } = self;
+        let mut rest = std::iter::once(&mut **right)
+            .chain(more.iter_mut().map(|side| &mut **side))
+            .enumerate()
+            .filter(|(at, _)| *at + 1 == a || *at + 1 == b)
+            .map(|(_, side)| side);
+        match (a, b) {
+            (0, _) => joined(&mut **left, rest.next().expect("a side"), end, leads),
+            (_, 0) => joined(rest.next().expect("a side"), &mut **left, end, leads),
+            _ => {
+                let (first, second) = (rest.next().expect("a side"), rest.next().expect("a side"));
+                match a < b {
+                    true => joined(first, second, end, leads),
+                    false => joined(second, first, end, leads),
+                }
+            }
+        }
+    }
+
+    fn agree(&mut self, end: End) -> Option<K> {
+        let lead = usize::from(self.order[0]);
+        if self.walks == 2 {
+            if !self.pair(lead, usize::from(self.order[1]), end, false) {
+                return None;
+            }
+            return side!(self, lead, |side| side.peek(end)).cloned();
+        }
+        let mut key = side!(self, lead, |side| side.fill(end))?.clone();
+        let (mut held, mut at) = (1, 0);
+        while held < self.walks {
+            at += 1;
+            if at == self.walks {
+                at = 0;
+            }
+            let walked = usize::from(self.order[at]);
+            let found = side!(self, walked, |side| side.seek(end, &key))?;
+            if *found == key {
+                held += 1;
+            } else {
+                key = found.clone();
+                held = 1;
+            }
+        }
+        Some(key)
+    }
+
+    #[inline(never)]
+    fn many(&mut self, end: End) -> bool {
+        let lead = usize::from(self.order[0]);
+        let checked = self.walks.max(2);
+        loop {
+            let key = if self.walks == 1 {
+                if !self.pair(lead, usize::from(self.order[1]), end, true) {
+                    return false;
+                }
+                side!(self, lead, |side| side.peek(end)).cloned()
+            } else {
+                self.agree(end)
+            };
+            let Some(key) = key else {
+                return false;
+            };
+            let mut answer = None;
+            for at in checked..self.sides() {
+                let probed = usize::from(self.order[at]);
+                answer = side!(self, probed, |side| match side.probe(end, &key) {
+                    Probe::At(found) if *found == key => None,
+                    other => Some(met(other)),
+                });
+                if answer.is_some() {
+                    break;
+                }
+            }
+            let moved = match answer {
+                None => return true,
+                Some(Met::At(found)) => side!(self, lead, |side| side.seek(end, &found)).is_some(),
+                Some(Met::Past(found)) => {
+                    side!(self, lead, |side| side.pass(end, &found)).is_some()
+                }
+                Some(Met::Gone) => false,
+            };
+            if !moved {
+                return false;
+            }
+        }
     }
 
     fn settle(&mut self, end: End) -> bool {
@@ -3765,15 +4373,73 @@ impl<K: Data + Ord, C> All<K, C> {
             Plan::Merge => merged(&mut *self.left, &mut *self.right, end),
             Plan::Left => led(&mut *self.left, &mut *self.right, end),
             Plan::Right => led(&mut *self.right, &mut *self.left, end),
+            Plan::Many => self.many(end),
         };
         self.settled[end.slot()] = settled;
         settled
+    }
+
+    fn lead(&self) -> usize {
+        match self.plan {
+            Some(Plan::Right) => 1,
+            Some(Plan::Many) => usize::from(self.order[0]),
+            _ => 0,
+        }
+    }
+
+    fn reads_left(&self) -> bool {
+        match self.plan {
+            Some(Plan::Right) => false,
+            Some(Plan::Many) => self.order[..self.walks].contains(&0),
+            _ => true,
+        }
+    }
+
+    #[inline(never)]
+    fn take_many(&mut self, end: End) -> Option<(K, Option<C>)> {
+        let mut taken = None;
+        for walked in 0..self.walks {
+            let at = usize::from(self.order[walked]);
+            let (key, covered) = match at {
+                0 => self.left.take(end)?,
+                at => (self.right_at(at).take(end)?.0, None),
+            };
+            if at == 0 || taken.is_none() {
+                taken = Some((key, covered));
+            }
+        }
+        let (key, covered) = taken?;
+        let covered = match covered {
+            None if self.covering && !self.reads_left() => self.left.found(),
+            covered => covered,
+        };
+        Some((key, covered))
+    }
+
+    #[inline(never)]
+    fn probe_many(&mut self, end: End, target: &K) -> Option<Met<K>> {
+        self.ordered();
+        for at in 0..self.sides() {
+            let at = usize::from(self.order[at]);
+            let answer = side!(self, at, |side| match side.probe(end, target) {
+                Probe::At(found) if found == target => None,
+                other => Some(met(other)),
+            });
+            if answer.is_some() {
+                return answer;
+            }
+        }
+        None
     }
 }
 
 impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
     fn len(&self) -> usize {
-        self.left.len().min(self.right.len())
+        self.more
+            .iter()
+            .fold(self.left.len().min(self.right.len()), |len, side| {
+                len.min(side.len())
+            })
     }
 
     fn cover(&mut self) {
@@ -3785,10 +4451,7 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
         if !self.settled[end.slot()] {
             return None;
         }
-        match self.plan? {
-            Plan::Merge | Plan::Left => self.left.peek(end),
-            Plan::Right => self.right.peek(end),
-        }
+        seen!(self, self.lead(), |side| side.peek(end))
     }
 
     fn fill(&mut self, end: End) -> Option<&K> {
@@ -3799,18 +4462,14 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
     }
 
     fn seek(&mut self, end: End, target: &K) -> Option<&K> {
-        match self.plan() {
-            Plan::Merge | Plan::Left => self.left.seek(end, target)?,
-            Plan::Right => self.right.seek(end, target)?,
-        };
+        self.plan();
+        side!(self, self.lead(), |side| side.seek(end, target))?;
         self.fill(end)
     }
 
     fn pass(&mut self, end: End, target: &K) -> Option<&K> {
-        match self.plan() {
-            Plan::Merge | Plan::Left => self.left.pass(end, target)?,
-            Plan::Right => self.right.pass(end, target)?,
-        };
+        self.plan();
+        side!(self, self.lead(), |side| side.pass(end, target))?;
         self.fill(end)
     }
 
@@ -3834,31 +4493,16 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
                 };
                 Some((key, covered))
             }
+            Plan::Many => self.take_many(end),
         }
     }
 
     fn probe(&mut self, end: End, target: &K) -> Probe<'_, K> {
-        let mut key = target.clone();
-        loop {
-            let found = match self.left.probe(end, &key) {
-                Probe::At(found) => found.clone(),
-                Probe::Past(past) => {
-                    let past = past.clone();
-                    return Probe::Past(self.landed.insert(past));
-                }
-                Probe::Gone => return Probe::Gone,
-            };
-            match self.right.probe(end, &found) {
-                Probe::At(again) if *again == found => {
-                    return Probe::At(self.landed.insert(found));
-                }
-                Probe::At(again) => key = again.clone(),
-                Probe::Past(past) => {
-                    let past = past.clone();
-                    return Probe::Past(self.landed.insert(past));
-                }
-                Probe::Gone => return Probe::Gone,
-            }
+        match self.probe_many(end, target) {
+            None => Probe::At(self.landed.insert(target.clone())),
+            Some(Met::At(key)) => Probe::At(self.landed.insert(key)),
+            Some(Met::Past(key)) => Probe::Past(self.landed.insert(key)),
+            Some(Met::Gone) => Probe::Gone,
         }
     }
 
@@ -3867,9 +4511,10 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
     }
 
     fn source(&self, end: End) -> usize {
-        match self.plan {
-            Some(Plan::Right) => self.left.found_source(),
-            _ => self.left.source(end),
+        if self.reads_left() {
+            self.left.source(end)
+        } else {
+            self.left.found_source()
         }
     }
 
@@ -3884,15 +4529,125 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
     fn follow(&mut self, lead: usize) {
         self.left.follow(lead);
         self.right.follow(lead);
+        for side in &mut self.more {
+            side.follow(lead);
+        }
     }
 
     fn adopt(&mut self, rows: &mut dyn std::any::Any) {
         self.left.adopt(rows);
+        if let Some(spare) = rows.downcast_mut::<Spare>() {
+            for at in 1..self.sides() {
+                if spare.0.is_none() {
+                    break;
+                }
+                if self.shares(at) {
+                    side!(self, at, |side| side.adopt(spare));
+                }
+            }
+        }
     }
 
     fn rowless(&mut self) {
         self.left.rowless();
         self.right.rowless();
+        for side in &mut self.more {
+            side.rowless();
+        }
+    }
+
+    fn wants(&self) -> bool {
+        (0..self.sides())
+            .any(|at| (at == 0 || self.shares(at)) && seen!(self, at, |side| side.wants()))
+    }
+
+    fn ranges(&self) -> bool {
+        (0..self.sides()).any(|at| seen!(self, at, |side| side.ranges()))
+    }
+
+    fn join(
+        &mut self,
+        right: Box<dyn Stream<K, ()>>,
+        same: bool,
+        total: usize,
+    ) -> Option<Box<dyn Stream<K, ()>>> {
+        let sides = self.sides();
+        if self.plan.is_some() || self.ordered || sides == SIDES {
+            return Some(right);
+        }
+        self.shared |= u8::from(same) << sides;
+        self.more.push(right);
+        self.total = total;
+        None
+    }
+
+    fn explain(&self, role: Role, offered: bool) -> Explain {
+        let sides = self.sides();
+        let mut roles = [role; SIDES];
+        let mut lent = [false; SIDES];
+        match role {
+            Role::Probed(_) => {
+                let mut offered = offered;
+                for (at, lent) in lent.iter_mut().enumerate().take(sides) {
+                    *lent = offered
+                        && (at == 0 || self.shares(at))
+                        && seen!(self, at, |side| side.wants());
+                    offered &= !*lent;
+                }
+            }
+            Role::Walked => {
+                let mut pair = [0; SIDES];
+                let (order, walks) = match self.plan {
+                    Some(Plan::Merge) => {
+                        pair[1] = 1;
+                        (pair, 2)
+                    }
+                    Some(Plan::Left) => {
+                        pair[1] = 1;
+                        (pair, 1)
+                    }
+                    Some(Plan::Right) => {
+                        pair[0] = 1;
+                        (pair, 1)
+                    }
+                    Some(Plan::Many) => (self.order, self.walks),
+                    None => {
+                        let (order, walks, _) = self.walked();
+                        (order, walks)
+                    }
+                };
+                let lead = match self.plan {
+                    Some(Plan::Many) | None if self.sides() > 2 => self.walked().2,
+                    _ => self.len_at(usize::from(order[0])),
+                };
+                let mut spares = [false; SIDES];
+                for &walked in &order[..walks] {
+                    let walked = usize::from(walked);
+                    spares[walked] = self.plan.is_none()
+                        && self.shares(walked)
+                        && seen!(self, walked, |side| side.spares());
+                }
+                for &probed in &order[walks..sides] {
+                    let probed = usize::from(probed);
+                    roles[probed] = Role::Probed(lead);
+                    if self.shares(probed)
+                        && seen!(self, probed, |side| side.wants())
+                        && let Some(giver) = spares.iter().position(|spares| *spares)
+                    {
+                        spares[giver] = false;
+                        lent[probed] = true;
+                    }
+                }
+            }
+        }
+        Explain {
+            step: Step::And,
+            read: role.read(),
+            keys: self.len(),
+            sides: (0..sides)
+                .map(|at| seen!(self, at, |side| side.explain(roles[at], lent[at])))
+                .collect(),
+        }
     }
 }
 
@@ -4042,6 +4797,33 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for Any<K, C> {
     fn rowless(&mut self) {
         for side in &mut self.sides {
             side.rowless();
+        }
+    }
+
+    fn wants(&self) -> bool {
+        self.sides.iter().any(|side| side.wants())
+    }
+
+    fn ranges(&self) -> bool {
+        self.sides.iter().any(|side| side.ranges())
+    }
+
+    fn explain(&self, role: Role, offered: bool) -> Explain {
+        let mut offered = offered;
+        let sides = self
+            .sides
+            .iter()
+            .map(|side| {
+                let taken = offered && side.wants();
+                offered &= !taken;
+                side.explain(role, taken)
+            })
+            .collect();
+        Explain {
+            step: Step::Or,
+            read: role.read(),
+            keys: self.len(),
+            sides,
         }
     }
 }
