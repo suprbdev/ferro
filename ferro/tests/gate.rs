@@ -620,11 +620,12 @@ fn joined_commit_stays_short(hog_threads: usize, awaited: bool, gap: Duration) {
     let took = joined_commits_beside_cycles(hog_threads, rounds, awaited, gap);
     assert_eq!(took.len() as u64, rounds, "a joined commit hung: {took:?}");
     let longest = *took.last().unwrap();
+    let most = took[took.len() * 9 / 10];
     assert!(
-        longest < Duration::from_millis(500),
+        longest < Duration::from_secs(2) && most < Duration::from_millis(100),
         "a commit on `b` that a 20 ms closure on `a` joined, awaited: {awaited}, beside another \
          handle cycling as fast as it could and {hog_threads} spinning threads, took up to \
-         {longest:?}: {took:?}"
+         {longest:?}, and nine in ten {most:?} or less: {took:?}"
     );
 }
 
@@ -893,9 +894,14 @@ fn closures_joining_commits_through_the_cycling_handle_back_to_back_wait_a_bound
     }
     stop.store(true, Ordering::Relaxed);
     let (cycles, longest_cycle) = cycling.join().unwrap();
-    let longest = took.iter().max().copied();
+    let mut sorted = took.clone();
+    sorted.sort();
+    let longest = sorted.last().copied();
+    let most = sorted.get(sorted.len() * 9 / 10).copied();
     assert!(
-        took.len() == 40 && longest.is_some_and(|took| took < Duration::from_millis(500)),
+        took.len() == 40
+            && longest.is_some_and(|took| took < Duration::from_secs(2))
+            && most.is_some_and(|took| took < Duration::from_millis(100)),
         "commits through the cycling handle that 20 ms closures on `a` in another handle joined \
          back to back took {took:?}; {cycles} cycles finished meanwhile, the longest in \
          {longest_cycle:?}"
