@@ -4940,6 +4940,7 @@ impl Store {
             outer: Vec::new(),
             planned: drift > 0,
             clear: false,
+            shifted: None,
         })
     }
 
@@ -5094,6 +5095,9 @@ pub struct Txn {
     /// Set by [`Txn::look_ahead`] when no frame placed since the draft began had written any of
     /// its records, as of when it looked.
     clear: bool,
+    /// Set once [`Txn::rebase`] has moved the draft in place without rewriting it yet: where the
+    /// drafted records began and ended, and how far they moved.
+    shifted: Option<(u64, u64, u64)>,
 }
 
 /// The offset of every object a transaction wrote or found, by hash.
@@ -5103,19 +5107,62 @@ type Seen = HashMap<Hash, u64, BuildHasherDefault<Prehashed>>;
 /// node that can be moved with its frame, how to move it and how many links its record has.
 type Remembered = (Hash, CacheEntry, Option<(Relocate, usize)>);
 
-/// What a draft carries from its rebase until its frame is placed: how its records moved, the
+/// What a draft carries from its rebase until its frame is written: how its records moved, the
 /// cached copies of the nodes it wrote, and the objects it wrote, for the cache and the
 /// deduplication table.
 pub(crate) struct Settling {
     moves: Option<Moves>,
+    shift: Option<Shift>,
     remembered: Vec<Remembered>,
     seen: Seen,
 }
 
+/// A draft moved in place by [`Txn::rebase`] whose table of moves is not built yet: where its
+/// records began and ended, how far they moved, and where each record began.
+struct Shift {
+    from: u64,
+    end: u64,
+    delta: u64,
+    starts: Vec<(u64, Hash)>,
+}
+
 impl Settling {
-    /// How the draft's records moved, if another frame was placed first.
+    /// How the draft's records moved, if another frame was placed first, once
+    /// [`Settling::settle`] has run.
     pub(crate) fn moves(&self) -> Option<&Moves> {
         self.moves.as_ref()
+    }
+
+    /// Whether another frame was placed first, so that the draft's records moved.
+    pub(crate) fn moved(&self) -> bool {
+        self.moves.is_some() || self.shift.is_some()
+    }
+
+    /// Where `ptr`, which the draft gave out, now points: past the frames placed first, for an
+    /// object the draft wrote. `None` for a drafted object its frame dropped.
+    pub(crate) fn ptr(&self, ptr: Ptr) -> Option<Ptr> {
+        match (&self.shift, &self.moves) {
+            (Some(shift), _) => Some(Ptr {
+                hash: ptr.hash,
+                offset: shift.offset(ptr.offset),
+            }),
+            (None, Some(moves)) => moves.ptr(ptr),
+            (None, None) => Some(ptr),
+        }
+    }
+
+    /// Builds the table of how a draft moved in place went, and gives each object it wrote its
+    /// new offset, once the caller has let `tip` go.
+    pub(crate) fn settle(&mut self) {
+        let Some(shift) = self.shift.take() else {
+            return;
+        };
+        for offset in self.seen.values_mut() {
+            *offset = shift.offset(*offset);
+        }
+        let olds: Vec<u64> = shift.starts.iter().map(|(offset, _)| *offset).collect();
+        let news = olds.iter().map(|offset| offset + shift.delta).collect();
+        self.moves = Some(Moves::new(shift.from, olds, news));
     }
 
     /// Takes over the record of what `txn` wrote, for [`Settling::finish`] to register.
@@ -5131,11 +5178,13 @@ impl Settling {
     /// cache cleared again, as [`Store::admit`] does: the writer has let its branch lock go, so a
     /// cycle in another process may have replaced the file and this process followed it, and a
     /// node that holds a nested map would keep the closed store and its file open from its cache.
-    pub(crate) fn finish(self, store: &Store) {
+    pub(crate) fn finish(mut self, store: &Store) {
+        self.settle();
         let Settling {
             moves,
             remembered,
             seen,
+            ..
         } = self;
         let inner = &store.inner;
         for (hash, offset) in seen {
@@ -5169,6 +5218,15 @@ impl Settling {
         }
         if inner.closed.load(Ordering::SeqCst) {
             empty(cache);
+        }
+    }
+}
+
+impl Shift {
+    fn offset(&self, offset: u64) -> u64 {
+        match (self.from..self.end).contains(&offset) {
+            true => offset + self.delta,
+            false => offset,
         }
     }
 }
@@ -5307,7 +5365,7 @@ impl Drop for Txn {
 
 impl Sink for Txn {
     fn check_link(&self, ptr: Ptr) -> Result<()> {
-        if self.seen.get(&ptr.hash) == Some(&ptr.offset) {
+        if self.seen.get(&ptr.hash).map(|offset| self.moved(*offset)) == Some(ptr.offset) {
             return Ok(());
         }
         match self.store.read_object(ptr) {
@@ -5401,7 +5459,7 @@ impl Txn {
         let offset = self
             .seen
             .get(&hash)
-            .copied()
+            .map(|offset| self.moved(*offset))
             .or_else(|| match self.unshared {
                 true => None,
                 false => self
@@ -5462,14 +5520,16 @@ impl Txn {
             Ordering::Relaxed,
         );
         let planned = mem::take(&mut self.planned);
-        let shifted = match now != self.origin && planned {
+        let shift = match now != self.origin && planned {
             true => self.shift(now),
             false => None,
         };
         self.slack = 0;
-        self.outer.clear();
+        if shift.is_none() {
+            self.outer.clear();
+        }
         let moves = match now == self.origin {
-            _ if shifted.is_some() => shifted,
+            _ if shift.is_some() => None,
             true => None,
             false => {
                 let mut hashes: Vec<(u64, Hash)> = self
@@ -5498,6 +5558,7 @@ impl Txn {
         };
         Ok(Settling {
             moves,
+            shift,
             remembered,
             seen: Seen::default(),
         })
@@ -5517,13 +5578,15 @@ impl Txn {
             });
     }
 
-    /// Moves the draft to `now` in place, by rewriting the distance of each link to an object
-    /// before it, if no frame placed since it began wrote any of its records and every distance
-    /// still fits the bytes it was given, and returns how its records moved.
+    /// Moves the draft to `now` in place, if no frame placed since it began wrote any of its
+    /// records and every distance still fits the bytes it was given, and returns how its records
+    /// moved.
     ///
     /// Every record moves by the same amount, so a link within the draft keeps its distance, and
-    /// the frame is the one [`relayout`] writes, but for the bytes a distance was given.
-    fn shift(&mut self, now: u64) -> Option<Moves> {
+    /// the frame is the one [`relayout`] writes, but for the bytes a distance was given. The
+    /// distance of each link to an object before the draft is written again by [`Landing::land`],
+    /// once the caller has let `tip` go.
+    fn shift(&mut self, now: u64) -> Option<Shift> {
         let delta = now - self.origin;
         let dedupe = &self.store.inner.dedupe;
         let found = match mem::take(&mut self.clear) {
@@ -5538,23 +5601,17 @@ impl Txn {
         if found || (delta > self.slack && !self.outer.iter().all(fits)) {
             return None;
         }
-        for (at, width, distance) in &self.outer {
-            put_distance(
-                &mut self.buf[*at..*at + *width],
-                distance.wrapping_add(delta),
-            );
-        }
-        for offset in self.seen.values_mut() {
-            if *offset >= self.origin {
-                *offset += delta;
-            }
-        }
-        let olds: Vec<u64> = self.starts.iter().map(|(offset, _)| *offset).collect();
-        let news = olds.iter().map(|offset| offset + delta).collect();
-        let moves = Moves::new(self.origin, olds, news);
+        let end = self.start + self.buf.len() as u64;
+        let shift = Shift {
+            from: self.origin,
+            end,
+            delta,
+            starts: mem::take(&mut self.starts),
+        };
+        self.shifted = Some((self.origin, end, delta));
         self.origin = now;
         self.start = now;
-        Some(moves)
+        Some(shift)
     }
 
     /// Appends the record of `staged` to the draft and registers its hash.
@@ -5631,6 +5688,12 @@ impl Txn {
         self.buf.len()
     }
 
+    /// Whether the transaction has written records past the end of the log, so that its frame is
+    /// written as it is placed.
+    pub(crate) fn spilled(&self) -> bool {
+        self.start != self.origin
+    }
+
     /// Whether the transaction has added a record, in memory or spilled.
     pub(crate) fn holds_records(&self) -> bool {
         self.start != self.origin || self.buf.len() > FRAME_BYTES
@@ -5638,7 +5701,16 @@ impl Txn {
 
     /// The offset of the object with `hash` that this transaction wrote or found.
     pub(crate) fn offset_of(&self, hash: &Hash) -> Option<u64> {
-        self.seen.get(hash).copied()
+        self.seen.get(hash).map(|offset| self.moved(*offset))
+    }
+
+    /// Where an offset this transaction drafted now lies, once [`Txn::rebase`] moved the draft in
+    /// place.
+    fn moved(&self, offset: u64) -> u64 {
+        match self.shifted {
+            Some((from, end, delta)) if (from..end).contains(&offset) => offset + delta,
+            _ => offset,
+        }
     }
 
     /// Writes the records waiting in memory past the end of the log, so that a large commit need
@@ -5728,6 +5800,8 @@ impl Txn {
             at: self.origin,
             buf: Vec::new(),
             pending: false,
+            outer: Vec::new(),
+            delta: 0,
         };
         if self.start == self.origin {
             if self.reserve {
@@ -5735,6 +5809,10 @@ impl Txn {
             }
             landing.buf = mem::take(&mut self.buf);
             landing.pending = true;
+            if let Some((_, _, delta)) = self.shifted {
+                landing.outer = mem::take(&mut self.outer);
+                landing.delta = delta;
+            }
         } else {
             let mut blocks = Blocks::new();
             self.hash_spilled(&mut blocks)?;
@@ -5765,7 +5843,7 @@ impl Txn {
             store.arrived(landing.at, end);
         }
         for (hash, offset) in mem::take(&mut self.seen) {
-            inner.dedupe.insert(hash, offset);
+            inner.dedupe.insert(hash, self.moved(offset));
         }
         for (hash, entry, _) in mem::take(&mut self.remembered) {
             inner.cache.insert(hash, entry);
@@ -5809,6 +5887,11 @@ pub(crate) struct Landing {
     buf: Vec<u8>,
     /// Set until the frame is written, when it is written here.
     pending: bool,
+    /// The links to objects before a frame moved in place, as [`Txn::shift`] noted them, whose
+    /// distances are written again before the frame.
+    outer: Vec<(usize, usize, u64)>,
+    /// How far the frame moved.
+    delta: u64,
 }
 
 impl Landing {
@@ -5825,6 +5908,12 @@ impl Landing {
             return Ok(());
         }
         self.pending = false;
+        for (at, width, distance) in mem::take(&mut self.outer) {
+            put_distance(
+                &mut self.buf[at..at + width],
+                distance.wrapping_add(self.delta),
+            );
+        }
         let records = self.buf.len();
         append_table(&mut self.buf, FRAME_BYTES);
         let mut header = self.frame.header();

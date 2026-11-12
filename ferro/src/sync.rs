@@ -4268,7 +4268,7 @@ impl<T: Data> Db<T> {
     /// ```
     pub fn have(&self) -> Result<Have> {
         self.caught_up()?;
-        let (store, refs) = self.published_refs();
+        let (store, refs) = self.published_refs()?;
         let mut marks = Vec::new();
         for (_, head) in refs.try_entries()? {
             if let Some(tip) = head.log.tip {
@@ -4332,7 +4332,7 @@ impl<T: Data> Db<T> {
 
     fn emitter(&self, have: &Have) -> Result<Emitter> {
         let have = Marks::decode(have.as_bytes())?;
-        let (store, refs) = self.published_refs();
+        let (store, refs) = self.published_refs()?;
         plan(&store, &refs, self.branch_name(), &have)
     }
 
@@ -4699,7 +4699,7 @@ impl<T: Data> Db<T> {
                         return Err(error);
                     }
                 };
-                bound = self.published_refs().0.together();
+                bound = self.published_store().together();
                 self.land_staged(remote, &header, received)?;
                 Some(ours)
             }
@@ -4747,7 +4747,7 @@ impl<T: Data> Db<T> {
             )));
         }
         self.check_writable()?;
-        let (store, refs) = self.published_refs();
+        let (store, refs) = self.published_refs()?;
         let root_kind = Kind::value::<T>();
         let mut anchors = anchors(&store, &refs, header, &root_kind)?;
         let mut staging = Staging::new(&store, SPILL_AT);
@@ -4812,7 +4812,7 @@ impl<T: Data> Db<T> {
             (&commits, &found),
             &mut learned,
         );
-        let failed = landed.is_err() && self.published_refs().0.check_healthy().is_err();
+        let failed = landed.is_err() && self.published_store().check_healthy().is_err();
         if !learned && !failed {
             staging.discard();
         }
@@ -4835,7 +4835,7 @@ impl<T: Data> Db<T> {
         let _cycles = spilled.then(|| self.hold_cycles()).transpose()?;
         let mut moved = None;
         if spilled {
-            let (store, refs) = self.published_refs();
+            let (store, refs) = self.published_refs()?;
             if staging.in_place(&store) {
                 drop((store, refs));
                 staging.sync()?;
@@ -4845,7 +4845,7 @@ impl<T: Data> Db<T> {
                 anchors = reanchor(&store, &refs, header, &anchors)?;
                 drop((store, refs));
                 moved = Some(self.place_staged(staging, &anchors, commits)?);
-                self.published_refs().0.flush()?;
+                self.published_store().flush()?;
             }
             self.step("placed");
         }

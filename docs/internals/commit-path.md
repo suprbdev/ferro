@@ -359,7 +359,8 @@ from `dedupe` only below it, so it may link into a frame that is still being wri
 one. A read between `written` and `placed` waits for `written` to pass it: a commit on another
 branch that loads a node of the refs the frame before named, once the cache has dropped it, or a
 merge that loads the other branch's newest entry. The writer it waits for holds no lock but its own
-lane and runs no user code before it writes, so the wait ends. A read past `placed` fails as before.
+lane, and the user code it may run before it writes cannot write, as described under [Less under
+`tip`](#less-under-tip), so the wait ends. A read past `placed` fails as before.
 The next commit on the same branch needs the lane, which the writer releases only after writing.
 
 The leader of a sync waits until `written` reaches the end of the last frame it took before it
@@ -798,9 +799,10 @@ a new buffer, looked each one up again in `dedupe` and wrote every link's distan
 rewrites in place only what depends on where the frame sits.
 
 While it drafts, a commit notes the offset and hash of each record and, for each link to an object
-before its frame, where the link's distance sits in the draft and how many bytes it was given. Under
-`tip`, if another frame was placed meanwhile, it writes each of those distances again for the new
-position, in the bytes it was given. Every record moves by the same amount, so a link within the
+before its frame, where the link's distance sits in the draft and how many bytes it was given. If
+another frame was placed meanwhile, it writes each of those distances again for the new position,
+in the bytes it was given, once it has let `tip` go, as described under [Less under
+`tip`](#less-under-tip). Every record moves by the same amount, so a link within the
 frame keeps its distance, and the frame is the one the full move writes but for those bytes. The
 links' bytes leave room to move: the store keeps its drift, the farthest a draft moved lately,
 losing a sixteenth and a byte with each commit placed, and a draft begun while the drift is above
@@ -885,3 +887,104 @@ Measured and left out:
   carry the bit, a byte more wherever a distance sits near the top of its varint's length, and every
   file of format 4 would have to be laid out again. Without the bit, an odd value can no longer mean
   a link forward, which only staged records use, so they keep the zigzag.
+
+## Less under `tip`
+
+With drafts moved in place, a commit with a writer on each of 16 branches still ran about 21,000
+instructions under `tip`. Counted with a user-space instruction counter read around each part, in
+`group` with `--branches own`, single-key commits into 100,000 keys and `Durability::Buffered`:
+
+| Part | Instructions |
+| --- | ---: |
+| Moving the draft in place | 4,550 |
+| Decoding the moved root | 650 |
+| Inserting the head into the table kept in memory | 4,370 |
+| Writing the step: encoding 1,210, decoding it back 990, hashing 990, appending 880 | 4,150 |
+| Storing the branch's new state and building the queue's entry | 2,700 |
+| Reading the branch's head, placing the frame and queueing it | 1,830 |
+
+The rest is the table written every 65th commit and the code between those parts. Much of it
+depends on nothing another frame can change once the frame's place is decided, so it now runs after
+`tip` is let go, still under the lane, and the rest costs less:
+
+- Under `tip` a moved draft only decides how it moves. It checks, as before, that no frame placed
+  since the draft began wrote one of its records and that its distances fit the bytes they were
+  given, and gives its root and its log entry their new offsets, the drafted ones plus how far the
+  frame moved. Writing each distance again, the records' new offsets for `dedupe` and the table of
+  moves for the cache come after `tip`, before the frame is checked and written, and so do decoding
+  the moved root, building the branch's new state and storing it as the branch's tip. The frame's
+  entry in the queue holds a slot for that state, which the writer fills before it writes the
+  frame, and a leader publishes a frame only once `written` has passed it, so the slot is full by
+  then. A draft that spilled is written as it is placed, so its state is still built under `tip`;
+  such a draft never moves.
+- The table kept in memory holds the steps beside it. It was a `Map`, and putting a head into it
+  copied the leaf that held the head, since the frame queued before still held that leaf: 4,370
+  instructions at 16 branches and 7,400 at 64. The state under `tip` now keeps the table as last
+  written or read and the steps this process wrote since, newest first, and a commit puts its step
+  on top whatever the branches. A whole table is built only when something asks for it, a merge, a
+  sync, `verify` or the commit that writes a table, from the newest step already built, applying
+  only the newest step of each branch, and kept with that step for the next one asked. Only a
+  branch's own writers step it, so a commit reads its branch's head from the step it last wrote,
+  while no table has been written since, rather than walking the steps.
+- A step whose head holds no merge records is not decoded back from what was written, since it
+  decodes to the head it was written from. The draft also encodes the step for the head it expects,
+  with a stand-in for the link to the step before, and under `tip` the commit checks that the head
+  it writes has the same fields and links to the same objects, and sets the links.
+
+When a draft moved, the decode of the moved root and the drop of the drafted value ran under `tip`,
+and now run after it but before the frame is written. A write from that user code would place a
+frame after this one and wait for this one to be written, which waits for that write, so the commit
+keeps the record of the whole file until its frame is written, and such a write fails with
+`Error::Reentrant` as it did under `tip`. Without that,
+`user_code_run_under_tip_when_a_draft_moves_cannot_deadlock_a_write` deadlocked on its first run.
+The frames are the bytes they were, since the distances are written before the frame's check, and
+`a_frame_another_branch_moves_is_the_frame_written_in_its_place` still finds each moved frame to be
+the frame placed in its place. With `shared`, a commit writes its frame before it lets go of the file's
+commit lock, so there the work taken out of `tip` still runs under that lock.
+
+Instructions under `tip` a commit, medians of three runs alternating with the tree before:
+
+| Writers | Before | After |
+| ---: | ---: | ---: |
+| 1 | 9,538 | 7,239 (-24%) |
+| 8 | 17,862 | 7,809 (-56%) |
+| 16 | 21,258 | 8,879 (-58%) |
+
+What is left at 16 writers is the step, 2,650 instructions, of which hashing it is 1,040, appending
+it 900 and fitting the drafted step 310; reading the branch's head, 830; building the commit and
+its head, 650; placing the frame, 430; deciding the move, 380; queueing, 350; putting the step on
+top, 340; and the table written every 65th commit, 100,000 instructions, 44,000 of them building
+it from the steps, about 1,500 a commit. One writer runs fewer too, since it no longer puts its head
+into a table.
+
+The machine was shared with other work for every run, its one-minute load average between 10 and
+31 on its 32 threads, so commits a second moved by more between runs than between trees. Two sets
+of runs alternating with the tree before, medians of five and of six, the first with the counters
+built into both trees but off, commits a second and p99:
+
+| Writers | Before | After | p99, before | After |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 38,646 and 44,432 | 43,305 and 45,378 | 45 and 44 µs | 42 and 44 µs |
+| 4 | 83,255 and 100,110 | 107,326 and 90,328 | 100 and 86 µs | 77 and 104 µs |
+| 8 | 115,884 and 145,630 | 141,536 and 141,276 | 120 and 114 µs | 123 and 118 µs |
+| 16 | 93,896 and 108,470 | 137,694 (1.47x) and 141,688 (1.31x) | 575 and 434 µs | 270 and 285 µs |
+
+Only 16 writers gained in both sets. At 4 writers `tip` is free most of the time, and the whole
+process ran 156,800 user-space instructions a commit against 158,400 before, two runs each, so
+nothing moved out of `tip` costs a writer more. Bytes per commit did not change.
+
+Measured and left out:
+
+- One waiter spinning on `tip` for up to 20 µs while the rest park, so that the lock passes to a
+  thread already running. In the runs above it gave 161,672 a second at 16 writers against 141,688,
+  p99 230 against 285 µs. But in a later set, with the load average up to 62, it gave 87,056 against
+  110,680 at 16 writers and a p99 of 906 against 482 µs, the cost found before for spinners under
+  load, as described under [Where own-branch writers stop
+  scaling](#where-own-branch-writers-stop-scaling).
+
+Left open:
+
+- The commit that writes a table, every 65th, runs about eleven times the instructions under `tip`
+  of one that writes a step at 16 branches, and building the table from the steps reads the table
+  before it from the file.
+- Handing `tip` to a waiter already running, without the cost under load.

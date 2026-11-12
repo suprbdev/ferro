@@ -26,11 +26,13 @@ returned (#41). These are the cases, each reproduced with a timeout in `ferro/te
   for `tip`, held by its own thread. Since commits draft outside `tip`, as described under [Drafting
   outside `tip`](commit-path.md#drafting-outside-tip), `Data::encode` and the decode of the new root
   run under the lane only, so a write from them is judged as one from the closure. What still runs
-  under `tip` is the drop of the drafted root when nothing changed; when another frame landed during
-  the draft, `decode` of the moved root and the drop of the drafted one it replaces; when a cycle
-  swapped the file during the draft, the whole draft again; and in a cycle's swap, the decode of
-  every attached branch's root from the new file. The tests cover the drops and the moved root's
-  `decode`.
+  under `tip` is the drop of the drafted root when nothing changed; when a cycle swapped the file
+  during the draft, the whole draft again; and in a cycle's swap, the decode of every attached
+  branch's root from the new file. When another frame landed during the draft, `decode` of the
+  moved root and the drop of the drafted one it replaces run after `tip` is let go but before the
+  frame is written, and the commit keeps the record of the whole file until it is: a write from
+  them would wait behind a frame placed after this one, which waits for this one to be written. The
+  tests cover the drops and the moved root's `decode`.
 - With `shared`, the decode of another process's roots while catching up with it, which also runs
   under `tip`. A write takes its lane and then catches up under `tip`, and does so again before it
   places its frame, and `fork`, `drop_branch`, `Db::branch`, `refresh`, a cycle and a follower's

@@ -12,11 +12,15 @@ refs take one lock for the whole file, so commit throughput across branches stop
 cost of that step, and on one branch, unless you opt in to `coalesce`, at the cost of the closure
 and encoding, with only the fsync shared: one leader's fsync covers every frame queued. Writing the
 refs is one small record per commit however many branches there are, and a commit whose draft
-another branch's frame overtook only rewrites its links' distances in place, so with one writer on
-each of 16 branches, single-key commits and `Durability::Buffered`, the file took about 135,000
-commits a second on the test machine on 2026-11-09, against 48,000 for one writer on one branch. A
-reclamation cycle, and `receive` once its bundle has arrived, wait for the closure running on every
-branch before they hold up all of them.
+another branch's frame overtook only rewrites its links' distances in place, once it has let that
+lock go. So with one writer on each of 16 branches, single-key commits and `Durability::Buffered`,
+the file took about 135,000 commits a second on the test machine on 2026-11-09, against 48,000 for
+one writer on one branch. Moving the rest of the work that does not need the lock out from under
+it, on 2026-11-12, cut what a commit runs under it at 16 branches from about 21,000 instructions to
+8,900, and gave 1.31 to 1.47 times the commits a second at 16 branches in runs alternating with the
+tree before on the same machine, then shared with other work, as described under [Less under
+`tip`](../internals/commit-path.md#less-under-tip). A reclamation cycle, and `receive` once its
+bundle has arrived, wait for the closure running on every branch before they hold up all of them.
 
 ## Awaited writes
 

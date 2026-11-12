@@ -19,7 +19,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,7 +28,7 @@ use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::admin::Keep;
-use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, try_hash_of};
+use crate::codec::{Data, Decoder, Encoder, Hash, Moves, Object, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::follow::{Follower, Following};
 use crate::graph::{self, Start};
@@ -384,25 +384,131 @@ impl Data for Head {
 /// The branch table: every branch's [`Head`] by name.
 pub(crate) type Refs = Map<String, Head>;
 
+/// The heads a file's head pointer names: a branch table with the steps written since applied,
+/// the pointer, how many steps deep it is, and the root of version 0 the table names.
+///
+/// A step written by this process is kept beside the table rather than put into it, so that a
+/// commit adds it without copying the table's nodes that the frames queued before it still hold.
+/// [`RefState::refs`] applies them when a whole table is asked for.
 #[derive(Clone)]
 struct RefState {
-    refs: Refs,
+    table: Refs,
+    steps: Option<Arc<Stepped>>,
+    /// How many times the table was replaced. Only a branch's own writers step it, so the step it
+    /// last wrote stays its newest until the table is replaced, as [`Branch::head_in`] relies on.
+    generation: u64,
     ptr: Option<Ptr>,
     depth: usize,
     genesis: Option<Ptr>,
 }
 
+/// A step this process wrote on top of a [`RefState`]'s table: one branch's new head, and the
+/// step before it.
+struct Stepped {
+    name: String,
+    head: Head,
+    before: Option<Arc<Stepped>>,
+    /// The table with this step and every step before it applied, once something asked for it.
+    applied: OnceLock<Refs>,
+}
+
 impl RefState {
-    fn since(&self) -> Option<refs::Since<'_>> {
-        self.ptr
-            .map(|known| (known, &self.refs, self.genesis, self.depth))
+    fn new(refs: Refs, ptr: Option<Ptr>, depth: usize, genesis: Option<Ptr>) -> Self {
+        RefState {
+            table: refs,
+            steps: None,
+            generation: 0,
+            ptr,
+            depth,
+            genesis,
+        }
+    }
+
+    /// Every branch's head by name: the table with the steps applied, built from the newest step
+    /// some earlier call applied.
+    ///
+    /// # Errors
+    ///
+    /// The error of reading a node of the table.
+    fn refs(&self) -> Result<&Refs> {
+        let Some(newest) = &self.steps else {
+            return Ok(&self.table);
+        };
+        if let Some(refs) = newest.applied.get() {
+            return Ok(refs);
+        }
+        let mut unapplied = Vec::new();
+        let mut base = &self.table;
+        let mut at = Some(newest);
+        while let Some(step) = at {
+            if let Some(refs) = step.applied.get() {
+                base = refs;
+                break;
+            }
+            unapplied.push(step);
+            at = step.before.as_ref();
+        }
+        let mut refs = base.clone();
+        let mut names: Vec<&str> = Vec::new();
+        for step in unapplied {
+            if names.contains(&step.name.as_str()) {
+                continue;
+            }
+            names.push(&step.name);
+            refs.try_insert(step.name.clone(), step.head.clone())?;
+        }
+        Ok(newest.applied.get_or_init(|| refs))
+    }
+
+    /// The head of branch `name`, or `None` if the table names no such branch.
+    ///
+    /// # Errors
+    ///
+    /// The error of reading a node of the table.
+    fn head(&self, name: &str) -> Result<Option<Head>> {
+        let mut at = self.steps.as_ref();
+        while let Some(step) = at {
+            if step.name == name {
+                return Ok(Some(step.head.clone()));
+            }
+            at = step.before.as_ref();
+        }
+        Ok(self.table.try_get(name)?.map(|head| (*head).clone()))
+    }
+
+    /// Puts the step at `ptr`, which sets branch `name` to `head`, on top, and returns it.
+    fn step(&mut self, ptr: Ptr, name: String, head: Head) -> Arc<Stepped> {
+        let step = Arc::new(Stepped {
+            name,
+            head,
+            before: self.steps.take(),
+            applied: OnceLock::new(),
+        });
+        self.steps = Some(step.clone());
+        self.ptr = Some(ptr);
+        self.depth += 1;
+        step
+    }
+
+    /// Replaces the heads with the table `refs`, which `ptr` names `depth` steps deep.
+    fn set(&mut self, refs: Refs, ptr: Option<Ptr>, depth: usize, genesis: Option<Ptr>) {
+        self.table = refs;
+        self.steps = None;
+        self.generation += 1;
+        self.ptr = ptr;
+        self.depth = depth;
+        self.genesis = genesis;
+    }
+
+    fn since(&self) -> Result<Option<refs::Since<'_>>> {
+        let Some(known) = self.ptr else {
+            return Ok(None);
+        };
+        Ok(Some((known, self.refs()?, self.genesis, self.depth)))
     }
 
     fn take(&mut self, ptr: Option<Ptr>, loaded: refs::Loaded) {
-        self.refs = loaded.refs;
-        self.ptr = ptr;
-        self.depth = loaded.depth;
-        self.genesis = loaded.genesis;
+        self.set(loaded.refs, ptr, loaded.depth, loaded.genesis);
     }
 }
 
@@ -524,7 +630,14 @@ fn moved(old: Option<&Head>, new: Option<&Head>) -> bool {
 
 enum Next {
     Table(Refs),
-    Head(String, Head),
+    Head(String, Head, Option<Box<refs::Drafted>>),
+}
+
+/// What a frame wrote for its heads: a whole table, with the root of version 0 it names, or a
+/// step setting one branch's head.
+enum Wrote {
+    Table(Refs, Option<Ptr>),
+    Step(String, Head),
 }
 
 /// An immutable view of one version of a branch.
@@ -641,6 +754,9 @@ struct Branch<T> {
     lane_at: u64,
     state: ArcSwap<State<T>>,
     tip: ArcSwap<State<T>>,
+    /// The step that last moved this branch, with the [`RefState::generation`] of `tip` it was
+    /// written in, while it is the branch's newest step there.
+    stepped: Mutex<Option<(u64, Weak<Stepped>)>>,
     feed: Arc<Feed<T>>,
     retired: AtomicBool,
     lane: Mutex<Slot<T>>,
@@ -731,6 +847,7 @@ impl<T> Branch<T> {
             feed: Arc::new(Feed::new(state.snapshot.clone())),
             state: ArcSwap::new(state.clone()),
             tip: ArcSwap::new(state),
+            stepped: Mutex::new(None),
             retired: AtomicBool::new(false),
             lane: Mutex::new(Slot {
                 group: None,
@@ -826,6 +943,18 @@ impl<T> Branch<T> {
         Ok(())
     }
 
+    /// The branch's head in `tip`, taken from the step it last wrote while no table replaced the
+    /// one that step went on, since only this branch's writers step it.
+    fn head_in(&self, tip: &RefState) -> Result<Option<Head>> {
+        if let Some((generation, step)) = &*self.stepped.lock()
+            && *generation == tip.generation
+            && let Some(step) = step.upgrade()
+        {
+            return Ok(Some(step.head.clone()));
+        }
+        tip.head(&self.name)
+    }
+
     fn dropped_in(&self, head: Option<&Head>) -> bool {
         self.name != MAIN && head.is_none_or(|head| head.born != self.born)
     }
@@ -841,7 +970,7 @@ type Moved<T> = (Arc<Branch<T>>, Arc<State<T>>);
 
 type LaneWaits = Mutex<HashMap<(u64, bool), Vec<Waker>>>;
 
-type Update<T> = Option<Moved<T>>;
+type Update<T> = Option<(Arc<Branch<T>>, Laid<T>)>;
 
 struct Pending<T> {
     frame: Frame,
@@ -1748,12 +1877,7 @@ impl Options {
                 Genesis::given(value, hash)
             }
         };
-        let tip = RefState {
-            refs: loaded.refs,
-            ptr: head,
-            depth: loaded.depth,
-            genesis: loaded.genesis,
-        };
+        let tip = RefState::new(loaded.refs, head, loaded.depth, loaded.genesis);
         let settled = store.last_seq();
         let automatic = !read_only && self.history != Keep::All && self.reclaim.every_bytes > 0;
         let signal = Arc::new(Signal {
@@ -1801,7 +1925,8 @@ impl Options {
             lane_waits: Arc::default(),
             flush: Shared::<T>::flush,
         });
-        let refs = shared.published.lock().refs.clone();
+        let published = shared.published.lock().clone();
+        let refs = published.refs()?.clone();
         let branch = shared.attach(MAIN, &refs)?;
         let follower = match self.follow && (read_only || shared.options.shared) {
             true => Some(Shared::follow_file(&shared, self.follow_poll)?),
@@ -1832,7 +1957,55 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     Ok((txn.put(object, hash)?, decoded))
 }
 
-type Placed = (u64, u64, Option<(Settling, Store, Landing)>);
+type Placed<T> = (u64, u64, Option<Unsettled<T>>);
+
+/// The state a commit's frame publishes for its branch, set by the committing thread once it has
+/// built it, before it writes the frame.
+type Laid<T> = Arc<OnceLock<Arc<State<T>>>>;
+
+/// A frame placed under `tip` that its commit still has to finish before writing it: build its
+/// branch's new state, unless the frame was written in place and the state built under `tip`,
+/// and settle how its draft moved.
+struct Unsettled<T> {
+    settling: Settling,
+    store: Store,
+    landing: Landing,
+    slot: Laid<T>,
+    later: Option<Later<T>>,
+}
+
+/// What a commit builds its branch's new state from once it has let `tip` go: the drafted value
+/// and the root object it was decoded from, which a moved draft decodes again through its moved
+/// links, and the commit and log.
+struct Later<T> {
+    value: T,
+    object: Object,
+    commit: Commit,
+    log: Chain,
+}
+
+impl<T: Data> Later<T> {
+    fn state(self, store: &Store, moves: Option<&Moves>) -> Result<State<T>> {
+        let value = match moves {
+            None => self.value,
+            Some(moves) => {
+                let links = self.object.links.iter().map(|link| moves.ptr(*link));
+                let links = links.collect::<Option<Vec<_>>>().ok_or_else(|| {
+                    Error::Corrupt("a drafted root links a record its frame lost".into())
+                })?;
+                T::decode(&mut Decoder::new(&self.object.body, &links, Some(store)))?
+            }
+        };
+        Ok(State {
+            snapshot: Snapshot {
+                value: Arc::new(value),
+                commit: Arc::new(self.commit),
+            },
+            log: self.log,
+            store: store.clone(),
+        })
+    }
+}
 
 struct Draft<T> {
     txn: Txn,
@@ -1841,6 +2014,7 @@ struct Draft<T> {
     value: T,
     object: Object,
     entry: Option<(Commit, Chain)>,
+    step: Option<Box<refs::Drafted>>,
 }
 
 fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
@@ -1857,6 +2031,7 @@ fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
         value,
         object,
         entry: None,
+        step: None,
     })
 }
 
@@ -2262,7 +2437,7 @@ impl<T: Data> Shared<T> {
                 });
             }
             None => {
-                let refs = tip.refs.clone();
+                let refs = tip.refs()?.clone();
                 self.stage(tip, Next::Table(refs), txn, None, None, None)?
                     .land()?;
             }
@@ -2300,9 +2475,10 @@ impl<T: Data> Shared<T> {
             }
             let tip = self.tip.lock();
             let _whole = reentry::whole(self.id, self.file_id);
-            let published = self.published.lock().refs.clone();
+            let published = self.published.lock().clone();
+            let published = published.refs()?.clone();
             if self.options.shared {
-                let newest = tip.refs.try_get(name)?;
+                let newest = tip.refs()?.try_get(name)?;
                 let seen = published.try_get(name)?;
                 if moved(seen.as_deref(), newest.as_deref()) {
                     continue;
@@ -2583,7 +2759,7 @@ impl<T: Data> Shared<T> {
         }
         if tip.genesis.is_none() {
             let _whole = reentry::whole(self.id, self.file_id);
-            let refs = tip.refs.clone();
+            let refs = tip.refs()?.clone();
             let txn = crossed.begin()?;
             self.stage(&mut tip, Next::Table(refs), txn, None, None, None)?
                 .land()?;
@@ -2654,7 +2830,7 @@ impl<T: Data> Shared<T> {
         frame: Frame,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
-        let loaded = refs::load(store, Some(frame.head), tip.since())?;
+        let loaded = refs::load(store, Some(frame.head), tip.since()?)?;
         let named = self.genesis_named(store, loaded.genesis);
         let genesis = self.genesis_after(named.as_ref());
         let adopted = genesis.hash != self.genesis.load().hash;
@@ -2668,7 +2844,7 @@ impl<T: Data> Shared<T> {
                 gone.push(branch);
                 continue;
             }
-            let old = tip.refs.try_get(&branch.name)?;
+            let old = tip.refs()?.try_get(&branch.name)?;
             let rooted = new.as_deref().is_some_and(|head| head.root.is_some());
             if moved(old.as_deref(), new.as_deref()) || (adopted && !rooted) {
                 let state = Arc::new(Self::state_in(&genesis, store, new.as_deref())?);
@@ -2793,7 +2969,7 @@ impl<T: Data> Shared<T> {
         let Some(ptr) = head else {
             return Ok(false);
         };
-        let since = tip.since().filter(|_| !replaced);
+        let since = tip.since()?.filter(|_| !replaced);
         let loaded = refs::load(&store, Some(ptr), since).inspect_err(|_| {
             if replaced {
                 store.close();
@@ -2876,19 +3052,19 @@ impl<T: Data> Shared<T> {
         drafted.txn.look_ahead();
         let mut tip = self.lock_tip(notices)?;
         let whole = reentry::whole(self.id, self.file_id);
-        let committed = self.commit_locked(&mut tip, change, drafted);
-        drop(whole);
-        let (version, time_ms, settling) = committed?;
-        let Some((settling, store, landing)) = settling else {
+        let (version, time_ms, unsettled) = self.commit_locked(&mut tip, change, drafted)?;
+        let Some(unsettled) = unsettled else {
             return Ok((version, time_ms));
         };
-        if tip.commit.is_some() {
-            self.land(branch, state, framed, landing)?;
+        let (settling, store) = if tip.commit.is_some() {
+            let laid = self.lay(branch, state, framed, unsettled)?;
             drop(tip);
+            laid
         } else {
             drop(tip);
-            self.land(branch, state, framed, landing)?;
-        }
+            self.lay(branch, state, framed, unsettled)?
+        };
+        drop(whole);
         landed();
         settling.finish(&store);
         Ok((version, time_ms))
@@ -3285,7 +3461,7 @@ impl<T: Data> Shared<T> {
         tip: &mut RefState,
         next: Next,
         txn: Txn,
-        branch: Option<(&Arc<Branch<T>>, State<T>)>,
+        branch: Option<(&Arc<Branch<T>>, Laid<T>)>,
         seal: Option<(&Arc<Seal>, u64, u64)>,
         settling: Option<&mut Settling>,
     ) -> Result<Landing> {
@@ -3311,25 +3487,23 @@ impl<T: Data> Shared<T> {
         tip: &mut RefState,
         next: Next,
         mut txn: Txn,
-        branch: Option<(&Arc<Branch<T>>, State<T>)>,
+        branch: Option<(&Arc<Branch<T>>, Laid<T>)>,
         settling: Option<&mut Settling>,
     ) -> Result<(Landing, Pending<T>)> {
         txn.unshared();
         let store = self.store();
         let stepped = tip.depth < refs::STEPS && tip.genesis.is_some();
         let mut written = None;
-        let (ptr, refs, depth, genesis) = match (next, tip.ptr) {
-            (Next::Head(name, head), Some(prev)) if stepped => {
-                let (ptr, head) = refs::write_step(&mut txn, &store, prev, &name, &head)?;
-                let mut refs = tip.refs.clone();
-                refs.try_insert(name, head)?;
-                (ptr, refs, tip.depth + 1, tip.genesis)
+        let (ptr, wrote) = match (next, tip.ptr) {
+            (Next::Head(name, head, drafted), Some(prev)) if stepped => {
+                let (ptr, head) = refs::write_step(&mut txn, &store, prev, &name, head, drafted)?;
+                (ptr, Wrote::Step(name, head))
             }
             (next, _) => {
                 let refs = match next {
                     Next::Table(refs) => refs,
-                    Next::Head(name, head) => {
-                        let mut refs = tip.refs.clone();
+                    Next::Head(name, head, _) => {
+                        let mut refs = tip.refs()?.clone();
                         refs.try_insert(name, head)?;
                         refs
                     }
@@ -3347,7 +3521,7 @@ impl<T: Data> Shared<T> {
                 else {
                     return Err(Error::Corrupt("a branch table decoded as a step".into()));
                 };
-                (ptr, refs, 0, genesis)
+                (ptr, Wrote::Table(refs, genesis))
             }
         };
         if let Some(settling) = settling {
@@ -3356,16 +3530,16 @@ impl<T: Data> Shared<T> {
         let landing = txn.place(ptr)?;
         let frame = landing.frame();
         let committed = branch.as_ref().map(|(branch, _)| Arc::clone(branch));
-        let update = branch.map(|(branch, state)| {
-            let state = Arc::new(state);
-            branch.tip.store(state.clone());
-            branch.framed.store(frame.seq, Ordering::Release);
-            (branch.clone(), state)
-        });
-        tip.refs = refs;
-        tip.ptr = Some(ptr);
-        tip.depth = depth;
-        tip.genesis = genesis;
+        let update = branch.map(|(branch, slot)| (branch.clone(), slot));
+        match wrote {
+            Wrote::Table(refs, genesis) => tip.set(refs, Some(ptr), 0, genesis),
+            Wrote::Step(name, head) => {
+                let step = tip.step(ptr, name, head);
+                if let Some(branch) = &committed {
+                    *branch.stepped.lock() = Some((tip.generation, Arc::downgrade(&step)));
+                }
+            }
+        }
         let mut pending = Pending {
             frame,
             refs: tip.clone(),
@@ -3452,8 +3626,10 @@ impl<T: Data> Shared<T> {
             if !synced {
                 continue;
             }
-            if let Some((branch, state)) = pending.update.take() {
-                notices.push(branch.publish(state));
+            if let Some((branch, slot)) = pending.update.take()
+                && let Some(state) = slot.get()
+            {
+                notices.push(branch.publish(state.clone()));
             }
             for (branch, state) in pending.followed.drain(..) {
                 notices.push(branch.publish(state));
@@ -3535,6 +3711,45 @@ impl<T: Data> Shared<T> {
         read_clock(self.clock.as_ref())
     }
 
+    /// Finishes a frame placed under `tip` and writes it: settles how its draft moved, builds the
+    /// branch's new state and makes it the branch's tip, and lands the frame. `state` and
+    /// `framed` are the branch's tip before, which a failed write puts back.
+    ///
+    /// The caller keeps the record of the whole file until this returns, so that user code run
+    /// here, the decode of a moved root and the drops of what it replaces, cannot start a write,
+    /// which would wait behind a frame placed after this one, and so for this one.
+    fn lay(
+        &self,
+        branch: &Branch<T>,
+        state: &Arc<State<T>>,
+        framed: u64,
+        unsettled: Unsettled<T>,
+    ) -> Result<(Settling, Store)> {
+        let Unsettled {
+            mut settling,
+            store,
+            landing,
+            slot,
+            later,
+        } = unsettled;
+        settling.settle();
+        let next = match later {
+            Some(later) => {
+                let next = Arc::new(later.state(&store, settling.moves())?);
+                let _ = slot.set(next.clone());
+                next
+            }
+            None => slot
+                .get()
+                .cloned()
+                .ok_or_else(|| Error::Corrupt("a frame written in place lost its state".into()))?,
+        };
+        branch.tip.store(next);
+        branch.framed.store(landing.frame().seq, Ordering::Release);
+        self.land(branch, state, framed, landing)?;
+        Ok((settling, store))
+    }
+
     fn land(
         &self,
         branch: &Branch<T>,
@@ -3559,6 +3774,16 @@ impl<T: Data> Shared<T> {
             && drafted.store.id() == change.state.store.id()
         {
             drafted.entry = self.draft_entry(change, &mut drafted)?;
+        }
+        if let Some((commit, log)) = &drafted.entry {
+            let head = Head {
+                version: commit.version,
+                root: commit.root,
+                log: *log,
+                merged: Map::new(),
+                born: change.branch.born,
+            };
+            drafted.step = Some(Box::new(refs::Drafted::new(&change.branch.name, head)?));
         }
         self.step("drafted");
         Ok(drafted)
@@ -3614,7 +3839,7 @@ impl<T: Data> Shared<T> {
         tip: &mut RefState,
         change: Change<'_, T>,
         drafted: Draft<T>,
-    ) -> Result<Placed> {
+    ) -> Result<Placed<T>> {
         let Change {
             branch,
             state,
@@ -3635,7 +3860,7 @@ impl<T: Data> Shared<T> {
                     "the file was replaced while a closure held its branch".into(),
                 ));
             }
-            let head = tip.refs.try_get(&branch.name)?;
+            let head = branch.head_in(tip)?;
             let at = head.and_then(|head| head.log.tip.map(|ptr| ptr.hash));
             if at != state.log.tip.map(|ptr| ptr.hash) {
                 return Err(Error::Corrupt(format!(
@@ -3655,9 +3880,10 @@ impl<T: Data> Shared<T> {
             mut txn,
             store,
             mut root,
-            mut value,
+            value,
             object,
             entry,
+            step,
         } = drafted;
         let previous = state.snapshot.commit.root.map(|ptr| ptr.hash);
         let version = state
@@ -3666,7 +3892,7 @@ impl<T: Data> Shared<T> {
             .version
             .checked_add(1)
             .ok_or_else(|| Error::Corrupt("the branch has reached the last version".into()))?;
-        let current = tip.refs.try_get(&branch.name)?;
+        let current = branch.head_in(tip)?;
         let born = current.as_ref().map_or(0, |head| head.born);
         let mut merged = current.map(|head| head.merged.clone()).unwrap_or_default();
         let recorded = match intent.record {
@@ -3685,16 +3911,13 @@ impl<T: Data> Shared<T> {
         }
         let mut settling = txn.rebase()?;
         let corrupt = || Error::Corrupt("a drafted root links a record its frame lost".into());
-        if let Some(moves) = settling.moves() {
-            root = moves.ptr(root).ok_or_else(corrupt)?;
-            let links = object.links.iter().map(|link| moves.ptr(*link));
-            let links = links.collect::<Option<Vec<_>>>().ok_or_else(corrupt)?;
-            value = T::decode(&mut Decoder::new(&object.body, &links, Some(&store)))?;
+        if settling.moved() {
+            root = settling.ptr(root).ok_or_else(corrupt)?;
         }
         let (commit, log) = match entry {
             Some((commit, log)) => {
-                let tip = match (settling.moves(), log.tip) {
-                    (Some(moves), Some(tip)) => Some(moves.ptr(tip).ok_or_else(corrupt)?),
+                let tip = match (settling.moved(), log.tip) {
+                    (true, Some(tip)) => Some(settling.ptr(tip).ok_or_else(corrupt)?),
                     (_, tip) => tip,
                 };
                 let commit = Commit {
@@ -3732,10 +3955,6 @@ impl<T: Data> Shared<T> {
             }
         };
         let time_ms = commit.time_ms;
-        let snapshot = Snapshot {
-            value: Arc::new(value),
-            commit: Arc::new(commit),
-        };
         let next = Next::Head(
             branch.name.clone(),
             Head {
@@ -3745,22 +3964,39 @@ impl<T: Data> Shared<T> {
                 merged,
                 born,
             },
+            step,
         );
-        let state = State {
-            snapshot,
+        let slot = Laid::default();
+        let later = Later {
+            value,
+            object,
+            commit,
             log,
-            store: store.clone(),
+        };
+        let later = match txn.spilled() {
+            true => {
+                let _ = slot.set(Arc::new(later.state(&store, None)?));
+                None
+            }
+            false => Some(later),
         };
         let seal = seal.map(|seal| (seal, version, time_ms));
         let landing = self.stage(
             tip,
             next,
             txn,
-            Some((branch, state)),
+            Some((branch, slot.clone())),
             seal,
             Some(&mut settling),
         )?;
-        Ok((version, time_ms, Some((settling, store, landing))))
+        let unsettled = Unsettled {
+            settling,
+            store,
+            landing,
+            slot,
+            later,
+        };
+        Ok((version, time_ms, Some(unsettled)))
     }
 
     fn step(&self, name: &'static str) {
@@ -3799,9 +4035,9 @@ impl<T: Data> Shared<T> {
                 }
                 keep => keep,
             };
-            let mut next = tip.refs.clone();
+            let mut next = tip.refs()?.clone();
             let mut dropped = 0;
-            for (name, mut head) in tip.refs.try_entries()? {
+            for (name, mut head) in tip.refs()?.try_entries()? {
                 let log = head.log.pruned(&store, keep)?;
                 if log != head.log {
                     dropped = u64::saturating_add(dropped, (head.log.len() - log.len()) as u64);
@@ -3816,7 +4052,7 @@ impl<T: Data> Shared<T> {
             self.stage(tip, Next::Table(next), txn, None, None, None)?
                 .land()?;
             self.settle(store.last_seq(), notices)?;
-            let refs = tip.refs.clone();
+            let refs = tip.refs()?.clone();
             let attached: Vec<_> = self.branches.lock().values().cloned().collect();
             for branch in &attached {
                 if let Some(head) = refs.try_get(&branch.name)? {
@@ -3941,7 +4177,7 @@ impl<T: Data> Shared<T> {
                 let (head, objects) = {
                     let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
                     let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
-                    copier.finish(&tip.refs, tip.genesis, store.last_seq(), survival)?
+                    copier.finish(tip.refs()?, tip.genesis, store.last_seq(), survival)?
                 };
                 report.handed_out = copier.handed_out();
                 let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
@@ -3964,12 +4200,12 @@ impl<T: Data> Shared<T> {
 
     fn copied_refs(&self, notices: &mut Vec<Notice<T>>) -> Result<(Refs, Option<Ptr>)> {
         if !self.options.shared {
-            let published = self.published.lock();
-            return Ok((published.refs.clone(), published.genesis));
+            let published = self.published.lock().clone();
+            return Ok((published.refs()?.clone(), published.genesis));
         }
         let mut tip = self.tip.lock();
         self.follow(&mut tip, false, notices)?;
-        Ok((tip.refs.clone(), tip.genesis))
+        Ok((tip.refs()?.clone(), tip.genesis))
     }
 
     fn swap_in(
@@ -5291,14 +5527,14 @@ impl<T: Data> Db<T> {
             let store = self.shared.store();
             let found = Self::merge_base(
                 &store,
-                (&self.branch.name, ours, &tip.refs),
+                (&self.branch.name, ours, tip.refs()?),
                 (&other.branch.name, &theirs, &published),
             )?;
             let link = match theirs.log.tip {
                 Some(ptr) if !holds(&found, ptr) => Some(Self::link_to(&theirs, ptr)?),
                 _ => None,
             };
-            let base = self.base_of((&[&tip.refs, &published], &store), found, &mut f)?;
+            let base = self.base_of((&[tip.refs()?, &published], &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -5330,7 +5566,7 @@ impl<T: Data> Db<T> {
             let store = self.shared.store();
             let found = Self::merge_base(
                 &store,
-                (&self.branch.name, ours, &tip.refs),
+                (&self.branch.name, ours, tip.refs()?),
                 (&other.branch.name, &theirs, &published),
             )?;
             let Some(ptr) = theirs.log.tip.filter(|ptr| !holds(&found, *ptr)) else {
@@ -5338,13 +5574,13 @@ impl<T: Data> Db<T> {
             };
             let root_of = |state: &State<T>| state.snapshot.commit.root.map(|ptr| ptr.hash);
             if root_of(ours) == root_of(&theirs) {
-                let starts = Self::starts(&store, (&self.branch.name, ours, &tip.refs))?;
+                let starts = Self::starts(&store, (&self.branch.name, ours, tip.refs()?))?;
                 if !brings_change(ours, starts, &found, &theirs)? {
                     return Ok((String::new(), Err(None), Intent::default()));
                 }
             }
             let link = Some(Self::link_to(&theirs, ptr)?);
-            let base = self.base_of((&[&tip.refs, &published], &store), found, &mut f)?;
+            let base = self.base_of((&[tip.refs()?, &published], &store), found, &mut f)?;
             let (message, value) = f(root, &base, &theirs.snapshot)?;
             let intent = Intent {
                 merged: link,
@@ -5487,7 +5723,7 @@ impl<T: Data> Db<T> {
 
     fn common_starts(&self, other: &Db<T>) -> Result<Vec<Start>> {
         self.same_file(other)?;
-        let (refs, store, ours, theirs) = {
+        let (published, store, ours, theirs) = {
             let published = self.shared.published.lock();
             self.branch.check_live()?;
             other.branch.check_live()?;
@@ -5495,17 +5731,13 @@ impl<T: Data> Db<T> {
                 self.branch.state.load_full(),
                 other.branch.state.load_full(),
             );
-            (
-                published.refs.clone(),
-                self.shared.store(),
-                states.0,
-                states.1,
-            )
+            (published.clone(), self.shared.store(), states.0, states.1)
         };
+        let refs = published.refs()?;
         Self::merge_base(
             &store,
-            (&self.branch.name, &ours, &refs),
-            (&other.branch.name, &theirs, &refs),
+            (&self.branch.name, &ours, refs),
+            (&other.branch.name, &theirs, refs),
         )
     }
 
@@ -5517,9 +5749,12 @@ impl<T: Data> Db<T> {
     }
 
     fn published_view(&self) -> Result<(Arc<State<T>>, Refs)> {
-        let published = self.shared.published.lock();
-        self.branch.check_live()?;
-        Ok((self.branch.state.load_full(), published.refs.clone()))
+        let (state, published) = {
+            let published = self.shared.published.lock();
+            self.branch.check_live()?;
+            (self.branch.state.load_full(), published.clone())
+        };
+        Ok((state, published.refs()?.clone()))
     }
 
     fn merge_base(
@@ -5614,18 +5849,17 @@ impl<T: Data> Db<T> {
         self.branch.check_live()?;
         let mut tip = self.shared.lock_tip(&mut notices)?;
         let whole = reentry::whole(self.shared.id, self.shared.file_id);
-        if name == MAIN || tip.refs.try_get(name)?.is_some() {
+        if name == MAIN || tip.refs()?.try_get(name)?.is_some() {
             return Err(Error::BranchExists(name.to_string()));
         }
         let state = self.branch.tip.load_full();
         let commit = &state.snapshot.commit;
         let merged = tip
-            .refs
-            .try_get(&self.branch.name)?
-            .map(|head| head.merged.clone())
+            .head(&self.branch.name)?
+            .map(|head| head.merged)
             .unwrap_or_default();
         let store = self.shared.store();
-        let mut next = tip.refs.clone();
+        let mut next = tip.refs()?.clone();
         next.insert(
             name.to_string(),
             Head {
@@ -5703,12 +5937,12 @@ impl<T: Data> Db<T> {
             {
                 continue;
             }
-            if tip.refs.try_get(name)?.is_none() {
+            if tip.refs()?.try_get(name)?.is_none() {
                 return Err(Error::NoBranch(name.to_string()));
             }
             let store = self.shared.store();
             let txn = store.begin()?;
-            let mut next = tip.refs.clone();
+            let mut next = tip.refs()?.clone();
             next.remove(name);
             for (branch, mut head) in next.try_entries()? {
                 if head.merged.try_get(name)?.is_some() {
@@ -5738,7 +5972,7 @@ impl<T: Data> Db<T> {
     /// The names of every branch in the file, sorted, `main` included.
     pub fn branches(&self) -> Vec<String> {
         let refs = self.shared.published.lock();
-        let mut names: Vec<String> = refs.refs.keys().collect();
+        let mut names: Vec<String> = refs.table.keys().collect();
         if !names.iter().any(|name| name == MAIN) {
             names.push(MAIN.to_string());
             names.sort();
@@ -5967,13 +6201,13 @@ impl<T: Data> Db<T> {
     ///
     /// [`List`]: crate::List
     pub fn verify_typed(&self) -> Result<Verified> {
-        let (head, refs, genesis, store) = {
+        let (published, store) = {
             let published = self.shared.published.lock();
-            let refs = published.refs.clone();
-            (published.ptr, refs, published.genesis, self.shared.store())
+            (published.clone(), self.shared.store())
         };
+        let (head, refs, genesis) = (published.ptr, published.refs()?, published.genesis);
         let report = crate::admin::verified(&store, head)?;
-        crate::admin::typed::<T>(&store, &refs, genesis)?;
+        crate::admin::typed::<T>(&store, refs, genesis)?;
         Ok(report)
     }
 }
@@ -6034,9 +6268,18 @@ impl<T: Data> Db<T> {
     }
 
     /// The current store and the branch table as last published.
-    pub(crate) fn published_refs(&self) -> (Store, Refs) {
-        let published = self.shared.published.lock();
-        (self.shared.store(), published.refs.clone())
+    pub(crate) fn published_refs(&self) -> Result<(Store, Refs)> {
+        let (store, published) = {
+            let published = self.shared.published.lock();
+            (self.shared.store(), published.clone())
+        };
+        Ok((store, published.refs()?.clone()))
+    }
+
+    /// The current store, as [`Db::published_refs`] gives it.
+    pub(crate) fn published_store(&self) -> Store {
+        let _published = self.shared.published.lock();
+        self.shared.store()
     }
 
     /// Calls the [`Options::hook`] at the step `name`, if one is set.
@@ -6144,7 +6387,7 @@ impl<T: Data> Db<T> {
             self.branch.check_live()?;
             let store = shared.store();
             let mut txn = store.begin()?;
-            let (next, out) = edit(&store, &mut txn, &tip.refs)?;
+            let (next, out) = edit(&store, &mut txn, tip.refs()?)?;
             let Some(next) = next else {
                 return Ok(out);
             };
@@ -6152,7 +6395,7 @@ impl<T: Data> Db<T> {
                 shared.write_records(tip, txn)?;
                 txn = store.begin()?;
             }
-            let states = shared.moved_states(&store, &tip.refs, &next)?;
+            let states = shared.moved_states(&store, tip.refs()?, &next)?;
             let (landing, mut pending) =
                 shared.place_frame(tip, Next::Table(next), txn, None, None)?;
             let landed = landing.land();

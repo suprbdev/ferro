@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::codec::{Data, Decoder, Encoder, Kind, Ptr, Sink};
+use crate::codec::{Data, Decoder, Encoder, HashSink, Kind, Object, Ptr, Sink};
 use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
 use crate::map::Map;
@@ -97,27 +97,91 @@ impl Data for Root {
     }
 }
 
-/// Writes the step that sets branch `name` to `head` on top of the table or step at `prev`.
+/// A step encoded before its commit knows the table or step it goes on top of, for the head the
+/// commit expects to write.
+pub(crate) struct Drafted {
+    head: Head,
+    object: Object,
+}
+
+impl Drafted {
+    /// Encodes the step that sets branch `name` to `head`, a head with no merge records, with a
+    /// stand-in for its link to the table or step before it.
+    pub(crate) fn new(name: &str, head: Head) -> Result<Drafted> {
+        let stand_in = Ptr {
+            hash: Default::default(),
+            offset: 0,
+        };
+        let mut sink = HashSink;
+        let mut encoder = Encoder::new(&mut sink);
+        encode_step(&mut encoder, stand_in, name, &head)?;
+        Ok(Drafted {
+            head,
+            object: encoder.into_object(),
+        })
+    }
+
+    /// The drafted step as it encodes on top of `prev` for `head`, if `head` encodes as the head
+    /// it was drafted for: the same fields, links to the same objects wherever they now lie, and
+    /// no merge records.
+    fn fit(self: Box<Self>, prev: Ptr, head: &Head) -> Option<Object> {
+        let hash = |ptr: Option<Ptr>| ptr.map(|ptr| ptr.hash);
+        let drafted = &self.head;
+        let same = head.merged.is_empty()
+            && drafted.version == head.version
+            && drafted.born == head.born
+            && drafted.log.first == head.log.first
+            && hash(drafted.root) == hash(head.root)
+            && hash(drafted.log.tip) == hash(head.log.tip);
+        if !same {
+            return None;
+        }
+        let mut object = self.object;
+        object.links.clear();
+        object.links.push(prev);
+        object.links.extend(head.root);
+        object.links.extend(head.log.tip);
+        Some(object)
+    }
+}
+
+/// Writes the step that sets branch `name` to `head` on top of the table or step at `prev`,
+/// taking it from `drafted` if that was drafted for this head.
 ///
-/// It returns the step's pointer and the head as decoded back from what was written.
+/// It returns the step's pointer and the head as a reader of the step finds it: `head` itself
+/// when it holds no merge records, and otherwise decoded back from what was written, so that its
+/// merge records are a link to the records the step wrote.
 pub(crate) fn write_step(
     txn: &mut Txn,
     store: &Store,
     prev: Ptr,
     name: &str,
-    head: &Head,
+    head: Head,
+    drafted: Option<Box<Drafted>>,
 ) -> Result<(Ptr, Head)> {
-    let mut encoder = Encoder::new(txn);
-    encode_step(&mut encoder, prev, name, head)?;
-    let object = encoder.into_object();
-    let decoded = Root::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
-    let Root::Step(step) = decoded else {
-        return Err(Error::Corrupt(
-            "a branch table step decoded as a table".into(),
-        ));
+    let object = match drafted.and_then(|drafted| drafted.fit(prev, &head)) {
+        Some(object) => object,
+        None => {
+            let mut encoder = Encoder::new(txn);
+            encode_step(&mut encoder, prev, name, &head)?;
+            encoder.into_object()
+        }
+    };
+    let head = match head.merged.is_empty() {
+        true => head,
+        false => {
+            let decoded =
+                Root::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+            let Root::Step(step) = decoded else {
+                return Err(Error::Corrupt(
+                    "a branch table step decoded as a table".into(),
+                ));
+            };
+            step.head
+        }
     };
     let hash = object.hash();
-    Ok((txn.put(object, hash)?, step.head))
+    Ok((txn.put(object, hash)?, head))
 }
 
 /// A branch table as [`load`] reads it.
@@ -291,7 +355,7 @@ mod tests {
 
     fn step(store: &Store, prev: Ptr, name: &str, version: u64) -> Ptr {
         let mut txn = store.begin().unwrap();
-        let (ptr, _) = write_step(&mut txn, store, prev, name, &head(version)).unwrap();
+        let (ptr, _) = write_step(&mut txn, store, prev, name, head(version), None).unwrap();
         txn.commit(ptr).unwrap();
         ptr
     }
@@ -434,5 +498,49 @@ mod tests {
         let trailing = encoder.finish().unwrap();
         txn.commit(trailing).unwrap();
         assert!(load(&store, Some(trailing), None).is_err());
+    }
+
+    #[test]
+    fn a_drafted_step_is_the_step_encoded_on_its_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let base = table(&store, 2);
+        let moved = Ptr {
+            hash: base.hash,
+            offset: base.offset + 1,
+        };
+        let linked = |root: Ptr| Head {
+            version: 3,
+            root: Some(root),
+            log: Chain {
+                tip: Some(root),
+                first: 1,
+                last: 3,
+            },
+            merged: Map::new(),
+            born: 7,
+        };
+        let written = |drafted: Option<Box<Drafted>>| {
+            let mut txn = store.begin().unwrap();
+            let (ptr, head) =
+                write_step(&mut txn, &store, base, "b1", linked(moved), drafted).unwrap();
+            txn.commit(ptr).unwrap();
+            let Root::Step(step) = store.decode_at(ptr, Root::decode).unwrap() else {
+                panic!("a step read back as a table");
+            };
+            assert_eq!(
+                (step.prev, step.head.root, step.head.log),
+                (base, Some(moved), head.log)
+            );
+            ptr.hash
+        };
+        let fresh = written(None);
+        let drafted = Drafted::new("b1", linked(base)).unwrap();
+        assert_eq!(written(Some(Box::new(drafted))), fresh);
+        let mut other = linked(base);
+        other.version = 4;
+        other.log.last = 4;
+        let unfit = Drafted::new("b1", other).unwrap();
+        assert_eq!(written(Some(Box::new(unfit))), fresh);
     }
 }
