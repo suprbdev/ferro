@@ -41,7 +41,7 @@ use std::any::{Any, TypeId, type_name};
 use std::borrow::{Borrow, Cow};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::{Deref, Range};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1514,25 +1514,53 @@ pub(crate) trait Walks {
     fn walk(&self, found: &mut Found) -> Result<()>;
 }
 
-/// Where a typed check puts the typed links it finds: all of them, for the caller to check once
-/// the check is done, or, with a [`Walks`], at most [`FOUND_HELD`] at a time, each batch walked
-/// as it fills.
+/// A [`Walks`] that drops what it is handed, for a check that only needs to pass.
+struct Dropped;
+
+impl Walks for Dropped {
+    fn walk(&self, found: &mut Found) -> Result<()> {
+        found.clear();
+        Ok(())
+    }
+}
+
+/// Where a typed check puts the typed links it finds, and where a decoder that does not hold its
+/// object's links reads them from.
+///
+/// One made with [`new`](Finding::new) keeps every typed link for the caller to check once the
+/// check is done. One made with [`reading`](Finding::reading) holds them until [`FOUND_HELD`] wait,
+/// and hands that batch to its [`Walks`] when the decoder next reads a link, so that a typed link
+/// is never walked before the decoder has read past it.
 pub(crate) struct Finding<'a> {
     found: RefCell<Found>,
     walks: Option<&'a dyn Walks>,
+    links: Option<&'a StagedLinks<'a>>,
 }
 
 impl<'a> Finding<'a> {
-    /// A place for the typed links a check finds, which hands them to `walks`, if given, as they
-    /// fill a batch.
-    pub(crate) fn new(walks: Option<&'a dyn Walks>) -> Finding<'a> {
+    /// A place for the typed links a check finds in an object whose links its decoder holds,
+    /// which keeps them all.
+    pub(crate) fn new() -> Finding<'a> {
         Finding {
             found: RefCell::new(Vec::new()),
-            walks,
+            walks: None,
+            links: None,
         }
     }
 
-    /// Walks the typed links held, once they fill a batch.
+    /// A place for the typed links a check finds in an object whose links `links` reads as the
+    /// check comes to each, which hands them to `walks` as they fill a batch, or drops them
+    /// without one.
+    pub(crate) fn reading(links: &'a StagedLinks<'a>, walks: Option<&'a dyn Walks>) -> Finding<'a> {
+        Finding {
+            found: RefCell::new(Vec::new()),
+            walks: Some(walks.unwrap_or(&Dropped)),
+            links: Some(links),
+        }
+    }
+
+    /// Walks the typed links held, once they fill a batch, as a decoder that reads its links from
+    /// a [`StagedLinks`] does before it reads the next.
     ///
     /// # Errors
     ///
@@ -1546,16 +1574,28 @@ impl<'a> Finding<'a> {
         }
     }
 
-    /// Drops the typed links held at or past `index`, as a decoder that goes back to a
-    /// checkpoint before them reads them again.
-    fn forget_from(&self, index: usize) {
-        self.found.borrow_mut().retain(|(at, _)| *at < index);
-    }
-
     /// The typed links found and not yet walked.
     pub(crate) fn into_found(self) -> Found {
         self.found.into_inner()
     }
+}
+
+/// An empty list of links whose address carries `count`, standing for the links of a part of an
+/// object that a decoder reads from a [`StagedLinks`] as it comes to each, as
+/// [`counted_links`] reads it back.
+fn uncounted_links(count: usize) -> &'static [Ptr] {
+    let at = count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(align_of::<Ptr>()))
+        .expect("a staged record has fewer links than the address space");
+    // SAFETY: `at` is a nonzero multiple of the alignment of `Ptr`, so the pointer is non-null
+    // and aligned, and a list of no links reads no memory through it.
+    unsafe { std::slice::from_raw_parts(std::ptr::without_provenance(at), 0) }
+}
+
+/// The count that [`uncounted_links`] made `links` carry.
+fn counted_links(links: &[Ptr]) -> usize {
+    links.as_ptr().addr() / align_of::<Ptr>() - 1
 }
 
 /// What checks that the indexes of a table agree with its rows: given the table, a table of the
@@ -2431,7 +2471,7 @@ impl Kind {
         store: Option<&Store>,
         tables: Option<&RefCell<Vec<FoundTable>>>,
     ) -> Result<(Shape, Found, u64)> {
-        let found = Finding::new(None);
+        let found = Finding::new();
         let mut decoder = Decoder::new(body, links, store);
         decoder.found = Some(&found);
         decoder.tables = tables;
@@ -2442,9 +2482,9 @@ impl Kind {
     }
 
     /// Checks an object without a store, as [`check`](Kind::check) does, reading its links from
-    /// `links` as the check comes to each, putting each typed link it finds in `found`, if given,
-    /// and adding to `tables`, if given, each table value it reads. It returns the object's shape
-    /// and the zero-width items it read.
+    /// the [`StagedLinks`] that `found` was made with as the check comes to each, putting each
+    /// typed link it finds in `found`, and adding to `tables`, if given, each table value it
+    /// reads. It returns the object's shape and the zero-width items it read.
     ///
     /// # Errors
     ///
@@ -2453,12 +2493,10 @@ impl Kind {
     pub(crate) fn check_reading(
         &self,
         body: &[u8],
-        links: &StagedLinks<'_>,
-        found: Option<&Finding<'_>>,
+        found: &Finding<'_>,
         tables: Option<&RefCell<Vec<FoundTable>>>,
     ) -> Result<(Shape, u64)> {
-        let mut decoder = Decoder::reading(body, links, None);
-        decoder.found = found;
+        let mut decoder = Decoder::reading(body, found, None);
         decoder.tables = tables;
         let shape = (self.check)(self, &mut decoder)?;
         decoder.end()?;
@@ -2466,19 +2504,19 @@ impl Kind {
     }
 
     /// Checks an object again with `store`, as [`recheck`](Kind::recheck) does, reading its
-    /// links from `links` as the check comes to each.
+    /// links from the [`StagedLinks`] that `found` was made with as the check comes to each.
     ///
     /// # Errors
     ///
-    /// As for [`check`](Kind::check), and the errors of `links`.
+    /// As for [`check`](Kind::check), and the error of reading a link.
     pub(crate) fn recheck_reading(
         &self,
         body: &[u8],
-        links: &StagedLinks<'_>,
+        found: &Finding<'_>,
         store: &Store,
         recalled: Option<&Recalled>,
     ) -> Result<(Shape, u64)> {
-        let mut decoder = Decoder::reading(body, links, Some(store));
+        let mut decoder = Decoder::reading(body, found, Some(store));
         decoder.recalled = recalled;
         let shape = (self.check)(self, &mut decoder)?;
         decoder.end()?;
@@ -2589,7 +2627,7 @@ impl Checked {
 pub(crate) struct Checkpoint {
     pos: usize,
     cursor: usize,
-    empty_items: u32,
+    empty_items: u64,
     heap: usize,
 }
 
@@ -2601,18 +2639,16 @@ pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
     links: &'a [Ptr],
-    count: usize,
-    source: Option<&'a StagedLinks<'a>>,
     cursor: usize,
     store: Option<&'a Store>,
-    empty_items: u32,
+    empty_items: u64,
     heap: usize,
     base: usize,
     found: Option<&'a Finding<'a>>,
     tables: Option<&'a RefCell<Vec<FoundTable>>>,
     recalled: Option<&'a Recalled>,
     rebuilds: bool,
-    depth: u16,
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -2626,8 +2662,6 @@ impl<'a> Decoder<'a> {
             buf,
             pos: 0,
             links,
-            count: links.len(),
-            source: None,
             cursor: 0,
             store,
             empty_items: 0,
@@ -2641,32 +2675,37 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Creates a decoder of the object with body `buf` whose links `links` reads as the decoder
-    /// comes to each, rather than holding them resolved, with `store` as for
+    /// Creates a decoder of the object with body `buf` whose links it reads from the
+    /// [`StagedLinks`] that `found` was made with as it comes to each, rather than holding them
+    /// resolved, putting the typed links it finds in `found`, with `store` as for
     /// [`new`](Decoder::new).
-    pub(crate) fn reading(
-        buf: &'a [u8],
-        links: &'a StagedLinks<'a>,
-        store: Option<&'a Store>,
-    ) -> Self {
+    ///
+    /// Such a decoder, and each one it makes for a field, holds a list of no links whose address
+    /// carries how many it stands for, and counts its links from one, so that every place that
+    /// would read or count one it holds finds none and goes to [`Decoder::read_link`],
+    /// [`Decoder::unended`] or [`Decoder::staged_part`], while a decoder that holds its links
+    /// takes the same paths it would without.
+    ///
+    /// # Panics
+    ///
+    /// If `found` was not made with [`Finding::reading`].
+    pub(crate) fn reading(buf: &'a [u8], found: &'a Finding<'a>, store: Option<&'a Store>) -> Self {
+        let staged = found
+            .links
+            .expect("a decoder reads links from a finding made to read them");
         Decoder {
-            count: links.count(),
-            source: Some(links),
+            links: uncounted_links(staged.count()),
+            cursor: 1,
+            base: usize::MAX,
+            found: Some(found),
             ..Decoder::new(buf, &[], store)
         }
     }
 
-    /// The links held resolved for the `range` of this decoder's links, as a part of the object
-    /// such as a field holds them, with the number of links in the range.
+    /// The links this decoder reads as it comes to each, if it does not hold them.
     #[inline]
-    fn part(&self, range: Range<usize>) -> (&'a [Ptr], usize) {
-        match self.source {
-            None => {
-                let held = &self.links[range];
-                (held, held.len())
-            }
-            Some(_) => (&[], range.len()),
-        }
+    fn staged(&self) -> Option<&'a StagedLinks<'a>> {
+        self.found.and_then(|found| found.links)
     }
 
     /// Makes this decoder leave empty each index of a table it decodes that the table does not
@@ -2706,7 +2745,8 @@ impl<'a> Decoder<'a> {
         self.empty_items = checkpoint.empty_items;
         self.heap = checkpoint.heap;
         if let Some(found) = self.found {
-            found.forget_from(self.base + checkpoint.cursor);
+            let from = self.base.wrapping_add(checkpoint.cursor);
+            found.found.borrow_mut().retain(|(index, _)| *index < from);
         }
     }
 
@@ -2720,20 +2760,19 @@ impl<'a> Decoder<'a> {
     fn reread<T>(
         &self,
         at: (usize, usize),
-        read: impl FnOnce(&mut Decoder<'a>) -> Result<T>,
+        read: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
+        let dropped = self.staged().map(|staged| Finding::reading(staged, None));
         let mut apart = Decoder {
             buf: self.buf,
             pos: at.0,
             links: self.links,
-            count: self.count,
-            source: self.source,
             cursor: at.1,
             store: self.store,
             empty_items: 0,
             heap: 0,
             base: self.base,
-            found: None,
+            found: dropped.as_ref(),
             tables: None,
             recalled: None,
             rebuilds: self.rebuilds,
@@ -2755,11 +2794,11 @@ impl<'a> Decoder<'a> {
         self.cursor != checkpoint.cursor
     }
 
-    /// The bytes and the links read since `checkpoint`, by a decoder that holds its links
-    /// resolved, as one made by [`new`](Decoder::new) does.
+    /// The bytes and the links read since `checkpoint`, by a decoder that holds its links, as one
+    /// made by [`new`](Decoder::new) does.
     pub(crate) fn read_since(&self, checkpoint: Checkpoint) -> (&'a [u8], &'a [Ptr]) {
         (
-            self.bytes_since(checkpoint),
+            &self.buf[checkpoint.pos..self.pos],
             &self.links[checkpoint.cursor..self.cursor],
         )
     }
@@ -2770,37 +2809,24 @@ impl<'a> Decoder<'a> {
     }
 
     /// The links read since `checkpoint`, read again from the object's [`StagedLinks`] where the
-    /// decoder does not hold them resolved.
+    /// decoder does not hold them.
     ///
     /// # Errors
     ///
     /// The error of reading a link again.
     pub(crate) fn links_since(&self, checkpoint: Checkpoint) -> Result<Cow<'a, [Ptr]>> {
-        match self.links.get(checkpoint.cursor..self.cursor) {
-            Some(links) => Ok(Cow::Borrowed(links)),
-            None => self
-                .read_links(checkpoint.cursor..self.cursor)
+        match self.staged() {
+            None => Ok(Cow::Borrowed(&self.links[checkpoint.cursor..self.cursor])),
+            Some(staged) => (checkpoint.cursor..self.cursor)
+                .map(|at| staged.link(self.base.wrapping_add(at)))
+                .collect::<Result<Vec<_>>>()
                 .map(Cow::Owned),
         }
-    }
-
-    /// The links in `range` of this decoder's links, read from the object's [`StagedLinks`].
-    #[cold]
-    fn read_links(&self, range: Range<usize>) -> Result<Vec<Ptr>> {
-        let source = self
-            .source
-            .ok_or_else(|| Error::Decode("link table exhausted".into()))?;
-        range.map(|at| source.link(self.base + at)).collect()
     }
 
     /// Notes the table value read since `start`, of the table type `id` named `name`, for
     /// `agree` to check once the typed check this decoder belongs to has passed, or beside it
     /// with `beside`, as [`FoundTable::beside`] says, if it collects tables.
-    ///
-    /// # Errors
-    ///
-    /// The error of reading the table's links again, where the decoder does not hold them.
-    #[inline]
     pub(crate) fn found_table(
         &self,
         start: Checkpoint,
@@ -2808,22 +2834,41 @@ impl<'a> Decoder<'a> {
         name: &'static str,
         agree: Agree,
         beside: bool,
-    ) -> Result<()> {
-        match self.tables {
-            None => Ok(()),
-            Some(tables) if self.source.is_none() => {
-                tables
-                    .borrow_mut()
-                    .push(self.table_since(start, id, name, agree, beside));
-                Ok(())
-            }
-            Some(tables) => {
-                let links = self.links_since(start)?;
-                let body = self.bytes_since(start);
-                tables
-                    .borrow_mut()
-                    .push(FoundTable::of(body, &links, id, name, agree, beside));
-                Ok(())
+    ) {
+        let Some(tables) = self.tables else {
+            return;
+        };
+        if self.staged().is_some() {
+            return self.note_staged_table(tables, start, (id, name, agree, beside));
+        }
+        tables
+            .borrow_mut()
+            .push(self.table_since(start, id, name, agree, beside));
+    }
+
+    /// Notes in `tables` the table value read since `start`, of the table type, name, check and
+    /// timing `kind` gives, for a decoder that reads its links from a [`StagedLinks`], reading the
+    /// table's links again, or leaves the error of reading them with the [`StagedLinks`].
+    #[cold]
+    fn note_staged_table(
+        &self,
+        tables: &RefCell<Vec<FoundTable>>,
+        start: Checkpoint,
+        (id, name, agree, beside): (TypeId, &'static str, Agree, bool),
+    ) {
+        match self.links_since(start) {
+            Ok(links) => tables.borrow_mut().push(FoundTable::of(
+                self.bytes_since(start),
+                &links,
+                id,
+                name,
+                agree,
+                beside,
+            )),
+            Err(error) => {
+                if let Some(staged) = self.staged() {
+                    staged.fail(error);
+                }
             }
         }
     }
@@ -2839,7 +2884,16 @@ impl<'a> Decoder<'a> {
         beside: bool,
     ) -> FoundTable {
         let (body, links) = self.read_since(start);
-        FoundTable::of(body, links, id, name, agree, beside)
+        let hash = hash_parts(body, links.iter().map(|link| &link.hash));
+        FoundTable {
+            id,
+            name,
+            agree,
+            beside,
+            body: body.into(),
+            links: links.into(),
+            hash,
+        }
     }
 
     /// Where a [`Kind::recheck`] keeps the summaries of the entries it computed, or `None` for
@@ -2875,10 +2929,29 @@ impl<'a> Decoder<'a> {
     /// Returns [`Error::Decode`] if bytes or links are left.
     #[inline]
     pub fn end(&self) -> Result<()> {
-        if self.pos != self.buf.len() || self.cursor != self.count {
-            return Err(unread(self.remaining(), self.count - self.cursor));
+        if self.pos != self.buf.len() || self.cursor != self.links.len() {
+            return self.unended();
         }
         Ok(())
+    }
+
+    /// What [`end`](Decoder::end) returns where the body or the links the decoder holds are not
+    /// all read: an error, unless the decoder reads its links from a [`StagedLinks`] and has read
+    /// the body and every link it stands for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] for the bytes or links left.
+    #[cold]
+    fn unended(&self) -> Result<()> {
+        let left = match self.staged() {
+            None => self.links.len() - self.cursor,
+            Some(_) => counted_links(self.links) + 1 - self.cursor,
+        };
+        if self.pos == self.buf.len() && left == 0 {
+            return Ok(());
+        }
+        Err(unread(self.remaining(), left))
     }
 
     /// Whether what is left of the body is exactly one varint, as the body of a map without a
@@ -2898,7 +2971,7 @@ impl<'a> Decoder<'a> {
     /// The zero-width items [`item`](Decoder::item) has counted in this object so far, less those
     /// read since a checkpoint it went back to.
     pub(crate) fn zero_width(&self) -> u64 {
-        u64::from(self.empty_items)
+        self.empty_items
     }
 
     fn allocated(&mut self, count: usize, bytes: usize) {
@@ -3037,7 +3110,7 @@ impl<'a> Decoder<'a> {
     fn counted(&mut self, before: (usize, usize)) -> Result<()> {
         if self.read_so_far() == before {
             self.empty_items += 1;
-            if u64::from(self.empty_items) > MAX_EMPTY_ITEMS {
+            if self.empty_items > MAX_EMPTY_ITEMS {
                 return Err(Error::Decode("too many zero-width items".into()));
             }
         }
@@ -3060,9 +3133,7 @@ impl<'a> Decoder<'a> {
         self.depth = self.deeper()?;
         let value = match stack::room() {
             true => read(self),
-            false => {
-                stack::elsewhere(|| read(self)).unwrap_or_else(|| Err(no_room(self.depth as usize)))
-            }
+            false => stack::elsewhere(|| read(self)).unwrap_or_else(|| Err(no_room(self.depth))),
         };
         self.depth -= 1;
         value
@@ -3071,8 +3142,8 @@ impl<'a> Decoder<'a> {
     /// The depth one level below where the decoder is reading, or [`Error::Decode`] if that is
     /// past [`MAX_DEPTH`].
     #[inline]
-    fn deeper(&self) -> Result<u16> {
-        if self.depth as usize >= MAX_DEPTH {
+    fn deeper(&self) -> Result<usize> {
+        if self.depth >= MAX_DEPTH {
             return Err(too_deep());
         }
         Ok(self.depth + 1)
@@ -3092,12 +3163,23 @@ impl<'a> Decoder<'a> {
         Ok(ptr)
     }
 
-    /// The link at the cursor, read from the object's [`StagedLinks`] where the decoder holds none
-    /// resolved there.
+    /// The link at the cursor where the decoder holds none there: read from the object's
+    /// [`StagedLinks`], or past the last one an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] past the last link, and the error of reading one.
     #[cold]
     fn read_link(&self) -> Result<Ptr> {
-        match self.source {
-            Some(source) if self.cursor < self.count => source.link(self.base + self.cursor),
+        match self.staged() {
+            Some(staged) if self.cursor <= counted_links(self.links) => {
+                if let Some(found) = self.found
+                    && let Some(walks) = found.walks
+                {
+                    found.walk_full(walks)?;
+                }
+                staged.link(self.base.wrapping_add(self.cursor))
+            }
             _ => Err(Error::Decode("link table exhausted".into())),
         }
     }
@@ -3109,13 +3191,10 @@ impl<'a> Decoder<'a> {
     ///
     /// As for [`link`](Decoder::link).
     pub(crate) fn typed_link(&mut self, kind: impl FnOnce() -> Kind) -> Result<Ptr> {
-        let index = self.base + self.cursor;
+        let index = self.base.wrapping_add(self.cursor);
         let ptr = self.link()?;
         if let Some(found) = self.found {
             found.found.borrow_mut().push((index, kind()));
-            if let Some(walks) = found.walks {
-                found.walk_full(walks)?;
-            }
         }
         Ok(ptr)
     }
@@ -3131,14 +3210,11 @@ impl<'a> Decoder<'a> {
         read: impl FnOnce(&mut Self) -> Result<T>,
         kind: impl FnOnce(&T) -> Kind,
     ) -> Result<T> {
-        let index = self.base + self.cursor;
+        let index = self.base.wrapping_add(self.cursor);
         self.link()?;
         let after = read(self)?;
         if let Some(found) = self.found {
             found.found.borrow_mut().push((index, kind(&after)));
-            if let Some(walks) = found.walks {
-                found.walk_full(walks)?;
-            }
         }
         Ok(after)
     }
@@ -3187,25 +3263,22 @@ impl<'a> Decoder<'a> {
         let count = self.varint()?;
         let mut floor = 0u32;
         for _ in 0..count {
-            let (tag, body, links) = self.field_parts()?;
+            let (tag, body, part) = self.field_parts()?;
             if u32::from(tag) < floor {
                 return Err(Error::Decode(format!(
                     "field tag {tag} is stored out of order"
                 )));
             }
             floor = u32::from(tag) + u32::from(!sharing);
-            let (held, count) = self.part(links.clone());
             let mut sub = Decoder {
                 buf: body,
                 pos: 0,
-                links: held,
-                count,
-                source: self.source,
-                cursor: 0,
+                links: part.links,
+                cursor: part.cursor,
                 store: self.store,
                 empty_items: self.empty_items,
                 heap: self.heap,
-                base: self.base + links.start,
+                base: part.base,
                 found: self.found,
                 tables: self.tables,
                 recalled: self.recalled,
@@ -3232,23 +3305,17 @@ impl<'a> Decoder<'a> {
     ///
     /// Returns [`Error::Decode`] for a field that runs past the end of the object.
     pub(crate) fn next_field(&mut self) -> Result<(u16, Decoder<'a>)> {
-        let (tag, body, links) = self.field_parts()?;
-        let (held, count) = self.part(links.clone());
-        let mut field = Decoder::new(body, held, self.store);
-        if self.source.is_some() {
-            field.count = count;
-            field.source = self.source;
-            field.base = self.base + links.start;
-        }
+        let (tag, body, part) = self.field_parts()?;
+        let mut field = Decoder::new(body, part.links, self.store);
         field.rebuilds = self.rebuilds;
         field.depth = self.depth;
         Ok((tag, field))
     }
 
     /// Reads the tag, the length and the link count of the next field of a struct, and returns
-    /// the tag, the field's bytes and the range of its links among this decoder's, moving past
+    /// the tag, the field's bytes and where a decoder of the field finds its links, moving past
     /// both.
-    fn field_parts(&mut self) -> Result<(u16, &'a [u8], Range<usize>)> {
+    fn field_parts(&mut self) -> Result<(u16, &'a [u8], Part<'a>)> {
         let tag = self.u16()?;
         let prefix = self.varint()?;
         let link_count = if prefix & 1 == 1 {
@@ -3261,13 +3328,55 @@ impl<'a> Decoder<'a> {
         };
         let body = self.take((prefix >> 1) as usize)?;
         let start = self.cursor;
-        let end = start
+        let Some(end) = start
             .checked_add(link_count)
-            .filter(|end| *end <= self.count)
+            .filter(|end| *end <= self.links.len())
+        else {
+            return Ok((tag, body, self.staged_part(link_count)?));
+        };
+        self.cursor = end;
+        let part = Part {
+            links: &self.links[start..end],
+            base: self.base + start,
+            cursor: 0,
+        };
+        Ok((tag, body, part))
+    }
+
+    /// Where a decoder of the next field, which holds `count` links, finds them, for a decoder
+    /// that reads its links from a [`StagedLinks`], moving past them: in the same place, read as
+    /// that decoder comes to each.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] for a field whose links run past the object's, or one of a decoder that
+    /// holds its links, which [`field_parts`](Decoder::field_parts) found do.
+    #[cold]
+    fn staged_part(&mut self, count: usize) -> Result<Part<'a>> {
+        let start = self.cursor;
+        let end = start
+            .checked_add(count)
+            .filter(|end| self.staged().is_some() && *end <= counted_links(self.links) + 1)
             .ok_or_else(|| Error::Decode("field link count out of range".into()))?;
         self.cursor = end;
-        Ok((tag, body, start..end))
+        Ok(Part {
+            links: uncounted_links(count),
+            base: self.base.wrapping_add(start).wrapping_sub(1),
+            cursor: 1,
+        })
     }
+}
+
+/// Where a decoder of one field of a struct finds the field's links, as
+/// [`Decoder::field_parts`] gives it.
+struct Part<'a> {
+    /// The links the decoder holds, or a list of none that carries how many it reads from a
+    /// [`StagedLinks`].
+    links: &'a [Ptr],
+    /// The index among the object's links of the decoder's first, less its first cursor.
+    base: usize,
+    /// Where the decoder's cursor starts.
+    cursor: usize,
 }
 
 impl Data for Ptr {

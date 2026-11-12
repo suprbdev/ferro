@@ -1516,14 +1516,21 @@ pub(crate) fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) 
 /// `links` and whether it is `packed`, the length `raw` of the body before compression if it is,
 /// and `payload`.
 fn append_head(buf: &mut Vec<u8>, payload: &[u8], packed: bool, raw: usize, links: usize) {
-    push_varint(buf, payload.len() as u64);
+    append_lengths(buf, payload.len(), packed, raw, links);
+    buf.extend_from_slice(payload);
+}
+
+/// Appends to `buf` what a record holds before its payload: the payload's length `stored`, the
+/// count of `links` and whether it is `packed`, and the length `raw` of the body before
+/// compression if it is.
+fn append_lengths(buf: &mut Vec<u8>, stored: usize, packed: bool, raw: usize, links: usize) {
+    push_varint(buf, stored as u64);
     if packed {
         push_varint(buf, (links as u64) << 1 | 1);
         push_varint(buf, raw as u64);
     } else {
         push_varint(buf, (links as u64) << 1);
     }
-    buf.extend_from_slice(payload);
 }
 
 /// Appends to `buf` one link of the record at `offset`: its hash and the distance back to its
@@ -6029,14 +6036,20 @@ pub(crate) enum LinkTo {
 /// Writes `buf`, the records a staging in the log holds in memory, to its file at `start`, and
 /// moves `start` past them.
 fn write_held(store: &Store, start: &mut u64, buf: &mut Vec<u8>) -> Result<()> {
-    if buf.is_empty() {
+    write_at(store, start, buf)?;
+    buf.clear();
+    Ok(())
+}
+
+/// Writes `bytes` to the file of `store` at `start`, and moves `start` past them.
+fn write_at(store: &Store, start: &mut u64, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
         return Ok(());
     }
     let file = &store.inner.file;
-    file.write_all_at(buf, *start)?;
-    platform::start_writeback(file, *start, buf.len() as u64);
-    *start += buf.len() as u64;
-    buf.clear();
+    file.write_all_at(bytes, *start)?;
+    platform::start_writeback(file, *start, bytes.len() as u64);
+    *start += bytes.len() as u64;
     Ok(())
 }
 
@@ -6103,7 +6116,19 @@ impl Staging {
                 Error::Bundle("it carries more objects than one receive can hold".into())
             })?;
         let offset = self.start + self.buf.len() as u64;
-        append_head(&mut self.buf, payload, packed.is_some(), body.len(), count);
+        if logged && payload.len() as u64 >= STAGED_ROOM {
+            append_lengths(
+                &mut self.buf,
+                payload.len(),
+                packed.is_some(),
+                body.len(),
+                count,
+            );
+            write_held(&self.store, &mut self.start, &mut self.buf)?;
+            write_at(&self.store, &mut self.start, payload)?;
+        } else {
+            append_head(&mut self.buf, payload, packed.is_some(), body.len(), count);
+        }
         let mut hashing = Hashing::new(&mut self.joined, body, count);
         let (mut written, mut split) = (0, false);
         for link in links {
@@ -6336,6 +6361,12 @@ impl Staging {
             None => reader.take(header.stored)?.to_vec(),
         };
         if header.links > most {
+            if u32::try_from(header.links).is_err() {
+                return Err(Error::Corrupt(format!(
+                    "the staged record at {} claims {} links",
+                    ptr.offset, header.links
+                )));
+            }
             let first = ptr.offset + reader.pos as u64;
             let links = StagedLinks {
                 file: file.filter(|_| held.is_empty()),
@@ -6350,6 +6381,7 @@ impl Staging {
                     pos: first,
                     marks: vec![first],
                 }),
+                failed: RefCell::new(None),
             };
             return Ok(Opened::Body(body, links));
         }
@@ -6504,6 +6536,8 @@ pub(crate) struct StagedLinks<'a> {
     tail: u64,
     count: usize,
     at: RefCell<LinksAt>,
+    /// The first error of a read that a decoder could not return.
+    failed: RefCell<Option<Error>>,
 }
 
 /// Where a [`StagedLinks`] is in its record's links.
@@ -6574,6 +6608,16 @@ impl StagedLinks<'_> {
     /// How many links the record has.
     pub(crate) fn count(&self) -> usize {
         self.count
+    }
+
+    /// Keeps `error`, a failed read that a decoder could not return, unless one is kept already.
+    pub(crate) fn fail(&self, error: Error) {
+        self.failed.borrow_mut().get_or_insert(error);
+    }
+
+    /// The error [`fail`](StagedLinks::fail) kept, if any.
+    pub(crate) fn failure(&self) -> Option<Error> {
+        self.failed.borrow_mut().take()
     }
 
     /// The link at `index` among the record's links.

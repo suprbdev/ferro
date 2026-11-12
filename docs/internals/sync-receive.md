@@ -166,9 +166,12 @@ for each object](sync.md#memory-for-each-object). A bundle that lands where it i
 more, since the offsets in the staging are those in the log; one that a cycle moved holds each
 object's offset in the new file and its hash beside them, 28 bytes an object more. When the staging
 moves into the log, the buffer it leaves and the frame it fills are both held for a moment, 1 MiB
-more. An object's body is held whole, about four times over while it is read, compressed again if it
-arrived uncompressed, as described under [Applying](sync.md#applying), hashed and copied, so the
-largest value sent bounds memory too. Its links are held resolved up to 1,024 of them, 40 KiB, and
+more. An object's body is held whole while it is read, into a buffer that grows by doubling up to
+its exact length, and compressed again if it arrived uncompressed, as described under
+[Applying](sync.md#applying), into a buffer a tenth larger than the body before it shrinks to fit,
+so the largest value sent bounds memory too, at about three times its size. A record whose body is
+1 MiB or more is written to its staging frame from the bytes it arrived as rather than copied into
+the staging buffer. Its links are held resolved up to 1,024 of them, 40 KiB, and
 past that only as the bytes they arrived as, a byte or two for a link by place, since its record is
 resolved and written a MiB at a time once they are in. The checks read an object of more than 1,024
 links back the same way, its body whole and its links one at a time where its record keeps them, as
@@ -186,8 +189,9 @@ Two million links by place to one object, 2.1 MB, took 7.4 MB, and sixteen milli
 25.4 MB, where each link used to become a 32-byte pointer and its record was held whole, and two
 million links took 215.5 MB. Two million empty objects that each said a later object would link
 them, 6.3 MB, were refused with 9.0 MB, where the hash kept for each took 220.6 MB. A node of a
-million keys that each spill one shared value, 6.3 MB, took 26.8 MB to check, where the check held
-each of its links resolved with the kind it must lead to and took 576.3 MB.
+million keys that each spill one shared value, 6.3 MB, took 21.7 MB to check and land, where the
+check held each of its links resolved with the kind it must lead to and took 576.3 MB, and one of
+four million keys, 27.5 MB, 77.6 MB against 2.3 GB.
 `hostile_bundles_cost_memory_in_proportion_to_what_they_carry` in `ferro/tests/sync_memory.rs`
 bounds each to three times its length and 20 MiB. A 33 MB stream of 4,549 objects took 5.5 MB, and
 256 commits with 64 KiB messages, 17 MB, took 5.9 MB.
@@ -473,26 +477,37 @@ and keep none of its links.
 
 A node of a million keys that each spill one shared value, a bundle of 6.3 MB, used to hold each of
 its links resolved, the kind each must lead to and a worklist entry for each, and took 576.3 MB of
-heap to check and land. It now takes 26.8 MB, most of it the node's body and the list of keys its
-check builds, in 0.18 s against 0.20 s, and one of four million keys, 27.5 MB, 106.4 MB against
-2.3 GB, most of that while its body arrives, as described under [Where checked objects
-wait](#where-checked-objects-wait), at the median of three runs alternating with the build before.
+heap to check and land. It now takes 21.7 MB, most of it the node's body and the list of keys its
+check builds, and one of four million keys, 27.5 MB, 77.6 MB against 2.3 GB, at the median of three
+runs alternating with the build before, in less time and 0.9% fewer instructions.
 `a_node_with_more_links_than_a_check_holds_lands_and_a_bad_one_past_them_is_refused`,
 `a_summarized_node_with_more_links_than_a_check_holds_is_held_to_each_entry` and
 `a_table_past_the_links_a_check_holds_is_held_to_its_rows` in `ferro/tests/sync.rs` land objects
 of 3,079 and 4,500 links and refuse each with one bad value, summary or table past its first two
 batches.
 
-Every decoder now carries where to read the links it does not hold and what to hand the typed links
-it finds to, so decoding costs a little more everywhere. Receiving the million objects of the clone
-under [Naming sent objects by their place](sync.md#naming-sent-objects-by-their-place) runs 13.77
-billion instructions against 13.74, 0.3% more, in the same time and heap, a pull of three one-key
-commits into it 3.79 million against 3.80, a pull of two commits, four million keys of a `Set<u32>`
-and 60,000 more, 0.5% more, and a pull of 50 versions of a root that holds 20,000 tables, 8.94
-billion against 8.81, 1.5% more, all in the same heap.
+A decoder that reads its links as it goes keeps the layout of one that holds them, so that ordinary
+reads decode as they did. Its list of links is empty, at an address that carries how many links it
+stands for, and it counts its links from one, so that every read of a link, every check that it has
+read them all and every field it opens finds none where a decoder that holds its links finds them,
+and goes to a path that one takes only on an error. Where it reads its links from, and the walk its
+typed links go to, sit in the list its check gathers them in, and a full batch is walked when the
+decoder next reads a link, so the code that records a typed link is the code it was. Visiting
+20,000 structs of two empty maps, and 20,000 empty tables, runs 1.4% and 1.3% fewer instructions
+than before, `verify_typed` of 50 versions of those tables 1.1% fewer, and `ferro-bench`'s cold and
+warm gets, table gets and scans and `reads`' cold scans and gets run as many as before within the
+spread of their runs. Receiving the million objects of the clone under [Naming sent objects by
+their place](sync.md#naming-sent-objects-by-their-place) runs 13.79 billion instructions against
+13.74, 0.4% more, in the same time and heap, a pull of three one-key commits into it as many as
+before, a pull of two commits, four million keys of a `Set<u32>` and 60,000 more, 0.5% more, and a
+pull of 50 versions of a root that holds 20,000 tables 1.3% fewer.
 
 Measured and left out:
 
+- A count of its links and a reader for them in every decoder, and a check for a walk at each
+  typed link. Visiting the 20,000 structs above ran 3.3% more instructions, the 20,000 tables 5.3%
+  more and their `verify_typed` 2.8% more, and the check for a walk changed what the compiler
+  inlined into gets, so that one of every 16th key of a map ran 0.9% more.
 - Refusing an object whose links would cost more to check than a multiple of its bytes. The walk
   held about 550 bytes for each typed link of the node above, against 6 it carried, and an honest
   root that holds maps or tables carries 2 to 25 bytes for each, so a bound that kept the walk

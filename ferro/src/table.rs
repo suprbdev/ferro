@@ -664,7 +664,7 @@ pub fn noted<'a, T: Record, R>(
         type_name::<T::Table>(),
         agree::<T>,
         !T::Table::indexing_reads(),
-    )?;
+    );
     Ok(value)
 }
 

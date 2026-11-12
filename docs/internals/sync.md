@@ -776,9 +776,9 @@ The check of an object still held each of its links resolved, with the kind it m
 node of a million keys that each spill one shared value, 6.3 MB, took 576.3 MB to check (#153). An
 object of more than 1,024 links is now read back as its body, its links read where its record keeps
 them, and the typed links its check finds walked 1,024 at a time as it goes, so that node takes
-26.8 MB, as described under [Checking trees](sync-receive.md#checking-trees). Receiving the million
-objects above runs 13.77 billion instructions against 13.74, 0.3% more, in the same time and heap,
-and a pull of three one-key commits 3.79 million against 3.80.
+21.7 MB, as described under [Checking trees](sync-receive.md#checking-trees). Receiving the million
+objects above runs 13.79 billion instructions against 13.74, 0.4% more, in the same time and heap,
+and a pull of three one-key commits as many as before.
 
 Small pulls cost what they did. A pull of three one-key commits into the clone of the eight million
 keys, 200 times, ran 3.78 million instructions at the median against 3.73 million, 1.4% more, in
@@ -904,15 +904,17 @@ Measured and left out:
   is a large part of its links. An incremental pull keeps 19 to 39 bytes for each object sent on
   the sender, and each hint costs about 140 bytes on the receiver, so a pull of scattered edits,
   which names about three held nodes for each one it sends, costs a few hundred bytes an object
-  there. Each object's body is held whole, about four times over while it arrives, so one huge
-  value needs a few times its size, and a node whose body is most of a bundle up to four times the
-  bundle. Checking an object of more than 1,024 links holds its body and a batch of up to 1,024 of
-  the typed links it finds while it checks what they lead to, so such objects nested in one another
-  hold that much for each level they nest. A hostile stream costs the same, for what it carries and
-  not for what it claims: two million links by place to one object, 2.1 MB, take 7.4 MB to
-  receive, two million objects that each claim a link never sent, 6.3 MB, are refused with 9.0 MB,
-  and a node of a million keys that each spill one shared value, 6.3 MB, takes 26.8 MB to check.
-  Checking it costs the same as well, as the limits on checks below describe.
+  there. Each object's body is held whole, about three times over while it arrives, so one huge
+  value needs a few times its size, and the check of a map node holds a list of its keys besides,
+  eight bytes for each `u64` key, so a node of four million keys that each spill one shared value,
+  27.5 MB, takes 77.6 MB to receive. Checking an object of more than 1,024 links holds its body and
+  a batch of up to 1,024 of the typed links it finds while it checks what they lead to, so such
+  objects nested in one another hold that much for each level they nest. A hostile stream costs
+  the same, for what it carries and not for what it claims: two million links by place to one
+  object, 2.1 MB, take 7.4 MB to receive, two million objects that each claim a link never sent,
+  6.3 MB, are refused with 9.0 MB, and a node of a million keys that each spill one shared value,
+  6.3 MB, takes 21.7 MB to check. Checking it costs the same as well, as the limits on checks below
+  describe.
 - A first pull sends an object the sending file holds twice, at two offsets, twice, and the
   receiving file then holds it twice as well.
 - `receive` writes a bundle over 1 MiB once, into staging frames as it arrives, but a reclamation

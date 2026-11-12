@@ -261,6 +261,11 @@ fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
             shares_one_spilled_value(MIB),
             3,
         ),
+        (
+            "a node of four million keys sharing one spilled value",
+            shares_one_spilled_value(4 * MIB),
+            3,
+        ),
     ];
     for (name, bundle, ratio) in cases {
         let len = bundle.as_bytes().len();

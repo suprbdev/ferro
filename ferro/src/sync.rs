@@ -332,7 +332,10 @@ impl<R: Read> Input<R> {
     }
 
     fn bytes(&mut self, len: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(len.min(READ_STEP));
+        if len > READ_STEP {
+            return self.bytes_in_steps(len);
+        }
+        let mut out = Vec::with_capacity(len);
         let got = (&mut self.source)
             .take(len as u64)
             .read_to_end(&mut out)
@@ -340,6 +343,23 @@ impl<R: Read> Input<R> {
         self.read += got as u64;
         if got != len {
             return Err(bad("truncated"));
+        }
+        Ok(out)
+    }
+
+    fn bytes_in_steps(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while out.len() < len {
+            let step = (len - out.len()).min(out.capacity().max(READ_STEP));
+            out.reserve_exact(step);
+            let got = (&mut self.source)
+                .take(step as u64)
+                .read_to_end(&mut out)
+                .map_err(from_io)?;
+            self.read += got as u64;
+            if got != step {
+                return Err(bad("truncated"));
+            }
         }
         Ok(out)
     }
@@ -2332,6 +2352,16 @@ impl Walks for Walking<'_, '_> {
     }
 }
 
+fn check_staged(
+    kind: &Kind,
+    body: &[u8],
+    links: &StagedLinks<'_>,
+    tables: Option<&RefCell<Vec<FoundTable>>>,
+) -> Result<(Shape, u64)> {
+    let checked = kind.check_reading(body, &Finding::reading(links, None), tables);
+    links.failure().map_or(checked, Err)
+}
+
 fn rejected(error: Error) -> Error {
     match error {
         Error::Decode(message) => bad(message),
@@ -2563,11 +2593,12 @@ impl Vetting<'_> {
             floor,
             failed: RefCell::new(None),
         };
-        let found = Finding::new(Some(&walking));
-        let checked = kind.check_reading(body, links, Some(&found), Some(&tables));
+        let found = Finding::reading(links, Some(&walking));
+        let checked = kind.check_reading(body, &found, Some(&tables));
+        let failure = links.failure();
         let mut rest = found.into_found();
         let checked = checked.and_then(|checked| walking.walk(&mut rest).map(|()| checked));
-        if let Some(error) = walking.failed.into_inner() {
+        if let Some(error) = walking.failed.into_inner().or(failure) {
             return Err(error);
         }
         let (shape, zero_width) = checked.map_err(|error| undecodable(kind, error))?;
@@ -2603,7 +2634,7 @@ impl Vetting<'_> {
             }
             Opened::Body(body, links) => {
                 self.rerun(body.len())?;
-                kind.check_reading(&body, &links, None, None)
+                check_staged(kind, &body, &links, None)
             }
         };
         let (shape, zero_width) = checked.map_err(|error| undecodable(kind, error))?;
@@ -2705,7 +2736,8 @@ impl Vetting<'_> {
                         kind.recheck(&object.body, &object.links, view, recalled)
                     }
                     Opened::Body(body, links) => {
-                        kind.recheck_reading(&body, &links, view, recalled)
+                        let found = Finding::reading(&links, None);
+                        kind.recheck_reading(&body, &found, view, recalled)
                     }
                 };
                 if let Some(error) = view.overdrawn() {
@@ -2734,8 +2766,7 @@ impl Vetting<'_> {
                         .check_tables(&object.body, &object.links, &tables)
                         .map(|(shape, _, zero_width)| (shape, zero_width)),
                     Opened::Body(body, links) => {
-                        self.root_kind
-                            .check_reading(&body, &links, None, Some(&tables))
+                        check_staged(self.root_kind, &body, &links, Some(&tables))
                     }
                 };
                 let (_, zero_width) =
