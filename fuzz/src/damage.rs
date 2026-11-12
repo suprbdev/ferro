@@ -232,7 +232,7 @@ fn anchor(image: &[u8]) -> Option<usize> {
     let mut newest = None;
     for slot in [0, SLOT_BYTES] {
         let header = &image[slot..slot + SUPER_BYTES];
-        if &header[..8] != b"FERRODB6"
+        if &header[..8] != b"FERRODB7"
             || blake3::hash(&header[..SUPER_CHECKED]).as_bytes()[..] != header[SUPER_CHECKED..]
         {
             continue;

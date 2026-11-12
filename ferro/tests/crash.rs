@@ -815,7 +815,7 @@ fn foreign_files_are_rejected_and_left_alone() {
 }
 
 #[test]
-fn a_file_of_a_format_before_staging_frames_is_not_ferro_and_left_alone() {
+fn a_file_of_an_earlier_format_is_not_ferro_and_left_alone() {
     let built = build(3, 3);
     let path = built.target();
     let sealed = |magic: &[u8; MAGIC]| {
@@ -827,9 +827,9 @@ fn a_file_of_a_format_before_staging_frames_is_not_ferro_and_left_alone() {
         }
         image
     };
-    fs::write(&path, sealed(b"FERRODB6")).unwrap();
+    fs::write(&path, sealed(b"FERRODB7")).unwrap();
     fast().open::<Root>(&path).unwrap().verify().unwrap();
-    for magic in [b"FERRODB4", b"FERRODB5"] {
+    for magic in [b"FERRODB5", b"FERRODB6"] {
         let old = sealed(magic);
         fs::write(&path, &old).unwrap();
         for options in [fast(), fast().read_only(true)] {

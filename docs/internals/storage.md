@@ -484,7 +484,7 @@ either way and thread CPU time by less than the noise between runs. The map and 
 
 Two 4 KiB superblock slots, then the log. A superblock names the head and the log end, records the
 size the file had when this generation began and how much of the previous one survived, and carries
-an anchor, the newest position known to be durable. The superblock's magic, `FERRODB6`, is the
+an anchor, the newest position known to be durable. The superblock's magic, `FERRODB7`, is the
 format's version. The log is a run of frames, one per commit. A frame is a 68-byte header (magic,
 sequence, end offset, head pointer, xxh3-128 check), the records the commit wrote, and a table that
 holds the xxh3-64 of each 4 KiB block of those records, the last block shorter, 8 bytes a block. The
@@ -492,8 +492,10 @@ check covers the header and the table, and through the table every record, so a 
 itself that it reached the disk whole, and the table says which block of it did not, as described
 under [Torn and damaged frames](#torn-and-damaged-frames). The head pointer names the branch table,
 or a step that puts one branch's new head on the table or step the frame before named, as described
-under [Branch-table steps](commit-path.md#branch-table-steps). A table's body is the varint count of
-its branches and its one link the root of the `Map`, as it always was. A step's body is the byte
+under [Branch-table steps](commit-path.md#branch-table-steps). A table's body is the byte `0x7e` and
+the varint count of its branches, and its links the root of version 0 and the root of the `Map`. A
+table with no version 0, which only a file converted from format 6 holds, is the count alone and the
+root of the `Map`, as before format 7. A step's body is the byte
 `0x7f`, the branch's name as a varint length and its bytes, and the `Head` as the table stores it:
 the version, the first version kept, the root and the log's tip each as a flag byte and, when set, a
 link, the map of merge records, and, when bit 2 of the root's flag byte is set, the sequence number
@@ -514,6 +516,12 @@ added these frames: a build of format 5 would read one as the end of the log and
 every frame after it, so no file of format 5 opens in this build, nor one of format 6 in an earlier
 one, and both report `Error::NotFerro`. A file of format 5 holds no staging frame, so its fixtures
 were converted by giving their superblocks the new magic and check.
+
+Format 7 stores version 0, as described under [Version 0](history.md#version-0). A build of format
+6 would fail to decode a table that names it, so no file of format 6 opens in this build, nor one
+of format 7 in an earlier one, and both report `Error::NotFerro`. The fixtures were converted the
+same way: their tables name no version 0, and the first frame written to one writes a table that
+does.
 
 A commit does this:
 

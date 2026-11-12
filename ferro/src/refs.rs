@@ -16,6 +16,7 @@ use crate::map::Map;
 use crate::store::{Store, Txn};
 
 const STEP: u8 = 0x7f;
+const TABLE: u8 = 0x7e;
 /// How many steps a writer stacks on a table before it writes a whole table again.
 pub(crate) const STEPS: usize = 64;
 const MAX_STEPS: usize = 1024;
@@ -31,8 +32,8 @@ pub(crate) struct Step {
 /// What a file's head points at.
 #[derive(Clone)]
 pub(crate) enum Root {
-    /// A whole branch table.
-    Table(Refs),
+    /// A whole branch table, with the root of version 0 once the file holds one.
+    Table(Refs, Option<Ptr>),
     /// A step on top of an earlier table or step.
     Step(Step),
 }
@@ -45,21 +46,41 @@ fn encode_step(w: &mut Encoder<'_>, prev: Ptr, name: &str, head: &Head) -> Resul
     head.encode(w)
 }
 
+/// Encodes the branch table `refs`, naming `genesis` as the root of version 0 when it is set.
+pub(crate) fn encode_table(w: &mut Encoder<'_>, refs: &Refs, genesis: Option<Ptr>) -> Result<()> {
+    if let Some(genesis) = genesis {
+        w.u8(TABLE);
+        w.link(genesis);
+    }
+    refs.encode(w)
+}
+
 impl Data for Root {
     const LOCATED: bool = true;
 
     fn encode(&self, w: &mut Encoder<'_>) -> Result<()> {
         match self {
-            Root::Table(refs) => refs.encode(w),
+            Root::Table(refs, genesis) => encode_table(w, refs, *genesis),
             Root::Step(step) => encode_step(w, step.prev, &step.name, &step.head),
         }
     }
 
     fn decode(r: &mut Decoder<'_>) -> Result<Self> {
         if r.lone_varint() {
-            return Ok(Root::Table(Refs::decode(r)?));
+            return Ok(Root::Table(Refs::decode(r)?, None));
         }
         let tag = r.u8()?;
+        if tag == TABLE {
+            let genesis = r.link()?;
+            let refs = Refs::decode(r)?;
+            if r.remaining() != 0 {
+                return Err(Error::Decode(format!(
+                    "a branch table has {} bytes after its count",
+                    r.remaining()
+                )));
+            }
+            return Ok(Root::Table(refs, Some(genesis)));
+        }
         if tag != STEP {
             return Err(Error::Decode(format!("invalid branch table tag {tag}")));
         }
@@ -99,31 +120,48 @@ pub(crate) fn write_step(
     Ok((txn.put(object, hash)?, step.head))
 }
 
+/// A branch table as [`load`] reads it.
+pub(crate) struct Loaded {
+    /// Every branch's head by name, the steps applied.
+    pub(crate) refs: Refs,
+    /// The root of version 0 that the table names, or `None` if it names none.
+    pub(crate) genesis: Option<Ptr>,
+    /// How many steps the table lies under.
+    pub(crate) depth: usize,
+}
+
+/// A head whose table is already loaded: its pointer, the table, the root of version 0 it names
+/// and its depth.
+pub(crate) type Since<'a> = (Ptr, &'a Refs, Option<Ptr>, usize);
+
 struct Layers {
     steps: Vec<Step>,
     base: Refs,
+    genesis: Option<Ptr>,
     depth: usize,
 }
 
-fn layers(store: &Store, head: Ptr, since: Option<(Ptr, &Refs, usize)>) -> Result<Layers> {
+fn layers(store: &Store, head: Ptr, since: Option<Since<'_>>) -> Result<Layers> {
     let mut steps = Vec::new();
     let mut at = head;
     loop {
-        if let Some((known, refs, depth)) = since
+        if let Some((known, refs, genesis, depth)) = since
             && known == at
         {
             return Ok(Layers {
                 depth: depth + steps.len(),
                 steps,
                 base: refs.clone(),
+                genesis,
             });
         }
         match store.decode_at(at, Root::decode)? {
-            Root::Table(base) => {
+            Root::Table(base, genesis) => {
                 return Ok(Layers {
                     depth: steps.len(),
                     steps,
                     base,
+                    genesis,
                 });
             }
             Root::Step(step) => {
@@ -140,7 +178,8 @@ fn layers(store: &Store, head: Ptr, since: Option<(Ptr, &Refs, usize)>) -> Resul
     }
 }
 
-/// The branch table at `head`, with its steps applied, and how many steps deep it is.
+/// The branch table at `head`, with its steps applied, the root of version 0 it names, and how
+/// many steps deep it is.
 ///
 /// `since` names a pointer whose table is already loaded, with its depth, so that the walk back
 /// stops there and reads only the steps written after it.
@@ -149,17 +188,18 @@ fn layers(store: &Store, head: Ptr, since: Option<(Ptr, &Refs, usize)>) -> Resul
 ///
 /// [`Error::Corrupt`] if the steps run back further than any writer stacks them, and read
 /// errors.
-pub(crate) fn load(
-    store: &Store,
-    head: Option<Ptr>,
-    since: Option<(Ptr, &Refs, usize)>,
-) -> Result<(Refs, usize)> {
+pub(crate) fn load(store: &Store, head: Option<Ptr>, since: Option<Since<'_>>) -> Result<Loaded> {
     let Some(head) = head else {
-        return Ok((Map::new(), 0));
+        return Ok(Loaded {
+            refs: Map::new(),
+            genesis: None,
+            depth: 0,
+        });
     };
     let Layers {
         steps,
         mut base,
+        genesis,
         depth,
     } = layers(store, head, since)?;
     if depth > MAX_STEPS {
@@ -171,7 +211,11 @@ pub(crate) fn load(
     for step in steps.into_iter().rev() {
         base.try_insert(step.name, step.head)?;
     }
-    Ok((base, depth))
+    Ok(Loaded {
+        refs: base,
+        genesis,
+        depth,
+    })
 }
 
 /// Every head a branch table records, from [`heads`].
@@ -266,15 +310,21 @@ mod tests {
         let two = step(&store, one, "b0", 20);
         let three = step(&store, two, "b1", 30);
         let new = step(&store, three, "b2", 40);
-        let (refs, depth) = load(&store, Some(new), None).unwrap();
+        let Loaded { refs, depth, .. } = load(&store, Some(new), None).unwrap();
         assert_eq!(depth, 4);
         let expected: Vec<_> = [("b0", 20), ("b1", 30), ("b2", 40)]
             .map(|(name, version)| (name.to_string(), version))
             .into();
         assert_eq!(versions(&refs), expected);
-        let (older, depth) = load(&store, Some(two), None).unwrap();
+        let Loaded {
+            refs: older, depth, ..
+        } = load(&store, Some(two), None).unwrap();
         assert_eq!(depth, 2);
-        let (caught_up, depth) = load(&store, Some(new), Some((two, &older, 2))).unwrap();
+        let Loaded {
+            refs: caught_up,
+            depth,
+            ..
+        } = load(&store, Some(new), Some((two, &older, None, 2))).unwrap();
         assert_eq!(depth, 4);
         assert_eq!(versions(&caught_up), expected);
     }
@@ -300,10 +350,10 @@ mod tests {
         let store = open(&dir);
         for branches in [126, 127, 128] {
             let base = table(&store, branches);
-            let (refs, depth) = load(&store, Some(base), None).unwrap();
+            let Loaded { refs, depth, .. } = load(&store, Some(base), None).unwrap();
             assert_eq!((refs.len(), depth), (branches as usize, 0));
             let top = step(&store, base, "b5", 99);
-            let (refs, depth) = load(&store, Some(top), None).unwrap();
+            let Loaded { refs, depth, .. } = load(&store, Some(top), None).unwrap();
             assert_eq!((refs.len(), depth), (branches as usize, 1));
             assert_eq!(refs.try_get("b5").unwrap().unwrap().log.first, 99);
         }
@@ -317,7 +367,7 @@ mod tests {
         for version in 1..=MAX_STEPS as u64 {
             top = step(&store, top, "b0", version);
         }
-        assert_eq!(load(&store, Some(top), None).unwrap().1, MAX_STEPS);
+        assert_eq!(load(&store, Some(top), None).unwrap().depth, MAX_STEPS);
         top = step(&store, top, "b0", 0);
         assert!(matches!(
             load(&store, Some(top), None),
@@ -330,7 +380,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open(&dir);
         let base = table(&store, 1);
-        for (tag, extra) in [(STEP, true), (STEP - 1, false), (STEP + 1, false)] {
+        for (tag, extra) in [(STEP, true), (TABLE - 1, false), (STEP + 1, false)] {
             let mut txn = store.begin().unwrap();
             let mut encoder = Encoder::new(&mut txn);
             encoder.u8(tag);
@@ -345,5 +395,44 @@ mod tests {
             txn.commit(ptr).unwrap();
             assert!(load(&store, Some(ptr), None).is_err());
         }
+    }
+
+    #[test]
+    fn a_table_names_version_0_for_the_steps_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let mut refs: Refs = Map::new();
+        refs.insert("b0".to_string(), head(1));
+        let mut txn = store.begin().unwrap();
+        let mut encoder = Encoder::new(&mut txn);
+        7u64.encode(&mut encoder).unwrap();
+        let genesis = encoder.finish().unwrap();
+        let mut encoder = Encoder::new(&mut txn);
+        encode_table(&mut encoder, &refs, Some(genesis)).unwrap();
+        let base = encoder.finish().unwrap();
+        txn.commit(base).unwrap();
+        let top = step(&store, base, "b1", 2);
+        let loaded = load(&store, Some(top), None).unwrap();
+        assert_eq!(
+            (loaded.genesis, loaded.depth, loaded.refs.len()),
+            (Some(genesis), 1, 2)
+        );
+        let older = load(&store, Some(base), None).unwrap();
+        let since = Some((base, &older.refs, older.genesis, older.depth));
+        assert_eq!(
+            load(&store, Some(top), since).unwrap().genesis,
+            Some(genesis)
+        );
+        assert_eq!(
+            load(&store, Some(table(&store, 1)), None).unwrap().genesis,
+            None
+        );
+        let mut txn = store.begin().unwrap();
+        let mut encoder = Encoder::new(&mut txn);
+        encode_table(&mut encoder, &refs, Some(genesis)).unwrap();
+        encoder.u8(0);
+        let trailing = encoder.finish().unwrap();
+        txn.commit(trailing).unwrap();
+        assert!(load(&store, Some(trailing), None).is_err());
     }
 }

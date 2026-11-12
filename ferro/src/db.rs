@@ -38,7 +38,7 @@ use crate::map::Map;
 use crate::platform::canonicalize;
 use crate::reclaim::{Compacted, Copier, Reclaim, Space, rename, sibling, sync_parent};
 use crate::reentry::{self, Crossing, Needs};
-use crate::refs;
+use crate::refs::{self, Root};
 use crate::stack;
 use crate::store::{
     Durability, Followed, Frame, Gate, Held, Landing, News, Op, Retired, Settling, Store,
@@ -389,6 +389,67 @@ struct RefState {
     refs: Refs,
     ptr: Option<Ptr>,
     depth: usize,
+    genesis: Option<Ptr>,
+}
+
+impl RefState {
+    fn since(&self) -> Option<refs::Since<'_>> {
+        self.ptr
+            .map(|known| (known, &self.refs, self.genesis, self.depth))
+    }
+
+    fn take(&mut self, ptr: Option<Ptr>, loaded: refs::Loaded) {
+        self.refs = loaded.refs;
+        self.ptr = ptr;
+        self.depth = loaded.depth;
+        self.genesis = loaded.genesis;
+    }
+}
+
+/// Version 0 of a file, the value every branch starts from, with the hash of its root.
+///
+/// One the file stores is read from its root when first asked for, so that an open does not read
+/// it.
+pub(crate) struct Genesis<T> {
+    hash: Hash,
+    root: Option<(Store, Ptr)>,
+    value: OnceLock<Arc<T>>,
+}
+
+impl<T: Data> Genesis<T> {
+    fn given(value: Arc<T>, hash: Hash) -> Self {
+        Genesis {
+            hash,
+            root: None,
+            value: OnceLock::from(value),
+        }
+    }
+
+    fn stored(store: &Store, ptr: Ptr) -> Self {
+        Genesis {
+            hash: ptr.hash,
+            root: Some((store.clone(), ptr)),
+            value: OnceLock::new(),
+        }
+    }
+
+    /// The value of version 0, read from the file the first time.
+    ///
+    /// # Errors
+    ///
+    /// Read errors from loading the root.
+    pub(crate) fn value(&self) -> Result<Arc<T>> {
+        if let Some(value) = self.value.get() {
+            return Ok(value.clone());
+        }
+        let Some((store, ptr)) = &self.root else {
+            return Err(Error::Corrupt(
+                "version 0 has neither a value nor a root".into(),
+            ));
+        };
+        let value = store.load::<T>(*ptr)?;
+        Ok(self.value.get_or_init(|| value).clone())
+    }
 }
 
 struct Byte {
@@ -989,8 +1050,7 @@ struct Shared<T> {
     published: Mutex<RefState>,
     queue: Mutex<Queue<T>>,
     done: Condvar,
-    genesis: Arc<T>,
-    genesis_hash: Hash,
+    genesis: ArcSwap<Genesis<T>>,
     branches: Mutex<HashMap<String, Arc<Branch<T>>>>,
     history: Keep,
     reclaim: Reclaim,
@@ -1607,7 +1667,8 @@ impl Options {
     /// Opens the database at `path` with these options, creating the file if it does not exist.
     ///
     /// The handle is on the `main` branch, and version 0, the value before the first commit, is
-    /// `T::default()`. A file that a crash left behind opens at its last complete commit.
+    /// `T::default()` until the file stores it, as [`Options::open_with`] describes. A file that a
+    /// crash left behind opens at its last complete commit.
     ///
     /// # Errors
     ///
@@ -1624,8 +1685,12 @@ impl Options {
 
     /// Opens the database at `path` like [`Options::open`], with version 0 from `init`.
     ///
-    /// Version 0 is not stored in the file, so `init` runs on every open and should give the same
-    /// value each time. It is also what a branch with no commits holds.
+    /// Version 0 is what every branch starts from, and what a branch with no commits holds. The
+    /// first commit, fork or pull written to the file stores it, and an open of a file that
+    /// stores it reads it from the file and does not call `init`, so a later change to `init`
+    /// leaves the version 0 of an existing database as it was. Until something is written, `init`
+    /// runs on each open, and a handle that opened then takes the stored value once it sees the
+    /// first write.
     ///
     /// # Errors
     ///
@@ -1649,9 +1714,21 @@ impl Options {
                 opened => break opened?,
             }
         };
-        let genesis = Arc::new(init());
-        let genesis_hash = try_hash_of(&*genesis)?;
-        let (refs, depth) = refs::load(&store, head, None).inspect_err(|_| store.close())?;
+        let loaded = refs::load(&store, head, None).inspect_err(|_| store.close())?;
+        let genesis = match loaded.genesis {
+            Some(ptr) => Genesis::stored(&store, ptr),
+            None => {
+                let value = Arc::new(init());
+                let hash = try_hash_of(&*value).inspect_err(|_| store.close())?;
+                Genesis::given(value, hash)
+            }
+        };
+        let tip = RefState {
+            refs: loaded.refs,
+            ptr: head,
+            depth: loaded.depth,
+            genesis: loaded.genesis,
+        };
         let settled = store.last_seq();
         let automatic = !read_only && self.history != Keep::All && self.reclaim.every_bytes > 0;
         let signal = Arc::new(Signal {
@@ -1672,16 +1749,8 @@ impl Options {
             },
             coalesce: self.coalesce && !read_only,
             costs: Costs::default(),
-            tip: Mutex::new(RefState {
-                refs: refs.clone(),
-                ptr: head,
-                depth,
-            }),
-            published: Mutex::new(RefState {
-                refs,
-                ptr: head,
-                depth,
-            }),
+            tip: Mutex::new(tip.clone()),
+            published: Mutex::new(tip),
             queue: Mutex::new(Queue {
                 waiting: Vec::new(),
                 open: Vec::new(),
@@ -1691,8 +1760,7 @@ impl Options {
                 tasks: Vec::new(),
             }),
             done: Condvar::new(),
-            genesis,
-            genesis_hash,
+            genesis: ArcSwap::from_pointee(genesis),
             branches: Mutex::new(HashMap::new()),
             history: self.history,
             reclaim: self.reclaim,
@@ -1962,11 +2030,55 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl<T: Data> Shared<T> {
+    /// Takes version 0 from the root `genesis` that a branch table read from `store` names, when
+    /// it differs from the one this handle holds or was read from another file, and returns
+    /// whether its value differs.
+    ///
+    /// A value the old one had read is handed to `notices`, to be dropped once the locks are
+    /// released.
+    fn adopt_genesis(
+        &self,
+        store: &Store,
+        genesis: Option<Ptr>,
+        notices: &mut Vec<Notice<T>>,
+    ) -> bool {
+        let Some(ptr) = genesis else {
+            return false;
+        };
+        let (changed, read_here) = {
+            let current = self.genesis.load();
+            let read_here = current
+                .root
+                .as_ref()
+                .is_some_and(|(read, _)| read.id() == store.id());
+            (ptr.hash != current.hash, read_here)
+        };
+        if !changed && read_here {
+            return false;
+        }
+        let old = self.genesis.swap(Arc::new(Genesis::stored(store, ptr)));
+        if let Some(value) = old.value.get() {
+            notices.push(Notice::freeing(Snapshot {
+                value: value.clone(),
+                commit: Arc::new(Commit::genesis()),
+            }));
+        }
+        changed
+    }
+
+    /// Writes version 0 into `txn`, for a branch table to name, and returns its root.
+    fn write_genesis(&self, txn: &mut Txn) -> Result<Ptr> {
+        let value = self.genesis.load().value()?;
+        let mut encoder = Encoder::new(txn);
+        value.encode(&mut encoder)?;
+        encoder.finish()
+    }
+
     fn state_of(&self, store: &Store, head: Option<&Head>) -> Result<State<T>> {
         let Some(head) = head else {
             return Ok(State {
                 snapshot: Snapshot {
-                    value: self.genesis.clone(),
+                    value: self.genesis.load().value()?,
                     commit: Arc::new(Commit::genesis()),
                 },
                 log: Chain::empty(),
@@ -1975,7 +2087,7 @@ impl<T: Data> Shared<T> {
         };
         let value = match head.root {
             Some(ptr) => store.load::<T>(ptr)?,
-            None => self.genesis.clone(),
+            None => self.genesis.load().value()?,
         };
         let commit = head
             .log
@@ -2423,8 +2535,9 @@ impl<T: Data> Shared<T> {
         frame: Frame,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
-        let since = tip.ptr.map(|known| (known, &tip.refs, tip.depth));
-        let (refs, depth) = refs::load(store, Some(frame.head), since)?;
+        let loaded = refs::load(store, Some(frame.head), tip.since())?;
+        let adopted = self.adopt_genesis(store, loaded.genesis, notices);
+        let refs = &loaded.refs;
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut followed = Vec::new();
         let mut gone = Vec::new();
@@ -2435,15 +2548,14 @@ impl<T: Data> Shared<T> {
                 continue;
             }
             let old = tip.refs.try_get(&branch.name)?;
-            if moved(old.as_deref(), new.as_deref()) {
+            let rooted = new.as_deref().is_some_and(|head| head.root.is_some());
+            if moved(old.as_deref(), new.as_deref()) || (adopted && !rooted) {
                 let state = Arc::new(self.state_of(store, new.as_deref())?);
                 followed.push((branch, state));
             }
         }
         store.advance(frame);
-        tip.refs = refs;
-        tip.ptr = Some(frame.head);
-        tip.depth = depth;
+        tip.take(Some(frame.head), loaded);
         for (branch, state) in &followed {
             free(notices, &branch.tip.swap(state.clone()));
             branch.framed.store(frame.seq, Ordering::Release);
@@ -2482,25 +2594,24 @@ impl<T: Data> Shared<T> {
         self.settle(old.last_seq(), notices)?;
         let (fresh, head) = Store::open(&self.file, self.options.clone())?;
         let rebound = (|| -> Result<_> {
-            let (refs, depth) = refs::load(&fresh, head, None)?;
+            let loaded = refs::load(&fresh, head, None)?;
+            self.adopt_genesis(&fresh, loaded.genesis, notices);
             let attached: Vec<_> = self.branches.lock().values().cloned().collect();
             let mut states = Vec::new();
             let mut gone = Vec::new();
             for branch in attached {
-                let found = refs.try_get(&branch.name)?;
+                let found = loaded.refs.try_get(&branch.name)?;
                 if branch.dropped_in(found.as_deref()) {
                     gone.push(branch);
                     continue;
                 }
                 states.push((branch, Arc::new(self.state_of(&fresh, found.as_deref())?)));
             }
-            Ok((refs, depth, states, gone))
+            Ok((loaded, states, gone))
         })();
-        let (refs, depth, states, gone) = rebound.inspect_err(|_| fresh.close())?;
+        let (loaded, states, gone) = rebound.inspect_err(|_| fresh.close())?;
         let mut published = self.published.lock();
-        tip.refs = refs;
-        tip.ptr = head;
-        tip.depth = depth;
+        tip.take(head, loaded);
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
         for (branch, state) in states {
@@ -2556,20 +2667,18 @@ impl<T: Data> Shared<T> {
         let Some(ptr) = head else {
             return Ok(false);
         };
-        let since = tip
-            .ptr
-            .filter(|_| !replaced)
-            .map(|known| (known, &tip.refs, tip.depth));
-        let (refs, depth) = refs::load(&store, Some(ptr), since).inspect_err(|_| {
+        let since = tip.since().filter(|_| !replaced);
+        let loaded = refs::load(&store, Some(ptr), since).inspect_err(|_| {
             if replaced {
                 store.close();
             }
         })?;
+        self.adopt_genesis(&store, loaded.genesis, &mut notices);
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         let mut gone = Vec::new();
         for branch in attached {
-            let head = refs.try_get(&branch.name)?;
+            let head = loaded.refs.try_get(&branch.name)?;
             if branch.dropped_in(head.as_deref()) {
                 gone.push(branch);
                 continue;
@@ -2578,9 +2687,7 @@ impl<T: Data> Shared<T> {
             states.push((branch, state));
         }
         let mut published = self.published.lock();
-        tip.refs = refs;
-        tip.ptr = Some(ptr);
-        tip.depth = depth;
+        tip.take(Some(ptr), loaded);
         if replaced {
             self.store.store(Arc::new(store.clone()));
         }
@@ -3078,12 +3185,13 @@ impl<T: Data> Shared<T> {
     ) -> Result<(Landing, Pending<T>)> {
         txn.unshared();
         let store = self.store();
-        let (ptr, refs, depth) = match (next, tip.ptr) {
-            (Next::Head(name, head), Some(prev)) if tip.depth < refs::STEPS => {
+        let stepped = tip.depth < refs::STEPS && tip.genesis.is_some();
+        let (ptr, refs, depth, genesis) = match (next, tip.ptr) {
+            (Next::Head(name, head), Some(prev)) if stepped => {
                 let (ptr, head) = refs::write_step(&mut txn, &store, prev, &name, &head)?;
                 let mut refs = tip.refs.clone();
                 refs.try_insert(name, head)?;
-                (ptr, refs, tip.depth + 1)
+                (ptr, refs, tip.depth + 1, tip.genesis)
             }
             (next, _) => {
                 let refs = match next {
@@ -3094,8 +3202,16 @@ impl<T: Data> Shared<T> {
                         refs
                     }
                 };
-                let (ptr, refs) = write_decoded(&refs, &mut txn, &store)?;
-                (ptr, refs, 0)
+                let genesis = match tip.genesis {
+                    Some(genesis) => genesis,
+                    None => self.write_genesis(&mut txn)?,
+                };
+                let table = Root::Table(refs, Some(genesis));
+                let (ptr, Root::Table(refs, genesis)) = write_decoded(&table, &mut txn, &store)?
+                else {
+                    return Err(Error::Corrupt("a branch table decoded as a step".into()));
+                };
+                (ptr, refs, 0, genesis)
             }
         };
         if let Some(settling) = settling {
@@ -3112,6 +3228,7 @@ impl<T: Data> Shared<T> {
         tip.refs = refs;
         tip.ptr = Some(ptr);
         tip.depth = depth;
+        tip.genesis = genesis;
         let pending = Pending {
             frame,
             refs: tip.clone(),
@@ -3313,7 +3430,7 @@ impl<T: Data> Shared<T> {
     ) -> Result<Option<(Commit, Chain)>> {
         let state = change.state;
         let head = &state.snapshot.commit;
-        if head.root.map_or(self.genesis_hash, |ptr| ptr.hash) == drafted.root.hash {
+        if head.root.map_or(self.genesis.load().hash, |ptr| ptr.hash) == drafted.root.hash {
             return Ok(None);
         }
         let version = head
@@ -3421,7 +3538,7 @@ impl<T: Data> Shared<T> {
         let head = &state.snapshot.commit;
         if !recorded
             && intent.merged.is_none()
-            && previous.unwrap_or(self.genesis_hash) == root.hash
+            && previous.unwrap_or(self.genesis.load().hash) == root.hash
         {
             return Ok((head.version, head.time_ms, None));
         }
@@ -3653,7 +3770,7 @@ impl<T: Data> Shared<T> {
             commits_dropped: self.prune(keep, notices)?,
             ..Compacted::default()
         };
-        let mut refs = self.copied_refs(notices)?;
+        let (mut refs, mut genesis) = self.copied_refs(notices)?;
         if self.published.lock().ptr.is_none() && refs.is_empty() {
             report.after_bytes = report.before_bytes;
             return Ok(report);
@@ -3662,9 +3779,9 @@ impl<T: Data> Shared<T> {
         let mut copier = Copier::create(store, &temp, &self.options, stop)?;
         self.step("created");
         for _ in 0..MAX_PASSES {
-            let copied = copier.pass(&refs)?;
+            let copied = copier.pass(&refs, genesis)?;
             report.passes += 1;
-            refs = self.copied_refs(notices)?;
+            (refs, genesis) = self.copied_refs(notices)?;
             if copied < QUIET_BYTES {
                 break;
             }
@@ -3683,7 +3800,7 @@ impl<T: Data> Shared<T> {
                 let (head, objects) = {
                     let grown = store.size().saturating_sub(basis.bytes).max(1) as f64;
                     let survival = copier.end().saturating_sub(basis.bytes) as f64 / grown;
-                    copier.finish(&tip.refs, store.last_seq(), survival)?
+                    copier.finish(&tip.refs, tip.genesis, store.last_seq(), survival)?
                 };
                 report.handed_out = copier.handed_out();
                 let (fresh, _) = Store::open_as(&temp, &self.file, self.options.clone())?;
@@ -3704,13 +3821,14 @@ impl<T: Data> Shared<T> {
         Ok(report)
     }
 
-    fn copied_refs(&self, notices: &mut Vec<Notice<T>>) -> Result<Refs> {
+    fn copied_refs(&self, notices: &mut Vec<Notice<T>>) -> Result<(Refs, Option<Ptr>)> {
         if !self.options.shared {
-            return Ok(self.published.lock().refs.clone());
+            let published = self.published.lock();
+            return Ok((published.refs.clone(), published.genesis));
         }
         let mut tip = self.tip.lock();
         self.follow(&mut tip, false, notices)?;
-        Ok(tip.refs.clone())
+        Ok((tip.refs.clone(), tip.genesis))
     }
 
     fn swap_in(
@@ -3722,9 +3840,10 @@ impl<T: Data> Shared<T> {
         head: Ptr,
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Vec<Moved<T>>> {
-        let (refs, depth) = refs::load(fresh, Some(head), None)?;
+        let loaded = refs::load(fresh, Some(head), None)?;
+        self.adopt_genesis(fresh, loaded.genesis, notices);
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
-        for (_, found) in refs.try_entries()? {
+        for (_, found) in loaded.refs.try_entries()? {
             for ptr in found.root.iter().chain(&found.log.tip) {
                 fresh.read_object(*ptr)?;
             }
@@ -3732,7 +3851,7 @@ impl<T: Data> Shared<T> {
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         for branch in attached {
-            let found = refs.try_get(&branch.name)?;
+            let found = loaded.refs.try_get(&branch.name)?;
             let state = Arc::new(self.state_of(fresh, found.as_deref())?);
             states.push((branch, state));
         }
@@ -3748,9 +3867,7 @@ impl<T: Data> Shared<T> {
             return Err(error.into());
         }
         fresh.trace(Op::SyncDir);
-        tip.refs = refs;
-        tip.ptr = Some(head);
-        tip.depth = depth;
+        tip.take(Some(head), loaded);
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
         for (branch, state) in &states {
@@ -3768,7 +3885,8 @@ impl<T: Data + Default> Db<T> {
     /// Opens the database at `path` with the default [`Options`], creating the file if it does not
     /// exist, and returns a handle on its `main` branch.
     ///
-    /// Version 0, the value before the first commit, is `T::default()`.
+    /// Version 0, the value before the first commit, is `T::default()` as it was when the file was
+    /// first written to, which the file stores.
     ///
     /// # Errors
     ///
@@ -3784,8 +3902,8 @@ impl<T: Data> Db<T> {
     /// Opens the database at `path` like [`Db::open`], with version 0 from `init`, for a `T` that
     /// is not [`Default`].
     ///
-    /// Version 0 is not stored in the file, so `init` runs on every open and should give the same
-    /// value each time.
+    /// The file stores version 0 when it is first written to, and later opens read it from there
+    /// without calling `init`, as [`Options::open_with`] describes.
     ///
     /// # Errors
     ///
@@ -4626,11 +4744,11 @@ impl<T: Data> Db<T> {
     }
 
     /// The snapshot of version 0, whether or not the branch still retains it.
-    pub(crate) fn genesis(&self) -> Snapshot<T> {
-        Snapshot {
-            value: self.shared.genesis.clone(),
+    pub(crate) fn genesis(&self) -> Result<Snapshot<T>> {
+        Ok(Snapshot {
+            value: self.shared.genesis.load().value()?,
             commit: Arc::new(Commit::genesis()),
-        }
+        })
     }
 
     /// The snapshot of `version` on this branch.
@@ -4671,7 +4789,7 @@ impl<T: Data> Db<T> {
             if state.log.first > 1 {
                 return Err(Error::NoVersion(0));
             }
-            return Ok(self.genesis());
+            return self.genesis();
         }
         let entry = state
             .log
@@ -4823,7 +4941,7 @@ impl<T: Data> Db<T> {
         F: Fn(&T) -> V,
     {
         let state = self.branch.state.load();
-        let genesis = (state.log.first == 1).then(|| self.shared.genesis.clone());
+        let genesis = (state.log.first == 1).then(|| self.shared.genesis.load_full());
         let bounds = state.log.retained(&versions);
         History::new(state.log, bounds, state.store.clone(), genesis, project)
     }
@@ -4908,7 +5026,7 @@ impl<T: Data> Db<T> {
         let high = (to, value_at(to)?);
         if from == 1 || from > state.log.first {
             let before = if from == 1 {
-                project(&self.shared.genesis)
+                project(&*self.shared.genesis.load().value()?)
             } else {
                 value_at(from - 1)?
             };
@@ -5123,7 +5241,7 @@ impl<T: Data> Db<T> {
         }
         let mut found = found.into_iter();
         let Some(first) = found.next() else {
-            return Ok(self.genesis());
+            return Ok(self.genesis()?);
         };
         let mut base = Self::snapshot_of(&first.store, &first.node.entry.commit)?;
         let mut merged = vec![first];
@@ -5200,7 +5318,7 @@ impl<T: Data> Db<T> {
         let first = self.common_starts(other)?.into_iter().next();
         match first {
             Some(start) => Self::snapshot_of(&start.store, &start.node.entry.commit),
-            None => Ok(self.genesis()),
+            None => self.genesis(),
         }
     }
 
@@ -5216,7 +5334,7 @@ impl<T: Data> Db<T> {
     pub fn common_ancestors(&self, other: &Db<T>) -> Result<Vec<Snapshot<T>>> {
         let found = self.common_starts(other)?;
         if found.is_empty() {
-            return Ok(vec![self.genesis()]);
+            return Ok(vec![self.genesis()?]);
         }
         found
             .iter()
@@ -5706,12 +5824,13 @@ impl<T: Data> Db<T> {
     ///
     /// [`List`]: crate::List
     pub fn verify_typed(&self) -> Result<Verified> {
-        let (head, refs, store) = {
+        let (head, refs, genesis, store) = {
             let published = self.shared.published.lock();
-            (published.ptr, published.refs.clone(), self.shared.store())
+            let refs = published.refs.clone();
+            (published.ptr, refs, published.genesis, self.shared.store())
         };
         let report = crate::admin::verified(&store, head)?;
-        crate::admin::typed::<T>(&store, &refs)?;
+        crate::admin::typed::<T>(&store, &refs, genesis)?;
         Ok(report)
     }
 }

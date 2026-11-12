@@ -1,7 +1,8 @@
 # History, versions and branches
 
 Every commit makes a new version of your root value. Each commit on a branch takes the next version
-number, and version 0 is the value before the first commit.
+number, and version 0 is the value before the first commit, which the file stores when it is first
+written to, so it stays what the database started from even if `Default` changes.
 
 ## Reading old versions
 

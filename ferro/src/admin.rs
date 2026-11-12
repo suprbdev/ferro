@@ -91,7 +91,7 @@ fn read_only(path: &Path) -> Result<(Closing, Option<Ptr>)> {
 }
 
 fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
-    Ok(refs::load(store, head, None)?.0)
+    Ok(refs::load(store, head, None)?.refs)
 }
 
 /// The length of the file at `path`, and each branch with its version, commit count and last
@@ -230,9 +230,9 @@ fn named_merges(refs: &Refs) -> Result<()> {
     Ok(())
 }
 
-/// Decodes every object reachable from every retained version in `refs` as the type that reads
-/// it, checking each map node against what its parent records. The branch table is left to
-/// [`verified`].
+/// Decodes every object reachable from every retained version in `refs`, and from version 0 at
+/// `genesis`, as the type that reads it, checking each map node against what its parent records.
+/// The branch table is left to [`verified`].
 ///
 /// Each object is checked without the store, and one whose summary needs it, because a value it
 /// summarizes or a summary it folds holds a collection, is checked again with the store once every
@@ -243,8 +243,8 @@ fn named_merges(refs: &Refs) -> Result<()> {
 ///
 /// [`Error::Corrupt`] naming the first object that does not decode or does not fit, or the first
 /// table whose indexes do not agree with its rows.
-pub(crate) fn typed<T: Data>(store: &Store, refs: &Refs) -> Result<()> {
-    let mut roots: Vec<Ptr> = Vec::new();
+pub(crate) fn typed<T: Data>(store: &Store, refs: &Refs, genesis: Option<Ptr>) -> Result<()> {
+    let mut roots: Vec<Ptr> = genesis.into_iter().collect();
     let mut commits = HashSet::new();
     let mut versions: Vec<(u64, Hash, Option<Ptr>, Option<Hash>)> = Vec::new();
     let mut closures = Closures::default();
@@ -441,9 +441,10 @@ pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let (store, head) = read_only(path.as_ref())?;
     let mut extents = Vec::new();
     if head.is_some() {
-        let refs = load_refs(&store, head)?;
-        let (pruned, _) = pruned(&store, &refs, keep)?;
+        let loaded = refs::load(&store, head, None)?;
+        let (pruned, _) = pruned(&store, &loaded.refs, keep)?;
         let mut roots = Roots {
+            trees: loaded.genesis.into_iter().collect(),
             exact: true,
             ..Roots::default()
         };
@@ -570,9 +571,10 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
             ..Compacted::default()
         });
     };
-    let refs = load_refs(&store, Some(head)).inspect_err(|_| store.close())?;
+    let loaded = refs::load(&store, Some(head), None).inspect_err(|_| store.close())?;
     let temp = sibling(path);
-    let result = write_copy(&store, &refs, keep, &temp).and_then(|mut report| {
+    let copied = write_copy(&store, (&loaded.refs, loaded.genesis), keep, &temp);
+    let result = copied.and_then(|mut report| {
         report.before_bytes = before_bytes;
         report.after_bytes = fs::metadata(&temp)?.len();
         rename(&temp, path)?;
@@ -586,13 +588,18 @@ pub fn compact(path: impl AsRef<Path>, keep: Keep) -> Result<Compacted> {
     result
 }
 
-fn write_copy(store: &Store, refs: &Refs, keep: Keep, temp: &Path) -> Result<Compacted> {
+fn write_copy(
+    store: &Store,
+    (refs, genesis): (&Refs, Option<Ptr>),
+    keep: Keep,
+    temp: &Path,
+) -> Result<Compacted> {
     let (pruned, commits_dropped) = pruned(store, refs, keep)?;
     let mut copier = Copier::create(store, temp, &StoreOptions::default(), None)?;
-    copier.pass(&pruned)?;
+    copier.pass(&pruned, genesis)?;
     let after = copier.end();
     let survival = after as f64 / store.size().max(1) as f64;
-    let (_, objects) = copier.finish(&pruned, store.last_seq(), survival)?;
+    let (_, objects) = copier.finish(&pruned, genesis, store.last_seq(), survival)?;
     Ok(Compacted {
         objects,
         commits_dropped,

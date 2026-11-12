@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::codec::Data;
-use crate::db::Commit;
+use crate::db::{Commit, Genesis};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Walk};
 use crate::map::fatal;
@@ -27,7 +27,7 @@ pub struct History<T, V, F> {
     floor: u64,
     walk: Option<Walk>,
     store: Store,
-    genesis: Option<Arc<T>>,
+    genesis: Option<Arc<Genesis<T>>>,
     project: F,
     run: Option<(Arc<Commit>, V)>,
 }
@@ -39,7 +39,7 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
         chain: Chain,
         bounds: Option<(u64, u64)>,
         store: Store,
-        genesis: Option<Arc<T>>,
+        genesis: Option<Arc<Genesis<T>>>,
         project: F,
     ) -> Self {
         History {
@@ -94,7 +94,7 @@ impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
             return Ok(None);
         }
         let unchanged = match &self.genesis {
-            Some(genesis) => (self.project)(genesis) == value,
+            Some(genesis) => (self.project)(&*genesis.value()?) == value,
             None => false,
         };
         Ok((!unchanged).then(|| (Arc::unwrap_or_clone(commit), value)))

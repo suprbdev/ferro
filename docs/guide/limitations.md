@@ -2,10 +2,9 @@
 
 This is an experiment, not a production database.
 
-- The file format is not stable and may change without migration. It is now format 5, which lets a
-  link's distance be padded so that a commit can move without laying its records out again: a file
-  of format 4 does not open in this build, nor one of format 5 in an earlier build, and both report
-  `Error::NotFerro`.
+- The file format is not stable and may change without migration. It is now format 7, whose branch
+  table names the stored version 0: a file of format 6 does not open in this build, nor one of
+  format 7 in an earlier build, and both report `Error::NotFerro`.
 - It runs on Unix and Windows. On Windows the file must be on NTFS: a reclamation cycle renames the
   new file over one that snapshots still hold open, which needs POSIX rename semantics, and Windows
   cannot sync a directory, so the rename is made durable by flushing the renamed file, which relies
@@ -19,8 +18,12 @@ This is an experiment, not a production database.
   reads check, as described under [Bytes of a small commit](../internals/commit-bytes.md). Without
   retention the file only grows.
 
-- Version 0 is not stored. `at(0)`, until version 1 is pruned, and forks of an empty database use
-  your current `Default`, or the `init` passed to `open_with`.
+- Version 0 is stored by the first commit, fork or pull that writes to a file, from `Default` or
+  the `init` passed to `open_with` at that moment, and read back from the file after that. Until
+  then a file holds nothing, and each open takes its own `init`. The file keeps version 0 for good,
+  even once pruning makes `at(0)` return `NoVersion`, so a large initial value keeps its room. Each
+  file stores its own: two files that share no commit merge against ours, as described under
+  [Versions and hashes across files](sync.md#versions-and-hashes-across-files).
 
 - One writer closure runs at a time on each branch, and placing commits and writing the refs take
   one lock for the whole file, as described under [Branches and the writer

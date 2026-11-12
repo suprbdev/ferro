@@ -88,7 +88,7 @@ pub(crate) fn fresh_reads() -> u64 {
 }
 
 /// The magic at the start of a superblock, which names the format of the file.
-const MAGIC: &[u8; 8] = b"FERRODB6";
+const MAGIC: &[u8; 8] = b"FERRODB7";
 /// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 /// The magic at the start of a staging frame's header, whose records no check covers.

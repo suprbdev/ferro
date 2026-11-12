@@ -696,17 +696,17 @@ impl Data for Forged {
     }
 }
 
-fn forged_file(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+fn forged_file<T: Data + Default>(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("forged.ferro");
-    let db = ferro::Db::<Forged>::open(&path).unwrap();
+    let db = ferro::Db::<Forged>::open_with(&path, || Forged(body_of(&T::default()))).unwrap();
     db.update(|root| *root = Forged(bytes.to_vec())).unwrap();
     drop(db);
     (dir, path)
 }
 
 fn forged_as<T: Data + Default + Debug>(bytes: &[u8]) {
-    let (_dir, path) = forged_file(bytes);
+    let (_dir, path) = forged_file::<T>(bytes);
     match ferro::Db::<T>::open(&path) {
         Err(ferro::Error::Decode(_)) => {}
         Err(other) => panic!("opening a forged root failed with {other}"),
@@ -727,7 +727,7 @@ fn a_root_written_in_a_form_no_encoder_writes_fails_to_open() {
 
 #[test]
 fn a_root_with_bytes_after_its_value_fails_a_typed_verify() {
-    let (_dir, path) = forged_file(&[0x05, 0x07]);
+    let (_dir, path) = forged_file::<u64>(&[0x05, 0x07]);
     let db = ferro::Db::<u64>::open(&path).unwrap();
     assert_eq!(*db.read(), 5);
     assert!(matches!(
@@ -812,7 +812,11 @@ impl Forge {
         self.0.push(root);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("forged.ferro");
-        let db = ferro::Db::<Objects>::open(&path).unwrap();
+        let empty = Obj {
+            body: body_of(&Map::<u64, u64>::new()),
+            links: Vec::new(),
+        };
+        let db = ferro::Db::<Objects>::open_with(&path, || Objects(Arc::new(vec![empty]))).unwrap();
         let objects = Objects(Arc::new(self.0));
         db.update(|root| *root = objects).unwrap();
         drop(db);

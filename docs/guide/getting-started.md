@@ -147,7 +147,9 @@ concurrency](concurrency.md#awaited-writes).
 | `copy_threads(usize)` | cores, up to 8 | Threads a reclamation cycle copies and checks on. See [Retention and reclamation](retention.md). |
 
 `open` needs `T: Default`, since version 0, the value before the first commit, is `T::default()`.
-`Db::open_with(path, init)` and `Options::open_with` take that value from `init` instead.
+`Db::open_with(path, init)` and `Options::open_with` take that value from `init` instead. The first
+commit, fork or pull stores it in the file, and later opens read it from there, so changing
+`Default` or `init` afterwards does not change version 0 of a file that already has one.
 
 ## Next
 

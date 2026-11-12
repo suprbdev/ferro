@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ferro::codec::{HASH_BYTES, Hash, Object, Ptr};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
-pub const MAGIC: &[u8; 8] = b"FERRODB6";
+pub const MAGIC: &[u8; 8] = b"FERRODB7";
 pub const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 pub const STAGING_MAGIC: &[u8; 8] = b"FERROSTG";
 pub const SLOT_BYTES: usize = 4096;

@@ -1146,7 +1146,7 @@ impl<'a> Copier<'a> {
         })
     }
 
-    fn encode(&mut self, refs: &Refs) -> Result<Ptr> {
+    fn encode(&mut self, refs: &Refs, genesis: Option<Ptr>) -> Result<Ptr> {
         let sink = &mut self.sink;
         let source = sink.source.clone();
         let mut retained: HashSet<Hash, ByHash> = HashSet::default();
@@ -1228,7 +1228,7 @@ impl<'a> Copier<'a> {
         }
         sink.stale = true;
         let mut encoder = Encoder::new(&mut *sink);
-        refs.encode(&mut encoder)?;
+        refs::encode_table(&mut encoder, refs, genesis)?;
         let head = encoder.finish();
         sink.needs.clear();
         sink.cache.clear();
@@ -1241,11 +1241,11 @@ impl<'a> Copier<'a> {
         Ok(head)
     }
 
-    /// Copies everything `refs` retains that earlier passes did not, checking every object's
-    /// hash, and returns the bytes written.
-    pub(crate) fn pass(&mut self, refs: &Refs) -> Result<u64> {
+    /// Copies everything `refs` retains, and version 0 at `genesis`, that earlier passes did not,
+    /// checking every object's hash, and returns the bytes written.
+    pub(crate) fn pass(&mut self, refs: &Refs, genesis: Option<Ptr>) -> Result<u64> {
         let before = self.sink.end;
-        self.encode(refs)?;
+        self.encode(refs, genesis)?;
         self.sink.drain()?;
         Ok(self.sink.end - before)
     }
@@ -1266,12 +1266,19 @@ impl<'a> Copier<'a> {
         Ok(())
     }
 
-    /// Copies what is left for `refs`, writes the branch table, and seals the copy with a
-    /// superblock at sequence `seq` that records `survival`, the share of new bytes that survived.
+    /// Copies what is left for `refs` and `genesis`, writes the branch table, and seals the copy
+    /// with a superblock at sequence `seq` that records `survival`, the share of new bytes that
+    /// survived.
     ///
     /// It returns the branch table's pointer in the copy and the number of objects copied in all.
-    pub(crate) fn finish(&mut self, refs: &Refs, seq: u64, survival: f64) -> Result<(Ptr, u64)> {
-        let head = self.encode(refs)?;
+    pub(crate) fn finish(
+        &mut self,
+        refs: &Refs,
+        genesis: Option<Ptr>,
+        seq: u64,
+        survival: f64,
+    ) -> Result<(Ptr, u64)> {
+        let head = self.encode(refs, genesis)?;
         self.sink.drain()?;
         let basis = Basis::new(self.sink.end, survival);
         seal(&self.sink.file, self.sink.end, head, seq, basis)?;

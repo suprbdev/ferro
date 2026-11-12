@@ -136,6 +136,12 @@ base only pruned history could show, such as one from a device that has pruned p
 last shared, lands the other branch and returns `NoCommonAncestor` instead of merging against
 nothing, which would bring back what the other device deleted.
 
+Each file stores its own version 0, and a bundle does not carry it. Two files that share no commit,
+such as two created on their own, share no version 0 either, and a pull between them merges against
+the receiving file's: the closure's `base` is that version 0, and a branch pulled from version 1
+reads it as its `at(0)`. If that base matters, give the files a commit in common first, by cloning
+one from the other with a first pull into an empty file.
+
 ## Converging devices
 
 Devices converge only if your closure gives the same result whichever side is `ours`, as

@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{Rng, cases, fast, text, uncached};
-use ferro::{Db, Error, Map, Options, Snapshot};
+use ferro::{Db, Error, Keep, Map, Options, Snapshot, admin};
 use proptest::prelude::*;
 
 type Root = Map<u32, String>;
@@ -443,4 +443,102 @@ fn open_with_custom_genesis_treats_equal_value_as_no_op() {
     assert_eq!(db.version(), 1);
     assert_eq!(db.at(0).unwrap().len(), 1);
     assert_eq!(db.at(1).unwrap().len(), 2);
+}
+
+fn seeded(seed: &'static str) -> impl FnOnce() -> Root {
+    move || {
+        let mut map = Map::new();
+        map.insert(0u32, seed.to_string());
+        map
+    }
+}
+
+fn seed_of(root: &Root) -> Option<String> {
+    root.get(&0).map(|seed| (*seed).clone())
+}
+
+fn unused() -> Root {
+    panic!("init ran for a file that holds version 0")
+}
+
+#[test]
+fn version_zero_is_read_back_from_the_file_whatever_init_gives_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.ferro");
+    let db = fast().open_with::<Root>(&path, seeded("first")).unwrap();
+    db.update(|root| {
+        root.insert(1, "one".into());
+    })
+    .unwrap();
+    drop(db);
+    let db = fast().open_with::<Root>(&path, unused).unwrap();
+    assert_eq!(seed_of(&db.at(0).unwrap()).as_deref(), Some("first"));
+    assert_eq!(db.history_of(seed_of).count(), 0);
+    assert!(db.bisect_changes(.., seed_of).unwrap().is_empty());
+    db.verify_typed().unwrap();
+    db.compact(Keep::All).unwrap();
+    drop(db);
+    admin::compact(&path, Keep::All).unwrap();
+    let db = fast().open_with::<Root>(&path, unused).unwrap();
+    assert_eq!(seed_of(&db.at(0).unwrap()).as_deref(), Some("first"));
+    assert_eq!(db.history_of(seed_of).count(), 0);
+    db.verify_typed().unwrap();
+}
+
+#[test]
+fn a_fork_of_an_empty_database_stores_the_value_it_starts_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.ferro");
+    let db = fast().open_with::<Root>(&path, seeded("first")).unwrap();
+    drop(db);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    let db = fast().open_with::<Root>(&path, seeded("second")).unwrap();
+    db.fork("side").unwrap();
+    drop(db);
+    let db = fast().open_with::<Root>(&path, unused).unwrap();
+    let side = db.branch("side").unwrap();
+    for branch in [&db, &side] {
+        assert_eq!(seed_of(&branch.read()).as_deref(), Some("second"));
+        assert_eq!(seed_of(&branch.at(0).unwrap()).as_deref(), Some("second"));
+    }
+    side.update(|root| {
+        root.insert(1, "side".into());
+    })
+    .unwrap();
+    db.update(|root| {
+        root.insert(2, "main".into());
+    })
+    .unwrap();
+    let base = db.common_ancestor(&side).unwrap();
+    assert_eq!(
+        (base.version(), seed_of(&base).as_deref()),
+        (0, Some("second"))
+    );
+    db.merge_with(&side, |ours, base, theirs| {
+        assert_eq!(seed_of(base).as_deref(), Some("second"));
+        ours.insert(1, (*theirs.get(&1).unwrap()).clone());
+        ("merge", ())
+    })
+    .unwrap();
+    assert_eq!(db.read().len(), 3);
+}
+
+#[test]
+fn a_reader_takes_version_0_from_the_file_once_a_writer_stores_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.ferro");
+    let writer = fast().open_with::<Root>(&path, seeded("writer")).unwrap();
+    let reader = fast()
+        .read_only(true)
+        .open_with::<Root>(&path, seeded("reader"))
+        .unwrap();
+    assert_eq!(seed_of(&reader.at(0).unwrap()).as_deref(), Some("reader"));
+    writer
+        .update(|root| {
+            root.insert(1, "one".into());
+        })
+        .unwrap();
+    assert!(reader.refresh().unwrap());
+    assert_eq!(seed_of(&reader.at(0).unwrap()).as_deref(), Some("writer"));
+    assert_eq!(reader.history_of(seed_of).count(), 0);
 }

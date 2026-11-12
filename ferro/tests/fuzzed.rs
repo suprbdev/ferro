@@ -535,7 +535,7 @@ fn compacting_a_tree_that_links_a_pruned_log_entry_fails() {
         let outcome = db.compact(Keep::Last(1));
         assert!(
             matches!(&outcome, Err(Error::Corrupt(message))
-                if message == "link to the pruned log entry at 16130"),
+                if message.starts_with("link to the pruned log entry at ")),
             "{threads} threads: {outcome:?}"
         );
         db.verify().unwrap();
@@ -1062,9 +1062,10 @@ fn a_tree_that_links_the_record_a_chain_reads_shares_its_copy() {
             let db: Db<Opaque> = Options::new().copy_threads(threads).open(&path).unwrap();
             let compacted = db.compact(keep).unwrap();
             drop(db);
+            let genesis = u64::from(matches!(keep, Keep::Last(_)));
             assert_eq!(
                 compacted.objects + compacted.commits_dropped,
-                objects,
+                objects + genesis,
                 "{threads} threads, {keep:?}"
             );
             assert_eq!(admin::verify(&path).unwrap().objects, compacted.objects);

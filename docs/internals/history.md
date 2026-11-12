@@ -107,10 +107,57 @@ Everything that names a version of a branch follows one rule: a version below `f
 returns `NoVersion` for it, `as_of` a time before the oldest retained commit returns `NoVersion`,
 `history_of` and `bisect_changes` report the oldest retained commit as a change because there is
 nothing left to compare it with, and a fork copies `first`, so it answers the same. Version 0, the
-value before the first commit, is not stored, and it counts as retained for exactly as long as
-version 1 is. `at(0)` used to return the current `Default` even after pruning, while `as_of` for the
-same moment returned `NoVersion`. The rule depends only on `first`, never on whether a reclamation
-cycle has removed the bytes yet, so an answer does not change when one runs.
+value before the first commit, counts as retained for exactly as long as version 1 is, though its
+value stays in the file, as [Version 0](#version-0) describes. `at(0)` used to return the current
+`Default` even after pruning, while `as_of` for the same moment returned `NoVersion`. The rule
+depends only on `first`, never on whether a reclamation cycle has removed the bytes yet, so an
+answer does not change when one runs.
+
+## Version 0
+
+Version 0 is the value before a branch's first commit. It has no log entry: the chain starts at
+version 1, and a head with no tip names no root. Its value is stored once for the whole file, as a
+root the branch table names, which every branch in the file starts from. A table's body starts with
+the byte `0x7e` and its first link is that root, as described under [File format and
+durability](storage.md#file-format-and-durability). Steps do not carry it, since they link back to
+a table.
+
+The first frame a file writes, a commit, a fork or a pull, always writes a table, and that table
+stores the `init` value of the process that writes it. Every later table names the same root, and
+a reclamation cycle and `compact` copy it as they copy the table. An open of a file whose table
+names version 0 never calls `init`, and reads the value only when something first asks for it, so
+damage to the oldest frames fails `at(0)` and not the open. A process that opened the file
+before anything was written, with an `init` of its own, takes the stored value when it catches up,
+refreshes or follows. A table that names none, as in a file converted from format 6, makes the next
+frame write a table rather than a step, so the file stores it then.
+
+Before, version 0 was `init` called at each open, so `at(0)`, `history_of` and `bisect_changes`
+comparing version 1 with it, a fork of an empty branch, and a merge of branches that share no
+commit all used whatever `Default` was at that open, not what the database started from. Two other
+places to store it were weighed:
+
+- A log entry at version 0. Its chain would start at 0, which the base search, the graph numbers,
+  `Log::len`, the rule that `first` is at least 1, the copy's pruning and sync's anchors all assume
+  is not so, and a bundle would have to carry the root too. Two files created apart would hold
+  different entries at version 0, so whether they share a commit would depend on when and with
+  what value each was created.
+- A root in each head. Every step would carry one more link, a 20-byte hash and its distance, on
+  every commit, and a branch that sync lands would need a value that the bundle does not carry, so
+  it would take the file's anyway.
+
+A file that nothing was written to stays two superblocks, 8 KiB, and opens with `init` each time. A
+file's first frame holds the value of version 0, a few bytes for an empty collection, and each table
+names it with one more byte and a link, once every 64 commits. The value is kept when pruning drops
+version 1: `at(0)` then returns `NoVersion` as the rule above says, but the file keeps the value,
+since a branch that a later pull lands from version 1, and a merge of branches that share no commit,
+start from it.
+
+Sync does not send version 0, and the bundle format is unchanged. A pull between files that share
+no commit merges against the receiving file's version 0, as it merged against that file's `init`
+before, and `common_ancestor` answers it for them as before. A branch a pull lands from version 1
+reads the receiving file's version 0 as its own, though the sending file may store another. Two
+files created apart never share a commit through version 0, so a first pull between them still
+sends everything.
 
 ## The `Log` handle
 

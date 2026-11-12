@@ -721,7 +721,9 @@ struct Stock {
 fn deep_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root.ferro");
-    let forger: Db<Raw> = fast().open(&root).unwrap();
+    let forger: Db<Raw> = fast()
+        .open_with(&root, || Raw(encoded(&Opt::default())))
+        .unwrap();
     forger
         .update(|raw| *raw = Raw(forged::<Opt>(HOSTILE)))
         .unwrap();

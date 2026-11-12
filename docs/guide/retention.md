@@ -53,8 +53,10 @@ lengths of the old and the new file, `objects` copied, `commits_dropped`, `passe
 
 A pruned version is gone, whether or not a cycle has reclaimed its bytes yet: `at` returns
 `NoVersion`, so does `as_of` a time before the oldest retained commit, `log` and `history_of` stop
-at the oldest retained commit, and a fork answers the same. Version 0, your `Default` before the
-first commit, goes when version 1 does. `head_hash` does not change, because retained commits are
+at the oldest retained commit, and a fork answers the same. Version 0, the value the file stored
+before the first commit, goes when version 1 does, though the file keeps its value, since it is
+where a branch that a later pull brings in from version 1 starts. `head_hash` does not change,
+because retained commits are
 not rewritten. A branch also keeps the commits its retained merges brought in, back to its oldest
 retained commit, so `merge_with` finds its base in what is retained and returns `NoCommonAncestor`
 when the answer could depend on what was pruned.

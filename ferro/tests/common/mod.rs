@@ -154,7 +154,7 @@ pub fn staging_frame(image: &[u8], start: usize) -> Option<usize> {
 pub fn frames_past_the_anchor(image: &[u8]) -> Vec<(usize, usize)> {
     let mut newest = None;
     for slot in [0, SLOT] {
-        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB6" {
+        if image.len() < slot + 144 || &image[slot..slot + 8] != b"FERRODB7" {
             continue;
         }
         if blake3::hash(&image[slot..slot + 112]).as_bytes()[..] != image[slot + 112..slot + 144] {
@@ -489,13 +489,32 @@ impl Data for RawHead {
     }
 }
 
+#[derive(Clone)]
+struct RawTable(Map<String, RawHead>);
+
+impl Data for RawTable {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        self.0.encode(w)
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        match r.u8()? {
+            0x7e => {
+                r.link()?;
+                Ok(RawTable(Map::decode(r)?))
+            }
+            tag => Err(ferro::Error::Decode(format!("no table tag but {tag}"))),
+        }
+    }
+}
+
 pub fn rewrite_branch_table(
     path: &Path,
     write: impl FnOnce(Map<String, RawHead>, &mut Txn) -> Ptr,
 ) {
     ferro::admin::compact(path, ferro::Keep::All).unwrap();
     let (store, head) = Store::open(path, StoreOptions::default()).unwrap();
-    let refs = (*store.load::<Map<String, RawHead>>(head.unwrap()).unwrap()).clone();
+    let refs = store.load::<RawTable>(head.unwrap()).unwrap().0.clone();
     let mut txn = store.begin().unwrap();
     let table = write(refs, &mut txn);
     txn.commit(table).unwrap();
