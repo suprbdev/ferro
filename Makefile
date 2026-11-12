@@ -19,6 +19,7 @@ STRESS_COPIES ?= 12
 STRESS_THREADS ?= 16
 LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
 GO_IMAGE ?= golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+IRMIN_IMAGE ?= ferro-versioned-irmin
 VERSIONED = $(CURDIR)/benchmarks/compare/target/versioned
 GO_BUILD = docker run --rm --memory=16g --memory-swap=16g --user $$(id -u):$$(id -g) -e HOME=/work/go \
 	-e GOPATH=/work/go -e GOCACHE=/work/go/cache -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly -v $(VERSIONED):/work
@@ -133,13 +134,17 @@ bench-combine: ## Compare ways to combine two index lookups by key
 bench-compare: ## Compare ferro with SQLite, redb and fjall
 	cd benchmarks/compare && $(RUN) run --release -- $(ARGS)
 
-compare-versioned: ## Compare ferro's history, branches, sync and verify with immudb and Dolt, both in Docker
+compare-versioned: ## Compare ferro's history, branches, sync and verify with immudb, Dolt and Irmin, all in Docker
 	@mkdir -p $(VERSIONED)/go $(VERSIONED)/bin $(VERSIONED)/runs
 	$(GO_BUILD) -e CGO_ENABLED=0 -v $(CURDIR)/benchmarks/compare/versioned/immudb:/src:ro -w /src $(GO_IMAGE) \
 		go build -trimpath -o /work/bin/immudb .
 	$(GO_BUILD) -e CGO_ENABLED=1 -v $(CURDIR)/benchmarks/compare/versioned/dolt:/src:ro -w /src $(GO_IMAGE) \
 		go build -tags gms_pure_go -trimpath -o /work/bin/dolt .
-	cd benchmarks/compare && $(RUN) run --release --bin versioned -- --image $(GO_IMAGE) $(ARGS)
+	docker build -q -t $(IRMIN_IMAGE) benchmarks/compare/versioned/irmin
+	docker run --rm --memory=16g --memory-swap=16g --network none --user $$(id -u):$$(id -g) -e DUNE_CACHE=disabled \
+		-v $(VERSIONED):/work -v $(CURDIR)/benchmarks/compare/versioned/irmin:/src:ro $(IRMIN_IMAGE) \
+		sh -c 'dune build --root /src --build-dir /work/irmin --profile release ./main.exe && install -m 0755 /work/irmin/default/main.exe /work/bin/irmin'
+	cd benchmarks/compare && $(RUN) run --release --bin versioned -- --image $(GO_IMAGE) --irmin-image $(IRMIN_IMAGE) $(ARGS)
 
 quickstart: ## Run the library's quickstart example
 	$(RUN) run --release -p ferro --example quickstart

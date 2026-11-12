@@ -16,7 +16,7 @@ const RANGE_LEN: usize = 100;
 const MERGE_COMMITS: u64 = 100;
 const PULL_COMMITS: u64 = 100;
 const ROUNDS: usize = 5;
-const ENGINES: [&str; 3] = ["ferro", "immudb", "dolt"];
+const ENGINES: [&str; 4] = ["ferro", "immudb", "dolt", "irmin"];
 
 type Kv = Map<u64, String>;
 
@@ -347,7 +347,7 @@ const ROWS: [(&str, &str, &str); 26] = [
     ("reopen_ms", "reopen and first get", "ms"),
 ];
 
-fn parent(rounds: usize, image: &str, engines: &[String]) {
+fn parent(rounds: usize, images: &BTreeMap<String, String>, engines: &[String]) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/versioned");
     let runs = root.join("runs");
     fs::create_dir_all(&runs).unwrap();
@@ -384,12 +384,13 @@ fn parent(rounds: usize, image: &str, engines: &[String]) {
                     "HOME=/runs",
                     "--user",
                     &user,
+                    "--entrypoint",
+                    &format!("/bench/{name}"),
                     "-v",
                 ]);
                 cmd.arg(format!("{}:/bench:ro", root.join("bin").display()));
                 cmd.arg("-v").arg(format!("{}:/runs", runs.display()));
-                cmd.arg(image)
-                    .arg(format!("/bench/{name}"))
+                cmd.arg(&images[name.as_str()])
                     .arg(format!("/runs/{name}-{round}"));
                 cmd
             };
@@ -462,12 +463,14 @@ fn main() {
     }
     let mut rounds = ROUNDS;
     let mut image = None;
+    let mut irmin_image = None;
     let mut engines: Vec<String> = ENGINES.iter().map(|e| e.to_string()).collect();
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--rounds" => rounds = rest.next().unwrap().parse().unwrap(),
             "--image" => image = rest.next().cloned(),
+            "--irmin-image" => irmin_image = rest.next().cloned(),
             "--engines" => {
                 engines = rest
                     .next()
@@ -479,11 +482,18 @@ fn main() {
             _ => panic!("unknown argument {arg}"),
         }
     }
-    let needs_image = engines.iter().any(|e| e != "ferro");
-    let image = match image {
-        Some(image) => image,
-        None if !needs_image => String::new(),
-        None => panic!("--image names the Go image the immudb and Dolt harnesses run in"),
-    };
-    parent(rounds, &image, &engines);
+    let mut images = BTreeMap::new();
+    for name in &engines {
+        let (flag, given) = match name.as_str() {
+            "ferro" => continue,
+            "immudb" | "dolt" => ("--image", &image),
+            "irmin" => ("--irmin-image", &irmin_image),
+            _ => panic!("unknown engine {name}"),
+        };
+        let image = given
+            .clone()
+            .unwrap_or_else(|| panic!("{flag} names the image the {name} harness runs in"));
+        images.insert(name.clone(), image);
+    }
+    parent(rounds, &images, &engines);
 }

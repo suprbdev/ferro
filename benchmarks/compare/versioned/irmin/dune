@@ -1,0 +1,3 @@
+(executable
+ (name main)
+ (libraries irmin irmin-pack irmin-pack.unix lwt lwt.unix mtime.clock unix))

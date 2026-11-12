@@ -1,0 +1,12 @@
+opam-version: "2.0"
+synopsis: "Irmin harness for ferro's versioned comparison"
+maintainer: "ferro"
+depends: [
+  "ocaml" {= "5.2.1"}
+  "dune" {>= "3.0"}
+  "irmin" {= "3.11.0"}
+  "irmin-pack" {= "3.11.0"}
+  "lwt"
+  "mtime" {>= "2.0.0"}
+]
+build: ["dune" "build" "-p" name "-j" jobs]
