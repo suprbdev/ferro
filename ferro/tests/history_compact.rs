@@ -439,31 +439,33 @@ fn readers_see_the_old_or_new_file_while_compactions_rename() {
     let path = dir.path().join("rn.ferro");
     let content = populate(&path, 400);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opened = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let reader = {
         let path = path.clone();
-        let stop = stop.clone();
+        let (stop, opened) = (stop.clone(), opened.clone());
         let content = content.clone();
         std::thread::spawn(move || {
-            let mut opened = 0;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 let db: Db<Root> = Options::new().read_only(true).open(&path).unwrap();
                 assert_eq!(dump(&db.read()), content);
                 db.verify().unwrap();
-                opened += 1;
+                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            opened
         })
     };
-    for round in 0..15 {
+    let mut round = 0;
+    while round < 15 || opened.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         let keep = if round % 2 == 0 {
             Keep::Last(50)
         } else {
             Keep::All
         };
         admin::compact(&path, keep).unwrap();
+        round += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(reader.join().unwrap() > 0);
+    reader.join().unwrap();
+    assert!(opened.load(std::sync::atomic::Ordering::SeqCst) > 0);
 }
 
 #[test]

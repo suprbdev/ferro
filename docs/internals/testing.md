@@ -738,6 +738,17 @@ about 8. The writers beside pulls committed at least 9.2 times a pull, and in 52
 beside the spinning processes fewer than the 8,000 times the old check asked. So did 50 runs of
 `shared.rs`, 30 beside the spinning processes and 20 beside the workspace's tests.
 
+A check that a thread did some work beside others, such as a reader that read while a writer
+committed, or a thread of the copy that wrote before the copy was shut down, asks for the outcome of
+a race, which a loaded machine can lose: at a load average of about 185,
+`shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_file` found that no
+thread of the copy had written by the time the copy reached 2 MiB, since the walk can write every
+job itself. So such a check waits for the work it asks for instead of for a time or an amount of
+other work. That test waits until a thread of the copy writes, and holds that write until the
+handle is about to be dropped, so the copy is still running when it is. The others keep the side
+with a fixed amount of work going until the other side has done its part, or start it once the
+other side is under way, so that the work they count has happened before they count it.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:

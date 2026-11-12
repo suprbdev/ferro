@@ -569,11 +569,15 @@ fn joined_commits_beside_cycles(
     let cycler: Db<Root> = manual().open(&path).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let hot = hogs(hog_threads, &stop);
+    let (begun, began) = mpsc::channel();
     let cycling = {
         let stop = stop.clone();
         thread::spawn(move || {
             let (mut cycles, mut longest) = (0u64, Duration::ZERO);
             while !stop.load(Ordering::Relaxed) {
+                if cycles == 0 {
+                    begun.send(()).unwrap();
+                }
                 let started = Instant::now();
                 cycler.compact(Keep::Last(1)).unwrap();
                 longest = longest.max(started.elapsed());
@@ -582,6 +586,7 @@ fn joined_commits_beside_cycles(
             (cycles, longest)
         })
     };
+    began.recv().unwrap();
     let (a, b) = (y.branch("a").unwrap(), y.branch("b").unwrap());
     let mut took = Vec::new();
     let (sent, waited) = mpsc::channel();

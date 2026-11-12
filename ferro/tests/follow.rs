@@ -155,6 +155,10 @@ fn a_follower_that_finds_nothing_new_refreshes_nothing() {
         watcher.recv_timeout(Duration::from_millis(50)),
         Err(RecvTimeoutError::Timeout)
     ));
+    until("the follower looked six times", || {
+        reader.following().unwrap().looks > 5
+    });
+    assert!(matches!(watcher.try_recv(), Err(mpsc::TryRecvError::Empty)));
     let following = reader.following().unwrap();
     assert!(following.looks > 5, "{following:?}");
     assert_eq!(following.refreshes, 0);

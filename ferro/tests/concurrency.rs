@@ -114,7 +114,7 @@ fn readers_see_atomic_commits_during_heavy_writes() {
     }
     let mut rng = Rng::new(1);
     let mut committed = 0;
-    while committed < 6000 {
+    while committed < 6000 || reads.load(Ordering::Relaxed) == 0 {
         db.update(|root| transfer(root, &mut rng)).unwrap();
         committed = db.read().transfers;
     }
@@ -453,28 +453,27 @@ fn read_only_open_never_races_a_writer_into_an_error() {
     let db = fast().open::<Ledger>(&path).unwrap();
     seeded(&db);
     let stop = Arc::new(AtomicBool::new(false));
+    let opens = Arc::new(AtomicU64::new(0));
     let mut openers = Vec::new();
     for _ in 0..4 {
         let path = path.clone();
-        let stop = stop.clone();
+        let (stop, opens) = (stop.clone(), opens.clone());
         openers.push(thread::spawn(move || {
-            let mut opens = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let reader = fast().read_only(true).open::<Ledger>(&path).unwrap();
                 assert_consistent(&reader.read());
-                opens += 1;
+                opens.fetch_add(1, Ordering::Relaxed);
             }
-            opens
         }));
     }
     let mut rng = Rng::new(3);
     let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
+    while Instant::now() < deadline || opens.load(Ordering::Relaxed) <= 10 {
         db.update(|root| transfer(root, &mut rng)).unwrap();
     }
     stop.store(true, Ordering::Relaxed);
-    let opens: u64 = openers.into_iter().map(|t| t.join().unwrap()).sum();
-    assert!(opens > 10);
+    openers.into_iter().for_each(|t| t.join().unwrap());
+    assert!(opens.load(Ordering::Relaxed) > 10);
 }
 
 #[test]

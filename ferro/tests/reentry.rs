@@ -4,7 +4,7 @@ use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, LocalKey, Thread};
 use std::time::{Duration, Instant};
@@ -516,11 +516,15 @@ fn writes_up_the_lane_order_survive_cycles_and_each_other() {
         let files = files(options);
         let rounds = if kind == "fsync" { 40 } else { 200 };
         let stop = Arc::new(AtomicBool::new(false));
+        let (begun, cycling) = mpsc::channel();
         let cycles = {
             let (files, stop) = (files.clone(), stop.clone());
             thread::spawn(move || {
                 let mut n = 0u64;
                 while !stop.load(Ordering::SeqCst) {
+                    if n == 0 {
+                        begun.send(()).unwrap();
+                    }
                     let keep = if n.is_multiple_of(2) {
                         Keep::All
                     } else {
@@ -532,6 +536,7 @@ fn writes_up_the_lane_order_survive_cycles_and_each_other() {
                 n
             })
         };
+        cycling.recv().unwrap();
         let spawn = |run: fn(&Files, u64)| {
             let files = files.clone();
             thread::spawn(move || (0..rounds).for_each(|i| run(&files, i)))

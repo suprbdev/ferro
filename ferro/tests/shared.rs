@@ -655,12 +655,18 @@ fn background_cycles_in_several_handles_run_one_at_a_time() {
                 for i in 1..=each {
                     bump(&db, writer, i);
                 }
-                db.space().unwrap().cycles
+                db
             })
         })
         .collect();
-    let cycles: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
-    assert!(cycles > 0);
+    let handles: Vec<Db<Root>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let cycles = || -> u64 { handles.iter().map(|db| db.space().unwrap().cycles).sum() };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while cycles() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(cycles() > 0);
+    drop(handles);
     let db: Db<Root> = Options::new().open(&path).unwrap();
     check_chain(&db.read(), 3, each);
     db.verify().unwrap();
@@ -1674,7 +1680,7 @@ fn writers_on_branches_of_their_own(
         first.fork(&format!("own-{writer}")).unwrap();
     }
     drop(first);
-    let ready = Arc::new(Barrier::new(writers as usize + 1));
+    let (ready, readied) = mpsc::channel();
     let threads = (0..writers)
         .map(|writer| {
             let path = path.to_path_buf();
@@ -1685,11 +1691,16 @@ fn writers_on_branches_of_their_own(
                 let db = db.branch(&format!("own-{writer}")).unwrap();
                 let outer = path.with_file_name(format!("outer-{writer}.ferro"));
                 let outer: Option<Db<Root>> = nested.then(|| fast().open(&outer).unwrap());
-                ready.wait();
                 let commit = |i: &mut u64| {
-                    while !stop.load(Ordering::Relaxed) {
+                    loop {
                         *i += 1;
                         bump(&db, writer, *i);
+                        if *i == 1 {
+                            ready.send(()).unwrap();
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
                 };
                 let mut i = 0;
@@ -1701,7 +1712,11 @@ fn writers_on_branches_of_their_own(
             })
         })
         .collect();
-    ready.wait();
+    for _ in 0..writers {
+        readied
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a writer never committed");
+    }
     threads
 }
 

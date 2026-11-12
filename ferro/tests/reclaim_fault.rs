@@ -37,6 +37,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 static COPY_SLOW: AtomicBool = AtomicBool::new(false);
 static COPY_WRITES: AtomicI64 = AtomicI64::new(0);
+static COPY_HELD: AtomicBool = AtomicBool::new(false);
 static COPY_FAILS: AtomicBool = AtomicBool::new(false);
 
 static READS_WATCHED: AtomicBool = AtomicBool::new(false);
@@ -140,6 +141,9 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
     if count > SPLIT && COPY_SLOW.load(Ordering::SeqCst) {
         if copying {
             COPY_WRITES.fetch_add(1, Ordering::SeqCst);
+            while COPY_HELD.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -568,11 +572,13 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     temp.push(".compacting");
     let temp = std::path::PathBuf::from(temp);
     let created = Arc::new(AtomicI64::new(0));
+    COPY_WRITES.store(0, Ordering::SeqCst);
     let hook = {
         let created = created.clone();
         move |name: &'static str| {
             if name == "created" {
                 created.fetch_add(1, Ordering::SeqCst);
+                COPY_HELD.store(true, Ordering::SeqCst);
                 COPY_SLOW.store(true, Ordering::SeqCst);
             }
         }
@@ -598,16 +604,18 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     }
     let want = dump(&db.read());
     let began = std::time::Instant::now();
-    while std::fs::metadata(&temp).map_or(0, |meta| meta.len()) < 2 << 20 {
-        assert!(
-            began.elapsed() < Duration::from_secs(30),
-            "the copy never grew"
-        );
+    while COPY_WRITES.load(Ordering::SeqCst) == 0 && began.elapsed() < Duration::from_secs(30) {
         std::thread::yield_now();
     }
+    let wrote = COPY_WRITES.load(Ordering::SeqCst) > 0;
+    let copying = temp.exists();
     #[cfg(target_os = "linux")]
-    assert_eq!(verifying_threads(), 3);
-    assert!(COPY_WRITES.load(Ordering::SeqCst) > 0);
+    let threads = verifying_threads();
+    COPY_HELD.store(false, Ordering::SeqCst);
+    assert!(wrote, "no thread of the copy wrote in 30 s");
+    assert!(copying, "the copy ended while a thread of it was held");
+    #[cfg(target_os = "linux")]
+    assert_eq!(threads, 3);
     drop(db);
     COPY_SLOW.store(false, Ordering::SeqCst);
     assert_eq!(created.load(Ordering::SeqCst), 1);

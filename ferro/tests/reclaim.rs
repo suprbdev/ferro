@@ -590,19 +590,19 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
     let db: Db<Root> = uncached().reclaim(MANUAL).open(&path).unwrap();
     fill(&db, 100, 30);
     let done = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(AtomicUsize::new(0));
     let reader = {
-        let (done, path) = (done.clone(), path.clone());
+        let (done, seen, path) = (done.clone(), seen.clone(), path.clone());
         thread::spawn(move || {
             let reader: Db<Root> = Options::new()
                 .read_only(true)
                 .cache_bytes(1)
                 .open(&path)
                 .unwrap();
-            let mut seen = 0;
             while !done.load(Ordering::Relaxed) {
                 reader.refresh().unwrap();
                 assert_eq!(reader.read().iter().count(), 30);
-                seen += 1;
+                seen.fetch_add(1, Ordering::Relaxed);
                 let fresh: Db<Root> = Options::new()
                     .read_only(true)
                     .cache_bytes(1)
@@ -611,15 +611,17 @@ fn a_read_only_reader_keeps_up_with_cycles_from_another_handle() {
                 assert!(fresh.version() >= 100);
                 assert_eq!(fresh.read().iter().count(), 30);
             }
-            seen
         })
     };
-    for _ in 0..60 {
+    let mut rounds = 0;
+    while rounds < 60 || seen.load(Ordering::Relaxed) == 0 {
         fill(&db, 40, 30);
         db.compact(Keep::Last(2)).unwrap();
+        rounds += 1;
     }
     done.store(true, Ordering::Relaxed);
-    assert!(reader.join().unwrap() > 0);
+    reader.join().unwrap();
+    assert!(seen.load(Ordering::Relaxed) > 0);
 }
 
 fn hooked(
@@ -1383,7 +1385,11 @@ fn snapshots_stay_consistent_under_writers_readers_and_cycles() {
     }
     let started = Instant::now();
     let mut cycles = 0;
-    while started.elapsed() < Duration::from_secs(4) {
+    while started.elapsed() < Duration::from_secs(4)
+        || cycles <= 3
+        || commits.load(Ordering::Relaxed) <= 100
+        || reads.load(Ordering::Relaxed) <= 10
+    {
         db.compact(Keep::Last(8)).unwrap();
         cycles += 1;
     }

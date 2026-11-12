@@ -25,6 +25,7 @@ const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
 const PATIENCE: Duration = Duration::from_secs(30);
 const OURS: u64 = 1 << 40;
 const DRAFTER: &str = "drafter";
+const EVENTS: [&str; 4] = ["cycle", "fork and drop", "read round", "watched"];
 
 fn dir() -> TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
@@ -763,6 +764,13 @@ impl Run {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
+
+    fn seen_each(&self) -> bool {
+        let events = self.events.lock();
+        EVENTS
+            .iter()
+            .all(|what| events.get(what).is_some_and(|n| *n > 0))
+    }
 }
 
 fn audit_key(thread: u64, k: u64) -> u64 {
@@ -1153,6 +1161,10 @@ fn combined(config: &Config) -> BTreeMap<&'static str, u64> {
             })
             .collect();
         thread::sleep(Duration::from_secs(config.seconds));
+        let deadline = Instant::now() + PATIENCE;
+        while !run.seen_each() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         run.stop.store(true, Ordering::SeqCst);
         let done: BTreeMap<u64, u64> = writing.into_iter().map(|h| h.join().unwrap()).collect();
         peering.join().unwrap();
@@ -1248,7 +1260,7 @@ fn branches_closures_files_receives_and_cycles_match_a_model() {
     ];
     for config in &configs {
         let events = combined(config);
-        for wanted in ["cycle", "fork and drop", "read round", "watched"] {
+        for wanted in EVENTS {
             assert!(
                 events.get(wanted).is_some_and(|n| *n > 0),
                 "{}: no {wanted}",

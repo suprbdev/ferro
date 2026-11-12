@@ -688,12 +688,17 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
             })
         })
         .collect();
+    let begun = Arc::new(AtomicUsize::new(0));
+    let helpers = if pruning { 2 } else { 3 };
     let handles: Vec<_> = writers
         .iter()
         .enumerate()
         .map(|(index, writer)| {
-            let writer = writer.clone();
+            let (writer, begun) = (writer.clone(), begun.clone());
             thread::spawn(move || {
+                while begun.load(Ordering::SeqCst) < helpers {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 let branch = index as u64 + 1;
                 let mut rng = Rng::new(branch);
                 for _ in 1..commits {
@@ -715,11 +720,14 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
         .collect();
     let forker = {
         let (db, writers, stop) = (db.clone(), writers.clone(), stop.clone());
-        let kind = kind.to_string();
+        let (kind, begun) = (kind.to_string(), begun.clone());
         thread::spawn(move || {
             let mut rng = Rng::new(99);
             let mut forks = 0;
             while !stop.load(Ordering::SeqCst) {
+                if forks == 0 {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                }
                 let index = rng.below(WRITERS) as usize;
                 let name = format!("tmp-{forks}");
                 let copy = writers[index].fork(&name).unwrap();
@@ -737,11 +745,14 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
     };
     let merger = {
         let (sink, writers, stop) = (sink.clone(), writers.clone(), stop.clone());
-        let kind = kind.to_string();
+        let (kind, begun) = (kind.to_string(), begun.clone());
         thread::spawn(move || {
             let mut rng = Rng::new(7);
             let mut merges = 0;
             while !pruning && !stop.load(Ordering::SeqCst) {
+                if merges == 0 {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                }
                 let index = rng.below(WRITERS) as usize;
                 merge_into(&sink, &writers[index]);
                 let root = sink.read();
@@ -754,10 +765,13 @@ fn stress(kind: &str, options: fn() -> Options, commits: u64, pruning: bool) {
         })
     };
     let compactor = {
-        let (db, stop) = (db.clone(), stop.clone());
+        let (db, stop, begun) = (db.clone(), stop.clone(), begun.clone());
         thread::spawn(move || {
             let mut cycles = 0;
             while !stop.load(Ordering::SeqCst) {
+                if cycles == 0 {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                }
                 let keep = if pruning && cycles % 2 == 0 {
                     Keep::Last(4)
                 } else {
