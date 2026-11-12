@@ -142,6 +142,10 @@ const FIRST_RESERVE: u64 = 64 << 10;
 const MAX_RESERVE: u64 = 4 << 20;
 /// How many times an open tries the writer lock again, a millisecond apart, before it fails.
 const LOCK_RETRIES: u32 = 5;
+/// How many times a read-only open looks for the writers alive, reading the superblocks again
+/// after each look that finds one it cannot vouch for, before it scans from the anchor itself, as
+/// [`observe`] describes.
+const LOOKS: usize = 4;
 /// How many bytes a read of a record takes at once, enough for most records whole.
 const READ_AHEAD: usize = 1024;
 /// How many bytes before a record a streaming [`Window`] also reads, where a map node's children
@@ -214,8 +218,9 @@ const LENT_KEEP: usize = 64 << 10;
 const EVICTED_KEEP: usize = 1 << 10;
 /// The first byte of the byte-range locks, past any real file.
 const LOCKS_AT: u64 = 1 << 62;
-/// The byte every shared writer holds shared from the end of its open for the rest of its life,
-/// which tells a read-only open, and a writer that opens, that one has opened and is alive.
+/// The byte every writer, shared or not, holds shared from the end of its open, once it has
+/// recovered the file, for the rest of its life, which tells a read-only open, and a shared writer
+/// that opens, that one has opened and is alive.
 const MULTI_AT: u64 = LOCKS_AT + 1;
 /// The placement lock, held exclusive to catch up, place a frame and write it.
 const COMMIT_AT: u64 = LOCKS_AT + 2;
@@ -1455,29 +1460,61 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
     Ok((tip, if moved { other } else { slot }))
 }
 
-/// The superblock a read-only open trusts: `sb`, unless no writer is alive and a scan from its
-/// anchor finds otherwise.
+/// The superblock a read-only open trusts, given `sb`, the newest it read from a file `len` bytes
+/// long, and with it the newest superblock the open judged: `sb`, or one it read again since.
+///
+/// The open looks for the writers alive, as [`look`] describes, up to [`LOOKS`] times. A look
+/// beside a writer it cannot vouch for reads the superblocks again, and the next look starts from
+/// the newest of them, so a writer that died while recovering leaves the open to scan as it does
+/// with no writer alive. If the last look still finds such a writer, as one that dies and another
+/// that opens again in turn can keep it doing, the open scans from the anchor itself, as
+/// [`beside_a_recovery`] describes, so a writer that keeps dying never holds it up.
+fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<(Super, Super)> {
+    let (mut sb, mut len) = (sb, len);
+    for _ in 0..LOOKS {
+        match look(file, path, sb, len)? {
+            Looked::Trusted(trusted) => return Ok((trusted, sb)),
+            Looked::Again(newest) => {
+                sb = newest;
+                len = file.metadata()?.len();
+            }
+        }
+    }
+    Ok((beside_a_recovery(file, sb)?, sb))
+}
+
+/// What a read-only open's [`look`] at the writers found: the superblock to trust, or the newest
+/// superblock read again, to look once more from.
+enum Looked {
+    /// The superblock the open trusts.
+    Trusted(Super),
+    /// The newest superblock, read again beside a writer the look could not vouch for.
+    Again(Super),
+}
+
+/// One look for the writers alive by a read-only open, given `sb`, the newest superblock it read,
+/// from a file `len` bytes long.
 ///
 /// A superblock that anchors itself with nothing like a frame after it is used as it is.
 /// Otherwise the open tries the writer lock shared, and where there are byte-range locks the
-/// placement lock shared too, and if it gets them and no shared writer holds [`MULTI_AT`], no
-/// writer is alive: it scans from the anchor under the locks, judging damage as a writer's open
-/// does, and syncs the frames it kept, since a dead writer's frames may be only in the page cache.
-/// It keeps none of the staging frames that end the log, which a writer opening drops, and which
-/// keep the head the frame before them names. A shared writer that opens meanwhile waits for the
-/// placement lock before it recovers or writes, so nothing it writes races the scan. With a writer
-/// alive, the open takes what [`beside_a_writer`] finds. A placement lock held elsewhere means a
-/// writer is placing a frame or opening, and is treated the same way, but a test of the lock that
-/// fails with an error says nothing about writers, and the open goes on to test [`MULTI_AT`] and
-/// scans without the placement lock, as it would where there are no byte-range locks, so a shared
+/// placement lock shared too, and if it gets them and no writer holds [`MULTI_AT`], no writer is
+/// alive: it scans from the anchor under the locks, judging damage as a writer's open does, and
+/// syncs the frames it kept, since a dead writer's frames may be only in the page cache. It keeps
+/// none of the staging frames that end the log, which a writer opening drops, and which keep the
+/// head the frame before them names. A shared writer that opens meanwhile waits for the placement
+/// lock before it recovers or writes, so nothing it writes races the scan. With a writer alive,
+/// the open takes what [`beside_a_writer`] finds. A placement lock held elsewhere means a writer
+/// is placing a frame or opening, and is treated the same way, but a test of the lock that fails
+/// with an error says nothing about writers, and the open goes on to test [`MULTI_AT`] and scans
+/// without the placement lock, as it would where there are no byte-range locks, so a shared
 /// writer that opens meanwhile can write during that scan.
-fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
+fn look(file: &File, path: &Path, sb: Super, len: u64) -> Result<Looked> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
         && read_or_end(file, &mut header, sb.log_end)?
         && frame_like(&header);
     if sb.settled() && !follows {
-        return Ok(sb);
+        return Ok(Looked::Trusted(sb));
     }
     if platform::try_lock_shared(file).is_err() {
         return beside_a_writer(file, sb);
@@ -1515,34 +1552,50 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
         });
     drop(placement);
     platform::unlock(file)?;
-    scanned
+    scanned.map(Looked::Trusted)
 }
 
-/// The superblock a read-only open trusts once it finds a writer alive, given `sb`, the newest it
-/// read before it looked.
+/// What a read-only open's [`look`] makes of `sb`, the newest superblock it read, once it finds a
+/// writer alive.
 ///
 /// A superblock that anchors itself names only durable frames, which no recovery drops, and is
-/// used as it is, as is any superblock where there are no byte-range locks. Otherwise a writer
+/// trusted as it is, as is any superblock where there are no byte-range locks. Otherwise a writer
 /// may be recovering the file, and a recovery that rolls back drops frames that `sb` names. A
 /// writer holds [`RECOVER_AT`] from before it takes the writer lock until it has recovered, and
-/// while it holds it the open scans from the anchor itself, without judging, since the writer may
-/// be truncating, and takes the last frame before any staging frames that end the log, which is
-/// where that recovery ends, if it ends before `sb`. Once nothing holds it, every writer that holds
-/// the writer lock has recovered, or recovers beside a live one, which rolls nothing back, but `sb`
-/// may have been read before, so the open reads the superblocks again.
-fn beside_a_writer(file: &File, sb: Super) -> Result<Super> {
+/// while it holds it, or a test of it fails, the open takes what [`beside_a_recovery`] finds.
+///
+/// Once nothing holds it, the writers that hold the writer lock have recovered, but the one the
+/// look found may instead have died while it recovered, before it wrote anything, and left `sb`
+/// naming frames that the next recovery drops. A writer takes [`MULTI_AT`] once it has recovered
+/// and holds it for life, and every writer that holds it opened since the last power cut, so if
+/// another holds it, no recovery is left to roll back, and the newest superblock the open reads
+/// after that test names only frames that stay: the open trusts it. If none holds it, the open
+/// reads the superblocks again and looks once more from the newest, which finds no writer alive if
+/// the one it found has died.
+fn beside_a_writer(file: &File, sb: Super) -> Result<Looked> {
     if sb.settled() || !platform::RANGES {
-        return Ok(sb);
+        return Ok(Looked::Trusted(sb));
     }
+    if !matches!(platform::range_held(file, RECOVER_AT, 1), Ok(false)) {
+        return beside_a_recovery(file, sb).map(Looked::Trusted);
+    }
+    let vouched = platform::range_held(file, MULTI_AT, 1).unwrap_or(false);
     let len = file.metadata()?.len();
-    match platform::range_held(file, RECOVER_AT, 1) {
-        Ok(true) => {
-            let (_, settled) = scan(file, sb.at_anchor(), len, false)?;
-            Ok(if settled.seq < sb.seq { settled } else { sb })
-        }
-        Ok(false) => Ok(read_supers(file, len)?.map_or(sb, |(newest, _)| newest)),
-        Err(_) => Ok(sb),
-    }
+    let newest = read_supers(file, len)?.map_or(sb, |(newest, _)| newest);
+    Ok(match vouched {
+        true => Looked::Trusted(newest),
+        false => Looked::Again(newest),
+    })
+}
+
+/// The superblock a read-only open trusts beside a writer that may be recovering the file, given
+/// `sb`, the newest it read: the open scans from the anchor itself, without judging, since the
+/// writer may be truncating, and takes the last frame before any staging frames that end the log,
+/// which is where a recovery ends, if it ends before `sb`, and `sb` otherwise.
+fn beside_a_recovery(file: &File, sb: Super) -> Result<Super> {
+    let len = file.metadata()?.len();
+    let (_, settled) = scan(file, sb.at_anchor(), len, false)?;
+    Ok(if settled.seq < sb.seq { settled } else { sb })
 }
 
 /// Maps a signed link delta to the unsigned value a record stores, small magnitudes first.
@@ -3074,7 +3127,7 @@ impl Store {
         }
         let len = file.metadata()?.len();
         let existing = read_supers(&file, len)?;
-        let named = existing.map(|(sb, _)| sb.mark());
+        let mut named = existing.map(|(sb, _)| sb.mark());
         let (sb, slot) = match existing {
             Some((sb, slot)) => {
                 let len = file.metadata()?.len();
@@ -3091,7 +3144,9 @@ impl Store {
                     )));
                 }
                 if options.read_only {
-                    (observe(&file, actual, sb, len)?, slot)
+                    let (trusted, judged) = observe(&file, actual, sb, len)?;
+                    named = Some(judged.mark());
+                    (trusted, slot)
                 } else {
                     let live = shared && platform::range_held(&file, MULTI_AT, 1)?;
                     if live {
@@ -3125,10 +3180,11 @@ impl Store {
             }
         };
         if !options.read_only {
+            match platform::lock_range(&file, MULTI_AT, 1, false, false) {
+                Err(error) if shared => return Err(locked(error)),
+                Ok(()) | Err(_) => {}
+            }
             let _ = platform::unlock_range(&file, RECOVER_AT, 1);
-        }
-        if shared {
-            platform::lock_range(&file, MULTI_AT, 1, false, false).map_err(locked)?;
         }
         drop((tops, commit));
         let cache_bytes = options.cache_bytes.max(1);
@@ -5108,7 +5164,8 @@ impl Store {
     }
 
     /// Closes the store: drops the cache and the frames a catch-up kept, flushes the epoch, and for
-    /// a writer truncates the zeroes preallocated past the log and lets the writer lock go.
+    /// a writer truncates the zeroes preallocated past the log and lets the lock that says it is
+    /// alive and the writer lock go.
     ///
     /// Clones of the store go on reading what they read before, and a new writer may open the
     /// file meanwhile. Cached and retired nodes that hold nested maps hold the store too, so
@@ -5153,6 +5210,7 @@ impl Store {
                 None => {}
             }
         }
+        let _ = platform::unlock_range(&inner.file, MULTI_AT, 1);
         let _ = platform::unlock(&inner.file);
     }
 

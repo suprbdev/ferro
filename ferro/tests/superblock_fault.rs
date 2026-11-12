@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,6 +20,7 @@ const SLOT_BYTES: i64 = 4096;
 const PATIENCE: Duration = Duration::from_secs(30);
 const EITHER_SLOT: i64 = -2;
 const FRAME_BYTES: u64 = 68;
+const RECOVER_AT: u64 = (1 << 62) + 9;
 
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -38,6 +40,7 @@ static RECORDED: Mutex<Vec<Recorded>> = Mutex::new(Vec::new());
 thread_local! {
     static STALL_AFTER_SLOT_0: Cell<bool> = const { Cell::new(false) };
     static STALL_AFTER_SLOT_1: Cell<bool> = const { Cell::new(false) };
+    static STALL_AFTER_REFUSED_FLOCK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A change to a file that the interposers saw while `RECORDING` was set, in the order made.
@@ -189,6 +192,34 @@ pub extern "C" fn ftruncate64(fd: c_int, length: i64) -> c_int {
     let real: extern "C" fn(c_int, i64) -> c_int = unsafe { std::mem::transmute(symbol) };
     record(Recorded::SetLen(length));
     real(fd, length)
+}
+
+/// Passes every call to glibc's `flock`, except that on a thread that set
+/// `STALL_AFTER_REFUSED_FLOCK`, once a lock it asked for without waiting is refused, it waits
+/// there until `RESUMED` is set, as a read-only open held up just after it found a writer alive
+/// does, and returns with `errno` as the refusal left it.
+#[unsafe(no_mangle)]
+pub extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"flock"` is a NUL-terminated string that outlives the call.
+    let symbol = unsafe { dlsym(RTLD_NEXT, c"flock".as_ptr()) };
+    // SAFETY: glibc defines `flock`, so `symbol` is the non-null address of that function, and its
+    // C prototype `int flock(int, int)` matches this function pointer type.
+    let real: extern "C" fn(c_int, c_int) -> c_int = unsafe { std::mem::transmute(symbol) };
+    let locked = real(fd, operation);
+    if locked != 0
+        && operation & libc::LOCK_NB != 0
+        && STALL_AFTER_REFUSED_FLOCK.with(|stall| stall.replace(false))
+    {
+        // SAFETY: `__errno_location` returns the calling thread's `errno`, which is valid for
+        // reads for the life of the thread.
+        let refused = unsafe { *libc::__errno_location() };
+        STALLED.store(true, Ordering::SeqCst);
+        wait_for(&RESUMED);
+        // SAFETY: as above, and the pointer is valid for writes too.
+        unsafe { *libc::__errno_location() = refused };
+    }
+    locked
 }
 
 fn reset() {
@@ -453,6 +484,101 @@ fn a_read_only_open_that_read_the_superblocks_before_a_rollback_opens_at_a_kept_
     });
 }
 
+fn hold_byte(file: &File, at: u64) {
+    // SAFETY: `flock` is a C struct of plain integers, for which all zero bytes are a valid value.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = at as libc::off_t;
+    lock.l_len = 1;
+    // SAFETY: the descriptor belongs to `file`, which is borrowed for the call, and
+    // `F_OFD_SETLK` takes a pointer to a `flock`, which `lock` is, initialized and live through
+    // the call.
+    let done = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
+    assert_eq!(done, 0, "{}", std::io::Error::last_os_error());
+}
+
+fn lose_the_table_of_the_last_of_four_frames(path: &Path) {
+    let db = buffered().open::<Root>(path).unwrap();
+    for n in 0..4 {
+        put(&db, n);
+    }
+    let end = newest_log_end(path);
+    let mut image = std::fs::read(path).unwrap();
+    drop(db);
+    image.truncate(end as usize);
+    image[end as usize - 8..].fill(0);
+    std::fs::write(path, &image).unwrap();
+}
+
+fn read_write(path: &Path) -> File {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn a_read_only_open_beside_a_writer_that_dies_in_its_recovery_opens_at_a_kept_commit() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    reset();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("d.ferro");
+    lose_the_table_of_the_last_of_four_frames(&path);
+    let recovering = read_write(&path);
+    hold_byte(&recovering, RECOVER_AT);
+    recovering.lock().unwrap();
+    let seen = thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            STALL_AFTER_REFUSED_FLOCK.with(|stall| stall.set(true));
+            reader_options().open::<Root>(&path).map(|db| db.version())
+        });
+        wait_for(&STALLED);
+        assert!(STALLED.load(Ordering::SeqCst));
+        drop(recovering);
+        RESUMED.store(true, Ordering::SeqCst);
+        reader.join().unwrap()
+    });
+    let recovered = buffered().open::<Root>(&path).unwrap().version();
+    assert_eq!(recovered, 3);
+    let seen = seen.unwrap_or_else(|error| {
+        panic!("a read-only open beside a writer that died in its recovery failed: {error}")
+    });
+    assert!(
+        seen <= recovered,
+        "a read-only open saw version {seen}, past the {recovered} kept"
+    );
+}
+
+#[test]
+fn a_read_only_open_beside_a_writer_it_cannot_vouch_for_scans_for_itself() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    reset();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("v.ferro");
+    lose_the_table_of_the_last_of_four_frames(&path);
+    let unvouched = read_write(&path);
+    unvouched.lock().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn({
+        let path = path.clone();
+        move || {
+            let seen = reader_options().open::<Root>(&path).map(|db| db.version());
+            let _ = sender.send(seen);
+        }
+    });
+    let seen = receiver
+        .recv_timeout(PATIENCE)
+        .expect("a read-only open beside a writer it cannot vouch for never returned");
+    drop(unvouched);
+    let seen = seen.unwrap_or_else(|error| {
+        panic!("a read-only open beside a writer it cannot vouch for failed: {error}")
+    });
+    assert_eq!(seen, 3);
+    assert_eq!(buffered().open::<Root>(&path).unwrap().version(), 3);
+}
+
 fn apply(image: &mut Vec<u8>, change: &Recorded, half: bool) {
     match change {
         Recorded::Write(at, bytes) => {
@@ -495,17 +621,10 @@ fn keeps_three_commits(path: &Path, context: &str) {
         .unwrap_or_else(|error| panic!("{context}: verify after a commit: {error}"));
 }
 
-#[test]
-fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    reset();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let path = dir.path().join("p.ferro");
-    lose_the_last_of_four_frames(&path, FRAME_BYTES);
-    let base = std::fs::read(&path).unwrap();
-    let dropped = newest_slot(&path) * SLOT_BYTES;
+fn record_a_rollback(path: &Path) -> (Vec<u8>, Vec<Recorded>, Vec<String>) {
+    let base = std::fs::read(path).unwrap();
     RECORDING.store(true, Ordering::SeqCst);
-    let opened = buffered().open::<Root>(&path).map(|db| db.version());
+    let opened = buffered().open::<Root>(path).map(|db| db.version());
     RECORDING.store(false, Ordering::SeqCst);
     assert_eq!(opened.unwrap(), 3);
     let changes = RECORDED
@@ -523,6 +642,18 @@ fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
             Recorded::Sync => "sync".into(),
         })
         .collect();
+    (base, changes, kinds)
+}
+
+#[test]
+fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    reset();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("p.ferro");
+    lose_the_last_of_four_frames(&path, FRAME_BYTES);
+    let dropped = newest_slot(&path) * SLOT_BYTES;
+    let (base, changes, kinds) = record_a_rollback(&path);
     let kept = SLOT_BYTES - dropped;
     assert_eq!(
         kinds,
@@ -536,7 +667,43 @@ fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
             "sync".into(),
         ]
     );
-    let image_path = dir.path().join("cut.ferro");
+    assert!(cut_anywhere(dir.path(), &base, &changes, &kinds) >= 15);
+}
+
+#[test]
+fn a_power_cut_anywhere_in_a_rollback_that_truncates_nothing_keeps_the_commits_it_keeps() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    reset();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("n.ferro");
+    let db = buffered().open::<Root>(&path).unwrap();
+    let mut ends = Vec::new();
+    for n in 0..4 {
+        put(&db, n);
+        ends.push(newest_log_end(&path));
+    }
+    let mut image = std::fs::read(&path).unwrap();
+    drop(db);
+    image.truncate(ends[2] as usize);
+    std::fs::write(&path, &image).unwrap();
+    let dropped = newest_slot(&path) * SLOT_BYTES;
+    let (base, changes, kinds) = record_a_rollback(&path);
+    let kept = SLOT_BYTES - dropped;
+    assert_eq!(
+        kinds,
+        [
+            "sync".to_string(),
+            format!("superblock 5 at {kept}"),
+            "sync".into(),
+            format!("superblock 5 at {dropped}"),
+            "sync".into(),
+        ]
+    );
+    assert!(cut_anywhere(dir.path(), &base, &changes, &kinds) >= 10);
+}
+
+fn cut_anywhere(dir: &Path, base: &[u8], changes: &[Recorded], kinds: &[String]) -> usize {
+    let image_path = dir.join("cut.ferro");
     let mut checked = 0;
     for cut in 0..=changes.len() {
         let durable = changes[..cut]
@@ -549,7 +716,7 @@ fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
             if half && !torn {
                 continue;
             }
-            let mut image = base.clone();
+            let mut image = base.to_vec();
             for change in &changes[..durable] {
                 apply(&mut image, change, false);
             }
@@ -567,5 +734,5 @@ fn a_power_cut_anywhere_in_a_rollback_keeps_the_commits_it_keeps() {
             checked += 1;
         }
     }
-    assert!(checked >= 15, "{checked}");
+    checked
 }

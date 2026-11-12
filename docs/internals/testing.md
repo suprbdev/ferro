@@ -841,9 +841,11 @@ Tests are described next to what they test:
   slots, and beside a closing writer, `superblock_fault.rs`: [Reading the
   slots](storage.md#reading-the-slots).
 - A read-only open beside a recovery that rolls back, held in its first superblock write, in the
-  sync after it, and between the open's read of the slots and its look at the writer, and a power
-  cut after each step of that recovery, `superblock_fault.rs`: [Buffered durability and
-  checkpoints](storage.md#buffered-durability-and-checkpoints).
+  sync after it, and between the open's read of the slots and its look at the writer, one held
+  between finding a writer alive and testing the recovery lock while that writer dies, one beside a
+  writer it can never vouch for, and a power cut after each step of that recovery, with the file cut
+  short and with it ending at the frame the recovery keeps, `superblock_fault.rs`: [Buffered
+  durability and checkpoints](storage.md#buffered-durability-and-checkpoints).
 - Followers of a read-only handle and a shared writer, across cycles, a removed file and damaged
   superblocks, and the end of their thread, `ferro/tests/follow.rs`, and a poisoned follower and a
   drop beside another handle's sync, `follow_fault.rs`: [Tests of

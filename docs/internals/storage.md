@@ -858,25 +858,44 @@ Before that first write lands, while the writer scans and syncs what it keeps, t
 superblock still names the frames the rollback drops, and a reader that finds a writer alive would
 trust it. So every writer holds the recovery lock, a byte-range lock at 2^62 + 9, from before it
 takes the writer lock until it has recovered, or for a shared writer until it finds another alive,
-beside which nothing rolls back. A read-only open that finds a writer alive and a superblock that
-does not anchor itself tests that lock. Held, the open scans from the anchor itself, without
-judging, since the writer may be truncating, and takes the last frame before any staging frames
-that end the log if that comes before the superblock: where the recovery ends. Free, it reads the
-slots again, since the superblock it read may predate a recovery that has finished since. A
-superblock that anchors itself names only durable frames, which no rollback drops, and is trusted
-as it is. Without byte-range locks, outside 64-bit Linux, an open beside a recovering writer can
-still trust the superblock that names the dropped frames until that first write lands.
+beside which nothing rolls back. Once it has recovered, every writer, with `Options::shared` or
+without, takes the lock at 2^62 + 1 shared, for its life, before it lets the recovery lock go. A
+read-only open that finds a writer alive and a superblock that does not anchor itself tests the
+recovery lock. Held, the open scans from the anchor itself, without judging, since the writer may
+be truncating, and takes the last frame before any staging frames that end the log if that comes
+before the superblock: where the recovery ends. Free, the writer it found has recovered, or has
+died while it recovered, before its first write, which leaves the superblock naming the frames the
+next writer drops. So the open tests the lock at 2^62 + 1. Held, a writer that recovered since the
+last power cut is alive, and no rollback is left to come, so the open reads the slots again and
+trusts the newest. Free, it reads the slots again and looks once more from the newest, and that
+look finds no writer alive, and scans, if the writer it found has died. Once four looks have each
+found a writer they cannot vouch for, as writers that die and open again in turn can leave it, the
+open scans from the anchor itself, as it does beside a recovery. A superblock that anchors itself
+names only durable frames, which no rollback drops, and is trusted as it is. Without byte-range
+locks, outside 64-bit Linux, an open beside a recovering writer can still trust the superblock that
+names the dropped frames until that first write lands.
+
+The first version of the recovery lock had the open read the slots again once the lock was free and
+trust the newest. An open that found a writer alive, which then died in its recovery before its
+first write, trusted the superblock that named the dropped frames: it opened at a commit the next
+writer rolled back, and its `refresh` after that rollback failed reading past the end of the file.
+Only shared writers held the lock at 2^62 + 1 then, so nothing told the open that a writer without
+the option had recovered.
 
 A read-only open cannot rewrite anything. It scans from the anchor when no writer holds the lock,
 and remembers the superblock it refused so that `refresh` ignores it until a writer replaces it.
 That is why `refresh` needs no lock: a reader open before the power cut died with it, one that
-opened before the recovering writer refused the superblock the rollback drops, and one that opened
-beside the recovery took what it keeps. `superblock_fault.rs` holds the first superblock write of a
-rollback halfway, and the sync after it, beside a read-only open, holds an open between its read of
-the slots and its look at the writer while a rollback runs, and opens the file as a power cut after
-each step of a rollback leaves it. Keeping the anchor in the superblock rather than
-dedicating one slot to it means neither slot has to be synced on its own: every superblock that
-survives names an anchor that was durable before that superblock was written.
+opened before the recovering writer refused the superblock the rollback drops, one that opened
+beside the recovery took what it keeps, and one that opened beside a writer that died in its
+recovery scanned as it would with no writer alive. `superblock_fault.rs` holds the first superblock
+write of a rollback halfway, and the sync after it, beside a read-only open, holds an open between
+its read of the slots and its look at the writer while a rollback runs, holds one between finding a
+writer alive and testing the recovery lock while that writer dies, opens one beside a writer it can
+never vouch for, and opens the file as a power cut after each step of a rollback leaves it, with
+the file cut short and with it ending at the frame the rollback keeps. Keeping the anchor in the
+superblock rather than dedicating one slot to it means neither slot has to be synced on its own:
+every superblock that survives names an anchor that was durable before that superblock was
+written.
 
 Recovery reads what lies between the anchor and the tail. With the frames still in the page cache,
 that took 13 ms for 64 MiB and 54 ms for 256 MiB, where a clean open takes 0.02 ms. The checkpoint

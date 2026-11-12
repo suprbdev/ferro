@@ -16,7 +16,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | Lock | Held | For |
 | --- | --- | --- |
 | The writer lock, a `flock` | Shared, for the writer's life | Keeping out writers without the option |
-| 2^62 + 1 | Shared, from the end of the writer's open for its life | Telling a read-only open, and a writer that opens, that a writer has opened and is alive |
+| 2^62 + 1 | Shared, by every writer, with the option or without, from the end of its open, once it has recovered, for its life | Telling a read-only open, and a shared writer that opens, that a writer has opened and is alive |
 | 2^62 + 2, placement | Exclusive, per frame, or shared by a read-only open's scan | Catching up, placing a frame and writing it |
 | 2^62 + 3, superblock | Exclusive, per sync | Syncing and writing a superblock |
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the landing of a large `receive` |
@@ -883,8 +883,8 @@ placing frames into it. The next writer to open truncates it, so the file can st
 longer than `size_on_disk` while no shared writer has it open.
 
 A read-only open that can take the writer lock shared takes the placement lock shared too, and
-trusts the superblock if another holds it, then tests the lock that shared writers hold once they
-have opened, and treats a held one as a live writer, trusting the superblock instead of scanning and
+trusts the superblock if another holds it, then tests the lock that writers hold once they have
+opened, and treats a held one as a live writer, trusting the superblock instead of scanning and
 syncing. If either test fails with an error rather than finding the lock held, it scans, as it
 would with no writer alive, without the placement lock when that was the test that failed. It holds
 the placement lock for the scan when it has it, so a shared writer that opens meanwhile waits for it
@@ -894,10 +894,12 @@ and place frames during the scan, so the scan may meet one being written. The fi
 placement lock trusted the superblock when its test failed with any error, so a reader whose lock
 failed with `ENOLCK` missed a commit whose superblock write a crash had lost (#82). Wherever it
 finds a writer alive and a superblock that does not anchor itself, it tests the recovery lock, and
-scans without the locks while a writer holds it, or reads the slots again once none does, as
-described under [Buffered durability and
-checkpoints](storage.md#buffered-durability-and-checkpoints). Read-only handles otherwise behave as
-before.
+scans without the locks while a writer holds it. Once none does, it reads the slots again and trusts
+the newest if a writer holds the lock at 2^62 + 1, which every writer, with the option or without,
+takes once it has recovered, and otherwise looks again from the newest, so that a writer that died
+in its recovery leaves it to scan, and after four such looks scans without the locks, as described
+under [Buffered durability and checkpoints](storage.md#buffered-durability-and-checkpoints).
+Read-only handles otherwise behave as before.
 
 ## Reclamation
 

@@ -1729,7 +1729,10 @@ impl Options {
     /// How long [`Options::open`] waits for another writer to close the file before it fails with
     /// [`Error::Locked`].
     ///
-    /// It checks every 10 ms. Zero, the default, fails at once.
+    /// It checks every 10 ms. Zero, the default, fails at once. With [`Options::shared`], an open
+    /// first waits for any writer that is opening the file to finish recovering it, however long
+    /// that takes, as after a crash, before it can tell whether to fail with [`Error::Locked`],
+    /// whatever this wait is.
     pub fn lock_wait(mut self, wait: Duration) -> Self {
         self.lock_wait = wait;
         self
