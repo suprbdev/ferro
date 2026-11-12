@@ -1972,6 +1972,7 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         ));
     };
     let tip = chain.tip.expect("chain has a tip");
+    chain.tip_entry(store)?;
     let mut known = Vec::new();
     for (index, mark) in have.marks.iter().enumerate() {
         if let Some((ptr, base)) = locate(store, refs, *mark)? {

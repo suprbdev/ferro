@@ -358,6 +358,22 @@ ran 4,550 to 4,882 executions, 7 or 8 a second, 19,072 together, ending at 37,30
 with 1,178 to 1,220 entries, 2,314 more together. No input crashed, hung, leaked or passed a memory
 limit, and the peak RSS was 982 MB.
 
+A later `refs` round crashed on a 20-byte input over the base of three branches (#169). It forged a
+head for `main` that named v112 and kept versions from 65, over the tip at v48. Decoding the head
+passed it, since a head may keep versions 65 to 112, and only the chain walk compared the tip with
+the version its head names. Opening the branch took its commit from the tip, so the commits after
+it ran on from v49 with a chain that still kept versions from 65, and `compact` under
+`Keep::Last(2)` panicked clamping the first version between 65 and 51. Every read of a tip on its
+own now checks it too, so opening, refreshing or attaching such a branch, `info`, `Log::last`, a
+commit and planning a bundle fail with `names v112 as its last but its tip is v48`. Pruning and a
+commit's new chain refuse a chain whose first version is past its last rather than panic, and its
+length is 0. `ferro/tests/fuzzed.rs` keeps the input's file and builds the shape on a second
+branch, which a commit cannot land on and a cycle refuses, and the `refs` seeds keep the input.
+With the fix `refs` ran 10 minutes on one core from a copy of the 4,125 inputs of its seed
+corpus, beside a workspace build and test run: it loaded them to 2,052 inputs reaching 18,702
+edges in 4,148 executions, and made 6,267 in all, 9 a second, ending at 18,707 edges with 2,081
+inputs. No input crashed, hung, leaked or passed a memory limit, and the peak RSS was 714 MB.
+
 ## Flipped bytes in the log
 
 `flipped_log_bytes_never_read_back_as_wrong_data` in `ferro/tests/crash.rs` builds a file of 40

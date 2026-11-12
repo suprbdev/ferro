@@ -113,7 +113,7 @@ impl Ahead {
         let Some(tip) = chain.tip.filter(|_| threads > 0) else {
             return Vec::new();
         };
-        let versions = chain.last - chain.first + 1;
+        let versions = chain.len() as u64;
         if versions < LEAST {
             return Vec::new();
         }

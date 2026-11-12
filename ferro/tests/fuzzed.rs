@@ -327,6 +327,22 @@ fn a_branch_whose_first_version_is_past_its_last_is_corrupt() {
 }
 
 #[test]
+fn a_branch_named_past_its_tip_fails_to_open_before_a_commit_lands_on_it() {
+    let (_dir, path) = fixture("tip-past-last");
+    let past = |outcome: &ferro::Result<()>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message.contains("names v112 as its last but its tip is v48"))
+    };
+    for outcome in [
+        Db::<Root>::open(&path).map(|_| ()),
+        read_only().open::<Root>(&path).map(|_| ()),
+        admin::info(&path).map(|_| ()),
+    ] {
+        assert!(past(&outcome), "{outcome:?}");
+    }
+}
+
+#[test]
 fn keeping_history_since_a_time_reaches_the_last_version_without_overflow() {
     let (_dir, path) = fixture("first-since");
     corrupt(admin::layout(&path, Keep::Since(1)));
@@ -762,26 +778,44 @@ fn a_prev_link_past_the_version_below_fails_verify_and_compaction() {
     }
 }
 
-#[test]
-fn a_head_whose_last_version_is_not_its_tips_fails_verify_and_compaction() {
-    for (named, threads) in [(6, 1), (6, 4), (4, 1), (4, 4)] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tip.ferro");
-        let (store, _) = Store::open(&path, buffered()).unwrap();
-        let mut txn = store.begin().unwrap();
+fn write_side_named(path: &Path, named: u64, first: u64) {
+    let (store, _) = Store::open(path, buffered()).unwrap();
+    let mut txn = store.begin().unwrap();
+    let mut refs: Map<String, Head> = Map::new();
+    for (name, version, first, late) in [("main", 5, 1, 0), ("side", named, first, 1)] {
         let mut tip = None;
-        for version in 1..=5 {
+        for at in 1..=5 {
             let entry = Entry {
-                version,
-                time_ms: 100 * version,
+                version: at,
+                time_ms: 100 * at + late,
                 prev: tip,
                 ..Entry::default()
             };
             tip = Some(entry.write(&mut txn));
         }
-        let head = write_refs(&mut txn, named, tip.unwrap());
-        txn.commit(head).unwrap();
-        store.close();
+        refs.insert(
+            name.into(),
+            Head {
+                version,
+                first,
+                tip,
+                ..Head::default()
+            },
+        );
+    }
+    let mut encoder = Encoder::new(&mut txn);
+    refs.encode(&mut encoder).unwrap();
+    let head = encoder.finish().unwrap();
+    txn.commit(head).unwrap();
+    store.close();
+}
+
+#[test]
+fn a_head_whose_last_version_is_not_its_tips_fails_verify_and_compaction() {
+    for (named, threads) in [(6, 1), (6, 4), (4, 1), (4, 4)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tip.ferro");
+        write_side_named(&path, named, 1);
         let wrong = |outcome: &ferro::Result<()>| {
             matches!(outcome, Err(Error::Corrupt(message))
                 if message.contains(&format!("names v{named} as its last but its tip is v5")))
@@ -789,13 +823,45 @@ fn a_head_whose_last_version_is_not_its_tips_fails_verify_and_compaction() {
         let case = format!("v{named} named, {threads} threads");
         let outcome = admin::verify(&path).map(|_| ());
         assert!(wrong(&outcome), "{case}: {outcome:?}");
-        if let Ok(db) = Options::new().copy_threads(threads).open::<Opaque>(&path) {
-            let outcome = db.compact(Keep::All).map(|_| ());
-            assert!(wrong(&outcome), "{case}: {outcome:?}");
-        }
+        let db = Options::new()
+            .copy_threads(threads)
+            .open::<Opaque>(&path)
+            .unwrap();
+        let outcome = db.branch("side").map(|_| ());
+        assert!(wrong(&outcome), "{case}: {outcome:?}");
+        let outcome = db.compact(Keep::All).map(|_| ());
+        assert!(wrong(&outcome), "{case}: {outcome:?}");
+        drop(db);
         let outcome = admin::verify(&path).map(|_| ());
         assert!(wrong(&outcome), "{case}: the file after: {outcome:?}");
     }
+}
+
+#[test]
+fn a_head_that_keeps_versions_past_its_tip_takes_no_commit_and_fails_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("past.ferro");
+    write_side_named(&path, 8, 7);
+    let past = |outcome: &ferro::Result<()>| {
+        matches!(outcome, Err(Error::Corrupt(message))
+            if message.contains("names v8 as its last but its tip is v5"))
+    };
+    let db = Db::<Root>::open(&path).unwrap();
+    let outcome = db
+        .branch("side")
+        .and_then(|side| {
+            side.update(|root| {
+                root.insert(1, "one".into());
+            })
+        })
+        .map(|_| ());
+    assert!(past(&outcome), "{outcome:?}");
+    for keep in [Keep::Last(2), Keep::All] {
+        corrupt(db.compact(keep));
+    }
+    drop(db);
+    corrupt(admin::compact(&path, Keep::Last(2)));
+    assert!(past(&admin::info(&path).map(|_| ())));
 }
 
 #[test]

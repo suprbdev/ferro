@@ -791,6 +791,15 @@ fn step_down(above: u64, at: u64) -> Result<()> {
     Ok(())
 }
 
+/// Fails unless a chain with a tip may keep versions `first` to `last`: `first` is at least 1 and
+/// no later than `last`.
+fn keeps(first: u64, last: u64) -> Result<()> {
+    if first == 0 || first > last {
+        return Err(corrupt(&format!("keeps versions {first} to {last}")));
+    }
+    Ok(())
+}
+
 /// A branch's retained commit log: its newest entry and the versions it keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Chain {
@@ -817,17 +826,30 @@ impl Chain {
     ///
     /// [`Error::Corrupt`] if a chain with a tip keeps no version or more than it holds.
     pub(crate) fn bounded(tip: Option<Ptr>, first: u64, last: u64) -> Result<Chain> {
-        if tip.is_some() && (first == 0 || first > last) {
-            return Err(corrupt(&format!("keeps versions {first} to {last}")));
+        if tip.is_some() {
+            keeps(first, last)?;
         }
         Ok(Chain { tip, first, last })
     }
 
+    /// How many versions the chain keeps, or 0 for a chain with no tip or one whose bounds
+    /// [`Chain::bounded`] refuses because `first` is past `last`.
     pub(crate) fn len(&self) -> usize {
-        match self.tip {
-            Some(_) => (self.last - self.first + 1) as usize,
-            None => 0,
+        match (self.tip, self.last.checked_sub(self.first)) {
+            (Some(_), Some(span)) => span.saturating_add(1) as usize,
+            _ => 0,
         }
+    }
+
+    /// Fails unless `at`, the version of the entry at the tip, is the chain's last version.
+    fn at_last(&self, at: u64) -> Result<()> {
+        if at != self.last {
+            return Err(corrupt(&format!(
+                "names v{} as its last but its tip is v{at}",
+                self.last
+            )));
+        }
+        Ok(())
     }
 
     fn descend(
@@ -858,11 +880,18 @@ impl Chain {
         }
     }
 
+    /// The newest entry, or `None` before the first commit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the tip is not at the chain's last version, and read errors.
     pub(crate) fn tip_entry(&self, store: &Store) -> Result<Option<Arc<Entry>>> {
-        match self.tip {
-            Some(ptr) => Ok(Some(Entry::load(store, ptr)?)),
-            None => Ok(None),
-        }
+        let Some(ptr) = self.tip else {
+            return Ok(None);
+        };
+        let entry = Entry::load(store, ptr)?;
+        self.at_last(entry.commit.version)?;
+        Ok(Some(entry))
     }
 
     /// The retained entry at `version` with its pointer, or `None` outside the retained versions.
@@ -992,10 +1021,16 @@ impl Chain {
 
     /// This chain with its oldest retained version raised as `keep` asks, never past the newest,
     /// so at least one commit stays.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the chain keeps no version or more than it holds, as
+    /// [`Chain::bounded`] has it, and read errors.
     pub(crate) fn pruned(&self, store: &Store, keep: Keep) -> Result<Chain> {
         if self.tip.is_none() {
             return Ok(*self);
         }
+        keeps(self.first, self.last)?;
         let first = match keep {
             Keep::All => self.first,
             Keep::Last(count) => self
@@ -1054,12 +1089,7 @@ impl Chain {
             let entry = decode(&object)?;
             let at = entry.commit.version;
             if trail.above == u64::MAX {
-                if at != self.last {
-                    return Err(corrupt(&format!(
-                        "names v{} as its last but its tip is v{at}",
-                        self.last
-                    )));
-                }
+                self.at_last(at)?;
                 if entry.commit.root.map(|root| root.hash) != root.map(|root| root.hash) {
                     return Err(corrupt(&format!(
                         "tip v{at} holds another root than its branch's head names"
@@ -1109,6 +1139,7 @@ impl Chain {
         } else {
             version
         };
+        keeps(first, version)?;
         let target = skip_version(version);
         let skip = if target >= first && target != version - 1 {
             self.pointer_to(store, target)?
@@ -1398,3 +1429,47 @@ impl DoubleEndedIterator for Iter {
 }
 
 impl ExactSizeIterator for Iter {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Closing, Durability, StoreOptions};
+
+    #[test]
+    fn a_chain_whose_first_version_is_past_its_last_keeps_nothing_and_fails_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            ..StoreOptions::default()
+        };
+        let store = Closing(
+            Store::open(&dir.path().join("chain.ferro"), options)
+                .unwrap()
+                .0,
+        );
+        let tip = Ptr {
+            hash: Default::default(),
+            offset: 1,
+        };
+        for (first, last) in [(65, 51), (0, 4)] {
+            let chain = Chain {
+                tip: Some(tip),
+                first,
+                last,
+            };
+            for keep in [Keep::All, Keep::Last(2), Keep::Since(0)] {
+                let pruned = chain.pruned(&store, keep);
+                assert!(
+                    matches!(pruned, Err(Error::Corrupt(_))),
+                    "{first} to {last}, {keep:?}: {pruned:?}"
+                );
+            }
+        }
+        let past = Chain {
+            tip: Some(tip),
+            first: 65,
+            last: 51,
+        };
+        assert_eq!(past.len(), 0);
+    }
+}

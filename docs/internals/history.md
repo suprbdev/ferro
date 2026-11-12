@@ -40,11 +40,13 @@ takes its numbers from its parents, and a received chain is checked against the 
 absence led to.
 
 - A head with a tip keeps versions `first` to its version, and `first` is at least 1. `len` and
-  every lookup and walk rely on it, and decoding the head checks it.
+  every lookup and walk rely on it, decoding the head checks it, and pruning and a commit's new
+  chain check it again.
 - A head with no tip names version 0 and no root. `read`, `info` and the version of the next commit
   rely on it, and decoding the head checks it.
-- The tip is at the version the head names. `at`, `Log::last` and sync's have rely on it, and the
-  chain walk checks it.
+- The tip is at the version the head names. `at`, `Log::last`, sync's have and the version of a
+  branch's next commit rely on it. The chain walk checks it, and so does every read of the tip on
+  its own: opening or refreshing a branch, `info`, `Log::last` and planning a bundle.
 - The head's root is the tip's. `read` and `at` of the head's version rely on it to agree, as does a
   commit's test for a change, and the chain walk checks it.
 - An entry is at version 1 or above, its reach is below its generation, and its last merge is its
