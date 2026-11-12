@@ -4277,7 +4277,8 @@ mod diffed {
                         let snapshot = forks[index].read();
                         let version = snapshot.version();
                         let model = loop {
-                            if let Some(model) = models[index].lock().unwrap().get(&version).cloned()
+                            if let Some(model) =
+                                models[index].lock().unwrap().get(&version).cloned()
                             {
                                 break model;
                             }
@@ -4422,8 +4423,10 @@ mod diffed {
             for (key, value) in &new {
                 assert_eq!(after.get(key).as_deref(), Some(value), "get {key}");
             }
-            let read: BTreeMap<u64, Vec<u8>> =
-                before.iter().map(|(key, value)| (key, (*value).clone())).collect();
+            let read: BTreeMap<u64, Vec<u8>> = before
+                .iter()
+                .map(|(key, value)| (key, (*value).clone()))
+                .collect();
             assert_eq!(read, old);
             assert_eq!(got(before.diff(&after), Vec::clone), wanted(&old, &new));
             assert_eq!(got(after.diff(&before), Vec::clone), wanted(&new, &old));
