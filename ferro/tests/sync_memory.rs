@@ -187,6 +187,30 @@ fn with_huge_claimed_size() -> Bundle {
     Bundle::from(out)
 }
 
+fn links_one_object_by_place(times: u64) -> Bundle {
+    let mut out = Vec::new();
+    header(&mut out, 0);
+    varint(&mut out, 2);
+    out.extend_from_slice(&[0, 0]);
+    varint(&mut out, times);
+    out.push(0);
+    varint(&mut out, times);
+    out.resize(out.len() + times as usize, 1);
+    out.push(0);
+    Bundle::from(out)
+}
+
+fn claims_links_never_made() -> Bundle {
+    let mut out = Vec::new();
+    header(&mut out, 0);
+    let count = 2 * MIB;
+    varint(&mut out, count as u64);
+    for _ in 0..count {
+        out.extend_from_slice(&[0, 0, 1]);
+    }
+    Bundle::from(out)
+}
+
 #[test]
 fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
     let dir = tempfile::tempdir().unwrap();
@@ -201,6 +225,17 @@ fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
         ("many hints", claims_many_hints(), 3),
         ("far expansion", expands_far(), 64),
         ("huge claimed size", with_huge_claimed_size(), 3),
+        (
+            "two million links by place to one object",
+            links_one_object_by_place(2 * MIB as u64),
+            3,
+        ),
+        (
+            "sixteen million links by place to one object",
+            links_one_object_by_place(16 * MIB as u64),
+            3,
+        ),
+        ("links claimed and never made", claims_links_never_made(), 3),
     ];
     for (name, bundle, ratio) in cases {
         let len = bundle.as_bytes().len();

@@ -118,32 +118,74 @@ thread_local! {
 /// The [`Hash`](type@Hash) of an object with this body and links with these hashes, as
 /// [`Object::hash`] computes it, for callers that hold the parts apart.
 pub(crate) fn hash_parts<'a>(body: &[u8], links: impl ExactSizeIterator<Item = &'a Hash>) -> Hash {
-    let mut header = [0u8; 8];
-    header[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    header[4..].copy_from_slice(&(links.len() as u32).to_le_bytes());
-    let total = header.len() + body.len() + links.len() * HASH_BYTES;
-    let full = if total <= JOINED_BYTES {
-        JOINED.with_borrow_mut(|joined| {
-            joined.clear();
+    JOINED.with_borrow_mut(|joined| {
+        let mut hashing = Hashing::new(joined, body, links.len());
+        for link in links {
+            hashing.link(link);
+        }
+        hashing.finish()
+    })
+}
+
+/// The [`Hash`](type@Hash) of an object built up from its parts as they come, the body first and
+/// then the hash of each link, which comes out as [`hash_parts`] computes it at once.
+///
+/// An object of up to 4 KiB with its link hashes is joined in a scratch buffer and hashed in one
+/// call, and a larger one is fed to the hasher piece by piece, so a caller need not hold its links
+/// to hash it.
+pub(crate) struct Hashing<'a> {
+    joined: &'a mut Vec<u8>,
+    hasher: Option<Box<blake3::Hasher>>,
+}
+
+impl<'a> Hashing<'a> {
+    /// Starts the hash of an object with `body` and `links` links, joining small objects in
+    /// `joined`.
+    pub(crate) fn new(joined: &'a mut Vec<u8>, body: &[u8], links: usize) -> Hashing<'a> {
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        header[4..].copy_from_slice(&(links as u32).to_le_bytes());
+        let total = links
+            .saturating_mul(HASH_BYTES)
+            .saturating_add(header.len() + body.len());
+        joined.clear();
+        if total <= JOINED_BYTES {
             joined.extend_from_slice(&header);
             joined.extend_from_slice(body);
-            for link in links {
-                joined.extend_from_slice(link);
-            }
-            blake3::hash(joined)
-        })
-    } else {
-        let mut hasher = blake3::Hasher::new();
+            return Hashing {
+                joined,
+                hasher: None,
+            };
+        }
+        let mut hasher = Box::new(blake3::Hasher::new());
         hasher.update(&header);
         hasher.update(body);
-        for link in links {
-            hasher.update(link);
+        Hashing {
+            joined,
+            hasher: Some(hasher),
         }
-        hasher.finalize()
-    };
-    let mut out = [0u8; HASH_BYTES];
-    out.copy_from_slice(&full.as_bytes()[..HASH_BYTES]);
-    out
+    }
+
+    /// Adds the hash of the next link.
+    pub(crate) fn link(&mut self, hash: &Hash) {
+        match &mut self.hasher {
+            Some(hasher) => {
+                hasher.update(hash);
+            }
+            None => self.joined.extend_from_slice(hash),
+        }
+    }
+
+    /// The object's hash, once every link is added.
+    pub(crate) fn finish(self) -> Hash {
+        let full = match self.hasher {
+            Some(hasher) => hasher.finalize(),
+            None => blake3::hash(self.joined),
+        };
+        let mut out = [0u8; HASH_BYTES];
+        out.copy_from_slice(&full.as_bytes()[..HASH_BYTES]);
+        out
+    }
 }
 
 impl Object {

@@ -6202,6 +6202,15 @@ impl Summary<u64, String> for Scan {
 }
 
 fn one_value_under(keys: &[u64], spill: &Object, size: usize) -> Received<Map<u64, String, Scan>> {
+    one_value_padded(keys, spill, size, 0)
+}
+
+fn one_value_padded(
+    keys: &[u64],
+    spill: &Object,
+    size: usize,
+    padding: usize,
+) -> Received<Map<u64, String, Scan>> {
     let sums: Vec<u64> = keys
         .iter()
         .map(|key| key.wrapping_mul(3).wrapping_add(size as u64))
@@ -6216,7 +6225,14 @@ fn one_value_under(keys: &[u64], spill: &Object, size: usize) -> Received<Map<u6
         .fold(0u64, |total, sum| total.wrapping_add(*sum));
     let leaf = summed_node(&entries, &[]);
     let root = summed_root(keys.len() as u64, total, &leaf);
-    receive_tree(&[spill, &leaf, &root])
+    let pad = Object {
+        body: Vec::new(),
+        links: vec![link_to(spill); padding],
+    };
+    match padding {
+        0 => receive_tree(&[spill, &leaf, &root]),
+        _ => receive_tree(&[spill, &pad, &leaf, &root]),
+    }
 }
 
 #[test]
@@ -6231,6 +6247,25 @@ fn one_spilled_value_under_many_keys_lands_within_a_budget() {
     assert_eq!(*b.read().get(&keys[199]).unwrap(), long);
     b.verify_typed().unwrap();
     let (b, result, _dir) = one_value_under(&keys, &spill, size);
+    match result {
+        Err(Error::Bundle(message)) => assert!(message.contains("too many keys"), "{message}"),
+        other => panic!("recomputed one value's summary under 4000 keys: {other:?}"),
+    }
+    assert_eq!(b.version(), 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn links_by_place_in_an_object_the_walk_never_reaches_buy_no_rereads() {
+    let size = 1 << 20;
+    let spill = object_of(&"x".repeat(size));
+    let keys = level_zero_keys(4_000);
+    let started = Instant::now();
+    let (b, result, _dir) = one_value_padded(&keys, &spill, size, 1 << 20);
     match result {
         Err(Error::Bundle(message)) => assert!(message.contains("too many keys"), "{message}"),
         other => panic!("recomputed one value's summary under 4000 keys: {other:?}"),

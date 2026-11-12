@@ -51,8 +51,8 @@ use quick_cache::{DefaultHashBuilder, Lifecycle, Weighter};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
-    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Moved, Moves, Object, Ptr, Relocate, Sink,
-    Staged, hash_parts, push_varint,
+    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Hashing, Moved, Moves, Object, Ptr, Relocate,
+    Sink, Staged, hash_parts, push_varint,
 };
 use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
@@ -1427,18 +1427,37 @@ pub(crate) fn staged<'a>(body: &'a [u8], packed: Option<&'a [u8]>, links: &'a [P
 
 /// Appends to `buf` the record of `staged`, as it would sit at `offset` in the log.
 pub(crate) fn append_staged(buf: &mut Vec<u8>, offset: u64, staged: Staged<'_>) {
-    push_varint(buf, staged.payload.len() as u64);
-    if staged.packed {
-        push_varint(buf, (staged.links.len() as u64) << 1 | 1);
-        push_varint(buf, staged.raw as u64);
-    } else {
-        push_varint(buf, (staged.links.len() as u64) << 1);
-    }
-    buf.extend_from_slice(staged.payload);
+    append_head(
+        buf,
+        staged.payload,
+        staged.packed,
+        staged.raw,
+        staged.links.len(),
+    );
     for link in staged.links {
-        buf.extend_from_slice(&link.hash);
-        push_varint(buf, zigzag(offset.wrapping_sub(link.offset) as i64));
+        append_link(buf, offset, link);
     }
+}
+
+/// Appends to `buf` the start of a record, up to its links: the length of `payload`, the count of
+/// `links` and whether it is `packed`, the length `raw` of the body before compression if it is,
+/// and `payload`.
+fn append_head(buf: &mut Vec<u8>, payload: &[u8], packed: bool, raw: usize, links: usize) {
+    push_varint(buf, payload.len() as u64);
+    if packed {
+        push_varint(buf, (links as u64) << 1 | 1);
+        push_varint(buf, raw as u64);
+    } else {
+        push_varint(buf, (links as u64) << 1);
+    }
+    buf.extend_from_slice(payload);
+}
+
+/// Appends to `buf` one link of the record at `offset`: its hash and the distance back to its
+/// offset, zigzagged.
+fn append_link(buf: &mut Vec<u8>, offset: u64, link: &Ptr) {
+    buf.extend_from_slice(&link.hash);
+    push_varint(buf, zigzag(offset.wrapping_sub(link.offset) as i64));
 }
 
 /// The length in bytes of the record that `object` would take at `offset` in the log.
@@ -2981,6 +3000,18 @@ impl Store {
         match &self.inner.view {
             Some(view) => view.charge(bytes),
             None => Ok(()),
+        }
+    }
+
+    /// Adds `bytes` to what a [`Store::view`] may still read at a charge, and does nothing for a
+    /// store opened on a file.
+    pub(crate) fn credit(&self, bytes: u64) {
+        if let Some(view) = &self.inner.view {
+            let _ = view
+                .left
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    Some(left.saturating_add(bytes))
+                });
         }
     }
 
@@ -5653,6 +5684,8 @@ pub(crate) struct Staging {
     /// The hashes of the last [`STAGED_LEARNED`] objects, once the records are in the log.
     recent: VecDeque<Hash>,
     offsets: Ascending,
+    /// Scratch for hashing the objects put.
+    joined: Vec<u8>,
 }
 
 /// Where a staging that outgrew memory writes its records.
@@ -5819,6 +5852,29 @@ fn parse_record(bytes: &[u8], at: u64, hash: Hash) -> Result<Option<(Record, usi
     Ok(Some((record, pos)))
 }
 
+/// A link of an object a [`Staging`] puts: to an object it put before, by its hash and id, or to
+/// one that `Ptr` gives.
+pub(crate) enum LinkTo {
+    /// The object put with this id, which has this hash.
+    Put(Hash, u32),
+    /// The object at this pointer, outside the staging, or at offset 0 for one not found yet.
+    At(Ptr),
+}
+
+/// Writes `buf`, the records a staging in the log holds in memory, to its file at `start`, and
+/// moves `start` past them.
+fn write_held(store: &Store, start: &mut u64, buf: &mut Vec<u8>) -> Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let file = &store.inner.file;
+    file.write_all_at(buf, *start)?;
+    platform::start_writeback(file, *start, buf.len() as u64);
+    *start += buf.len() as u64;
+    buf.clear();
+    Ok(())
+}
+
 /// The most bytes the record of `staged` can take.
 fn most_bytes(staged: &Staged<'_>) -> u64 {
     let links = staged.links.len() * (HASH_BYTES + MAX_VARINT);
@@ -5838,37 +5894,41 @@ impl Staging {
             hashes: Some(Column::new()),
             recent: VecDeque::new(),
             offsets: Ascending::new(),
+            joined: Vec::new(),
         }
     }
 
-    /// Adds the record of `staged` behind `hash` and returns the object's id, moving the records
-    /// into the log first if this one could take them past the limit, and asking `room` for a
-    /// staging frame whenever the one being filled cannot hold it.
+    /// Adds the record of an object with `body`, stored as `packed` if that is given, and the
+    /// `count` links that `links` yields, and returns the object's id and hash.
+    ///
+    /// The records move into the log first if this one could take them past the limit, and `room`
+    /// is asked for a staging frame whenever the one being filled cannot hold it, before the first
+    /// link is taken from `links`. Its links are then written, and hashed, as they come, and in
+    /// the log written out whenever [`STAGED_ROOM`] of them wait, so a record of many links is
+    /// never held whole.
     ///
     /// # Errors
     ///
     /// [`Error::Bundle`] once the staging holds as many objects as it has ids, the error of
-    /// `room`, and the I/O error of a failed write.
+    /// `room`, the I/O error of a failed write, and [`Error::Corrupt`] if `links` does not yield
+    /// `count` links.
     pub(crate) fn put(
         &mut self,
-        hash: Hash,
-        staged: Staged<'_>,
+        body: &[u8],
+        packed: Option<&[u8]>,
+        count: usize,
+        links: impl Iterator<Item = LinkTo>,
         room: &mut Room<'_>,
-    ) -> Result<u32> {
-        let most = most_bytes(&staged);
-        let mut moved = None;
-        if self.log.is_none()
-            && !self.buf.is_empty()
-            && self.buf.len() as u64 + most > self.limit as u64
-        {
-            let was = self.spill(room)?;
-            moved = Some(self.moved_links(staged.links, &was, self.offsets.len() as u32));
+    ) -> Result<(u32, Hash)> {
+        let payload = packed.unwrap_or(body);
+        let most = (payload.len() as u64)
+            .saturating_add(3 * MAX_VARINT as u64)
+            .saturating_add((count as u64).saturating_mul((HASH_BYTES + MAX_VARINT) as u64));
+        if self.log.is_none() && self.buf.len() as u64 + most > self.limit as u64 {
+            self.spill(room)?;
         }
-        let staged = Staged {
-            links: moved.as_deref().unwrap_or(staged.links),
-            ..staged
-        };
-        if self.log.is_some() {
+        let logged = self.log.is_some();
+        if logged {
             self.make_room(most, room)?;
         }
         let id = u32::try_from(self.offsets.len())
@@ -5878,7 +5938,34 @@ impl Staging {
                 Error::Bundle("it carries more objects than one receive can hold".into())
             })?;
         let offset = self.start + self.buf.len() as u64;
-        append_staged(&mut self.buf, offset, staged);
+        append_head(&mut self.buf, payload, packed.is_some(), body.len(), count);
+        let mut hashing = Hashing::new(&mut self.joined, body, count);
+        let (mut written, mut split) = (0, false);
+        for link in links {
+            let link = match link {
+                LinkTo::Put(hash, id) => Ptr {
+                    hash,
+                    offset: self.offsets.get(id),
+                },
+                LinkTo::At(ptr) => ptr,
+            };
+            append_link(&mut self.buf, offset, &link);
+            hashing.link(&link.hash);
+            written += 1;
+            if logged && self.buf.len() as u64 >= STAGED_ROOM {
+                write_held(&self.store, &mut self.start, &mut self.buf)?;
+                split = true;
+            }
+        }
+        if split {
+            write_held(&self.store, &mut self.start, &mut self.buf)?;
+        }
+        if written != count {
+            return Err(Error::Corrupt(format!(
+                "a staged object said it had {count} links and gave {written}"
+            )));
+        }
+        let hash = hashing.finish();
         match &mut self.hashes {
             Some(hashes) => hashes.push(hash),
             None => {
@@ -5889,12 +5976,12 @@ impl Staging {
             }
         }
         self.offsets.push(offset);
-        Ok(id)
+        Ok((id, hash))
     }
 
     /// Moves the records held in memory into staging frames, linking each record to the new
-    /// offsets of those before it, and returns the offsets they had.
-    fn spill(&mut self, room: &mut Room<'_>) -> Result<Ascending> {
+    /// offsets of those before it.
+    fn spill(&mut self, room: &mut Room<'_>) -> Result<()> {
         let held = mem::take(&mut self.buf);
         let was = mem::replace(&mut self.offsets, Ascending::new());
         let base = mem::replace(&mut self.start, LOG_START);
@@ -5919,7 +6006,7 @@ impl Staging {
             append_staged(&mut self.buf, offset, staged);
             self.offsets.push(offset);
         }
-        Ok(was)
+        Ok(())
     }
 
     /// `links`, with each link to an object put before the id `before`, at the offset `was` gave
@@ -5981,15 +6068,7 @@ impl Staging {
 
     /// Writes the records held in memory to the file, once the staging is in the log.
     fn write_out(&mut self) -> Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let file = &self.store.inner.file;
-        file.write_all_at(&self.buf, self.start)?;
-        platform::start_writeback(file, self.start, self.buf.len() as u64);
-        self.start += self.buf.len() as u64;
-        self.buf.clear();
-        Ok(())
+        write_held(&self.store, &mut self.start, &mut self.buf)
     }
 
     /// The number of objects put.

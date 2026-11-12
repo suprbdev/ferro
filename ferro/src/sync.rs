@@ -12,7 +12,7 @@
 //! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
 
 use std::any::{Any, TypeId};
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BinaryHeap, HashMap, HashSet, hash_map};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::mem;
@@ -35,7 +35,7 @@ use crate::map::Map;
 use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
 use crate::store::{
-    Record, Room, Staging, Store, Together, Txn, compressed, staged, stored_within,
+    LinkTo, Record, Room, Staging, Store, Together, Txn, compressed, stored_within,
 };
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -47,10 +47,16 @@ const RECHECK_SLACK: usize = 16 << 20;
 const RERUN_FACTOR: usize = 8;
 const RERUN_SLACK: usize = 256 << 20;
 const RERUN_PER_LINK: usize = 4 << 10;
+const CREDIT_BATCH: u64 = 1 << 10;
 const ZERO_WIDTH_SLACK: u64 = 1 << 28;
 const ZERO_WIDTH_PER_BYTE: u64 = 16;
 const CONFIRMED_KEPT: usize = 1 << 16;
 const RANGES_KEPT: usize = 16;
+const LIVE_CHUNK: usize = 1 << 12;
+const LIVE_SETTLE: usize = 1 << 6;
+const LIVE_SCAN: usize = 1 << 4;
+const LINKS_HELD: usize = 1 << 10;
+const LIVE_SLACK: u64 = 4 << 20;
 const HELD_SLOTS: usize = 1 << 18;
 const HELD_KEPT: usize = HELD_SLOTS / 8 * 7;
 const HELD_FIRST: usize = 1 << 10;
@@ -2280,6 +2286,10 @@ struct Vetting<'a> {
     rerun_budget: usize,
     zero_width_budget: u64,
     view: OnceCell<Store>,
+    views: RefCell<Vec<Store>>,
+    walked: Vec<u64>,
+    credited: u64,
+    flushed: Cell<u64>,
     recalled: Option<Recalled>,
 }
 
@@ -2413,6 +2423,7 @@ impl Vetting<'_> {
         let (shape, found, zero_width) = kind
             .check_tables(&object.body, &object.links, &tables)
             .map_err(|error| undecodable(kind, error))?;
+        self.credit(id, object.links.len());
         self.tables.note(tables.into_inner());
         self.tally(zero_width)?;
         if shape.deferred {
@@ -2521,11 +2532,38 @@ impl Vetting<'_> {
     }
 
     fn fresh_view(&self) -> Store {
-        self.store.view(
-            self.carried as u64,
-            self.rerun_budget as u64,
-            self.zero_width_budget,
-        )
+        self.flush();
+        let allowance = (self.rerun_budget as u64)
+            .saturating_add(self.credited.saturating_mul(RERUN_PER_LINK as u64));
+        let view = self
+            .store
+            .view(self.carried as u64, allowance, self.zero_width_budget);
+        self.views.borrow_mut().push(view.clone());
+        view
+    }
+
+    fn credit(&mut self, id: u32, links: usize) {
+        let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+        if self.walked[word] & bit != 0 {
+            return;
+        }
+        self.walked[word] |= bit;
+        self.credited = self.credited.saturating_add(links as u64);
+        if self.credited - self.flushed.get() >= CREDIT_BATCH {
+            self.flush();
+        }
+    }
+
+    fn flush(&self) {
+        let links = self.credited - self.flushed.get();
+        if links == 0 {
+            return;
+        }
+        self.flushed.set(self.credited);
+        let bytes = links.saturating_mul(RERUN_PER_LINK as u64);
+        for view in self.views.borrow().iter() {
+            view.credit(bytes);
+        }
     }
 
     fn tally(&self, zero_width: u64) -> Result<()> {
@@ -2653,6 +2691,7 @@ impl Vetting<'_> {
             before(self, at);
             self.queue.push((*root, self.root_kind.clone(), None));
             self.run()?;
+            self.flush();
         }
         self.settle()
     }
@@ -3224,7 +3263,162 @@ struct Streamed {
     links: Column<u8>,
     loose: Vec<u32>,
     carried: usize,
-    linked: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Pending {
+    id: u32,
+    hash: Hash,
+    left: u64,
+}
+
+#[derive(Default)]
+struct Live {
+    chunks: Vec<Vec<Pending>>,
+    len: usize,
+    dead: usize,
+}
+
+impl Live {
+    fn bytes(&self) -> u64 {
+        ((self.len - self.dead) * mem::size_of::<Pending>()) as u64
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == self.dead
+    }
+
+    fn push(&mut self, id: u32, hash: Hash, left: u64) {
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == LIVE_CHUNK)
+        {
+            self.chunks.push(Vec::with_capacity(LIVE_CHUNK));
+        }
+        let chunk = self.chunks.last_mut().expect("a chunk was just made");
+        chunk.push(Pending { id, hash, left });
+        self.len += 1;
+    }
+
+    fn find(&self, id: u32) -> Option<(usize, usize)> {
+        let last = self.chunks.len().checked_sub(1)?;
+        let tail = &self.chunks[last];
+        for at in (tail.len().saturating_sub(LIVE_SCAN)..tail.len()).rev() {
+            match tail[at].id.cmp(&id) {
+                std::cmp::Ordering::Equal => return Some((last, at)),
+                std::cmp::Ordering::Less => return None,
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        let chunk = match self.chunks[last][0].id <= id {
+            true => last,
+            false => self.chunks[..last]
+                .partition_point(|chunk| chunk[0].id <= id)
+                .checked_sub(1)?,
+        };
+        let entries = &self.chunks[chunk];
+        let (mut low, mut high, mut step) = (entries.len() - 1, entries.len(), 1);
+        while low > 0 && entries[low].id > id {
+            high = low;
+            low = low.saturating_sub(step);
+            step *= 2;
+        }
+        let at = low
+            + entries[low..high]
+                .binary_search_by_key(&id, |pending| pending.id)
+                .ok()?;
+        Some((chunk, at))
+    }
+
+    fn get(&self, id: u32) -> Option<&Pending> {
+        self.find(id).map(|(chunk, at)| &self.chunks[chunk][at])
+    }
+
+    fn take(&mut self, id: u32) -> Option<Hash> {
+        let (chunk, at) = self.find(id)?;
+        let pending = &mut self.chunks[chunk][at];
+        if pending.left == 0 {
+            return None;
+        }
+        pending.left -= 1;
+        if pending.left == 0 {
+            self.dead += 1;
+        }
+        Some(pending.hash)
+    }
+
+    fn settle(&mut self) {
+        while let Some(chunk) = self.chunks.last_mut()
+            && chunk.last().is_some_and(|pending| pending.left == 0)
+        {
+            chunk.pop();
+            if chunk.is_empty() {
+                self.chunks.pop();
+            }
+            self.len -= 1;
+            self.dead -= 1;
+        }
+        if self.dead * 4 <= self.len || self.len < LIVE_SETTLE {
+            return;
+        }
+        let (mut to, mut at) = (0, 0);
+        for from in 0..self.chunks.len() {
+            for index in 0..self.chunks[from].len() {
+                let pending = self.chunks[from][index];
+                if pending.left == 0 {
+                    continue;
+                }
+                self.chunks[to][at] = pending;
+                at += 1;
+                if at == LIVE_CHUNK {
+                    (to, at) = (to + 1, 0);
+                }
+            }
+        }
+        self.chunks.truncate(to + 1);
+        self.chunks[to].truncate(at);
+        if at == 0 {
+            self.chunks.pop();
+        }
+        self.len -= self.dead;
+        self.dead = 0;
+    }
+}
+
+struct Linked<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    left: usize,
+    held: u64,
+    position: u64,
+    live: &'a Live,
+    anchors: &'a Anchors,
+}
+
+impl Iterator for Linked<'_> {
+    type Item = LinkTo;
+
+    fn next(&mut self) -> Option<LinkTo> {
+        self.left = self.left.checked_sub(1)?;
+        let reference = take_varint(self.bytes, &mut self.pos);
+        if let Some(back) = reference.checked_sub(self.held + 1) {
+            let id = (self.position - back - 1) as u32;
+            let pending = self
+                .live
+                .get(id)
+                .expect("a link checked as it arrived names an object still held");
+            return Some(LinkTo::Put(pending.hash, id));
+        }
+        let hash: Hash = self.bytes[self.pos..self.pos + HASH_BYTES]
+            .try_into()
+            .expect("a link that is not by place carries its hash");
+        self.pos += HASH_BYTES;
+        Some(LinkTo::At(match reference.checked_sub(1) {
+            None => Ptr { hash, offset: 0 },
+            Some(reference) => self.anchors.ptr(reference as u32),
+        }))
+    }
 }
 
 fn stream<R: Read>(
@@ -3239,37 +3433,34 @@ fn stream<R: Read>(
         links: Column::new(),
         loose: Vec::new(),
         carried: 0,
-        linked: 0,
     };
-    let mut live: HashTable<(u32, Hash, u64)> = HashTable::new();
-    let spot = |id: u32| u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut live = Live::default();
+    let (mut raw, mut near) = (Vec::new(), Vec::new());
     for _ in 0..header.count {
         let (body, packed) = input.body()?;
         let position = staging.len() as u64;
-        let mut links = Vec::new();
+        let count = input.varint()?;
+        let few = count <= LINKS_HELD as u64;
         let mut open = false;
-        for _ in 0..input.varint()? {
-            found.linked += 1;
+        raw.clear();
+        near.clear();
+        for _ in 0..count {
             let reference = input.varint()?;
+            if !few {
+                push_varint(&mut raw, reference);
+            }
             if let Some(back) = reference.checked_sub(held + 1) {
                 let id = back
                     .checked_add(1)
                     .and_then(|back| position.checked_sub(back))
                     .ok_or_else(|| bad("a link leads past the start of the bundle"))?
                     as u32;
-                let Ok(mut used) = live.find_entry(spot(id), |(at, ..)| *at == id) else {
+                let Some(hash) = live.take(id) else {
                     return Err(bad("it links an object more often than it said it would"));
                 };
-                let (_, hash, left) = used.get_mut();
-                let hash = *hash;
-                *left -= 1;
-                if *left == 0 {
-                    used.remove();
+                if few {
+                    near.push(LinkTo::Put(hash, id));
                 }
-                links.push(Ptr {
-                    hash,
-                    offset: staging.offset(id),
-                });
                 continue;
             }
             let hash = input.hash()?;
@@ -3283,17 +3474,41 @@ fn stream<R: Read>(
             if ptr.hash != hash {
                 return Err(bad("a link does not match the object it names"));
             }
-            links.push(ptr);
+            match few {
+                true => near.push(LinkTo::At(ptr)),
+                false => raw.extend_from_slice(&hash),
+            }
         }
         let uses = input.varint()?;
-        let object = Object { body, links };
-        let hash = object.hash();
-        found.carried = found.carried.saturating_add(object.body.len());
-        let staged = staged(&object.body, packed.as_deref(), &object.links);
-        let id = staging.put(hash, staged, room)?;
+        let count = count as usize;
+        let (id, hash) = match few {
+            true => staging.put(&body, packed.as_deref(), count, near.drain(..), room)?,
+            false => {
+                let links = Linked {
+                    bytes: &raw,
+                    pos: 0,
+                    left: count,
+                    held,
+                    position,
+                    live: &live,
+                    anchors,
+                };
+                staging.put(&body, packed.as_deref(), count, links, room)?
+            }
+        };
+        live.settle();
+        if raw.capacity() > READ_BUFFER {
+            raw = Vec::new();
+        }
+        found.carried = found.carried.saturating_add(body.len());
         found.links.push(u8::try_from(uses).unwrap_or(u8::MAX));
         if uses > 0 {
-            live.insert_unique(spot(id), (id, hash, uses), |(at, ..)| spot(*at));
+            live.push(id, hash, uses);
+            if live.bytes() > input.read.saturating_add(LIVE_SLACK) {
+                return Err(bad(
+                    "it says later objects link more of its objects than its size allows",
+                ));
+            }
         }
         if open {
             found.loose.push(id);
@@ -3582,12 +3797,15 @@ fn resolve<O: Objects>(
             rerun_budget: streamed
                 .carried
                 .saturating_mul(RERUN_FACTOR)
-                .saturating_add(streamed.linked.saturating_mul(RERUN_PER_LINK))
                 .saturating_add(RERUN_SLACK),
             zero_width_budget: (streamed.carried as u64)
                 .saturating_mul(ZERO_WIDTH_PER_BYTE)
                 .saturating_add(ZERO_WIDTH_SLACK),
             view: OnceCell::new(),
+            views: RefCell::new(Vec::new()),
+            walked: vec![0; staging.len().div_ceil(64)],
+            credited: 0,
+            flushed: Cell::new(0),
             recalled: (order.len() > 1).then(Recalled::default),
         };
         let roots: Vec<Ptr> = order
@@ -4651,4 +4869,44 @@ fn recorded(
     let mut next = refs.clone();
     next.insert(name.to_string(), head);
     Ok(Some(next))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_finds_each_object_until_its_last_link_and_settles_what_is_spent() {
+        let mut live = Live::default();
+        let count = 3 * LIVE_CHUNK as u32 + 17;
+        for id in 0..count {
+            let mut hash = [0u8; HASH_BYTES];
+            hash[..4].copy_from_slice(&id.to_le_bytes());
+            live.push(id * 2, hash, u64::from(id % 3) + 1);
+        }
+        assert_eq!(live.bytes(), u64::from(count) * 32);
+        assert!(live.get(1).is_none() && live.take(1).is_none());
+        for id in (0..count).filter(|id| id % 3 == 0) {
+            assert!(live.take(id * 2).is_some());
+            assert!(live.take(id * 2).is_none());
+            live.settle();
+        }
+        let left = count - count.div_ceil(3);
+        assert_eq!(live.bytes(), u64::from(left) * 32);
+        assert!(live.len - live.dead <= live.chunks.len() * LIVE_CHUNK);
+        for id in (0..count).filter(|id| id % 3 != 0) {
+            let pending = live
+                .get(id * 2)
+                .expect("an object with links to come is held");
+            assert_eq!(pending.hash[..4], id.to_le_bytes());
+            let pending_hash = pending.hash;
+            for _ in 0..id % 3 + 1 {
+                assert_eq!(live.take(id * 2), Some(pending_hash));
+            }
+            assert!(live.take(id * 2).is_none());
+            live.settle();
+        }
+        assert!(live.is_empty());
+        assert_eq!(live.bytes(), 0);
+    }
 }

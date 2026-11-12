@@ -16,24 +16,27 @@ holds up no commit on the receiving file (#42).
 `receive` reads the bundle's header, then resolves the anchors and hints against the published refs,
 so a stale have fails before any object is read. It keeps the `Store` of that generation for the
 rest of the transfer, so a reclamation cycle that swaps the file meanwhile leaves every object it
-resolved readable. Each object is hashed as it arrives and appended to a staging buffer, in the
-log's record format, with its links resolved to offsets: to an object sent earlier, by its offset in
-the staging, to an anchor or hint, by its offset in the file, or, where a link names something not
-sent, to offset 0 for now. Each record keeps the body it arrived with, its LZ4 bytes or those a body
-that arrived uncompressed compressed to, as described under [Applying](sync.md#applying), so nothing
-is compressed again when it lands. In memory the records sit at offsets of their own, from where
-the log ended when the bundle began to arrive, past every object of the file the bundle can name,
-so an offset tells a staged object from one it links in the file and a link leads back from its
-record into the file, and every distance is zigzagged. The offsets grow with
-the order the objects came in, so an offset finds its object's place by halving them, and no table
-from hash to object is kept: a link to a sent object names its place in the bundle, as described
-under [What is sent](sync.md#what-is-sent), and its hash is kept only until the last link the
-bundle says later objects make to it.
+resolved readable. Each object's links are read and checked first, and kept resolved, up to 1,024 of
+them, or past that as the bytes they arrived as, a byte or two for a link to an object sent earlier.
+Then its record is appended to a staging buffer, in the log's record format, and the object hashed
+as the record is written, with its links resolved to offsets: to an object sent earlier, by its
+offset in the staging, to an anchor or hint, by its offset in the file, or, where a link names
+something not sent, to offset 0 for now. So an object of many links is never held as a list of them.
+Each record keeps the body it arrived with, its LZ4 bytes or those a body that arrived uncompressed
+compressed to, as described under [Applying](sync.md#applying), so nothing is compressed again when
+it lands. In memory the records sit at offsets of their own, from where the log ended when the
+bundle began to arrive, past every object of the file the bundle can name, so an offset tells a
+staged object from one it links in the file and a link leads back from its record into the file, and
+every distance is zigzagged. The offsets grow with the order the objects came in, so an offset finds
+its object's place by halving them, and no table from hash to object is kept: a link to a sent
+object names its place in the bundle, as described under [What is sent](sync.md#what-is-sent), and
+its hash is kept only until the last link the bundle says later objects make to it.
 
-Before a record would take the buffer past 1 MiB, the staging moves into the log. It asks for a
-staging frame: under the `tip` mutex, and in a shared file the placement lock, it places a frame
-with room for 1 MiB of records, or for one record that needs more, at the end of the log, writes its
-68-byte header, makes the file at least as long as the frame, and lets the locks go. The header
+Before a record would take the buffer past 1 MiB, even the first, the staging moves into the log.
+It asks for a staging frame: under the `tip` mutex, and in a shared file the placement lock, it
+places a frame with room for 1 MiB of records, or for one record that needs more, at the end of the
+log, writes its 68-byte header, makes the file at least as long as the frame, and lets the locks
+go. The header
 carries the next sequence number, the frame's end and the head the frame before named, so the frame
 keeps the refs as they were, and its check covers the header alone, as described under [File format
 and durability](storage.md#file-format-and-durability). The records held in memory are encoded again
@@ -163,11 +166,27 @@ for each object](sync.md#memory-for-each-object). A bundle that lands where it i
 more, since the offsets in the staging are those in the log; one that a cycle moved holds each
 object's offset in the new file and its hash beside them, 28 bytes an object more. When the staging
 moves into the log, the buffer it leaves and the frame it fills are both held for a moment, 1 MiB
-more. An object is held whole, about four times over while it is read, compressed again if it
+more. An object's body is held whole, about four times over while it is read, compressed again if it
 arrived uncompressed, as described under [Applying](sync.md#applying), hashed and copied, so the
-largest value sent bounds memory too. A hostile stream gets no more: 48 distinct objects of 1 MiB
-took 2.4 MiB of heap and never landed. A 33 MB stream of 4,549 objects took 2.7 MB, and 256 commits
-with 64 KiB messages, 17 MB, took 3.3 MB.
+largest value sent bounds memory too. Its links are held resolved up to 1,024 of them, 40 KiB, and
+past that only as the bytes they arrived as, a byte or two for a link by place, since its record is
+resolved and written a MiB at a time once they are in. The hashes held for links still to arrive are
+bounded by what the bundle has carried: once those of the objects later links are said to name, at
+32 bytes each, would take more than the bytes read so far and 4 MiB, the bundle is refused with "it
+says later objects link more of its objects than its size allows". An honest bundle holds far fewer.
+Its objects take more than 32 bytes, and only those that a later commit links again wait long:
+291,342 of them, 9.3 MB, where a pull of two commits, four million keys of a `Set<u32>` and 60,000
+more spread across them, had read 29 MB, as the second commit links again nearly every node the
+first wrote.
+
+A hostile stream gets no more. 48 distinct objects of 1 MiB took 2.4 MiB of heap and never landed.
+Two million links by place to one object, 2.1 MB, took 7.4 MB, and sixteen million, 16.8 MB, took
+25.4 MB, where each link used to become a 32-byte pointer and its record was held whole, and two
+million links took 215.5 MB. Two million empty objects that each said a later object would link
+them, 6.3 MB, were refused with 9.0 MB, where the hash kept for each took 220.6 MB.
+`hostile_bundles_cost_memory_in_proportion_to_what_they_carry` in `ferro/tests/sync_memory.rs`
+bounds each to three times its length and 20 MiB. A 33 MB stream of 4,549 objects took 5.5 MB, and
+256 commits with 64 KiB messages, 17 MB, took 5.9 MB.
 
 ### Staging in the log, measured
 
@@ -730,7 +749,8 @@ Recomputing summaries can read far more than the bundle carries: a value spilled
 read once for each, and `of` reads a nested collection whole for each entry that holds it. The
 receive makes one view, when it first needs one, for the deferred pass and for the hint path below,
 and charges what it reads against an allowance of eight times the bundle's body bytes, plus 4 KiB
-for each link the bundle carries, plus 256 MiB, past which the bundle is refused with
+for each link of each object the walk checks, added as it checks the object, plus 256 MiB, past
+which the bundle is refused with
 `Error::Bundle`, "recomputing its summaries reads more than its size allows", or "checking held
 data it links as another type reads more than its size allows" when the read that ran out was the
 walk described under [Held data linked as another
@@ -751,11 +771,20 @@ sent again, makes the receiver read what it holds again each time: a bundle of 1
 summary did not check read 1.28 GB of held pages on each attempt, about 380 ms, where before the
 free first read the allowance refused it after 256 MiB. A value of up to 4 KiB lands under any
 number of keys, since each key's slot brings the allowance for one more read of it, and a value of 1
-MiB lands under about 265 keys and no more, where each key costs the bundle a slot of some 25 bytes
+MiB lands under about 265 keys and no more, where each key costs the bundle a slot of a few bytes
 and the receiver a read of the whole value. A nested map of 40,000 entries that `of` sums under
 1,500 keys of one node is refused about a second in, where reading it each time would take several,
 and a nested map stored once in the receiver's file and shared by several keys is charged from its
 second read.
+
+The allowance used to count every link the bundle carried, from the start, when each link cost the
+bundle at least 21 bytes. A link by place costs one, and an object no walk reaches is refused only
+once the walk is done, so links in such an object bought rereads for nothing: a 1 MiB value under
+4,000 keys of a map with a summary, padded with an object of a million links by place to it, 2.1 MB,
+read about 4 GiB again in 1.24 s and was then refused for carrying an object nothing links to. It is
+now refused for its keys in 0.12 s, as it is without the padding, by
+`links_by_place_in_an_object_the_walk_never_reaches_buy_no_rereads` in `ferro/tests/sync.rs`. The
+checks of the tables that run beside the walk draw on what the walk has added so far.
 
 The deferred pass used to charge every read, held or staged. Fourteen keys in one node, each holding
 a nested `Map<u64, u64>` of 2,500,000 entries that `of` sums, make a file of 403 MB, and a bundle

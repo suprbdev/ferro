@@ -663,33 +663,35 @@ object. The receiver keeps, for each object in the bundle:
   which also finds the objects nothing links to.
 
 That is about 5 bytes. An object's hash is held only from its arrival to the last link the bundle
-says later objects make to it, in a table from its place in the bundle to its hash and the links
-still to come, 32 bytes and a slot. A first pull comes in the order of the sender's file, where a
-commit writes each node just after its children, so that table holds a few hundred objects at a
-time, and in a history also the nodes a later commit links again: in 100,000 commits of ten keys,
-121 at most. Beside them the receiver keeps the hashes of the last 131,072 objects, 2.5 MiB, for the
-deduplication table to learn once the bundle has landed, and of every object while the staging is in
-memory, under 1 MiB of records. Placing a bundle under 1 MiB, or one that a cycle moved, keeps each
-object's offset in the log beside the others, 8 bytes, and the moved one each hash as it is read
-back, 20 more. A check is kept only while a later link of its type may need it, as described under
-[Checking trees](sync-receive.md#checking-trees). The walk below held data linked as another type
-keeps at most 229,376 checks of 24 bytes, in a table of 6.25 MiB that peaks at 9.4 MiB while it
-grows, however much of the file it reads and however long its keys, as described under [Held data
-linked as another type](sync-receive.md#held-data-linked-as-another-type). Each sent commit adds its
-graph facts, root, hash and segment, 112 bytes, and about 130 more in indexes, the order it is
-checked in, and the list by hash the landing finds it by. Each hint an incremental bundle names adds
-the object it resolves to, the kind it holds with its parent's key range, and its place in the
-header, about 140 bytes. Hints are resolved grouped by parent, so one parent's links and kinds are
-held at a time, where every parent read used to be kept, about 2.3 KB each, until the last hint.
-They are resolved a level of the paths at a time, and within a level grouped by the object their
-parent resolves to and the kind it holds, not by the parent's place in the header, so a held object
-is read once however many hints lead to it. Grouped by place, a 1.18 MB header naming the first link
-of an anchor root 200,000 times, and then the first link of each of those hints, read that object
-200,000 times. On a map of 100,000 keys that took 111 ms, against 36 ms before hints were grouped
-and 18 ms now. `hints_that_name_one_held_object_many_ways_read_it_once` in
-`ferro/tests/sync_memory.rs` sends that header to a map of 20,000 keys and expects it to allocate no
-more than 400,000 hints on the root's link do: 63 MB each now, where it allocated 381 MB in 175 ms.
-Each hint's depth in its path, 4 bytes, is held while they resolve.
+says later objects make to it, in a list by its place in the bundle of its hash and the links still
+to come, 32 bytes, and a bundle whose list would pass the bytes it has carried and 4 MiB is refused,
+as described under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). A first
+pull comes in the order of the sender's file, where a commit writes each node just after its
+children, so that list holds a few hundred objects at a time, and in a history also the nodes a
+later commit links again: in 100,000 commits of ten keys, 121 at most. Beside them the receiver
+keeps the hashes of the last 131,072 objects, 2.5 MiB, for the deduplication table to learn once the
+bundle has landed, and of every object while the staging is in memory, under 1 MiB of records.
+Placing a bundle under 1 MiB, or one that a cycle moved, keeps each object's offset in the log
+beside the others, 8 bytes, and the moved one each hash as it is read back, 20 more. A check is kept
+only while a later link of its type may need it, as described under [Checking
+trees](sync-receive.md#checking-trees). The walk below held data linked as another type keeps at
+most 229,376 checks of 24 bytes, in a table of 6.25 MiB that peaks at 9.4 MiB while it grows,
+however much of the file it reads and however long its keys, as described under [Held data linked as
+another type](sync-receive.md#held-data-linked-as-another-type). Each sent commit adds its graph
+facts, root, hash and segment, 112 bytes, and about 130 more in indexes, the order it is checked in,
+and the list by hash the landing finds it by. Each hint an incremental bundle names adds the object
+it resolves to, the kind it holds with its parent's key range, and its place in the header, about
+140 bytes. Hints are resolved grouped by parent, so one parent's links and kinds are held at a time,
+where every parent read used to be kept, about 2.3 KB each, until the last hint. They are resolved a
+level of the paths at a time, and within a level grouped by the object their parent resolves to and
+the kind it holds, not by the parent's place in the header, so a held object is read once however
+many hints lead to it. Grouped by place, a 1.18 MB header naming the first link of an anchor root
+200,000 times, and then the first link of each of those hints, read that object 200,000 times. On a
+map of 100,000 keys that took 111 ms, against 36 ms before hints were grouped and 18 ms now.
+`hints_that_name_one_held_object_many_ways_read_it_once` in `ferro/tests/sync_memory.rs` sends that
+header to a map of 20,000 keys and expects it to allocate no more than 400,000 hints on the root's
+link do: 63 MB each now, where it allocated 381 MB in 175 ms. Each hint's depth in its path, 4
+bytes, is held while they resolve.
 
 The sender of a first pull keeps, for each object it will send, an entry in the list described
 under [What is sent](#what-is-sent): the distance to the offset before it, 2 bytes for records of a
@@ -757,6 +759,18 @@ before took 25.1 MB for each to send and 21.5 and 24.0 to receive. A bundle of 2
 objects, 6.3 MB, took 20.0 MB of heap and was refused, since nothing links them: an object is no
 longer refused as a repeat when it arrives, as nothing finds one by its hash, and costs what any
 other does.
+
+As first built, a link by place still became a 32-byte pointer as it arrived, and an object's record
+was held whole until it was written, so a bundle of one object linked by place two million times,
+2.1 MB, took 215.5 MB of heap, and the same empty objects each saying a later object would link
+them, a link never sent, took 220.6 MB for the hashes held for those links (#152). The links of an
+object are now kept as the bytes they arrived as and its record written a MiB at a time, and the
+hashes held are bounded by the bytes read, so those bundles take 7.4 and 9.0 MB, as described under
+[Where checked objects wait](sync-receive.md#where-checked-objects-wait). Receiving the million
+objects above runs 13.74 billion instructions against 13.48, 1.9% more, in the same time within the
+noise, and the ten million 137.8 billion against 135.4, with 53.0 MiB of heap against 51.8, since
+the receive keeps a bit for each object the walk has checked. A pull of three one-key commits runs
+3.79 million instructions against 3.78.
 
 Small pulls cost what they did. A pull of three one-key commits into the clone of the eight million
 keys, 200 times, ran 3.78 million instructions at the median against 3.73 million, 1.4% more, in
@@ -882,9 +896,13 @@ Measured and left out:
   is a large part of its links. An incremental pull keeps 19 to 39 bytes for each object sent on
   the sender, and each hint costs about 140 bytes on the receiver, so a pull of scattered edits,
   which names about three held nodes for each one it sends, costs a few hundred bytes an object
-  there. Each object is held whole, so one huge value needs a few times its size. A hostile stream
-  costs the same, for what it carries and not for what it claims, and so does checking it, as the
-  limits on checks below describe.
+  there. Each object's body is held whole, so one huge value needs a few times its size, and an
+  object being checked holds each of its links as a pointer and the type it is checked as, so a
+  node of a million keys that each spill one shared value, 9.4 MB, took 620 MB to check. A hostile
+  stream costs the same, for what it carries and not for what it claims: two million links by place
+  to one object, 2.1 MB, take 7.4 MB to receive, and two million objects that each claim a link
+  never sent, 6.3 MB, are refused with 9.0 MB. Checking it costs the same as well, as the limits on
+  checks below describe.
 - A first pull sends an object the sending file holds twice, at two offsets, twice, and the
   receiving file then holds it twice as well.
 - `receive` writes a bundle over 1 MiB once, into staging frames as it arrives, but a reclamation
@@ -1029,12 +1047,13 @@ Measured and left out:
   and so is a collection that `of` reads in a value shared by many keys, and a nested collection
   that `of` reads is read whole again in each version of it a bundle carries. The first read of
   each record the receiver holds is free, and a bundle whose other reads would pass eight times its
-  body bytes, plus 4 KiB for each link it carries, plus 256 MiB, is refused. So one value of 1 MiB
-  under more than about 265 keys does not sync, nor a bundle of sixteen commits that each change the
-  same nested map of 2,500,000 entries that `of` sums, nor a commit that puts a value holding a
-  16 MiB collection `of` reads under more than about 17 keys, as described under [Recomputing
-  summaries](sync-receive.md#recomputing-summaries). Those reads are free once per receive, so a
-  bundle that is refused and sent again makes the receiver read what it holds again each time.
+  body bytes, plus 4 KiB for each link of the objects its walk checks, plus 256 MiB, is refused. So
+  one value of 1 MiB under more than about 265 keys does not sync, nor a bundle of sixteen commits
+  that each change the same nested map of 2,500,000 entries that `of` sums, nor a commit that puts
+  a value holding a 16 MiB collection `of` reads under more than about 17 keys, as described under
+  [Recomputing summaries](sync-receive.md#recomputing-summaries). Those reads are free once per
+  receive, so a bundle that is refused and sent again makes the receiver read what it holds again
+  each time.
 - Checking that a table's indexes agree with its rows diffs the rows and each index that a version
   changes against the version before, reading the nodes that differ on both sides, so a clone reads
   most of what it carries a second time and an incremental pull reads the old versions of what it

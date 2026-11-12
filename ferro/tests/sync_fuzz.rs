@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use common::{cases, fast, panic_text, quiet_ferro_panics, text};
 use ferro::codec::{Decoder, Encoder, Object, Pairing, Tabled};
 use ferro::{
-    Bundle, Bytes, Data, Db, Error, Hash, List, Map, Outcome, Ptr, Record, Set, Snapshot, Summary,
-    Table,
+    Bundle, Bytes, Data, Db, Error, Hash, Keep, List, Map, Outcome, Ptr, Record, Set, Snapshot,
+    Summary, Table,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{TestRng, TestRunner};
@@ -966,5 +966,218 @@ fn btrees_out_of_order_holding_tables_and_maps_land_and_verify_through_many_comm
         }
         let (sent, got) = (rooted.read(), rooted_receiver.read());
         assert!(sent.0.iter().eq(got.0.iter()), "round {round}");
+    }
+}
+
+type Texts = Map<u64, String>;
+
+fn texts_merge(_: &mut Texts, _: &Snapshot<Texts>, _: &Snapshot<Texts>) -> (String, ()) {
+    panic!("no merge expected")
+}
+
+fn objects_counted(objects: &[(Vec<u64>, u64)]) -> Bundle {
+    let mut out = b"FERROBDL".to_vec();
+    out.extend_from_slice(&[2, 1]);
+    out.extend_from_slice(&[7; 20]);
+    varint(&mut out, 1);
+    for _ in 0..3 {
+        varint(&mut out, 0);
+    }
+    varint(&mut out, objects.len() as u64);
+    for (links, uses) in objects {
+        out.push(0);
+        varint(&mut out, links.len() as u64);
+        for reference in links {
+            varint(&mut out, *reference);
+        }
+        varint(&mut out, *uses);
+    }
+    Bundle::from(out)
+}
+
+#[test]
+fn a_bundle_whose_links_by_place_or_counts_of_links_are_forged_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db: Db<Texts> = fast().open(dir.path().join("b.ferro")).unwrap();
+    db.commit("seed", |root| {
+        root.insert(1, "one".to_string());
+    })
+    .unwrap();
+    let cases = [
+        (
+            "before the start",
+            vec![(vec![], 1), (vec![2], 0)],
+            "past the start",
+        ),
+        (
+            "far before the start",
+            vec![(vec![], 1), (vec![u64::MAX], 0)],
+            "past the start",
+        ),
+        (
+            "from the first object",
+            vec![(vec![1], 0)],
+            "past the start",
+        ),
+        (
+            "past its count",
+            vec![(vec![], 1), (vec![1, 1], 0)],
+            "more often than it said",
+        ),
+        (
+            "to one that counts none",
+            vec![(vec![], 0), (vec![1], 0)],
+            "more often than it said",
+        ),
+        (
+            "short of its count",
+            vec![(vec![], 3), (vec![1, 1], 0)],
+            "more often than it does",
+        ),
+        (
+            "short of a huge count",
+            vec![(vec![], u64::MAX), (vec![1], 0)],
+            "more often than it does",
+        ),
+    ];
+    for (name, objects, refusal) in cases {
+        match db.receive("evil", &objects_counted(&objects), texts_merge) {
+            Err(Error::Bundle(message)) => {
+                assert!(message.contains(refusal), "{name}: {message}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert_eq!(db.version(), 1);
+    db.verify_typed().unwrap();
+}
+
+#[test]
+fn a_file_holding_a_value_twice_sends_it_twice_and_every_pull_after_lands_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Texts> = common::uncached().open(dir.path().join("a.ferro")).unwrap();
+    let shared = text(999, 8 << 10);
+    a.commit("first", |root| {
+        root.insert(0, shared.clone());
+    })
+    .unwrap();
+    for round in 0..6u64 {
+        a.commit(format!("round {round}"), |root| {
+            for key in 1 + round * 500..1 + (round + 1) * 500 {
+                root.insert(key, text(key, 8 << 10));
+            }
+        })
+        .unwrap();
+    }
+    a.commit("again", |root| {
+        root.insert(10_000, shared.clone());
+    })
+    .unwrap();
+    let b: Db<Texts> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let hashes: Vec<Hash> = Parsed::of(&bundle).objects.iter().map(Wire::hash).collect();
+    let distinct: HashSet<Hash> = hashes.iter().copied().collect();
+    assert!(
+        distinct.len() < hashes.len(),
+        "the file did not hold a value twice"
+    );
+    b.receive("a", &bundle, texts_merge).unwrap();
+    b.verify_typed().unwrap();
+    assert_eq!(
+        b.read().get(&10_000).map(|value| (*value).clone()),
+        Some(shared.clone())
+    );
+    a.commit("third", |root| {
+        root.insert(10_001, shared.clone());
+        root.insert(3, shared.clone());
+        root.remove(&0);
+    })
+    .unwrap();
+    b.pull(&a, "a", texts_merge).unwrap();
+    b.verify_typed().unwrap();
+    assert_eq!(
+        b.read().get(&10_001).map(|value| (*value).clone()),
+        Some(shared.clone())
+    );
+    a.compact(Keep::All).unwrap();
+    a.commit("fourth", |root| {
+        root.insert(10_002, shared.clone());
+    })
+    .unwrap();
+    b.pull(&a, "a", texts_merge).unwrap();
+    b.verify_typed().unwrap();
+    let c: Db<Texts> = fast().open(dir.path().join("c.ferro")).unwrap();
+    c.pull(&b, "b", texts_merge).unwrap();
+    c.verify_typed().unwrap();
+    assert!(a.read().iter().eq(c.read().iter()));
+}
+
+struct Cycling<'a> {
+    db: &'a Db<Texts>,
+    keep: Keep,
+    out: Vec<u8>,
+    cycled: bool,
+}
+
+impl std::io::Write for Cycling<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.out.extend_from_slice(buf);
+        if !self.cycled && self.out.len() > 256 << 10 {
+            self.cycled = true;
+            self.db.compact(self.keep).unwrap();
+            self.db
+                .commit("during", |root| {
+                    for key in 50_000..50_400 {
+                        root.insert(key, text(key, 4 << 10));
+                    }
+                })
+                .unwrap();
+            self.db.compact(self.keep).unwrap();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bundles_sent_while_the_sender_cycles_and_prunes_land_whole() {
+    for keep in [Keep::All, Keep::Last(1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let a: Db<Texts> = common::uncached().open(dir.path().join("a.ferro")).unwrap();
+        for round in 0..4u64 {
+            a.commit(format!("round {round}"), |root| {
+                for key in round * 1000..(round + 1) * 1000 {
+                    root.insert(key, text(key, 4 << 10));
+                }
+            })
+            .unwrap();
+        }
+        let b: Db<Texts> = fast().open(dir.path().join("b.ferro")).unwrap();
+        for edit in 0..2u64 {
+            let sent = a.read();
+            let mut out = Cycling {
+                db: &a,
+                keep,
+                out: Vec::new(),
+                cycled: false,
+            };
+            a.bundle_to(&b.have().unwrap(), &mut out).unwrap();
+            assert!(out.cycled, "{keep:?}");
+            b.receive("a", &Bundle::from(out.out), texts_merge).unwrap();
+            b.verify_typed().unwrap();
+            assert!(sent.iter().eq(b.read().iter()), "{keep:?}");
+            a.commit("more", |root| {
+                for key in 0..2000 {
+                    root.insert(key, text(key + 7 + edit, 4 << 10));
+                }
+            })
+            .unwrap();
+        }
+        b.pull(&a, "a", texts_merge).unwrap();
+        b.verify_typed().unwrap();
+        assert!(a.read().iter().eq(b.read().iter()), "{keep:?}");
     }
 }

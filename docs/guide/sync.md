@@ -102,7 +102,8 @@ still here. A damaged or forged bundle is rejected with `Error::Bundle` and noth
 ever linked, except that damage to the part that names the commit it builds on reads as
 `Error::StaleHave`, described below. Either way, fetch a fresh bundle. `receive` uses a fixed
 buffer, the object it is reading and about 5 bytes for each object the bundle carries, with the
-hash of each object a later one still links, not memory for its bytes or for what it claims, and
+hash of each object a later one still links, not memory for its bytes or for what it claims: a
+bundle whose objects say they are linked again more than its size allows is refused. It also
 refuses commits dated more than a day past this machine's clock.
 
 ## When the other side has moved
