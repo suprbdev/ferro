@@ -695,10 +695,13 @@ combination's rows when the range leads it through `into_matches`, so such a ran
 whatever the other side held. `and` now hands the finder of the side it is given, when no stream on
 that side took it and both sides read one version of one table, to a range on the left that has
 none, and a plan whose lead is a range hands the lead's finder, which a walked range no longer
-needs, to a range it looks keys up in. The finder travels as a `Spare`, which a stream takes without
-asking its source number, so `and` offers it only between sides it compared with `Finder::same_map`
-when it was built. Since that comparison costs a few dozen instructions, `and` makes it only when a
-side holds a range not yet read.
+needs, to a range it looks keys up in. A walked `or` hands on the finder of any range among its
+sides, all of which it walks, and a walked `and` plans itself first and hands on that of a range its
+own plan walks, so a range written before `r.or(x)` or `r.and(s)`, where `r` took that side's
+finder, borrows `r`'s when that side is walked. The finder travels as a `Spare`, which a stream
+takes without asking its source number, so `and` offers it only between sides it compared with
+`Finder::same_map` when it was built. Since that comparison costs a few dozen instructions, `and`
+makes it only when a side holds a range not yet read.
 
 `Matches::explain` walks the streams without changing them and reports, for each, its length and how
 it will be read: walked, looked up, tested or collected first. A node not yet planned reports the
@@ -768,9 +771,13 @@ tests can cost about as much as the collection would, and no more, before the co
 for. The keys tested count as well, against a quarter of those entries, since a cached test costs
 about what four collected entries do. A lead counted exactly, or bounded, never reaches that, as a
 range is tested only against a quarter of its entries or fewer, so cached rows stop the testing only
-when a chain estimated too few keys. A first build counted both in one sum, four entries a test and
-64 a read: a lead of exactly a quarter then left no room for reads, and 1,000 keys against a range
-of 4,000 with every row cached ran 47% more instructions, collecting after a stray read.
+when a chain estimated too few keys. That holds since a range remembers the last key it tested from
+each end: an `or` refills every side before it takes from one, so a side waiting on a key at the
+front is asked about it again after each key taken from the back. With one remembered key, an `or`
+read from both ends tested the same keys over and over, 3,755 tests for 197 keys, until it reached
+the quarter and collected. A first build counted both in one sum, four entries a test and 64 a
+read: a lead of exactly a quarter then left no room for reads, and 1,000 keys against a range of
+4,000 with every row cached ran 47% more instructions, collecting after a stray read.
 
 The test relies on the index agreeing with the rows, as every lookup does: an entry for exactly
 the values the rows hold. The derive refuses an index on a `#[ferro(skip)]` field, which rows read

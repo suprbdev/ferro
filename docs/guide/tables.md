@@ -236,13 +236,16 @@ measurements.
 
 A range written first, as `orders.by_day_range(first..=last).into_matches().and(...)`, is tested
 too when another side of the `and` reads the same table at the same version, since the combination
-reads its rows through the range's own finder and the range borrows that side's: 10 keys against
-a range of 100,000 written that way took 1.4 µs, where it had taken 2.4 ms. Of two ranges, the one
-with fewer keys leads and the other is tested. In a chain, the keys led to a range are estimated
-from the lookups walked before it, as if they matched independently, so two lookups of 50,000 keys
-that share 12,500 and a range of 100,000 took 3.0 ms where they took 4.6 ms with the range read in
-full. The tests stop once they number a quarter of the range's keys, so when the estimate was too
-low they cost about what reading the range would, as rows read from the file do.
+reads its rows through the range's own finder and the range borrows that side's. That side can be
+an `or` or another `and`, which lends the finder of a range it reads in full; only a side whose
+every range is itself tested has none to lend. 10 keys against a range of 100,000 written that way
+took 1.4 µs, where it had taken 2.4 ms. Of two ranges, the one with fewer keys leads and the other
+is tested. In a chain, the keys led to a range are estimated from the lookups walked before it, as
+if they matched independently, so two lookups of 50,000 keys that share 12,500 and a range of
+100,000 took 3.0 ms where they took 4.6 ms with the range read in full. A range tests each key led
+to it once, from whichever end the combination is read, so the tests stop once they number a
+quarter of the range's keys only when the estimate was too low, and then cost about what reading
+the range would, as rows read from the file do.
 
 Lookups of two tables of the same row type, or of two versions of one table, such as a snapshot's
 and the one inside a commit, combine as well. Each answers for the table and version it was made

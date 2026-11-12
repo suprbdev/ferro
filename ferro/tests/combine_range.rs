@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Range, RangeBounds};
 
 use common::{Rng, fast, uncached};
-use ferro::table::{IndexEach, IndexIter, IntoMatches, Matches, Read};
+use ferro::table::{Explain, IndexEach, IndexIter, IntoMatches, Matches, Read, Step};
 use ferro::{Data, Db, Record, Table};
 use proptest::prelude::*;
 
@@ -1516,4 +1516,442 @@ fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
         costs.insert(tested);
     }
     assert_eq!(costs.len(), 1, "tests by order: {costs:?}");
+}
+
+fn explained_alike(
+    before: &Explain,
+    after: &Explain,
+    path: &str,
+    two: bool,
+    out: &mut Vec<String>,
+) {
+    if before.step != after.step || before.sides.len() != after.sides.len() {
+        out.push(format!(
+            "{path}: shape {:?} became {:?}",
+            before.step, after.step
+        ));
+        return;
+    }
+    let fine = match (before.step, before.read, after.read) {
+        (Step::Range, Read::Tested, Read::Tested) => true,
+        (Step::Range, Read::Tested, Read::Searched | Read::Collected) => !two,
+        (Step::Range, Read::Collected, Read::Collected | Read::Walked | Read::Searched) => true,
+        (Step::List, Read::Collected, _) => true,
+        (_, was, now) => was == now,
+    };
+    if !fine {
+        out.push(format!(
+            "{path}: {:?} read {:?} became {:?}",
+            before.step, before.read, after.read
+        ));
+    }
+    let two = before.step == Step::And && before.sides.len() == 2 && before.read == Read::Walked;
+    for (at, (was, now)) in before.sides.iter().zip(&after.sides).enumerate() {
+        explained_alike(was, now, &format!("{path}.{at}"), two, out);
+    }
+}
+
+fn explain_agrees(versions: &[Version<'_>], query: &Query) {
+    let tables = tables_of(versions);
+    let mut matches = query.lookup_in(&tables, 0);
+    let before = matches.explain();
+    let first = matches.next().map(|row| row.id);
+    let after = matches.explain();
+    let mut out = Vec::new();
+    explained_alike(&before, &after, "top", false, &mut out);
+    assert!(
+        out.is_empty(),
+        "{query:?}\nfirst {first:?}\n{out:?}\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
+fn explain_matches_the_plan_a_combination_runs() {
+    for seed in 0..u64::from(common::cases(40)) {
+        let mut rng = Rng::new(seed);
+        let shape = if seed % 2 == 0 { WIDE } else { NARROW };
+        let count = 300 + rng.below(1500) as u32;
+        let model = model(&mut rng, count, shape);
+        let table = table_of(&model);
+        let (newer, changed) = edited(&mut rng, &table, &model, shape);
+        let versions = [(&table, &model), (&newer, &changed)];
+        let ids = ids_in(&versions);
+        for _ in 0..60 {
+            let count = 1 + rng.below(2) as usize;
+            let query = match rng.below(4) {
+                0 => led(&mut rng, ids, shape, count),
+                1 | 2 => chain(&mut rng, ids, shape, count),
+                _ => query(&mut rng, ids, shape, 3, count),
+            };
+            explain_agrees(&versions[..count], &query);
+            started_chain_agrees(&versions[..count], &query, &mut rng);
+        }
+    }
+}
+
+fn started_chain_agrees(versions: &[Version<'_>], query: &Query, rng: &mut Rng) {
+    let tables = tables_of(versions);
+    let (table, model) = versions[0];
+    let rows = query.rows(versions, 0);
+    let wanted: Vec<u32> = rows.keys().copied().collect();
+    let (front, back) = (rng.below(4) as usize, rng.below(4) as usize);
+    let mut matches = query.lookup_in(&tables, 0);
+    let mut read: Vec<u32> = (&mut matches).take(front).map(|row| row.id).collect();
+    let mut tail: Vec<u32> = (&mut matches).rev().take(back).map(|row| row.id).collect();
+    tail.reverse();
+    let rest: Vec<u32> = match rng.below(3) {
+        0 => matches.keys().collect(),
+        1 => zigzag(matches.keys(), rng),
+        _ => {
+            let mut lent = Vec::new();
+            while let Some(row) = matches.next_ref() {
+                lent.push(row.id);
+            }
+            lent
+        }
+    };
+    read.extend(rest);
+    read.extend(tail);
+    assert_eq!(read, wanted, "started {query:?}, {front} then {back}");
+
+    let group = rng.below(4) as u8;
+    let links = query.links();
+    let find = table.find();
+    let chained = || {
+        links.iter().fold(find.by_group(&group), |all, link| {
+            all.and(link.lookup_in(&tables, 0))
+        })
+    };
+    let wanted: Vec<(u32, (u16, u8))> = model
+        .values()
+        .filter(|row| row.group == group && rows.contains_key(&row.id))
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let mut matches = chained();
+    let mut read: Vec<(u32, (u16, u8))> = (&mut matches)
+        .take(front)
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let mut tail: Vec<(u32, (u16, u8))> = (&mut matches)
+        .rev()
+        .take(back)
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    tail.reverse();
+    read.extend(zigzag(matches.covered(), rng));
+    read.extend(tail);
+    assert_eq!(
+        read, wanted,
+        "covered after starting group {group} and {query:?}, {front} then {back}"
+    );
+}
+
+fn tagged_table(rows: u32, seed: u64) -> (Table<Tagged>, Vec<Tagged>) {
+    let mut rng = Rng::new(seed);
+    let rows: Vec<Tagged> = (0..rows)
+        .map(|id| Tagged {
+            id,
+            group: match rng.below(100) {
+                0 => 0,
+                1..=49 => 1,
+                _ => 2,
+            },
+            tags: Counted(vec![rng.below(200) as u16]),
+        })
+        .collect();
+    let mut table: Table<Tagged> = Table::new();
+    for row in &rows {
+        table.insert(row.clone());
+    }
+    (table, rows)
+}
+
+fn alternate<I: DoubleEndedIterator<Item = u32>>(mut iter: I) -> Vec<u32> {
+    let (mut front, mut back) = (Vec::new(), Vec::new());
+    while let Some(key) = iter.next() {
+        front.push(key);
+        let Some(key) = iter.next_back() else {
+            break;
+        };
+        back.push(key);
+    }
+    front.extend(back.into_iter().rev());
+    front
+}
+
+#[test]
+fn a_tested_range_inside_an_or_read_from_both_ends_tests_each_key_once() {
+    let (table, rows) = tagged_table(20_000, 97);
+    let lead = table.by_group(&0).len() as u64;
+    assert!(lead > 100 && table.by_tags_range(0..150).len() as u64 > 4 * lead);
+    let wanted: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0 && row.tags.0[0] < 150 || row.group == 1)
+        .map(|row| row.id)
+        .collect();
+    let find = table.find();
+    let either = || {
+        find.by_group(&0)
+            .and(table.by_tags_range(0..150))
+            .or(find.by_group(&1))
+    };
+    assert_eq!(either().explain().sides[0].sides[1].read, Read::Tested);
+    let (keys, forward) = counted(|| either().keys().collect::<Vec<_>>());
+    assert_eq!((keys, forward), (wanted.clone(), lead));
+    let (keys, both) = counted(|| alternate(either().keys()));
+    assert_eq!(keys, wanted);
+    assert_eq!(
+        both, lead,
+        "{both} tests for {lead} keys read from both ends"
+    );
+    let mut rng = Rng::new(97);
+    for _ in 0..8 {
+        let (ids, both) = counted(|| zigzag(either().map(|row| row.id), &mut rng));
+        assert_eq!((ids, both), (wanted.clone(), lead));
+        let mirrored = || {
+            find.by_group(&1)
+                .or(find.by_group(&0).and(table.by_tags_range(0..150)))
+        };
+        let (keys, both) = counted(|| zigzag(mirrored().keys(), &mut rng));
+        assert_eq!((keys, both), (wanted.clone(), lead));
+    }
+}
+
+#[test]
+fn a_range_written_first_is_tested_against_an_or_of_the_same_table() {
+    let (table, rows) = tagged_table(20_000, 103);
+    let wanted: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0 && row.tags.0[0] < 150)
+        .map(|row| row.id)
+        .collect();
+    let lead = table.by_group(&0).len() as u64;
+    assert!(table.by_tags_range(0..150).len() as u64 > 4 * lead);
+    let few = || {
+        table
+            .by_group_range(0..1)
+            .into_matches()
+            .or(table.find().by_group(&9))
+    };
+    let after = || few().and(table.by_tags_range(0..150));
+    let first = || table.by_tags_range(0..150).into_matches().and(few());
+    assert_eq!(after().explain().sides[1].read, Read::Tested);
+    let (keys, tested) = counted(|| after().keys().collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), lead));
+    let (keys, tested) = counted(|| first().keys().collect::<Vec<_>>());
+    assert_eq!(keys, wanted);
+    assert_eq!(
+        (first().explain().sides[0].read, tested),
+        (Read::Tested, lead),
+        "written first:\n{}",
+        first().explain()
+    );
+    let nested = || {
+        table.by_tags_range(0..150).into_matches().and(
+            table
+                .by_group_range(0..1)
+                .into_matches()
+                .and(table.by_group_range(0..2)),
+        )
+    };
+    let (keys, tested) = counted(|| nested().map(|row| row.id).collect::<Vec<_>>());
+    assert_eq!(keys, wanted);
+    assert_eq!(
+        (nested().explain().sides[0].read, tested),
+        (Read::Tested, lead),
+        "written first:\n{}",
+        nested().explain()
+    );
+}
+
+#[test]
+fn covered_tests_a_range_on_the_right_and_reads_one_it_takes_fields_from_in_full() {
+    let (table, rows) = tagged_table(20_000, 101);
+    let lead = table.by_group(&0).len() as u64;
+    let wanted: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.group == 0 && row.tags.0[0] < 150)
+        .map(|row| row.id)
+        .collect();
+    let right = || table.find().by_group(&0).and(table.by_tags_range(0..150));
+    assert_eq!(right().explain().sides[1].read, Read::Tested);
+    let (keys, tested) = counted(|| right().covered().map(|(key, ())| key).collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), lead));
+
+    let left = || {
+        table
+            .by_tags_range(0..150)
+            .into_matches()
+            .and(table.find().by_group(&0))
+    };
+    assert_eq!(left().explain().sides[0].read, Read::Tested);
+    let (keys, tested) = counted(|| left().keys().collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), lead));
+    let (keys, tested) = counted(|| left().covered().map(|(key, ())| key).collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), 0));
+
+    let either = || {
+        table
+            .by_tags_range(0..150)
+            .into_matches()
+            .or(table.find().by_group(&9))
+            .and(table.find().by_group(&0))
+    };
+    let (keys, tested) = counted(|| either().keys().collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted.clone(), lead));
+    let (keys, tested) = counted(|| either().covered().map(|(key, ())| key).collect::<Vec<_>>());
+    assert_eq!((keys, tested), (wanted, 0));
+}
+
+#[derive(Clone, Debug)]
+enum Shaped {
+    Plain(Query),
+    Blind(Box<Shaped>),
+    Started(Box<Shaped>, usize, usize),
+    And(Box<Shaped>, Box<Shaped>),
+    Or(Box<Shaped>, Box<Shaped>),
+}
+
+impl Shaped {
+    fn keys(&self, versions: &[Version<'_>]) -> Vec<u32> {
+        match self {
+            Shaped::Plain(query) => query.rows(versions, 0).into_keys().collect(),
+            Shaped::Blind(inner) => inner.keys(versions),
+            Shaped::Started(inner, front, back) => {
+                let keys = inner.keys(versions);
+                let start = (*front).min(keys.len());
+                let end = keys.len().saturating_sub(*back).max(start);
+                keys[start..end].to_vec()
+            }
+            Shaped::And(left, right) => {
+                let right: BTreeSet<u32> = right.keys(versions).into_iter().collect();
+                left.keys(versions)
+                    .into_iter()
+                    .filter(|key| right.contains(key))
+                    .collect()
+            }
+            Shaped::Or(left, right) => {
+                let mut keys: BTreeSet<u32> = left.keys(versions).into_iter().collect();
+                keys.extend(right.keys(versions));
+                keys.into_iter().collect()
+            }
+        }
+    }
+
+    fn lookup(&self, tables: &[&Table<Row>]) -> Matches<Row> {
+        match self {
+            Shaped::Plain(query) => query.lookup_in(tables, 0),
+            Shaped::Blind(inner) => inner.lookup(tables).uncovered(),
+            Shaped::Started(inner, front, back) => {
+                let mut matches = inner.lookup(tables);
+                for _ in 0..*front {
+                    matches.next();
+                }
+                for _ in 0..*back {
+                    matches.next_back();
+                }
+                matches
+            }
+            Shaped::And(left, right) => left.lookup(tables).and(right.lookup(tables)),
+            Shaped::Or(left, right) => left.lookup(tables).or(right.lookup(tables)),
+        }
+    }
+}
+
+fn shaped(rng: &mut Rng, ids: u32, shape: Shape, depth: u32, versions: usize) -> Shaped {
+    if depth == 0 || rng.chance(20) {
+        let query = match rng.below(3) {
+            0 => chain(rng, ids, shape, versions),
+            1 => led(rng, ids, shape, versions),
+            _ => query(rng, ids, shape, 1, versions),
+        };
+        return Shaped::Plain(query);
+    }
+    match rng.below(10) {
+        0 => Shaped::Blind(Box::new(shaped(rng, ids, shape, depth - 1, versions))),
+        1 => Shaped::Started(
+            Box::new(shaped(rng, ids, shape, depth - 1, versions)),
+            rng.below(3) as usize,
+            rng.below(3) as usize,
+        ),
+        2 | 3 => Shaped::Or(
+            Box::new(shaped(rng, ids, shape, depth - 1, versions)),
+            Box::new(shaped(rng, ids, shape, depth - 1, versions)),
+        ),
+        _ => {
+            let mut chain = shaped(rng, ids, shape, depth - 1, versions);
+            for _ in 0..1 + rng.below(9) {
+                let side = shaped(rng, ids, shape, depth.saturating_sub(2), versions);
+                chain = Shaped::And(Box::new(chain), Box::new(side));
+            }
+            chain
+        }
+    }
+}
+
+fn shaped_agrees(versions: &[Version<'_>], query: &Shaped, rng: &mut Rng) {
+    let tables = tables_of(versions);
+    let wanted = query.keys(versions);
+    let what = format!("{query:?}");
+    let keys: Vec<u32> = query.lookup(&tables).keys().collect();
+    assert_eq!(keys, wanted, "keys of {what}");
+    let rows: Vec<u32> = query.lookup(&tables).map(|row| row.id).collect();
+    assert_eq!(rows, wanted, "rows of {what}");
+    let mut back: Vec<u32> = query.lookup(&tables).keys().rev().collect();
+    back.reverse();
+    assert_eq!(back, wanted, "keys from the back of {what}");
+    assert_eq!(
+        zigzag(query.lookup(&tables).keys(), rng),
+        wanted,
+        "keys from both ends of {what}"
+    );
+    assert_eq!(
+        zigzag(query.lookup(&tables).map(|row| row.id), rng),
+        wanted,
+        "rows from both ends of {what}"
+    );
+    let (table, model) = versions[0];
+    let group = rng.below(4) as u8;
+    let fields: Vec<(u32, (u16, u8))> = wanted
+        .iter()
+        .filter_map(|id| model.get(id))
+        .filter(|row| row.group == group)
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let covered: Vec<(u32, (u16, u8))> = zigzag(
+        table
+            .find()
+            .by_group(&group)
+            .and(query.lookup(&tables))
+            .covered(),
+        rng,
+    );
+    assert_eq!(covered, fields, "covered group {group} and {what}");
+}
+
+#[test]
+fn shaped_combinations_match_a_filter() {
+    for seed in 0..u64::from(common::cases(24)) {
+        let mut rng = Rng::new(seed ^ 0x5eed);
+        let shape = if seed % 2 == 0 { WIDE } else { NARROW };
+        let count = 200 + rng.below(1200) as u32;
+        let model = model(&mut rng, count, shape);
+        let table = table_of(&model);
+        let (newer, changed) = edited(&mut rng, &table, &model, shape);
+        let versions = [(&table, &model), (&newer, &changed)];
+        let ids = ids_in(&versions);
+        for _ in 0..25 {
+            let count = 1 + rng.below(2) as usize;
+            let query = shaped(&mut rng, ids, shape, 3, count);
+            shaped_agrees(&versions[..count], &query, &mut rng);
+        }
+        let (_dir, db) = stored_pair(&table, &newer);
+        let read = db.read();
+        let stored = [(&read.rows, &model), (&read.other, &changed)];
+        for _ in 0..10 {
+            let count = 1 + rng.below(2) as usize;
+            let query = shaped(&mut rng, ids, shape, 3, count);
+            shaped_agrees(&stored[..count], &query, &mut rng);
+        }
+    }
 }
