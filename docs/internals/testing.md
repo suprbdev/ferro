@@ -661,6 +661,83 @@ makes a hold longer by what others wrote since its last but moves no taker in th
 that tells a writer its process holds the gate, or a holder taking the gate again on the new file
 after another process's cycle replaced it.
 
+## Timed checks
+
+The tests of the gate in `ferro/tests/gate.rs` and `ferro/tests/shared.rs` time how long writes wait
+beside cycles, pulls and pauses, and those times stretch with the load on the machine. Their bounds
+were set on a quiet machine, and on one shared with other builds, at a load average of 20 to 70 on
+32 cores, they failed a few times a day (#165): the 90th percentile of 40 joined commits took 105 ms
+and 101.8 ms against 100 ms, and a writer held at a pause that panicked took 674 ms against 600 ms.
+Beside 48 processes spinning on the cores, at a load average of 80 to 145, 14 of 18 runs of
+`gate.rs` failed. The 90th percentile of joined commits went past 100 ms in 52 of 168 runs of a
+check, up to 150 ms, against about 40 ms beside only the rest of `gate.rs`; the writers at the
+panicking pause took up to 1.1 s; and a writer beside four handles pulling back to back made 4,123
+to 14,155 commits in 3 s against the 8,000 asked, which 24 of 36 runs missed. What the checks are
+for costs far more: a writer that misses the end of its phase, or a gate whose phases never end,
+waits the full 2 s after which a writer goes on, and the designs before the phase gate kept joined
+commits and cycles waiting from 2 s to 18 s.
+
+So a timed check has two bounds. Its ceiling is a time the failure it is for always reaches, and
+does not move with the load: every joined commit under 2 s, which [The gate](processes.md#the-gate)
+promises; nine in ten under 500 ms, half the longest round, so that joined commits that wait out
+long rounds fail however busy the machine; the writers at the panicking pause, and a writer at a
+phase byte another open holds, under 1.5 s, short of the 2 s a writer waits for an end that never
+comes; and a commit joined at a hold about 50 ms old under 600 ms, short of the 655 ms it waited
+with the second version's record. Below the ceiling the check holds the bound it had on a quiet
+machine, stretched by the load the run met. `Lateness::watch`, in `ferro/tests/common/mod.rs`, runs
+a thread beside the timed work that sleeps 1 ms over and over and times each sleep, and
+`Lateness::bound` multiplies the quiet bound by one more than the 99th percentile of how late those
+sleeps woke, counted in milliseconds. The gate's writers and holders wait between sleeps of up to a
+millisecond, so a machine on which such a sleep takes several times as long stretches their waits
+about as much, and a slow tenth of the timed commits falls in stretches of load that more than a
+hundredth of the sleeps also fall in. Run one at a time, the tests saw sleeps 55 to 70 µs late at
+the 99th percentile, which stretches a bound by about 1.06. The whole of `gate.rs`, three of whose
+tests spin two threads a core, beside other builds at a load average of about 30, saw them 1.7 to 2
+ms late, about 2.9 times, and beside the 48 spinning processes 2.6 to 10 ms, 3.6 to 11 times. A
+count of work rather than a time is compared with other work counted in the same run.
+
+Adding the lateness once for each of eight hand-offs between threads, rather than multiplying,
+widened the 100 ms to 121 to 181 ms beside the spinning processes, and the 90th percentile reached
+0.9 to 1.12 times that, since a hold that lasts longer begins longer rounds, and a joined commit
+waits out the round it meets. Multiplied, the bounds came to 377 ms and more, and the 90th
+percentile reached at most a third of its bound.
+
+The writers beside four handles pulling back to back now commit at least four times for each pull
+made in the same run, instead of 8,000 times in 3 s. A writer that waits only for the hold it finds
+goes on when that hold ends and commits many times between holds: 112 and 141 times a pull on an
+idle machine, and 9.6 to 28.7 times beside the spinning processes. One that waits out later holds
+commits about once a wait: with every hold starting on the first phase byte, its process
+numbering phases afresh and no 1 ms after a gate the holder waited for, as b2741a3 had it, the
+writers committed 0.6 and 1.2 times a pull. They also committed 14,485 and 23,429 times, past the
+8,000, since without the 1 ms the pulls ran ten times as often.
+
+Each check still fails on what it is for, with the code changed to fail that way for the run. With
+phases that never end, the six checks of joined commits and
+`a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wait_ran_out` waited
+2.0 s. With every hold starting on a round of a second, the six waited about 1 s at the 90th
+percentile and the commit joined at a hold 50 ms old 950 ms. With a gate that keeps its phase while
+it unwinds, the writers at the panicking pause took 2.0 s in each of three runs, and with writers
+that wait for every phase byte rather than the one they found,
+`a_writer_waits_for_the_phase_byte_it_finds_until_the_holder_moves_to_the_next` took 2.0 s. With a
+first round of 400 ms rather than 4 ms, which breaks no promise of the gate, joined commits took
+about 380 ms, and the four checks run on their own failed against bounds of 105 to 116 ms, but
+beside the rest of `gate.rs` the bounds stretched to 360 to 540 ms and five of the six passed: as
+the machine gets busier, the checks narrow to what costs seconds.
+
+Checks whose bound is several times what they take on a loaded machine keep it fixed: the 1 s of
+`cycles_beside_threads_of_the_cycling_handle_contending_for_one_branch_take_under_a_second`, which
+took up to 140 ms beside the spinning processes, the 1 s of a commit through the cycling handle in
+`a_closure_joining_a_commit_through_the_handle_that_cycles_finishes_beside_its_cycle` and its
+awaited form, up to 92 ms, and in `shared_process.rs` the 1 s within which a writer held at the
+gate of a killed process goes on, up to 14 ms.
+
+With the checks as they are, 210 runs of `gate.rs` passed: 50 beside the 48 spinning processes, at
+a load average of 75 to 180 with other work on the machine, 80 beside a release build of the
+workspace, 60 beside the workspace's tests and 20 as other work eased, from a load average of
+about 8. The writers beside pulls committed at least 9.2 times a pull, and in 52 of the 100 checks
+beside the spinning processes fewer than the 8,000 times the old check asked. So did 50 runs of
+`shared.rs`, 30 beside the spinning processes and 20 beside the workspace's tests.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:

@@ -464,8 +464,9 @@ and [The gate model](testing.md#the-gate-model) tests the designs:
   `a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wait_ran_out` waited
   655 ms with the second version's record. The five `a_joined_commit_beside_cycles_stays_short_*`
   tests join 40 commits from 20 ms closures back to back beside a handle cycling as fast as it can,
-  on an idle machine, 5 ms apart, beside two spinning threads a core and awaited, each under
-  500 ms, where 51dbfc6 kept a cycle waiting 18 s, and
+  on an idle machine, 5 ms apart, beside two spinning threads a core and awaited, every one under
+  2 s and nine in ten under 100 ms on a quiet machine, as [Timed
+  checks](testing.md#timed-checks) describes, where 51dbfc6 kept a cycle waiting 18 s, and
   `closures_joining_commits_through_the_cycling_handle_back_to_back_wait_a_bounded_time` does it
   through the cycling handle, where 51dbfc6's commits waited up to 16.4 s.
   `forks_and_drops_joined_from_closures_finish_beside_cycles` joins forks and drops, and

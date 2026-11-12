@@ -12,7 +12,7 @@ use std::task::{Context, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Rng, Spread, cases, fast, padded_links, spread_into, spread_of};
+use common::{Lateness, Rng, Spread, cases, fast, padded_links, spread_into, spread_of};
 use ferro::db::{Clock, Hook};
 use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim, Snapshot};
 
@@ -2055,6 +2055,7 @@ fn a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wa
         })
     };
     in_a.wait();
+    let watch = Lateness::watch();
     resume.wait();
     wait_for_step(&steps, "synced");
     thread::sleep(Duration::from_millis(50));
@@ -2062,12 +2063,15 @@ fn a_joined_commit_waits_at_the_gate_no_longer_than_the_hold_after_an_earlier_wa
     let waited = took
         .recv_timeout(Duration::from_secs(20))
         .expect("the joined commit never finished");
+    let late = watch.stop();
     closure.join().unwrap();
     cycle.join().unwrap().unwrap();
+    let limit = late.bound(Duration::from_millis(300), Duration::from_millis(600));
     assert!(
-        waited < Duration::from_millis(300),
+        waited < limit,
         "a commit that a closure on `a` joined waited {waited:?} at a gate held for about 50 ms, \
-         after the same handle's last write had waited {first:?} at an earlier hold"
+         against {limit:?} with sleeps ending {late:?} late, after the same handle's last write \
+         had waited {first:?} at an earlier hold"
     );
 }
 
@@ -2421,10 +2425,14 @@ fn commit_beside_a_phase_held_for(held: Option<Duration>) -> Duration {
 
 #[test]
 fn a_writer_waits_at_the_gate_until_the_phase_another_open_holds_ends() {
+    let watch = Lateness::watch();
     let took = commit_beside_a_phase_held_for(Some(Duration::from_millis(200)));
+    let late = watch.stop();
+    let limit = late.bound(Duration::from_millis(400), Duration::from_millis(1_500));
     assert!(
-        took >= Duration::from_millis(200) && took < Duration::from_millis(400),
-        "a commit beside a phase byte that another open held for 200 ms took {took:?}"
+        took >= Duration::from_millis(200) && took < limit,
+        "a commit beside a phase byte that another open held for 200 ms took {took:?}, against \
+         {limit:?} with sleeps ending {late:?} late"
     );
 }
 
@@ -2439,6 +2447,7 @@ fn a_writer_waits_for_the_phase_byte_it_finds_until_the_holder_moves_to_the_next
     let at = PHASE_AT + 2 * 500;
     ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, GATE_AT, 1);
     ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, at, 1);
+    let watch = Lateness::watch();
     let started = Instant::now();
     let writer = thread::spawn(move || {
         tick(&own);
@@ -2448,10 +2457,14 @@ fn a_writer_waits_for_the_phase_byte_it_finds_until_the_holder_moves_to_the_next
     ofd(&holder, libc::F_OFD_SETLK, libc::F_WRLCK, at + 2, 1);
     ofd(&holder, libc::F_OFD_SETLK, libc::F_UNLCK, at, 1);
     let took = writer.join().unwrap();
+    let late = watch.stop();
     drop(holder);
+    let limit = late.bound(Duration::from_millis(400), Duration::from_millis(1_500));
     assert!(
-        took >= Duration::from_millis(200) && took < Duration::from_millis(400),
-        "a writer beside a phase byte in the middle of them that another open held, and moved          from to the next at 200 ms, took {took:?}"
+        took >= Duration::from_millis(200) && took < limit,
+        "a writer beside a phase byte in the middle of them that another open held, and moved \
+         from to the next at 200 ms, took {took:?}, against {limit:?} with sleeps ending {late:?} \
+         late"
     );
 }
 

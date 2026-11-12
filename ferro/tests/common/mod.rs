@@ -4,7 +4,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ferro::codec::{Decoder, Encoder, HashSink, Object};
 use ferro::store::{Store, StoreOptions, Txn};
@@ -387,6 +390,83 @@ pub fn cases(base: u32) -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(1);
     base.saturating_mul(scale.max(1))
+}
+
+/// How much longer than asked a sleeping thread took to wake while a timed check ran.
+///
+/// A loaded machine makes each thread that wakes wait for a core, and the gate's writers and
+/// holders wait between sleeps of up to a millisecond, so what a test times of the gate stretches
+/// with the load, and so does each hand-off between the threads of the test. A timed check starts
+/// [`Lateness::watch`] beside what it times, stops it once the times are in, and checks them
+/// against [`Lateness::bound`]: the bound it held on a quiet machine stretched by
+/// [`Lateness::slowdown`], but never past a ceiling that the failure it is there to catch reaches.
+/// `docs/internals/testing.md` describes the policy under Timed checks.
+#[derive(Clone, Copy, Debug)]
+pub struct Lateness {
+    /// How many sleeps the watch timed.
+    pub sleeps: usize,
+    /// How much longer than [`Lateness::NAP`] the 99th percentile of those sleeps took.
+    pub p99: Duration,
+    /// How much longer than [`Lateness::NAP`] the longest of them took.
+    pub longest: Duration,
+}
+
+/// A thread that sleeps [`Lateness::NAP`] over and over until [`Watch::stop`].
+pub struct Watch {
+    stop: Arc<AtomicBool>,
+    probe: thread::JoinHandle<Vec<Duration>>,
+}
+
+impl Lateness {
+    /// The sleep whose overshoot the watch times.
+    pub const NAP: Duration = Duration::from_millis(1);
+
+    /// Starts a thread that times how long past [`Lateness::NAP`] each of its sleeps takes.
+    pub fn watch() -> Watch {
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut late = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    thread::sleep(Lateness::NAP);
+                    late.push(started.elapsed().saturating_sub(Lateness::NAP));
+                }
+                late
+            })
+        };
+        Watch { stop, probe }
+    }
+
+    /// How many times as long as asked the 99th percentile of the sleeps took: just over 1 on an
+    /// idle machine, and several times that once threads queue for every core.
+    pub fn slowdown(&self) -> f64 {
+        1.0 + self.p99.as_secs_f64() / Lateness::NAP.as_secs_f64()
+    }
+
+    /// `quiet`, a bound that holds on a quiet machine, stretched by [`Lateness::slowdown`], and at
+    /// most `ceiling`, which the failure the bound is for always reaches.
+    pub fn bound(&self, quiet: Duration, ceiling: Duration) -> Duration {
+        quiet.mul_f64(self.slowdown()).min(ceiling)
+    }
+}
+
+impl Watch {
+    /// Stops the thread and returns how late its sleeps ended.
+    pub fn stop(self) -> Lateness {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut late = self.probe.join().unwrap();
+        late.sort();
+        Lateness {
+            sleeps: late.len(),
+            p99: late
+                .get(late.len().saturating_sub(1) * 99 / 100)
+                .copied()
+                .unwrap_or_default(),
+            longest: late.last().copied().unwrap_or_default(),
+        }
+    }
 }
 
 pub fn level_of<K: Data>(key: &K) -> u32 {

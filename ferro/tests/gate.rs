@@ -10,7 +10,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::fast;
+use common::{Lateness, fast};
 use ferro::db::Hook;
 use ferro::{Data, Db, Keep, Options, Reclaim, Snapshot};
 
@@ -431,9 +431,10 @@ fn assert_commits_wait_no_longer_than_holds(pullers: usize, one_handle: bool) {
     );
     println!("{pullers} pullers, one handle: {one_handle}: {seen}");
     assert!(
-        commits.count >= 8_000,
+        commits.count >= 4 * pulls.count.max(1),
         "a writer beside {pullers} threads pulling back to back, in one handle: {one_handle}, \
-         waited out holds that began after the one it found: {seen}"
+         committed fewer than four times a pull, so it waited out holds that began after the one \
+         it found: {seen}"
     );
 }
 
@@ -475,6 +476,7 @@ fn writers_held_at_a_pause_that_panics_go_on_as_it_unwinds() {
             .is_err()
     });
     at_pause.recv_timeout(Duration::from_secs(10)).unwrap();
+    let watch = Lateness::watch();
     let started = Instant::now();
     let elsewhere = thread::spawn(move || {
         tick(&own_elsewhere);
@@ -485,11 +487,14 @@ fn writers_held_at_a_pause_that_panics_go_on_as_it_unwinds() {
         started.elapsed()
     });
     let (elsewhere, within) = (elsewhere.join().unwrap(), within.join().unwrap());
+    let late = watch.stop();
     assert!(cycling.join().unwrap(), "the pause did not panic");
+    let limit = late.bound(Duration::from_millis(600), Duration::from_millis(1_500));
     assert!(
-        elsewhere < Duration::from_millis(600) && within < Duration::from_millis(600),
+        elsewhere < limit && within < limit,
         "writers that came during a 300 ms pause that then panicked took {elsewhere:?} in another \
-         handle and {within:?} in the cycling handle"
+         handle and {within:?} in the cycling handle, against {limit:?} with sleeps ending {late:?} \
+         late"
     );
 }
 
@@ -554,7 +559,7 @@ fn joined_commits_beside_cycles(
     rounds: u64,
     awaited: bool,
     gap: Duration,
-) -> Vec<Duration> {
+) -> (Vec<Duration>, Lateness) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("joined.ferro");
     let y: Db<Root> = manual().open(&path).unwrap();
@@ -580,6 +585,7 @@ fn joined_commits_beside_cycles(
     let (a, b) = (y.branch("a").unwrap(), y.branch("b").unwrap());
     let mut took = Vec::new();
     let (sent, waited) = mpsc::channel();
+    let watch = Lateness::watch();
     for _ in 0..rounds {
         thread::sleep(gap);
         let (b, sent) = (b.clone(), sent.clone());
@@ -604,6 +610,7 @@ fn joined_commits_beside_cycles(
             Err(_) => break,
         }
     }
+    let late = watch.stop();
     stop.store(true, Ordering::Relaxed);
     let (cycles, longest_cycle) = cycling.join().unwrap();
     hot.into_iter().for_each(|h| h.join().unwrap());
@@ -612,20 +619,22 @@ fn joined_commits_beside_cycles(
         cycles > 0,
         "the other handle finished no cycle, the longest taking {longest_cycle:?}"
     );
-    took
+    (took, late)
 }
 
 fn joined_commit_stays_short(hog_threads: usize, awaited: bool, gap: Duration) {
     let rounds = 40;
-    let took = joined_commits_beside_cycles(hog_threads, rounds, awaited, gap);
+    let (took, late) = joined_commits_beside_cycles(hog_threads, rounds, awaited, gap);
     assert_eq!(took.len() as u64, rounds, "a joined commit hung: {took:?}");
     let longest = *took.last().unwrap();
     let most = took[took.len() * 9 / 10];
+    let limit = late.bound(Duration::from_millis(100), Duration::from_millis(500));
     assert!(
-        longest < Duration::from_secs(2) && most < Duration::from_millis(100),
+        longest < Duration::from_secs(2) && most < limit,
         "a commit on `b` that a 20 ms closure on `a` joined, awaited: {awaited}, beside another \
          handle cycling as fast as it could and {hog_threads} spinning threads, took up to \
-         {longest:?}, and nine in ten {most:?} or less: {took:?}"
+         {longest:?}, and nine in ten {most:?} or less against {limit:?}, with sleeps ending \
+         {late:?} late: {took:?}"
     );
 }
 
@@ -874,6 +883,7 @@ fn closures_joining_commits_through_the_cycling_handle_back_to_back_wait_a_bound
     let (a, b) = (y.branch("a").unwrap(), cycler.branch("b").unwrap());
     let (sent, waited) = mpsc::channel();
     let mut took = Vec::new();
+    let watch = Lateness::watch();
     let started = Instant::now();
     while took.len() < 40 && started.elapsed() < Duration::from_secs(30) {
         let (a, b, sent) = (a.clone(), b.clone(), sent.clone());
@@ -892,19 +902,21 @@ fn closures_joining_commits_through_the_cycling_handle_back_to_back_wait_a_bound
             Err(_) => break,
         }
     }
+    let late = watch.stop();
     stop.store(true, Ordering::Relaxed);
     let (cycles, longest_cycle) = cycling.join().unwrap();
     let mut sorted = took.clone();
     sorted.sort();
     let longest = sorted.last().copied();
     let most = sorted.get(sorted.len() * 9 / 10).copied();
+    let limit = late.bound(Duration::from_millis(100), Duration::from_millis(500));
     assert!(
         took.len() == 40
             && longest.is_some_and(|took| took < Duration::from_secs(2))
-            && most.is_some_and(|took| took < Duration::from_millis(100)),
+            && most.is_some_and(|took| took < limit),
         "commits through the cycling handle that 20 ms closures on `a` in another handle joined \
-         back to back took {took:?}; {cycles} cycles finished meanwhile, the longest in \
-         {longest_cycle:?}"
+         back to back took {took:?}, nine in ten against {limit:?} with sleeps ending {late:?} \
+         late; {cycles} cycles finished meanwhile, the longest in {longest_cycle:?}"
     );
 }
 
