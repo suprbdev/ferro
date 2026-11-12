@@ -545,13 +545,16 @@ counts only if its magic, sequence (the previous one plus 1), end offset, table 
 right. The first that is not ends the log, unless it reached the disk whole and was damaged since,
 which fails the open with `Error::Corrupt`, as described below. A torn tail, zeroes and garbage all
 stop the scan, and an acknowledged commit survives a stale or torn superblock. A writer then syncs
-the frames it accepted, truncates the rest, and rewrites the superblock, in that order. The
-truncation is durable before any new frame is written, so a frame stranded past a torn one can
-never line up with the log later. Nothing at or below the newest superblock is truncated but what
-lies past its anchor, which under `Durability::Buffered` a crash may have lost, as described under
-[What a superblock names](#what-a-superblock-names), and staging frames that end the log, which a
-writer opening with no writer alive drops: a landing is written after the frames it links, so
-nothing can have linked them.
+the frames it accepted, truncates the rest, and rewrites the superblock, in that order, unless it
+drops frames the superblock names, when it writes and syncs the new superblock before it
+truncates, as described under [Buffered durability and
+checkpoints](#buffered-durability-and-checkpoints). The truncation is durable before any new frame
+is written, so a frame stranded past a torn one can never line up with the log later. Nothing at
+or below the newest superblock is truncated but what lies past its anchor, which under
+`Durability::Buffered` a crash may have lost, as described under [What a superblock
+names](#what-a-superblock-names), and staging frames that end the log, which a writer opening with
+no writer alive drops: a landing is written after the frames it links, so nothing can have linked
+them.
 
 ### Torn and damaged frames
 
@@ -841,10 +844,37 @@ first frame the power cut damaged, whatever the superblock claims. Only frames p
 roll back, so a superblock that anchors itself still reports a hole in its log as corruption, not as
 a short log.
 
-A rollback rewrites both slots, syncing between them, so a reader that opens beside the new writer
-trusts a superblock that names only surviving frames. A read-only open cannot rewrite anything. It
-scans from the anchor when no writer holds the lock, and remembers the superblock it refused so that
-`refresh` ignores it until a writer replaces it. Keeping the anchor in the superblock rather than
+A rollback numbers its superblock one past the newest, so that it is newer than either slot holds
+and the frames after it are numbered past every frame the file held. It writes that superblock to
+the slot that does not hold the newest and syncs it before it truncates anything, and once the
+truncation is durable writes it over the superblock that named the dropped frames and syncs again,
+so no slot names a lost frame. From the first of those writes on, a reader picks the new
+superblock by its sequence number. A rollback used to truncate first and write the frame it kept,
+under its old number, to both slots, so until the second write the newest slot named frames that
+were gone, and a read-only open beside the recovering writer trusted it and failed reading past the
+end of the file (#168).
+
+Before that first write lands, while the writer scans and syncs what it keeps, the newest
+superblock still names the frames the rollback drops, and a reader that finds a writer alive would
+trust it. So every writer holds the recovery lock, a byte-range lock at 2^62 + 9, from before it
+takes the writer lock until it has recovered, or for a shared writer until it finds another alive,
+beside which nothing rolls back. A read-only open that finds a writer alive and a superblock that
+does not anchor itself tests that lock. Held, the open scans from the anchor itself, without
+judging, since the writer may be truncating, and takes the last frame before any staging frames
+that end the log if that comes before the superblock: where the recovery ends. Free, it reads the
+slots again, since the superblock it read may predate a recovery that has finished since. A
+superblock that anchors itself names only durable frames, which no rollback drops, and is trusted
+as it is. Without byte-range locks, outside 64-bit Linux, an open beside a recovering writer can
+still trust the superblock that names the dropped frames until that first write lands.
+
+A read-only open cannot rewrite anything. It scans from the anchor when no writer holds the lock,
+and remembers the superblock it refused so that `refresh` ignores it until a writer replaces it.
+That is why `refresh` needs no lock: a reader open before the power cut died with it, one that
+opened before the recovering writer refused the superblock the rollback drops, and one that opened
+beside the recovery took what it keeps. `superblock_fault.rs` holds the first superblock write of a
+rollback halfway, and the sync after it, beside a read-only open, holds an open between its read of
+the slots and its look at the writer while a rollback runs, and opens the file as a power cut after
+each step of a rollback leaves it. Keeping the anchor in the superblock rather than
 dedicating one slot to it means neither slot has to be synced on its own: every superblock that
 survives names an anchor that was durable before that superblock was written.
 
@@ -866,16 +896,18 @@ superblock and never scans. A read-only open scans only when a frame follows the
 superblock does not anchor itself, and it can take a shared lock, which proves no writer is alive.
 It holds that lock for the scan and syncs what it accepted, since a dead writer's frames may exist
 only in the page cache. If a writer holds the lock, the superblock is current and the reader uses
-it, as long as it read the slots as described under [Reading the slots](#reading-the-slots). A
-writer opening during that short scan retries for a few milliseconds before reporting
-`Error::Locked`.
+it, as long as it read the slots as described under [Reading the slots](#reading-the-slots) and
+the writer has recovered, as described under [Buffered durability and
+checkpoints](#buffered-durability-and-checkpoints). A writer opening during that short scan retries
+for a few milliseconds before reporting `Error::Locked`.
 
 ### Reading the slots
 
 A read of the page cache is not atomic against a write of the same bytes, so a reader beside a
 superblock write can find it half written, failing its check. A writer writes one superblock at a
 time, shared writers under the superblock lock, and only to the slot that does not hold the newest,
-so while one slot is half written the other holds the newest. But a reader may have read that other
+a recovery that rolls back included, since it numbers its superblock past the newest, so while one
+slot is half written the other holds the newest. But a reader may have read that other
 slot first and been held up before reading the second. A read-only open read slot 0 and was held up
 for a millisecond while the next writer handle committed twice, to slot 0 and then to slot 1, and
 read slot 1 in the middle of the second write. It took the superblock it had read from slot 0, one

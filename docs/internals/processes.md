@@ -22,6 +22,7 @@ each other. Everything else is a byte-range lock past any real file, at 2^62 and
 | 2^62 + 4, cycle | Exclusive, per cycle | A reclamation cycle, and the landing of a large `receive` |
 | 2^62 + 5, gate | Exclusive, while a thread wants or holds every branch lock | Letting one thread of the machine at a time want them |
 | 2^62 + 7, door | Exclusive, while a thread that wants the gate draws a turn | Handing out turns one at a time |
+| 2^62 + 9, recovery | Exclusive, by every writer, with the option or without, from before it takes the writer lock until it has recovered, or for a shared writer until it finds another alive | Telling a read-only open that finds a writer alive whether the newest superblock may still name frames a rollback drops |
 | 2^62 + 2^19 and every other byte of the 2,048 from there, turn | Exclusive, one per thread queued for the gate, through its open, from its draw until its hold ends | Letting takers take the gate in the order they drew |
 | 2^62 + 3 · 2^18 and every other byte of the 2,048 from there, phase | Exclusive, one at a time, by the gate's holder, from one drawn at random to the next at the end of each round; only ever tested by writers | Holding off new branch locks until the end of a phase |
 | 2^62 + 2^20 + a 60-bit xxh3 of the branch name | Exclusive, per closure | A branch's closure, across processes |
@@ -33,7 +34,8 @@ gate](#the-gate) describes.
 Locks are taken in the order lane, branch lock, `tip`, placement lock, and the leader of a sync
 takes the superblock lock holding none of them. A writer passes the gate before its lane, holding
 no lock of the file, and the whole range is taken after every lane and the gate, and the gate
-after a turn. The cycle lock comes before all of them.
+after a turn. The cycle lock comes before all of them, and the recovery lock before the writer
+lock and every other.
 
 The byte-range locks are open file description locks, `fcntl` with `F_OFD_SETLK` and
 `F_OFD_SETLKW`, which only Linux has, on 64-bit targets where `off_t` holds the offsets. Classic
@@ -890,8 +892,12 @@ before it recovers or writes, and the scan, which judges a frame that does not c
 torn, never reads one being written. Without it, a shared writer that opens meanwhile can recover
 and place frames during the scan, so the scan may meet one being written. The first version of the
 placement lock trusted the superblock when its test failed with any error, so a reader whose lock
-failed with `ENOLCK` missed a commit whose superblock write a crash had lost (#82). Read-only
-handles otherwise behave as before.
+failed with `ENOLCK` missed a commit whose superblock write a crash had lost (#82). Wherever it
+finds a writer alive and a superblock that does not anchor itself, it tests the recovery lock, and
+scans without the locks while a writer holds it, or reads the slots again once none does, as
+described under [Buffered durability and
+checkpoints](storage.md#buffered-durability-and-checkpoints). Read-only handles otherwise behave as
+before.
 
 ## Reclamation
 

@@ -229,6 +229,11 @@ const GATE_AT: u64 = LOCKS_AT + 5;
 /// The door, held exclusive by a thread that wants the gate while it draws a turn, as
 /// [`Store::take_turn`] describes.
 const DOOR_AT: u64 = LOCKS_AT + 7;
+/// The recovery lock, held exclusive by every writer from before it takes the writer lock until
+/// it has recovered the file, or a shared writer until it finds another alive, beside which no
+/// recovery rolls back. It tells a read-only open that finds a writer alive whether its superblock
+/// may still name frames a recovery drops, as [`beside_a_writer`] describes.
+const RECOVER_AT: u64 = LOCKS_AT + 9;
 /// The first of the [`TURNS`] turn bytes, every other byte from here, one of which each thread
 /// queued for the gate holds through its open, so that takers get the gate in the order they drew
 /// their turns. They lie clear of every other lock and of each other, so the kernel never merges
@@ -737,15 +742,15 @@ fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
 /// The valid superblock with the highest sequence number, then anchor, among the slots that
 /// `read` reads, and the slot it is in, reading them again while one does not check.
 ///
-/// A writer writes one superblock at a time, and only to the slot that does not hold the newest,
-/// but for the second write of a recovery that rolls back, which replaces one naming frames it
-/// dropped. A read beside such a write can find it half written, failing its check. The other
-/// slot then holds the newest, but a read held up between the slots may have read that one
-/// before the write that made it the newest, and would return a superblock older than ones that
-/// named commits already acknowledged. So once a slot fails its check, both are read again,
-/// until both check or two reads in a row find the same bytes, as a slot that stays damaged
-/// leaves them, or a write held up partway. Either way, the superblock returned is at least as
-/// new as every one written whole before the first read began.
+/// A writer writes one superblock at a time, only to the slot that does not hold the newest, and
+/// never one older than the newest: a recovery that rolls back numbers its superblock past the
+/// one that names the frames it drops. A read beside such a write can find it half written,
+/// failing its check. The other slot then holds the newest, but a read held up between the slots
+/// may have read that one before the write that made it the newest, and would return a
+/// superblock older than ones that named commits already acknowledged. So once a slot fails its
+/// check, both are read again, until both check or two reads in a row find the same bytes, as a
+/// slot that stays damaged leaves them, or a write held up partway. Either way, the superblock
+/// returned is at least as new as every one written whole before the first read began.
 fn settled_supers(mut read: impl FnMut() -> Result<Slots>) -> Result<Option<(Super, u64)>> {
     let mut slots = read()?;
     loop {
@@ -1387,10 +1392,16 @@ fn scan(file: &File, sb: Super, len: u64, judge: bool) -> Result<(Super, Super)>
 /// If the log moved or the superblock did not anchor itself, it syncs the frames it kept and
 /// writes a superblock anchoring the last of them to the other slot. It truncates anything past
 /// that frame, durably, before any new frame is written, so a frame stranded past a torn one can
-/// never line up with the log later. If the scan ended before the frame the superblock named, it
-/// writes the new superblock to both slots, syncing between them, so no slot names a lost frame.
-/// A frame that reached the disk whole and was damaged since fails it with [`Error::Corrupt`]
-/// before it writes anything.
+/// never line up with the log later. A frame that reached the disk whole and was damaged since
+/// fails it with [`Error::Corrupt`] before it writes anything.
+///
+/// If the scan ended before the frame the superblock named, the log rolls back, and the new
+/// superblock takes the sequence number after the one `sb` names, so that it is newer than either
+/// slot holds and the frames after it are numbered past every frame the file held. It goes to the
+/// other slot and is synced before anything is truncated, so from then on a reader picks it over
+/// `sb`, and once the truncation is durable it is written over `sb` too and synced, so no slot
+/// names a lost frame. A superblock that names the last sequence number cannot roll back, and
+/// fails it with [`Error::Corrupt`] before it writes anything.
 ///
 /// With `live` set, another shared writer that has opened is alive, so no crash can have taken
 /// back a frame `sb` names since that writer recovered the file, and the scan ending before the
@@ -1407,25 +1418,41 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
     let moved = tip.seq != sb.seq || !sb.settled();
     let rolled_back = tip.seq < sb.seq;
     let shrink = len > tip.log_end;
+    if rolled_back {
+        tip.seq = sb.seq.checked_add(1).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "frame {} at {} does not check, and the superblock past it names the last \
+                 sequence number",
+                tip.seq.saturating_add(1),
+                tip.log_end
+            ))
+        })?;
+    }
     tip.anchor = tip.mark();
+    let other = 1 - slot;
     if moved {
         file.sync_data()?;
+    }
+    if rolled_back {
+        file.write_all_at(&tip.encode(), other * SLOT_BYTES)?;
+        if shrink {
+            file.sync_all()?;
+        }
     }
     if shrink {
         file.set_len(tip.log_end)?;
     }
-    let slot = if moved { 1 - slot } else { slot };
-    if moved {
-        file.write_all_at(&tip.encode(), slot * SLOT_BYTES)?;
+    if moved && !rolled_back {
+        file.write_all_at(&tip.encode(), other * SLOT_BYTES)?;
     }
     if moved || shrink {
         file.sync_all()?;
     }
     if rolled_back {
-        file.write_all_at(&tip.encode(), (1 - slot) * SLOT_BYTES)?;
+        file.write_all_at(&tip.encode(), slot * SLOT_BYTES)?;
         file.sync_all()?;
     }
-    Ok((tip, slot))
+    Ok((tip, if moved { other } else { slot }))
 }
 
 /// The superblock a read-only open trusts: `sb`, unless no writer is alive and a scan from its
@@ -1439,18 +1466,21 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
 /// It keeps none of the staging frames that end the log, which a writer opening drops, and which
 /// keep the head the frame before them names. A shared writer that opens meanwhile waits for the
 /// placement lock before it recovers or writes, so nothing it writes races the scan. With a writer
-/// alive, `sb` is current. A placement lock held elsewhere means a writer is placing a frame, so
-/// `sb` is used as it is, but a test of the lock that fails with an error says nothing about
-/// writers, and the open goes on to test [`MULTI_AT`] and scans without the placement lock, as it
-/// would where there are no byte-range locks, so a shared writer that opens meanwhile can write
-/// during that scan.
+/// alive, the open takes what [`beside_a_writer`] finds. A placement lock held elsewhere means a
+/// writer is placing a frame or opening, and is treated the same way, but a test of the lock that
+/// fails with an error says nothing about writers, and the open goes on to test [`MULTI_AT`] and
+/// scans without the placement lock, as it would where there are no byte-range locks, so a shared
+/// writer that opens meanwhile can write during that scan.
 fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     let mut header = [0u8; FRAME_BYTES];
     let follows = sb.log_end.saturating_add(FRAME_BYTES as u64) <= len
         && read_or_end(file, &mut header, sb.log_end)?
         && frame_like(&header);
-    if (sb.settled() && !follows) || platform::try_lock_shared(file).is_err() {
+    if sb.settled() && !follows {
         return Ok(sb);
+    }
+    if platform::try_lock_shared(file).is_err() {
+        return beside_a_writer(file, sb);
     }
     let placement = match platform::RANGES {
         true => match platform::lock_range(file, COMMIT_AT, 1, false, false) {
@@ -1460,7 +1490,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
             }),
             Err(TryLockError::WouldBlock) => {
                 platform::unlock(file)?;
-                return Ok(sb);
+                return beside_a_writer(file, sb);
             }
             Err(TryLockError::Error(_)) => None,
         },
@@ -1469,7 +1499,7 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     if platform::range_held(file, MULTI_AT, 1).unwrap_or(false) {
         drop(placement);
         platform::unlock(file)?;
-        return Ok(sb);
+        return beside_a_writer(file, sb);
     }
     let before = sb.anchor.seq;
     let scanned = file
@@ -1486,6 +1516,33 @@ fn observe(file: &File, path: &Path, sb: Super, len: u64) -> Result<Super> {
     drop(placement);
     platform::unlock(file)?;
     scanned
+}
+
+/// The superblock a read-only open trusts once it finds a writer alive, given `sb`, the newest it
+/// read before it looked.
+///
+/// A superblock that anchors itself names only durable frames, which no recovery drops, and is
+/// used as it is, as is any superblock where there are no byte-range locks. Otherwise a writer
+/// may be recovering the file, and a recovery that rolls back drops frames that `sb` names. A
+/// writer holds [`RECOVER_AT`] from before it takes the writer lock until it has recovered, and
+/// while it holds it the open scans from the anchor itself, without judging, since the writer may
+/// be truncating, and takes the last frame before any staging frames that end the log, which is
+/// where that recovery ends, if it ends before `sb`. Once nothing holds it, every writer that holds
+/// the writer lock has recovered, or recovers beside a live one, which rolls nothing back, but `sb`
+/// may have been read before, so the open reads the superblocks again.
+fn beside_a_writer(file: &File, sb: Super) -> Result<Super> {
+    if sb.settled() || !platform::RANGES {
+        return Ok(sb);
+    }
+    let len = file.metadata()?.len();
+    match platform::range_held(file, RECOVER_AT, 1) {
+        Ok(true) => {
+            let (_, settled) = scan(file, sb.at_anchor(), len, false)?;
+            Ok(if settled.seq < sb.seq { settled } else { sb })
+        }
+        Ok(false) => Ok(read_supers(file, len)?.map_or(sb, |(newest, _)| newest)),
+        Err(_) => Ok(sb),
+    }
 }
 
 /// Maps a signed link delta to the unsigned value a record stores, small magnitudes first.
@@ -2097,10 +2154,13 @@ pub(crate) fn seal(file: &Traced, log_end: u64, head: Ptr, seq: u64, basis: Basi
 /// Opens the file at `path` and, for a writer, takes the writer lock: exclusive, or shared with
 /// `shared`.
 ///
-/// A writer tries a held lock again [`LOCK_RETRIES`] times, a millisecond apart, before it fails
-/// with `Error::Locked`, and opens the path again if it no longer names the file it locked. A
-/// read-only open takes no lock and fails with `Error::NoDatabase` if the file is missing. A
-/// shared writer fails with an `Unsupported` I/O error where there are no byte-range locks.
+/// A writer first takes [`RECOVER_AT`] exclusive, which [`Store::opened`] lets go once it has
+/// recovered, waiting for it with `shared` and otherwise counting a held one as a held writer
+/// lock. Where byte-range locks fail with an error, it goes on without it. A writer tries a held
+/// lock again [`LOCK_RETRIES`] times, a millisecond apart, before it fails with `Error::Locked`,
+/// and opens the path again if it no longer names the file it locked. A read-only open takes no
+/// lock and fails with `Error::NoDatabase` if the file is missing. A shared writer fails with an
+/// `Unsupported` I/O error where there are no byte-range locks.
 fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
     if shared && !read_only && !platform::RANGES {
         return Err(Error::Io(std::io::Error::new(
@@ -2125,9 +2185,10 @@ fn open_locked(path: &Path, read_only: bool, shared: bool) -> Result<File> {
         if read_only {
             return Ok(file);
         }
-        let locked = match shared {
-            true => platform::try_lock_shared(&file),
-            false => platform::try_lock(&file),
+        let locked = match platform::lock_range(&file, RECOVER_AT, 1, true, shared) {
+            Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
+            Ok(()) | Err(TryLockError::Error(_)) if shared => platform::try_lock_shared(&file),
+            Ok(()) | Err(TryLockError::Error(_)) => platform::try_lock(&file),
         };
         match locked {
             Ok(()) => {}
@@ -3033,6 +3094,9 @@ impl Store {
                     (observe(&file, actual, sb, len)?, slot)
                 } else {
                     let live = shared && platform::range_held(&file, MULTI_AT, 1)?;
+                    if live {
+                        let _ = platform::unlock_range(&file, RECOVER_AT, 1);
+                    }
                     recover(&file, sb, slot, len, live)?
                 }
             }
@@ -3060,6 +3124,9 @@ impl Store {
                 (sb, 0)
             }
         };
+        if !options.read_only {
+            let _ = platform::unlock_range(&file, RECOVER_AT, 1);
+        }
         if shared {
             platform::lock_range(&file, MULTI_AT, 1, false, false).map_err(locked)?;
         }
@@ -7841,9 +7908,9 @@ mod tests {
         for opener in openers {
             let store = opener.join().unwrap().unwrap();
             assert_eq!(
-                store.last_seq(),
-                1,
-                "the log was not rolled back to its first frame"
+                (store.size(), store.last_seq()),
+                (second as u64, 4),
+                "the log was not rolled back to its first frame, numbered past the frames it named"
             );
             store.close();
         }
