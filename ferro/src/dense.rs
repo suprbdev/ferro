@@ -147,16 +147,17 @@ impl Ascending {
             .partition_point(|first| *first <= offset)
             .checked_sub(1)?;
         let base = (chunk * CHUNK) as u32;
-        let (mut low, mut high) = (0, self.distances.chunks[chunk].len());
-        while low < high {
-            let middle = (low + high) / 2;
-            match self.get(base + middle as u32).cmp(&offset) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => return Some(base + middle as u32),
-            }
+        match u32::try_from(offset - self.firsts[chunk]) {
+            Ok(distance) if distance < u32::MAX => self.distances.chunks[chunk]
+                .binary_search(&distance)
+                .ok()
+                .map(|at| base + at as u32),
+            _ => self
+                .far
+                .binary_search_by_key(&offset, |(_, held)| *held)
+                .ok()
+                .map(|at| self.far[at].0),
         }
-        None
     }
 }
 

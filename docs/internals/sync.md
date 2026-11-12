@@ -120,19 +120,28 @@ file.
 A bundle for a file that shares no anchor with the sender, a first pull, is sent in the order of the
 sender's file. Every link in a ferro file leads back, to an earlier offset, so that order puts every
 object after what it links. The sender finds what to send with one pass from the end of the file
-toward its start: a heap holds the offsets that what it has reached links to, it takes the largest,
-reads that record's links and adds them, and an offset it takes twice in a row is one object linked
-twice, which also counts the links to it. The commits sent start the heap, and of a commit only its
-root and the commits sent that it links are followed. The pass reads the file 1 MiB at a time
-toward its start and takes each record's links from those bytes, since the kernel reads ahead only
-toward the end of a file, as measured under [Naming sent objects by their
-place](#naming-sent-objects-by-their-place). Each offset reached goes into a list, 64 to a
-run, each run its first offset and then the distance down to each next one as a varint, with the
-first four bytes of the hash the link named and the count of links, so the list takes about seven
-bytes an object. Then the list is read back from its end, and each object read from the file in
-order, its hash checked against those four bytes, and written; a link to a sent object finds that
-object's place in the list by galloping from the run being written and halving one run. Objects the
-file holds twice, at two offsets, are sent twice, since the pass knows objects by their offsets.
+toward its start: it holds the offsets that what it has reached links to, takes the largest, reads
+that record's links and adds them, and an offset it takes twice in a row is one object linked
+twice, which also counts the links to it. The commits sent start the pass, and of a commit only its
+root and the commits sent that it links are followed. The offsets waiting are kept by the window of
+the file they fall in, windows of 64 KiB, or wider in a file so large that 16,384 would not cover
+it: an offset below the window the pass is in goes into its window's list, which is sorted once the
+pass comes down to it, and only one inside that window goes into a heap. The pass reads the file
+1 MiB at a time toward its start and takes each record's links from those bytes, since the kernel
+reads ahead only toward the end of a file, as measured under [Naming sent objects by their
+place](#naming-sent-objects-by-their-place). Each offset reached goes into a list, 64 to a run,
+each run its first offset and then the distance of each other one below it, all in as many bytes as
+the run's widest distance needs, with the first four bytes of the hash the link named and the count
+of links, so the list takes about seven bytes an object, and an offset is found in a run by halving
+it where it lies, without decoding the run. Then the list is read back from its end. Up to four
+threads take its runs in turn, read each object from the file, check its hash against those four
+bytes and encode it as it will be sent, each link to a sent object as how far back it is, which
+they find by galloping over the runs from the object's own and halving one. The sending thread
+puts the encoded objects out in their order. A thread works at most four runs a thread ahead of the
+run being sent, and waits while 256 KiB of encoded objects does, unless its run is the one
+being sent. A first pull of fewer than 4,096 objects, or on one core, encodes each run on the sending
+thread. Objects the file holds twice, at two offsets, are sent twice, since the pass knows objects
+by their offsets.
 
 An incremental bundle is planned as before. The tree comparison reads only the links of each record,
 and keeps each object it will send in a table of 16-byte slots: its offset, its place in the bundle,
@@ -651,6 +660,61 @@ about 25 µs. Staging a large bundle in the log instead, where it lands, took th
 read back out, as described under [Staging in the log,
 measured](sync-receive.md#staging-in-the-log-measured).
 
+### A first pull of a history
+
+The comparison harness in `benchmarks/compare` clones a `Map<u64, String>` of 100,000 keys, loaded
+in 100 commits and then changed by 2,000 commits of one key, a fork and a merge: a bundle of 33.5 MiB
+that carries every version, most of whose nodes the next commit links again. Building it took about
+2.2 µs an object and receiving it 3.5. Building it spent 46% of its time finding where in the list
+each linked object was sent, which decoded the whole run of 64 that held it for every link, 22%
+hashing the objects it read, and 17% in the heap of the pass. Receiving it spent a third streaming,
+most of that hashing, and two thirds in the checks of its trees, where finding a kept check by the
+object's place, and each place by halving the offsets, missed the cache on most of the 635,000
+links the checks followed.
+
+The runs of the list now find an offset where it lies, the pass keeps most offsets in sorted lists
+by window, and threads read, hash and encode the objects while the sending thread puts them out, as
+described under [What is sent](#what-is-sent). The checks look a link up in one table of kept
+checks by its offset before finding its object's place, find a place by halving the run of 4,096
+four-byte distances that holds it in place, take a node's scratch for hashing its keys once rather
+than once a key, and read the staging through a window, as described under [Where checked objects
+wait](sync-receive.md#where-checked-objects-wait). The bundles are the same, byte for byte. Medians
+of three runs alternating with the build before, on the 32-thread machine at a load of 4 to 7:
+
+| Case | Before | After |
+| --- | --- | --- |
+| The harness's clone into an empty file, `Durability::Fsync` | 863 ms | 404 ms |
+| Of that, building the bundle | 365 ms | 76 ms |
+| The harness's pull of 100 one-key commits | 8.2 to 9.2 ms | 7.8 to 8.9 ms |
+| `clone`'s `send` of 8M keys, 999,734 objects, Buffered | 0.64 s, 7.7 MiB heap | 0.28 s, 8.2 MiB heap |
+| `clone`'s `receive` of them | 1.31 s, 9.4 MiB heap | 0.98 s, 9.5 MiB heap |
+| `clone`'s `pull` of them | 1.38 s, 15.5 MiB heap | 1.05 to 1.10 s, 17.0 MiB heap |
+| `clone`'s `incremental` pull of three one-key commits, 200 times | 3.80 million instructions, 0.36 ms | 3.73 million, 0.36 ms |
+
+In user-space instructions, building that bundle from a file written the same way took 3.85
+billion, and takes 1.58 billion on all its threads, 0.32 billion of them on the sending thread;
+receiving it took 4.38 billion and takes 3.37 billion. A pull holds 1.5 MiB more at its peak: half a
+MiB more to build its bundle, and its sending side, now the faster, keeps more of the eight chunks of
+64 KiB between the two sides full.
+
+Measured and left out:
+
+- A table by place in the bundle for the hashes held for links still to come, in place of the list
+  by place: 7% fewer instructions to receive the history, but its growth took the bundle of two
+  million empty objects that each say a later object links them to 16.3 MB of heap before it was
+  refused, against 9.0. Guessing a place in a run of that list from the ids at its ends, rather
+  than halving it, saved nothing.
+- Threads that checked each object a check queued while the walk went on, which the walk then took
+  in place of checking it: the walk ran 35% fewer instructions, but the receive took 1.6 to 2.6
+  times as long, handing over and waiting on checks of about a microsecond each, and 1.2 to 2 times
+  as long when they took the oldest queued first and the walk never waited.
+- Hashing the objects that link nothing on a second thread while the stream reads on: those come to
+  200 million of the receive's instructions, and it ran no faster.
+- Taking a kept check for each child before queueing it: 0.7% fewer instructions.
+- A heap of the offsets of each window of 1 MiB, then sorted lists by window of 1 MiB, against those
+  of 64 KiB: 466 and 397 million instructions on the sending thread, against 324.
+- Letting the encoded objects waiting take 1 MiB rather than 256 KiB: no faster.
+
 ## Memory for each object
 
 What a sync holds grows with the objects it moves, not with their bytes, and by a few bytes an
@@ -663,11 +727,12 @@ object. The receiver keeps, for each object in the bundle:
   which also finds the objects nothing links to.
 
 That is about 5 bytes. An object's hash is held only from its arrival to the last link the bundle
-says later objects make to it, in a list by its place in the bundle of its hash and the links still
-to come, 32 bytes, and a bundle whose list would pass the bytes it has carried and 4 MiB is refused,
-as described under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). A first
-pull comes in the order of the sender's file, where a commit writes each node just after its
-children, so that list holds a few hundred objects at a time, and in a history also the nodes a
+says later objects make to it, in a table by its place in the bundle of its hash and the links
+still to come, 32 bytes and a control byte in a table at most seven eighths full, and a bundle whose
+entries would pass the bytes it has carried and 4 MiB, at 32 bytes each, is refused, as described
+under [Where checked objects wait](sync-receive.md#where-checked-objects-wait). A first pull comes
+in the order of the sender's file, where a commit writes each node just after its children, so that
+table holds a few hundred objects at a time, and in a history also the nodes a
 later commit links again: in 100,000 commits of ten keys, 121 at most. Beside them the receiver
 keeps the hashes of the last 131,072 objects, 2.5 MiB, for the deduplication table to learn once the
 bundle has landed, and of every object while the staging is in memory, under 1 MiB of records.
@@ -694,13 +759,17 @@ link do: 63 MB each now, where it allocated 381 MB in 175 ms. Each hint's depth 
 bytes, is held while they resolve.
 
 The sender of a first pull keeps, for each object it will send, an entry in the list described
-under [What is sent](#what-is-sent): the distance to the offset before it, 2 bytes for records of a
-few hundred bytes, the first four bytes of its hash and the count of links to it, about 7 bytes,
-with the first offset of each run of 64 and where its bytes start, 12 bytes a run. The heap holds 16
-bytes for each link the pass has yet to follow: a few hundred in a tree written in commits, since
-each node follows its children closely, and 388,454 at most for the 895,489 objects of 100,000
-commits of ten keys, since each commit links nodes written by the ones before. It reads the file
-through a window of 1 MiB, and each commit adds about 100 bytes. The sender of an incremental pull
+under [What is sent](#what-is-sent): its distance below the first offset of its run, 2 bytes for
+records of a few hundred bytes, the first four bytes of its hash and the count of links to it,
+about 7 bytes, with the first offset of each run of 64, where its bytes start and how wide its
+distances are, 13 bytes a run. The lists of the windows and the heap hold 16 bytes for each link
+the pass has yet to follow: a few hundred in a tree written in commits, since each node follows its
+children closely, and 388,454 at most for the 895,489 objects of 100,000 commits of ten keys, since
+each commit links nodes written by the ones before. Each window adds an empty list, 24 bytes, at
+most 384 KiB in all. It reads the file through a window of 1 MiB, and each commit adds about 100
+bytes. While the objects go out, those encoded and waiting take at most 256 KiB, besides the run
+being sent and what each thread is encoding, 32 objects or 16 KiB of them at most and one object
+more. The sender of an incremental pull
 keeps, for each object it will send, a 16-byte slot and a control byte in a table split into 16
 that runs between 44 and 88% full, 19 to 39 bytes, a commit adds 80 bytes, and each object the old
 side reaches its hash, its origin as a position and link index, and a slot, about 40. The

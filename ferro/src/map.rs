@@ -115,6 +115,7 @@ pub(crate) const SPILL_BYTES: usize = 512;
 /// a value.
 const NODE_LEVELS: usize = 2;
 const LEVEL_BITS: u32 = 3;
+const KEYS_RESERVED: usize = 16;
 const LEVELS: u8 = (u64::BITS / LEVEL_BITS) as u8 + 1;
 const PIN_DEPTH: usize = 3;
 const ARC_HEADER: usize = 16;
@@ -275,14 +276,19 @@ fn fold<K, V, S: Summary<K, V>>(total: Option<S>, next: &S) -> Option<S> {
 }
 
 fn level_of<K: Data>(key: &K) -> Result<u8> {
+    let mut scratch = KEY_SCRATCH.take();
+    let level = level_in(key, &mut scratch);
+    KEY_SCRATCH.with(|kept| kept.replace(scratch));
+    level
+}
+
+fn level_in<K: Data>(key: &K, scratch: &mut Vec<u8>) -> Result<u8> {
     let mut sink = HashSink;
-    let mut encoder = Encoder::reusing(&mut sink, KEY_SCRATCH.take());
+    let mut encoder = Encoder::reusing(&mut sink, mem::take(scratch));
     let encoded = key.encode(&mut encoder);
-    let buf = encoder.into_buf();
-    let word = xxh3_64(&buf);
-    KEY_SCRATCH.set(buf);
+    *scratch = encoder.into_buf();
     encoded?;
-    Ok((word.trailing_zeros() / LEVEL_BITS) as u8)
+    Ok((xxh3_64(scratch).trailing_zeros() / LEVEL_BITS) as u8)
 }
 
 const fn by_copy<V>() -> bool {
@@ -1193,7 +1199,7 @@ fn entry_summary<K: Data, V: Data, S: Summary<K, V>>(key: &K, r: &mut Decoder<'_
         encoder.bytes(),
         encoder.links().iter().map(|link| &link.hash),
     );
-    KEY_SCRATCH.set(encoder.into_buf());
+    KEY_SCRATCH.with(|scratch| scratch.replace(encoder.into_buf()));
     encoded?;
     let id = (TypeId::of::<(K, V, S)>(), hash);
     if let Some(summary) = recalled.get::<S>(&id) {
@@ -1432,10 +1438,11 @@ fn node_keys<K: Data + Ord>(kind: &Kind, r: &mut Decoder<'_>) -> Result<(u8, Vec
     if n == 0 || n > r.remaining() as u64 {
         return Err(Error::Decode(format!("node claims {n} keys")));
     }
-    let mut keys: Vec<K> = Vec::new();
+    let mut keys: Vec<K> = Vec::with_capacity((n as usize).min(KEYS_RESERVED));
+    let mut scratch = KEY_SCRATCH.take();
     for _ in 0..n {
         let key = K::decode(r)?;
-        if level_of(&key)? != level {
+        if level_in(&key, &mut scratch)? != level {
             return Err(Error::Decode(
                 "a key sits at a level it does not hash to".into(),
             ));
@@ -1445,6 +1452,7 @@ fn node_keys<K: Data + Ord>(kind: &Kind, r: &mut Decoder<'_>) -> Result<(u8, Vec
         }
         keys.push(key);
     }
+    KEY_SCRATCH.with(|kept| kept.replace(scratch));
     if outside(span_of::<K>(kind), &keys[0], &keys[keys.len() - 1]) {
         return Err(Error::Decode(
             "node keys fall outside the range their parent gives them".into(),
@@ -1472,10 +1480,11 @@ fn check_plain<K: Data + Ord, V: Data, S: Summary<K, V>>(
     if n == 0 || n > r.remaining() as u64 {
         return Err(Error::Decode(format!("node claims {n} keys")));
     }
-    let mut keys: Vec<K> = Vec::new();
+    let mut keys: Vec<K> = Vec::with_capacity((n as usize).min(KEYS_RESERVED));
+    let mut scratch = KEY_SCRATCH.take();
     for _ in 0..n {
         let key = K::decode(r)?;
-        if level_of(&key)? != level {
+        if level_in(&key, &mut scratch)? != level {
             return Err(Error::Decode(
                 "a key sits at a level it does not hash to".into(),
             ));
@@ -1485,6 +1494,7 @@ fn check_plain<K: Data + Ord, V: Data, S: Summary<K, V>>(
         }
         keys.push(key);
     }
+    KEY_SCRATCH.with(|kept| kept.replace(scratch));
     let span = span_of::<K>(kind);
     if outside(span, &keys[0], &keys[keys.len() - 1]) {
         return Err(Error::Decode(

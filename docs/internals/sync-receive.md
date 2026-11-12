@@ -47,8 +47,11 @@ placed. Commits on every branch go on between and beside them: a staging frame p
 commit drafts moves the draft as any frame does, and a writer of another process catching up checks
 the header and goes on at the frame's end without reading the records. A bundle under 1 MiB places
 no frame. The checks above read the sent objects back from the staging without hashing them again,
-from the buffer and through the page cache, and what the receiver holds from the generation
-`receive` started in. A bundle that fails any of them, or a stream that errors or ends early, lands
+from the buffer and through the page cache, 16 KiB of the file at a time, which serve the records
+read next from within them, and what the receiver holds from the generation `receive` started in.
+A check reads a record within those 16 KiB of the one read before it 94% of the time, since a
+commit writes a node near its children: a receive of a clone of 152,733 objects made 19,000 reads
+of files in all, where it made 166,000 with a read of each record it checked. A bundle that fails any of them, or a stream that errors or ends early, lands
 nothing.
 
 Only a commit may link to something not sent, and an object that does and is not one of the new
@@ -442,8 +445,9 @@ and runs each root's tree to the end before the next. A link to a sent object ch
 the kind the link names and pushes its own links. Most objects are linked once, so their checks are
 not kept. While the bundle streams, the receiver counts the links each object gets from other sent
 objects, and only an object linked more than once, or also named by a hint, keeps the kinds it was
-checked as, the last 16 for each type. It keeps those of each type until as many links as it has
-have reached it as that type, since a parent checked as two types reaches each child once as each
+checked as, the last 16 for each type, in one table by its offset in the staging and its type,
+which a link is looked up in before the object's place is found. It keeps those of each type until
+as many links as it has have reached it as that type, since a parent checked as two types reaches each child once as each
 through one link, and a type that fewer links reach it as keeps its check until the walk ends. A
 later link of the same type whose range contains one it was checked under is not checked again. A
 link under a range no earlier check covers checks the object again, and if that check finds typed

@@ -13,15 +13,17 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BinaryHeap, HashMap, HashSet, hash_map};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque, hash_map};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use hashbrown::HashTable;
 use hashbrown::hash_table as table;
+use parking_lot::{Condvar, Mutex};
 
 use crate::codec::{
     Checks, Claim, Data, Decoder, Finding, FoundTable, HASH_BYTES, Hash, Kind, Object, PairRoots,
@@ -85,6 +87,14 @@ const SWEPT_RUN: usize = 64;
 const SWEPT_PAGE: usize = 64 << 10;
 const SWEPT_WINDOW: u64 = 1 << 20;
 const SWEPT_TAIL: u64 = 64 << 10;
+const FRONTIER_SHIFT: u32 = 16;
+const FRONTIER_WINDOWS: u32 = 14;
+const SEND_THREADS: usize = 4;
+const AHEAD_FROM: usize = 1 << 12;
+const AHEAD_RUNS: usize = 4;
+const AHEAD_BATCH: usize = 32;
+const AHEAD_BYTES: usize = 256 << 10;
+const AHEAD_CHUNK: usize = 16 << 10;
 const WAITING: u8 = 0;
 const OPEN: u8 = 1;
 const SENT: u8 = 2;
@@ -421,7 +431,7 @@ fn put_mark(out: &mut Vec<u8>, mark: Mark) {
 fn put_body(
     out: &mut Vec<u8>,
     body: &[u8],
-    packed: Option<Vec<u8>>,
+    packed: Option<&[u8]>,
     bodies: &mut usize,
     before: usize,
 ) {
@@ -431,7 +441,7 @@ fn put_body(
         Some(packed) => {
             push_varint(out, (packed.len() as u64) << 1 | 1);
             push_varint(out, body.len() as u64);
-            out.extend_from_slice(&packed);
+            out.extend_from_slice(packed);
         }
         None => {
             push_varint(out, (body.len() as u64) << 1);
@@ -536,7 +546,6 @@ struct Ready {
     ptr: Ptr,
     object: Object,
     packed: Option<Vec<u8>>,
-    uses: u64,
 }
 
 fn take_varint(bytes: &[u8], pos: &mut usize) -> u64 {
@@ -557,13 +566,17 @@ struct Swept {
     places: Vec<(u32, u32)>,
     pages: Vec<Vec<u8>>,
     len: usize,
-    last: u64,
-    run: Option<usize>,
-    found: Vec<(u64, u32, u64)>,
+    filling: Vec<(u64, u32, u64)>,
 }
 
 fn part_of(hash: &Hash) -> u32 {
     u32::from_le_bytes(hash[..4].try_into().expect("a hash is longer than 4 bytes"))
+}
+
+fn read_width(bytes: &[u8], at: usize, width: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word[..width].copy_from_slice(&bytes[at..at + width]);
+    u64::from_le_bytes(word)
 }
 
 impl Swept {
@@ -573,9 +586,7 @@ impl Swept {
             places: Vec::new(),
             pages: Vec::new(),
             len: 0,
-            last: u64::MAX,
-            run: None,
-            found: Vec::new(),
+            filling: Vec::new(),
         }
     }
 
@@ -583,51 +594,73 @@ impl Swept {
         if self.len >= u32::MAX as usize {
             return Err(too_many());
         }
-        if self.len.is_multiple_of(SWEPT_RUN) {
-            if self
-                .pages
-                .last()
-                .is_none_or(|page| page.len() + SWEPT_RUN * 24 > SWEPT_PAGE)
-            {
-                self.pages.push(Vec::with_capacity(SWEPT_PAGE));
-            }
-            let page = self.pages.len() - 1;
-            self.heads.push(offset);
-            self.places
-                .push((page as u32, self.pages[page].len() as u32));
-        } else {
-            let page = self.pages.last_mut().expect("a run has a page");
-            push_varint(page, self.last - offset);
-        }
-        let page = self.pages.last_mut().expect("a run has a page");
-        page.extend_from_slice(&part.to_le_bytes());
-        push_varint(page, uses);
-        self.last = offset;
+        self.filling.push((offset, part, uses));
         self.len += 1;
+        if self.filling.len() == SWEPT_RUN {
+            self.seal();
+        }
         Ok(())
+    }
+
+    fn seal(&mut self) {
+        let Some(&(head, _, _)) = self.filling.first() else {
+            return;
+        };
+        let widest = head - self.filling.last().map_or(head, |entry| entry.0);
+        let width = (u64::BITS - widest.leading_zeros()).div_ceil(8) as usize;
+        if self
+            .pages
+            .last()
+            .is_none_or(|page| page.len() + SWEPT_RUN * 24 > SWEPT_PAGE)
+        {
+            self.pages.push(Vec::with_capacity(SWEPT_PAGE));
+        }
+        let at = self.pages.len() - 1;
+        let page = &mut self.pages[at];
+        self.heads.push(head);
+        self.places.push((at as u32, page.len() as u32));
+        page.push(width as u8);
+        for (offset, _, _) in &self.filling[1..] {
+            page.extend_from_slice(&(head - offset).to_le_bytes()[..width]);
+        }
+        for (_, part, _) in &self.filling {
+            page.extend_from_slice(&part.to_le_bytes());
+        }
+        for (_, _, uses) in &self.filling {
+            push_varint(page, *uses);
+        }
+        self.filling.clear();
     }
 
     fn runs(&self) -> usize {
         self.heads.len()
     }
 
-    fn decode(&self, run: usize, out: &mut Vec<(u64, u32, u64)>) {
-        out.clear();
+    fn run(&self, run: usize) -> (&[u8], usize, usize) {
         let count = (self.len - run * SWEPT_RUN).min(SWEPT_RUN);
         let (page, start) = self.places[run];
         let bytes = &self.pages[page as usize][start as usize..];
-        let (mut offset, mut pos) = (self.heads[run], 0);
+        (bytes, usize::from(bytes[0]), count)
+    }
+
+    fn decode(&self, run: usize, out: &mut Vec<(u64, u32, u64)>) {
+        out.clear();
+        let (bytes, width, count) = self.run(run);
+        let head = self.heads[run];
+        let parts = 1 + (count - 1) * width;
+        let mut pos = parts + 4 * count;
         for at in 0..count {
-            if at > 0 {
-                offset -= take_varint(bytes, &mut pos);
-            }
-            let part = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("four bytes"));
-            pos += 4;
+            let offset = match at {
+                0 => head,
+                _ => head - read_width(bytes, 1 + (at - 1) * width, width),
+            };
+            let part = parts + 4 * at;
+            let part = u32::from_le_bytes(bytes[part..part + 4].try_into().expect("four bytes"));
             out.push((offset, part, take_varint(bytes, &mut pos)));
         }
     }
 
-    fn position(&mut self, offset: u64, from: usize) -> Option<u32> {
+    fn position(&self, offset: u64, from: usize) -> Option<u32> {
         let heads = &self.heads;
         if heads.get(from).is_none_or(|head| *head < offset) {
             return None;
@@ -639,24 +672,79 @@ impl Swept {
         }
         let high = (low + step).min(heads.len());
         let run = low + heads[low..high].partition_point(|head| *head >= offset) - 1;
-        if self.run != Some(run) {
-            let mut found = mem::take(&mut self.found);
-            self.decode(run, &mut found);
-            self.found = found;
-            self.run = Some(run);
+        let (bytes, width, count) = self.run(run);
+        let distance = heads[run] - offset;
+        let (mut first, mut last) = (0, count);
+        while first < last {
+            let middle = (first + last) / 2;
+            let held = match middle {
+                0 => 0,
+                _ => read_width(bytes, 1 + (middle - 1) * width, width),
+            };
+            match held.cmp(&distance) {
+                std::cmp::Ordering::Less => first = middle + 1,
+                std::cmp::Ordering::Greater => last = middle,
+                std::cmp::Ordering::Equal => {
+                    return Some((self.len - 1 - (run * SWEPT_RUN + middle)) as u32);
+                }
+            }
         }
-        let within = self
-            .found
-            .binary_search_by(|(held, _, _)| offset.cmp(held))
-            .ok()?;
-        Some((self.len - 1 - (run * SWEPT_RUN + within)) as u32)
+        None
+    }
+}
+
+struct Frontier {
+    buckets: Vec<Vec<(u64, u32)>>,
+    sorted: Vec<(u64, u32)>,
+    current: BinaryHeap<(u64, u32)>,
+    shift: u32,
+    window: usize,
+}
+
+impl Frontier {
+    fn new(top: u64) -> Frontier {
+        let shift = (u64::BITS - top.leading_zeros())
+            .saturating_sub(FRONTIER_WINDOWS)
+            .max(FRONTIER_SHIFT);
+        let windows = (top >> shift) as usize + 1;
+        Frontier {
+            buckets: (0..windows).map(|_| Vec::new()).collect(),
+            sorted: Vec::new(),
+            current: BinaryHeap::new(),
+            shift,
+            window: windows,
+        }
+    }
+
+    fn push(&mut self, (offset, part): (u64, u32)) {
+        let window = (offset >> self.shift) as usize;
+        match window < self.window {
+            true => self.buckets[window].push((offset, part)),
+            false => self.current.push((offset, part)),
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        loop {
+            match (self.sorted.last(), self.current.peek()) {
+                (Some(sorted), Some(current)) if sorted >= current => return self.sorted.pop(),
+                (_, Some(_)) => return self.current.pop(),
+                (Some(_), None) => return self.sorted.pop(),
+                (None, None) => {}
+            }
+            self.window = self.buckets[..self.window]
+                .iter()
+                .rposition(|bucket| !bucket.is_empty())?;
+            self.sorted = mem::take(&mut self.buckets[self.window]);
+            self.sorted.sort_unstable();
+        }
     }
 }
 
 fn sweep(store: &Store, entries: &[Sending]) -> Result<Swept> {
     let mut commits: Vec<u64> = entries.iter().map(|sending| sending.ptr.offset).collect();
     commits.sort_unstable();
-    let mut frontier = BinaryHeap::with_capacity(2 * entries.len());
+    let mut frontier = Frontier::new(commits.last().copied().unwrap_or(0));
     for sending in entries {
         frontier.push((sending.ptr.offset, part_of(&sending.ptr.hash)));
     }
@@ -720,6 +808,7 @@ fn sweep(store: &Store, entries: &[Sending]) -> Result<Swept> {
     if let Some((at, part, uses)) = current {
         reached.push(at, part, uses)?;
     }
+    reached.seal();
     Ok(reached)
 }
 
@@ -743,48 +832,367 @@ impl Walk {
             },
             object,
             packed,
-            uses: 0,
         }))
+    }
+}
+
+struct Prepared {
+    bytes: Vec<u8>,
+    items: Vec<Item>,
+    next: usize,
+    failed: Option<Error>,
+}
+
+struct Item {
+    body: usize,
+    packed: Option<usize>,
+    tail: usize,
+}
+
+struct Encoded<'a> {
+    body: &'a [u8],
+    packed: Option<&'a [u8]>,
+    tail: &'a [u8],
+}
+
+struct Due {
+    offset: u64,
+    part: u32,
+    uses: u64,
+    run: usize,
+    position: u32,
+}
+
+impl Prepared {
+    fn new() -> Prepared {
+        Prepared {
+            bytes: Vec::new(),
+            items: Vec::new(),
+            next: 0,
+            failed: None,
+        }
+    }
+
+    fn add(&mut self, store: &Store, reached: &Swept, at: Due, held: u64) -> Result<()> {
+        let (object, packed) = store.read_packed_at(at.offset)?;
+        let hash = object.hash();
+        if part_of(&hash) != at.part {
+            return Err(Error::Corrupt(format!(
+                "hash mismatch for object at {}",
+                at.offset
+            )));
+        }
+        self.bytes.extend_from_slice(&object.body);
+        let body = self.bytes.len();
+        let packed = packed.map(|packed| {
+            self.bytes.extend_from_slice(&packed);
+            self.bytes.len()
+        });
+        push_varint(&mut self.bytes, object.links.len() as u64);
+        for link in &object.links {
+            let sent = match link.offset {
+                0 => None,
+                offset => reached.position(offset, at.run),
+            };
+            match sent {
+                Some(sent) if sent < at.position => {
+                    push_varint(
+                        &mut self.bytes,
+                        held + 1 + u64::from(at.position - 1 - sent),
+                    );
+                }
+                _ => {
+                    push_varint(&mut self.bytes, 0);
+                    self.bytes.extend_from_slice(&link.hash);
+                }
+            }
+        }
+        push_varint(&mut self.bytes, at.uses);
+        self.items.push(Item {
+            body,
+            packed,
+            tail: self.bytes.len(),
+        });
+        Ok(())
+    }
+
+    fn take(&mut self) -> Option<Encoded<'_>> {
+        let item = self.items.get(self.next)?;
+        let start = match self.next {
+            0 => 0,
+            at => self.items[at - 1].tail,
+        };
+        self.next += 1;
+        let (packed, tail) = match item.packed {
+            Some(end) => (Some(&self.bytes[item.body..end]), end),
+            None => (None, item.body),
+        };
+        Some(Encoded {
+            body: &self.bytes[start..item.body],
+            packed,
+            tail: &self.bytes[tail..item.tail],
+        })
+    }
+}
+
+fn prepare(
+    store: &Store,
+    reached: &Swept,
+    run: usize,
+    offsets: &mut Vec<(u64, u32, u64)>,
+    held: u64,
+    mut publish: impl FnMut(Prepared, bool) -> bool,
+) {
+    reached.decode(run, offsets);
+    let mut prepared = Prepared::new();
+    while let Some((offset, part, uses)) = offsets.pop() {
+        let at = Due {
+            offset,
+            part,
+            uses,
+            run,
+            position: (reached.len - 1 - (run * SWEPT_RUN + offsets.len())) as u32,
+        };
+        if let Err(error) = prepared.add(store, reached, at, held) {
+            prepared.failed = Some(error);
+            publish(prepared, true);
+            return;
+        }
+        let last = offsets.is_empty();
+        if (last || prepared.items.len() >= AHEAD_BATCH || prepared.bytes.len() >= AHEAD_CHUNK)
+            && !publish(mem::replace(&mut prepared, Prepared::new()), last)
+        {
+            return;
+        }
+    }
+}
+
+#[derive(Default)]
+struct Slot {
+    chunks: VecDeque<Prepared>,
+    done: bool,
+}
+
+#[derive(Default)]
+struct Readied {
+    claimed: usize,
+    emitting: usize,
+    slots: VecDeque<Slot>,
+    bytes: usize,
+    stopped: bool,
+    panic: Option<Box<dyn Any + Send>>,
+}
+
+#[derive(Default)]
+struct Lookahead {
+    state: Mutex<Readied>,
+    ready: Condvar,
+    room: Condvar,
+}
+
+impl Lookahead {
+    fn work(&self, store: &Store, reached: &Swept, held: u64, window: usize) {
+        let runs = reached.runs();
+        let mut offsets = Vec::new();
+        loop {
+            let claimed = {
+                let mut state = self.state.lock();
+                loop {
+                    if state.stopped || state.claimed == runs {
+                        return;
+                    }
+                    if state.claimed - state.emitting < window {
+                        break;
+                    }
+                    self.room.wait(&mut state);
+                }
+                state.claimed += 1;
+                state.slots.push_back(Slot::default());
+                state.claimed - 1
+            };
+            let mut going = true;
+            prepare(
+                store,
+                reached,
+                runs - 1 - claimed,
+                &mut offsets,
+                held,
+                |chunk, last| {
+                    let mut state = self.state.lock();
+                    while !state.stopped && claimed != state.emitting && state.bytes >= AHEAD_BYTES
+                    {
+                        self.room.wait(&mut state);
+                    }
+                    going = !state.stopped && chunk.failed.is_none();
+                    if state.stopped {
+                        return false;
+                    }
+                    state.bytes += chunk.bytes.capacity();
+                    let at = claimed - state.emitting;
+                    let slot = &mut state.slots[at];
+                    slot.chunks.push_back(chunk);
+                    slot.done = last;
+                    self.ready.notify_one();
+                    going
+                },
+            );
+            if !going {
+                return;
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.state.lock().stopped = true;
+        self.room.notify_all();
+        self.ready.notify_all();
+    }
+}
+
+struct Ahead {
+    shared: Arc<Lookahead>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl Ahead {
+    fn start(store: &Store, reached: &Arc<Swept>, held: u64) -> Option<Ahead> {
+        let threads = thread::available_parallelism()
+            .map_or(1, |cores| cores.get())
+            .min(SEND_THREADS);
+        if threads < 2 || reached.len < AHEAD_FROM {
+            return None;
+        }
+        let shared = Arc::new(Lookahead::default());
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (store, reached, worker) =
+                (store.clone(), Arc::clone(reached), Arc::clone(&shared));
+            let spawned = thread::Builder::new()
+                .name("ferro-send".into())
+                .spawn(move || {
+                    let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                        worker.work(&store, &reached, held, AHEAD_RUNS * threads)
+                    }));
+                    if let Err(payload) = ran {
+                        worker.state.lock().panic.get_or_insert(payload);
+                        worker.stop();
+                    }
+                });
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(_) => break,
+            }
+        }
+        if workers.is_empty() {
+            return None;
+        }
+        Some(Ahead { shared, workers })
+    }
+
+    fn next(&mut self, runs: usize) -> Option<Prepared> {
+        let mut state = self.shared.state.lock();
+        loop {
+            if let Some(payload) = state.panic.take() {
+                drop(state);
+                panic::resume_unwind(payload);
+            }
+            if state.emitting == runs {
+                return None;
+            }
+            if let Some(slot) = state.slots.front_mut() {
+                if let Some(chunk) = slot.chunks.pop_front() {
+                    state.bytes -= chunk.bytes.capacity();
+                    self.shared.room.notify_all();
+                    return Some(chunk);
+                }
+                if slot.done {
+                    state.slots.pop_front();
+                    state.emitting += 1;
+                    self.shared.room.notify_all();
+                    continue;
+                }
+            }
+            self.shared.ready.wait(&mut state);
+        }
+    }
+}
+
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        self.shared.stop();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
 struct Sweep {
-    reached: Swept,
+    reached: Arc<Swept>,
     run: usize,
+    held: u64,
     offsets: Vec<(u64, u32, u64)>,
+    pending: VecDeque<Prepared>,
+    chunk: Option<Prepared>,
+    ahead: Option<Ahead>,
+    started: bool,
 }
 
 impl Sweep {
-    fn new(reached: Swept) -> Sweep {
+    fn new(reached: Swept, held: u64) -> Sweep {
         Sweep {
             run: reached.runs(),
-            reached,
+            reached: Arc::new(reached),
+            held,
             offsets: Vec::new(),
+            pending: VecDeque::new(),
+            chunk: None,
+            ahead: None,
+            started: false,
         }
     }
 
-    fn next(&mut self, store: &Store) -> Result<Option<Ready>> {
-        if self.offsets.is_empty() {
-            let Some(run) = self.run.checked_sub(1) else {
-                return Ok(None);
-            };
+    fn following(&mut self, store: &Store) -> Option<Prepared> {
+        if !self.started {
+            self.started = true;
+            self.ahead = Ahead::start(store, &self.reached, self.held);
+        }
+        if let Some(ahead) = &mut self.ahead {
+            return ahead.next(self.reached.runs());
+        }
+        if self.pending.is_empty() {
+            let run = self.run.checked_sub(1)?;
             self.run = run;
-            self.reached.decode(run, &mut self.offsets);
+            let pending = &mut self.pending;
+            prepare(
+                store,
+                &self.reached,
+                run,
+                &mut self.offsets,
+                self.held,
+                |chunk, _| {
+                    pending.push_back(chunk);
+                    true
+                },
+            );
         }
-        let (offset, part, uses) = self.offsets.pop().expect("a run holds an offset");
-        let (object, packed) = store.read_packed_at(offset)?;
-        let hash = object.hash();
-        if part_of(&hash) != part {
-            return Err(Error::Corrupt(format!(
-                "hash mismatch for object at {offset}"
-            )));
+        self.pending.pop_front()
+    }
+
+    fn next(&mut self, store: &Store) -> Result<Option<Encoded<'_>>> {
+        loop {
+            match &mut self.chunk {
+                Some(chunk) if chunk.next < chunk.items.len() => break,
+                Some(chunk) if chunk.failed.is_some() => {
+                    return Err(chunk.failed.take().expect("a failed chunk holds its error"));
+                }
+                _ => {}
+            }
+            self.chunk = self.following(store);
+            if self.chunk.is_none() {
+                return Ok(None);
+            }
         }
-        Ok(Some(Ready {
-            ptr: Ptr { hash, offset },
-            object,
-            packed,
-            uses,
-        }))
+        Ok(self.chunk.as_mut().and_then(Prepared::take))
     }
 }
 
@@ -829,38 +1237,24 @@ impl Emitter {
         }
     }
 
-    fn sent_at(&mut self, link: Ptr) -> Result<Option<u32>> {
-        if link.offset == 0 {
-            return Ok(None);
-        }
-        Ok(match &mut self.order {
-            Order::Walk(walk) => walk
-                .send
-                .get(link)?
-                .filter(|place| place.state == SENT)
-                .map(|place| place.position),
-            Order::Sweep(sweep) => sweep.reached.position(link.offset, sweep.run),
-        })
-    }
-
-    fn emit(&mut self, mut ready: Ready) -> Result<()> {
-        if let Order::Walk(walk) = &mut self.order {
-            let position = self.position;
-            let place = walk.send.update(ready.ptr, |place| Place {
-                state: SENT,
-                position,
-                ..place
-            })?;
-            let place = place.ok_or_else(|| {
-                Error::Corrupt(format!("hash mismatch for object at {}", ready.ptr.offset))
-            })?;
-            ready.uses = u64::from(place.position);
-        }
+    fn emit(&mut self, ready: Ready) -> Result<()> {
+        let Order::Walk(walk) = &mut self.order else {
+            unreachable!("only a walk emits objects one at a time");
+        };
+        let position = self.position;
+        let place = walk.send.update(ready.ptr, |place| Place {
+            state: SENT,
+            position,
+            ..place
+        })?;
+        let place = place.ok_or_else(|| {
+            Error::Corrupt(format!("hash mismatch for object at {}", ready.ptr.offset))
+        })?;
         let before = self.sent;
         put_body(
             &mut self.out,
             &ready.object.body,
-            ready.packed,
+            ready.packed.as_deref(),
             &mut self.bodies,
             before,
         );
@@ -871,7 +1265,15 @@ impl Emitter {
                 self.out.extend_from_slice(&link.hash);
                 continue;
             }
-            match self.sent_at(*link)? {
+            let sent = match link.offset {
+                0 => None,
+                _ => walk
+                    .send
+                    .get(*link)?
+                    .filter(|place| place.state == SENT)
+                    .map(|place| place.position),
+            };
+            match sent {
                 Some(position) if position < self.position => {
                     let back = u64::from(self.position - 1 - position);
                     push_varint(&mut self.out, self.held as u64 + 1 + back);
@@ -882,7 +1284,7 @@ impl Emitter {
                 }
             }
         }
-        push_varint(&mut self.out, ready.uses);
+        push_varint(&mut self.out, u64::from(place.position));
         self.position += 1;
         Ok(())
     }
@@ -896,14 +1298,28 @@ impl Emitter {
             return Ok(true);
         }
         while self.out.len() < WRITE_CHUNK {
-            let ready = match &mut self.order {
-                Order::Walk(walk) => walk.next(&self.store)?,
-                Order::Sweep(sweep) => sweep.next(&self.store)?,
-            };
-            let Some(ready) = ready else {
-                break;
-            };
-            self.emit(ready)?;
+            match &mut self.order {
+                Order::Walk(walk) => {
+                    let Some(ready) = walk.next(&self.store)? else {
+                        break;
+                    };
+                    self.emit(ready)?;
+                }
+                Order::Sweep(sweep) => {
+                    let Some(encoded) = sweep.next(&self.store)? else {
+                        break;
+                    };
+                    put_body(
+                        &mut self.out,
+                        encoded.body,
+                        encoded.packed,
+                        &mut self.bodies,
+                        self.sent,
+                    );
+                    self.out.extend_from_slice(encoded.tail);
+                    self.position += 1;
+                }
+            }
         }
         self.sent += self.out.len();
         Ok(!self.out.is_empty())
@@ -1533,7 +1949,7 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         return Ok(Emitter::new(
             store,
             &header,
-            Order::Sweep(Sweep::new(Swept::new())),
+            Order::Sweep(Sweep::new(Swept::new(), 0)),
             HashMap::new(),
         ));
     };
@@ -1616,7 +2032,8 @@ fn plan(store: &Store, refs: &Refs, name: &str, have: &Marks) -> Result<Emitter>
         let reached = sweep(store, &entries)?;
         drop(entries);
         header.count = reached.len as u64;
-        let order = Order::Sweep(Sweep::new(reached));
+        let held = (header.roots.len() + header.hints.len()) as u64;
+        let order = Order::Sweep(Sweep::new(reached, held));
         return Ok(Emitter::new(store, &header, order, HashMap::new()));
     }
     let new_roots = entries
@@ -2154,9 +2571,15 @@ impl Landing<'_> {
 }
 
 struct Kept {
+    at: u64,
+    id: TypeId,
     left: u8,
     shape: Shape,
     kinds: Vec<Kind>,
+}
+
+fn kept_at(at: u64) -> u64 {
+    walked_at(at, 0)
 }
 
 enum Beneath {
@@ -2295,7 +2718,7 @@ struct Vetting<'a> {
     held_at: &'a Index,
     root_kind: &'a Kind,
     pair_roots: PairRoots,
-    kept: HashMap<u32, Vec<Kept>>,
+    kept: HashTable<Kept>,
     held: Retyped,
     beneath: Vec<Beneath>,
     spent: usize,
@@ -2418,20 +2841,29 @@ impl Vetting<'_> {
 
     fn run_above(&mut self, floor: usize) -> Result<()> {
         while self.queue.len() > floor
-            && let Some((ptr, kind, before)) = self.queue.pop()
+            && let Some((ptr, kind, mut before)) = self.queue.pop()
         {
-            let shape = match self.staging.find(ptr) {
-                Some(id) => self.sent(id, ptr.hash, &kind, before)?,
-                None => {
-                    let reference = self.anchors.find(self.held_at, &ptr.hash).ok_or_else(|| {
-                        bad("an object links to one that was neither sent nor known")
-                    })? as usize
-                        + 1;
-                    match self.held(ptr.hash, reference, &kind)? {
-                        Some(shape) => shape,
-                        None => continue,
+            let counted = before.is_none();
+            let recalled = match self.kept.is_empty() {
+                true => None,
+                false => self.recall(ptr, &kind, &mut before)?,
+            };
+            let shape = match recalled {
+                Some(shape) => shape,
+                None => match self.staging.find(ptr) {
+                    Some(id) => self.sent(id, ptr, &kind, before, counted)?,
+                    None => {
+                        let reference =
+                            self.anchors.find(self.held_at, &ptr.hash).ok_or_else(|| {
+                                bad("an object links to one that was neither sent nor known")
+                            })? as usize
+                                + 1;
+                        match self.held(ptr.hash, reference, &kind)? {
+                            Some(shape) => shape,
+                            None => continue,
+                        }
                     }
-                }
+                },
             };
             if !kind.fits(shape) {
                 return Err(bad(format!(
@@ -2443,60 +2875,61 @@ impl Vetting<'_> {
         Ok(())
     }
 
+    fn recall(
+        &mut self,
+        ptr: Ptr,
+        kind: &Kind,
+        before: &mut Option<Kind>,
+    ) -> Result<Option<Shape>> {
+        let Ok(mut found) = self.kept.find_entry(kept_at(ptr.offset), |kept| {
+            kept.at == ptr.offset && kept.id == kind.id
+        }) else {
+            return Ok(None);
+        };
+        let kept = found.get_mut();
+        if before.is_none() && kept.left != u8::MAX {
+            kept.left = kept.left.saturating_sub(1);
+        }
+        let hit = kept
+            .kinds
+            .iter()
+            .any(|seen| (seen.within)(seen, kind))
+            .then(|| {
+                (
+                    kept.shape,
+                    kept.kinds.iter().any(|seen| kind.vouched_by(seen)),
+                )
+            });
+        if let Some((shape, vouched)) = hit {
+            if kept.left == 0 {
+                found.remove();
+            }
+            if !vouched {
+                self.confirm(ptr, kind)?;
+            }
+            return Ok(Some(shape));
+        }
+        if before.is_none() {
+            *before = kept.kinds.last().cloned();
+        }
+        Ok(None)
+    }
+
     fn sent(
         &mut self,
         id: u32,
-        hash: Hash,
+        ptr: Ptr,
         kind: &Kind,
-        mut before: Option<Kind>,
+        before: Option<Kind>,
+        counted: bool,
     ) -> Result<Shape> {
         let links = self.links.get(id);
-        let pinned = links == u8::MAX || self.anchors.find(self.held_at, &hash).is_some();
-        let shared = links >= 2 || pinned;
-        let counted = before.is_none();
-        if shared
-            && let Some(checks) = self.kept.get_mut(&id)
-            && let Some(at) = checks.iter().position(|kept| kept.kinds[0].id == kind.id)
-        {
-            let kept = &mut checks[at];
-            if counted && kept.left != u8::MAX {
-                kept.left = kept.left.saturating_sub(1);
-            }
-            let hit = kept
-                .kinds
-                .iter()
-                .any(|seen| (seen.within)(seen, kind))
-                .then(|| {
-                    (
-                        kept.shape,
-                        kept.kinds.iter().any(|seen| kind.vouched_by(seen)),
-                    )
-                });
-            if let Some((shape, vouched)) = hit {
-                if kept.left == 0 {
-                    checks.swap_remove(at);
-                    if checks.is_empty() {
-                        self.kept.remove(&id);
-                    }
-                }
-                if !vouched {
-                    self.confirm(id, hash, kind)?;
-                }
-                return Ok(shape);
-            }
-            if before.is_none() {
-                before = kept.kinds.last().cloned();
-            }
-        }
-        let ptr = Ptr {
-            hash,
-            offset: self.staging.offset(id),
-        };
+        let pinned = links == u8::MAX || self.anchors.find(self.held_at, &ptr.hash).is_some();
         let object = match self.staging.open(ptr, LINKS_HELD)? {
             Opened::Whole(object) => object,
             Opened::Body(body, staged) => {
                 let shape = self.dense(id, ptr, kind, &body, &staged)?;
-                self.keep(id, kind, shape, (links, pinned, counted));
+                self.keep(ptr.offset, kind, shape, (links, pinned, counted));
                 return Ok(shape);
             }
         };
@@ -2533,13 +2966,13 @@ impl Vetting<'_> {
             }
             self.queue.push((object.links[index], child, covered));
         }
-        self.keep(id, kind, shape, (links, pinned, counted));
+        self.keep(ptr.offset, kind, shape, (links, pinned, counted));
         Ok(shape)
     }
 
     fn keep(
         &mut self,
-        id: u32,
+        at: u64,
         kind: &Kind,
         shape: Shape,
         (links, pinned, counted): (u8, bool, bool),
@@ -2552,26 +2985,33 @@ impl Vetting<'_> {
         } else {
             links - u8::from(counted)
         };
-        let checks = self.kept.entry(id).or_default();
-        match checks.iter().position(|kept| kept.kinds[0].id == kind.id) {
-            Some(at) if checks[at].left == 0 => {
-                checks.swap_remove(at);
+        match self
+            .kept
+            .find_entry(kept_at(at), |kept| kept.at == at && kept.id == kind.id)
+        {
+            Ok(found) if found.get().left == 0 => {
+                found.remove();
             }
-            Some(at) => {
-                let kinds = &mut checks[at].kinds;
+            Ok(mut found) => {
+                let kinds = &mut found.get_mut().kinds;
                 if kinds.len() >= RANGES_KEPT {
                     kinds.remove(0);
                 }
                 kinds.push(kind.clone());
             }
-            None => checks.push(Kept {
-                left,
-                shape,
-                kinds: vec![kind.clone()],
-            }),
-        }
-        if checks.is_empty() {
-            self.kept.remove(&id);
+            Err(_) => {
+                self.kept.insert_unique(
+                    kept_at(at),
+                    Kept {
+                        at,
+                        id: kind.id,
+                        left,
+                        shape,
+                        kinds: vec![kind.clone()],
+                    },
+                    |kept| kept_at(kept.at),
+                );
+            }
         }
     }
 
@@ -2618,14 +3058,10 @@ impl Vetting<'_> {
         Ok(())
     }
 
-    fn confirm(&mut self, id: u32, hash: Hash, kind: &Kind) -> Result<()> {
-        if !self.remember(hash, kind) {
+    fn confirm(&mut self, ptr: Ptr, kind: &Kind) -> Result<()> {
+        if !self.remember(ptr.hash, kind) {
             return Ok(());
         }
-        let ptr = Ptr {
-            hash,
-            offset: self.staging.offset(id),
-        };
         let checked = match self.staging.open(ptr, LINKS_HELD)? {
             Opened::Whole(object) => {
                 self.rerun(object.body.len())?;
@@ -3929,7 +4365,7 @@ fn resolve<O: Objects>(
             held_at: &held_at,
             root_kind,
             pair_roots,
-            kept: HashMap::new(),
+            kept: HashTable::new(),
             held: Retyped::default(),
             beneath: Vec::new(),
             spent: 0,

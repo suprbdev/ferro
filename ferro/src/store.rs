@@ -45,7 +45,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, Weighter};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -192,6 +192,9 @@ const READ_WORDS: usize = 64;
 const REPLAY_CHUNK: usize = 256 << 10;
 /// The room for records each staging frame of a large receive leaves, unless one record needs more.
 const STAGED_ROOM: u64 = 1 << 20;
+/// The bytes a staging reads from its file at a time to serve the reads of its records, which a
+/// check of what it sent makes mostly near one another.
+const STAGED_WINDOW: u64 = 16 << 10;
 /// How many of the objects a receive staged in the log, the last it staged, the deduplication
 /// table learns once they have passed every check.
 const STAGED_LEARNED: usize = 1 << 17;
@@ -6117,6 +6120,9 @@ pub(crate) struct Staging {
     offsets: Ascending,
     /// Scratch for hashing the objects put.
     joined: Vec<u8>,
+    /// The bytes of the file that the last read of a record written there brought in, with where
+    /// they start, which serve the records read next from within them.
+    window: Mutex<(u64, Vec<u8>)>,
 }
 
 /// Where a staging that outgrew memory writes its records.
@@ -6332,6 +6338,7 @@ impl Staging {
             recent: VecDeque::new(),
             offsets: Ascending::new(),
             joined: Vec::new(),
+            window: Mutex::new((0, Vec::new())),
         }
     }
 
@@ -6591,14 +6598,19 @@ impl Staging {
                 ptr.offset
             )));
         }
-        let bytes = match file {
+        let window = match file {
             Some(file) if held.is_empty() => {
                 let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
-                let mut bytes = vec![0u8; want];
-                file.read_exact_at(&mut bytes, ptr.offset)?;
-                Cow::Owned(bytes)
+                Some((self.read_written(file, ptr.offset, want, tail)?, want))
             }
-            _ => Cow::Borrowed(held),
+            _ => None,
+        };
+        let bytes = match &window {
+            Some((read, want)) => {
+                let skip = (ptr.offset - read.0) as usize;
+                Cow::Borrowed(&read.1[skip..skip + want])
+            }
+            None => Cow::Borrowed(held),
         };
         let mut reader = RecordReader {
             file,
@@ -6663,6 +6675,32 @@ impl Staging {
             )));
         }
         Ok(Opened::Whole(object))
+    }
+
+    /// The window of the file that holds the `want` bytes at `at`: the one of [`STAGED_WINDOW`]
+    /// bytes that the last read brought in if it holds them, or else one read anew, which ends
+    /// before `tail`, the end of what the staging has written, unless the bytes wanted pass it.
+    fn read_written(
+        &self,
+        file: &File,
+        at: u64,
+        want: usize,
+        tail: u64,
+    ) -> Result<MutexGuard<'_, (u64, Vec<u8>)>> {
+        let mut window = self.window.lock();
+        let (start, held) = &mut *window;
+        let end = at + want as u64;
+        if at < *start || end > *start + held.len() as u64 {
+            let from = at - at % STAGED_WINDOW;
+            let to = (from + STAGED_WINDOW).min(tail).max(end);
+            held.resize((to - from) as usize, 0);
+            if let Err(error) = file.read_exact_at(held, from) {
+                held.clear();
+                return Err(error.into());
+            }
+            *start = from;
+        }
+        Ok(window)
     }
 
     /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`].

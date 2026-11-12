@@ -64,7 +64,11 @@ replaced took 1.1 GB, and 2.6 s where streaming took 2.3 s in the same runs, wit
 fast. Staging the bundle in a scratch file, so that commits go on while it arrives, added about a
 seventh to a clone and nothing to its memory, and staging it in the file instead, where it
 lands, took a sixth off a 1 GB receive and wrote it once, as described under [Staging in the log,
-measured](../internals/sync-receive.md#staging-in-the-log-measured).
+measured](../internals/sync-receive.md#staging-in-the-log-measured). A first pull's bundle is read,
+hashed and encoded on up to four threads besides the caller's, once it carries 4,096 objects:
+cloning a history of 100,000 keys and 2,000 commits, 33.5 MiB, took 404 ms where it took 863, and
+building its bundle 76 ms where it took 365, as described under [A first pull of a
+history](../internals/sync.md#a-first-pull-of-a-history).
 
 A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
 it lacks and the objects their trees reach that it does not hold, so it costs what changed: three
