@@ -155,6 +155,9 @@ const WINDOW_NEAR: u64 = 64 << 10;
 /// The most bytes of frames another process placed that a catch-up keeps in memory for reads of
 /// the objects in them, and so the largest frame it keeps.
 const FOLLOWED_BYTES: usize = 4 << 20;
+/// The most bytes of frames a catch-up's first read reaches for, a quarter more than the last
+/// catch-up of its kind followed, before it has found any.
+const AHEAD_BYTES: usize = 256 << 10;
 /// What a cache entry weighs for itself, beside the object it holds.
 const ENTRY_BYTES: usize = 96;
 /// The fewest entries of the deduplication table.
@@ -779,15 +782,52 @@ struct Copied {
     start: u64,
     /// Where it ends.
     end: u64,
-    /// The frame's header, records and table, and the bytes after it that the read took too, as
-    /// many of the [`FRAME_BYTES`] and [`LEFT_PEEK`] past the frame as the file held.
-    bytes: Vec<u8>,
+    /// The bytes of the read that took the frame whole, which other frames of the same read share.
+    bytes: Arc<Vec<u8>>,
+    /// Where the frame starts in `bytes`.
+    from: usize,
 }
 
-impl Copied {
-    /// The bytes the read took past the frame's end, where the next frame's header would start.
-    fn after(&self) -> &[u8] {
-        &self.bytes[(self.end - self.start) as usize..]
+/// The bytes of one read a catch-up made from the log, which can hold several frames.
+struct Chunk {
+    /// Where the bytes start in the log.
+    start: u64,
+    /// The bytes.
+    bytes: Arc<Vec<u8>>,
+    /// Whether the read stopped short at the end of the file.
+    short: bool,
+}
+
+impl Chunk {
+    /// Reads `len` bytes of `file` from `at`, or as many as the file holds, into `spare`'s
+    /// buffer.
+    fn read(file: &File, at: u64, len: usize, spare: &mut Vec<u8>) -> Result<Chunk> {
+        let mut bytes = mem::take(spare);
+        bytes.resize(len, 0);
+        let got = read_some(file, &mut bytes, at)?;
+        bytes.truncate(got);
+        Ok(Chunk {
+            start: at,
+            bytes: Arc::new(bytes),
+            short: got < len,
+        })
+    }
+
+    /// The `len` bytes from `at`, or those up to the end of the file if the read stopped short
+    /// there, or `None` if the read did not take them.
+    fn from(&self, at: u64, len: usize) -> Option<&[u8]> {
+        let from = usize::try_from(at.checked_sub(self.start)?).ok()?;
+        let rest = self.bytes.get(from..)?;
+        match rest.get(..len) {
+            Some(bytes) => Some(bytes),
+            None if self.short => Some(rest),
+            None => None,
+        }
+    }
+
+    /// The chunk's buffer, unless a frame kept from it still holds it.
+    fn into_spare(self) -> Option<Vec<u8>> {
+        Arc::try_unwrap(self.bytes).ok()
     }
 }
 
@@ -814,6 +854,13 @@ impl Kept {
         })
     }
 
+    /// The largest buffer of a read the frames came from, once nothing else holds it.
+    fn into_spare(self) -> Option<Vec<u8>> {
+        let spare = self.frames.into_iter();
+        let spare = spare.filter_map(|frame| Arc::try_unwrap(frame.bytes).ok());
+        spare.max_by_key(Vec::capacity)
+    }
+
     /// The bytes held from `offset` to the end of its frame or to `tail`, whichever comes first,
     /// or none if no frame held holds `offset`.
     fn from(&self, offset: u64, tail: u64) -> &[u8] {
@@ -828,7 +875,8 @@ impl Kept {
         if offset >= end {
             return &[];
         }
-        &frame.bytes[(offset - frame.start) as usize..(end - frame.start) as usize]
+        let from = frame.from + (offset - frame.start) as usize;
+        &frame.bytes[from..frame.from + (end - frame.start) as usize]
     }
 }
 
@@ -2312,6 +2360,21 @@ struct Cursor {
     reserve: u64,
     /// Where the staging frames this writer placed last begin, while no other frame follows them.
     staged_from: Option<u64>,
+    /// How many bytes of frames the catch-ups followed lately, without the placement lock and
+    /// under it, which sizes the first read of the next one.
+    ahead: [usize; 2],
+    /// A buffer the frames of an earlier catch-up were read into, for the next one to read into.
+    spare: Vec<u8>,
+}
+
+impl Cursor {
+    /// Keeps `spare` for the next catch-up to read into, unless it is larger than
+    /// [`SCRATCH_KEEP`].
+    fn keep_spare(&mut self, spare: Vec<u8>) {
+        if spare.capacity() <= SCRATCH_KEEP {
+            self.spare = spare;
+        }
+    }
 }
 
 /// The newest frame a superblock names, and the anchor, the newest frame known to be durable.
@@ -2881,6 +2944,8 @@ impl Store {
                     reserved: sb.log_end,
                     reserve: 0,
                     staged_from: None,
+                    ahead: [0; 2],
+                    spare: Vec::new(),
                 }),
                 slot: AtomicU64::new(slot),
                 marks: Mutex::new(Marks {
@@ -2952,6 +3017,8 @@ impl Store {
                     reserved: placed,
                     reserve: 0,
                     staged_from: None,
+                    ahead: [0; 2],
+                    spare: Vec::new(),
                 }),
                 slot: AtomicU64::new(inner.slot.load(Ordering::Acquire)),
                 marks: Mutex::new(marks),
@@ -3999,15 +4066,27 @@ impl Store {
         let mut len = None;
         let mut copied: VecDeque<Copied> = VecDeque::new();
         let mut held = 0;
+        let ahead = cursor.ahead[usize::from(holds)];
+        let want = (ahead + ahead / 4).min(AHEAD_BYTES) + FRAME_BYTES + LEFT_PEEK;
+        let mut chunk: Option<Chunk> = None;
         let left = loop {
             let mut peek = [0u8; FRAME_BYTES + LEFT_PEEK];
-            let got = match copied.back().filter(|last| last.end == at.log_end) {
-                Some(last) => {
-                    let after = last.after();
-                    peek[..after.len()].copy_from_slice(after);
-                    after.len()
+            let found = chunk
+                .as_ref()
+                .and_then(|chunk| chunk.from(at.log_end, peek.len()));
+            let got = match found {
+                Some(found) => {
+                    peek[..found.len()].copy_from_slice(found);
+                    found.len()
                 }
-                None => read_some(&inner.file, &mut peek, at.log_end)?,
+                None if want <= peek.len() => read_some(&inner.file, &mut peek, at.log_end)?,
+                None => {
+                    let read = Chunk::read(&inner.file, at.log_end, want, &mut cursor.spare)?;
+                    let read = chunk.insert(read);
+                    let found = read.from(at.log_end, peek.len()).unwrap_or_default();
+                    peek[..found.len()].copy_from_slice(found);
+                    found.len()
+                }
             };
             let written = peek[..got].iter().any(|byte| *byte != 0);
             let Some(header) = peek
@@ -4034,10 +4113,21 @@ impl Store {
                 let whole = frame.log_end - at.log_end;
                 if whole <= FOLLOWED_BYTES as u64 {
                     let whole = whole as usize;
-                    let mut bytes = vec![0u8; whole + peek.len()];
-                    bytes[..got].copy_from_slice(&peek[..got]);
-                    let read = read_some(&inner.file, &mut bytes[got..], at.log_end + got as u64)?;
-                    bytes.truncate(got + read);
+                    let need = whole + peek.len();
+                    let taken = chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.from(at.log_end, need))
+                        .is_some_and(|bytes| bytes.len() >= whole);
+                    if !taken {
+                        let last = chunk.as_ref().map_or(0, |chunk| chunk.bytes.len());
+                        let len = (2 * last).max(want).min(FOLLOWED_BYTES).max(need);
+                        let read = Chunk::read(&inner.file, at.log_end, len, &mut cursor.spare)?;
+                        if let Some(spare) = chunk.replace(read).and_then(Chunk::into_spare) {
+                            cursor.keep_spare(spare);
+                        }
+                    }
+                    let read = chunk.as_ref().expect("a chunk was read");
+                    let bytes = read.from(at.log_end, need).unwrap_or_default();
                     if bytes.len() >= whole && whole_in(header, &bytes[FRAME_BYTES..whole], records)
                     {
                         if frame.head.is_none() {
@@ -4052,7 +4142,8 @@ impl Store {
                         copied.push_back(Copied {
                             start: at.log_end,
                             end: frame.log_end,
-                            bytes,
+                            bytes: read.bytes.clone(),
+                            from: (at.log_end - read.start) as usize,
                         });
                         at = frame;
                         last = Some(frame);
@@ -4074,6 +4165,14 @@ impl Store {
                 Found::Whole(_) => break false,
             }
         };
+        let ahead = &mut cursor.ahead[usize::from(holds)];
+        *ahead = match (at.log_end - start.log_end) as usize {
+            0 => *ahead / 2,
+            followed => followed,
+        };
+        if let Some(spare) = chunk.and_then(Chunk::into_spare) {
+            cursor.keep_spare(spare);
+        }
         if upto != u64::MAX && at.seq < upto {
             return Err(Error::Corrupt(format!(
                 "frame {} at {} does not check, inside the log the newest superblock names to \
@@ -4102,7 +4201,11 @@ impl Store {
             return Ok(Followed::Still);
         };
         if let Some(kept) = Kept::new(copied) {
-            inner.followed.store(Some(Arc::new(kept)));
+            let old = inner.followed.swap(Some(Arc::new(kept)));
+            let spare = old.and_then(|old| Arc::try_unwrap(old).ok());
+            if let Some(spare) = spare.and_then(Kept::into_spare) {
+                cursor.keep_spare(spare);
+            }
         }
         inner.written.fetch_max(last.log_end, Ordering::AcqRel);
         Ok(Followed::Moved(Frame {
@@ -7169,7 +7272,8 @@ mod tests {
         let frame = |start: u64, end: u64| Copied {
             start,
             end,
-            bytes: (start..end + LEFT_PEEK as u64).map(|at| at as u8).collect(),
+            bytes: Arc::new((start..end + LEFT_PEEK as u64).map(|at| at as u8).collect()),
+            from: 0,
         };
         let frames = VecDeque::from([frame(100, 150), frame(150, 160), frame(200, 260)]);
         let kept = Kept::new(frames).unwrap();
@@ -7238,6 +7342,50 @@ mod tests {
             Err(Error::Corrupt(_))
         ));
         assert_eq!(follower.read_object(second).unwrap().body, noise(2, 600));
+        writer.close();
+        follower.close();
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_catch_up_keeps_every_frame_it_follows_however_many_land_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ahead.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            shared: true,
+            ..StoreOptions::default()
+        };
+        let (writer, _) = Store::open(&path, options.clone()).unwrap();
+        let (follower, _) = Store::open(&path, options).unwrap();
+        let damage = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut seed = 0;
+        for (frames, len) in [(3, 900), (1, 300), (0, 0), (9, 5000), (2, 70_000), (6, 40)] {
+            let mut written = Vec::new();
+            for _ in 0..frames {
+                seed += 1;
+                let object = Object {
+                    body: noise(seed, len),
+                    links: Vec::new(),
+                };
+                let mut txn = writer.begin().unwrap();
+                let ptr = txn.put_ref(&object, object.hash()).unwrap();
+                txn.commit(ptr).unwrap();
+                written.push((seed, ptr));
+            }
+            match follower.follow(false, u64::MAX).unwrap() {
+                Followed::Moved(frame) => follower.advance(frame),
+                Followed::Still => assert_eq!(frames, 0),
+                Followed::Retired => panic!("the file was not replaced"),
+            }
+            for (_, ptr) in &written {
+                damage.write_all_at(&[0xff; 8], ptr.offset + 8).unwrap();
+            }
+            for (seed, ptr) in written {
+                assert_eq!(follower.read_object(ptr).unwrap().body, noise(seed, len));
+                assert!(matches!(writer.read_object(ptr), Err(Error::Corrupt(_))));
+            }
+        }
         writer.close();
         follower.close();
     }

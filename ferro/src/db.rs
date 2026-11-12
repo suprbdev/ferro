@@ -673,6 +673,15 @@ impl<T> Lane<'_, T> {
             store.unlock_lane(self.branch.lane_at);
         }
     }
+
+    fn landed(&mut self) {
+        if let Some(slot) = self.guard.as_mut()
+            && slot.group.is_none()
+            && let Some(store) = slot.crossed.take()
+        {
+            store.unlock_lane(self.branch.lane_at);
+        }
+    }
 }
 
 impl<T> Deref for Lane<'_, T> {
@@ -2861,6 +2870,7 @@ impl<T: Data> Shared<T> {
         change: Change<'_, T>,
         mut drafted: Draft<T>,
         framed: u64,
+        landed: impl FnOnce(),
         notices: &mut Vec<Notice<T>>,
     ) -> Result<(u64, u64)> {
         drafted.txn.look_ahead();
@@ -2879,6 +2889,7 @@ impl<T: Data> Shared<T> {
             drop(tip);
             self.land(branch, state, framed, landing)?;
         }
+        landed();
         settling.finish(&store);
         Ok((version, time_ms))
     }
@@ -2989,7 +3000,8 @@ impl<T: Data> Shared<T> {
             };
             let drafted = self.draft(&mut change)?;
             let mut notices = Vec::new();
-            self.place_change((branch, &state), change, drafted, framed, &mut notices)
+            let branch = (&**branch, &state);
+            self.place_change(branch, change, drafted, framed, || {}, &mut notices)
         }));
         self.costs.sealed(started.elapsed());
         let ticket = branch.framed.load(Ordering::Acquire);
@@ -4753,9 +4765,9 @@ impl<T: Data> Db<T> {
             };
             let drafted = self.shared.draft(&mut change)?;
             let branch = (&*self.branch, &state);
-            let placed = self
-                .shared
-                .place_change(branch, change, drafted, framed, &mut notices);
+            let landed = || lane.landed();
+            let shared = &self.shared;
+            let placed = shared.place_change(branch, change, drafted, framed, landed, &mut notices);
             let (version, time_ms) = placed?;
             Ok((value, version, time_ms))
         });

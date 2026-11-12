@@ -650,7 +650,11 @@ the process stayed stopped, and now it finishes while the process is still stopp
    processes placed on other branches while it drafted. If any did, the draft moves, as it does when
    another branch's frame lands first within a process. It checks that its branch's head is the one
    it started from, then places the frame and writes it before releasing the placement lock.
-4. The leader of the sync takes the superblock lock, syncs and writes a superblock, as described
+4. With the frame written and its branch's state moved to it, the writer lets the branch lock go,
+   and only then registers the objects it wrote for deduplication and puts the nodes in its cache,
+   still holding its lane. Another process takes the branch meanwhile, and a thread of the same
+   process still waits for the lane, so it finds those nodes cached as before.
+5. The leader of the sync takes the superblock lock, syncs and writes a superblock, as described
    under [Superblocks and group commit](#superblocks-and-group-commit).
 
 A closure never runs against a head another process has since moved, so it never runs again. The
@@ -668,25 +672,29 @@ A process knows where the log ended when it last looked, `placed`. To catch up i
 header there. If it is a frame with the next sequence number, it reads the whole frame and checks
 it, then the next, until it finds one that is not. It reads a header's 68 bytes and the 16 after
 them, where the first record of a frame that spilled would start, so a process that is alone reads
-84 bytes, a reservation of zeroes or the end of the file, each time it looks. A frame of up to 4 MiB
-is read in one read together with the 84 bytes after it, which hold the next header, and checked
-in memory, so following _n_ frames takes _n_ + 1 reads; a larger frame, or one that does not check
-in memory, is read again from the file and judged there, as below. In this mode a frame is written
-before the placement lock is released, so a frame that a live process placed is whole whenever
-another can take that lock, and one that a process left half-written when it died fails its check
-and ends the log there. A process killed in a write stops at a page boundary, so the rest
-of its frame keeps its older bytes and reads as torn. A catch-up under the placement lock that finds
-anything but zeroes in those 84 bytes past the last whole frame, part of a dead process's frame or
-the records of one that spilled before its header was written, truncates the file there and syncs
-before the next frame is written in its place, as recovery at open does, so that a power cut cannot
-leave a sector of the next frame holding the dead one's bytes, which can be a bit from it. It does
-the same when a stale cycle marker, one the path still names, has anything but zeroes in the 16
-bytes past its 68. A frame that reached the disk whole and was damaged since, one bit from checking
-as [Torn and damaged frames](storage.md#torn-and-damaged-frames) describes, fails a catch-up under
-the placement lock with `Error::Corrupt`, so no commit is written over it. A catch-up without that
-lock, on taking a branch lock, at `refresh` or before a cycle's pass, may meet a frame another
-process is still writing, so it takes any frame that does not check for the end of the log, and the
-catch-up under the placement lock before the next frame is placed judges it.
+84 bytes, a reservation of zeroes or the end of the file, each time it looks. A process that finds
+frames reads more at once: its first read takes as many bytes as the last catch-up of the same kind,
+under the placement lock or not, followed, and a quarter more, up to 256 KiB, a guess that halves
+after each catch-up that finds nothing. A frame of up to 4 MiB is checked in memory within a read
+that holds it whole together with the 84 bytes after it, which hold the next header, and a frame
+that runs past the read is read again with it, in a read twice as long as the last, so following
+_n_ frames that the guess covers takes one read where it took _n_ + 1; a larger frame, or one that
+does not check in memory, is read again from the file and judged there, as below. In this mode a
+frame is written before the placement lock is released, so a frame that a live process placed is
+whole whenever another can take that lock, and one that a process left half-written when it died
+fails its check and ends the log there. A process killed in a write stops at a page boundary, so
+the rest of its frame keeps its older bytes and reads as torn. A catch-up under the placement lock
+that finds anything but zeroes in those 84 bytes past the last whole frame, part of a dead
+process's frame or the records of one that spilled before its header was written, truncates the
+file there and syncs before the next frame is written in its place, as recovery at open does, so
+that a power cut cannot leave a sector of the next frame holding the dead one's bytes, which can be
+a bit from it. It does the same when a stale cycle marker, one the path still names, has anything
+but zeroes in the 16 bytes past its 68. A frame that reached the disk whole and was damaged since,
+one bit from checking as [Torn and damaged frames](storage.md#torn-and-damaged-frames) describes,
+fails a catch-up under the placement lock with `Error::Corrupt`, so no commit is written over it. A
+catch-up without that lock, on taking a branch lock, at `refresh` or before a cycle's pass, may meet
+a frame another process is still writing, so it takes any frame that does not check for the end of
+the log, and the catch-up under the placement lock before the next frame is placed judges it.
 
 Nothing at or below the newest superblock is ever truncated or written over. A catch-up under the
 placement lock starts from this process's `placed`, which can lie many frames behind the newest
@@ -740,7 +748,10 @@ object against the pointer it came from, as a read from the file does. The bytes
 catch-up checked, and a frame that checks stays as it is in the file for as long as the file is in
 use, since nothing is written below the end of the log a live process has placed and only bytes past
 the last whole frame are ever truncated. A damaged copy on the disk is found by the next read from
-the file, once a later catch-up has replaced the bytes held.
+the file, once a later catch-up has replaced the bytes held. The frames of one read share its
+buffer, and a catch-up that replaces them keeps the buffer once no reader holds it, for the next
+catch-up to read into, up to 1 MiB, so a writer that catches up on every turn neither allocates nor
+zeroes memory for it.
 
 The first form kept them behind a mutex that every read of a shared writer took, found a read's
 frame by a scan, and let the oldest frame go by removing it from the front of a `Vec`, which made a
@@ -1434,6 +1445,42 @@ overlap. Six more Fsync rounds at eight processes spread from about 500 to 10,50
 in every build as the disk stalled, and the medians, 9,774, 9,450 and 9,422 on one branch and
 9,381, 9,659 and 9,680 on branches of their own for `main`, the first change and both, moved in no
 one direction.
+
+Two more changes came of a profile of the same tool on 2026-11-12, taken by a sampler built into
+probes kept out of the tree. At eight processes on one branch a turn spent about 6 µs following the
+seven frames before it: eight reads, one for the first header and one for each frame with the
+header after it, each into a buffer allocated and zeroed for it, which alone took about 1.3 µs a
+turn, much of it page faults as the heap grew and shrank. A catch-up now reads the frames at once,
+into the buffer of the frames it let go before, as [Catching up](#catching-up) describes. And a
+writer held its branch lock while it put the nodes it wrote in its cache, 3 to 4 µs a commit that
+no other process waits for, which it now does once it has let the lock go, as [A
+commit](#a-commit) describes. In a probe that commits single keys through eight shared handles of
+one file in turn from one thread, so that each commit follows seven frames and waits for nothing,
+user-space instructions fell from 260,260 a commit to 254,630, and with one handle they went from
+125,660 to 125,744. At eight processes on one branch each process made 8.6 reads a commit where it
+made 15.3.
+
+Other work kept the machine's 32 cores busy, at load averages from 12 to 60, so each round ran the
+build before the changes and the build with them at the same time, and the time each process held
+its branch lock came from timers around the kernel lock in a build kept for the measurement. Median
+of eight rounds on one branch, five on branches of their own and six for one writer, the ratio the
+median of each round's ratio, commits a second and µs the branch lock was held a commit:
+
+| Branches | Writers | Processes, before | After | Ratio | Held, before | After | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one | 1 | 37,318 | 37,666 | 1.001 | 23.2 | 19.4 | 0.846 |
+| one | 2 | 17,550 | 18,528 | 1.047 | 52.0 | 47.7 | 0.943 |
+| one | 8 | 11,486 | 12,218 | 1.027 | 80.5 | 74.0 | 0.921 |
+| own | 2 | 31,973 | 32,391 | 1.022 | 46.3 | 44.7 | 0.874 |
+| own | 4 | 41,389 | 41,207 | 1.009 | 56.5 | 56.5 | 0.904 |
+| own | 8 | 20,978 | 26,967 | 1.121 | 187.1 | 182.9 | 0.868 |
+
+Threads of one process, whose lane still holds the branch while they cache, moved by at most 2% at
+the median ratio, from 21,494 and 19,340 commits a second to 21,871 and 19,184 at two and eight on
+one branch, and from 57,497 to 62,987 at four on branches of their own. An earlier run the same
+day, against the tree before the frame that stores version 0 went in, gave ratios of 1.065 and
+1.037 in commits a second and 0.930 and 0.939 in time held at two and eight processes on one
+branch.
 
 ## Measured and left out
 
