@@ -653,7 +653,12 @@ the process stayed stopped, and now it finishes while the process is still stopp
 4. With the frame written and its branch's state moved to it, the writer lets the branch lock go,
    and only then registers the objects it wrote for deduplication and puts the nodes in its cache,
    still holding its lane. Another process takes the branch meanwhile, and a thread of the same
-   process still waits for the lane, so it finds those nodes cached as before.
+   process still waits for the lane, so it finds those nodes cached as before. Another process can
+   then also take every branch lock and run a cycle that replaces the file, and a thread of this
+   one can follow it and close the old store, so the writer caches nothing in a store that is
+   closed, and clears the cache again if the close came while it cached, as every read that
+   caches does: a node that holds a nested map holds its store, and would keep the old file open
+   for as long as the process runs.
 5. The leader of the sync takes the superblock lock, syncs and writes a superblock, as described
    under [Superblocks and group commit](#superblocks-and-group-commit).
 
@@ -675,8 +680,8 @@ them, where the first record of a frame that spilled would start, so a process t
 84 bytes, a reservation of zeroes or the end of the file, each time it looks. A process that finds
 frames reads more at once: its first read takes as many bytes as the last catch-up of the same kind,
 under the placement lock or not, followed, and a quarter more, up to 256 KiB, a guess that halves
-after each catch-up that finds nothing. A frame of up to 4 MiB is checked in memory within a read
-that holds it whole together with the 84 bytes after it, which hold the next header, and a frame
+after each catch-up that finds nothing. A frame that fits in 4 MiB together with the 84 bytes after
+it, which hold the next header, is checked in memory within a read that holds both, and a frame
 that runs past the read is read again with it, in a read twice as long as the last, so following
 _n_ frames that the guess covers takes one read where it took _n_ + 1; a larger frame, or one that
 does not check in memory, is read again from the file and judged there, as below. In this mode a
@@ -737,10 +742,11 @@ states a catch-up replaces, and those of a branch it retires, go into notices it
 it has let `tip` and its lanes go, so a `Drop` among them runs outside the locks. A catch-up that
 finds nothing records nothing, so a process alone pays nothing for either.
 
-The bytes of the frames a catch-up followed and checked in memory, up to 4 MiB of them, stay in
-memory until a later catch-up keeps the frames it follows, a catch-up truncates the file or the
-store closes, and a read of an object in them takes its record from there rather than from the file:
-the steps, the new root and log entry of each branch that moved, and the nodes of those frames that
+The bytes of the frames a catch-up followed and checked in memory stay in memory, in the buffers of
+the reads that took them, until a later catch-up keeps the frames it follows, a catch-up truncates
+the file or the store closes. Each buffer counts whole towards the 4 MiB they may take, read past
+the frames or not, and the oldest frames go first when they would take more. While they stay, a
+read of an object in them takes its record from there rather than from the file: the steps, the new root and log entry of each branch that moved, and the nodes of those frames that
 the next closure reads back. A read loads the frames through an `ArcSwapOption`, so reads on many
 threads take no lock and change no shared count, tests its offset against where the first frame
 starts and the last ends, and finds its frame by a binary search. Every such read still hashes the

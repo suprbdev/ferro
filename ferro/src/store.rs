@@ -152,8 +152,9 @@ const WINDOW_BEHIND: u64 = 4 << 10;
 const WINDOW_AHEAD: u64 = 4 << 10;
 /// How close to the start of a streaming [`Window`] a read must land for it to read wider.
 const WINDOW_NEAR: u64 = 64 << 10;
-/// The most bytes of frames another process placed that a catch-up keeps in memory for reads of
-/// the objects in them, and so the largest frame it keeps.
+/// The most bytes a catch-up keeps in memory of the frames another process placed, for reads of
+/// the objects in them, counting the whole buffer of each read the frames came from, and so the
+/// largest frame it keeps together with the bytes read past it.
 const FOLLOWED_BYTES: usize = 4 << 20;
 /// The most bytes of frames a catch-up's first read reaches for, a quarter more than the last
 /// catch-up of its kind followed, before it has found any.
@@ -804,9 +805,10 @@ struct Chunk {
 
 impl Chunk {
     /// Reads `len` bytes of `file` from `at`, or as many as the file holds, into `spare`'s
-    /// buffer.
+    /// buffer, grown to no more than `len` if it is smaller.
     fn read(file: &File, at: u64, len: usize, spare: &mut Vec<u8>) -> Result<Chunk> {
         let mut bytes = mem::take(spare);
+        bytes.reserve_exact(len.saturating_sub(bytes.len()));
         bytes.resize(len, 0);
         let got = read_some(file, &mut bytes, at)?;
         bytes.truncate(got);
@@ -4114,9 +4116,9 @@ impl Store {
                 && let Some((frame, records)) = shape(&at, header, u64::MAX)
             {
                 let whole = frame.log_end - at.log_end;
-                if whole <= FOLLOWED_BYTES as u64 {
-                    let whole = whole as usize;
-                    let need = whole + peek.len();
+                let need = whole.saturating_add(peek.len() as u64);
+                if need <= FOLLOWED_BYTES as u64 {
+                    let (whole, need) = (whole as usize, need as usize);
                     let taken = chunk
                         .as_ref()
                         .and_then(|chunk| chunk.from(at.log_end, need))
@@ -4136,11 +4138,11 @@ impl Store {
                         if frame.head.is_none() {
                             break false;
                         }
-                        held += whole;
-                        while held > FOLLOWED_BYTES
-                            && let Some(oldest) = copied.pop_front()
-                        {
-                            held -= (oldest.end - oldest.start) as usize;
+                        let shares = copied
+                            .back()
+                            .is_some_and(|newest| Arc::ptr_eq(&newest.bytes, &read.bytes));
+                        if !shares {
+                            held += read.bytes.capacity();
                         }
                         copied.push_back(Copied {
                             start: at.log_end,
@@ -4148,6 +4150,14 @@ impl Store {
                             bytes: read.bytes.clone(),
                             from: (at.log_end - read.start) as usize,
                         });
+                        while held > FOLLOWED_BYTES
+                            && let Some(oldest) = copied.pop_front()
+                        {
+                            let next = copied.front();
+                            if next.is_none_or(|next| !Arc::ptr_eq(&next.bytes, &oldest.bytes)) {
+                                held -= oldest.bytes.capacity();
+                            }
+                        }
                         at = frame;
                         last = Some(frame);
                         continue;
@@ -5116,28 +5126,49 @@ impl Settling {
     /// Registers the objects written for deduplication and puts the cached copies in the cache,
     /// moving each node of a moved draft with its records; a copy that cannot be moved is left
     /// out.
+    ///
+    /// A store that is closed takes no copies, and one that a close reaches meanwhile has its
+    /// cache cleared again, as [`Store::admit`] does: the writer has let its branch lock go, so a
+    /// cycle in another process may have replaced the file and this process followed it, and a
+    /// node that holds a nested map would keep the closed store and its file open from its cache.
     pub(crate) fn finish(self, store: &Store) {
-        let cache = &store.inner.cache;
-        for (hash, offset) in self.seen {
-            store.inner.dedupe.insert(hash, offset);
+        let Settling {
+            moves,
+            remembered,
+            seen,
+        } = self;
+        let inner = &store.inner;
+        for (hash, offset) in seen {
+            inner.dedupe.insert(hash, offset);
         }
-        let Some(moves) = &self.moves else {
-            for (hash, entry, _) in self.remembered {
-                cache.insert(hash, entry);
-            }
+        if inner.closed.load(Ordering::SeqCst) {
             return;
-        };
-        let mut moved = Moved::new();
-        for (hash, entry, relocate) in self.remembered {
-            let (Some((relocate, links)), Entry::Node { node: old, .. }) = (relocate, &entry.0)
-            else {
-                continue;
-            };
-            let Some(value) = relocate(old, links, moves, &moved) else {
-                continue;
-            };
-            moved.insert(old.as_ptr().addr(), value.clone());
-            cache.insert(hash, CacheEntry::node(value, entry.weight()));
+        }
+        let cache = &inner.cache;
+        match &moves {
+            None => {
+                for (hash, entry, _) in remembered {
+                    cache.insert(hash, entry);
+                }
+            }
+            Some(moves) => {
+                let mut moved = Moved::new();
+                for (hash, entry, relocate) in remembered {
+                    let (Some((relocate, links)), Entry::Node { node: old, .. }) =
+                        (relocate, &entry.0)
+                    else {
+                        continue;
+                    };
+                    let Some(value) = relocate(old, links, moves, &moved) else {
+                        continue;
+                    };
+                    moved.insert(old.as_ptr().addr(), value.clone());
+                    cache.insert(hash, CacheEntry::node(value, entry.weight()));
+                }
+            }
+        }
+        if inner.closed.load(Ordering::SeqCst) {
+            empty(cache);
         }
     }
 }
@@ -7619,6 +7650,48 @@ mod tests {
                 assert!(matches!(writer.read_object(ptr), Err(Error::Corrupt(_))));
             }
         }
+        writer.close();
+        follower.close();
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_long_catch_up_keeps_no_more_buffers_than_its_bound_and_keeps_the_newest_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bound.ferro");
+        let options = StoreOptions {
+            durability: Durability::Buffered,
+            shared: true,
+            ..StoreOptions::default()
+        };
+        let (writer, _) = Store::open(&path, options.clone()).unwrap();
+        let (follower, _) = Store::open(&path, options).unwrap();
+        let damage = OpenOptions::new().write(true).open(&path).unwrap();
+        let len = 100_000;
+        let mut written = Vec::new();
+        for seed in 0..60 {
+            let object = Object {
+                body: noise(seed, len),
+                links: Vec::new(),
+            };
+            let mut txn = writer.begin().unwrap();
+            let ptr = txn.put_ref(&object, object.hash()).unwrap();
+            txn.commit(ptr).unwrap();
+            written.push((seed, ptr));
+        }
+        let Followed::Moved(frame) = follower.follow(false, u64::MAX).unwrap() else {
+            panic!("the follower found no frames");
+        };
+        follower.advance(frame);
+        let kept = follower.inner.followed.load_full().unwrap();
+        let mut buffers: Vec<&Arc<Vec<u8>>> =
+            kept.frames.iter().map(|frame| &frame.bytes).collect();
+        buffers.dedup_by(|one, other| Arc::ptr_eq(one, other));
+        let held: usize = buffers.iter().map(|bytes| bytes.capacity()).sum();
+        assert!(held <= FOLLOWED_BYTES, "the frames kept hold {held} bytes");
+        let (seed, newest) = *written.last().unwrap();
+        damage.write_all_at(&[0xff; 8], newest.offset + 8).unwrap();
+        assert_eq!(follower.read_object(newest).unwrap().body, noise(seed, len));
         writer.close();
         follower.close();
     }
