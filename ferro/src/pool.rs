@@ -311,25 +311,34 @@ impl Latch {
 mod tests {
     use std::collections::HashSet;
     use std::thread::{self, ThreadId};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
     #[test]
     fn every_thread_of_a_pool_runs_work_and_no_more_than_threads_allows() {
         let caller = thread::current().id();
+        let expected = workers().clamp(1, THREADS);
         let ran: Mutex<HashSet<ThreadId>> = Mutex::new(HashSet::new());
         scope(|pool| {
             for _ in 0..64 {
                 let ran = &ran;
                 pool.queue(job(move |_| {
                     ran.lock().insert(thread::current().id());
-                    thread::sleep(Duration::from_millis(20));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline {
+                        let seen = ran.lock();
+                        if seen.len() - usize::from(seen.contains(&caller)) >= expected {
+                            break;
+                        }
+                        drop(seen);
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }));
             }
         });
         let mut ran = ran.into_inner();
         ran.remove(&caller);
-        assert_eq!(ran.len(), workers().clamp(1, THREADS));
+        assert_eq!(ran.len(), expected);
     }
 }
