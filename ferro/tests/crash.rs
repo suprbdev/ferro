@@ -712,9 +712,10 @@ fn corrupt_superblocks_fall_back_or_report() {
     let last = built.lens.len() - 1;
     let newest = Built::newest_slot(last);
     let older = Built::newest_slot(last - 1);
+    let unsettled = built.image(last, built.lens[last]);
     for byte in 0..SUPER {
         for bit in [0x01u8, 0x80] {
-            let mut image = built.bytes.clone();
+            let mut image = unsettled.clone();
             image[newest + byte] ^= bit;
             fs::write(&path, &image).unwrap();
             let db = fast().read_only(true).open::<Root>(&path).unwrap();
@@ -732,14 +733,14 @@ fn corrupt_superblocks_fall_back_or_report() {
                 check_at_version(&opened.unwrap(), &built, last - 1);
             }
 
-            let mut image = built.bytes.clone();
+            let mut image = unsettled.clone();
             image[older + byte] ^= bit;
             fs::write(&path, &image).unwrap();
             let db = fast().read_only(true).open::<Root>(&path).unwrap();
             check_at_version(&db, &built, last);
             drop(db);
 
-            let mut image = built.bytes.clone();
+            let mut image = unsettled.clone();
             image[newest + byte] ^= bit;
             image[older + byte] ^= bit;
             fs::write(&path, &image).unwrap();
@@ -748,7 +749,7 @@ fn corrupt_superblocks_fall_back_or_report() {
         }
     }
     for (magic, check) in [(0, SLOT + SUPER - 1), (SLOT, SUPER - 1)] {
-        let mut image = built.bytes.clone();
+        let mut image = unsettled.clone();
         image[magic] ^= 0x01;
         image[check] ^= 0x01;
         fs::write(&path, &image).unwrap();
@@ -756,7 +757,7 @@ fn corrupt_superblocks_fall_back_or_report() {
         assert_eq!(fs::read(&path).unwrap(), image);
     }
     for byte in [SUPER, SUPER + 1, SLOT - 1, SLOT + SUPER, 2 * SLOT - 1] {
-        let mut image = built.bytes.clone();
+        let mut image = unsettled.clone();
         image[byte] ^= 0xFF;
         fs::write(&path, &image).unwrap();
         let db = fast().open::<Root>(&path).unwrap();

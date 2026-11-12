@@ -837,6 +837,9 @@ Tests are described next to what they test:
   gate](processes.md#the-gate).
 - The nodes a commit reads from the file to change, which stay out of the cache: [Nodes a commit
   changes](read-path.md#nodes-a-commit-changes).
+- Superblocks held half written beside a read-only open and a `refresh` held up between the two
+  slots, and beside a closing writer, `superblock_fault.rs`: [Reading the
+  slots](storage.md#reading-the-slots).
 - Followers of a read-only handle and a shared writer, across cycles, a removed file and damaged
   superblocks, and the end of their thread, `ferro/tests/follow.rs`, and a poisoned follower and a
   drop beside another handle's sync, `follow_fault.rs`: [Tests of

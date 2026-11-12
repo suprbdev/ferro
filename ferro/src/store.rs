@@ -711,26 +711,64 @@ impl Super {
     }
 }
 
-/// Reads both superblock slots of a file `len` bytes long, and returns the valid superblock with
-/// the highest sequence number, then anchor, and the slot it is in.
+/// The bytes of both superblock slots as one read found them, `None` for a slot past the end of
+/// the file.
+type Slots = [Option<[u8; SUPER_BYTES]>; 2];
+
+/// Reads both superblock slots of a file `len` bytes long, one at a time, and returns the valid
+/// superblock with the highest sequence number, then anchor, and the slot it is in, reading them
+/// again while one does not check, as [`settled_supers`] describes.
 fn read_supers(file: &File, len: u64) -> Result<Option<(Super, u64)>> {
-    let mut best: Option<(Super, u64)> = None;
-    for slot in 0..2u64 {
-        let start = slot * SLOT_BYTES;
-        if len < start + SUPER_BYTES as u64 {
-            continue;
+    settled_supers(|| {
+        let mut slots: Slots = [None; 2];
+        for (slot, out) in (0..).zip(slots.iter_mut()) {
+            let start = slot * SLOT_BYTES;
+            if len < start + SUPER_BYTES as u64 {
+                continue;
+            }
+            let mut bytes = [0u8; SUPER_BYTES];
+            file.read_exact_at(&mut bytes, start)?;
+            *out = Some(bytes);
         }
-        let mut bytes = [0u8; SUPER_BYTES];
-        file.read_exact_at(&mut bytes, start)?;
-        if let Some(candidate) = Super::decode(&bytes)
-            && best
-                .as_ref()
-                .is_none_or(|b| (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq))
-        {
-            best = Some((candidate, slot));
+        Ok(slots)
+    })
+}
+
+/// The valid superblock with the highest sequence number, then anchor, among the slots that
+/// `read` reads, and the slot it is in, reading them again while one does not check.
+///
+/// A writer writes one superblock at a time, and only to the slot that does not hold the newest,
+/// but for the second write of a recovery that rolls back, which replaces one naming frames it
+/// dropped. A read beside such a write can find it half written, failing its check. The other
+/// slot then holds the newest, but a read held up between the slots may have read that one
+/// before the write that made it the newest, and would return a superblock older than ones that
+/// named commits already acknowledged. So once a slot fails its check, both are read again,
+/// until both check or two reads in a row find the same bytes, as a slot that stays damaged
+/// leaves them, or a write held up partway. Either way, the superblock returned is at least as
+/// new as every one written whole before the first read began.
+fn settled_supers(mut read: impl FnMut() -> Result<Slots>) -> Result<Option<(Super, u64)>> {
+    let mut slots = read()?;
+    loop {
+        let found = slots.map(|bytes| bytes.and_then(|bytes| Super::decode(&bytes)));
+        if found.iter().any(Option::is_none) {
+            let again = read()?;
+            if again != slots {
+                slots = again;
+                continue;
+            }
         }
+        let mut best: Option<(Super, u64)> = None;
+        for (slot, candidate) in (0..).zip(found) {
+            if let Some(candidate) = candidate
+                && best.as_ref().is_none_or(|b| {
+                    (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq)
+                })
+            {
+                best = Some((candidate, slot));
+            }
+        }
+        return Ok(best);
     }
-    Ok(best)
 }
 
 /// Fills `out` from the file at `at`, returning `false` if the file ends first.
@@ -759,19 +797,11 @@ fn read_some(file: &File, out: &mut [u8], at: u64) -> Result<usize> {
 /// [`read_supers`] in one read of both slots, for a file that holds its header.
 fn newest_super(file: &File) -> Result<Option<(Super, u64)>> {
     let mut bytes = vec![0u8; SLOT_BYTES as usize + SUPER_BYTES];
-    file.read_exact_at(&mut bytes, 0)?;
-    let mut best: Option<(Super, u64)> = None;
-    for slot in 0..2u64 {
-        let at = (slot * SLOT_BYTES) as usize;
-        if let Some(candidate) = Super::decode(&bytes[at..at + SUPER_BYTES])
-            && best
-                .as_ref()
-                .is_none_or(|b| (candidate.seq, candidate.anchor.seq) > (b.0.seq, b.0.anchor.seq))
-        {
-            best = Some((candidate, slot));
-        }
-    }
-    Ok(best)
+    settled_supers(|| {
+        file.read_exact_at(&mut bytes, 0)?;
+        let slot = |at: usize| bytes[at..at + SUPER_BYTES].try_into().ok();
+        Ok([slot(0), slot(SLOT_BYTES as usize)])
+    })
 }
 
 /// Whether the frame whose header is `header`, and whose records and table, `records` bytes of
@@ -3693,6 +3723,10 @@ impl Store {
     /// Syncs and writes a superblock that anchors itself at the newest frame named, if the anchor
     /// lags behind it, as a writer does as it closes. It does nothing for a read-only or poisoned
     /// store.
+    ///
+    /// The superblock goes to the slot that does not hold the newest, as every other does, never
+    /// over the newest, so that a reader that finds it half written has the newest in the other
+    /// slot, as [`settled_supers`] needs.
     pub(crate) fn settle_anchor(&self) -> Result<()> {
         let inner = &self.inner;
         let marks = *inner.marks.lock();
@@ -3701,13 +3735,7 @@ impl Store {
             return Ok(());
         }
         inner.file.sync_data()?;
-        let sb = Super::new(marks.latest, marks.latest, inner.basis);
-        if inner.options.shared {
-            self.write_super(&sb)?;
-        } else {
-            let slot = inner.slot.load(Ordering::Relaxed);
-            inner.file.write_all_at(&sb.encode(), slot * SLOT_BYTES)?;
-        }
+        self.write_super(&Super::new(marks.latest, marks.latest, inner.basis))?;
         inner.marks.lock().anchor = marks.latest;
         Ok(())
     }

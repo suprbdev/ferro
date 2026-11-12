@@ -866,8 +866,41 @@ superblock and never scans. A read-only open scans only when a frame follows the
 superblock does not anchor itself, and it can take a shared lock, which proves no writer is alive.
 It holds that lock for the scan and syncs what it accepted, since a dead writer's frames may exist
 only in the page cache. If a writer holds the lock, the superblock is current and the reader uses
-it. A writer opening during that short scan retries for a few milliseconds before reporting
+it, as long as it read the slots as described under [Reading the slots](#reading-the-slots). A
+writer opening during that short scan retries for a few milliseconds before reporting
 `Error::Locked`.
+
+### Reading the slots
+
+A read of the page cache is not atomic against a write of the same bytes, so a reader beside a
+superblock write can find it half written, failing its check. A writer writes one superblock at a
+time, shared writers under the superblock lock, and only to the slot that does not hold the newest,
+so while one slot is half written the other holds the newest. But a reader may have read that other
+slot first and been held up before reading the second. A read-only open read slot 0 and was held up
+for a millisecond while the next writer handle committed twice, to slot 0 and then to slot 1, and
+read slot 1 in the middle of the second write. It took the superblock it had read from slot 0, one
+sync older than the newest when the open began, and with the writer alive it trusted that one, so a
+commit acknowledged under `Durability::Fsync`, which an earlier open had seen, went missing (#167).
+Neither the writer's open nor its close wrote anything there: the open found the log as the close
+left it, and the close cut only the preallocation. With 180 busy loops beside it on 32 cores, a load
+of about 190, `read_only_open_never_races_a_durable_writer_closing` failed that way in 5 of 3,000
+runs, and with 100 loops in 1 of 800. The build from before that day's changes to commits, catch-up
+and version 0, `0038c6d`, failed in 11 of 2,000 runs beside the fixed build. A `refresh` could miss
+a commit the same way, and a reader held up between two writes could find both slots half written
+and report both invalid.
+
+So every read of the slots, at open, in `refresh` and wherever a writer or a follower looks for the
+newest superblock, reads both again once one fails its check, until both check or two reads in a row
+find the same bytes. Both checking is enough, since a slot's superblock only grows, so each holds at
+least what it held when the reading began. Two equal reads are enough too: the slot that checked
+held the same bytes from before the other was found half written until after, so it held the newest
+while that one was being written, and a slot that stays damaged, or a write held up partway, gives
+equal reads. A clean close used to write the superblock that anchors its last commit over the newest
+rather than to the other slot, so a reader that found that one half written was left with the one
+before; it now goes to the other slot like every other. With the fix the stress test passed all
+3,000 runs beside the same 180 loops. `superblock_fault.rs` holds a superblock write halfway, and a
+reader between the two slots: an open and a `refresh` beside a writer committing twice, and an open
+beside a closing writer, each of which saw an older version before.
 
 ### Preallocating the log
 
