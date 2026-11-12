@@ -72,8 +72,8 @@ struct Inside {
     panic: Option<Box<dyn Any + Send>>,
 }
 
-/// Withdraws a call's seats and waits for the crew threads inside it, even when the caller's own
-/// share of the work unwinds.
+/// Withdraws a call's seats and waits for the crew threads inside it, even when listing the call
+/// or the caller's own share of the work unwinds.
 struct Leave<'a>(&'a Arc<Latch>);
 
 impl Drop for Leave<'_> {
@@ -96,11 +96,10 @@ fn wake(state: &State, seats: usize) {
     }
 }
 
-/// Lists `work` for up to `seats` crew threads, wakes a few idle ones, each of which wakes a few
-/// more while seats are left, and starts more threads, up to `limit`, for the seats the idle ones
-/// leave.
-fn post(work: Work, seats: usize, limit: usize) -> Arc<Latch> {
-    let latch = Arc::new(Latch::default());
+/// Lists `work` under `latch` for up to `seats` crew threads, wakes a few idle ones, each of which
+/// wakes a few more while seats are left, and starts more threads, up to `limit`, for the seats the
+/// idle ones leave.
+fn post(work: Work, seats: usize, limit: usize, latch: &Arc<Latch>) {
     let start = {
         let mut state = CREW.state.lock();
         state.calls.push(Call {
@@ -115,15 +114,40 @@ fn post(work: Work, seats: usize, limit: usize) -> Arc<Latch> {
         state.threads += start;
         start
     };
+    let mut unstarted = Unstarted(start);
+    #[cfg(test)]
+    if tests::START_PANICS.get() {
+        panic!("a crew thread failed to start");
+    }
     for _ in 0..start {
         let spawned = std::thread::Builder::new()
             .name("ferro-crew".to_string())
             .spawn(serve);
-        if spawned.is_err() {
-            CREW.state.lock().threads -= 1;
+        if spawned.is_ok() {
+            unstarted.0 -= 1;
         }
     }
-    latch
+}
+
+/// The threads [`post`] counted but has not started, which it gives back to the crew's count when
+/// dropped, so that a thread that fails to start, or a panic while starting one, leaves room for
+/// later calls to start another.
+struct Unstarted(usize);
+
+impl Drop for Unstarted {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            CREW.state.lock().threads -= self.0;
+        }
+    }
+}
+
+/// Drops a panic's payload, and forgets the payload of a panic its drop raises, so that a payload
+/// that panics when dropped cannot unwind out of a crew thread.
+fn discard(payload: Box<dyn Any + Send>) {
+    if let Err(again) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        std::mem::forget(again);
+    }
 }
 
 /// Runs `own` on this thread while up to `helpers` crew threads run `work`, and returns what `own`
@@ -147,16 +171,17 @@ pub(crate) fn run<R>(
     if helpers == 0 {
         return own();
     }
-    // SAFETY: only the lifetime changes. `Leave` withdraws the call before `run` returns or
-    // unwinds, and then waits until no crew thread that took it is still inside, so no thread
-    // calls `work` once its borrow ends.
+    // SAFETY: only the lifetime changes. `Leave` is made before `post` lists the call, so however
+    // `run` returns or unwinds from then on, `Leave` withdraws the call and then waits until no
+    // crew thread that took it is still inside, so no thread calls `work` once its borrow ends.
     let erased = unsafe {
         std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const (dyn Fn() + Sync + 'static)>(
             work,
         )
     };
-    let latch = post(Work(erased), helpers, limit);
+    let latch = Arc::new(Latch::default());
     let leave = Leave(&latch);
+    post(Work(erased), helpers, limit, &latch);
     let out = own();
     drop(leave);
     if let Some(panic) = latch.inside.lock().panic.take() {
@@ -190,9 +215,10 @@ fn serve() {
         // SAFETY: the caller of `run` waits in `Leave` until `running`, raised above while the
         // call was still listed, falls back to zero, so the closure is alive for this call.
         let outcome = catch_unwind(AssertUnwindSafe(|| unsafe { (*work.0)() }));
+        let mut spare = outcome.err();
         let mut inside = latch.inside.lock();
-        if let Err(panic) = outcome {
-            inside.panic.get_or_insert(panic);
+        if inside.panic.is_none() {
+            inside.panic = spare.take();
         }
         inside.running -= 1;
         if inside.running == 0 {
@@ -200,6 +226,9 @@ fn serve() {
         }
         drop(inside);
         drop(latch);
+        if let Some(payload) = spare {
+            discard(payload);
+        }
         state = CREW.state.lock();
     }
 }
@@ -207,8 +236,13 @@ fn serve() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    thread_local! {
+        pub(super) static START_PANICS: Cell<bool> = const { Cell::new(false) };
+    }
 
     #[test]
     fn every_item_is_taken_once_whoever_takes_it() {
@@ -271,5 +305,60 @@ mod tests {
             }
         });
         assert_eq!(total.load(Ordering::Relaxed), 8 * 50 * 64 * 4);
+    }
+
+    #[test]
+    fn a_panic_after_the_call_is_listed_leaves_nothing_listed() {
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let work: &'static (dyn Fn() + Sync) = Box::leak(Box::new(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        START_PANICS.set(true);
+        let outcome = catch_unwind(AssertUnwindSafe(|| run(64, 15, work, || ())));
+        START_PANICS.set(false);
+        assert!(outcome.is_err());
+        let listed = CREW
+            .state
+            .lock()
+            .calls
+            .iter()
+            .any(|call| std::ptr::addr_eq(call.work.0, work));
+        assert!(!listed);
+    }
+
+    struct Bomb;
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("payload dropped");
+        }
+    }
+
+    #[test]
+    fn a_payload_that_panics_on_drop_does_not_hang_the_caller() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = AtomicUsize::new(0);
+            let meet = || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let began = Instant::now();
+                while started.load(Ordering::SeqCst) < 3 && began.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::yield_now();
+                }
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let work = || {
+                    meet();
+                    std::panic::panic_any(Bomb);
+                };
+                run(2, 15, &work, meet)
+            }));
+            let carried = outcome.is_err();
+            std::mem::forget(outcome);
+            let _ = sender.send(carried);
+        });
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(20)), Ok(true));
     }
 }
