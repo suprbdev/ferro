@@ -1303,25 +1303,22 @@ comparison was made on one base, before value columns landed:
 
 A cycle walks the log on one thread, with up to four others reading the chains ahead of it, and
 copies the trees it reaches on up to seven others, checking every object's hash as it goes, as
-described under [The copy on several threads](#the-copy-on-several-threads). On 2026-11-11 the copy
-of a file in the page cache, keeping everything, ran at 1,078 MB/s on 189 MB of table rows, 200,000
-rows and 40,000 updates in 383,364 objects, and at 2,958 MB/s on 331 MB of a million 320 byte values
-in 124,939 objects, with 8 threads, medians of five runs, against 993 MB/s on the table rows before
-and as before on the values, with 4 threads at 652 and 2,180 MB/s, and with 16 at 993 and 3,040. On
-2026-11-12, on a machine other work was sharing, the table rows ran at 250 MB/s on one thread and
-682 MB/s on 4, against 231 and 618 MB/s before in the same runs, and the values at 778 MB/s on one
-thread against 753, as described under [Checking and looking up with less
-work](#checking-and-looking-up-with-less-work). Later that day, with other work at a load average of
-15 to 26, the table rows copied at 215 MB/s on one thread, 517 on 4, 756 on 8, 738 on 16 and 675 on
-32, against 194, 462, 639, 647 and 553 MB/s before in the same runs, as described under [Fewer locks
-and allocations past eight threads](#fewer-locks-and-allocations-past-eight-threads). Checking many
-hashes at once then made the table rows copy in 0.532 s against 0.837 on one thread, 0.271 against
-0.307 on 4, 0.182 against 0.204 on 8 and 0.177 against 0.214 on 16, at a load average of 11 to 14,
-and the values in 0.225 against 0.450 s on one thread, as described under [Checking many hashes at
-once](#checking-many-hashes-at-once). So a 10 GB database of table rows takes about 9 seconds and
-needs 10 GB free. The trigger keeps that to one
-extra byte copied per byte written, at worst. Past 8 threads the copy of table rows gains about a
-tenth at 16 threads, 1,136 MB/s with them spread over all 32 CPUs, and runs at 828 MB/s at 32, since
+described under [The copy on several threads](#the-copy-on-several-threads). The copy of a file in
+the page cache, keeping everything, runs at these rates in MB/s, the file's bytes over the median of
+five runs of `ferro-bench --bin reclaim copy`, measured on 2026-11-12 on 16 cores and 32 CPUs at a
+load average of 2.3 to 2.7:
+
+| File | 1 thread | 4 threads | 8 threads | 16 threads | 32 threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 189 MB of table rows, 200,000 rows and 40,000 updates in 383,365 objects | 431 | 988 | 1,437 | 1,375 | 1,084 |
+| 331 MB of a million 320 byte values in 124,940 objects | 1,726 | 3,602 | 4,142 | 4,194 | 3,525 |
+
+So a 10 GB database of table rows takes about 7 seconds on the default 8 threads and needs 10 GB
+free. The trigger keeps that to one extra byte copied per byte written, at worst. [Checking and
+looking up with less work](#checking-and-looking-up-with-less-work) and [Fewer locks and allocations
+past eight threads](#fewer-locks-and-allocations-past-eight-threads) describe what a thread does for
+each object it copies, and [Checking many hashes at once](#checking-many-hashes-at-once) how it
+checks their hashes together. Past 8 threads the copy gains nothing, and at 32 it is slower, since
 the walk down the chains and the writing of the entries after every tree stay on one thread, the
 walk's bookkeeping slows as more cores run, as described under [Past eight threads
 again](#past-eight-threads-again), and the threads place units in order no faster than about 500 a

@@ -51,11 +51,9 @@ This is an experiment, not a production database.
 - A held `Snapshot` or `Map` keeps its file open, and the disk space of a file a cycle replaced
   comes back only when the last such handle is dropped, as described under [Several
   processes](concurrency.md#several-processes) and [Limits](retention.md#limits).
-- A reclamation cycle needs free disk for everything retained, and copies small table rows at 250
-  MB/s on one thread and 1,078 MB/s on eight, measured before changes on 2026-11-12 that made it a
-  tenth faster on one thread and a sixth on eight on a busy machine, and later ones that took 36%
-  less time on one thread and 11% less on eight, and at most a tenth faster on more, as described
-  under [Limits](retention.md#limits).
+- A reclamation cycle needs free disk for everything retained, and copies small table rows at
+  431 MB/s on one thread and 1,437 MB/s on eight, measured on 2026-11-12, and no faster on more, as
+  described under [Limits](retention.md#limits).
 - Crash safety was never tested on real hardware. A frame past the superblock damaged in more than
   one bit of a 4 KiB block, in a block and in that block's entry in the frame's table, in more than
   8 blocks, or in a bit with only zeroes or only ones between it and an end of its sector, cannot

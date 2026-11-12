@@ -10,9 +10,9 @@ alternating with plain ones. The commits on 16 branches are medians of six runs 
 figure on this page but those under [Huge pages](#huge-pages) was measured again that day, and a
 figure that came within the spread of its runs of the one measured on 2026-11-04 is given as it was.
 The copy a reclamation cycle makes, under [Other tools](#other-tools), was measured again on
-2026-11-07, pinned to 16 cores, once it ran on up to 8 threads by default, and the Buffered commits
-of writers on their own branches on 2026-11-09, once a moved draft rewrote its links in place, as
-described under [Writers and branches](#writers-and-branches). The figures under [Reads past the
+2026-11-12, unpinned, and the Buffered commits of writers on their own branches on 2026-11-09, once
+a moved draft rewrote its links in place, as described under [Writers and
+branches](#writers-and-branches). The figures under [Reads past the
 cache](#reads-past-the-cache) were measured on 2026-11-09 beside other work, as that section says.
 
 | Operation | Result |
@@ -255,7 +255,7 @@ median of:
 | `watchers`, 5 | A Buffered single-key commit with 0, 1,000 and 10,000 parked watchers | 12.3, 12.0 and 12.1 µs, and 23, 57 and 375 µs at p50 to a watcher whose test passes |
 | `reclaim`, 3 | 15 s of fsync commits keeping 100 versions, a cycle every 64 MiB | Longest pause 2.9 ms on `metrics`, 3.2 ms on `ledger`, 3.4 ms on `wiki` and 2.8 ms on table updates, commits a second within 2.2% of no cycles |
 | `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.4 ms |
-| `reclaim copy`, 5 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on the default 8 threads, measured on 2026-11-07 | 0.19 and 0.11 s, 1,000 and 2,960 MB/s, against 0.80 and 0.41 s on one thread |
+| `reclaim copy`, 5 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on the default 8 threads, measured on 2026-11-12 at a load average of 2.3 to 2.7 | 0.132 and 0.080 s, 1,437 and 4,142 MB/s, against 0.440 and 0.192 s on one thread |
 | `verify`, 5 | `Db::verify` of the 47.9 MB file `make compare-versioned` builds, 151,133 objects, measured on 2026-11-12 beside other work at a load average of 37 to 56 | 36 ms on the default 8 threads and 112 ms on one, against 279 ms before a verify ran on several threads and checked hashes many at once |
 
 ## Slower than before

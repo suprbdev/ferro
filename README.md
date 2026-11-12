@@ -71,8 +71,8 @@ explained or undone from the history, and corruption surfaces as an error rather
   `or` combine equality lookups by key, a range tests the keys of a side with a quarter of its keys
   or fewer by reading their rows and joins otherwise only after its keys are read and sorted, and
   each matching row is read separately unless the index covers the fields it needs.
-- **Very large files.** A reclamation cycle copies everything retained at 1.1 to 3.0 GB/s on eight
-  threads, the default on eight cores or more, and 650 MB/s to 2.2 GB/s on four, and needs that much
+- **Very large files.** A reclamation cycle copies everything retained at 1.4 to 4.1 GB/s on eight
+  threads, the default on eight cores or more, and 990 MB/s to 3.6 GB/s on four, and needs that much
   free disk, and a first sync keeps about 5 bytes per object in memory to receive and 7 to send,
   about 250 and 340 MiB for 50 million objects.
 - **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
