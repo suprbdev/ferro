@@ -123,13 +123,34 @@ durability](storage.md#file-format-and-durability). Steps do not carry it, since
 a table.
 
 The first frame a file writes, a commit, a fork or a pull, always writes a table, and that table
-stores the `init` value of the process that writes it. Every later table names the same root, and
-a reclamation cycle and `compact` copy it as they copy the table. An open of a file whose table
-names version 0 never calls `init`, and reads the value only when something first asks for it, so
-damage to the oldest frames fails `at(0)` and not the open. A process that opened the file
-before anything was written, with an `init` of its own, takes the stored value when it catches up,
-refreshes or follows. A table that names none, as in a file converted from format 6, makes the next
-frame write a table rather than a step, so the file stores it then.
+stores the `init` value of the process that writes it. That process then holds the value as it
+decodes from what was written, as it holds a commit's, so a field the file does not store reads the
+same before and after a cycle or a reopen. Every later table names the same root, and a reclamation
+cycle and `compact` copy it as they copy the table. A table that names none, as in a file converted
+from format 6, makes the next frame write a table rather than a step, so the file stores it then.
+
+An open of a file whose table names version 0 never calls `init`, and reads the value only when
+something first asks for it. Damage to its records fails what reads them: `at(0)`, `history_of`
+and `bisect_changes` as far as version 1, a merge against it, a reclamation cycle and `compact`,
+which copy it, and `verify`. While `main` has a commit, the open does not read it. When `main` has
+none, its value is version 0, and the open reads it to give the handle `main`, so damage fails the
+open too. A value that is a collection reads only its top record when it is loaded, so damage
+below that fails where the collection is read, as it does for any version.
+
+A process that opened the file before anything was written, with an `init` of its own, takes the
+stored value when it catches up, refreshes or follows, and gives it to each branch with no commits.
+It takes it only once every such branch has its new state, so a catch-up that fails partway leaves
+the process as it was, and the next one makes the whole change. A reclamation cycle likewise points
+version 0 at the new file only once the swap can no longer fail, so a failed swap holds nothing of
+the abandoned copy open.
+
+With `Options::shared`, a closure can run on a branch with no commits while another process writes
+the file's first frame, such as the staging frame of a pull, which needs no branch's lock. The
+closure would then have started from an `init` that the file does not keep, and a commit cannot run
+its closure again. So before such a closure runs in a file that does not store version 0, the
+crossing that takes its branch's lock writes a frame that stores it, or takes the one another
+process stored first. It writes that frame even if the closure then changes nothing, once for the
+file, and a file opened without `shared` never needs it, since its writers share one process.
 
 Before, version 0 was `init` called at each open, so `at(0)`, `history_of` and `bisect_changes`
 comparing version 1 with it, a fork of an empty branch, and a merge of branches that share no
@@ -145,12 +166,13 @@ places to store it were weighed:
   every commit, and a branch that sync lands would need a value that the bundle does not carry, so
   it would take the file's anyway.
 
-A file that nothing was written to stays two superblocks, 8 KiB, and opens with `init` each time. A
-file's first frame holds the value of version 0, a few bytes for an empty collection, and each table
-names it with one more byte and a link, once every 64 commits. The value is kept when pruning drops
-version 1: `at(0)` then returns `NoVersion` as the rule above says, but the file keeps the value,
-since a branch that a later pull lands from version 1, and a merge of branches that share no commit,
-start from it.
+A file that nothing was written to stays two superblocks, 8 KiB, and opens with `init` each time,
+except a shared file in which a closure ran on an empty branch, as above. A file's first frame
+holds the value of version 0, a few bytes for an empty collection, and each table names it with one
+more byte and a link, once every 64 commits. The value is kept when pruning drops version 1:
+`at(0)` then returns `NoVersion` as the rule above says, but the file keeps the value, since a
+branch that a later pull lands from version 1, and a merge of branches that share no commit, start
+from it.
 
 Sync does not send version 0, and the bundle format is unchanged. A pull between files that share
 no commit merges against the receiving file's version 0, as it merged against that file's `init`

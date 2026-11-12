@@ -19,7 +19,9 @@ This is an experiment, not a production database.
   retention the file only grows.
 
 - Version 0 is stored by the first commit, fork or pull that writes to a file, from `Default` or
-  the `init` passed to `open_with` at that moment, and read back from the file after that. Until
+  the `init` passed to `open_with` by the handle that writes it, and read back from the file after
+  that. With `Options::shared`, the first closure on a branch with no commits stores it before it
+  runs, even if it then changes nothing, so that every process starts from the same one. Until
   then a file holds nothing, and each open takes its own `init`. The file keeps version 0 for good,
   even once pruning makes `at(0)` return `NoVersion`, so a large initial value keeps its room. Each
   file stores its own: two files that share no commit merge against ours, as described under

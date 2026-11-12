@@ -542,3 +542,35 @@ fn a_reader_takes_version_0_from_the_file_once_a_writer_stores_it() {
     assert_eq!(seed_of(&reader.at(0).unwrap()).as_deref(), Some("writer"));
     assert_eq!(reader.history_of(seed_of).count(), 0);
 }
+
+#[derive(Clone, Debug, Default, PartialEq, ferro::Data)]
+struct Noted {
+    count: u64,
+    #[ferro(skip)]
+    note: String,
+}
+
+#[test]
+fn version_0_reads_the_same_in_the_process_that_stored_it_as_after_a_cycle_or_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.ferro");
+    let init = || Noted {
+        count: 1,
+        note: "init".into(),
+    };
+    let db = fast().open_with::<Noted>(&path, init).unwrap();
+    db.fork("side").unwrap();
+    let stored = db.at(0).unwrap().note.clone();
+    db.compact(Keep::All).unwrap();
+    let cycled = db.at(0).unwrap().note.clone();
+    drop(db);
+    let db = fast()
+        .open_with::<Noted>(&path, || panic!("init ran for a file that holds version 0"))
+        .unwrap();
+    let reopened = db.at(0).unwrap().note.clone();
+    assert_eq!(
+        [stored.as_str(), cycled.as_str()],
+        [reopened.as_str(), reopened.as_str()],
+        "version 0 in the process that stored it, then after a cycle, then after a reopen"
+    );
+}

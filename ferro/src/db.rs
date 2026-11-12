@@ -433,6 +433,14 @@ impl<T: Data> Genesis<T> {
         }
     }
 
+    fn written(store: &Store, ptr: Ptr, value: Arc<T>) -> Self {
+        Genesis {
+            hash: ptr.hash,
+            root: Some((store.clone(), ptr)),
+            value: OnceLock::from(value),
+        }
+    }
+
     /// The value of version 0, read from the file the first time.
     ///
     /// # Errors
@@ -832,6 +840,7 @@ struct Pending<T> {
     update: Update<T>,
     seal: Option<Arc<Seal>>,
     followed: Vec<Moved<T>>,
+    freed: Vec<Snapshot<T>>,
 }
 
 struct Task {
@@ -1689,8 +1698,15 @@ impl Options {
     /// first commit, fork or pull written to the file stores it, and an open of a file that
     /// stores it reads it from the file and does not call `init`, so a later change to `init`
     /// leaves the version 0 of an existing database as it was. Until something is written, `init`
-    /// runs on each open, and a handle that opened then takes the stored value once it sees the
-    /// first write.
+    /// runs on each open. The handle that writes it then holds the value as read back from the
+    /// file, so a field the file does not store reads as it does after a reopen. Another handle
+    /// that opened before takes the stored value, in place of its own, when it catches up,
+    /// refreshes or follows.
+    ///
+    /// With [`Options::shared`], a closure that is about to run on a branch with no commits, in a
+    /// file that does not store version 0 yet, first writes it in a frame of its own, or takes
+    /// the one another process stored meanwhile, so the closure always starts from the version 0
+    /// the file keeps, whatever another process writes while it runs.
     ///
     /// # Errors
     ///
@@ -2030,55 +2046,114 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl<T: Data> Shared<T> {
-    /// Takes version 0 from the root `genesis` that a branch table read from `store` names, when
-    /// it differs from the one this handle holds or was read from another file, and returns
-    /// whether its value differs.
+    /// The version 0 that the root `genesis`, named by a branch table read from `store`, makes
+    /// this handle's, or `None` when the one it holds already has that value and was read from
+    /// `store`.
+    ///
+    /// Nothing changes until [`Shared::take_genesis`] installs it, so a catch-up that fails
+    /// partway leaves this handle as it was, and the next one finds the same change again.
+    fn genesis_named(&self, store: &Store, genesis: Option<Ptr>) -> Option<Arc<Genesis<T>>> {
+        let ptr = genesis?;
+        let current = self.genesis.load();
+        let read_here = current
+            .root
+            .as_ref()
+            .is_some_and(|(read, _)| read.id() == store.id());
+        if ptr.hash == current.hash && read_here {
+            return None;
+        }
+        Some(Arc::new(Genesis::stored(store, ptr)))
+    }
+
+    /// The version 0 this handle holds once `named`, from [`Shared::genesis_named`], is
+    /// installed.
+    fn genesis_after(&self, named: Option<&Arc<Genesis<T>>>) -> Arc<Genesis<T>> {
+        named.cloned().unwrap_or_else(|| self.genesis.load_full())
+    }
+
+    /// Installs `genesis`, from [`Shared::genesis_named`], as this handle's version 0.
     ///
     /// A value the old one had read is handed to `notices`, to be dropped once the locks are
     /// released.
-    fn adopt_genesis(
-        &self,
-        store: &Store,
-        genesis: Option<Ptr>,
-        notices: &mut Vec<Notice<T>>,
-    ) -> bool {
-        let Some(ptr) = genesis else {
-            return false;
+    fn take_genesis(&self, genesis: Option<Arc<Genesis<T>>>, notices: &mut Vec<Notice<T>>) {
+        let Some(genesis) = genesis else {
+            return;
         };
-        let (changed, read_here) = {
-            let current = self.genesis.load();
-            let read_here = current
-                .root
-                .as_ref()
-                .is_some_and(|(read, _)| read.id() == store.id());
-            (ptr.hash != current.hash, read_here)
-        };
-        if !changed && read_here {
-            return false;
-        }
-        let old = self.genesis.swap(Arc::new(Genesis::stored(store, ptr)));
+        let old = self.genesis.swap(genesis);
         if let Some(value) = old.value.get() {
             notices.push(Notice::freeing(Snapshot {
                 value: value.clone(),
                 commit: Arc::new(Commit::genesis()),
             }));
         }
-        changed
     }
 
-    /// Writes version 0 into `txn`, for a branch table to name, and returns its root.
-    fn write_genesis(&self, txn: &mut Txn) -> Result<Ptr> {
+    /// Writes version 0 into `txn`, for a branch table to name, and returns its root with
+    /// version 0 as the file holds it, its value decoded back from what was written, as a
+    /// commit's is.
+    fn write_genesis(&self, txn: &mut Txn, store: &Store) -> Result<(Ptr, Arc<Genesis<T>>)> {
         let value = self.genesis.load().value()?;
-        let mut encoder = Encoder::new(txn);
-        value.encode(&mut encoder)?;
-        encoder.finish()
+        let (ptr, decoded) = write_decoded(&*value, txn, store)?;
+        let genesis = Genesis::written(store, ptr, Arc::new(decoded));
+        Ok((ptr, Arc::new(genesis)))
+    }
+
+    /// Makes `genesis`, written by [`Shared::write_genesis`] in the frame that `pending` places,
+    /// this handle's version 0, and gives its value to each attached branch with no commits other
+    /// than `committed`.
+    ///
+    /// The branches take it as [`Shared::adopt`] gives them one another process wrote: their
+    /// writers at once, and their readers once `pending` is published. What they and the old
+    /// version 0 held is freed with `pending`, once the locks are released.
+    fn settle_genesis(
+        &self,
+        genesis: Arc<Genesis<T>>,
+        committed: Option<&Arc<Branch<T>>>,
+        pending: &mut Pending<T>,
+    ) {
+        if let Some(value) = genesis.value.get() {
+            let attached: Vec<_> = self.branches.lock().values().cloned().collect();
+            for branch in attached {
+                if committed.is_some_and(|committed| Arc::ptr_eq(committed, &branch)) {
+                    continue;
+                }
+                let state = branch.tip.load_full();
+                if state.snapshot.commit.root.is_some() {
+                    continue;
+                }
+                let next = Arc::new(State {
+                    snapshot: Snapshot {
+                        value: value.clone(),
+                        commit: state.snapshot.commit.clone(),
+                    },
+                    log: state.log,
+                    store: state.store.clone(),
+                });
+                let replaced = branch.tip.swap(next.clone());
+                pending.freed.push(replaced.snapshot.clone());
+                branch.framed.store(pending.frame.seq, Ordering::Release);
+                pending.followed.push((branch, next));
+            }
+        }
+        let old = self.genesis.swap(genesis);
+        if let Some(value) = old.value.get() {
+            pending.freed.push(Snapshot {
+                value: value.clone(),
+                commit: Arc::new(Commit::genesis()),
+            });
+        }
     }
 
     fn state_of(&self, store: &Store, head: Option<&Head>) -> Result<State<T>> {
+        Self::state_in(&self.genesis.load(), store, head)
+    }
+
+    /// The state of a branch whose head in `store` is `head`, with `genesis` as version 0.
+    fn state_in(genesis: &Genesis<T>, store: &Store, head: Option<&Head>) -> Result<State<T>> {
         let Some(head) = head else {
             return Ok(State {
                 snapshot: Snapshot {
-                    value: self.genesis.load().value()?,
+                    value: genesis.value()?,
                     commit: Arc::new(Commit::genesis()),
                 },
                 log: Chain::empty(),
@@ -2087,7 +2162,7 @@ impl<T: Data> Shared<T> {
         };
         let value = match head.root {
             Some(ptr) => store.load::<T>(ptr)?,
-            None => self.genesis.load().value()?,
+            None => genesis.value()?,
         };
         let commit = head
             .log
@@ -2174,6 +2249,7 @@ impl<T: Data> Shared<T> {
                     update: None,
                     seal: None,
                     followed: Vec::new(),
+                    freed: Vec::new(),
                 });
             }
             None => {
@@ -2457,7 +2533,16 @@ impl<T: Data> Shared<T> {
                 true => self.follow(&mut tip, false, notices),
                 false => Ok(Caught::Swapped),
             };
+            let unstored = tip.genesis.is_none()
+                && !self.options.read_only
+                && lane.branch.tip.load().snapshot.commit.root.is_none();
             drop(tip);
+            let caught = match caught {
+                Ok(Caught::Still | Caught::Moved) if unstored => {
+                    self.store_genesis(&store, notices)
+                }
+                caught => caught,
+            };
             match caught {
                 Ok(Caught::Swapped) => store.unlock_lane(at),
                 Ok(_) => {
@@ -2470,6 +2555,31 @@ impl<T: Data> Shared<T> {
                 }
             }
         }
+    }
+
+    /// Writes version 0 to a shared file that does not store it yet, for a closure about to run
+    /// on a branch with no commits, whose lane this thread took on `crossed`.
+    ///
+    /// The closure starts from version 0, so it must be the one the file keeps: without this, a
+    /// first frame that another process writes while the closure runs, such as the staging frame
+    /// of a pull, would store that process's version 0 under a commit drafted from this one's. If
+    /// another process stored it meanwhile, the catch-up takes that one instead.
+    ///
+    /// It returns [`Caught::Swapped`] if a reclamation cycle replaced the file, so that the
+    /// caller takes the lane again on the new one.
+    fn store_genesis(&self, crossed: &Store, notices: &mut Vec<Notice<T>>) -> Result<Caught> {
+        let mut tip = self.lock_tip(notices)?;
+        if self.store().id() != crossed.id() {
+            return Ok(Caught::Swapped);
+        }
+        if tip.genesis.is_none() {
+            let _whole = reentry::whole(self.id, self.file_id);
+            let refs = tip.refs.clone();
+            let txn = crossed.begin()?;
+            self.stage(&mut tip, Next::Table(refs), txn, None, None, None)?
+                .land()?;
+        }
+        Ok(Caught::Moved)
     }
 
     fn lock_tip(&self, notices: &mut Vec<Notice<T>>) -> Result<Tip<'_>> {
@@ -2536,7 +2646,9 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
     ) -> Result<()> {
         let loaded = refs::load(store, Some(frame.head), tip.since())?;
-        let adopted = self.adopt_genesis(store, loaded.genesis, notices);
+        let named = self.genesis_named(store, loaded.genesis);
+        let genesis = self.genesis_after(named.as_ref());
+        let adopted = genesis.hash != self.genesis.load().hash;
         let refs = &loaded.refs;
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut followed = Vec::new();
@@ -2550,11 +2662,12 @@ impl<T: Data> Shared<T> {
             let old = tip.refs.try_get(&branch.name)?;
             let rooted = new.as_deref().is_some_and(|head| head.root.is_some());
             if moved(old.as_deref(), new.as_deref()) || (adopted && !rooted) {
-                let state = Arc::new(self.state_of(store, new.as_deref())?);
+                let state = Arc::new(Self::state_in(&genesis, store, new.as_deref())?);
                 followed.push((branch, state));
             }
         }
         store.advance(frame);
+        self.take_genesis(named, notices);
         tip.take(Some(frame.head), loaded);
         for (branch, state) in &followed {
             free(notices, &branch.tip.swap(state.clone()));
@@ -2581,6 +2694,7 @@ impl<T: Data> Shared<T> {
             update: None,
             seal: None,
             followed,
+            freed: Vec::new(),
         });
         Ok(())
     }
@@ -2595,7 +2709,8 @@ impl<T: Data> Shared<T> {
         let (fresh, head) = Store::open(&self.file, self.options.clone())?;
         let rebound = (|| -> Result<_> {
             let loaded = refs::load(&fresh, head, None)?;
-            self.adopt_genesis(&fresh, loaded.genesis, notices);
+            let named = self.genesis_named(&fresh, loaded.genesis);
+            let genesis = self.genesis_after(named.as_ref());
             let attached: Vec<_> = self.branches.lock().values().cloned().collect();
             let mut states = Vec::new();
             let mut gone = Vec::new();
@@ -2605,12 +2720,14 @@ impl<T: Data> Shared<T> {
                     gone.push(branch);
                     continue;
                 }
-                states.push((branch, Arc::new(self.state_of(&fresh, found.as_deref())?)));
+                let state = Self::state_in(&genesis, &fresh, found.as_deref())?;
+                states.push((branch, Arc::new(state)));
             }
-            Ok((loaded, states, gone))
+            Ok((loaded, named, states, gone))
         })();
-        let (loaded, states, gone) = rebound.inspect_err(|_| fresh.close())?;
+        let (loaded, named, states, gone) = rebound.inspect_err(|_| fresh.close())?;
         let mut published = self.published.lock();
+        self.take_genesis(named, notices);
         tip.take(head, loaded);
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
@@ -2673,7 +2790,8 @@ impl<T: Data> Shared<T> {
                 store.close();
             }
         })?;
-        self.adopt_genesis(&store, loaded.genesis, &mut notices);
+        let named = self.genesis_named(&store, loaded.genesis);
+        let genesis = self.genesis_after(named.as_ref());
         let attached: Vec<_> = self.branches.lock().values().cloned().collect();
         let mut states = Vec::new();
         let mut gone = Vec::new();
@@ -2683,10 +2801,11 @@ impl<T: Data> Shared<T> {
                 gone.push(branch);
                 continue;
             }
-            let state = Arc::new(self.state_of(&store, head.as_deref())?);
+            let state = Arc::new(Self::state_in(&genesis, &store, head.as_deref())?);
             states.push((branch, state));
         }
         let mut published = self.published.lock();
+        self.take_genesis(named, &mut notices);
         tip.take(Some(ptr), loaded);
         if replaced {
             self.store.store(Arc::new(store.clone()));
@@ -3186,6 +3305,7 @@ impl<T: Data> Shared<T> {
         txn.unshared();
         let store = self.store();
         let stepped = tip.depth < refs::STEPS && tip.genesis.is_some();
+        let mut written = None;
         let (ptr, refs, depth, genesis) = match (next, tip.ptr) {
             (Next::Head(name, head), Some(prev)) if stepped => {
                 let (ptr, head) = refs::write_step(&mut txn, &store, prev, &name, &head)?;
@@ -3204,7 +3324,11 @@ impl<T: Data> Shared<T> {
                 };
                 let genesis = match tip.genesis {
                     Some(genesis) => genesis,
-                    None => self.write_genesis(&mut txn)?,
+                    None => {
+                        let (ptr, genesis) = self.write_genesis(&mut txn, &store)?;
+                        written = Some(genesis);
+                        ptr
+                    }
                 };
                 let table = Root::Table(refs, Some(genesis));
                 let (ptr, Root::Table(refs, genesis)) = write_decoded(&table, &mut txn, &store)?
@@ -3219,6 +3343,7 @@ impl<T: Data> Shared<T> {
         }
         let landing = txn.place(ptr)?;
         let frame = landing.frame();
+        let committed = branch.as_ref().map(|(branch, _)| Arc::clone(branch));
         let update = branch.map(|(branch, state)| {
             let state = Arc::new(state);
             branch.tip.store(state.clone());
@@ -3229,13 +3354,17 @@ impl<T: Data> Shared<T> {
         tip.ptr = Some(ptr);
         tip.depth = depth;
         tip.genesis = genesis;
-        let pending = Pending {
+        let mut pending = Pending {
             frame,
             refs: tip.clone(),
             update,
             seal: None,
             followed: Vec::new(),
+            freed: Vec::new(),
         };
+        if let Some(written) = written {
+            self.settle_genesis(written, committed.as_ref(), &mut pending);
+        }
         Ok((landing, pending))
     }
 
@@ -3841,7 +3970,8 @@ impl<T: Data> Shared<T> {
         notices: &mut Vec<Notice<T>>,
     ) -> Result<Vec<Moved<T>>> {
         let loaded = refs::load(fresh, Some(head), None)?;
-        self.adopt_genesis(fresh, loaded.genesis, notices);
+        let named = self.genesis_named(fresh, loaded.genesis);
+        let genesis = self.genesis_after(named.as_ref());
         let _fresh = fresh.is_shared().then(|| fresh.lock_commit()).transpose()?;
         for (_, found) in loaded.refs.try_entries()? {
             for ptr in found.root.iter().chain(&found.log.tip) {
@@ -3852,7 +3982,7 @@ impl<T: Data> Shared<T> {
         let mut states = Vec::new();
         for branch in attached {
             let found = loaded.refs.try_get(&branch.name)?;
-            let state = Arc::new(self.state_of(fresh, found.as_deref())?);
+            let state = Arc::new(Self::state_in(&genesis, fresh, found.as_deref())?);
             states.push((branch, state));
         }
         let mut published = self.published.lock();
@@ -3867,6 +3997,7 @@ impl<T: Data> Shared<T> {
             return Err(error.into());
         }
         fresh.trace(Op::SyncDir);
+        self.take_genesis(named, notices);
         tip.take(Some(head), loaded);
         self.store.store(Arc::new(fresh.clone()));
         let replaced = mem::replace(&mut *published, tip.clone());
@@ -6018,7 +6149,7 @@ impl<T: Data> Db<T> {
                     free(notices, &branch.tip.swap(state.clone()));
                     branch.framed.store(pending.frame.seq, Ordering::Release);
                 }
-                pending.followed = states;
+                pending.followed.extend(states);
             }
             shared.queue.lock().waiting.push(pending);
             landed?;

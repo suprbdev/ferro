@@ -422,10 +422,11 @@ pub struct Layout {
 ///
 /// The records are the log entries of the versions each branch keeps under `keep`, those of the
 /// commits that merges brought into them as far as a compaction keeps them, every object the
-/// trees of those versions reach, and the record each branch keeps of the branches merged into
-/// it. A log entry stored at two offsets is listed at each that a kept version reaches, as a
-/// compaction copies each, and any other object stored at two offsets once, at the first offset
-/// reached, as a compaction copies it once.
+/// trees of those versions reach, every object the tree of version 0 reaches when the branch
+/// table names one, which a compaction keeps whatever `keep` prunes, and the record each branch
+/// keeps of the branches merged into it. A log entry stored at two offsets is listed at each
+/// that a kept version reaches, as a compaction copies each, and any other object stored at two
+/// offsets once, at the first offset reached, as a compaction copies it once.
 ///
 /// Not listed are the branch table and the steps written on top of it, with the older heads
 /// those steps record, since a compaction copies none of them: it writes a new branch table from

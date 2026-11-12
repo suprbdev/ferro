@@ -741,3 +741,34 @@ fn reads_ahead_that_fail_leave_the_walk_to_read_the_entries_itself() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn copies_held_open(dir: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| {
+            target.starts_with(dir) && target.to_string_lossy().contains(".compacting")
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_rename_leaves_no_copy_held_open() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let db: Db<Root> = options().open(&path).unwrap();
+    fill(&db, 0, 800);
+    RENAME_ERROR.store(EIO, Ordering::SeqCst);
+    let outcome = db.compact(Keep::Last(1));
+    RENAME_ERROR.store(0, Ordering::SeqCst);
+    assert!(matches!(outcome, Err(Error::Io(_))), "{outcome:?}");
+    assert!(no_temp(&path));
+    let held = copies_held_open(dir.path());
+    assert!(
+        held.is_empty(),
+        "the abandoned copy is still open: {held:?}"
+    );
+}

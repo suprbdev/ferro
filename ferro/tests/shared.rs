@@ -1297,7 +1297,7 @@ fn below_the_superblock(durability: Durability, rot: Rot) {
     let context = format!("{durability:?}, {rot:?}");
     let outcome = commit(&b, &pads[4]);
     assert!(
-        matches!(&outcome, Err(Error::Corrupt(message)) if message.contains(&format!("frame 2 at {} ", ends[1]))),
+        matches!(&outcome, Err(Error::Corrupt(message)) if message.contains(&format!("frame 3 at {} ", ends[1]))),
         "{context}: {outcome:?}"
     );
     assert_eq!(
@@ -1357,7 +1357,7 @@ fn a_writer_that_opens_beside_a_live_one_reports_a_frame_below_the_superblock_th
         let image = std::fs::read(&path).unwrap();
         let opened = shared().reclaim(manual).open::<Padded>(&path);
         assert!(
-            matches!(&opened, Err(Error::Corrupt(message)) if message.contains(&format!("frame 2 at {} ", ends[1]))),
+            matches!(&opened, Err(Error::Corrupt(message)) if message.contains(&format!("frame 3 at {} ", ends[1]))),
             "{rot:?}: {:?}",
             opened.map(|db| db.read().n)
         );
@@ -1645,7 +1645,7 @@ fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
         thread::sleep(Duration::from_millis(5));
     };
     assert!(
-        error.contains("frame 3") && error.contains("does not check"),
+        error.contains("frame 4") && error.contains("does not check"),
         "{error}"
     );
     assert_eq!(b.read().n, 1);
@@ -2911,4 +2911,119 @@ fn three_handles_that_fork_drop_merge_restore_pull_and_cycle_meet_only_expected_
         }
         assert!(odd.is_empty(), "round {round}: {odd:#?}");
     }
+}
+
+fn seeded_spread(seed: &'static str) -> impl FnOnce() -> Spread {
+    move || {
+        let mut map = Spread::new();
+        map.insert(0, seed.to_string());
+        map
+    }
+}
+
+fn seed_of_spread(root: &Spread) -> Option<String> {
+    root.get(&0).map(|seed| (*seed).clone())
+}
+
+fn across_the_first_frame(
+    write: impl FnOnce(&mut Spread) + Send + 'static,
+) -> (tempfile::TempDir, Db<Spread>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let source: Db<Spread> = fast().open(dir.path().join("source.ferro")).unwrap();
+    source
+        .update(|root| {
+            for key in 1..=120u64 {
+                root.insert(key, common::text(key, 30_000));
+            }
+        })
+        .unwrap();
+    let path = dir.path().join("first.ferro");
+    let (staged, on_staged) = mpsc::channel();
+    let staged = Mutex::new(staged);
+    let hook = Hook(Arc::new(move |step| {
+        if step == "staging" {
+            let _ = staged.lock().unwrap().send(());
+        }
+    }));
+    let a: Db<Spread> = shared()
+        .hook(hook)
+        .open_with(&path, seeded_spread("a"))
+        .unwrap();
+    let b: Db<Spread> = shared().open_with(&path, seeded_spread("b")).unwrap();
+    let (inside, on_inside) = mpsc::channel();
+    let (go, on_go) = mpsc::channel::<()>();
+    let writer = thread::spawn(move || {
+        b.update(|root| {
+            inside.send(()).unwrap();
+            on_go.recv().unwrap();
+            write(root);
+        })
+        .unwrap();
+        b
+    });
+    on_inside.recv().unwrap();
+    let puller = thread::spawn(move || {
+        a.pull(&source, "origin", |_, _, _| ("merge", ())).unwrap();
+        a
+    });
+    on_staged.recv_timeout(Duration::from_secs(60)).unwrap();
+    go.send(()).unwrap();
+    let b = writer.join().unwrap();
+    let a = puller.join().unwrap();
+    b.refresh().unwrap();
+    let zero = seed_of_spread(&b.at(0).unwrap()).expect("version 0 is one of the inits");
+    assert_eq!(seed_of_spread(&a.at(0).unwrap()), Some(zero.clone()));
+    drop(a);
+    (dir, b, zero)
+}
+
+#[test]
+fn a_closure_running_while_another_handle_writes_the_first_frame_starts_from_its_version_0() {
+    let (_dir, b, zero) = across_the_first_frame(|root| drop(root.insert(1, "from b".into())));
+    let first = b.at(1).unwrap();
+    assert_eq!(first.get(&1).as_deref().map(String::as_str), Some("from b"));
+    assert_eq!(
+        seed_of_spread(&first),
+        Some(zero),
+        "version 1 was drafted from the init of a handle whose version 0 lost"
+    );
+}
+
+#[test]
+fn a_closure_that_changes_nothing_while_another_handle_writes_the_first_frame_commits_nothing() {
+    let (_dir, b, zero) = across_the_first_frame(|_| {});
+    let lost = if zero == "a" { "b" } else { "a" };
+    let seeds: Vec<_> = (1..=b.version())
+        .map(|version| seed_of_spread(&b.at(version).unwrap()))
+        .collect();
+    assert!(
+        !seeds.contains(&Some(lost.to_string())),
+        "a closure that changed nothing committed the losing init: {seeds:?}"
+    );
+}
+
+#[test]
+fn a_catch_up_that_fails_once_still_gives_an_empty_branch_the_stored_version_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retry.ferro");
+    let a: Db<common::Fragile> = shared()
+        .open_with(&path, || common::Fragile(0, "a".into()))
+        .unwrap();
+    let b: Db<common::Fragile> = shared()
+        .open_with(&path, || common::Fragile(0, "b".into()))
+        .unwrap();
+    a.fork("side").unwrap();
+    common::fuse(0, true);
+    let failed = b.refresh();
+    common::defuse();
+    assert!(matches!(failed, Err(Error::Decode(_))), "{failed:?}");
+    b.refresh().unwrap();
+    assert_eq!(b.at(0).unwrap().1, "a");
+    assert_eq!(
+        b.read().1,
+        "a",
+        "main still holds the init of a handle whose version 0 lost"
+    );
+    b.update(|value| value.0 += 1).unwrap();
+    assert_eq!(b.at(1).unwrap().1, "a");
 }
