@@ -422,8 +422,8 @@ the 84 of `sync.rs`, the 32 of `crash.rs` and the 35 of `reclaim.rs`.
 
 Five designs of the gate that lets a cycle, a landing or a prune take every branch lock under
 `shared`, described under [The gate](processes.md#the-gate), each fixed what a review of the last
-found and brought new hangs or stalls (#128, #136, #142, #145, #146, #147). The last two were
-chosen in a model first: `ferro/tests/gate_model.rs` runs each design as tasks of a
+found and brought new hangs or stalls (#128, #136, #142, #145, #146, #147, #149, #155). The last
+four were chosen in a model first: `ferro/tests/gate_model.rs` runs each design as tasks of a
 single-threaded executor on a simulated clock, which moves only when every task waits, so a run is
 fixed by its seed.
 
@@ -468,10 +468,20 @@ The model has what the designs differ in, and nothing of the file itself:
   without repeating. The pool waits 1 ms after a gate it had to wait for, and b919d64's gate is
   the pool with that wait. They differ last in how takers queue for the gate byte: in the table and
   the kernel, as b919d64 did; the same with no try before the blocking take; in a line of each
-  open's takers by ticket; with a turn drawn among the opens as well, waiting on the turn before
-  it; and the chosen one, which keeps a pull's place in line and turn from its landing for its
-  integration. The writers of every phase gate give up after 2 s, in their own process as in
-  others, and test the time before each sleep, as the code does.
+  open's takers by ticket; with a turn drawn among the opens as well by the first in each line,
+  waiting in the kernel on the turn before it; the same keeping a pull's place in line and turn
+  from its landing for its integration, as e11aab6 did; a turn drawn by each thread when it asks,
+  counting the turns its own open's threads hold, which a test does not show, waiting on its open's
+  record for a turn one of them holds and in the kernel for another's; the chosen one, which tests a
+  turn another open holds between sleeps, passes it once it has stayed held for 10 ms with the turn
+  before it and the gate free, and gives the door up after 10 ms; and that one with a mark byte for
+  each turn that the gate's holder holds, on which a waiter sleeps in the kernel between holds. The
+  last four keep a pull's turn from its landing for its integration. The writers of every phase gate
+  give up after 2 s, in their own process as in others, and test the time before each sleep, as the
+  code does. A scenario can stop a taker for a while where it stands, holding what it holds there,
+  as `SIGSTOP` does: while it waits for its turn, or, in the designs without turns, out of the
+  kernel's chain of waiters for the gate byte, which a stop takes it out of; while it holds the
+  door; or between a pull's landing and its integration.
 
 Every wake runs after a delay drawn from one of three profiles, which alternate by seed: calm, a few
 microseconds with 0.2% of wakes preempted for up to 4 ms; busy, up to 300 µs with 4% preempted for
@@ -516,18 +526,25 @@ over 2 s about once in 5,000 runs, under b2741a3's gate and the chosen one alike
 allows 2.5 s.
 
 Those of #149 run sixteen takers that pull over and over for 3 s, each pull a landing and an
-integration and a merge committed through the puller: in opens of their own beside four and
-sixteen opens committing in 5 ms closures, and as threads of one open beside four. Taken in turn,
-each taker pulls once in about the time all of them take to pull once each, 3 s times the takers
-over the pulls made in all, so each checks that no pull, nor the wait for one that had not ended
-when the run stopped, took more than twice that and 100 ms, and that the taker that pulled fewest
-times, counted with one more, pulled at least half as often as the one that pulled most. With the
+integration and a merge committed through the puller: in opens of their own beside four and, for
+6 s, sixteen opens committing in 5 ms closures, and as threads of one open beside four; #155 adds
+eight threads of one open beside eight opens of their own. Taken in turn, each taker pulls once in
+about the time all of them take to pull once each, the run's length times the takers over the
+pulls made in all, so each checks that no pull, nor the wait for one that had not ended when the
+run stopped, took more than twice that and 100 ms, that every taker pulled, and that the taker
+that pulled fewest times, counted with one more, pulled at least half as often as the one that
+pulled most. Beside sixteen writers each hold waits out a few rounds and the takers pulled once or
+twice each in 3 s, so a taker that never pulled passed the other checks there; the run is twice as
+long now, and the check that every taker pulled fails b919d64's order. The rest of #155 stop a
+fourth taker for 2 s, while it waits, while it holds the door and between its landing and its
+integration, beside three handles pulling over and over and four committing in closures of up to
+1 ms, and check that none of the three's pulls, nor a wait for one, took 750 ms. With the
 kernel's chains of waiters in the model, a cycle beside sixteen handles with 5 ms closures took up
 to 380 ms once in 6,000 runs, under b919d64's gate and the chosen one alike, past the 350 ms that
 scenario allowed, so the five of #128 allow 250 ms rather than 200 ms over thirty closures.
 
 `the_phase_gate_passes_every_scenario` runs the chosen design over 1,200 seeds of each scenario, in
-about a minute, or as many as `FERRO_GATE_SEEDS` says.
+about two minutes, or as many as `FERRO_GATE_SEEDS` says.
 `the_model_finds_what_the_reviews_of_earlier_designs_found` checks that the model finds each failure
 the reviews found, in the design they were found in, within 120 seeds: 6fb68bc's 4 to 6 s cycles
 beside its own threads on one branch, its hangs beside a write waiting for the joining closure's
@@ -537,14 +554,18 @@ threads of its handle taking one lane in turn, its back-to-back livelock, its jo
 to 16.4 s through the cycling handle, as the review measured, and its hang beside the group; and
 b2741a3's writers waiting out holds after the one they found, beside one taker and two and four
 pullers, within 600 seeds for four, and finding their phase after it ended; and b919d64's takers
-served out of turn in all three runs of #149, and a line in each open out of turn across opens. It
+served out of turn in all three runs of #149, and a line in each open out of turn across opens;
+e11aab6's turns for each open, which serve the threads of an open that others share the gate with
+out of turn and hold up every taker behind one that stops while it waits or between a pull's
+holds; and turns for each thread that wait in the kernel, which hold every taker up behind one
+stopped while it waits or holds the door. It
 also finds that a phase gate without the rule for a busy branch lets a chain of joining closures on
 one branch keep a cycle waiting for good, and that a rule that waits as long as the branch stays
 busy holds a joined commit for 2 s on a branch other handles keep busy. `compare_designs`, ignored, prints each design's failures and the spread
 of its takers' and joined writes' times, and `sweep_one_design` one design's, named by
 `FERRO_GATE_DESIGN`, over the scenarios `FERRO_GATE_ONLY` names.
 
-With 300 seeds of each scenario, the chosen phase gate passed all 46, and the others failed these,
+With 300 seeds of each scenario, the chosen phase gate passed all 50, and the others failed these,
 out of 300, where the phase gates of the first table, which queue takers as the chosen one does,
 are named by their rule for a busy branch:
 
@@ -563,7 +584,9 @@ are named by their rule for a busy branch:
 | Four threads' joining closures on branches of their own, joined commits only | 0 | 212 | 0 | 0 |
 | #147, four handles pulling | 0 | 19 | 0 | 0 |
 | #147, closures of 128.1, 511.9 and 512.1 ms | 4, 203, 206 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
-| #149, sixteen opens pulling beside 4 and 16 writers, and sixteen threads of one open | 299, 249, 300 | 300, 283, 269 | 0, 0, 0 | 0, 0, 0 |
+| #149, sixteen opens pulling beside 4 and 16 writers, and sixteen threads of one open | 299, 299, 300 | 300, 297, 269 | 0, 0, 0 | 0, 0, 0 |
+| #155, eight threads of one open beside eight opens | 300 | 300 | 0 | 0 |
+| #155, a taker stopped while it waits, holding the door and between a pull's holds | 0, 0, 0 | 91, 91, 94 | 0, 0, 0 | 0, 0, 0 |
 
 and the phase gates that tell phases apart in other ways, each with the rule for a busy branch and
 takers queued in the kernel:
@@ -575,7 +598,8 @@ takers queued in the kernel:
 | #147, two and four handles pulling | 1, 2 | 0, 0 | 0, 0 | 0, 0 | 0, 0 |
 | #147, writers that come at any time beside a cycle | 71 | 71 | 0 | 0 | 0 |
 | #147, closures of 511.9 ms | 0 | 0 | 1 | 0 | 0 |
-| #149, the three runs | 198, 134, 300 | 197, 134, 298 | 198, 122, 299 | 197, 132, 300 | 196, 147, 296 |
+| #149, the three runs | 198, 178, 300 | 197, 161, 298 | 198, 167, 299 | 197, 156, 300 | 196, 189, 296 |
+| #155, eight threads of one open beside eight opens | 298 | 208 | 297 | 298 | 299 |
 
 The pair spaced 1.5 ms apart keeps b2741a3's two tests, which a holder moving between them defeats,
 and costs every hold its space; the counter would have to live in the file. The pool alone passes
@@ -587,23 +611,38 @@ the real code needed.
 
 The ways of queueing takers, each with the pool and 1 ms, failed these, and the last rows give, at
 the median of the seeds, how many pulls the taker that pulled fewest and the one that pulled most
-made:
+made, and the longest pull of any seed:
 
-| Scenario | b919d64, the kernel | No try first | A line in each open | Turns | Turns, a pull's holds in one |
-| --- | --- | --- | --- | --- | --- |
-| #149, sixteen opens pulling beside 4 writers | 196 | 200 | 196 | 0 | 0 |
-| #149, sixteen opens pulling beside 16 writers | 147 | 164 | 147 | 0 | 0 |
-| #149, sixteen threads of one open pulling | 296 | 296 | 0 | 0 | 0 |
-| Pulls each, #147, two handles pulling in 1.5 s | 45-48 | 45-48 | 45-48 | 33-34 | 41-43 |
-| Pulls each, #147, four handles pulling in 1.5 s | 21-25 | 21-25 | 21-25 | 18-19 | 21-22 |
-| Pulls each, #149, sixteen opens beside 4 writers in 3 s | 1-7 | 1-7 | 1-7 | 3-4 | 4-5 |
+| Scenario | b919d64, the kernel | No try first | A line in each open | Turns for each open | And a pull's holds in one, e11aab6 | Turns for each thread | And passing, chosen | And marks |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| #149, sixteen opens pulling beside 4 and 16 writers, and sixteen threads of one open | 196, 189, 296 | 200, 197, 296 | 196, 189, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
+| #155, eight threads of one open beside eight opens | 299 | 296 | 293 | 300 | 300 | 0 | 0 | 0 |
+| #155, a taker stopped while it waits, holding the door and between a pull's holds | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 300, 300, 0 | 300, 300, 300 | 300, 300, 300 | 0, 0, 0 | 0, 0, 0 |
+| Pulls each, #147, two handles pulling in 1.5 s | 45-48 | 45-48 | 45-48 | 33-34 | 41-43 | 41-43 | 37-39 | 36-38 |
+| Pulls each, #147, four handles pulling in 1.5 s | 21-25 | 21-25 | 21-25 | 18-19 | 21-22 | 21-22 | 19-20 | 17-18 |
+| Pulls each, #149, sixteen opens beside 4 writers in 3 s | 1-7 | 1-7 | 1-7 | 3-4 | 4-5 | 4-5 | 3-4 | 3-4 |
+| Pulls each, #155, eight threads of one open beside eight opens in 3 s | 1-7 | 1-7 | 1-8 | 0-6 | 1-7 | 4-5 | 3-5 | 3-4 |
+| Longest pull, #149, sixteen opens beside 4 writers | 3.00 s | 3.01 s | 3.00 s | 1.52 s | 1.34 s | 1.34 s | 1.37 s | 1.65 s |
+| Longest pull, #155, eight threads of one open beside eight opens | 3.01 s | 3.00 s | 2.78 s | 3.01 s | 3.01 s | 1.31 s | 1.48 s | 1.39 s |
 
 A blocking take with no try first changes nothing, since the kernel grants a lock just let go to
 whichever taker asks first, blocking or not. A line orders the threads of one open and leaves the
-opens to the kernel. Turns order both, but a pull that queues again for its integration waits
-behind every taker that came during its landing and 1 ms more after it, and two handles pulling
-made a quarter fewer pulls; keeping the landing's place and turn for the integration makes nearly
-as many as b919d64 with two and as many with four.
+opens to the kernel. Turns for each open order both, but a pull that queues again for its
+integration waits behind every taker that came during its landing and 1 ms more after it, and two
+handles pulling made a quarter fewer pulls; keeping the landing's place and turn for the
+integration makes nearly as many as b919d64 with two and as many with four. A thread queued behind
+another of its open still draws its turn only once those ahead of it in the line have held the gate,
+after every open that asked meanwhile, so eight threads of one open beside eight opens pulled 1 to
+7 times each, the threads of the one open least. A turn for each thread, drawn when it asks, orders
+them all and pulls as often as e11aab6 elsewhere. All three wait in the kernel for the turn before
+their own, holding their own, so a taker stopped while it waits, or while it holds the door that a
+blocking draw waits for, holds up every taker after it for the whole 2 s, and so does one stopped
+between a pull's holds wherever the landing keeps its turn. Passing turns test the turn before
+their own between sleeps, so their waiters wake more often, and in the model, where any wake may be
+preempted, beside a fast writer two and four handles made a tenth fewer pulls; in the real code they
+came within the noise of e11aab6's, as [Takers in turn](processes.md#takers-in-turn) records. A
+mark that the holder holds, for waiters to sleep on in the kernel between holds, pulled no more
+often and made the longest pulls longer.
 
 The last scenario of the first table, four threads looping closures that join commits on branches
 of their own, is beyond what the gate promises a taker, as [The gate](processes.md#the-gate) says,

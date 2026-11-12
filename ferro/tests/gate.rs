@@ -964,8 +964,9 @@ fn a_closure_joining_a_commit_on_an_earlier_branch_of_its_handle_finishes_beside
 
 #[test]
 #[ignore = "prints how often each of FERRO_PULLERS threads, of one handle if FERRO_ONE_HANDLE is \
-            set, pulls beside FERRO_WRITERS handles whose closures sleep FERRO_CLOSURE_US, over \
-            FERRO_SECS"]
+            set, or the first FERRO_IN_ONE_HANDLE of them of one handle and the rest of handles \
+            of their own, pulls beside FERRO_WRITERS handles whose closures sleep \
+            FERRO_CLOSURE_US, over FERRO_SECS"]
 fn threads_pulling_beside_writers_report_how_often_each_pulls() {
     let setting =
         |name: &str, default: u64| std::env::var(name).map_or(default, |v| v.parse().unwrap());
@@ -973,7 +974,10 @@ fn threads_pulling_beside_writers_report_how_often_each_pulls() {
     let writers = setting("FERRO_WRITERS", 4);
     let closure = Duration::from_micros(setting("FERRO_CLOSURE_US", 5_000));
     let secs = setting("FERRO_SECS", 10);
-    let one_handle = std::env::var("FERRO_ONE_HANDLE").is_ok();
+    let in_one = match std::env::var("FERRO_ONE_HANDLE").is_ok() {
+        true => pullers,
+        false => setting("FERRO_IN_ONE_HANDLE", 0),
+    };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pulls.ferro");
     let stop = Arc::new(AtomicBool::new(false));
@@ -981,7 +985,7 @@ fn threads_pulling_beside_writers_report_how_often_each_pulls() {
     let first: Db<Root> = manual().open(&path).unwrap();
     let pulls: Vec<_> = (0..pullers)
         .map(|at| {
-            let puller: Db<Root> = match one_handle {
+            let puller: Db<Root> = match at < in_one {
                 true => first.clone(),
                 false => manual().open(&path).unwrap(),
             };
@@ -1000,19 +1004,27 @@ fn threads_pulling_beside_writers_report_how_often_each_pulls() {
         .map(|p| waits(p.join().unwrap()))
         .collect();
     let commits: u64 = writing.into_iter().map(|w| w.join().unwrap()).sum();
+    let longest_of = |each: &[Waits]| {
+        each.iter()
+            .map(|waits| waits.longest)
+            .max()
+            .unwrap_or_default()
+    };
+    let (shared, own) = each.split_at(usize::try_from(in_one).unwrap());
+    let mut of_one: Vec<usize> = shared.iter().map(|waits| waits.count).collect();
+    of_one.sort_unstable();
+    let longest_of_one = longest_of(shared);
+    let longest_of_own = longest_of(own);
     each.sort_by_key(|waits| waits.count);
     let counts: Vec<usize> = each.iter().map(|waits| waits.count).collect();
     let mut medians: Vec<Duration> = each.iter().map(|waits| waits.median).collect();
     medians.sort();
-    let longest = each
-        .iter()
-        .map(|waits| waits.longest)
-        .max()
-        .unwrap_or_default();
+    let longest = longest_of(&each);
     println!(
-        "PULLING THREADS {pullers}, one handle: {one_handle}, beside {writers} writers, {secs} s: \
-         pulls each {counts:?}, {} in all; median pull per thread {:?} to {:?}; longest pull \
-         {longest:?}; writer commits {commits}",
+        "PULLING THREADS {pullers}, {in_one} of one handle, beside {writers} writers, {secs} s: \
+         pulls each {counts:?}, {} in all, of one handle {of_one:?}; median pull per thread {:?} \
+         to {:?}; longest pull {longest:?}, of one handle {longest_of_one:?}, of the others \
+         {longest_of_own:?}; writer commits {commits}",
         counts.iter().sum::<usize>(),
         medians.first().copied().unwrap_or_default(),
         medians.last().copied().unwrap_or_default(),

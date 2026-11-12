@@ -73,6 +73,9 @@ const DOOR: u64 = 11;
 const TURN_AT: u64 = 4000;
 /// How many turn bytes there are.
 const TURNS: u64 = 64;
+/// The first of the marks of [`Queue::Marked`], every other byte from here, one for each turn,
+/// which the holder of the gate holds while it holds the gate in that turn.
+const MARK_AT: u64 = 6000;
 /// The first branch byte; branch `b` locks `BYTES + b`.
 const BYTES: u64 = 1 << 20;
 /// Every branch byte.
@@ -170,6 +173,37 @@ enum Queue {
     /// to be let go before it takes the gate, so that opens take the gate in the order they
     /// drew, each waiting on a byte no other waits on.
     Turns,
+    /// Each taker draws its own turn when it asks, under [`DOOR`] and its open's lock on drawing:
+    /// the turn after the last one held by any open, its own included, which only its open's
+    /// record shows, since an open never sees its own locks. It waits for the turn before its own
+    /// in its open's record if a thread of its open holds that turn, and in `F_OFD_SETLKW` as
+    /// [`Queue::Turns`] does otherwise, so takers get the gate in the order they asked whatever
+    /// open they ask through.
+    Threads,
+    /// As [`Queue::Threads`], but no wait outlasts a taker stopped in its process: the door is
+    /// tried between sleeps and given up after this long, for no turn, and a turn held by another
+    /// open is tested between sleeps, as [`NEXT_POLL`] and [`QUEUED_POLL`] say, and passed once
+    /// it has stayed held this long while the turn before it and the gate were free, when the
+    /// taker that holds it would have taken the gate had it run.
+    Passing(u64),
+    /// As [`Queue::Passing`], with the holder of the gate holding the mark of its turn while it
+    /// holds the gate byte, and letting it go after its turn, so that a taker waiting for a turn
+    /// held by another open waits in `F_OFD_SETLKW` for the mark of the holder, if any, and wakes
+    /// once at the end of each hold rather than testing between sleeps.
+    Marked(u64),
+}
+
+/// Where a scenario stops a taker, as `SIGSTOP` or a debugger stops its process, holding what it
+/// holds there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// Queued for the gate: holding its turn while it waits for the one before it, or out of the
+    /// kernel's chain of waiters for the gate byte, which a stop takes it out of.
+    Queued,
+    /// Holding the door while it draws a turn.
+    Door,
+    /// Between a pull's landing and its integration.
+    Between,
 }
 
 /// The phase gate of b2741a3.
@@ -227,10 +261,40 @@ const TURNED: Knobs = Knobs {
     ..KERNEL
 };
 
-/// The chosen phase gate: [`TURNED`], with a pull's landing and integration in one turn.
-const CHOSEN: Knobs = Knobs {
+/// The phase gate of e11aab6: [`TURNED`], with a pull's landing and integration in one turn.
+const OPENS: Knobs = Knobs {
     together: true,
     ..TURNED
+};
+
+/// [`OPENS`] with a turn for each taker, drawn when it asks.
+const THREADS: Knobs = Knobs {
+    queue: Queue::Threads,
+    ..OPENS
+};
+
+/// How long a turn held by another open may stay held while the turn before it and the gate are
+/// free before the taker after it passes it.
+const PASS: u64 = 10 * MS;
+
+/// The longest sleep between two tests of the turn before a taker's own while no turn before
+/// that one is held, so that the taker is next.
+const NEXT_POLL: u64 = 50 * US;
+
+/// The longest sleep between two tests of the turn before a taker's own while the turn before
+/// that one is held too.
+const QUEUED_POLL: u64 = 2 * MS;
+
+/// The chosen phase gate: [`THREADS`], with waits that pass a taker stopped in its process.
+const CHOSEN: Knobs = Knobs {
+    queue: Queue::Passing(PASS),
+    ..THREADS
+};
+
+/// [`CHOSEN`], with a waiter woken at the end of each hold by the mark of its holder.
+const MARKED: Knobs = Knobs {
+    queue: Queue::Marked(PASS),
+    ..THREADS
 };
 
 /// The phase gate without its rule for busy branches.
@@ -358,6 +422,11 @@ struct Open {
     tickets: u64,
     serving: u64,
     served: Vec<usize>,
+    turns: Vec<u64>,
+    turned: Vec<usize>,
+    drawing: bool,
+    drawers: Vec<usize>,
+    marked: Option<u64>,
 }
 
 struct Lock {
@@ -398,6 +467,7 @@ struct Seen {
     late_waits: u64,
     most_late: u64,
     pulls: Vec<u64>,
+    passed: u64,
 }
 
 struct St {
@@ -421,6 +491,7 @@ struct St {
     counter: u64,
     helpers: HashMap<(usize, usize, bool), usize>,
     hold_began: Option<u64>,
+    stopper: Option<(usize, Stop, u64)>,
 }
 
 impl St {
@@ -1778,6 +1849,7 @@ fn turn_byte(index: u64) -> u64 {
 /// byte held, if one was free, and whether a turn came before it, as the code counts a wait.
 async fn take_turn(w: &W, open: usize) -> (Option<u64>, bool) {
     w.lock(open, DOOR, DOOR + 1).await;
+    stopped_at(w, Stop::Door).await;
     let found = w.conflict(open, TURN_AT, TURN_AT + 2 * TURNS).await;
     let last = match found {
         None => None,
@@ -1804,6 +1876,7 @@ async fn take_turn(w: &W, open: usize) -> (Option<u64>, bool) {
     if !held {
         return (None, false);
     }
+    stopped_at(w, Stop::Queued).await;
     let Some(last) = last else {
         return (Some(turn_byte(mine)), false);
     };
@@ -1811,6 +1884,185 @@ async fn take_turn(w: &W, open: usize) -> (Option<u64>, bool) {
     w.lock(open, before, before + 1).await;
     w.unlock(open, before, before + 1).await;
     (Some(turn_byte(mine)), true)
+}
+
+/// Stops the running task for the length its scenario set, if the scenario stops it at `at`.
+async fn stopped_at(w: &W, at: Stop) {
+    let length = {
+        let mut st = w.st();
+        let me = st.cur;
+        match st.stopper {
+            Some((task, stop, length)) if task == me && stop == at => {
+                st.stopper = None;
+                Some(length)
+            }
+            _ => None,
+        }
+    };
+    if let Some(length) = length {
+        w.cpu(length).await;
+    }
+}
+
+/// Whether `open` or another open holds the turn byte `at`.
+async fn turn_held(w: &W, open: usize, at: u64) -> bool {
+    w.conflict(open, at, at + 1).await.is_some() || w.st().opens[open].turns.contains(&at)
+}
+
+/// Lets the turn byte `at` that a taker of `open` holds go.
+async fn let_turn_go(w: &W, open: usize, at: u64) {
+    w.unlock(open, at, at + 1).await;
+    let mut st = w.st();
+    st.opens[open].turns.retain(|held| *held != at);
+    let turned = std::mem::take(&mut st.opens[open].turned);
+    st.wake_all(turned);
+}
+
+/// Takes the door between sleeps, giving up after `bound`.
+async fn try_door(w: &W, open: usize, bound: u64) -> bool {
+    let started = w.now();
+    let mut pause = 10 * US;
+    loop {
+        if w.try_lock(open, DOOR, DOOR + 1).await {
+            return true;
+        }
+        if w.now() - started >= bound {
+            return false;
+        }
+        w.sleep(pause).await;
+        pause = (pause * 2).min(200 * US);
+    }
+}
+
+/// Draws this taker's own turn as [`Queue::Threads`] and [`Queue::Passing`] have it, and waits for
+/// the one before it: returns the turn byte held, if one was free, and whether a turn came before
+/// it.
+async fn take_own_turn(w: &W, open: usize, queue: Queue) -> (Option<u64>, bool) {
+    let pass = match queue {
+        Queue::Passing(bound) | Queue::Marked(bound) => Some(bound),
+        _ => None,
+    };
+    w.until(|st, me| {
+        let shared = &mut st.opens[open];
+        if !shared.drawing {
+            shared.drawing = true;
+            return true;
+        }
+        shared.drawers.push(me);
+        false
+    })
+    .await;
+    let door = match pass {
+        None => {
+            w.lock(open, DOOR, DOOR + 1).await;
+            true
+        }
+        Some(bound) => try_door(w, open, bound).await,
+    };
+    let mut drawn = None;
+    if door {
+        stopped_at(w, Stop::Door).await;
+        let found = match w.conflict(open, TURN_AT, TURN_AT + 2 * TURNS).await {
+            Some(at) => Some(at),
+            None => w.st().opens[open].turns.first().copied(),
+        };
+        let last = match found {
+            None => None,
+            Some(at) => {
+                for _ in 0..TURNS.ilog2() {
+                    w.syscall().await;
+                }
+                let st = w.st();
+                let first = (at - TURN_AT) / 2;
+                let held = |index: u64| {
+                    let byte = turn_byte(index);
+                    st.conflict(open, byte, byte + 1).is_some()
+                        || st.opens[open].turns.contains(&byte)
+                };
+                let last = (1..TURNS / 2)
+                    .rev()
+                    .map(|ahead| first + ahead)
+                    .find(|index| held(*index))
+                    .unwrap_or(first);
+                Some(last)
+            }
+        };
+        let mine = turn_byte(last.map_or(0, |last| last + 1));
+        let own = w.st().opens[open].turns.contains(&mine);
+        if !own && w.try_lock(open, mine, mine + 1).await {
+            w.st().opens[open].turns.push(mine);
+            drawn = Some((mine, last));
+        }
+        w.unlock(open, DOOR, DOOR + 1).await;
+    }
+    {
+        let mut st = w.st();
+        st.opens[open].drawing = false;
+        let drawers = std::mem::take(&mut st.opens[open].drawers);
+        st.wake_all(drawers);
+    }
+    let Some((mine, last)) = drawn else {
+        return (None, false);
+    };
+    stopped_at(w, Stop::Queued).await;
+    let Some(last) = last else {
+        return (Some(mine), false);
+    };
+    let before = turn_byte(last);
+    if w.st().opens[open].turns.contains(&before) {
+        w.until(|st, me| {
+            if !st.opens[open].turns.contains(&before) {
+                return true;
+            }
+            st.opens[open].turned.push(me);
+            false
+        })
+        .await;
+        return (Some(mine), true);
+    }
+    let Some(bound) = pass else {
+        w.lock(open, before, before + 1).await;
+        w.unlock(open, before, before + 1).await;
+        return (Some(mine), true);
+    };
+    let earlier = turn_byte(last + TURNS - 1);
+    let mut pause = PHASE_POLL.0;
+    let mut idle: Option<u64> = None;
+    loop {
+        if w.conflict(open, before, before + 1).await.is_none() {
+            break;
+        }
+        if matches!(queue, Queue::Marked(_))
+            && let Some(mark) = w.conflict(open, MARK_AT, MARK_AT + 2 * TURNS).await
+        {
+            w.lock(open, mark, mark + 1).await;
+            w.unlock(open, mark, mark + 1).await;
+            idle = None;
+            pause = PHASE_POLL.0;
+            continue;
+        }
+        let queued = turn_held(w, open, earlier).await;
+        let gate = !queued
+            && (w.st().opens[open].taken.contains(&GATE)
+                || w.conflict(open, GATE, GATE + 1).await.is_some());
+        if gate || queued {
+            idle = None;
+        } else {
+            let now = w.now();
+            if now - *idle.get_or_insert(now) >= bound {
+                w.st().seen.passed += 1;
+                break;
+            }
+        }
+        let longest = match queued {
+            true => QUEUED_POLL,
+            false => NEXT_POLL,
+        };
+        pause = pause.min(longest);
+        w.sleep(pause).await;
+        pause = (pause * 2).min(longest);
+    }
+    (Some(mine), true)
 }
 
 /// Queues for the gate byte as `queue` has it and takes it: returns the turn byte held, if any,
@@ -1831,6 +2083,14 @@ async fn queue_for_gate(
         let (held, behind) = take_turn(w, open).await;
         turn = held;
         waited |= behind;
+    }
+    if kept.is_none() && matches!(queue, Queue::Threads | Queue::Passing(_) | Queue::Marked(_)) {
+        let (held, behind) = take_own_turn(w, open, queue).await;
+        turn = held;
+        waited |= behind;
+    }
+    if matches!(queue, Queue::Kernel | Queue::Blocking | Queue::Local) {
+        stopped_at(w, Stop::Queued).await;
     }
     if queue == Queue::Blocking {
         let (_, blocked) = w.held(open, GATE, true).await;
@@ -1853,6 +2113,12 @@ async fn take_phase_gate(
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
     let phasing = knobs.phasing;
     let (turn, waited) = queue_for_gate(w, open, knobs.queue, kept).await;
+    if let (Queue::Marked(_), Some(at)) = (knobs.queue, turn) {
+        let mark = MARK_AT + (at - TURN_AT);
+        if w.try_lock(open, mark, mark + 1).await {
+            w.st().opens[open].marked = Some(mark);
+        }
+    }
     if waited && knobs.gap > 0 {
         w.sleep(knobs.gap).await;
     }
@@ -1967,11 +2233,15 @@ async fn leave_phase_gate(
     }
     w.st().hold_began = None;
     w.release(open, GATE, true).await;
+    let mark = w.st().opens[open].marked.take();
+    if !keep && let Some(at) = turn {
+        let_turn_go(w, open, at).await;
+    }
+    if let Some(mark) = mark {
+        w.unlock(open, mark, mark + 1).await;
+    }
     if keep {
         return Some(turn);
-    }
-    if let Some(at) = turn {
-        w.unlock(open, at, at + 1).await;
     }
     if matches!(knobs.queue, Queue::Local | Queue::Turns) {
         leave_line(w, open);
@@ -2016,11 +2286,13 @@ async fn land_and_integrate(w: &W, open: usize, decide: u64) {
         Design::Phases(knobs) if knobs.together => {
             let kept = exclusively_in_phases(w, open, knobs, None, true).await;
             w.cpu(decide).await;
+            stopped_at(w, Stop::Between).await;
             exclusively_in_phases(w, open, knobs, kept, false).await;
         }
         _ => {
             exclusively(w.clone(), open).await;
             w.cpu(decide).await;
+            stopped_at(w, Stop::Between).await;
             exclusively(w.clone(), open).await;
         }
     }
@@ -2065,6 +2337,7 @@ impl Model {
             counter: 0,
             helpers: HashMap::new(),
             hold_began: None,
+            stopper: None,
         };
         Model {
             w: W(Rc::new(RefCell::new(st))),
@@ -2878,31 +3151,36 @@ fn fewest_and_most(seen: &Seen) -> (u64, u64) {
     (fewest, most)
 }
 
-/// #149: `takers` pull over and over, each in an open of its own or, if `one_open` is set, in
-/// threads of one open, each pull a landing and an integration, each taking every branch, and a
-/// merge committed through the puller, beside `writers` other opens committing on branches of
-/// their own in 5 ms closures, for 3 s. Taken in turn, each taker pulls once in about the time
-/// all of them take to pull once each, 3 s times the takers over the pulls they made in all, so
-/// each pull, and each wait for one that had not ended when the run stopped, must take at most
-/// twice that and 100 ms, and the taker that pulled fewest times, with one more, at least half as
-/// often as the one that pulled most.
+/// How long sixteen pullers pull beside sixteen writers: long enough for each to pull a few times
+/// when they take the gate in turn, since each hold there waits out a few rounds.
+const PULLS_BESIDE_16: u64 = 6 * SEC;
+
+/// #149 and #155: takers pull over and over, `in_one` of them as threads of one open and `alone`
+/// each in an open of its own, each pull a landing and an integration, each taking every branch,
+/// and a merge committed through the puller, beside `writers` other opens committing on branches
+/// of their own in 5 ms closures, for `window`. Taken in turn, each taker pulls once in about the
+/// time all of them take to pull once each, `window` times the takers over the pulls they made in
+/// all, so each pull, and each wait for one that had not ended when the run stopped, must take at
+/// most twice that and 100 ms, every taker must pull, and the taker that pulled fewest times, with
+/// one more, at least half as often as the one that pulled most.
 fn fair_pulls(
     design: Design,
     timing: Timing,
     seed: u64,
-    (takers, writers, one_open): (usize, usize, bool),
+    (in_one, alone, writers, window): (usize, usize, usize, u64),
 ) -> Verdict {
     let mut m = Model::new(design, timing, seed);
     for writer_at in 0..writers {
         let open = m.open(&[MAIN, OWN + writer_at], false);
         m.spawn(writer(&m.w, open, OWN + writer_at, (5 * MS, 5 * MS), 0));
     }
-    let shared = one_open.then(|| m.open(&[MAIN], false));
+    let takers = in_one + alone;
+    let shared = (in_one > 0).then(|| m.open(&[MAIN], false));
     m.w.st().seen.pulls = vec![0; takers];
     let pulling = Rc::new(RefCell::new(vec![None; takers]));
     for at in 0..takers {
         let branch = OWN + writers + at;
-        let puller = match shared {
+        let puller = match shared.filter(|_| at < in_one) {
             Some(open) => {
                 m.w.st().opens[open].attached.push(branch);
                 open
@@ -2932,9 +3210,8 @@ fn fair_pulls(
             }
         }));
     }
-    let window = 3 * SEC;
     stop_after(&m.w, window);
-    let end = m.run(10 * SEC, |st| !st.seen.marks.is_empty());
+    let end = m.run(window + 7 * SEC, |st| !st.seen.marks.is_empty());
     let now = m.w.now();
     let mut seen = std::mem::take(&mut m.w.st().seen);
     seen.cycles.extend(
@@ -2948,10 +3225,75 @@ fn fair_pulls(
         let (fewest, most) = fewest_and_most(seen);
         let round = window * takers as u64 / seen.pulls.iter().sum::<u64>().max(1);
         under("a pull", &seen.cycles, 2 * round + 100 * MS).or_else(|| {
-            (2 * (fewest + 1) < most)
-                .then(|| format!("takers pulled from {fewest} to {most} times each"))
+            (fewest == 0 || 2 * (fewest + 1) < most).then(|| {
+                format!(
+                    "takers pulled from {fewest} to {most} times each: {:?}",
+                    seen.pulls
+                )
+            })
         })
     })
+}
+
+/// #155: three opens pull over and over beside four opens committing in closures of up to 1 ms,
+/// and a fourth open pulls once, 100 ms in, stopped for 2 s where `at` says, holding what it
+/// holds there. No pull of the other three may wait for it: each must take under 750 ms, and each
+/// wait for one that had not ended when the run stopped too.
+fn stopped_taker(design: Design, timing: Timing, seed: u64, at: Stop) -> Verdict {
+    let mut m = Model::new(design, timing, seed);
+    for writer_at in 0..4 {
+        let open = m.open(&[MAIN, OWN + writer_at], false);
+        m.spawn(writer(&m.w, open, OWN + writer_at, (0, MS), 0));
+    }
+    let takers = 3;
+    m.w.st().seen.pulls = vec![0; takers];
+    let pulling = Rc::new(RefCell::new(vec![None; takers]));
+    for index in 0..takers {
+        let branch = OWN + 4 + index;
+        let puller = m.open(&[MAIN, branch], false);
+        let w = m.w.clone();
+        let pulling = pulling.clone();
+        m.spawn(Box::pin(async move {
+            w.sleep(index as u64 * 200 * US + offset(seed)).await;
+            while !w.st().stop {
+                let fetch = w.st().rng.within((100 * US, 300 * US));
+                w.cpu(fetch).await;
+                let started = w.now();
+                pulling.borrow_mut()[index] = Some(started);
+                let decide = w.st().rng.within((50 * US, 150 * US));
+                land_and_integrate(&w, puller, decide).await;
+                commit(w.clone(), puller, branch, nothing()).await;
+                pulling.borrow_mut()[index] = None;
+                let mut st = w.st();
+                if st.stop {
+                    return;
+                }
+                let took = st.now - started;
+                st.seen.cycles.push(took);
+                st.seen.pulls[index] += 1;
+            }
+        }));
+    }
+    let branch = OWN + 4 + takers;
+    let stopped = m.open(&[MAIN, branch], false);
+    let w = m.w.clone();
+    let task = m.spawn(Box::pin(async move {
+        w.sleep(100 * MS + offset(seed)).await;
+        land_and_integrate(&w, stopped, 100 * US).await;
+    }));
+    m.w.st().stopper = Some((task, at, 2 * SEC));
+    stop_after(&m.w, 3 * SEC);
+    let end = m.run(10 * SEC, |st| !st.seen.marks.is_empty());
+    let now = m.w.now();
+    let mut seen = std::mem::take(&mut m.w.st().seen);
+    seen.cycles.extend(
+        pulling
+            .borrow()
+            .iter()
+            .flatten()
+            .map(|started| now - started),
+    );
+    Verdict::check(end, seen, |seen| under("a pull", &seen.cycles, 750 * MS))
 }
 
 fn stop_after(w: &W, length: u64) {
@@ -3184,13 +3526,26 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         }),
         ("#147 swap race", swap_race),
         ("#149 16 pullers beside 4 writers", |d, t, s| {
-            fair_pulls(d, t, s, (16, 4, false))
+            fair_pulls(d, t, s, (0, 16, 4, 3 * SEC))
         }),
         ("#149 16 pullers beside 16 writers", |d, t, s| {
-            fair_pulls(d, t, s, (16, 16, false))
+            fair_pulls(d, t, s, (0, 16, 16, PULLS_BESIDE_16))
         }),
         ("#149 16 threads of one open pulling", |d, t, s| {
-            fair_pulls(d, t, s, (16, 4, true))
+            fair_pulls(d, t, s, (16, 0, 4, 3 * SEC))
+        }),
+        (
+            "#155 8 threads of one open beside 8 opens pulling",
+            |d, t, s| fair_pulls(d, t, s, (8, 8, 4, 3 * SEC)),
+        ),
+        ("#155 a taker stopped while it waits", |d, t, s| {
+            stopped_taker(d, t, s, Stop::Queued)
+        }),
+        ("#155 a taker stopped holding the door", |d, t, s| {
+            stopped_taker(d, t, s, Stop::Door)
+        }),
+        ("#155 a puller stopped between its holds", |d, t, s| {
+            stopped_taker(d, t, s, Stop::Between)
         }),
     ]
 }
@@ -3210,6 +3565,7 @@ struct Worst {
     commits: u64,
     fewest: u64,
     most: u64,
+    passed: u64,
 }
 
 /// Runs `scenario` under `design` for `count` seeds, calm and busy, and returns how many failed
@@ -3233,6 +3589,7 @@ fn sweep(design: Design, scenario: Scenario, count: u64) -> (u64, Option<String>
             commits: verdict.seen.commits,
             fewest,
             most,
+            passed: verdict.seen.passed,
         });
         if let Some(why) = verdict.failure {
             failed += 1;
@@ -3277,8 +3634,9 @@ fn report(design: Design, count: u64) -> Vec<String> {
         let fewest = median(worst.iter().map(|worst| worst.fewest).collect());
         let most = median(worst.iter().map(|worst| worst.most).collect());
         let least = worst.iter().map(|worst| worst.fewest).min().unwrap_or(0);
+        let passed: u64 = worst.iter().map(|worst| worst.passed).sum();
         println!(
-            "{design:?} | {name} | failed {failed}/{count} | taker ms p50/p99/max {taken} | joined {joined} | gate wait {waited} | commits p50 {commits} | pulls each p50 {fewest}-{most}, fewest {least}"
+            "{design:?} | {name} | failed {failed}/{count} | taker ms p50/p99/max {taken} | joined {joined} | gate wait {waited} | commits p50 {commits} | pulls each p50 {fewest}-{most}, fewest {least} | passed {passed}"
         );
         if let Some(first) = first {
             failures.push(format!("{name}: {failed}/{count}, {first}"));
@@ -3333,6 +3691,31 @@ fn the_model_finds_what_the_reviews_of_earlier_designs_found() {
             "#149 16 pullers beside 4 writers",
             120,
         ),
+        (
+            Design::Phases(OPENS),
+            "#155 8 threads of one open beside 8 opens pulling",
+            120,
+        ),
+        (
+            Design::Phases(OPENS),
+            "#155 a taker stopped while it waits",
+            120,
+        ),
+        (
+            Design::Phases(OPENS),
+            "#155 a puller stopped between its holds",
+            120,
+        ),
+        (
+            Design::Phases(THREADS),
+            "#155 a taker stopped while it waits",
+            120,
+        ),
+        (
+            Design::Phases(THREADS),
+            "#155 a taker stopped holding the door",
+            120,
+        ),
     ];
     let all = scenarios();
     let mut missed = Vec::new();
@@ -3365,6 +3748,9 @@ fn sweep_one_design() {
         Ok("blocking") => Design::Phases(BLOCKING),
         Ok("local") => Design::Phases(LOCAL),
         Ok("turns") => Design::Phases(TURNED),
+        Ok("opens") => Design::Phases(OPENS),
+        Ok("threads") => Design::Phases(THREADS),
+        Ok("marked") => Design::Phases(MARKED),
         _ => Design::Phases(CHOSEN),
     };
     let failures = report(design, seeds(300));
@@ -3387,9 +3773,26 @@ fn compare_designs() {
         Design::Phases(BLOCKING),
         Design::Phases(LOCAL),
         Design::Phases(TURNED),
+        Design::Phases(OPENS),
+        Design::Phases(THREADS),
+        Design::Phases(MARKED),
         Design::Phases(CHOSEN),
     ] {
         let failures = report(design, seeds(300));
         println!("{design:?}: {failures:#?}");
     }
+}
+
+#[test]
+fn threads_of_one_open_pull_as_often_as_opens_of_their_own_beside_them() {
+    let scenario: Scenario = |d, t, s| fair_pulls(d, t, s, (8, 8, 4, 3 * SEC));
+    let (failed, first, worst) = sweep(Design::Phases(CHOSEN), scenario, seeds(30));
+    let spread: Vec<(u64, u64, u64)> = worst
+        .iter()
+        .map(|worst| (worst.fewest, worst.most, worst.taker / MS))
+        .collect();
+    assert_eq!(
+        failed, 0,
+        "{first:?}; fewest and most pulls of a taker, and its longest pull in ms, by seed: {spread:?}"
+    );
 }

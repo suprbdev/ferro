@@ -211,12 +211,13 @@ const GATE_AT: u64 = LOCKS_AT + 5;
 /// The door, held exclusive by a thread that wants the gate while it draws a turn, as
 /// [`Store::take_turn`] describes.
 const DOOR_AT: u64 = LOCKS_AT + 7;
-/// The first of the [`TURNS`] turn bytes, every other byte from here, one of which each open
-/// queued for the gate holds, so that opens take the gate in the order they drew their turns.
-/// They lie clear of every other lock and of each other, so the kernel never merges the lock on
-/// one with another lock of the same open, and a test over all of them reports a byte held.
+/// The first of the [`TURNS`] turn bytes, every other byte from here, one of which each thread
+/// queued for the gate holds through its open, so that takers get the gate in the order they drew
+/// their turns. They lie clear of every other lock and of each other, so the kernel never merges
+/// the lock on one with another lock of the same open, and a test over all of them reports a byte
+/// held.
 const TURN_AT: u64 = LOCKS_AT + (1 << 19);
-/// How many turn bytes there are, of which the opens queued for the gate hold a run at a time,
+/// How many turn bytes there are, of which the threads queued for the gate hold a run at a time,
 /// wrapping around: up to half of them before a turn drawn could land on one still held.
 const TURNS: u64 = 1 << 10;
 /// The first of the [`PHASES`] phase bytes, every other byte from here, of which the gate's
@@ -246,6 +247,26 @@ const GATE_GAP: Duration = GATE_POLL.1;
 /// The longest a writer waits at the gate, past the longest round, in case its holder stopped
 /// without letting the phase byte go.
 const GATE_WAIT: Duration = Duration::from_secs(2);
+/// How long a taker waits for the turn before its own while that turn stays held and the turn
+/// before it and the gate are free, before it passes the taker that holds it as one that stopped,
+/// and how long it waits for the door.
+#[cfg(not(test))]
+const TURN_PASS: Duration = Duration::from_millis(10);
+/// How long a taker waits for the turn before its own while that turn stays held and the turn
+/// before it and the gate are free, before it passes the taker that holds it as one that stopped,
+/// and how long it waits for the door: a second in the unit tests, which check the order of
+/// takers that run while copies of them load the machine, and a taker preempted for longer than
+/// the bound is passed as a stopped one is.
+#[cfg(test)]
+const TURN_PASS: Duration = Duration::from_secs(1);
+/// The longest sleep between two tests of the turn before a taker's own while no turn before that
+/// one is held, so that the taker is next.
+const NEXT_POLL: Duration = Duration::from_micros(50);
+/// The longest sleep between two tests of the turn before a taker's own while the turn before
+/// that one is held too, so that at least one hold comes first.
+const QUEUED_POLL: Duration = Duration::from_millis(2);
+/// The shortest and longest sleep between two tries for the door.
+const DOOR_POLL: (Duration, Duration) = (Duration::from_micros(10), Duration::from_micros(200));
 /// The first byte of the branch locks, each a byte at a 60-bit hash of the branch's name.
 const LANES_AT: u64 = LOCKS_AT + (1 << 20);
 /// How many bytes the branch locks span.
@@ -2024,40 +2045,16 @@ impl Lanes {
     }
 }
 
-/// The threads of this process that want the gate, by ticket.
-#[derive(Default)]
-struct Line {
-    /// The ticket the next thread to join takes.
-    next: u64,
-    /// The ticket of the thread at the front, which goes on to the gate.
-    serving: u64,
-}
-
-/// A thread's place at the front of its process's line for the gate, which lets the next thread
-/// in line on when dropped.
-struct Place {
-    store: Store,
-}
-
-impl Drop for Place {
-    fn drop(&mut self) {
-        let inner = &self.store.inner;
-        inner.line.lock().serving += 1;
-        inner.served.notify_all();
-    }
-}
-
-/// A place in line and a turn that a thread keeps from one hold of the gate to its next while a
-/// [`Together`] lasts, with the id of the store it holds them on.
+/// A turn that a thread keeps from one hold of the gate to its next while a [`Together`] lasts,
+/// with the id of the store it holds it on.
 struct Parked {
     store: u64,
     turn: Option<Turn>,
-    place: Option<Place>,
 }
 
 /// Binds the holds of the gate that this thread takes while it lasts, as a pull's landing and its
-/// integration are: each keeps its place in line and its turn for the next, which goes straight
-/// to the gate byte, and dropping it lets the place and the turn kept go.
+/// integration are: each keeps its turn for the next, which goes straight to the gate byte, and
+/// dropping it lets the turn kept go.
 pub(crate) struct Together {
     was: bool,
 }
@@ -2078,15 +2075,19 @@ impl Drop for Together {
     }
 }
 
-/// A turn byte held, let go when dropped.
+/// A turn for the gate that a thread of this process holds, by its index among the [`TURNS`]
+/// turn bytes, let go when dropped.
 struct Turn {
     store: Store,
-    at: u64,
+    index: u64,
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        let _ = platform::unlock_range(&self.store.inner.file, self.at, 1);
+        let inner = &self.store.inner;
+        let _ = platform::unlock_range(&inner.file, turn_byte(self.index), 1);
+        inner.turns.lock().retain(|held| *held != self.index);
+        inner.turned.notify_all();
     }
 }
 
@@ -2095,9 +2096,16 @@ fn turn_byte(index: u64) -> u64 {
     TURN_AT + 2 * (index % TURNS)
 }
 
-/// Whether another open holds any of the `count` turn bytes from the `index`th, wrapping around.
-fn turns_held(file: &File, index: u64, count: u64) -> std::io::Result<bool> {
+/// Whether a thread of this process, by `own`, or another open holds any of the `count` turn
+/// bytes from the `index`th, wrapping around.
+fn turns_held(file: &File, own: &[u64], index: u64, count: u64) -> std::io::Result<bool> {
     let start = index % TURNS;
+    if own
+        .iter()
+        .any(|held| (held + TURNS - start) % TURNS < count)
+    {
+        return Ok(true);
+    }
     let ahead = count.min(TURNS - start);
     if platform::range_excluded(file, turn_byte(start), 2 * ahead - 1)? {
         return Ok(true);
@@ -2105,22 +2113,26 @@ fn turns_held(file: &File, index: u64, count: u64) -> std::io::Result<bool> {
     Ok(ahead < count && platform::range_excluded(file, TURN_AT, 2 * (count - ahead) - 1)?)
 }
 
-/// The index of the last turn byte another open holds, or `None` if none does: the furthest held
-/// within half the turn bytes on from the one a test over all of them reports, found by halving.
-fn last_turn(file: &File) -> std::io::Result<Option<u64>> {
-    let Some(found) = platform::excluded_at(file, TURN_AT, 2 * TURNS)? else {
-        return Ok(None);
+/// The index of the last turn held, by a thread of this process, as `own` lists them, or by
+/// another open, or `None` if none is: the furthest held within half the turn bytes on from one
+/// held, which a test over all of them reports, found by halving.
+fn last_turn(file: &File, own: &[u64]) -> std::io::Result<Option<u64>> {
+    let first = match platform::excluded_at(file, TURN_AT, 2 * TURNS)? {
+        Some(found) => found.saturating_sub(TURN_AT) / 2,
+        None => match own.first() {
+            Some(index) => *index,
+            None => return Ok(None),
+        },
     };
-    let first = found.saturating_sub(TURN_AT) / 2;
     let (mut low, mut high) = (0, TURNS / 2);
     while high - low > 1 {
         let mid = (low + high) / 2;
-        match turns_held(file, first + mid, high - mid)? {
+        match turns_held(file, own, first + mid, high - mid)? {
             true => low = mid,
             false => high = mid,
         }
     }
-    Ok(Some(first + low))
+    Ok(Some((first + low) % TURNS))
 }
 
 /// The phase byte `index` phases from the first, wrapping around.
@@ -2178,7 +2190,6 @@ pub(crate) struct Gate {
     ends: Instant,
     pause: Duration,
     turn: Option<Turn>,
-    place: Option<Place>,
 }
 
 impl Gate {
@@ -2225,7 +2236,6 @@ impl Drop for Gate {
         let mut parked = Some(Parked {
             store: self.store.id(),
             turn: self.turn.take(),
-            place: self.place.take(),
         });
         if TOGETHER.try_with(Cell::get).unwrap_or(false) {
             let _ = PARKED.try_with(|slot| slot.set(parked.take()));
@@ -2486,11 +2496,14 @@ struct Inner {
     taken: Mutex<Vec<u64>>,
     /// Woken when one of them is let go.
     freed: Condvar,
-    /// The tickets of the threads of this process that want the gate, as [`Store::join_line`]
-    /// describes.
-    line: Mutex<Line>,
-    /// Woken when the thread at the front of `line` lets the gate go.
-    served: Condvar,
+    /// Held by a thread of this process while it draws a turn for the gate, as
+    /// [`Store::take_turn`] describes.
+    drawing: Mutex<()>,
+    /// The indices of the turns for the gate that threads of this process hold, which no test of
+    /// the turn bytes shows, since an open never sees its own locks.
+    turns: Mutex<Vec<u64>>,
+    /// Woken when a thread of this process lets a turn go.
+    turned: Condvar,
     /// The frames that the last catch-up to follow any kept, for reads of their objects.
     followed: ArcSwapOption<Kept>,
     /// How the store was opened.
@@ -2893,8 +2906,9 @@ impl Store {
                 phased: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
-                line: Mutex::new(Line::default()),
-                served: Condvar::new(),
+                drawing: Mutex::new(()),
+                turns: Mutex::new(Vec::new()),
+                turned: Condvar::new(),
                 followed: ArcSwapOption::empty(),
                 options,
                 view: None,
@@ -2960,8 +2974,9 @@ impl Store {
                 phased: Condvar::new(),
                 taken: Mutex::new(Vec::new()),
                 freed: Condvar::new(),
-                line: Mutex::new(Line::default()),
-                served: Condvar::new(),
+                drawing: Mutex::new(()),
+                turns: Mutex::new(Vec::new()),
+                turned: Condvar::new(),
                 followed: ArcSwapOption::empty(),
                 options: StoreOptions {
                     read_only: true,
@@ -3584,29 +3599,22 @@ impl Store {
     /// Takes the gate, and holds its first phase, on a phase byte drawn at random, as [`Gate`]
     /// describes.
     ///
-    /// The threads of this process that want it queue in the order they came, through
-    /// [`Store::join_line`], and the one at the front draws a turn among the opens that want it,
-    /// through [`Store::take_turn`], before it takes the gate byte, waiting for another open that
-    /// holds it, such as one of an earlier build. Takers are served in the order they came, so
-    /// none waits for more than the holds of those ahead of it, where a thread that had just let
-    /// the gate go could take it again before a waiter woke, and the kernel, which links a new
-    /// waiter below those it finds and relinks those it wakes, could put each newcomer ahead of
-    /// them. A thread whose holds a [`Together`] binds keeps its place and turn from its last
-    /// hold and goes straight to the gate byte. If it had to wait, in its line, for a turn or for
-    /// the gate byte, it waits [`GATE_GAP`] more.
+    /// The thread draws a turn among every thread of every open that wants the gate, through
+    /// [`Store::take_turn`], and waits for the turn before its own to end, before it takes the
+    /// gate byte, waiting for another open that holds it, such as one of an earlier build. Takers
+    /// are served in the order they asked, so none waits for more than the holds of those ahead
+    /// of it, where a thread that had just let the gate go could take it again before a waiter
+    /// woke, and the kernel, which links a new waiter below those it finds and relinks those it
+    /// wakes, could put each newcomer ahead of them. A thread whose holds a [`Together`] binds
+    /// keeps its turn from its last hold and goes straight to the gate byte. If it had to wait,
+    /// for a turn or for the gate byte, it waits [`GATE_GAP`] more.
     pub(crate) fn take_gate(&self) -> Result<Gate> {
         let parked = PARKED.try_with(Cell::take).ok().flatten();
-        let (place, turn, mut waited) = match parked {
-            Some(Parked {
-                store,
-                turn,
-                place: Some(place),
-            }) if store == self.id() => (place, turn, false),
+        let (turn, mut waited) = match parked {
+            Some(Parked { store, turn }) if store == self.id() => (turn, false),
             parked => {
                 drop(parked);
-                let (place, lined) = self.join_line();
-                let (turn, behind) = self.take_turn();
-                (place, turn, lined || behind)
+                self.take_turn()
             }
         };
         let held = match self.hold(GATE_AT, 1, false)? {
@@ -3633,7 +3641,6 @@ impl Store {
             ends: Instant::now() + ROUNDS.0,
             pause: RANGE_POLL.0,
             turn,
-            place: Some(place),
         })
     }
 
@@ -3643,62 +3650,113 @@ impl Store {
         self.is_shared().then(together)
     }
 
-    /// Takes a ticket in the line of this process's threads that want the gate and waits until
-    /// it is served, and returns its place at the front and whether it had to wait.
-    fn join_line(&self) -> (Place, bool) {
-        let inner = &self.inner;
-        let mut line = inner.line.lock();
-        let ticket = line.next;
-        line.next += 1;
-        let waited = line.serving != ticket;
-        while line.serving != ticket {
-            inner.served.wait(&mut line);
-        }
-        (
-            Place {
-                store: self.clone(),
-            },
-            waited,
-        )
-    }
-
-    /// Draws this open's turn for the gate and waits for the turn before it to end, and returns
+    /// Draws this thread's turn for the gate and waits for the turn before it to end, and returns
     /// the turn, if it drew one, and whether one came before it.
     ///
-    /// Under [`DOOR_AT`] it locks the turn byte after the last one another open holds, and then
-    /// waits in the kernel for the one before it to be let go, which no other open waits for, so
-    /// the open ahead hands its turn to this one alone, and opens take the gate in the order they
-    /// drew. A thread draws only at the front of its process's line, since one open's locks never
-    /// conflict with each other. Turns only order takers that would otherwise wait for the gate in
-    /// any order, so a failure to draw one lets the thread on to the gate without a turn.
+    /// Under [`DOOR_AT`], and the lock on drawing that the threads of this process share, it
+    /// locks the turn byte after the last one held, by another open or by a thread of this
+    /// process, which only `turns` shows, since an open never sees its own locks. So every
+    /// thread of every open that wants the gate draws in the order it asked, and waits for the
+    /// turn drawn just before its own: on `turned` if a thread of this process holds it, and
+    /// otherwise as [`Store::await_turn`] describes. Turns only order takers that would otherwise
+    /// wait for the gate in any order, so a failure to draw one, or a door held for longer than
+    /// [`TURN_PASS`] by a process that stopped while it drew, lets the thread on to the gate
+    /// without a turn.
     fn take_turn(&self) -> (Option<Turn>, bool) {
-        let file = &self.inner.file;
-        if platform::lock_range(file, DOOR_AT, 1, true, true).is_err() {
+        let inner = &self.inner;
+        let file = &inner.file;
+        let drawing = inner.drawing.lock();
+        if !self.take_door() {
             return (None, false);
         }
-        let last = last_turn(file);
-        let mine = match &last {
-            Ok(last) => last.map_or(0, |last| last + 1),
-            Err(_) => u64::MAX,
-        };
-        let drawn =
-            mine != u64::MAX && platform::lock_range(file, turn_byte(mine), 1, true, false).is_ok();
+        let own = inner.turns.lock().clone();
+        let last = last_turn(file, &own).ok();
+        let mine = last.map(|last| last.map_or(0, |last| (last + 1) % TURNS));
+        let drawn = mine.filter(|mine| {
+            !own.contains(mine)
+                && platform::lock_range(file, turn_byte(*mine), 1, true, false).is_ok()
+        });
+        if let Some(mine) = drawn {
+            inner.turns.lock().push(mine);
+        }
         let _ = platform::unlock_range(file, DOOR_AT, 1);
-        if !drawn {
+        drop(drawing);
+        let Some(index) = drawn else {
             return (None, false);
-        }
+        };
         let turn = Turn {
             store: self.clone(),
-            at: turn_byte(mine),
+            index,
         };
-        let Ok(Some(last)) = last else {
+        let Some(Some(before)) = last else {
             return (Some(turn), false);
         };
-        let before = turn_byte(last);
-        if platform::lock_range(file, before, 1, true, true).is_ok() {
-            let _ = platform::unlock_range(file, before, 1);
+        let mut turns = inner.turns.lock();
+        if turns.contains(&before) {
+            while turns.contains(&before) {
+                inner.turned.wait(&mut turns);
+            }
+            return (Some(turn), true);
         }
+        drop(turns);
+        self.await_turn(before);
         (Some(turn), true)
+    }
+
+    /// Takes [`DOOR_AT`], trying between sleeps for at most [`TURN_PASS`], since the door is
+    /// held only while a turn is drawn and a holder that keeps it longer has stopped, and returns
+    /// whether it did.
+    fn take_door(&self) -> bool {
+        let file = &self.inner.file;
+        let started = Instant::now();
+        let mut pause = DOOR_POLL.0;
+        loop {
+            match platform::lock_range(file, DOOR_AT, 1, true, false) {
+                Ok(()) => return true,
+                Err(TryLockError::WouldBlock) if started.elapsed() < TURN_PASS => {}
+                Err(_) => return false,
+            }
+            thread::sleep(pause);
+            pause = (pause * 2).min(DOOR_POLL.1);
+        }
+    }
+
+    /// Waits until another open lets the turn `before` go, or passes it.
+    ///
+    /// It tests the turn between sleeps that double from 50 µs to a millisecond, or to
+    /// [`NEXT_POLL`] once no turn before that one is held, so that this thread is next. A taker
+    /// that holds a turn takes the gate once the turn before its own and the gate are free,
+    /// within a sleep, so a turn that stays held for [`TURN_PASS`] while they are free belongs to
+    /// a taker that does not run: a process stopped while it waited for the gate, or between a
+    /// pull's landing and its integration. This thread then passes it, rather than wait for as
+    /// long as that process stays stopped, and keeps its own turn, so the takers after it wait
+    /// for it as before. A failure to test lets the thread on.
+    fn await_turn(&self, before: u64) {
+        let inner = &self.inner;
+        let file = &inner.file;
+        let earlier = (before + TURNS - 1) % TURNS;
+        let mut pause = GATE_POLL.0;
+        let mut idle: Option<Instant> = None;
+        while platform::range_excluded(file, turn_byte(before), 1).unwrap_or(false) {
+            let queued = inner.turns.lock().contains(&earlier)
+                || platform::range_excluded(file, turn_byte(earlier), 1).unwrap_or(false);
+            let held = || {
+                inner.taken.lock().contains(&GATE_AT)
+                    || platform::range_excluded(file, GATE_AT, 1).unwrap_or(true)
+            };
+            if queued || held() {
+                idle = None;
+            } else if idle.get_or_insert_with(Instant::now).elapsed() >= TURN_PASS {
+                return;
+            }
+            let longest = match queued {
+                true => QUEUED_POLL,
+                false => NEXT_POLL,
+            };
+            pause = pause.min(longest);
+            thread::sleep(pause);
+            pause = (pause * 2).min(longest);
+        }
     }
 
     /// Whether no thread of this process holds a branch lock and no other process holds any,
@@ -7405,7 +7463,7 @@ mod tests {
         let store = shared_stores(dir.path(), 1).remove(0);
         let line = store.clone();
         let order = gate_order(&store, vec![store.clone(); 3], |taker| {
-            line.inner.line.lock().next > taker as u64
+            line.inner.turns.lock().contains(&(taker as u64))
         });
         assert_eq!(
             order,
@@ -7448,6 +7506,86 @@ mod tests {
         drop(bound);
         queued.join().unwrap();
         assert_eq!(*order.lock(), [0, 1]);
+        stores.iter().for_each(Store::close);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_taker_passes_a_turn_kept_with_the_gate_free_for_longer_than_a_taker_that_runs_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = shared_stores(dir.path(), 2);
+        let file = stores[0].inner.file.try_clone().unwrap();
+        let bound = stores[0].together();
+        let held = stores[0].take_gate().unwrap();
+        let other = stores[1].clone();
+        let (went, gone) = std::sync::mpsc::channel();
+        let queued = thread::spawn(move || {
+            let gate = other.take_gate().unwrap();
+            let _ = went.send(Instant::now());
+            drop(gate);
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !platform::range_excluded(&file, turn_byte(1), 1).unwrap() {
+            assert!(Instant::now() < deadline, "the other open never queued");
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            gone.try_recv().is_err(),
+            "the queued open passed a turn whose holder held the gate"
+        );
+        let kept = Instant::now();
+        drop(held);
+        let went = gone
+            .recv_timeout(10 * TURN_PASS)
+            .expect("the queued open waited for a turn kept with the gate free");
+        let after = went.duration_since(kept);
+        assert!(
+            after >= TURN_PASS && after < 5 * TURN_PASS,
+            "the queued open passed a kept turn {after:?} after the gate came free"
+        );
+        queued.join().unwrap();
+        drop(bound);
+        stores.iter().for_each(Store::close);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_thread_queued_in_its_opens_line_gets_the_gate_before_an_open_that_asked_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = shared_stores(dir.path(), 2);
+        let file = stores[0].inner.file.try_clone().unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = stores[0].take_gate().unwrap();
+        let taker = |index: usize, store: Store| {
+            let order = order.clone();
+            thread::spawn(move || {
+                let gate = store.take_gate().unwrap();
+                order.lock().push(index);
+                thread::sleep(Duration::from_millis(5));
+                drop(gate);
+            })
+        };
+        let wait_for = |queued: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !queued() {
+                assert!(Instant::now() < deadline, "a taker never queued");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let same_open = taker(1, stores[0].clone());
+        wait_for(&|| stores[0].inner.turns.lock().contains(&1));
+        thread::sleep(Duration::from_millis(50));
+        let other_open = taker(2, stores[1].clone());
+        wait_for(&|| platform::range_excluded(&file, turn_byte(2), 1).unwrap());
+        drop(held);
+        same_open.join().unwrap();
+        other_open.join().unwrap();
+        assert_eq!(
+            *order.lock(),
+            [1, 2],
+            "a thread that asked for the gate first got it after an open that asked later"
+        );
         stores.iter().for_each(Store::close);
     }
 }

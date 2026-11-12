@@ -104,6 +104,10 @@ fn shared_child() {
         puller(Path::new(&path), writer);
         return;
     }
+    if role == "queued puller" {
+        queued_puller(Path::new(&path));
+        return;
+    }
     let mut options = options();
     if let Ok(step) = std::env::var("FERRO_SHARED_ABORT") {
         options = options.hook(abort_at(step, number("FERRO_SHARED_NTH")));
@@ -1274,5 +1278,97 @@ fn cycles_beside_writer_processes_report_their_times() {
          passes {pauses:?}",
         setting("FERRO_CLOSURE_US", 5_000),
         took[2]
+    );
+}
+
+fn queued_puller(path: &Path) {
+    let db: Db<Root> = options().open(path).unwrap();
+    let pulled = db.branch("pulled-0").unwrap();
+    let source: Db<Root> = Options::new()
+        .durability(Durability::Buffered)
+        .open(path.with_file_name("source-0.ferro"))
+        .unwrap();
+    commit(&source, 0, 1);
+    println!("PULLING");
+    pulled.pull(&source, "source", keeping_ours).unwrap();
+    println!("PULLED");
+}
+
+fn signal(child: &Child, name: &str) {
+    let status = Command::new("kill")
+        .args([name, &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill {name} failed");
+}
+
+#[test]
+fn a_taker_stopped_while_it_waits_for_the_gate_holds_up_no_taker_that_comes_after_it() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("stopped.ferro");
+    let first: Db<Root> = options().open(&path).unwrap();
+    for branch in ["hold", "pulled-0", "pulled-1"] {
+        first.fork(branch).unwrap();
+    }
+    commit(&first, 9, 1);
+    let hold = first.branch("hold").unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holding = std::thread::spawn(move || {
+        hold.update(|root| {
+            let _ = released.recv();
+            root.n += 1;
+        })
+        .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let pulling = first.branch("pulled-1").unwrap();
+    let source: Db<Root> = Options::new()
+        .durability(Durability::Buffered)
+        .open(dir.path().join("source-1.ferro"))
+        .unwrap();
+    commit(&source, 1, 1);
+    let landing =
+        std::thread::spawn(move || pulling.pull(&source, "source", keeping_ours).map(drop));
+    std::thread::sleep(Duration::from_millis(300));
+    let mut spawned = spawn(&path, "queued puller", 0, 0, 0, &[]);
+    let mut lines = BufReader::new(spawned.child.stdout.take().unwrap()).lines();
+    let killed = Killed(vec![spawned.child]);
+    let pulling = lines
+        .by_ref()
+        .map_while(std::result::Result::ok)
+        .any(|line| line.contains("PULLING"));
+    assert!(pulling, "the other process never began its pull");
+    let (ended, pulled) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ended.send(
+            lines
+                .map_while(std::result::Result::ok)
+                .any(|line| line.contains("PULLED")),
+        );
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    signal(&killed.0[0], "-STOP");
+    release.send(()).unwrap();
+    holding.join().unwrap();
+    landing.join().unwrap().unwrap();
+    let second: Db<Root> = options().open(&path).unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let cycling = std::thread::spawn(move || {
+        let started = Instant::now();
+        second.compact(Keep::All).unwrap();
+        let _ = done.send(started.elapsed());
+    });
+    let while_stopped = finished.recv_timeout(Duration::from_secs(5)).ok();
+    signal(&killed.0[0], "-CONT");
+    let after = finished.recv_timeout(Duration::from_secs(30)).ok();
+    let pulled = pulled.recv_timeout(Duration::from_secs(30)).ok();
+    if after.is_some() || while_stopped.is_some() {
+        cycling.join().unwrap();
+    }
+    drop(killed);
+    assert!(
+        while_stopped.is_some(),
+        "a cycle waited over 5 s for a process stopped while it queued for the gate, which never \
+         held it; once that process went on the cycle took {after:?}, and its pull ended: {pulled:?}"
     );
 }
