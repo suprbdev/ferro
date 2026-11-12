@@ -52,7 +52,7 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Hashing, Moved, Moves, Object, Ptr, Relocate,
-    Sink, Staged, hash_parts, push_varint,
+    Sink, Staged, hash_filled, hash_parts, push_varint,
 };
 use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
@@ -1714,9 +1714,15 @@ fn unpack_into(payload: &[u8], raw: usize, at: u64, out: &mut Vec<u8>) -> Result
     } else {
         out.resize(raw, 0);
     }
+    unpack_slice(payload, out, at)
+}
+
+/// Decompresses `payload`, a body stored at `at`, into all of `out`, failing with
+/// `Error::Corrupt` if the payload is damaged or decompresses to another length.
+fn unpack_slice(payload: &[u8], out: &mut [u8], at: u64) -> Result<()> {
     let len = lz4_flex::block::decompress_into(payload, out)
         .map_err(|error| Error::Corrupt(format!("bad compressed body at {at}: {error}")))?;
-    if len != raw {
+    if len != out.len() {
         return Err(wrong_length(at));
     }
     Ok(())
@@ -1894,52 +1900,38 @@ pub(crate) fn stored_within(bytes: &[u8], start: u64, links: &mut Vec<Ptr>) -> O
 #[derive(Default)]
 pub(crate) struct Unpacked {
     body: Vec<u8>,
-    hashes: Vec<Hash>,
 }
 
-/// Checks that `record`, the bytes of the record at `ptr`, holds an object whose hash is `ptr`'s,
-/// and lets the scratch body shrink back to [`SCRATCH_KEEP`].
+/// Checks that `record`, the bytes of the record at `ptr` that [`stored_within`] or
+/// [`Store::read_stored`] found to hold `stored` and `links`, holds an object whose hash is
+/// `ptr`'s, and lets the scratch body shrink back to [`SCRATCH_KEEP`].
+///
+/// A compressed body is decompressed straight into the bytes the hash is taken over.
 ///
 /// # Errors
 ///
-/// `Error::Corrupt` if the record does not parse, its body does not decompress, or the hash
-/// differs.
-pub(crate) fn verify_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
-    let checked = check_stored(record, ptr, scratch);
+/// `Error::Corrupt` if the body does not decompress to its length or the hash differs.
+pub(crate) fn verify_stored(
+    record: &[u8],
+    stored: &Stored,
+    links: &[Ptr],
+    ptr: Ptr,
+    scratch: &mut Unpacked,
+) -> Result<()> {
+    let payload = &record[stored.payload.clone()];
+    let hashes = links.iter().map(|link| &link.hash);
+    let hash = hash_filled(stored.raw, hashes, &mut scratch.body, |body| {
+        match stored.packed {
+            true => unpack_slice(payload, body, ptr.offset),
+            false => {
+                body.copy_from_slice(payload);
+                Ok(())
+            }
+        }
+    });
     scratch.body.clear();
     scratch.body.shrink_to(SCRATCH_KEEP);
-    checked
-}
-
-/// The check that [`verify_stored`] makes.
-fn check_stored(record: &[u8], ptr: Ptr, scratch: &mut Unpacked) -> Result<()> {
-    let mut reader = RecordReader {
-        file: None,
-        start: ptr.offset,
-        tail: ptr.offset.saturating_add(record.len() as u64),
-        bytes: Cow::Borrowed(record),
-        pos: 0,
-        staged: false,
-    };
-    let header = reader.header()?;
-    let start = reader.pos;
-    reader.take(header.stored)?;
-    let payload = start..reader.pos;
-    scratch.hashes.clear();
-    for _ in 0..header.links {
-        let link = reader.link()?;
-        scratch.hashes.push(link.hash);
-    }
-    let payload = &record[payload];
-    let body = match header.raw {
-        Some(raw) => {
-            unpack_into(payload, raw, ptr.offset, &mut scratch.body)?;
-            &scratch.body
-        }
-        None => payload,
-    };
-    let hash = hash_parts(body, scratch.hashes.iter());
-    if hash != ptr.hash {
+    if hash? != ptr.hash {
         return Err(Error::Corrupt(format!(
             "hash mismatch for object at {}",
             ptr.offset
@@ -6926,11 +6918,13 @@ mod tests {
         .unwrap();
         assert_eq!((read.links, len as usize), (links.to_vec(), record.len()));
         let mut scratch = Unpacked::default();
-        verify_stored(&record, ptr, &mut scratch).unwrap();
+        verify_stored(&record, &stored, &found, ptr, &mut scratch).unwrap();
+        let mut damaged = record.clone();
+        damaged[stored.payload.start] ^= 1;
+        assert!(verify_stored(&damaged, &stored, &found, ptr, &mut scratch).is_err());
         let last = record.len() - 1;
         record[last] ^= 0x80;
         assert!(stored_within(&record, at, &mut found).is_none_or(|stored| stored.len != last + 1));
-        assert!(verify_stored(&record, ptr, &mut scratch).is_err());
     }
 
     #[test]

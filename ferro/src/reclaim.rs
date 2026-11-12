@@ -33,9 +33,11 @@ use crate::store::{
     compressed, seal, staged, stored_within, verify_stored,
 };
 use ahead::Ahead;
+use copies::Copies;
 use units::{Key, PENDING, Reserved, Settled, Units};
 
 mod ahead;
+mod copies;
 mod units;
 
 const FLUSH_BYTES: usize = 1 << 20;
@@ -282,7 +284,7 @@ struct CopySink<'a> {
     body: Vec<u8>,
     cache: EntryCache,
     spare: Vec<Buffers>,
-    copied: HashMap<Hash, Copied, ByHash>,
+    copied: Copies,
     walked: HashMap<u64, Hash, ByOffset>,
     reached: HashMap<String, u64>,
     records: HashMap<u64, u64, ByOffset>,
@@ -306,9 +308,10 @@ enum Copied {
 }
 
 impl Copied {
-    fn entry(&mut self) {
-        if let Copied::Object(offset) = *self {
-            *self = Copied::Both(offset);
+    fn entered(copied: Option<Copied>) -> Copied {
+        match copied {
+            None | Some(Copied::Entry) => Copied::Entry,
+            Some(Copied::Object(offset) | Copied::Both(offset)) => Copied::Both(offset),
         }
     }
 
@@ -607,19 +610,17 @@ impl CopySink<'_> {
         self.end += (self.buf.len() - before) as u64;
         match below {
             Some(below) => {
-                self.copied
-                    .entry(hash)
-                    .and_modify(Copied::entry)
-                    .or_insert(Copied::Entry);
+                self.copied.update(&hash, Copied::entered);
                 self.records.insert(from.offset, offset);
                 self.below.insert(offset, below);
                 self.needs.hand(from.offset, &mut self.kept);
             }
             None => {
-                let copied = self.copied.entry(hash).or_insert(Copied::Object(offset));
-                if let Copied::Entry = copied {
-                    *copied = Copied::Both(offset);
-                }
+                self.copied.update(&hash, |copied| match copied {
+                    None => Copied::Object(offset),
+                    Some(Copied::Entry) => Copied::Both(offset),
+                    Some(copied) => copied,
+                });
                 if let Some(units) = &self.units {
                     let key = self.fallback.unwrap_or_else(|| units.walk_key());
                     units.place(&hash, key, offset);
@@ -680,10 +681,7 @@ impl CopySink<'_> {
             return self.placed(hash);
         };
         match copied {
-            Copied::Object(offset) | Copied::Both(offset) => Some(Ptr {
-                hash,
-                offset: *offset,
-            }),
+            Copied::Object(offset) | Copied::Both(offset) => Some(Ptr { hash, offset }),
             Copied::Entry => None,
         }
     }
@@ -710,7 +708,7 @@ impl CopySink<'_> {
                 )));
             }
             None => return Ok(self.placed(link.hash).map_or(Link::Object, Link::Copied)),
-            Some(copied) => *copied,
+            Some(copied) => copied,
         };
         let walked = || self.walked.get(&link.offset) == Some(&link.hash);
         Ok(match copied {
@@ -843,11 +841,15 @@ impl CopySink<'_> {
             *reserved = units.as_ref().map(|units| units.reserve(claim as u64));
             Ok(())
         };
+        self.copied.prefetch(&ptr.hash);
         let read = self.source.read_stored(ptr, bytes, &mut held.old, large);
         self.reserved = None;
         let (record, stored) = read?;
+        for link in &held.old {
+            self.copied.prefetch(&link.hash);
+        }
         if !entry || self.walked.get(&ptr.offset) != Some(&ptr.hash) {
-            verify_stored(record, ptr, &mut self.scratch)?;
+            verify_stored(record, &stored, &held.old, ptr, &mut self.scratch)?;
         }
         let entry = match entry {
             true => {
@@ -1150,7 +1152,7 @@ impl<'a> Copier<'a> {
                 body: Vec::new(),
                 cache: EntryCache::default(),
                 spare: Vec::new(),
-                copied: HashMap::default(),
+                copied: Copies::default(),
                 walked: HashMap::default(),
                 reached: HashMap::new(),
                 records: HashMap::default(),
@@ -1236,13 +1238,10 @@ impl<'a> Copier<'a> {
         }
         for hash in &retained {
             sink.pruned.remove(hash);
-            sink.copied
-                .entry(*hash)
-                .and_modify(Copied::entry)
-                .or_insert(Copied::Entry);
+            sink.copied.update(hash, Copied::entered);
         }
         for hash in edge {
-            let copied = sink.copied.get(&hash).copied();
+            let copied = sink.copied.get(&hash);
             if !retained.contains(&hash) && !copied.is_some_and(Copied::is_entry) {
                 sink.pruned.insert(hash);
             }

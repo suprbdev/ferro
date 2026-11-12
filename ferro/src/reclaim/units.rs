@@ -616,7 +616,7 @@ impl Shared {
                 *taken = None;
                 *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
             }
-            verify_stored(record, ptr, &mut s.unpacked).ok()?;
+            verify_stored(record, &stored, &links, ptr, &mut s.unpacked).ok()?;
         }
         let len = u32::try_from(stored.len).ok()?;
         if links

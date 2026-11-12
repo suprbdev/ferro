@@ -130,6 +130,54 @@ pub(crate) fn hash_parts<'a>(body: &[u8], links: impl ExactSizeIterator<Item = &
     })
 }
 
+/// The [`Hash`](type@Hash) of an object of `raw` body bytes and links with these hashes, whose
+/// body `fill` writes into the bytes it is given, as [`hash_parts`] computes it.
+///
+/// A body that fits the scratch buffer [`hash_parts`] joins small objects in is written there
+/// directly, so it is never copied, and a larger one is written to `spill` first, which is
+/// allocated zeroed when it has too little room, so that only the pages `fill` writes are touched.
+///
+/// # Errors
+///
+/// Whatever `fill` returns.
+pub(crate) fn hash_filled<'a>(
+    raw: usize,
+    links: impl ExactSizeIterator<Item = &'a Hash>,
+    spill: &mut Vec<u8>,
+    fill: impl FnOnce(&mut [u8]) -> Result<()>,
+) -> Result<Hash> {
+    let total = links
+        .len()
+        .saturating_mul(HASH_BYTES)
+        .saturating_add(raw.saturating_add(8));
+    if total > JOINED_BYTES {
+        spill.clear();
+        if spill.capacity() < raw {
+            *spill = vec![0; raw];
+        } else {
+            spill.resize(raw, 0);
+        }
+        fill(spill)?;
+        return Ok(hash_parts(spill, links));
+    }
+    JOINED.with_borrow_mut(|joined| {
+        if joined.len() < total {
+            joined.resize(total, 0);
+        }
+        let joined = &mut joined[..total];
+        joined[..4].copy_from_slice(&(raw as u32).to_le_bytes());
+        joined[4..8].copy_from_slice(&(links.len() as u32).to_le_bytes());
+        fill(&mut joined[8..8 + raw])?;
+        for (index, link) in links.enumerate() {
+            let at = 8 + raw + index * HASH_BYTES;
+            joined[at..at + HASH_BYTES].copy_from_slice(link);
+        }
+        let mut out = [0u8; HASH_BYTES];
+        out.copy_from_slice(&blake3::hash(joined).as_bytes()[..HASH_BYTES]);
+        Ok(out)
+    })
+}
+
 /// The [`Hash`](type@Hash) of an object built up from its parts as they come, the body first and
 /// then the hash of each link, which comes out as [`hash_parts`] computes it at once.
 ///

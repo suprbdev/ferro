@@ -705,8 +705,9 @@ impl Hint {
     }
 }
 
+/// Starts fetching the cache line that holds `address` into the cache, a hint that never faults.
 #[inline(always)]
-fn prefetch(address: usize) {
+pub(crate) fn prefetch(address: usize) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: a prefetch is a hint that never faults, whatever the address, and changes nothing the
     // program can observe, and the SSE it needs is part of every x86_64 target.
