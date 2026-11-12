@@ -4540,8 +4540,8 @@ mod diffed {
                 let diffed = panic::catch_unwind(AssertUnwindSafe(|| {
                     empty
                         .diff(&map)
-                        .map(|change| change.after().map(|value| value.len()))
-                        .count()
+                        .filter_map(|change| change.after().map(|value| value.len()))
+                        .sum::<usize>()
                 }));
                 assert!(
                     diffed.is_err(),
